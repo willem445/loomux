@@ -894,7 +894,24 @@ export interface AgentSummary {
   idle_since_ms: number | null;
   /** Milliseconds since the agent was spawned. */
   uptime_ms: number;
+  /** Compact-nudge state-machine phase (PR #329 round 6) — narrates the
+   *  real backend state, not a parallel vocabulary. See `compactionStatusLabel`. */
+  compaction: CompactionStatus;
+  /** Last-known context-window usage (PR #329 round 6) — cached by the
+   *  backend's own compact-nudge tick, not a per-poll transcript read. Both
+   *  null until the first reading (no session yet, or a non-Claude agent). */
+  context: { tokens: number | null; percent: number | null };
 }
+
+/** Compact-nudge (PR #329 round 6): the compaction state-machine phase for
+ *  one agent, mirroring the backend's `CompactionStatus` enum verbatim
+ *  (`#[serde(tag = "status")]`) — never invent a parallel vocabulary here. */
+export type CompactionStatus =
+  | { status: "none" }
+  | { status: "armed"; trusted: boolean }
+  | { status: "awaiting_evidence"; trusted: boolean }
+  | { status: "reinjecting"; attempt: number; max_attempts: number }
+  | { status: "abandoned"; reason: string; since_ms: number };
 
 /** At-a-glance lifecycle summary for a group (backend `orch_group_summary`). */
 export interface GroupSummary {

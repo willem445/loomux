@@ -13,7 +13,12 @@ use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
-    claude_permission_mode, cli_ready, copilot_autopilot_prompt_detected, create_orchestration_group,
+    claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
+    compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_role_allowed,
+    compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
+    CompactionStatus,
+    auto_compact_banner_detected, compaction_confirmed, directive_ledger_embed, ledger_capped,
+    human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, resolve_output_text,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
@@ -32,7 +37,7 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentRecord, AttentionItem, Caller, Delivery, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
+    AgentRecord, AttentionItem, Caller, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -5125,6 +5130,1528 @@ fn idle_tick_status_reports_paused_with_no_countdown() {
     assert!(s["eligible_in_secs"].as_u64().is_some());
 }
 
+// ---------- compact-nudge: periodic /compact at natural lulls (#287) ----------
+
+/// Guardrails on Claude with compact-nudge set to `minutes` (0 = off) for the
+/// given `roles` (lowercase `Role::as_str()` names), other fields mirroring
+/// `rails()`.
+fn compact_rails(minutes: u32, roles: &[&str]) -> Guardrails {
+    Guardrails {
+        compact_nudge_minutes: minutes,
+        compact_nudge_roles: roles.iter().map(|s| s.to_string()).collect(),
+        ..rails()
+    }
+}
+
+/// rev-42 delta (round 2): a `delivery_confirmations` map reporting a
+/// CONFIRMED delivery to `agent_id` at `submit_sent_ms` — what a real
+/// `deliver_prompt` background thread would eventually record, supplied
+/// directly since unit tests have no live pty/app handle to exercise it for
+/// real (see `DeliveryConfirmation`'s doc). `from: "loomux"` — every
+/// existing caller uses this to simulate loomux's OWN reinjection delivery
+/// confirming, never a human/other-agent message.
+fn confirmed_delivery(agent_id: &str, submit_sent_ms: u64) -> HashMap<String, DeliveryConfirmation> {
+    [(agent_id.to_string(), DeliveryConfirmation { submit_sent_ms, confirmed: true, from: "loomux".to_string() })]
+        .into_iter()
+        .collect()
+}
+
+/// Group with a live (Running, headless) orchestrator and compact-nudge
+/// enabled for `minutes` on the default (orchestrator-only) role set. Returns
+/// (reg, tempdir, group id, orchestrator id).
+fn compact_nudge_setup(minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", compact_rails(minutes, &["orchestrator"])).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+#[test]
+fn compact_nudge_role_gate_defaults_to_orchestrator_only() {
+    let default_roles = vec!["orchestrator".to_string()];
+    assert!(compact_nudge_role_allowed(Role::Orchestrator, &default_roles));
+    assert!(!compact_nudge_role_allowed(Role::Worker, &default_roles),
+        "workers are short-lived — not eligible unless explicitly configured");
+    assert!(!compact_nudge_role_allowed(Role::Reviewer, &default_roles));
+    assert!(!compact_nudge_role_allowed(Role::Planner, &default_roles));
+    // Config-selectable: a group that opts a worker in gets exactly that.
+    let widened = vec!["orchestrator".to_string(), "worker".to_string()];
+    assert!(compact_nudge_role_allowed(Role::Worker, &widened));
+    assert!(!compact_nudge_role_allowed(Role::Reviewer, &widened));
+}
+
+#[test]
+fn compact_nudge_cli_gate_is_claude_only() {
+    // `/compact` is a Claude Code built-in; no other supported CLI has an
+    // equivalent, so the nudge must never fire for them.
+    assert!(compact_nudge_cli_supported("claude"));
+    assert!(!compact_nudge_cli_supported("copilot"));
+    assert!(!compact_nudge_cli_supported("codex"));
+    assert!(!compact_nudge_cli_supported(""));
+}
+
+#[test]
+fn compact_nudge_defaults_off_and_orchestrator_only_and_zero_survives_clamping() {
+    // The conservative shipped default: off, and — if ever turned on without an
+    // explicit role list — orchestrator-only.
+    let g = Guardrails::default().clamped();
+    assert_eq!(g.compact_nudge_minutes, 0, "off by default");
+    assert_eq!(g.compact_nudge_roles, vec!["orchestrator".to_string()]);
+    // Unlike `idle_tick_minutes`, 0 here is a real "off", not "unset → default"
+    // (there is no separate on/off marker) — clamped() must never float it up.
+    let g = Guardrails { compact_nudge_minutes: 0, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_minutes, 0);
+    let g = Guardrails { compact_nudge_minutes: 99_999, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_minutes, 1440, "clamps to the 24h ceiling");
+    // Unrecognized role names are dropped and duplicates deduped; an all-bogus
+    // list falls back to orchestrator-only rather than disabling every role.
+    let g = Guardrails {
+        compact_nudge_roles: vec!["bogus".into(), "worker".into(), "worker".into()],
+        ..rails()
+    }
+    .clamped();
+    assert_eq!(g.compact_nudge_roles, vec!["worker".to_string()]);
+    let g = Guardrails { compact_nudge_roles: vec!["bogus".into()], ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_roles, vec!["orchestrator".to_string()]);
+}
+
+#[test]
+fn compact_nudge_off_by_default_never_fires() {
+    let (reg, _d, gid, _oid) = compact_nudge_setup(0);
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
+        "compact_nudge_minutes 0 must never fire, no matter how long the pane is quiet");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 0);
+}
+
+#[test]
+fn compact_nudge_fires_once_per_window_and_rearms_on_output() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let empty = HashMap::new();
+    // Idle-at-prompt (output-quiet) far past the window → exactly one nudge,
+    // audited, delivered via the same idleness signal idle-tick reads.
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![oid.clone()],
+        "an eligible pane quiet past the window must be nudged");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1, "the nudge must be audited once");
+    // Rate limit: still quiet, already latched → no second nudge in the same
+    // window (this is also the "held is skipped, not queued" property at the
+    // tick layer — there is no retry loop, just the one-shot latch).
+    assert!(reg.compact_nudge_tick(FAR + 60_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(), "one nudge per quiet window");
+    // The pane produces real output (mid-turn / busy): clock + latch both
+    // reset, and this very tick can't also fire — "never mid-turn" pinned
+    // directly against the tick's own fire decision.
+    let grew: HashMap<String, u64> = [(oid.clone(), 4096u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(FAR, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(), "output growth is activity, not idle-at-prompt");
+    // Quiet again shortly after: busy-then-quiet resolves (trusted arm) into
+    // the delivery-confirmation phase — NOT itself a re-fire, and `compact_
+    // pending` still gates the heuristic until that delivery confirms
+    // (rev-42 delta, round 2).
+    assert!(reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
+        "resolving into the confirmation-wait phase is not itself a fire");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "the first arm's reinjection was attempted");
+    assert!(reg.agent(&oid).unwrap().compact_pending, "still pending — waiting on confirmed delivery");
+    // Confirm that delivery: the latch releases.
+    let confirmed = confirmed_delivery(&oid, FAR + 1_000);
+    assert!(reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "confirmed delivery releases the latch");
+    // No further growth; a whole fresh window elapses (from the busy tick's
+    // last_progress_ms) → a brand-new nudge.
+    assert_eq!(reg.compact_nudge_tick(FAR + 20 * 60_000 + 1, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![oid.clone()],
+        "a new quiet window after activity earns a new nudge");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 2);
+}
+
+#[test]
+fn compact_nudge_ignores_subfloor_repaint_growth() {
+    // Same repaint-vs-real-turn discrimination idle-tick uses (shared
+    // `idle_activity_floor_bytes` guardrail, shared `idle_output_is_activity`):
+    // a statusline/spinner frame must not indefinitely defer the nudge.
+    let (reg, _d, _gid, oid) = compact_nudge_setup(5);
+    let m = |total: u64| -> HashMap<String, u64> { [(oid.clone(), total)].into_iter().collect() };
+    assert!(reg.compact_nudge_tick(1_000, &m(500), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(), "an early sub-floor repaint is not a tick");
+    assert_eq!(reg.compact_nudge_tick(FAR, &m(900), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![oid.clone()],
+        "sub-floor creep never resets the clock, so the window still elapses");
+}
+
+#[test]
+fn compact_nudge_skips_a_role_not_in_the_eligible_set() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", compact_rails(20, &["orchestrator"])).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+    let empty = HashMap::new();
+    let nudged = reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(nudged, vec![o.id.clone()], "only the configured (orchestrator) role is eligible");
+    assert!(!nudged.contains(&w.id), "a worker must never be nudged with the default role set");
+}
+
+#[test]
+fn compact_nudge_skips_a_cli_with_no_compact_equivalent() {
+    let (reg, _d) = test_registry();
+    let non_claude_rails = Guardrails {
+        agent_cli: "copilot".into(),
+        compact_nudge_minutes: 20,
+        compact_nudge_roles: vec!["orchestrator".into()],
+        ..rails()
+    };
+    let g = reg.create_group("C:/tmp/repo", non_claude_rails).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
+        "/compact has no copilot equivalent — the nudge must never fire for it");
+    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 0);
+}
+
+#[test]
+fn compact_nudge_skips_a_paused_group_preserving_the_latch() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let empty = HashMap::new();
+    reg.pause_group(&gid).unwrap();
+    assert!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(), "a paused group is never nudged");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 0);
+    // The one-shot latch/rate budget must be intact: pausing must not have
+    // burned it, so on resume the outstanding quiet window still earns its
+    // first nudge.
+    reg.resume_group(&gid).unwrap();
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![oid.clone()],
+        "resuming a still-idle eligible pane earns its first nudge");
+}
+
+#[test]
+fn compact_nudge_rate_limit_holds_under_the_per_hour_cap() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(5); // 5-minute quiet window
+    let m = |t: u64| -> HashMap<String, u64> { [(oid.clone(), t)].into_iter().collect() };
+    let none = HashMap::new();
+    let win = 5 * 60_000u64;
+    let mut t = FAR;
+    // The per-hour cap is 4: drive four full fire/reset cycles, each needing
+    // the latch cleared (a real burst) then a full window of quiet.
+    for i in 0u64..4 {
+        assert_eq!(reg.compact_nudge_tick(t, &none, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![oid.clone()], "nudge {i} under the cap");
+        t += 1_000;
+        let burst = m(1_000_000 + i * 200_000);
+        assert!(reg.compact_nudge_tick(t, &burst, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(), "burst {i} resets the latch");
+        t += 1_000;
+        // Quiet again: busy-then-quiet resolves (trusted arm) into the
+        // delivery-confirmation phase — `compact_pending` still gates the
+        // next fire until that delivery confirms (rev-42 delta, round 2).
+        assert!(reg.compact_nudge_tick(t, &burst, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(), "resolve {i} into the confirmation-wait phase");
+        let confirmed = confirmed_delivery(&oid, t);
+        t += 1_000;
+        assert!(reg.compact_nudge_tick(t, &burst, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed).is_empty(), "confirm {i}");
+        assert!(!reg.agent(&oid).unwrap().compact_pending, "confirmed {i}: latch released");
+        t += win + 1;
+    }
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 4);
+    // Latch is clear and the quiet window has fully elapsed again — the ONLY
+    // thing standing between here and a fifth nudge is the per-hour cap.
+    assert!(reg.compact_nudge_tick(t, &none, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
+        "the per-hour cap must hold even though the quiet window elapsed again");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 4, "cap must not be exceeded");
+}
+
+#[test]
+fn compact_nudge_minutes_and_roles_are_configurable_persisted_and_audited() {
+    let (reg, dir, gid, _oid) = compact_nudge_setup(0);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.compact_nudge_minutes, 0, "off at launch");
+    assert_eq!(reg.set_compact_nudge_minutes(&gid, 15).unwrap(), 15);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.compact_nudge_minutes, 15);
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge-minutes-set"), 1);
+    assert_eq!(reg.set_compact_nudge_minutes(&gid, 99_999).unwrap(), 1440, "clamps to the ceiling");
+    assert_eq!(reg.set_compact_nudge_minutes(&gid, 0).unwrap(), 0, "0 stays off, never floored to a default");
+    assert!(reg.set_compact_nudge_minutes("no-such-group", 5).is_err());
+    reg.set_compact_nudge_minutes(&gid, 15).unwrap();
+
+    let roles = reg.set_compact_nudge_roles(&gid, vec!["orchestrator".into(), "worker".into()]).unwrap();
+    assert_eq!(roles, vec!["orchestrator".to_string(), "worker".to_string()]);
+    assert_eq!(reg.group(&gid).unwrap().guardrails.compact_nudge_roles, roles);
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge-roles-set"), 1);
+    // Unrecognized entries dropped; an empty result falls back to orchestrator-only.
+    assert_eq!(reg.set_compact_nudge_roles(&gid, vec!["bogus".into()]).unwrap(), vec!["orchestrator".to_string()]);
+    assert!(reg.set_compact_nudge_roles("no-such-group", vec![]).is_err());
+
+    reg.set_compact_nudge_roles(&gid, vec!["orchestrator".into(), "worker".into()]).unwrap();
+    // Persisted across restart (live-set values win over the launch default).
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    reg2.create_group("C:/tmp/repo", rails()).unwrap();
+    let persisted = &reg2.group(&gid).unwrap().guardrails;
+    assert_eq!(persisted.compact_nudge_minutes, 15, "a live-set window survives restart");
+    assert_eq!(persisted.compact_nudge_roles, vec!["orchestrator".to_string(), "worker".to_string()],
+        "live-set roles survive restart");
+}
+
+#[test]
+fn compact_nudge_roles_are_canonicalized_to_lowercase_on_set() {
+    // rev-24 review: `kind_from_str` validates a role name case-insensitively
+    // but does not normalize it, so a mixed-case name would persist as-typed
+    // and then never match `compact_nudge_role_allowed`'s lowercase
+    // comparison — silently disabling the very role it was meant to enable.
+    let (reg, _d, gid, _oid) = compact_nudge_setup(0);
+    let applied =
+        reg.set_compact_nudge_roles(&gid, vec!["Orchestrator".into(), "WORKER".into()]).unwrap();
+    assert_eq!(applied, vec!["orchestrator".to_string(), "worker".to_string()],
+        "mixed-case role names must be canonicalized, not stored as-typed");
+    assert!(compact_nudge_role_allowed(Role::Worker, &applied),
+        "a canonicalized role must actually match the gate it configures");
+    // `clamped()` applies the same canonicalization to a hand-edited/persisted list.
+    let g = Guardrails { compact_nudge_roles: vec!["Orchestrator".into()], ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_roles, vec!["orchestrator".to_string()]);
+}
+
+#[test]
+fn compact_nudge_and_idle_tick_both_rearm_in_the_combined_configuration() {
+    // rev-24 review: the primary configuration the feature is FOR — autonomous
+    // idle-tick AND compact-nudge both watching the same orchestrator — was
+    // never exercised together. An earlier revision had both ticks rebaseline
+    // the SAME pty-output counter, so whichever tick polled a burst first
+    // consumed it and the other's activity detection (and, transitively, its
+    // own anti-nag latch) never saw it: compact-nudge fired at most once per
+    // pane lifetime. This drives BOTH ticks across one burst and pins that
+    // BOTH independently re-arm afterward.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", compact_rails(5, &["orchestrator"])).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    let empty = HashMap::new();
+
+    // Both earn their first fire off the initial (spawn-time) quiet clock.
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![o.id.clone()], "idle-tick's first tick");
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![o.id.clone()], "compact-nudge's first nudge");
+
+    // A real burst: idle-tick observes it first (mirrors `lib.rs`'s setup
+    // order — `start_idle_tick` is registered before `start_compact_nudge`).
+    let grew: HashMap<String, u64> = [(o.id.clone(), 100_000u64)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR, &grew, &empty).is_empty(), "idle-tick sees the burst, no re-fire this tick");
+    assert!(reg.compact_nudge_tick(FAR, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
+        "compact-nudge independently sees the SAME burst — not idle-tick's leftovers");
+
+    // Quiet again shortly after: the first arm resolves (trusted, busy-then-
+    // quiet) into the delivery-confirmation phase — `compact_pending` still
+    // gates the next fire until that delivery confirms (rev-42 delta,
+    // round 2), independently of idle-tick's own re-arm above.
+    assert!(reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
+        "resolving into the confirmation-wait phase is not itself a fire");
+    let confirmed = confirmed_delivery(&o.id, FAR + 1_000);
+    assert!(reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed).is_empty());
+    assert!(!reg.agent(&o.id).unwrap().compact_pending, "confirmed delivery releases the latch");
+
+    // A fresh quiet window after the burst (both windows default to 5 min) —
+    // BOTH must earn a second fire. Under the shared-counter bug this is the
+    // genuine red: compact-nudge's latch was never cleared by the burst above
+    // (idle-tick had already rebaselined the shared counter to the same
+    // value), so it stayed latched and never fired again.
+    let later = FAR + 5 * 60_000 + 1;
+    assert_eq!(reg.idle_tick_tick(later, &grew, &empty), vec![o.id.clone()], "idle-tick re-arms after the burst");
+    assert_eq!(reg.compact_nudge_tick(later, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![o.id.clone()],
+        "compact-nudge must ALSO re-arm after the burst, independently of idle-tick");
+}
+
+// ---------- compact-nudge expansion: request_compact, checklist warning, ----
+// ---------- context escalation, mandatory re-injection (#328) --------------
+
+#[test]
+fn compact_request_should_fire_bypasses_the_minutes_threshold_but_not_the_cap() {
+    let none: Vec<u64> = vec![];
+    assert!(compact_request_should_fire(true, &none, 1_000_000, 4), "quiet + under cap fires immediately");
+    assert!(!compact_request_should_fire(false, &none, 1_000_000, 4), "busy this tick never fires");
+    let at_cap = vec![100, 200, 300, 400];
+    assert!(!compact_request_should_fire(true, &at_cap, 1_000_000, 4), "the shared per-hour cap still applies");
+    assert!(compact_request_should_fire(true, &at_cap, 1_000_000, 0), "cap 0 = uncapped");
+}
+
+#[test]
+fn context_percent_used_clamps_and_rounds_down() {
+    assert_eq!(context_percent_used(0, 200_000), 0);
+    assert_eq!(context_percent_used(100_000, 200_000), 50);
+    assert_eq!(context_percent_used(199_999, 200_000), 99, "rounds down, never overstates");
+    assert_eq!(context_percent_used(200_000, 200_000), 100);
+    assert_eq!(context_percent_used(999_999, 200_000), 100, "over-window clamps to 100, never overflows past it");
+    assert_eq!(context_percent_used(50_000, 0), 0, "a zero window never divides by zero");
+}
+
+#[test]
+fn compact_escalation_should_fire_latches_and_respects_threshold_off() {
+    assert!(!compact_escalation_should_fire(90, 0, false), "threshold 0 = escalation disabled entirely");
+    assert!(!compact_escalation_should_fire(50, 80, false), "under threshold — purely opportunistic");
+    assert!(compact_escalation_should_fire(80, 80, false), "exactly at threshold escalates");
+    assert!(compact_escalation_should_fire(95, 80, false));
+    assert!(!compact_escalation_should_fire(95, 80, true), "already notified — one escalation per crossing");
+}
+
+#[test]
+fn compact_escalation_notice_names_the_percent_and_the_recovery_move() {
+    let n = compact_escalation_notice(87);
+    assert!(n.starts_with("[loomux]"));
+    assert!(n.contains("87%"), "got: {n}");
+    assert!(n.contains("request_compact"), "got: {n}");
+}
+
+#[test]
+fn compact_checklist_warning_is_recency_gated_never_blocking() {
+    assert!(compact_checklist_warning(0, 1_000_000, 900_000).is_some(), "never observed = warn");
+    assert!(compact_checklist_warning(100_000, 1_000_000, 900_000).is_some(), "stale (at the window edge) = warn");
+    assert!(compact_checklist_warning(950_000, 1_000_000, 900_000).is_none(), "recent = no warning");
+}
+
+#[test]
+fn human_typed_compact_detected_matches_standalone_tokens_only() {
+    assert!(human_typed_compact_detected("> /compact\nCompacting conversation..."));
+    assert!(human_typed_compact_detected("/compact"));
+    assert!(!human_typed_compact_detected("editing src/compact_nudge.rs"), "embedded in a path/word must not match");
+    assert!(!human_typed_compact_detected("I'll call request_compact for you"), "a different token entirely");
+    assert!(!human_typed_compact_detected(""));
+}
+
+#[test]
+fn compact_reinjection_notice_embeds_the_instructions_verbatim() {
+    let instructions = "You are the orchestrator...\nNever merge without a gate.";
+    let n = compact_reinjection_notice(instructions, None);
+    assert!(n.starts_with("[loomux]"));
+    assert!(n.contains(instructions), "must embed the FULL instructions text, not a pointer to go read it");
+    assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"), "got: {n}");
+    assert!(!n.contains("directive ledger"), "None must embed nothing — no ledger header for an agent that never used it");
+}
+
+#[test]
+fn compact_reinjection_notice_folds_in_the_ledger_when_present() {
+    let instructions = "You are a worker...";
+    let n = compact_reinjection_notice(instructions, Some("Your directive ledger:\n[1] scope to auth only"));
+    assert!(n.contains(instructions), "instructions still embedded");
+    assert!(n.contains("scope to auth only"), "got: {n}");
+    // The ledger must land AFTER the instructions and BEFORE the re-sync
+    // line — re-grounding first, then the diary, then the live-state pointer.
+    let ins_pos = n.find(instructions).unwrap();
+    let ledger_pos = n.find("scope to auth only").unwrap();
+    let resync_pos = n.find("Now re-sync live state").unwrap();
+    assert!(ins_pos < ledger_pos && ledger_pos < resync_pos, "got: {n}");
+}
+
+#[test]
+fn directive_ledger_embed_is_none_for_empty_or_whitespace_only() {
+    assert!(directive_ledger_embed("", 2048, "C:/g/ledger-w-1.log").is_none());
+    assert!(directive_ledger_embed("   \n  \n", 2048, "C:/g/ledger-w-1.log").is_none());
+}
+
+#[test]
+fn directive_ledger_embed_keeps_the_tail_and_states_truncation() {
+    // Ten one-line entries, cap tight enough that only the last few fit.
+    let ledger: String = (1..=10).map(|i| format!("[{i}] entry number {i}\n")).collect();
+    let cap = 40; // enough for ~2 short lines, not all 10
+    let embed = directive_ledger_embed(&ledger, cap, "C:/g/ledger-w-1.log").unwrap();
+    assert!(embed.contains("entry number 10"), "must keep the NEWEST entry: {embed}");
+    assert!(!embed.contains("entry number 1\n"), "oldest entry must be the one dropped: {embed}");
+    assert!(embed.contains("full history at C:/g/ledger-w-1.log"), "truncation must name the file: {embed}");
+    assert!(embed.contains("most recent"), "truncation must be stated, not silent: {embed}");
+}
+
+#[test]
+fn directive_ledger_embed_never_drops_the_single_newest_entry_even_over_cap() {
+    let ledger = "a much longer single directive entry than the tiny cap below allows for";
+    let embed = directive_ledger_embed(ledger, 8, "C:/g/ledger-w-1.log").unwrap();
+    assert!(embed.contains(ledger), "the newest entry is never silently dropped for being long: {embed}");
+}
+
+#[test]
+fn directive_ledger_embed_omits_truncation_wording_when_everything_fits() {
+    let ledger = "[1] only one short entry";
+    let embed = directive_ledger_embed(ledger, 2048, "C:/g/ledger-w-1.log").unwrap();
+    assert!(embed.contains(ledger));
+    assert!(!embed.contains("most recent"), "no truncation language when nothing was cut: {embed}");
+    assert!(!embed.contains("full history at"), "no file pointer needed when nothing was cut: {embed}");
+}
+
+#[test]
+fn auto_compact_banner_detected_matches_claudes_stable_substring_only() {
+    assert!(auto_compact_banner_detected("claude", "✢ Compacting conversation… (esc to interrupt · 8s · ↓ 172 tokens)"));
+    assert!(auto_compact_banner_detected("claude", "Compacting conversation"));
+    assert!(!auto_compact_banner_detected("claude", "editing src/compact_nudge.rs"), "unrelated pane text must not match");
+    assert!(!auto_compact_banner_detected("claude", ""));
+    assert!(!auto_compact_banner_detected("copilot", "Compacting conversation"), "no known banner for copilot yet — never guessed");
+}
+
+#[test]
+fn compaction_confirmed_requires_a_real_drop_and_fails_closed_without_evidence() {
+    // Production bug fix (D2): busy-then-quiet alone is not evidence a real
+    // compaction ran — this is the confirmation gate that closes that gap.
+    assert!(compaction_confirmed(Some(100_000), Some(5_000)), "a dramatic drop is confirmed");
+    assert!(compaction_confirmed(Some(100_000), Some(69_000)), "just under the ratio threshold confirms");
+    assert!(!compaction_confirmed(Some(100_000), Some(70_001)), "just over the ratio threshold does not confirm");
+    assert!(!compaction_confirmed(Some(100_000), Some(100_000)), "no change at all is not evidence of anything");
+    assert!(!compaction_confirmed(Some(50_000), Some(80_000)), "growth is the opposite of evidence");
+    // Fails CLOSED: no reading available in either direction must never be
+    // read as "trust it anyway" — a missed reinjection is acceptable, an
+    // ungrounded one is the production incident this function exists to stop.
+    assert!(!compaction_confirmed(None, Some(5_000)), "no baseline captured — never a guess");
+    assert!(!compaction_confirmed(Some(100_000), None), "no current reading available — never a guess");
+    assert!(!compaction_confirmed(None, None), "neither reading available — never a guess");
+    assert!(!compaction_confirmed(Some(0), Some(0)), "a zero baseline has nothing meaningful to compare against");
+}
+
+#[test]
+fn compaction_status_narrates_every_real_state_machine_phase() {
+    // Lifecycle-panel surfacing (PR #329 round 6): pure derivation from
+    // already-tracked state — pin each real phase maps to the right variant,
+    // never a phase the state machine can't actually be in.
+    assert_eq!(
+        compaction_status(false, false, false, None, 0, None, None, 1_000),
+        CompactionStatus::None,
+        "no arm, no reinjection, no lost outcome"
+    );
+    assert_eq!(
+        compaction_status(true, true, false, None, 0, None, None, 1_000),
+        CompactionStatus::Armed { trusted: true },
+        "pending, not yet observed busy — trusted arm"
+    );
+    assert_eq!(
+        compaction_status(true, false, false, None, 0, None, None, 1_000),
+        CompactionStatus::Armed { trusted: false },
+        "pending, not yet observed busy — inference arm"
+    );
+    assert_eq!(
+        compaction_status(true, false, true, None, 0, None, None, 1_000),
+        CompactionStatus::AwaitingEvidence { trusted: false },
+        "pending, busy observed — waiting on quiet to resolve"
+    );
+    assert_eq!(
+        compaction_status(true, true, false, Some(900), 2, None, None, 1_000),
+        CompactionStatus::Reinjecting { attempt: 2, max_attempts: 3 },
+        "reinject_attempted_ms set takes priority over the arm phase"
+    );
+    assert_eq!(
+        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 1_000),
+        CompactionStatus::Abandoned { reason: "arm-timeout".to_string(), since_ms: 500 },
+        "a recent lost outcome, no active arm"
+    );
+    assert_eq!(
+        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 500 + 10 * 60 * 1000),
+        CompactionStatus::None,
+        "a lost outcome outside the recency window reads as none, not a stale problem"
+    );
+}
+
+#[test]
+fn auto_compact_banner_detected_is_position_anchored_to_the_last_line_only() {
+    // rev review B1: a bare substring scan false-positives on any busy pane
+    // that PRINTS or DISCUSSES the banner text rather than actually running
+    // it — the growth from rendering the mention IS the growth a `!
+    // currently_quiet` gate would see, so recency alone can't separate them.
+    // The fix is positional: only the tail's LAST non-blank line counts,
+    // since the real spinner is the live status line with nothing after it
+    // while it runs, whereas a quoted mention sits in scrolled content with
+    // more lines following it.
+
+    // A `gh pr diff` hunk quoting the doc comment — banner text mid-diff,
+    // more diff lines after it.
+    let diff_tail = "\
+diff --git a/src-tauri/src/orchestration/mod.rs b/src-tauri/src/orchestration/mod.rs
++/// Claude Code's own emergency auto-compact renders a spinner line while it
++/// runs, observed (1.0.x) as `Compacting conversation` — a leading spinner
++/// glyph and a trailing elapsed-time/token-count suffix.
++pub fn auto_compact_banner_detected(cli: &str, tail: &str) -> bool {";
+    assert!(!auto_compact_banner_detected("claude", diff_tail), "a diff hunk quoting the string must not match: not the last line");
+
+    // A rust string literal inside a code listing — banner text mid-file,
+    // more code after it.
+    let code_tail = "\
+fn auto_compact_banner_substrings(cli: &str) -> &'static [&'static str] {
+    match cli {
+        \"claude\" => &[\"Compacting conversation\"],
+        _ => &[],
+    }
+}";
+    assert!(!auto_compact_banner_detected("claude", code_tail), "a string literal in a code listing must not match: not the last line");
+
+    // Prose discussion of the feature — banner text mid-sentence, more
+    // sentences after it.
+    let prose_tail = "\
+The detector matches the stable \"Compacting conversation\" substring.
+This is expected to survive across CLI point releases even if the
+spinner or counters' exact formatting doesn't change.";
+    assert!(!auto_compact_banner_detected("claude", prose_tail), "prose discussing the string must not match: not the last line");
+
+    // The real banner, as the tail's actual final line, with prior turn
+    // output before it — this MUST still trigger.
+    let real_tail = "\
+Reading src-tauri/src/orchestration/mod.rs...
+Found the compact-nudge tick function.
+✢ Compacting conversation… (esc to interrupt · 12s · ↓ 340 tokens)";
+    assert!(auto_compact_banner_detected("claude", real_tail), "the real banner as the last line must still trigger");
+
+    // A trailing blank line (e.g. a stray newline from the tail's own ring)
+    // must not hide a real banner sitting just above it.
+    let real_tail_trailing_blank = "✢ Compacting conversation… (esc to interrupt · 3s · ↓ 40 tokens)\n\n";
+    assert!(auto_compact_banner_detected("claude", real_tail_trailing_blank), "a trailing blank line must not mask the real last content line");
+}
+
+#[test]
+fn request_compact_is_self_scoped_and_cli_gated() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+    let msg = reg.request_compact(&o.id).unwrap();
+    assert!(msg.contains("compact requested"), "got: {msg}");
+    assert!(reg.agent(&o.id).unwrap().compact_requested, "flag set on the CALLING agent");
+    assert!(!reg.agent(&w.id).unwrap().compact_requested, "never set on another pane in the same group");
+}
+
+#[test]
+fn note_directive_appends_are_self_scoped_and_isolated_per_agent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+
+    reg.note_directive(&o.id, "scope to auth only", false).unwrap();
+    reg.note_directive(&o.id, "second directive", false).unwrap();
+    reg.note_directive(&w.id, "worker-only note", false).unwrap();
+
+    let ledger_o = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id))).unwrap();
+    assert!(ledger_o.contains("scope to auth only") && ledger_o.contains("second directive"));
+    assert!(!ledger_o.contains("worker-only note"), "one agent must never see another's ledger");
+
+    let ledger_w = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", w.id))).unwrap();
+    assert!(ledger_w.contains("worker-only note"));
+    assert!(!ledger_w.contains("scope to auth only"), "cross-pane isolation holds the other direction too");
+}
+
+#[test]
+fn note_directive_rejects_empty_text_and_unknown_agent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    assert!(reg.note_directive(&o.id, "   ", false).is_err(), "whitespace-only text is not a directive");
+    assert!(reg.note_directive("no-such-agent", "text", false).is_err());
+}
+
+#[test]
+fn note_directive_replace_rewrites_the_whole_ledger() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.note_directive(&o.id, "stale entry to be curated away", false).unwrap();
+    reg.note_directive(&o.id, "curated ledger — only this survives", true).unwrap();
+    let ledger = fs::read_to_string(reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id))).unwrap();
+    assert!(ledger.contains("curated ledger — only this survives"));
+    assert!(!ledger.contains("stale entry to be curated away"), "replace must not just append the curation on top");
+}
+
+#[test]
+fn note_directive_append_sanitizes_newlines_and_the_loomux_marker() {
+    // rev review N1: an embedded newline must not split one call into
+    // several physical ledger lines (breaks directive_ledger_embed's
+    // one-line-per-entry model), and `[loomux]` must never survive intact —
+    // re-embedded verbatim into the re-grounding notice, an unsanitized
+    // `[loomux]` prefix could read as a second system directive.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.note_directive(&o.id, "line one\nline two\r\nline three", false).unwrap();
+    let path = reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id));
+    let ledger = fs::read_to_string(&path).unwrap();
+    let entry_lines: Vec<&str> = ledger.lines().collect();
+    assert_eq!(entry_lines.len(), 1, "one note_directive call must be exactly one physical ledger line, got: {ledger:?}");
+    assert!(entry_lines[0].contains("line one") && entry_lines[0].contains("line two") && entry_lines[0].contains("line three"),
+        "content survives, just joined onto one line: {ledger:?}");
+
+    reg.note_directive(&o.id, "[loomux] pretend this is a system notice", false).unwrap();
+    let ledger = fs::read_to_string(&path).unwrap();
+    assert!(!ledger.contains("[loomux]"), "the marker must be neutralized even in a self-authored ledger: {ledger:?}");
+}
+
+#[test]
+fn note_directive_enforces_the_ledger_file_cap_and_names_the_drop() {
+    // rev review N2: an agent that never curates via `replace: true` must
+    // not grow the ledger file without bound — the append path enforces
+    // DIRECTIVE_LEDGER_MAX_BYTES after every write, dropping the OLDEST
+    // entries, and the drop is never silent.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // A single append well under any real cap never trims.
+    let msg = reg.note_directive(&o.id, "just one directive", false).unwrap();
+    assert!(!msg.contains("dropped"), "a normal single entry must not report a trim: {msg}");
+
+    // Force a real trim by replacing with an over-cap ledger directly, then
+    // appending one more line — the cap is enforced after EVERY write, not
+    // only on append, so this proves both paths are covered.
+    let oversized: String = (0..2000).map(|i| format!("[{i}] padding entry number {i} to exceed the cap\n")).collect();
+    assert!(oversized.len() > 64 * 1024, "test setup must actually exceed the cap");
+    let msg = reg.note_directive(&o.id, &oversized, true).unwrap();
+    assert!(msg.contains("dropped"), "an over-cap replace must report the trim: {msg}");
+    let path = reg.state_root().join(&g.id).join(format!("ledger-{}.log", o.id));
+    let ledger = fs::read_to_string(&path).unwrap();
+    assert!(ledger.len() <= 64 * 1024 + 200, "stored ledger must be capped (small slop for the last kept line): got {} bytes", ledger.len());
+    assert!(ledger.contains("padding entry number 1999"), "must keep the NEWEST entries, not the oldest: {ledger:?}");
+    assert!(!ledger.contains("padding entry number 0\n"), "oldest entries must be the ones dropped");
+}
+
+#[test]
+fn ledger_capped_keeps_newest_entries_and_reports_the_drop_count() {
+    let ledger: String = (0..10).map(|i| format!("[{i}] entry {i}\n")).collect();
+    let (capped, dropped) = ledger_capped(&ledger, 40);
+    assert!(dropped > 0, "an over-cap ledger must report a non-zero drop");
+    assert!(capped.contains("entry 9"), "must keep the newest entry: {capped:?}");
+    assert!(!capped.contains("entry 0\n"), "oldest entry must be the one dropped: {capped:?}");
+}
+
+#[test]
+fn ledger_capped_is_a_no_op_under_cap() {
+    let ledger = "[1] a short ledger\n[2] with two entries\n";
+    let (capped, dropped) = ledger_capped(ledger, 4096);
+    assert_eq!(dropped, 0);
+    assert_eq!(capped, ledger, "under cap must return the content unchanged, not re-serialized");
+}
+
+#[test]
+fn mcp_note_directive_dispatch_is_self_scoped() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "note_directive", "arguments": { "text": "human said: focus on #42" } })).unwrap();
+    assert_eq!(out["isError"], false);
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("recorded"), "got: {text}");
+    let ledger_o = fs::read_to_string(reg.state_root().join(&co.group).join(format!("ledger-{}.log", co.agent_id))).unwrap();
+    assert!(ledger_o.contains("human said: focus on #42"));
+
+    // Self-scoped: the worker's own call must never land in the orchestrator's ledger.
+    dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "note_directive", "arguments": { "text": "worker-only note" } })).unwrap();
+    let ledger_o_after = fs::read_to_string(reg.state_root().join(&co.group).join(format!("ledger-{}.log", co.agent_id))).unwrap();
+    assert!(!ledger_o_after.contains("worker-only note"), "cross-pane leak via dispatch");
+}
+
+#[test]
+fn mcp_note_directive_requires_text() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "note_directive", "arguments": {} })).unwrap();
+    assert_eq!(out["isError"], true, "missing text must error, not silently no-op");
+}
+
+#[test]
+fn request_compact_rejects_a_non_claude_cli_without_setting_the_flag() {
+    let (reg, _d) = test_registry();
+    let non_claude = Guardrails { agent_cli: "copilot".into(), ..rails() };
+    let g = reg.create_group("C:/tmp/repo", non_claude).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let err = reg.request_compact(&o.id).unwrap_err();
+    assert!(err.contains("Claude"), "must name the reason, got: {err}");
+    assert!(!reg.agent(&o.id).unwrap().compact_requested, "a rejected request must never flag the pane");
+}
+
+#[test]
+fn request_compact_offload_checklist_warning_is_recency_gated_on_set_state() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let first = reg.request_compact(&o.id).unwrap();
+    assert!(first.contains("warning"), "no set_state call yet — must warn, got: {first}");
+    reg.note_state_write(&o.id);
+    let second = reg.request_compact(&o.id).unwrap();
+    assert!(!second.contains("warning"), "set_state was just called — no warning, got: {second}");
+    // Non-orchestrator callers never see the warning (set_state isn't even
+    // available to them).
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+    let worker_msg = reg.request_compact(&w.id).unwrap();
+    assert!(!worker_msg.contains("warning"), "the checklist warning is orchestrator-only, got: {worker_msg}");
+}
+
+#[test]
+fn compact_nudge_tick_fires_a_requested_worker_regardless_of_role_eligibility() {
+    let (reg, _d) = test_registry();
+    // Default role set is orchestrator-only; the worker is NOT eligible for
+    // the heuristic path, but request_compact is self-initiated and role-
+    // agnostic.
+    let g = reg.create_group("C:/tmp/repo", compact_rails(20, &["orchestrator"])).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "work", false, None).unwrap();
+    reg.request_compact(&w.id).unwrap();
+    let empty = HashMap::new();
+    let nudged = reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(nudged, vec![w.id.clone()], "a requested fire is role-agnostic");
+    assert!(!reg.agent(&w.id).unwrap().compact_requested, "the request is consumed on fire");
+}
+
+#[test]
+fn compact_nudge_tick_requested_fire_waits_for_quiet_not_a_minutes_threshold() {
+    let (reg, _d, _gid, oid) = compact_nudge_setup(9999); // heuristic threshold effectively unreachable
+    reg.request_compact(&oid).unwrap();
+    let empty = HashMap::new();
+    // now=1 is far too early for ANY minutes-scale heuristic threshold — a
+    // requested fire needs no elapsed quiet-window time, only "quiet on this
+    // observation".
+    assert_eq!(reg.compact_nudge_tick(1, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![oid.clone()],
+        "a request fires at the next quiet observation, independent of the heuristic minutes threshold");
+}
+
+#[test]
+fn compact_nudge_tick_escalation_notice_then_falls_back_to_requesting_next_tick() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(9999);
+    reg.set_compact_context_threshold(&gid, 80).unwrap();
+    let empty = HashMap::new();
+    let percents: HashMap<String, u32> = [(oid.clone(), 85u32)].into_iter().collect();
+    // Tick 1: crosses threshold — notice fires, no auto-request yet (the
+    // agent gets a chance to self-request first — see the fn doc for why
+    // this is split across two ticks rather than done together).
+    let nudged = reg.compact_nudge_tick(1, &empty, &HashMap::new(), &percents, &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(nudged.is_empty(), "escalation alone doesn't paste /compact");
+    assert_eq!(audit_count(&reg, &gid, "compact-escalation"), 1);
+    assert!(!reg.agent(&oid).unwrap().compact_requested, "no auto-request on the SAME tick as the notice");
+    // Tick 2: still over threshold, agent still hasn't self-requested —
+    // loomux falls back on its behalf, setting `compact_requested`. #410
+    // (round 6): the fire-check that consumes it now runs BEFORE this
+    // escalation block in per-agent iteration order (fixing a request-
+    // starvation incident), so the fallback-set request is no longer
+    // visible to a fire-check until the NEXT tick.
+    let nudged2 = reg.compact_nudge_tick(2, &empty, &HashMap::new(), &percents, &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(nudged2.is_empty(), "the fallback sets compact_requested but cannot fire until the next tick (round-6 reorder)");
+    assert!(reg.agent(&oid).unwrap().compact_requested, "fallback set the request on the agent's behalf");
+    // Tick 3: the fire-check now sees the request set on tick 2.
+    let nudged3 = reg.compact_nudge_tick(3, &empty, &HashMap::new(), &percents, &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(nudged3, vec![oid.clone()], "fallback request fires the tick after it's set");
+    assert_eq!(audit_count(&reg, &gid, "compact-escalation"), 1, "still just one notice — no re-nag");
+}
+
+#[test]
+fn compact_nudge_tick_escalation_latch_clears_once_back_under_threshold() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(9999);
+    reg.set_compact_context_threshold(&gid, 80).unwrap();
+    let empty = HashMap::new();
+    let over: HashMap<String, u32> = [(oid.clone(), 90u32)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(1, &empty, &HashMap::new(), &over, &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-escalation"), 1);
+    let under: HashMap<String, u32> = [(oid.clone(), 10u32)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(2, &empty, &HashMap::new(), &under, &HashMap::new(), &HashMap::new(), &HashMap::new()); // e.g. after a compact landed
+    let _ = reg.compact_nudge_tick(3, &empty, &HashMap::new(), &over, &HashMap::new(), &HashMap::new(), &HashMap::new()); // crosses again
+    assert_eq!(audit_count(&reg, &gid, "compact-escalation"), 2, "a fresh crossing after clearing earns a new notice");
+}
+
+#[test]
+fn compact_nudge_tick_never_fires_a_second_compact_while_the_first_is_still_pending() {
+    // rev-12 review: neither the context-escalation fallback nor the final
+    // fire decision checked `compact_pending`, so a still-over-threshold
+    // context% reading on the tick right after a fallback-triggered fire —
+    // before the pane has visibly gone busy from loomux's point of view, so
+    // it still reads quiet — re-armed `compact_requested` (reset to false
+    // when the first /compact fired) and typed a SECOND `/compact` into a
+    // pane whose first compact hadn't resolved yet.
+    let (reg, _d, gid, oid) = compact_nudge_setup(9999); // heuristic effectively unreachable
+    reg.set_compact_context_threshold(&gid, 80).unwrap();
+    let empty = HashMap::new();
+    let over: HashMap<String, u32> = [(oid.clone(), 90u32)].into_iter().collect();
+
+    // Tick 1: first crossing — notice only, no fire.
+    assert!(reg.compact_nudge_tick(1, &empty, &HashMap::new(), &over, &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-escalation"), 1);
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+
+    // Tick 2: still over threshold, notice already latched — the fallback
+    // sets `compact_requested`. #410 (round 6): the fire-check now runs
+    // BEFORE this escalation block, so it isn't visible to fire until the
+    // NEXT tick (see the escalation-notice test above for the same shift).
+    let set_only = reg.compact_nudge_tick(2, &empty, &HashMap::new(), &over, &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(set_only.is_empty(), "the fallback sets the request but cannot fire until the next tick");
+    assert!(reg.agent(&oid).unwrap().compact_requested);
+
+    // Tick 3: the fire-check now sees it — the legitimate fallback fires the
+    // FIRST compact.
+    let nudged = reg.compact_nudge_tick(3, &empty, &HashMap::new(), &over, &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(nudged, vec![oid.clone()], "the fallback's first fire is expected");
+    assert!(reg.agent(&oid).unwrap().compact_pending, "now pending — unresolved");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1);
+
+    // Tick 4: STILL over threshold (a stale/unchanged reading — the compact
+    // from tick 3 hasn't produced visible output yet, so the pane still
+    // reads quiet). This is exactly the window the bug lived in. Must NOT
+    // fire a second /compact, and must not even re-notify or re-arm.
+    let nudged2 = reg.compact_nudge_tick(4, &empty, &HashMap::new(), &over, &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(nudged2.is_empty(), "must not fire a second /compact while the first is still pending");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1, "still just the one fire");
+    assert_eq!(audit_count(&reg, &gid, "compact-escalation"), 1, "no re-notify while pending either");
+    assert!(!reg.agent(&oid).unwrap().compact_requested,
+        "compact_requested must not be silently re-armed by escalation while pending");
+}
+
+#[test]
+fn compact_nudge_tick_detects_a_manually_typed_compact_and_reinjects_after_it_finishes() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(0); // heuristic off — isolate manual detection
+    let signals: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("> /compact\n".to_string(), 500u64))].into_iter().collect();
+    let empty = HashMap::new();
+    // Production bug fix (D2): reinjection now also requires a confirmed
+    // context-token drop, not just busy-then-quiet. `baseline` is captured
+    // at the ARM tick (500); `dropped` is what the resolve tick (700) reads —
+    // well under the confirmation ratio, simulating a real compaction.
+    let baseline: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let dropped: HashMap<String, u64> = [(oid.clone(), 5_000u64)].into_iter().collect();
+    // Detected: pending starts, but nothing fires yet (no busy observed).
+    let nudged = reg.compact_nudge_tick(500, &empty, &signals, &HashMap::new(), &baseline, &HashMap::new(), &HashMap::new());
+    assert!(nudged.is_empty());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "manual /compact must start pending tracking");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 0, "loomux pastes nothing — the human already did");
+    // Compaction runs: a real output burst.
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(600, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "still pending — busy, not finished");
+    // Compaction finishes: quiet again (same total, no further growth), AND
+    // the token reading confirms a real drop happened.
+    let _ = reg.compact_nudge_tick(700, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "confirmed, but waiting on the delivery to confirm (rev-42 delta, round 2)");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    // Delivery confirms: the latch finally releases.
+    let confirmed = confirmed_delivery(&oid, 700);
+    let _ = reg.compact_nudge_tick(800, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved");
+}
+
+#[test]
+fn compact_nudge_tick_detects_the_clis_own_auto_compact_banner_and_reinjects_after_it_finishes() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(0); // heuristic off — isolate banner detection
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("✢ Compacting conversation… (esc to interrupt · 8s · ↓ 172 tokens)".to_string(), 0u64))]
+            .into_iter()
+            .collect();
+    // The banner appears WHILE the pane is busy — real output growth on the
+    // very same tick, exactly like the CLI actually rendering it.
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    // Production bug fix (D2): baseline captured at the arm tick, a confirmed
+    // drop at the resolve tick — this is the exact scenario the production
+    // incident showed CANNOT be trusted on busy-then-quiet alone (a mention
+    // of the banner text produces the identical busy-then-quiet shape with
+    // NO real compaction and NO token drop — see the `_ignores_a_busy_pane_
+    // that_merely_mentions_the_banner` test for that negative case).
+    let baseline: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let dropped: HashMap<String, u64> = [(oid.clone(), 5_000u64)].into_iter().collect();
+    let nudged = reg.compact_nudge_tick(500, &grew, &banner_tail, &HashMap::new(), &baseline, &HashMap::new(), &HashMap::new());
+    assert!(nudged.is_empty(), "loomux pastes nothing — the CLI is already compacting on its own");
+    assert!(reg.agent(&oid).unwrap().compact_pending, "the CLI's own auto-compact must start pending tracking");
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 0);
+    // Detected mid-compaction, so `compact_seen_busy` is already true — the
+    // very next quiet tick resolves, no separate busy tick needed first
+    // (unlike the manual-`/compact` path, which only starts pending and
+    // waits for a later busy observation).
+    let _ = reg.compact_nudge_tick(600, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "confirmed on the first quiet tick, but waiting on delivery (rev-42 delta, round 2)");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    let confirmed = confirmed_delivery(&oid, 600);
+    let _ = reg.compact_nudge_tick(700, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved");
+}
+
+#[test]
+fn compact_nudge_tick_ignores_an_auto_compact_banner_on_a_quiet_tick() {
+    // The tail holds the banner substring, but NO fresh growth landed this
+    // tick — the whole point of gating on `!currently_quiet` rather than a
+    // duration window (see the fn doc): a banner sitting in unchanged tail
+    // content is not news, however long it's been there.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("Compacting conversation".to_string(), 0u64))].into_iter().collect();
+    let empty = HashMap::new();
+    let _ = reg.compact_nudge_tick(500, &empty, &banner_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "no growth this tick — must not trigger on a quiet read");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0);
+}
+
+#[test]
+fn compact_nudge_tick_ignores_a_busy_pane_that_merely_mentions_the_banner() {
+    // rev review B1, the test gap the review named directly: a `!
+    // currently_quiet` growth gate alone does NOT close the false positive,
+    // because a busy pane that PRINTS or DISCUSSES the banner text satisfies
+    // the growth gate BY the mention itself — the mention and the trigger
+    // are the same event. This is the scenario that must NOT fire once the
+    // position-anchored fix (last-line-only) is in place: real growth this
+    // tick, but the banner substring sits mid-scrollback, not as the tail's
+    // final line.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let mention_tail: HashMap<String, (String, u64)> = [(
+        oid.clone(),
+        (
+            "grep results:\n\
+             doc/design/orchestration.md: rendered as `Compacting conversation` — a leading spinner\n\
+             src-tauri/src/orchestration/mod.rs: \"claude\" => &[\"Compacting conversation\"],\n\
+             Done — 2 matches."
+                .to_string(),
+            0u64,
+        ),
+    )]
+    .into_iter()
+    .collect();
+    // Real growth this tick (the grep output itself), same as any normal turn.
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(500, &grew, &mention_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(
+        !reg.agent(&oid).unwrap().compact_pending,
+        "a busy pane merely mentioning the banner text mid-scrollback must not be read as a real auto-compact"
+    );
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0);
+}
+
+#[test]
+fn compact_nudge_tick_never_reads_an_auto_compact_banner_for_an_unsupported_cli() {
+    // Belt-and-suspenders on the outer `compact_nudge_cli_supported` gate at
+    // the top of the per-agent loop: a non-Claude-CLI agent is skipped
+    // entirely before this code is ever reached, so a "Compacting
+    // conversation" string in ITS pane (coincidence, unrelated tooling)
+    // can never be misread as Claude's own auto-compact.
+    let (reg, _d) = test_registry();
+    let rails = Guardrails { agent_cli: "copilot".into(), ..compact_rails(0, &["orchestrator"]) };
+    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(o.id.clone(), ("Compacting conversation".to_string(), 0u64))].into_iter().collect();
+    let grew: HashMap<String, u64> = [(o.id.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(500, &grew, &banner_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&o.id).unwrap().compact_pending, "non-Claude CLI must never be read for Claude's banner");
+}
+
+#[test]
+fn compact_nudge_tick_ignores_a_stale_manual_compact_tail_outside_the_recency_window() {
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    // The tail still shows an OLD /compact echo, but the human hasn't typed
+    // anything in a very long time — must not (re-)trigger detection.
+    let signals: HashMap<String, (String, u64)> = [(oid.clone(), ("/compact".to_string(), 0u64))].into_iter().collect();
+    let empty = HashMap::new();
+    let _ = reg.compact_nudge_tick(FAR, &empty, &signals, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "stale tail content outside the recency window must not trigger");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0);
+}
+
+#[test]
+fn compact_nudge_tick_reinjects_after_a_loomux_initiated_fire_too() {
+    // The busy-then-quiet detector is shared by all three trigger paths —
+    // pin it for the heuristic/requested path, not just the manual one.
+    let (reg, _d, gid, oid) = compact_nudge_setup(5);
+    let empty = HashMap::new();
+    // Production bug fix (D2): baseline at the arm tick, confirmed drop at
+    // the resolve tick — same requirement now applies uniformly to every
+    // trigger path, not just the two externally-observed ones.
+    let baseline: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let dropped: HashMap<String, u64> = [(oid.clone(), 5_000u64)].into_iter().collect();
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &baseline, &HashMap::new(), &HashMap::new()), vec![oid.clone()],
+        "the heuristic fire pastes /compact and starts pending tracking");
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    let _ = reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "confirmed once busy-then-quiet is observed, but waiting on delivery (rev-42 delta, round 2)");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    let confirmed = confirmed_delivery(&oid, FAR + 2_000);
+    let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved");
+}
+
+#[test]
+fn compact_nudge_tick_discards_an_unconfirmed_pending_state_without_reinjecting() {
+    // Production bug fix (D2/D3): the exact production incident, reproduced
+    // as a regression case. An orchestrator asked to discuss the compact-
+    // nudge feature produced output whose busy-then-quiet cycle satisfied the
+    // banner detector (mention, not a real auto-compact — see the B1 fix)
+    // with NO context-token drop. The state machine must resolve this to a
+    // DISCARD, not a reinjection: `compact_pending` clears (one-shot, D3),
+    // no `compact-reinjection` audit lands, and the discard itself IS
+    // observable (`compact-pending-discarded`) — the exact visibility gap
+    // that made the live incident hard to root-cause from the audit log
+    // alone.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("✢ Compacting conversation… (esc to interrupt · 8s · ↓ 172 tokens)".to_string(), 0u64))]
+            .into_iter()
+            .collect();
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    // No real token drop: baseline and "current" read the same, ordinary-turn
+    // growth, not a compaction.
+    let unchanged: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let nudged = reg.compact_nudge_tick(500, &grew, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(nudged.is_empty());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "detection still arms pending — only the RESOLUTION changes");
+
+    let resolved = reg.compact_nudge_tick(600, &grew, &HashMap::new(), &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(resolved.is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "one-shot: cleared regardless of confirmation (D3)");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0, "no reinjection without confirmed evidence (D2)");
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 1, "the discard itself must be visible");
+}
+
+#[test]
+fn compact_nudge_tick_never_loops_when_the_false_signal_repeats_every_cycle() {
+    // Production bug fix (D4, the review's named regression test): "reinjection
+    // delivery → agent responds → detector must NOT fire again." The live
+    // incident's actual shape was worse than one false positive — it repeated
+    // every response cycle for as long as the orchestrator kept discussing the
+    // feature. This drives THREE full arm-resolve cycles with the identical
+    // unconfirmed signal and pins that context never grows via a reinjection:
+    // `compact-reinjection` stays at 0 throughout, no matter how many times
+    // the same false condition re-satisfies detection.
+    //
+    // rev-42 delta (round 7): each cycle now needs to clear `INFERENCE_ARM_
+    // COOLDOWN_MS` before the NEXT one can arm (the round-7 fix for exactly
+    // this repeating-false-signal shape re-arming instantly) — the gaps
+    // between cycles below account for that; the CORE invariant this test
+    // pins (zero reinjections, ever) is unaffected.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("Compacting conversation".to_string(), 0u64))].into_iter().collect();
+    let unchanged: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let cooldown_ms = 3 * 60_000u64; // INFERENCE_ARM_COOLDOWN_MS
+    let mut t = 500u64;
+    for cycle in 0..3u32 {
+        let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64 * (cycle as u64 + 1))].into_iter().collect();
+        // Arm: banner (mention) detected alongside fresh growth.
+        let _ = reg.compact_nudge_tick(t, &grew, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+        assert!(reg.agent(&oid).unwrap().compact_pending, "cycle {cycle}: arms once the cooldown has cleared, same as production");
+        t += 100;
+        // Resolve: quiet again, same total — no confirmed drop.
+        let _ = reg.compact_nudge_tick(t, &grew, &HashMap::new(), &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+        assert!(!reg.agent(&oid).unwrap().compact_pending, "cycle {cycle}: resolves (discarded), never stuck pending");
+        assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0,
+            "cycle {cycle}: a reinjection loop must never start, however many times the false signal repeats");
+        t += cooldown_ms + 1;
+    }
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 3, "every cycle's discard is individually visible");
+}
+
+#[test]
+fn compact_nudge_tick_suppresses_an_immediate_rearm_of_the_same_false_signal_within_the_cooldown() {
+    // rev-42 delta (round 7): the OTHER half of D4's fix — unlike the test
+    // above (which lets the cooldown clear between cycles), the identical
+    // false signal repeating BEFORE the cooldown clears must not even
+    // re-arm at all — this is what actually closes the live incident's
+    // "discard, then immediately re-arm" cycling that starved a queued
+    // request_compact (#410).
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let banner_tail: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("Compacting conversation".to_string(), 0u64))].into_iter().collect();
+    let unchanged: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(500, &grew, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+    let _ = reg.compact_nudge_tick(600, &grew, &HashMap::new(), &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved (discarded)");
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 1);
+
+    // The identical banner mention recurs, WITH fresh real growth this tick
+    // (banner detection's own busy requirement genuinely satisfied) —
+    // still within the cooldown, so it must not re-arm.
+    let grew2: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(700, &grew2, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "cooldown suppresses the immediate rearm");
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 1, "no second discard — it never armed at all");
+
+    // A genuinely NEW banner mention, after the cooldown has cleared, still
+    // arms normally — the cooldown suppresses noise, it doesn't disable the
+    // detector.
+    let cooldown_ms = 3 * 60_000u64; // INFERENCE_ARM_COOLDOWN_MS
+    let grew3: HashMap<String, u64> = [(oid.clone(), 150_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(600 + cooldown_ms + 1, &grew3, &banner_tail, &HashMap::new(), &unchanged, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "a genuinely new signal after the cooldown clears still arms");
+}
+
+#[test]
+fn compact_nudge_tick_never_reads_its_own_compact_paste_echo_as_a_manually_typed_one() {
+    // #410/round-7, the user's own disambiguating hypothesis: `human_typed_
+    // compact_detected` scans the WHOLE tail for a standalone `/compact`
+    // token, not just fresh growth — so loomux's OWN `/compact` paste from a
+    // genuine, already-resolved compaction can still be sitting in the
+    // bounded tail when the human later types something completely
+    // UNRELATED (satisfying manual detection's recency-of-ANY-keystroke
+    // gate) — misreading loomux's own stale echo as a freshly human-typed
+    // `/compact`. The provenance fix: a CONFIRMED delivery `from ==
+    // "loomux"` extends the inference-arm cooldown, independent of and in
+    // addition to the post-resolve cooldown above.
+    let (reg, _d, gid, oid) = compact_nudge_setup(5); // heuristic on — the loomux-initiated arm
+    let empty = HashMap::new();
+    // Loomux's own fire, busy-then-quiet resolve — a genuine, real compaction.
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "the heuristic fire pastes /compact itself"
+    );
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    let _ = reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    let confirmed = confirmed_delivery(&oid, FAR + 2_000);
+    let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved once the trusted arm's delivery confirms");
+
+    // Minutes later (past MANUAL_COMPACT_DETECT_WINDOW_MS's own recency gate
+    // if that were the only check), the human types something UNRELATED —
+    // the tail still contains loomux's OWN `/compact` paste from earlier in
+    // the SAME pane (it hasn't scrolled out of the bounded tail yet), and the
+    // human's fresh keystroke alone would satisfy the OLD recency-only check.
+    let stale_tail_with_our_own_paste: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("some unrelated output\n> /compact\nmore unrelated output".to_string(), FAR + 5_000))]
+            .into_iter()
+            .collect();
+    let _ = reg.compact_nudge_tick(
+        FAR + 5_000, &grew, &stale_tail_with_our_own_paste, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(
+        !reg.agent(&oid).unwrap().compact_pending,
+        "loomux's own recently-confirmed paste must never satisfy its own manual detector"
+    );
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1, "no second /compact typed — the arm never even started");
+}
+
+#[test]
+fn compact_nudge_tick_reinjects_a_loomux_initiated_fire_even_with_no_confirmed_token_drop() {
+    // rev-42 delta (the deadlock this round fixes): `usage::latest_context_
+    // tokens`'s drop is a NEXT-TURN phenomenon (proved against a real
+    // transcript in `usage::tests::real_transcript_proves_the_token_drop_is_
+    // a_next_turn_phenomenon_rev42_q1`). On the loomux-initiated arm (the one
+    // that pastes `/compact` itself, below), the ONLY next turn available is
+    // the reinjection this gate would authorize — requiring a confirmed drop
+    // here deadlocks forever: no reading is ever taken that could show the
+    // drop, because no turn happens before the (gated) reinjection. Before
+    // `compact_pending_trusted`, this test would have failed (red): the flat
+    // token reading below never satisfies `compaction_confirmed`, so the
+    // resolve would silently discard a genuine loomux-initiated compaction on
+    // every occurrence — worse than the original reinjection-loop incident,
+    // because it is silent identity loss on the PRIMARY path, not a loop.
+    let (reg, _d, gid, oid) = compact_nudge_setup(5);
+    let empty = HashMap::new();
+    // Token reading never drops — same value at arm, busy, and resolve ticks,
+    // simulating "no next turn ever came to reveal the drop".
+    let flat: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "the heuristic fire pastes /compact and starts pending tracking"
+    );
+    assert!(reg.agent(&oid).unwrap().compact_pending_trusted, "loomux-initiated arm must be marked trusted");
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "still pending — busy, not finished");
+    let resolved = reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &HashMap::new());
+    assert!(resolved.is_empty(), "resolution never pastes /compact itself, only the fire tick does");
+    assert!(reg.agent(&oid).unwrap().compact_pending,
+        "confirmed on busy-then-quiet alone, no token drop needed — but waiting on delivery (rev-42 delta, round 2)");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1,
+        "trusted arm must reinject even with a flat token reading — the exact deadlock this test regresses against");
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 0,
+        "must never silently discard a genuine loomux-initiated compaction");
+    let confirmed = confirmed_delivery(&oid, FAR + 2_000);
+    let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved once the delivery confirms");
+}
+
+#[test]
+fn compact_nudge_tick_recovers_via_a_re_request_after_an_inference_arm_is_discarded() {
+    // Non-blocking hardening (rev-42 item 3, end-to-end coverage): an
+    // inference-arm discard is not a dead end. The agent (or the heuristic
+    // fallback) can re-request, and the loomux-initiated (trusted) arm
+    // resolves normally even against the SAME flat token reading that just
+    // discarded the first arm — proof the two paths compose within one
+    // agent's lifetime rather than only in isolation.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0); // heuristic off — isolate the two arms
+    let signals: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("> /compact\n".to_string(), 500u64))].into_iter().collect();
+    let empty = HashMap::new();
+    let flat: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+
+    // First arm: manual `/compact` detection — an inference arm, untrusted.
+    let _ = reg.compact_nudge_tick(500, &empty, &signals, &HashMap::new(), &flat, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+    assert!(!reg.agent(&oid).unwrap().compact_pending_trusted, "manual detection is an inference arm");
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(600, &grew, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &HashMap::new());
+    // No drop, no marker: resolves to a DISCARD, not a reinjection.
+    let _ = reg.compact_nudge_tick(700, &grew, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "one-shot: cleared");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0);
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 1);
+
+    // Agent re-requests explicitly — this arm is loomux-initiated, trusted.
+    reg.request_compact(&oid).unwrap();
+    let nudged = reg.compact_nudge_tick(800, &grew, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &HashMap::new());
+    assert_eq!(nudged, vec![oid.clone()], "the re-request fires a fresh /compact paste");
+    assert!(reg.agent(&oid).unwrap().compact_pending_trusted, "the re-request arm is loomux-initiated, trusted");
+    let grew2: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(900, &grew2, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &HashMap::new());
+    let _ = reg.compact_nudge_tick(1000, &grew2, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending,
+        "confirmed against the same flat token reading that discarded the first arm, but waiting on delivery (rev-42 delta, round 2)");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1,
+        "the trusted re-request arm resolves even against the same flat token reading that discarded the first arm");
+    let confirmed = confirmed_delivery(&oid, 1000);
+    let _ = reg.compact_nudge_tick(1100, &grew2, &HashMap::new(), &HashMap::new(), &flat, &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved");
+}
+
+#[test]
+fn compact_nudge_tick_resolves_a_loomux_initiated_fire_via_the_boundary_marker_when_output_never_clears_the_busy_floor() {
+    // PR #329 round-5 re-demo, the ACTUAL root cause: the forensic timeline
+    // (audit.jsonl + breadcrumbs.log around a genuine, CONFIRMED `/compact`
+    // paste) showed no reinjection audit, no discard audit — nothing — for
+    // over three minutes while the agent was demonstrably back to normal
+    // work. The busy-then-quiet resolver never even reached its confirm/
+    // discard branch: `compact_seen_busy` depended ENTIRELY on real
+    // terminal-output growth clearing `idle_activity_floor_bytes`, and a
+    // real but small/fast compaction can fail to clear it — unlike the two
+    // INFERENCE arms (which set `compact_seen_busy = true` immediately from
+    // the very evidence that armed them: the banner text, the manual
+    // typing), the loomux-initiated arm had no such alternate evidence and
+    // was purely waiting on a later tick's byte-growth observation that may
+    // simply never come. This pins the fix: a rise in the `compact_boundary`
+    // transcript marker counts as "seen busy" too — direct, floor-
+    // independent proof a compaction actually happened, for every arm.
+    let (reg, _d, gid, oid) = compact_nudge_setup(5);
+    let empty = HashMap::new();
+    let markers_baseline: HashMap<String, u64> = [(oid.clone(), 1u64)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &markers_baseline, &HashMap::new()),
+        vec![oid.clone()],
+        "the heuristic fire pastes /compact and starts pending tracking"
+    );
+    // NO real output growth is EVER observed on any subsequent tick
+    // (simulating a compaction whose own terminal rendering never clears the
+    // floor) — only the transcript's compact_boundary marker advances.
+    let markers_after: HashMap<String, u64> = [(oid.clone(), 2u64)].into_iter().collect();
+    let resolved = reg.compact_nudge_tick(
+        FAR + 60_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &markers_after, &HashMap::new());
+    assert!(resolved.is_empty(), "resolution never pastes /compact itself, only the fire tick does");
+    assert!(reg.agent(&oid).unwrap().compact_pending, "confirmed via the marker, waiting on delivery to confirm");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1,
+        "a marker rise alone must resolve the arm even though compact_seen_busy (byte-growth) was never observed");
+    let confirmed = confirmed_delivery(&oid, FAR + 60_000);
+    let _ = reg.compact_nudge_tick(
+        FAR + 61_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &markers_after, &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "resolved");
+}
+
+#[test]
+fn compact_nudge_tick_retries_a_reinjection_whose_delivery_never_confirms_then_delivers_exactly_once() {
+    // rev-42 delta (round 2): `deliver_prompt` is fire-and-forget — a fired
+    // reinjection's delivery can be held (a human typing), never confirm, or
+    // otherwise not land on the first attempt. The latch must not release
+    // until a delivery genuinely confirms; a stuck delivery gets a bounded,
+    // audited retry rather than being silently treated as "done" the instant
+    // it was attempted — the fix contract the round-5 re-demo required
+    // regardless of which mechanism caused that specific re-demo's gap.
+    // Heuristic off, armed via `request_compact` instead — isolates the
+    // confirmation-retry mechanics from the heuristic's OWN minutes window,
+    // which would otherwise re-elapse (and spuriously re-arm) during the
+    // multi-minute confirmation wait this test drives.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let empty = HashMap::new();
+    reg.request_compact(&oid).unwrap();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+    );
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    let _ = reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "first attempt fires");
+    assert!(reg.agent(&oid).unwrap().compact_pending, "still pending — waiting on confirmation");
+
+    // No delivery ever confirms (a held/lost delivery) — right up to, but not
+    // past, the retry timeout.
+    let timeout_ms = 5 * 60 * 1000u64; // REINJECT_CONFIRM_TIMEOUT_MS
+    let still_waiting = reg.compact_nudge_tick(
+        FAR + 2_000 + timeout_ms - 1, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(still_waiting.is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "must not retry before the timeout — a slow delivery may still be legitimately in flight");
+
+    // Timeout elapses with STILL no confirmation: a bounded retry fires.
+    let retry_time = FAR + 2_000 + timeout_ms;
+    let _ = reg.compact_nudge_tick(retry_time, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 2, "a stuck delivery gets a retry");
+    assert!(reg.agent(&oid).unwrap().compact_pending, "still pending — waiting on THIS attempt's confirmation");
+
+    // THIS retry's delivery confirms: the latch finally releases, exactly once.
+    let confirmed = confirmed_delivery(&oid, retry_time);
+    let _ = reg.compact_nudge_tick(retry_time + 1_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "confirmed — resolved");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 2, "exactly one retry, no runaway re-firing");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-confirmed"), 1);
+}
+
+#[test]
+fn compact_nudge_tick_abandons_a_stuck_reinjection_after_the_retry_budget_and_frees_the_latch() {
+    // rev-42 delta (round 2): a reinjection that never confirms despite
+    // retries must not wedge the state machine forever — a lost re-grounding
+    // is a real gap, but a PERMANENTLY stuck agent (no future compaction can
+    // ever arm again) is worse. Bounded give-up, audited, latch released.
+    // Heuristic off, armed via `request_compact` instead — same isolation
+    // reason as the retry test above (avoids the heuristic's own minutes
+    // window spuriously re-elapsing across this test's ~20-minute span).
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let empty = HashMap::new();
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let timeout_ms = 5 * 60 * 1000u64; // REINJECT_CONFIRM_TIMEOUT_MS
+    let mut t = FAR;
+    reg.request_compact(&oid).unwrap();
+    assert_eq!(
+        reg.compact_nudge_tick(t, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+    );
+    t += 1_000;
+    let _ = reg.compact_nudge_tick(t, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    t += 1_000;
+    let _ = reg.compact_nudge_tick(t, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "first attempt");
+    // MAX_REINJECT_ATTEMPTS is 3 total (1 initial + 2 retries) — never
+    // confirmed, so each timeout re-fires until the budget is spent.
+    for attempt in 2..=3u32 {
+        t += timeout_ms;
+        let _ = reg.compact_nudge_tick(t, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), attempt as usize, "attempt {attempt}");
+    }
+    assert!(reg.agent(&oid).unwrap().compact_pending, "still pending after the 3rd attempt, awaiting its own confirm window");
+    // A 4th timeout, still unconfirmed: the budget is exhausted — abandon.
+    t += timeout_ms;
+    let _ = reg.compact_nudge_tick(t, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "abandoned — latch released rather than stuck forever");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 3, "no 4th attempt — bounded");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-abandoned"), 1);
+}
+
+#[test]
+fn compact_nudge_tick_times_out_a_stuck_arm_that_never_reaches_a_busy_then_quiet_resolution() {
+    // #410 (round 6): live evidence (a user demo, testbed group `loomux-
+    // testbed-cc077f09`) showed `request_compact` answered "a compact is
+    // already in flight for this pane" for 10+ minutes — an inference arm
+    // kept re-arming (most likely the auto-compact banner, given the
+    // session's accumulated size) and correctly resolving to a DISCARD each
+    // time (D4 held — no reinjection loop), but the cycling meant `compact_
+    // pending` was essentially never open long enough for the queued
+    // request to win the race. Whatever the exact mechanism, an arm that
+    // never reaches a busy-then-quiet resolution at all must not wedge the
+    // state machine forever — symmetric to the delivery-confirmation
+    // phase's own bounded retry/abandon.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0); // heuristic off — isolate manual detection
+    let signals: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("> /compact\n".to_string(), 500u64))].into_iter().collect();
+    let empty = HashMap::new();
+    let _ = reg.compact_nudge_tick(500, &empty, &signals, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "manual /compact starts pending tracking");
+
+    // No growth is EVER observed (compact_seen_busy never sets) and no
+    // marker ever rises — a genuinely stuck arm. Right up to, but not past,
+    // the arm-pending timeout.
+    let timeout_ms = 5 * 60 * 1000u64; // ARM_PENDING_TIMEOUT_MS
+    let still_stuck = reg.compact_nudge_tick(
+        500 + timeout_ms - 1, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(still_stuck.is_empty());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "still pending — not yet timed out");
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 0);
+
+    // Timeout elapses: forced abandon, latch released.
+    let _ = reg.compact_nudge_tick(
+        500 + timeout_ms, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "timed out — latch released rather than stuck forever");
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0, "never a reinjection — no compaction was ever confirmed");
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 0, "distinct from an ordinary discard — this is a stuck-arm timeout");
+}
+
+#[test]
+fn compact_nudge_tick_arms_cleanly_via_request_compact_after_an_arm_timeout() {
+    // #410 end-to-end: an arm-timeout is not a dead end — a subsequent
+    // request_compact arms and fires normally, proving the two mechanisms
+    // compose within one agent's lifetime.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let signals: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("> /compact\n".to_string(), 500u64))].into_iter().collect();
+    let empty = HashMap::new();
+    let _ = reg.compact_nudge_tick(500, &empty, &signals, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    let timeout_ms = 5 * 60 * 1000u64; // ARM_PENDING_TIMEOUT_MS
+    let _ = reg.compact_nudge_tick(
+        500 + timeout_ms, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 1);
+
+    // Re-request: arms and fires cleanly.
+    reg.request_compact(&oid).unwrap();
+    let t2 = 500 + timeout_ms + 1_000;
+    let nudged = reg.compact_nudge_tick(t2, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(nudged, vec![oid.clone()], "a subsequent request arms cleanly after the timeout");
+    assert!(reg.agent(&oid).unwrap().compact_pending_trusted);
+}
+
+#[test]
+fn compact_nudge_tick_lets_a_queued_request_win_the_race_against_a_same_tick_inference_rearm() {
+    // #410 (round 6) forensic finding: the live incident's discards (three
+    // `compact-pending-discarded` audits, ~2-3 minutes apart, each with an
+    // unchanged token reading) prove D4 held — no reinjection loop — but the
+    // user's `request_compact` still sat "already in flight" for 10+
+    // minutes. The mechanism: on the exact tick a discard clears `compact_
+    // pending`, an inference arm (manual detection, gated only on recency +
+    // a tail match — no `!currently_quiet` requirement, unlike the banner
+    // detector) can re-satisfy its OWN condition on that SAME tick and
+    // re-arm BEFORE the already-queued, deterministic request ever gets a
+    // turn — in the OLD per-agent iteration order. This pins the fix: the
+    // loomux-initiated fire-check now runs FIRST, so a queued request always
+    // gets first refusal on the tick its predecessor resolves.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0); // heuristic off — isolate the two arms
+    let signals: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("> /compact\n".to_string(), 500u64))].into_iter().collect();
+    let empty = HashMap::new();
+    // Arm via manual detection.
+    let _ = reg.compact_nudge_tick(500, &empty, &signals, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+    // Busy tick.
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(600, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    // The user's explicit request queues BEFORE the resolve tick.
+    reg.request_compact(&oid).unwrap();
+    // Resolve tick: quiet (no further growth) — the arm resolves to a
+    // DISCARD (no token drop, no marker). The tail STILL shows a fresh
+    // `/compact`-matching line at THIS exact tick's timestamp — simulating
+    // the human still actively typing near the discard, exactly the
+    // condition that let manual detection re-arm on the same tick under the
+    // old ordering.
+    let still_typing: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("> /compact\n".to_string(), 700u64))].into_iter().collect();
+    let nudged = reg.compact_nudge_tick(700, &grew, &still_typing, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 1, "the stale arm still resolves to a discard first");
+    assert_eq!(nudged, vec![oid.clone()],
+        "the queued request must win the race against a same-tick manual re-arm, not be starved by it");
+    assert!(reg.agent(&oid).unwrap().compact_pending_trusted,
+        "the winning arm is the loomux-initiated request, not a manual-detection re-arm");
+}
+
+#[test]
+fn mcp_request_compact_dispatches_end_to_end() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let caller = reg.resolve_token(&o.token).unwrap();
+    let resp =
+        dispatch(&reg, &caller, "tools/call", &json!({ "name": "request_compact", "arguments": {} })).unwrap();
+    assert_eq!(resp["isError"], false);
+    let text = resp["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("compact requested"), "got: {text}");
+    assert!(reg.agent(&o.id).unwrap().compact_requested);
+}
+
+#[test]
+fn mcp_request_compact_is_listed_for_every_non_solo_role() {
+    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
+        let (reg, _d) = test_registry();
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        let task = if role == Role::Orchestrator { "" } else { "t" };
+        let a = reg.spawn_agent(&g.id, role, "a", task, false, None).unwrap();
+        let caller = reg.resolve_token(&a.token).unwrap();
+        let resp = dispatch(&reg, &caller, "tools/list", &json!({})).unwrap();
+        let names: Vec<&str> = resp["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"request_compact"), "{role:?} must see request_compact, got: {names:?}");
+    }
+}
+
+#[test]
+fn set_state_stamps_last_state_write_for_the_checklist_warning() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let caller = reg.resolve_token(&o.token).unwrap();
+    assert_eq!(reg.agent(&o.id).unwrap().last_state_write_ms, 0, "never called yet");
+    let _ = dispatch(&reg, &caller, "tools/call",
+        &json!({ "name": "set_state", "arguments": { "state": "{}" } }));
+    assert!(reg.agent(&o.id).unwrap().last_state_write_ms > 0, "set_state via MCP must stamp the timestamp");
+}
+
 // ---------- enforced merge gate (#83) ----------
 
 fn s(v: &str) -> String { v.to_string() }
@@ -8054,9 +9581,126 @@ fn group_summary_counts_live_agents_roles_and_uptime() {
     assert_eq!(agents.len(), 2);
     assert!(agents.iter().all(|a| a["uptime_ms"].as_u64().is_some()));
     assert!(!agents.iter().any(|a| a["id"] == dead.id.as_str()));
+    // Lifecycle-panel surfacing (round 6): an agent with no compact-nudge
+    // activity yet reads as idle on both new fields, not absent/null-shaped
+    // in some other way the frontend would have to special-case.
+    assert!(agents.iter().all(|a| a["compaction"]["status"] == "none"));
+    assert!(agents.iter().all(|a| a["context"]["tokens"].is_null() && a["context"]["percent"].is_null()));
     // Pausing the group is reflected so the panel can compose the two actions.
     reg.pause_group(&g.id).unwrap();
     assert_eq!(reg.group_summary(&g.id)["paused"], true);
+}
+
+#[test]
+fn group_summary_surfaces_live_compaction_state_and_cached_context_usage() {
+    // Lifecycle-panel surfacing (PR #329 round 6): the payload the panel
+    // actually polls must reflect the REAL, live state machine — not just
+    // the pure function in isolation.
+    let (reg, _d, gid, oid) = compact_nudge_setup(5);
+    let empty = HashMap::new();
+    let tokens: HashMap<String, u64> = [(oid.clone(), 40_000u64)].into_iter().collect();
+    // Fire: arms the trusted (loomux-initiated) path, and caches the context
+    // reading from the SAME tick's `context_tokens` map — no extra read.
+    let _ = reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &tokens, &HashMap::new(), &HashMap::new());
+    let s = reg.group_summary(&gid);
+    let a = s["agents"].as_array().unwrap().iter().find(|a| a["id"] == oid.as_str()).unwrap();
+    assert_eq!(a["compaction"]["status"], "armed");
+    assert_eq!(a["compaction"]["trusted"], true);
+    assert_eq!(a["context"]["tokens"], 40_000);
+    assert!(a["context"]["percent"].as_u64().is_some(), "percent derived from the cached token reading");
+
+    // Busy then quiet: the trusted arm confirms on busy-then-quiet alone
+    // (rev-42) — moves into the reinjecting phase, not discarded.
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &tokens, &HashMap::new(), &HashMap::new());
+    let _ = reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &tokens, &HashMap::new(), &HashMap::new());
+    let s2 = reg.group_summary(&gid);
+    let a2 = s2["agents"].as_array().unwrap().iter().find(|a| a["id"] == oid.as_str()).unwrap();
+    assert_eq!(a2["compaction"]["status"], "reinjecting");
+    assert_eq!(a2["compaction"]["attempt"], 1);
+    assert_eq!(a2["compaction"]["max_attempts"], 3);
+
+    // Delivery confirms: reads back to none, not a lingering state.
+    let confirmed = confirmed_delivery(&oid, FAR + 2_000);
+    let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &tokens, &HashMap::new(), &confirmed);
+    let s3 = reg.group_summary(&gid);
+    let a3 = s3["agents"].as_array().unwrap().iter().find(|a| a["id"] == oid.as_str()).unwrap();
+    assert_eq!(a3["compaction"]["status"], "none", "confirmed and resolved — no lingering state");
+}
+
+#[test]
+fn run_compact_nudge_reads_a_model_aware_window_from_the_real_transcript() {
+    // PR #329 round 7, live demo evidence: the lifecycle gauge showed 26%
+    // for a token count the CLI's own `/context` reported as ~5% — loomux
+    // was dividing by a flat 200K window while the agent ran Opus (1M-tier
+    // in the reporting deployment). This drives the REAL impure path
+    // (`run_compact_nudge`, a real fixture transcript) end to end: both
+    // `group_summary`'s displayed percent AND the escalation threshold that
+    // shares the same denominator.
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    // Escalation threshold at 50%: under the OLD flat-200K assumption,
+    // 150_000 tokens reads as 75% and would escalate immediately (wrongly
+    // early, by ~5x, for a real 1M-context session). Under the model-aware
+    // fix, 150_000 / 1_000_000 = 15% — nowhere near the threshold.
+    let rails = Guardrails { compact_context_threshold_percent: 50, ..compact_rails(0, &["orchestrator"]) };
+    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let sid = o.session_id.clone().unwrap();
+
+    let encoded = proj.path().join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    let transcript = format!(
+        "{}\n",
+        json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8",
+            "usage":{"input_tokens":150000,"output_tokens":500,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+    );
+    fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
+
+    let _ = reg.run_compact_nudge(1);
+    assert_eq!(audit_count(&reg, &g.id, "compact-escalation"), 0,
+        "must NOT escalate — 15% of the real (1M-tier) window is nowhere near the 50% threshold");
+
+    let s = reg.group_summary(&g.id);
+    let a = s["agents"].as_array().unwrap().iter().find(|a| a["id"] == o.id.as_str()).unwrap();
+    assert_eq!(a["context"]["tokens"], 150_000);
+    assert_eq!(a["context"]["percent"], 15, "the lifecycle panel must show the SAME model-aware percent, not the old flat-200K ~75%");
+}
+
+#[test]
+fn run_compact_nudge_honors_an_explicit_context_window_override() {
+    // The escape hatch: an explicit human override wins outright over the
+    // model-based guess, for a deployment where the guess would be wrong.
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let rails = Guardrails {
+        compact_context_threshold_percent: 50,
+        context_window_tokens_override: Some(200_000), // this deployment's Opus is NOT 1M-tier
+        ..compact_rails(0, &["orchestrator"])
+    };
+    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let sid = o.session_id.clone().unwrap();
+
+    let encoded = proj.path().join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    let transcript = format!(
+        "{}\n",
+        json!({"type":"assistant","message":{"id":"m1","model":"claude-opus-4-8",
+            "usage":{"input_tokens":150000,"output_tokens":500,
+                     "cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}),
+    );
+    fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
+
+    let _ = reg.run_compact_nudge(1);
+    assert_eq!(audit_count(&reg, &g.id, "compact-escalation"), 1,
+        "the override (200K) correctly reads 75% and escalates, overriding the model-based 1M guess");
+    let s = reg.group_summary(&g.id);
+    let a = s["agents"].as_array().unwrap().iter().find(|a| a["id"] == o.id.as_str()).unwrap();
+    assert_eq!(a["context"]["percent"], 75);
 }
 
 #[test]

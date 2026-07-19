@@ -195,6 +195,147 @@ pub fn parse_claude_transcript(text: &str) -> SessionUsage {
     }
 }
 
+/// Approximate current context-window usage from a Claude Code transcript
+/// (#328): the LATEST assistant message's `input_tokens +
+/// cache_creation_input_tokens + cache_read_input_tokens` — the size of
+/// everything sent as context for that turn. This is a materially different
+/// question from `parse_claude_transcript`'s cumulative totals (which sum
+/// every turn's input across the WHOLE session, for cost/billing purposes);
+/// the context window's current fullness is what the MOST RECENT turn sent,
+/// not the running lifetime sum. Self-correcting after a compaction — the
+/// next turn's input tokens drop back down, exactly reflecting the freshly
+/// summarized context. `output_tokens` is excluded: it's what the turn
+/// PRODUCED, not what was IN context going in. `None` if no real (non-
+/// synthetic) assistant `usage` line is found. Exact (an API-reported figure
+/// from the CLI's own transcript), not a byte-count proxy — see
+/// `doc/design/orchestration.md`'s Compact-nudge section for why this beats
+/// inventing one.
+pub fn latest_context_tokens(text: &str) -> Option<u64> {
+    let v = latest_real_assistant_turn(text)?;
+    let usage = v.get("message")?.get("usage")?;
+    let input = u64_field(usage, "input_tokens");
+    let cache_creation = u64_field(usage, "cache_creation_input_tokens");
+    let cache_read = u64_field(usage, "cache_read_input_tokens");
+    Some(input + cache_creation + cache_read)
+}
+
+/// Production bug fix (PR #329 round 7): the model id the LATEST real turn
+/// ran on — the exact `"model"` field `latest_context_tokens` already reads
+/// past on its way to the token count, now also surfaced so a caller can
+/// derive the ACTUAL context-window size for this session
+/// (`claude_context_window_tokens`) instead of assuming a flat one. Shares
+/// `latest_real_assistant_turn`'s "which turn is latest" definition with
+/// `latest_context_tokens`, so the two can never disagree about which turn
+/// they're each reading.
+pub fn latest_context_model(text: &str) -> Option<String> {
+    let v = latest_real_assistant_turn(text)?;
+    v.get("message")?.get("model")?.as_str().map(str::to_string)
+}
+
+/// The LATEST real (non-synthetic, `usage`-bearing) assistant turn in a
+/// transcript, scanning newest-to-oldest — shared scan behind both `latest_
+/// context_tokens` and `latest_context_model`.
+fn latest_real_assistant_turn(text: &str) -> Option<Value> {
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(msg) = v.get("message") else { continue };
+        if msg.get("usage").is_none() {
+            continue;
+        }
+        let model = msg.get("model").and_then(Value::as_str).unwrap_or("");
+        if model.is_empty() || model == "<synthetic>" {
+            continue; // not a real turn's context
+        }
+        return Some(v);
+    }
+    None
+}
+
+/// Production bug fix (PR #329 round 7): the standard Claude context window
+/// (tokens) — the conservative fallback `claude_context_window_tokens` uses
+/// for an absent/unrecognized model id. UNDER-estimating the window (reading
+/// a HIGHER percent than reality) nudges toward compacting SOONER, never
+/// later — the safe direction when genuinely unsure, since the alternative
+/// (silently assuming a bigger window than reality) risks the escalation
+/// threshold firing too LATE and letting the CLI's own emergency auto-
+/// compact land with no offload.
+pub const DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
+
+/// Context-window size (tokens) for a Claude model, matched the SAME way
+/// `price_for` matches (substring of the transcript's own model id) — real
+/// evidence (a live demo, PR #329 round 7) showed a flat 200K denominator
+/// reads badly wrong for a model actually running with a much larger window:
+/// the CLI's own `/context` reported ~5% for a token count loomux read as
+/// ~26% under the flat assumption. Opus is the one family with concrete,
+/// user-reported evidence of a 1M-token tier; everything else (and an
+/// absent/unrecognized model id) falls back to the documented default. This
+/// is a best-effort GUESS, not a guarantee — Claude's actual context tier is
+/// ultimately a per-request API setting this transcript field doesn't fully
+/// pin down — so callers needing certainty should prefer an explicit
+/// human-set override over this function's return value; see `doc/design/
+/// orchestration.md`'s Compact-nudge section.
+pub fn claude_context_window_tokens(model: Option<&str>) -> u64 {
+    let Some(model) = model else { return DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS };
+    let m = model.to_ascii_lowercase();
+    if m.contains("opus") {
+        1_000_000
+    } else {
+        DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS
+    }
+}
+
+/// Production bug fix (PR #329, rev-42 delta): count of `type: "system",
+/// subtype: "compact_boundary"` lines in a Claude transcript — the CLI's own
+/// structural marker for "a compaction just completed here", written by the
+/// CLI the INSTANT compaction finishes, carrying the exact `preTokens`/
+/// `postTokens` it measured. Unlike `latest_context_tokens`'s drop, this
+/// needs no following turn to observe: real transcript evidence (a genuine
+/// dogfood session on this repo, `1aadeb3f-e8a1-4d29-88d4-7cf4b44ddf2a.jsonl`)
+/// shows the boundary line lands 20 lines before the next real assistant
+/// `usage` line — several non-assistant bookkeeping lines (a synthetic
+/// continuation summary, attachment deltas, a `last-prompt` marker) sit in
+/// between with no `type: "assistant"` at all. `latest_context_tokens`
+/// genuinely cannot see a compact happened until that next turn exists; this
+/// function can, immediately. Monotonically non-decreasing across a growing
+/// transcript (more compactions only ever ADD boundary lines), so comparing a
+/// later count against a baseline captured earlier is a clean "did a NEW
+/// compaction happen since then" signal — see `orchestration::
+/// inferred_compaction_confirmed`, its consumer.
+pub fn compact_boundary_count(text: &str) -> u64 {
+    text.lines()
+        .filter(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return false;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else { return false };
+            v.get("type").and_then(Value::as_str) == Some("system")
+                && v.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        })
+        .count() as u64
+}
+
+/// Both compaction-confirmation signals from a single transcript read
+/// (rev-42 Q4: the two separate whole-file reads `claude_context_tokens_in`
+/// and `agent_context_percents` each did are replaced by callers sharing
+/// this one bounded read).
+pub struct CompactionSignal {
+    pub tokens: Option<u64>,
+    pub compact_boundary_count: u64,
+    /// Production bug fix (PR #329 round 7): the model the latest real turn
+    /// ran on (`latest_context_model`) — lets a caller derive the ACTUAL
+    /// context-window size (`claude_context_window_tokens`) for the percent
+    /// this reading feeds, instead of assuming a flat one.
+    pub model: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Transcript location
 // ---------------------------------------------------------------------------
@@ -247,6 +388,65 @@ pub fn claude_session_usage_in(root: &Path, session_id: &str) -> Option<SessionU
         text.push('\n');
     }
     Some(parse_claude_transcript(&text))
+}
+
+/// Bytes read from the END of a transcript file for the tail-based signals
+/// (rev-42 Q4 cost fix): `latest_context_tokens` and `compact_boundary_count`
+/// both only ever need RECENT lines — the current context reading and any
+/// compaction boundary relevant to the pane's current arm state — never the
+/// full session history, which can reach many MB over a long-lived
+/// orchestrator. Generous relative to a handful of transcript lines (even a
+/// large tool-output turn) so the bound essentially never bites for what
+/// these two functions actually look at.
+const TRANSCRIPT_TAIL_READ_BYTES: u64 = 256 * 1024;
+
+/// Read the last `TRANSCRIPT_TAIL_READ_BYTES` of `path`, discarding a
+/// possibly-truncated leading partial line (unless the read reached the true
+/// start of the file, in which case there's nothing to truncate). `None` on
+/// any I/O failure.
+fn read_transcript_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TRANSCRIPT_TAIL_READ_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if start == 0 {
+        return Some(text);
+    }
+    match text.find('\n') {
+        Some(idx) => Some(text[idx + 1..].to_string()),
+        None => Some(String::new()), // the whole read was one truncated line
+    }
+}
+
+/// Read a Claude session's CURRENT context-window usage (#328) — see
+/// `latest_context_tokens` — from a transcript under an explicit projects
+/// `root`. `None` when the transcript can't be found/opened or carries no
+/// real assistant turn yet. A thin convenience wrapper over
+/// `compaction_signal_in` for callers that only need the token half.
+pub fn claude_context_tokens_in(root: &Path, session_id: &str) -> Option<u64> {
+    compaction_signal_in(root, session_id)?.tokens
+}
+
+/// Read BOTH compaction-confirmation signals (`latest_context_tokens` and
+/// `compact_boundary_count`) from a single bounded tail read of a Claude
+/// session's transcript. `None` when the transcript can't be found/opened;
+/// `tokens` is separately `None` within a `Some(CompactionSignal)` when no
+/// real assistant turn has landed in the tail window (matching `latest_
+/// context_tokens`'s own `None` case) — `compact_boundary_count` still
+/// reports 0 in that case rather than failing the whole read, since a
+/// boundary marker's absence is itself a meaningful, distinct fact.
+pub fn compaction_signal_in(root: &Path, session_id: &str) -> Option<CompactionSignal> {
+    let path = claude_transcript_path(root, session_id)?;
+    let text = read_transcript_tail(&path)?;
+    Some(CompactionSignal {
+        tokens: latest_context_tokens(&text),
+        compact_boundary_count: compact_boundary_count(&text),
+        model: latest_context_model(&text),
+    })
 }
 
 #[cfg(test)]
@@ -348,5 +548,181 @@ mod tests {
         assert!(price_for("claude-haiku-4-5").is_some());
         assert!(price_for("claude-fable-5").is_some());
         assert!(price_for("gpt-4o").is_none());
+    }
+
+    // ---------- latest_context_tokens (#328) ----------
+
+    #[test]
+    fn latest_context_tokens_reads_the_last_real_turn_not_the_cumulative_sum() {
+        // The whole point of this fn vs `parse_claude_transcript`: context
+        // fullness is what the MOST RECENT turn sent, not the running total
+        // across the session.
+        let text = [
+            line("t1", "claude-sonnet-5", 50_000, 500, 0, 0),
+            line("t2", "claude-sonnet-5", 80_000, 500, 0, 20_000),
+        ]
+        .join("\n");
+        // Cumulative sum (what parse_claude_transcript reports) would be
+        // 130_000 input tokens; the LATEST turn's context is 80_000 + 20_000
+        // (cache read) = 100_000, a materially different figure.
+        assert_eq!(latest_context_tokens(&text), Some(100_000));
+        let cumulative = parse_claude_transcript(&text);
+        assert_eq!(cumulative.tokens.input_tokens, 130_000, "sanity: cumulative really does differ");
+    }
+
+    #[test]
+    fn latest_context_model_reads_the_same_latest_turn_tokens_does() {
+        // PR #329 round 7: the two must never disagree about which turn is
+        // "latest" — they share `latest_real_assistant_turn`.
+        let text = [
+            line("t1", "claude-sonnet-5", 50_000, 500, 0, 0),
+            line("t2", "claude-opus-4-8", 80_000, 500, 0, 20_000),
+        ]
+        .join("\n");
+        assert_eq!(latest_context_model(&text).as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn latest_context_model_skips_synthetic_and_non_assistant_lines_same_as_tokens() {
+        let text = [
+            r#"{"type":"user","message":{"content":"hi"}}"#.to_string(),
+            line("synth", "<synthetic>", 1, 1, 0, 0),
+            line("real", "claude-opus-4-8", 10, 10, 0, 0),
+        ]
+        .join("\n");
+        assert_eq!(latest_context_model(&text).as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn latest_context_model_none_when_no_real_turn_exists() {
+        assert_eq!(latest_context_model(""), None);
+        assert_eq!(latest_context_model("not json\n{\"type\":\"user\"}"), None);
+    }
+
+    #[test]
+    fn claude_context_window_tokens_defaults_conservative_and_widens_only_for_opus() {
+        // PR #329 round 7: live evidence — a hardcoded 200K flat assumption
+        // read a 1M-context Opus session's usage as ~5x too full (26% vs the
+        // CLI's own reported ~5%). Opus is the one family with concrete
+        // evidence of a larger tier; everything else, and an absent/
+        // unrecognized model, falls back to the documented conservative
+        // default (the safe direction when unsure: NEVER assume a bigger
+        // window than reality, which would delay a needed compaction).
+        assert_eq!(claude_context_window_tokens(Some("claude-opus-4-8")), 1_000_000);
+        assert_eq!(claude_context_window_tokens(Some("claude-opus-4-7")), 1_000_000, "matches by family, like price_for");
+        assert_eq!(claude_context_window_tokens(Some("claude-sonnet-5")), DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(claude_context_window_tokens(Some("claude-haiku-4-5")), DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(claude_context_window_tokens(Some("some-future-model-nobody-has-heard-of")), DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS,
+            "an unrecognized model must never silently widen the window — conservative fallback, not a guess in the unsafe direction");
+        assert_eq!(claude_context_window_tokens(None), DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS);
+    }
+
+    #[test]
+    fn latest_context_tokens_self_corrects_after_a_compact() {
+        // A compact's next turn sends far less context — the figure must
+        // reflect that drop, not stay pinned to the pre-compact peak.
+        let text = [
+            line("before", "claude-sonnet-5", 180_000, 500, 0, 0),
+            line("after-compact", "claude-sonnet-5", 8_000, 500, 0, 0),
+        ]
+        .join("\n");
+        assert_eq!(latest_context_tokens(&text), Some(8_000));
+    }
+
+    /// A REAL (structurally trimmed, numbers untouched) excerpt from an actual
+    /// dogfood session on this repo — `1aadeb3f-e8a1-4d29-88d4-7cf4b44ddf2a.jsonl`,
+    /// `~/.claude/projects/C--Projects-loomux/`, 2026-07-15 — captured specifically
+    /// to settle the rev-42 delta review's Q1: does `latest_context_tokens` see a
+    /// compaction's drop before the next real assistant turn, or only after?
+    /// Synthetic injection can't answer this (it assumes the very timing in
+    /// question); this is the actual CLI's own transcript shape. Only the huge,
+    /// parser-irrelevant fields (`preservedSegment`/`preCompactDiscoveredTools`
+    /// arrays, the multi-paragraph summary prose) were elided for fixture size —
+    /// every field either `latest_context_tokens` or `compact_boundary_count`
+    /// reads is verbatim, including the exact token counts.
+    const REAL_DOGFOOD_COMPACT_EXCERPT_PRE: &str =
+        r#"{"type":"assistant","message":{"model":"claude-fable-5","usage":{"input_tokens":2,"output_tokens":1305,"cache_creation_input_tokens":48,"cache_read_input_tokens":516543}}}"#;
+    const REAL_DOGFOOD_COMPACT_EXCERPT_BOUNDARY: &str =
+        r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","level":"info","compactMetadata":{"trigger":"manual","preTokens":518258,"postTokens":7716,"cumulativeDroppedTokens":510542},"timestamp":"2026-07-15T01:46:54.839Z"}"#;
+    // Interstitial bookkeeping lines the REAL transcript has between the
+    // boundary and the next assistant turn — a synthetic continuation summary,
+    // then (in the real file) several attachment-delta lines omitted here as
+    // pure repetition, then a last-prompt marker. None are `type: "assistant"`.
+    const REAL_DOGFOOD_COMPACT_EXCERPT_SUMMARY: &str =
+        r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"[summary text elided for fixture size — real content is a multi-paragraph session recap]"}}"#;
+    const REAL_DOGFOOD_COMPACT_EXCERPT_LASTPROMPT: &str =
+        r#"{"type":"last-prompt","lastPrompt":"/compact"}"#;
+    const REAL_DOGFOOD_COMPACT_EXCERPT_POST: &str =
+        r#"{"type":"assistant","message":{"model":"claude-fable-5","usage":{"input_tokens":2,"output_tokens":1568,"cache_creation_input_tokens":15688,"cache_read_input_tokens":28268}}}"#;
+
+    #[test]
+    fn real_transcript_proves_the_token_drop_is_a_next_turn_phenomenon_rev42_q1() {
+        // The window `compact_nudge_tick`'s resolver actually reads at: a
+        // compact just completed (the boundary line exists), but the CLI
+        // hasn't produced a new real assistant turn yet — only the synthetic
+        // continuation summary and a last-prompt marker sit after it, exactly
+        // as the real transcript shows.
+        let before_next_turn = [
+            REAL_DOGFOOD_COMPACT_EXCERPT_PRE,
+            REAL_DOGFOOD_COMPACT_EXCERPT_BOUNDARY,
+            REAL_DOGFOOD_COMPACT_EXCERPT_SUMMARY,
+            REAL_DOGFOOD_COMPACT_EXCERPT_LASTPROMPT,
+        ]
+        .join("\n");
+        // Real pre-compact figure: 2 + 48 + 516_543 = 516_593. Confirms rev-42's
+        // Q1 empirically: `latest_context_tokens` is STILL pinned to the
+        // pre-compact peak here — it has no way to know a compaction happened.
+        assert_eq!(
+            latest_context_tokens(&before_next_turn),
+            Some(516_593),
+            "before any new assistant turn, the reading must still show the STALE pre-compact value — this is the deadlock"
+        );
+        // But the boundary marker is ALREADY visible — no next turn required.
+        assert_eq!(compact_boundary_count(&before_next_turn), 1,
+            "compact_boundary_count sees the compaction immediately, unlike the token reading");
+
+        // Now the next real assistant turn lands (the reinjection's own
+        // response, in production) — only THEN does the token reading correct.
+        let after_next_turn = format!("{before_next_turn}\n{REAL_DOGFOOD_COMPACT_EXCERPT_POST}");
+        assert_eq!(
+            latest_context_tokens(&after_next_turn),
+            Some(2 + 15_688 + 28_268),
+            "only once a new assistant turn exists does the drop become visible — confirms it's a next-turn phenomenon, not an at-compaction one"
+        );
+        assert_eq!(compact_boundary_count(&after_next_turn), 1, "still just the one real compaction");
+    }
+
+    #[test]
+    fn compact_boundary_count_is_zero_when_absent_and_counts_every_real_boundary() {
+        assert_eq!(compact_boundary_count(""), 0);
+        assert_eq!(compact_boundary_count("not json\n{\"type\":\"user\"}"), 0);
+        assert_eq!(compact_boundary_count(r#"{"type":"system","subtype":"other_thing"}"#), 0,
+            "a different system subtype must not be mistaken for a compaction");
+        let two_compactions = [
+            REAL_DOGFOOD_COMPACT_EXCERPT_BOUNDARY,
+            REAL_DOGFOOD_COMPACT_EXCERPT_POST,
+            REAL_DOGFOOD_COMPACT_EXCERPT_BOUNDARY,
+        ]
+        .join("\n");
+        assert_eq!(compact_boundary_count(&two_compactions), 2, "monotonically counts every boundary seen");
+    }
+
+    #[test]
+    fn latest_context_tokens_skips_synthetic_and_non_assistant_lines() {
+        let text = [
+            r#"{"type":"summary","summary":"a title"}"#.to_string(),
+            line("real", "claude-sonnet-5", 42_000, 100, 0, 1_000),
+            // A trailing synthetic line (no real usage) must not be read as
+            // "the latest turn" and mask the real one before it.
+            line("synth", "<synthetic>", 999_999, 1, 0, 0),
+        ]
+        .join("\n");
+        assert_eq!(latest_context_tokens(&text), Some(43_000));
+    }
+
+    #[test]
+    fn latest_context_tokens_none_when_no_real_turn_exists() {
+        assert_eq!(latest_context_tokens(""), None);
+        assert_eq!(latest_context_tokens("not json\n{\"type\":\"user\"}"), None);
     }
 }

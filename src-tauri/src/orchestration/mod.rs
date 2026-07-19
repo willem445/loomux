@@ -1105,6 +1105,95 @@ const MAX_IDLE_ACTIVITY_FLOOR_BYTES: u64 = 1024 * 1024;
 /// the tick source. With a minutes-scale quiet gate the latch already bounds this
 /// near ~one per window; the cap catches any pathological re-arm. 0 would disable it.
 const MAX_IDLE_TICKS_PER_HOUR: u32 = 6;
+/// Compact-nudge (#287): upper bound on `compact_nudge_minutes` (24h); 0 is
+/// "off", not clamped away — see `Guardrails::clamped`.
+const MAX_COMPACT_NUDGE_MINUTES: u32 = 1440;
+/// Compact-nudge (#287): hard backstop on `/compact` nudges delivered per
+/// rolling hour, independent of the one-shot latch — same role as
+/// `MAX_IDLE_TICKS_PER_HOUR` for the idle tick, reused via the same
+/// `idle_tick_should_fire` gate (see `compact_nudge_tick`).
+const MAX_COMPACT_NUDGES_PER_HOUR: u32 = 4;
+/// Production bug fix (rev-42 delta, round 2): how long a fired reinjection
+/// is given to confirm delivery before `compact_nudge_tick` treats it as
+/// stuck and retries. Generous enough to clear `deliver_prompt`'s own
+/// worst-case hold chain (two `USER_QUIET_MAX_HOLD` waits plus
+/// `SUBMIT_MAX_WAIT` and the echo/retry window — comfortably under this)
+/// without racing a delivery that is merely slow, not lost.
+const REINJECT_CONFIRM_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+/// Production bug fix (rev-42 delta, round 2): bounded retry count for a
+/// reinjection stuck past `REINJECT_CONFIRM_TIMEOUT_MS` — see `AgentEntry::
+/// compact_reinject_attempts`'s doc for why this must never be unbounded.
+const MAX_REINJECT_ATTEMPTS: u32 = 3;
+/// Production bug fix (#410, PR #329 round 6): how long a `compact_pending`
+/// arm is given to reach a busy-then-quiet resolution (confirm or discard)
+/// before the resolver forces an abandon — symmetric to `REINJECT_CONFIRM_
+/// TIMEOUT_MS`'s bound on the delivery-confirmation phase. See `AgentEntry::
+/// compact_pending_armed_ms`'s doc for the live incident this closes.
+const ARM_PENDING_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+/// Production bug fix (PR #329 round 7): how long INFERENCE arms (banner,
+/// manual detection) are suppressed after a loomux-authored delivery
+/// confirms, or after this agent's own compact_pending resolves — see
+/// `AgentEntry::compact_inference_guard_until_ms`'s doc. Matches `MANUAL_
+/// COMPACT_DETECT_WINDOW_MS`'s existing 3-minute scale: long enough to cover
+/// both a paste's echo settling into the pane AND the immediate post-
+/// compact conversation ABOUT the compact-nudge feature itself (exactly the
+/// live-demo scenario this closes), short enough that a genuinely NEW
+/// signal minutes later still arms normally. Loomux-initiated (trusted)
+/// arms are NEVER gated by this — they don't infer anything, so there is
+/// nothing for a stale echo to fool.
+const INFERENCE_ARM_COOLDOWN_MS: u64 = 3 * 60_000;
+/// Compact-nudge (#328): upper bound on `compact_context_threshold_percent`;
+/// 0 is "off" (see `Guardrails::clamped`), 100 = only at total exhaustion
+/// (effectively disabled in practice, since the CLI's own emergency
+/// auto-compact would already have fired by then).
+const MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT: u32 = 100;
+// Compact-nudge (#328): the context window for `latest_context_tokens`-based
+// percent calculations used to be a single flat constant here
+// (`CLAUDE_CONTEXT_WINDOW_TOKENS`, 200K) — a documented assumption, not a
+// measured fact, and PROVEN wrong in a live demo (PR #329 round 7): an agent
+// actually running a much larger tier read as ~5x more full than the CLI's
+// own `/context` reported. Replaced by `effective_context_window_tokens`
+// (model-aware, with a human override and a conservative fallback) — see
+// its doc and `usage::claude_context_window_tokens`'s.
+/// Compact-nudge (#328): how recently the orchestrator's `set_state` call
+/// must land for `request_compact` to skip its offload-checklist warning.
+/// Not a hard gate (the issue is explicit: warn, never block) — a human-
+/// readable proxy for "was durable state offloaded before compacting", which
+/// loomux can see via the pane's own tool-call timeline (`AgentEntry.
+/// last_state_write_ms`).
+const SET_STATE_RECENCY_WINDOW_MS: u64 = 15 * 60_000;
+/// Compact-nudge (#328): a human-typed `/compact` detected in a pane's output
+/// tail only counts as fresh if the pane's `last_user_input_ms` falls within
+/// this window of "now" — guards against the tail's bounded ring buffer still
+/// holding an OLDER `/compact` echo re-triggering the post-compact
+/// re-injection for a compaction that already completed and was already
+/// handled. Generous relative to `IDLE_TICK_INTERVAL` (the tick cadence that
+/// reads it) so a slow-typed command is never missed.
+const MANUAL_COMPACT_DETECT_WINDOW_MS: u64 = 3 * 60_000; // 3x IDLE_TICK_INTERVAL's 60s
+/// Directive ledger (#329 expansion): max bytes of a pane's ledger tail
+/// embedded verbatim in its post-compact re-grounding notice. The file on
+/// disk is never truncated — only what gets PASTED into the pane is capped,
+/// the same relationship the reinjected instructions text already has to the
+/// (much larger) conversation it's re-grounding. Sized generously relative to
+/// a one-line diary entry so a normal session's ledger fits whole; the tail
+/// (most recent entries) survives a cut, never the head, because the newest
+/// directives are the ones most likely to still be live.
+const DIRECTIVE_LEDGER_EMBED_CAP_BYTES: usize = 2048;
+/// Directive ledger (#329 review, N2): hard cap on the LEDGER FILE itself —
+/// distinct from `DIRECTIVE_LEDGER_EMBED_CAP_BYTES`, which only bounds what
+/// gets pasted into a reinjection notice. Without this, an agent that notes
+/// liberally and never curates (`replace: true`) grows the file (and the
+/// full-file `fs::read_to_string` every reinjection does) without bound.
+/// Generous relative to one line per human directive — curation via
+/// `replace` stays the primary, deliberate mechanism; this is only the
+/// backstop for a session that never uses it. See `ledger_capped`.
+const DIRECTIVE_LEDGER_MAX_BYTES: usize = 64 * 1024;
+/// Directive ledger (#329 review, N1): max characters kept from a single
+/// `note_directive` append-mode entry after sanitization — mirrors
+/// `OrchRegistry::CHANNEL_TEXT_CAP`'s role for `channel_send` (a directive is
+/// closer to a message than to a terse notification field, hence this and
+/// not the smaller `notify::NOTICE_FIELD_CAP`).
+const DIRECTIVE_ENTRY_MAX_CHARS: usize = 2000;
 /// How often the attention scan recomputes which panes need the human
 /// (idle-with-prompt detection; report/gate signals are event-driven and
 /// picked up on the next tick).
@@ -1771,6 +1860,47 @@ pub struct Guardrails {
     /// `set_idle_activity_floor` so a chattier CLI whose idle repaints exceed the
     /// default has a runtime remedy (rev-59). See `idle_output_is_activity`.
     pub idle_activity_floor_bytes: u64,
+    /// Compact-nudge (#287): how long an eligible pane must be idle at its input
+    /// prompt (output-quiet, the SAME clock `idle_tick_minutes` reads — see
+    /// `compact_nudge_tick`) before loomux pastes `/compact` for it. Unlike
+    /// `idle_tick_minutes`, 0 here means the feature is OFF — there is no
+    /// separate on/off marker for compact-nudge, so this single field is both
+    /// the switch and the interval, mirroring `watchdog_stall_minutes` /
+    /// `idle_kill_minutes`. Persisted in group.json, live-settable via
+    /// `set_compact_nudge_minutes`. Conservative default: off.
+    pub compact_nudge_minutes: u32,
+    /// Compact-nudge (#287): which capability classes are eligible for the
+    /// automatic `/compact` nudge, as lowercase role names (`Role::as_str`).
+    /// `clamped()` drops unrecognized entries and falls back to
+    /// `["orchestrator"]` if that leaves it empty — workers/reviewers are
+    /// short-lived, so the orchestrator (the one pane whose lifetime cache-read
+    /// volume this feature exists to cut) is the sane default. Persisted in
+    /// group.json, live-settable via `set_compact_nudge_roles`.
+    pub compact_nudge_roles: Vec<String>,
+    /// Compact-nudge (#328): percent of the Claude context window
+    /// (`effective_context_window_tokens`, round 7: model-aware, was a flat
+    /// constant) an eligible agent's context must cross
+    /// before loomux escalates — delivering `compact_escalation_notice` and, if
+    /// the agent doesn't self-request within the same pass, marking the compact
+    /// requested on its behalf (better a loomux-timed compact with the
+    /// escalation warning already delivered than the CLI's own 100% emergency
+    /// auto-compact with zero offload). `0` = off (the conservative default):
+    /// purely opportunistic, no escalation. Persisted in group.json,
+    /// live-settable via `set_compact_context_threshold`.
+    pub compact_context_threshold_percent: u32,
+    /// Production bug fix (PR #329 round 7): an explicit human override for
+    /// the context-window size (tokens) this group's escalation percent and
+    /// lifecycle-panel display are computed against — takes absolute
+    /// precedence over `usage::claude_context_window_tokens`'s model-based
+    /// guess (see `effective_context_window_tokens`). Live evidence showed
+    /// that guess can be wrong (Claude's actual context tier is ultimately a
+    /// per-request API setting the transcript doesn't fully pin down): this
+    /// is the escape hatch for a deployment where it is. `None` (the
+    /// conservative default) defers entirely to the guess. Persisted in
+    /// group.json; no live setter this round (set at launch, or by hand-
+    /// editing group.json for an existing group — same precedent as
+    /// `max_spawns_per_hour`, which is also create-time-only today).
+    pub context_window_tokens_override: Option<u64>,
 }
 
 impl Guardrails {
@@ -1857,6 +1987,17 @@ impl Guardrails {
         }
         self.idle_activity_floor_bytes =
             self.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES);
+        // Compact-nudge (#287): 0 stays 0 (off) — only cap a too-large value.
+        self.compact_nudge_minutes = self.compact_nudge_minutes.min(MAX_COMPACT_NUDGE_MINUTES);
+        // Unrecognized role names (typos, a stale/future value) are dropped
+        // rather than rejected — a hand-edited group.json with a bad entry
+        // should not crash the group, just silently not grant that role
+        // eligibility. See `canonicalize_compact_nudge_roles` for why survivors
+        // are also case-normalized, not just filtered.
+        self.compact_nudge_roles = canonicalize_compact_nudge_roles(self.compact_nudge_roles);
+        // Compact-nudge (#328): 0 stays 0 (off) — only cap a too-large value.
+        self.compact_context_threshold_percent =
+            self.compact_context_threshold_percent.min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
         self
     }
 
@@ -2189,6 +2330,494 @@ pub fn idle_tick_should_fire(
 /// activity; sub-floor growth is noise and leaves the quiet clock running.
 pub fn idle_output_is_activity(prev_total: u64, cur_total: u64, floor: u64) -> bool {
     cur_total.saturating_sub(prev_total) >= floor
+}
+
+/// Compact-nudge (#287): whether `role`'s capability class is one of the
+/// group's configured eligible roles for the automatic `/compact` nudge. Pure
+/// so role gating is testable without a registry. `allowed_roles` is
+/// `Guardrails::compact_nudge_roles` after `clamped()` (lowercase
+/// `Role::as_str()` names; never empty for a group that went through it).
+pub fn compact_nudge_role_allowed(role: Role, allowed_roles: &[String]) -> bool {
+    allowed_roles.iter().any(|r| r == role.as_str())
+}
+
+/// Canonicalize a compact-nudge role list (rev-24 review fix): drop
+/// unrecognized entries and normalize every survivor to `Role::as_str()`'s
+/// lowercase wire name. `workflow::kind_from_str` validates case-
+/// insensitively but does not normalize — keeping the as-typed string (e.g.
+/// `"Orchestrator"`) let it persist and pass validation, yet
+/// `compact_nudge_role_allowed`'s lowercase comparison would then never match
+/// it, silently disabling the role. Sorted + deduped for a stable
+/// persisted/reported shape; an all-unrecognized/empty result falls back to
+/// `["orchestrator"]` rather than disabling every role. Shared by
+/// `Guardrails::clamped`, the `resumed` re-normalization in
+/// `create_group_ex`, and `set_compact_nudge_roles` so the rule lives once.
+fn canonicalize_compact_nudge_roles(roles: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = roles
+        .into_iter()
+        .filter_map(|r| workflow::kind_from_str(&r).map(|k| k.as_str().to_string()))
+        .collect();
+    out.sort();
+    out.dedup();
+    if out.is_empty() {
+        out = vec![Role::Orchestrator.as_str().to_string()];
+    }
+    out
+}
+
+/// Compact-nudge (#287): whether `cli` has a `/compact` equivalent loomux can
+/// drive the same way (a bare pane write + CR). `/compact` is a Claude Code
+/// built-in; no other supported CLI (copilot, codex, gemini, …) exposes one,
+/// so the nudge is gated to exactly this CLI rather than typing a junk slash
+/// command into an agent that doesn't understand it. Pure so the gate is
+/// testable without a registry; `cli` comes from `Guardrails::cli_for`.
+pub fn compact_nudge_cli_supported(cli: &str) -> bool {
+    cli == "claude"
+}
+
+/// Compact-nudge (#328): whether an agent-requested compact should fire NOW.
+/// Unlike the heuristic path (`idle_tick_should_fire`, a minutes-scale
+/// threshold) there is no quiet-window wait here — the agent's own
+/// `request_compact` call IS the trigger — so the only gates are: the pane
+/// must be quiet on THIS observation (no growth since the last poll, i.e. not
+/// actively mid-turn right now), and the shared per-hour cap must not already
+/// be exhausted (reused via `spawn_rate_exceeded`, the same rule
+/// `idle_tick_should_fire` reuses, so both paths draw from ONE budget). Pure
+/// so the gate is testable without a registry.
+pub fn compact_request_should_fire(
+    is_currently_quiet: bool,
+    tick_times: &[u64],
+    now_ms: u64,
+    per_hour_cap: u32,
+) -> bool {
+    is_currently_quiet && !spawn_rate_exceeded(tick_times, now_ms, per_hour_cap, SPAWN_RATE_WINDOW_MS)
+}
+
+/// Compact-nudge (#328): percent of `window_tokens` that `context_tokens`
+/// represents, clamped to `0..=100`. Pure arithmetic split out of the
+/// registry pass so the rounding/clamping rule is unit-testable without a
+/// transcript fixture.
+pub fn context_percent_used(context_tokens: u64, window_tokens: u64) -> u32 {
+    if window_tokens == 0 {
+        return 0;
+    }
+    ((context_tokens.min(window_tokens) * 100) / window_tokens) as u32
+}
+
+/// Production bug fix (PR #329 round 7): the context-window size (tokens) to
+/// compute a percent against, for one agent — single shared derivation for
+/// BOTH the lifecycle-panel display and the `compact_context_threshold_
+/// percent` escalation. Before this fix each read a flat `CLAUDE_CONTEXT_
+/// WINDOW_TOKENS` (200K) independently, silently wrong (and the escalation
+/// threshold firing ~5x too early) for any agent actually running a model on
+/// a larger tier. An explicit human `override_tokens` (set on the group's
+/// guardrails) wins outright; otherwise the model recorded in the agent's
+/// OWN transcript (`usage::claude_context_window_tokens`) — this is the
+/// authoritative-when-available signal (reflects what's ACTUALLY running,
+/// immune to config drift), falling back to `usage::
+/// DEFAULT_CLAUDE_CONTEXT_WINDOW_TOKENS` when the model is unknown.
+pub fn effective_context_window_tokens(override_tokens: Option<u64>, model: Option<&str>) -> u64 {
+    override_tokens.unwrap_or_else(|| crate::usage::claude_context_window_tokens(model))
+}
+
+/// Production bug fix (PR #329 delta review): how much the context-token
+/// reading must drop, relative to the baseline captured when `compact_
+/// pending` was set, to count as `100`-scaled ratio evidence a REAL
+/// compaction happened. Context tokens only grow across ordinary turns (each
+/// turn's context recap includes everything before it) until a compaction
+/// resets it, so ANY drop below the baseline is already meaningful — but a
+/// generous margin (require the reading to fall to at most 70% of the
+/// baseline) tolerates cache-boundary noise in the raw number without being
+/// so loose that ordinary turn-to-turn fluctuation could pass for it; a real
+/// compact's actual reduction is typically far more dramatic than this
+/// (summarization commonly cuts what's sent to the model by 80-95%+).
+const COMPACTION_CONFIRMED_MAX_RATIO_PERCENT: u64 = 70;
+
+/// Production bug fix (PR #329 delta review — B2/D2): whether the observed
+/// token reading is convincing evidence a compaction actually ran, comparing
+/// `current` against the `baseline` captured the moment `compact_pending`
+/// was set (see `AgentEntry.compact_pending_baseline_tokens`).
+///
+/// **Why this exists.** A live production incident showed the prior design
+/// — treat ANY busy-then-quiet cycle while `compact_pending` as proof
+/// compaction ran — is not evidence, only a proxy that can be satisfied by an
+/// agent's ORDINARY turn: an orchestrator asked to discuss the compact-nudge
+/// feature produced output whose growth (busy) then silence (quiet)
+/// repeatedly matched the completion detector with no compaction ever
+/// running, delivering the mandatory re-injection on a loop that only grew
+/// context every cycle — the opposite of what the feature exists to prevent.
+///
+/// **Fails CLOSED, not open**: `None` for either reading (no baseline was
+/// captured, or no current reading is available) returns `false` — no
+/// evidence means no reinjection, never a guess. A missed reinjection is a
+/// missed convenience; a reinjection loop that only grows context is a
+/// production incident (the exact one this function exists to prevent). Pure
+/// so the ratio math is testable without a registry or a transcript file.
+pub fn compaction_confirmed(baseline: Option<u64>, current: Option<u64>) -> bool {
+    match (baseline, current) {
+        (Some(b), Some(c)) if b > 0 => c.saturating_mul(100) <= b.saturating_mul(COMPACTION_CONFIRMED_MAX_RATIO_PERCENT),
+        _ => false,
+    }
+}
+
+/// Production bug fix (rev-42 delta review): whether the observed signals
+/// are convincing evidence a compaction actually ran, for the two INFERENCE
+/// trigger paths (banner detection, human-typed `/compact` detection) — the
+/// only ones that can be WRONG about a compaction having happened at all.
+/// (The loomux-initiated paths — heuristic timer, `request_compact` — skip
+/// this check entirely; see `AgentEntry.compact_pending_trusted`'s doc for
+/// why applying it there deadlocks instead of protecting anything.)
+///
+/// Confirmed by EITHER signal:
+/// - `compaction_confirmed`'s token-ratio check (`token_baseline`/
+///   `token_current`) — solid once available, but a NEXT-TURN phenomenon
+///   (proven against a real transcript — see `usage::tests::
+///   real_transcript_proves_the_token_drop_is_a_next_turn_phenomenon_
+///   rev42_q1`): the compaction call itself still reports the PRE-compact
+///   token count, and the drop only appears on the turn after.
+/// - a NEW `usage::compact_boundary_count` since `marker_baseline` — the
+///   CLI's own structural "a compaction just completed" marker, observable
+///   the INSTANT compaction finishes, with no next-turn dependency at all.
+///   Preferred where available; kept alongside the token check (not a
+///   replacement for it) as defense-in-depth against either signal being
+///   unavailable or wrong in some future CLI build.
+///
+/// Fails CLOSED exactly like `compaction_confirmed`: no evidence in EITHER
+/// direction, on EITHER signal, is never a guess.
+pub fn inferred_compaction_confirmed(
+    token_baseline: Option<u64>,
+    token_current: Option<u64>,
+    marker_baseline: Option<u64>,
+    marker_current: Option<u64>,
+) -> bool {
+    if compaction_confirmed(token_baseline, token_current) {
+        return true;
+    }
+    match (marker_baseline, marker_current) {
+        (Some(b), Some(c)) => c > b,
+        _ => false,
+    }
+}
+
+/// Lifecycle-panel surfacing (PR #329 round 6): how long a lost-outcome
+/// (`CompactionStatus::Abandoned`) stays visible after the fact — an old one
+/// would read as a current problem long after the agent moved on.
+const COMPACTION_STATUS_RECENT_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+/// Compact-nudge (PR #329 round 6, lifecycle UI): the compaction state-
+/// machine phase to surface per agent. Serializes as `{"status": "armed",
+/// "trusted": true}` etc. (`tag = "status"`) — the group lifecycle panel's
+/// wire shape.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CompactionStatus {
+    /// No arm, no in-flight reinjection, no recent lost outcome.
+    None,
+    /// `compact_pending`, not yet observed busy. `trusted` distinguishes the
+    /// loomux-initiated arm (heuristic/`request_compact`) from an inference
+    /// arm (banner/manual detection) — the former skips confirmation, the
+    /// latter needs evidence before it can resolve to a reinjection.
+    Armed { trusted: bool },
+    /// `compact_pending`, busy observed — waiting on quiet to attempt a
+    /// confirm/discard resolution.
+    AwaitingEvidence { trusted: bool },
+    /// A reinjection has been decided and is waiting on its delivery to
+    /// confirm (or its next bounded retry) — see `compact_reinject_
+    /// attempted_ms`'s doc. `attempt` is 1-indexed, bounded by `max_attempts`
+    /// (`MAX_REINJECT_ATTEMPTS`).
+    Reinjecting { attempt: u32, max_attempts: u32 },
+    /// A lost terminal outcome (`arm-timeout` or `reinjection-abandoned`)
+    /// within `COMPACTION_STATUS_RECENT_WINDOW_MS` of now — worth a human's
+    /// attention, but only briefly.
+    Abandoned { reason: String, since_ms: u64 },
+}
+
+/// Pure derivation of `CompactionStatus` from already-tracked `AgentEntry`
+/// fields — narrates the real state machine, never a parallel vocabulary.
+/// Split out (rather than inlined in `group_summary`) so the phase logic is
+/// synthetic-input testable without a registry.
+pub fn compaction_status(
+    compact_pending: bool,
+    compact_pending_trusted: bool,
+    compact_seen_busy: bool,
+    reinject_attempted_ms: Option<u64>,
+    reinject_attempts: u32,
+    last_lost_reason: Option<&str>,
+    last_lost_ms: Option<u64>,
+    now: u64,
+) -> CompactionStatus {
+    if reinject_attempted_ms.is_some() {
+        return CompactionStatus::Reinjecting { attempt: reinject_attempts, max_attempts: MAX_REINJECT_ATTEMPTS };
+    }
+    if compact_pending {
+        return if compact_seen_busy {
+            CompactionStatus::AwaitingEvidence { trusted: compact_pending_trusted }
+        } else {
+            CompactionStatus::Armed { trusted: compact_pending_trusted }
+        };
+    }
+    if let (Some(reason), Some(ms)) = (last_lost_reason, last_lost_ms) {
+        if now.saturating_sub(ms) < COMPACTION_STATUS_RECENT_WINDOW_MS {
+            return CompactionStatus::Abandoned { reason: reason.to_string(), since_ms: ms };
+        }
+    }
+    CompactionStatus::None
+}
+
+/// Compact-nudge (#328): whether context usage has crossed the group's
+/// escalation threshold and escalation hasn't already been latched for this
+/// window. `threshold_percent` 0 disables escalation entirely (purely
+/// opportunistic). Mirrors the anti-nag shape used everywhere else in this
+/// feature (`watchdog_should_notify`, `idle_tick_should_fire`): fire once,
+/// don't re-fire until the condition clears (context% drops back under the
+/// threshold, e.g. after a compact) and re-crosses it.
+pub fn compact_escalation_should_fire(
+    percent: u32,
+    threshold_percent: u32,
+    already_notified: bool,
+) -> bool {
+    threshold_percent != 0 && percent >= threshold_percent && !already_notified
+}
+
+/// The escalation notice delivered when an agent's context usage crosses the
+/// group's configured threshold (#328). Names the actual percent so the
+/// agent (and a human reading the pane) can judge urgency, and points at the
+/// exact recovery move (`request_compact`) rather than assuming the agent
+/// remembers the tool exists.
+pub fn compact_escalation_notice(percent: u32) -> String {
+    format!(
+        "[loomux] context at {percent}% — offload state (set_state, the task board, any \
+         GitHub issues/PRs carrying plan context) and call request_compact at your next \
+         stopping point. If you don't, loomux will request one on your behalf and fire it \
+         at your next idle moment — better a planned compact now than the CLI's own \
+         emergency auto-compact with no offload."
+    )
+}
+
+/// Compact-nudge (#328): whether `request_compact`'s pre-compact offload-
+/// checklist warning should be appended to its response. A soft nudge, never
+/// a block (the tool call always succeeds) — `last_state_write_ms` 0 means
+/// "never observed" and always warns. Pure so the recency rule is testable
+/// without a registry.
+pub fn compact_checklist_warning(last_state_write_ms: u64, now_ms: u64, window_ms: u64) -> Option<&'static str> {
+    if now_ms.saturating_sub(last_state_write_ms) < window_ms {
+        return None;
+    }
+    Some(
+        "warning: set_state hasn't been called recently — reconcile the task board and \
+         persist durable state (set_state) before this compact lands, or the post-compact \
+         re-sync may come back incomplete",
+    )
+}
+
+/// Compact-nudge (#328): whether the pane's recent output shows a human
+/// manually submitting `/compact` — the terminal echoes what was typed, so a
+/// submitted `/compact` line appears in the pane's (ANSI-stripped) output
+/// tail like any other typed command. Used only to START tracking
+/// (`AgentEntry.compact_pending`) for the mandatory post-compact
+/// re-injection; loomux pastes nothing in this path — the human already did.
+/// Looks for a STANDALONE `/compact` token (whitespace-delimited), not
+/// embedded in a longer word/path, so e.g. a line mentioning
+/// `src/compact_nudge.rs` can't false-positive. Best-effort and tolerant of
+/// the tail's bounded ring: a `/compact` typed further back than the tail
+/// window is simply missed, never misdetected as something else. The caller
+/// (`compact_nudge_tick`) additionally requires the pane's most recent human
+/// input to be within `MANUAL_COMPACT_DETECT_WINDOW_MS` before trusting a
+/// match, so stale tail content left over from an ALREADY-handled compact
+/// can't re-trigger detection on its own.
+pub fn human_typed_compact_detected(tail: &str) -> bool {
+    tail.lines().any(|line| line.split_whitespace().any(|tok| tok == "/compact"))
+}
+
+/// Directive ledger (#329 expansion): per-CLI stable substrings that appear in
+/// a pane's own rendered output while IT (not a human, not loomux) is
+/// actively auto-compacting. Keyed the same way `compact_nudge_cli_supported`
+/// gates the rest of this feature to `SUPPORTED_CLIS`, so adding a CLI's
+/// banner is a one-line addition here, never a change to the generic
+/// detection/pipeline code that calls `auto_compact_banner_detected` — this
+/// repo is never allowed to bake one CLI's quirks into product code (see
+/// CLAUDE.md's toolchain-agnostic constraint; the analogous concern here is
+/// *agent-CLI*-agnostic, not toolchain, but the same rule: express it as
+/// per-CLI data, not an `if cli == "claude"` buried in the tick).
+///
+/// Claude Code's own emergency auto-compact renders a spinner line while it
+/// runs, observed (1.0.x) as `✢ Compacting conversation… (esc to interrupt ·
+/// 8s · ↓ 172 tokens)` — a leading spinner glyph and a trailing elapsed-
+/// time/token-count suffix that both change on every repaint, wrapped around
+/// a stable `Compacting conversation` core. Matching only that core substring
+/// is the documented assumption: it is expected to survive across CLI point
+/// releases even if the spinner or counters' exact formatting doesn't, but it
+/// is a string this repo does not control and could change in a future
+/// release without notice — if this detector stops firing, that is the first
+/// thing to re-verify against a current build. No other supported CLI has a
+/// known equivalent yet; an empty slice means "never detected for this CLI",
+/// not a build error.
+fn auto_compact_banner_substrings(cli: &str) -> &'static [&'static str] {
+    match cli {
+        "claude" => &["Compacting conversation"],
+        _ => &[],
+    }
+}
+
+/// Directive ledger (#329 expansion): whether `cli`'s pane output tail shows
+/// ITS OWN auto-compact running right now — the fourth trigger path, distinct
+/// from all three #328 covers (agent-requested, threshold-escalation
+/// fallback, human-typed `/compact`), because every one of those is loomux
+/// either pasting `/compact` itself or detecting someone else doing so. None
+/// of them see the CLI silently deciding on its own that context is full and
+/// compacting without asking anyone — the exact incident driving this
+/// expansion: an orchestrator came back from one as a generic agent with
+/// every mid-session human directive gone, because loomux never learned a
+/// compact had happened at all, so the mandatory post-compact re-injection
+/// (#328) never fired. Pure so the substring match is testable without a
+/// registry; the caller (`compact_nudge_tick`) additionally requires fresh
+/// growth on this exact tick (`!currently_quiet`) before trusting a match.
+///
+/// **Position-anchored, not a bare substring scan (rev review B1 fix).** The
+/// first version matched the substring ANYWHERE in the tail, which a `!
+/// currently_quiet` growth gate does not close: a busy pane that merely
+/// PRINTS or DISCUSSES the banner text (a `gh pr diff` hunk, a grep result, a
+/// rust string literal in a code listing, the model streaming a sentence
+/// about this very feature — this repo's own source contains the string) IS
+/// the growth that satisfies the gate, so the mention and the trigger are the
+/// same event; a recency/growth check can never tell them apart. What CAN:
+/// the real spinner renders as the live status line — the very last thing on
+/// screen while it runs, continuously redrawn in place, with nothing after it
+/// until compaction finishes. A quoted mention sits in scrolled content with
+/// other lines following it in the same read (the diff continues, the file
+/// continues, the sentence has more sentences after it) almost always. So
+/// only the tail's LAST non-blank line is checked, never the full tail.
+///
+/// This is a real reduction in false-positive surface, not a perfect one:
+/// the residual, accepted risk is a mention that happens to be the exact
+/// last line of output at the instant this tick reads the pane (e.g. a
+/// streamed reply that ends its turn on a sentence naming the string, with
+/// nothing rendered yet after it). That case is not defended against here —
+/// doing so would need either a structural signal from the CLI itself (see
+/// `doc/design/orchestration.md`'s note on #397's `PreCompact` hook) or a
+/// second-tick confirmation before latching, which was judged not worth the
+/// added state for how narrow the remaining window is. If this assumption
+/// stops holding in practice, that added confirmation tick is the next move,
+/// not a broader substring match.
+pub fn auto_compact_banner_detected(cli: &str, tail: &str) -> bool {
+    let subs = auto_compact_banner_substrings(cli);
+    if subs.is_empty() {
+        return false;
+    }
+    let Some(last_line) = tail.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    subs.iter().any(|s| last_line.contains(s))
+}
+
+/// Directive ledger (#329 expansion): the ledger section embedded verbatim in
+/// the post-compact re-grounding notice, or `None` for an empty/missing
+/// ledger — nothing is embedded rather than a header with nothing under it.
+/// Keeps the TAIL (most recent entries) when `ledger` exceeds `cap_bytes`,
+/// cut on a line boundary so truncation never slices one entry in half, and
+/// always includes at least the single newest entry even if it alone exceeds
+/// the cap — a directive is never silently dropped for being long, only ever
+/// declared truncated. States the truncation and points at `ledger_path` for
+/// the full file rather than a silent cap (this repo's no-silent-caps rule
+/// for every bounded-coverage feature).
+pub fn directive_ledger_embed(ledger: &str, cap_bytes: usize, ledger_path: &str) -> Option<String> {
+    let trimmed = ledger.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let mut tail: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev() {
+        let line_len = line.len() + 1; // +1 for the newline joining it back
+        if used + line_len > cap_bytes && !tail.is_empty() {
+            break;
+        }
+        used += line_len;
+        tail.push(line);
+    }
+    tail.reverse();
+    let truncated = tail.len() < lines.len();
+    let body = tail.join("\n");
+    Some(if truncated {
+        format!(
+            "Your directive ledger (most recent {} of {} entries — full history at {ledger_path}):\n{body}",
+            tail.len(),
+            lines.len()
+        )
+    } else {
+        format!("Your directive ledger:\n{body}")
+    })
+}
+
+/// Directive ledger (#329 review, N2): trim the STORED ledger file to
+/// `cap_bytes`, dropping the OLDEST entries (line boundary, never mid-entry)
+/// — the backstop for an agent that notes liberally and never curates via
+/// `replace: true`. Returns `(retained_content, dropped_entry_count)`;
+/// `dropped == 0` means `ledger` already fit and is returned unchanged (not
+/// re-serialized, so a no-op call never even rewrites the file). Unlike
+/// `directive_ledger_embed` (which keeps the tail for a one-off notice and
+/// leaves the file untouched), this one's output IS the new file — so unlike
+/// that function it never force-keeps an over-cap single entry: a ledger
+/// that's over cap after keeping only its newest line is left at just that
+/// line, however large, since there's nothing older left to drop and
+/// truncating an entry's own text is not this function's job.
+pub fn ledger_capped(ledger: &str, cap_bytes: usize) -> (String, usize) {
+    if ledger.len() <= cap_bytes {
+        return (ledger.to_string(), 0);
+    }
+    let lines: Vec<&str> = ledger.lines().collect();
+    let mut tail: Vec<&str> = Vec::new();
+    let mut used = 0usize;
+    for line in lines.iter().rev() {
+        let line_len = line.len() + 1;
+        if used + line_len > cap_bytes && !tail.is_empty() {
+            break;
+        }
+        used += line_len;
+        tail.push(line);
+    }
+    tail.reverse();
+    let dropped = lines.len() - tail.len();
+    let mut body = tail.join("\n");
+    body.push('\n');
+    (body, dropped)
+}
+
+/// The mandatory post-compact re-grounding prompt (#328, extended #329),
+/// delivered once compaction is detected as finished, regardless of which of
+/// the four trigger paths (agent-requested, threshold-escalation fallback, a
+/// human typing `/compact` manually, or the CLI's own auto-compact banner)
+/// started it. `instructions` is the exact contract text the pane was
+/// kickoff'd with (read back from the durable instructions file loomux
+/// already writes at spawn — see `write_instruction_files`), embedded
+/// verbatim rather than pointing the agent at a file to go re-read:
+/// compaction preserves a summary of the CONVERSATION, but the operating
+/// rules can get diluted in that summary, and re-injecting the source text is
+/// the only way to guarantee the agent is grounded in what loomux actually
+/// seeded it with, not a paraphrase of a paraphrase.
+///
+/// `ledger_embed` is `directive_ledger_embed`'s output — the pane's own
+/// diary of human directives/scope-decisions/feedback, folded in alongside
+/// the instructions for the same reason: a compaction summary can dilute a
+/// directive as easily as it dilutes a rule, and the CLI's own emergency
+/// auto-compact (trigger path four) gives no warning turn to re-state
+/// anything first. `None` embeds nothing — an agent whose ledger is empty
+/// sees exactly the #328 notice, unchanged.
+///
+/// Always also tells the agent to re-sync live state, since the instructions
+/// file (and the ledger) don't carry runtime facts (task board, group state,
+/// roster).
+pub fn compact_reinjection_notice(instructions: &str, ledger_embed: Option<&str>) -> String {
+    let ledger_section = match ledger_embed {
+        Some(l) => format!("\n\n{l}"),
+        None => String::new(),
+    };
+    format!(
+        "[loomux] Context was compacted. Re-grounding you in your role instructions before \
+         you act — the summary above may have diluted them:\n\n{instructions}{ledger_section}\n\n\
+         Now re-sync live state: list_tasks, get_state, list_agents."
+    )
 }
 
 /// Autonomous mode (#83): whether autonomous-era spend has crossed the group's
@@ -2918,9 +3547,18 @@ pub struct AgentEntry {
     /// Seeded at spawn and whenever work is (re)assigned. See
     /// `watchdog_should_notify`.
     pub last_progress_ms: u64,
-    /// Watchdog: last observed value of the pane's monotonic pty output
-    /// counter, so a tick can tell whether the CLI has emitted anything since
-    /// the previous one even when the output ring is saturated.
+    /// Watchdog/idle-tick: last observed value of the pane's monotonic pty
+    /// output counter, so a tick can tell whether the CLI has emitted anything
+    /// since the previous one even when the output ring is saturated. Exclusive
+    /// to watchdog (non-orchestrator working agents) and idle-tick (the
+    /// orchestrator in an autonomous group) — the two never watch the same
+    /// agent (partitioned by role), so sharing this baseline between them is
+    /// safe. Compact-nudge does NOT use this field — see
+    /// `compact_nudge_last_output_total`; the two CAN watch the same agent
+    /// (default: the orchestrator), and an earlier revision shared this field
+    /// between them, which meant whichever tick polled first each cycle
+    /// rebaselined it and starved the other's activity detection (rev-24
+    /// review finding) — hence the separate baseline.
     pub last_output_total: u64,
     /// Watchdog anti-nag latch: set once a stall notice has been delivered for
     /// the current stall, cleared when the agent produces output/reports again.
@@ -2932,6 +3570,217 @@ pub struct AgentEntry {
     /// `last_progress_ms` above double as the idle-tick output counter / quiet
     /// clock for the orchestrator, which the watchdog never touches.
     pub idle_tick_notified: bool,
+    /// Compact-nudge (#287) anti-nag latch, meaningful only for a role in the
+    /// group's `compact_nudge_roles`: set once `/compact` has been pasted for
+    /// the current quiet window, cleared when the pane produces real output
+    /// again (per compact-nudge's OWN observation — see
+    /// `compact_nudge_last_output_total`). `last_progress_ms` above is still
+    /// the shared quiet clock both idle-tick and compact-nudge read/advance —
+    /// deliberately the same idleness signal, not a second one — but each
+    /// tick now detects "did real growth happen" from its own baseline before
+    /// touching it, so one tick's poll can no longer consume the growth out
+    /// from under the other. See `compact_nudge_tick`.
+    pub compact_nudge_notified: bool,
+    /// Compact-nudge's OWN baseline pty output-total, independent of
+    /// `last_output_total` (rev-24 review fix). Idle-tick and compact-nudge can
+    /// both be watching the SAME agent (default config: both target the
+    /// orchestrator), unlike watchdog/idle-tick which never overlap — so they
+    /// cannot share one rebaselined counter without whichever tick polls first
+    /// each cycle consuming the growth and starving the other's activity
+    /// detection (and, transitively, its anti-nag latch, which never clears
+    /// again). Each tick keeping its own last-seen snapshot of the same
+    /// monotonic pty counter is the standard fix for two independent readers
+    /// of one counter — a Kafka-consumer-offset shape, not a new signal.
+    pub compact_nudge_last_output_total: u64,
+    /// Compact-nudge (#328): set by the self-scoped `request_compact` MCP
+    /// tool call — the calling agent asked to be compacted at its next idle
+    /// moment. Consumed (cleared) the instant `compact_nudge_tick` fires the
+    /// `/compact` paste for it; unlike `compact_nudge_notified` this is a
+    /// one-shot REQUEST, not an anti-nag latch, and firing on it bypasses the
+    /// `compact_nudge_minutes` threshold entirely (the agent's own signal IS
+    /// the trigger) while still respecting the CLI gate and the shared
+    /// per-hour cap.
+    pub compact_requested: bool,
+    /// Compact-nudge (#328): true from the moment a compact has been
+    /// initiated for this pane — by loomux pasting `/compact` (heuristic or
+    /// requested fire) or by detecting a human typed it manually
+    /// (`human_typed_compact_detected`) — until the mandatory post-compact
+    /// re-injection fires. The single piece of state the "did compaction just
+    /// finish" detector needs, shared by all three trigger paths so the
+    /// detection logic lives once. See `compact_nudge_tick`.
+    pub compact_pending: bool,
+    /// Compact-nudge (#328): while `compact_pending`, latches true the first
+    /// time a tick observes REAL output growth (compaction actively running
+    /// or its own output rendering) — the busy half of the busy-then-quiet
+    /// edge `compact_nudge_tick` uses to recognize "compaction just
+    /// finished" without parsing Claude's own completion text. Reset when the
+    /// re-injection fires (or `compact_pending` clears).
+    pub compact_seen_busy: bool,
+    /// Production bug fix (PR #329 delta review): the agent's context-token
+    /// reading (`usage::latest_context_tokens`, via `agent_context_signals`)
+    /// captured the moment `compact_pending` most recently became `true` via
+    /// an INFERENCE trigger path (banner or manual detection — see
+    /// `compact_pending_trusted`). `None` when no reading was available at
+    /// that moment (no session yet). Live production evidence showed
+    /// busy-then-quiet ALONE is not proof a compaction ran for these two
+    /// paths — an orchestrator asked to explain/discuss the compact-nudge
+    /// feature itself produced output whose growth-then-quiet cycle
+    /// repeatedly satisfied the banner detector with no real compaction ever
+    /// happening, delivering the reinjection notice on a loop that only grew
+    /// context. This baseline lets the resolver REQUIRE evidence a real
+    /// compaction occurred before trusting an inference-path arm; see
+    /// `inferred_compaction_confirmed`. A SECOND live-evidence round (rev-42)
+    /// showed the naive fix (requiring this for every path uniformly) traded
+    /// that loop for a silent deadlock on the loomux-INITIATED path instead —
+    /// `usage::latest_context_tokens`'s drop is a next-turn phenomenon
+    /// (proven against a real transcript, see `usage::tests::
+    /// real_transcript_proves_the_token_drop_is_a_next_turn_phenomenon_
+    /// rev42_q1`), and on that path the only "next turn" is the reinjection
+    /// itself — gating it behind its own evidence is a deadlock, not a race.
+    /// So this baseline (and the marker-count baseline below) is only ever
+    /// CONSULTED when `compact_pending_trusted` is `false`; for a trusted arm
+    /// it's still captured (uniform arming code, cheap) but ignored at
+    /// resolution. Always cleared the instant a pending state resolves
+    /// (confirmed or not) — never carried across trigger cycles.
+    pub compact_pending_baseline_tokens: Option<u64>,
+    /// Production bug fix (rev-42 delta): companion baseline to `compact_
+    /// pending_baseline_tokens`, using `usage::compact_boundary_count`
+    /// instead of a token reading — the CLI's own structural "a compaction
+    /// just completed" marker, observable the INSTANT compaction finishes,
+    /// with no next-turn dependency at all (unlike the token drop). Confirmed
+    /// via `inferred_compaction_confirmed` if a NEW boundary appears since
+    /// this baseline (`current > baseline`) — a strictly better, faster
+    /// signal than the token drop for the inference paths, kept alongside it
+    /// (OR'd together) as defense-in-depth rather than a full replacement.
+    pub compact_pending_baseline_marker_count: Option<u64>,
+    /// Production bug fix (rev-42 delta): `true` when the CURRENT `compact_
+    /// pending` arm came from a LOOMUX-INITIATED trigger (the heuristic timer
+    /// or an agent's own `request_compact`) — the path where loomux itself
+    /// decided to paste `/compact`, which was never the false-positive
+    /// source the production incident lived in (that was the banner
+    /// detector's mention-vs-real-event confusion). `false` for the two
+    /// INFERENCE paths (banner, manual `/compact` detection), which CAN be
+    /// wrong about a compaction having happened at all and therefore still
+    /// require `inferred_compaction_confirmed` before resolving to a
+    /// reinjection. Read only at resolution time, alongside the two
+    /// baselines above; reset to `false` (its inert default) the instant a
+    /// pending state resolves.
+    pub compact_pending_trusted: bool,
+    /// Production bug fix (rev-42 delta, round 2): `Some(now)` from the tick a
+    /// reinjection was DECIDED (confirmed or trusted) and its delivery fired,
+    /// until that delivery is confirmed or the attempt budget is exhausted.
+    /// `None` while still deciding whether to reinject at all, and again once
+    /// the arm fully resolves. Live re-demo evidence (PR #329 round 5) showed
+    /// the one-shot latch being consumed at the DECISION rather than at
+    /// confirmed delivery is itself a gap: `deliver_prompt` is fire-and-
+    /// forget (D1's finding, see the design doc), so a decision to reinject
+    /// was previously treated as done the instant `deliver_prompt` was
+    /// *called*, with no feedback loop if that delivery never actually
+    /// landed. This field is what makes the latch wait for real evidence: see
+    /// `compact_nudge_tick`'s resolver for how it's consulted against
+    /// `delivery_confirmations`.
+    pub compact_reinject_attempted_ms: Option<u64>,
+    /// Production bug fix (rev-42 delta, round 2): 1-indexed count of
+    /// reinjection delivery attempts made for the CURRENT arm (1 = the first
+    /// fire, not yet a retry). Bounded by `MAX_REINJECT_ATTEMPTS` — a
+    /// reinjection that still hasn't confirmed after that many tries is
+    /// abandoned (audited, latch released) rather than wedging the state
+    /// machine so no future compaction can ever arm again for this agent.
+    /// Reset to `0` whenever no reinjection is in flight.
+    pub compact_reinject_attempts: u32,
+    /// Production bug fix (#410, PR #329 round 6): Unix-ms the CURRENT
+    /// `compact_pending` arm started (set at each of the three arm sites,
+    /// cleared on any resolution — discard, handoff into the reinjection-
+    /// confirmation phase, or this field's own timeout). Live evidence (a
+    /// user demo, testbed group `loomux-testbed-cc077f09`) showed a
+    /// `request_compact` call answered "a compact is already in flight for
+    /// this pane" for 10+ minutes: an inference arm (almost certainly the
+    /// auto-compact banner, given the session's accumulated size across many
+    /// testing rounds) kept re-arming and correctly resolving to a DISCARD
+    /// each time (D4 held — no reinjection loop), but the repeated cycling
+    /// meant `compact_pending` was essentially never open long enough for
+    /// the user's queued request to win the race (closed by the arm-site
+    /// reorder below) or, in the more literal #410 scenario, an arm that
+    /// simply never reaches a busy-then-quiet observation at all (a stalled
+    /// agent, or a compaction that never actually starts) stays pending
+    /// forever with no bound. This field lets the resolver force an
+    /// abandon — audited, latch released — once an arm has been open past
+    /// `ARM_PENDING_TIMEOUT_MS`, symmetric to `compact_reinject_attempted_
+    /// ms`'s bound on the delivery-confirmation phase.
+    pub compact_pending_armed_ms: Option<u64>,
+    /// Lifecycle-panel surfacing (PR #329 round 6): the reason the most
+    /// recent "something was lost" terminal outcome fired — `"arm-timeout"`
+    /// (#410) or `"reinjection-abandoned"` (a stuck delivery past its retry
+    /// budget) — paired with `compact_last_lost_ms`. Distinct from an
+    /// ordinary discard (a harmless false-positive, not worth lingering
+    /// visibility for): these two ARE worth surfacing to a human watching
+    /// the lifecycle panel, but only briefly (see `compaction_status`'s
+    /// recency window) — an old one would be misleading noise long after
+    /// the agent moved on.
+    pub compact_last_lost_reason: Option<String>,
+    /// Unix-ms `compact_last_lost_reason` was set. See its doc.
+    pub compact_last_lost_ms: Option<u64>,
+    /// Lifecycle-panel surfacing (PR #329 round 6): the last context-token
+    /// reading `compact_nudge_tick` observed for this agent (from `usage::
+    /// compaction_signal_in`, the SAME bounded tail-read the compact-nudge
+    /// background tick already does every `IDLE_TICK_INTERVAL` — this just
+    /// caches its result so `group_summary` can surface it on the UI's own,
+    /// much more frequent poll cadence WITHOUT an extra transcript read per
+    /// poll). `None` until the first successful reading; never cleared once
+    /// set (a transient read miss keeps the last-known value rather than
+    /// blanking the display).
+    pub last_context_tokens: Option<u64>,
+    /// Production bug fix (PR #329 round 7): the model the transcript
+    /// reading behind `last_context_tokens` came from — cached the same way
+    /// (from `run_compact_nudge`'s own `agent_context_signals` read, not a
+    /// per-poll re-read) so `group_summary` can derive the ACTUAL context-
+    /// window size (`effective_context_window_tokens`) instead of assuming a
+    /// flat one. `None` until the first reading; never cleared once set.
+    pub last_context_model: Option<String>,
+    /// Production bug fix (PR #329 round 7): INFERENCE arms (banner, manual
+    /// detection — never the loomux-initiated/trusted arm, which needs no
+    /// inference at all) may only arm while `now >= this`. Live demo
+    /// evidence: minutes after a REAL, confirmed compaction resolved, a
+    /// second inference arm formed and discarded — most likely loomux's OWN
+    /// `/compact` paste (or the reinjection notice that followed) still
+    /// sitting in the bounded output tail, re-satisfying `human_typed_
+    /// compact_detected`/`auto_compact_banner_detected`, possibly compounded
+    /// by the pane's own post-compact discussion of the test that just ran.
+    /// Not a reinjection LOOP (D4 held — every arm resolved to a correctly-
+    /// audited discard) but noisy and conceptually wrong: a detector
+    /// inferring a NEW compaction from an echo of loomux's own recent
+    /// activity, or from the immediate aftermath of one it already handled.
+    ///
+    /// `0` (never gates) until extended, in two places, to `X +
+    /// INFERENCE_ARM_COOLDOWN_MS`: (a) whenever a CONFIRMED delivery `from
+    /// == "loomux"` lands for this agent's pty (`X` = that delivery's
+    /// `submit_sent_ms` — the provenance principle: loomux's own paste's
+    /// echo must never satisfy loomux's own detectors, whether that paste
+    /// was a `/compact` command or a reinjection/escalation notice), and
+    /// (b) whenever `compact_pending` reaches a terminal resolution
+    /// (discard, arm-timeout, reinjection confirmed, reinjection abandoned;
+    /// `X` = `now`) — the immediate post-compact conversation window.
+    /// Deliberately NOT also seeded at construction/resume: live forensics
+    /// couldn't attribute the analogous "arms shortly after a restart"
+    /// incident to any delivery THIS agent's entry ever made (a fresh
+    /// `AgentEntry` has made none yet) — a construction-time grace period
+    /// would just be a blunt "distrust every fresh session" hack, not this
+    /// principle. Never gates the trusted arm: loomux has positive
+    /// knowledge it initiated that one itself, so there is no inference for
+    /// a stale echo to fool.
+    pub compact_inference_guard_until_ms: u64,
+    /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
+    /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
+    /// handler on the CALLING agent's own entry — meaningful only for the
+    /// orchestrator (the only role `set_state` is available to). Backs
+    /// `request_compact`'s pre-compact offload-checklist warning (a soft nudge
+    /// — never a block — that state was likely persisted before compacting).
+    pub last_state_write_ms: u64,
+    /// Compact-nudge (#328) context-escalation anti-nag latch: set once
+    /// `compact_escalation_notice` has fired for the current above-threshold
+    /// window, cleared once context% drops back under the group's
+    /// `compact_context_threshold_percent` (e.g. after a compact lands).
+    pub compact_escalation_notified: bool,
     /// The actual agent CLI a **solo** pane (`role == Role::Solo`) is
     /// running, e.g. `"codex"`/`"gemini"` — the group-guardrails CLI
     /// resolution (`Guardrails::cli_for`) that every orchestration-group
@@ -3484,6 +4333,10 @@ pub struct OrchRegistry {
     /// for the `MAX_IDLE_TICKS_PER_HOUR` backstop; pruned to the trailing hour on
     /// each check. The runaway analogue of `spawn_times`.
     idle_tick_times: Mutex<HashMap<String, Vec<u64>>>,
+    /// Compact-nudge (#287): per-group `/compact` nudge delivery timestamps
+    /// (Unix-ms) for the `MAX_COMPACT_NUDGES_PER_HOUR` backstop; pruned to the
+    /// trailing hour on each check. Mirrors `idle_tick_times`.
+    compact_nudge_times: Mutex<HashMap<String, Vec<u64>>>,
     /// Debounced cap-change notices (#79): group → its pending, not-yet-
     /// delivered `PendingMaxNotice`. `set_max_agents` folds rapid stepper
     /// clicks in here (persist/enforce/audit stay per-click); the
@@ -4114,6 +4967,22 @@ fn append_audit(root: &Path, group: &str, actor: &str, action: &str, detail: Val
     }
 }
 
+/// Directive ledger (#329 expansion): append one line to a pane's ledger
+/// file. Same single-`write_all` rule as `append_audit` (rule 1 in its doc)
+/// is what makes the append atomic — but unlike `audit.jsonl`, a ledger file
+/// has exactly one writer (the owning agent, self-scoped via `note_directive`)
+/// and no rotation, so there is no second process or rotate-vs-append race to
+/// guard against and no need for `AUDIT_LOCK`-style serialization.
+fn append_ledger_line(path: &Path, line: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut buf = line.to_string();
+    buf.push('\n');
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(&buf.into_bytes())
+}
+
 /// One parsed audit-log line, for the in-app timeline viewer. Mirrors the
 /// shape written by `append_audit`; `detail` stays an opaque JSON value so the
 /// frontend can render per-action without the backend knowing every schema.
@@ -4356,7 +5225,7 @@ pub fn submit_sequence(cli: &str) -> &'static [u8] {
 /// The outcome of the most recent delivery to a pane, kept in-memory per pty so
 /// the next delivery can detect a previous prompt still stranded in the input
 /// box (#81/#84).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct DeliveryOutcome {
     /// Whether that delivery's Enter was observed to submit (box cleared / turn
     /// started). `false` means the text may still be sitting unsubmitted.
@@ -4364,6 +5233,32 @@ struct DeliveryOutcome {
     /// Unix-ms the final Enter was sent — the reference point for deciding
     /// whether a human has since typed into the pane.
     submit_sent_ms: u64,
+    /// Production bug fix (PR #329 round 7): the delivery's `from` (the
+    /// `deliver_prompt` caller — `"loomux"` for every compact-nudge notice,
+    /// `"human"` for a message typed through loomux's UI, an agent id for a
+    /// forwarded `message_orchestrator`). See `AgentEntry::compact_
+    /// inference_guard_until_ms`'s doc for why this specific distinction
+    /// matters.
+    from: String,
+}
+
+/// Production bug fix (rev-42 delta, round 2): a per-agent snapshot of the
+/// most recent delivery to that agent's pane, in the shape `compact_nudge_
+/// tick`'s reinjection-confirmation resolver needs. Mirrors the private
+/// `DeliveryOutcome` above (same two fields, same meaning) but kept as its
+/// own `pub` type rather than making delivery-plumbing internals public: a
+/// synthetic-input test constructs one directly, with no live pty/app
+/// handle round trip — `deliver_prompt` is fire-and-forget and unit tests
+/// can't exercise it for real (D1's rejected precedent, see the design
+/// doc), so this is threaded through as an ordinary input map exactly like
+/// `context_tokens`/`context_boundary_counts`, with `agent_last_deliveries`
+/// as the impure reader that supplies it in production.
+#[derive(Clone, Debug)]
+pub struct DeliveryConfirmation {
+    pub submit_sent_ms: u64,
+    pub confirmed: bool,
+    /// See `DeliveryOutcome::from`'s doc — mirrored verbatim.
+    pub from: String,
 }
 
 /// Whether output growth after the submit Enter counts as the submit landing.
@@ -4878,6 +5773,7 @@ impl OrchRegistry {
             dangerous_groups: Mutex::new(HashSet::new()),
             spawn_expanded_groups: Mutex::new(HashSet::new()),
             idle_tick_times: Mutex::new(HashMap::new()),
+            compact_nudge_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
             low_disk_notified: Mutex::new(false),
@@ -4941,6 +5837,16 @@ impl OrchRegistry {
     /// on group end alongside the worktrees.
     fn attachments_dir(&self, group: &str) -> PathBuf {
         self.group_dir(group).join("attachments")
+    }
+
+    /// Directive ledger (#329 expansion): one pane's ledger file, directly in
+    /// the group dir alongside `audit.jsonl` — human-inspectable the same
+    /// way, per the #240 precedent. Keyed by agent id, not by role/block
+    /// (unlike the instructions files): a pane's own directives are its own
+    /// regardless of which block it's running, and a resume should still see
+    /// them. See `note_directive`, the sole writer.
+    fn ledger_path(&self, group: &str, agent_id: &str) -> PathBuf {
+        self.group_dir(group).join(format!("ledger-{agent_id}.log"))
     }
 
     /// The CLI the group's orchestrator runs (`claude`/`copilot`/…), resolving
@@ -5917,6 +6823,20 @@ impl OrchRegistry {
                 idle_tick_minutes: g["idle_tick_minutes"].as_u64().unwrap_or(0) as u32,
                 // Idle-tick activity floor (#83): absent → 0 → clamped() → default.
                 idle_activity_floor_bytes: g["idle_activity_floor_bytes"].as_u64().unwrap_or(0),
+                // Compact-nudge (#287): absent → 0 → off, exactly the conservative
+                // default a group.json written before this field existed means.
+                compact_nudge_minutes: g["compact_nudge_minutes"].as_u64().unwrap_or(0) as u32,
+                compact_nudge_roles: g["compact_nudge_roles"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default(),
+                // Compact-nudge context escalation (#328): absent → 0 → off.
+                compact_context_threshold_percent:
+                    g["compact_context_threshold_percent"].as_u64().unwrap_or(0) as u32,
+                // Context-window override (PR #329 round 7): absent → None →
+                // defer entirely to the model-based guess, the conservative
+                // default for a group.json written before this field existed.
+                context_window_tokens_override: g["context_window_tokens_override"].as_u64(),
             },
         ))
     }
@@ -6188,6 +7108,17 @@ impl OrchRegistry {
                 } else {
                     persisted.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES)
                 };
+                // Compact-nudge (#287) is likewise live-adjustable and persisted;
+                // 0 is a real "off" here (not "unset"), so just re-cap it.
+                guardrails.compact_nudge_minutes =
+                    persisted.compact_nudge_minutes.min(MAX_COMPACT_NUDGE_MINUTES);
+                // Re-run the same role normalization `clamped()` applies (this
+                // overwrite lands after that top-of-fn call, straight from a
+                // raw disk read that never went through it).
+                guardrails.compact_nudge_roles = canonicalize_compact_nudge_roles(persisted.compact_nudge_roles);
+                guardrails.compact_context_threshold_percent = persisted
+                    .compact_context_threshold_percent
+                    .min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
             }
         }
         // #255: advisory only — never override a cap the human set. A launcher
@@ -6228,6 +7159,10 @@ impl OrchRegistry {
                 "autonomy_budget_tokens": info.guardrails.autonomy_budget_tokens,
                 "idle_tick_minutes": info.guardrails.idle_tick_minutes,
                 "idle_activity_floor_bytes": info.guardrails.idle_activity_floor_bytes,
+                "compact_nudge_minutes": info.guardrails.compact_nudge_minutes,
+                "compact_nudge_roles": info.guardrails.compact_nudge_roles,
+                "compact_context_threshold_percent": info.guardrails.compact_context_threshold_percent,
+                "context_window_tokens_override": info.guardrails.context_window_tokens_override,
             },
         }))
         .unwrap();
@@ -7778,6 +8713,24 @@ impl OrchRegistry {
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
+            compact_nudge_notified: false,
+            compact_nudge_last_output_total: 0,
+            compact_requested: false,
+            compact_pending: false,
+            compact_seen_busy: false,
+            compact_pending_baseline_tokens: None,
+            compact_pending_baseline_marker_count: None,
+            compact_pending_trusted: false,
+            compact_reinject_attempted_ms: None,
+            compact_reinject_attempts: 0,
+            compact_pending_armed_ms: None,
+            compact_last_lost_reason: None,
+            compact_last_lost_ms: None,
+            last_context_tokens: None,
+            last_context_model: None,
+            compact_inference_guard_until_ms: 0,
+            last_state_write_ms: 0,
+            compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
             last_exit_tail: None,
         };
@@ -7887,6 +8840,24 @@ impl OrchRegistry {
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
+            compact_nudge_notified: false,
+            compact_nudge_last_output_total: 0,
+            compact_requested: false,
+            compact_pending: false,
+            compact_seen_busy: false,
+            compact_pending_baseline_tokens: None,
+            compact_pending_baseline_marker_count: None,
+            compact_pending_trusted: false,
+            compact_reinject_attempted_ms: None,
+            compact_reinject_attempts: 0,
+            compact_pending_armed_ms: None,
+            compact_last_lost_reason: None,
+            compact_last_lost_ms: None,
+            last_context_tokens: None,
+            last_context_model: None,
+            compact_inference_guard_until_ms: 0,
+            last_state_write_ms: 0,
+            compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
             last_exit_tail: None,
         };
@@ -8102,6 +9073,1014 @@ impl OrchRegistry {
         self.enforce_autonomy_budgets(now);
         let (outputs, inputs) = self.orchestrator_activity();
         self.idle_tick_tick(now, &outputs, &inputs)
+    }
+
+    // ---------- compact-nudge (#287): periodic `/compact` at natural lulls ----------
+
+    /// One compact-nudge pass. For each **non-paused** group's running agent
+    /// whose role is in that group's `compact_nudge_roles` and whose CLI
+    /// supports `/compact` (`compact_nudge_cli_supported`), fold in the latest
+    /// pty output counter using the group's `idle_activity_floor_bytes` —
+    /// meaningful growth (a real turn, not idle repaint noise) resets the
+    /// quiet clock and this tick's own one-shot latch.
+    ///
+    /// This deliberately reads the SAME quiet-clock concept `idle_tick_tick`
+    /// reads (guardrail #1: reuse the idleness signal, don't invent a second
+    /// one) — but rebaselines against its OWN `compact_nudge_last_output_total`,
+    /// not `idle_tick_tick`'s `last_output_total` (rev-24 review finding: idle-
+    /// tick and compact-nudge can both be watching the SAME agent — default
+    /// config targets the orchestrator for both — and an earlier revision
+    /// shared one rebaselined counter between them, so whichever tick polled
+    /// first each cycle consumed the growth and the other's `idle_output_is_
+    /// activity` check permanently saw a zero delta: its latch, once set,
+    /// could never clear again). Each tick keeping its own last-seen baseline
+    /// on the same monotonic pty counter is the standard fix for two
+    /// independent readers of one counter (a consumer-offset shape), not a
+    /// second idleness mechanism — both still derive activity from the exact
+    /// same source (the pty's `output_total`) via the exact same rule
+    /// (`idle_output_is_activity` against the group's `idle_activity_floor_
+    /// bytes`). `last_progress_ms` itself stays shared and is safe for both
+    /// to advance: each writes it only after independently confirming real
+    /// growth from its own baseline, so a write here can only move the quiet
+    /// clock's timestamp closer to the truth, never corrupt the other tick's
+    /// next comparison.
+    ///
+    /// An eligible pane quiet past its group's `compact_nudge_minutes`, not
+    /// already latched, and under `MAX_COMPACT_NUDGES_PER_HOUR` (reusing
+    /// `idle_tick_should_fire`'s gate — the identical shape, not a copy with a
+    /// new name) gets `/compact` typed through `deliver_prompt`'s normal
+    /// delivery path (`Delivery::MidSession`: a pane write of `/compact` + CR,
+    /// no PTY resize, no new agent capability). #287 shipped an immediate,
+    /// optional follow-up notice here; #328 replaces it with the MANDATORY
+    /// `compact_reinjection_notice` below, delivered once compaction is
+    /// actually observed to have finished rather than guessed at the moment
+    /// of the paste.
+    ///
+    /// `deliver_prompt` owns never clobbering a human's unsubmitted line
+    /// (#111/#171/#246): if the pane's input box is occupied, it holds up to
+    /// the shipped cap and then silently aborts — a held compact is skipped,
+    /// not queued, exactly like any other delivery to the orchestrator (no
+    /// notice, since a notice about a delivery to the orchestrator would
+    /// itself be a delivery to the orchestrator).
+    ///
+    /// `compact_nudge_minutes` 0 disables the group entirely (the conservative
+    /// default). Paused groups are skipped wholesale — same reasoning as
+    /// `watchdog_tick`/`idle_tick_tick`. Returns the nudged agent ids. Split
+    /// from the pty read (`agent_output_totals`) so the gate/latch/cap/pause
+    /// logic is testable with synthetic counters — the `watchdog_tick` shape.
+    ///
+    /// Two more independent pieces of state ride the same per-agent pass
+    /// (#328), each gated so the group's existing behavior is unchanged when
+    /// unused:
+    /// - **Compaction-completion detection**, shared by all FOUR trigger
+    ///   paths (a heuristic/requested fire below; a human typing `/compact`
+    ///   manually, detected via `human_typed_compact_detected`; or the CLI's
+    ///   own auto-compact banner, detected via `auto_compact_banner_detected`
+    ///   — #329 expansion, see below). `AgentEntry.compact_pending` tracks "a
+    ///   compact was initiated, not yet resolved"; `compact_seen_busy` is the
+    ///   busy half of the busy-then-quiet edge that marks it finished — no
+    ///   text-parsing of Claude's own completion output needed, since
+    ///   `compact_nudge_tick` already has a busy/quiet detector for its own
+    ///   idleness signal. Resolution delivers the MANDATORY
+    ///   `compact_reinjection_notice` (the instructions file read back and
+    ///   embedded verbatim, plus the pane's directive ledger — #329
+    ///   expansion), superseding #287's optional post-fire notice.
+    /// - **Auto-compact banner detection (#329 expansion)**: the CLI's own
+    ///   emergency auto-compact never goes through `request_compact`, a
+    ///   heuristic fire, or a human typing `/compact` — none of those three
+    ///   paths ever set `compact_pending`, so without this the mandatory
+    ///   re-injection above would simply never fire for it, which is the
+    ///   exact incident that motivated this expansion. Detected from the same
+    ///   output tail the manual-`/compact` detector already reads, gated on
+    ///   `!compact_pending` (nothing else already tracking this pane) and
+    ///   `!currently_quiet` — this tick's OWN fresh-growth signal, not a
+    ///   duration-based window: `last_progress_ms` gets rewritten to `now` by
+    ///   the growth check whenever the pane is busy for any reason, so a
+    ///   window compared against it would read as "fresh" on every busy tick
+    ///   regardless of why the tail holds the banner text. Requiring growth
+    ///   on the SAME tick the banner is read is the strongest signal actually
+    ///   available. Sets `compact_seen_busy` immediately (the banner IS the
+    ///   busy signal, caught mid-compaction rather than inferred after the
+    ///   fact from a separate growth observation).
+    /// - **Context-usage escalation**: once `compact_context_threshold_percent`
+    ///   is crossed (percent from `usage::latest_context_tokens`, an exact
+    ///   transcript-recorded figure, not a byte proxy — see that fn's doc),
+    ///   `compact_escalation_notice` fires once, giving the agent that tick
+    ///   to self-request. If it's still over threshold on a LATER tick and
+    ///   still hasn't called `request_compact`, loomux sets `compact_requested`
+    ///   on its behalf, so a fire follows at the next idle moment regardless.
+    pub fn compact_nudge_tick(
+        &self,
+        now: u64,
+        outputs: &HashMap<String, u64>,
+        manual_signals: &HashMap<String, (String, u64)>,
+        context_percents: &HashMap<String, u32>,
+        context_tokens: &HashMap<String, u64>,
+        context_boundary_counts: &HashMap<String, u64>,
+        delivery_confirmations: &HashMap<String, DeliveryConfirmation>,
+    ) -> Vec<String> {
+        let paused = self.paused.lock_safe().clone();
+        // Snapshot per-group guardrails (Clone) rather than per-agent CLI
+        // lookups while holding the agents lock — `Guardrails::cli_for` needs
+        // the whole roster, and `cli_for_agent` would re-lock `self.groups`.
+        let groups: HashMap<String, Guardrails> = self
+            .groups
+            .lock_safe()
+            .iter()
+            .map(|(id, g)| (id.clone(), g.guardrails.clone()))
+            .collect();
+        let tick_times = self.compact_nudge_times.lock_safe().clone();
+
+        let mut to_fire: Vec<(String, String)> = Vec::new();
+        // `u32` is the 1-indexed attempt number (see `AgentEntry::
+        // compact_reinject_attempts`) — carried through so the audit line
+        // distinguishes a first fire from a retry.
+        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf, u32)> = Vec::new();
+        let mut to_escalate: Vec<(String, String, u32)> = Vec::new();
+        // Production bug fix (D2/D3): a resolved-but-unconfirmed pending
+        // state — audited for visibility (this exact gap in observability is
+        // why the live incident took real forensic work to root-cause: no
+        // record existed of WHICH detector armed `compact_pending`, or that
+        // it had been discarded rather than genuinely resolved).
+        let mut to_discard: Vec<(String, String, Option<u64>, Option<u64>)> = Vec::new();
+        // rev-42 delta (round 2): a reinjection whose delivery just confirmed
+        // — audited for visibility, distinct from the initial fire above.
+        let mut to_reinject_confirmed: Vec<(String, String)> = Vec::new();
+        // rev-42 delta (round 2): a reinjection stuck past `MAX_REINJECT_
+        // ATTEMPTS` — the latch is released anyway (never wedge the state
+        // machine), but this must be visible: it's a genuinely lost
+        // re-grounding, not a harmless discard.
+        let mut to_abandon: Vec<(String, String, u32)> = Vec::new();
+        // #410 (round 6): an arm forced open past `ARM_PENDING_TIMEOUT_MS`
+        // without ever reaching a busy-then-quiet resolution — audited
+        // distinctly from `to_abandon` (which is specifically a stuck
+        // reinjection DELIVERY, past the arm phase).
+        let mut to_arm_timeout: Vec<(String, String)> = Vec::new();
+        {
+            let mut agents = self.agents.lock_safe();
+            for a in agents.values_mut() {
+                let Some(g) = groups.get(&a.group) else { continue };
+                if a.status != AgentStatus::Running || !compact_nudge_cli_supported(g.cli_for(a.role)) {
+                    continue;
+                }
+
+                // Lifecycle-panel surfacing (PR #329 round 6): cache this
+                // tick's context-token reading (if any) so `group_summary`
+                // can surface it without its own transcript read — see
+                // `last_context_tokens`'s doc. Every agent in this loop
+                // already cleared the CLI-support gate above, so every
+                // reading here is for an agent the panel would want to show
+                // usage for anyway.
+                if let Some(&tokens) = context_tokens.get(&a.id) {
+                    a.last_context_tokens = Some(tokens);
+                }
+
+                // Production bug fix (PR #329 round 7): provenance — a
+                // CONFIRMED delivery `from == "loomux"` extends this agent's
+                // inference-arm cooldown, so loomux's OWN paste (a `/compact`
+                // command, a reinjection/escalation notice) can never have
+                // its own echo satisfy loomux's own banner/manual detectors.
+                // `from` distinguishes this from a human's own message or
+                // another agent's forwarded one reaching the same pane
+                // through the same delivery pipeline — neither of those
+                // should suppress detection. `.max` never SHORTENS an
+                // already-later guard (e.g. one just set by a resolve below).
+                if let Some(d) = delivery_confirmations.get(&a.id) {
+                    if d.confirmed && d.from == "loomux" {
+                        a.compact_inference_guard_until_ms =
+                            a.compact_inference_guard_until_ms.max(d.submit_sent_ms + INFERENCE_ARM_COOLDOWN_MS);
+                    }
+                }
+
+                // Rebaseline / meaningful-growth detection — own baseline
+                // (`compact_nudge_last_output_total`, not idle-tick's
+                // `last_output_total`) — see the fn doc for why sharing the
+                // rebaselined counter with idle-tick was the bug.
+                let mut currently_quiet = true;
+                if let Some(&cur) = outputs.get(&a.id) {
+                    let meaningful = idle_output_is_activity(
+                        a.compact_nudge_last_output_total,
+                        cur,
+                        g.idle_activity_floor_bytes,
+                    );
+                    a.compact_nudge_last_output_total = cur; // rebaseline every observation
+                    if meaningful {
+                        a.last_progress_ms = now;
+                        a.compact_nudge_notified = false;
+                        currently_quiet = false;
+                        if a.compact_pending {
+                            a.compact_seen_busy = true;
+                        }
+                    }
+                }
+
+                // rev-42 delta (round 2, PR #329 round-5 re-demo): while a
+                // decided reinjection is waiting on its delivery to confirm,
+                // skip straight to that check — do NOT re-run the busy/
+                // confirm decision below (already decided; `compact_pending`
+                // stays `true` throughout this phase so no other arm site can
+                // re-fire in the meantime).
+                //
+                // Live re-demo evidence (round 5) showed the previous design
+                // — clear the latch the INSTANT `deliver_prompt` is called,
+                // regardless of outcome — has a real gap: `deliver_prompt` is
+                // fire-and-forget (its `Result` reflects only whether the
+                // spawn succeeded, never whether the paste actually landed),
+                // so "decided to reinject" was being treated as "reinjected"
+                // with no feedback loop if that delivery never confirmed
+                // (held for a human typing, the input box never clearing,
+                // or any other silent failure). The forensic timeline for
+                // that re-demo actually showed something more fundamental —
+                // the busy-then-quiet PRECONDITION below never fired at all
+                // (see that comment) — but the confirmed-delivery gate is a
+                // real, separate gap in its own right and the fix contract
+                // requires it regardless of which mechanism this particular
+                // re-demo hit.
+                if let Some(attempted_ms) = a.compact_reinject_attempted_ms {
+                    let confirmed_delivery = delivery_confirmations
+                        .get(&a.id)
+                        .is_some_and(|d| d.submit_sent_ms >= attempted_ms && d.confirmed);
+                    if confirmed_delivery {
+                        a.compact_pending = false;
+                        a.compact_reinject_attempted_ms = None;
+                        a.compact_reinject_attempts = 0;
+                        // #410/round-7: the immediate post-compact discussion
+                        // is exactly the window an inference arm can misread
+                        // as a new compaction — cool down.
+                        a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                        to_reinject_confirmed.push((a.id.clone(), a.group.clone()));
+                    } else if now.saturating_sub(attempted_ms) >= REINJECT_CONFIRM_TIMEOUT_MS {
+                        if a.compact_reinject_attempts < MAX_REINJECT_ATTEMPTS {
+                            a.compact_reinject_attempts += 1;
+                            a.compact_reinject_attempted_ms = Some(now);
+                            let instructions = self.group_dir(&a.group).join(
+                                g.block(&a.block)
+                                    .map(|b| b.instructions_file())
+                                    .unwrap_or_else(|| a.role.instructions_file().to_string()),
+                            );
+                            let ledger = self.ledger_path(&a.group, &a.id);
+                            to_reinject.push((
+                                a.id.clone(), a.group.clone(), instructions, ledger,
+                                a.compact_reinject_attempts,
+                            ));
+                        } else {
+                            to_abandon.push((a.id.clone(), a.group.clone(), a.compact_reinject_attempts));
+                            a.compact_pending = false;
+                            a.compact_reinject_attempted_ms = None;
+                            a.compact_reinject_attempts = 0;
+                            a.compact_last_lost_reason = Some("reinjection-abandoned".to_string());
+                            a.compact_last_lost_ms = Some(now);
+                            a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                        }
+                    }
+                    // else: still within the timeout, a delivery may be
+                    // legitimately in flight (a long human-typing hold) —
+                    // wait, don't re-fire yet.
+                } else if a.compact_pending {
+                    // Production bug fix (#410, PR #329 round 6): an arm that
+                    // never reaches a busy-then-quiet resolution — a stalled
+                    // agent, a compaction that never actually starts, or (the
+                    // live incident this closes) a rapid discard/re-arm cycle
+                    // that never leaves `compact_pending` open long enough
+                    // for a queued `request_compact` to win the race — must
+                    // not wedge the state machine forever. Checked BEFORE the
+                    // `currently_quiet` gate below (unlike the delivery-
+                    // confirmation phase's timeout, which only matters once
+                    // already resolved, a stuck ARM might never go quiet at
+                    // all, so this bound cannot wait for that).
+                    let armed_too_long = a
+                        .compact_pending_armed_ms
+                        .is_some_and(|armed_ms| now.saturating_sub(armed_ms) >= ARM_PENDING_TIMEOUT_MS);
+                    if armed_too_long {
+                        to_arm_timeout.push((a.id.clone(), a.group.clone()));
+                        a.compact_pending = false;
+                        a.compact_seen_busy = false;
+                        a.compact_pending_baseline_tokens = None;
+                        a.compact_pending_baseline_marker_count = None;
+                        a.compact_pending_trusted = false;
+                        a.compact_pending_armed_ms = None;
+                        a.compact_last_lost_reason = Some("arm-timeout".to_string());
+                        a.compact_last_lost_ms = Some(now);
+                        a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                    } else if currently_quiet {
+                    // Compaction-completion: busy (compaction ran/rendered)
+                    // then quiet again while pending — resolve regardless of
+                    // pause state (a pause must not strand a pane mid-compact
+                    // forever).
+                    //
+                    // Production bug fix (D2/D3, PR #329 delta review): busy-
+                    // then-quiet is necessary but not SUFFICIENT — a live
+                    // incident showed it can be satisfied by an agent's
+                    // ordinary turn, with no compaction ever running.
+                    // `compaction_confirmed` requires the context-token
+                    // reading to have actually dropped since the baseline
+                    // captured when `compact_pending` was set before the
+                    // mandatory re-injection is trusted to fire.
+                    //
+                    // rev-42 delta (deadlock fix): that gate is only sound
+                    // for INFERENCE arms (manual `/compact` typing, the
+                    // auto-compact banner) — paths where loomux merely
+                    // *believes* a compact happened. It deadlocks the
+                    // LOOMUX-INITIATED arm (heuristic fallback /
+                    // `request_compact`, the one that actually types
+                    // `/compact` itself, below): `usage::
+                    // latest_context_tokens`'s drop is a NEXT-TURN phenomenon
+                    // (proved against a real transcript in `usage::tests::
+                    // real_transcript_proves_the_token_drop_is_a_next_turn_
+                    // phenomenon_rev42_q1`) and the only next turn available
+                    // is the reinjection this gate is supposed to authorize —
+                    // a reading taken before that turn is always still-high,
+                    // so a uniform gate silently discards genuine
+                    // compactions on the primary path forever.
+                    // `compact_pending_trusted` (set at each arm site below)
+                    // is the fix: trusted arms skip confirmation entirely —
+                    // loomux has positive knowledge it pasted `/compact`
+                    // itself, so busy-then-quiet IS the signal, same as it
+                    // always was before D2/D3 (this was never the
+                    // false-positive path that motivated the gate).
+                    // Inference arms keep the hard gate, now widened to
+                    // `inferred_compaction_confirmed` (token-drop OR the
+                    // `compact_boundary` transcript marker).
+                    //
+                    // rev-42 delta (round 2, the round-5 re-demo's ACTUAL
+                    // root cause): "busy" used to mean ONLY real terminal-
+                    // output growth clearing `idle_activity_floor_bytes`
+                    // (`compact_seen_busy`, set by the rebaseline block
+                    // above). The re-demo's forensic timeline (audit.jsonl +
+                    // breadcrumbs.log around the genuine, confirmed `/compact`
+                    // paste) showed NO reinjection audit line, NO discard
+                    // audit line — nothing — for over three minutes while
+                    // the agent was demonstrably back to normal work; the
+                    // resolver never even reached this branch. The floor-
+                    // gated busy check depends on the compaction's OWN
+                    // terminal rendering being large enough to clear a
+                    // threshold tuned to filter ordinary repaint noise — a
+                    // real but small/fast compaction can fail to clear it,
+                    // and unlike the two INFERENCE arms (which set
+                    // `compact_seen_busy = true` immediately at arm time,
+                    // from the very evidence that armed them), the
+                    // LOOMUX-INITIATED arm has no such alternate evidence —
+                    // it waited PURELY on a later tick's byte-growth
+                    // observation, which may simply never come. A rise in
+                    // the `compact_boundary` marker is direct, floor-
+                    // independent proof the compaction actually happened
+                    // (same-turn, no next-turn dependency — same signal
+                    // `inferred_compaction_confirmed` already uses), so it
+                    // now counts as "seen busy" too, for every arm — closing
+                    // this gap without weakening the "don't paste while the
+                    // agent is visibly still busy" intent `currently_quiet`
+                    // protects (a marker rise only ever WIDENS what counts as
+                    // the busy half; the quiet requirement is untouched).
+                    //
+                    // `compact_pending`/`compact_seen_busy`/both baselines/
+                    // the trust flag are ALWAYS cleared on a DISCARD — one
+                    // resolution attempt per arming, so a repeatedly-false-
+                    // positiving detector can re-arm the state machine as
+                    // many times as it wants but can never cause more than
+                    // one discarded, context-growth-free no-op per arming
+                    // (audited with baseline/current tokens, Q3). A CONFIRM
+                    // instead moves into the delivery-confirmation phase
+                    // above rather than clearing immediately — see
+                    // `compact_reinject_attempted_ms`'s doc.
+                    let marker_baseline = a.compact_pending_baseline_marker_count;
+                    let marker_current = context_boundary_counts.get(&a.id).copied();
+                    let marker_rose = matches!((marker_baseline, marker_current), (Some(b), Some(c)) if c > b);
+                    if a.compact_seen_busy || marker_rose {
+                        let baseline_tokens = a.compact_pending_baseline_tokens;
+                        let current_tokens = context_tokens.get(&a.id).copied();
+                        let confirmed = a.compact_pending_trusted
+                            || inferred_compaction_confirmed(
+                                baseline_tokens,
+                                current_tokens,
+                                marker_baseline,
+                                marker_current,
+                            );
+                        if confirmed {
+                            a.compact_pending_baseline_tokens = None;
+                            a.compact_pending_baseline_marker_count = None;
+                            a.compact_pending_trusted = false;
+                            a.compact_seen_busy = false;
+                            a.compact_pending_armed_ms = None;
+                            a.compact_reinject_attempts = 1;
+                            a.compact_reinject_attempted_ms = Some(now);
+                            let instructions = self.group_dir(&a.group).join(
+                                g.block(&a.block)
+                                    .map(|b| b.instructions_file())
+                                    .unwrap_or_else(|| a.role.instructions_file().to_string()),
+                            );
+                            let ledger = self.ledger_path(&a.group, &a.id);
+                            to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger, 1));
+                        } else {
+                            a.compact_pending = false;
+                            a.compact_seen_busy = false;
+                            a.compact_pending_baseline_tokens = None;
+                            a.compact_pending_baseline_marker_count = None;
+                            a.compact_pending_trusted = false;
+                            a.compact_pending_armed_ms = None;
+                            // #410/round-7: the same repeating-false-signal
+                            // shape D4 pins can otherwise re-arm on the very
+                            // next tick — a short cooldown after ANY discard
+                            // gives the state machine room to actually settle
+                            // rather than cycling discard-then-immediate-
+                            // rearm indefinitely.
+                            a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                            to_discard.push((a.id.clone(), a.group.clone(), baseline_tokens, current_tokens));
+                        }
+                    }
+                    }
+                }
+
+                // A paused group's agents are deliberately quiet; never nudge,
+                // escalate, or start a new manual-detection window, and never
+                // burn the one-shot latch or the per-hour budget.
+                if paused.contains(&a.group) {
+                    continue;
+                }
+
+                // #410 (round 6): the loomux-initiated (heuristic/requested)
+                // fire-check runs FIRST among the four arm sites — moved up
+                // from after manual/banner detection/escalation. Live
+                // evidence (the incident `ARM_PENDING_TIMEOUT_MS` above also
+                // closes) showed a queued `request_compact` starved for 10+
+                // minutes: a discard just above can clear `compact_pending`
+                // on this SAME tick, and — in the OLD order — an inference
+                // arm re-satisfying its own condition on this same tick (a
+                // recurring banner mention, an ongoing conversation) would
+                // re-arm `compact_pending` before this check ever ran,
+                // repeatedly starving the EXPLICIT, already-queued request
+                // of the brief window it needs. Running this deterministic,
+                // already-decided check first means a fresh discard always
+                // gives a queued request first refusal, before any inference
+                // arm gets a chance to re-claim the pane this same tick.
+                let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
+                // Heuristic (role-gated, minutes-threshold) fallback fire.
+                let heuristic_fires = compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
+                    && idle_tick_should_fire(
+                        a.last_progress_ms,
+                        now,
+                        g.compact_nudge_minutes,
+                        a.compact_nudge_notified,
+                        times,
+                        MAX_COMPACT_NUDGES_PER_HOUR,
+                    );
+                // Agent-requested (via `request_compact`, or set on its
+                // behalf by escalation BELOW, one tick later than before this
+                // round's reorder — see the reorder note above) fire — no
+                // role gate (self-initiated), no minutes threshold (the
+                // request IS the trigger), still CLI-gated (checked above)
+                // and rate-limited (shared budget).
+                let requested_fires = a.compact_requested
+                    && compact_request_should_fire(currently_quiet, times, now, MAX_COMPACT_NUDGES_PER_HOUR);
+                // `!a.compact_pending` (rev-12 review finding): this is the
+                // one place that actually types `/compact`, so it is the
+                // authoritative choke point — a compact already pending for
+                // this pane must never get a second one queued behind it,
+                // regardless of how `heuristic_fires`/`requested_fires` got
+                // set. A `request_compact` call that lands while already
+                // pending is not lost: `compact_requested` just stays set and
+                // is honored on a LATER tick, once `compact_pending` clears.
+                if !a.compact_pending && (heuristic_fires || requested_fires) {
+                    a.compact_nudge_notified = true;
+                    a.compact_requested = false;
+                    a.compact_pending = true;
+                    a.compact_seen_busy = false;
+                    a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
+                    a.compact_pending_baseline_marker_count = context_boundary_counts.get(&a.id).copied();
+                    // Loomux-initiated arm (rev-42 delta): THIS is the arm
+                    // that pastes `/compact` itself below — loomux has
+                    // positive knowledge the command was submitted, so
+                    // busy-then-quiet is sufficient on its own; trusted arms
+                    // skip `inferred_compaction_confirmed` entirely (see the
+                    // resolver's doc for why a hard gate here deadlocks the
+                    // primary path).
+                    a.compact_pending_trusted = true;
+                    a.compact_pending_armed_ms = Some(now);
+                    to_fire.push((a.id.clone(), a.group.clone()));
+                }
+
+                // Manual `/compact` detection (only while nothing is already
+                // pending, and only on a FRESH human write — see
+                // `MANUAL_COMPACT_DETECT_WINDOW_MS`'s doc for why the recency
+                // gate matters).
+                //
+                // Production bug fix (PR #329 round 7): also gated on
+                // `compact_inference_guard_until_ms` — recency of the
+                // human's OWN last keystroke says nothing about whether the
+                // `/compact` TOKEN this scan matches is itself fresh; a live
+                // demo showed loomux's own earlier `/compact` paste (or the
+                // reinjection notice that followed it) can sit in the
+                // bounded tail for minutes, and an UNRELATED fresh keystroke
+                // nearby was enough to satisfy the old recency check alone
+                // and misread that stale echo as a new human-typed command.
+                // See `compact_inference_guard_until_ms`'s doc.
+                if !a.compact_pending && now >= a.compact_inference_guard_until_ms {
+                    if let Some((tail, last_input_ms)) = manual_signals.get(&a.id) {
+                        if now.saturating_sub(*last_input_ms) < MANUAL_COMPACT_DETECT_WINDOW_MS
+                            && human_typed_compact_detected(tail)
+                        {
+                            // Inference arm (loomux only believes a human
+                            // typed `/compact`) — untrusted, keeps the hard
+                            // `inferred_compaction_confirmed` gate above.
+                            a.compact_pending = true;
+                            a.compact_seen_busy = false;
+                            a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
+                            a.compact_pending_baseline_marker_count =
+                                context_boundary_counts.get(&a.id).copied();
+                            a.compact_pending_trusted = false;
+                            a.compact_pending_armed_ms = Some(now);
+                        }
+                    }
+                }
+
+                // Auto-compact banner detection (#329 expansion, 4th trigger
+                // path): the CLI's OWN emergency auto-compact — no
+                // `request_compact` call, no heuristic fire, no human typing
+                // `/compact` — so none of the checks above ever see it start.
+                // Reuses the same tail already read for manual detection;
+                // gated on nothing already pending, plus `!currently_quiet`
+                // (computed above, from THIS tick's real output growth) —
+                // deliberately NOT a duration-based recency window like
+                // `MANUAL_COMPACT_DETECT_WINDOW_MS`: `last_progress_ms` gets
+                // rewritten to `now` by the growth check earlier in this same
+                // iteration whenever the pane is busy for ANY reason, so
+                // comparing "now" against it would trivially read as fresh on
+                // every busy tick regardless of why the tail contains the
+                // banner text — not a real recency signal at all. Requiring
+                // fresh growth on THIS exact tick is the strongest signal
+                // actually available: a banner sitting in the tail with NO
+                // new output since is definitely stale (an already-resolved
+                // compact, or scrollback that never left); still best-effort,
+                // same as `human_typed_compact_detected`, if unrelated fresh
+                // growth happens to land in the same observation window as
+                // old banner text still inside the tail's bounded ring.
+                // `compact_seen_busy` is set true immediately, not left for a
+                // later tick to observe — the banner match IS the busy
+                // signal, caught mid-compaction.
+                //
+                // Production bug fix (PR #329 round 7): also gated on
+                // `compact_inference_guard_until_ms`, same reasoning as the
+                // manual-detection gate above — the banner substring can
+                // appear in loomux's OWN reinjection notice (it quotes the
+                // role instructions verbatim, which may itself describe or
+                // mention this feature) or in the immediate post-compact
+                // discussion of the test that just ran.
+                if !a.compact_pending && !currently_quiet && now >= a.compact_inference_guard_until_ms {
+                    if let Some((tail, _)) = manual_signals.get(&a.id) {
+                        if auto_compact_banner_detected(g.cli_for(a.role), tail) {
+                            // Inference arm (loomux only believes the CLI's
+                            // own auto-compact banner appeared) — untrusted,
+                            // keeps the hard `inferred_compaction_confirmed`
+                            // gate above.
+                            a.compact_pending = true;
+                            a.compact_seen_busy = true;
+                            a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
+                            a.compact_pending_baseline_marker_count =
+                                context_boundary_counts.get(&a.id).copied();
+                            a.compact_pending_trusted = false;
+                            a.compact_pending_armed_ms = Some(now);
+                        }
+                    }
+                }
+
+                // Context-usage escalation: latch on crossing, clear once back
+                // under threshold (e.g. after a compact lands). The notice
+                // fires ALONE on the crossing tick — giving the agent this
+                // tick to self-request before loomux falls back on its
+                // behalf on a LATER tick still over threshold, so the
+                // fallback request never races the notice with an
+                // interleaved `/compact`.
+                //
+                // #410 (round 6): the fire-check that consumes `compact_
+                // requested` now runs ABOVE this block (moved up to fix the
+                // request-starvation incident — see its own comment), so a
+                // `compact_requested` set HERE can no longer be read by the
+                // SAME tick's fire-check at all — it is always honored on a
+                // LATER tick, one full tick later than the escalation-notice
+                // split above already intended. Harmless: the notice-then-
+                // fallback shape this comment describes only ever needed
+                // "not the same tick as the notice," never "the very next
+                // tick" specifically.
+                //
+                // Gated on `!a.compact_pending` (rev-12 review finding):
+                // without this, a still-over-threshold reading on the tick
+                // right after a fallback-triggered fire — before the pane has
+                // visibly gone busy from loomux's point of view, so
+                // `currently_quiet` is still `true` — re-armed
+                // `compact_requested` (reset to `false` when the first
+                // `/compact` fired) and the fire-check above would type a
+                // SECOND `/compact` into a pane whose first compact hadn't
+                // resolved yet. A compact already in flight is reason enough
+                // to hold off on both re-notifying and re-arming; the
+                // existing quiet-clock resolution above already clears
+                // `compact_pending` the moment the first one is actually
+                // done, at which point escalation resumes normally.
+                if !a.compact_pending {
+                    if let Some(&percent) = context_percents.get(&a.id) {
+                        if percent < g.compact_context_threshold_percent
+                            || g.compact_context_threshold_percent == 0
+                        {
+                            a.compact_escalation_notified = false;
+                        } else if compact_escalation_should_fire(
+                            percent,
+                            g.compact_context_threshold_percent,
+                            a.compact_escalation_notified,
+                        ) {
+                            a.compact_escalation_notified = true;
+                            to_escalate.push((a.id.clone(), a.group.clone(), percent));
+                        } else if !a.compact_requested {
+                            // Still over threshold on a later tick, notice
+                            // already delivered, agent still hasn't asked —
+                            // request on its behalf. Silent: the notice already
+                            // told it what would happen.
+                            a.compact_requested = true;
+                        }
+                    }
+                }
+
+            }
+        }
+
+        let mut nudged = Vec::new();
+        for (id, group) in to_fire {
+            {
+                let mut tt = self.compact_nudge_times.lock_safe();
+                let v = tt.entry(group.clone()).or_default();
+                v.push(now);
+                v.retain(|&t| now.saturating_sub(t) < SPAWN_RATE_WINDOW_MS);
+            }
+            self.audit(&group, "loomux", "compact-nudge", json!({ "agent": id }));
+            let _ = self.deliver_prompt(&id, "/compact", "loomux", Delivery::MidSession);
+            nudged.push(id);
+        }
+        for (id, group, baseline_tokens, current_tokens) in to_discard {
+            self.audit(&group, "loomux", "compact-pending-discarded", json!({
+                "agent": id,
+                "reason": "quiet-after-busy without confirmed compaction (no token drop, no compact_boundary marker)",
+                "baseline_tokens": baseline_tokens,
+                "current_tokens": current_tokens,
+            }));
+        }
+        for (id, group, percent) in to_escalate {
+            self.audit(&group, "loomux", "compact-escalation", json!({ "agent": id, "percent": percent }));
+            let _ = self.deliver_prompt(&id, &compact_escalation_notice(percent), "loomux", Delivery::MidSession);
+        }
+        for (id, group, instructions_path, ledger_path, attempt) in to_reinject {
+            let text = fs::read_to_string(&instructions_path).unwrap_or_default();
+            // Missing/empty ledger reads as "" and `directive_ledger_embed`
+            // turns that into `None` — nothing embeds for a pane that never
+            // called `note_directive`, so this is a no-op for every session
+            // until the directive-ledger feature is actually used.
+            let ledger = fs::read_to_string(&ledger_path).unwrap_or_default();
+            let ledger_path_str = ledger_path.display().to_string();
+            let ledger_embed = directive_ledger_embed(&ledger, DIRECTIVE_LEDGER_EMBED_CAP_BYTES, &ledger_path_str);
+            self.audit(&group, "loomux", "compact-reinjection",
+                json!({ "agent": id, "ledger_embedded": ledger_embed.is_some(), "attempt": attempt }));
+            let notice = compact_reinjection_notice(&text, ledger_embed.as_deref());
+            let _ = self.deliver_prompt(&id, &notice, "loomux", Delivery::MidSession);
+        }
+        // rev-42 delta (round 2): terminal-state audits for the confirmed-
+        // delivery gate — visibility for both outcomes the fix contract
+        // requires (exactly one delivered re-grounding, or a bounded, visible
+        // give-up), neither of which existed before this round.
+        for (id, group) in to_reinject_confirmed {
+            self.audit(&group, "loomux", "compact-reinjection-confirmed", json!({ "agent": id }));
+        }
+        for (id, group, attempts) in to_abandon {
+            self.audit(&group, "loomux", "compact-reinjection-abandoned", json!({ "agent": id, "attempts": attempts }));
+        }
+        for (id, group) in to_arm_timeout {
+            self.audit(&group, "loomux", "compact-arm-timeout", json!({
+                "agent": id,
+                "reason": "arm never reached a busy-then-quiet resolution within ARM_PENDING_TIMEOUT_MS",
+            }));
+        }
+        nudged
+    }
+
+    /// Compact-nudge (#328): per-agent (ANSI-stripped output tail, last
+    /// human-input Unix-ms) snapshot for the manual-`/compact`-detection
+    /// pass. Impure (pty read); split from the decision so
+    /// `human_typed_compact_detected` and the recency gate stay
+    /// synthetic-input testable. A dead pty or no app handle simply omits
+    /// that agent — a missing entry never counts as a detected manual
+    /// compact.
+    fn agent_compact_signals(&self) -> HashMap<String, (String, u64)> {
+        let Some(app) = self.app.lock_safe().clone() else {
+            return HashMap::new();
+        };
+        let ptys = app.state::<crate::pty::PtyManager>();
+        self.agents
+            .lock_safe()
+            .values()
+            .filter_map(|a| {
+                let pty_id = a.pty_id?;
+                let tail = strip_ansi(&ptys.output_tail(pty_id)?);
+                let last_input = ptys.last_user_input_ms(pty_id).unwrap_or(0);
+                Some((a.id.clone(), (tail, last_input)))
+            })
+            .collect()
+    }
+
+    /// Production bug fix (PR #329 delta review, rev-42 Q4): ONE transcript
+    /// tail-read per Running Claude-CLI agent with a resolvable session id —
+    /// EVERY one, not gated on the group's escalation threshold, since the
+    /// reading is load-bearing for CORRECTNESS (the busy-then-quiet
+    /// resolver's confirmation gate), not just the opportunistic escalation
+    /// notice. Replaces the former `agent_context_percents` +
+    /// `agent_context_tokens` pair, which each did their own whole-file read
+    /// against the same transcripts — `agent_context_percents` now derives
+    /// its percents from this map instead of re-reading, closing that
+    /// double-read. Via `usage::compaction_signal_in` (bounded tail-read),
+    /// carrying both the context-token reading (percent/gating) and the
+    /// `compact_boundary` marker count (`inferred_compaction_confirmed`'s
+    /// no-next-turn-required signal). Impure (disk read); split from the
+    /// decision so `compaction_confirmed`/`inferred_compaction_confirmed`
+    /// stay synthetic-input testable.
+    fn agent_context_signals(&self) -> HashMap<String, crate::usage::CompactionSignal> {
+        let candidates: Vec<(String, String)> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter(|a| a.status == AgentStatus::Running)
+            .filter_map(|a| Some((a.id.clone(), a.session_id.clone()?)))
+            .collect();
+        if candidates.is_empty() {
+            return HashMap::new();
+        }
+        let Some(root) = self
+            .claude_projects_dir
+            .lock_safe()
+            .clone()
+            .or_else(crate::usage::default_claude_projects_root)
+        else {
+            return HashMap::new();
+        };
+        candidates
+            .into_iter()
+            .filter_map(|(id, sid)| Some((id, crate::usage::compaction_signal_in(&root, &sid)?)))
+            .collect()
+    }
+
+    /// Compact-nudge (#328): current context-window usage percent per Claude
+    /// agent whose group has escalation enabled
+    /// (`compact_context_threshold_percent > 0`). Derived from `signals`
+    /// (already read once for every Running Claude agent by `agent_context_
+    /// signals`, rev-42 Q4) — no transcript read of its own. Split from the
+    /// decision so `compact_escalation_should_fire` stays synthetic-input
+    /// testable.
+    fn agent_context_percents(
+        &self,
+        signals: &HashMap<String, crate::usage::CompactionSignal>,
+    ) -> HashMap<String, u32> {
+        // Production bug fix (PR #329 round 7): threshold AND the override
+        // both come from the same per-group guardrails snapshot, so the
+        // escalation percent below is computed against the SAME window the
+        // lifecycle panel shows (see `effective_context_window_tokens`) —
+        // no more flat 200K assumption that fires the escalation ~5x too
+        // early for a larger-context agent.
+        let (thresholds, overrides): (HashMap<String, u32>, HashMap<String, Option<u64>>) = {
+            let groups = self.groups.lock_safe();
+            (
+                groups.iter().map(|(id, g)| (id.clone(), g.guardrails.compact_context_threshold_percent)).collect(),
+                groups.iter().map(|(id, g)| (id.clone(), g.guardrails.context_window_tokens_override)).collect(),
+            )
+        };
+        let agent_groups: HashMap<String, String> = self
+            .agents
+            .lock_safe()
+            .iter()
+            .map(|(id, a)| (id.clone(), a.group.clone()))
+            .collect();
+        signals
+            .iter()
+            .filter_map(|(id, sig)| {
+                let group = agent_groups.get(id)?;
+                if thresholds.get(group).copied().unwrap_or(0) == 0 {
+                    return None;
+                }
+                let tokens = sig.tokens?;
+                let override_tokens = overrides.get(group).copied().flatten();
+                let window = effective_context_window_tokens(override_tokens, sig.model.as_deref());
+                Some((id.clone(), context_percent_used(tokens, window)))
+            })
+            .collect()
+    }
+
+    /// rev-42 delta (round 2): per-agent snapshot of the most recent delivery
+    /// to that agent's pane, resolved via its CURRENT `pty_id` — a fresh read
+    /// every tick, so a pane that was rebound (a new pty after a resume)
+    /// simply reads as "no delivery yet" rather than a stale one from a
+    /// now-dead pty. Impure (locks `self.last_delivery`); split from the
+    /// decision so `compact_nudge_tick`'s reinjection-confirmation resolver
+    /// stays synthetic-input testable — see `DeliveryConfirmation`'s doc for
+    /// why this can't just be read live off `deliver_prompt` itself.
+    fn agent_last_deliveries(&self) -> HashMap<String, DeliveryConfirmation> {
+        let pty_ids: Vec<(String, u32)> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter_map(|a| Some((a.id.clone(), a.pty_id?)))
+            .collect();
+        if pty_ids.is_empty() {
+            return HashMap::new();
+        }
+        let last_delivery = self.last_delivery.lock_safe();
+        pty_ids
+            .into_iter()
+            .filter_map(|(id, pty_id)| {
+                let outcome = last_delivery.get(&pty_id)?;
+                Some((id, DeliveryConfirmation {
+                    submit_sent_ms: outcome.submit_sent_ms,
+                    confirmed: outcome.confirmed,
+                    from: outcome.from.clone(),
+                }))
+            })
+            .collect()
+    }
+
+    /// One full compact-nudge cycle: read pty counters, then tick. Called on a
+    /// timer by `start_compact_nudge`; `now` injected so tests drive it
+    /// deterministically.
+    pub fn run_compact_nudge(&self, now: u64) -> Vec<String> {
+        let outputs = self.agent_output_totals();
+        let manual_signals = self.agent_compact_signals();
+        let signals = self.agent_context_signals();
+        let context_percents = self.agent_context_percents(&signals);
+        let context_tokens: HashMap<String, u64> = signals
+            .iter()
+            .filter_map(|(id, s)| s.tokens.map(|t| (id.clone(), t)))
+            .collect();
+        let context_boundary_counts: HashMap<String, u64> = signals
+            .iter()
+            .map(|(id, s)| (id.clone(), s.compact_boundary_count))
+            .collect();
+        let delivery_confirmations = self.agent_last_deliveries();
+        // Production bug fix (PR #329 round 7): cache each agent's model
+        // from this SAME read (no extra transcript access) so `group_
+        // summary` can compute a model-aware percent on its own, much more
+        // frequent poll cadence — same "cache from the background tick,
+        // don't re-read per poll" shape as `last_context_tokens`. Not
+        // threaded through `compact_nudge_tick` itself: nothing in the
+        // decision logic needs it, so keeping it out of that pure function's
+        // parameter list means no churn to its ~50 existing test call sites.
+        {
+            let mut agents = self.agents.lock_safe();
+            for (id, sig) in &signals {
+                if let Some(model) = &sig.model {
+                    if let Some(a) = agents.get_mut(id) {
+                        a.last_context_model = Some(model.clone());
+                    }
+                }
+            }
+        }
+        self.compact_nudge_tick(
+            now,
+            &outputs,
+            &manual_signals,
+            &context_percents,
+            &context_tokens,
+            &context_boundary_counts,
+            &delivery_confirmations,
+        )
+    }
+
+    /// Compact-nudge (#328): self-scoped agent request. Sets `compact_
+    /// requested` on the CALLING agent's own entry ONLY — the token that
+    /// resolves to `agent_id` is the entire trust surface, so there is no
+    /// `group_id`-style path segment and no cross-pane power (mirrors
+    /// `report`/`message_orchestrator`'s self-scoping). Returns a clear
+    /// not-supported error for a non-Claude CLI rather than silently flagging
+    /// a request that can never fire. For an orchestrator caller, appends
+    /// `compact_checklist_warning`'s soft nudge (never a block — the call
+    /// always succeeds) if `set_state` hasn't landed recently.
+    ///
+    /// Deliberately does NOT check `compact_pending` itself (rev-12 review
+    /// asked this be verified for consistency with `compact_nudge_tick`'s
+    /// pending gate): a call landing while a compact is already in flight for
+    /// this pane is not an error and not lost — `compact_requested` just sits
+    /// set, and `compact_nudge_tick`'s fire-check (the ONE place that
+    /// actually types `/compact`, and the sole authoritative gate on
+    /// `compact_pending`) honors it on a later tick once the in-flight
+    /// compact resolves, rather than firing a second one concurrently. The
+    /// response says so rather than implying "at your next idle moment" is
+    /// necessarily the very next one.
+    pub fn request_compact(&self, agent_id: &str) -> Result<String, String> {
+        let a = self.agent(agent_id).ok_or("unknown agent")?;
+        let cli = self.cli_for_agent(&a);
+        if !compact_nudge_cli_supported(&cli) {
+            return Err(format!(
+                "/compact has no equivalent on {cli} — request_compact is Claude-Code-only"
+            ));
+        }
+        if let Some(e) = self.agents.lock_safe().get_mut(agent_id) {
+            e.compact_requested = true;
+        }
+        self.audit(&a.group, agent_id, "compact-requested", json!({}));
+        let warning = (a.role == Role::Orchestrator)
+            .then(|| compact_checklist_warning(a.last_state_write_ms, now_ms(), SET_STATE_RECENCY_WINDOW_MS))
+            .flatten();
+        let when = if a.compact_pending {
+            "queued — a compact is already in flight for this pane; yours will fire once it resolves"
+        } else {
+            "will fire at your next idle moment"
+        };
+        Ok(match warning {
+            Some(w) => format!("compact requested — {when} ({w})"),
+            None => format!("compact requested — {when}"),
+        })
+    }
+
+    /// Compact-nudge (#328): stamp the calling agent's `last_state_write_ms` —
+    /// self-scoped sign-of-life backing `request_compact`'s offload-checklist
+    /// warning. Called from the `set_state` MCP handler.
+    pub fn note_state_write(&self, agent_id: &str) {
+        if let Some(a) = self.agents.lock_safe().get_mut(agent_id) {
+            a.last_state_write_ms = now_ms();
+        }
+    }
+
+    /// Directive ledger (#329 expansion): self-scoped append (default) or
+    /// full-rewrite (`replace: true`) of the CALLING agent's own ledger — the
+    /// diary a human directive, scope decision, or piece of feedback is
+    /// recorded into at RECEIPT time, precisely because the CLI's own
+    /// emergency auto-compact (see `auto_compact_banner_detected`) gives no
+    /// warning turn to backfill one from memory afterward. Mirrors
+    /// `request_compact`'s self-scoping: the token that resolves to
+    /// `agent_id` is the entire trust surface, so there is no `group_id`-style
+    /// path segment and no cross-pane power — an agent can only ever touch
+    /// its own ledger file (`ledger_path`).
+    ///
+    /// `replace: true` is how an agent CURATES the ledger — typically right
+    /// after the post-compact re-injection has just shown it its own tail
+    /// verbatim — dropping entries that are done or no longer relevant rather
+    /// than letting it grow forever; `text` in that mode is the whole
+    /// replacement ledger, not one more line. A plain append (the default)
+    /// never loses a prior entry to a curation mistake in this code, only
+    /// ever to the calling agent's own judgment on a later `replace`.
+    ///
+    /// Each append is stamped with `now_ms()` for a human skimming the file
+    /// directly (matching `audit.jsonl`'s `ts_ms` convention). Append-mode
+    /// `text` is sanitized with `notify::sanitize_gh_text` (rev review N1) —
+    /// the exact function `channel_send` already runs untrusted text through
+    /// — before it's written: strips control characters (so an embedded `\n`
+    /// can't split one call into several physical lines, which would break
+    /// `directive_ledger_embed`'s one-line-per-entry model) and neutralizes
+    /// `[`/`]` (so a line can never start with a forged `[loomux]` marker
+    /// once re-embedded verbatim in the post-compact notice). Low severity —
+    /// the ledger is self-authored and self-scoped, so an agent can only ever
+    /// spoof itself — but free to close the same way `channel_send` already
+    /// does. `replace` writes `text` verbatim, UNSANITIZED: it is the
+    /// curation path, expected to contain the agent's own prior (already-
+    /// sanitized) entries copied back in, not fresh untrusted input, and a
+    /// replacement without a trailing newline gets one added so a later
+    /// append can never land glued onto its last line.
+    ///
+    /// After either write, the STORED file is capped at
+    /// `DIRECTIVE_LEDGER_MAX_BYTES` (rev review N2) via `ledger_capped` —
+    /// oldest entries dropped first, never silently: a non-zero drop count is
+    /// audited (`ledger-trimmed`) and named in the response string, so a
+    /// human or the calling agent can see it happened. Curation via
+    /// `replace: true` is still the primary, deliberate mechanism; this is
+    /// only the backstop for a session that never uses it.
+    ///
+    /// Audited like any other durable write (#240): the text itself is not
+    /// duplicated into the audit log (the ledger file already holds it in
+    /// full), only the fact and shape of the write.
+    pub fn note_directive(&self, agent_id: &str, text: &str, replace: bool) -> Result<String, String> {
+        let a = self.agent(agent_id).ok_or("unknown agent")?;
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("text must not be empty".into());
+        }
+        let path = self.ledger_path(&a.group, agent_id);
+        if replace {
+            let mut body = text.to_string();
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            atomic_write(&path, body.as_bytes()).map_err(|e| e.to_string())?;
+        } else {
+            let sanitized = notify::sanitize_gh_text(text, DIRECTIVE_ENTRY_MAX_CHARS);
+            append_ledger_line(&path, &format!("[{}] {sanitized}", now_ms())).map_err(|e| e.to_string())?;
+        }
+        self.audit(&a.group, agent_id, "note-directive", json!({ "replace": replace, "bytes": text.len() }));
+
+        let mut cap_note = String::new();
+        if let Ok(current) = fs::read_to_string(&path) {
+            let (capped, dropped) = ledger_capped(&current, DIRECTIVE_LEDGER_MAX_BYTES);
+            if dropped > 0 {
+                atomic_write(&path, capped.as_bytes()).map_err(|e| e.to_string())?;
+                self.audit(&a.group, agent_id, "ledger-trimmed", json!({ "dropped": dropped }));
+                cap_note = format!(
+                    " ({dropped} older entries dropped — ledger exceeded {DIRECTIVE_LEDGER_MAX_BYTES} bytes; curate with replace to control this yourself)"
+                );
+            }
+        }
+        Ok(if replace {
+            format!("ledger replaced{cap_note}")
+        } else {
+            format!("directive recorded{cap_note}")
+        })
     }
 
     // ---------- attention routing: surface which pane needs the human ----------
@@ -8689,10 +10668,19 @@ impl OrchRegistry {
     }
 
     /// Additive crash-safe patch of a single numeric `guardrails.<key>` in
-    /// group.json (preserves every other field; temp-file + atomic rename, the
-    /// `persist_max_agents` pattern). The shared body behind the live-settable
-    /// numeric guardrails (budget, activity floor).
+    /// group.json. The shared body behind the live-settable numeric
+    /// guardrails (budget, activity floor). Thin wrapper over
+    /// `persist_guardrail_json`.
     fn persist_guardrail_u64(&self, group: &str, key: &str, value: u64) -> Result<(), String> {
+        self.persist_guardrail_json(group, key, json!(value))
+    }
+
+    /// Additive crash-safe patch of a single arbitrary-JSON `guardrails.<key>`
+    /// in group.json (preserves every other field; temp-file + atomic rename,
+    /// the `persist_max_agents` pattern). `persist_guardrail_u64` covers the
+    /// numeric guardrails; this is the general form, needed for
+    /// `compact_nudge_roles` (a string array, not a number).
+    fn persist_guardrail_json(&self, group: &str, key: &str, value: Value) -> Result<(), String> {
         let dir = self.group_dir(group);
         let path = dir.join("group.json");
         let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
@@ -8700,7 +10688,7 @@ impl OrchRegistry {
         let obj = v.as_object_mut().ok_or("group.json root is not a JSON object")?;
         match obj.get_mut("guardrails").and_then(Value::as_object_mut) {
             Some(guard) => {
-                guard.insert(key.into(), json!(value));
+                guard.insert(key.into(), value);
             }
             None => {
                 obj.insert("guardrails".into(), json!({ key: value }));
@@ -8714,6 +10702,90 @@ impl OrchRegistry {
             let _ = fs::remove_file(&tmp);
         }
         Ok(())
+    }
+
+    /// Set a live group's compact-nudge quiet window in minutes on the fly
+    /// (#287). 0 disables the feature entirely — unlike
+    /// `set_idle_tick_minutes`, 0 is a legitimate value here (there is no
+    /// separate on/off marker for compact-nudge), so it is only capped at the
+    /// max, never floored to a default. Written to the in-memory guardrail
+    /// (the compact-nudge loop reads it fresh each pass) and persisted, then
+    /// audited. Returns the applied (clamped) value.
+    pub fn set_compact_nudge_minutes(&self, group: &str, minutes: u32) -> Result<u32, String> {
+        let applied = minutes.min(MAX_COMPACT_NUDGE_MINUTES);
+        let old = self
+            .group(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_nudge_minutes;
+        if applied == old {
+            return Ok(applied);
+        }
+        self.persist_guardrail_u64(group, "compact_nudge_minutes", applied as u64)?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_nudge_minutes = applied;
+        self.audit(group, "human", "compact-nudge-minutes-set",
+            json!({ "from": old, "to": applied }));
+        Ok(applied)
+    }
+
+    /// Set a live group's compact-nudge eligible roles on the fly (#287).
+    /// Canonicalized via `canonicalize_compact_nudge_roles` (drops unrecognized
+    /// entries, case-normalizes survivors, dedupes/sorts, falls back to
+    /// `["orchestrator"]` if empty) since a live setter bypasses `clamped()`.
+    /// Persisted + audited. Returns the applied set.
+    pub fn set_compact_nudge_roles(&self, group: &str, roles: Vec<String>) -> Result<Vec<String>, String> {
+        let applied = canonicalize_compact_nudge_roles(roles);
+        let old = self
+            .group(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_nudge_roles
+            .clone();
+        if applied == old {
+            return Ok(applied);
+        }
+        self.persist_guardrail_json(group, "compact_nudge_roles", json!(applied))?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_nudge_roles = applied.clone();
+        self.audit(group, "human", "compact-nudge-roles-set",
+            json!({ "from": old, "to": &applied }));
+        Ok(applied)
+    }
+
+    /// Set a live group's compact-nudge context-usage escalation threshold on
+    /// the fly (#328). `0` disables escalation (purely opportunistic); only
+    /// capped at the max, never floored to a default — same "0 is a real off"
+    /// shape as `compact_nudge_minutes`. Written to the in-memory guardrail
+    /// and persisted, then audited. Returns the applied (clamped) value.
+    pub fn set_compact_context_threshold(&self, group: &str, percent: u32) -> Result<u32, String> {
+        let applied = percent.min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
+        let old = self
+            .group(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_context_threshold_percent;
+        if applied == old {
+            return Ok(applied);
+        }
+        self.persist_guardrail_u64(group, "compact_context_threshold_percent", applied as u64)?;
+        self.groups
+            .lock_safe()
+            .get_mut(group)
+            .ok_or("unknown group")?
+            .guardrails
+            .compact_context_threshold_percent = applied;
+        self.audit(group, "human", "compact-context-threshold-set",
+            json!({ "from": old, "to": applied }));
+        Ok(applied)
     }
 
     /// The group's lifetime usage-token total (live + historical snapshots), the
@@ -9872,6 +11944,10 @@ impl OrchRegistry {
             .collect();
         let (mut orch, mut worker, mut reviewer, mut planner) = (0u32, 0u32, 0u32, 0u32);
         let mut earliest: Option<u64> = None;
+        // Production bug fix (PR #329 round 7): same override this group's
+        // escalation threshold uses (`agent_context_percents`) — one shared
+        // denominator, never two independently-guessed ones.
+        let context_window_override = self.group(group).and_then(|g| g.guardrails.context_window_tokens_override);
         let mut list: Vec<Value> = live
             .iter()
             .map(|a| {
@@ -9896,6 +11972,31 @@ impl OrchRegistry {
                     "block": a.block,
                     "task": a.task, "idle_since_ms": a.idle_since_ms,
                     "uptime_ms": now.saturating_sub(a.started_ms),
+                    // Lifecycle-panel surfacing (PR #329 round 6): live
+                    // compaction-state-machine phase + last-known context
+                    // usage, straight from tracked state — no extra
+                    // transcript read per poll (see `last_context_tokens`'s
+                    // doc).
+                    "compaction": compaction_status(
+                        a.compact_pending,
+                        a.compact_pending_trusted,
+                        a.compact_seen_busy,
+                        a.compact_reinject_attempted_ms,
+                        a.compact_reinject_attempts,
+                        a.compact_last_lost_reason.as_deref(),
+                        a.compact_last_lost_ms,
+                        now,
+                    ),
+                    "context": {
+                        "tokens": a.last_context_tokens,
+                        // Production bug fix (PR #329 round 7): model-aware
+                        // window (`effective_context_window_tokens`) instead
+                        // of a flat 200K assumption — see its doc.
+                        "percent": a.last_context_tokens.map(|t| context_percent_used(
+                            t,
+                            effective_context_window_tokens(context_window_override, a.last_context_model.as_deref()),
+                        )),
+                    },
                 })
             })
             .collect();
@@ -11846,6 +13947,24 @@ impl OrchRegistry {
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
+            compact_nudge_notified: false,
+            compact_nudge_last_output_total: 0,
+            compact_requested: false,
+            compact_pending: false,
+            compact_seen_busy: false,
+            compact_pending_baseline_tokens: None,
+            compact_pending_baseline_marker_count: None,
+            compact_pending_trusted: false,
+            compact_reinject_attempted_ms: None,
+            compact_reinject_attempts: 0,
+            compact_pending_armed_ms: None,
+            compact_last_lost_reason: None,
+            compact_last_lost_ms: None,
+            last_context_tokens: None,
+            last_context_model: None,
+            compact_inference_guard_until_ms: 0,
+            last_state_write_ms: 0,
+            compact_escalation_notified: false,
             solo_cli: None,
             last_exit_tail: None,
         };
@@ -12246,6 +14365,13 @@ impl OrchRegistry {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
+        // Production bug fix (PR #329 round 7): captured so the recorded
+        // `DeliveryOutcome` carries WHO this delivery is from — the
+        // provenance `compact_nudge_tick`'s inference-arm cooldown needs to
+        // recognize (and suppress detection on) loomux's own paste echo,
+        // as opposed to a human or another agent's message reaching this
+        // same pane through the same delivery pipeline.
+        let delivery_from = from.to_string();
         let last_delivery = self.last_delivery.clone();
         // Captured for the unconfirmed-delivery notice (#103): whether this
         // target is the orchestrator (a notice to it would loop, so it's
@@ -12334,11 +14460,12 @@ impl OrchRegistry {
             // only if no human has typed since that delivery (else the box may
             // hold a person's line, which must never be blind-submitted — the
             // pre-paste hold above already waited for them to go quiet).
-            let prev = last_delivery.lock_safe().get(&pty_id).copied();
+            let prev = last_delivery.lock_safe().get(&pty_id).cloned();
             let human_typed_since = prev
+                .as_ref()
                 .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
                 .unwrap_or(false);
-            if should_flush_before_paste(prev.map(|o| o.confirmed), human_typed_since)
+            if should_flush_before_paste(prev.as_ref().map(|o| o.confirmed), human_typed_since)
                 && ptys.write_bytes(pty_id, submit).is_ok()
             {
                 append_audit(&root, &group, "loomux", "delivery-flush",
@@ -12531,7 +14658,7 @@ impl OrchRegistry {
             // prompt still stranded in the box (#81/#84).
             last_delivery
                 .lock_safe()
-                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms });
+                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms, from: delivery_from });
             append_audit(&root, &group, "loomux", "prompt-typed", json!({
                 "to": agent,
                 "cli": cli,
@@ -12986,6 +15113,22 @@ pub fn start_idle_tick(reg: Arc<OrchRegistry>) {
     });
 }
 
+/// Background loop for compact-nudge (#287): every `IDLE_TICK_INTERVAL` it
+/// pastes `/compact` for any eligible pane (default: the orchestrator, on
+/// Claude Code) that has gone output-quiet past its group's
+/// `compact_nudge_minutes` — the same idleness signal `idle_tick_tick`
+/// reads, not a second one. Off by default (`compact_nudge_minutes == 0`);
+/// non-Claude CLIs and paused groups are skipped inside `run_compact_nudge` /
+/// `compact_nudge_tick`. Reuses `IDLE_TICK_INTERVAL`'s cadence — a 60s wake is
+/// cheap and plenty precise for a minutes-scale quiet gate. Started once at
+/// app setup.
+pub fn start_compact_nudge(reg: Arc<OrchRegistry>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(IDLE_TICK_INTERVAL);
+        reg.run_compact_nudge(now_ms());
+    });
+}
+
 /// Free bytes on the disk that hosts `path`: the mounted volume whose mount
 /// point is the longest prefix of `path`. `None` if no volume matches (or the
 /// listing is empty), so the caller no-ops rather than guessing.
@@ -13107,6 +15250,18 @@ pub fn create_orchestration(
             // #83: 0 → clamped() applies DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES; live-settable
             // via orch_set_idle_activity_floor.
             idle_activity_floor_bytes: 0,
+            // #287: off at launch (the conservative default); live-settable via
+            // orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles.
+            compact_nudge_minutes: 0,
+            compact_nudge_roles: Vec::new(),
+            // #328: off at launch; live-settable via orch_set_compact_context_threshold.
+            compact_context_threshold_percent: 0,
+            // Context-window override (PR #329 round 7): no launcher field
+            // yet (same precedent as max_spawns_per_hour) — a human who
+            // knows their deployment's actual context tier sets this by
+            // hand-editing group.json; `None` defers to the model-based
+            // guess.
+            context_window_tokens_override: None,
         },
         None,
         None,
@@ -13415,6 +15570,40 @@ pub fn orch_set_idle_activity_floor(
     bytes: u64,
 ) -> Result<u64, String> {
     reg.set_idle_activity_floor(&group_id, bytes)
+}
+
+/// Set a group's compact-nudge quiet window in minutes (#287; 0 = off,
+/// clamped to the max; durable, audited). Returns the applied value.
+#[tauri::command]
+pub fn orch_set_compact_nudge_minutes(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    minutes: u32,
+) -> Result<u32, String> {
+    reg.set_compact_nudge_minutes(&group_id, minutes)
+}
+
+/// Set a group's compact-nudge eligible roles (#287; unrecognized names
+/// dropped, empty falls back to `["orchestrator"]`; durable, audited).
+/// Returns the applied set.
+#[tauri::command]
+pub fn orch_set_compact_nudge_roles(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    roles: Vec<String>,
+) -> Result<Vec<String>, String> {
+    reg.set_compact_nudge_roles(&group_id, roles)
+}
+
+/// Set a group's compact-nudge context-usage escalation threshold (#328; `0`
+/// = off, clamped to 100; durable, audited). Returns the applied value.
+#[tauri::command]
+pub fn orch_set_compact_context_threshold(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    percent: u32,
+) -> Result<u32, String> {
+    reg.set_compact_context_threshold(&group_id, percent)
 }
 
 /// The group's autonomous-mode state for the panel: toggles, budget, anchor, and
@@ -13729,6 +15918,24 @@ fn register_orchestrator_pane(
         last_output_total: 0,
         watchdog_notified: false,
         idle_tick_notified: false,
+        compact_nudge_notified: false,
+        compact_nudge_last_output_total: 0,
+        compact_requested: false,
+        compact_pending: false,
+        compact_seen_busy: false,
+        compact_pending_baseline_tokens: None,
+        compact_pending_baseline_marker_count: None,
+        compact_pending_trusted: false,
+        compact_reinject_attempted_ms: None,
+        compact_reinject_attempts: 0,
+        compact_pending_armed_ms: None,
+        compact_last_lost_reason: None,
+        compact_last_lost_ms: None,
+        last_context_tokens: None,
+        last_context_model: None,
+        compact_inference_guard_until_ms: 0,
+        last_state_write_ms: 0,
+        compact_escalation_notified: false,
         solo_cli: None,
         last_exit_tail: None,
     };

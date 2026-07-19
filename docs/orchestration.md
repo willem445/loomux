@@ -402,6 +402,67 @@ Enforced by loomux, not the model:
 - the permission mode fixed at group creation (native auto mode or acceptEdits —
   never bypass).
 
+### Compact-nudge
+
+The orchestrator pane lives for the whole session and every turn re-reads its entire
+history — it's typically the biggest token consumer in a group. Loomux can drive Claude
+Code's own `/compact` for it at a natural lull: once an eligible pane has been idle at its
+input prompt (the same output-quiet signal the watchdog and idle-tick already read — never
+mid-turn) past a configured window, loomux pastes `/compact` for it exactly like any other
+prompt delivery — no PTY resize, no new agent capability — and it never overwrites text
+you're mid-typing (a held nudge is silently skipped, not queued; it just tries again at the
+next natural lull).
+
+Off by default. A group opts in with a quiet-window (minutes) and, optionally, which roles
+are eligible — the orchestrator only, by default, since workers are short-lived and rarely
+worth compacting. `/compact` is a Claude Code built-in, so the nudge only ever fires for
+Claude Code panes.
+
+**The orchestrator can also ask for it directly.** `request_compact()` is the primary
+mechanism — the timed nudge above is the fallback for personas that never call it. The
+orchestrator (or any agent) calls it as the LAST action of a turn, at a natural lull; loomux
+pastes `/compact` the moment the pane actually goes idle, not immediately (a mid-turn write
+would land as a queued message). Before calling it, the persona is expected to offload
+durable state (task board, `set_state`, relevant GitHub issues/PRs) — the tool warns, but
+never blocks, if that looks skipped. If a group sets a context-usage threshold (percent of
+the model's context window), crossing it delivers a `[loomux] context at NN% …` notice; if
+the agent still hasn't asked by the next check, loomux requests one on its behalf rather than
+letting the CLI hit its own emergency auto-compact with no offload.
+
+**Loomux also catches that emergency auto-compact itself, when it happens anyway.** There's
+no way to plan around a compact nobody asked for, but loomux recognizes Claude Code's own
+auto-compact banner in the pane and treats it the same as any other compact: whichever way
+one gets triggered — the timed nudge, a direct request, the threshold fallback, a human
+typing `/compact` by hand, or the CLI's own emergency auto-compact — once it's done, loomux
+re-grounds the pane in its full role instructions (not just a pointer to go re-read them)
+and prompts it to re-sync live state. Before doing so, loomux checks that context actually
+shrank (a real signal a compaction ran, not just an ordinary quiet moment) — if it can't
+confirm that, it skips the re-grounding rather than risk delivering it on a loop.
+
+**Directive ledger.** Any agent can call `note_directive(text)` to jot down a one-line diary
+entry — a human directive, a scope decision, a piece of feedback — the moment it receives
+one, before acting on it. The point is timing: an emergency auto-compact strikes with no
+warning turn, so there's no "offload before it happens" moment to rely on for something that
+only ever lived in the conversation. Loomux embeds each agent's own ledger (its recent tail,
+size-capped, pointing at the full file if anything had to be cut) right alongside the role
+instructions in that same re-grounding notice, so a directive survives a compact even when
+nothing warned anyone first. `note_directive(text, replace: true)` rewrites the whole ledger
+in one shot — how an agent curates it after being shown its own tail, dropping anything
+already done or no longer relevant. The ledger lives at
+`<data dir>/loomux/orchestration/<group>/ledger-<agent-id>.log` — a plain, human-readable
+file, one entry per line, that a human can open directly.
+
+**Lifecycle panel.** The group lifecycle panel (`Alt+O`) shows each Claude agent's current
+context-window usage (tokens + percent) next to its uptime and cost, and — only when there's
+something worth a glance — its compact-nudge phase: armed (waiting to observe the pane go
+busy), awaiting evidence (busy observed, waiting on quiet to resolve), re-grounding (a
+reinjection is in flight, with its attempt count), or a recent lost outcome (an arm or
+delivery that didn't resolve in time and was released rather than left stuck). An idle agent
+with nothing pending shows neither line — this narrates the same state machine described
+above, not a separate status. The percent is against the model's ACTUAL context window (Opus's
+larger tier reads correctly, not against a flat assumption) — a group can override the guess
+explicitly if it's ever wrong for a given deployment.
+
 ## Persistence & restart
 
 Each group keeps durable state under
@@ -411,7 +472,8 @@ Each group keeps durable state under
   every change);
 - `audit.jsonl` — every tool call, prompt, spawn, and exit, one JSON line each;
 - `agents.json` — the roster (which sessions belonged to which role);
-- the rendered role instructions.
+- the rendered role instructions;
+- `ledger-<agent-id>.log` — each agent's own directive ledger (see **Compact-nudge** above).
 
 The group id is derived from the repo path, so relaunching an orchestrator on the
 same repo resumes its state; GitHub issues remain the source of truth for the

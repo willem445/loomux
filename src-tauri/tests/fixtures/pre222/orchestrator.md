@@ -106,6 +106,8 @@ memory of it — is the contract.
   **sender** (may send any time), everyone else is a **receiver** (may only reply once the
   sender messages them, and only to the sender). A peer may also be **receive-only**
   (`channel_status` shows `can_send: false`) — it will never reply, by design.
+- `note_directive(text, replace?)` — append a one-line diary entry to your own directive
+  ledger, or (`replace: true`) rewrite the whole thing. See **Durability rules**.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
@@ -770,11 +772,37 @@ when the whole value is "the next orchestrator should just already know this."
   anything `list_notifications()` shows you were still waiting on.
 - Keep your context lean: never paste large diffs or files into it; monitor via reports,
   `get_output` tails and `gh` summaries.
-- **Compact at lulls** (INVARIANT 11). Run `/compact` at natural quiet points — right after a
-  merge gate or completion report lands, before you go idle waiting on CI or a human, whenever
-  context is running high. Never mid-decision or with a prompt half-typed. Then treat the next
-  turn like a session start: **re-read INVARIANTS**, re-sync with `list_tasks`, `get_state` and
-  `list_agents`, and lean on the issues and PRs themselves for anything the summary blurred.
+- **Compact at lulls** (INVARIANT 11). At natural quiet points — right after a merge gate or
+  completion report lands, before you pull new work, before you go idle waiting on CI or a
+  human, whenever context is running high — call `request_compact()` as the LAST action of
+  your turn. Never mid-decision or with a prompt half-typed: it doesn't compact you
+  immediately, it flags this pane so loomux pastes `/compact` the moment you actually go idle.
+  Before calling it, offload what you'll need after the summary: reconcile the task board,
+  `set_state` anything mid-decision, push plan/progress context living only in this
+  conversation to the relevant issues/PRs — `request_compact` warns (never blocks) if it looks
+  like you skipped this. Once the compact lands, loomux re-grounds you in these invariants and
+  prompts you to re-sync with `list_tasks`, `get_state` and `list_agents` automatically — you
+  do not need to remember to do that part yourself. If you're ever notified your context is
+  running high (`[loomux] context at NN% …`), that's loomux telling you it will request one on
+  your behalf if you don't get to it first — better a planned compact than the CLI's own
+  emergency auto-compact mid-decision. loomux also recognizes that emergency auto-compact itself
+  when it happens (there is no way to plan around one you never saw coming) and re-grounds you
+  the same way — but only the durable state you already offloaded comes back; a directive that
+  only ever lived in conversation does not, which is exactly what the directive ledger below is
+  for.
+- **Directive ledger.** The human's directives, scope decisions, and feedback are exactly the
+  kind of detail a compaction summary dilutes first — and the CLI's own emergency auto-compact
+  gives you no warning turn to offload one before it fires. So don't wait for a lull: the moment
+  the human (directly, or relayed through you to a delegate) gives you a directive, a scope
+  decision, or feedback, call `note_directive(text)` to record it BEFORE you act on it — a
+  one-line diary entry, kept at receipt time. loomux embeds your ledger verbatim in the mandatory
+  post-compact re-grounding notice (size-capped to the recent tail; it says so and points at the
+  full file if it had to cut anything), so a directive survives even a compact you never saw
+  coming. Once re-grounded and shown your own tail, curate: `note_directive(text, replace: true)`
+  with that tail minus anything already done or no longer relevant, so the ledger stays a living
+  record instead of an ever-growing dump. This is a diary for what the human told you, not a
+  replacement for the board or `set_state` — decisions with lasting consequence still belong
+  there too.
 
 ## Style
 

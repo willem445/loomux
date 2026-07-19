@@ -81,6 +81,15 @@ so far:
   work the brief's steps one at a time, verify each against its own stated check before moving
   on, and treat a step whose verification won't pass after a real attempt as something to
   report rather than quietly skip past.
+- **#328, `request_compact` as the primary compact mechanism** — `orchestrator.md` only.
+  The pre-existing "Compact at lulls" invariant used to tell the orchestrator to type
+  `/compact` itself and then manually treat the next turn like a session start. It now
+  calls `request_compact()` as the last action of a turn instead (loomux pastes `/compact`
+  once the pane is actually idle, never mid-turn), names the pre-compact offload checklist
+  as a precondition (`request_compact` warns, never blocks, if it looks skipped), and drops
+  the manual re-sync instruction now that loomux's own mandatory post-compact re-injection
+  does that automatically. It also tells the orchestrator what a `[loomux] context at NN% …`
+  escalation notice means.
 
 - **#337, CONFLICTING never gets checks** — `orchestrator.md` and `worker.md` only. A
   `notify_when(kind: "pr_checks")` watch now resolves the moment its PR goes
@@ -116,6 +125,18 @@ so far:
   board's Approve button is gated on status alone, so leaving a reopened item's status untouched
   leaves Approve showing on work that is no longer ready. Pairs with the board itself now doing
   this automatically for the human's own **✎ Changes** action.
+
+- **#329 expansion, the directive ledger** — all four files. A new `note_directive(text,
+  replace?)` tool bullet, and a **Directive ledger** section (`orchestrator.md` folds it into
+  **Durability rules** instead, alongside the existing compact material): record a human
+  directive, scope decision, or piece of feedback via `note_directive` BEFORE acting on it —
+  a diary kept at receipt time, because the CLI's own emergency auto-compact gives no warning
+  turn to offload one first. Curate the ledger (`replace: true`) once a compact re-grounds an
+  agent in its own tail. `orchestrator.md`'s existing "Compact at lulls" text also gains one
+  sentence: loomux now recognizes the CLI's own emergency auto-compact when it happens (not
+  just the three loomux-initiated/human-typed paths #328 covered) and re-grounds the pane the
+  same way — but only durable state already offloaded comes back, which is what the ledger is
+  for.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched

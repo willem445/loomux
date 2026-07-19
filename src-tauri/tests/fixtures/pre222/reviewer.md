@@ -24,6 +24,18 @@ you at it as a reason to approve.
   message or check who you're connected to. Human-only to set up; you cannot open, close, or
   join a channel yourself. Channels are directional — if you're a **receiver**, `channel_send`
   only works once the **sender** has messaged you, and goes to the sender only.
+- `note_directive(text, replace?)` — append a one-line diary entry to your own directive
+  ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.
+
+## Directive ledger
+
+The CLI's own emergency auto-compact can strike with no warning turn. Whenever the human (or
+the orchestrator) gives you a directive, a scope decision, or feedback about how to review,
+call `note_directive(text)` to record it BEFORE you act on it — a one-line diary entry kept at
+the moment you receive it. loomux embeds your ledger verbatim in the mandatory post-compact
+re-grounding notice, so it survives even a compact you never saw coming. Once re-grounded,
+curate it: `note_directive(text, replace: true)` with the tail you were just shown, minus
+anything done or no longer relevant.
 
 ## Review protocol
 
