@@ -1962,13 +1962,19 @@ same-named event that means something else.
 <file-or-json>` flag loads an ADDITIONAL settings layer Claude Code itself composes over
 project/user settings — so "never clobber the user's own hooks" is a property of the CLI flag,
 not something loomux re-implements by hand-parsing and merging their `.claude/settings.json`
-(which loomux never touches). The generated hook config folds into the SAME file
-`--mcp-config`/`--strict-mcp-config` already point at (`write_mcp_config`, `cli == "claude"`
-branch) and that file is passed a SECOND time via `--settings` — one generated file, two flags,
-rather than a second file to keep in sync. Absent a resolvable `sh` interpreter (`resolve_hook_
-sh`, mirroring the `.cmd` shim delegators' `winpath::resolve_sh` reasoning — never trusting a
-bare `sh` on PATH, which Windows doesn't guarantee), the file simply carries no `hooks` key: a
-harmless no-op read, fail-open, same policy as a missing gh/git shim.
+(which loomux never touches). The generated hook config lives in its OWN file
+(`write_hook_settings_file`, `<agent-id>-hooks.json`) — deliberately SEPARATE from
+`--mcp-config`'s file (`write_mcp_config`), rather than one file under two flags: an earlier
+revision folded `hooks` into the same JSON `--mcp-config`/`--strict-mcp-config` already point at,
+which only stays safe while each flag's reader happens to ignore the other's top-level keys — a
+schema assumption neither this file nor Claude Code's own docs pin down, and a future release
+tightening either reader's validation would be a silent breakage no local test could catch (rev-4
+review, N2). Two small generated files, one per flag, costs one extra `fs::write` per Claude
+spawn and removes that risk entirely. Absent a resolvable `sh` interpreter (`resolve_hook_sh`,
+mirroring the `.cmd` shim delegators' `winpath::resolve_sh` reasoning — never trusting a bare
+`sh` on PATH, which Windows doesn't guarantee), `write_hook_settings_file` returns `None` and
+`--settings` is omitted entirely — never pointed at an empty file, fail-open, same policy as a
+missing gh/git shim.
 
 The hook `command` for each event explicitly invokes the resolved `sh` against ONE generic
 script (`COMPACT_HOOK_SCRIPT`, written once per machine to a `compacthook/` dir sibling to
@@ -1985,10 +1991,15 @@ cap/truncation rule drifting apart).
 
 **Hybrid, argued rather than assumed:** native `additionalContext` is race-free (no delivery/hold
 window — the whole class of bug rounds 4-6 fixed) but necessarily minimal (a hook script has no
-business re-implementing `directive_ledger_embed`'s cap/truncation logic in shell). loomux's own
-tick-driven reinjection still delivers the FULL notice (current ledger tail, `#416` makes the
-*instructions* half of it redundant-but-harmless rather than load-bearing). What #417 actually
-replaces is the ARM/CONFIRM evidence, not the reinjection delivery itself:
+business re-implementing `directive_ledger_embed`'s cap/truncation logic in shell). Whether
+loomux's own tick-driven reinjection ALSO fires depends on which marker confirmed the
+compaction (rev-4 review, N3 — see below): a PreCompact-only arm never delivered native
+context (only the `sessionstart-compact` script branch emits `additionalContext`), so loomux's
+reinjection is the ONLY re-grounding channel and still fires normally; a SessionStart-confirmed
+arm already got native re-grounding, so loomux's reinjection is SKIPPED for it — pasting it
+anyway would be a duplicate, spending exactly the context tokens native delivery exists to save.
+What #417 actually replaces is the ARM/CONFIRM evidence, not the reinjection delivery itself
+(which now runs, or doesn't, per the rule above):
 
 - `read_hook_marker_ts` reads a marker FILE's mtime (not a timestamp encoded in its content —
   the generic script never needs portable clock-formatting logic this way). `AgentEntry.
@@ -2025,7 +2036,62 @@ compaction. The design leans on `--settings` being documented as an additive set
 same reasoning `--setting-sources`'s default-to-all-three implies); if that assumption turns out
 wrong for hook arrays specifically, the user's first live demo from this feature's own worktree
 is the fastest way to find out, and the fix (an explicit merge step reading the user's own
-settings file) is scoped and known if needed.
+settings file) is scoped and known if needed. **If it turns out to REPLACE rather than merge**,
+the consequence is not cosmetic: any of the user's own hooks for the SAME event (say, a
+`PreToolUse` denial they rely on) would silently stop firing the moment loomux's own `--settings`
+file is added to the command line — worth checking for explicitly on that first live demo, not
+assumed benign.
+
+**rev-4 review round — one blocking fix, three follow-on hardening items:**
+
+- **B1 (blocking): a live restart could arm a spurious, ungrounded reinjection.** Marker files are
+  never deleted on their own, `AgentEntry.compact_hook_*_seen_ms` is in-memory (resets to `None`
+  on every restart), and agent ids come from an in-memory counter — so a fresh boot can mint an id
+  a PREVIOUS process already used, while that old process's marker file sits untouched on disk.
+  The very first tick after such a restart would have read it as "fresh evidence" (`ts >
+  None.unwrap_or(0)` is true for any real mtime), arming TRUSTED with no compaction having
+  happened. Fixed with three layers, since this is the TRUSTED tier and a false positive here is
+  worse than one in the inference tiers: (1) `ts >= a.started_ms` — a marker can only be evidence
+  for a compaction that happened during THIS agent's own lifetime (`>=`, not `>`: both timestamps
+  are millisecond-resolution real wall clock, so a marker written in the same millisecond an
+  agent started is still legitimately its own); (2) delete-on-consume — an actually-used marker is
+  removed from disk immediately, independent of whether the in-memory bookkeeping survives a
+  future restart; (3) a regression test (`compact_nudge_tick_ignores_a_hook_marker_older_than_
+  the_agent_itself`) simulating the exact sequence — a fresh `AgentEntry`, the same agent id, an
+  old marker already present.
+- **N2: split the shared `--mcp-config`/`--settings` file.** Covered above — two small generated
+  files now, removing the schema-drift risk of one file serving two flags with two different
+  readers.
+- **N3: suppress loomux's own reinjection when native re-grounding already landed.** Covered
+  above — `AgentEntry.compact_hook_native_notice_delivered` tracks specifically whether the
+  SessionStart hook (the one script branch that emits `additionalContext`) confirmed THIS pending
+  cycle; when it did, the resolution audits `compact-reinjection-skipped-native` and clears
+  straight to a terminal state instead of pasting a duplicate notice. A PreCompact-only arm (no
+  SessionStart marker seen) is unaffected — loomux's reinjection remains the only channel and
+  still fires, proven by its own test
+  (`compact_nudge_tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection`) alongside the
+  positive case (`compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_confirm`,
+  updated for the new terminal-resolution shape).
+- **N4: reclaim generated Copilot agent files on group end.** Without this, a #416-generated
+  `~/.copilot/agents/loomux-<group>-<block>.agent.md` outlives the group it was written for,
+  accumulating forever and cluttering the user's real Copilot agent list with dead groups' names.
+  `end_group` now sweeps every member's handle (`end_group_reclaims_generated_copilot_agent_
+  files`), best-effort and harmless to attempt even for a Claude-only group (no handle was ever
+  written for it). **Deliberately NOT built this round:** a startup sweep reconciling orphans from
+  a group that never reaches `end_group` at all (a crash, or state deleted out from under loomux).
+  A stray tiny markdown file the user can delete by hand is a cosmetic cost, not a resource or
+  security one — a reconciliation sweep is real, if modest, additional complexity (enumerating
+  every group's state to know which handles are still legitimate) for a narrow, self-correcting-
+  by-hand failure mode, so it's left as a deliberate follow-up rather than built speculatively.
+- **Test-infra fix found along the way (not reviewer-flagged, surfaced by chasing an intermittent
+  local flake):** `compact_hook_dir()` derives from `self.root.parent()`, which for
+  `test_registry()`'s disposable tempdir is the SHARED SYSTEM TEMP DIRECTORY — so every test that
+  spawns a Claude agent (the common case across the whole suite) was writing/reading the SAME real
+  script file, racing every other such test. Fixed with a test-only override
+  (`compact_hook_dir_override`/`set_compact_hook_dir_override`, mirroring the existing
+  `copilot_agents_dir_override`/`claude_projects_dir` pattern), wired into all four `test_registry`
+  helpers. Confirmed via 5 consecutive full-suite runs with no failures, after having reproduced
+  the flake reliably enough to trace it.
 
 **#411, folded in because the plumbing was already open:** the orchestration-RESTORE kickoff (an
 app restart resuming a live session) is a fixed string with no directive-ledger embed, unlike the

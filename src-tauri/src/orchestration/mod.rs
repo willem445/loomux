@@ -3857,6 +3857,19 @@ pub struct AgentEntry {
     /// human can tell a hook-confirmed compaction from an inferred one.
     /// Cleared alongside the other arm state on any resolution.
     pub compact_pending_evidence: Option<&'static str>,
+    /// rev-4 review (N3): `true` from the moment the SessionStart(compact)
+    /// hook marker armed/confirmed THIS pending cycle — the ONE signal that
+    /// means Claude Code already delivered native `additionalContext`
+    /// re-grounding for it (the generic hook script only emits that JSON
+    /// from its `sessionstart-compact` branch, never `precompact`). When
+    /// true at resolution time, `compact_nudge_tick` skips loomux's own
+    /// reinjection entirely — pasting it anyway would be a duplicate
+    /// re-grounding, spending exactly the context tokens native delivery
+    /// exists to save. `false` for a PreCompact-only arm (no SessionStart
+    /// marker seen yet for this cycle) and every pre-#417 path, so loomux's
+    /// reinjection remains the sole channel — the correct fallback, not a
+    /// double-delivery, when native re-grounding was never actually sent.
+    pub compact_hook_native_notice_delivered: bool,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -4493,6 +4506,17 @@ pub struct OrchRegistry {
     /// (`~/.copilot/agents`) — the generated per-block contract file (#416)
     /// writes here. `None` in production. Mirrors `claude_projects_dir`.
     copilot_agents_dir_override: Mutex<Option<PathBuf>>,
+    /// Test-only override of the #417 compact-hook script directory
+    /// (`compact_hook_dir`, normally a sibling of `shim_dir()` under the real
+    /// per-machine loomux data dir). Without this, `compact_hook_dir`
+    /// derives from `self.root.parent()` — which for `test_registry()`'s
+    /// disposable tempdir is the SHARED SYSTEM TEMP DIRECTORY, so every test
+    /// that spawns a Claude agent (the common case) would write/read the
+    /// SAME real script file, racing every other such test in the suite
+    /// (rev-4 review round: an intermittent flake in exactly the one test
+    /// that reads the script's content back traced to this). `None` in
+    /// production. Mirrors `claude_projects_dir`.
+    compact_hook_dir_override: Mutex<Option<PathBuf>>,
     /// Low-disk backstop latch (#134): true once the one-per-episode disk-space
     /// notice has been delivered, cleared when free space recovers past
     /// `LOW_DISK_CLEAR_BYTES`. Machine-wide (the disk is shared across groups).
@@ -5922,6 +5946,7 @@ impl OrchRegistry {
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
             copilot_agents_dir_override: Mutex::new(None),
+            compact_hook_dir_override: Mutex::new(None),
             low_disk_notified: Mutex::new(false),
             audit_skips_notified: Mutex::new(HashMap::new()),
             watches: Mutex::new(HashMap::new()),
@@ -5946,6 +5971,15 @@ impl OrchRegistry {
     #[doc(hidden)]
     pub fn set_copilot_agents_dir_override(&self, dir: PathBuf) {
         *self.copilot_agents_dir_override.lock_safe() = Some(dir);
+    }
+
+    /// Point the #417 compact-hook script directory at a specific directory,
+    /// instead of the real per-machine one `compact_hook_dir` otherwise
+    /// derives. Test-only seam (see `compact_hook_dir_override`'s doc for the
+    /// cross-test race this exists to avoid).
+    #[doc(hidden)]
+    pub fn set_compact_hook_dir_override(&self, dir: PathBuf) {
+        *self.compact_hook_dir_override.lock_safe() = Some(dir);
     }
 
     /// Copilot's own custom-agent directory (`~/.copilot/agents`, per its
@@ -8899,6 +8933,7 @@ impl OrchRegistry {
             compact_hook_precompact_seen_ms: None,
             compact_hook_sessionstart_seen_ms: None,
             compact_pending_evidence: None,
+            compact_hook_native_notice_delivered: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -9029,6 +9064,7 @@ impl OrchRegistry {
             compact_hook_precompact_seen_ms: None,
             compact_hook_sessionstart_seen_ms: None,
             compact_pending_evidence: None,
+            compact_hook_native_notice_delivered: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -9393,6 +9429,12 @@ impl OrchRegistry {
         // for "this compaction's evidence came from a hook, not a guess" is the
         // whole point of the feature, not incidental.
         let mut to_hook_armed: Vec<(String, String, &'static str)> = Vec::new();
+        // rev-4 review (N3): a confirmed arm whose native additionalContext
+        // ALREADY delivered the re-grounding — loomux's own reinjection is
+        // skipped for it (see `compact_hook_native_notice_delivered`'s doc),
+        // audited distinctly so "no reinjection fired" reads as a deliberate
+        // choice, not a silently dropped one.
+        let mut to_hook_native_skip: Vec<(String, String)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -9459,13 +9501,43 @@ impl OrchRegistry {
                 // "newer than the last one this agent already consumed" — a
                 // hook that never fires just leaves both reads `None`
                 // forever, a total no-op for a hook-less setup.
+                //
+                // rev-4 review (B1, blocking): a marker file has no idea an
+                // app can restart. `AgentEntry.compact_hook_*_seen_ms` is
+                // in-memory, so it resets to `None` on every restart, and
+                // agent ids are minted from an in-memory counter too — a
+                // fresh boot can hand out an id a PREVIOUS process already
+                // used. Combined: restart, get the same id back, and the
+                // first tick reads a marker from the OLD process's hook fire
+                // as "fresh" (`ts > None.unwrap_or(0)` is true for any real
+                // mtime) — arming TRUSTED with `seen_busy = true`, bypassing
+                // every evidence gate, and reinjecting "Context was
+                // compacted" with no compaction having happened. Three
+                // layers, belt-and-suspenders (this is the TRUSTED tier, so
+                // a false positive here is worse than one in the inference
+                // tiers below): (1) `ts >= a.started_ms` — a marker can only
+                // be evidence for a compaction that happened during THIS
+                // agent's own lifetime, which a stale cross-restart marker
+                // structurally never was (`>=`, not `>`: `started_ms` and a
+                // marker's mtime are both millisecond-resolution real wall
+                // clock, so a marker written in the SAME millisecond an
+                // agent started is still legitimately its own, not a false
+                // rejection); (2) delete-on-consume — once a
+                // marker is actually used to arm, it is removed from disk so
+                // it can never be re-read as evidence again, independent of
+                // whether the in-memory bookkeeping survives; (3) the
+                // regression test simulating exactly this sequence (fresh
+                // `AgentEntry`, same id, an old marker already on disk).
                 let hooks_dir = self.group_dir(&a.group).join("hooks");
-                let precompact_ts =
-                    read_hook_marker_ts(&hooks_dir.join(format!("{}.precompact.json", a.id)));
-                let sessionstart_ts =
-                    read_hook_marker_ts(&hooks_dir.join(format!("{}.sessionstart-compact.json", a.id)));
+                let precompact_marker = hooks_dir.join(format!("{}.precompact.json", a.id));
+                let sessionstart_marker = hooks_dir.join(format!("{}.sessionstart-compact.json", a.id));
+                let precompact_ts = read_hook_marker_ts(&precompact_marker);
+                let sessionstart_ts = read_hook_marker_ts(&sessionstart_marker);
                 if let Some(ts) = precompact_ts {
-                    if ts > a.compact_hook_precompact_seen_ms.unwrap_or(0) && !a.compact_pending {
+                    if ts > a.compact_hook_precompact_seen_ms.unwrap_or(0)
+                        && ts >= a.started_ms
+                        && !a.compact_pending
+                    {
                         // Direct proof a compaction just STARTED — arm exactly
                         // like the loomux-initiated path (`compact_pending_
                         // trusted = true`: no inference gate needed) and treat
@@ -9473,6 +9545,7 @@ impl OrchRegistry {
                         // the busy half of busy-then-quiet, whether or not it
                         // grew the pane's own output past the activity floor.
                         a.compact_hook_precompact_seen_ms = Some(ts);
+                        let _ = fs::remove_file(&precompact_marker);
                         a.compact_pending = true;
                         a.compact_pending_trusted = true;
                         a.compact_seen_busy = true;
@@ -9484,7 +9557,7 @@ impl OrchRegistry {
                     }
                 }
                 if let Some(ts) = sessionstart_ts {
-                    if ts > a.compact_hook_sessionstart_seen_ms.unwrap_or(0) {
+                    if ts > a.compact_hook_sessionstart_seen_ms.unwrap_or(0) && ts >= a.started_ms {
                         // Even STRONGER direct proof: Claude Code itself just
                         // told us a session started because of a compact.
                         // Unconditional on `compact_pending` (unlike the
@@ -9495,10 +9568,17 @@ impl OrchRegistry {
                         // PreCompact branch just above), this simply
                         // (re)confirms trust/busy — inert, never double-arms.
                         a.compact_hook_sessionstart_seen_ms = Some(ts);
+                        let _ = fs::remove_file(&sessionstart_marker);
                         a.compact_pending = true;
                         a.compact_pending_trusted = true;
                         a.compact_seen_busy = true;
                         a.compact_pending_evidence = Some("hook");
+                        // rev-4 review (N3): the ONLY script branch that
+                        // emits `additionalContext` — see `COMPACT_HOOK_
+                        // SCRIPT`'s `sessionstart-compact` case — so this is
+                        // the one signal that native re-grounding actually
+                        // reached the agent already.
+                        a.compact_hook_native_notice_delivered = true;
                         if a.compact_pending_armed_ms.is_none() {
                             a.compact_pending_armed_ms = Some(now);
                         }
@@ -9537,6 +9617,7 @@ impl OrchRegistry {
                         a.compact_reinject_attempted_ms = None;
                         a.compact_reinject_attempts = 0;
                         a.compact_pending_evidence = None;
+                        a.compact_hook_native_notice_delivered = false;
                         // #410/round-7: the immediate post-compact discussion
                         // is exactly the window an inference arm can misread
                         // as a new compaction — cool down.
@@ -9562,6 +9643,7 @@ impl OrchRegistry {
                             a.compact_reinject_attempted_ms = None;
                             a.compact_reinject_attempts = 0;
                             a.compact_pending_evidence = None;
+                            a.compact_hook_native_notice_delivered = false;
                             a.compact_last_lost_reason = Some("reinjection-abandoned".to_string());
                             a.compact_last_lost_ms = Some(now);
                             a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
@@ -9594,6 +9676,7 @@ impl OrchRegistry {
                         a.compact_pending_trusted = false;
                         a.compact_pending_armed_ms = None;
                         a.compact_pending_evidence = None;
+                        a.compact_hook_native_notice_delivered = false;
                         a.compact_last_lost_reason = Some("arm-timeout".to_string());
                         a.compact_last_lost_ms = Some(now);
                         a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
@@ -9690,7 +9773,25 @@ impl OrchRegistry {
                                 marker_baseline,
                                 marker_current,
                             );
-                        if confirmed {
+                        if confirmed && a.compact_hook_native_notice_delivered {
+                            // rev-4 review (N3): Claude Code already delivered
+                            // native `additionalContext` re-grounding for this
+                            // exact compaction (the SessionStart hook fired) —
+                            // loomux's own reinjection would be a SECOND one,
+                            // spending exactly the context tokens native
+                            // delivery exists to save. Resolve straight to a
+                            // terminal state; there is no delivery to confirm.
+                            a.compact_pending = false;
+                            a.compact_pending_baseline_tokens = None;
+                            a.compact_pending_baseline_marker_count = None;
+                            a.compact_pending_trusted = false;
+                            a.compact_seen_busy = false;
+                            a.compact_pending_armed_ms = None;
+                            a.compact_pending_evidence = None;
+                            a.compact_hook_native_notice_delivered = false;
+                            a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                            to_hook_native_skip.push((a.id.clone(), a.group.clone()));
+                        } else if confirmed {
                             a.compact_pending_baseline_tokens = None;
                             a.compact_pending_baseline_marker_count = None;
                             a.compact_pending_trusted = false;
@@ -9713,6 +9814,7 @@ impl OrchRegistry {
                             a.compact_pending_trusted = false;
                             a.compact_pending_armed_ms = None;
                             a.compact_pending_evidence = None;
+                            a.compact_hook_native_notice_delivered = false;
                             // #410/round-7: the same repeating-false-signal
                             // shape D4 pins can otherwise re-arm on the very
                             // next tick — a short cooldown after ANY discard
@@ -9992,6 +10094,12 @@ impl OrchRegistry {
         }
         for (id, group, event) in to_hook_armed {
             self.audit(&group, "loomux", "compact-hook-evidence", json!({ "agent": id, "event": event }));
+        }
+        for (id, group) in to_hook_native_skip {
+            self.audit(&group, "loomux", "compact-reinjection-skipped-native", json!({
+                "agent": id,
+                "reason": "SessionStart hook already delivered native additionalContext for this compaction",
+            }));
         }
         nudged
     }
@@ -12325,6 +12433,25 @@ impl OrchRegistry {
         // policy is simply "cleaned up on group end", no per-image bookkeeping.
         let _ = fs::remove_dir_all(self.attachments_dir(group));
 
+        // rev-4 review (N4): reclaim any #416 generated Copilot custom-agent
+        // files this group's members ever got (`write_copilot_agent_file`) —
+        // otherwise they accumulate in `~/.copilot/agents` forever and
+        // clutter the user's Copilot agent list with dead groups' names.
+        // Best-effort per member (a handle a member never actually got a
+        // file for is just a missing-file no-op); harmless to attempt for a
+        // Claude-only group too, since none of its handles were ever
+        // written. NOT swept for orphans from a group that never reaches
+        // `end_group` at all (a crash, or state deleted out from under
+        // loomux) — a stray tiny markdown file the user can delete by hand
+        // is a cosmetic cost, not a resource or security one, so a startup
+        // reconciliation sweep is left as a deliberate follow-up rather than
+        // built speculatively here.
+        if let Some(dir) = self.copilot_agents_dir() {
+            for a in &members {
+                let _ = fs::remove_file(dir.join(format!("loomux-{group}-{}.agent.md", a.block)));
+            }
+        }
+
         // Total teardown: drop any pause (in-memory + marker) so a future
         // relaunch on this repo starts clean rather than silently paused.
         if self.paused.lock_safe().remove(group) {
@@ -13340,11 +13467,18 @@ impl OrchRegistry {
 
     /// Write the per-agent MCP config the agent CLI connects with. Claude
     /// and Copilot share the same core schema; Copilot additionally expects
-    /// a `tools` allowlist inside the server entry. For Claude, the SAME file
-    /// also carries the #417 compact-lifecycle hook config (folded into
-    /// `hooks`, alongside `mcpServers`) and is passed a second time via
-    /// `--settings` (see `build_agent_command`) — one generated file, two
-    /// flags, rather than a second file to keep in sync.
+    /// a `tools` allowlist inside the server entry.
+    ///
+    /// rev-4 review (N2): this file used to ALSO carry the #417 hook config
+    /// (folded into a top-level `hooks` key, passed a second time via
+    /// `--settings`) — one generated file, two flags. That only stays safe
+    /// while `--mcp-config`'s reader and `--settings`'s reader each happen to
+    /// ignore the other's top-level keys, which is a schema assumption
+    /// neither this file nor Claude Code's own docs pin down; a future
+    /// Claude Code release tightening either reader's validation would be a
+    /// silent breakage with no test able to catch it locally. Split instead
+    /// (see `write_hook_settings_file`): two small generated files, one per
+    /// flag, at the cost of one extra `fs::write` per Claude spawn.
     fn write_mcp_config(
         &self,
         group: &str,
@@ -13364,12 +13498,7 @@ impl OrchRegistry {
         if cli == "copilot" {
             server["tools"] = json!(["*"]);
         }
-        let mut cfg = json!({ "mcpServers": { "loomux": server } });
-        if cli == "claude" {
-            if let Some(hooks) = self.compact_hook_settings(group, agent_id) {
-                cfg["hooks"] = hooks;
-            }
-        }
+        let cfg = json!({ "mcpServers": { "loomux": server } });
         let dir = self.group_dir(group).join("configs");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{agent_id}.json"));
@@ -13377,12 +13506,33 @@ impl OrchRegistry {
         Ok(path)
     }
 
+    /// Claude's `--settings` file (#417, split from `--mcp-config`'s file per
+    /// rev-4 review N2 — see `write_mcp_config`'s doc): just the `hooks` key,
+    /// nothing shared with the MCP config's schema. `None` when
+    /// `compact_hook_settings` has nothing to write (no `sh` resolvable) —
+    /// the caller then omits `--settings` entirely rather than writing an
+    /// empty file no flag points at.
+    fn write_hook_settings_file(&self, group: &str, agent_id: &str) -> Option<PathBuf> {
+        let hooks = self.compact_hook_settings(group, agent_id)?;
+        let cfg = json!({ "hooks": hooks });
+        let dir = self.group_dir(group).join("configs");
+        fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!("{agent_id}-hooks.json"));
+        fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).ok()?;
+        Some(path)
+    }
+
     /// The shared directory holding the generic compact-lifecycle hook
     /// script (#417) — a sibling of `shim_dir()`, one copy for every group:
     /// the script itself carries no group- or agent-specific text, only argv
     /// (the group's state dir + the agent's id, baked into each agent's own
-    /// `command` string below).
+    /// `command` string below). Test-overridable (see
+    /// `compact_hook_dir_override`'s doc) — every real deployment gets the
+    /// derived path.
     fn compact_hook_dir(&self) -> PathBuf {
+        if let Some(dir) = self.compact_hook_dir_override.lock_safe().clone() {
+            return dir;
+        }
         self.root.parent().unwrap_or(&self.root).join("compacthook")
     }
 
@@ -13427,11 +13577,11 @@ impl OrchRegistry {
     }
 
     /// Claude's PreCompact + SessionStart(compact) hook config (#417) — the
-    /// `hooks` object folded into the same file `write_mcp_config` writes,
-    /// which also rides on `--settings` (an ADDITIVE settings layer Claude
-    /// Code composes over the user's own `.claude/settings.json`, never a
-    /// hand merge of it — "never clobber the user's hooks" is a property of
-    /// the CLI flag itself here, not something loomux re-implements by
+    /// `hooks` object `write_hook_settings_file` writes, which rides on
+    /// `--settings` (an ADDITIVE settings layer Claude Code composes over
+    /// the user's own `.claude/settings.json`, never a hand merge of it —
+    /// "never clobber the user's hooks" is a property of the CLI flag
+    /// itself here, not something loomux re-implements by
     /// parsing their JSON).
     ///
     /// The `command` for each event explicitly invokes the resolved `sh`
@@ -13752,6 +13902,12 @@ impl OrchRegistry {
         model: &str,
         auto_ops: bool,
         cfg: &Path,
+        // Claude's `--settings` file (#417) — `write_hook_settings_file`'s
+        // output, a SEPARATE file from `cfg` (rev-4 review N2: one file
+        // serving both `--mcp-config` and `--settings` is a schema-drift
+        // time bomb — see `write_mcp_config`'s doc). `None` omits
+        // `--settings` entirely (no hooks configured, or a non-Claude CLI).
+        hook_settings: Option<&Path>,
         group_dir: &Path,
         workdir: &Path,
         session: Option<&str>,
@@ -13850,19 +14006,19 @@ impl OrchRegistry {
                 // so it runs under Auto perms even in a non-auto_ops group.
                 let perm = claude_permission_mode(unattended);
                 let mut cmd = format!(
-                    "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --settings \"{}\" \
+                    "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config \
                      --model {model} --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
-                    cfg.display(),
-                    // #417: the SAME generated file — it also carries the
-                    // PreCompact/SessionStart(compact) hook config
-                    // `write_mcp_config` folds in for Claude (see its doc).
-                    // `--settings` is Claude Code's own ADDITIVE settings
-                    // layer, so this can never clobber the user's own
-                    // `.claude/settings.json` hooks; a file with no `hooks`
-                    // key (no `sh` resolvable) is a harmless no-op read.
                     cfg.display(),
                     group_dir.display()
                 );
+                // #417: Claude Code's own ADDITIVE settings layer — never
+                // clobbers the user's own `.claude/settings.json` hooks.
+                // Omitted entirely (not pointed at an empty file) when this
+                // agent has no hook config (a non-Claude CLI, or no `sh`
+                // resolvable — see `write_hook_settings_file`).
+                if let Some(hs) = hook_settings {
+                    cmd.push_str(&format!(" --settings \"{}\"", hs.display()));
+                }
                 if unattended {
                     // Pre-approve git + gh so the unattended flow runs without
                     // prompts (workers: branch→commit→PR; planners: read-only
@@ -13957,6 +14113,7 @@ impl OrchRegistry {
         model: &str,
         auto_ops: bool,
         cfg: &Path,
+        hook_settings: Option<&Path>,
         group_dir: &Path,
         workdir: &Path,
         session: Option<&str>,
@@ -14035,10 +14192,6 @@ impl OrchRegistry {
                 push(&mut a, "--mcp-config");
                 a.push(cfg.display().to_string());
                 push(&mut a, "--strict-mcp-config");
-                // #417: same file as --mcp-config — see build_agent_command's
-                // doc for why one generated file under two flags is safe here.
-                push(&mut a, "--settings");
-                a.push(cfg.display().to_string());
                 push(&mut a, "--model");
                 push(&mut a, model);
                 push(&mut a, "--permission-mode");
@@ -14047,6 +14200,12 @@ impl OrchRegistry {
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--allowedTools");
                 push(&mut a, "mcp__loomux");
+                // #417: a SEPARATE file from --mcp-config's (rev-4 review
+                // N2) — omitted entirely when this agent has no hook config.
+                if let Some(hs) = hook_settings {
+                    push(&mut a, "--settings");
+                    a.push(hs.display().to_string());
+                }
                 if unattended {
                     // == CLAUDE_UNATTENDED_ALLOW, as literal (unquoted) tokens.
                     push(&mut a, "Bash(git *)");
@@ -14341,11 +14500,16 @@ impl OrchRegistry {
         let inject = self.persona_inject(group_id, &block, &cli, persona.as_ref(), &contract);
 
         let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli)?;
+        // #417, split from `cfg` per rev-4 review N2 — only Claude ever has
+        // a hook config, so this is always `None` for every other CLI.
+        let hook_settings =
+            (cli == "claude").then(|| self.write_hook_settings_file(group_id, &agent_id)).flatten();
         let command = self.build_agent_command(
             &cli,
             &model,
             group.guardrails.auto_ops,
             &cfg,
+            hook_settings.as_deref(),
             &self.group_dir(group_id),
             Path::new(&cwd),
             session_id.as_deref(),
@@ -14358,6 +14522,7 @@ impl OrchRegistry {
             &model,
             group.guardrails.auto_ops,
             &cfg,
+            hook_settings.as_deref(),
             &self.group_dir(group_id),
             Path::new(&cwd),
             session_id.as_deref(),
@@ -14407,6 +14572,7 @@ impl OrchRegistry {
             compact_hook_precompact_seen_ms: None,
             compact_hook_sessionstart_seen_ms: None,
             compact_pending_evidence: None,
+            compact_hook_native_notice_delivered: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -16322,11 +16488,16 @@ fn register_orchestrator_pane(
         .unwrap_or_default();
     let contract = block_contract_text(&instructions_body, persona.as_ref());
     let inject = reg.persona_inject(&group.id, &block, &cli, persona.as_ref(), &contract);
+    // #417, split from `cfg` per rev-4 review N2 — only Claude ever has a
+    // hook config, so this is always `None` for every other CLI.
+    let hook_settings =
+        (cli == "claude").then(|| reg.write_hook_settings_file(&group.id, &agent_id)).flatten();
     let command = reg.build_agent_command(
         &cli,
         &model,
         group.guardrails.auto_ops,
         &cfg,
+        hook_settings.as_deref(),
         &reg.group_dir(&group.id),
         Path::new(&group.repo),
         session_id.as_deref(),
@@ -16339,6 +16510,7 @@ fn register_orchestrator_pane(
         &model,
         group.guardrails.auto_ops,
         &cfg,
+        hook_settings.as_deref(),
         &reg.group_dir(&group.id),
         Path::new(&group.repo),
         session_id.as_deref(),
@@ -16389,6 +16561,7 @@ fn register_orchestrator_pane(
         compact_hook_precompact_seen_ms: None,
         compact_hook_sessionstart_seen_ms: None,
         compact_pending_evidence: None,
+        compact_hook_native_notice_delivered: false,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,

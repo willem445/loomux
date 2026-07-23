@@ -100,6 +100,7 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     // #416: never let a test write a generated Copilot custom-agent file into
     // the REAL `~/.copilot/agents` — point it at this same disposable tree.
     reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
     (reg, dir)
 }
 
@@ -940,7 +941,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
@@ -949,7 +950,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(cmd.contains("--allowedTools mcp__loomux"),
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git"), "git is not pre-approved for a non-auto_ops worker");
-    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
     assert!(cmd.contains("\"Bash(git *)\"") && cmd.contains("\"Bash(gh *)\""),
@@ -962,7 +963,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(!cmd.contains("--disallowedTools"), "non-planner agents get no tool denials");
     // A planner (read_only=true) is denied file writes + git commit/push at
     // the CLI level, even under Auto perms — but keeps gh for the plan comment.
-    let plan = reg.build_agent_command("claude", "opus", true, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("claude", "opus", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
     for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
         assert!(plan.contains(denied), "planner must deny the {denied} tool");
@@ -989,7 +990,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("claude", "opus", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("claude", "opus", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--permission-mode auto"),
         "a planner runs unattended (Auto perms) even when the group is not auto_ops — else it deadlocks");
     assert!(plan.contains("\"Bash(gh *)\""),
@@ -1000,7 +1001,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
         "writes/commit/push stay denied structurally — Auto perms don't loosen the read-only contract");
     // By contrast a non-auto_ops WORKER (read_only=false) is unchanged: it
     // stays in acceptEdits with no pre-approved git/gh (the human gates ops).
-    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(worker.contains("--permission-mode acceptEdits"),
         "a non-auto_ops worker is unaffected: it still gates ops through acceptEdits");
     assert!(!worker.contains("\"Bash(gh *)\""),
@@ -1012,7 +1013,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
     assert!(
         cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
@@ -1036,22 +1037,22 @@ fn copilot_command_uses_copilot_adapter_flags() {
     assert!(cmd.contains("--autopilot"),
         "group copilot workers run in true autopilot mode; the kickoff confirms the consent dialog");
     // Conservative preset keeps the explicit allowlist instead.
-    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), true, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), false, false, &PersonaInject::default());
     assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
         "a fresh copilot spawn cannot pin a session id");
     // A non-planner copilot agent gets no deny-tool flags.
     assert!(!cmd.contains("--deny-tool"), "non-planner copilot agents get no tool denials");
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
-    let plan = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"edit\""),
         "planner must deny copilot's write/edit tools, got: {plan}");
     assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
@@ -1070,7 +1071,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
         "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
     assert!(plan.contains("--autopilot"),
@@ -1081,7 +1082,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
     // the conservative interactive preset (no allow-all).
-    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let worker = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(!worker.contains("--allow-all-tools") && !worker.contains("--autopilot"),
         "a non-auto_ops copilot worker stays interactive — only planners run unattended");
 }
@@ -1148,7 +1149,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
 
     // Claude: permission mode + the shared git/gh allowlist constant.
     let group_claude =
-        reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+        reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_claude = single_pane_autopilot_flags("claude");
     assert!(single_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
     assert!(group_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
@@ -1159,7 +1160,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
     // enter true autopilot mode, so single_pane_autopilot_flags reuses the
     // group constant directly rather than inventing a divergent string.
     let group_copilot =
-        reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+        reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_copilot = single_pane_autopilot_flags("copilot");
     assert_eq!(single_copilot, COPILOT_GROUP_AUTOPILOT_FLAGS,
         "single-pane copilot must reuse the group autopilot atom verbatim, not a divergent string");
@@ -1200,8 +1201,8 @@ fn copilot_single_pane_now_shares_the_group_autopilot_posture() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let worker = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
-    let planner = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let worker = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let planner = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(worker.contains("--autopilot") && planner.contains("--autopilot"),
         "group-mode unattended copilot spawns enter true autopilot mode");
 }
@@ -1407,17 +1408,17 @@ fn build_agent_command_full_line_snapshots() {
     let wd = Path::new("C:/repo");
     // signature: (cli, model, auto_ops, cfg, group_dir, workdir, session, resume, read_only)
     let cmd = |cli, model, auto_ops, read_only| {
-        reg.build_agent_command(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default())
+        reg.build_agent_command(cli, model, auto_ops, cfg, None, gdir, wd, None, false, read_only, &PersonaInject::default())
     };
 
     // Claude worker, auto_ops ON → native Auto mode + git/gh pre-approval.
-    // #417: `--settings` now always rides alongside `--mcp-config` for Claude
-    // (the same generated file — see `write_mcp_config`'s doc) so the
-    // PreCompact/SessionStart hook config can layer in when present; a
-    // `PersonaInject::default()` command still carries no `--agents`/`--agent`.
+    // No `hook_settings` passed here (`None`) ⇒ no `--settings` at all — see
+    // `claude_worker_gets_a_settings_flag_only_when_hook_settings_is_some`
+    // below for the #417 flag itself, split from `--mcp-config`'s file per
+    // rev-4 review N2.
     assert_eq!(
         cmd("claude", "sonnet", true, false),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --settings \"C:/x/cfg.json\" \
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
          --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\""
     );
@@ -1425,7 +1426,7 @@ fn build_agent_command_full_line_snapshots() {
     // Claude worker, auto_ops OFF → acceptEdits, no git/gh, no denials.
     assert_eq!(
         cmd("claude", "sonnet", false, false),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --settings \"C:/x/cfg.json\" \
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
          --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
     );
 
@@ -1449,7 +1450,7 @@ fn build_agent_command_full_line_snapshots() {
     // plus the write/commit/push denials, gh still reachable.
     assert_eq!(
         cmd("claude", "opus", false, true),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --settings \"C:/x/cfg.json\" \
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
          --model opus --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
          \"Bash(git commit *)\" \"Bash(git push *)\""
@@ -1473,6 +1474,38 @@ fn build_agent_command_full_line_snapshots() {
         cmd("claude", "sonnet", true, false),
         "an unrecognized CLI must build the exact claude fallback command"
     );
+}
+
+#[test]
+fn claude_gets_a_settings_flag_only_when_hook_settings_is_some() {
+    // #417, split from `--mcp-config`'s file per rev-4 review N2: `--settings`
+    // is a SEPARATE file/flag, present only when the caller actually has one
+    // (Claude with a resolvable hook script) — never emitted just because
+    // the agent is Claude, and never pointed at `cfg` (the mcp-config file).
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let hooks = Path::new("C:/x/cfg-hooks.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+
+    let cmd = reg.build_agent_command(
+        "claude", "sonnet", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+    );
+    assert!(cmd.contains("--settings \"C:/x/cfg-hooks.json\""), "{cmd}");
+    assert!(!cmd.contains("--settings \"C:/x/cfg.json\""), "must never point --settings at the mcp-config file: {cmd}");
+
+    let argv = reg.build_agent_argv(
+        "claude", "sonnet", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+    );
+    assert!(argv.windows(2).any(|w| w == ["--settings", "C:/x/cfg-hooks.json"]), "{argv:?}");
+    assert_eq!(shell_tokenize(&cmd), argv, "the two forms must never drift on the new flag either");
+
+    // Copilot never gets a --settings flag, `hook_settings` or not — it isn't
+    // wired through the copilot branch at all (copilot has no hook config).
+    let copilot_cmd = reg.build_agent_command(
+        "copilot", "auto", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+    );
+    assert!(!copilot_cmd.contains("--settings"), "{copilot_cmd}");
 }
 
 /// Split a shell command line into argv, honoring the two quotings
@@ -1524,15 +1557,15 @@ fn build_agent_argv_snapshots() {
     let gdir = Path::new("C:/data/group");
     let wd = Path::new("C:/repo");
     let argv =
-        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default());
+        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, None, gdir, wd, None, false, read_only, &PersonaInject::default());
 
     // Claude worker, auto_ops ON. Note the quote-free literal tool tokens.
-    // #417: `--settings` (same file as `--mcp-config`) now always rides too.
+    // No `hook_settings` (`None`) ⇒ no `--settings` — see
+    // `claude_gets_a_settings_flag_only_when_hook_settings_is_some` for that.
     assert_eq!(
         argv("claude", "sonnet", true, false),
         vec![
-            "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--settings",
-            "C:/x/cfg.json", "--model", "sonnet",
+            "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--model", "sonnet",
             "--permission-mode", "auto", "--add-dir", "C:/data/group", "--allowedTools",
             "mcp__loomux", "Bash(git *)", "Bash(gh *)",
         ]
@@ -1596,10 +1629,10 @@ fn build_agent_argv_matches_command_line() {
                 for (session, resume) in sessions {
                     for persona in &personas {
                         let line = reg.build_agent_command(
-                            cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only, persona,
+                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, read_only, persona,
                         );
                         let argv = reg.build_agent_argv(
-                            cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only, persona,
+                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, read_only, persona,
                         );
                         assert_eq!(
                             shell_tokenize(&line),
@@ -1647,9 +1680,11 @@ fn copilot_mcp_config_includes_tools_allowlist() {
 
 #[test]
 fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
-    // #417: PreCompact + SessionStart(compact) hook config folds into the
-    // SAME generated file `--mcp-config`/`--settings` both point at (see
-    // `write_mcp_config`'s doc) — never a hand-merge of the user's own
+    // #417: PreCompact + SessionStart(compact) hook config rides in its own
+    // generated file (`write_hook_settings_file`), a SEPARATE file from
+    // `--mcp-config`'s (rev-4 review N2 — see `write_mcp_config`'s doc for
+    // why sharing one file between the two was a schema-drift risk), passed
+    // via `--settings` — never a hand-merge of the user's own
     // `.claude/settings.json`. Skipped (not failed) when no `sh` interpreter
     // is resolvable at all, mirroring the #335 shim tests' "skip, don't
     // fail" precedent for an environment where `sh.exe` genuinely can't be
@@ -1663,13 +1698,18 @@ fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
-    let cfg_path = reg.state_root().join(&g.id).join("configs").join(format!("{}.json", w.id));
-    let cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
-    let precompact = cfg["hooks"]["PreCompact"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
-    let sessionstart = cfg["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+    let mcp_cfg_path = reg.state_root().join(&g.id).join("configs").join(format!("{}.json", w.id));
+    let mcp_cfg: Value = serde_json::from_str(&fs::read_to_string(&mcp_cfg_path).unwrap()).unwrap();
+    assert!(mcp_cfg.get("hooks").is_none(), "the mcp-config file must carry no hooks key at all: {mcp_cfg}");
+    assert!(mcp_cfg.get("mcpServers").is_some());
+
+    let hooks_path = reg.state_root().join(&g.id).join("configs").join(format!("{}-hooks.json", w.id));
+    let hooks_cfg: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    let precompact = hooks_cfg["hooks"]["PreCompact"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+    let sessionstart = hooks_cfg["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
     assert!(precompact.contains("precompact"), "{precompact}");
     assert!(sessionstart.contains("sessionstart-compact"), "{sessionstart}");
-    assert_eq!(cfg["hooks"]["SessionStart"][0]["matcher"], json!("compact"), "only compact-sourced starts are hooked");
+    assert_eq!(hooks_cfg["hooks"]["SessionStart"][0]["matcher"], json!("compact"), "only compact-sourced starts are hooked");
     // The command embeds this agent's group dir + id as literal argv — the
     // generic script itself carries none of it (constraint #8).
     assert!(precompact.contains(&w.id), "{precompact}");
@@ -2366,10 +2406,10 @@ fn claude_agents_get_preassigned_resumable_sessions() {
     // The launch command pins the id.
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/x/g");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), Some(&sid), false, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--session-id {sid}")));
     // Resume uses --resume instead.
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), Some(&sid), true, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
 }
 
@@ -5323,6 +5363,20 @@ fn compact_nudge_ignores_subfloor_repaint_growth() {
         "sub-floor creep never resets the clock, so the window still elapses");
 }
 
+/// Write a hook marker file with an EXPLICIT mtime, `offset_ms` (signed)
+/// after `base_ms` (both real wall-clock ms since the epoch) — never a bare
+/// `fs::write` right after spawning an agent, whose own `started_ms` is
+/// sampled from the SAME real clock a few statements earlier: two real-clock
+/// reads landing in the same millisecond (or a filesystem mtime-write
+/// buffering delay) would otherwise make the product's `ts >= a.started_ms`
+/// gate an intermittent test flake instead of a deterministic pass/fail.
+fn write_hook_marker(path: &Path, base_ms: u64, offset_ms: i64) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let f = fs::File::create(path).unwrap();
+    let ms = (base_ms as i64 + offset_ms).max(0) as u64;
+    f.set_modified(UNIX_EPOCH + Duration::from_millis(ms)).unwrap();
+}
+
 #[test]
 fn compact_nudge_tick_treats_a_precompact_hook_marker_as_trusted_evidence() {
     // #417: a PreCompact hook marker (a marker FILE the generic hook script
@@ -5333,6 +5387,7 @@ fn compact_nudge_tick_treats_a_precompact_hook_marker_as_trusted_evidence() {
     // SAME tick, unlike a banner/manual inference arm which always needs a
     // later quiet observation.
     let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
     let empty = HashMap::new();
 
     // No marker yet: an ordinary quiet tick fires nothing (the heuristic
@@ -5342,8 +5397,7 @@ fn compact_nudge_tick_treats_a_precompact_hook_marker_as_trusted_evidence() {
 
     // Simulate the hook firing: write the marker the script would have.
     let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
-    fs::create_dir_all(marker.parent().unwrap()).unwrap();
-    fs::write(&marker, "").unwrap();
+    write_hook_marker(&marker, started_ms, 1_000);
 
     // The marker arms AND resolves in this one tick (loomux pasted nothing
     // itself, so this is not a "nudge"; the reinjection notice is a separate
@@ -5377,22 +5431,108 @@ fn compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_confirm(
     // the PreCompact marker, which only arms while nothing is already
     // pending). This covers a hook config with only SessionStart wired, or a
     // PreCompact marker a tick loop raced past.
+    //
+    // rev-4 review (N3): the SessionStart hook is also the ONE script branch
+    // that emits native `additionalContext` (see `COMPACT_HOOK_SCRIPT`) — so
+    // Claude Code has ALREADY re-grounded the agent by the time this marker
+    // is observed. loomux's OWN reinjection is therefore skipped entirely
+    // here (a double re-grounding would spend exactly the tokens native
+    // delivery exists to save) — this resolves straight to `compact_pending
+    // = false`, not into the delivery-confirmation phase.
     let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
     let empty = HashMap::new();
 
     let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
-    fs::create_dir_all(marker.parent().unwrap()).unwrap();
-    fs::write(&marker, "").unwrap();
+    write_hook_marker(&marker, started_ms, 1_000);
 
-    // Arms AND resolves into the delivery-confirmation phase on this one
-    // tick, same as the PreCompact marker with an already-quiet pane.
     assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
     let a = reg.agent(&oid).unwrap();
-    assert!(a.compact_pending);
+    assert!(!a.compact_pending, "native re-grounding already landed — nothing left pending");
+    assert!(a.compact_reinject_attempted_ms.is_none(), "no loomux-side delivery to confirm");
+    assert_eq!(a.compact_pending_evidence, None, "cleared on this terminal resolution");
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1, "the arm is still audited");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0, "no duplicate re-grounding is pasted");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 1);
+}
+
+#[test]
+fn compact_nudge_tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection() {
+    // rev-4 review (N3): the fallback half of the same fix. A PreCompact
+    // marker with NO SessionStart marker (a hook config that only wires the
+    // one event, or a SessionStart marker this tick loop simply hasn't seen
+    // yet) never delivered native `additionalContext` — the script's
+    // `precompact` branch only ever writes a marker, nothing else — so
+    // loomux's own reinjection must still fire. Never silently drop the ONLY
+    // re-grounding channel just because SOME hook evidence exists.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty = HashMap::new();
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on the reinjection's own delivery to confirm");
     assert!(a.compact_reinject_attempted_ms.is_some());
     assert_eq!(a.compact_pending_evidence, Some("hook"));
-    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1);
-    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "the ONLY re-grounding channel available must still fire");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 0);
+}
+
+#[test]
+fn compact_nudge_tick_ignores_a_hook_marker_older_than_the_agent_itself() {
+    // rev-4 review (B1, blocking): the exact failure sequence a live restart
+    // can hit. `compact_hook_*_seen_ms` is in-memory (resets to `None` on a
+    // fresh `AgentEntry`), and agent ids come from an in-memory counter too
+    // — so a fresh boot can mint an id a PREVIOUS process already used,
+    // while the group's `hooks/` marker files (on disk) survive the
+    // restart untouched. Without the `ts > a.started_ms` gate, the very
+    // first tick after such a restart would read the OLD process's marker
+    // as "fresh evidence" (`ts > None.unwrap_or(0)` is true for any real
+    // mtime) and arm TRUSTED with no compaction having happened at all.
+    // Uses the PreCompact marker specifically (not SessionStart): #417's N3
+    // fix resolves a fresh SessionStart marker straight to a terminal state
+    // in the SAME tick (native re-grounding already delivered — see
+    // `compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_
+    // confirm`), which would make this test's own "still arms normally"
+    // half read the wrong signal. PreCompact's arm-then-wait-for-delivery
+    // shape keeps this test's B1 story (the `started_ms` gate itself)
+    // decoupled from N3's separate concern.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    let f = fs::File::create(&marker).unwrap();
+    // Backdate the marker to well before this agent's own `started_ms` —
+    // exactly the shape of one surviving from a PREVIOUS process.
+    f.set_modified(UNIX_EPOCH + Duration::from_millis(started_ms.saturating_sub(60_000))).unwrap();
+    drop(f);
+
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "a marker older than the agent's own started_ms must never arm");
+    assert_eq!(a.compact_pending_evidence, None);
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 0);
+    // Never treated as evidence at all, so never consumed either.
+    assert!(marker.exists(), "a rejected stale marker is left alone, not silently deleted");
+
+    // A GENUINELY fresh marker (mtime after started_ms) from the SAME agent
+    // still arms normally — the fix excludes only markers that PREDATE it.
+    // Mtime set explicitly (not just "written just now") so this assertion
+    // can never flake on two real-clock reads landing in the same
+    // millisecond as `started_ms` itself.
+    let f = fs::File::create(&marker).unwrap();
+    f.set_modified(UNIX_EPOCH + Duration::from_millis(started_ms + 1_000)).unwrap();
+    drop(f);
+    assert!(reg.compact_nudge_tick(2_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "a marker written during this agent's own lifetime still arms");
+    assert_eq!(a.compact_pending_evidence, Some("hook"));
+    assert!(!marker.exists(), "delete-on-consume: an ACTUALLY-used marker is removed from disk");
 }
 
 #[test]
@@ -10364,6 +10504,23 @@ fn end_group_sweeps_the_attachments_scratch_dir() {
         dir.path().join(&g.id).join("state.json").is_file(),
         "non-attachment group state must survive teardown",
     );
+}
+
+#[test]
+fn end_group_reclaims_generated_copilot_agent_files() {
+    // rev-4 review (N4): without this, a #416-generated `~/.copilot/agents/
+    // loomux-<group>-<block>.agent.md` outlives the group it was written
+    // for — accumulating forever and cluttering the user's real Copilot
+    // agent list with dead groups' names.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let generated = dir.path().join("copilot-agents").join(format!("loomux-{}-{}.agent.md", g.id, w.block));
+    assert!(generated.is_file(), "the default-roster worker must have gotten a generated wrapper file: {generated:?}");
+
+    reg.end_group(&g.id, false).unwrap();
+    assert!(!generated.exists(), "the generated file must be reclaimed on group end");
 }
 
 #[test]
