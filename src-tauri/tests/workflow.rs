@@ -33,6 +33,7 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     // #416: never let a test write a generated Copilot custom-agent file into
     // the REAL `~/.copilot/agents` — point it at this same disposable tree.
     reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
     (reg, dir)
 }
 
@@ -1027,6 +1028,7 @@ fn default_roster_command_lines_now_carry_the_durable_contract_on_agents() {
             workflow::model_of(b, &g.guardrails.agent_cli),
             auto_ops,
             cfg,
+            None,
             gdir,
             wd,
             None,
@@ -1053,7 +1055,7 @@ fn default_roster_command_lines_now_carry_the_durable_contract_on_agents() {
             &serde_json::to_string(&json!({ block_id: payload[block_id] })).unwrap(),
         );
         let expected = format!(
-            "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --settings \"C:/x/cfg.json\" \
+            "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
              --model {model} --permission-mode {perm} --add-dir \"C:/data/group\" \
              --allowedTools mcp__loomux{extra} --agents '{agents_json}' --agent {block_id}"
         );
@@ -1533,6 +1535,7 @@ fn compile(reg: &OrchRegistry, g: &loomux_lib::orchestration::GroupInfo, block_i
         workflow::model_of(b, &g.guardrails.agent_cli),
         false,
         &cfg,
+        None,
         &gdir,
         Path::new("C:/repo"),
         None,
@@ -1545,6 +1548,7 @@ fn compile(reg: &OrchRegistry, g: &loomux_lib::orchestration::GroupInfo, block_i
         workflow::model_of(b, &g.guardrails.agent_cli),
         false,
         &cfg,
+        None,
         &gdir,
         Path::new("C:/repo"),
         None,
@@ -2518,6 +2522,7 @@ fn orchestrator_command(
         workflow::model_of(b, &g.guardrails.agent_cli),
         true, // auto_ops — the default, and the posture that makes this matter
         Path::new("C:/x/cfg.json"),
+        None,
         Path::new("C:/data/group"),
         Path::new("C:/repo"),
         None,
