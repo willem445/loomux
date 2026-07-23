@@ -17,15 +17,33 @@ test("compactionStatusLabel: none omits the row entirely", () => {
 });
 
 test("compactionStatusLabel: armed names the trust source", () => {
-  assert.equal(compactionStatusLabel({ status: "armed", trusted: true }), "compact armed");
-  assert.equal(compactionStatusLabel({ status: "armed", trusted: false }), "compact armed (unconfirmed)");
+  assert.equal(compactionStatusLabel({ status: "armed", trusted: true, source: null }), "compact armed");
+  assert.equal(compactionStatusLabel({ status: "armed", trusted: false, source: null }), "compact armed (unconfirmed)");
 });
 
 test("compactionStatusLabel: awaiting_evidence names the trust source", () => {
-  assert.equal(compactionStatusLabel({ status: "awaiting_evidence", trusted: true }), "compact awaiting evidence");
   assert.equal(
-    compactionStatusLabel({ status: "awaiting_evidence", trusted: false }),
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: true, source: null }),
+    "compact awaiting evidence"
+  );
+  assert.equal(
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: false, source: null }),
     "compact awaiting evidence (unconfirmed)"
+  );
+});
+
+test("compactionStatusLabel: #417 hook-sourced evidence beats trusted/unconfirmed wording", () => {
+  // A hook-confirmed arm IS trusted (no inference gate), but the label must
+  // still distinguish it from the loomux-initiated trusted arm — a human
+  // watching the panel should be able to tell "a hook told us" from "loomux
+  // decided to compact" at a glance.
+  assert.equal(
+    compactionStatusLabel({ status: "armed", trusted: true, source: "hook" }),
+    "compact armed (hook-confirmed)"
+  );
+  assert.equal(
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: true, source: "hook" }),
+    "compact awaiting evidence (hook-confirmed)"
   );
 });
 
@@ -55,10 +73,12 @@ test("compactionStatusLabel: abandoned names the two real lost-outcome reasons",
 
 test("compactionStatusTitle: every non-none status has an explanatory tooltip", () => {
   const statuses: CompactionStatus[] = [
-    { status: "armed", trusted: true },
-    { status: "armed", trusted: false },
-    { status: "awaiting_evidence", trusted: true },
-    { status: "awaiting_evidence", trusted: false },
+    { status: "armed", trusted: true, source: null },
+    { status: "armed", trusted: false, source: null },
+    { status: "armed", trusted: true, source: "hook" },
+    { status: "awaiting_evidence", trusted: true, source: null },
+    { status: "awaiting_evidence", trusted: false, source: null },
+    { status: "awaiting_evidence", trusted: true, source: "hook" },
     { status: "reinjecting", attempt: 1, max_attempts: 3 },
     { status: "abandoned", reason: "arm-timeout", since_ms: 0 },
     { status: "abandoned", reason: "reinjection-abandoned", since_ms: 0 },

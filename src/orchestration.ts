@@ -908,8 +908,10 @@ export interface AgentSummary {
  *  (`#[serde(tag = "status")]`) — never invent a parallel vocabulary here. */
 export type CompactionStatus =
   | { status: "none" }
-  | { status: "armed"; trusted: boolean }
-  | { status: "awaiting_evidence"; trusted: boolean }
+  // `source` (#417): "hook" when a PreCompact/SessionStart marker armed this —
+  // trusted evidence, not an inference — vs `null` for every pre-#417 arm path.
+  | { status: "armed"; trusted: boolean; source: string | null }
+  | { status: "awaiting_evidence"; trusted: boolean; source: string | null }
   | { status: "reinjecting"; attempt: number; max_attempts: number }
   | { status: "abandoned"; reason: string; since_ms: number };
 

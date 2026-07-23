@@ -20,7 +20,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
 use loomux_lib::orchestration::{
-    Caller, Guardrails, Launch, OrchRegistry, PersonaInject, Role,
+    block_contract_text, Caller, Guardrails, Launch, OrchRegistry, Role,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -30,6 +30,9 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = OrchRegistry::new(dir.path().to_path_buf());
     reg.set_port(45999); // fake port so config writing works
+    // #416: never let a test write a generated Copilot custom-agent file into
+    // the REAL `~/.copilot/agents` — point it at this same disposable tree.
+    reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
     (reg, dir)
 }
 
@@ -973,12 +976,20 @@ fn gate_require_and_threshold_disagreeing_is_a_named_error() {
 // ───────────────────── the default roster: nothing changed ──────────────────
 
 #[test]
-fn default_roster_command_lines_match_legacy() {
-    // THE regression pin (#222). A repo with no `.loomux/workflow.yml` gets the
-    // synthesized 4-block roster, and every block must build the byte-for-byte
-    // command line loomux emitted before blocks existed. The expected strings
-    // below are copied verbatim from `build_agent_command_full_line_snapshots`
-    // in tests/orchestration.rs, which predates this change.
+fn default_roster_command_lines_now_carry_the_durable_contract_on_agents() {
+    // Formerly "THE regression pin (#222)": a repo with no `.loomux/
+    // workflow.yml` used to get the byte-for-byte pre-#222 command line —
+    // NO `--agents`/`--agent`/`--settings` at all, since those only ever
+    // carried a REPO persona and a default-roster block has none.
+    //
+    // #416 deliberately changes that: the built-in role CONTRACT (mechanics +
+    // class template — exactly the bytes written to the block's instructions
+    // file) now rides the CLI's native system-prompt mechanism for EVERY
+    // block, persona or not. This is a re-blessed golden, not a regression —
+    // the gap it closes is real (see doc/design/orchestration.md's #416
+    // note): compaction could dilute the contract when it lived only in a
+    // "read this file" kickoff step. Everything ELSE about the command line
+    // (model, permission-mode, allow/deny lists) is still pinned exactly.
     let (reg, _d) = test_registry();
     let repo = Repo::new(); // no .loomux/ at all — the common case
     let g = reg.create_group(&repo.path(), rails()).unwrap();
@@ -994,15 +1005,24 @@ fn default_roster_command_lines_match_legacy() {
     let wd = Path::new("C:/repo");
 
     // Build each block exactly the way `spawn_agent_ex` does: resolve its
-    // persona, compile it, hand it to the command builder.
-    let line = |block_id: &str, auto_ops: bool| -> String {
+    // persona, read back the instructions file for `contract` (already
+    // written by `create_group`'s `write_instruction_files`), compile it,
+    // hand it to the command builder. Returns the shell-string command PLUS
+    // the parsed `--agents` payload, so the test can check the contract's
+    // CONTENT, not just that the flag is present.
+    let line = |block_id: &str, auto_ops: bool| -> (String, Value) {
         let b = g.guardrails.block(block_id).unwrap();
         let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
         let persona = reg.resolve_persona(&g, b).unwrap();
         assert!(persona.is_none(), "a default-roster block has no persona to compile");
-        let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref());
-        assert_eq!(inject, PersonaInject::default(), "no persona ⇒ no flags at all");
-        reg.build_agent_command(
+        let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+        let contract = block_contract_text(&instructions_body, persona.as_ref());
+        assert_eq!(contract, instructions_body, "no persona ⇒ contract IS the instructions body, unchanged");
+        assert!(!contract.trim().is_empty(), "{block_id}'s contract must never be empty");
+        let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+        assert!(inject.kickoff.is_none(), "claude never uses the kickoff fallback");
+        assert!(inject.extra_allow.is_empty(), "no persona ⇒ no extra allow patterns");
+        let cmd = reg.build_agent_command(
             cli,
             workflow::model_of(b, &g.guardrails.agent_cli),
             auto_ops,
@@ -1013,35 +1033,45 @@ fn default_roster_command_lines_match_legacy() {
             false,
             b.kind.is_read_only(),
             &inject,
-        )
+        );
+        let payload: Value = serde_json::from_str(inject.claude_agents_json.as_deref().unwrap())
+            .expect("--agents payload must be valid JSON");
+        // #416: the payload is sanitized the same way a repo persona already
+        // was — loomux's own template prose is full of literal apostrophes
+        // ("don't"), which would otherwise close the single-quoted shell
+        // token the payload rides in.
+        assert_eq!(
+            payload[block_id]["prompt"], json!(workflow::sanitize_persona(&contract)),
+            "{block_id}'s system-prompt payload must be its instructions-file bytes, sanitized"
+        );
+        assert_eq!(payload[block_id]["description"], json!(block_id), "no persona ⇒ description falls back to the block id");
+        (cmd, payload)
     };
 
-    assert_eq!(
-        line("worker", true),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
-         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
-         \"Bash(git *)\" \"Bash(gh *)\"",
-        "the worker block must emit the pre-#222 worker command, to the byte"
+    let expect = |cmd: &str, payload: &Value, block_id: &str, model: &str, perm: &str, extra: &str| {
+        let agents_json = workflow::ascii_escape_json(
+            &serde_json::to_string(&json!({ block_id: payload[block_id] })).unwrap(),
+        );
+        let expected = format!(
+            "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --settings \"C:/x/cfg.json\" \
+             --model {model} --permission-mode {perm} --add-dir \"C:/data/group\" \
+             --allowedTools mcp__loomux{extra} --agents '{agents_json}' --agent {block_id}"
+        );
+        assert_eq!(cmd, &expected, "{block_id}'s command line changed in an unexpected way");
+    };
+
+    let (cmd, payload) = line("worker", true);
+    expect(&cmd, &payload, "worker", "sonnet", "auto", " \"Bash(git *)\" \"Bash(gh *)\"");
+    let (cmd, payload) = line("reviewer", false);
+    expect(&cmd, &payload, "reviewer", "sonnet", "acceptEdits", "");
+    let (cmd, payload) = line("planner", false);
+    expect(
+        &cmd, &payload, "planner", "opus", "auto",
+        " \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
+          \"Bash(git commit *)\" \"Bash(git push *)\"",
     );
-    assert_eq!(
-        line("reviewer", false),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
-         --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
-    );
-    assert_eq!(
-        line("planner", false),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model opus \
-         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
-         \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
-         \"Bash(git commit *)\" \"Bash(git push *)\"",
-        "the planner block must still be structurally read-only at the CLI level"
-    );
-    assert_eq!(
-        line("orchestrator", true),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model opus \
-         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
-         \"Bash(git *)\" \"Bash(gh *)\""
-    );
+    let (cmd, payload) = line("orchestrator", true);
+    expect(&cmd, &payload, "orchestrator", "opus", "auto", " \"Bash(git *)\" \"Bash(gh *)\"");
 
     // Agent ids and instruction-file paths are unchanged too — they are in the
     // kickoff text the agent reads.
@@ -1423,15 +1453,22 @@ fn copilot_native_agent_is_refused_when_the_handle_names_a_different_file() {
             "---\nname: worker\ndescription: The worker.\n---\nBranch, commit, open a PR.",
         );
     let g = reg.create_group(&repo.path(), rails()).unwrap();
-    let (cmd, _argv, kickoff) = compile(&reg, &g, "rev-security");
+    let (cmd, argv, kickoff) = compile(&reg, &g, "rev-security");
 
+    // #416: the ambiguous handle still must NOT reach copilot's NATIVE flag
+    // (that would load the wrong file — the reasoning above is unchanged),
+    // but the persona loomux actually read now reaches the CLI via a
+    // loomux-GENERATED wrapper file (a unique handle loomux invents itself,
+    // so there is no ambiguity to exploit) instead of falling all the way
+    // back to a kickoff-only paste.
+    let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
+    assert_ne!(handle, "worker", "must never resolve to the wrong file's name: {cmd}");
+    assert!(kickoff.is_none(), "the generated wrapper carries it now; no kickoff fallback needed");
+    let generated_path = _d.path().join("copilot-agents").join(format!("{handle}.agent.md"));
+    let generated_text = fs::read_to_string(&generated_path).expect("generated wrapper must exist");
     assert!(
-        !cmd.contains("--agent"),
-        "an ambiguous handle must NOT reach copilot's native flag — it would load the wrong file: {cmd}"
-    );
-    assert!(
-        kickoff.as_deref().unwrap().contains("injection and authz"),
-        "the persona loomux actually read is delivered instead, via the kickoff"
+        generated_text.contains("injection and authz"),
+        "the persona loomux actually read is delivered, not the file `worker` would ambiguously resolve to: {generated_text}"
     );
     let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
     assert!(audit.lines().any(|l| l.contains("copilot-agent-handle-ambiguous")), "and it is audited");
@@ -1483,7 +1520,12 @@ fn compile(reg: &OrchRegistry, g: &loomux_lib::orchestration::GroupInfo, block_i
     // A persona that won't load is dropped, exactly as `spawn_agent_ex` drops it
     // (audited, never fatal) — so this helper must not unwrap the error either.
     let persona = reg.resolve_persona(g, b).unwrap_or(None);
-    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref());
+    // #416: the same instructions-file read-back + `block_contract_text` fold-in
+    // `spawn_agent_ex`/`register_orchestrator_pane` use for `contract` —
+    // `create_group` above already wrote the file via `write_instruction_files`.
+    let instructions_body = instructions_lf(reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
     let cfg = PathBuf::from("C:/x/cfg.json");
     let gdir = PathBuf::from("C:/data/group");
     let cmd = reg.build_agent_command(
@@ -1564,23 +1606,36 @@ fn copilot_uses_its_native_agent_flag_only_for_a_user_authored_github_agents_fil
     let g = reg.create_group(&repo.path(), rails()).unwrap();
 
     // A `profile:` under .github/agents is exactly what Copilot's `--agent` can
-    // resolve — so use the native flag and hand it the NAME.
+    // resolve — so use the native flag and hand it the NAME, unwrapped: loomux
+    // never synthesizes a file around a user-authored one (residual #416 gap,
+    // documented in doc/design/orchestration.md — this one case still relies
+    // on the kickoff/file-read for mechanics-core coverage).
     let (cmd, argv, kickoff) = compile(&reg, &g, "worker");
     assert!(cmd.contains("--agent repo-worker"), "native copilot persona: {cmd}");
     assert!(argv.windows(2).any(|w| w == ["--agent", "repo-worker"]));
     assert!(kickoff.is_none(), "the native flag carries the persona; nothing to inject");
     assert!(!cmd.contains("--agents"), "--agents is a claude flag; copilot has no inline form");
 
-    // An INLINE prompt has no file for `--agent` to name, and loomux must not
-    // manufacture one in the user's .github/agents (that would dirty their git
-    // tree with files they didn't write). So it falls back to kickoff injection.
-    let (cmd, _argv, kickoff) = compile(&reg, &g, "rev-perf");
-    assert!(!cmd.contains("--agent"), "no file to name ⇒ no --agent: {cmd}");
-    assert!(
-        kickoff.as_deref().unwrap().contains("perf regressions"),
-        "the persona must reach the agent as kickoff text instead"
-    );
-    // And the user's repo is untouched.
+    // #416: an INLINE prompt has no user-authored file to name, but loomux must
+    // still get the durable contract onto Copilot's system-prompt layer — so it
+    // generates its OWN wrapper file, in Copilot's user-level agent directory
+    // (never the repo's `.github/agents/`, which stays untouched), and points
+    // `--agent` at THAT. This replaces the pre-#416 kickoff-only fallback.
+    let (cmd, argv, kickoff) = compile(&reg, &g, "rev-perf");
+    assert!(kickoff.is_none(), "the generated file carries it now; no kickoff fallback needed");
+    let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
+    assert!(handle.starts_with(&format!("loomux-{}-rev-perf", g.id)), "unexpected handle: {handle}");
+    assert!(cmd.contains(&format!("--agent {handle}")), "{cmd}");
+    assert!(!cmd.contains("--agents"), "--agents is a claude flag; copilot has no inline form");
+    // `test_registry` points the generated-file directory at `_d`'s own temp
+    // tree (never the real `~/.copilot/agents`) — read it back from there.
+    let generated_path = _d.path().join("copilot-agents").join(format!("{handle}.agent.md"));
+    let generated_text = fs::read_to_string(&generated_path)
+        .unwrap_or_else(|e| panic!("generated copilot agent file must exist at {}: {e}", generated_path.display()));
+    assert!(generated_text.contains("perf regressions"), "{generated_text}");
+    assert!(generated_text.contains("Loomux reviewer instructions"), "the mechanics core rides along too: {generated_text}");
+
+    // And the user's repo is untouched either way.
     let authored: Vec<String> = fs::read_dir(Path::new(&repo.path()).join(".github/agents"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1590,19 +1645,38 @@ fn copilot_uses_its_native_agent_flag_only_for_a_user_authored_github_agents_fil
 
 #[test]
 fn a_kickoff_persona_is_framed_as_an_addendum_not_a_replacement() {
-    // The copilot fallback pastes repo-authored text into an agent's first
-    // prompt. That text must never read as "ignore your instructions" — it is
-    // introduced as a persona layered on the loomux contract, which stays in the
-    // instructions file the same prompt points at.
+    // #416: an inline `prompt:` persona now normally reaches copilot via a
+    // GENERATED wrapper file (see `copilot_uses_its_native_agent_flag_only_
+    // for_a_user_authored_github_agents_file`), not the kickoff paste this
+    // test used to exercise directly. The framing invariant itself — a
+    // persona is introduced as an ADDENDUM layered on the loomux contract,
+    // never as something that could read "ignore your instructions" — now
+    // lives in `block_contract_text`, so that's what's pinned first; the
+    // kickoff-fallback path (still reachable when `~/.copilot/agents` is
+    // unwritable) is checked second, directly, since `compile` no longer
+    // naturally exercises it in a normal test environment.
     let (reg, _d) = test_registry();
     let repo = Repo::new().workflow(
         "version: 1\nblocks:\n  - id: worker\n    kind: worker\n    cli: copilot\n    prompt: You are terse.\n",
     );
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
-    let (_cmd, _argv, kickoff) = compile(&reg, &g, "worker");
+    let (_cmd, argv, kickoff) = compile(&reg, &g, "worker");
+    assert!(kickoff.is_none(), "the generated wrapper carries it now");
+    let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
+    let generated_path = _d.path().join("copilot-agents").join(format!("{handle}.agent.md"));
+    let generated = fs::read_to_string(&generated_path).expect("generated wrapper must exist");
+    assert!(generated.contains("You are terse."), "the persona is delivered");
+    assert!(
+        generated.contains("does not override the loomux mechanics"),
+        "the persona must be framed as an addendum: {generated}"
+    );
 
-    let k = reg.kickoff_prompt(&w, &g, "note", kickoff.as_deref());
+    // The kickoff-fallback framing (unwritable `~/.copilot/agents`, or any
+    // other CLI/case still reaching `kickoff_prompt`'s `persona` parameter)
+    // is unchanged: still an addendum, never a replacement, with the
+    // instructions file still pointed at.
+    let k = reg.kickoff_prompt(&w, &g, "note", Some("You are terse."));
     assert!(k.contains("You are terse."), "the persona is delivered");
     assert!(k.contains("worker.md"), "the loomux contract is still pointed at");
     assert!(
@@ -2415,7 +2489,14 @@ fn a_persona_file_cannot_move_a_block_into_another_capability_class() {
     assert_eq!(p.role, Role::Planner);
     let (cmd, _argv, kickoff) = compile(&reg, &g, "plan");
     assert!(cmd.contains("--disallowedTools Edit Write"), "still structurally read-only: {cmd}");
-    assert!(!cmd.contains("--agent "), "the rejected persona reaches the CLI in no form");
+    // #416: --agent DOES appear (loomux's own planner.md contract, since the
+    // block still gets its durable contract regardless of the rejected
+    // persona) — what must never reach the CLI is the REJECTED file's text.
+    assert!(cmd.contains("--agent plan"), "the built-in contract still rides the system prompt: {cmd}");
+    assert!(
+        !cmd.contains("write access, please"),
+        "the rejected persona's text reaches the CLI in no form: {cmd}"
+    );
     assert!(kickoff.is_none());
 }
 
@@ -2429,7 +2510,9 @@ fn orchestrator_command(
     let b = g.guardrails.block_for(Role::Orchestrator).expect("a group always has one");
     let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
     let persona = reg.resolve_persona(g, b).unwrap_or(None);
-    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref());
+    let instructions_body = instructions_lf(reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
     let cmd = reg.build_agent_command(
         cli,
         workflow::model_of(b, &g.guardrails.agent_cli),
@@ -2478,12 +2561,19 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
 
     // 2. End to end: the file is skipped, and rev-7's repro — the evil
     //    `--agents '{...}' --agent orchestrator` emission — is unreachable.
+    //
+    // #416: `--agents '{...}' --agent orchestrator` DOES now appear on every
+    // orchestrator command line (the durable-contract change applies to the
+    // trust root too) — but its payload is loomux's OWN orchestrator.md
+    // contract, never the repo's. The assertion that matters was never
+    // "no --agents flag", it was "no REPO TEXT reaches the trust root's
+    // system prompt", so that's what's pinned directly against the payload.
     let (reg, _d) = test_registry();
     let repo = Repo::new().workflow(evil);
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let (cmd, kickoff) = orchestrator_command(&reg, &g);
-    assert!(!cmd.contains("--agents"), "no repo text may reach the trust root's system prompt: {cmd}");
-    assert!(!cmd.contains("--agent "), "{cmd}");
+    assert!(cmd.contains("--agents"), "the built-in contract still rides the system prompt: {cmd}");
+    assert!(cmd.contains("--agent orchestrator"), "{cmd}");
     assert!(!cmd.contains("curl evil.sh"), "{cmd}");
     assert!(kickoff.is_none(), "nor via the kickoff fallback");
 
@@ -2514,7 +2604,10 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
 
     let (cmd, kickoff) = orchestrator_command(&reg, &g);
     assert!(!cmd.contains("curl evil.sh"), "the smuggled prompt must not reach the CLI: {cmd}");
-    assert!(!cmd.contains("--agents") && !cmd.contains("--agent "), "{cmd}");
+    // #416: --agents/--agent DO appear (loomux's own contract, same as any
+    // other orchestrator) — the security property is "no repo text", not
+    // "no flag", exactly like case 2 above.
+    assert!(cmd.contains("--agents") && cmd.contains("--agent orchestrator"), "{cmd}");
     assert!(!cmd.contains("Bash(curl *)"), "nor may it pre-approve the trust root's tools: {cmd}");
     assert!(kickoff.is_none());
     let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
@@ -4443,9 +4536,13 @@ fn the_builtin_roster_still_honors_the_launchers_per_role_models() {
         ["orchestrator", "worker", "reviewer", "planner"],
         "the toggle is off — the repo's own workflow file must not be read at all"
     );
-    let (worker, _, _) = compile(&reg, &g, "worker");
+    let (worker, _, kickoff) = compile(&reg, &g, "worker");
     assert!(worker.contains("--model opus"), "the launcher's worker pick decides: {worker}");
-    assert!(!worker.contains("--agent"), "and a toggle-off group has no personas: {worker}");
+    // #416: --agent DOES appear (the built-in worker contract, same as any
+    // default-roster block) — "a toggle-off group has no personas" now means
+    // no REPO text reaches it, not that the flag is absent.
+    assert!(worker.contains("--agent worker"), "the built-in contract still rides the system prompt: {worker}");
+    assert!(kickoff.is_none(), "a toggle-off group has no persona to fall back to a kickoff for");
     let (reviewer, _, _) = compile(&reg, &g, "reviewer");
     assert!(reviewer.contains("--model haiku"), "the launcher's reviewer pick decides: {reviewer}");
 }

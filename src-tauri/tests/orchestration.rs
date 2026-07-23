@@ -29,7 +29,7 @@ use loomux_lib::orchestration::{
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     paste_held_notice,
-    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
+    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, resume_kickoff_notice, rotate_audit_if_needed,
     sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
@@ -97,6 +97,9 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = OrchRegistry::new(dir.path().to_path_buf());
     reg.set_port(45999); // fake port so config writing works
+    // #416: never let a test write a generated Copilot custom-agent file into
+    // the REAL `~/.copilot/agents` — point it at this same disposable tree.
+    reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
     (reg, dir)
 }
 
@@ -1408,18 +1411,22 @@ fn build_agent_command_full_line_snapshots() {
     };
 
     // Claude worker, auto_ops ON → native Auto mode + git/gh pre-approval.
+    // #417: `--settings` now always rides alongside `--mcp-config` for Claude
+    // (the same generated file — see `write_mcp_config`'s doc) so the
+    // PreCompact/SessionStart hook config can layer in when present; a
+    // `PersonaInject::default()` command still carries no `--agents`/`--agent`.
     assert_eq!(
         cmd("claude", "sonnet", true, false),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
-         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --settings \"C:/x/cfg.json\" \
+         --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\""
     );
 
     // Claude worker, auto_ops OFF → acceptEdits, no git/gh, no denials.
     assert_eq!(
         cmd("claude", "sonnet", false, false),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
-         --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --settings \"C:/x/cfg.json\" \
+         --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
     );
 
     // Copilot worker, auto_ops ON → group autopilot: --autopilot + all tools/paths.
@@ -1442,8 +1449,8 @@ fn build_agent_command_full_line_snapshots() {
     // plus the write/commit/push denials, gh still reachable.
     assert_eq!(
         cmd("claude", "opus", false, true),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model opus \
-         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --settings \"C:/x/cfg.json\" \
+         --model opus --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
          \"Bash(git commit *)\" \"Bash(git push *)\""
     );
@@ -1520,10 +1527,12 @@ fn build_agent_argv_snapshots() {
         |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default());
 
     // Claude worker, auto_ops ON. Note the quote-free literal tool tokens.
+    // #417: `--settings` (same file as `--mcp-config`) now always rides too.
     assert_eq!(
         argv("claude", "sonnet", true, false),
         vec![
-            "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--model", "sonnet",
+            "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--settings",
+            "C:/x/cfg.json", "--model", "sonnet",
             "--permission-mode", "auto", "--add-dir", "C:/data/group", "--allowedTools",
             "mcp__loomux", "Bash(git *)", "Bash(gh *)",
         ]
@@ -1631,6 +1640,47 @@ fn copilot_mcp_config_includes_tools_allowlist() {
     .unwrap();
     assert!(cfg.contains("\"tools\""), "copilot expects a tools allowlist in the server entry");
     assert!(cfg.contains(&w.token));
+    // #417: copilot has no PreCompact-equivalent hook (confirmed absent
+    // upstream) — it stays on the pre-existing inference tier, never faked.
+    assert!(!cfg.contains("\"hooks\""), "copilot must not get a hooks block it can't use: {cfg}");
+}
+
+#[test]
+fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
+    // #417: PreCompact + SessionStart(compact) hook config folds into the
+    // SAME generated file `--mcp-config`/`--settings` both point at (see
+    // `write_mcp_config`'s doc) — never a hand-merge of the user's own
+    // `.claude/settings.json`. Skipped (not failed) when no `sh` interpreter
+    // is resolvable at all, mirroring the #335 shim tests' "skip, don't
+    // fail" precedent for an environment where `sh.exe` genuinely can't be
+    // found — `resolve_hook_sh`'s own fail-open policy.
+    #[cfg(windows)]
+    if locate_sh_exe().is_none() {
+        eprintln!("SKIP claude_agent_spawn_provisions_the_compact_lifecycle_hooks: no sh.exe found via `where`");
+        return;
+    }
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let cfg_path = reg.state_root().join(&g.id).join("configs").join(format!("{}.json", w.id));
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    let precompact = cfg["hooks"]["PreCompact"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+    let sessionstart = cfg["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+    assert!(precompact.contains("precompact"), "{precompact}");
+    assert!(sessionstart.contains("sessionstart-compact"), "{sessionstart}");
+    assert_eq!(cfg["hooks"]["SessionStart"][0]["matcher"], json!("compact"), "only compact-sourced starts are hooked");
+    // The command embeds this agent's group dir + id as literal argv — the
+    // generic script itself carries none of it (constraint #8).
+    assert!(precompact.contains(&w.id), "{precompact}");
+    assert!(precompact.contains(&g.id), "{precompact}");
+
+    // The generic script itself was written to the shared, per-machine dir —
+    // never per-group, since it carries no group-specific text.
+    let script = reg.state_root().parent().unwrap().join("compacthook").join("compact-hook.sh");
+    let script_text = fs::read_to_string(&script).expect("the hook script must be written");
+    assert!(script_text.contains("precompact") && script_text.contains("sessionstart-compact"));
+    assert!(!script_text.contains(&g.id), "the script itself must stay generic — group specifics ride on argv only");
 }
 
 fn copilot_rails() -> Guardrails {
@@ -5274,6 +5324,78 @@ fn compact_nudge_ignores_subfloor_repaint_growth() {
 }
 
 #[test]
+fn compact_nudge_tick_treats_a_precompact_hook_marker_as_trusted_evidence() {
+    // #417: a PreCompact hook marker (a marker FILE the generic hook script
+    // writes — see `COMPACT_HOOK_SCRIPT`) is DIRECT evidence. It arms exactly
+    // like the loomux-initiated path (trusted, no busy-then-quiet inference
+    // gate) AND is treated as already busy — so with the pane already quiet
+    // (no output growth), arm and resolve-into-reinjection happen on the
+    // SAME tick, unlike a banner/manual inference arm which always needs a
+    // later quiet observation.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let empty = HashMap::new();
+
+    // No marker yet: an ordinary quiet tick fires nothing (the heuristic
+    // window is 20 minutes away; nothing else armed it either).
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+
+    // Simulate the hook firing: write the marker the script would have.
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(&marker, "").unwrap();
+
+    // The marker arms AND resolves in this one tick (loomux pasted nothing
+    // itself, so this is not a "nudge"; the reinjection notice is a separate
+    // `deliver_prompt`, not something `compact_nudge_tick`'s return value
+    // reports).
+    assert!(reg.compact_nudge_tick(2_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1, "the arm itself is audited, distinctly from the reinjection");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on confirmed delivery");
+    assert!(a.compact_reinject_attempted_ms.is_some(), "moved into the delivery-confirmation phase");
+    assert_eq!(a.compact_pending_evidence, Some("hook"), "the evidence tag survives into that phase");
+
+    // Confirm delivery: the arm resolves and the evidence tag clears.
+    let confirmed = confirmed_delivery(&oid, 2_000);
+    assert!(reg.compact_nudge_tick(3_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "confirmed delivery releases the latch");
+    assert_eq!(a.compact_pending_evidence, None, "cleared on resolution, like the trust flag it rides alongside");
+
+    // The SAME marker (unchanged mtime) must never re-arm.
+    assert!(reg.compact_nudge_tick(4_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "a stale, already-consumed marker must not re-arm");
+}
+
+#[test]
+fn compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_confirm() {
+    // #417: the SessionStart(compact) marker is even STRONGER direct proof —
+    // Claude Code itself restarted the session specifically because of a
+    // compact — so it arms AND confirms in one step, unconditionally (unlike
+    // the PreCompact marker, which only arms while nothing is already
+    // pending). This covers a hook config with only SessionStart wired, or a
+    // PreCompact marker a tick loop raced past.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let empty = HashMap::new();
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(&marker, "").unwrap();
+
+    // Arms AND resolves into the delivery-confirmation phase on this one
+    // tick, same as the PreCompact marker with an already-quiet pane.
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending);
+    assert!(a.compact_reinject_attempted_ms.is_some());
+    assert_eq!(a.compact_pending_evidence, Some("hook"));
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+}
+
+#[test]
 fn compact_nudge_skips_a_role_not_in_the_eligible_set() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", compact_rails(20, &["orchestrator"])).unwrap();
@@ -5546,6 +5668,25 @@ fn directive_ledger_embed_keeps_the_tail_and_states_truncation() {
 }
 
 #[test]
+fn resume_kickoff_notice_embeds_the_ledger_and_reproduces_the_old_string_without_one() {
+    // #411: the orchestration-restore kickoff didn't embed the directive
+    // ledger, unlike the post-compact reinjection notice — an app restart is
+    // the other surprise discontinuity the ledger exists to survive.
+    assert_eq!(
+        resume_kickoff_notice(None),
+        "[loomux] Orchestration restored: your MCP tools, the task board, and the audit log are \
+         live again in this session. Re-sync now: list_tasks, list_agents, get_state. Your \
+         previous worker panes are gone; resume a task session with spawn_agent(resume_session, \
+         cwd) when follow-ups need it. Then give the human a short status summary.",
+        "no ledger ⇒ byte-identical to the pre-#411 fixed string"
+    );
+    let embed = directive_ledger_embed("[1] scope: only touch the auth module", 2048, "C:/g/ledger-orch.log").unwrap();
+    let notice = resume_kickoff_notice(Some(&embed));
+    assert!(notice.contains("only touch the auth module"), "{notice}");
+    assert!(notice.starts_with("[loomux] Orchestration restored"), "the base notice is unchanged: {notice}");
+}
+
+#[test]
 fn directive_ledger_embed_never_drops_the_single_newest_entry_even_over_cap() {
     let ledger = "a much longer single directive entry than the tiny cap below allows for";
     let embed = directive_ledger_embed(ledger, 8, "C:/g/ledger-w-1.log").unwrap();
@@ -5594,37 +5735,45 @@ fn compaction_status_narrates_every_real_state_machine_phase() {
     // already-tracked state — pin each real phase maps to the right variant,
     // never a phase the state machine can't actually be in.
     assert_eq!(
-        compaction_status(false, false, false, None, 0, None, None, 1_000),
+        compaction_status(false, false, false, None, 0, None, None, 1_000, None),
         CompactionStatus::None,
         "no arm, no reinjection, no lost outcome"
     );
     assert_eq!(
-        compaction_status(true, true, false, None, 0, None, None, 1_000),
-        CompactionStatus::Armed { trusted: true },
+        compaction_status(true, true, false, None, 0, None, None, 1_000, None),
+        CompactionStatus::Armed { trusted: true, source: None },
         "pending, not yet observed busy — trusted arm"
     );
     assert_eq!(
-        compaction_status(true, false, false, None, 0, None, None, 1_000),
-        CompactionStatus::Armed { trusted: false },
+        compaction_status(true, false, false, None, 0, None, None, 1_000, None),
+        CompactionStatus::Armed { trusted: false, source: None },
         "pending, not yet observed busy — inference arm"
     );
     assert_eq!(
-        compaction_status(true, false, true, None, 0, None, None, 1_000),
-        CompactionStatus::AwaitingEvidence { trusted: false },
+        compaction_status(true, false, true, None, 0, None, None, 1_000, None),
+        CompactionStatus::AwaitingEvidence { trusted: false, source: None },
         "pending, busy observed — waiting on quiet to resolve"
     );
     assert_eq!(
-        compaction_status(true, true, false, Some(900), 2, None, None, 1_000),
+        // #417: a hook-armed pending is ALSO trusted (no inference gate), but
+        // carries `source: Some("hook")` so the panel can distinguish it from
+        // the loomux-initiated trusted arm above.
+        compaction_status(true, true, false, None, 0, None, None, 1_000, Some("hook")),
+        CompactionStatus::Armed { trusted: true, source: Some("hook") },
+        "pending, not yet observed busy — hook-confirmed arm"
+    );
+    assert_eq!(
+        compaction_status(true, true, false, Some(900), 2, None, None, 1_000, None),
         CompactionStatus::Reinjecting { attempt: 2, max_attempts: 3 },
         "reinject_attempted_ms set takes priority over the arm phase"
     );
     assert_eq!(
-        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 1_000),
+        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 1_000, None),
         CompactionStatus::Abandoned { reason: "arm-timeout".to_string(), since_ms: 500 },
         "a recent lost outcome, no active arm"
     );
     assert_eq!(
-        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 500 + 10 * 60 * 1000),
+        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 500 + 10 * 60 * 1000, None),
         CompactionStatus::None,
         "a lost outcome outside the recency window reads as none, not a stale problem"
     );
