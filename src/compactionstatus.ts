@@ -16,9 +16,9 @@ export function compactionStatusLabel(status: CompactionStatus): string | null {
     case "none":
       return null;
     case "armed":
-      return `compact ${status.trusted ? "armed" : "armed (unconfirmed)"}`;
+      return `compact ${armedQualifier(status)}`;
     case "awaiting_evidence":
-      return `compact awaiting evidence${status.trusted ? "" : " (unconfirmed)"}`;
+      return `compact awaiting evidence${evidenceQualifier(status)}`;
     case "reinjecting":
       return `re-grounding (attempt ${status.attempt}/${status.max_attempts})`;
     case "abandoned":
@@ -33,10 +33,12 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
     case "none":
       return null;
     case "armed":
+      if (status.source === "hook") return "a PreCompact/SessionStart hook confirmed this directly — waiting to observe the pane go busy";
       return status.trusted
         ? "loomux pasted /compact itself — waiting to observe the pane go busy"
         : "loomux believes a compact started (banner or manual typing) — waiting to observe the pane go busy";
     case "awaiting_evidence":
+      if (status.source === "hook") return "a PreCompact/SessionStart hook confirmed this directly — no inference needed, waiting for quiet to resolve";
       return status.trusted
         ? "busy observed — waiting for quiet to resolve"
         : "busy observed — waiting for quiet, then a confirmed token drop or compact_boundary marker before trusting it";
@@ -45,6 +47,19 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
     case "abandoned":
       return lostReasonTitle(status.reason);
   }
+}
+
+/** "hook-confirmed" beats "armed"/"armed (unconfirmed)" (#417) — a human
+ *  watching the panel should be able to tell a hook-confirmed compaction
+ *  from an inferred/loomux-initiated one at a glance. */
+function armedQualifier(status: { trusted: boolean; source: string | null }): string {
+  if (status.source === "hook") return "armed (hook-confirmed)";
+  return status.trusted ? "armed" : "armed (unconfirmed)";
+}
+
+function evidenceQualifier(status: { trusted: boolean; source: string | null }): string {
+  if (status.source === "hook") return " (hook-confirmed)";
+  return status.trusted ? "" : " (unconfirmed)";
 }
 
 function lostReasonLabel(reason: string): string {

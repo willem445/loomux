@@ -1870,6 +1870,176 @@ kickoff doesn't embed the directive ledger the way a `/compact` reinjection does
 [#411](https://github.com/willem445/loomux/issues/411), a known scope boundary (a different code
 path, `spawn_agent_ex`'s resume branch, not `compact_nudge_tick`).
 
+### #416/#417: a durable system-prompt contract, and compact hooks as a trusted evidence source
+
+Everything above this point hardens **detection and recovery**: infer that a compaction
+happened (banner, token drop, `compact_boundary` marker) and re-inject the role contract +
+ledger once it's confirmed. #416 and #417 attack the two remaining soft spots that survived
+seven review rounds of that machinery: the contract itself never lived anywhere structurally
+durable, and every detection path was inference, never direct evidence. Neither issue
+restructures the #329 state machine (rev-48/50 judged the core sound) — both land as new
+capability at its existing seams.
+
+**#416's actual gap, found by re-deriving the history rather than assuming it.** loomux
+already migrated away from `--append-system-prompt-file` once, in #222/#105: `claude --agents
+'<json>' --agent <id>` replaced it, because it lets loomux synthesize a persona inline with zero
+repo files and zero trust problem (see `profiles.rs`'s module doc and `persona_inject`'s doc).
+The natural assumption is that this closed #416 already — it didn't. Reading `persona_inject`
+before this change: `--agents` only ever carried a **repo-authored persona's** text
+(`ResolvedPersona.text`), and only when a block had one (`prompt:`/`profile:` in
+`.loomux/workflow.yml`). The built-in role contract — `mechanics_core` plus the class template,
+the actual "you are a worker, here is `report()`, here is the git discipline" text — reached an
+agent exactly one way: the kickoff prompt says "First read your role instructions: `<path>`",
+and the agent's own `Read` tool call puts that text into the conversation as a **tool result**,
+not the system prompt. That's a plain conversation turn, exactly as compressible by a summarizer
+as anything else — which is what the user's live v0.10.0 incident actually proved: not that
+`--agents` was broken, but that the default roster (the common case — no workflow file) never
+used it for the one thing that mattered, and a workflow-customized block's `--agents` payload
+carried only the *persona*, never loomux's own mechanics on top of it.
+
+The fix is additive to the existing mechanism, not a second one: `block_contract_text`
+(`mod.rs`) unifies `render_block_instructions`'s output (the exact bytes the instructions FILE
+gets — refactored out of `write_block_instructions` so file and system-prompt payload can never
+diverge) with a configured persona, folded in as an addendum (`mode: append`) or alongside the
+non-overridable mechanics core (`mode: replace`) — the same composition the file/kickoff pair
+already did, just unified into one string. `persona_inject` now emits `--agents`/`--agent` for
+**every** Claude block, persona or not — the trust-root orchestrator included (`--agents` now
+always appears on its command line too; what stays absent is repo TEXT, never the flag itself —
+see `a_repo_file_can_never_author_the_orchestrators_persona`, updated rather than weakened). One
+sharp-edged bug surfaced immediately doing this: loomux's own template prose is full of literal
+apostrophes ("don't", "aren't") that were never a hazard while this text only ever reached an
+agent via a file read — riding inside `--agents`'s single-quoted shell token, an unescaped `'`
+closes that quote early, exactly the hazard `workflow::sanitize_persona` already exists to
+neutralize for repo personas. Fixed by sanitizing at the same point personas already are, in
+`persona_inject`, never at the source (the instructions file keeps real apostrophes — nothing
+about `write_block_instructions`'s output changed, so the `tests/fixtures/pre222` golden is
+untouched).
+
+**Per-CLI capability matrix (#416):**
+
+| | system-prompt mechanism | default roster (no persona) | workflow persona |
+|---|---|---|---|
+| Claude | `--agents '<json>' --agent <id>` | contract rides inline (new) | contract + persona, one payload (new: contract was previously absent) |
+| Copilot, user-authored `.github/agents/*.md` | native `--agent <name>` | n/a | unchanged — `--agent` still points at the exact file loomux read (`profiles::handle_resolves_to`); mechanics-core coverage for this ONE case is still kickoff/file-read only (documented residual gap below) |
+| Copilot, no persona / inline `prompt:` | generated `--agent loomux-<group>-<block>` file | contract rides via generated file (new) | contract + persona in the generated file (new: previously nothing for no-persona, kickoff-only for inline `prompt:`) |
+
+Copilot's `--agent <name>` resolves a NAME against a fixed directory precedence
+(`~/.copilot/agents` → repo `.github/agents/` → org), confirmed against current upstream docs —
+never an arbitrary path. loomux was already careful never to write a generated persona into the
+repo's own `.github/agents/` (that would dirty the user's git tree with a file they didn't
+author — `profiles::is_copilot_native`'s reasoning). `~/.copilot/agents` is the other end of that
+same precedence chain: Copilot's OWN user-level convention, not a loomux invention, exactly as
+`~/.claude/agents` is for Claude — so writing loomux's generated wrapper there (`OrchRegistry::
+write_copilot_agent_file`, test-overridable via `set_copilot_agents_dir_override`, mirroring
+`set_claude_projects_dir`) closes the SAME gap Claude had, for the SAME reason, without touching
+anything the user authored. The one deliberately NOT closed this round: a user's own native
+`.github/agents/*.md` persona still gets loomux's mechanics core only via the kickoff/file-read
+path, not the system-prompt layer — synthesizing a wrapper around a user-authored file would
+trade the carefully-reasoned `handle_resolves_to` trust property (the `--agent` flag resolves to
+**exactly the file loomux read and kind-checked**, nothing else) for coverage this one case
+doesn't have yet. Worth closing, not free, left as follow-up.
+
+**Honesty note, since this is a claim about a CLI loomux doesn't control:** whether a Copilot
+custom-agent file's content survives Copilot's OWN compaction/summarization structurally (the
+way `--agents` unambiguously is Claude's system-prompt layer) is **not confirmed** by Copilot's
+docs — no source describes where custom-agent instructions live in Copilot's prompt
+architecture relative to a `/compact` event. This is the best available mechanism (a system-level
+custom-agent flag beats a conversation-turn file-read on priors), not a proven guarantee — a
+gap to note honestly rather than paper over, and easy to revisit if Copilot's own docs firm up.
+
+### #417: compact hooks as a TRUSTED evidence source (Claude only)
+
+Claude Code has a `PreCompact` hook (fires before manual AND auto compaction) and a
+`SessionStart` hook with `matcher: "compact"` whose output can inject `additionalContext`
+natively. **Copilot does not** — confirmed via its current changelog and an open, unresolved
+upstream feature request explicitly asking for `preCompact` and stating its absence; Copilot's
+own `sessionStart`/`sessionEnd`/`userPromptSubmitted`/`preToolUse`/`postToolUse`/`errorOccurred`
+hooks exist but none fire specifically around a compaction. Per the #413 tier model, Copilot
+stays on the pre-existing inference tier for this — not faked, not approximated with a
+same-named event that means something else.
+
+**Provisioning, without touching the user's own settings.** Claude Code's `--settings
+<file-or-json>` flag loads an ADDITIONAL settings layer Claude Code itself composes over
+project/user settings — so "never clobber the user's own hooks" is a property of the CLI flag,
+not something loomux re-implements by hand-parsing and merging their `.claude/settings.json`
+(which loomux never touches). The generated hook config folds into the SAME file
+`--mcp-config`/`--strict-mcp-config` already point at (`write_mcp_config`, `cli == "claude"`
+branch) and that file is passed a SECOND time via `--settings` — one generated file, two flags,
+rather than a second file to keep in sync. Absent a resolvable `sh` interpreter (`resolve_hook_
+sh`, mirroring the `.cmd` shim delegators' `winpath::resolve_sh` reasoning — never trusting a
+bare `sh` on PATH, which Windows doesn't guarantee), the file simply carries no `hooks` key: a
+harmless no-op read, fail-open, same policy as a missing gh/git shim.
+
+The hook `command` for each event explicitly invokes the resolved `sh` against ONE generic
+script (`COMPACT_HOOK_SCRIPT`, written once per machine to a `compacthook/` dir sibling to
+`ghshim/`) with the event name, this group's state dir, and this agent's id as literal argv —
+so the script itself carries zero repo/group-specific text (constraint #8) and no new env var
+is needed to tell it which agent it's running for. It does exactly two things, both fail-open
+(every path exits 0 — a hook's nonzero exit can block the CLI's own lifecycle event):
+`precompact` creates/truncates a marker file at `<group_dir>/hooks/<agent_id>.precompact.json`;
+`sessionstart-compact` does the same for its own marker AND prints Claude's native
+`additionalContext` JSON shape with a fixed, generic re-grounding line (pointing at the ledger
+path by convention, not by reading it — keeping the script free of any ledger-parsing/truncation
+logic, which stays Rust-side in `directive_ledger_embed` to avoid two implementations of the same
+cap/truncation rule drifting apart).
+
+**Hybrid, argued rather than assumed:** native `additionalContext` is race-free (no delivery/hold
+window — the whole class of bug rounds 4-6 fixed) but necessarily minimal (a hook script has no
+business re-implementing `directive_ledger_embed`'s cap/truncation logic in shell). loomux's own
+tick-driven reinjection still delivers the FULL notice (current ledger tail, `#416` makes the
+*instructions* half of it redundant-but-harmless rather than load-bearing). What #417 actually
+replaces is the ARM/CONFIRM evidence, not the reinjection delivery itself:
+
+- `read_hook_marker_ts` reads a marker FILE's mtime (not a timestamp encoded in its content —
+  the generic script never needs portable clock-formatting logic this way). `AgentEntry.
+  compact_hook_precompact_seen_ms`/`compact_hook_sessionstart_seen_ms` bookkeep the freshest
+  marker already consumed.
+- Checked in `compact_nudge_tick`'s per-agent loop, right after the existing rebaseline/growth
+  block and before every pre-existing arm site (loomux-initiated, manual, banner) — a FRESH
+  PreCompact marker arms exactly like the loomux-initiated path (`compact_pending_trusted =
+  true`, no `inferred_compaction_confirmed` gate) and is treated as already busy (the compaction
+  itself IS the busy half, whether or not it happened to clear the byte-growth floor). A FRESH
+  SessionStart(compact) marker is even stronger — direct proof Claude Code restarted the session
+  BECAUSE of a compact — so it arms-and-confirms unconditionally (covers a hook config with only
+  SessionStart wired, or a PreCompact marker this tick loop raced past). With the pane already
+  quiet (the common case — nothing typed since the hook fired), arm and resolve-into-reinjection
+  happen on the SAME tick, closing the gap faster than a banner/manual arm ever could (those
+  always need a LATER quiet observation).
+- `AgentEntry.compact_pending_evidence: Option<&'static str>` (`Some("hook")`) rides alongside
+  `compact_pending_trusted` purely for visibility — audited as its own event
+  (`compact-hook-evidence`, distinct from `compact-nudge`/`compact-reinjection`) and threaded
+  through `compaction_status`'s new `source` field so the lifecycle chip (`compactionstatus.ts`)
+  reads "armed (hook-confirmed)" rather than conflating a direct signal with the
+  loomux-initiated trusted arm that happens to look identical in every OTHER field.
+
+Nothing about the resolution logic itself — busy-then-quiet, the confirm gate, the
+delivery-confirmation retry/abandon bounds, the per-agent arm-timeout — changed; the hook is
+purely a new, stronger way to reach the SAME `compact_pending`/`compact_seen_busy`/
+`compact_pending_trusted` triple every pre-existing arm site already writes.
+
+**Verification limit, stated plainly:** whether `--settings`'s hook arrays ADD to a user's own
+project/user `hooks.PreCompact` list or replace that event's list outright is not something this
+change could verify empirically — the "never spawn a real agent CLI to test" constraint applies
+here precisely because confirming it would mean actually running Claude Code through a real
+compaction. The design leans on `--settings` being documented as an additive settings layer (the
+same reasoning `--setting-sources`'s default-to-all-three implies); if that assumption turns out
+wrong for hook arrays specifically, the user's first live demo from this feature's own worktree
+is the fastest way to find out, and the fix (an explicit merge step reading the user's own
+settings file) is scoped and known if needed.
+
+**#411, folded in because the plumbing was already open:** the orchestration-RESTORE kickoff (an
+app restart resuming a live session) is a fixed string with no directive-ledger embed, unlike the
+post-compact reinjection notice — filed separately in #411 during #329's own testing as a
+deliberate scope cut. Since `directive_ledger_embed`/`DIRECTIVE_LEDGER_EMBED_CAP_BYTES` needed no
+changes to reuse, `resume_kickoff_notice` (mirroring `compact_reinjection_notice`'s exact shape)
+folds the SAME ledger embed into the resume-kickoff string — a missing/empty ledger reproduces
+the pre-#411 fixed string byte-for-byte, so a group that never calls `note_directive` sees no
+change. A SessionStart(resume)-sourced native hook was considered as an alternative delivery for
+this and set aside: the resume-kickoff is already a loomux-composed prompt (not relying on
+Claude's own context recall the way a mid-session compact does), so a second, hook-driven
+delivery channel for the same restart event would be redundant complexity for no clear gain —
+noted here rather than built.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged
