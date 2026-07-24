@@ -7,7 +7,7 @@
 // Pure tab state lives in TabManager (tabs.ts); this module renders it and turns
 // interactions into TabManager / backend calls, re-rendering on onChange.
 
-import type { TabManager, ManagedWorkspace } from "./tabs";
+import { dropTargetIndex, type TabManager, type ManagedWorkspace } from "./tabs";
 import { safeStyleDeclarations, compositeScale, type PreviewNode, type PreviewFit } from "./tabroute";
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
@@ -64,6 +64,12 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
    *  takes a deliberate second action. */
   private closeArmedId: string | null = null;
   private closeArmTimer: number | null = null;
+  /** The tab id mid-drag (#379), or null. Held on the strip rather than per-tab
+   *  DOM state so `dragover` handlers on every OTHER tab can tell whether a
+   *  drag is in progress and where it started, without re-reading dataTransfer
+   *  (whose `getData` is only readable on `drop`, not `dragover`, in most
+   *  browsers). */
+  private draggingId: string | null = null;
 
   private el: HTMLElement;
   private tabs: TabManager<T>;
@@ -166,6 +172,12 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   private render(): void {
     // Don't stomp an in-flight rename input.
     if (this.renamingId) return;
+    // Don't rebuild out from under an in-flight native drag (#379) — replacing
+    // the dragged element mid-gesture (e.g. a status poll landing between
+    // dragstart and drop) would yank it out of the browser's own drag session.
+    // `drop` clears draggingId itself, before calling moveTab, so the reorder's
+    // own render still goes through.
+    if (this.draggingId) return;
     this.el.replaceChildren();
 
     for (const ws of this.tabs.tabs) {
@@ -317,6 +329,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         this.closePreview();
         this.openMenu(ws, e.clientX, e.clientY);
       });
+      this.wireDrag(tab, ws.id);
       this.el.appendChild(tab);
     }
 
@@ -326,6 +339,77 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     add.title = "New tab (Ctrl+Shift+T)";
     add.addEventListener("click", () => this.onNewTab());
     this.el.appendChild(add);
+  }
+
+  /** Wire native HTML5 drag-and-drop reordering (#379) onto one tab element.
+   *  The dragged tab dims; the tab under the pointer shows a thin accent line
+   *  on whichever edge the drop would land on (CSS `.drag-before`/
+   *  `.drag-after`) — the same "target shows where it lands" convention as
+   *  the split-drag drop zones (layout.ts). All the actual index arithmetic
+   *  is `dropTargetIndex` (tabs.ts), unit-tested on its own; this is wiring. */
+  private wireDrag(tab: HTMLElement, wsId: string): void {
+    tab.draggable = true;
+    tab.addEventListener("dragstart", (e) => {
+      this.closePreview();
+      this.draggingId = wsId;
+      tab.classList.add("dragging");
+      // Firefox refuses to start a drag without data set on it; the value
+      // itself is unused (draggingId is what drop/dragover read).
+      e.dataTransfer?.setData("text/plain", wsId);
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+    });
+    // `dragenter` must ALSO preventDefault, not just `dragover` — a live-demo
+    // finding (#402 review): without it the browser never arms this element
+    // as a drop target at all (not-allowed cursor, `drop` never fires),
+    // regardless of what `dragover` does once entered — that's the HTML5
+    // D&D spec's actual contract. Exactly the kind of gap the pure
+    // `dropTargetIndex` tests couldn't have caught (no DOM event dispatch to
+    // get wrong in a pure function) and that "DOM wiring is hand-validated"
+    // only catches if the hand-validation actually happens against a real
+    // browser before merge, not just read back from the diff.
+    tab.addEventListener("dragenter", (e) => {
+      if (!this.draggingId || this.draggingId === wsId) return;
+      e.preventDefault();
+    });
+    tab.addEventListener("dragover", (e) => {
+      if (!this.draggingId || this.draggingId === wsId) return;
+      e.preventDefault(); // required for `drop` to fire at all
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move"; // matches effectAllowed — the "allowed" cursor
+      const before = this.dropsBefore(tab, e.clientX);
+      tab.classList.toggle("drag-before", before);
+      tab.classList.toggle("drag-after", !before);
+    });
+    tab.addEventListener("dragleave", () => tab.classList.remove("drag-before", "drag-after"));
+    tab.addEventListener("drop", (e) => {
+      e.preventDefault();
+      tab.classList.remove("drag-before", "drag-after");
+      const draggedId = this.draggingId;
+      // Clear BEFORE moveTab: its emit() → render() checks draggingId and
+      // skips the rebuild while a drag is in flight (see render()) — the drop
+      // itself must not be mistaken for still-dragging, or the reorder never
+      // paints until some unrelated later render happens to fire.
+      this.draggingId = null;
+      if (!draggedId || draggedId === wsId) return;
+      const before = this.dropsBefore(tab, e.clientX);
+      const ids = this.tabs.tabs.map((w) => w.id);
+      this.tabs.moveTab(draggedId, dropTargetIndex(ids, draggedId, wsId, before));
+    });
+    tab.addEventListener("dragend", () => {
+      this.draggingId = null;
+      // A drop outside any tab (or a cancelled drag) never fires `dragleave`
+      // on whichever tab last showed the indicator — sweep them all rather
+      // than track which one.
+      for (const el of this.el.querySelectorAll(".drag-before, .drag-after, .dragging")) {
+        el.classList.remove("drag-before", "drag-after", "dragging");
+      }
+    });
+  }
+
+  /** Which half of `tab` the pointer is over — the drop lands before it on the
+   *  left half, after it on the right. */
+  private dropsBefore(tab: HTMLElement, clientX: number): boolean {
+    const rect = tab.getBoundingClientRect();
+    return clientX < rect.left + rect.width / 2;
   }
 
   /** Poll each group-bound tab for its live status; re-render if anything moved. */

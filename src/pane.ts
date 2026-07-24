@@ -26,7 +26,9 @@ import {
 import { voiceController, type VoiceTargetPane, type VoicePhase } from "./voicecontrol";
 import { pathTail, type ShellKind } from "./panesetup";
 import { invoke } from "@tauri-apps/api/core";
-import { parseOsc52, writeClipboard } from "./clipboard";
+import { parseOsc52, writeClipboard, readClipboard } from "./clipboard";
+import { keyDisposition } from "./pasteflow";
+import { getSettings } from "./settings";
 import {
   checkAttachment,
   attachRejectMessage,
@@ -751,25 +753,71 @@ export class Pane implements VoiceTargetPane {
       return true;
     });
 
-    // Let app-level shortcuts pass through xterm untouched; handle
-    // clipboard combos here (Windows Terminal conventions).
+    // Let app-level shortcuts pass through xterm untouched; handle clipboard
+    // combos here (Windows Terminal conventions — Ctrl+Shift+C/V always work;
+    // plain Ctrl+V additionally pastes when the `pasteOnPlainCtrlV` setting
+    // (default on) allows it — #370's review found the unconditional version
+    // silently broke vim's VISUAL BLOCK mode and readline's quoted-insert, so
+    // it's an opt-out, not a forced default; see settings.ts).
+    //
+    // preventDefault() on copy/paste is load-bearing, not decoration (#402
+    // live-demo finding): returning `false` from attachCustomKeyEventHandler
+    // only tells XTERM not to process the key — it does NOT suppress the
+    // browser's own native handling of it. Without preventDefault, plain
+    // Ctrl+V ALSO triggered the browser's native paste on xterm's focused
+    // textarea, which xterm itself listens for (its own "paste" DOM
+    // listener) and pastes AGAIN — the double-paste bug. See keyDisposition's
+    // own doc comment (pasteflow.ts) for the full mechanism.
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       if (isAppShortcut(e)) return false;
-      if (e.ctrlKey && e.shiftKey && e.code === "KeyC") {
-        const sel = this.term.getSelection();
-        if (sel) void this.copyToClipboard(sel);
-        return false;
+      switch (keyDisposition(e, getSettings().pasteOnPlainCtrlV)) {
+        case "copy": {
+          e.preventDefault();
+          const sel = this.term.getSelection();
+          if (sel) void this.copyToClipboard(sel);
+          return false;
+        }
+        case "paste":
+          e.preventDefault();
+          void this.pasteFromClipboard();
+          return false;
+        case "pass":
+          return true;
       }
-      if (e.ctrlKey && e.shiftKey && e.code === "KeyV") {
-        navigator.clipboard
-          .readText()
-          .then((t) => t && this.term.paste(t))
-          .catch(() => {});
-        return false;
-      }
-      return true;
     });
+
+    // xterm.js binds its OWN native "paste" DOM-event listener directly on
+    // its internal textarea/root element (independent of our keydown
+    // handling above), so ANY browser-native paste — e.g. the Ctrl+V
+    // accelerator on a path this preventDefault doesn't reach — lands there
+    // too, double-pasting alongside our own explicit readClipboard()-driven
+    // paste (#402 live-demo finding). We own paste entirely now; xterm's
+    // native path is never wanted. Capture phase, so this runs BEFORE the
+    // event reaches xterm's own listener (bound to a descendant of termEl,
+    // in the bubble phase) no matter what triggered it. Our own paste calls
+    // are `this.term.paste(text)` — a direct method call that never
+    // dispatches a DOM "paste" event — so this can never block a paste WE
+    // intended.
+    this.termEl.addEventListener(
+      "paste",
+      (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      },
+      true
+    );
+
+    // NOTE (#402 second live-demo round): a right-click Copy/Paste context
+    // menu briefly lived here. Removed — the menu's paste path was
+    // unreliable in practice and the human chose not to iterate on it rather
+    // than keep debugging a second right-click-specific native-event path.
+    // Right-click on a terminal is back to its pre-#370 behavior: nothing (a
+    // no-op past the global `.pane-term` contextmenu preventDefault in
+    // main.ts, which only suppresses the browser's own native menu and
+    // predates this PR). Copy still works via Ctrl+Shift+C above (selection
+    // → copyToClipboard) — see doc/design/clipboard.md's #370 section for
+    // the supported copy/paste surface.
 
     this.el.addEventListener("mousedown", () => {
       this.events.onFocus(this);
@@ -2319,6 +2367,24 @@ export class Pane implements VoiceTargetPane {
   private async copyToClipboard(text: string): Promise<void> {
     const ok = await writeClipboard(text);
     if (!ok) showToast("Copy failed — click the pane and try again.");
+  }
+
+  /** Paste the system clipboard into the terminal (#370): Ctrl+V, Ctrl+Shift+V,
+   *  and the right-click menu all route here. Never fails silently — a genuine
+   *  read failure (readClipboard exhausts its own fallback) surfaces a toast
+   *  instead of the prior `.catch(() => {})`, which looked identical to a
+   *  keypress that simply did nothing. An empty clipboard is not a failure. */
+  private async pasteFromClipboard(): Promise<void> {
+    const res = await readClipboard();
+    if (!res.ok) {
+      // Wording deliberately doesn't assert "blocked" — readClipboard can also
+      // fail on a transient condition (a momentary focus loss) that a retry
+      // clears on its own, and claiming a permission block for that would be
+      // its own small lie (#370 review).
+      showToast("Paste failed — click the pane and try again.");
+      return;
+    }
+    if (res.text) this.term.paste(res.text);
   }
 
   /** Build the loomux steering strip and dock it under the terminal (#43,

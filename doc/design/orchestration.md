@@ -760,10 +760,18 @@ alongside the task board and #7's cost figures.
   later relaunch on the same repo id starts clean instead of silently resuming paused.
 - **Spawn docking, on by default (#260).** New worker/reviewer/planner panes open
   straight into the minimize dock instead of expanding into the split tree, so a burst
-  of delegate spawns doesn't crowd the orchestrator pane out of focus — reusing #46's
-  existing minimize/restore plumbing (`Grid.minimize`) rather than a new "open into the
-  dock" path, so a freshly-docked pane behaves exactly like one a human folded by hand a
-  moment after it opened (including the "never dock the grid's last visible pane" guard).
+  of delegate spawns doesn't crowd the orchestrator pane out of focus. Originally this
+  reused #46's minimize/restore plumbing verbatim — `Grid.openPane` (full tree slot) then
+  `Grid.minimize(pane)` once the pty finished spawning — so a freshly-docked pane behaved
+  exactly like one a human folded by hand a moment after opening it. That "open, then
+  fold" order painted at least one full-size frame during the pty spawn's IPC round trip
+  (a visible flash, #387) and resized the pty to a layout size the pane was never shown
+  at. `Grid.openPaneMinimized` (grid.ts) replaces it for the minimized path: the pane
+  never gets a tree leaf at all, so its terminal opens detached and `fit()` lands on
+  xterm's construction default (80×24) instead of any real slot — `restore()` still does
+  the one genuine fit when a human actually reveals it. It still honors the "never dock
+  the grid's last visible pane" guard (falls back to a normal, visible open when the grid
+  has no other pane yet — the same edge case `Grid.minimize` itself no-ops on).
   A per-group **Auto-dock** toggle in the panel (mirrors the Notify toggle's shape:
   `spawn_expanded`/`set_spawn_expanded`, durable `spawn_expanded` marker, `orch_spawn_expanded`/
   `orch_set_spawn_expanded` commands) opts back into the pre-#260 always-expand behavior.

@@ -165,11 +165,11 @@ src-tauri/src/
     digest.rs       session-digest friction extraction (#250/#324): normalizes a Claude `.jsonl` or Copilot session-state transcript into one event stream, then reduces it, deterministically and LLM-free, into "friction windows" (a tool error, a near-duplicate rerun, a test that went red-then-green, a reverted edit) — the `session_digest` MCP tool a `role_hint: process` block calls to mine a finished session cold. See doc/design/supervisor-skills.md
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
-  uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
+  uistate.rs        durable UI state: atomic tabs.json store (project tabs #63) + settings.json store (app settings #370) -- same atomic-write/corrupt-quarantine primitives, opaque JSON owned by the frontend schema
   fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
   filemgr.rs        file-MANAGER pane (#214): list, new file/folder, rename, delete-to-Recycle-Bin, open-with-default-app, open-with chooser, reveal-in-OS-file-manager; reuses fileedit's path choke point. Shell APIs come from the `windows` dep we already have (ShellExecuteW + SHFileOperationW)
   filehash.rs       file hashing (#214): SHA-256/512, SHA-1, CRC-32/16/8 — streamed off-thread on a worker (never the main thread), cancellable via the #207 registry
-  command_manifest.rs  single source of truth for the ACL manifest's 120 app-command names (#363) — shared by build.rs (include!, feeds the app manifest) and lib.rs (feeds tests/acl_manifest.rs, the coherence guard). See doc/design/acl-manifest.md
+  command_manifest.rs  single source of truth for the ACL manifest's 123 app-command names (#363) — shared by build.rs (include!, feeds the app manifest) and lib.rs (feeds tests/acl_manifest.rs, the coherence guard). See doc/design/acl-manifest.md
   lib.rs            Tauri wiring
 src-tauri/
   capabilities/     ACL grants (#363): default.json grants `main` every command via the `main-ui` permission set; plugin-zero-template.json is the zero-grant template a future #360 plugin webview binds to
@@ -185,6 +185,7 @@ src/
   tabbar.ts         the tab strip: switch/close/new, rename, color, alert chips, deterministic agent counter + orchestration markers (#194), preview
   tabroute.ts       pure tab routing + preview scale/sanitizer (unit-tested, DOM-free)
   tabstore.ts       pure encode/decode + schema validation of the persisted tab set (tabs + per-tab pane layout + restore pref, #194)
+  settings.ts       durable app-wide settings (#370): pure encode/decode (DOM-free, unit-tested) + an in-memory singleton (getSettings/setSettings) for synchronous reads from pane.ts's keydown handler. Config-file-only -- no Settings UI exists yet
   restoredecision.ts pure restore-vs-fresh-vs-ask decision for the boot splash (DOM-free, unit-tested, #194)
   panerestore.ts    pure per-pane restore policy + layout-tree -> ordered rebuild plan + agent resume-command builder (DOM-free, unit-tested, #194)
   restoresplash.ts  cold-boot "restore last session?" overlay (thin DOM over restoredecision.ts, #194)
@@ -204,6 +205,7 @@ src/
   filemenu.ts       pure context-menu model: what appears, what it acts on (target bound at menu-open) (DOM-free, unit-tested)
   contextmenu.ts    generic context-menu renderer, `MenuItem<A>`: placement, submenus, Esc/click-away (DOM wiring)
   panemenu.ts       pure pane-header connect-menu model (#271): Connect/directional-completion/Join-as-receiver/Cancel/Disconnect/Make-sender per pane + pending-arm state, standalone panes included (DOM-free, unit-tested)
+  pasteflow.ts      pure terminal paste keydown gesture decisions (#370): Ctrl+V/Ctrl+Shift+V key matching + the copy/paste/pass disposition enum that drives pane.ts's preventDefault() calls (DOM-free, unit-tested)
   channel.ts        pure connect-gesture reducer (arm/complete/cancel/set-sender) + per-channel color/number/direction chip derivation (#271) (DOM-free, unit-tested)
   filehashmodel.ts  pure hashing policy: auto-hash threshold, digest cache keying (path+size+mtime), formatting (DOM-free, unit-tested)
   filemgr.ts        typed bridge to filemgr.rs + filehash.rs (per-feature wrapper, like fileapi.ts)

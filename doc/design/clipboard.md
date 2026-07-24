@@ -1,6 +1,6 @@
 # Design: reliable copy & paste
 
-Status: implemented (issue #65).
+Status: implemented (issue #65, extended by #370).
 
 ## Problem
 
@@ -104,3 +104,189 @@ spawn.
 The interactive halves (does the OS clipboard actually change; does a real
 paste into a bracketed-paste CLI land) are covered by the manual repro matrix
 in the PR.
+
+## #370: paste was Ctrl+Shift+V-only, and read failures were swallowed
+
+Two follow-on symptoms, both in the terminal's keydown handler (not the OSC 52
+path above, which was already sound):
+
+- **Plain `Ctrl+V` did nothing.** The handler matched only
+  `ctrlKey && shiftKey && KeyV` (Windows Terminal convention — plain `Ctrl+V`
+  is traditionally a shell's readline "quoted insert next char"). Muscle
+  memory reaches for plain `Ctrl+V` first; getting silence read as "paste is
+  broken here."
+- **A blocked clipboard read was silent.**
+  `navigator.clipboard.readText().then(...).catch(() => {})` — a rejected read
+  (focus loss, permission, non-secure context) looked identical to a keypress
+  that did nothing. The copy side already had a toast for this (#65); paste
+  didn't.
+
+### Fix
+
+`src/pasteflow.ts` (DOM-free, unit tested) decides the gestures: `isPasteKey`
+matches `Ctrl+Shift+V` unconditionally (the original binding, kept) and plain
+`Ctrl+V` **only when the `pasteOnPlainCtrlV` setting allows it** (default on
+— see "The plain-Ctrl+V tradeoff, and the setting" below). `isCopyKey` is
+unchanged — `Ctrl+Shift+C` only, since plain `Ctrl+C` must stay SIGINT.
+`isPasteKey` also refuses to match with Alt held (`e.altKey`), guarding
+against a keyboard-layout collision: on layouts where AltGr (= Ctrl+Alt) + V
+types a character, an unguarded plain-Ctrl+V match would eat `Ctrl+Alt+V` as
+a paste instead of letting that character reach the shell.
+
+`src/clipboard.ts` gained `readClipboard()`, the paste-side mirror of
+`writeClipboard`: async Clipboard API first, a hidden-`textarea` +
+`execCommand("paste")` fallback second, and an explicit `{ok: false}` only
+when *both* fail — never swallowed. `pane.ts`'s `pasteFromClipboard()` surfaces
+that with the same toast convention `copyToClipboard` already uses. An empty
+clipboard (`ok: true, text: ""`) is not a failure — it's a legitimate no-op.
+
+A right-click Copy/Paste context menu briefly lived here too — see "Right-
+click menu: tried, then removed" below for why it didn't survive.
+
+### The plain-Ctrl+V tradeoff, and the setting
+
+The first version of this fix bound plain `Ctrl+V` to paste **unconditionally**
+and named only readline's quoted-insert as the cost — understating it. Review
+caught the real casualty: **vim/nvim's `Ctrl+V` enters VISUAL BLOCK mode**, one
+of vim's everyday, signature motions, and vim/nvim users are exactly the kind
+of power user a terminal multiplexer's audience skews toward. The same holds
+for any other TUI or agent CLI running in the pane that binds plain `Ctrl+V`
+itself — readline's quoted-insert is the least of what an unconditional
+interception costs.
+
+The review also caught an overstated justification: "every terminal emulator
+already binds plain `Ctrl+V`" is not true. Windows Terminal does, by default —
+but gnome-terminal, iTerm2, kitty, and alacritty all default to
+`Ctrl+Shift+V` specifically to leave plain `Ctrl+V` free for whatever is
+running in the pane.
+
+This is the exact shape of tradeoff `shortcuts.ts` already made a call on for
+`Alt+V` (#155): loomux used to intercept it, discovered it was Claude Code's
+own paste-image binding, and **stopped intercepting** rather than keep
+stealing a key an agent pane needed. Plain `Ctrl+V` is the same failure mode —
+a multiplexer-level binding shadowing a key the program *inside* the pane
+wants — so it gets the same resolution in spirit: don't force the choice on
+everyone, offer it.
+
+**`src/settings.ts`** adds `pasteOnPlainCtrlV: boolean` (default `true`) as
+loomux's first durable app setting, persisted the same way the tab set already
+is — a sibling `settings.json` written through two new backend commands
+(`load_settings`/`save_settings`, `uistate.rs`) that reuse the *exact same*
+atomic-write + corrupt-quarantine primitives `load_ui_tabs`/`save_ui_tabs`
+already use, not a new storage mechanism. `main.ts` loads it once at boot;
+`pane.ts`'s keydown handler reads it synchronously via `settings.getSettings()`
+on every keystroke (a settings object can't be threaded through
+`attachCustomKeyEventHandler`'s synchronous callback any other way).
+
+There is **no Settings/Preferences UI anywhere in loomux today** — checked
+before choosing this shape, so this isn't a fallback taken to avoid building
+one. The setting is config-file-only: on first run (or after a corrupt file
+is quarantined) loomux seeds `settings.json` with the defaults, so the file
+exists to be found and hand-edited; there is no live reload, so a change takes
+effect on the next launch. `Ctrl+Shift+V` pastes unconditionally either way —
+turning the setting off only returns plain `Ctrl+V` to the pane, exactly the
+pre-#370 behavior for that one key.
+
+### The double-paste bug (#402 live-demo round 2, findings 1 + 2)
+
+A human running a real dev build (not covered by the pure test suites at
+all) found plain `Ctrl+V` pasting the clipboard **twice**, and right-clicking
+an agent pane both opening the (then-still-present) Copy/Paste menu *and*
+pasting immediately.
+
+**Root cause, both bugs, one mechanism.** `@xterm/xterm` binds its own,
+independent `"paste"` DOM event listener directly on its internal textarea
+and root element (`handlePasteEvent`, xterm's own input-handler module) — a
+completely separate path from anything in `pasteflow.ts`/`pane.ts`. Whenever
+the *browser* fires a native `paste` event on that textarea, xterm pastes
+into the terminal itself, independent of and in addition to loomux's own
+`readClipboard()`-driven paste.
+
+- **Plain Ctrl+V:** the original fix returned `false` from
+  `attachCustomKeyEventHandler` on a match, which per xterm's own contract
+  only means "don't let xterm's key handling process this" — it does **not**
+  call `preventDefault()` on the underlying `KeyboardEvent`. Without that, the
+  browser's own native Ctrl+V accelerator still fires on xterm's focused
+  textarea, which dispatches the native `paste` event xterm listens for —
+  landing the clipboard text a second time. `Ctrl+Shift+V` had the identical
+  gap the whole time (pre-dating this PR) but never manifested, because
+  `Ctrl+Shift+V` isn't a browser-native paste accelerator — nothing native
+  ever fired for it. Fix: `keyDisposition` (see its own doc comment,
+  pasteflow.ts) collapses the copy/paste decision into one enum so the DOM
+  layer's `preventDefault()` calls in pane.ts can't be added for one branch
+  and forgotten for the other.
+- **Right-click:** xterm's `contextmenu` listener (bound on its own root
+  element, a descendant of `pane.ts`'s `termEl`) does not itself paste — it
+  only repositions its hidden textarea and pre-selects text for a native
+  Copy. But *some* browser-native path (right-click's own default handling in
+  the webview, independent of the `contextmenu` event our own listener
+  already `preventDefault()`s) still ends up dispatching that same native
+  `paste` event xterm listens for. `preventDefault()` on `contextmenu` stops
+  the native *context menu*; it does nothing about a native `paste` event
+  triggered by a different code path.
+
+**Fix, for both:** `pane.ts` adds a capture-phase `"paste"` listener directly
+on `termEl` that unconditionally calls `preventDefault()`/`stopPropagation()`.
+Capture phase means it runs *before* the event ever reaches xterm's own
+listener (bound to a descendant, in the bubble phase), so it kills the native
+path regardless of what triggered it — the Ctrl+V accelerator, the right-click
+gesture, or anything else the webview might do. This can never block a paste
+loomux *intends*: our own paste path is `this.term.paste(text)`, a direct
+method call on xterm's public API that never dispatches a DOM `paste` event
+at all. Combined with the keydown handler's now-explicit `preventDefault()`,
+loomux owns paste entirely — xterm's native path never fires.
+
+### Right-click menu: tried, then removed (#402 live-demo round 3)
+
+The right-click Copy/Paste menu (`pasteflow.ts`'s `buildTerminalMenu`,
+rendered through the shared `contextmenu.ts`) was added to give the terminal
+a discoverable paste affordance no other pane kind needed (a native
+`<textarea>`/`<input>` gets a right-click Copy/Paste menu from the browser
+for free; the terminal is a canvas and had nothing). The capture-phase native-
+`"paste"` kill switch above fixed the *double*-paste half of the right-click
+bug, but a further live-demo round found the menu's own paste path still
+unreliable in practice, and the human decided not to keep debugging a second
+right-click-specific native-event interaction — the menu was removed rather
+than iterated on further.
+
+Right-click on a terminal is now back to its pre-#370 behavior: nothing. The
+global `.pane-term` `contextmenu` `preventDefault()` in `main.ts` (which
+predates this PR) still suppresses the browser's own native menu, so a
+right-click is silently absorbed rather than doing anything — the same as
+before this issue was ever filed. Copy remains available via `Ctrl+Shift+C`
+on a selection, unaffected by the menu's removal (it was always the keydown
+path, never routed through the menu). `pasteflow.ts` keeps only the keydown
+gesture logic (`isPasteKey`/`isCopyKey`/`keyDisposition`) — no menu-shape
+code remains.
+
+### WebView2 clipboard permission: dev vs. packaged
+
+Live-testing (`npm run tauri dev`, origin `http://localhost:1420`) surfaced a
+WebView2 clipboard-permission prompt on first paste — the dev server's origin
+is a plain HTTP origin, which WebView2 treats like any other web page and
+gates the async Clipboard API behind a runtime permission prompt. The
+**packaged app loads from its own custom app origin**
+(`http://tauri.localhost` on Windows — see `tests/acl_manifest.rs`'s
+`LOCAL_ORIGIN_URL`), which does not go through that same runtime
+permission-prompt flow. This is a dev-environment-only wrinkle, not a bug: a
+denied/blocked read (in either environment) already falls through
+`readClipboard`'s `execCommand` fallback and, if that fails too, surfaces the
+honest "Paste failed" toast (pane.ts) — never a silent no-op.
+
+### Testing
+
+- `test/pasteflow.test.ts` — key matching (`Ctrl+Shift+V` always pastes;
+  plain `Ctrl+V` pastes only when the setting says so; `Ctrl+Alt+V`/AltGr and
+  `Ctrl+C` alone are never a paste/copy) and `keyDisposition`'s collapsed
+  copy/paste/pass enum.
+- `test/settings.test.ts` — `encodeSettings`/`decodeSettings` round-trip,
+  first-run/corrupt-file `null` handling, and per-key fallback so a partial or
+  future-versioned hand-edit degrades gracefully instead of losing the file.
+- DOM wiring (the keydown handler, the capture-phase native-paste kill
+  switch, the toast) and the settings load/seed-on-first-run are
+  hand-validated — see the PR body for the manual steps. The double-paste,
+  right-click-paste, and menu-unreliability findings are exactly the class of
+  defect the pure suites structurally cannot see (no DOM event dispatch, no
+  xterm instance) — they surfaced only across three rounds of a real dev-build
+  live demo, which is also why the menu itself was ultimately removed rather
+  than iterated on further.

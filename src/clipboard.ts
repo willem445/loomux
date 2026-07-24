@@ -80,3 +80,34 @@ export async function writeClipboard(text: string): Promise<boolean> {
   }
   return ok;
 }
+
+/** Read text off the system clipboard, with the same legacy fallback
+ *  `writeClipboard` uses for a webview that rejects the async Clipboard API.
+ *  Never throws. `ok: false` means the read genuinely failed (both the async
+ *  API and the execCommand fallback came up empty) — the caller's job is to
+ *  SURFACE that, not swallow it (#370: the terminal paste handler used to do
+ *  exactly `.catch(() => {})`, so a blocked/denied read looked identical to a
+ *  keypress that did nothing). An empty-but-successful read (`ok: true, text:
+ *  ""`) is not a failure — the clipboard legitimately has nothing in it, and a
+ *  paste of nothing is a normal no-op, not an error to report. */
+export async function readClipboard(): Promise<{ ok: true; text: string } | { ok: false }> {
+  try {
+    return { ok: true, text: await navigator.clipboard.readText() };
+  } catch {
+    /* fall through to the execCommand path */
+  }
+  const ta = document.createElement("textarea");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  let ok = false;
+  try {
+    ok = document.execCommand("paste");
+  } catch {
+    ok = false; // nothing more we can do
+  }
+  const text = ta.value;
+  ta.remove();
+  return ok ? { ok: true, text } : { ok: false };
+}

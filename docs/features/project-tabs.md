@@ -34,6 +34,11 @@ repaints a terminal (the same no-resize promise as maximize).
   pick the pane's kind (Agent, Orchestrator, or Terminal) — never a blank tab.
 - **Switch** — click a tab, or page with `Ctrl+Shift+[` (previous) and
   `Ctrl+Shift+]` (next).
+- **Reorder** — drag a tab to a new spot in the strip; drop it to the left or
+  right half of another tab to land it there. `Ctrl+Alt+Shift+[` /
+  `Ctrl+Alt+Shift+]` move the active tab one slot left/right without a mouse.
+  The new order is saved with everything else a tab carries — it survives a
+  restart.
 - **Close** — `Ctrl+Shift+K`, or the tab's **✕**. There's always at least one
   tab; closing the last one is refused.
 

@@ -10,6 +10,8 @@ export type ShortcutAction =
   | "close-tab"
   | "next-tab"
   | "prev-tab"
+  | "move-tab-left"
+  | "move-tab-right"
   | "toggle-sessions"
   | "toggle-git"
   | "toggle-issues"
@@ -45,6 +47,17 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyK": return "close-tab";
       case "BracketRight": return "next-tab";
       case "BracketLeft": return "prev-tab";
+    }
+  }
+  // Tab REORDER (#379): same bracket keys as switching, plus Alt — the
+  // keyboard alternative to dragging. The issue's suggested Ctrl+Shift+
+  // PgUp/PgDn would have been a fresh convention; this instead extends the
+  // bracket-key pair the app already uses for tab navigation, so "move" reads
+  // as "switch, but Alt for real."
+  if (e.ctrlKey && e.shiftKey && e.altKey) {
+    switch (e.code) {
+      case "BracketRight": return "move-tab-right";
+      case "BracketLeft": return "move-tab-left";
     }
   }
   if (e.altKey && !e.ctrlKey && !e.shiftKey) {

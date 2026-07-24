@@ -62,6 +62,29 @@ export interface ManagedWorkspace {
  *  tab bar can re-render. */
 export type TabsListener = () => void;
 
+/** Compute the `moveTab` target index for a drag-drop (#379): dropping a
+ *  dragged tab on `overId`'s leading edge (`before=true`) or trailing edge
+ *  (`before=false`). `ids` is the CURRENT tab order (as shown, before the
+ *  drop). `moveTab(id, toIndex)` places `id` at index `toIndex` of the
+ *  RESULTING list — so when the dragged tab starts BEFORE the target, the
+ *  target (and everything between them) shifts left by one as the drag
+ *  vacates its old slot, and the target index must shift with it; dragging
+ *  from AFTER the target needs no such adjustment. Isolated from the tab
+ *  strip's pointer/rect math so the off-by-one is unit-tested on its own. */
+export function dropTargetIndex(
+  ids: readonly string[],
+  draggedId: string,
+  overId: string,
+  before: boolean
+): number {
+  const from = ids.indexOf(draggedId);
+  const overIdx = ids.indexOf(overId);
+  if (from < 0 || overIdx < 0) return from;
+  let to = before ? overIdx : overIdx + 1;
+  if (from < to) to -= 1;
+  return to;
+}
+
 export class TabManager<T extends ManagedWorkspace> {
   private workspaces: T[] = [];
   private activeId: string | null = null;
@@ -199,6 +222,33 @@ export class TabManager<T extends ManagedWorkspace> {
     if (!ws) return;
     ws.color = color;
     this.emit();
+  }
+
+  /** Reorder a tab (#379): move it to `toIndex` in the display order, shifting
+   *  the tabs between its old and new slot. `tabs`'s array order IS the display
+   *  and persisted order (see `snapshot`), so this is the entire model — the
+   *  tab strip's drag handling and the keyboard alternative both call it with
+   *  an already-clamped index. A no-op for an unknown id or a no-move
+   *  (`toIndex` at or past the current slot after removal collapses to the
+   *  same position). */
+  moveTab(id: string, toIndex: number): void {
+    const from = this.workspaces.findIndex((w) => w.id === id);
+    if (from < 0) return;
+    const clamped = Math.max(0, Math.min(toIndex, this.workspaces.length - 1));
+    if (clamped === from) return;
+    const [ws] = this.workspaces.splice(from, 1);
+    this.workspaces.splice(clamped, 0, ws);
+    this.emit();
+  }
+
+  /** Move the active tab one slot left/right (#379's keyboard alternative to
+   *  dragging — Ctrl+Alt+Shift+BracketLeft/Right, main.ts). A no-op at either
+   *  end, same as `moveTab` clamping past the array bounds. */
+  moveActiveTab(delta: -1 | 1): void {
+    if (!this.activeId) return;
+    const from = this.workspaces.findIndex((w) => w.id === this.activeId);
+    if (from < 0) return;
+    this.moveTab(this.activeId, from + delta);
   }
 
   // ---------- orchestration routing ----------

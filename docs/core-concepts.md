@@ -263,10 +263,32 @@ a restart — are on the **[Project tabs](features/project-tabs.html)** feature 
 
 ## Copy & paste
 
-- **Copy / paste** — `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also pastes).
+- **Copy** — select text in a terminal, then `Ctrl+Shift+C`. There's no
+  right-click menu for this (one existed briefly; its paste path proved
+  unreliable and was removed rather than iterated on) and no copy-on-select —
+  `Ctrl+Shift+C` is the one supported gesture.
+- **Paste** — `Ctrl+Shift+V` always pastes. Plain `Ctrl+V` also pastes by
+  default — turn that off if you use vim/nvim's `Ctrl+V` **VISUAL BLOCK**
+  mode, readline's quoted-insert, or run anything else in the pane that wants
+  the raw key: see [Settings](#settings) below.
+- If the clipboard genuinely can't be read or written (a locked-down webview,
+  focus loss), paste says so with a toast instead of quietly doing nothing.
 - A CLI running in a pane (e.g. an agent that says "copied to clipboard") copies
   straight to your **system** clipboard too, via OSC 52 — no manual re-select
   needed.
+
+## Settings
+
+loomux has no settings/preferences window yet — the handful of durable app
+settings that exist live in a hand-editable `settings.json` next to `tabs.json`
+in the app's data directory (Windows:
+`%APPDATA%\loomux\settings.json`). It's seeded with the defaults on first run,
+so the file is there to find. Edit it and relaunch loomux to pick up a change
+— there's no live reload.
+
+| Key | Default | Effect when `false` |
+| --- | --- | --- |
+| `pasteOnPlainCtrlV` | `true` | Plain `Ctrl+V` in a terminal pane passes through to whatever's running there (vim, readline, an agent CLI) instead of pasting. `Ctrl+Shift+V` still always pastes. |
 
 ## Keyboard shortcuts
 
@@ -281,6 +303,7 @@ this table mirrors it.
 | New project tab | `Ctrl+Shift+T` (or **+** in the tab strip) |
 | Close project tab | `Ctrl+Shift+K` (or the tab's ✕) |
 | Prev / next tab | `Ctrl+Shift+[` / `Ctrl+Shift+]` (or click a tab) |
+| Reorder tabs | `Ctrl+Alt+Shift+[` / `Ctrl+Alt+Shift+]` (or drag a tab) |
 | Rename pane | `F2`, or double-click its title |
 | Move focus | `Alt+←/→/↑/↓` (or click) |
 | Resize panes | drag the divider between them |
@@ -292,7 +315,7 @@ this table mirrors it.
 | Git view | `Alt+G` (or the ⑂ icon) |
 | GitHub issues view | `Alt+I` (or the ◉ icon) |
 | Voice prompt | `Alt+S` (push-to-talk; `Esc` cancels) |
-| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also pastes) |
+| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also pastes by default — [Settings](#settings)) |
 
 Orchestrator panes add a few more (steering strip, task board, audit viewer,
 lifecycle panel) — those live in the [orchestration guide](orchestration.html).

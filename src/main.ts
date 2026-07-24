@@ -13,11 +13,14 @@ import {
   onPtyExit,
   loadUiTabs,
   saveUiTabs,
+  loadSettings,
+  saveSettings,
   guardAppClose,
   listSessions,
   type PtyExit,
   type SessionInfo,
 } from "./pty";
+import { decodeSettings, encodeSettings, setSettings, DEFAULT_SETTINGS } from "./settings";
 import { modal } from "./modal";
 import { SubmitLatch } from "./panesetup";
 import {
@@ -1288,6 +1291,12 @@ document.addEventListener(
       case "prev-tab":
         tabs.prevTab();
         break;
+      case "move-tab-right":
+        tabs.moveActiveTab(1);
+        break;
+      case "move-tab-left":
+        tabs.moveActiveTab(-1);
+        break;
       case "toggle-sessions":
         sessions.toggle();
         break;
@@ -1408,6 +1417,35 @@ initHintBar();
 // (orchWiring) is implemented over the TabManager above. Wired before any
 // orchestrator can launch (below), so no spawn event races an unready router.
 initOrchestration(orchWiring);
+
+// Load durable app settings (#370) — independent of the tab layer below, so
+// it's its own boot IIFE rather than threaded through the restore flow. Any
+// terminal keydown before this resolves reads settings.ts's DEFAULT_SETTINGS
+// (module-level default), which is the safe direction — no real pane can spawn
+// and take a keystroke before the seed tab below even exists, so in practice
+// this always wins the race, but there's no hard ordering dependency either
+// way. A first-run/quarantined-corrupt load (raw === null) seeds a fresh,
+// discoverable settings.json with the defaults — config-file-only (no
+// Settings UI exists in loomux yet) means "find the file and see what's in
+// it" is the whole discovery story, so it should exist to be found.
+void (async () => {
+  try {
+    const raw = await loadSettings();
+    const decoded = decodeSettings(raw) ?? DEFAULT_SETTINGS;
+    setSettings(decoded);
+    // raw === null covers BOTH first run and a quarantined-corrupt file
+    // (load_settings returns None for either, uistate.rs) — seed a fresh,
+    // discoverable file in both cases. A THROWN load (the catch below) is
+    // deliberately NOT treated the same way: that's a transient IPC failure,
+    // not "nothing is there," and writing defaults over it could silently
+    // reset a user's real settings.json to the default the next time this
+    // races a hiccup.
+    if (raw === null) void saveSettings(encodeSettings(decoded));
+  } catch {
+    /* best-effort — keep running on DEFAULT_SETTINGS (settings.ts's own
+       module-level default); never write anything on this path. */
+  }
+})();
 
 // Boot the tab layer. Restoring the tab set is now async (it reads the durable
 // backend store), so the whole seed → mount → fill sequence is one async flow.

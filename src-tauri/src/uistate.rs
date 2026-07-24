@@ -1,12 +1,14 @@
-//! Durable UI state persisted across launches — currently the project-tab set
-//! (#63). This is app-global UI state (not per-group), so it lives directly
-//! under the app data dir as `tabs.json`, a sibling of `orchestration/` and
-//! `logs/` — the same `<data dir>/loomux/…` tree the rest of the app's durable
-//! state uses (see `OrchRegistry::default_root`, `obs::logs_dir`).
+//! Durable UI state persisted across launches — the project-tab set (#63) and,
+//! since #370, app-wide terminal settings. Both are app-global (not per-group),
+//! so they live directly under the app data dir as `tabs.json`/`settings.json`,
+//! siblings of `orchestration/` and `logs/` — the same `<data dir>/loomux/…`
+//! tree the rest of the app's durable state uses (see
+//! `OrchRegistry::default_root`, `obs::logs_dir`).
 //!
-//! The blob is an OPAQUE JSON string the frontend owns the schema for
-//! (`src/tabstore.ts` encodes/decodes and validates the shape — the single
-//! source of the tab schema). The backend's job here is narrow but critical:
+//! Each blob is an OPAQUE JSON string the frontend owns the schema for
+//! (`src/tabstore.ts` / `src/settings.ts` encode/decode and validate their own
+//! shape — this file never parses either beyond "is it JSON at all"). The
+//! backend's job here is narrow but critical, and identical for both files:
 //!
 //!  1. **Atomic writes.** Serialize to a sibling temp file, then rename over the
 //!     target. A bare `fs::write` truncates the file in place, so a crash / kill
@@ -53,6 +55,11 @@ fn state_dir() -> PathBuf {
 /// Absolute path of the persisted tab set.
 fn tabs_path() -> PathBuf {
     state_dir().join("tabs.json")
+}
+
+/// Absolute path of the persisted app settings (#370).
+fn settings_path() -> PathBuf {
+    state_dir().join("settings.json")
 }
 
 /// Atomically write `contents` to `path`: create the parent dir, write a unique
@@ -118,6 +125,22 @@ pub fn load_ui_tabs() -> Option<String> {
 #[tauri::command]
 pub fn save_ui_tabs(contents: String) -> Result<(), String> {
     write_atomic(&tabs_path(), &contents)
+}
+
+/// Read the persisted app settings (#370: `terminal.pasteOnPlainCtrlV` and
+/// whatever else lands here later) as an opaque JSON string, or `null` on
+/// first run / a quarantined corrupt file — `src/settings.ts` degrades that
+/// to its defaults, exactly like `load_ui_tabs`/`tabstore.ts`.
+#[tauri::command]
+pub fn load_settings() -> Option<String> {
+    load_or_quarantine(&settings_path())
+}
+
+/// Persist app settings (an opaque JSON string produced by `settings.ts`),
+/// atomically. Same best-effort contract as `save_ui_tabs`.
+#[tauri::command]
+pub fn save_settings(contents: String) -> Result<(), String> {
+    write_atomic(&settings_path(), &contents)
 }
 
 #[cfg(test)]

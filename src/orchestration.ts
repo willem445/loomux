@@ -274,26 +274,31 @@ async function openAgentPane(
   // restore, launching an orchestrator) pass false to focus the new pane.
   background: boolean
 ): Promise<void> {
-  const pane = await grid.openPane(
-    {
-      name: req.name,
-      cwd: req.cwd,
-      command: req.command,
-      argv: req.argv,
-      env: req.env,
-      badge: badgeFor(req),
-      orchGroup: req.group_id,
-      orchRole: req.role,
-      orchAgent: req.agent_id,
-      // Record the session id the backend embedded in the command (#194.5) so
-      // capture() persists it — a group resume then restores exactly the captured
-      // members from their own sessions, not the full historical roster.
-      sessionId: sessionIdFromCommand(req.command, req.argv ?? null) ?? undefined,
-      background,
-    },
-    paneEvents,
-    grid.paneCount >= 2 ? "column" : "row"
-  );
+  const paneOpts = {
+    name: req.name,
+    cwd: req.cwd,
+    command: req.command,
+    argv: req.argv,
+    env: req.env,
+    badge: badgeFor(req),
+    orchGroup: req.group_id,
+    orchRole: req.role,
+    orchAgent: req.agent_id,
+    // Record the session id the backend embedded in the command (#194.5) so
+    // capture() persists it — a group resume then restores exactly the captured
+    // members from their own sessions, not the full historical roster.
+    sessionId: sessionIdFromCommand(req.command, req.argv ?? null) ?? undefined,
+    background,
+  };
+  const dir = grid.paneCount >= 2 ? "column" : "row";
+  // The backend already decided this pane should open minimized (#260: a
+  // delegate role, group hasn't opted out) — `openPaneMinimized` lands it
+  // straight in the dock instead of a real tree slot, so it never renders a
+  // full-size frame before folding (#387) or resizes its PTY to a layout size
+  // the human never sees.
+  const pane = req.minimized
+    ? await grid.openPaneMinimized(paneOpts, paneEvents, dir)
+    : await grid.openPane(paneOpts, paneEvents, dir);
   try {
     // A failed spawn (ptyId null) has no pty to bind; it times out backend-side.
     if (pane.ptyId === null) return;
@@ -303,14 +308,6 @@ async function openAgentPane(
       discardStalePane(grid, pane);
       return;
     }
-    // Dock it straight away (#260): the backend already decided this pane
-    // should open minimized (a delegate role, group hasn't opted out) — reuse
-    // the existing minimize/dock plumbing (#46) rather than a parallel
-    // "open into the dock" path, so this behaves exactly like a human folding
-    // the pane by hand a moment after it opened. `grid.minimize` refuses to
-    // dock the grid's last visible pane, so this is a no-op in that edge case
-    // rather than ever leaving the grid empty.
-    if (req.minimized) grid.minimize(pane);
     // Report the pty so the backend can unblock the spawner and type the kickoff.
     try {
       await invoke("bind_agent", { agentId: req.agent_id, ptyId: pane.ptyId });
