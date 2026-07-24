@@ -129,7 +129,7 @@ pane stays open showing the status).
 | --- | --- | --- |
 | `spawn_agent(name, kind, task, worktree?, branch?, base?)` | ✓ (guardrailed) | ✗ |
 | `send_prompt(agent_id, text)` | ✓ | ✗ |
-| `report(status, summary)` / `message_orchestrator(text)` | ✗ | ✓ |
+| `report(status?, summary?, outcome?, ref?, detail_url?, note?)` / `message_orchestrator(text)` | ✗ | ✓ |
 | `list_agents()` | ✓ | ✓ |
 | `get_output(agent_id, lines)` | ✓ | ✗ |
 | `kill_agent(agent_id)` / `focus_agent(agent_id)` | ✓ | ✗ |
@@ -847,6 +847,52 @@ box clears) rather than making the orchestrator poll terminals by hand.
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
 
+## Decision-grade structured reports (#398)
+
+Every worker/reviewer/planner `report(...)` lands in the orchestrator's context window, and for
+most of them the orchestrator is only ever a router whose next action depends on one bit plus a
+reference — "review done, changes requested, PR #N" or "CI green, ready for review, PR #N" — while
+the free-text `summary` had no shape and no cap, so a 300-word paraphrase of a review that was
+already posted to the PR was a normal report. Verbose inbound reports were the single biggest
+avoidable drain on the orchestrator's context, and every unneeded paragraph brings the next
+compaction closer (the same pressure #287/#328/#329's compact-nudge work manages from the other
+side).
+
+- **Structural enforcement over prose.** `report`'s legacy shape (`status: progress|done|blocked`,
+  free-text `summary`, no cap) still works — nothing that called it before this shipped breaks —
+  but is soft-deprecated: the role templates stop teaching it. The new shape is `outcome` (a
+  five-value enum: `done`, `blocked`, `progress`, plus `approved`/`request_changes` for a
+  reviewer's report — a superset of the legacy three, not a parallel vocabulary), `ref` (the
+  PR/issue, e.g. `"#123"`), `detail_url` (the GitHub comment/PR where the FULL detail already
+  lives), and `note` — hard-capped at `report::NOTE_CHAR_CAP` (500 **characters**, never split
+  mid-codepoint) by `report::truncate_note`, which always appends a stated `[…truncated, N chars
+  total — see detail_url]` marker rather than silently cutting text. A cap the tool enforces beats
+  a guideline the template merely asks for.
+- **`outcome` implies `status` when the caller omits it** (`report::status_for_outcome`): `done` →
+  `done`, `blocked` → `blocked`, `progress` → `progress`, and both `approved`/`request_changes` →
+  `done` — a reviewer's turn being over (idle-kill clock restarts, attention badge clears) is the
+  same event whichever way the review came out. This is what lets a fully-structured report never
+  need the legacy field at all; `mcp.rs`'s dispatch validates whichever of `status`/`outcome` is
+  given (rejecting an unrecognized value in either vocabulary, never defaulting one) and requires
+  at least one, and likewise requires at least one of `summary`/`note` for the text.
+- **Artifact-first is the assumption this rests on.** The report is a *notification*, not the
+  record — the role templates (all four) now say so explicitly in their tool-doc bullet: post the
+  full detail to GitHub FIRST (a worker's PR body/comment, a reviewer's review body, a planner's
+  issue comment — already close to universal practice via the existing `review_verdict`/PR flow),
+  then `report` the pointer. `report::structured_notice` composes the delivered `[loomux] <agent>
+  reports <outcome> (<ref>): <note> — see <detail_url>` line — decision-grade, and small enough
+  that even a batch of them doesn't threaten the next compaction.
+- **Cutting the review fix-loop's middle hop.** The mirror change, in `orchestrator.md` and
+  `worker.md`: on `request_changes`, the orchestrator routes **one line** to the worker ("review
+  requested changes on PR #N — read the findings and revisit") rather than relaying the findings
+  it never needed to hold in its own context — the findings are already on the PR (the reviewer
+  posted them there before calling `report`), so the worker reads them directly. The full review
+  never transits the orchestrator's context at all.
+- **Template lockstep.** All four role templates changed; the `tests/fixtures/pre222` goldens were
+  re-blessed in the same commit (see that directory's README for the diff-as-review-surface
+  convention) — a prose pin (`tests/prompts.rs`) audited clean, since none of #398's edits touched
+  a pinned region.
+
 ## Notification backend (#243)
 
 Three MCP tools — `notify_when`, `list_notifications`, `cancel_notification` — let the
@@ -1224,6 +1270,90 @@ the two cost/safety controls the unattended-spend risk demands.
   delivered to it never touches worker `idle_since_ms`, so idle workers still reap on schedule.
   Spawns a tick induces still count against `max_spawns_per_hour`. The human's pause/off-switch
   is instant.
+
+### Idle-tick intake gate (#332)
+
+The idle tick above fires on a **fixed quiet-window schedule**, regardless of whether anything
+has actually changed — the common case in a settled group is a full LLM turn against the
+orchestrator's (largest) context that ends "nothing new, going quiet." The intake gate makes the
+tick **conditional** on a host-side, zero-token pre-check for exactly the two things the tick's
+cadence exists to catch: new/changed `agent-ready`/`agent-investigation` labels, and open-PR
+check-state transitions.
+
+- **A second, independently-clocked poller.** `start_intake_poller` (`INTAKE_POLL_SCAN_INTERVAL`,
+  60s wake, the `start_notify_poller`/`start_idle_tick` shape) calls `poll_intake`, which — for
+  every **autonomous** group with `Guardrails.intake_poll_minutes` nonzero and due
+  (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval idiom) — shells out
+  to `gh issue list --json number,title,labels` and `gh pr list --json
+  number,title,statusCheckRollup` (via the existing `gh_capture` helper `poll_watches` already
+  uses; no new subprocess plumbing) and diffs the result against that group's last-seen state
+  (`OrchRegistry.intake_seen`, in-memory only — the `watches`/`idle_tick_times` lifetime class).
+  Two calls per due group regardless of how many issues/PRs exist — the API-budget discipline
+  `notify.rs`'s round-robin/per-tick cap defends, applied here as "one list call, not one per
+  item."
+- **Pure diff + notice composition (`intake.rs`, mirrors `notify.rs` exactly).**
+  `label_deltas`/`pr_check_deltas` take the already-parsed `gh --json` output and the prior
+  poll's last-seen maps and return only what's NEW: a label present now that wasn't at the last
+  observation (covers both a brand-new labeled issue and a label added to a known one; a label
+  removed then re-added reads as new again, not a repeat), or a PR whose coarse check-state
+  (`PrCheckState::{Pending,Success,Failure}`, classified with the exact `check_is_pending`/
+  `check_is_failing` predicates `notify::pr_checks_result` already uses, so the two call sites
+  can never disagree about what "failing" means) reached a NEW terminal value. A restart empties
+  `intake_seen`, so the very next poll reads everything currently labeled/terminal as new exactly
+  once — the acceptance criterion ("harmless one-time re-fire, never a repeat") falls out of the
+  diff with no special-casing. `intake_wake_summary` composes the addendum text, sanitized with
+  `notify::sanitize_gh_text` exactly like every other GitHub-derived field reaching a `[loomux]`
+  notice (issue titles are third-party text — the #189 threat model applies here too), capped at
+  `MAX_SIGNALS_IN_SUMMARY` with a stated "+N more" rather than growing unboundedly.
+- **The gate itself (`intake::idle_tick_gate`).** Once `idle_tick_should_fire`'s quiet-window
+  threshold clears (unchanged from #83), a group with the gate ON consults **four** signals
+  before actually notifying: a pending intake signal from the poller above; an outstanding
+  `notify_when` CI watch for the group (the "a lost notification degrades to poll-on-sweep"
+  invariant already in `orchestrator.md` — an outstanding watch means the tick's fallback-sweep
+  duty still has a job even with zero label/PR news); an unresolved watchdog stall
+  (`AgentEntry.watchdog_notified` on any agent in the group); or the **bounded fallback**
+  (`intake::idle_tick_fallback_due`, `Guardrails.idle_tick_fallback_minutes`, default 180 = 3h,
+  the middle of the issue's suggested 2–4h range) having come due since the group's last actual
+  fire (`OrchRegistry.idle_tick_last_fired_ms`) — never since the gate was last merely
+  *evaluated*, which can happen every 60s scan while a group sits quiet. Any one of the four
+  fires the tick; none of them SKIPS it — audited (`idle-tick-skipped`, with the reason), never
+  silently. A skip re-arms the one-notice latch (`idle_tick_notified`) so the loop doesn't
+  busy-spin re-checking every scan, but with a NEW per-agent field
+  (`AgentEntry.idle_tick_skip_rearm_ms`) that auto-clears it once `intake_poll_minutes` could
+  actually have refreshed the poller's findings — unlike the #83 latch, which only clears on the
+  orchestrator producing real output, a *skip* means it produced none, so nothing else would ever
+  clear it.
+- **`intake_poll_minutes` is the one field in this whole guardrail struct where 0 means "off,"
+  literally** — every other minutes-guardrail in `Guardrails` (`idle_tick_minutes`,
+  `watchdog_stall_minutes`, …) treats 0 as "unset → coerce to a default." This field inverts that
+  convention on purpose: the gate is new, opt-in behavior layered on an existing tick, and an
+  upgraded group's `group.json` (written before this field existed, so it decodes to 0) must
+  reproduce today's unconditional-tick behavior byte for byte rather than silently start skipping
+  ticks the human never asked to have gated. `idle_tick_fallback_minutes`, by contrast, follows
+  the normal idiom (0 → default, then clamped `30..=10080` min) — it is the backstop *for* the
+  gate, so it must never be configurable to "off."
+- **When the tick DOES fire because of the gate**, the notice (`idle_tick_notice`, now taking an
+  `Option<&str>` intake summary) states what changed — issue numbers, PR state deltas — so the
+  orchestrator can act on it directly instead of re-polling the exact thing loomux already
+  checked for zero tokens. This is the same "don't make the recipient re-derive what the sender
+  already knows" principle behind #398's structured reports, applied to the opposite direction of
+  the same channel.
+- **Degrade, don't deny.** A `gh` failure on either call (auth, not installed, transient) simply
+  skips that half of the diff for the current scan; the poll attempt is still stamped (so a
+  persistently-failing `gh` isn't retried every 60s), and the bounded fallback covers the group
+  regardless — a poller outage can make the gate less useful, never silence the orchestrator past
+  the fallback's own interval.
+
+**Coexistence with compact-nudge (below):** the two mechanisms are fully decoupled — compact-nudge
+runs as its own background thread (`start_compact_nudge`/`run_compact_nudge`/`compact_nudge_tick`),
+never inside `idle_tick_tick`, with its own anti-nag latch (`compact_nudge_notified`) and its own
+output-total baseline (`compact_nudge_last_output_total`, kept deliberately separate from this
+gate's `last_output_total` — see that field's own doc for the rev-24 finding this avoids: two
+readers of one counter starving each other). The only state they share is the read of
+`AgentEntry.last_progress_ms`, the quiet clock `idle_tick_should_fire` gates on for both — and this
+gate never writes to it differently depending on whether it fires or skips (a skip is purely "don't
+delivered the notice"), so compact-nudge's own independent read of that clock is unaffected by
+whatever this gate decides for the same tick.
 
 ## Compact-nudge (#287)
 
@@ -1869,6 +1999,58 @@ ever" invariant is unaffected).
 kickoff doesn't embed the directive ledger the way a `/compact` reinjection does — filed as
 [#411](https://github.com/willem445/loomux/issues/411), a known scope boundary (a different code
 path, `spawn_agent_ex`'s resume branch, not `compact_nudge_tick`).
+
+### Min-context floor (benchtest finding, landed alongside #332 — same token-economy theme)
+
+A `loomux-testbed` benchtest of the #398/#332 PR surfaced a second waste pattern on the
+compact-nudge side: a single-feature session ran 3-4 real compactions, and every one of them —
+correlated against the nearby `compact-pending-discarded` token readings, the closest available
+evidence — landed at roughly 20-31% of the context window. The lull-timer's quiet-window gate
+was doing exactly its job (firing at a genuinely idle moment); the missing piece was any
+awareness of *how full the pane actually was* before paying a full re-grounding cycle for it —
+right timing, wrong context level.
+
+- **The floor gates the HEURISTIC fire only.** `Guardrails.compact_nudge_min_context_percent` is
+  checked by `compact_nudge_context_floor_met` and ANDed into `heuristic_fires` alongside the
+  existing role/threshold checks in `compact_nudge_tick`. It is never applied to `requested_fires`
+  (`request_compact`) — an agent that explicitly asks is always honored regardless of context%,
+  exactly per #328's original framing: loomux's own unprompted judgment is what gets a floor, not
+  the agent's.
+- **Smart default (rev-65 review round): tri-state `Option<u32>`, resolved at the GATE, not at
+  `clamped()`.** A first cut shipped this as a plain `u32` with "0 = off" — but that shape asked
+  the human to configure a percentage just to get a fix for a problem they didn't cause, and the
+  reviewer flagged that a re-benchtest at the (then) default config would reproduce the exact
+  over-compaction the finding was about. The fix: `None` (unset — what every group gets with zero
+  config) resolves to `DEFAULT_COMPACT_NUDGE_MIN_CONTEXT_PERCENT` (50) automatically **whenever
+  `compact_nudge_minutes > 0`** — enabling the quiet-window alone is enough, no second field to
+  touch. `Some(0)` is the explicit opt-out (today's pre-smart-default behavior, preserved
+  verbatim), `Some(n)` an explicit floor. The resolution deliberately lives in
+  `compact_nudge_context_floor_met` (reading the LIVE `compact_nudge_minutes` every tick already
+  has in hand) rather than in `Guardrails::clamped()` — a group that flips `compact_nudge_minutes`
+  on later via a live setter gets the smart default immediately, with no re-launch or
+  re-normalization pass needed to "catch up". `Option<u32>` mirrors the one other place this
+  struct already needed "let a real value distinguish from absence" —
+  `context_window_tokens_override`.
+- **Fails open with no reading**, in every one of the three states — a missing/stale
+  context-percent reading must never silently disable the whole heuristic nudge, the same
+  "degrade, don't deny" posture #332's intake gate takes on a `gh` failure.
+- **Template guidance, not a tool change.** `orchestrator.md`'s existing "Compact at lulls"
+  section and `docs/orchestration.md`'s user-facing **Compact-nudge** section both name the smart
+  default and its number (50%) explicitly, so the template and the config never quote different
+  figures. The tool itself (`request_compact`) stays unconditionally available at any context
+  level, per the design above.
+- **Config surface:** persisted in group.json (`null`/absent for `None`, an integer for `Some`),
+  live-settable via `orch_set_compact_nudge_min_context_percent` — which always writes an explicit
+  `Some` and can never restore `None`, since touching the control at all is the explicit choice
+  (mirrors `orch_set_compact_context_threshold`'s shape otherwise).
+- **Interaction with the escalation threshold (`compact_context_threshold_percent`) is unchanged
+  by the smart default.** The two are independent knobs answering different questions — the floor
+  gates the TIME-based lull fire ("don't act on the timer alone below N%"), the threshold drives a
+  SEPARATE context-based escalation path ("act because you crossed N%") — and neither reads the
+  other's value. A group with both configured can end up with the escalation threshold LOWER than
+  the min-context floor (escalation fires before the lull-timer's floor would ever have let it
+  through); that is intentional, not a bug to reconcile — escalation is not the lull-timer, and
+  crossing its own threshold is authorization enough for a request_compact on the agent's behalf.
 
 ## Enforced merge gate (#83)
 

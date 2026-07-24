@@ -138,6 +138,61 @@ so far:
   same way — but only durable state already offloaded comes back, which is what the ledger is
   for.
 
+- **#398, terse decision-grade reports** — all four files. Every `report(...)` tool-doc bullet now
+  teaches the structured shape (`outcome`/`ref`/`detail_url`/`note`, the note hard-capped ~500
+  chars by the tool itself) instead of the free-text `status`/`summary` pair — every role's report
+  is a **notification, not the record**: the full detail (PR body/comment, issue comment, review
+  body) is posted to GitHub FIRST, and the report just points at it. The legacy shape still works
+  (soft-deprecated: accepted, but no longer taught). `worker.md`'s **Review findings** section and
+  `orchestrator.md`'s worker-reports-a-PR step 2 both flip the request-changes loop the other way:
+  the orchestrator routes one line ("read the findings and revisit"), never the findings
+  themselves — the worker reads them off the PR directly.
+
+- **#332, event-driven intake wake** — `orchestrator.md` only, landed in the same PR as #398
+  above (both attack the orchestrator's context from opposite ends: #398 shrinks inbound report
+  bloat, #332 eliminates empty idle-tick turns). The **Autonomous mode (idle-tick)** section gains
+  a paragraph naming the host-side gate: a zero-token poll checks for new intake-label/PR-check-
+  state signals before an idle tick fires, a tick with nothing new (and no other wake reason — a
+  pending CI watch, a watchdog stall) is skipped quietly and audited rather than spending a turn,
+  a bounded fallback still wakes the orchestrator unconditionally on a slow cadence regardless,
+  and a tick that DOES fire because of the gate names what changed so the orchestrator doesn't
+  re-poll it. `worker.md`/`reviewer.md`/`planner.md` are untouched by this one.
+
+- **Benchtest findings on #398/#332 (rev-31's live testbed run), two more re-blessings in the same
+  PR:**
+  - **Terse reports still triggered reflexive `gh` re-reads.** The testbed's audit + transcript
+    forensics showed the orchestrator re-reading a PR's diff/body/comments/mergeable-state
+    repeatedly across consecutive same-verdict reports (25 `gh` calls across one PR's review
+    lifecycle, several of them exact repeats). `orchestrator.md` gains an **"act on the report,
+    don't re-derive it"** rule right where `report(...)` is first introduced (read the artifact
+    only when the next action needs its CONTENT — CI/mergeable state for a merge, nothing for a
+    routing hand-off) and step 2's worker-reports-a-PR hand-back is tightened to an explicit
+    one-line template with a named, bounded exception (an ADDITIVE delta only — context the
+    reviewer lacked — never a restatement). `worker.md`/`reviewer.md`'s `report(...)` bullets gain
+    mandatory per-outcome examples for what earns `note` space; `reviewer.md`'s is reserved for
+    orchestrator-decision-relevant facts (needs-human-decision, cross-PR conflict, accepted
+    residual+tradeoff, a blocker's one-sentence mechanism) and explicitly never a findings summary.
+  - **Compact-nudge min-context floor.** The same testbed run showed 3-4 real compactions, all at
+    ~20-31% context — the lull timer's quiet-window gate firing at the right moment but the wrong
+    context level. `orchestrator.md`'s existing **Compact at lulls** paragraph (#328/#329) gains a
+    sentence naming the new floor and telling the orchestrator not to call `request_compact` out
+    of lull habit below roughly 50% — the tool itself stays unconditionally available at any
+    context level (agent judgment always wins); only loomux's own unprompted heuristic nudge is
+    gated. `worker.md`/`reviewer.md`/`planner.md` are untouched by this one too (compact-nudge is
+    orchestrator-only by default).
+
+- **Smart-default re-blessing (rev-65's review of the min-context floor above)** —
+  `orchestrator.md` only. The floor as first shipped was a plain `u32` defaulting to `0`
+  (off) — a re-benchtest at default config would have reproduced the exact over-compaction
+  the floor exists to fix, since nothing turns it on without a manual setter call.
+  `compact_nudge_min_context_percent` is now tri-state (`Option<u32>`: unset → the 50%
+  smart default applies automatically the moment the quiet-window (`compact_nudge_minutes`)
+  is on; explicit `0` → floor disabled; explicit `N` → `N`), resolved fresh on every gate
+  check rather than baked in at group creation, so turning the quiet-window on later still
+  gets the default with no re-launch. `orchestrator.md`'s **Compact at lulls** paragraph is
+  reworded to say the floor is "automatic the moment the quiet-window is on, nothing to
+  configure" instead of describing a value the operator would otherwise have had to set.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

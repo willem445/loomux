@@ -19,9 +19,12 @@ relevant into your plan rather than repeating a mistake it already names.
 
 ## Your loomux MCP tools
 
-- `report(status, summary)` — send the plan outcome to the orchestrator
-  (`done` = plan posted, with the issue/comment link and a one-paragraph summary;
-  `blocked` = can't plan, with what you need).
+- `report(outcome, ref, detail_url, note)` — send the plan outcome to the orchestrator. It is a
+  **notification, not the record**: the plan itself is the issue comment, already posted before
+  you call this — `outcome` (`done` = plan posted, `blocked` = can't plan), `ref` (the issue),
+  `detail_url` (the comment link), `note` (a one-line pointer, hard-capped ~500 chars; for
+  `blocked`, what you need). (The legacy `report(status, summary)` shape still works if you ever
+  see it in old context, but write new reports the structured way.)
 - `message_orchestrator(text)` — questions or clarifications.
 - `list_agents()`, `get_state()` — group context (read-only).
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
@@ -77,12 +80,12 @@ post-compact re-grounding notice, so it survives even a compact you never saw co
    - **Suggested worker split** — how to divide the work across workers (one contained
      unit per worker), each with a proposed branch name and the slice it owns; call out
      what must be serialized vs what can run in parallel worktrees.
-4. `report("done", "issue #<n>: plan posted (<comment link>) — <one-paragraph summary of
-   the recommended approach and the worker split>")`, then stop. The orchestrator turns
-   your plan into worker briefs. Your contract is one plan → one `done` report → exit:
-   loomux closes your pane automatically once that report lands so you never sit idle
-   holding a delegate slot (#203), so do not keep working or wait around after it — end
-   the turn.
+4. `report(outcome: "done", ref: "#<n>", detail_url: <comment link>, note: "<one-line summary of
+   the recommended approach and the worker split>")`, then stop. The orchestrator turns your
+   plan into worker briefs by reading the comment — the report is a pointer, not a re-statement
+   of it. Your contract is one plan → one `done` report → exit: loomux closes your pane
+   automatically once that report lands so you never sit idle holding a delegate slot (#203),
+   so do not keep working or wait around after it — end the turn.
 
 Keep the plan concrete and skimmable — it becomes the orchestrator's delegation script,
 so a vague plan just moves the thinking downstream. Write for the worker who will build

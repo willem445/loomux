@@ -9,6 +9,7 @@
 //! every tool is scoped to the caller's group — panes without a token can't
 //! reach this server's state at all, and group A can never see group B.
 
+use super::report;
 use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
 use serde_json::{json, Value};
 use std::io::Read as _;
@@ -326,12 +327,16 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
     } else {
         tools.extend([
             tool("report",
-                "Report a status change to the orchestrator: progress | done | blocked. For done, include the PR URL.",
+                "Report to the orchestrator — decision-grade, not a narrative: it is a router whose next action depends on one bit plus a reference, and every paragraph beyond that is context it pays for on every future turn. Post your FULL detail to GitHub first (PR body/comment, issue comment — the system of record); this tool is the notification, not the record. Prefer the structured shape: `outcome` (done | blocked | approved | request_changes | progress — approved/request_changes are for a reviewer's report after `review_verdict`, and both count as this agent's turn being over, same as done), `ref` (the PR/issue this is about, e.g. \"#123\"), `detail_url` (the GitHub comment/PR where the full detail lives), and `note` — a short pointer (~1-2 lines), hard-capped at 500 characters and truncated WITH a stated marker if you go over, so the cap is enforced, not merely asked for. The legacy shape (`status` + free-text `summary`, no cap) still works — nothing breaks — but is soft-deprecated: write new reports the structured way. Give exactly one of `status`/`outcome` and one of `summary`/`note`.",
                 json!({
-                    "status": { "type": "string", "enum": ["progress", "done", "blocked"] },
-                    "summary": { "type": "string" },
+                    "status": { "type": "string", "enum": ["progress", "done", "blocked"], "description": "Legacy — soft-deprecated. Prefer `outcome`." },
+                    "summary": { "type": "string", "description": "Legacy free text, uncapped — soft-deprecated. Prefer `note`." },
+                    "outcome": { "type": "string", "enum": ["done", "blocked", "approved", "request_changes", "progress"], "description": "Structured decision-grade outcome. approved/request_changes are a reviewer's report after review_verdict." },
+                    "ref": { "type": "string", "description": "The PR/issue this report is about, e.g. \"#123\"." },
+                    "detail_url": { "type": "string", "description": "URL of the GitHub PR/issue comment carrying the full detail — the system of record." },
+                    "note": { "type": "string", "description": "Short pointer, hard-capped at ~500 chars (truncated with a stated marker if longer)." },
                 }),
-                &["status", "summary"]),
+                &[]),
             tool("message_orchestrator", "Send a free-form message to the orchestrator.",
                 json!({ "text": { "type": "string" } }), &["text"]),
         ]);
@@ -870,22 +875,49 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role == Role::Orchestrator {
                 return Err("report is for workers/reviewers; use send_prompt".into());
             }
-            let status = arg_str(args, "status").unwrap_or("progress");
-            if !matches!(status, "progress" | "done" | "blocked") {
-                return Err("status must be progress | done | blocked".into());
+            // #398: two report shapes share this one tool. `outcome` (new,
+            // structured) is a superset of legacy `status` — it's what implies
+            // status when the caller omits it, so a fully-structured report
+            // never has to pass both. Either the legacy `status` or the new
+            // `outcome` is required (never neither); same for the text.
+            let outcome = arg_str(args, "outcome");
+            if let Some(o) = outcome {
+                if !report::OUTCOMES.contains(&o) {
+                    return Err(format!("outcome must be one of: {}", report::OUTCOMES.join(", ")));
+                }
             }
-            let summary = arg_str(args, "summary").ok_or("summary required")?;
+            let status_arg = arg_str(args, "status");
+            if let Some(s) = status_arg {
+                if !report::STATUSES.contains(&s) {
+                    return Err("status must be progress | done | blocked".into());
+                }
+            }
+            let status = status_arg
+                .or_else(|| outcome.map(report::status_for_outcome))
+                .ok_or("status or outcome required")?;
+            let note = arg_str(args, "note").filter(|s| !s.is_empty());
+            let summary = arg_str(args, "summary").filter(|s| !s.is_empty());
+            if note.is_none() && summary.is_none() {
+                return Err("summary or note required".into());
+            }
             // A worker that finished (done) or stalled (blocked) is idle
             // again — restart its idle-kill clock; progress keeps it active.
             reg.set_agent_idle(&caller.agent_id, matches!(status, "done" | "blocked"));
             // Attention routing: a done/blocked report badges the pane (and can
             // toast) so the human sees which one needs them; progress clears it.
             reg.note_report_attention(&caller.agent_id, status);
-            reg.deliver_to_orchestrator(
-                &caller.group,
-                &format!("[loomux] {} reports {status}: {summary}", caller.agent_id),
-                &caller.agent_id,
-            )?;
+            let message = match outcome {
+                // Structured path: the note is hard-capped here (not in a
+                // template guideline) and the notice names the ref/pointer the
+                // orchestrator routes on instead of reading a paraphrase.
+                Some(o) => {
+                    let body = note.map(report::truncate_note).unwrap_or_else(|| summary.unwrap_or("").to_string());
+                    report::structured_notice(&caller.agent_id, o, &body, arg_str(args, "ref"), arg_str(args, "detail_url"))
+                }
+                // Legacy path: byte-for-byte the pre-#398 message, uncapped.
+                None => format!("[loomux] {} reports {status}: {}", caller.agent_id, note.or(summary).unwrap()),
+            };
+            reg.deliver_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
             // #203: a planner's contract is one plan → one report → exit. Close
             // its pane deterministically on the `done` report so it stops holding
             // a delegate slot the instant its work is posted — the role-template
