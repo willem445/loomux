@@ -1901,6 +1901,20 @@ pub struct Guardrails {
     /// editing group.json for an existing group — same precedent as
     /// `max_spawns_per_hour`, which is also create-time-only today).
     pub context_window_tokens_override: Option<u64>,
+    /// **The resolved intake profile (#382 P1).** One source of truth for
+    /// "what counts as intake" — the built-in `github-labels` default unless
+    /// the repo declared an `intake:` block AND the advanced-orchestrator
+    /// toggle is on for a **fresh** launch, mirroring exactly how `blocks`
+    /// resolves (see [`Launch`], `create_group_ex`). Persisted in group.json
+    /// so a resumed group is pinned to the profile its human approved, and so
+    /// every consumer that needs "what is an intake signal" — the template
+    /// renderer, `gh.rs`'s label allow-list, `idle_tick_notice()`, the #332
+    /// host poller — reads the same value (P2-P4, separate PRs).
+    ///
+    /// Available regardless of the toggle: autonomous mode can run with the
+    /// built-in roster, so a consumer must always have a profile to read, not
+    /// just when the advanced orchestrator is in play.
+    pub intake: workflow::IntakeProfile,
 }
 
 impl Guardrails {
@@ -3493,6 +3507,48 @@ fn blocks_json(blocks: &[workflow::Block]) -> Value {
             })
             .collect(),
     )
+}
+
+/// Read the resolved intake profile out of a group.json `guardrails` object
+/// (#382 P1). Absent key (a group.json predating this field, or one where the
+/// repo declared nothing) resolves to [`workflow::builtin_intake_profile`] —
+/// the same migration guarantee #222's `blocks` gave. A hand-edited
+/// group.json never met `parse_workflow`, so each label falls back to the
+/// built-in value for its field rather than propagating an unusable string,
+/// same defensive posture as [`read_blocks`]'s unrecognized-`kind` handling.
+fn read_intake(g: &Value) -> workflow::IntakeProfile {
+    let default = workflow::IntakeProfile::default();
+    let Some(i) = g.get("intake") else { return default };
+    let source = workflow::intake_source_from_str(i["source"].as_str().unwrap_or(""))
+        .unwrap_or(default.source);
+    let label = |k: &str, fallback: &str| -> String {
+        let v = i["labels"][k].as_str().unwrap_or("");
+        match workflow::sanitize_id(v) {
+            Some(clean) if clean == v.trim() => clean,
+            _ => fallback.to_string(),
+        }
+    };
+    workflow::IntakeProfile {
+        source,
+        ready: label("ready", &default.ready),
+        investigate: label("investigate", &default.investigate),
+        owned: label("owned", &default.owned),
+        prototype: label("prototype", &default.prototype),
+    }
+}
+
+/// Serialize the resolved intake profile for group.json. The inverse of
+/// [`read_intake`].
+fn intake_json(p: &workflow::IntakeProfile) -> Value {
+    json!({
+        "source": p.source.as_str(),
+        "labels": {
+            "ready": p.ready,
+            "investigate": p.investigate,
+            "owned": p.owned,
+            "prototype": p.prototype,
+        },
+    })
 }
 
 #[derive(Clone)]
@@ -6837,6 +6893,9 @@ impl OrchRegistry {
                 // defer entirely to the model-based guess, the conservative
                 // default for a group.json written before this field existed.
                 context_window_tokens_override: g["context_window_tokens_override"].as_u64(),
+                // The resolved intake profile (#382 P1). Absent → the
+                // built-in default, same migration guarantee as `blocks`.
+                intake: read_intake(g),
             },
         ))
     }
@@ -6854,8 +6913,18 @@ impl OrchRegistry {
     /// longer declares, which is exactly the thing worth being able to see.
     fn audit_workflow_drift(&self, id: &str, repo: &str, g: &Guardrails) {
         let ids = |bs: &[workflow::Block]| -> Vec<String> { bs.iter().map(|b| b.id.clone()).collect() };
-        let (now, note) = match workflow::load_workflow(repo) {
+        // #382 NB2: intake drifts independently of the roster — a repo can
+        // rename its label vocabulary without touching a single block, and
+        // that must be as visible as a roster change. `roster_is_custom(&g.
+        // blocks)` alone still gates every arm below correctly even though it
+        // only inspects blocks: `blocks` and `intake` are ALWAYS resolved
+        // together, from the same `wf`, in the same `Launch::Fresh` branch
+        // (`create_group_ex`) — a group's roster is custom iff its intake
+        // profile could be too, so there is no case where blocks reads
+        // "built-in" while intake is quietly running something declared.
+        let (now, now_intake, note) = match workflow::load_workflow(repo) {
             Ok(Some(wf)) => {
+                let resolved_intake = wf.intake.clone();
                 let resolved = Guardrails {
                     agent_cli: g.agent_cli.clone(),
                     blocks: wf.blocks,
@@ -6863,8 +6932,8 @@ impl OrchRegistry {
                 }
                 .clamped()
                 .blocks;
-                if resolved == g.blocks {
-                    return; // the file still says what the group is running
+                if resolved == g.blocks && resolved_intake == g.intake {
+                    return; // the file still says what the group is running — roster AND intake
                 }
                 // "Appeared" and "changed" are different events to a human reading
                 // the trail, and only one of them means "somebody edited the file
@@ -6876,17 +6945,22 @@ impl OrchRegistry {
                 } else {
                     "the repo has gained a workflow file since this group was launched"
                 };
-                (ids(&resolved), note)
+                (ids(&resolved), Some(resolved_intake), note)
             }
             Ok(None) if !workflow::roster_is_custom(&g.blocks) => return, // no file, no workflow: nothing to drift from
-            Ok(None) => (Vec::new(), "the file the group was launched from is gone"),
-            Err(_) => (Vec::new(), "the file no longer validates"),
+            Ok(None) => (Vec::new(), None, "the file the group was launched from is gone"),
+            Err(_) => (Vec::new(), None, "the file no longer validates"),
         };
         self.audit(id, "loomux", "workflow-changed-since-launch", json!({
             "path": workflow::WORKFLOW_PATH,
             "note": note,
             "running": ids(&g.blocks),
             "on_disk": now,
+            // Mirrors `running`/`on_disk` for the intake profile — null
+            // `intake_on_disk` means the file is gone/broken, same as an
+            // empty `on_disk` for blocks in those arms.
+            "intake_running": intake_json(&g.intake),
+            "intake_on_disk": now_intake.as_ref().map(intake_json),
             "action": "keeping the roster this group was launched with — relaunch to pick up the new one",
         }));
     }
@@ -6979,6 +7053,7 @@ impl OrchRegistry {
                         "min_agents": capacity_rec.minimum,
                         "recommended_agents": capacity_rec.recommended,
                         "reviewers_needed": capacity_rec.reviewers_needed,
+                        "intake_source": wf.intake.source.as_str(),
                     }));
                     // The declared merge gate (#222/#197) becomes the `merge_gate`
                     // spec file the gh shim enforces — or, when the file declares
@@ -6997,6 +7072,13 @@ impl OrchRegistry {
                         }));
                     }
                     guardrails.blocks = wf.blocks;
+                    // #382 P1: same gate as the roster override above — the
+                    // repo's declared intake profile takes effect only on a
+                    // FRESH launch with the toggle on, the moment the human
+                    // was shown the resolved roster/gate in the launcher
+                    // preview. A resume never re-reads it (see the `else if`
+                    // arm below); the persisted profile stands.
+                    guardrails.intake = wf.intake;
                     // Re-run the roster normalization (model defaults follow each
                     // block's *effective* CLI, which the file may have changed).
                     guardrails = guardrails.clamped();
@@ -7163,6 +7245,9 @@ impl OrchRegistry {
                 "compact_nudge_roles": info.guardrails.compact_nudge_roles,
                 "compact_context_threshold_percent": info.guardrails.compact_context_threshold_percent,
                 "context_window_tokens_override": info.guardrails.context_window_tokens_override,
+                // #382 P1: the resolved intake profile, so a restart and the
+                // #332 host poller both read exactly what this launch resolved.
+                "intake": intake_json(&info.guardrails.intake),
             },
         }))
         .unwrap();
@@ -15262,6 +15347,11 @@ pub fn create_orchestration(
             // hand-editing group.json; `None` defers to the model-based
             // guess.
             context_window_tokens_override: None,
+            // #382 P1: the launcher has no intake picker yet — the built-in
+            // `github-labels` profile stands unless the repo's workflow file
+            // overrides it (only takes effect with `advanced_orchestrator` on,
+            // gated exactly like `blocks` in `create_group_ex`).
+            intake: workflow::IntakeProfile::default(),
         },
         None,
         None,
