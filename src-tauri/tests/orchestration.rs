@@ -14,6 +14,7 @@ use loomux_lib::orchestration::{
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
+    COMPACT_HOOK_SCRIPT, COPILOT_PRECOMPACT_HOOK_BASH, COPILOT_PRECOMPACT_HOOK_POWERSHELL,
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
     CompactionStatus,
@@ -29,7 +30,7 @@ use loomux_lib::orchestration::{
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     paste_held_notice,
-    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
+    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, resume_kickoff_notice, rotate_audit_if_needed,
     sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
@@ -97,6 +98,11 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = OrchRegistry::new(dir.path().to_path_buf());
     reg.set_port(45999); // fake port so config writing works
+    // #416: never let a test write a generated Copilot custom-agent file into
+    // the REAL `~/.copilot/agents` — point it at this same disposable tree.
+    reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
+    reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
     (reg, dir)
 }
 
@@ -937,7 +943,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
@@ -946,7 +952,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(cmd.contains("--allowedTools mcp__loomux"),
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git"), "git is not pre-approved for a non-auto_ops worker");
-    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
     assert!(cmd.contains("\"Bash(git *)\"") && cmd.contains("\"Bash(gh *)\""),
@@ -959,7 +965,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(!cmd.contains("--disallowedTools"), "non-planner agents get no tool denials");
     // A planner (read_only=true) is denied file writes + git commit/push at
     // the CLI level, even under Auto perms — but keeps gh for the plan comment.
-    let plan = reg.build_agent_command("claude", "opus", true, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("claude", "opus", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
     for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
         assert!(plan.contains(denied), "planner must deny the {denied} tool");
@@ -986,7 +992,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("claude", "opus", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("claude", "opus", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--permission-mode auto"),
         "a planner runs unattended (Auto perms) even when the group is not auto_ops — else it deadlocks");
     assert!(plan.contains("\"Bash(gh *)\""),
@@ -997,7 +1003,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
         "writes/commit/push stay denied structurally — Auto perms don't loosen the read-only contract");
     // By contrast a non-auto_ops WORKER (read_only=false) is unchanged: it
     // stays in acceptEdits with no pre-approved git/gh (the human gates ops).
-    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(worker.contains("--permission-mode acceptEdits"),
         "a non-auto_ops worker is unaffected: it still gates ops through acceptEdits");
     assert!(!worker.contains("\"Bash(gh *)\""),
@@ -1009,7 +1015,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
     assert!(
         cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
@@ -1033,22 +1039,22 @@ fn copilot_command_uses_copilot_adapter_flags() {
     assert!(cmd.contains("--autopilot"),
         "group copilot workers run in true autopilot mode; the kickoff confirms the consent dialog");
     // Conservative preset keeps the explicit allowlist instead.
-    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), true, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), true, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), Some(sid), false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), false, false, &PersonaInject::default());
     assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
         "a fresh copilot spawn cannot pin a session id");
     // A non-planner copilot agent gets no deny-tool flags.
     assert!(!cmd.contains("--deny-tool"), "non-planner copilot agents get no tool denials");
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
-    let plan = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"edit\""),
         "planner must deny copilot's write/edit tools, got: {plan}");
     assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
@@ -1067,7 +1073,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
         "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
     assert!(plan.contains("--autopilot"),
@@ -1078,7 +1084,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
     // the conservative interactive preset (no allow-all).
-    let worker = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let worker = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     assert!(!worker.contains("--allow-all-tools") && !worker.contains("--autopilot"),
         "a non-auto_ops copilot worker stays interactive — only planners run unattended");
 }
@@ -1145,7 +1151,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
 
     // Claude: permission mode + the shared git/gh allowlist constant.
     let group_claude =
-        reg.build_agent_command("claude", "sonnet", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+        reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_claude = single_pane_autopilot_flags("claude");
     assert!(single_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
     assert!(group_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
@@ -1156,7 +1162,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
     // enter true autopilot mode, so single_pane_autopilot_flags reuses the
     // group constant directly rather than inventing a divergent string.
     let group_copilot =
-        reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+        reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
     let single_copilot = single_pane_autopilot_flags("copilot");
     assert_eq!(single_copilot, COPILOT_GROUP_AUTOPILOT_FLAGS,
         "single-pane copilot must reuse the group autopilot atom verbatim, not a divergent string");
@@ -1197,8 +1203,8 @@ fn copilot_single_pane_now_shares_the_group_autopilot_posture() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let worker = reg.build_agent_command("copilot", "auto", true, cfg, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
-    let planner = reg.build_agent_command("copilot", "auto", false, cfg, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let worker = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let planner = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(worker.contains("--autopilot") && planner.contains("--autopilot"),
         "group-mode unattended copilot spawns enter true autopilot mode");
 }
@@ -1404,22 +1410,26 @@ fn build_agent_command_full_line_snapshots() {
     let wd = Path::new("C:/repo");
     // signature: (cli, model, auto_ops, cfg, group_dir, workdir, session, resume, read_only)
     let cmd = |cli, model, auto_ops, read_only| {
-        reg.build_agent_command(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default())
+        reg.build_agent_command(cli, model, auto_ops, cfg, None, gdir, wd, None, false, read_only, &PersonaInject::default())
     };
 
     // Claude worker, auto_ops ON → native Auto mode + git/gh pre-approval.
+    // No `hook_settings` passed here (`None`) ⇒ no `--settings` at all — see
+    // `claude_worker_gets_a_settings_flag_only_when_hook_settings_is_some`
+    // below for the #417 flag itself, split from `--mcp-config`'s file per
+    // rev-4 review N2.
     assert_eq!(
         cmd("claude", "sonnet", true, false),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
-         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
+         --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\""
     );
 
     // Claude worker, auto_ops OFF → acceptEdits, no git/gh, no denials.
     assert_eq!(
         cmd("claude", "sonnet", false, false),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model sonnet \
-         --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
+         --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
     );
 
     // Copilot worker, auto_ops ON → group autopilot: --autopilot + all tools/paths.
@@ -1442,8 +1452,8 @@ fn build_agent_command_full_line_snapshots() {
     // plus the write/commit/push denials, gh still reachable.
     assert_eq!(
         cmd("claude", "opus", false, true),
-        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config --model opus \
-         --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
+         --model opus --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
          \"Bash(git commit *)\" \"Bash(git push *)\""
     );
@@ -1466,6 +1476,38 @@ fn build_agent_command_full_line_snapshots() {
         cmd("claude", "sonnet", true, false),
         "an unrecognized CLI must build the exact claude fallback command"
     );
+}
+
+#[test]
+fn claude_gets_a_settings_flag_only_when_hook_settings_is_some() {
+    // #417, split from `--mcp-config`'s file per rev-4 review N2: `--settings`
+    // is a SEPARATE file/flag, present only when the caller actually has one
+    // (Claude with a resolvable hook script) — never emitted just because
+    // the agent is Claude, and never pointed at `cfg` (the mcp-config file).
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let hooks = Path::new("C:/x/cfg-hooks.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+
+    let cmd = reg.build_agent_command(
+        "claude", "sonnet", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+    );
+    assert!(cmd.contains("--settings \"C:/x/cfg-hooks.json\""), "{cmd}");
+    assert!(!cmd.contains("--settings \"C:/x/cfg.json\""), "must never point --settings at the mcp-config file: {cmd}");
+
+    let argv = reg.build_agent_argv(
+        "claude", "sonnet", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+    );
+    assert!(argv.windows(2).any(|w| w == ["--settings", "C:/x/cfg-hooks.json"]), "{argv:?}");
+    assert_eq!(shell_tokenize(&cmd), argv, "the two forms must never drift on the new flag either");
+
+    // Copilot never gets a --settings flag, `hook_settings` or not — it isn't
+    // wired through the copilot branch at all (copilot has no hook config).
+    let copilot_cmd = reg.build_agent_command(
+        "copilot", "auto", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+    );
+    assert!(!copilot_cmd.contains("--settings"), "{copilot_cmd}");
 }
 
 /// Split a shell command line into argv, honoring the two quotings
@@ -1517,9 +1559,11 @@ fn build_agent_argv_snapshots() {
     let gdir = Path::new("C:/data/group");
     let wd = Path::new("C:/repo");
     let argv =
-        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, gdir, wd, None, false, read_only, &PersonaInject::default());
+        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, None, gdir, wd, None, false, read_only, &PersonaInject::default());
 
     // Claude worker, auto_ops ON. Note the quote-free literal tool tokens.
+    // No `hook_settings` (`None`) ⇒ no `--settings` — see
+    // `claude_gets_a_settings_flag_only_when_hook_settings_is_some` for that.
     assert_eq!(
         argv("claude", "sonnet", true, false),
         vec![
@@ -1587,10 +1631,10 @@ fn build_agent_argv_matches_command_line() {
                 for (session, resume) in sessions {
                     for persona in &personas {
                         let line = reg.build_agent_command(
-                            cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only, persona,
+                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, read_only, persona,
                         );
                         let argv = reg.build_agent_argv(
-                            cli, "m", auto_ops, cfg, gdir, wd, session, resume, read_only, persona,
+                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, read_only, persona,
                         );
                         assert_eq!(
                             shell_tokenize(&line),
@@ -1631,6 +1675,54 @@ fn copilot_mcp_config_includes_tools_allowlist() {
     .unwrap();
     assert!(cfg.contains("\"tools\""), "copilot expects a tools allowlist in the server entry");
     assert!(cfg.contains(&w.token));
+    // #417: copilot has no PreCompact-equivalent hook (confirmed absent
+    // upstream) — it stays on the pre-existing inference tier, never faked.
+    assert!(!cfg.contains("\"hooks\""), "copilot must not get a hooks block it can't use: {cfg}");
+}
+
+#[test]
+fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
+    // #417: PreCompact + SessionStart(compact) hook config rides in its own
+    // generated file (`write_hook_settings_file`), a SEPARATE file from
+    // `--mcp-config`'s (rev-4 review N2 — see `write_mcp_config`'s doc for
+    // why sharing one file between the two was a schema-drift risk), passed
+    // via `--settings` — never a hand-merge of the user's own
+    // `.claude/settings.json`. Skipped (not failed) when no `sh` interpreter
+    // is resolvable at all, mirroring the #335 shim tests' "skip, don't
+    // fail" precedent for an environment where `sh.exe` genuinely can't be
+    // found — `resolve_hook_sh`'s own fail-open policy.
+    #[cfg(windows)]
+    if locate_sh_exe().is_none() {
+        eprintln!("SKIP claude_agent_spawn_provisions_the_compact_lifecycle_hooks: no sh.exe found via `where`");
+        return;
+    }
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let mcp_cfg_path = reg.state_root().join(&g.id).join("configs").join(format!("{}.json", w.id));
+    let mcp_cfg: Value = serde_json::from_str(&fs::read_to_string(&mcp_cfg_path).unwrap()).unwrap();
+    assert!(mcp_cfg.get("hooks").is_none(), "the mcp-config file must carry no hooks key at all: {mcp_cfg}");
+    assert!(mcp_cfg.get("mcpServers").is_some());
+
+    let hooks_path = reg.state_root().join(&g.id).join("configs").join(format!("{}-hooks.json", w.id));
+    let hooks_cfg: Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+    let precompact = hooks_cfg["hooks"]["PreCompact"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+    let sessionstart = hooks_cfg["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+    assert!(precompact.contains("precompact"), "{precompact}");
+    assert!(sessionstart.contains("sessionstart-compact"), "{sessionstart}");
+    assert_eq!(hooks_cfg["hooks"]["SessionStart"][0]["matcher"], json!("compact"), "only compact-sourced starts are hooked");
+    // The command embeds this agent's group dir + id as literal argv — the
+    // generic script itself carries none of it (constraint #8).
+    assert!(precompact.contains(&w.id), "{precompact}");
+    assert!(precompact.contains(&g.id), "{precompact}");
+
+    // The generic script itself was written to the shared, per-machine dir —
+    // never per-group, since it carries no group-specific text.
+    let script = reg.state_root().parent().unwrap().join("compacthook").join("compact-hook.sh");
+    let script_text = fs::read_to_string(&script).expect("the hook script must be written");
+    assert!(script_text.contains("precompact") && script_text.contains("sessionstart-compact"));
+    assert!(!script_text.contains(&g.id), "the script itself must stay generic — group specifics ride on argv only");
 }
 
 fn copilot_rails() -> Guardrails {
@@ -2316,10 +2408,10 @@ fn claude_agents_get_preassigned_resumable_sessions() {
     // The launch command pins the id.
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/x/g");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), Some(&sid), false, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--session-id {sid}")));
     // Resume uses --resume instead.
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, gdir, Path::new("C:/repo"), Some(&sid), true, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), Some(&sid), true, false, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
 }
 
@@ -5181,11 +5273,14 @@ fn compact_nudge_role_gate_defaults_to_orchestrator_only() {
 }
 
 #[test]
-fn compact_nudge_cli_gate_is_claude_only() {
-    // `/compact` is a Claude Code built-in; no other supported CLI has an
-    // equivalent, so the nudge must never fire for them.
+fn compact_nudge_cli_gate_covers_claude_and_copilot() {
+    // Both currently-supported CLIs have a real `/compact` command (Copilot's
+    // confirmed via docs.github.com/en/copilot/reference/copilot-cli-reference/
+    // cli-command-reference — an earlier round of this feature wrongly
+    // asserted Copilot has none). Anything outside `SUPPORTED_CLIS` still
+    // gets no nudge.
     assert!(compact_nudge_cli_supported("claude"));
-    assert!(!compact_nudge_cli_supported("copilot"));
+    assert!(compact_nudge_cli_supported("copilot"));
     assert!(!compact_nudge_cli_supported("codex"));
     assert!(!compact_nudge_cli_supported(""));
 }
@@ -5273,6 +5368,504 @@ fn compact_nudge_ignores_subfloor_repaint_growth() {
         "sub-floor creep never resets the clock, so the window still elapses");
 }
 
+/// Write a hook marker file with an EXPLICIT mtime, `offset_ms` (signed)
+/// after `base_ms` (both real wall-clock ms since the epoch) — never a bare
+/// `fs::write` right after spawning an agent, whose own `started_ms` is
+/// sampled from the SAME real clock a few statements earlier: two real-clock
+/// reads landing in the same millisecond (or a filesystem mtime-write
+/// buffering delay) would otherwise make the product's `ts >= a.started_ms`
+/// gate an intermittent test flake instead of a deterministic pass/fail.
+fn write_hook_marker(path: &Path, base_ms: u64, offset_ms: i64) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let f = fs::File::create(path).unwrap();
+    let ms = (base_ms as i64 + offset_ms).max(0) as u64;
+    f.set_modified(UNIX_EPOCH + Duration::from_millis(ms)).unwrap();
+}
+
+#[test]
+fn compact_nudge_tick_treats_a_precompact_hook_marker_as_trusted_evidence() {
+    // #417: a PreCompact hook marker (a marker FILE the generic hook script
+    // writes — see `COMPACT_HOOK_SCRIPT`) is DIRECT evidence. It arms exactly
+    // like the loomux-initiated path (trusted, no busy-then-quiet inference
+    // gate) AND is treated as already busy — so with the pane already quiet
+    // (no output growth), arm and resolve-into-reinjection happen on the
+    // SAME tick, unlike a banner/manual inference arm which always needs a
+    // later quiet observation.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty = HashMap::new();
+
+    // No marker yet: an ordinary quiet tick fires nothing (the heuristic
+    // window is 20 minutes away; nothing else armed it either).
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+
+    // Simulate the hook firing: write the marker the script would have.
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    // The marker arms AND resolves in this one tick (loomux pasted nothing
+    // itself, so this is not a "nudge"; the reinjection notice is a separate
+    // `deliver_prompt`, not something `compact_nudge_tick`'s return value
+    // reports).
+    assert!(reg.compact_nudge_tick(2_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1, "the arm itself is audited, distinctly from the reinjection");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on confirmed delivery");
+    assert!(a.compact_reinject_attempted_ms.is_some(), "moved into the delivery-confirmation phase");
+    assert_eq!(a.compact_pending_evidence, Some("hook"), "the evidence tag survives into that phase");
+
+    // Confirm delivery: the arm resolves and the evidence tag clears.
+    let confirmed = confirmed_delivery(&oid, 2_000);
+    assert!(reg.compact_nudge_tick(3_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "confirmed delivery releases the latch");
+    assert_eq!(a.compact_pending_evidence, None, "cleared on resolution, like the trust flag it rides alongside");
+
+    // The SAME marker (unchanged mtime) must never re-arm.
+    assert!(reg.compact_nudge_tick(4_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "a stale, already-consumed marker must not re-arm");
+}
+
+#[test]
+fn compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_confirm() {
+    // #417: the SessionStart(compact) marker is even STRONGER direct proof —
+    // Claude Code itself restarted the session specifically because of a
+    // compact — so it arms AND confirms in one step, unconditionally (unlike
+    // the PreCompact marker, which only arms while nothing is already
+    // pending). This covers a hook config with only SessionStart wired, or a
+    // PreCompact marker a tick loop raced past.
+    //
+    // rev-4 review (N3): the SessionStart hook is also the ONE script branch
+    // that emits native `additionalContext` (see `COMPACT_HOOK_SCRIPT`) — so
+    // Claude Code has ALREADY re-grounded the agent by the time this marker
+    // is observed. loomux's OWN reinjection is therefore skipped entirely
+    // here (a double re-grounding would spend exactly the tokens native
+    // delivery exists to save) — this resolves straight to `compact_pending
+    // = false`, not into the delivery-confirmation phase.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty = HashMap::new();
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "native re-grounding already landed — nothing left pending");
+    assert!(a.compact_reinject_attempted_ms.is_none(), "no loomux-side delivery to confirm");
+    assert_eq!(a.compact_pending_evidence, None, "cleared on this terminal resolution");
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1, "the arm is still audited");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0, "no duplicate re-grounding is pasted");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 1);
+}
+
+#[test]
+fn compact_nudge_tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection() {
+    // rev-4 review (N3): the fallback half of the same fix. A PreCompact
+    // marker with NO SessionStart marker (a hook config that only wires the
+    // one event, or a SessionStart marker this tick loop simply hasn't seen
+    // yet) never delivered native `additionalContext` — the script's
+    // `precompact` branch only ever writes a marker, nothing else — so
+    // loomux's own reinjection must still fire. Never silently drop the ONLY
+    // re-grounding channel just because SOME hook evidence exists.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty = HashMap::new();
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on the reinjection's own delivery to confirm");
+    assert!(a.compact_reinject_attempted_ms.is_some());
+    assert_eq!(a.compact_pending_evidence, Some("hook"));
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "the ONLY re-grounding channel available must still fire");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 0);
+}
+
+#[test]
+fn compact_nudge_tick_ignores_a_hook_marker_older_than_the_agent_itself() {
+    // rev-4 review (B1, blocking): the exact failure sequence a live restart
+    // can hit. `compact_hook_*_seen_ms` is in-memory (resets to `None` on a
+    // fresh `AgentEntry`), and agent ids come from an in-memory counter too
+    // — so a fresh boot can mint an id a PREVIOUS process already used,
+    // while the group's `hooks/` marker files (on disk) survive the
+    // restart untouched. Without the `ts > a.started_ms` gate, the very
+    // first tick after such a restart would read the OLD process's marker
+    // as "fresh evidence" (`ts > None.unwrap_or(0)` is true for any real
+    // mtime) and arm TRUSTED with no compaction having happened at all.
+    // Uses the PreCompact marker specifically (not SessionStart): #417's N3
+    // fix resolves a fresh SessionStart marker straight to a terminal state
+    // in the SAME tick (native re-grounding already delivered — see
+    // `compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_
+    // confirm`), which would make this test's own "still arms normally"
+    // half read the wrong signal. PreCompact's arm-then-wait-for-delivery
+    // shape keeps this test's B1 story (the `started_ms` gate itself)
+    // decoupled from N3's separate concern.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    let f = fs::File::create(&marker).unwrap();
+    // Backdate the marker to well before this agent's own `started_ms` —
+    // exactly the shape of one surviving from a PREVIOUS process.
+    f.set_modified(UNIX_EPOCH + Duration::from_millis(started_ms.saturating_sub(60_000))).unwrap();
+    drop(f);
+
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "a marker older than the agent's own started_ms must never arm");
+    assert_eq!(a.compact_pending_evidence, None);
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 0);
+    // Never treated as evidence at all, so never consumed either.
+    assert!(marker.exists(), "a rejected stale marker is left alone, not silently deleted");
+
+    // A GENUINELY fresh marker (mtime after started_ms) from the SAME agent
+    // still arms normally — the fix excludes only markers that PREDATE it.
+    // Mtime set explicitly (not just "written just now") so this assertion
+    // can never flake on two real-clock reads landing in the same
+    // millisecond as `started_ms` itself.
+    let f = fs::File::create(&marker).unwrap();
+    f.set_modified(UNIX_EPOCH + Duration::from_millis(started_ms + 1_000)).unwrap();
+    drop(f);
+    assert!(reg.compact_nudge_tick(2_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "a marker written during this agent's own lifetime still arms");
+    assert_eq!(a.compact_pending_evidence, Some("hook"));
+    assert!(!marker.exists(), "delete-on-consume: an ACTUALLY-used marker is removed from disk");
+}
+
+// ─────────────── #417 correction round: Copilot's own PreCompact hook ───────────────
+//
+// An earlier round of this feature wrongly asserted Copilot has no compaction hooks at
+// all upstream. It does: `preCompact` (docs.github.com/en/copilot/reference/hooks-
+// reference), with a payload nearly identical to Claude's. What it does NOT have is any
+// `sessionStart` source value indicating a post-compaction resume (`source` is exactly
+// `"startup" | "resume" | "new"` — confirmed by the docs, not ambiguous) or a
+// `postCompact` event of any kind — so Copilot gets the TRUSTED ARM half of #417
+// (`compact_pending_trusted = true`, same as Claude's own `precompact`-only case) but
+// never the native-`additionalContext` / N3-suppression half, which stays Claude-only.
+// The marker-consumption path itself (the B1 fix: `ts >= a.started_ms`, delete-on-
+// consume) is CLI-agnostic — it reads `<group_dir>/hooks/<agent_id>.precompact.json`
+// with no idea which CLI wrote it, so the tests below reuse it unchanged; only the
+// SETUP (a copilot-CLI group) and the one new CLI-admission gate differ from the
+// Claude tests above.
+
+fn compact_copilot_rails(minutes: u32, roles: &[&str]) -> Guardrails {
+    Guardrails {
+        compact_nudge_minutes: minutes,
+        compact_nudge_roles: roles.iter().map(|s| s.to_string()).collect(),
+        ..copilot_rails()
+    }
+}
+
+fn compact_nudge_setup_copilot(minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", compact_copilot_rails(minutes, &["orchestrator"])).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+#[test]
+fn copilot_precompact_hook_marker_is_trusted_evidence_too() {
+    // Same evidence class as Claude's `precompact` case (`compact_pending_trusted =
+    // true`) — a hook telling loomux a compaction is starting is equally trustworthy
+    // regardless of which CLI's hook fired it. Before #417's CLI-gate widening
+    // (`compact_nudge_cli_supported`), a copilot agent never even reached this code —
+    // the per-agent loop's admission gate used to be claude-only, so this marker
+    // would have been silently ignored forever.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty = HashMap::new();
+
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    // Arms AND resolves into the delivery-confirmation phase on this one tick — a
+    // Copilot precompact arm has no native re-grounding to make redundant (unlike a
+    // Claude SessionStart-confirmed one), so loomux's OWN reinjection is the only
+    // re-grounding channel here, same as Claude's precompact-only case.
+    assert!(reg.compact_nudge_tick(2_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 0);
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on confirmed delivery");
+    assert!(a.compact_reinject_attempted_ms.is_some());
+    assert_eq!(a.compact_pending_evidence, Some("hook"));
+
+    let confirmed = confirmed_delivery(&oid, 2_000);
+    assert!(reg.compact_nudge_tick(3_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+}
+
+#[test]
+fn copilot_precompact_marker_gets_the_same_b1_restart_protection() {
+    // The exact B1 regression, replayed for a Copilot marker — "one mechanism, two
+    // writers" only actually holds if the SAME gate protects both.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    let f = fs::File::create(&marker).unwrap();
+    f.set_modified(UNIX_EPOCH + Duration::from_millis(started_ms.saturating_sub(60_000))).unwrap();
+    drop(f);
+
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "a marker older than started_ms must never arm, Copilot included");
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 0);
+    assert!(marker.exists());
+}
+
+#[test]
+fn compact_nudge_tick_does_paste_slash_compact_into_a_copilot_pane() {
+    // #417 correction round 2: an earlier round of this feature asserted
+    // Copilot has no `/compact` command at all and pinned a NEGATIVE test
+    // here proving loomux must never paste it into a Copilot pane. That
+    // claim was wrong — GitHub's own CLI command reference documents
+    // `/compact [FOCUS-INSTRUCTIONS]` as a real Copilot CLI command,
+    // identical in spirit to Claude's — so this test now inverts to prove
+    // the OPPOSITE: a copilot agent quiet past the heuristic window DOES get
+    // nudged with a real `/compact` paste, exactly like a Claude agent would.
+    let (reg, _d, _gid, oid) = compact_nudge_setup_copilot(1);
+    let empty = HashMap::new();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "a copilot agent quiet past the heuristic window gets the same /compact paste a Claude agent would"
+    );
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+}
+
+#[test]
+fn compact_nudge_tick_copilot_full_loop_paste_then_hook_confirms_then_reinjects() {
+    // #417 correction round 2, the FULL loop this correction completes for
+    // Copilot, in its two independent halves — exactly mirroring how the
+    // pre-existing Claude tests cover the same two halves separately
+    // (`compact_nudge_tick_reinjects_after_a_loomux_initiated_fire_too` and
+    // `compact_nudge_tick_treats_a_precompact_hook_marker_as_trusted_
+    // evidence`), now proven back-to-back for the SAME copilot agent:
+    //
+    // Half 1 — loomux-initiated: the heuristic fire pastes `/compact` into
+    // the copilot pane (now possible — see the test above); this arm is
+    // trusted by PROVENANCE alone (loomux has positive knowledge the
+    // command was submitted — the rev-42 delta), so it resolves via
+    // busy-then-quiet, with no hook marker needed at all.
+    //
+    // Half 2 — hook-initiated: independently of anything loomux pasted,
+    // Copilot's own `preCompact` hook can fire for a real compaction (an
+    // autonomous auto-compact, or a human-typed `/compact` loomux's manual
+    // detector missed) and the marker is TRUSTED evidence on its own,
+    // arming AND resolving into the delivery-confirmation phase in one
+    // tick — loomux's own reinjection is the only re-grounding channel
+    // (Copilot has no native additionalContext path for compaction, unlike
+    // Claude's SessionStart branch).
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(5);
+    let empty = HashMap::new();
+
+    // Half 1: heuristic fire pastes /compact, then resolves via busy-then-quiet.
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "the heuristic fire pastes /compact itself"
+    );
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1);
+    let baseline: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let dropped: HashMap<String, u64> = [(oid.clone(), 5_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &baseline, &HashMap::new(), &HashMap::new());
+    let _ = reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    let confirmed = confirmed_delivery(&oid, FAR + 2_000);
+    let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "half 1 resolved cleanly before half 2 starts");
+
+    // Half 2: Copilot's own preCompact hook fires independently and writes
+    // the marker `ensure_copilot_compact_hook`'s script provisions — the
+    // SAME marker-consumption path Claude's hook uses, CLI-agnostic by design.
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    // The marker-arm gate only ever compares `ts` against `started_ms` and
+    // the last-seen marker ts, never against `now` — so the mtime stays a
+    // small, real offset from `started_ms` (matching every other marker
+    // test) even while `now` keeps advancing on the FAR-scale clock half 1
+    // already established.
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    assert!(reg.compact_nudge_tick(FAR + 4_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 2, "the second, hook-confirmed cycle reinjects too");
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on confirmed delivery");
+    assert_eq!(a.compact_pending_evidence, Some("hook"));
+
+    let confirmed2 = confirmed_delivery(&oid, FAR + 4_000);
+    assert!(reg.compact_nudge_tick(FAR + 5_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed2).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "the full detection/recovery loop resolves cleanly, both halves");
+}
+
+#[test]
+fn ensure_copilot_compact_hook_writes_an_additive_generic_precompact_entry() {
+    // Copilot's own docs confirm multiple hook-config sources are MERGED — "When
+    // the same event appears in multiple sources, all hook entries from all
+    // sources are run" — so writing this file is proven safe against a user's own
+    // hooks, unlike Claude's `--settings` (whose merge semantics this repo could
+    // not verify empirically). Written to the SAME user-level directory Copilot
+    // itself auto-loads (no CLI flag needed), never the repo's `.github/hooks/`.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let cfg_path = dir.path().join("copilot-hooks").join("loomux-compact.json");
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    assert_eq!(cfg["version"], json!(1));
+    let entry = &cfg["hooks"]["preCompact"][0];
+    assert_eq!(entry["type"], json!("command"));
+    // Both variants always provided — Copilot itself picks the one for its host
+    // OS; loomux never resolves its own interpreter path for Copilot (unlike
+    // Claude's hook command, which bakes in an absolute `sh.exe`).
+    let bash = entry["bash"].as_str().unwrap();
+    let ps1 = entry["powershell"].as_str().unwrap();
+    assert!(bash.contains("LOOMUX_GROUP_DIR") && bash.contains("LOOMUX_AGENT_ID"), "{bash}");
+    assert!(ps1.contains("LOOMUX_GROUP_DIR") && ps1.contains("LOOMUX_AGENT_ID"), "{ps1}");
+    assert!(bash.contains("precompact.json") && ps1.contains("precompact.json"));
+
+    // No payload parsing happens on loomux's side at all — the script only ever
+    // reads its OWN inherited environment (never Copilot's camelCase/snake_case
+    // JSON piped to stdin), so there is no casing distinction for loomux's code
+    // to get wrong. That's a deliberate simplification: the marker's mere
+    // existence is the whole signal (`read_hook_marker_ts` reads the FILE's own
+    // mtime), so nothing here needs to understand the event's payload shape.
+
+    // A Claude-CLI group must never get this file at all.
+    let (reg2, dir2) = test_registry();
+    let g2 = reg2.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    reg2.spawn_agent(&g2.id, Role::Worker, "w", "t", false, None).unwrap();
+    assert!(!dir2.path().join("copilot-hooks").join("loomux-compact.json").exists());
+}
+
+// ───────── rev-4 review round 3: PreCompact can BLOCK compaction — exit-0 safety ─────────
+//
+// Claude's own hooks reference (code.claude.com/docs/en/hooks) confirms `PreCompact` is a
+// BLOCKING event: exit code 2 (or `{"decision":"block"}`) prevents the compaction from
+// happening at all. Copilot's reference documents the same for its own `preCompact`. A
+// marker-write failure (a full disk, a permissions problem, a path collision) must degrade
+// to "no hook signal, the inference tier still catches it" — NEVER to "the user's
+// compaction silently didn't happen." These tests run the ACTUAL generated script/command
+// text under an induced failure and assert the real process exit code, rather than
+// reasoning about shell semantics from the Rust side only.
+
+/// `sh` to run a hook script with — `locate_sh_exe`'s absolute Windows path, or a bare `sh`
+/// (a POSIX guarantee) everywhere else. `None` only when Windows genuinely has no `sh.exe`
+/// anywhere (same "skip, don't fail" precedent as the #335 shim tests).
+fn resolve_test_sh() -> Option<String> {
+    #[cfg(windows)]
+    {
+        locate_sh_exe()
+    }
+    #[cfg(not(windows))]
+    {
+        Some("sh".to_string())
+    }
+}
+
+#[test]
+fn compact_hook_script_sh_exits_zero_when_the_marker_dir_cant_be_created() {
+    let Some(sh) = resolve_test_sh() else {
+        eprintln!("SKIP compact_hook_script_sh_exits_zero_when_the_marker_dir_cant_be_created: no sh found");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    // A regular FILE occupying the path the script wants to `mkdir -p` a
+    // subdirectory under — fails `mkdir -p "$group_dir/hooks"` portably, with
+    // no reliance on chmod/permission APIs (unreliable to set up on Windows).
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+    let script_path = td.path().join("compact-hook.sh");
+    fs::write(&script_path, COMPACT_HOOK_SCRIPT).unwrap();
+
+    for event in ["precompact", "sessionstart-compact"] {
+        let output = std::process::Command::new(&sh)
+            .arg(&script_path)
+            .arg(event)
+            .arg(blocked_group_dir.display().to_string())
+            .arg("agent-1")
+            .output()
+            .expect("sh must run");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "event={event}: the hook must never fail PreCompact's blocking lifecycle event just \
+             because its own marker write failed — stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+#[test]
+fn copilot_precompact_hook_bash_exits_zero_when_the_marker_dir_cant_be_created() {
+    let Some(sh) = resolve_test_sh() else {
+        eprintln!("SKIP copilot_precompact_hook_bash_exits_zero_when_the_marker_dir_cant_be_created: no sh found");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+
+    let output = std::process::Command::new(&sh)
+        .arg("-c")
+        .arg(COPILOT_PRECOMPACT_HOOK_BASH)
+        .env("LOOMUX_GROUP_DIR", blocked_group_dir.display().to_string())
+        .env("LOOMUX_AGENT_ID", "agent-1")
+        .output()
+        .expect("sh must run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Copilot's preCompact is ALSO a blocking event per its own docs — stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn copilot_precompact_hook_powershell_exits_zero_when_the_marker_dir_cant_be_created() {
+    let td = tempfile::tempdir().unwrap();
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+
+    let output = std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(COPILOT_PRECOMPACT_HOOK_POWERSHELL)
+        .env("LOOMUX_GROUP_DIR", blocked_group_dir.display().to_string())
+        .env("LOOMUX_AGENT_ID", "agent-1")
+        .output()
+        .expect("powershell must run on a Windows CI runner");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the try/catch around both New-Item calls must make this deterministic regardless of \
+         PowerShell's own terminating-vs-non-terminating error classification — stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 #[test]
 fn compact_nudge_skips_a_role_not_in_the_eligible_set() {
     let (reg, _d) = test_registry();
@@ -5286,20 +5879,24 @@ fn compact_nudge_skips_a_role_not_in_the_eligible_set() {
 }
 
 #[test]
-fn compact_nudge_skips_a_cli_with_no_compact_equivalent() {
+fn compact_nudge_no_longer_skips_copilot_which_has_its_own_compact_equivalent() {
+    // #417 correction round 2: this test used to prove copilot was skipped
+    // entirely ("/compact has no copilot equivalent"). That claim was wrong
+    // — see `compact_nudge_cli_supported`'s doc — so it now proves the
+    // opposite: a copilot agent gets nudged exactly like a Claude one.
     let (reg, _d) = test_registry();
-    let non_claude_rails = Guardrails {
+    let copilot_rails = Guardrails {
         agent_cli: "copilot".into(),
         compact_nudge_minutes: 20,
         compact_nudge_roles: vec!["orchestrator".into()],
         ..rails()
     };
-    let g = reg.create_group("C:/tmp/repo", non_claude_rails).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let g = reg.create_group("C:/tmp/repo", copilot_rails).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let empty = HashMap::new();
-    assert!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
-        "/compact has no copilot equivalent — the nudge must never fire for it");
-    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 0);
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![o.id.clone()],
+        "Copilot has its own /compact — the nudge fires for it too");
+    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 1);
 }
 
 #[test]
@@ -5546,6 +6143,25 @@ fn directive_ledger_embed_keeps_the_tail_and_states_truncation() {
 }
 
 #[test]
+fn resume_kickoff_notice_embeds_the_ledger_and_reproduces_the_old_string_without_one() {
+    // #411: the orchestration-restore kickoff didn't embed the directive
+    // ledger, unlike the post-compact reinjection notice — an app restart is
+    // the other surprise discontinuity the ledger exists to survive.
+    assert_eq!(
+        resume_kickoff_notice(None),
+        "[loomux] Orchestration restored: your MCP tools, the task board, and the audit log are \
+         live again in this session. Re-sync now: list_tasks, list_agents, get_state. Your \
+         previous worker panes are gone; resume a task session with spawn_agent(resume_session, \
+         cwd) when follow-ups need it. Then give the human a short status summary.",
+        "no ledger ⇒ byte-identical to the pre-#411 fixed string"
+    );
+    let embed = directive_ledger_embed("[1] scope: only touch the auth module", 2048, "C:/g/ledger-orch.log").unwrap();
+    let notice = resume_kickoff_notice(Some(&embed));
+    assert!(notice.contains("only touch the auth module"), "{notice}");
+    assert!(notice.starts_with("[loomux] Orchestration restored"), "the base notice is unchanged: {notice}");
+}
+
+#[test]
 fn directive_ledger_embed_never_drops_the_single_newest_entry_even_over_cap() {
     let ledger = "a much longer single directive entry than the tiny cap below allows for";
     let embed = directive_ledger_embed(ledger, 8, "C:/g/ledger-w-1.log").unwrap();
@@ -5594,37 +6210,45 @@ fn compaction_status_narrates_every_real_state_machine_phase() {
     // already-tracked state — pin each real phase maps to the right variant,
     // never a phase the state machine can't actually be in.
     assert_eq!(
-        compaction_status(false, false, false, None, 0, None, None, 1_000),
+        compaction_status(false, false, false, None, 0, None, None, 1_000, None),
         CompactionStatus::None,
         "no arm, no reinjection, no lost outcome"
     );
     assert_eq!(
-        compaction_status(true, true, false, None, 0, None, None, 1_000),
-        CompactionStatus::Armed { trusted: true },
+        compaction_status(true, true, false, None, 0, None, None, 1_000, None),
+        CompactionStatus::Armed { trusted: true, source: None },
         "pending, not yet observed busy — trusted arm"
     );
     assert_eq!(
-        compaction_status(true, false, false, None, 0, None, None, 1_000),
-        CompactionStatus::Armed { trusted: false },
+        compaction_status(true, false, false, None, 0, None, None, 1_000, None),
+        CompactionStatus::Armed { trusted: false, source: None },
         "pending, not yet observed busy — inference arm"
     );
     assert_eq!(
-        compaction_status(true, false, true, None, 0, None, None, 1_000),
-        CompactionStatus::AwaitingEvidence { trusted: false },
+        compaction_status(true, false, true, None, 0, None, None, 1_000, None),
+        CompactionStatus::AwaitingEvidence { trusted: false, source: None },
         "pending, busy observed — waiting on quiet to resolve"
     );
     assert_eq!(
-        compaction_status(true, true, false, Some(900), 2, None, None, 1_000),
+        // #417: a hook-armed pending is ALSO trusted (no inference gate), but
+        // carries `source: Some("hook")` so the panel can distinguish it from
+        // the loomux-initiated trusted arm above.
+        compaction_status(true, true, false, None, 0, None, None, 1_000, Some("hook")),
+        CompactionStatus::Armed { trusted: true, source: Some("hook") },
+        "pending, not yet observed busy — hook-confirmed arm"
+    );
+    assert_eq!(
+        compaction_status(true, true, false, Some(900), 2, None, None, 1_000, None),
         CompactionStatus::Reinjecting { attempt: 2, max_attempts: 3 },
         "reinject_attempted_ms set takes priority over the arm phase"
     );
     assert_eq!(
-        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 1_000),
+        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 1_000, None),
         CompactionStatus::Abandoned { reason: "arm-timeout".to_string(), since_ms: 500 },
         "a recent lost outcome, no active arm"
     );
     assert_eq!(
-        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 500 + 10 * 60 * 1000),
+        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 500 + 10 * 60 * 1000, None),
         CompactionStatus::None,
         "a lost outcome outside the recency window reads as none, not a stale problem"
     );
@@ -5830,15 +6454,36 @@ fn mcp_note_directive_requires_text() {
     assert_eq!(out["isError"], true, "missing text must error, not silently no-op");
 }
 
+// The previous version of this test used "copilot" as its non-Claude
+// example CLI, proving `request_compact` rejected it — #417 correction
+// round 2 made that claim wrong (Copilot has its own `/compact` too, see
+// `compact_nudge_cli_supported`'s doc), so that assertion inverted to
+// `request_compact_now_accepts_a_copilot_caller` above. There is no
+// remaining way to construct this rejection through the public API: any
+// group's `agent_cli` is coerced into `SUPPORTED_CLIS` by `clamped()`, and
+// any per-role CLI override is rejected at `spawn_agent` time rather than
+// reaching a live agent (see `clamped()`'s own doc, issue #4) — so a
+// successfully spawned agent's CLI is always a `compact_nudge_cli_
+// supported` member today. The gate itself (and its "codex"/""-return-false
+// cases) stays covered directly at the pure-function level by
+// `compact_nudge_cli_gate_covers_claude_and_copilot` above; `request_
+// compact`'s own `if !compact_nudge_cli_supported` branch is defensive
+// belt-and-braces against a hand-edited or pre-#4 persisted group.json, not
+// something a live test can trigger without bypassing the public API.
+
 #[test]
-fn request_compact_rejects_a_non_claude_cli_without_setting_the_flag() {
+fn request_compact_now_accepts_a_copilot_caller() {
+    // #417 correction round 2: Copilot's own `/compact [FOCUS-INSTRUCTIONS]`
+    // (docs.github.com/en/copilot/reference/copilot-cli-reference/
+    // cli-command-reference) means `request_compact` must no longer reject
+    // a copilot caller the way it used to.
     let (reg, _d) = test_registry();
-    let non_claude = Guardrails { agent_cli: "copilot".into(), ..rails() };
-    let g = reg.create_group("C:/tmp/repo", non_claude).unwrap();
+    let copilot = Guardrails { agent_cli: "copilot".into(), ..rails() };
+    let g = reg.create_group("C:/tmp/repo", copilot).unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    let err = reg.request_compact(&o.id).unwrap_err();
-    assert!(err.contains("Claude"), "must name the reason, got: {err}");
-    assert!(!reg.agent(&o.id).unwrap().compact_requested, "a rejected request must never flag the pane");
+    let msg = reg.request_compact(&o.id).unwrap();
+    assert!(msg.contains("compact requested"), "got: {msg}");
+    assert!(reg.agent(&o.id).unwrap().compact_requested, "flag set on the calling copilot agent");
 }
 
 #[test]
@@ -6089,12 +6734,14 @@ fn compact_nudge_tick_ignores_a_busy_pane_that_merely_mentions_the_banner() {
 }
 
 #[test]
-fn compact_nudge_tick_never_reads_an_auto_compact_banner_for_an_unsupported_cli() {
-    // Belt-and-suspenders on the outer `compact_nudge_cli_supported` gate at
-    // the top of the per-agent loop: a non-Claude-CLI agent is skipped
-    // entirely before this code is ever reached, so a "Compacting
-    // conversation" string in ITS pane (coincidence, unrelated tooling)
-    // can never be misread as Claude's own auto-compact.
+fn compact_nudge_tick_never_reads_claudes_auto_compact_banner_for_a_copilot_agent() {
+    // Banner detection is keyed PER-CLI (`auto_compact_banner_substrings`),
+    // independent of the broader `compact_nudge_cli_supported` admission
+    // gate — a copilot agent is admitted to the loop now (#417 correction
+    // round 2: Copilot has its own `/compact` too), but it still has no
+    // banner substring of its own registered, so Claude's exact "Compacting
+    // conversation" string appearing in a copilot pane (coincidence,
+    // unrelated tooling) must never be misread as an auto-compact.
     let (reg, _d) = test_registry();
     let rails = Guardrails { agent_cli: "copilot".into(), ..compact_rails(0, &["orchestrator"]) };
     let g = reg.create_group("C:/tmp/repo", rails).unwrap();
@@ -10215,6 +10862,23 @@ fn end_group_sweeps_the_attachments_scratch_dir() {
         dir.path().join(&g.id).join("state.json").is_file(),
         "non-attachment group state must survive teardown",
     );
+}
+
+#[test]
+fn end_group_reclaims_generated_copilot_agent_files() {
+    // rev-4 review (N4): without this, a #416-generated `~/.copilot/agents/
+    // loomux-<group>-<block>.agent.md` outlives the group it was written
+    // for — accumulating forever and cluttering the user's real Copilot
+    // agent list with dead groups' names.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let generated = dir.path().join("copilot-agents").join(format!("loomux-{}-{}.agent.md", g.id, w.block));
+    assert!(generated.is_file(), "the default-roster worker must have gotten a generated wrapper file: {generated:?}");
+
+    reg.end_group(&g.id, false).unwrap();
+    assert!(!generated.exists(), "the generated file must be reclaimed on group end");
 }
 
 #[test]

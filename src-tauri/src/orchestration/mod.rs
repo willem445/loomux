@@ -2108,6 +2108,117 @@ pub const COPILOT_GROUP_AUTOPILOT_FLAGS: &str = "--autopilot --allow-all-tools -
 /// matches every git subcommand; a planner's denials carve commit/push back out.
 pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 
+/// The generic Claude PreCompact / SessionStart(compact) hook body (#417),
+/// written once per machine (`OrchRegistry::ensure_compact_hook_script`) and
+/// invoked per agent with `event`, the group's state dir, and the agent's id
+/// as literal argv — see `compact_hook_settings` for how those are supplied.
+/// Deliberately carries NO repo/group/toolchain-specific text (constraint #8):
+/// it only ever writes a marker file loomux's own compact-nudge tick polls,
+/// and — for `sessionstart-compact` — prints Claude Code's own
+/// `additionalContext` JSON shape with a fixed, generic re-grounding line.
+///
+/// Never fails: **`PreCompact` can BLOCK compaction itself** — Claude Code's
+/// own hooks reference (code.claude.com/docs/en/hooks) confirms exit code 2
+/// (or a `{"decision":"block"}` JSON) on `PreCompact` prevents the compact
+/// from happening at all (rev-4 review round 3, safety finding). A marker-
+/// write failure must never escalate into "the user's compaction didn't
+/// happen" — so every path here exits 0 regardless of whether the marker
+/// write actually landed: no `set -e`/`set -o pipefail` anywhere, and the
+/// unconditional `exit 0` on the LAST line runs no matter what any earlier
+/// command returned. A silently-lost marker just leaves this agent on the
+/// pre-#417 inference tier for this one event — a degrade, never a block.
+///
+/// The marker is written with `touch`, NOT the more obvious `: > "$path"`
+/// (round 3's first draft used that, and the real-execution test below
+/// caught it): a bare `> "$path"` redirect that fails to OPEN its target
+/// (e.g. the parent directory doesn't exist, as it wouldn't if `mkdir -p`
+/// above also failed) is a shell-level redirection error, and POSIX makes
+/// that FATAL for a non-interactive shell — it aborts the whole script on
+/// the spot, before ever reaching the trailing `exit 0`, and the `2>/dev/
+/// null` on the same line never even gets applied (the shell fails to set
+/// up the redirect before it can process the next one). `touch`'s own
+/// failure, by contrast, is an ordinary COMMAND failure (`touch`'s own error
+/// handling, not the shell's redirection machinery), which a non-interactive
+/// shell simply reports and continues past — exactly the behavior this
+/// script needs. Pinned directly by `compact_hook_script_sh_exits_zero_when_
+/// the_marker_dir_cant_be_created`, which runs this exact script under an
+/// induced `mkdir` failure and asserts the real process exit code — the
+/// ORIGINAL `: >` version of this script failed that test for real.
+#[doc(hidden)] // pub for integration tests: they run this script for real
+pub const COMPACT_HOOK_SCRIPT: &str = "#!/bin/sh\n\
+event=\"$1\"\n\
+group_dir=\"$2\"\n\
+agent_id=\"$3\"\n\
+if [ -n \"$group_dir\" ] && [ -n \"$agent_id\" ]; then\n\
+  mkdir -p \"$group_dir/hooks\" 2>/dev/null\n\
+  case \"$event\" in\n\
+    precompact)\n\
+      touch \"$group_dir/hooks/$agent_id.precompact.json\" 2>/dev/null\n\
+      ;;\n\
+    sessionstart-compact)\n\
+      touch \"$group_dir/hooks/$agent_id.sessionstart-compact.json\" 2>/dev/null\n\
+      ctx=\"[loomux] Session resumed after a compact. Your durable role contract already rides in the system prompt (--agents) -- trust it over any summary above. Re-sync live state now: list_tasks, get_state, list_agents. Directive ledger (if any): ${group_dir}/ledger-${agent_id}.log\"\n\
+      printf '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"%s\"}}\\n' \"$ctx\"\n\
+      ;;\n\
+  esac\n\
+fi\n\
+exit 0\n\
+";
+
+/// #417 (Copilot correction): the `bash` half of loomux's `preCompact` hook
+/// entry (see `OrchRegistry::ensure_copilot_compact_hook`) — inline, per the
+/// docs' own `"bash": "YOUR_BASH_COMMAND"` convention, rather than a separate
+/// script file: Copilot invokes this string directly (POSIX shell), so
+/// there's no `sh.exe`-resolution dance to do (unlike Claude's hook command,
+/// which invokes an absolute interpreter path itself). No-ops silently
+/// (never a nonzero exit) when this Copilot session isn't a loomux pane at
+/// all (`LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID` unset) — the discrimination a
+/// GLOBAL, machine-wide hook file needs, since it applies to every Copilot
+/// session on the box. Same exit-0-no-matter-what safety requirement as
+/// Claude's script (rev-4 review round 3) — Copilot's own hooks reference
+/// (docs.github.com/en/copilot/reference/hooks-reference) documents
+/// `preCompact` as a blocking event there too.
+///
+/// Writes the marker with `touch`, not `: > "$path"` — the same real bug
+/// `COMPACT_HOOK_SCRIPT`'s doc explains in full: a bare `>` redirect whose
+/// target can't be opened (the parent directory doesn't exist, as it
+/// wouldn't if `mkdir -p` above also failed) is FATAL for a non-interactive
+/// POSIX shell, aborting before the trailing `exit 0` and before the SAME
+/// line's own `2>/dev/null` can even apply. `touch`'s failure is an ordinary
+/// command failure the shell just reports and continues past. The `: >`
+/// version of this failed a real-execution test
+/// (`copilot_precompact_hook_bash_exits_zero_when_the_marker_dir_cant_be_
+/// created`) before this fix.
+#[doc(hidden)] // pub for integration tests: they run this command for real
+pub const COPILOT_PRECOMPACT_HOOK_BASH: &str =
+    "if [ -n \"$LOOMUX_GROUP_DIR\" ] && [ -n \"$LOOMUX_AGENT_ID\" ]; then \
+     mkdir -p \"$LOOMUX_GROUP_DIR/hooks\" 2>/dev/null; \
+     touch \"$LOOMUX_GROUP_DIR/hooks/$LOOMUX_AGENT_ID.precompact.json\" 2>/dev/null; \
+     fi; exit 0";
+
+/// The `powershell` half of the same hook entry — Windows' native shell, so
+/// Copilot never has to fall back to (or loomux resolve) a POSIX `sh` on a
+/// machine that may not have Git for Windows installed at all.
+///
+/// Wrapped in `try`/`catch` with `-ErrorAction Stop` on both `New-Item`
+/// calls (rev-4 review round 3): unlike POSIX `sh`, PowerShell's DEFAULT
+/// error preference (`Continue`) leaves whether a given cmdlet failure is
+/// terminating or not somewhat provider-dependent — `-ErrorAction Stop`
+/// makes every failure here explicitly terminating, and the surrounding
+/// `catch {}` swallows it unconditionally, so the trailing `exit 0` (outside
+/// the `try`/`catch`, always reached) is deterministic regardless of which
+/// failure mode a given filesystem error takes. Pinned (Windows-only) by
+/// `copilot_precompact_hook_powershell_exits_zero_when_the_marker_dir_cant_
+/// be_created`.
+#[doc(hidden)] // pub for integration tests: they run this command for real
+pub const COPILOT_PRECOMPACT_HOOK_POWERSHELL: &str =
+    "try { if ($env:LOOMUX_GROUP_DIR -and $env:LOOMUX_AGENT_ID) { \
+     $hooksDir = Join-Path $env:LOOMUX_GROUP_DIR 'hooks'; \
+     New-Item -ItemType Directory -Force -Path $hooksDir -ErrorAction Stop | Out-Null; \
+     $marker = Join-Path $hooksDir ($env:LOOMUX_AGENT_ID + '.precompact.json'); \
+     New-Item -ItemType File -Force -Path $marker -ErrorAction Stop | Out-Null \
+     } } catch {}; exit 0";
+
 /// Claude Code's permission mode for an (un)attended agent: its native `auto`
 /// preset when unattended (what a human uses interactively), else `acceptEdits`.
 pub fn claude_permission_mode(unattended: bool) -> &'static str {
@@ -2365,14 +2476,25 @@ fn canonicalize_compact_nudge_roles(roles: Vec<String>) -> Vec<String> {
     out
 }
 
-/// Compact-nudge (#287): whether `cli` has a `/compact` equivalent loomux can
-/// drive the same way (a bare pane write + CR). `/compact` is a Claude Code
-/// built-in; no other supported CLI (copilot, codex, gemini, …) exposes one,
-/// so the nudge is gated to exactly this CLI rather than typing a junk slash
-/// command into an agent that doesn't understand it. Pure so the gate is
-/// testable without a registry; `cli` comes from `Guardrails::cli_for`.
+/// Compact-nudge (#287; widened #417 correction round): whether `cli` has a
+/// `/compact` equivalent loomux can drive the same way (a bare pane write +
+/// CR) AND gets a seat in `compact_nudge_tick`'s per-agent loop at all.
+///
+/// An earlier round of this feature asserted Copilot has no `/compact`
+/// command and kept this claude-only, admitting Copilot to the loop through
+/// a separate, broader `compact_hook_cli_supported` gate instead (for its
+/// `PreCompact` hook alone). That claim was wrong: GitHub's own CLI command
+/// reference (docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)
+/// documents `/compact [FOCUS-INSTRUCTIONS]` as a real Copilot CLI command,
+/// identical in spirit to Claude's. Since both currently-supported CLIs now
+/// agree on this gate, the separate broader gate was pure duplication and has
+/// been folded back into this one function — see `git log` for the prior
+/// two-gate shape if a future CLI ever needs hook-admission without
+/// `/compact`-paste (or vice versa), which would be the reason to split them
+/// again. Pure so the gate is testable without a registry; `cli` comes from
+/// `Guardrails::cli_for`.
 pub fn compact_nudge_cli_supported(cli: &str) -> bool {
-    cli == "claude"
+    matches!(cli, "claude" | "copilot")
 }
 
 /// Compact-nudge (#328): whether an agent-requested compact should fire NOW.
@@ -2516,11 +2638,14 @@ pub enum CompactionStatus {
     /// `compact_pending`, not yet observed busy. `trusted` distinguishes the
     /// loomux-initiated arm (heuristic/`request_compact`) from an inference
     /// arm (banner/manual detection) — the former skips confirmation, the
-    /// latter needs evidence before it can resolve to a reinjection.
-    Armed { trusted: bool },
+    /// latter needs evidence before it can resolve to a reinjection. `source`
+    /// (#417) is `Some("hook")` when a PreCompact/SessionStart marker armed
+    /// this, `None` for every pre-#417 arm path — so the panel can tell a
+    /// hook-confirmed compaction from an inferred/loomux-initiated one.
+    Armed { trusted: bool, source: Option<&'static str> },
     /// `compact_pending`, busy observed — waiting on quiet to attempt a
     /// confirm/discard resolution.
-    AwaitingEvidence { trusted: bool },
+    AwaitingEvidence { trusted: bool, source: Option<&'static str> },
     /// A reinjection has been decided and is waiting on its delivery to
     /// confirm (or its next bounded retry) — see `compact_reinject_
     /// attempted_ms`'s doc. `attempt` is 1-indexed, bounded by `max_attempts`
@@ -2545,15 +2670,16 @@ pub fn compaction_status(
     last_lost_reason: Option<&str>,
     last_lost_ms: Option<u64>,
     now: u64,
+    evidence: Option<&'static str>,
 ) -> CompactionStatus {
     if reinject_attempted_ms.is_some() {
         return CompactionStatus::Reinjecting { attempt: reinject_attempts, max_attempts: MAX_REINJECT_ATTEMPTS };
     }
     if compact_pending {
         return if compact_seen_busy {
-            CompactionStatus::AwaitingEvidence { trusted: compact_pending_trusted }
+            CompactionStatus::AwaitingEvidence { trusted: compact_pending_trusted, source: evidence }
         } else {
-            CompactionStatus::Armed { trusted: compact_pending_trusted }
+            CompactionStatus::Armed { trusted: compact_pending_trusted, source: evidence }
         };
     }
     if let (Some(reason), Some(ms)) = (last_lost_reason, last_lost_ms) {
@@ -2750,6 +2876,17 @@ pub fn directive_ledger_embed(ledger: &str, cap_bytes: usize, ledger_path: &str)
     })
 }
 
+/// #417: the freshness discriminator for a compact-lifecycle hook marker —
+/// the marker FILE's own mtime, not a timestamp encoded in its content (the
+/// generic hook script just creates/truncates it; no clock-formatting logic
+/// needed in a script that has to stay portable — see `COMPACT_HOOK_SCRIPT`).
+/// `None` for a missing file (the hook never fired, or isn't configured at
+/// all) — the caller's existing inference tiers cover that silently.
+fn read_hook_marker_ts(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis() as u64)
+}
+
 /// Directive ledger (#329 review, N2): trim the STORED ledger file to
 /// `cap_bytes`, dropping the OLDEST entries (line boundary, never mid-entry)
 /// — the backstop for an agent that notes liberally and never curates via
@@ -2817,6 +2954,26 @@ pub fn compact_reinjection_notice(instructions: &str, ledger_embed: Option<&str>
         "[loomux] Context was compacted. Re-grounding you in your role instructions before \
          you act — the summary above may have diluted them:\n\n{instructions}{ledger_section}\n\n\
          Now re-sync live state: list_tasks, get_state, list_agents."
+    )
+}
+
+/// The orchestration-restore kickoff (#411) — an app restart resuming a live
+/// session. `ledger_embed` is `directive_ledger_embed`'s output, folded in
+/// for the SAME reason `compact_reinjection_notice` folds it into the
+/// post-compact notice: a restart is another surprise discontinuity with no
+/// other durable channel back to a directive noted before it struck. `None`
+/// (a missing/empty ledger, or a group that never calls `note_directive`)
+/// reproduces the pre-#411 fixed string byte-for-byte.
+pub fn resume_kickoff_notice(ledger_embed: Option<&str>) -> String {
+    let ledger_section = match ledger_embed {
+        Some(l) => format!("\n\n{l}"),
+        None => String::new(),
+    };
+    format!(
+        "[loomux] Orchestration restored: your MCP tools, the task board, and the audit log are \
+         live again in this session. Re-sync now: list_tasks, list_agents, get_state. Your \
+         previous worker panes are gone; resume a task session with spawn_agent(resume_session, \
+         cwd) when follow-ups need it. Then give the human a short status summary.{ledger_section}"
     )
 }
 
@@ -3769,6 +3926,38 @@ pub struct AgentEntry {
     /// knowledge it initiated that one itself, so there is no inference for
     /// a stale echo to fool.
     pub compact_inference_guard_until_ms: u64,
+    /// #417: the freshest PreCompact hook marker mtime already acted on for
+    /// this agent (see `read_hook_marker_ts`) — bookkeeping so a tick doesn't
+    /// re-arm on a marker it already consumed. `None` until the first
+    /// hook-sourced arm.
+    pub compact_hook_precompact_seen_ms: Option<u64>,
+    /// #417: companion bookkeeping for the SessionStart(compact) hook marker
+    /// — DIRECT proof a compaction just finished (Claude Code itself
+    /// restarted the session specifically because of one), independent of
+    /// whether PreCompact fired/was configured at all.
+    pub compact_hook_sessionstart_seen_ms: Option<u64>,
+    /// #417: how the CURRENT (or most recently resolved) `compact_pending`
+    /// arm was armed — `Some("hook")` for a PreCompact/SessionStart marker
+    /// (trusted evidence, no inference gate needed), `None` for the
+    /// pre-existing tiers (the loomux-initiated/heuristic/manual/banner
+    /// arms already distinguish themselves via `compact_pending_trusted`
+    /// and don't need a second label). Surfaced on the lifecycle chip so a
+    /// human can tell a hook-confirmed compaction from an inferred one.
+    /// Cleared alongside the other arm state on any resolution.
+    pub compact_pending_evidence: Option<&'static str>,
+    /// rev-4 review (N3): `true` from the moment the SessionStart(compact)
+    /// hook marker armed/confirmed THIS pending cycle — the ONE signal that
+    /// means Claude Code already delivered native `additionalContext`
+    /// re-grounding for it (the generic hook script only emits that JSON
+    /// from its `sessionstart-compact` branch, never `precompact`). When
+    /// true at resolution time, `compact_nudge_tick` skips loomux's own
+    /// reinjection entirely — pasting it anyway would be a duplicate
+    /// re-grounding, spending exactly the context tokens native delivery
+    /// exists to save. `false` for a PreCompact-only arm (no SessionStart
+    /// marker seen yet for this cycle) and every pre-#417 path, so loomux's
+    /// reinjection remains the sole channel — the correct fallback, not a
+    /// double-delivery, when native re-grounding was never actually sent.
+    pub compact_hook_native_notice_delivered: bool,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -4131,44 +4320,54 @@ pub struct Caller {
     pub role_hint: Option<String>,
 }
 
-/// A workflow block's persona, compiled down to what each agent CLI can
-/// actually consume (#222).
+/// A block's durable role CONTRACT plus any workflow persona, compiled down to
+/// what each agent CLI can actually consume (#222, restructured #416).
 ///
-/// The investigation's load-bearing asymmetry: **Claude takes a persona
+/// The investigation's load-bearing asymmetry: **Claude takes a definition
 /// inline** (`--agents '<json>' --agent <id>`), so loomux can synthesize one
 /// with zero repo files. **Copilot cannot** — its `--agent` resolves a *name*
-/// against `.github/agents/`, so it can only ever engage a file the user
-/// already wrote. Hence exactly three outcomes, one per row below:
+/// against a known directory, so engaging one needs either a file the user
+/// already wrote (`.github/agents/`) or one loomux generates itself into
+/// Copilot's OWN user-level agent directory (`~/.copilot/agents` — never the
+/// repo's `.github/agents/`, which would dirty the user's git tree). Hence:
 ///
 /// | block persona | claude | copilot |
 /// |---|---|---|
-/// | none | nothing (pre-#222 command, byte for byte) | nothing |
-/// | `prompt:` (inline) | `--agents` + `--agent` | **kickoff-prompt injection** |
-/// | `profile: .github/agents/x.md` | file body → `--agents` + `--agent` | `--agent x` (native) |
+/// | none | contract → `--agents` + `--agent` | contract → generated file + `--agent` |
+/// | `prompt:` (inline) | contract+persona → `--agents` + `--agent` | contract+persona → generated file + `--agent` |
+/// | `profile: .github/agents/x.md` | contract+persona → `--agents` + `--agent` | `--agent x` (native, unwrapped — see `persona_inject`) |
 ///
-/// A persona-less block passes `PersonaInject::default()` and every field is
-/// `None`/empty, so no flag is added at all. That is the mechanism behind the
-/// "a repo with no workflow file behaves exactly as before" guarantee.
+/// Before #416, the `none` row emitted nothing at all on either CLI (the
+/// pre-#222 command, byte for byte) and the built-in mechanics/template body
+/// never reached a system-prompt layer on ANY row — only a repo's own persona
+/// text did. `contract` (see [`block_contract_text`]) closes that: it is
+/// ALWAYS present and ALWAYS what rides on the CLI's native custom-agent
+/// mechanism now, with a configured persona folded in as an addendum rather
+/// than the sole payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PersonaInject {
-    /// Claude `--agents '<json>'`: the inline block definition. Already
-    /// persona-sanitized and ASCII-escaped, so it is safe inside the
-    /// single-quoted shell token `build_agent_command` wraps it in.
+    /// Claude `--agents '<json>'`: the inline block definition, carrying
+    /// [`block_contract_text`]'s output. Already persona-sanitized and
+    /// ASCII-escaped, so it is safe inside the single-quoted shell token
+    /// `build_agent_command` wraps it in.
     pub claude_agents_json: Option<String>,
     /// Claude `--agent <id>`: activates the block defined above. Always set
     /// together with `claude_agents_json`.
     pub claude_agent: Option<String>,
-    /// Copilot `--agent <name>`. Set **only** for a user-authored
-    /// `.github/agents/*.md` — loomux never generates a file there to make this
-    /// flag reachable (see `profiles::is_copilot_native`).
+    /// Copilot `--agent <name>` — either a user-authored `.github/agents/*.md`
+    /// (native, unwrapped) or a loomux-generated `~/.copilot/agents/*.agent.md`
+    /// carrying the contract (#416; see `OrchRegistry::write_copilot_agent_file`).
+    /// loomux never writes a generated file into the repo's own
+    /// `.github/agents/` (see `profiles::is_copilot_native`).
     pub copilot_agent: Option<String>,
     /// Extra pre-approved tool patterns from the persona's `allow:`. Widens
     /// only *within* the capability class: deny rules beat allow rules on both
     /// CLIs, so this can never re-grant what the block's `kind` denies.
     pub extra_allow: Vec<String>,
-    /// Persona body for the **kickoff-prompt fallback**: the CLI has no inline
-    /// persona flag and no user-authored file to point at (copilot + an inline
-    /// `prompt:`). Delivered as text in the kickoff, which every CLI reads.
+    /// Persona body for the **kickoff-prompt fallback** — reached only when
+    /// `~/.copilot/agents` is unwritable (the generated file above is the
+    /// normal #416 path). Delivered as text in the kickoff, which every CLI
+    /// reads.
     pub kickoff: Option<String>,
 }
 
@@ -4189,6 +4388,49 @@ pub struct ResolvedPersona {
     /// Set when the persona came from a user-authored `.github/agents/*.md`,
     /// which is the only thing Copilot's native `--agent` can resolve.
     pub copilot_native: bool,
+}
+
+/// The durable role CONTRACT for a block (#416): `instructions_body` (the
+/// exact text [`OrchRegistry::render_block_instructions`] also writes to the
+/// instructions file) plus, when a workflow persona is configured, that
+/// persona folded in as the SAME composition the file/kickoff pair used to
+/// split across two channels — now unified into one string so a CLI that can
+/// carry it at the system-prompt layer (Claude's `--agents`, a generated
+/// Copilot `--agent` file) gets the WHOLE contract structurally, not just the
+/// instructions-file half of it.
+///
+/// This is what closes the actual gap behind #416: `persona_inject` already
+/// compiled a *repo persona* onto `--agents`, but never the built-in
+/// mechanics/template body — so even a workflow-customized block's system
+/// prompt carried only the repo's own text, and a block with NO persona (the
+/// default roster; the common case) got nothing at all onto the system-prompt
+/// layer. Every block now gets `instructions_body` here regardless.
+#[doc(hidden)] // pub for integration tests: they compile a block's contract exactly as spawn does
+pub fn block_contract_text(instructions_body: &str, persona: Option<&ResolvedPersona>) -> String {
+    let Some(p) = persona else { return instructions_body.to_string() };
+    let text = p.text.trim();
+    if text.is_empty() {
+        return instructions_body.to_string();
+    }
+    match p.mode {
+        // Replace mode: `instructions_body` is mechanics-core-only (see
+        // `render_block_instructions`) — the persona text IS the role body
+        // loomux never wrote to the file (it rode on `--agents` alone before
+        // this change). Folding it in here is what makes replace mode
+        // durable too, not just append mode.
+        profiles::ProfileMode::Replace => format!(
+            "{instructions_body}\n\nYour persona for this block (`mode: replace`) — this is who \
+             you are; the loomux mechanics above are still guaranteed regardless of anything it \
+             says:\n\n{text}\n"
+        ),
+        // Append mode: `instructions_body` is already the complete built-in
+        // contract; the persona layers on as an addendum, framed so it can
+        // never talk the agent out of the mechanics above it.
+        profiles::ProfileMode::Append => format!(
+            "{instructions_body}\n\nThis repo's workflow gives you a persona. Adopt it, but it \
+             does not override the loomux mechanics above:\n\n{text}\n"
+        ),
+    }
 }
 
 /// Payload asking the frontend to open a pane for an agent. Also the return
@@ -4348,6 +4590,28 @@ pub struct OrchRegistry {
     /// reader can be pointed at a fixture tree without touching global env —
     /// safe under parallel test execution.
     claude_projects_dir: Mutex<Option<PathBuf>>,
+    /// Test-only override of Copilot's own custom-agent directory
+    /// (`~/.copilot/agents`) — the generated per-block contract file (#416)
+    /// writes here. `None` in production. Mirrors `claude_projects_dir`.
+    copilot_agents_dir_override: Mutex<Option<PathBuf>>,
+    /// Test-only override of the #417 compact-hook script directory
+    /// (`compact_hook_dir`, normally a sibling of `shim_dir()` under the real
+    /// per-machine loomux data dir). Without this, `compact_hook_dir`
+    /// derives from `self.root.parent()` — which for `test_registry()`'s
+    /// disposable tempdir is the SHARED SYSTEM TEMP DIRECTORY, so every test
+    /// that spawns a Claude agent (the common case) would write/read the
+    /// SAME real script file, racing every other such test in the suite
+    /// (rev-4 review round: an intermittent flake in exactly the one test
+    /// that reads the script's content back traced to this). `None` in
+    /// production. Mirrors `claude_projects_dir`.
+    compact_hook_dir_override: Mutex<Option<PathBuf>>,
+    /// Test-only override of Copilot's own user-level hooks directory
+    /// (`~/.copilot/hooks`, or `$COPILOT_HOME/hooks`) — the SAME real-shared-
+    /// path test-isolation concern `compact_hook_dir_override` documents
+    /// applies here too (a single, GLOBAL, machine-wide config file every
+    /// test registry would otherwise race on). `None` in production. Mirrors
+    /// `claude_projects_dir`.
+    copilot_hooks_dir_override: Mutex<Option<PathBuf>>,
     /// Low-disk backstop latch (#134): true once the one-per-episode disk-space
     /// notice has been delivered, cleared when free space recovers past
     /// `LOW_DISK_CLEAR_BYTES`. Machine-wide (the disk is shared across groups).
@@ -5776,6 +6040,9 @@ impl OrchRegistry {
             compact_nudge_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
+            copilot_agents_dir_override: Mutex::new(None),
+            compact_hook_dir_override: Mutex::new(None),
+            copilot_hooks_dir_override: Mutex::new(None),
             low_disk_notified: Mutex::new(false),
             audit_skips_notified: Mutex::new(HashMap::new()),
             watches: Mutex::new(HashMap::new()),
@@ -5792,6 +6059,44 @@ impl OrchRegistry {
     #[doc(hidden)]
     pub fn set_claude_projects_dir(&self, dir: PathBuf) {
         *self.claude_projects_dir.lock_safe() = Some(dir);
+    }
+
+    /// Point the generated Copilot custom-agent file at a specific directory,
+    /// instead of `~/.copilot/agents`. Test-only seam (see
+    /// `copilot_agents_dir_override`).
+    #[doc(hidden)]
+    pub fn set_copilot_agents_dir_override(&self, dir: PathBuf) {
+        *self.copilot_agents_dir_override.lock_safe() = Some(dir);
+    }
+
+    /// Point the #417 compact-hook script directory at a specific directory,
+    /// instead of the real per-machine one `compact_hook_dir` otherwise
+    /// derives. Test-only seam (see `compact_hook_dir_override`'s doc for the
+    /// cross-test race this exists to avoid).
+    #[doc(hidden)]
+    pub fn set_compact_hook_dir_override(&self, dir: PathBuf) {
+        *self.compact_hook_dir_override.lock_safe() = Some(dir);
+    }
+
+    /// Point Copilot's user-level hooks directory at a specific directory,
+    /// instead of `~/.copilot/hooks`. Test-only seam (see
+    /// `copilot_hooks_dir_override`'s doc).
+    #[doc(hidden)]
+    pub fn set_copilot_hooks_dir_override(&self, dir: PathBuf) {
+        *self.copilot_hooks_dir_override.lock_safe() = Some(dir);
+    }
+
+    /// Copilot's own custom-agent directory (`~/.copilot/agents`, per its
+    /// docs — highest-precedence in ITS OWN `--agent` resolution order), or
+    /// the test override. Never the repo's `.github/agents/`: writing a
+    /// generated file there would dirty the user's git tree with a file they
+    /// didn't author (`profiles::is_copilot_native`'s reasoning). `None` only
+    /// if the home directory can't be resolved at all.
+    fn copilot_agents_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = self.copilot_agents_dir_override.lock_safe().clone() {
+            return Some(dir);
+        }
+        dirs::home_dir().map(|h| h.join(".copilot").join("agents"))
     }
 
     /// Record the `Arc` the registry is stored behind so `&self` methods can
@@ -8729,6 +9034,10 @@ impl OrchRegistry {
             last_context_tokens: None,
             last_context_model: None,
             compact_inference_guard_until_ms: 0,
+            compact_hook_precompact_seen_ms: None,
+            compact_hook_sessionstart_seen_ms: None,
+            compact_pending_evidence: None,
+            compact_hook_native_notice_delivered: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -8856,6 +9165,10 @@ impl OrchRegistry {
             last_context_tokens: None,
             last_context_model: None,
             compact_inference_guard_until_ms: 0,
+            compact_hook_precompact_seen_ms: None,
+            compact_hook_sessionstart_seen_ms: None,
+            compact_pending_evidence: None,
+            compact_hook_native_notice_delivered: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -9216,10 +9529,25 @@ impl OrchRegistry {
         // distinctly from `to_abandon` (which is specifically a stuck
         // reinjection DELIVERY, past the arm phase).
         let mut to_arm_timeout: Vec<(String, String)> = Vec::new();
+        // #417: audited separately from the pre-existing arm sites — visibility
+        // for "this compaction's evidence came from a hook, not a guess" is the
+        // whole point of the feature, not incidental.
+        let mut to_hook_armed: Vec<(String, String, &'static str)> = Vec::new();
+        // rev-4 review (N3): a confirmed arm whose native additionalContext
+        // ALREADY delivered the re-grounding — loomux's own reinjection is
+        // skipped for it (see `compact_hook_native_notice_delivered`'s doc),
+        // audited distinctly so "no reinjection fired" reads as a deliberate
+        // choice, not a silently dropped one.
+        let mut to_hook_native_skip: Vec<(String, String)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
                 let Some(g) = groups.get(&a.group) else { continue };
+                // #417 (Copilot correction, round 2): Copilot has its own
+                // `/compact` command after all (see `compact_nudge_cli_
+                // supported`'s doc) — the loop admission gate and the
+                // `/compact`-paste gate are the same check now for both
+                // currently-supported CLIs, so there's a single gate here.
                 if a.status != AgentStatus::Running || !compact_nudge_cli_supported(g.cli_for(a.role)) {
                     continue;
                 }
@@ -9274,6 +9602,99 @@ impl OrchRegistry {
                     }
                 }
 
+                // #417: hook-sourced evidence — a new TRUSTED arm/confirm
+                // source, checked before any inference arm site so a
+                // configured hook always wins over guessing. `read_hook_
+                // marker_ts` reads the marker FILE's mtime (see its doc for
+                // why not a timestamp inside the file), so "fresh" means
+                // "newer than the last one this agent already consumed" — a
+                // hook that never fires just leaves both reads `None`
+                // forever, a total no-op for a hook-less setup.
+                //
+                // rev-4 review (B1, blocking): a marker file has no idea an
+                // app can restart. `AgentEntry.compact_hook_*_seen_ms` is
+                // in-memory, so it resets to `None` on every restart, and
+                // agent ids are minted from an in-memory counter too — a
+                // fresh boot can hand out an id a PREVIOUS process already
+                // used. Combined: restart, get the same id back, and the
+                // first tick reads a marker from the OLD process's hook fire
+                // as "fresh" (`ts > None.unwrap_or(0)` is true for any real
+                // mtime) — arming TRUSTED with `seen_busy = true`, bypassing
+                // every evidence gate, and reinjecting "Context was
+                // compacted" with no compaction having happened. Three
+                // layers, belt-and-suspenders (this is the TRUSTED tier, so
+                // a false positive here is worse than one in the inference
+                // tiers below): (1) `ts >= a.started_ms` — a marker can only
+                // be evidence for a compaction that happened during THIS
+                // agent's own lifetime, which a stale cross-restart marker
+                // structurally never was (`>=`, not `>`: `started_ms` and a
+                // marker's mtime are both millisecond-resolution real wall
+                // clock, so a marker written in the SAME millisecond an
+                // agent started is still legitimately its own, not a false
+                // rejection); (2) delete-on-consume — once a
+                // marker is actually used to arm, it is removed from disk so
+                // it can never be re-read as evidence again, independent of
+                // whether the in-memory bookkeeping survives; (3) the
+                // regression test simulating exactly this sequence (fresh
+                // `AgentEntry`, same id, an old marker already on disk).
+                let hooks_dir = self.group_dir(&a.group).join("hooks");
+                let precompact_marker = hooks_dir.join(format!("{}.precompact.json", a.id));
+                let sessionstart_marker = hooks_dir.join(format!("{}.sessionstart-compact.json", a.id));
+                let precompact_ts = read_hook_marker_ts(&precompact_marker);
+                let sessionstart_ts = read_hook_marker_ts(&sessionstart_marker);
+                if let Some(ts) = precompact_ts {
+                    if ts > a.compact_hook_precompact_seen_ms.unwrap_or(0)
+                        && ts >= a.started_ms
+                        && !a.compact_pending
+                    {
+                        // Direct proof a compaction just STARTED — arm exactly
+                        // like the loomux-initiated path (`compact_pending_
+                        // trusted = true`: no inference gate needed) and treat
+                        // it as already busy, since the compaction itself is
+                        // the busy half of busy-then-quiet, whether or not it
+                        // grew the pane's own output past the activity floor.
+                        a.compact_hook_precompact_seen_ms = Some(ts);
+                        let _ = fs::remove_file(&precompact_marker);
+                        a.compact_pending = true;
+                        a.compact_pending_trusted = true;
+                        a.compact_seen_busy = true;
+                        a.compact_pending_baseline_tokens = context_tokens.get(&a.id).copied();
+                        a.compact_pending_baseline_marker_count = context_boundary_counts.get(&a.id).copied();
+                        a.compact_pending_armed_ms = Some(now);
+                        a.compact_pending_evidence = Some("hook");
+                        to_hook_armed.push((a.id.clone(), a.group.clone(), "precompact"));
+                    }
+                }
+                if let Some(ts) = sessionstart_ts {
+                    if ts > a.compact_hook_sessionstart_seen_ms.unwrap_or(0) && ts >= a.started_ms {
+                        // Even STRONGER direct proof: Claude Code itself just
+                        // told us a session started because of a compact.
+                        // Unconditional on `compact_pending` (unlike the
+                        // PreCompact marker above) — this covers a hook config
+                        // that only has SessionStart, or a PreCompact marker
+                        // this tick loop missed/raced. If an arm is already
+                        // open (almost always this same one, from the
+                        // PreCompact branch just above), this simply
+                        // (re)confirms trust/busy — inert, never double-arms.
+                        a.compact_hook_sessionstart_seen_ms = Some(ts);
+                        let _ = fs::remove_file(&sessionstart_marker);
+                        a.compact_pending = true;
+                        a.compact_pending_trusted = true;
+                        a.compact_seen_busy = true;
+                        a.compact_pending_evidence = Some("hook");
+                        // rev-4 review (N3): the ONLY script branch that
+                        // emits `additionalContext` — see `COMPACT_HOOK_
+                        // SCRIPT`'s `sessionstart-compact` case — so this is
+                        // the one signal that native re-grounding actually
+                        // reached the agent already.
+                        a.compact_hook_native_notice_delivered = true;
+                        if a.compact_pending_armed_ms.is_none() {
+                            a.compact_pending_armed_ms = Some(now);
+                        }
+                        to_hook_armed.push((a.id.clone(), a.group.clone(), "sessionstart-compact"));
+                    }
+                }
+
                 // rev-42 delta (round 2, PR #329 round-5 re-demo): while a
                 // decided reinjection is waiting on its delivery to confirm,
                 // skip straight to that check — do NOT re-run the busy/
@@ -9304,6 +9725,8 @@ impl OrchRegistry {
                         a.compact_pending = false;
                         a.compact_reinject_attempted_ms = None;
                         a.compact_reinject_attempts = 0;
+                        a.compact_pending_evidence = None;
+                        a.compact_hook_native_notice_delivered = false;
                         // #410/round-7: the immediate post-compact discussion
                         // is exactly the window an inference arm can misread
                         // as a new compaction — cool down.
@@ -9328,6 +9751,8 @@ impl OrchRegistry {
                             a.compact_pending = false;
                             a.compact_reinject_attempted_ms = None;
                             a.compact_reinject_attempts = 0;
+                            a.compact_pending_evidence = None;
+                            a.compact_hook_native_notice_delivered = false;
                             a.compact_last_lost_reason = Some("reinjection-abandoned".to_string());
                             a.compact_last_lost_ms = Some(now);
                             a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
@@ -9359,6 +9784,8 @@ impl OrchRegistry {
                         a.compact_pending_baseline_marker_count = None;
                         a.compact_pending_trusted = false;
                         a.compact_pending_armed_ms = None;
+                        a.compact_pending_evidence = None;
+                        a.compact_hook_native_notice_delivered = false;
                         a.compact_last_lost_reason = Some("arm-timeout".to_string());
                         a.compact_last_lost_ms = Some(now);
                         a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
@@ -9455,7 +9882,25 @@ impl OrchRegistry {
                                 marker_baseline,
                                 marker_current,
                             );
-                        if confirmed {
+                        if confirmed && a.compact_hook_native_notice_delivered {
+                            // rev-4 review (N3): Claude Code already delivered
+                            // native `additionalContext` re-grounding for this
+                            // exact compaction (the SessionStart hook fired) —
+                            // loomux's own reinjection would be a SECOND one,
+                            // spending exactly the context tokens native
+                            // delivery exists to save. Resolve straight to a
+                            // terminal state; there is no delivery to confirm.
+                            a.compact_pending = false;
+                            a.compact_pending_baseline_tokens = None;
+                            a.compact_pending_baseline_marker_count = None;
+                            a.compact_pending_trusted = false;
+                            a.compact_seen_busy = false;
+                            a.compact_pending_armed_ms = None;
+                            a.compact_pending_evidence = None;
+                            a.compact_hook_native_notice_delivered = false;
+                            a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                            to_hook_native_skip.push((a.id.clone(), a.group.clone()));
+                        } else if confirmed {
                             a.compact_pending_baseline_tokens = None;
                             a.compact_pending_baseline_marker_count = None;
                             a.compact_pending_trusted = false;
@@ -9477,6 +9922,8 @@ impl OrchRegistry {
                             a.compact_pending_baseline_marker_count = None;
                             a.compact_pending_trusted = false;
                             a.compact_pending_armed_ms = None;
+                            a.compact_pending_evidence = None;
+                            a.compact_hook_native_notice_delivered = false;
                             // #410/round-7: the same repeating-false-signal
                             // shape D4 pins can otherwise re-arm on the very
                             // next tick — a short cooldown after ANY discard
@@ -9513,6 +9960,10 @@ impl OrchRegistry {
                 // gives a queued request first refusal, before any inference
                 // arm gets a chance to re-claim the pane this same tick.
                 let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
+                // The loop's own admission gate above (`compact_nudge_cli_
+                // supported`) already guarantees this CLI has `/compact` to
+                // paste, so the fire conditions below don't re-check it — see
+                // that gate's doc for the correction-round history.
                 // Heuristic (role-gated, minutes-threshold) fallback fire.
                 let heuristic_fires = compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
                     && idle_tick_should_fire(
@@ -9527,8 +9978,9 @@ impl OrchRegistry {
                 // behalf by escalation BELOW, one tick later than before this
                 // round's reorder — see the reorder note above) fire — no
                 // role gate (self-initiated), no minutes threshold (the
-                // request IS the trigger), still CLI-gated (checked above)
-                // and rate-limited (shared budget).
+                // request IS the trigger; `request_compact` itself already
+                // refuses a caller whose CLI fails the gate above) and
+                // rate-limited (shared budget).
                 let requested_fires = a.compact_requested
                     && compact_request_should_fire(currently_quiet, times, now, MAX_COMPACT_NUDGES_PER_HOUR);
                 // `!a.compact_pending` (rev-12 review finding): this is the
@@ -9754,6 +10206,15 @@ impl OrchRegistry {
                 "reason": "arm never reached a busy-then-quiet resolution within ARM_PENDING_TIMEOUT_MS",
             }));
         }
+        for (id, group, event) in to_hook_armed {
+            self.audit(&group, "loomux", "compact-hook-evidence", json!({ "agent": id, "event": event }));
+        }
+        for (id, group) in to_hook_native_skip {
+            self.audit(&group, "loomux", "compact-reinjection-skipped-native", json!({
+                "agent": id,
+                "reason": "SessionStart hook already delivered native additionalContext for this compaction",
+            }));
+        }
         nudged
     }
 
@@ -9969,7 +10430,7 @@ impl OrchRegistry {
         let cli = self.cli_for_agent(&a);
         if !compact_nudge_cli_supported(&cli) {
             return Err(format!(
-                "/compact has no equivalent on {cli} — request_compact is Claude-Code-only"
+                "/compact has no equivalent on {cli} — request_compact is not supported for this CLI"
             ));
         }
         if let Some(e) = self.agents.lock_safe().get_mut(agent_id) {
@@ -11986,6 +12447,7 @@ impl OrchRegistry {
                         a.compact_last_lost_reason.as_deref(),
                         a.compact_last_lost_ms,
                         now,
+                        a.compact_pending_evidence,
                     ),
                     "context": {
                         "tokens": a.last_context_tokens,
@@ -12084,6 +12546,25 @@ impl OrchRegistry {
         // but never sent (removed chips / abandoned drafts), so the cheap
         // policy is simply "cleaned up on group end", no per-image bookkeeping.
         let _ = fs::remove_dir_all(self.attachments_dir(group));
+
+        // rev-4 review (N4): reclaim any #416 generated Copilot custom-agent
+        // files this group's members ever got (`write_copilot_agent_file`) —
+        // otherwise they accumulate in `~/.copilot/agents` forever and
+        // clutter the user's Copilot agent list with dead groups' names.
+        // Best-effort per member (a handle a member never actually got a
+        // file for is just a missing-file no-op); harmless to attempt for a
+        // Claude-only group too, since none of its handles were ever
+        // written. NOT swept for orphans from a group that never reaches
+        // `end_group` at all (a crash, or state deleted out from under
+        // loomux) — a stray tiny markdown file the user can delete by hand
+        // is a cosmetic cost, not a resource or security one, so a startup
+        // reconciliation sweep is left as a deliberate follow-up rather than
+        // built speculatively here.
+        if let Some(dir) = self.copilot_agents_dir() {
+            for a in &members {
+                let _ = fs::remove_file(dir.join(format!("loomux-{group}-{}.agent.md", a.block)));
+            }
+        }
 
         // Total teardown: drop any pause (in-memory + marker) so a future
         // relaunch on this repo starts clean rather than silently paused.
@@ -12463,31 +12944,36 @@ impl OrchRegistry {
         }
     }
 
-    /// Write one block's role-instruction file, honoring its persona mode.
+    /// Compute one block's role-instruction body, honoring its persona mode —
+    /// the pure half of [`write_block_instructions`], split out (#416) so the
+    /// exact bytes written to the instructions file are ALSO what
+    /// [`persona_inject`](Self::persona_inject) hands the CLI's own native
+    /// custom-agent flag (`--agents` on Claude, a generated `--agent` file on
+    /// Copilot). Two channels computing the same text independently is
+    /// exactly the silent-divergence risk this repo's conventions warn about
+    /// (see `profiles.rs`'s `model:` note) — one function, called from both
+    /// sites, makes it structurally impossible for the file an agent is told
+    /// to read and the contract riding in its system prompt to disagree.
     ///
     /// - **append** (and no persona): the built-in class template, as before.
-    ///   The persona itself does not go here — it reaches the agent through the
-    ///   CLI's native custom-agent flag (or the kickoff), so this file stays the
-    ///   loomux contract and nothing else.
     /// - **replace**: [`mechanics_core`] *instead of* the class template. The
     ///   persona has replaced the role body — but the mechanics (MCP tools, the
     ///   board, `report()` discipline, branch→PR) are **not overridable**, so
-    ///   loomux writes them itself and the kickoff points the agent at them. A
-    ///   replace persona can change who the agent is; it can never leave it
-    ///   unable to report or unable to open a PR.
+    ///   loomux writes them itself. A replace persona can change who the agent
+    ///   is; it can never leave it unable to report or unable to open a PR.
     ///
     /// `persona` is the block's already-resolved persona — passed in rather than
     /// re-resolved, so the file this writes and the flags the CLI gets can never
     /// disagree about a persona that was edited mid-spawn.
-    fn write_block_instructions(
+    fn render_block_instructions(
         &self,
         g: &GroupInfo,
         b: &workflow::Block,
         persona: Option<&ResolvedPersona>,
         vars: &[(&str, &str)],
-    ) -> Result<(), String> {
+    ) -> String {
         let replace = persona.is_some_and(|p| p.mode == profiles::ProfileMode::Replace);
-        let body = if replace {
+        if replace {
             format!(
                 "# {} — loomux mechanics (non-overridable)\n\n\
                  This repo's persona for the `{}` block runs in `mode: replace`: it replaces \
@@ -12510,7 +12996,20 @@ impl OrchRegistry {
                 vars.iter().filter(|(k, _)| *k != "BLOCK_NOTE").copied().collect();
             vars.push(("BLOCK_NOTE", note.as_str()));
             render_template(b.kind.template(), &vars)
-        };
+        }
+    }
+
+    /// Write one block's role-instruction file — see
+    /// [`render_block_instructions`](Self::render_block_instructions) for the
+    /// body itself.
+    fn write_block_instructions(
+        &self,
+        g: &GroupInfo,
+        b: &workflow::Block,
+        persona: Option<&ResolvedPersona>,
+        vars: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let body = self.render_block_instructions(g, b, persona, vars);
         fs::write(self.group_dir(&g.id).join(b.instructions_file()), body)
             .map_err(|e| e.to_string())
     }
@@ -12611,9 +13110,25 @@ impl OrchRegistry {
 
     /// The extra environment injected into an *agent* pane (never a human's plain
     /// shell): the gh + git shims prepended to PATH so the merge/release gates are
-    /// enforced, and `LOOMUX_GROUP_DIR` so the shim finds this group's
-    /// markers/grants. Empty when neither gh nor git is installed (nothing to gate).
-    fn agent_pane_env(&self, group: &str) -> Vec<(String, String)> {
+    /// enforced, and `LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID` so a shim or hook script
+    /// finds this group's markers/grants and knows which agent it's running for.
+    ///
+    /// `LOOMUX_AGENT_ID` (#417 Copilot correction) exists specifically for
+    /// Copilot's compact-hook script: unlike Claude's `--settings` file (baked
+    /// per-agent with the id in its own argv), Copilot's hook config is a
+    /// GLOBAL, machine-wide file (`~/.copilot/hooks/*.json`) shared by every
+    /// Copilot session on the box, loomux-launched or not — so the script has
+    /// no argv to read an id from and must recover both facts from its own
+    /// inherited environment instead. Absence of these two vars (a human's own
+    /// non-loomux Copilot session) is precisely the signal the script uses to
+    /// no-op — see `COPILOT_COMPACT_HOOK_SCRIPT`'s doc.
+    ///
+    /// Only ever computed when at least the shims exist (gh or git installed);
+    /// empty when neither is, which would also mean an agent pane never gets
+    /// these two vars — an acceptable joint fate today since every environment
+    /// that installs Claude/Copilot for loomux-managed development is assumed
+    /// to have git.
+    fn agent_pane_env(&self, group: &str, agent_id: &str) -> Vec<(String, String)> {
         let Some(shim) = self.ensure_shims() else {
             return Vec::new();
         };
@@ -12625,6 +13140,7 @@ impl OrchRegistry {
         vec![
             ("PATH".to_string(), path),
             ("LOOMUX_GROUP_DIR".to_string(), self.group_dir(group).display().to_string()),
+            ("LOOMUX_AGENT_ID".to_string(), agent_id.to_string()),
         ]
     }
 
@@ -13083,6 +13599,17 @@ impl OrchRegistry {
     /// Write the per-agent MCP config the agent CLI connects with. Claude
     /// and Copilot share the same core schema; Copilot additionally expects
     /// a `tools` allowlist inside the server entry.
+    ///
+    /// rev-4 review (N2): this file used to ALSO carry the #417 hook config
+    /// (folded into a top-level `hooks` key, passed a second time via
+    /// `--settings`) — one generated file, two flags. That only stays safe
+    /// while `--mcp-config`'s reader and `--settings`'s reader each happen to
+    /// ignore the other's top-level keys, which is a schema assumption
+    /// neither this file nor Claude Code's own docs pin down; a future
+    /// Claude Code release tightening either reader's validation would be a
+    /// silent breakage with no test able to catch it locally. Split instead
+    /// (see `write_hook_settings_file`): two small generated files, one per
+    /// flag, at the cost of one extra `fs::write` per Claude spawn.
     fn write_mcp_config(
         &self,
         group: &str,
@@ -13108,6 +13635,190 @@ impl OrchRegistry {
         let path = dir.join(format!("{agent_id}.json"));
         fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).map_err(|e| e.to_string())?;
         Ok(path)
+    }
+
+    /// Claude's `--settings` file (#417, split from `--mcp-config`'s file per
+    /// rev-4 review N2 — see `write_mcp_config`'s doc): just the `hooks` key,
+    /// nothing shared with the MCP config's schema. `None` when
+    /// `compact_hook_settings` has nothing to write (no `sh` resolvable) —
+    /// the caller then omits `--settings` entirely rather than writing an
+    /// empty file no flag points at.
+    fn write_hook_settings_file(&self, group: &str, agent_id: &str) -> Option<PathBuf> {
+        let hooks = self.compact_hook_settings(group, agent_id)?;
+        let cfg = json!({ "hooks": hooks });
+        let dir = self.group_dir(group).join("configs");
+        fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!("{agent_id}-hooks.json"));
+        fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).ok()?;
+        Some(path)
+    }
+
+    /// The shared directory holding the generic compact-lifecycle hook
+    /// script (#417) — a sibling of `shim_dir()`, one copy for every group:
+    /// the script itself carries no group- or agent-specific text, only argv
+    /// (the group's state dir + the agent's id, baked into each agent's own
+    /// `command` string below). Test-overridable (see
+    /// `compact_hook_dir_override`'s doc) — every real deployment gets the
+    /// derived path.
+    fn compact_hook_dir(&self) -> PathBuf {
+        if let Some(dir) = self.compact_hook_dir_override.lock_safe().clone() {
+            return dir;
+        }
+        self.root.parent().unwrap_or(&self.root).join("compacthook")
+    }
+
+    /// Write (or refresh) the generic hook script, returning its path or
+    /// `None` if it can't be written. Idempotent/always-rewritten, like
+    /// `write_shim` — cheap, and keeps it current if loomux itself updated.
+    fn ensure_compact_hook_script(&self) -> Option<PathBuf> {
+        let dir = self.compact_hook_dir();
+        fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("compact-hook.sh");
+        fs::write(&path, COMPACT_HOOK_SCRIPT).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
+        }
+        Some(path)
+    }
+
+    /// The `sh` interpreter to run the hook script with, resolved the same
+    /// way `ensure_shims`'s Windows `.cmd` delegators bake in an absolute
+    /// `sh.exe` (#335) rather than trusting a bare `sh` on PATH (not
+    /// guaranteed on Windows) or Claude Code's own shell resolution, which
+    /// loomux has no visibility into. `None` when no `sh` exists anywhere
+    /// (essentially POSIX-only risk; Windows resolves via git's own install
+    /// layout) — hook provisioning is then skipped entirely for this spawn,
+    /// same fail-open policy as a missing gh/git shim.
+    fn resolve_hook_sh(&self) -> Option<PathBuf> {
+        #[cfg(target_os = "windows")]
+        {
+            let git = crate::winpath::resolve_program(
+                "git",
+                &crate::winpath::launch_path(),
+                &crate::winpath::launch_pathext(),
+            )?;
+            crate::winpath::resolve_sh(&git, &crate::winpath::launch_path(), &crate::winpath::launch_pathext())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Some(PathBuf::from("/bin/sh"))
+        }
+    }
+
+    /// Claude's PreCompact + SessionStart(compact) hook config (#417) — the
+    /// `hooks` object `write_hook_settings_file` writes, which rides on
+    /// `--settings` (an ADDITIVE settings layer Claude Code composes over
+    /// the user's own `.claude/settings.json`, never a hand merge of it —
+    /// "never clobber the user's hooks" is a property of the CLI flag
+    /// itself here, not something loomux re-implements by
+    /// parsing their JSON).
+    ///
+    /// The `command` for each event explicitly invokes the resolved `sh`
+    /// (never a bare `sh` on PATH) against the generic script, with the
+    /// event name + this group's state dir + this agent's id as literal argv
+    /// — so the script itself carries zero repo/group-specific text (#8's
+    /// generic-product constraint) and no new env var is needed to tell it
+    /// which agent it's running for.
+    ///
+    /// `None` when no `sh` is resolvable — the agent then has no hooks
+    /// configured at all, same as before this feature existed (fail-open, not
+    /// a spawn failure).
+    fn compact_hook_settings(&self, group: &str, agent_id: &str) -> Option<Value> {
+        let script = self.ensure_compact_hook_script()?;
+        let sh = self.resolve_hook_sh()?;
+        // Forward-slashed so the path is safe inside the POSIX script's own
+        // argv handling, mirroring `write_shim`'s identical reasoning.
+        let group_dir = self.group_dir(group).display().to_string().replace('\\', "/");
+        let script_fwd = script.display().to_string().replace('\\', "/");
+        let sh_fwd = sh.display().to_string().replace('\\', "/");
+        let cmd = |event: &str| format!("\"{sh_fwd}\" \"{script_fwd}\" {event} \"{group_dir}\" \"{agent_id}\"");
+        Some(json!({
+            "PreCompact": [{ "hooks": [{ "type": "command", "command": cmd("precompact") }] }],
+            "SessionStart": [{ "matcher": "compact", "hooks": [{ "type": "command", "command": cmd("sessionstart-compact") }] }],
+        }))
+    }
+
+    /// #417 (Copilot correction): Copilot's own user-level hook config
+    /// directory — `$COPILOT_HOME/hooks` if that env var is set, else
+    /// `~/.copilot/hooks` per GitHub's docs
+    /// (docs.github.com/en/copilot/reference/hooks-reference). Test-
+    /// overridable (`copilot_hooks_dir_override`), mirroring
+    /// `copilot_agents_dir`. Deliberately NEVER the repo's `.github/hooks/`
+    /// — same reasoning as never writing into the repo's `.github/agents/`
+    /// (#416): a generated file there would dirty the user's git tree with
+    /// something they didn't author. The user-level directory is Copilot's
+    /// OWN convention for machine-wide config, and — confirmed by the docs
+    /// (constraint: "When the same event appears in multiple sources, all
+    /// hook entries from all sources are run") — genuinely ADDITIVE: adding
+    /// a file here is proven never to clobber the user's own hooks, unlike
+    /// Claude's `--settings`, whose merge semantics this repo could not
+    /// verify (see `compact_hook_settings`'s doc).
+    fn copilot_hooks_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = self.copilot_hooks_dir_override.lock_safe().clone() {
+            return Some(dir);
+        }
+        if let Ok(home) = std::env::var("COPILOT_HOME") {
+            if !home.trim().is_empty() {
+                return Some(PathBuf::from(home).join("hooks"));
+            }
+        }
+        dirs::home_dir().map(|h| h.join(".copilot").join("hooks"))
+    }
+
+    /// Write (or refresh) loomux's `PreCompact` hook config into Copilot's
+    /// user-level hooks directory — a single small, GENERIC, machine-wide
+    /// file (`loomux-compact.json`, idempotent/always-rewritten, like the
+    /// gh/git shims), never one generated per group or per agent: unlike
+    /// Claude's `--settings` (baked per-agent with the agent's id in its own
+    /// argv), Copilot's hook config is a single GLOBAL surface shared by
+    /// every Copilot session on the machine — loomux-launched or not — so
+    /// there is exactly one file to maintain, and the hook script recovers
+    /// which (if any) loomux agent it's running for from its OWN inherited
+    /// environment at invocation time (`LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID`
+    /// — see `agent_pane_env`'s doc), never from anything baked into this
+    /// file. Absent either var (a human's own, non-loomux Copilot session on
+    /// this machine), the inline command below is a silent no-op — the
+    /// discrimination the review round required, done via the SAME
+    /// env-var-presence idiom the gh/git shims already use (`LOOMUX_GROUP_
+    /// DIR` unset ⇒ "not a loomux pane, do nothing"), rather than matching
+    /// the payload's `cwd` against a live list of loomux worktrees: that
+    /// would need either a registration file the script re-reads on every
+    /// invocation (extra I/O and a staleness/race surface) or a static list
+    /// baked in at generation time (stale the moment a new group spawns
+    /// after this file was last written) — env-var inheritance has neither
+    /// problem, since it is always current for the actual process the hook
+    /// runs inside.
+    ///
+    /// The command itself only WRITES A MARKER FILE, matching Claude's
+    /// `precompact` case exactly — no payload parsing needed (the marker's
+    /// mere existence, at `read_hook_marker_ts`'s mtime, is the whole
+    /// signal), so the script never needs to read the JSON Copilot pipes in.
+    /// Both `bash` and `powershell` fields are always provided (per the
+    /// docs' own two-variant `command` hook shape) — Copilot picks the one
+    /// for its host OS itself, so loomux never needs its own `sh.exe`
+    /// resolution dance the way Claude's hook command does.
+    ///
+    /// Returns `false` (never fatal — fail-open, same as a missing gh/git
+    /// shim) when the hooks directory can't be created/written.
+    fn ensure_copilot_compact_hook(&self) -> bool {
+        let Some(dir) = self.copilot_hooks_dir() else { return false };
+        if fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        let cfg = json!({
+            "version": 1,
+            "hooks": {
+                "preCompact": [{
+                    "type": "command",
+                    "bash": COPILOT_PRECOMPACT_HOOK_BASH,
+                    "powershell": COPILOT_PRECOMPACT_HOOK_POWERSHELL,
+                    "timeoutSec": 10,
+                }],
+            },
+        });
+        fs::write(dir.join("loomux-compact.json"), serde_json::to_string_pretty(&cfg).unwrap()).is_ok()
     }
 
     /// Resolve a block's persona from its `prompt:` (inline) or `profile:` (a
@@ -13228,6 +13939,46 @@ impl OrchRegistry {
         }));
     }
 
+    /// Generate (or refresh) a loomux-owned Copilot custom-agent file carrying
+    /// `contract` (#416) — written into Copilot's OWN user-level agent
+    /// directory (`~/.copilot/agents`, see [`copilot_agents_dir`]
+    /// (Self::copilot_agents_dir)), never the repo's `.github/agents/`. Its
+    /// handle is unique per group+block so concurrent groups never collide,
+    /// and it is rewritten on every spawn (like `write_mcp_config`) so an
+    /// edited template/persona applies to the next agent without restarting
+    /// the group. Returns the `--agent` handle, or `None` when the directory
+    /// can't be created/written (fail-open — the caller falls back to the
+    /// pre-#416 kickoff-text path rather than failing the spawn).
+    fn write_copilot_agent_file(&self, group: &str, block: &workflow::Block, contract: &str) -> Option<String> {
+        let dir = self.copilot_agents_dir()?;
+        fs::create_dir_all(&dir).ok()?;
+        let handle = format!("loomux-{group}-{}", block.id);
+        // `contract` is already built from loomux's own trusted templates plus
+        // (if any) a persona already sanitized at resolution time
+        // (`workflow::sanitize_persona`, applied in `resolve_persona`) — no
+        // further escaping needed for a file body. The frontmatter split in
+        // `profiles::parse_profile` only ever looks at the FIRST `\n---`
+        // after the opening one, so a `---` line anywhere inside `contract`
+        // itself is inert.
+        let body = format!("---\nname: {handle}\n---\n{contract}\n");
+        let path = dir.join(format!("{handle}.agent.md"));
+        fs::write(&path, body).ok()?;
+        Some(handle)
+    }
+
+    /// Compile a resolved persona into the launch flags of `cli` — the table in
+    /// [`PersonaInject`]. `contract` is the block's full durable role CONTRACT
+    /// (see [`block_contract_text`]) — computed once at the spawn site from
+    /// the SAME [`render_block_instructions`](Self::render_block_instructions)
+    /// call that wrote the instructions file, so the system-prompt payload and
+    /// the file can never disagree.
+    ///
+    /// #416: unlike the pre-#416 behavior (a repo persona compiled onto
+    /// `--agents`/a native Copilot file, nothing at all otherwise), `contract`
+    /// reaches the CLI's native custom-agent mechanism for EVERY block, workflow-
+    /// customized or not — the durable-role-contract gap this closes was never
+    /// about *whether* a persona could ride the system-prompt layer, it was
+    /// that loomux's OWN mechanics/template body never did, on any block.
     #[doc(hidden)] // pub for integration tests
     pub fn persona_inject(
         &self,
@@ -13235,10 +13986,8 @@ impl OrchRegistry {
         block: &workflow::Block,
         cli: &str,
         persona: Option<&ResolvedPersona>,
+        contract: &str,
     ) -> PersonaInject {
-        let Some(p) = persona else {
-            return PersonaInject::default();
-        };
         // CAPABILITY CLOSURE, enforced at the last possible moment (#222).
         //
         // `workflow::parse_workflow` already refuses `allow:` on a read-only
@@ -13252,36 +14001,74 @@ impl OrchRegistry {
         //
         // Nobody can enumerate every write-capable program. So a read-only block
         // simply gets no allow patterns, from any source, ever.
-        let allow: Vec<String> = if block.kind.is_read_only() {
-            if !p.allow.is_empty() {
-                self.audit_allow_denied(group, block, &p.allow);
+        let allow: Vec<String> = match persona {
+            Some(p) if block.kind.is_read_only() => {
+                if !p.allow.is_empty() {
+                    self.audit_allow_denied(group, block, &p.allow);
+                }
+                Vec::new()
             }
-            Vec::new()
-        } else {
-            p.allow.clone()
+            Some(p) => p.allow.clone(),
+            None => Vec::new(),
         };
         let mut out = PersonaInject { extra_allow: allow, ..Default::default() };
-        if p.text.trim().is_empty() {
-            return out; // allow-only block
-        }
+
         if cli == "copilot" {
-            if p.copilot_native {
-                out.copilot_agent = Some(p.name.clone());
-            } else {
-                // No inline persona flag on Copilot and no user-authored file to
-                // name — so the persona travels as text in the kickoff prompt.
-                out.kickoff = Some(p.text.clone());
+            if persona.is_some_and(|p| p.copilot_native) {
+                // Unchanged (#222): a user-authored `.github/agents/*.md`
+                // persona reaches Copilot by pointing `--agent` at the exact
+                // file loomux read and kind-checked. Synthesizing a wrapper
+                // around it would trade that carefully-resolved trust
+                // property (`profiles::handle_resolves_to`) for mechanics-
+                // core coverage this one case still lacks — a residual,
+                // documented gap (doc/design/orchestration.md's #416 note),
+                // not something worth reaching across that boundary for.
+                out.copilot_agent = persona.map(|p| p.name.clone());
+                return out;
+            }
+            // #416: every OTHER copilot block — the default roster, an inline
+            // `prompt:` persona, or an ambiguous native handle — now gets the
+            // durable contract via a loomux-generated custom-agent file,
+            // where before it got nothing (default roster) or a kickoff-
+            // prompt paste (inline `prompt:`).
+            match self.write_copilot_agent_file(group, block, contract) {
+                Some(handle) => out.copilot_agent = Some(handle),
+                None => {
+                    // `~/.copilot/agents` unwritable — fall back to the
+                    // pre-#416 kickoff-text path rather than silently losing
+                    // a configured persona. An allow-only/no-persona block
+                    // has no text to fall back to, so this is a true no-op
+                    // for it, same as before.
+                    if let Some(p) = persona {
+                        if !p.text.trim().is_empty() {
+                            out.kickoff = Some(p.text.clone());
+                        }
+                    }
+                }
             }
             return out;
         }
-        // Claude (and the fallback adapter): define the block inline and
-        // activate it. `description` is required by the CLI's schema.
-        let payload = json!({
-            &block.id: {
-                "description": if p.description.trim().is_empty() { block.id.as_str() } else { p.description.trim() },
-                "prompt": p.text,
-            }
-        });
+
+        // Claude (and the fallback adapter): the durable contract ALWAYS
+        // rides inline now — every block, persona or not. `description` is
+        // required by the CLI's schema.
+        //
+        // Unlike a repo persona (already `sanitize_persona`d in
+        // `resolve_persona`), `contract` is loomux's OWN template prose —
+        // which is full of literal ASCII apostrophes ("don't", "aren't")
+        // that were never a hazard while this text only ever reached the
+        // agent via a file read. Riding inside the `--agents` payload's
+        // SINGLE-quoted shell token, an un-sanitized apostrophe closes that
+        // quote early, same as an unsanitized persona would. Sanitize here,
+        // not at the source: the instructions FILE (and the copilot-agent
+        // file below, which is a file on disk, not a shell token) keep the
+        // real apostrophe for a human/agent reading prose.
+        let description = persona
+            .map(|p| p.description.trim())
+            .filter(|d| !d.is_empty())
+            .unwrap_or(block.id.as_str());
+        let sanitized_contract = workflow::sanitize_persona(contract);
+        let payload = json!({ &block.id: { "description": description, "prompt": sanitized_contract } });
         out.claude_agents_json =
             Some(workflow::ascii_escape_json(&serde_json::to_string(&payload).unwrap_or_default()));
         out.claude_agent = Some(block.id.clone());
@@ -13327,6 +14114,12 @@ impl OrchRegistry {
         model: &str,
         auto_ops: bool,
         cfg: &Path,
+        // Claude's `--settings` file (#417) — `write_hook_settings_file`'s
+        // output, a SEPARATE file from `cfg` (rev-4 review N2: one file
+        // serving both `--mcp-config` and `--settings` is a schema-drift
+        // time bomb — see `write_mcp_config`'s doc). `None` omits
+        // `--settings` entirely (no hooks configured, or a non-Claude CLI).
+        hook_settings: Option<&Path>,
         group_dir: &Path,
         workdir: &Path,
         session: Option<&str>,
@@ -13425,11 +14218,19 @@ impl OrchRegistry {
                 // so it runs under Auto perms even in a non-auto_ops group.
                 let perm = claude_permission_mode(unattended);
                 let mut cmd = format!(
-                    "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config --model {model} \
-                     --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
+                    "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config \
+                     --model {model} --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
                     cfg.display(),
                     group_dir.display()
                 );
+                // #417: Claude Code's own ADDITIVE settings layer — never
+                // clobbers the user's own `.claude/settings.json` hooks.
+                // Omitted entirely (not pointed at an empty file) when this
+                // agent has no hook config (a non-Claude CLI, or no `sh`
+                // resolvable — see `write_hook_settings_file`).
+                if let Some(hs) = hook_settings {
+                    cmd.push_str(&format!(" --settings \"{}\"", hs.display()));
+                }
                 if unattended {
                     // Pre-approve git + gh so the unattended flow runs without
                     // prompts (workers: branch→commit→PR; planners: read-only
@@ -13524,6 +14325,7 @@ impl OrchRegistry {
         model: &str,
         auto_ops: bool,
         cfg: &Path,
+        hook_settings: Option<&Path>,
         group_dir: &Path,
         workdir: &Path,
         session: Option<&str>,
@@ -13610,6 +14412,12 @@ impl OrchRegistry {
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--allowedTools");
                 push(&mut a, "mcp__loomux");
+                // #417: a SEPARATE file from --mcp-config's (rev-4 review
+                // N2) — omitted entirely when this agent has no hook config.
+                if let Some(hs) = hook_settings {
+                    push(&mut a, "--settings");
+                    a.push(hs.display().to_string());
+                }
                 if unattended {
                     // == CLAUDE_UNATTENDED_ALLOW, as literal (unquoted) tokens.
                     push(&mut a, "Bash(git *)");
@@ -13897,14 +14705,32 @@ impl OrchRegistry {
                 "block": block.id, "file": block.instructions_file(), "err": e,
             }));
         }
-        let inject = self.persona_inject(group_id, &block, &cli, persona.as_ref());
+        // #416: the SAME render (not a re-derivation) feeds the CLI's native
+        // system-prompt mechanism, so the file and the flags can never disagree.
+        let instructions_body = self.render_block_instructions(&group, &block, persona.as_ref(), &vars);
+        let contract = block_contract_text(&instructions_body, persona.as_ref());
+        let inject = self.persona_inject(group_id, &block, &cli, persona.as_ref(), &contract);
 
         let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli)?;
+        // #417, split from `cfg` per rev-4 review N2 — Claude's hook config
+        // rides a per-agent `--settings` file, so this is `None` for every
+        // other CLI (Copilot's own hook wiring, below, needs no launch flag
+        // at all — see `ensure_copilot_compact_hook`'s doc).
+        let hook_settings =
+            (cli == "claude").then(|| self.write_hook_settings_file(group_id, &agent_id)).flatten();
+        // #417 (Copilot correction): Copilot auto-loads its user-level hooks
+        // directory itself (no CLI flag needed, unlike Claude's `--settings`)
+        // — best-effort, never blocks a spawn if the directory can't be
+        // written (fail-open, same policy as every other hook/shim path).
+        if cli == "copilot" {
+            let _ = self.ensure_copilot_compact_hook();
+        }
         let command = self.build_agent_command(
             &cli,
             &model,
             group.guardrails.auto_ops,
             &cfg,
+            hook_settings.as_deref(),
             &self.group_dir(group_id),
             Path::new(&cwd),
             session_id.as_deref(),
@@ -13917,6 +14743,7 @@ impl OrchRegistry {
             &model,
             group.guardrails.auto_ops,
             &cfg,
+            hook_settings.as_deref(),
             &self.group_dir(group_id),
             Path::new(&cwd),
             session_id.as_deref(),
@@ -13963,6 +14790,10 @@ impl OrchRegistry {
             last_context_tokens: None,
             last_context_model: None,
             compact_inference_guard_until_ms: 0,
+            compact_hook_precompact_seen_ms: None,
+            compact_hook_sessionstart_seen_ms: None,
+            compact_pending_evidence: None,
+            compact_hook_native_notice_delivered: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -14042,8 +14873,8 @@ impl OrchRegistry {
             deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
             argv,
             // Agent pane: inject the gh-shim PATH + LOOMUX_GROUP_DIR so the merge
-            // gate is enforced structurally (#83).
-            env: self.agent_pane_env(group_id),
+            // gate is enforced structurally (#83), plus LOOMUX_AGENT_ID (#417).
+            env: self.agent_pane_env(group_id, &agent_id),
             // #260: delegate panes open docked by default so a burst of spawns
             // doesn't crowd the orchestrator pane out of focus.
             minimized: spawn_opens_minimized(role, self.spawn_expanded(group_id)),
@@ -15869,12 +16700,28 @@ fn register_orchestrator_pane(
     // The orchestrator block's persona, if the workflow file gave it one. A
     // broken one is audited and dropped, never fatal.
     let persona = reg.resolve_persona_or_audit(group, &block);
-    let inject = reg.persona_inject(&group.id, &block, &cli, persona.as_ref());
+    // #416: read back the instructions file `create_group_ex` already wrote
+    // (via `write_instruction_files`) rather than re-deriving it — this path
+    // has no `vars` in scope, and the file on disk is the one source of
+    // truth the kickoff/reinjection paths already trust for this exact
+    // reason (see `compact_reinjection_notice`'s doc).
+    let instructions_body = fs::read_to_string(reg.group_dir(&group.id).join(block.instructions_file()))
+        .unwrap_or_default();
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&group.id, &block, &cli, persona.as_ref(), &contract);
+    // #417, split from `cfg` per rev-4 review N2 — Claude's hook config rides
+    // a per-agent `--settings` file; Copilot's own wiring needs no flag.
+    let hook_settings =
+        (cli == "claude").then(|| reg.write_hook_settings_file(&group.id, &agent_id)).flatten();
+    if cli == "copilot" {
+        let _ = reg.ensure_copilot_compact_hook();
+    }
     let command = reg.build_agent_command(
         &cli,
         &model,
         group.guardrails.auto_ops,
         &cfg,
+        hook_settings.as_deref(),
         &reg.group_dir(&group.id),
         Path::new(&group.repo),
         session_id.as_deref(),
@@ -15887,6 +16734,7 @@ fn register_orchestrator_pane(
         &model,
         group.guardrails.auto_ops,
         &cfg,
+        hook_settings.as_deref(),
         &reg.group_dir(&group.id),
         Path::new(&group.repo),
         session_id.as_deref(),
@@ -15934,6 +16782,10 @@ fn register_orchestrator_pane(
         last_context_tokens: None,
         last_context_model: None,
         compact_inference_guard_until_ms: 0,
+        compact_hook_precompact_seen_ms: None,
+        compact_hook_sessionstart_seen_ms: None,
+        compact_pending_evidence: None,
+        compact_hook_native_notice_delivered: false,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,
@@ -15957,8 +16809,9 @@ fn register_orchestrator_pane(
         deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
         argv,
         // The orchestrator is the pane the incident implicated — inject the
-        // gh-shim env so its merge gate is enforced too (#83).
-        env: reg.agent_pane_env(&group.id),
+        // gh-shim env so its merge gate is enforced too (#83), plus
+        // LOOMUX_AGENT_ID (#417).
+        env: reg.agent_pane_env(&group.id, &agent_id),
         // The orchestrator's own pane is never minimized (#260) — see
         // `spawn_opens_minimized`, called here too so both `SpawnRequest` sites
         // agree on the rule structurally, not by two independently-written `false`s.
@@ -16008,7 +16861,18 @@ fn register_orchestrator_pane(
         reg2.audit(&group2.id, "loomux", "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
         crate::obs::breadcrumb("agent-bind", &format!("agent={agent_id} pty={pty_id} role=Orchestrator"));
         let kickoff = if resume {
-            "[loomux] Orchestration restored: your MCP tools, the task board, and the audit log are live again in this session. Re-sync now: list_tasks, list_agents, get_state. Your previous worker panes are gone; resume a task session with spawn_agent(resume_session, cwd) when follow-ups need it. Then give the human a short status summary.".to_string()
+            // #411: an app restart is exactly the surprise discontinuity the
+            // directive ledger exists to survive, but this fixed string used
+            // to embed nothing from it — a directive noted before the
+            // restart had no durable channel back in, even though the SAME
+            // ledger file `compact_reinjection_notice` already reads back on
+            // a real compaction sat right there on disk.
+            let ledger_path = reg2.ledger_path(&group2.id, &agent_id);
+            let ledger = fs::read_to_string(&ledger_path).unwrap_or_default();
+            let ledger_embed = directive_ledger_embed(
+                &ledger, DIRECTIVE_LEDGER_EMBED_CAP_BYTES, &ledger_path.display().to_string(),
+            );
+            resume_kickoff_notice(ledger_embed.as_deref())
         } else {
             match reg2.agent(&agent_id) {
                 Some(a) => reg2.kickoff_prompt(&a, &group2, "", kickoff_persona.as_deref()),
