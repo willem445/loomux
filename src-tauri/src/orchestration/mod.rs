@@ -2142,6 +2142,33 @@ fi\n\
 exit 0\n\
 ";
 
+/// #417 (Copilot correction): the `bash` half of loomux's `preCompact` hook
+/// entry (see `OrchRegistry::ensure_copilot_compact_hook`) — inline, per the
+/// docs' own `"bash": "YOUR_BASH_COMMAND"` convention, rather than a separate
+/// script file: Copilot invokes this string directly (POSIX shell), so
+/// there's no `sh.exe`-resolution dance to do (unlike Claude's hook command,
+/// which invokes an absolute interpreter path itself). No-ops silently
+/// (never a nonzero exit) when this Copilot session isn't a loomux pane at
+/// all (`LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID` unset) — the discrimination a
+/// GLOBAL, machine-wide hook file needs, since it applies to every Copilot
+/// session on the box.
+const COPILOT_PRECOMPACT_HOOK_BASH: &str =
+    "if [ -n \"$LOOMUX_GROUP_DIR\" ] && [ -n \"$LOOMUX_AGENT_ID\" ]; then \
+     mkdir -p \"$LOOMUX_GROUP_DIR/hooks\" 2>/dev/null; \
+     : > \"$LOOMUX_GROUP_DIR/hooks/$LOOMUX_AGENT_ID.precompact.json\" 2>/dev/null; \
+     fi; exit 0";
+
+/// The `powershell` half of the same hook entry — Windows' native shell, so
+/// Copilot never has to fall back to (or loomux resolve) a POSIX `sh` on a
+/// machine that may not have Git for Windows installed at all.
+const COPILOT_PRECOMPACT_HOOK_POWERSHELL: &str =
+    "if ($env:LOOMUX_GROUP_DIR -and $env:LOOMUX_AGENT_ID) { \
+     $hooksDir = Join-Path $env:LOOMUX_GROUP_DIR 'hooks'; \
+     New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null; \
+     $marker = Join-Path $hooksDir ($env:LOOMUX_AGENT_ID + '.precompact.json'); \
+     New-Item -ItemType File -Force -Path $marker | Out-Null \
+     }; exit 0";
+
 /// Claude Code's permission mode for an (un)attended agent: its native `auto`
 /// preset when unattended (what a human uses interactively), else `acceptEdits`.
 pub fn claude_permission_mode(unattended: bool) -> &'static str {
@@ -2407,6 +2434,23 @@ fn canonicalize_compact_nudge_roles(roles: Vec<String>) -> Vec<String> {
 /// testable without a registry; `cli` comes from `Guardrails::cli_for`.
 pub fn compact_nudge_cli_supported(cli: &str) -> bool {
     cli == "claude"
+}
+
+/// #417 (Copilot correction): whether `cli` gets a SEAT in `compact_nudge_
+/// tick`'s per-agent loop at all — broader than `compact_nudge_cli_supported`
+/// above, which is specifically "has a `/compact` loomux can paste" and stays
+/// claude-only. Copilot's own `PreCompact` hook (confirmed via GitHub's
+/// hooks reference, docs.github.com/en/copilot/reference/hooks-reference —
+/// an earlier round of this feature wrongly asserted Copilot has no
+/// compaction hooks at all) gives it a real, TRUSTED arm signal even though
+/// it has no `/compact` command loomux could ever paste for it — so it needs
+/// admission to the loop the CLI-paste-specific gate would otherwise deny it
+/// entirely. Everything inside the loop that actually PASTES `/compact`
+/// (the heuristic/requested fire sites) re-checks `compact_nudge_cli_
+/// supported` explicitly rather than relying on this broader gate — see
+/// those sites' own comments.
+pub fn compact_hook_cli_supported(cli: &str) -> bool {
+    matches!(cli, "claude" | "copilot")
 }
 
 /// Compact-nudge (#328): whether an agent-requested compact should fire NOW.
@@ -4517,6 +4561,13 @@ pub struct OrchRegistry {
     /// that reads the script's content back traced to this). `None` in
     /// production. Mirrors `claude_projects_dir`.
     compact_hook_dir_override: Mutex<Option<PathBuf>>,
+    /// Test-only override of Copilot's own user-level hooks directory
+    /// (`~/.copilot/hooks`, or `$COPILOT_HOME/hooks`) — the SAME real-shared-
+    /// path test-isolation concern `compact_hook_dir_override` documents
+    /// applies here too (a single, GLOBAL, machine-wide config file every
+    /// test registry would otherwise race on). `None` in production. Mirrors
+    /// `claude_projects_dir`.
+    copilot_hooks_dir_override: Mutex<Option<PathBuf>>,
     /// Low-disk backstop latch (#134): true once the one-per-episode disk-space
     /// notice has been delivered, cleared when free space recovers past
     /// `LOW_DISK_CLEAR_BYTES`. Machine-wide (the disk is shared across groups).
@@ -5947,6 +5998,7 @@ impl OrchRegistry {
             claude_projects_dir: Mutex::new(None),
             copilot_agents_dir_override: Mutex::new(None),
             compact_hook_dir_override: Mutex::new(None),
+            copilot_hooks_dir_override: Mutex::new(None),
             low_disk_notified: Mutex::new(false),
             audit_skips_notified: Mutex::new(HashMap::new()),
             watches: Mutex::new(HashMap::new()),
@@ -5980,6 +6032,14 @@ impl OrchRegistry {
     #[doc(hidden)]
     pub fn set_compact_hook_dir_override(&self, dir: PathBuf) {
         *self.compact_hook_dir_override.lock_safe() = Some(dir);
+    }
+
+    /// Point Copilot's user-level hooks directory at a specific directory,
+    /// instead of `~/.copilot/hooks`. Test-only seam (see
+    /// `copilot_hooks_dir_override`'s doc).
+    #[doc(hidden)]
+    pub fn set_copilot_hooks_dir_override(&self, dir: PathBuf) {
+        *self.copilot_hooks_dir_override.lock_safe() = Some(dir);
     }
 
     /// Copilot's own custom-agent directory (`~/.copilot/agents`, per its
@@ -9439,7 +9499,12 @@ impl OrchRegistry {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
                 let Some(g) = groups.get(&a.group) else { continue };
-                if a.status != AgentStatus::Running || !compact_nudge_cli_supported(g.cli_for(a.role)) {
+                // #417 (Copilot correction): admission is the BROADER hook-tier
+                // gate now (claude OR copilot) — see `compact_hook_cli_supported`'s
+                // doc. The narrower `/compact`-paste gate (`compact_nudge_cli_
+                // supported`, still claude-only) is re-checked explicitly at the
+                // two sites below that actually pastes it.
+                if a.status != AgentStatus::Running || !compact_hook_cli_supported(g.cli_for(a.role)) {
                     continue;
                 }
 
@@ -9851,8 +9916,15 @@ impl OrchRegistry {
                 // gives a queued request first refusal, before any inference
                 // arm gets a chance to re-claim the pane this same tick.
                 let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
+                // #417 (Copilot correction): the loop's own admission gate is
+                // now the broader hook-tier one (claude OR copilot — see the
+                // gate above), so this is the site that actually pastes
+                // `/compact` and must re-assert the narrower, still-claude-
+                // only gate explicitly rather than inheriting it for free.
+                let cli_supports_compact_paste = compact_nudge_cli_supported(g.cli_for(a.role));
                 // Heuristic (role-gated, minutes-threshold) fallback fire.
-                let heuristic_fires = compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
+                let heuristic_fires = cli_supports_compact_paste
+                    && compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
                     && idle_tick_should_fire(
                         a.last_progress_ms,
                         now,
@@ -9865,9 +9937,13 @@ impl OrchRegistry {
                 // behalf by escalation BELOW, one tick later than before this
                 // round's reorder — see the reorder note above) fire — no
                 // role gate (self-initiated), no minutes threshold (the
-                // request IS the trigger), still CLI-gated (checked above)
-                // and rate-limited (shared budget).
-                let requested_fires = a.compact_requested
+                // request IS the trigger), still CLI-gated (`request_compact`
+                // itself already refuses a non-Claude caller, but re-checked
+                // here too since `compact_requested` is a plain bool with no
+                // memory of which gate set it) and rate-limited (shared
+                // budget).
+                let requested_fires = cli_supports_compact_paste
+                    && a.compact_requested
                     && compact_request_should_fire(currently_quiet, times, now, MAX_COMPACT_NUDGES_PER_HOUR);
                 // `!a.compact_pending` (rev-12 review finding): this is the
                 // one place that actually types `/compact`, so it is the
@@ -12996,9 +13072,25 @@ impl OrchRegistry {
 
     /// The extra environment injected into an *agent* pane (never a human's plain
     /// shell): the gh + git shims prepended to PATH so the merge/release gates are
-    /// enforced, and `LOOMUX_GROUP_DIR` so the shim finds this group's
-    /// markers/grants. Empty when neither gh nor git is installed (nothing to gate).
-    fn agent_pane_env(&self, group: &str) -> Vec<(String, String)> {
+    /// enforced, and `LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID` so a shim or hook script
+    /// finds this group's markers/grants and knows which agent it's running for.
+    ///
+    /// `LOOMUX_AGENT_ID` (#417 Copilot correction) exists specifically for
+    /// Copilot's compact-hook script: unlike Claude's `--settings` file (baked
+    /// per-agent with the id in its own argv), Copilot's hook config is a
+    /// GLOBAL, machine-wide file (`~/.copilot/hooks/*.json`) shared by every
+    /// Copilot session on the box, loomux-launched or not — so the script has
+    /// no argv to read an id from and must recover both facts from its own
+    /// inherited environment instead. Absence of these two vars (a human's own
+    /// non-loomux Copilot session) is precisely the signal the script uses to
+    /// no-op — see `COPILOT_COMPACT_HOOK_SCRIPT`'s doc.
+    ///
+    /// Only ever computed when at least the shims exist (gh or git installed);
+    /// empty when neither is, which would also mean an agent pane never gets
+    /// these two vars — an acceptable joint fate today since every environment
+    /// that installs Claude/Copilot for loomux-managed development is assumed
+    /// to have git.
+    fn agent_pane_env(&self, group: &str, agent_id: &str) -> Vec<(String, String)> {
         let Some(shim) = self.ensure_shims() else {
             return Vec::new();
         };
@@ -13010,6 +13102,7 @@ impl OrchRegistry {
         vec![
             ("PATH".to_string(), path),
             ("LOOMUX_GROUP_DIR".to_string(), self.group_dir(group).display().to_string()),
+            ("LOOMUX_AGENT_ID".to_string(), agent_id.to_string()),
         ]
     }
 
@@ -13607,6 +13700,87 @@ impl OrchRegistry {
             "PreCompact": [{ "hooks": [{ "type": "command", "command": cmd("precompact") }] }],
             "SessionStart": [{ "matcher": "compact", "hooks": [{ "type": "command", "command": cmd("sessionstart-compact") }] }],
         }))
+    }
+
+    /// #417 (Copilot correction): Copilot's own user-level hook config
+    /// directory — `$COPILOT_HOME/hooks` if that env var is set, else
+    /// `~/.copilot/hooks` per GitHub's docs
+    /// (docs.github.com/en/copilot/reference/hooks-reference). Test-
+    /// overridable (`copilot_hooks_dir_override`), mirroring
+    /// `copilot_agents_dir`. Deliberately NEVER the repo's `.github/hooks/`
+    /// — same reasoning as never writing into the repo's `.github/agents/`
+    /// (#416): a generated file there would dirty the user's git tree with
+    /// something they didn't author. The user-level directory is Copilot's
+    /// OWN convention for machine-wide config, and — confirmed by the docs
+    /// (constraint: "When the same event appears in multiple sources, all
+    /// hook entries from all sources are run") — genuinely ADDITIVE: adding
+    /// a file here is proven never to clobber the user's own hooks, unlike
+    /// Claude's `--settings`, whose merge semantics this repo could not
+    /// verify (see `compact_hook_settings`'s doc).
+    fn copilot_hooks_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = self.copilot_hooks_dir_override.lock_safe().clone() {
+            return Some(dir);
+        }
+        if let Ok(home) = std::env::var("COPILOT_HOME") {
+            if !home.trim().is_empty() {
+                return Some(PathBuf::from(home).join("hooks"));
+            }
+        }
+        dirs::home_dir().map(|h| h.join(".copilot").join("hooks"))
+    }
+
+    /// Write (or refresh) loomux's `PreCompact` hook config into Copilot's
+    /// user-level hooks directory — a single small, GENERIC, machine-wide
+    /// file (`loomux-compact.json`, idempotent/always-rewritten, like the
+    /// gh/git shims), never one generated per group or per agent: unlike
+    /// Claude's `--settings` (baked per-agent with the agent's id in its own
+    /// argv), Copilot's hook config is a single GLOBAL surface shared by
+    /// every Copilot session on the machine — loomux-launched or not — so
+    /// there is exactly one file to maintain, and the hook script recovers
+    /// which (if any) loomux agent it's running for from its OWN inherited
+    /// environment at invocation time (`LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID`
+    /// — see `agent_pane_env`'s doc), never from anything baked into this
+    /// file. Absent either var (a human's own, non-loomux Copilot session on
+    /// this machine), the inline command below is a silent no-op — the
+    /// discrimination the review round required, done via the SAME
+    /// env-var-presence idiom the gh/git shims already use (`LOOMUX_GROUP_
+    /// DIR` unset ⇒ "not a loomux pane, do nothing"), rather than matching
+    /// the payload's `cwd` against a live list of loomux worktrees: that
+    /// would need either a registration file the script re-reads on every
+    /// invocation (extra I/O and a staleness/race surface) or a static list
+    /// baked in at generation time (stale the moment a new group spawns
+    /// after this file was last written) — env-var inheritance has neither
+    /// problem, since it is always current for the actual process the hook
+    /// runs inside.
+    ///
+    /// The command itself only WRITES A MARKER FILE, matching Claude's
+    /// `precompact` case exactly — no payload parsing needed (the marker's
+    /// mere existence, at `read_hook_marker_ts`'s mtime, is the whole
+    /// signal), so the script never needs to read the JSON Copilot pipes in.
+    /// Both `bash` and `powershell` fields are always provided (per the
+    /// docs' own two-variant `command` hook shape) — Copilot picks the one
+    /// for its host OS itself, so loomux never needs its own `sh.exe`
+    /// resolution dance the way Claude's hook command does.
+    ///
+    /// Returns `false` (never fatal — fail-open, same as a missing gh/git
+    /// shim) when the hooks directory can't be created/written.
+    fn ensure_copilot_compact_hook(&self) -> bool {
+        let Some(dir) = self.copilot_hooks_dir() else { return false };
+        if fs::create_dir_all(&dir).is_err() {
+            return false;
+        }
+        let cfg = json!({
+            "version": 1,
+            "hooks": {
+                "preCompact": [{
+                    "type": "command",
+                    "bash": COPILOT_PRECOMPACT_HOOK_BASH,
+                    "powershell": COPILOT_PRECOMPACT_HOOK_POWERSHELL,
+                    "timeoutSec": 10,
+                }],
+            },
+        });
+        fs::write(dir.join("loomux-compact.json"), serde_json::to_string_pretty(&cfg).unwrap()).is_ok()
     }
 
     /// Resolve a block's persona from its `prompt:` (inline) or `profile:` (a
@@ -14500,10 +14674,19 @@ impl OrchRegistry {
         let inject = self.persona_inject(group_id, &block, &cli, persona.as_ref(), &contract);
 
         let cfg = self.write_mcp_config(group_id, &agent_id, &token, &cli)?;
-        // #417, split from `cfg` per rev-4 review N2 — only Claude ever has
-        // a hook config, so this is always `None` for every other CLI.
+        // #417, split from `cfg` per rev-4 review N2 — Claude's hook config
+        // rides a per-agent `--settings` file, so this is `None` for every
+        // other CLI (Copilot's own hook wiring, below, needs no launch flag
+        // at all — see `ensure_copilot_compact_hook`'s doc).
         let hook_settings =
             (cli == "claude").then(|| self.write_hook_settings_file(group_id, &agent_id)).flatten();
+        // #417 (Copilot correction): Copilot auto-loads its user-level hooks
+        // directory itself (no CLI flag needed, unlike Claude's `--settings`)
+        // — best-effort, never blocks a spawn if the directory can't be
+        // written (fail-open, same policy as every other hook/shim path).
+        if cli == "copilot" {
+            let _ = self.ensure_copilot_compact_hook();
+        }
         let command = self.build_agent_command(
             &cli,
             &model,
@@ -14652,8 +14835,8 @@ impl OrchRegistry {
             deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
             argv,
             // Agent pane: inject the gh-shim PATH + LOOMUX_GROUP_DIR so the merge
-            // gate is enforced structurally (#83).
-            env: self.agent_pane_env(group_id),
+            // gate is enforced structurally (#83), plus LOOMUX_AGENT_ID (#417).
+            env: self.agent_pane_env(group_id, &agent_id),
             // #260: delegate panes open docked by default so a burst of spawns
             // doesn't crowd the orchestrator pane out of focus.
             minimized: spawn_opens_minimized(role, self.spawn_expanded(group_id)),
@@ -16488,10 +16671,13 @@ fn register_orchestrator_pane(
         .unwrap_or_default();
     let contract = block_contract_text(&instructions_body, persona.as_ref());
     let inject = reg.persona_inject(&group.id, &block, &cli, persona.as_ref(), &contract);
-    // #417, split from `cfg` per rev-4 review N2 — only Claude ever has a
-    // hook config, so this is always `None` for every other CLI.
+    // #417, split from `cfg` per rev-4 review N2 — Claude's hook config rides
+    // a per-agent `--settings` file; Copilot's own wiring needs no flag.
     let hook_settings =
         (cli == "claude").then(|| reg.write_hook_settings_file(&group.id, &agent_id)).flatten();
+    if cli == "copilot" {
+        let _ = reg.ensure_copilot_compact_hook();
+    }
     let command = reg.build_agent_command(
         &cli,
         &model,
@@ -16585,8 +16771,9 @@ fn register_orchestrator_pane(
         deadline_ms: now_ms() + BIND_TIMEOUT.as_millis() as u64,
         argv,
         // The orchestrator is the pane the incident implicated — inject the
-        // gh-shim env so its merge gate is enforced too (#83).
-        env: reg.agent_pane_env(&group.id),
+        // gh-shim env so its merge gate is enforced too (#83), plus
+        // LOOMUX_AGENT_ID (#417).
+        env: reg.agent_pane_env(&group.id, &agent_id),
         // The orchestrator's own pane is never minimized (#260) — see
         // `spawn_opens_minimized`, called here too so both `SpawnRequest` sites
         // agree on the rule structurally, not by two independently-written `false`s.

@@ -101,6 +101,7 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     // the REAL `~/.copilot/agents` — point it at this same disposable tree.
     reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
     reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
+    reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
     (reg, dir)
 }
 
@@ -5533,6 +5534,152 @@ fn compact_nudge_tick_ignores_a_hook_marker_older_than_the_agent_itself() {
     assert!(a.compact_pending, "a marker written during this agent's own lifetime still arms");
     assert_eq!(a.compact_pending_evidence, Some("hook"));
     assert!(!marker.exists(), "delete-on-consume: an ACTUALLY-used marker is removed from disk");
+}
+
+// ─────────────── #417 correction round: Copilot's own PreCompact hook ───────────────
+//
+// An earlier round of this feature wrongly asserted Copilot has no compaction hooks at
+// all upstream. It does: `preCompact` (docs.github.com/en/copilot/reference/hooks-
+// reference), with a payload nearly identical to Claude's. What it does NOT have is any
+// `sessionStart` source value indicating a post-compaction resume (`source` is exactly
+// `"startup" | "resume" | "new"` — confirmed by the docs, not ambiguous) or a
+// `postCompact` event of any kind — so Copilot gets the TRUSTED ARM half of #417
+// (`compact_pending_trusted = true`, same as Claude's own `precompact`-only case) but
+// never the native-`additionalContext` / N3-suppression half, which stays Claude-only.
+// The marker-consumption path itself (the B1 fix: `ts >= a.started_ms`, delete-on-
+// consume) is CLI-agnostic — it reads `<group_dir>/hooks/<agent_id>.precompact.json`
+// with no idea which CLI wrote it, so the tests below reuse it unchanged; only the
+// SETUP (a copilot-CLI group) and the one new CLI-admission gate differ from the
+// Claude tests above.
+
+fn compact_copilot_rails(minutes: u32, roles: &[&str]) -> Guardrails {
+    Guardrails {
+        compact_nudge_minutes: minutes,
+        compact_nudge_roles: roles.iter().map(|s| s.to_string()).collect(),
+        ..copilot_rails()
+    }
+}
+
+fn compact_nudge_setup_copilot(minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", compact_copilot_rails(minutes, &["orchestrator"])).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+#[test]
+fn copilot_precompact_hook_marker_is_trusted_evidence_too() {
+    // Same evidence class as Claude's `precompact` case (`compact_pending_trusted =
+    // true`) — a hook telling loomux a compaction is starting is equally trustworthy
+    // regardless of which CLI's hook fired it. Without #417's CLI-gate widening
+    // (`compact_hook_cli_supported`), a copilot agent never even reached this code —
+    // the per-agent loop's admission gate used to be the claude-only `/compact`-paste
+    // gate, so this marker would have been silently ignored forever.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty = HashMap::new();
+
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    // Arms AND resolves into the delivery-confirmation phase on this one tick — a
+    // Copilot precompact arm has no native re-grounding to make redundant (unlike a
+    // Claude SessionStart-confirmed one), so loomux's OWN reinjection is the only
+    // re-grounding channel here, same as Claude's precompact-only case.
+    assert!(reg.compact_nudge_tick(2_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 0);
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on confirmed delivery");
+    assert!(a.compact_reinject_attempted_ms.is_some());
+    assert_eq!(a.compact_pending_evidence, Some("hook"));
+
+    let confirmed = confirmed_delivery(&oid, 2_000);
+    assert!(reg.compact_nudge_tick(3_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+}
+
+#[test]
+fn copilot_precompact_marker_gets_the_same_b1_restart_protection() {
+    // The exact B1 regression, replayed for a Copilot marker — "one mechanism, two
+    // writers" only actually holds if the SAME gate protects both.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    let f = fs::File::create(&marker).unwrap();
+    f.set_modified(UNIX_EPOCH + Duration::from_millis(started_ms.saturating_sub(60_000))).unwrap();
+    drop(f);
+
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "a marker older than started_ms must never arm, Copilot included");
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 0);
+    assert!(marker.exists());
+}
+
+#[test]
+fn compact_nudge_tick_never_pastes_slash_compact_into_a_copilot_pane() {
+    // #417 correction: widening the loop's admission gate to `compact_hook_cli_
+    // supported` (claude OR copilot) must NOT also widen the heuristic/requested
+    // fire sites — those still paste a literal `/compact`, which Copilot has no
+    // built-in command for at all. A copilot agent quiet well past the heuristic
+    // window must never get nudged.
+    let (reg, _d, _gid, oid) = compact_nudge_setup_copilot(1);
+    let empty = HashMap::new();
+    assert!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
+        "a copilot agent must never be nudged with a /compact paste, however long it's quiet"
+    );
+    assert!(!reg.agent(&oid).unwrap().compact_pending);
+    // `request_compact` (the other `/compact`-pasting path) already refuses a
+    // non-Claude caller outright — proven by its own existing test; not re-proven
+    // here.
+}
+
+#[test]
+fn ensure_copilot_compact_hook_writes_an_additive_generic_precompact_entry() {
+    // Copilot's own docs confirm multiple hook-config sources are MERGED — "When
+    // the same event appears in multiple sources, all hook entries from all
+    // sources are run" — so writing this file is proven safe against a user's own
+    // hooks, unlike Claude's `--settings` (whose merge semantics this repo could
+    // not verify empirically). Written to the SAME user-level directory Copilot
+    // itself auto-loads (no CLI flag needed), never the repo's `.github/hooks/`.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let cfg_path = dir.path().join("copilot-hooks").join("loomux-compact.json");
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    assert_eq!(cfg["version"], json!(1));
+    let entry = &cfg["hooks"]["preCompact"][0];
+    assert_eq!(entry["type"], json!("command"));
+    // Both variants always provided — Copilot itself picks the one for its host
+    // OS; loomux never resolves its own interpreter path for Copilot (unlike
+    // Claude's hook command, which bakes in an absolute `sh.exe`).
+    let bash = entry["bash"].as_str().unwrap();
+    let ps1 = entry["powershell"].as_str().unwrap();
+    assert!(bash.contains("LOOMUX_GROUP_DIR") && bash.contains("LOOMUX_AGENT_ID"), "{bash}");
+    assert!(ps1.contains("LOOMUX_GROUP_DIR") && ps1.contains("LOOMUX_AGENT_ID"), "{ps1}");
+    assert!(bash.contains("precompact.json") && ps1.contains("precompact.json"));
+
+    // No payload parsing happens on loomux's side at all — the script only ever
+    // reads its OWN inherited environment (never Copilot's camelCase/snake_case
+    // JSON piped to stdin), so there is no casing distinction for loomux's code
+    // to get wrong. That's a deliberate simplification: the marker's mere
+    // existence is the whole signal (`read_hook_marker_ts` reads the FILE's own
+    // mtime), so nothing here needs to understand the event's payload shape.
+
+    // A Claude-CLI group must never get this file at all.
+    let (reg2, dir2) = test_registry();
+    let g2 = reg2.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    reg2.spawn_agent(&g2.id, Role::Worker, "w", "t", false, None).unwrap();
+    assert!(!dir2.path().join("copilot-hooks").join("loomux-compact.json").exists());
 }
 
 #[test]

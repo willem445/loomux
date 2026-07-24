@@ -1947,16 +1947,32 @@ architecture relative to a `/compact` event. This is the best available mechanis
 custom-agent flag beats a conversation-turn file-read on priors), not a proven guarantee — a
 gap to note honestly rather than paper over, and easy to revisit if Copilot's own docs firm up.
 
-### #417: compact hooks as a TRUSTED evidence source (Claude only)
+### #417: compact hooks as a TRUSTED evidence source
+
+**Correction (this section originally claimed Copilot has no compaction hooks at all — that
+was wrong, and the record should say so plainly rather than quietly editing history.** An
+earlier round asserted this based on Copilot's changelog and an open feature-request issue that
+turned out to be stale/misleading; the user supplied the authoritative reference —
+[docs.github.com/en/copilot/reference/hooks-reference](https://docs.github.com/en/copilot/reference/hooks-reference)
+— which documents 14 hook events including `preCompact`, with a payload nearly identical to
+Claude's. Read in full before correcting this section. Copilot IS wired into the hook tier as
+of this correction; see below for exactly how much of #417 that covers and how much it doesn't.
 
 Claude Code has a `PreCompact` hook (fires before manual AND auto compaction) and a
 `SessionStart` hook with `matcher: "compact"` whose output can inject `additionalContext`
-natively. **Copilot does not** — confirmed via its current changelog and an open, unresolved
-upstream feature request explicitly asking for `preCompact` and stating its absence; Copilot's
-own `sessionStart`/`sessionEnd`/`userPromptSubmitted`/`preToolUse`/`postToolUse`/`errorOccurred`
-hooks exist but none fire specifically around a compaction. Per the #413 tier model, Copilot
-stays on the pre-existing inference tier for this — not faked, not approximated with a
-same-named event that means something else.
+natively.
+
+**Copilot's real event table** (per the reference above): `preCompact` fires with `{sessionId,
+timestamp, cwd, transcriptPath, trigger: "manual"|"auto", customInstructions}` — structurally
+the same evidence Claude's version gives. **There is no `postCompact` event of any kind** (the
+docs are silent on one existing at all), and `sessionStart`'s `source` field is documented as
+taking **exactly** `"startup" | "resume" | "new"` — no `"compact"` value, and no other mention
+of compaction triggering it. This is a confirmed negative, not an open question: Copilot has a
+trusted ARM signal but no trusted CONFIRM/native-re-grounding signal the way Claude's
+`SessionStart(compact)` gives one. Per the #413 tier model, Copilot's hook wiring below covers
+the ARM half of #417 only; the CONFIRM half already had a trust bypass that doesn't need a
+second signal (see the bullet list below) — Copilot does not fall back to the pre-#417
+inference tier the way this section originally (wrongly) implied it would need to.
 
 **Provisioning, without touching the user's own settings.** Claude Code's `--settings
 <file-or-json>` flag loads an ADDITIONAL settings layer Claude Code itself composes over
@@ -2022,6 +2038,81 @@ What #417 actually replaces is the ARM/CONFIRM evidence, not the reinjection del
   through `compaction_status`'s new `source` field so the lifecycle chip (`compactionstatus.ts`)
   reads "armed (hook-confirmed)" rather than conflating a direct signal with the
   loomux-initiated trusted arm that happens to look identical in every OTHER field.
+
+**Copilot wiring (correction round).** `compact_hook_cli_supported(cli)` (`claude | copilot`) is
+a NEW, broader admission gate for `compact_nudge_tick`'s per-agent loop — deliberately distinct
+from `compact_nudge_cli_supported` (unchanged, still claude-only), which gates specifically "has
+a `/compact` loomux can paste." Before this correction the loop's own top-of-function gate WAS
+`compact_nudge_cli_supported`, so a copilot agent never reached ANY of the loop's logic,
+hook-evidence included. Widening admission without care would have also widened the heuristic/
+requested-fire sites into pasting a literal `/compact` into a Copilot pane (no such built-in
+command exists there) — so those two sites now explicitly re-assert `compact_nudge_cli_supported`
+themselves rather than inheriting it for free from the loop's own gate (pinned by
+`compact_nudge_tick_never_pastes_slash_compact_into_a_copilot_pane`). Once admitted, a Copilot
+`preCompact` marker is read and consumed by the EXACT SAME code the Claude `precompact` case
+uses — "one mechanism, two writers": the marker-file convention
+(`<group_dir>/hooks/<agent_id>.precompact.json`), the `ts >= a.started_ms` freshness gate, and
+delete-on-consume are all CLI-agnostic already, so no new state-machine code was needed, only the
+gate change plus provisioning.
+
+- **Trust class.** A Copilot `preCompact` marker sets `compact_pending_trusted = true`, the same
+  evidence class as Claude's — a hook is equally trustworthy regardless of which CLI's hook fired
+  it. Since Copilot has no compact-sourced `SessionStart` (confirmed absent, see above),
+  `compact_hook_native_notice_delivered` never gets set for it, so N3's suppression never
+  applies — loomux's own reinjection is (correctly) the ONLY re-grounding channel for a Copilot
+  compaction, same shape as Claude's precompact-only case.
+- **Provisioning is a single, GLOBAL, machine-wide file**, not one per agent or group — the
+  opposite of Claude's per-agent `--settings` file. Copilot's own hook-config precedence list
+  (policy → repo `.github/hooks/` → **user-level `~/.copilot/hooks/*.json` (or `$COPILOT_HOME/
+  hooks`)** → inline settings → plugins) is loaded automatically; loomux writes exactly one
+  small, idempotent, always-rewritten file there (`ensure_copilot_compact_hook`,
+  `loomux-compact.json`) — never the repo's `.github/hooks/`, for the same reason a generated
+  file never lands in `.github/agents/` (#416): it would dirty the user's git tree with
+  something they didn't author. Unlike Claude's `--settings` (unverified merge semantics — see
+  below), Copilot's docs EXPLICITLY confirm multiple hook-config sources are additive: "When the
+  same event appears in multiple sources, all hook entries from all sources are run" — so this
+  file is proven, not merely argued, never to clobber a user's own hooks.
+- **Self-scoping via env-var presence, not `cwd`/session matching.** Because the config is
+  global, EVERY Copilot session on the machine loads it — a human's own, non-loomux session
+  included. The brief's suggested fix was matching the hook payload's `cwd` against known loomux
+  worktrees, or a registration file the script re-reads. Both were set aside for a THIRD option
+  that's simpler and already the codebase's own convention: the hook script (both the `bash` and
+  `powershell` command variants, run via `type: "command"`'s two OS-specific fields — Copilot
+  itself picks the one for its host OS, so loomux never resolves its own interpreter path the
+  way Claude's hook command does) checks for `LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID` in its OWN
+  inherited environment and no-ops silently if either is absent. This is the EXACT idiom the
+  gh/git shims already use (`LOOMUX_GROUP_DIR` unset ⇒ "not a loomux pane, refuse/no-op") —
+  reused here rather than invented fresh, and it avoids both alternatives' failure modes: a
+  registration file needs extra I/O and a staleness/race window on every hook invocation; a
+  static list baked in at generation time goes stale the moment a new group spawns after the
+  file was last written. Env-var inheritance has neither problem — it's always current for the
+  actual process the hook runs inside. `agent_pane_env` now sets `LOOMUX_AGENT_ID` alongside the
+  pre-existing `LOOMUX_GROUP_DIR` on every agent pane for exactly this purpose (Claude's own hook
+  command never needed it, since its per-agent `--settings` file bakes the agent id into its own
+  argv instead).
+- **No payload parsing, deliberately.** The hook script never reads the JSON Copilot pipes to it
+  at all — the marker file's mere existence (at `read_hook_marker_ts`'s mtime) is the whole
+  signal. This sidesteps a real wrinkle in the reference docs: every event ships in TWO payload
+  shapes, camelCase (`sessionId`, `transcriptPath`) and a VS-Code-compatible snake_case one
+  (`session_id`, `transcript_path`, plus a `hook_event_name` field) — a script that needed to
+  read `trigger`/`sessionId` would have to handle both. Since nothing here needs the payload's
+  content, that casing distinction never has to be gotten right, and there is no parser in
+  loomux's own code to test either way (see `ensure_copilot_compact_hook_writes_an_additive_
+  generic_precompact_entry`'s own note on this).
+- **Cleanup and orphans.** Unlike the per-group `--settings`/generated-agent files, this ONE
+  config file is not per-group at all, so there's nothing to reclaim per `end_group` — it stays
+  installed for the lifetime of the machine's Copilot install, the same way the gh/git shims and
+  the Claude hook script itself are never uninstalled per group either. No new orphan-sweep
+  surface here.
+
+**Demo-script checks, since the docs' own precision doesn't replace live verification:**
+1. Trigger a real Copilot compaction and confirm the `preCompact` marker actually appears under
+   `<group state dir>/hooks/<agent-id>.precompact.json` and the lifecycle chip reads
+   "armed (hook-confirmed)".
+2. Watch what `sessionStart`'s `source` value actually reads immediately after that compaction,
+   in practice — the docs say `startup|resume|new` with nothing indicating compaction, but CLI
+   behavior can outrun docs; if a live session ever shows an unexpected value there, that is the
+   signal a native-re-grounding path could be wired for Copilot too, symmetric with Claude's.
 
 Nothing about the resolution logic itself — busy-then-quiet, the confirm gate, the
 delivery-confirmation retry/abandon bounds, the per-agent arm-timeout — changed; the hook is
