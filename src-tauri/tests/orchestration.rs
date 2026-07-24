@@ -14,6 +14,7 @@ use loomux_lib::orchestration::{
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
+    COMPACT_HOOK_SCRIPT, COPILOT_PRECOMPACT_HOOK_BASH, COPILOT_PRECOMPACT_HOOK_POWERSHELL,
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
     CompactionStatus,
@@ -5680,6 +5681,117 @@ fn ensure_copilot_compact_hook_writes_an_additive_generic_precompact_entry() {
     let g2 = reg2.create_group("C:/tmp/claude-repo", rails()).unwrap();
     reg2.spawn_agent(&g2.id, Role::Worker, "w", "t", false, None).unwrap();
     assert!(!dir2.path().join("copilot-hooks").join("loomux-compact.json").exists());
+}
+
+// ───────── rev-4 review round 3: PreCompact can BLOCK compaction — exit-0 safety ─────────
+//
+// Claude's own hooks reference (code.claude.com/docs/en/hooks) confirms `PreCompact` is a
+// BLOCKING event: exit code 2 (or `{"decision":"block"}`) prevents the compaction from
+// happening at all. Copilot's reference documents the same for its own `preCompact`. A
+// marker-write failure (a full disk, a permissions problem, a path collision) must degrade
+// to "no hook signal, the inference tier still catches it" — NEVER to "the user's
+// compaction silently didn't happen." These tests run the ACTUAL generated script/command
+// text under an induced failure and assert the real process exit code, rather than
+// reasoning about shell semantics from the Rust side only.
+
+/// `sh` to run a hook script with — `locate_sh_exe`'s absolute Windows path, or a bare `sh`
+/// (a POSIX guarantee) everywhere else. `None` only when Windows genuinely has no `sh.exe`
+/// anywhere (same "skip, don't fail" precedent as the #335 shim tests).
+fn resolve_test_sh() -> Option<String> {
+    #[cfg(windows)]
+    {
+        locate_sh_exe()
+    }
+    #[cfg(not(windows))]
+    {
+        Some("sh".to_string())
+    }
+}
+
+#[test]
+fn compact_hook_script_sh_exits_zero_when_the_marker_dir_cant_be_created() {
+    let Some(sh) = resolve_test_sh() else {
+        eprintln!("SKIP compact_hook_script_sh_exits_zero_when_the_marker_dir_cant_be_created: no sh found");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    // A regular FILE occupying the path the script wants to `mkdir -p` a
+    // subdirectory under — fails `mkdir -p "$group_dir/hooks"` portably, with
+    // no reliance on chmod/permission APIs (unreliable to set up on Windows).
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+    let script_path = td.path().join("compact-hook.sh");
+    fs::write(&script_path, COMPACT_HOOK_SCRIPT).unwrap();
+
+    for event in ["precompact", "sessionstart-compact"] {
+        let output = std::process::Command::new(&sh)
+            .arg(&script_path)
+            .arg(event)
+            .arg(blocked_group_dir.display().to_string())
+            .arg("agent-1")
+            .output()
+            .expect("sh must run");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "event={event}: the hook must never fail PreCompact's blocking lifecycle event just \
+             because its own marker write failed — stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+}
+
+#[test]
+fn copilot_precompact_hook_bash_exits_zero_when_the_marker_dir_cant_be_created() {
+    let Some(sh) = resolve_test_sh() else {
+        eprintln!("SKIP copilot_precompact_hook_bash_exits_zero_when_the_marker_dir_cant_be_created: no sh found");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+
+    let output = std::process::Command::new(&sh)
+        .arg("-c")
+        .arg(COPILOT_PRECOMPACT_HOOK_BASH)
+        .env("LOOMUX_GROUP_DIR", blocked_group_dir.display().to_string())
+        .env("LOOMUX_AGENT_ID", "agent-1")
+        .output()
+        .expect("sh must run");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Copilot's preCompact is ALSO a blocking event per its own docs — stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn copilot_precompact_hook_powershell_exits_zero_when_the_marker_dir_cant_be_created() {
+    let td = tempfile::tempdir().unwrap();
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+
+    let output = std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(COPILOT_PRECOMPACT_HOOK_POWERSHELL)
+        .env("LOOMUX_GROUP_DIR", blocked_group_dir.display().to_string())
+        .env("LOOMUX_AGENT_ID", "agent-1")
+        .output()
+        .expect("powershell must run on a Windows CI runner");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the try/catch around both New-Item calls must make this deterministic regardless of \
+         PowerShell's own terminating-vs-non-terminating error classification — stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]

@@ -2119,19 +2119,30 @@ delivery-confirmation retry/abandon bounds, the per-agent arm-timeout — change
 purely a new, stronger way to reach the SAME `compact_pending`/`compact_seen_busy`/
 `compact_pending_trusted` triple every pre-existing arm site already writes.
 
-**Verification limit, stated plainly:** whether `--settings`'s hook arrays ADD to a user's own
-project/user `hooks.PreCompact` list or replace that event's list outright is not something this
-change could verify empirically — the "never spawn a real agent CLI to test" constraint applies
-here precisely because confirming it would mean actually running Claude Code through a real
-compaction. The design leans on `--settings` being documented as an additive settings layer (the
-same reasoning `--setting-sources`'s default-to-all-three implies); if that assumption turns out
-wrong for hook arrays specifically, the user's first live demo from this feature's own worktree
-is the fastest way to find out, and the fix (an explicit merge step reading the user's own
-settings file) is scoped and known if needed. **If it turns out to REPLACE rather than merge**,
-the consequence is not cosmetic: any of the user's own hooks for the SAME event (say, a
-`PreToolUse` denial they rely on) would silently stop firing the moment loomux's own `--settings`
-file is added to the command line — worth checking for explicitly on that first live demo, not
-assumed benign.
+**Merge semantics — updated with the authoritative reference (rev-4 review round 3).** Claude
+Code's own hooks reference (code.claude.com/docs/en/hooks), read in full for this round, settles
+the general question this section originally hedged on: hook configuration from every documented
+source — user (`~/.claude/settings.json`), project (`.claude/settings.json`,
+`.claude/settings.local.json`), managed policy settings, plugin `hooks/hooks.json`, and
+skill/agent frontmatter — is **additive, not replacing**. Two direct quotes: "All matching hooks
+run in parallel, and identical handlers are deduplicated automatically" (dedup is by exact command
+string/args or URL — never by event), and "When a plugin is enabled, its hooks merge with your
+user and project hooks." Nothing in the reference describes any source REPLACING another's
+entries for the same event.
+
+**The one residual, stated precisely (not a general hedge anymore):** the reference's own
+location/precedence table does not list `--settings` as a source at all — it documents the six
+sources above, and loomux's generated file rides on a CLI flag the table is simply silent about.
+Given every OTHER documented source is additive, and `--settings` is Claude Code's own mechanism
+for layering settings in from outside those standard file locations, the strong prior is that it
+composes the same way — but this ONE specific gap (an undocumented flag's exact interaction with
+an otherwise-fully-documented additive model) is what the "never spawn a real agent CLI to test"
+constraint prevents this change from closing empirically. The demo script asks for a quick live
+confirmation of this specific point, not a full investigation of merge behavior in general (that
+question is now answered by the docs). If `--settings` turns out to be the one source that
+doesn't compose the way every other one does, the consequence is not cosmetic: a user's own hook
+for the same event (say, a `PreToolUse` denial) would stop firing the moment loomux's file is
+added — worth a quick explicit check, not assumed either way.
 
 **rev-4 review round — one blocking fix, three follow-on hardening items:**
 
@@ -2183,6 +2194,50 @@ assumed benign.
   `copilot_agents_dir_override`/`claude_projects_dir` pattern), wired into all four `test_registry`
   helpers. Confirmed via 5 consecutive full-suite runs with no failures, after having reproduced
   the flake reliably enough to trace it.
+
+**rev-4 review round 3 (safety):** Claude's hooks reference confirms `PreCompact` is a BLOCKING
+event — exit code 2, or `{"decision": "block", "reason": "..."}`, prevents the compaction from
+happening at all. Copilot's own reference documents the identical behavior for its `preCompact`.
+A hook script whose marker-write logic can fail in a way that escalates to a nonzero/blocking
+exit would mean a bug in loomux's OWN generated script could block a user's compaction outright —
+categorically worse than the "no signal, falls back to the pre-#417 inference tier" degrade this
+feature is supposed to guarantee on any failure. Auditing both scripts under REAL execution (not
+just reasoning about shell semantics) found a genuine bug: the original marker write used a bare
+`: > "$path"` redirect, and POSIX makes a redirect that fails to open its target FATAL for a
+non-interactive shell — it aborts the whole script before ever reaching the trailing `exit 0`,
+and even the `2>/dev/null` on that SAME line never gets applied (the shell fails to set up the
+first redirect before it can process the second). This is exactly the shape of failure a full
+disk, a permissions problem, or a stale/deleted group directory could trigger — not a contrived
+edge case. Fixed by writing the marker with `touch` instead: `touch`'s own failure is an ordinary
+COMMAND failure (its own error handling, not the shell's redirection machinery), which a
+non-interactive shell reports and continues past normally. Both real-execution tests
+(`compact_hook_script_sh_exits_zero_when_the_marker_dir_cant_be_created`,
+`copilot_precompact_hook_bash_exits_zero_when_the_marker_dir_cant_be_created`) caught the ORIGINAL
+`: >` version failing for real (process exit code 1, not 0) before this fix — genuine
+red-before-green, not asserted after the fact. The PowerShell hook command was additionally
+hardened with `try`/`catch` and `-ErrorAction Stop` around both `New-Item` calls, since
+PowerShell's default error preference makes whether a given cmdlet failure is terminating
+somewhat provider-dependent; forcing it to always be terminating and unconditionally swallowing
+it in the `catch` removes that ambiguity, pinned by a Windows-only real-execution test
+(`copilot_precompact_hook_powershell_exits_zero_when_the_marker_dir_cant_be_created`).
+
+**rev-4 review round 3 (matcher precision):** Claude's `SessionStart` fires with exactly five
+`source` values: `startup`, `resume`, `clear`, `compact`, `fork`. loomux's hook config matcher is
+the exact string `"compact"` (letters-only matcher syntax, so it's an EXACT match against the
+source, not a prefix/regex) — verified to fire on that source alone. The other four are
+deliberately NOT wired into this hook, each for a stated reason rather than left unconsidered:
+`startup`/`clear` need no re-grounding here at all, since a fresh/cleared session already gets
+loomux's own FULL kickoff prompt (not this hook) as its first turn; `resume` is handled by a
+SEPARATE, already-shipped mechanism (`resume_kickoff_notice`, #411, above) rather than this hook —
+the two were never meant to be the same delivery path, and adding a second, hook-driven channel
+for the identical event would be redundant complexity for no clear gain (the same reasoning #411's
+own note already gives for not building a native resume hook); `fork` is deliberately left
+unwired because a forked session INHERITS its parent's context verbatim (per the docs) rather than
+summarizing or reloading it — nothing is diluted by forking, so there is nothing here to
+re-ground. Finally, the reference notes `SessionStart`/`Setup` typically fire BEFORE MCP servers
+finish connecting — a non-issue for this hook specifically, since its script needs zero MCP
+connectivity: it only ever writes a marker file and (for `sessionstart-compact`) prints a fixed,
+generic string to stdout.
 
 **#411, folded in because the plumbing was already open:** the orchestration-RESTORE kickoff (an
 app restart resuming a live session) is a fixed string with no directive-ledger embed, unlike the

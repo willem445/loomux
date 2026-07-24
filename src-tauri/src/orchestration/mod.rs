@@ -2117,12 +2117,35 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 /// and — for `sessionstart-compact` — prints Claude Code's own
 /// `additionalContext` JSON shape with a fixed, generic re-grounding line.
 ///
-/// Never fails: a hook's nonzero exit can block the CLI's own lifecycle event
-/// (Claude Code treats some hook failures as blocking), so every path here
-/// exits 0 regardless of whether the marker write actually landed — a
-/// silently-lost marker just leaves this agent on the pre-#417 inference
-/// tier for this one event, never a stuck/aborted session.
-const COMPACT_HOOK_SCRIPT: &str = "#!/bin/sh\n\
+/// Never fails: **`PreCompact` can BLOCK compaction itself** — Claude Code's
+/// own hooks reference (code.claude.com/docs/en/hooks) confirms exit code 2
+/// (or a `{"decision":"block"}` JSON) on `PreCompact` prevents the compact
+/// from happening at all (rev-4 review round 3, safety finding). A marker-
+/// write failure must never escalate into "the user's compaction didn't
+/// happen" — so every path here exits 0 regardless of whether the marker
+/// write actually landed: no `set -e`/`set -o pipefail` anywhere, and the
+/// unconditional `exit 0` on the LAST line runs no matter what any earlier
+/// command returned. A silently-lost marker just leaves this agent on the
+/// pre-#417 inference tier for this one event — a degrade, never a block.
+///
+/// The marker is written with `touch`, NOT the more obvious `: > "$path"`
+/// (round 3's first draft used that, and the real-execution test below
+/// caught it): a bare `> "$path"` redirect that fails to OPEN its target
+/// (e.g. the parent directory doesn't exist, as it wouldn't if `mkdir -p`
+/// above also failed) is a shell-level redirection error, and POSIX makes
+/// that FATAL for a non-interactive shell — it aborts the whole script on
+/// the spot, before ever reaching the trailing `exit 0`, and the `2>/dev/
+/// null` on the same line never even gets applied (the shell fails to set
+/// up the redirect before it can process the next one). `touch`'s own
+/// failure, by contrast, is an ordinary COMMAND failure (`touch`'s own error
+/// handling, not the shell's redirection machinery), which a non-interactive
+/// shell simply reports and continues past — exactly the behavior this
+/// script needs. Pinned directly by `compact_hook_script_sh_exits_zero_when_
+/// the_marker_dir_cant_be_created`, which runs this exact script under an
+/// induced `mkdir` failure and asserts the real process exit code — the
+/// ORIGINAL `: >` version of this script failed that test for real.
+#[doc(hidden)] // pub for integration tests: they run this script for real
+pub const COMPACT_HOOK_SCRIPT: &str = "#!/bin/sh\n\
 event=\"$1\"\n\
 group_dir=\"$2\"\n\
 agent_id=\"$3\"\n\
@@ -2130,10 +2153,10 @@ if [ -n \"$group_dir\" ] && [ -n \"$agent_id\" ]; then\n\
   mkdir -p \"$group_dir/hooks\" 2>/dev/null\n\
   case \"$event\" in\n\
     precompact)\n\
-      : > \"$group_dir/hooks/$agent_id.precompact.json\" 2>/dev/null\n\
+      touch \"$group_dir/hooks/$agent_id.precompact.json\" 2>/dev/null\n\
       ;;\n\
     sessionstart-compact)\n\
-      : > \"$group_dir/hooks/$agent_id.sessionstart-compact.json\" 2>/dev/null\n\
+      touch \"$group_dir/hooks/$agent_id.sessionstart-compact.json\" 2>/dev/null\n\
       ctx=\"[loomux] Session resumed after a compact. Your durable role contract already rides in the system prompt (--agents) -- trust it over any summary above. Re-sync live state now: list_tasks, get_state, list_agents. Directive ledger (if any): ${group_dir}/ledger-${agent_id}.log\"\n\
       printf '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"%s\"}}\\n' \"$ctx\"\n\
       ;;\n\
@@ -2151,23 +2174,50 @@ exit 0\n\
 /// (never a nonzero exit) when this Copilot session isn't a loomux pane at
 /// all (`LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID` unset) — the discrimination a
 /// GLOBAL, machine-wide hook file needs, since it applies to every Copilot
-/// session on the box.
-const COPILOT_PRECOMPACT_HOOK_BASH: &str =
+/// session on the box. Same exit-0-no-matter-what safety requirement as
+/// Claude's script (rev-4 review round 3) — Copilot's own hooks reference
+/// (docs.github.com/en/copilot/reference/hooks-reference) documents
+/// `preCompact` as a blocking event there too.
+///
+/// Writes the marker with `touch`, not `: > "$path"` — the same real bug
+/// `COMPACT_HOOK_SCRIPT`'s doc explains in full: a bare `>` redirect whose
+/// target can't be opened (the parent directory doesn't exist, as it
+/// wouldn't if `mkdir -p` above also failed) is FATAL for a non-interactive
+/// POSIX shell, aborting before the trailing `exit 0` and before the SAME
+/// line's own `2>/dev/null` can even apply. `touch`'s failure is an ordinary
+/// command failure the shell just reports and continues past. The `: >`
+/// version of this failed a real-execution test
+/// (`copilot_precompact_hook_bash_exits_zero_when_the_marker_dir_cant_be_
+/// created`) before this fix.
+#[doc(hidden)] // pub for integration tests: they run this command for real
+pub const COPILOT_PRECOMPACT_HOOK_BASH: &str =
     "if [ -n \"$LOOMUX_GROUP_DIR\" ] && [ -n \"$LOOMUX_AGENT_ID\" ]; then \
      mkdir -p \"$LOOMUX_GROUP_DIR/hooks\" 2>/dev/null; \
-     : > \"$LOOMUX_GROUP_DIR/hooks/$LOOMUX_AGENT_ID.precompact.json\" 2>/dev/null; \
+     touch \"$LOOMUX_GROUP_DIR/hooks/$LOOMUX_AGENT_ID.precompact.json\" 2>/dev/null; \
      fi; exit 0";
 
 /// The `powershell` half of the same hook entry — Windows' native shell, so
 /// Copilot never has to fall back to (or loomux resolve) a POSIX `sh` on a
 /// machine that may not have Git for Windows installed at all.
-const COPILOT_PRECOMPACT_HOOK_POWERSHELL: &str =
-    "if ($env:LOOMUX_GROUP_DIR -and $env:LOOMUX_AGENT_ID) { \
+///
+/// Wrapped in `try`/`catch` with `-ErrorAction Stop` on both `New-Item`
+/// calls (rev-4 review round 3): unlike POSIX `sh`, PowerShell's DEFAULT
+/// error preference (`Continue`) leaves whether a given cmdlet failure is
+/// terminating or not somewhat provider-dependent — `-ErrorAction Stop`
+/// makes every failure here explicitly terminating, and the surrounding
+/// `catch {}` swallows it unconditionally, so the trailing `exit 0` (outside
+/// the `try`/`catch`, always reached) is deterministic regardless of which
+/// failure mode a given filesystem error takes. Pinned (Windows-only) by
+/// `copilot_precompact_hook_powershell_exits_zero_when_the_marker_dir_cant_
+/// be_created`.
+#[doc(hidden)] // pub for integration tests: they run this command for real
+pub const COPILOT_PRECOMPACT_HOOK_POWERSHELL: &str =
+    "try { if ($env:LOOMUX_GROUP_DIR -and $env:LOOMUX_AGENT_ID) { \
      $hooksDir = Join-Path $env:LOOMUX_GROUP_DIR 'hooks'; \
-     New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null; \
+     New-Item -ItemType Directory -Force -Path $hooksDir -ErrorAction Stop | Out-Null; \
      $marker = Join-Path $hooksDir ($env:LOOMUX_AGENT_ID + '.precompact.json'); \
-     New-Item -ItemType File -Force -Path $marker | Out-Null \
-     }; exit 0";
+     New-Item -ItemType File -Force -Path $marker -ErrorAction Stop | Out-Null \
+     } } catch {}; exit 0";
 
 /// Claude Code's permission mode for an (un)attended agent: its native `auto`
 /// preset when unattended (what a human uses interactively), else `acceptEdits`.
