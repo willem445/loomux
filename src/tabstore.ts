@@ -101,6 +101,40 @@ export interface PersistedPane {
    *  on from the file browser). Null for every other kind, and absent from any snapshot
    *  written before #217. */
   file: string | null;
+  /** Every view CURRENTLY docked to this "orch" pane (#361) — up to three
+   *  entries, one per occupied edge (left/right/bottom), each naming which
+   *  view and its share of that edge's split. Empty = nothing docked, every
+   *  view opens as its floating overlay (the pre-#361 default). Only the
+   *  orchestration-family views are ever captured here
+   *  (`PersistedEmbedView`); git/issues are embeddable on every pane kind
+   *  but have no restore hook to carry them through (see
+   *  doc/design/embedded-panels.md's persistence section). Absent from any
+   *  snapshot written before #361 (or before the multi-slot
+   *  generalization), which both decode as `[]` — same as a pane that was
+   *  simply never docked. */
+  embeds: PersistedEmbed[];
+}
+
+/** The orchestration-family views a pane's embed preference can name (#361)
+ *  — a subset of `pane.ts`'s own `EmbedKind` (git/issues aren't restorable
+ *  today, so they're not representable here at all). Kept local rather than
+ *  imported from pane.ts: tabstore.ts is the pure persistence layer pane.ts
+ *  depends ON, not the reverse. */
+export type PersistedEmbedView = "tasks" | "audit" | "group";
+
+/** Which edge of the terminal a docked view sits on (#361) — mirrors
+ *  `pane.ts`'s own `EmbedSide`, kept local for the same reason
+ *  `PersistedEmbedView` is. No `"top"` — the pane header already owns that
+ *  edge. */
+export type PersistedEmbedSide = "left" | "right" | "bottom";
+
+export interface PersistedEmbed {
+  view: PersistedEmbedView;
+  side: PersistedEmbedSide;
+  /** The docked panel's share of its edge's split — a flex-grow ratio, the
+   *  same units a split node's own `weight` below already persists (not a
+   *  pixel size). */
+  share: number;
 }
 
 /** A tab's pane layout: the split tree with PersistedPane leaves. Mirrors grid's
@@ -173,6 +207,65 @@ export function encodeTabs(state: PersistedTabs): string {
   });
 }
 
+const EMBED_VIEWS: readonly PersistedEmbedView[] = ["tasks", "audit", "group"];
+const EMBED_SIDES: readonly PersistedEmbedSide[] = ["left", "right", "bottom"];
+
+function isEmbedView(v: unknown): v is PersistedEmbedView {
+  return typeof v === "string" && (EMBED_VIEWS as readonly string[]).includes(v);
+}
+
+function isEmbedSide(v: unknown): v is PersistedEmbedSide {
+  return typeof v === "string" && (EMBED_SIDES as readonly string[]).includes(v);
+}
+
+/** Validate one `{view, side, share}` entry, returning null on any
+ *  malformation. Never fails the WHOLE `embeds` array over one bad entry —
+ *  see `decodeEmbeds`. */
+function decodeOneEmbed(v: unknown): PersistedEmbed | null {
+  if (!v || typeof v !== "object") return null;
+  const r = v as Record<string, unknown>;
+  if (!isEmbedView(r.view) || !isEmbedSide(r.side)) return null;
+  if (typeof r.share !== "number" || !Number.isFinite(r.share)) return null;
+  return { view: r.view, side: r.side, share: r.share };
+}
+
+/** Decode the pane's docked views (#361), tolerating BOTH shapes this one
+ *  replaced — a single-slot `embed: {view, share}` (bottom-only, no `side`)
+ *  and, before that, a bare `taskEmbed: number` (task board only, bottom
+ *  only). Neither ever shipped in a release (each was renamed/generalized
+ *  within the same PR, #404's review rounds), but decode stays lenient
+ *  anyway: the cost of tolerating two more shapes is a few lines, the cost
+ *  of not is a silently dropped preference on the next boot after a stray
+ *  hand-edited or pre-rebase tabs.json. Newest present shape wins if a
+ *  decoded blob somehow carried more than one. Malformed entries within a
+ *  valid `embeds` array are dropped individually (never fail the whole
+ *  pane over one bad slot); a second entry naming a SIDE already claimed by
+ *  an earlier one in the same array is dropped too — one view per side,
+ *  first one wins. */
+function decodeEmbeds(v: unknown, legacyEmbed: unknown, legacyTaskEmbed: unknown): PersistedEmbed[] {
+  if (Array.isArray(v)) {
+    const seen = new Set<PersistedEmbedSide>();
+    const out: PersistedEmbed[] = [];
+    for (const entry of v) {
+      const decoded = decodeOneEmbed(entry);
+      if (!decoded || seen.has(decoded.side)) continue;
+      seen.add(decoded.side);
+      out.push(decoded);
+    }
+    return out;
+  }
+  if (legacyEmbed && typeof legacyEmbed === "object") {
+    const r = legacyEmbed as Record<string, unknown>;
+    if (isEmbedView(r.view) && typeof r.share === "number" && Number.isFinite(r.share)) {
+      return [{ view: r.view, side: "bottom", share: r.share }];
+    }
+  }
+  if (typeof legacyTaskEmbed === "number" && Number.isFinite(legacyTaskEmbed)) {
+    return [{ view: "tasks", side: "bottom", share: legacyTaskEmbed }];
+  }
+  return [];
+}
+
 /** Validate one persisted pane leaf, returning null on any malformation so its
  *  whole layout tree degrades (see decodeLayout). */
 function decodePane(v: unknown): PersistedPane | null {
@@ -192,6 +285,7 @@ function decodePane(v: unknown): PersistedPane | null {
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
     role: typeof r.role === "string" ? r.role : null,
     file: typeof r.file === "string" ? r.file : null,
+    embeds: decodeEmbeds(r.embeds, r.embed, r.taskEmbed),
   };
 }
 

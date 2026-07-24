@@ -85,6 +85,17 @@ export interface GitViewHost {
   /** EMBEDDED mode: pane content, not an overlay. Drops the ✕ and the Esc-to-close
    *  binding — the PANE's ✕ is the close affordance. */
   embedded?: boolean;
+  /** The view's own header embed button was clicked (#361) — a THIRD,
+   *  unrelated sense of "embed" from the `embedded` flag above: that one
+   *  means "hosted as a whole content pane, no terminal at all"; this is
+   *  "share space with a terminal that's still right there," picked at
+   *  runtime (which of up to three edges) from a still-floating-or-docked
+   *  git view. `anchor` is the button element, for the host to position its
+   *  side-picker menu against. Never offered when `embedded` is already
+   *  true — a content pane has no terminal to share space WITH.
+   *  `setPanelActive` (not `setEmbedded`) is the runtime method that
+   *  reflects the result, for the same disambiguation reason. */
+  onEmbedMenu?: (anchor: HTMLElement) => void;
 }
 
 type Selection = { kind: "working" } | { kind: "commit"; hash: string };
@@ -273,6 +284,7 @@ export class GitView {
   private headBranchEl: HTMLElement;
   private pullBtn: HTMLButtonElement;
   private pushBtn: HTMLButtonElement;
+  private embedBtn: HTMLButtonElement;
   private graphListEl: HTMLElement;
   private diffHeadEl: HTMLElement;
   private diffBodyEl: HTMLElement;
@@ -338,6 +350,13 @@ export class GitView {
     fetchBtn.addEventListener("click", () =>
       void this.runOp(fetchBtn, () => gitFetch(this.repoRoot!), "Fetched")
     );
+    // Embed side-picker (#361): only offered when this view has a terminal
+    // to share space WITH at all — never on a content pane (`host.embedded`),
+    // which has none. See `GitViewHost.onEmbedMenu` above for the naming
+    // disambiguation from the unrelated `embedded` flag.
+    this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
+    this.embedBtn.hidden = !!host.embedded;
+    this.embedBtn.addEventListener("click", () => this.host.onEmbedMenu?.(this.embedBtn));
     const closeBtn = el("button", "pane-btn close", "✕");
     closeBtn.title = "Back to terminal (Esc)";
     closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
@@ -350,6 +369,7 @@ export class GitView {
       pullBtn,
       pushBtn,
       fetchBtn,
+      this.embedBtn,
       closeBtn
     );
     this.graphListEl = el("div", "git-graph-list");
@@ -400,6 +420,7 @@ export class GitView {
     this.changesEl.style.flex = `0 0 ${parseStoredSize(readSize(KEY_CHANGES_H)) ?? DEFAULT_CHANGES_H}px`;
     this.resizeObs = new ResizeObserver(() => this.relayout());
     this.resizeObs.observe(this.el);
+    this.setPanelActive(false);
   }
 
   get visible(): boolean {
@@ -417,6 +438,19 @@ export class GitView {
   hide(): void {
     closeMenu();
     this.el.hidden = true;
+  }
+
+  /** Reflect whether the pane currently has this view docked to ANY embed
+   *  slot (#361) — pure display state on the header's toggle button; the
+   *  pane owns the actual move. `setPanelActive`, not `setEmbedded`: see
+   *  `GitViewHost.onEmbedMenu`'s comment for why the two must not share a
+   *  name on this class. */
+  setPanelActive(active: boolean): void {
+    this.embedBtn.classList.toggle("active", active);
+    this.embedBtn.textContent = active ? "⬓" : "⬒";
+    this.embedBtn.title = active
+      ? "Un-embed — back to a floating overlay"
+      : "Embed beside the terminal (resizes this pane)";
   }
 
   // ---------- resizable sub-panes ----------

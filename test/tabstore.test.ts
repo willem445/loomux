@@ -44,6 +44,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             sessionId: "abc",
             role: null,
             file: null,
+            embeds: [],
           },
         ],
       },
@@ -161,6 +162,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         sessionId: null,
         role: null,
         file: null,
+        embeds: [],
       },
     },
     {
@@ -181,6 +183,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: "abc-123",
             role: null,
             file: null,
+            embeds: [],
           },
         },
         {
@@ -196,6 +199,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: "orch-sess-9",
             role: "orchestrator",
             file: null,
+            embeds: [],
           },
         },
         {
@@ -213,6 +217,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             sessionId: null,
             role: null,
             file: null,
+            embeds: [],
           },
         },
       ],
@@ -243,6 +248,7 @@ test("a files leaf round-trips its root — and needed NO new field or schema bu
     sessionId: null,
     role: null,
     file: null,
+    embeds: [],
   };
   const state: PersistedTabs = {
     tabs: [
@@ -311,6 +317,7 @@ test("editor and git leaves round-trip their root — and the editor's open FILE
     sessionId: null,
     role: null,
     file,
+    embeds: [],
   });
   const state: PersistedTabs = {
     tabs: [
@@ -426,6 +433,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       sessionId: null,
       role: 99, // non-string → null
       file: 7, // non-string → null (#217)
+      embeds: "0.4", // not an array → [] (#361)
     },
   };
   const back = decodeTabs(
@@ -444,8 +452,209 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       sessionId: null,
       role: null,
       file: null,
+      embeds: [],
     },
   });
+});
+
+// ---------- #361 embedded views (multi-slot: left/right/bottom) ----------
+
+test("embed preferences ({view, side, share}), one per docked edge, round-trip through encode/decode", () => {
+  const orch: PersistedPane = {
+    paneKind: "orch",
+    name: "orchestrator",
+    cwd: "/repo",
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: "orch-1",
+    role: "orchestrator",
+    file: null,
+    embeds: [
+      { view: "group", side: "bottom", share: 0.42 },
+      { view: "tasks", side: "left", share: 0.3 },
+    ],
+  };
+  const state: PersistedTabs = {
+    tabs: [
+      { name: "t", color: null, groupId: "g", layout: { kind: "leaf", weight: 1, pane: orch } },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const leaf = back?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [
+    { view: "group", side: "bottom", share: 0.42 },
+    { view: "tasks", side: "left", share: 0.3 },
+  ]);
+});
+
+test("an old snapshot with no embeds key decodes it as [] (overlay mode, unchanged)", () => {
+  // A pre-#361 file never wrote the key at all — additive, like `role` and the
+  // files root before it: no schema bump, no decoder branch needed.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: { paneKind: "orch", name: "orchestrator", role: "orchestrator" },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, []);
+});
+
+test("a malformed entry inside a valid embeds array is dropped, not the whole array", () => {
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "orch",
+            name: "orchestrator",
+            role: "orchestrator",
+            embeds: [
+              { view: "group", side: "bottom", share: 0.4 }, // valid
+              { view: "git", side: "left", share: 0.3 }, // not a RESTORABLE kind
+              { view: "tasks", side: "sideways", share: 0.3 }, // bad side
+              { view: "audit", side: "right", share: "big" }, // bad share
+              "not even an object",
+            ],
+          },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [{ view: "group", side: "bottom", share: 0.4 }]);
+});
+
+test("two entries claiming the SAME side: the first wins, the second is dropped", () => {
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "orch",
+            name: "orchestrator",
+            role: "orchestrator",
+            embeds: [
+              { view: "tasks", side: "left", share: 0.3 },
+              { view: "audit", side: "left", share: 0.5 }, // same side, stale/malformed data
+            ],
+          },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [{ view: "tasks", side: "left", share: 0.3 }]);
+});
+
+test("a legacy single-slot embed:{view,share} (pre-multi-slot #361 shape) migrates to bottom", () => {
+  // The single-embed-slot shape never shipped in a release (generalized to
+  // multiple sides within the same PR) — but decode stays lenient
+  // regardless: bottom was the only side that shape could ever mean.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "orch",
+            name: "orchestrator",
+            role: "orchestrator",
+            embed: { view: "audit", share: 0.5 },
+          },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [{ view: "audit", side: "bottom", share: 0.5 }]);
+});
+
+test("a legacy taskEmbed:number (pre-generalization #361 shape, oldest of the three) migrates to [{tasks, bottom}]", () => {
+  // taskEmbed never shipped in a release either (renamed, then generalized,
+  // within the same PR, #404's review rounds) — decode stays lenient for
+  // the same reason: the cost of tolerating an old shape is a few lines,
+  // the cost of not is a silently dropped preference on the next boot after
+  // a stray hand-edited or pre-rebase tabs.json.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: { paneKind: "orch", name: "orchestrator", role: "orchestrator", taskEmbed: 0.3 },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [{ view: "tasks", side: "bottom", share: 0.3 }]);
+});
+
+test("the newest present shape wins when a pane somehow carries more than one", () => {
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "orch",
+            name: "orchestrator",
+            role: "orchestrator",
+            embeds: [{ view: "group", side: "right", share: 0.6 }],
+            embed: { view: "audit", share: 0.5 }, // stale — ignored when `embeds` is present
+            taskEmbed: 0.9, // stalest — ignored too
+          },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [{ view: "group", side: "right", share: 0.6 }]);
 });
 
 test("restorePref and schemaVersion coerce unknown values to safe defaults", () => {

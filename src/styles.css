@@ -642,6 +642,84 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .pane-term .xterm { height: 100%; padding: 6px 2px 4px 10px; }
 
+/* ---------- embedded panels (#361) ---------- */
+/* A discrete, user-initiated alternative to a floating overlay: up to THREE
+   of the task board / git / issues / audit log / group lifecycle panel —
+   one each on the left, right, and bottom edges (never the file editor —
+   see doc/design/embedded-panels.md's "What's embeddable, and what isn't")
+   — rendered as REAL flex siblings of the terminal, so all of them stay
+   fully visible together and the terminal's own box genuinely resizes. See
+   the design note for why that's the legitimate side of the
+   no-PTY-resize-for-chrome rule (CLAUDE.md constraint 1), not a violation
+   of it.
+
+   NESTED, not a flat row, mirroring `Pane.ensureEmbedHost`'s own structure
+   exactly (see its doc comment for the full picture and why nesting, not a
+   flat 5-child row, is what keeps every divider's own drag math a plain
+   two-element pair):
+     .pane-embed-host   (column)  — bottom spans the row's FULL width
+       .pane-embed-row    (row)    — left | center
+         .pane-embed-panel.side-left
+         .pane-embed-divider.side-left
+         .pane-embed-center (row)  — term | right
+           .pane-term
+           .pane-embed-divider.side-right
+           .pane-embed-panel.side-right
+       .pane-embed-divider.side-bottom
+       .pane-embed-panel.side-bottom
+   `.pane-embed-host` takes over `.pane-term`'s old role as `.pane`'s direct
+   flex:1 child; with every slot's divider/panel `[hidden]`, the nested
+   structure lays out identically to `.pane-term` being that child directly.
+   Only one view occupies any given slot (`Pane.embedSlots`), but up to
+   three slots can be occupied AT ONCE, one per side. */
+.pane-embed-host {
+  display: flex; flex-direction: column; flex: 1; min-height: 0;
+}
+.pane-embed-row {
+  display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; min-width: 0;
+}
+.pane-embed-center {
+  display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; min-width: 0;
+}
+.pane-embed-panel {
+  flex: 1 1 0; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app);
+}
+/* Base rule: bottom's own orientation (a horizontal bar between the row and
+   the bottom slot). Left/right override to a vertical bar below. */
+.pane-embed-divider {
+  flex: none; height: 6px; cursor: row-resize;
+  background: transparent; border-radius: 3px;
+  transition: background 0.18s var(--ease);
+}
+.pane-embed-divider.side-left, .pane-embed-divider.side-right {
+  height: auto; width: 6px; cursor: col-resize; align-self: stretch;
+}
+.pane-embed-divider:hover, .pane-embed-divider.dragging { background: var(--accent-dim); }
+.pane-embed-divider.dragging { background: var(--accent); }
+
+/* `reclampViewFloor`'s content-driven floor-grow protection (the group
+   panel's fixed chrome growing after it opens — a suspended-budget banner,
+   say) only ever resizes a divider for the BOTTOM slot and the floating
+   overlay: those two host modes route through the view's own `floorPx()`.
+   Left/right deliberately use a fixed WIDTH constant instead (#361's
+   left/right simplification — a view's floorPx() measures vertical chrome,
+   which doesn't transfer to "how narrow can this go"), so nothing widens a
+   left/right divider when the group panel's HEIGHT-wise content grows.
+   Scroll rather than clip when that happens (#361 rev-58 NB3) — a bounded
+   fix, not a second floor-grow mechanism for a width-only floor. */
+.pane-embed-panel.side-left .group-view,
+.pane-embed-panel.side-right .group-view {
+  overflow-y: auto;
+}
+
+/* Every embeddable view's own embed toggle (task board / git / issues /
+   audit / group, each in its own header) reads as pressed once the pane's
+   embed-panel slot is actually showing it — unscoped by header class since
+   all five headers already force `.pane-btn` to opacity:1 for themselves. */
+.pane-btn.embed.active { color: var(--accent); }
+
 /* ---------- orchestrator steering strip (#43, option C) ---------- */
 /* Docked under the ORCHESTRATOR pane's terminal. Styled like the task board's
    "Add a task" field; the group accent on the top edge ties it to the pane.

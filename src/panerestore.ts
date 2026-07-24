@@ -31,7 +31,7 @@
 // Flip AUTO_RESUME_AGENTS to false to make EVERY agent restore dormant instead —
 // the plan's promised one-line switch, kept literally one line here.
 
-import type { PersistedPane, PersistedLayoutNode } from "./tabstore";
+import type { PersistedPane, PersistedLayoutNode, PersistedEmbed } from "./tabstore";
 
 /** The adopted default (#194): auto-resume agent panes into their prior session.
  *  Set to false for the conservative all-dormant behavior (every agent gets a
@@ -81,6 +81,13 @@ export type RestoreAction =
       name: string;
       sessionId: string | null;
       role: string | null;
+      /** Every orchestration-family view docked to this pane (#361) — up to
+       *  three, one per edge — carried the same way role and sessionId are:
+       *  main.ts's resumeDormantGroup matches this back to the member it
+       *  belongs to (by sessionId) and re-applies it to the freshly resumed
+       *  pane via Pane.restoreEmbeds — the ONE place a captured UI
+       *  preference is threaded through a whole-group resume today. */
+      embeds: PersistedEmbed[];
     }
   | {
       // A file-explorer pane (#214), back at its recorded root. Nothing to spawn
@@ -154,8 +161,15 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
     case "orch":
       // Never auto-resume a group — dormant, human-triggered Resume only. Carry
       // the captured session id + role so the placeholder knows which group member
-      // it is (a whole-group resume reads these off the tab's placeholders).
-      return { type: "dormant-group", name: pane.name, sessionId: pane.sessionId, role: pane.role };
+      // it is (a whole-group resume reads these off the tab's placeholders), and
+      // the embed preference (#361) for the same reason.
+      return {
+        type: "dormant-group",
+        name: pane.name,
+        sessionId: pane.sessionId,
+        role: pane.role,
+        embeds: pane.embeds,
+      };
     case "files":
       // Pure content: no process, no credits, no session — it just comes back at
       // the root it was captured with (which lives in `cwd`).
@@ -412,4 +426,37 @@ export function planLayoutRestore(
   };
   expand(layout, 0);
   return steps;
+}
+
+// ---------- #361 whole-group resume: locating the resumed pane ----------
+
+/** Just enough of a live pane to decide whether it's the one a just-resumed
+ *  session id belongs to — a plain-data projection, not a live `Pane`, so the
+ *  decision below can be unit-tested without a DOM or a grid. */
+export interface ResumedPaneCandidate {
+  isDormant: boolean;
+  sessionId: string | null;
+}
+
+/** Pick which candidate a just-resumed session id actually belongs to, among
+ *  every pane currently in the tab (`main.ts`'s `resumeDormantGroup` maps
+ *  `ws.grid.allPanes()` to this shape and calls it, once `resumeOrchSession`
+ *  resolves — the pane itself isn't returned, only the group id, so it has to
+ *  be located by scanning afterward).
+ *
+ *  MUST exclude dormant candidates. The tab's own dormant ORCH placeholder
+ *  for this same member carries the IDENTICAL captured session id — that's
+ *  the whole point of a captured record (`planPaneRestore`'s `dormant-group`
+ *  case, above) — and it is still in the tree at the moment this runs (the
+ *  placeholder cleanup happens later, after every member has been resumed).
+ *  An unfiltered first-match would find that stale placeholder before the
+ *  real, freshly-resumed pane; returning `-1` in that case (rather than the
+ *  placeholder's index) is the one behavior this function exists to pin —
+ *  see `test/panerestore.test.ts`'s dormant-shadow case, which fails on a
+ *  version of this predicate that doesn't check `isDormant`. */
+export function findResumedPaneIndex(
+  candidates: readonly ResumedPaneCandidate[],
+  sessionId: string
+): number {
+  return candidates.findIndex((p) => !p.isDormant && p.sessionId === sessionId);
 }

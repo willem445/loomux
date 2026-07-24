@@ -30,6 +30,10 @@ Every rung is a complete tool on its own — climb when you're ready:
    to worker and reviewer panes. Every prompt visible, every action audited,
    guardrails host-enforced, no agent ever merges. Hard-won lessons persist
    across groups via a committed `.loomux/lessons.md`, not just this run.
+   The task board and the group lifecycle panel — each its own keystroke
+   away on an orchestration pane — persist across a close/reopen and a group
+   resume, in whichever presentation you last left them in (see the next
+   paragraph).
 4. **Custom agent workflows** — commit `.loomux/workflow.yml` and your repo
    declares its own roster and merge gate: five focused reviewers, five
    prompts, five models — plus an on-demand advisor the orchestrator
@@ -39,8 +43,18 @@ Every rung is a complete tool on its own — climb when you're ready:
    lifecycle panel, and the toggle that turns it on is a live control — flip
    it mid-session, no relaunch needed.
 
-Plus a git view, file editor, file explorer, and voice prompts — one
-keystroke away on any rung, never disturbing the shell underneath.
+Plus a git view, GitHub issues, file editor, file explorer, and voice
+prompts — one keystroke away on any rung, never disturbing the shell
+underneath. Any of the task board, git, issues, the audit log, or the group
+panel can float over the terminal like a classic overlay, or **embed**
+beside it instead (a header toggle on the view itself, picking a side) — the
+pane resizes so the full CLI and the panel stay visible together, with a
+draggable divider between them. Up to three can be embedded at once — one
+each on the left, right, and bottom — so everything you need stays visible
+while you work; docking a fourth to an already-occupied side swaps it in.
+The file editor stays overlay-only — open it as its own **pane** instead
+(`files`/`editor` kind, or "Open in editor pane" from the file browser) for
+the equivalent of keeping it around beside your agent.
 
 ### Why loomux over…
 
