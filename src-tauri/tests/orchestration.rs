@@ -5273,11 +5273,14 @@ fn compact_nudge_role_gate_defaults_to_orchestrator_only() {
 }
 
 #[test]
-fn compact_nudge_cli_gate_is_claude_only() {
-    // `/compact` is a Claude Code built-in; no other supported CLI has an
-    // equivalent, so the nudge must never fire for them.
+fn compact_nudge_cli_gate_covers_claude_and_copilot() {
+    // Both currently-supported CLIs have a real `/compact` command (Copilot's
+    // confirmed via docs.github.com/en/copilot/reference/copilot-cli-reference/
+    // cli-command-reference — an earlier round of this feature wrongly
+    // asserted Copilot has none). Anything outside `SUPPORTED_CLIS` still
+    // gets no nudge.
     assert!(compact_nudge_cli_supported("claude"));
-    assert!(!compact_nudge_cli_supported("copilot"));
+    assert!(compact_nudge_cli_supported("copilot"));
     assert!(!compact_nudge_cli_supported("codex"));
     assert!(!compact_nudge_cli_supported(""));
 }
@@ -5572,10 +5575,10 @@ fn compact_nudge_setup_copilot(minutes: u32) -> (OrchRegistry, tempfile::TempDir
 fn copilot_precompact_hook_marker_is_trusted_evidence_too() {
     // Same evidence class as Claude's `precompact` case (`compact_pending_trusted =
     // true`) — a hook telling loomux a compaction is starting is equally trustworthy
-    // regardless of which CLI's hook fired it. Without #417's CLI-gate widening
-    // (`compact_hook_cli_supported`), a copilot agent never even reached this code —
-    // the per-agent loop's admission gate used to be the claude-only `/compact`-paste
-    // gate, so this marker would have been silently ignored forever.
+    // regardless of which CLI's hook fired it. Before #417's CLI-gate widening
+    // (`compact_nudge_cli_supported`), a copilot agent never even reached this code —
+    // the per-agent loop's admission gate used to be claude-only, so this marker
+    // would have been silently ignored forever.
     let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
     let started_ms = reg.agent(&oid).unwrap().started_ms;
     let empty = HashMap::new();
@@ -5625,22 +5628,91 @@ fn copilot_precompact_marker_gets_the_same_b1_restart_protection() {
 }
 
 #[test]
-fn compact_nudge_tick_never_pastes_slash_compact_into_a_copilot_pane() {
-    // #417 correction: widening the loop's admission gate to `compact_hook_cli_
-    // supported` (claude OR copilot) must NOT also widen the heuristic/requested
-    // fire sites — those still paste a literal `/compact`, which Copilot has no
-    // built-in command for at all. A copilot agent quiet well past the heuristic
-    // window must never get nudged.
+fn compact_nudge_tick_does_paste_slash_compact_into_a_copilot_pane() {
+    // #417 correction round 2: an earlier round of this feature asserted
+    // Copilot has no `/compact` command at all and pinned a NEGATIVE test
+    // here proving loomux must never paste it into a Copilot pane. That
+    // claim was wrong — GitHub's own CLI command reference documents
+    // `/compact [FOCUS-INSTRUCTIONS]` as a real Copilot CLI command,
+    // identical in spirit to Claude's — so this test now inverts to prove
+    // the OPPOSITE: a copilot agent quiet past the heuristic window DOES get
+    // nudged with a real `/compact` paste, exactly like a Claude agent would.
     let (reg, _d, _gid, oid) = compact_nudge_setup_copilot(1);
     let empty = HashMap::new();
-    assert!(
-        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
-        "a copilot agent must never be nudged with a /compact paste, however long it's quiet"
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "a copilot agent quiet past the heuristic window gets the same /compact paste a Claude agent would"
     );
-    assert!(!reg.agent(&oid).unwrap().compact_pending);
-    // `request_compact` (the other `/compact`-pasting path) already refuses a
-    // non-Claude caller outright — proven by its own existing test; not re-proven
-    // here.
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+}
+
+#[test]
+fn compact_nudge_tick_copilot_full_loop_paste_then_hook_confirms_then_reinjects() {
+    // #417 correction round 2, the FULL loop this correction completes for
+    // Copilot, in its two independent halves — exactly mirroring how the
+    // pre-existing Claude tests cover the same two halves separately
+    // (`compact_nudge_tick_reinjects_after_a_loomux_initiated_fire_too` and
+    // `compact_nudge_tick_treats_a_precompact_hook_marker_as_trusted_
+    // evidence`), now proven back-to-back for the SAME copilot agent:
+    //
+    // Half 1 — loomux-initiated: the heuristic fire pastes `/compact` into
+    // the copilot pane (now possible — see the test above); this arm is
+    // trusted by PROVENANCE alone (loomux has positive knowledge the
+    // command was submitted — the rev-42 delta), so it resolves via
+    // busy-then-quiet, with no hook marker needed at all.
+    //
+    // Half 2 — hook-initiated: independently of anything loomux pasted,
+    // Copilot's own `preCompact` hook can fire for a real compaction (an
+    // autonomous auto-compact, or a human-typed `/compact` loomux's manual
+    // detector missed) and the marker is TRUSTED evidence on its own,
+    // arming AND resolving into the delivery-confirmation phase in one
+    // tick — loomux's own reinjection is the only re-grounding channel
+    // (Copilot has no native additionalContext path for compaction, unlike
+    // Claude's SessionStart branch).
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(5);
+    let empty = HashMap::new();
+
+    // Half 1: heuristic fire pastes /compact, then resolves via busy-then-quiet.
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "the heuristic fire pastes /compact itself"
+    );
+    assert!(reg.agent(&oid).unwrap().compact_pending);
+    assert_eq!(audit_count(&reg, &gid, "compact-nudge"), 1);
+    let baseline: HashMap<String, u64> = [(oid.clone(), 100_000u64)].into_iter().collect();
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let dropped: HashMap<String, u64> = [(oid.clone(), 5_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(FAR + 1_000, &grew, &HashMap::new(), &HashMap::new(), &baseline, &HashMap::new(), &HashMap::new());
+    let _ = reg.compact_nudge_tick(FAR + 2_000, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    let confirmed = confirmed_delivery(&oid, FAR + 2_000);
+    let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &dropped, &HashMap::new(), &confirmed);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "half 1 resolved cleanly before half 2 starts");
+
+    // Half 2: Copilot's own preCompact hook fires independently and writes
+    // the marker `ensure_copilot_compact_hook`'s script provisions — the
+    // SAME marker-consumption path Claude's hook uses, CLI-agnostic by design.
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    // The marker-arm gate only ever compares `ts` against `started_ms` and
+    // the last-seen marker ts, never against `now` — so the mtime stays a
+    // small, real offset from `started_ms` (matching every other marker
+    // test) even while `now` keeps advancing on the FAR-scale clock half 1
+    // already established.
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    assert!(reg.compact_nudge_tick(FAR + 4_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 2, "the second, hook-confirmed cycle reinjects too");
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on confirmed delivery");
+    assert_eq!(a.compact_pending_evidence, Some("hook"));
+
+    let confirmed2 = confirmed_delivery(&oid, FAR + 4_000);
+    assert!(reg.compact_nudge_tick(FAR + 5_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed2).is_empty());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "the full detection/recovery loop resolves cleanly, both halves");
 }
 
 #[test]
@@ -5807,20 +5879,24 @@ fn compact_nudge_skips_a_role_not_in_the_eligible_set() {
 }
 
 #[test]
-fn compact_nudge_skips_a_cli_with_no_compact_equivalent() {
+fn compact_nudge_no_longer_skips_copilot_which_has_its_own_compact_equivalent() {
+    // #417 correction round 2: this test used to prove copilot was skipped
+    // entirely ("/compact has no copilot equivalent"). That claim was wrong
+    // — see `compact_nudge_cli_supported`'s doc — so it now proves the
+    // opposite: a copilot agent gets nudged exactly like a Claude one.
     let (reg, _d) = test_registry();
-    let non_claude_rails = Guardrails {
+    let copilot_rails = Guardrails {
         agent_cli: "copilot".into(),
         compact_nudge_minutes: 20,
         compact_nudge_roles: vec!["orchestrator".into()],
         ..rails()
     };
-    let g = reg.create_group("C:/tmp/repo", non_claude_rails).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let g = reg.create_group("C:/tmp/repo", copilot_rails).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let empty = HashMap::new();
-    assert!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty(),
-        "/compact has no copilot equivalent — the nudge must never fire for it");
-    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 0);
+    assert_eq!(reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()), vec![o.id.clone()],
+        "Copilot has its own /compact — the nudge fires for it too");
+    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 1);
 }
 
 #[test]
@@ -6378,15 +6454,36 @@ fn mcp_note_directive_requires_text() {
     assert_eq!(out["isError"], true, "missing text must error, not silently no-op");
 }
 
+// The previous version of this test used "copilot" as its non-Claude
+// example CLI, proving `request_compact` rejected it — #417 correction
+// round 2 made that claim wrong (Copilot has its own `/compact` too, see
+// `compact_nudge_cli_supported`'s doc), so that assertion inverted to
+// `request_compact_now_accepts_a_copilot_caller` above. There is no
+// remaining way to construct this rejection through the public API: any
+// group's `agent_cli` is coerced into `SUPPORTED_CLIS` by `clamped()`, and
+// any per-role CLI override is rejected at `spawn_agent` time rather than
+// reaching a live agent (see `clamped()`'s own doc, issue #4) — so a
+// successfully spawned agent's CLI is always a `compact_nudge_cli_
+// supported` member today. The gate itself (and its "codex"/""-return-false
+// cases) stays covered directly at the pure-function level by
+// `compact_nudge_cli_gate_covers_claude_and_copilot` above; `request_
+// compact`'s own `if !compact_nudge_cli_supported` branch is defensive
+// belt-and-braces against a hand-edited or pre-#4 persisted group.json, not
+// something a live test can trigger without bypassing the public API.
+
 #[test]
-fn request_compact_rejects_a_non_claude_cli_without_setting_the_flag() {
+fn request_compact_now_accepts_a_copilot_caller() {
+    // #417 correction round 2: Copilot's own `/compact [FOCUS-INSTRUCTIONS]`
+    // (docs.github.com/en/copilot/reference/copilot-cli-reference/
+    // cli-command-reference) means `request_compact` must no longer reject
+    // a copilot caller the way it used to.
     let (reg, _d) = test_registry();
-    let non_claude = Guardrails { agent_cli: "copilot".into(), ..rails() };
-    let g = reg.create_group("C:/tmp/repo", non_claude).unwrap();
+    let copilot = Guardrails { agent_cli: "copilot".into(), ..rails() };
+    let g = reg.create_group("C:/tmp/repo", copilot).unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    let err = reg.request_compact(&o.id).unwrap_err();
-    assert!(err.contains("Claude"), "must name the reason, got: {err}");
-    assert!(!reg.agent(&o.id).unwrap().compact_requested, "a rejected request must never flag the pane");
+    let msg = reg.request_compact(&o.id).unwrap();
+    assert!(msg.contains("compact requested"), "got: {msg}");
+    assert!(reg.agent(&o.id).unwrap().compact_requested, "flag set on the calling copilot agent");
 }
 
 #[test]
@@ -6637,12 +6734,14 @@ fn compact_nudge_tick_ignores_a_busy_pane_that_merely_mentions_the_banner() {
 }
 
 #[test]
-fn compact_nudge_tick_never_reads_an_auto_compact_banner_for_an_unsupported_cli() {
-    // Belt-and-suspenders on the outer `compact_nudge_cli_supported` gate at
-    // the top of the per-agent loop: a non-Claude-CLI agent is skipped
-    // entirely before this code is ever reached, so a "Compacting
-    // conversation" string in ITS pane (coincidence, unrelated tooling)
-    // can never be misread as Claude's own auto-compact.
+fn compact_nudge_tick_never_reads_claudes_auto_compact_banner_for_a_copilot_agent() {
+    // Banner detection is keyed PER-CLI (`auto_compact_banner_substrings`),
+    // independent of the broader `compact_nudge_cli_supported` admission
+    // gate — a copilot agent is admitted to the loop now (#417 correction
+    // round 2: Copilot has its own `/compact` too), but it still has no
+    // banner substring of its own registered, so Claude's exact "Compacting
+    // conversation" string appearing in a copilot pane (coincidence,
+    // unrelated tooling) must never be misread as an auto-compact.
     let (reg, _d) = test_registry();
     let rails = Guardrails { agent_cli: "copilot".into(), ..compact_rails(0, &["orchestrator"]) };
     let g = reg.create_group("C:/tmp/repo", rails).unwrap();

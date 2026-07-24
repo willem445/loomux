@@ -2039,16 +2039,16 @@ What #417 actually replaces is the ARM/CONFIRM evidence, not the reinjection del
   reads "armed (hook-confirmed)" rather than conflating a direct signal with the
   loomux-initiated trusted arm that happens to look identical in every OTHER field.
 
-**Copilot wiring (correction round).** `compact_hook_cli_supported(cli)` (`claude | copilot`) is
-a NEW, broader admission gate for `compact_nudge_tick`'s per-agent loop — deliberately distinct
-from `compact_nudge_cli_supported` (unchanged, still claude-only), which gates specifically "has
-a `/compact` loomux can paste." Before this correction the loop's own top-of-function gate WAS
-`compact_nudge_cli_supported`, so a copilot agent never reached ANY of the loop's logic,
-hook-evidence included. Widening admission without care would have also widened the heuristic/
-requested-fire sites into pasting a literal `/compact` into a Copilot pane (no such built-in
-command exists there) — so those two sites now explicitly re-assert `compact_nudge_cli_supported`
-themselves rather than inheriting it for free from the loop's own gate (pinned by
-`compact_nudge_tick_never_pastes_slash_compact_into_a_copilot_pane`). Once admitted, a Copilot
+**Copilot wiring (correction round).** `compact_hook_cli_supported(cli)` (`claude | copilot`) was
+introduced this round as a NEW, broader admission gate for `compact_nudge_tick`'s per-agent loop
+— at the time, deliberately kept distinct from `compact_nudge_cli_supported` (which this round
+left claude-only), on the premise that Copilot has no `/compact` command to paste. **That premise
+was wrong — see "rev-4 review round 4 (Copilot `/compact` correction)" below, which widened
+`compact_nudge_cli_supported` itself and collapsed the two gates back into one function**; this
+paragraph is left as-is (rather than silently edited) as the record of what this round actually
+believed and built. What's still accurate: before THIS round's admission-gate widening, the
+loop's own top-of-function gate WAS the narrower `/compact`-paste gate, so a copilot agent never
+reached ANY of the loop's logic, hook-evidence included — and once admitted, a Copilot
 `preCompact` marker is read and consumed by the EXACT SAME code the Claude `precompact` case
 uses — "one mechanism, two writers": the marker-file convention
 (`<group_dir>/hooks/<agent_id>.precompact.json`), the `ts >= a.started_ms` freshness gate, and
@@ -2238,6 +2238,68 @@ re-ground. Finally, the reference notes `SessionStart`/`Setup` typically fire BE
 finish connecting — a non-issue for this hook specifically, since its script needs zero MCP
 connectivity: it only ever writes a marker file and (for `sessionstart-compact`) prints a fixed,
 generic string to stdout.
+
+**rev-4 review round 4 (Copilot `/compact` correction) — another wrong claim, corrected plainly
+rather than edited away.** The "Copilot wiring (correction round)" subsection above widened
+`compact_nudge_tick`'s admission gate to Copilot but deliberately kept `compact_nudge_cli_
+supported` (the narrower "has a `/compact` loomux can paste" gate) claude-only, on the premise
+that Copilot has no `/compact` command at all — re-asserted explicitly at the two sites that
+actually paste it, and pinned by a NEGATIVE test
+(`compact_nudge_tick_never_pastes_slash_compact_into_a_copilot_pane`) proving loomux would never
+type it into a Copilot pane. **That premise was wrong.** GitHub's own CLI command reference
+([docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference))
+documents `/compact [FOCUS-INSTRUCTIONS]`: "Summarize the conversation history to reduce context
+window usage. Optionally provide focus instructions to steer the summary." — a real, built-in
+Copilot CLI command, identical in spirit (and near-identical in syntax) to Claude's own.
+
+The linked context-management page
+([docs.github.com/en/copilot/concepts/agents/copilot-cli/context-management#compaction](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/context-management#compaction))
+additionally documents Copilot's AUTOMATIC compaction: it begins in the background at roughly
+80% context-window usage, and if compaction hasn't finished by roughly 95%, Copilot pauses and
+waits for it rather than proceeding. This confirms the `preCompact` hook's own `trigger:
+"manual"|"auto"` field (read in full during the previous correction round) covers BOTH paths —
+loomux's trusted-arm handling already treats every fresh marker identically regardless of
+`trigger`, since the marker's mere existence (not its parsed payload) is the whole signal, so no
+code change was needed for the auto-compaction path specifically — it was already covered, just
+not yet documented as confirmed.
+
+**The fix:** `compact_nudge_cli_supported` widens to `matches!(cli, "claude" | "copilot")`. Since
+this makes it identical to `compact_hook_cli_supported` for both currently-supported CLIs, the
+two gates collapsed back into one function — keeping both as separate stubs with identical
+bodies would be exactly the unneeded duplication CLAUDE.md's no-premature-abstraction guidance
+warns against. The heuristic/requested-fire sites' own re-check of the (now-removed) narrower
+gate is gone too — the loop's single top-of-function admission gate already guarantees `/compact`
+paste capability for anything that reaches those sites. `request_compact`'s own CLI-gate error
+message no longer hardcodes "Claude-Code-only" (a copilot caller is now accepted; the check
+itself is retained as belt-and-braces against a hand-edited or pre-existing group.json with an
+unsupported CLI string, since `Guardrails::clamped()` and `spawn_agent`'s own per-role validation
+mean no group/agent created through the current API can ever reach it with an unsupported value —
+see `request_compact_now_accepts_a_copilot_caller`'s sibling test note in `tests/orchestration.rs`
+for why no integration test exercises that branch directly anymore).
+
+**Updated capability matrix for #417** (supersedes the informal claims embedded in the
+"Copilot wiring" prose above — that section's ARM/CONFIRM analysis is otherwise unchanged, only
+the `/compact`-paste row was wrong):
+
+| | `preCompact`/`PreCompact` hook | `/compact` loomux can paste | native re-grounding on resume |
+|---|---|---|---|
+| Claude | ✓ (arms trusted) | ✓ | ✓ — `SessionStart(compact)` injects `additionalContext` natively |
+| Copilot | ✓ (arms trusted — covers both `trigger: "manual"` and `trigger: "auto"`, i.e. Copilot's own ~80%/~95% automatic compaction too) | ✓ (as of this correction) | ✗ — no compact-sourced `SessionStart` equivalent; reinjection is always via loomux's own delivery, one tick later than Claude's native path |
+
+**Tests flipped red-before-green:** the negative test above inverted to
+`compact_nudge_tick_does_paste_slash_compact_into_a_copilot_pane` (proving the paste now fires);
+a second, previously-negative test (`compact_nudge_skips_a_cli_with_no_compact_equivalent`) that
+made the identical wrong claim for the plain heuristic-fire path inverted to
+`compact_nudge_no_longer_skips_copilot_which_has_its_own_compact_equivalent`; and a new full-loop
+test (`compact_nudge_tick_copilot_full_loop_paste_then_hook_confirms_then_reinjects`) chains both
+of #417's Copilot halves back-to-back for the same agent — the loomux-initiated paste (trusted by
+provenance, resolved via busy-then-quiet) followed by an independent `preCompact` hook marker
+(trusted by the hook itself, resolved via the delivery-confirmation phase) — proving the
+detection/recovery loop closes end to end via either path, exactly as it already did for Claude.
+`deliver_prompt` itself needed no change: its `/compact`-paste call site was already routing
+through the same CLI-aware-but-content-agnostic delivery machinery (`submit_sequence(cli)` for
+the Enter/focus-in sequence, `bracketed_paste` for the text) used for every other prompt this
+registry ever sends to any pane — nothing in that path singles out Claude, or ever did.
 
 **#411, folded in because the plumbing was already open:** the orchestration-RESTORE kickoff (an
 app restart resuming a live session) is a fixed string with no directive-ledger embed, unlike the

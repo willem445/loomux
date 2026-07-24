@@ -2476,30 +2476,24 @@ fn canonicalize_compact_nudge_roles(roles: Vec<String>) -> Vec<String> {
     out
 }
 
-/// Compact-nudge (#287): whether `cli` has a `/compact` equivalent loomux can
-/// drive the same way (a bare pane write + CR). `/compact` is a Claude Code
-/// built-in; no other supported CLI (copilot, codex, gemini, …) exposes one,
-/// so the nudge is gated to exactly this CLI rather than typing a junk slash
-/// command into an agent that doesn't understand it. Pure so the gate is
-/// testable without a registry; `cli` comes from `Guardrails::cli_for`.
+/// Compact-nudge (#287; widened #417 correction round): whether `cli` has a
+/// `/compact` equivalent loomux can drive the same way (a bare pane write +
+/// CR) AND gets a seat in `compact_nudge_tick`'s per-agent loop at all.
+///
+/// An earlier round of this feature asserted Copilot has no `/compact`
+/// command and kept this claude-only, admitting Copilot to the loop through
+/// a separate, broader `compact_hook_cli_supported` gate instead (for its
+/// `PreCompact` hook alone). That claim was wrong: GitHub's own CLI command
+/// reference (docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)
+/// documents `/compact [FOCUS-INSTRUCTIONS]` as a real Copilot CLI command,
+/// identical in spirit to Claude's. Since both currently-supported CLIs now
+/// agree on this gate, the separate broader gate was pure duplication and has
+/// been folded back into this one function — see `git log` for the prior
+/// two-gate shape if a future CLI ever needs hook-admission without
+/// `/compact`-paste (or vice versa), which would be the reason to split them
+/// again. Pure so the gate is testable without a registry; `cli` comes from
+/// `Guardrails::cli_for`.
 pub fn compact_nudge_cli_supported(cli: &str) -> bool {
-    cli == "claude"
-}
-
-/// #417 (Copilot correction): whether `cli` gets a SEAT in `compact_nudge_
-/// tick`'s per-agent loop at all — broader than `compact_nudge_cli_supported`
-/// above, which is specifically "has a `/compact` loomux can paste" and stays
-/// claude-only. Copilot's own `PreCompact` hook (confirmed via GitHub's
-/// hooks reference, docs.github.com/en/copilot/reference/hooks-reference —
-/// an earlier round of this feature wrongly asserted Copilot has no
-/// compaction hooks at all) gives it a real, TRUSTED arm signal even though
-/// it has no `/compact` command loomux could ever paste for it — so it needs
-/// admission to the loop the CLI-paste-specific gate would otherwise deny it
-/// entirely. Everything inside the loop that actually PASTES `/compact`
-/// (the heuristic/requested fire sites) re-checks `compact_nudge_cli_
-/// supported` explicitly rather than relying on this broader gate — see
-/// those sites' own comments.
-pub fn compact_hook_cli_supported(cli: &str) -> bool {
     matches!(cli, "claude" | "copilot")
 }
 
@@ -9549,12 +9543,12 @@ impl OrchRegistry {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
                 let Some(g) = groups.get(&a.group) else { continue };
-                // #417 (Copilot correction): admission is the BROADER hook-tier
-                // gate now (claude OR copilot) — see `compact_hook_cli_supported`'s
-                // doc. The narrower `/compact`-paste gate (`compact_nudge_cli_
-                // supported`, still claude-only) is re-checked explicitly at the
-                // two sites below that actually pastes it.
-                if a.status != AgentStatus::Running || !compact_hook_cli_supported(g.cli_for(a.role)) {
+                // #417 (Copilot correction, round 2): Copilot has its own
+                // `/compact` command after all (see `compact_nudge_cli_
+                // supported`'s doc) — the loop admission gate and the
+                // `/compact`-paste gate are the same check now for both
+                // currently-supported CLIs, so there's a single gate here.
+                if a.status != AgentStatus::Running || !compact_nudge_cli_supported(g.cli_for(a.role)) {
                     continue;
                 }
 
@@ -9966,15 +9960,12 @@ impl OrchRegistry {
                 // gives a queued request first refusal, before any inference
                 // arm gets a chance to re-claim the pane this same tick.
                 let times = tick_times.get(&a.group).map(Vec::as_slice).unwrap_or(&[]);
-                // #417 (Copilot correction): the loop's own admission gate is
-                // now the broader hook-tier one (claude OR copilot — see the
-                // gate above), so this is the site that actually pastes
-                // `/compact` and must re-assert the narrower, still-claude-
-                // only gate explicitly rather than inheriting it for free.
-                let cli_supports_compact_paste = compact_nudge_cli_supported(g.cli_for(a.role));
+                // The loop's own admission gate above (`compact_nudge_cli_
+                // supported`) already guarantees this CLI has `/compact` to
+                // paste, so the fire conditions below don't re-check it — see
+                // that gate's doc for the correction-round history.
                 // Heuristic (role-gated, minutes-threshold) fallback fire.
-                let heuristic_fires = cli_supports_compact_paste
-                    && compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
+                let heuristic_fires = compact_nudge_role_allowed(a.role, &g.compact_nudge_roles)
                     && idle_tick_should_fire(
                         a.last_progress_ms,
                         now,
@@ -9987,13 +9978,10 @@ impl OrchRegistry {
                 // behalf by escalation BELOW, one tick later than before this
                 // round's reorder — see the reorder note above) fire — no
                 // role gate (self-initiated), no minutes threshold (the
-                // request IS the trigger), still CLI-gated (`request_compact`
-                // itself already refuses a non-Claude caller, but re-checked
-                // here too since `compact_requested` is a plain bool with no
-                // memory of which gate set it) and rate-limited (shared
-                // budget).
-                let requested_fires = cli_supports_compact_paste
-                    && a.compact_requested
+                // request IS the trigger; `request_compact` itself already
+                // refuses a caller whose CLI fails the gate above) and
+                // rate-limited (shared budget).
+                let requested_fires = a.compact_requested
                     && compact_request_should_fire(currently_quiet, times, now, MAX_COMPACT_NUDGES_PER_HOUR);
                 // `!a.compact_pending` (rev-12 review finding): this is the
                 // one place that actually types `/compact`, so it is the
@@ -10442,7 +10430,7 @@ impl OrchRegistry {
         let cli = self.cli_for_agent(&a);
         if !compact_nudge_cli_supported(&cli) {
             return Err(format!(
-                "/compact has no equivalent on {cli} — request_compact is Claude-Code-only"
+                "/compact has no equivalent on {cli} — request_compact is not supported for this CLI"
             ));
         }
         if let Some(e) = self.agents.lock_safe().get_mut(agent_id) {
