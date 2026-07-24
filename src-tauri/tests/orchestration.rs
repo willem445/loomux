@@ -6335,9 +6335,35 @@ fn human_typed_compact_detected_matches_standalone_tokens_only() {
 }
 
 #[test]
-fn compact_reinjection_notice_embeds_the_instructions_verbatim() {
+fn compact_reinjection_notice_is_slim_when_the_contract_rides_the_system_layer() {
+    // #417 correction round 5: the common case (`contract_text: None`) —
+    // the block's contract already rides the CLI's own system-prompt layer
+    // (#416), so nothing about it needs re-embedding after a compaction.
+    let n = compact_reinjection_notice(None, "C:/g/ledger-w-1.log", None);
+    assert!(n.starts_with("[loomux]"));
+    assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"), "got: {n}");
+    assert!(n.contains("C:/g/ledger-w-1.log"), "the ledger path is still named as a pointer, got: {n}");
+    assert!(!n.contains("You are"), "must never embed instructions/persona prose when there's nothing to embed, got: {n}");
+    assert!(n.len() < 700, "the slim notice should be short — got {} bytes: {n}", n.len());
+}
+
+#[test]
+fn compact_reinjection_notice_slim_still_inlines_the_ledger_tail() {
+    // Belt-and-braces: even in the slim shape, the ledger TAIL is still
+    // inlined directly (highest value-per-byte of anything left to resend),
+    // not reduced to a bare pointer like the rest of the notice.
+    let n = compact_reinjection_notice(None, "C:/g/ledger-w-1.log", Some("Your directive ledger:\n[1] scope to auth only"));
+    assert!(n.contains("scope to auth only"), "got: {n}");
+}
+
+#[test]
+fn compact_reinjection_notice_embeds_the_instructions_verbatim_when_the_contract_is_not_durable() {
+    // The ONE documented exception (a Copilot block on a user-authored
+    // native persona, or the `~/.copilot/agents`-unwritable fallback) still
+    // gets the full verbose embedding, since there is no system-prompt-layer
+    // copy of the contract to trust instead.
     let instructions = "You are the orchestrator...\nNever merge without a gate.";
-    let n = compact_reinjection_notice(instructions, None);
+    let n = compact_reinjection_notice(Some(instructions), "C:/g/ledger-o-1.log", None);
     assert!(n.starts_with("[loomux]"));
     assert!(n.contains(instructions), "must embed the FULL instructions text, not a pointer to go read it");
     assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"), "got: {n}");
@@ -6345,9 +6371,9 @@ fn compact_reinjection_notice_embeds_the_instructions_verbatim() {
 }
 
 #[test]
-fn compact_reinjection_notice_folds_in_the_ledger_when_present() {
+fn compact_reinjection_notice_verbose_folds_in_the_ledger_when_present() {
     let instructions = "You are a worker...";
-    let n = compact_reinjection_notice(instructions, Some("Your directive ledger:\n[1] scope to auth only"));
+    let n = compact_reinjection_notice(Some(instructions), "C:/g/ledger-w-1.log", Some("Your directive ledger:\n[1] scope to auth only"));
     assert!(n.contains(instructions), "instructions still embedded");
     assert!(n.contains("scope to auth only"), "got: {n}");
     // The ledger must land AFTER the instructions and BEFORE the re-sync

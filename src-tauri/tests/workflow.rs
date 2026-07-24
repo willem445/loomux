@@ -1492,6 +1492,66 @@ fn copilot_native_agent_is_refused_when_the_handle_names_a_different_file() {
     assert!(kickoff.is_none(), "the native flag carries it — nothing to inject");
 }
 
+// ─────────── #417 correction round 5: contract_on_system_layer ───────────
+
+#[test]
+fn contract_on_system_layer_is_false_only_for_an_unambiguous_copilot_native_persona() {
+    // `compact_reinjection_notice`'s slim-vs-verbose choice after a compact
+    // depends entirely on this flag being right: `true` means the CONTRACT
+    // itself (not just a persona) rides `--agent`, `false` means only the
+    // user's own file does. This is the ONE documented #416 residual gap —
+    // the exact fixture `copilot_native_agent_is_refused_when_the_handle_
+    // names_a_different_file` uses for its own unambiguous-native case.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new()
+        .workflow(
+            "version: 1\nblocks:\n  - id: rev-security\n    kind: reviewer\n    cli: copilot\n\
+             \x20   profile: .github/agents/security-review.md\n",
+        )
+        .agent_file(
+            "security-review.md",
+            "---\nname: security-review\ndescription: Security review.\n---\nReview for injection.",
+        );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let b = g.guardrails.block("rev-security").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(&g, b).unwrap();
+    assert!(persona.as_ref().is_some_and(|p| p.copilot_native), "must resolve natively for this fixture");
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+    assert!(inject.copilot_agent.is_some(), "the native --agent flag is still emitted");
+    assert!(!inject.contract_on_system_layer, "a native persona's OWN file rides --agent, never loomux's contract");
+}
+
+#[test]
+fn contract_on_system_layer_is_true_for_the_generated_copilot_wrapper_and_every_claude_block() {
+    // The generated-wrapper path (default roster, no persona at all here)
+    // durably carries loomux's own contract — the opposite of the native
+    // case above.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new(); // no .loomux/ at all — default roster
+    let g = reg.create_group(&repo.path(), Guardrails { agent_cli: "copilot".into(), ..rails() }).unwrap();
+    let b = g.guardrails.block_for(Role::Worker).unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(&g, b).unwrap();
+    assert!(persona.is_none(), "default roster has no persona");
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+    assert!(inject.copilot_agent.is_some(), "the generated wrapper's handle is emitted");
+    assert!(inject.contract_on_system_layer, "the generated wrapper carries loomux's own contract");
+
+    // Every Claude block, persona or not, always carries the contract inline.
+    let g2 = reg.create_group(&repo.path(), rails()).unwrap();
+    let b2 = g2.guardrails.block_for(Role::Worker).unwrap();
+    let cli2 = workflow::cli_of(b2, &g2.guardrails.agent_cli);
+    let instructions_body2 = instructions_lf(&reg, &g2.id, &b2.instructions_file());
+    let contract2 = block_contract_text(&instructions_body2, None);
+    let inject2 = reg.persona_inject(&g2.id, b2, cli2, None, &contract2);
+    assert!(inject2.contract_on_system_layer, "claude always carries the contract inline (#416)");
+}
+
 #[test]
 fn a_workflow_without_an_orchestrator_block_still_gets_one() {
     // A repo declares the agents it cares about — three reviewers, a worker. It

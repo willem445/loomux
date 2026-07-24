@@ -2166,6 +2166,20 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 /// and — for `sessionstart-compact` — prints Claude Code's own
 /// `additionalContext` JSON shape with a fixed, generic re-grounding line.
 ///
+/// **Already slim, verified consistent with `compact_reinjection_notice`'s
+/// round-5 correction:** this `ctx` line was ALREADY the terse shape that
+/// correction brought the Rust-side notice to — it names the contract as
+/// durable (`--agents`) rather than re-embedding it, and points at (never
+/// inlines) the ledger path. It stays a bare pointer rather than an
+/// inlined tail like the Rust side's belt-and-braces ledger embed: this
+/// script is one generic file for the whole machine (constraint #8 again),
+/// and embedding a properly-capped, line-safe tail would duplicate
+/// `directive_ledger_embed`'s truncation logic in POSIX shell — exactly
+/// the two-implementations-drifting-apart risk that function's own doc
+/// already argues against. So the two channels agree on CONTENT (the
+/// contract is durable, re-sync via list_tasks/get_state/list_agents, the
+/// ledger's location) without being byte-identical strings.
+///
 /// Never fails: **`PreCompact` can BLOCK compaction itself** — Claude Code's
 /// own hooks reference (code.claude.com/docs/en/hooks) confirms exit code 2
 /// (or a `{"decision":"block"}` JSON) on `PreCompact` prevents the compact
@@ -2970,40 +2984,68 @@ pub fn ledger_capped(ledger: &str, cap_bytes: usize) -> (String, usize) {
     (body, dropped)
 }
 
-/// The mandatory post-compact re-grounding prompt (#328, extended #329),
-/// delivered once compaction is detected as finished, regardless of which of
-/// the four trigger paths (agent-requested, threshold-escalation fallback, a
-/// human typing `/compact` manually, or the CLI's own auto-compact banner)
-/// started it. `instructions` is the exact contract text the pane was
-/// kickoff'd with (read back from the durable instructions file loomux
-/// already writes at spawn — see `write_instruction_files`), embedded
-/// verbatim rather than pointing the agent at a file to go re-read:
-/// compaction preserves a summary of the CONVERSATION, but the operating
-/// rules can get diluted in that summary, and re-injecting the source text is
-/// the only way to guarantee the agent is grounded in what loomux actually
-/// seeded it with, not a paraphrase of a paraphrase.
+/// The mandatory post-compact re-grounding prompt (#328, extended #329;
+/// slimmed #417 correction round 5), delivered once compaction is detected
+/// as finished, regardless of which trigger path (loomux-initiated,
+/// agent-requested, threshold-escalation, a human typing `/compact`
+/// manually, the CLI's own auto-compact banner, or a trusted hook marker)
+/// started it, and regardless of hook-tier vs. inference-tier detection —
+/// there is exactly ONE notice shape per agent; which of the two below it
+/// gets is a system-prompt-layer fact about THAT agent (`AgentEntry::
+/// contract_on_system_layer`), not a property of how the compaction was
+/// detected.
 ///
-/// `ledger_embed` is `directive_ledger_embed`'s output — the pane's own
-/// diary of human directives/scope-decisions/feedback, folded in alongside
-/// the instructions for the same reason: a compaction summary can dilute a
-/// directive as easily as it dilutes a rule, and the CLI's own emergency
-/// auto-compact (trigger path four) gives no warning turn to re-state
-/// anything first. `None` embeds nothing — an agent whose ledger is empty
-/// sees exactly the #328 notice, unchanged.
+/// **Slim (the common case, `contract_text: None`):** since #416, the
+/// block's full CONTRACT rides the CLI's own system-prompt layer for both
+/// supported CLIs — Claude's `--agents` (every block, unconditionally) and
+/// Copilot's generated `~/.copilot/agents/*.agent.md` (the default roster
+/// and inline `prompt:` blocks). Both CLIs' own docs confirm compaction
+/// only ever touches CONVERSATION history, never the system prompt: Claude
+/// Code's hooks reference frames `PreCompact`/`SessionStart` purely in terms
+/// of conversation summarization, and Copilot's context-management page
+/// (docs.github.com/en/copilot/concepts/agents/copilot-cli/
+/// context-management#compaction) states its summarizer explicitly
+/// preserves "original user instructions" as one of the things a
+/// compaction keeps. Re-embedding contract text an agent's own system
+/// prompt already holds verbatim, permanently, would be pure waste — so the
+/// slim notice never does. It still explicitly re-sync's the things that
+/// AREN'T durable anywhere but a live query: the task board (`list_tasks`),
+/// durable state (`get_state`), the roster (`list_agents`), and the
+/// directive ledger — named by path AND (unlike the two runtime-only
+/// sources) inlined as a tail (`ledger_embed`, capped, highest value per
+/// byte of anything left to re-send) as belt-and-braces on top of the path
+/// pointer, since a directive is qualitatively different from a fact a tool
+/// call can re-derive: it can never be re-asked for.
 ///
-/// Always also tells the agent to re-sync live state, since the instructions
-/// file (and the ledger) don't carry runtime facts (task board, group state,
-/// roster).
-pub fn compact_reinjection_notice(instructions: &str, ledger_embed: Option<&str>) -> String {
+/// **Verbose (`contract_text: Some(text)`, the ONE documented exception):**
+/// a Copilot block using a user-authored native `.github/agents/*.md`
+/// persona (only the user's OWN file rides `--agent`, never loomux's
+/// contract — see `PersonaInject::contract_on_system_layer`'s doc) — plus
+/// the rare `~/.copilot/agents`-unwritable fallback — has NO system-prompt-
+/// layer copy of the contract to trust, so the pre-#417-correction-5 full
+/// embedding is still the only way to guarantee this agent is grounded in
+/// what loomux actually seeded it with, not a paraphrase of a paraphrase.
+/// `text` is the exact contract the pane was kickoff'd with (read back from
+/// the durable instructions file — see `write_instruction_files`).
+pub fn compact_reinjection_notice(contract_text: Option<&str>, ledger_path: &str, ledger_embed: Option<&str>) -> String {
     let ledger_section = match ledger_embed {
         Some(l) => format!("\n\n{l}"),
         None => String::new(),
     };
-    format!(
-        "[loomux] Context was compacted. Re-grounding you in your role instructions before \
-         you act — the summary above may have diluted them:\n\n{instructions}{ledger_section}\n\n\
-         Now re-sync live state: list_tasks, get_state, list_agents."
-    )
+    match contract_text {
+        Some(text) => format!(
+            "[loomux] Context was compacted. Re-grounding you in your role instructions before \
+             you act — the summary above may have diluted them:\n\n{text}{ledger_section}\n\n\
+             Now re-sync live state: list_tasks, get_state, list_agents."
+        ),
+        None => format!(
+            "[loomux] Context was compacted. Your role contract already rides your CLI's own \
+             system prompt and survives this structurally — trust it over anything in the \
+             summary above; no need to re-read it. Re-sync live state now: list_tasks (task \
+             board), get_state (durable state), list_agents (roster), and your directive ledger \
+             at {ledger_path}.{ledger_section}"
+        ),
+    }
 }
 
 /// The orchestration-restore kickoff (#411) — an app restart resuming a live
@@ -4049,6 +4091,17 @@ pub struct AgentEntry {
     /// reinjection remains the sole channel — the correct fallback, not a
     /// double-delivery, when native re-grounding was never actually sent.
     pub compact_hook_native_notice_delivered: bool,
+    /// #417 correction round 5: mirrors `PersonaInject::contract_on_system_
+    /// layer` as decided at THIS agent's own spawn — `true` unless this is a
+    /// Copilot block using a user-authored native `.github/agents/*.md`
+    /// persona, or the rare `~/.copilot/agents`-unwritable fallback (see that
+    /// field's doc for why). `compact_reinjection_notice` uses this to
+    /// choose slim (the common case — the contract already survives
+    /// compaction structurally) vs. verbose (re-embed the contract verbatim,
+    /// for the one documented case where it doesn't). Set once at spawn,
+    /// never mutated — a persona/workflow-file edit takes effect on the
+    /// NEXT spawn, same as every other `persona_inject` output.
+    pub contract_on_system_layer: bool,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -4460,6 +4513,21 @@ pub struct PersonaInject {
     /// normal #416 path). Delivered as text in the kickoff, which every CLI
     /// reads.
     pub kickoff: Option<String>,
+    /// Whether the block's full CONTRACT (mechanics + persona, [`block_
+    /// contract_text`]) actually rides this agent's system-prompt layer —
+    /// `true` for every Claude block (`--agents` always carries it) and for
+    /// a Copilot block on the generated-file path (`write_copilot_agent_
+    /// file` succeeded); `false` for a Copilot block using a user-authored
+    /// native `.github/agents/*.md` persona (only the user's OWN file rides
+    /// `--agent`, never loomux's contract — the documented #416 residual
+    /// gap) and for the rare `~/.copilot/agents`-unwritable fallback (only
+    /// the persona text, not the full contract, reaches the kickoff).
+    /// Consumed post-spawn by `compact_reinjection_notice`'s slim/verbose
+    /// choice (round #417 correction 5): a compaction can only dilute what
+    /// ISN'T already durable on the system-prompt layer, so only an agent
+    /// where this is `false` needs the contract re-embedded verbatim after
+    /// one.
+    pub contract_on_system_layer: bool,
 }
 
 /// A block's persona after the `prompt:` / `profile:` sources have been
@@ -9564,6 +9632,11 @@ impl OrchRegistry {
             compact_hook_sessionstart_seen_ms: None,
             compact_pending_evidence: None,
             compact_hook_native_notice_delivered: false,
+            // Solo panes have no group/persona system at all — `compact_
+            // nudge_tick`'s reinjection path never reaches a `Role::Solo`
+            // entry (it's skipped at `groups.get(&a.group)`), so this is
+            // unused; `false` is the safe/conservative value regardless.
+            contract_on_system_layer: false,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -9695,6 +9768,7 @@ impl OrchRegistry {
             compact_hook_sessionstart_seen_ms: None,
             compact_pending_evidence: None,
             compact_hook_native_notice_delivered: false,
+            contract_on_system_layer: false, // unused — see solo_prepare's identical field
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -9981,9 +10055,11 @@ impl OrchRegistry {
     ///   text-parsing of Claude's own completion output needed, since
     ///   `compact_nudge_tick` already has a busy/quiet detector for its own
     ///   idleness signal. Resolution delivers the MANDATORY
-    ///   `compact_reinjection_notice` (the instructions file read back and
-    ///   embedded verbatim, plus the pane's directive ledger — #329
-    ///   expansion), superseding #287's optional post-fire notice.
+    ///   `compact_reinjection_notice` — slim for almost every agent since
+    ///   #417 correction round 5 (the contract already rides the
+    ///   system-prompt layer; only the ledger tail and re-sync pointers need
+    ///   resending), verbose only for the one documented case where it
+    ///   doesn't — superseding #287's optional post-fire notice.
     /// - **Auto-compact banner detection (#329 expansion)**: the CLI's own
     ///   emergency auto-compact never goes through `request_compact`, a
     ///   heuristic fire, or a human typing `/compact` — none of those three
@@ -10034,7 +10110,7 @@ impl OrchRegistry {
         // `u32` is the 1-indexed attempt number (see `AgentEntry::
         // compact_reinject_attempts`) — carried through so the audit line
         // distinguishes a first fire from a retry.
-        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf, u32)> = Vec::new();
+        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf, u32, bool)> = Vec::new();
         let mut to_escalate: Vec<(String, String, u32)> = Vec::new();
         // Production bug fix (D2/D3): a resolved-but-unconfirmed pending
         // state — audited for visibility (this exact gap in observability is
@@ -10270,7 +10346,7 @@ impl OrchRegistry {
                             let ledger = self.ledger_path(&a.group, &a.id);
                             to_reinject.push((
                                 a.id.clone(), a.group.clone(), instructions, ledger,
-                                a.compact_reinject_attempts,
+                                a.compact_reinject_attempts, a.contract_on_system_layer,
                             ));
                         } else {
                             to_abandon.push((a.id.clone(), a.group.clone(), a.compact_reinject_attempts));
@@ -10440,7 +10516,7 @@ impl OrchRegistry {
                                     .unwrap_or_else(|| a.role.instructions_file().to_string()),
                             );
                             let ledger = self.ledger_path(&a.group, &a.id);
-                            to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger, 1));
+                            to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger, 1, a.contract_on_system_layer));
                         } else {
                             a.compact_pending = false;
                             a.compact_seen_busy = false;
@@ -10702,8 +10778,14 @@ impl OrchRegistry {
             self.audit(&group, "loomux", "compact-escalation", json!({ "agent": id, "percent": percent }));
             let _ = self.deliver_prompt(&id, &compact_escalation_notice(percent), "loomux", Delivery::MidSession);
         }
-        for (id, group, instructions_path, ledger_path, attempt) in to_reinject {
-            let text = fs::read_to_string(&instructions_path).unwrap_or_default();
+        for (id, group, instructions_path, ledger_path, attempt, contract_on_system_layer) in to_reinject {
+            // #417 correction round 5: the instructions file is only read
+            // back at all for the ONE documented case where this agent's
+            // contract does NOT already ride its CLI's system-prompt layer
+            // — see `compact_reinjection_notice`'s doc. The common case
+            // never pays for a read it wouldn't use.
+            let contract_text = (!contract_on_system_layer)
+                .then(|| fs::read_to_string(&instructions_path).unwrap_or_default());
             // Missing/empty ledger reads as "" and `directive_ledger_embed`
             // turns that into `None` — nothing embeds for a pane that never
             // called `note_directive`, so this is a no-op for every session
@@ -10712,8 +10794,9 @@ impl OrchRegistry {
             let ledger_path_str = ledger_path.display().to_string();
             let ledger_embed = directive_ledger_embed(&ledger, DIRECTIVE_LEDGER_EMBED_CAP_BYTES, &ledger_path_str);
             self.audit(&group, "loomux", "compact-reinjection",
-                json!({ "agent": id, "ledger_embedded": ledger_embed.is_some(), "attempt": attempt }));
-            let notice = compact_reinjection_notice(&text, ledger_embed.as_deref());
+                json!({ "agent": id, "ledger_embedded": ledger_embed.is_some(), "attempt": attempt,
+                        "verbose": contract_text.is_some() }));
+            let notice = compact_reinjection_notice(contract_text.as_deref(), &ledger_path_str, ledger_embed.as_deref());
             let _ = self.deliver_prompt(&id, &notice, "loomux", Delivery::MidSession);
         }
         // rev-42 delta (round 2): terminal-state audits for the confirmed-
@@ -14558,7 +14641,10 @@ impl OrchRegistry {
             // where before it got nothing (default roster) or a kickoff-
             // prompt paste (inline `prompt:`).
             match self.write_copilot_agent_file(group, block, contract) {
-                Some(handle) => out.copilot_agent = Some(handle),
+                Some(handle) => {
+                    out.copilot_agent = Some(handle);
+                    out.contract_on_system_layer = true;
+                }
                 None => {
                     // `~/.copilot/agents` unwritable — fall back to the
                     // pre-#416 kickoff-text path rather than silently losing
@@ -14598,6 +14684,7 @@ impl OrchRegistry {
         out.claude_agents_json =
             Some(workflow::ascii_escape_json(&serde_json::to_string(&payload).unwrap_or_default()));
         out.claude_agent = Some(block.id.clone());
+        out.contract_on_system_layer = true;
         out
     }
 
@@ -15320,6 +15407,7 @@ impl OrchRegistry {
             compact_hook_sessionstart_seen_ms: None,
             compact_pending_evidence: None,
             compact_hook_native_notice_delivered: false,
+            contract_on_system_layer: inject.contract_on_system_layer,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -17492,6 +17580,7 @@ fn register_orchestrator_pane(
         compact_hook_sessionstart_seen_ms: None,
         compact_pending_evidence: None,
         compact_hook_native_notice_delivered: false,
+        contract_on_system_layer: inject.contract_on_system_layer,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,

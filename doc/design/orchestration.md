@@ -1380,13 +1380,18 @@ limit.
   standalone `/compact` token (the terminal echoes typed input like any other line) — gated
   by `MANUAL_COMPACT_DETECT_WINDOW_MS` against the pane's `last_user_input_ms` so the tail's
   bounded ring buffer can't replay an ALREADY-handled compact and re-trigger detection.
-  Resolution delivers `compact_reinjection_notice`, which embeds the pane's ACTUAL kickoff
-  instructions file — read back verbatim from the durable file `write_instruction_files`
-  already writes at spawn, not a pointer telling the agent to go re-read it (the issue's
-  explicit preference: no reliance on the agent locating a file). This supersedes #287's
-  optional immediate post-paste notice entirely — sending both would be redundant, and the
-  immediate version risked landing while compaction was still running; the mandatory version
-  only ever fires once compaction is actually observed to be done.
+  Resolution delivers `compact_reinjection_notice`, which — AT THE TIME #328/#329 were built —
+  always embedded the pane's ACTUAL kickoff instructions file, read back verbatim from the
+  durable file `write_instruction_files` already writes at spawn, not a pointer telling the
+  agent to go re-read it (the issue's explicit preference: no reliance on the agent locating a
+  file). **This full-embedding default no longer holds — see "#417 correction round 5: slimming
+  the re-grounding notice" below**, which changed the FACTS this decision rested on (#416 gave
+  the contract a durable home OUTSIDE this notice entirely, for almost every agent) rather than
+  reversing the reasoning itself: "no reliance on the agent locating a file" is exactly as true
+  as ever for the one case that still gets the full embedding. This supersedes #287's optional
+  immediate post-paste notice entirely — sending both would be redundant, and the immediate
+  version risked landing while compaction was still running; the mandatory version only ever
+  fires once compaction is actually observed to be done.
 - **Template.** The orchestrator persona's existing "Compact at lulls" invariant (predating
   even #287 — it used to tell the orchestrator to type `/compact` itself) is rewritten to
   call `request_compact()` as the primary mechanism, name the offload checklist as a
@@ -1397,7 +1402,11 @@ limit.
   Only full re-injection is built — it is both the stated default AND the recommended,
   more-robust option (no reliance on the agent finding a file), so a second mode whose whole
   purpose is being the less-recommended alternative wasn't worth the added config surface
-  here. Revisit if a real need for the pointer mode shows up.
+  here. **Revisit if a real need for the pointer mode shows up** — #416 turned out to BE that
+  need: not a config knob a human toggles, but a per-agent FACT (`AgentEntry::contract_on_
+  system_layer`) about whether the contract has a durable home outside this notice at all. See
+  "#417 correction round 5" below — still no config surface, since the choice is now something
+  loomux already knows at spawn time, not a preference to expose.
 
 ### #329 expansion: the directive ledger and the fourth trigger path
 
@@ -2113,6 +2122,14 @@ gate change plus provisioning.
    in practice — the docs say `startup|resume|new` with nothing indicating compaction, but CLI
    behavior can outrun docs; if a live session ever shows an unexpected value there, that is the
    signal a native-re-grounding path could be wired for Copilot too, symmetric with Claude's.
+3. **(#417 correction round 5)** For that same real Copilot compaction, confirm the generated
+   `~/.copilot/agents/loomux-<group>-<block>.agent.md` content is STILL what the agent acts on
+   afterward — the one soft spot the docs don't specifically pin down (they confirm "original
+   user instructions" survive compaction generally, not an `agent.md` FILE'S specific region of
+   the prompt architecture). If it isn't, `contract_on_system_layer` is wrong for the generated-
+   wrapper path and the slim notice is under-informing that agent — the signal to revert this
+   one path to verbose, not evidence against the Claude side (whose `--agents` system-prompt
+   durability is separately and more directly confirmed).
 
 Nothing about the resolution logic itself — busy-then-quiet, the confirm gate, the
 delivery-confirmation retry/abandon bounds, the per-agent arm-timeout — changed; the hook is
@@ -2300,6 +2317,82 @@ detection/recovery loop closes end to end via either path, exactly as it already
 through the same CLI-aware-but-content-agnostic delivery machinery (`submit_sequence(cli)` for
 the Enter/focus-in sequence, `bracketed_paste` for the text) used for every other prompt this
 registry ever sends to any pane — nothing in that path singles out Claude, or ever did.
+
+**#417 correction round 5: slimming the re-grounding notice.** User-directed, after #416/#417
+docs verification, not a wrong-claim correction like rounds 2/4 above — the underlying FACTS
+this notice's design rested on changed (#416 landed after #328/#329's original "always embed
+the full instructions file" decision), so the notice is revisited rather than retracted. Once
+the block's full CONTRACT rides the CLI's own system-prompt layer for almost every agent (#416:
+Claude's `--agents`, unconditionally, for every block; Copilot's generated `~/.copilot/agents/
+*.agent.md` for the default roster and inline `prompt:` blocks), re-embedding that same text
+verbatim in the post-compact notice is pure waste — the agent's system prompt already holds it,
+permanently, immune to whatever the compaction summarized away.
+
+- **Both CLIs' own docs confirm compaction only touches conversation history, never the system
+  prompt.** Claude Code's hooks reference frames `PreCompact`/`SessionStart` entirely in terms
+  of summarizing the CONVERSATION; Copilot's context-management page
+  (docs.github.com/en/copilot/concepts/agents/copilot-cli/context-management#compaction) is
+  more directly on point — its 4-step compaction process explicitly states the summarizer
+  preserves "original user instructions" as one of the things a compaction keeps. Between the
+  two, there's a solid basis for trusting the system-prompt layer survives structurally; the
+  one soft spot (Copilot's docs don't specifically confirm an `agent.md` FILE'S region of the
+  prompt architecture, as opposed to instructions given inline) is covered by the demo script
+  below, not asserted blind.
+- **One flag, decided once, at spawn:** `PersonaInject::contract_on_system_layer` — `true` for
+  the Claude branch (unconditionally: the contract always rides `--agents` now) and for a
+  Copilot block on the generated-wrapper path (`write_copilot_agent_file` succeeded); `false`
+  for a Copilot block resolving to an unambiguous user-authored native `.github/agents/*.md`
+  persona (only the user's OWN file rides `--agent` — the documented #416 residual gap, see the
+  per-CLI capability matrix above) and for the rare `~/.copilot/agents`-unwritable fallback
+  (only the persona text, not the full mechanics-core contract, reaches the kickoff in that
+  failure case). Copied onto `AgentEntry.contract_on_system_layer` at spawn and never mutated —
+  a persona/workflow-file edit takes effect on the agent's NEXT spawn, same as every other
+  `persona_inject` output.
+- **`compact_reinjection_notice` picks ONE of exactly two shapes from that single flag** —
+  never from which of the six trigger paths (loomux-initiated, agent-requested,
+  threshold-escalation, manual `/compact`, the auto-compact banner, or a trusted hook marker)
+  detected the compaction, and never from hook-tier vs. inference-tier detection. System-layer
+  durability is a LAUNCHER property of this agent, not a property of how loomux happened to
+  notice the compaction — so there is exactly one notice per agent, not one per detection path:
+  - **Slim (`contract_text: None`, the common case):** never re-embeds the contract. States
+    plainly that it already rides the system prompt and survives structurally, then re-syncs
+    only what actually ISN'T durable anywhere but a live query: `list_tasks` (task board),
+    `get_state` (durable state), `list_agents` (roster). The directive ledger gets BOTH a named
+    path pointer AND its tail still inlined verbatim (`directive_ledger_embed`, unchanged,
+    same cap) — belt-and-braces, since a directive is qualitatively different from every other
+    re-sync target: a tool call can re-derive the task board or durable state on demand, but a
+    directive already given can never be re-asked for, so it stays the one thing worth paying
+    the extra bytes to inline rather than merely point at.
+  - **Verbose (`contract_text: Some(text)`, the one documented exception):** unchanged from
+    #328/#329 — the full instructions-file text, read back and embedded verbatim, plus the
+    ledger, for the one case that has no system-prompt-layer copy of the contract to trust
+    instead.
+- **The instructions file is only read back when it's actually going to be used.** The
+  reinjection call site now checks `contract_on_system_layer` BEFORE calling
+  `fs::read_to_string` on the instructions path at all — the common (slim) case never pays for
+  a read whose result it would then throw away.
+- **The SessionStart(compact) native `additionalContext` line was ALREADY this slim** — verified,
+  not changed. It already named the contract as durable (`--agents`) rather than re-embedding
+  it, and already pointed at (never inlined) the ledger path rather than parsing/truncating it
+  in shell — deliberately: this one script is generic for the whole machine (constraint #8), and
+  duplicating `directive_ledger_embed`'s capped-tail truncation logic in POSIX shell would be
+  exactly the two-implementations-drifting-apart risk that function's own doc already argues
+  against for the Rust side. So the two channels agree on CONTENT — the contract is durable,
+  re-sync via `list_tasks`/`get_state`/`list_agents`, the ledger's location — without being
+  byte-identical strings, and whichever one fires for a given agent, that agent gets the same
+  information either way.
+- **Tests:** the two pre-existing pure-function tests renamed and repointed at the verbose
+  branch (`compact_reinjection_notice_embeds_the_instructions_verbatim_when_the_contract_is_
+  not_durable`, `compact_reinjection_notice_verbose_folds_in_the_ledger_when_present`); two new
+  slim-branch tests
+  (`compact_reinjection_notice_is_slim_when_the_contract_rides_the_system_layer`, `..._slim_
+  still_inlines_the_ledger_tail`), one of which pins a byte-length ceiling so the notice
+  actually reads as slim, not just structurally different; two new integration tests in
+  `tests/workflow.rs` (`contract_on_system_layer_is_false_only_for_an_unambiguous_copilot_
+  native_persona`, `..._is_true_for_the_generated_copilot_wrapper_and_every_claude_block`)
+  pinning the flag itself against real persona-resolution fixtures, not just the notice
+  function in isolation. Red-before-green on both the flag's native-persona branch and the
+  notice's slim-selection call site.
 
 **#411, folded in because the plumbing was already open:** the orchestration-RESTORE kickoff (an
 app restart resuming a live session) is a fixed string with no directive-ledger embed, unlike the
