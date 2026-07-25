@@ -3046,62 +3046,105 @@ pub fn ledger_capped(ledger: &str, cap_bytes: usize) -> (String, usize) {
     (body, dropped)
 }
 
+/// The three post-compact re-grounding shapes `compact_reinjection_notice`
+/// can render — round 8 review (N2, rev-16): promoted from a `Option<&str>`
+/// to its own enum precisely because the third state below is NOT "some
+/// text was found" or "no text was found", it's a distinct THING a compact
+/// reinjection can be, mirroring [`ContractCarrier`]'s own three states.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReinjectShape {
+    /// The FULL contract already durably rides the system-prompt layer —
+    /// nothing to re-embed, nothing even worth pointing at.
+    Slim,
+    /// Only the non-negotiable core durably rides the system-prompt layer —
+    /// point at the full instructions file, but never embed it (that would
+    /// re-spend exactly the tokens a compaction is supposed to reclaim).
+    Pointer,
+    /// Nothing durable rides the system-prompt layer — embed the full
+    /// contract, read back from the instructions file, verbatim. The one
+    /// shape that pays for a read and a re-send.
+    Verbose(String),
+}
+
 /// The mandatory post-compact re-grounding prompt (#328, extended #329;
-/// slimmed #417 correction round 5), delivered once compaction is detected
-/// as finished, regardless of which trigger path (loomux-initiated,
-/// agent-requested, threshold-escalation, a human typing `/compact`
-/// manually, the CLI's own auto-compact banner, or a trusted hook marker)
-/// started it, and regardless of hook-tier vs. inference-tier detection —
-/// there is exactly ONE notice shape per agent; which of the two below it
-/// gets is a system-prompt-layer fact about THAT agent (`AgentEntry::
-/// contract_on_system_layer`), not a property of how the compaction was
-/// detected.
+/// slimmed #417 correction round 5; given a real third shape round 8),
+/// delivered once compaction is detected as finished, regardless of which
+/// trigger path (loomux-initiated, agent-requested, threshold-escalation, a
+/// human typing `/compact` manually, the CLI's own auto-compact banner, or
+/// a trusted hook marker) started it, and regardless of hook-tier vs.
+/// inference-tier detection — there is exactly ONE notice shape per agent;
+/// which of the three below it gets is a system-prompt-layer fact about
+/// THAT agent ([`ContractCarrier`], via `AgentEntry::contract_carrier`), not
+/// a property of how the compaction was detected. `instructions_path` is
+/// only read for its display text (the `Pointer` shape) — never re-read
+/// from disk here; see [`reinject_shape`] for the function that actually
+/// decides which of the three this call gets and does any file I/O.
 ///
-/// **Slim (the common case, `contract_text: None`):** since #416, the
-/// block's full CONTRACT rides the CLI's own system-prompt layer for both
-/// supported CLIs — Claude's generated `~/.claude/agents/*.md` (round #417
-/// correction 6; every block, unconditionally) and Copilot's generated
-/// `~/.copilot/agents/*.agent.md` (the default roster and inline `prompt:`
-/// blocks). Both CLIs' own docs confirm compaction
-/// only ever touches CONVERSATION history, never the system prompt: Claude
-/// Code's hooks reference frames `PreCompact`/`SessionStart` purely in terms
-/// of conversation summarization, and Copilot's context-management page
-/// (docs.github.com/en/copilot/concepts/agents/copilot-cli/
-/// context-management#compaction) states its summarizer explicitly
-/// preserves "original user instructions" as one of the things a
-/// compaction keeps. Re-embedding contract text an agent's own system
-/// prompt already holds verbatim, permanently, would be pure waste — so the
-/// slim notice never does. It still explicitly re-sync's the things that
-/// AREN'T durable anywhere but a live query: the task board (`list_tasks`),
-/// durable state (`get_state`), the roster (`list_agents`), and the
-/// directive ledger — named by path AND (unlike the two runtime-only
-/// sources) inlined as a tail (`ledger_embed`, capped, highest value per
-/// byte of anything left to re-send) as belt-and-braces on top of the path
-/// pointer, since a directive is qualitatively different from a fact a tool
-/// call can re-derive: it can never be re-asked for.
+/// **Slim (`ReinjectShape::Slim`, `ContractCarrier::SystemLayerFull`):**
+/// since #416, the block's FULL CONTRACT rides Claude's own system-prompt
+/// layer, every block, unconditionally (round #417 correction 6). Claude's
+/// own hooks reference frames `PreCompact`/`SessionStart` purely in terms
+/// of conversation summarization — never the system prompt — so
+/// re-embedding contract text an agent's own system prompt already holds
+/// verbatim, permanently, would be pure waste. Still explicitly re-syncs
+/// the things that AREN'T durable anywhere but a live query: the task
+/// board (`list_tasks`), durable state (`get_state`), the roster
+/// (`list_agents`), and the directive ledger — named by path AND (unlike
+/// the three runtime-only sources) inlined as a tail (`ledger_embed`,
+/// capped, highest value per byte of anything left to re-send) as
+/// belt-and-braces on top of the path pointer, since a directive is
+/// qualitatively different from a fact a tool call can re-derive: it can
+/// never be re-asked for.
 ///
-/// **Verbose (`contract_text: Some(text)`, the ONE documented exception):**
-/// a Copilot block using a user-authored native `.github/agents/*.md`
-/// persona (only the user's OWN file rides `--agent`, never loomux's
-/// contract — see `PersonaInject::contract_on_system_layer`'s doc) — plus
-/// the rare `~/.copilot/agents`-unwritable fallback — has NO system-prompt-
-/// layer copy of the contract to trust, so the pre-#417-correction-5 full
-/// embedding is still the only way to guarantee this agent is grounded in
-/// what loomux actually seeded it with, not a paraphrase of a paraphrase.
-/// `text` is the exact contract the pane was kickoff'd with (read back from
-/// the durable instructions file — see `write_instruction_files`).
-pub fn compact_reinjection_notice(contract_text: Option<&str>, ledger_path: &str, ledger_embed: Option<&str>) -> String {
+/// **Pointer (`ReinjectShape::Pointer`, `ContractCarrier::SystemLayerCore`,
+/// NEW in round 8):** Copilot's generated-wrapper happy path. Its system
+/// prompt durably holds identity + the non-negotiable mechanics core + a
+/// pointer to the full instructions file (`copilot_agent_body`'s doc) —
+/// but NOT the full role template, which is what routinely blew GitHub's
+/// documented 30,000-character body cap. Before round 8 this state didn't
+/// exist as a THIRD option; the bool it used to be forced it into the same
+/// bucket as `KickoffOnly` below, so every Copilot compaction paid for a
+/// full verbose re-embed of the whole instructions file — right after a
+/// compaction meant to reclaim exactly that context, and counter to this
+/// notice's own slimming principle. The pointer shape re-syncs the same
+/// live-state items the slim shape does, PLUS an explicit instruction to
+/// re-read the instructions file — honest about what's missing from the
+/// system layer, without paying to re-send it.
+///
+/// **Verbose (`ReinjectShape::Verbose(text)`, `ContractCarrier::
+/// KickoffOnly`, the true fallback):** a Copilot block using a
+/// user-authored native `.github/agents/*.md` persona (only the user's OWN
+/// file rides `--agent`, never loomux's contract — the documented #416
+/// residual gap), the rare `~/.copilot/agents`-unwritable fallback, or an
+/// over-cap generated body the round-8 write guard refused to write — has
+/// NO system-prompt-layer copy of ANYTHING loomux authored, so the
+/// pre-#417-correction-5 full embedding is still the only way to guarantee
+/// this agent is grounded in what loomux actually seeded it with, not a
+/// paraphrase of a paraphrase. `text` is the exact contract the pane was
+/// kickoff'd with (read back from the durable instructions file — see
+/// `write_instruction_files`); if even that read fails, [`reinject_shape`]
+/// degrades to `Pointer` instead — honest ("go look") beats a false claim
+/// of durability, which `Slim` would be here.
+pub fn compact_reinjection_notice(shape: &ReinjectShape, instructions_path: &str, ledger_path: &str, ledger_embed: Option<&str>) -> String {
     let ledger_section = match ledger_embed {
         Some(l) => format!("\n\n{l}"),
         None => String::new(),
     };
-    match contract_text {
-        Some(text) => format!(
+    match shape {
+        ReinjectShape::Verbose(text) => format!(
             "[loomux] Context was compacted. Re-grounding you in your role instructions before \
              you act — the summary above may have diluted them:\n\n{text}{ledger_section}\n\n\
              Now re-sync live state: list_tasks, get_state, list_agents."
         ),
-        None => format!(
+        ReinjectShape::Pointer => format!(
+            "[loomux] Context was compacted. Your identity and non-negotiable mechanics already \
+             ride your CLI's own system prompt and survive this structurally, but your FULL role \
+             instructions do not — re-read {instructions_path} before acting; the summary above \
+             may have diluted or dropped anything beyond the mechanics. Re-sync live state now: \
+             list_tasks (task board), get_state (durable state), list_agents (roster), and your \
+             directive ledger at {ledger_path}.{ledger_section}"
+        ),
+        ReinjectShape::Slim => format!(
             "[loomux] Context was compacted. Your role contract already rides your CLI's own \
              system prompt and survives this structurally — trust it over anything in the \
              summary above; no need to re-read it. Re-sync live state now: list_tasks (task \
@@ -3131,23 +3174,35 @@ pub fn resume_kickoff_notice(ledger_embed: Option<&str>) -> String {
     )
 }
 
-/// rev-10 review (N3), round 7: the read-and-degrade half of a verbose
-/// reinjection's contract text, pulled out of the `to_reinject` audit loop
-/// so it's directly unit-testable — the loop's caller (`self.audit(...)`
-/// on `None`) is the only part that still needs `&self`. `contract_on_
-/// system_layer` short-circuits to `None` without even touching the
-/// filesystem (the common case never pays for a read it wouldn't use);
-/// otherwise a missing OR EMPTY read both degrade to `None` (the slim
-/// notice shape) rather than embedding nothing under a "here is your
-/// contract" heading — see `compact_reinjection_notice`'s doc for what a
-/// `Some`/`None` return produces.
-pub fn reinject_contract_text(instructions_path: &Path, contract_on_system_layer: bool) -> Option<String> {
-    if contract_on_system_layer {
-        return None;
-    }
-    match fs::read_to_string(instructions_path) {
-        Ok(s) if !s.trim().is_empty() => Some(s),
-        _ => None,
+/// rev-10 review (N3, round 7), widened to a real three-way choice by
+/// rev-16 review (N2, round 8): decide which [`ReinjectShape`] a compact
+/// reinjection gets for a given [`ContractCarrier`], doing the ONE piece of
+/// file I/O this decision can require (the `KickoffOnly` read-back) right
+/// here so the `to_reinject` processing loop's caller only needs `&self`
+/// for the resulting audit line, not for the decision itself.
+///
+/// - `SystemLayerFull` → `Slim`, no filesystem touch at all — the common
+///   case never pays for a read it wouldn't use.
+/// - `SystemLayerCore` → `Pointer`, likewise no filesystem touch — the
+///   pointer text names the path, it doesn't need the path's CONTENTS.
+/// - `KickoffOnly` → reads the instructions file back. A successful,
+///   non-empty read is `Verbose(text)`. A missing or empty read degrades
+///   to `Pointer`, not `Slim`: `Slim` would falsely claim this agent's
+///   system prompt already holds the contract, which is exactly what
+///   `KickoffOnly` means it does NOT. `Pointer` — "go read the file" — is
+///   still honest advice even when THIS particular read attempt failed
+///   (a momentary race, a permissions blip); the caller audits this
+///   specific degradation (`compact-reinjection-contract-unreadable`)
+///   since, unlike a genuine `SystemLayerCore` agent, this one should have
+///   had a full embed and didn't get one.
+pub fn reinject_shape(instructions_path: &Path, carrier: ContractCarrier) -> ReinjectShape {
+    match carrier {
+        ContractCarrier::SystemLayerFull => ReinjectShape::Slim,
+        ContractCarrier::SystemLayerCore => ReinjectShape::Pointer,
+        ContractCarrier::KickoffOnly => match fs::read_to_string(instructions_path) {
+            Ok(s) if !s.trim().is_empty() => ReinjectShape::Verbose(s),
+            _ => ReinjectShape::Pointer,
+        },
     }
 }
 
@@ -4174,17 +4229,17 @@ pub struct AgentEntry {
     /// reinjection remains the sole channel — the correct fallback, not a
     /// double-delivery, when native re-grounding was never actually sent.
     pub compact_hook_native_notice_delivered: bool,
-    /// #417 correction round 5: mirrors `PersonaInject::contract_on_system_
-    /// layer` as decided at THIS agent's own spawn — `true` unless this is a
-    /// Copilot block using a user-authored native `.github/agents/*.md`
-    /// persona, or the rare `~/.copilot/agents`-unwritable fallback (see that
-    /// field's doc for why). `compact_reinjection_notice` uses this to
-    /// choose slim (the common case — the contract already survives
-    /// compaction structurally) vs. verbose (re-embed the contract verbatim,
-    /// for the one documented case where it doesn't). Set once at spawn,
-    /// never mutated — a persona/workflow-file edit takes effect on the
-    /// NEXT spawn, same as every other `persona_inject` output.
-    pub contract_on_system_layer: bool,
+    /// #417 correction round 5, promoted from a lossy bool to
+    /// [`ContractCarrier`] in round 8 (rev-16 review, N1/N2 — the bool
+    /// version of this exact doc paragraph was the staleness rev-16 named
+    /// as a 3-round pattern on this PR, which is the whole reason it's an
+    /// enum now): mirrors `PersonaInject::contract_carrier` as decided at
+    /// THIS agent's own spawn. `reinject_shape` uses this to choose the
+    /// notice's shape — see that function's and `ContractCarrier`'s own
+    /// docs for the three states. Set once at spawn, never mutated — a
+    /// persona/workflow-file edit takes effect on the NEXT spawn, same as
+    /// every other `persona_inject` output.
+    pub contract_carrier: ContractCarrier,
     /// Compact-nudge (#328): Unix-ms this agent's `set_state` call was last
     /// observed (0 = never). Self-scoped, stamped by the `set_state` MCP
     /// handler on the CALLING agent's own entry — meaningful only for the
@@ -4547,6 +4602,67 @@ pub struct Caller {
     pub role_hint: Option<String>,
 }
 
+/// Round 8 review (N1/N2, rev-16): WHAT of a block's durable role material
+/// actually rides an agent's CLI system-prompt layer — replaces the lossy
+/// `contract_on_system_layer: bool` this PR carried through round 8's own
+/// B1 fix. The bool collapsed a real THREE-state fact into two: "full
+/// contract" and "kickoff only" were both real, distinct states before
+/// round 8 (Claude vs. everything else), but round 8's Copilot slimming
+/// introduced a genuine THIRD state — mechanics core + a pointer, durable
+/// but not complete — and the bool forced it into `false`/"nothing durable"
+/// alongside the true kickoff-only cases, which is what made every Copilot
+/// compaction re-embed the full ~58-60KB instructions file via VERBOSE
+/// reinjection: exactly the cost a compaction is supposed to reclaim, and
+/// counter to round 5's own user-directed slimming. rev-16 also named the
+/// staleness this caused as a 3-round pattern on this PR (the [`AgentEntry::
+/// contract_carrier`] doc and the `to_reinject` processing comment both
+/// described a binary fact a bool could still technically hold, even after
+/// round 8 changed what was actually true) — an enum makes the docs
+/// structurally unable to describe a state that doesn't exist.
+///
+/// Not persisted: `AgentEntry` (where this rides at runtime) derives only
+/// `Clone, Debug` — no `Serialize`/`Deserialize` — and is never written to
+/// disk. The one roster structure that IS persisted, [`AgentRecord`]
+/// (`agents.json`), does not carry this fact at all; it is recomputed fresh
+/// by `persona_inject` on every spawn and every resume. So there is no
+/// serde migration surface for this field to get wrong — checked, not
+/// assumed, before concluding no compat shim was needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContractCarrier {
+    /// The FULL contract ([`block_contract_text`]: mechanics + the complete
+    /// role template, persona folded in) rides the system-prompt layer
+    /// verbatim. Every Claude block, either path (`--agent <generated
+    /// file>` or the `--append-system-prompt-file` fallback — both are
+    /// launch-time system-prompt construction, not a conversation-history
+    /// artifact a compaction could touch).
+    SystemLayerFull,
+    /// Only the non-negotiable CORE (identity + `mechanics_core` + persona,
+    /// if any, + a pointer to the full instructions file — see
+    /// `copilot_agent_body`'s doc) rides the system-prompt layer. Copilot's
+    /// generated-wrapper happy path, as of round 8: durable, but
+    /// deliberately incomplete, because the full contract routinely blows
+    /// GitHub's documented body cap.
+    SystemLayerCore,
+    /// Nothing loomux-authored is durable on the system-prompt layer for
+    /// this agent — at most the kickoff prompt got a copy, once, of
+    /// whatever a workflow persona supplied. A Copilot block on a
+    /// user-authored native `.github/agents/*.md` persona (only the user's
+    /// OWN file rides `--agent`, never loomux's contract — the documented
+    /// #416 residual gap), the `~/.copilot/agents`-unwritable fallback, and
+    /// an over-cap generated body the round-8 write guard refused to write.
+    KickoffOnly,
+}
+
+impl Default for ContractCarrier {
+    /// The safest assumption when nothing else is known: treat an agent as
+    /// if it has NOTHING durable, same as the pre-enum bool's `false`
+    /// default — a false "nothing durable" wastes a verbose re-embed at
+    /// worst; a false "fully durable" would silently drop a contract.
+    fn default() -> Self {
+        Self::KickoffOnly
+    }
+}
+
 /// A block's durable role CONTRACT plus any workflow persona, compiled down to
 /// what each agent CLI can actually consume (#222, restructured #416, moved
 /// off argv onto a file for Claude in round #417 correction 6).
@@ -4579,14 +4695,15 @@ pub struct Caller {
 /// if any, via the same [`block_contract_text`] framing, + a pointer to the
 /// full instructions file) instead of the raw contract — a per-CLI
 /// composition decision, not a universal thinning; Claude's row is
-/// unchanged. `contract_on_system_layer` is `false` for every Copilot row
-/// as of this split (see that field's doc).
+/// unchanged. Copilot's row carries `ContractCarrier::SystemLayerCore` as
+/// of this split — a real durable state, distinct from `KickoffOnly` (see
+/// that enum's doc).
 ///
 /// (Claude's write-failure fallback — `~/.claude/agents` unwritable — is
 /// `--append-system-prompt-file <instructions file>`, not shown above; still
 /// a file, never argv. Copilot's write-failure fallback is a kickoff-text
 /// paste, the one case where the contract does NOT reach the system-prompt
-/// layer — see `contract_on_system_layer`'s doc.)
+/// layer at all — `ContractCarrier::KickoffOnly`.)
 ///
 /// Before #416, the `none` row emitted nothing at all on either CLI (the
 /// pre-#222 command, byte for byte) and the built-in mechanics/template body
@@ -4620,10 +4737,16 @@ pub struct PersonaInject {
     /// state dir (never a second file loomux has to invent or clean up) —
     /// docs-confirmed to "load additional system prompt text from a file and
     /// append to the default prompt", so this stays system-prompt-layer
-    /// durable (`contract_on_system_layer` stays `true`) even in this rare
-    /// path, unlike Copilot's equivalent fallback (which has no such flag
-    /// and degrades to a kickoff-only paste). Never set together with
-    /// `claude_agent`.
+    /// durable (`ContractCarrier::SystemLayerFull`) even in this rare path,
+    /// unlike Copilot's equivalent fallback (which has no such flag and
+    /// degrades to a kickoff-only paste). Round 8 review (N3b): the
+    /// instructions file this points at is the MECHANICS/template body
+    /// only — a `mode: replace` block's actual persona TEXT never lands
+    /// there (only in `contract`, which is what failed to write) — so this
+    /// specific combination (write failure + replace-mode persona) is
+    /// audited (`claude-fallback-persona-dropped`) at the `persona_inject`
+    /// call site, narrowly scoped to that one gap rather than reworked
+    /// here. Never set together with `claude_agent`.
     pub claude_append_system_prompt_file: Option<PathBuf>,
     /// Copilot `--agent <name>` — either a user-authored `.github/agents/*.md`
     /// (native, unwrapped) or a loomux-generated `~/.copilot/agents/*.agent.md`
@@ -4643,30 +4766,22 @@ pub struct PersonaInject {
     /// reads. Claude has no equivalent: its own write-failure fallback
     /// (`claude_append_system_prompt_file`) never needs one.
     pub kickoff: Option<String>,
-    /// Whether the block's full CONTRACT (mechanics + persona, [`block_
-    /// contract_text`]) actually rides this agent's system-prompt layer —
-    /// `true` for EVERY Claude block regardless of which of the two paths
-    /// above carried it (both `--agent <generated file>` and `--append-
-    /// system-prompt-file` are launch-time system-prompt construction, per
-    /// Claude's own CLI reference — neither is a conversation-history
-    /// artifact a compaction could touch); as of round 8, `false` for
-    /// EVERY Copilot block, full stop — a user-authored native
-    /// `.github/agents/*.md` persona never carried loomux's contract to
-    /// begin with (documented #416 residual gap), the `~/.copilot/agents`-
-    /// unwritable fallback only ever gets the persona text via the
-    /// kickoff, and the generated-file path (`write_copilot_agent_file`)
-    /// now carries only a SLIM composition, never the FULL contract (see
-    /// `copilot_agent_body`'s doc — GitHub's documented 30,000-character
-    /// body cap made the old "full contract, always" promise unkeepable
-    /// for Copilot specifically). Consumed post-spawn by `compact_
-    /// reinjection_notice`'s slim/verbose choice (round #417 correction
-    /// 5): a compaction can only dilute what ISN'T already durable on the
-    /// system-prompt layer, so only an agent where this is `false` needs
-    /// the contract re-embedded verbatim after one — which, as of round 8,
-    /// is every Copilot agent, matching that CLI having no native post-
-    /// compact re-grounding channel anyway (see the capability matrix in
-    /// this module's #417 design notes).
-    pub contract_on_system_layer: bool,
+    /// WHAT of the block's durable role material rides this agent's
+    /// system-prompt layer — see [`ContractCarrier`]'s own doc for the
+    /// three states and round 8's rev-16 finding about why this used to be
+    /// a lossy bool. `SystemLayerFull` for every Claude block (either
+    /// generation path); `SystemLayerCore` for Copilot's generated-wrapper
+    /// happy path (round 8); `KickoffOnly` for a Copilot native persona,
+    /// an unwritable `~/.copilot/agents`, or an over-cap body the write
+    /// guard refused. Consumed post-spawn by `compact_reinjection_notice`'s
+    /// three-way shape choice (round #417 correction 5, revised round 8):
+    /// `SystemLayerFull` → slim (nothing to re-embed or point at);
+    /// `SystemLayerCore` → pointer (re-read the full instructions file, no
+    /// embed — the compaction can only dilute what the core DOESN'T
+    /// already durably hold); `KickoffOnly` → verbose (embed the full
+    /// contract read back from the instructions file — the true fallback,
+    /// nothing else is durable).
+    pub contract_carrier: ContractCarrier,
 }
 
 /// A block's persona after the `prompt:` / `profile:` sources have been
@@ -4753,6 +4868,24 @@ const COPILOT_AGENT_BODY_DOCUMENTED_CAP_CHARS: usize = 30_000;
 /// for the case a workflow-declared persona is itself unusually large.
 const COPILOT_AGENT_BODY_SAFE_CHARS: usize = 27_000;
 
+/// Round 8 review (N3a): a short, CLI-agnostic self-check appended to EVERY
+/// generated agent file, on BOTH CLIs — delivery-independent insurance
+/// against a missed or delayed post-compact reinjection. loomux's own
+/// mandatory notice (`compact_reinjection_notice`) is the PRIMARY channel;
+/// this makes an agent's own system prompt independently able to recover
+/// even if that notice never arrives (a race, a dropped delivery, a bug),
+/// cheap enough to never be a size concern on either CLI (a couple hundred
+/// bytes, well within Copilot's 27,000-char safety margin) — and never
+/// meant to be the ONLY channel, which is why it stays this short rather
+/// than re-deriving the full reinjection logic inline.
+fn compaction_self_check_clause(instructions_path: &Path) -> String {
+    format!(
+        "\n\nSelf-check: after any compaction or context loss, re-read `{}` before acting — \
+         even if no re-grounding notice arrives.\n",
+        instructions_path.display()
+    )
+}
+
 /// Round 8 review (B1, blocking): the full block CONTRACT (`block_contract_
 /// text` — mechanics core + the COMPLETE built-in role template, which is
 /// pages of mechanics, examples and style guidance) routinely exceeds
@@ -4784,11 +4917,24 @@ const COPILOT_AGENT_BODY_SAFE_CHARS: usize = 27_000;
 ///   instruction_files` already wrote — the long-form built-in template
 ///   prose lives there, one `Read` away, rather than duplicated here.
 ///
-/// `contract_on_system_layer` is `false` for the caller as a result (see
-/// that field's doc) — the FULL contract no longer rides this file, so a
-/// real compaction still needs loomux's own verbose reinjection to
-/// re-embed it from the instructions file. This is a per-CLI composition
-/// decision: Claude's rendition (no documented cap) is unchanged.
+/// The caller sets `ContractCarrier::SystemLayerCore` as a result (see
+/// that enum's doc) — a real durable state, not "nothing durable" — so a
+/// real compaction routes to `ReinjectShape::Pointer` (round 8 rev-16
+/// review, N2): a short instruction to re-read the full instructions
+/// file, never a full verbose re-embed of it. Re-embedding it would waste
+/// exactly the tokens a compaction is supposed to reclaim, on a state that
+/// (unlike `KickoffOnly`) already has a durable, load-bearing core. This is
+/// a per-CLI composition decision: Claude's rendition (no documented cap)
+/// is unchanged.
+///
+/// Round 8 review (N3a): also carries a short, delivery-independent
+/// self-check (`compaction_self_check_clause`) instructing the agent to
+/// re-read the instructions file after ANY compaction or context loss —
+/// insurance against a missed/delayed reinjection, not a replacement for
+/// it. Mirrored onto Claude's generated file too (`write_claude_agent_
+/// file`), since neither CLI's own docs guarantee reinjection delivery is
+/// instantaneous or lossless, only that compaction itself doesn't touch
+/// the system prompt.
 fn copilot_agent_body(block: &workflow::Block, persona: Option<&ResolvedPersona>, instructions_path: &Path) -> String {
     let mechanics_only = mechanics_core(block.kind, block.role_hint.as_deref());
     let slim_contract = block_contract_text(&mechanics_only, persona);
@@ -4798,11 +4944,12 @@ fn copilot_agent_body(block: &workflow::Block, persona: Option<&ResolvedPersona>
          This is a SLIM system-prompt copy, kept well under Copilot's documented agent-body \
          limit. Your FULL role instructions — the complete built-in role template, and this \
          block's own notes — live in `{}`. Read that file for anything beyond the mechanics \
-         above; treat it as authoritative whenever this summary and it disagree.\n",
+         above; treat it as authoritative whenever this summary and it disagree.{}\n",
         block.name,
         block.id,
         block.kind.as_str(),
         instructions_path.display(),
+        compaction_self_check_clause(instructions_path),
     )
 }
 
@@ -9878,8 +10025,9 @@ impl OrchRegistry {
             // Solo panes have no group/persona system at all — `compact_
             // nudge_tick`'s reinjection path never reaches a `Role::Solo`
             // entry (it's skipped at `groups.get(&a.group)`), so this is
-            // unused; `false` is the safe/conservative value regardless.
-            contract_on_system_layer: false,
+            // unused; the enum's own `KickoffOnly` default is the safe/
+            // conservative value regardless.
+            contract_carrier: ContractCarrier::default(),
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: Some(cli.to_string()),
@@ -10011,7 +10159,7 @@ impl OrchRegistry {
             compact_hook_sessionstart_seen_ms: None,
             compact_pending_evidence: None,
             compact_hook_native_notice_delivered: false,
-            contract_on_system_layer: false, // unused — see solo_prepare's identical field
+            contract_carrier: ContractCarrier::default(), // unused — see solo_prepare's identical field
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
@@ -10353,7 +10501,7 @@ impl OrchRegistry {
         // `u32` is the 1-indexed attempt number (see `AgentEntry::
         // compact_reinject_attempts`) — carried through so the audit line
         // distinguishes a first fire from a retry.
-        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf, u32, bool)> = Vec::new();
+        let mut to_reinject: Vec<(String, String, PathBuf, PathBuf, u32, ContractCarrier)> = Vec::new();
         let mut to_escalate: Vec<(String, String, u32)> = Vec::new();
         // Production bug fix (D2/D3): a resolved-but-unconfirmed pending
         // state — audited for visibility (this exact gap in observability is
@@ -10656,7 +10804,7 @@ impl OrchRegistry {
                             let ledger = self.ledger_path(&a.group, &a.id);
                             to_reinject.push((
                                 a.id.clone(), a.group.clone(), instructions, ledger,
-                                a.compact_reinject_attempts, a.contract_on_system_layer,
+                                a.compact_reinject_attempts, a.contract_carrier,
                             ));
                         } else {
                             to_abandon.push((a.id.clone(), a.group.clone(), a.compact_reinject_attempts));
@@ -10835,7 +10983,7 @@ impl OrchRegistry {
                                     .unwrap_or_else(|| a.role.instructions_file().to_string()),
                             );
                             let ledger = self.ledger_path(&a.group, &a.id);
-                            to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger, 1, a.contract_on_system_layer));
+                            to_reinject.push((a.id.clone(), a.group.clone(), instructions, ledger, 1, a.contract_carrier));
                         } else {
                             a.compact_pending = false;
                             a.compact_seen_busy = false;
@@ -11097,34 +11245,32 @@ impl OrchRegistry {
             self.audit(&group, "loomux", "compact-escalation", json!({ "agent": id, "percent": percent }));
             let _ = self.deliver_prompt(&id, &compact_escalation_notice(percent), "loomux", Delivery::MidSession);
         }
-        for (id, group, instructions_path, ledger_path, attempt, contract_on_system_layer) in to_reinject {
-            // #417 correction round 5: the instructions file is only read
-            // back at all for the ONE documented case where this agent's
-            // contract does NOT already ride its CLI's system-prompt layer
-            // — see `compact_reinjection_notice`'s doc. The common case
-            // never pays for a read it wouldn't use.
+        for (id, group, instructions_path, ledger_path, attempt, contract_carrier) in to_reinject {
+            // #417 correction round 5: `reinject_shape` only reads the
+            // instructions file back at all for `ContractCarrier::
+            // KickoffOnly` — see `compact_reinjection_notice`'s doc. The
+            // other two states never pay for a read they wouldn't use.
             //
-            // rev-10 review (N3), round 7: the path this reads was already
-            // computed with a fallback to the class file if the block that
-            // owns it is gone from the roster (same `g.block(&a.block).map(
-            // ..).unwrap_or_else(..)` shape `kickoff_prompt` uses) — but a
-            // READ can still come back empty (or fail outright) if that
-            // fallback file was itself never written for this exact case, or
-            // is momentarily missing (e.g. the #423 sweep reclaiming a
-            // block's file out from under a still-live agent). `unwrap_or_
-            // default()` used to turn that into a verbose notice with an
-            // EMPTY contract body, silently — worse than no notice at all,
-            // since it *looks* like re-grounding happened.
-            //
-            // `reinject_contract_text` is the pure read-and-degrade half,
-            // pulled out so it's directly unit-testable without needing a
-            // live `contract_on_system_layer = false` agent (the Copilot-
-            // native-persona / `~/.copilot/agents`-unwritable cases) wired
-            // up end to end. Loud instead of silent: an empty or unreadable
-            // read degrades to the slim notice shape (no embed), audited —
-            // never silently swallowed.
-            let contract_text = reinject_contract_text(&instructions_path, contract_on_system_layer);
-            if contract_text.is_none() && !contract_on_system_layer {
+            // rev-10 review (N3, round 7), widened to a real three-way
+            // choice by rev-16 review (N2, round 8): the path this reads
+            // was already computed with a fallback to the class file if the
+            // block that owns it is gone from the roster (same `g.block(&a.
+            // block).map(..).unwrap_or_else(..)` shape `kickoff_prompt`
+            // uses) — but a READ can still come back empty (or fail
+            // outright) if that fallback file was itself never written for
+            // this exact case, or is momentarily missing (e.g. the #423
+            // sweep reclaiming a block's file out from under a still-live
+            // agent). `unwrap_or_default()` used to turn that into a
+            // verbose notice with an EMPTY contract body, silently — worse
+            // than no notice at all, since it *looks* like re-grounding
+            // happened. Loud instead: `reinject_shape` degrades a failed
+            // `KickoffOnly` read to `Pointer`, never `Slim` (which would
+            // falsely claim durability this agent doesn't have) — audited
+            // here specifically for that degraded case, since a genuine
+            // `SystemLayerCore` agent's `Pointer` shape is the CORRECT
+            // outcome, not something to flag.
+            let shape = reinject_shape(&instructions_path, contract_carrier);
+            if contract_carrier == ContractCarrier::KickoffOnly && matches!(shape, ReinjectShape::Pointer) {
                 self.audit(&group, "loomux", "compact-reinjection-contract-unreadable", json!({
                     "agent": id,
                     "path": instructions_path.display().to_string(),
@@ -11137,10 +11283,16 @@ impl OrchRegistry {
             let ledger = fs::read_to_string(&ledger_path).unwrap_or_default();
             let ledger_path_str = ledger_path.display().to_string();
             let ledger_embed = directive_ledger_embed(&ledger, DIRECTIVE_LEDGER_EMBED_CAP_BYTES, &ledger_path_str);
+            let shape_label = match &shape {
+                ReinjectShape::Slim => "slim",
+                ReinjectShape::Pointer => "pointer",
+                ReinjectShape::Verbose(_) => "verbose",
+            };
             self.audit(&group, "loomux", "compact-reinjection",
                 json!({ "agent": id, "ledger_embedded": ledger_embed.is_some(), "attempt": attempt,
-                        "verbose": contract_text.is_some() }));
-            let notice = compact_reinjection_notice(contract_text.as_deref(), &ledger_path_str, ledger_embed.as_deref());
+                        "shape": shape_label }));
+            let instructions_path_str = instructions_path.display().to_string();
+            let notice = compact_reinjection_notice(&shape, &instructions_path_str, &ledger_path_str, ledger_embed.as_deref());
             let _ = self.deliver_prompt(&id, &notice, "loomux", Delivery::MidSession);
         }
         // rev-42 delta (round 2): terminal-state audits for the confirmed-
@@ -14007,8 +14159,8 @@ impl OrchRegistry {
     /// block (roster changed mid-life, agent didn't) means a LATER compact
     /// reinjection for that agent can find its own instructions file gone.
     /// Mitigated, not prevented, on the reinjection side — see
-    /// `reinject_contract_text`'s doc — which degrades that read loudly to
-    /// the slim notice shape instead of embedding an empty contract.
+    /// `reinject_shape`'s doc — which degrades that read loudly to the
+    /// pointer notice shape instead of embedding an empty contract.
     fn sweep_stale_instruction_files(&self, g: &GroupInfo, current: &HashSet<String>, known: &HashSet<String>) {
         let dir = self.group_dir(&g.id);
         let Ok(entries) = fs::read_dir(&dir) else { return };
@@ -15113,9 +15265,18 @@ impl OrchRegistry {
         // since — unlike `contract`, loomux's own trusted text — it can
         // carry a repo-authored persona's free-text description, which is
         // not guaranteed YAML-safe (a bare colon would break the mapping).
+        //
+        // Round 8 review (N3a): `compaction_self_check_clause` mirrors the
+        // same delivery-independent self-check Copilot's generated file
+        // carries — see that function's doc. Claude's own docs confirm
+        // compaction never touches the system prompt, so this is belt-
+        // and-braces on top of an already-reliable channel, not a
+        // response to a known gap on Claude's side specifically.
+        let instructions_path = self.group_dir(group).join(block.instructions_file());
         let body = format!(
-            "---\nname: {handle}\ndescription: {}\n---\n{contract}\n",
-            yaml_double_quoted(description)
+            "---\nname: {handle}\ndescription: {}\n---\n{contract}{}\n",
+            yaml_double_quoted(description),
+            compaction_self_check_clause(&instructions_path),
         );
         let path = dir.join(format!("{handle}.md"));
         fs::write(&path, body).ok()?;
@@ -15174,19 +15335,19 @@ impl OrchRegistry {
     /// here is `copilot_agent_body`'s SLIM composition, never the raw
     /// `contract` (see that function's doc for what it keeps vs. defers to
     /// the instructions file) — a per-CLI decision; Claude's rendition is
-    /// unchanged. `contract_on_system_layer` is `false` for every Copilot
-    /// block as of this composition (set by the caller in `persona_inject`)
-    /// — the FULL contract no longer rides this file, so a real compaction
-    /// still needs loomux's own verbose reinjection to re-embed it; see
-    /// `PersonaInject::contract_on_system_layer`'s doc.
+    /// unchanged. The caller sets `ContractCarrier::SystemLayerCore` on
+    /// success (rev-16 review, round 8 delta): a real durable state, NOT
+    /// "nothing durable" — a real compaction routes to `ReinjectShape::
+    /// Pointer` (re-read the file, no re-embed), never the full verbose
+    /// embed a `KickoffOnly` agent gets. See `ContractCarrier`'s doc.
     ///
     /// Belt-and-braces, mirroring `command_line_length_guard`'s shape: a
     /// composed body over `COPILOT_AGENT_BODY_SAFE_CHARS` fails LOUDLY here
     /// (audited, naming the block and the measured size) rather than ever
     /// writing a file Copilot might truncate or refuse — `None` routes the
     /// caller to the existing write-failure fallback (kickoff delivery,
-    /// `contract_on_system_layer = false`, verbose re-grounding), exactly
-    /// like an unwritable directory already does.
+    /// `ContractCarrier::KickoffOnly`, verbose re-grounding), exactly like
+    /// an unwritable directory already does.
     fn write_copilot_agent_file(
         &self,
         group: &str,
@@ -15289,31 +15450,36 @@ impl OrchRegistry {
                 // core coverage this one case still lacks — a residual,
                 // documented gap (doc/design/orchestration.md's #416 note),
                 // not something worth reaching across that boundary for.
+                // `contract_carrier` stays its default (`KickoffOnly`) —
+                // only the user's OWN file rides `--agent`, never anything
+                // loomux authored.
                 out.copilot_agent = persona.map(|p| p.name.clone());
                 return out;
             }
             // #416: every OTHER copilot block — the default roster, an inline
             // `prompt:` persona, or an ambiguous native handle — now gets a
-            // durable (round 8: SLIM, not full — see `copilot_agent_body`'s
-            // doc) contract via a loomux-generated custom-agent file, where
-            // before it got nothing (default roster) or a kickoff-prompt
-            // paste (inline `prompt:`).
+            // durable (round 8: a SLIM core, not the full contract — see
+            // `copilot_agent_body`'s doc) contract via a loomux-generated
+            // custom-agent file, where before it got nothing (default
+            // roster) or a kickoff-prompt paste (inline `prompt:`).
             match self.write_copilot_agent_file(group, block, persona) {
                 Some(handle) => {
                     out.copilot_agent = Some(handle);
-                    // Round 8: `false`, not `true` — the generated file no
-                    // longer carries the FULL contract (`copilot_agent_
-                    // body`'s doc explains why), so this must stay honest
-                    // per `contract_on_system_layer`'s own documented
-                    // meaning: a real compaction still needs loomux's own
-                    // verbose reinjection to re-embed the full contract.
+                    // A real durable state (rev-16 review, round 8 delta) —
+                    // NOT `KickoffOnly`. See `ContractCarrier::
+                    // SystemLayerCore`'s doc for what's guaranteed vs. what
+                    // a real compaction still has to re-read from disk.
+                    out.contract_carrier = ContractCarrier::SystemLayerCore;
                 }
                 None => {
-                    // `~/.copilot/agents` unwritable — fall back to the
+                    // `~/.copilot/agents` unwritable, OR the composed body
+                    // blew the round-8 size guard — fall back to the
                     // pre-#416 kickoff-text path rather than silently losing
                     // a configured persona. An allow-only/no-persona block
                     // has no text to fall back to, so this is a true no-op
-                    // for it, same as before.
+                    // for it, same as before. `contract_carrier` stays its
+                    // default (`KickoffOnly`) — nothing loomux authored is
+                    // durable here.
                     if let Some(p) = persona {
                         if !p.text.trim().is_empty() {
                             out.kickoff = Some(p.text.clone());
@@ -15350,12 +15516,29 @@ impl OrchRegistry {
                 // clean up). Still system-prompt-layer durable either way
                 // — see `claude_append_system_prompt_file`'s doc — so this
                 // fallback, unlike Copilot's kickoff-text one, never needs
-                // `contract_on_system_layer` to go `false`.
+                // `contract_carrier` to drop below `SystemLayerFull`.
+                //
+                // Round 8 review (N3b): that fallback file is mechanics/
+                // template ONLY — a `mode: replace` block's actual persona
+                // TEXT lives in `contract` (which is what just failed to
+                // write), never in the instructions file. Narrow, real gap:
+                // audited rather than silently dropped. Not fixed by
+                // appending the persona into the instructions file itself —
+                // that file has other writers (`write_instruction_files`)
+                // and a per-fallback mutation of shared state is a bigger
+                // change than this narrow case warrants.
+                if persona.is_some_and(|p| p.mode == profiles::ProfileMode::Replace && !p.text.trim().is_empty()) {
+                    self.audit(group, "loomux", "claude-fallback-persona-dropped", json!({
+                        "block": block.id,
+                        "reason": "~/.claude/agents unwritable; the --append-system-prompt-file \
+                                    fallback carries mechanics only, never a replace-mode persona's own text",
+                    }));
+                }
                 out.claude_append_system_prompt_file =
                     Some(self.group_dir(group).join(block.instructions_file()));
             }
         }
-        out.contract_on_system_layer = true;
+        out.contract_carrier = ContractCarrier::SystemLayerFull;
         out
     }
 
@@ -16073,7 +16256,7 @@ impl OrchRegistry {
             compact_hook_sessionstart_seen_ms: None,
             compact_pending_evidence: None,
             compact_hook_native_notice_delivered: false,
-            contract_on_system_layer: inject.contract_on_system_layer,
+            contract_carrier: inject.contract_carrier,
             last_state_write_ms: 0,
             compact_escalation_notified: false,
             solo_cli: None,
@@ -18253,7 +18436,7 @@ fn register_orchestrator_pane(
         compact_hook_sessionstart_seen_ms: None,
         compact_pending_evidence: None,
         compact_hook_native_notice_delivered: false,
-        contract_on_system_layer: inject.contract_on_system_layer,
+        contract_carrier: inject.contract_carrier,
         last_state_write_ms: 0,
         compact_escalation_notified: false,
         solo_cli: None,

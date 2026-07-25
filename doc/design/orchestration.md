@@ -2612,15 +2612,76 @@ composition entirely and has no cap concern of loomux's to test);
 a ~40KB persona pushes the composed body over the cap, and the test asserts no file is EVER
 written at any handle-shaped path, not just that the returned handle is `None`);
 `contract_on_system_layer_is_false_for_every_copilot_block_and_true_for_every_claude_block`
-(renamed from the pre-round-8 test whose own name stopped being true). Red-before-green: the 8a
-fix was reverted locally and the frontmatter-schema test confirmed to fail with the incident's own
-error text before being restored.
+(renamed from the pre-round-8 test whose own name stopped being true; renamed AGAIN in the
+rev-16 reviewer delta below, to `contract_carrier_is_system_layer_core_for_the_copilot_
+generated_wrapper_and_full_for_claude`, once this exact assertion's own premise stopped being
+true a second time). Red-before-green: the 8a fix was reverted locally and the
+frontmatter-schema test confirmed to fail with the incident's own error text before being
+restored.
 
 **Sanity-swept, flagged rather than fixed** (scope discipline — the ask was to check, not chase):
 whether the autopilot-consent flow interacts with an active `--agent` handle, and the exact
 kickoff-paste timing relative to a `--agent` load failure. Neither has a code path coupling it to
 this round's changes, but neither had been exercised through a real Copilot launch before this
 demo either — noted for whoever demos those paths next, not built speculatively here.
+
+### Round 8 reviewer delta (rev-16): the lossy bool becomes `ContractCarrier`, plus N3a/N3b
+
+**N2, the substantive finding.** The round-8 B1 fix (above) set the pre-enum bool
+`contract_on_system_layer` to `false` for the Copilot generated-wrapper's happy path — accurate
+in the narrow sense that the FULL contract no longer rode there, but it collapsed a genuine
+THREE-state fact into two. Before round 8, "full contract" (Claude) and "kickoff only" (Copilot's
+residual gaps) were the only two states that existed, so the bool was lossless. Round 8's own
+slimming introduced a real third state — a durable CORE (identity + `mechanics_core` + a pointer)
+that is neither "full" nor "nothing" — and forcing it into the same bucket as genuinely
+undurable agents meant EVERY Copilot compaction paid for a full verbose re-embed of the whole
+instructions file (tens of KB), right after a compaction meant to reclaim exactly that context,
+and directly counter to round 5's own user-directed slimming principle.
+
+Fixed by replacing the bool with `ContractCarrier { SystemLayerFull, SystemLayerCore,
+KickoffOnly }`, threaded through `PersonaInject`, `AgentEntry`, and a new `reinject_shape`
+(replacing `reinject_contract_text`) that returns a matching `ReinjectShape { Slim, Pointer,
+Verbose(String) }` for `compact_reinjection_notice` to render:
+
+- `SystemLayerFull` → `Slim` — nothing to re-embed or point at (Claude, always).
+- `SystemLayerCore` → `Pointer` — re-read the full instructions file; never re-embed it (Copilot's
+  generated-wrapper happy path, round 8's new third state).
+- `KickoffOnly` → `Verbose(text)` — the true fallback, full embed, nothing else is durable
+  (Copilot native persona, unwritable directory, or an over-cap body the write guard refused). A
+  failed read in this state degrades to `Pointer`, never `Slim` — `Slim` would falsely claim
+  durability this agent doesn't have; `Pointer` ("go read the file") stays honest even when the
+  read attempt itself failed, and the caller audits that specific degradation
+  (`compact-reinjection-contract-unreadable`) since a genuine `SystemLayerCore` agent's `Pointer`
+  shape is the CORRECT outcome, not something to flag.
+
+**This also closes N1 structurally, not just for this round.** rev-16 named the staleness of the
+`AgentEntry::contract_on_system_layer` doc and the `to_reinject` processing comment as a 3-round
+pattern on this PR — both described a binary fact the bool could still technically hold even
+after round 8 changed what was actually true. An enum can't drift the same way: there is no
+fourth state for a stale comment to silently describe, and every match arm that used to read
+`if contract_on_system_layer { .. } else { .. }` is now an exhaustive 3-way match the compiler
+enforces.
+
+**Persistence checked, not assumed.** `AgentRecord` (`agents.json`, the one roster structure
+actually written to disk) does not carry this fact at all — `AgentEntry` (where it rides at
+runtime) derives only `Clone, Debug`, no `Serialize`/`Deserialize`, and is recomputed fresh by
+`persona_inject` on every spawn and every resume. So there is no serde migration surface for this
+field, and no compat shim was built for one — confirmed by reading the actual persistence code,
+not assumed from the field's name.
+
+**N3a.** Both `write_claude_agent_file` and `copilot_agent_body` now append a short,
+CLI-agnostic self-check clause (`compaction_self_check_clause`) instructing the agent to re-read
+its instructions file after ANY compaction or context loss, independent of whether loomux's own
+reinjection notice arrives — cheap insurance (a couple hundred bytes) against a missed or delayed
+delivery, never a replacement for the primary channel.
+
+**N3b.** Claude's `--append-system-prompt-file` write-failure fallback points at the instructions
+file, which is mechanics/template only — a `mode: replace` block's actual persona text lives only
+in `contract` (the thing that just failed to write), so that specific combination silently dropped
+the persona before this delta. Now audited (`claude-fallback-persona-dropped`), scoped narrowly to
+`mode: replace` per the review — append-mode's similar, pre-existing, wider gap (its persona isn't
+in the instructions file either) is out of this round's stated scope and left flagged, not fixed,
+in the code comment at the call site.
 
 ## Enforced merge gate (#83)
 

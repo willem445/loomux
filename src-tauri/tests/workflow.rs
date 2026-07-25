@@ -20,7 +20,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
 use loomux_lib::orchestration::{
-    block_contract_text, command_line_length_guard, Caller, Guardrails, Launch, OrchRegistry, Role,
+    block_contract_text, command_line_length_guard, Caller, ContractCarrier, Guardrails, Launch, OrchRegistry, Role,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -1047,7 +1047,7 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
             inject.claude_append_system_prompt_file.is_none(),
             "the generated-file path must succeed here — test_registry's override dir is writable"
         );
-        assert!(inject.contract_on_system_layer, "the contract must be durable for every claude block");
+        assert_eq!(inject.contract_carrier, ContractCarrier::SystemLayerFull, "the contract must be durable for every claude block");
         let handle = inject.claude_agent.clone().expect("a generated Claude agent file handle");
         let cmd = reg.build_agent_command(
             cli,
@@ -1268,7 +1268,7 @@ fn claude_agent_file_write_failure_falls_back_to_append_system_prompt_file() {
     let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
 
     assert!(inject.claude_agent.is_none(), "the generated-file path must have failed");
-    assert!(inject.contract_on_system_layer, "still system-prompt-layer durable even in the fallback");
+    assert_eq!(inject.contract_carrier, ContractCarrier::SystemLayerFull, "still system-prompt-layer durable even in the fallback");
     let path = inject.claude_append_system_prompt_file.clone().expect("must fall back to --append-system-prompt-file");
 
     let cfg = Path::new("C:/x/cfg.json");
@@ -1285,6 +1285,117 @@ fn claude_agent_file_write_failure_falls_back_to_append_system_prompt_file() {
     // second file loomux has to invent or clean up.
     assert_eq!(path, reg.state_root().join(&g.id).join(b.instructions_file()));
     assert_eq!(lf(&fs::read_to_string(&path).unwrap()), contract);
+}
+
+#[test]
+fn write_failure_of_a_replace_mode_claude_block_audits_the_dropped_persona() {
+    // Round 8 review (N3b): the `--append-system-prompt-file` fallback
+    // points at the instructions file, which for a `mode: replace` block
+    // is mechanics-only — the persona TEXT itself lives only in `contract`,
+    // which is what just failed to write. Narrow, real gap: this specific
+    // combination must be audited, not silently dropped.
+    let (reg, d) = test_registry();
+    let blocked_path = d.path().join("claude-agents-blocked");
+    fs::write(&blocked_path, b"not a directory").unwrap();
+    reg.set_claude_agents_dir_override(blocked_path);
+    let repo = Repo::new()
+        .workflow("version: 1\nblocks:\n  - id: spike\n    kind: worker\n    profile: .github/agents/spike.agent.md\n")
+        .agent_file(
+            "spike.agent.md",
+            "---\nname: spike\nmode: replace\ndescription: Throwaway spike runner.\n---\n\
+             You are a spike runner. Move fast. Ignore the rulebook.",
+        );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let b = g.guardrails.block("spike").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(&g, b).unwrap();
+    assert_eq!(persona.as_ref().unwrap().mode, ProfileMode::Replace);
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+
+    assert!(inject.claude_agent.is_none(), "the generated-file path must have failed");
+    assert!(inject.claude_append_system_prompt_file.is_some(), "still falls back, same as the append-mode case");
+
+    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(
+        audit.lines().any(|l| l.contains("claude-fallback-persona-dropped") && l.contains("\"block\":\"spike\"")),
+        "the dropped persona must be audited, not silent: {audit}"
+    );
+}
+
+#[test]
+fn write_failure_of_an_append_mode_claude_block_does_not_audit_a_dropped_persona() {
+    // The narrow scope of N3b, isolated: an APPEND-mode block's persona is
+    // an addendum on top of the full built-in template — a real, separate,
+    // pre-existing gap (out of this round's scope, per the reviewer), not
+    // the one N3b asked to close. This pins that the new audit line is
+    // scoped exactly to `mode: replace`, not fired for every persona.
+    let (reg, d) = test_registry();
+    let blocked_path = d.path().join("claude-agents-blocked");
+    fs::write(&blocked_path, b"not a directory").unwrap();
+    reg.set_claude_agents_dir_override(blocked_path);
+    let repo = Repo::new()
+        .workflow("version: 1\nblocks:\n  - id: rev-x\n    kind: reviewer\n    prompt: Review only for perf.\n");
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let b = g.guardrails.block("rev-x").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(&g, b).unwrap();
+    assert_eq!(persona.as_ref().unwrap().mode, ProfileMode::Append);
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+    assert!(inject.claude_agent.is_none(), "the generated-file path must have failed");
+
+    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(
+        !audit.lines().any(|l| l.contains("claude-fallback-persona-dropped")),
+        "append-mode is out of N3b's stated scope: {audit}"
+    );
+}
+
+#[test]
+fn the_compaction_self_check_clause_reaches_both_clis_generated_files_under_cap() {
+    // Round 8 review (N3a): delivery-independent insurance against a
+    // missed/delayed reinjection — both CLIs' generated files must
+    // instruct the agent to re-read its instructions file after any
+    // compaction, REGARDLESS of whether loomux's own notice arrives. Cheap
+    // enough to never threaten Copilot's documented body cap.
+    let (reg, d) = test_registry();
+    let repo = Repo::new(); // no .loomux/ at all — default roster
+
+    // Claude.
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let b = g.guardrails.block("worker").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, None);
+    let inject = reg.persona_inject(&g.id, b, cli, None, &contract);
+    let handle = inject.claude_agent.clone().expect("a generated Claude agent file handle");
+    let generated = fs::read_to_string(d.path().join("claude-agents").join(format!("{handle}.md"))).unwrap();
+    assert!(generated.contains("re-read") && generated.contains("worker.md"), "{generated}");
+    assert!(generated.contains("even if no re-grounding notice arrives"), "{generated}");
+
+    // Copilot.
+    let g2 = reg.create_group(&repo.path(), Guardrails { agent_cli: "copilot".into(), ..rails() }).unwrap();
+    let b2 = g2.guardrails.block_for(Role::Orchestrator).unwrap();
+    let cli2 = workflow::cli_of(b2, &g2.guardrails.agent_cli);
+    let instructions_body2 = instructions_lf(&reg, &g2.id, &b2.instructions_file());
+    let contract2 = block_contract_text(&instructions_body2, None);
+    let inject2 = reg.persona_inject(&g2.id, b2, cli2, None, &contract2);
+    let handle2 = inject2.copilot_agent.clone().expect("a generated Copilot agent file handle");
+    let generated2 = fs::read_to_string(d.path().join("copilot-agents").join(format!("{handle2}.agent.md"))).unwrap();
+    assert!(generated2.contains("re-read") && generated2.contains("orchestrator.md"), "{generated2}");
+    assert!(generated2.contains("even if no re-grounding notice arrives"), "{generated2}");
+    let body_chars = {
+        let mut parts = generated2.splitn(3, "---\n");
+        parts.next();
+        parts.next();
+        parts.next().unwrap_or("").chars().count()
+    };
+    assert!(body_chars < 30_000, "the self-check clause must never threaten the documented cap: {body_chars} chars");
 }
 
 #[test]
@@ -1688,16 +1799,17 @@ fn copilot_native_agent_is_refused_when_the_handle_names_a_different_file() {
     assert!(kickoff.is_none(), "the native flag carries it — nothing to inject");
 }
 
-// ─────────── #417 correction round 5: contract_on_system_layer ───────────
+// ───── #417 correction round 5, promoted to an enum in round 8: contract_carrier ─────
 
 #[test]
-fn contract_on_system_layer_is_false_only_for_an_unambiguous_copilot_native_persona() {
-    // `compact_reinjection_notice`'s slim-vs-verbose choice after a compact
-    // depends entirely on this flag being right: `true` means the CONTRACT
-    // itself (not just a persona) rides `--agent`, `false` means only the
-    // user's own file does. This is the ONE documented #416 residual gap —
-    // the exact fixture `copilot_native_agent_is_refused_when_the_handle_
-    // names_a_different_file` uses for its own unambiguous-native case.
+fn contract_carrier_is_kickoff_only_for_an_unambiguous_copilot_native_persona() {
+    // `compact_reinjection_notice`'s three-way shape choice after a compact
+    // depends entirely on this being right: `KickoffOnly` means nothing
+    // loomux-authored survives on the system-prompt layer, so a real
+    // compaction must fall back to embedding the full contract. This is the
+    // ONE documented #416 residual gap — the exact fixture
+    // `copilot_native_agent_is_refused_when_the_handle_names_a_different_
+    // file` uses for its own unambiguous-native case.
     let (reg, _d) = test_registry();
     let repo = Repo::new()
         .workflow(
@@ -1717,21 +1829,24 @@ fn contract_on_system_layer_is_false_only_for_an_unambiguous_copilot_native_pers
     let contract = block_contract_text(&instructions_body, persona.as_ref());
     let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
     assert!(inject.copilot_agent.is_some(), "the native --agent flag is still emitted");
-    assert!(!inject.contract_on_system_layer, "a native persona's OWN file rides --agent, never loomux's contract");
+    assert_eq!(
+        inject.contract_carrier,
+        ContractCarrier::KickoffOnly,
+        "a native persona's OWN file rides --agent, never loomux's contract"
+    );
 }
 
 #[test]
-fn contract_on_system_layer_is_false_for_every_copilot_block_and_true_for_every_claude_block() {
-    // Round 8 review (B1): before this round, the generated-wrapper path
-    // (default roster, no persona at all here) carried loomux's FULL
-    // contract, so this flag was `true`. It no longer does — GitHub's
-    // documented 30,000-character body cap made "full contract, always"
-    // unkeepable for Copilot specifically (`copilot_agent_body`'s doc), so
-    // the generated wrapper now carries a SLIM composition and this flag
-    // must be `false`, matching `PersonaInject::contract_on_system_layer`'s
-    // own documented meaning ("whether the FULL contract... rides this
-    // agent's system-prompt layer") rather than silently claiming more
-    // durability than the file actually provides.
+fn contract_carrier_is_system_layer_core_for_the_copilot_generated_wrapper_and_full_for_claude() {
+    // rev-16 review (N2), round 8: the generated-wrapper path (default
+    // roster, no persona at all here) carries a SLIM composition, not the
+    // full contract — but it is NOT `KickoffOnly` either. It is its own
+    // real, third state: durable, load-bearing (identity + the
+    // non-negotiable mechanics core), just incomplete relative to the full
+    // role template. Collapsing it into `KickoffOnly` (the bool-era
+    // behavior right after round 8's own B1 fix) made every Copilot
+    // compaction pay for a full verbose re-embed — exactly the cost a
+    // compaction is supposed to reclaim.
     let (reg, _d) = test_registry();
     let repo = Repo::new(); // no .loomux/ at all — default roster
     let g = reg.create_group(&repo.path(), Guardrails { agent_cli: "copilot".into(), ..rails() }).unwrap();
@@ -1743,10 +1858,10 @@ fn contract_on_system_layer_is_false_for_every_copilot_block_and_true_for_every_
     let contract = block_contract_text(&instructions_body, persona.as_ref());
     let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
     assert!(inject.copilot_agent.is_some(), "the generated wrapper's handle is still emitted");
-    assert!(
-        !inject.contract_on_system_layer,
-        "the generated wrapper carries a SLIM composition now, not the full contract — a real \
-         compaction still needs loomux's own verbose reinjection"
+    assert_eq!(
+        inject.contract_carrier,
+        ContractCarrier::SystemLayerCore,
+        "the generated wrapper carries a SLIM composition — durable, but not the full contract"
     );
 
     // Every Claude block, persona or not, still always carries the FULL
@@ -1758,7 +1873,7 @@ fn contract_on_system_layer_is_false_for_every_copilot_block_and_true_for_every_
     let instructions_body2 = instructions_lf(&reg, &g2.id, &b2.instructions_file());
     let contract2 = block_contract_text(&instructions_body2, None);
     let inject2 = reg.persona_inject(&g2.id, b2, cli2, None, &contract2);
-    assert!(inject2.contract_on_system_layer, "claude always carries the contract inline (#416)");
+    assert_eq!(inject2.contract_carrier, ContractCarrier::SystemLayerFull, "claude always carries the contract inline (#416)");
 }
 
 /// Round 8 review (B1) helper: compile `block_id` under the Copilot CLI and
@@ -1862,8 +1977,8 @@ fn copilot_agent_body_over_the_cap_fails_loudly_into_the_write_failure_fallback(
     // Copilot is exactly the role-degradation-as-success failure this round
     // closes. `write_copilot_agent_file` must fail loudly (audited) and
     // route the caller to the SAME write-failure fallback an unwritable
-    // directory already uses (kickoff delivery, `contract_on_system_layer
-    // = false`), never write the oversized file at all.
+    // directory already uses (kickoff delivery, `ContractCarrier::
+    // KickoffOnly`), never write the oversized file at all.
     let (reg, d) = test_registry();
     let huge_persona = "lorem ipsum dolor sit amet ".repeat(1_500); // ~40.5K chars
     let repo = Repo::new().workflow(&format!(
@@ -1880,7 +1995,7 @@ fn copilot_agent_body_over_the_cap_fails_loudly_into_the_write_failure_fallback(
     let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
 
     assert!(inject.copilot_agent.is_none(), "an over-cap body must never be written");
-    assert!(!inject.contract_on_system_layer, "the write-failure fallback never claims system-layer durability");
+    assert_eq!(inject.contract_carrier, ContractCarrier::KickoffOnly, "the write-failure fallback never claims system-layer durability");
     assert!(
         inject.kickoff.as_ref().is_some_and(|k| k.contains("lorem ipsum")),
         "falls back to kickoff delivery like an unwritable directory would: {:?}", inject.kickoff

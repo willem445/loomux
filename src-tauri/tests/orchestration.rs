@@ -30,8 +30,9 @@ use loomux_lib::orchestration::{
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     paste_held_notice, question_held_notice, held_delivery_notice,
-    prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_contract_text, resolve_paste_gate, resolve_ref_url,
+    prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
     resume_kickoff_notice, rotate_audit_if_needed,
+    ContractCarrier, ReinjectShape,
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     record_aborted_preenter_outcome, recorded_confirmed,
@@ -6477,10 +6478,10 @@ fn human_typed_compact_detected_matches_standalone_tokens_only() {
 
 #[test]
 fn compact_reinjection_notice_is_slim_when_the_contract_rides_the_system_layer() {
-    // #417 correction round 5: the common case (`contract_text: None`) —
+    // #417 correction round 5: the common case (`ReinjectShape::Slim`) —
     // the block's contract already rides the CLI's own system-prompt layer
     // (#416), so nothing about it needs re-embedding after a compaction.
-    let n = compact_reinjection_notice(None, "C:/g/ledger-w-1.log", None);
+    let n = compact_reinjection_notice(&ReinjectShape::Slim, "C:/g/worker.md", "C:/g/ledger-w-1.log", None);
     assert!(n.starts_with("[loomux]"));
     assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"), "got: {n}");
     assert!(n.contains("C:/g/ledger-w-1.log"), "the ledger path is still named as a pointer, got: {n}");
@@ -6493,18 +6494,52 @@ fn compact_reinjection_notice_slim_still_inlines_the_ledger_tail() {
     // Belt-and-braces: even in the slim shape, the ledger TAIL is still
     // inlined directly (highest value-per-byte of anything left to resend),
     // not reduced to a bare pointer like the rest of the notice.
-    let n = compact_reinjection_notice(None, "C:/g/ledger-w-1.log", Some("Your directive ledger:\n[1] scope to auth only"));
+    let n = compact_reinjection_notice(
+        &ReinjectShape::Slim,
+        "C:/g/worker.md",
+        "C:/g/ledger-w-1.log",
+        Some("Your directive ledger:\n[1] scope to auth only"),
+    );
+    assert!(n.contains("scope to auth only"), "got: {n}");
+}
+
+#[test]
+fn compact_reinjection_notice_is_a_pointer_when_only_the_core_rides_the_system_layer() {
+    // rev-16 review (N2), round 8: the THIRD shape — Copilot's generated-
+    // wrapper happy path. Must name the instructions path and the live-
+    // state re-sync steps, but must NEVER embed the instructions body
+    // itself (that would re-spend exactly the tokens a compaction is
+    // supposed to reclaim, which is the whole reason this shape exists
+    // instead of collapsing into `Verbose`).
+    let n = compact_reinjection_notice(&ReinjectShape::Pointer, "C:/g/orchestrator.md", "C:/g/ledger-o-1.log", None);
+    assert!(n.starts_with("[loomux]"));
+    assert!(n.contains("C:/g/orchestrator.md"), "must name the instructions path to re-read: {n}");
+    assert!(n.contains("re-read"), "must instruct the agent to actually go read it: {n}");
+    assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"), "got: {n}");
+    assert!(n.contains("C:/g/ledger-o-1.log"), "the ledger path is still named as a pointer, got: {n}");
+    assert!(n.len() < 700, "the pointer notice should stay short — it does NOT embed the instructions body: got {} bytes: {n}", n.len());
+}
+
+#[test]
+fn compact_reinjection_notice_pointer_still_inlines_the_ledger_tail() {
+    let n = compact_reinjection_notice(
+        &ReinjectShape::Pointer,
+        "C:/g/orchestrator.md",
+        "C:/g/ledger-o-1.log",
+        Some("Your directive ledger:\n[1] scope to auth only"),
+    );
     assert!(n.contains("scope to auth only"), "got: {n}");
 }
 
 #[test]
 fn compact_reinjection_notice_embeds_the_instructions_verbatim_when_the_contract_is_not_durable() {
-    // The ONE documented exception (a Copilot block on a user-authored
-    // native persona, or the `~/.copilot/agents`-unwritable fallback) still
-    // gets the full verbose embedding, since there is no system-prompt-layer
-    // copy of the contract to trust instead.
+    // The true fallback (`ReinjectShape::Verbose`) — a Copilot block on a
+    // user-authored native persona, the `~/.copilot/agents`-unwritable
+    // fallback, or an over-cap generated body — still gets the full
+    // verbose embedding, since there is no system-prompt-layer copy of
+    // ANYTHING loomux authored to trust instead.
     let instructions = "You are the orchestrator...\nNever merge without a gate.";
-    let n = compact_reinjection_notice(Some(instructions), "C:/g/ledger-o-1.log", None);
+    let n = compact_reinjection_notice(&ReinjectShape::Verbose(instructions.to_string()), "C:/g/orchestrator.md", "C:/g/ledger-o-1.log", None);
     assert!(n.starts_with("[loomux]"));
     assert!(n.contains(instructions), "must embed the FULL instructions text, not a pointer to go read it");
     assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"), "got: {n}");
@@ -6512,50 +6547,78 @@ fn compact_reinjection_notice_embeds_the_instructions_verbatim_when_the_contract
 }
 
 #[test]
-fn reinject_contract_text_on_system_layer_never_touches_the_filesystem() {
-    // The common case: a path that doesn't exist would be an `Err` if this
-    // ever actually read it — the short-circuit must return `None` without
-    // trying.
-    assert_eq!(reinject_contract_text(Path::new("C:/does/not/exist.md"), true), None);
+fn reinject_shape_on_system_layer_full_never_touches_the_filesystem() {
+    // The common (Claude) case: a path that doesn't exist would be an
+    // `Err` if this ever actually read it — the short-circuit must return
+    // `Slim` without trying.
+    assert_eq!(
+        reinject_shape(Path::new("C:/does/not/exist.md"), ContractCarrier::SystemLayerFull),
+        ReinjectShape::Slim
+    );
 }
 
 #[test]
-fn reinject_contract_text_reads_the_file_when_the_contract_is_not_on_the_system_layer() {
+fn reinject_shape_system_layer_core_never_touches_the_filesystem_either() {
+    // The pointer shape doesn't need the file's CONTENTS, only its path
+    // (already known to the caller) — no read, same short-circuit as Full.
+    assert_eq!(
+        reinject_shape(Path::new("C:/does/not/exist.md"), ContractCarrier::SystemLayerCore),
+        ReinjectShape::Pointer
+    );
+}
+
+#[test]
+fn reinject_shape_reads_the_file_when_nothing_is_durable() {
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("worker.md");
     fs::write(&p, "You are a worker...\nNever merge without a gate.").unwrap();
     assert_eq!(
-        reinject_contract_text(&p, false),
-        Some("You are a worker...\nNever merge without a gate.".to_string())
+        reinject_shape(&p, ContractCarrier::KickoffOnly),
+        ReinjectShape::Verbose("You are a worker...\nNever merge without a gate.".to_string())
     );
 }
 
 #[test]
-fn reinject_contract_text_degrades_to_none_not_empty_string_when_unreadable_or_empty() {
-    // rev-10 review (N3), round 7: this is the fix itself, isolated — a
+fn reinject_shape_degrades_to_pointer_not_slim_when_unreadable_or_empty() {
+    // rev-10 review (N3), round 7; widened to a real three-way choice by
+    // rev-16 review (N2), round 8: this is the fix itself, isolated — a
     // missing file (e.g. the #423 sweep reclaiming a block's file out from
     // under a still-live agent) and an empty-but-present file must BOTH
-    // degrade to `None` (the slim notice shape), never `Some("")` (a
-    // verbose notice with nothing embedded under it, which used to happen
-    // silently via `unwrap_or_default()`).
+    // degrade to `Pointer`, never `Slim` (which would falsely claim this
+    // `KickoffOnly` agent's system prompt already holds the contract) and
+    // never `Verbose("")` (a verbose notice with nothing embedded under
+    // it, which used to happen silently via `unwrap_or_default()`).
     let d = tempfile::tempdir().unwrap();
     assert_eq!(
-        reinject_contract_text(&d.path().join("gone.md"), false),
-        None,
-        "a missing file must not become Some(\"\")"
+        reinject_shape(&d.path().join("gone.md"), ContractCarrier::KickoffOnly),
+        ReinjectShape::Pointer,
+        "a missing file must not become Verbose(\"\")"
     );
     let empty = d.path().join("empty.md");
     fs::write(&empty, "").unwrap();
-    assert_eq!(reinject_contract_text(&empty, false), None, "an empty file must not become Some(\"\")");
+    assert_eq!(
+        reinject_shape(&empty, ContractCarrier::KickoffOnly),
+        ReinjectShape::Pointer,
+        "an empty file must not become Verbose(\"\")"
+    );
     let whitespace_only = d.path().join("whitespace.md");
     fs::write(&whitespace_only, "   \n\n  ").unwrap();
-    assert_eq!(reinject_contract_text(&whitespace_only, false), None, "whitespace-only must not read as real content");
+    assert_eq!(
+        reinject_shape(&whitespace_only, ContractCarrier::KickoffOnly),
+        ReinjectShape::Pointer,
+        "whitespace-only must not read as real content"
+    );
 }
 
 #[test]
 fn compact_reinjection_notice_verbose_folds_in_the_ledger_when_present() {
     let instructions = "You are a worker...";
-    let n = compact_reinjection_notice(Some(instructions), "C:/g/ledger-w-1.log", Some("Your directive ledger:\n[1] scope to auth only"));
+    let n = compact_reinjection_notice(
+        &ReinjectShape::Verbose(instructions.to_string()),
+        "C:/g/worker.md",
+        "C:/g/ledger-w-1.log",
+        Some("Your directive ledger:\n[1] scope to auth only"),
+    );
     assert!(n.contains(instructions), "instructions still embedded");
     assert!(n.contains("scope to auth only"), "got: {n}");
     // The ledger must land AFTER the instructions and BEFORE the re-sync
