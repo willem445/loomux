@@ -126,16 +126,19 @@ jobs:
 
       - name: Run Playwright E2E suite
         run: npx playwright test
-
-      # If the suite above failed, surface WHY in the job output itself — not
-      # just in a comment nobody reading the failed run sees. See
-      # doc/design/e2e-testing.md "CI status" for the full writeup.
-      - name: Explain an expected-red run
-        if: failure()
-        run: |
-          echo "::warning::e2e-windows failed. If this is the known High-IL WebView2 CDP restriction (not your change), see doc/design/e2e-testing.md 'CI status' for the root cause, citations, and what was tried (HKLM policy above, runas de-elevation). This job is continue-on-error and does not gate merges."
         env:
           LOOMUX_E2E_EXE: ${{ github.workspace }}\src-tauri\target\debug\loomux.exe
+
+      # If the suite above failed, surface a pointer to the debugging docs in
+      # the job output itself — not just in a comment nobody reading the
+      # failed run sees. The HKLM policy fix (above) is confirmed working, so
+      # a red run here is most likely a real spec/app problem now, not the
+      # runner's execution context — this is a pointer to check, not a
+      # default explanation. See doc/design/e2e-testing.md "CI status".
+      - name: Note where to start debugging a red run
+        if: failure()
+        run: |
+          echo "::warning::e2e-windows failed. This job is continue-on-error and does not gate merges, but treat this as a real signal first -- the CI-side HKLM policy workaround for WebView2's High-IL restriction is confirmed working (see doc/design/e2e-testing.md 'CI status'), so a red run here is unlikely to be that issue recurring. Check the specs/app first."
 
       - name: Upload Playwright report
         if: always()

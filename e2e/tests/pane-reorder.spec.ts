@@ -34,8 +34,13 @@ test("dragging a pane onto another's center swaps their on-screen order", async 
   // explicitly refuses to start a drag when the target is inside
   // `button, input, .pane-meta-item`, by design (so clicking a header button
   // never accidentally starts a reorder). `.pane-title` is always
-  // left-anchored ahead of every button, so it's a stable, button-free grab
-  // point regardless of header width.
+  // left-anchored ahead of every button, so it can never collide with one —
+  // but it's `flex: 0 1 auto; min-width: 0` (styles.css), so at a narrow
+  // enough header it shrinks toward zero width and stops being a usable grab
+  // point. Assert it's a real target rather than assume: a title collapsed to
+  // nothing is a loud, specific failure here instead of a silent no-op.
+  const titleBox = await paneB.locator(".pane-title").boundingBox();
+  expect(titleBox?.width, "Pane B's title collapsed to an unusable drag source").toBeGreaterThan(10);
   await paneB.locator(".pane-title").dragTo(paneA);
 
   await expect

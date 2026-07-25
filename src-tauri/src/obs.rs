@@ -67,6 +67,12 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 static LOG_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
+/// Guards the rejection warning below to once per process: `data_root_from`
+/// is called from every `logs_dir()`/`state_dir()`/`default_root()` call —
+/// unbounded over the process lifetime, including once per breadcrumb write
+/// — not once at startup.
+static WARNED_BAD_DATA_DIR: std::sync::Once = std::sync::Once::new();
+
 /// The `data_root()` decision, taking the env var reading as a parameter so
 /// it's testable without mutating real process env (`std::env::set_var` is
 /// both `unsafe` and cross-thread-global — not worth it for a one-branch
@@ -77,18 +83,23 @@ static LOG_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// failure), so a bad value wouldn't error — it would silently redirect
 /// orchestration state, logs, and tabs into whatever the process's current
 /// working directory happens to be (often a git repo). Falling back to the
-/// platform data dir keeps that failure mode from being silent — the
-/// rejection itself is still logged, see `data_root()`.
+/// platform data dir keeps that failure mode from being silent: the
+/// rejection prints once to stderr (not routed through `breadcrumb()`, which
+/// itself calls back into this function via `logs_dir()` — that would
+/// recurse). The durable, always-checkable record of what root a run actually
+/// used is the `data_root=` startup breadcrumb (`lib.rs`), not this warning.
 fn data_root_from(env_override: Option<std::ffi::OsString>) -> PathBuf {
     if let Some(dir) = &env_override {
         let path = PathBuf::from(dir);
         if !dir.is_empty() && path.is_absolute() {
             return path;
         }
-        eprintln!(
-            "loomux: LOOMUX_DATA_DIR={dir:?} is empty or not an absolute path — ignoring it \
-             and using the platform data dir instead"
-        );
+        WARNED_BAD_DATA_DIR.call_once(|| {
+            eprintln!(
+                "loomux: LOOMUX_DATA_DIR={dir:?} is empty or not an absolute path — ignoring it \
+                 and using the platform data dir instead"
+            );
+        });
     }
     dirs::data_dir()
         .unwrap_or_else(std::env::temp_dir)

@@ -158,6 +158,19 @@ process rather than starting its own), and the harness never touched it —
 the live production instance's own WebView2 process tree was confirmed
 untouched immediately afterward.
 
+A refusal deliberately leaves the process running and its temp data dir in
+place rather than cleaning either up (killing it is exactly the hazard being
+guarded against) — so the thrown error names the pid and the dir path
+explicitly, rather than leaving a silent orphan. It also distinguishes *why*
+no child appeared: a differently-identified (production) instance already
+owning the shared browser process, vs. a previous E2E run's browser process
+that hadn't finished exiting yet — the second case being a known, narrow
+race between specs (WebView2's shared-process model means a not-yet-exited
+previous instance can be joined instead of a new one spawning), which
+teardown now reduces by waiting for both the host process and its WebView2
+child to actually disappear (not just calling `kill()` and moving on) before
+the next spec starts.
+
 ## What E2E can and cannot validate here
 
 Honestly, up front:
