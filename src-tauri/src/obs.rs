@@ -67,18 +67,38 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 static LOG_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// `<user data dir>/loomux/logs`. Falls back to the temp dir when the platform
-/// has no data dir, mirroring `OrchRegistry::default_root` so crash logs and
-/// orchestration state live under the same `loomux/` root.
+/// The `data_root()` decision, taking the env var reading as a parameter so
+/// it's testable without mutating real process env (`std::env::set_var` is
+/// both `unsafe` and cross-thread-global — not worth it for a one-branch
+/// decision when the branch itself can just be a pure function).
+fn data_root_from(env_override: Option<std::ffi::OsString>) -> PathBuf {
+    match env_override {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::data_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("loomux"),
+    }
+}
+
+/// `<user data dir>/loomux` (or `$LOOMUX_DATA_DIR` if set) — the root every
+/// persisted-state singleton (`orchestration/`, `logs/`, `tabs.json`, …) lives
+/// under. A dev instance and a production install share this root by default,
+/// which means they also share `running.lock` and every other singleton in it
+/// (#394); the env override lets a dev/test run point at its own tree instead
+/// — e.g. an isolated profile for E2E runs — without touching the platform
+/// data dir at all.
+pub fn data_root() -> PathBuf {
+    data_root_from(std::env::var_os("LOOMUX_DATA_DIR"))
+}
+
+/// `<data root>/logs`. Mirrors `OrchRegistry::default_root` so crash logs and
+/// orchestration state live under the same root.
 pub fn logs_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = LOG_DIR_OVERRIDE.lock().unwrap().clone() {
         return dir;
     }
-    dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("loomux")
-        .join("logs")
+    data_root().join("logs")
 }
 
 // ---------- timestamps ----------
@@ -341,6 +361,19 @@ mod tests {
         let out = f();
         *LOG_DIR_OVERRIDE.lock().unwrap() = None;
         out
+    }
+
+    #[test]
+    fn data_root_honors_env_override() {
+        let overridden = data_root_from(Some(std::ffi::OsString::from(r"C:\isolated\profile")));
+        assert_eq!(overridden, Path::new(r"C:\isolated\profile"));
+    }
+
+    #[test]
+    fn data_root_falls_back_to_platform_data_dir() {
+        let default = data_root_from(None);
+        assert_eq!(default.file_name().unwrap(), "loomux");
+        assert_ne!(default, Path::new(r"C:\isolated\profile"));
     }
 
     #[test]

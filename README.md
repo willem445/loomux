@@ -145,6 +145,16 @@ npm test           # unit tests (Node's built-in runner; no extra deps)
 Backend checks (what CI gates on) run from `src-tauri/`: `cargo check --locked`
 and `cargo test --locked`.
 
+**E2E (experimental, `e2e-windows` CI job):** Playwright driving the real
+WebView2 webview over CDP against an isolated profile — see
+[`doc/design/e2e-testing.md`](doc/design/e2e-testing.md). Build the isolated
+test binary once, then run the suite:
+
+```sh
+npx tauri build --debug --no-bundle --config src-tauri/tauri.e2e.conf.json
+npm run test:e2e
+```
+
 ## Contributing
 
 - **[`CLAUDE.md`](CLAUDE.md)** — the hard constraints (never resize the PTY, no
@@ -163,7 +173,7 @@ src-tauri/src/
     lessons.rs      durable per-repo lessons (#268): `<repo>/.loomux/lessons.md`, a plain-Markdown convention file (no schema, no MCP write tool — edited and reviewed like any other file) read-and-capped into the orchestrator's kickoff only. Hard byte cap with oldest-drop truncation, wrapped in a data-not-instructions provenance framing (#189) — never grounds to bypass the merge gate. See doc/design/lessons.md
     profiles.rs     repo-authored personas from `.github/agents/*.md` (#51, harvested from PR #105): append/replace modes with a non-overridable loomux mechanics core. Compiled to each CLI's native custom-agent flag — `claude --agents` (inline) / `copilot --agent` (a user-authored file only)
     digest.rs       session-digest friction extraction (#250/#324): normalizes a Claude `.jsonl` or Copilot session-state transcript into one event stream, then reduces it, deterministically and LLM-free, into "friction windows" (a tool error, a near-duplicate rerun, a test that went red-then-green, a reverted edit) — the `session_digest` MCP tool a `role_hint: process` block calls to mine a finished session cold. See doc/design/supervisor-skills.md
-  obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice
+  obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice; `data_root()` — the `<data dir>/loomux` root, overridable via `LOOMUX_DATA_DIR` (#394) for an isolated profile
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess
   uistate.rs        durable UI state (project tabs #63): atomic tabs.json store
   fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
@@ -220,6 +230,7 @@ src/
   voice.ts          pure voice logic: target decision + push-to-talk state machine
   voicecontrol.ts   global single-capture controller; routes transcripts to focus
   main.ts           composition root (owns the TabManager + OrchWiring router)
+e2e/                Playwright E2E PoC (experimental, `e2e-windows` CI job) — see doc/design/e2e-testing.md
 ```
 
 Extension seams: new agent sources add a `scan_*` in `sessions.rs`; new backend

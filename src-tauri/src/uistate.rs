@@ -37,17 +37,13 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// (mirrors `obs::LOG_DIR_OVERRIDE`). `None` in production.
 static STATE_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// `<user data dir>/loomux` — the app-global state root. Falls back to the
-/// system temp dir if the platform can't report a data dir (same degradation as
-/// the orchestration root / logs dir), so persistence is best-effort, never a
-/// hard failure.
+/// The app-global state root (see `obs::data_root`), or the test override
+/// when one is set.
 fn state_dir() -> PathBuf {
     if let Some(dir) = STATE_DIR_OVERRIDE.lock().unwrap().clone() {
         return dir;
     }
-    dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("loomux")
+    crate::obs::data_root()
 }
 
 /// Absolute path of the persisted tab set.
