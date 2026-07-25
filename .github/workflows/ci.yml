@@ -102,24 +102,51 @@ jobs:
       - name: Diagnose WebView2 launch
         shell: pwsh
         run: |
+          Write-Host "--- process integrity level ---"
+          whoami /groups | Select-String "Label"
+
+          Write-Host "--- attempt 1: direct launch (elevated context, if any) ---"
           $env:LOOMUX_DATA_DIR = "$env:RUNNER_TEMP\loomux-diag"
           $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=9999 --disable-gpu"
           $p = Start-Process -FilePath "src-tauri\target\debug\loomux.exe" -PassThru
           Start-Sleep -Seconds 15
-          Write-Host "--- loomux.exe process ---"
           Get-Process -Id $p.Id -ErrorAction SilentlyContinue | Format-List Id,ProcessName,Responding,HasExited
-          Write-Host "--- msedgewebview2.exe processes ---"
-          Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" | Select-Object ProcessId,CommandLine | Format-List
-          Write-Host "--- listening ports ---"
-          netstat -ano | Select-String ":9999|:9333|:9334|:9335|:9336|:9337|:9338"
-          Write-Host "--- CDP endpoint probe ---"
+          netstat -ano | Select-String ":9999"
           try {
             $resp = Invoke-WebRequest -Uri "http://127.0.0.1:9999/json/version" -UseBasicParsing -TimeoutSec 5
-            Write-Host $resp.Content
+            Write-Host "SUCCESS (direct): $($resp.Content)"
           } catch {
-            Write-Host "probe failed: $_"
+            Write-Host "probe failed (direct): $_"
           }
           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
+          # WebView2 Runtime 150+ has a known regression (MicrosoftEdge/WebView2Feedback#5640):
+          # the DevTools/CDP endpoint never opens when the host app runs at High
+          # integrity level. GitHub-hosted windows-latest runs jobs as an admin
+          # account, which is plausibly why attempt 1 above fails while the same
+          # code works on a normal (Medium IL) dev machine. `runas /trustlevel:0x20000`
+          # re-launches at Medium IL without a credential prompt (de-elevating, not
+          # elevating, needs no consent) -- testing whether that's the actual fix.
+          Write-Host "--- attempt 2: de-elevated launch via runas /trustlevel:0x20000 (Medium IL) ---"
+          $launcher = "$env:RUNNER_TEMP\launch.bat"
+          $exePath = (Resolve-Path "src-tauri\target\debug\loomux.exe").Path
+          $dataDir2 = "$env:RUNNER_TEMP\loomux-diag2"
+          @"
+          @echo off
+          set LOOMUX_DATA_DIR=$dataDir2
+          set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9998 --disable-gpu
+          start "" "$exePath"
+          "@ | Set-Content -Path $launcher -Encoding ASCII
+          runas /trustlevel:0x20000 "cmd /c `"$launcher`""
+          Start-Sleep -Seconds 15
+          netstat -ano | Select-String ":9998"
+          try {
+            $resp2 = Invoke-WebRequest -Uri "http://127.0.0.1:9998/json/version" -UseBasicParsing -TimeoutSec 5
+            Write-Host "SUCCESS (de-elevated): $($resp2.Content)"
+          } catch {
+            Write-Host "probe failed (de-elevated): $_"
+          }
+          Get-Process loomux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         continue-on-error: true
 
       - name: Run Playwright E2E suite
