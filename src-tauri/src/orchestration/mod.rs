@@ -10259,8 +10259,11 @@ impl OrchRegistry {
         // #410 (round 6): an arm forced open past `ARM_PENDING_TIMEOUT_MS`
         // without ever reaching a busy-then-quiet resolution — audited
         // distinctly from `to_abandon` (which is specifically a stuck
-        // reinjection DELIVERY, past the arm phase).
-        let mut to_arm_timeout: Vec<(String, String)> = Vec::new();
+        // reinjection DELIVERY, past the arm phase). The `bool` (round 7) is
+        // whether hook evidence was recorded for this arm before it timed
+        // out — see the push site's own doc for why "no evidence" would
+        // misreport a PreCompact-only arm that simply never went quiet.
+        let mut to_arm_timeout: Vec<(String, String, bool)> = Vec::new();
         // #417: audited separately from the pre-existing arm sites — visibility
         // for "this compaction's evidence came from a hook, not a guess" is the
         // whole point of the feature, not incidental.
@@ -10404,26 +10407,49 @@ impl OrchRegistry {
                         // Unconditional on `compact_pending` (unlike the
                         // PreCompact marker above) — this covers a hook config
                         // that only has SessionStart, or a PreCompact marker
-                        // this tick loop missed/raced. If an arm is already
-                        // open (almost always this same one, from the
-                        // PreCompact branch just above), this simply
-                        // (re)confirms trust/busy — inert, never double-arms.
+                        // this tick loop missed/raced.
                         a.compact_hook_sessionstart_seen_ms = Some(ts);
                         let _ = fs::remove_file(&sessionstart_marker);
-                        a.compact_pending = true;
-                        a.compact_pending_trusted = true;
-                        a.compact_seen_busy = true;
-                        a.compact_pending_evidence = Some("hook");
-                        // rev-4 review (N3): the ONLY script branch that
-                        // emits `additionalContext` — see `COMPACT_HOOK_
-                        // SCRIPT`'s `sessionstart-compact` case — so this is
-                        // the one signal that native re-grounding actually
-                        // reached the agent already.
-                        a.compact_hook_native_notice_delivered = true;
-                        if a.compact_pending_armed_ms.is_none() {
-                            a.compact_pending_armed_ms = Some(now);
-                        }
                         to_hook_armed.push((a.id.clone(), a.group.clone(), "sessionstart-compact"));
+                        // Round 7 (live-demo finding): this marker is a
+                        // TERMINAL resolution, not just another arm — resolve
+                        // RIGHT HERE rather than falling through to the
+                        // busy-then-quiet resolver below. Unlike a PreCompact
+                        // marker (proof compaction STARTED — genuinely still
+                        // needs a later quiet observation to know when it's
+                        // done), SessionStart(compact) firing IS proof the
+                        // compaction has ALREADY FINISHED (Claude Code
+                        // restarted the session because of it) AND that
+                        // native `additionalContext` re-grounding already
+                        // reached the agent (the ONLY script branch that
+                        // emits it — see `COMPACT_HOOK_SCRIPT`'s
+                        // `sessionstart-compact` case). There is nothing left
+                        // to confirm: waiting on `currently_quiet` here just
+                        // races `ARM_PENDING_TIMEOUT_MS` against however long
+                        // the agent's own post-compact turn happens to run,
+                        // and loses on any fast compact whose agent keeps
+                        // working continuously afterward — the EXACT shape
+                        // the live incident's audit timeline showed (both
+                        // hook-evidence events landed, N3 suppression was the
+                        // correct call, then `compact-arm-timeout` fired
+                        // anyway at precisely `ARM_PENDING_TIMEOUT_MS` after
+                        // the precompact arm, having never observed a quiet
+                        // tick). This is the missing 6th terminal path
+                        // alongside reinject-confirmed / reinject-abandoned /
+                        // arm-timeout / discard / the old busy-then-quiet-
+                        // gated native-skip (now folded into this one, since
+                        // `compact_hook_native_notice_delivered` can no
+                        // longer be `true` by the time that check would run).
+                        a.compact_pending = false;
+                        a.compact_pending_baseline_tokens = None;
+                        a.compact_pending_baseline_marker_count = None;
+                        a.compact_pending_trusted = false;
+                        a.compact_seen_busy = false;
+                        a.compact_pending_armed_ms = None;
+                        a.compact_pending_evidence = None;
+                        a.compact_hook_native_notice_delivered = false;
+                        a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                        to_hook_native_skip.push((a.id.clone(), a.group.clone()));
                     }
                 }
 
@@ -10509,7 +10535,18 @@ impl OrchRegistry {
                         .compact_pending_armed_ms
                         .is_some_and(|armed_ms| now.saturating_sub(armed_ms) >= ARM_PENDING_TIMEOUT_MS);
                     if armed_too_long {
-                        to_arm_timeout.push((a.id.clone(), a.group.clone()));
+                        // Round 7 (label-honesty finding): a PreCompact-only
+                        // arm (no SessionStart wired — e.g. Copilot, or a
+                        // Claude config missing that one hook) can still
+                        // legitimately hit this bound if the agent's own
+                        // post-compact turn simply never goes quiet within
+                        // `ARM_PENDING_TIMEOUT_MS` — hook evidence WAS
+                        // recorded (see the marker-consumption block above),
+                        // it just wasn't enough on its own to auto-resolve.
+                        // "no evidence" would misreport that case, so the
+                        // reason carries what was actually seen.
+                        let had_hook_evidence = a.compact_pending_evidence == Some("hook");
+                        to_arm_timeout.push((a.id.clone(), a.group.clone(), had_hook_evidence));
                         a.compact_pending = false;
                         a.compact_seen_busy = false;
                         a.compact_pending_baseline_tokens = None;
@@ -10518,7 +10555,9 @@ impl OrchRegistry {
                         a.compact_pending_armed_ms = None;
                         a.compact_pending_evidence = None;
                         a.compact_hook_native_notice_delivered = false;
-                        a.compact_last_lost_reason = Some("arm-timeout".to_string());
+                        a.compact_last_lost_reason = Some(
+                            if had_hook_evidence { "arm-timeout-with-evidence" } else { "arm-timeout" }.to_string(),
+                        );
                         a.compact_last_lost_ms = Some(now);
                         a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
                     } else if currently_quiet {
@@ -10614,25 +10653,21 @@ impl OrchRegistry {
                                 marker_baseline,
                                 marker_current,
                             );
-                        if confirmed && a.compact_hook_native_notice_delivered {
-                            // rev-4 review (N3): Claude Code already delivered
-                            // native `additionalContext` re-grounding for this
-                            // exact compaction (the SessionStart hook fired) —
-                            // loomux's own reinjection would be a SECOND one,
-                            // spending exactly the context tokens native
-                            // delivery exists to save. Resolve straight to a
-                            // terminal state; there is no delivery to confirm.
-                            a.compact_pending = false;
-                            a.compact_pending_baseline_tokens = None;
-                            a.compact_pending_baseline_marker_count = None;
-                            a.compact_pending_trusted = false;
-                            a.compact_seen_busy = false;
-                            a.compact_pending_armed_ms = None;
-                            a.compact_pending_evidence = None;
-                            a.compact_hook_native_notice_delivered = false;
-                            a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
-                            to_hook_native_skip.push((a.id.clone(), a.group.clone()));
-                        } else if confirmed {
+                        // rev-4 review (N3), moved to the SessionStart marker-
+                        // consumption site in round 7: `a.compact_hook_native_
+                        // notice_delivered` can never be `true` here anymore
+                        // — that marker is now a TERMINAL resolution the
+                        // instant it's consumed (see that block's own doc for
+                        // why waiting on `currently_quiet` here was actively
+                        // wrong: it raced `ARM_PENDING_TIMEOUT_MS` against
+                        // however long the agent's post-compact turn ran, and
+                        // lost on any fast compact whose agent kept working —
+                        // the live incident this round fixes). What's left
+                        // here is purely the INFERENCE-arm and PreCompact-
+                        // only-arm path, which still genuinely needs a quiet
+                        // observation to know the compaction (and whatever
+                        // followed it) has settled.
+                        if confirmed {
                             a.compact_pending_baseline_tokens = None;
                             a.compact_pending_baseline_marker_count = None;
                             a.compact_pending_trusted = false;
@@ -10939,10 +10974,11 @@ impl OrchRegistry {
         for (id, group, attempts) in to_abandon {
             self.audit(&group, "loomux", "compact-reinjection-abandoned", json!({ "agent": id, "attempts": attempts }));
         }
-        for (id, group) in to_arm_timeout {
+        for (id, group, had_hook_evidence) in to_arm_timeout {
             self.audit(&group, "loomux", "compact-arm-timeout", json!({
                 "agent": id,
                 "reason": "arm never reached a busy-then-quiet resolution within ARM_PENDING_TIMEOUT_MS",
+                "had_hook_evidence": had_hook_evidence,
             }));
         }
         for (id, group, event) in to_hook_armed {

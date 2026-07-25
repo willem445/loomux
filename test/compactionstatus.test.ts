@@ -54,10 +54,19 @@ test("compactionStatusLabel: reinjecting shows the bounded attempt count", () =>
   );
 });
 
-test("compactionStatusLabel: abandoned names the two real lost-outcome reasons", () => {
+test("compactionStatusLabel: abandoned names the three real lost-outcome reasons", () => {
   assert.equal(
     compactionStatusLabel({ status: "abandoned", reason: "arm-timeout", since_ms: 0 }),
     "compact timed out (no evidence)"
+  );
+  // Round 7: a PreCompact-only hook arm can still legitimately time out if
+  // the agent's own turn never settles — but hook evidence WAS seen, so the
+  // label must say so rather than falsely claiming none was recorded. (A
+  // SessionStart-evidenced arm resolves immediately now and never reaches
+  // "abandoned" at all — see the backend's compact_nudge_tick doc.)
+  assert.equal(
+    compactionStatusLabel({ status: "abandoned", reason: "arm-timeout-with-evidence", since_ms: 0 }),
+    "compact timed out after hook evidence — resolution never observed"
   );
   assert.equal(
     compactionStatusLabel({ status: "abandoned", reason: "reinjection-abandoned", since_ms: 0 }),
@@ -81,6 +90,7 @@ test("compactionStatusTitle: every non-none status has an explanatory tooltip", 
     { status: "awaiting_evidence", trusted: true, source: "hook" },
     { status: "reinjecting", attempt: 1, max_attempts: 3 },
     { status: "abandoned", reason: "arm-timeout", since_ms: 0 },
+    { status: "abandoned", reason: "arm-timeout-with-evidence", since_ms: 0 },
     { status: "abandoned", reason: "reinjection-abandoned", since_ms: 0 },
   ];
   for (const s of statuses) {

@@ -5698,6 +5698,78 @@ fn compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_confirm(
 }
 
 #[test]
+fn compact_nudge_tick_sessionstart_evidence_resolves_even_while_the_pane_is_busy() {
+    // Round 7, the live-demo incident reproduced directly: both hooks fired
+    // for real, N3 suppression correctly held (no reinjection), but the
+    // lifecycle badge then showed "compact timed out (no evidence)" anyway.
+    // Root cause — the SessionStart resolution used to be nested inside
+    // `else if currently_quiet`, so it only took effect on a tick where the
+    // pane happened to show NO growth. A fast compact whose agent keeps
+    // working continuously afterward (this test's shape: real, large output
+    // growth on the SAME tick the marker is consumed) never satisfies that,
+    // and `compact-arm-timeout` fires instead at precisely `ARM_PENDING_
+    // TIMEOUT_MS` after the precompact arm — exactly the incident's audit
+    // timeline. SessionStart evidence must resolve unconditionally: it is
+    // proof the compaction already finished AND that native re-grounding
+    // already reached the agent, so there is nothing left for a quiet
+    // observation to confirm.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    // The pane is BUSY on this exact tick — real growth well past any
+    // activity floor, i.e. `currently_quiet` is false.
+    let busy: HashMap<String, u64> = [(oid.clone(), 500_000u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(1_000, &busy, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "resolves regardless of busy/quiet — there is no confirmation left to wait on");
+    assert_eq!(a.compact_pending_evidence, None);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 0);
+
+    // The agent then keeps being busy for well past ARM_PENDING_TIMEOUT_MS
+    // (5 minutes) — since the arm already resolved, this must never trip
+    // the timeout the incident's audit log showed firing.
+    let still_busy: HashMap<String, u64> = [(oid.clone(), 2_000_000u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(1_000 + 6 * 60_000, &still_busy, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 0, "already resolved — nothing left to time out");
+}
+
+#[test]
+fn compact_nudge_tick_fast_compact_both_hook_events_in_one_poll_gap_resolves_not_abandoned() {
+    // Round 7: the OTHER real-world shape from the same incident — a fast
+    // compaction where both PreCompact and SessionStart markers already
+    // exist by the time loomux's tick loop gets around to polling (a slow
+    // poll cadence, or a compaction fast enough to finish between two
+    // ticks). Both markers land in the SAME `compact_nudge_tick` call: the
+    // PreCompact block arms, then the SessionStart block — running right
+    // after it, same iteration — resolves immediately. Must never leave
+    // `compact_pending` open long enough to reach `ARM_PENDING_TIMEOUT_MS`.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+
+    let precompact_marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    let sessionstart_marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    write_hook_marker(&precompact_marker, started_ms, 1_000);
+    write_hook_marker(&sessionstart_marker, started_ms, 1_000);
+
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "both events land, then resolve, in the SAME tick");
+    assert_eq!(audit_count(&reg, &gid, "compact-hook-evidence"), 2, "both arm events are still individually audited");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 1, "exactly one terminal resolution, not one per event");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0);
+
+    // Ticking well past ARM_PENDING_TIMEOUT_MS must never abandon something
+    // that already resolved.
+    assert!(reg.compact_nudge_tick(1_000 + 6 * 60_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 0);
+}
+
+#[test]
 fn compact_nudge_tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection() {
     // rev-4 review (N3): the fallback half of the same fix. A PreCompact
     // marker with NO SessionStart marker (a hook config that only wires the
@@ -7453,6 +7525,51 @@ fn compact_nudge_tick_times_out_a_stuck_arm_that_never_reaches_a_busy_then_quiet
     assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 1);
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0, "never a reinjection — no compaction was ever confirmed");
     assert_eq!(audit_count(&reg, &gid, "compact-pending-discarded"), 0, "distinct from an ordinary discard — this is a stuck-arm timeout");
+    // Round 7: no hook evidence was ever recorded for this manual-detection
+    // arm, so the plain "no evidence" label is honest here — unlike the
+    // precompact-only case right below, which gets the `-with-evidence`
+    // variant.
+    assert_eq!(reg.agent(&oid).unwrap().compact_last_lost_reason.as_deref(), Some("arm-timeout"));
+}
+
+#[test]
+fn compact_nudge_tick_precompact_only_arm_that_stalls_times_out_labeled_with_evidence() {
+    // Round 7 (label-honesty finding): unlike a SessionStart-evidenced arm
+    // (which now resolves immediately — see the round-7 tests above), a
+    // PreCompact-ONLY arm (no SessionStart wired — e.g. Copilot, or a
+    // Claude config missing that one hook) still genuinely needs a later
+    // quiet observation, and can still legitimately hit `ARM_PENDING_
+    // TIMEOUT_MS` if the agent's own turn simply never settles. Hook
+    // evidence WAS recorded here, so the abandoned reason must say so —
+    // "no evidence" (the plain `arm-timeout` label) would be factually
+    // wrong for this case.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+    // Busy on the arming tick too — otherwise a quiet first observation
+    // would resolve it via reinjection immediately, same as `compact_nudge_
+    // tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection` already
+    // covers; this test wants the genuinely-stuck shape instead.
+    let busy: HashMap<String, u64> = [(oid.clone(), 500_000u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(1_000, &busy, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "precompact arms and waits for quiet");
+    assert_eq!(reg.agent(&oid).unwrap().compact_pending_evidence, Some("hook"));
+
+    // The pane stays BUSY on the next observed tick too — never quiet —
+    // right up through ARM_PENDING_TIMEOUT_MS.
+    let timeout_ms = 5 * 60 * 1000u64;
+    let still_busy: HashMap<String, u64> = [(oid.clone(), 5_000_000u64)].into_iter().collect();
+    let _ = reg.compact_nudge_tick(
+        1_000 + timeout_ms, &still_busy, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "timed out — latch released");
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 1);
+    assert_eq!(
+        reg.agent(&oid).unwrap().compact_last_lost_reason.as_deref(),
+        Some("arm-timeout-with-evidence"),
+        "hook evidence was recorded — the reason must say so, not claim none was seen"
+    );
 }
 
 #[test]

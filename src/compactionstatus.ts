@@ -66,6 +66,13 @@ function lostReasonLabel(reason: string): string {
   switch (reason) {
     case "arm-timeout":
       return "timed out (no evidence)";
+    case "arm-timeout-with-evidence":
+      // Round 7: a PreCompact-only hook arm (no SessionStart wired) can
+      // still legitimately time out if the agent's own turn never settles
+      // — but hook evidence WAS seen, so "no evidence" would be wrong. A
+      // SessionStart-evidenced arm resolves immediately now and never
+      // reaches this label at all — see compact_nudge_tick's own doc.
+      return "timed out after hook evidence — resolution never observed";
     case "reinjection-abandoned":
       return "re-grounding lost";
     default:
@@ -77,6 +84,8 @@ function lostReasonTitle(reason: string): string {
   switch (reason) {
     case "arm-timeout":
       return "an arm never reached a busy-then-quiet resolution within the bound — released so a new compaction can arm";
+    case "arm-timeout-with-evidence":
+      return "a hook confirmed this compaction directly, but the pane never settled within the bound to resolve it — released so a new compaction can arm";
     case "reinjection-abandoned":
       return "a decided reinjection's delivery never confirmed despite retries — released so a new compaction can arm";
     default:
