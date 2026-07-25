@@ -1117,6 +1117,72 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
     );
 }
 
+// ─── round 8: both CLIs' generated agent files against their real schema ───
+
+/// Parse the frontmatter block (between the two `---` delimiters) of a
+/// generated agent file as actual YAML — round 8 review: the pre-round-8
+/// Copilot test coverage only ever checked a `starts_with("---\nname: ...")`
+/// prefix, which happily passed a file missing `description:` entirely (the
+/// live incident: Copilot's own `CustomAgentLoadFailedError: ...
+/// description: Required`). A prefix check proves the file LOOKS like
+/// frontmatter; only an actual parse proves every field a real loader would
+/// require is really there.
+fn parse_agent_frontmatter(generated: &str) -> std::collections::BTreeMap<String, String> {
+    let mut parts = generated.splitn(3, "---\n");
+    assert_eq!(parts.next(), Some(""), "must open with a bare --- line: {generated}");
+    let frontmatter = parts.next().expect("a closing --- must follow: {generated}");
+    serde_norway::from_str(frontmatter)
+        .unwrap_or_else(|e| panic!("frontmatter did not parse as YAML: {e}\n{frontmatter}"))
+}
+
+#[test]
+fn generated_agent_files_satisfy_each_clis_documented_required_frontmatter_fields() {
+    // The exact incident shape, both CLIs, both reproduced via the SAME
+    // no-persona default-roster path the live demo used: GitHub's custom-
+    // agents-configuration reference (docs.github.com/en/copilot/reference/
+    // custom-agents-configuration) requires `description` (not `name`,
+    // which defaults to the filename); Claude's sub-agents doc
+    // (code.claude.com/docs/en/sub-agents, "Supported frontmatter fields")
+    // requires BOTH `name` and `description`. A generated file missing
+    // either must never reach either CLI again.
+    let (reg, d) = test_registry();
+
+    // Claude side.
+    let repo = Repo::new();
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let b = g.guardrails.block("worker").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, None);
+    let inject = reg.persona_inject(&g.id, b, cli, None, &contract);
+    let handle = inject.claude_agent.clone().expect("a generated Claude agent file handle");
+    let generated = fs::read_to_string(d.path().join("claude-agents").join(format!("{handle}.md"))).unwrap();
+    let fm = parse_agent_frontmatter(&generated);
+    assert!(fm.get("name").is_some_and(|v| !v.is_empty()), "Claude requires `name`: {fm:?}");
+    assert!(fm.get("description").is_some_and(|v| !v.is_empty()), "Claude requires `description`: {fm:?}");
+
+    // Copilot side — this is the round-8 live-demo blocker's exact shape: a
+    // default-roster (no persona) orchestrator block on the Copilot CLI.
+    let g2 = reg.create_group(&repo.path(), Guardrails { agent_cli: "copilot".into(), ..rails() }).unwrap();
+    let b2 = g2.guardrails.block_for(Role::Orchestrator).unwrap();
+    let cli2 = workflow::cli_of(b2, &g2.guardrails.agent_cli);
+    let instructions_body2 = instructions_lf(&reg, &g2.id, &b2.instructions_file());
+    let contract2 = block_contract_text(&instructions_body2, None);
+    let inject2 = reg.persona_inject(&g2.id, b2, cli2, None, &contract2);
+    let handle2 = inject2.copilot_agent.clone().expect("a generated Copilot agent file handle");
+    let generated2 = fs::read_to_string(d.path().join("copilot-agents").join(format!("{handle2}.agent.md"))).unwrap();
+    let fm2 = parse_agent_frontmatter(&generated2);
+    assert!(
+        fm2.get("description").is_some_and(|v| !v.is_empty()),
+        "Copilot requires `description` — a missing/empty one is exactly `CustomAgentLoadFailedError: \
+         ... description: Required`, the round-8 live-demo blocker: {fm2:?}"
+    );
+    // `name` is documented optional for Copilot (defaults to the filename) —
+    // loomux still sets it deliberately (harmless, gives a readable display
+    // name), so pin that it's present too, not just tolerated if absent.
+    assert!(fm2.get("name").is_some_and(|v| !v.is_empty()), "{fm2:?}");
+}
+
 // ─────── round #417 correction 6: the argv-length bug and its fix ───────
 
 #[test]

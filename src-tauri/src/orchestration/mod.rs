@@ -14978,11 +14978,24 @@ impl OrchRegistry {
     /// Its handle is unique per group+block so concurrent groups never
     /// collide, and it is rewritten on every spawn (like `write_mcp_
     /// config`) so an edited template/persona applies to the next agent
-    /// without restarting the group. `description` is REQUIRED by Claude's
-    /// own subagent-file schema (unlike Copilot's generated file, which has
-    /// none at all). Returns the `--agent` handle, or `None` when the
-    /// directory can't be created/written (fail-open — the caller falls
-    /// back to `--append-system-prompt-file` rather than failing the spawn).
+    /// without restarting the group. Returns the `--agent` handle, or
+    /// `None` when the directory can't be created/written (fail-open — the
+    /// caller falls back to `--append-system-prompt-file` rather than
+    /// failing the spawn).
+    ///
+    /// Round 8 audit (rev-10 lineage), against Claude Code's own sub-agents
+    /// doc (code.claude.com/docs/en/sub-agents, "Supported frontmatter
+    /// fields"): "Only `name` and `description` are required" — both
+    /// written below, so this was already schema-compliant, not merely
+    /// lenient (unlike Copilot's generated file before this same round —
+    /// see `write_copilot_agent_file`'s doc for that fix). One documented
+    /// difference from Copilot worth naming: the doc states outright "The
+    /// filename doesn't have to match" `name` for Claude — `--agent <name>`
+    /// resolves against the frontmatter field, not the filename stem — the
+    /// opposite of Copilot's filename-keyed resolution. `handle` here is
+    /// both, so the distinction is inert for loomux either way, but it is
+    /// why the Claude and Copilot functions must never be assumed to share
+    /// a resolution rule just because they share a `handle` shape.
     fn write_claude_agent_file(&self, group: &str, block: &workflow::Block, contract: &str, description: &str) -> Option<String> {
         let dir = self.claude_agents_dir()?;
         fs::create_dir_all(&dir).ok()?;
@@ -15016,6 +15029,33 @@ impl OrchRegistry {
     /// the group. Returns the `--agent` handle, or `None` when the directory
     /// can't be created/written (fail-open — the caller falls back to the
     /// pre-#416 kickoff-text path rather than failing the spawn).
+    ///
+    /// Round 8 (live-demo blocker, rev-10 lineage): a Copilot launch failed
+    /// with `CustomAgentLoadFailedError: ... description: Required`. GitHub's
+    /// own custom-agents-configuration reference (docs.github.com/en/copilot/
+    /// reference/custom-agents-configuration) lists exactly two frontmatter
+    /// fields with any required/optional distinction that matters here —
+    /// `description` (**required**) and `name` (optional, defaults to the
+    /// filename if omitted) — everything else (`tools`, `model`,
+    /// `disable-model-invocation`, `user-invocable`, `mcp-servers`,
+    /// `metadata`) is optional and deliberately left unset here so nothing
+    /// silently narrows what the agent can do. `description` never needs to
+    /// be distinctive prose — it is loomux's own bookkeeping label, not
+    /// something a human browses — so it is built deterministically from
+    /// `group`/`block.id` alone: same inputs, byte-identical description,
+    /// every render, forever (no timestamp, no persona text, nothing that
+    /// would make two renders of the same block disagree).
+    ///
+    /// Filename convention, confirmed against the same reference and the
+    /// CLI how-to (docs.github.com/en/copilot/how-tos/copilot-cli/customize-
+    /// copilot/create-custom-agents-for-cli): `--agent <value>` resolves
+    /// against the FILENAME stem (minus `.agent.md`), never the frontmatter
+    /// `name` field — the opposite of Claude's `--agent`, which resolves
+    /// against frontmatter `name` and documents "the filename doesn't have
+    /// to match" (see `write_claude_agent_file`'s doc). `handle` here is
+    /// simultaneously the `--agent` value, the filename stem, and the
+    /// frontmatter `name` — correct for Copilot's filename-keyed resolution,
+    /// and harmless extra information for a field the docs say is optional.
     fn write_copilot_agent_file(&self, group: &str, block: &workflow::Block, contract: &str) -> Option<String> {
         let dir = self.copilot_agents_dir()?;
         fs::create_dir_all(&dir).ok()?;
@@ -15026,8 +15066,16 @@ impl OrchRegistry {
         // further escaping needed for a file body. The frontmatter split in
         // `profiles::parse_profile` only ever looks at the FIRST `\n---`
         // after the opening one, so a `---` line anywhere inside `contract`
-        // itself is inert.
-        let body = format!("---\nname: {handle}\n---\n{contract}\n");
+        // itself is inert. `group`/`block.id` are both loomux-internal
+        // identifiers (sanitized elsewhere), never repo-authored free text,
+        // but `description` is still quoted the same way the Claude path
+        // quotes ITS (persona-sourced) description — cheap, uniform defense
+        // against a stray YAML-significant character either way.
+        let description = format!("loomux {} agent for group {group}", block.id);
+        let body = format!(
+            "---\nname: {handle}\ndescription: {}\n---\n{contract}\n",
+            yaml_double_quoted(&description)
+        );
         let path = dir.join(format!("{handle}.agent.md"));
         fs::write(&path, body).ok()?;
         Some(handle)
