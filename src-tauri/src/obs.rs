@@ -71,13 +71,28 @@ static LOG_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// it's testable without mutating real process env (`std::env::set_var` is
 /// both `unsafe` and cross-thread-global — not worth it for a one-branch
 /// decision when the branch itself can just be a pure function).
+///
+/// An empty or relative override is rejected rather than used as-is: every
+/// consumer of this root treats persistence as best-effort (never a hard
+/// failure), so a bad value wouldn't error — it would silently redirect
+/// orchestration state, logs, and tabs into whatever the process's current
+/// working directory happens to be (often a git repo). Falling back to the
+/// platform data dir keeps that failure mode from being silent — the
+/// rejection itself is still logged, see `data_root()`.
 fn data_root_from(env_override: Option<std::ffi::OsString>) -> PathBuf {
-    match env_override {
-        Some(dir) => PathBuf::from(dir),
-        None => dirs::data_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("loomux"),
+    if let Some(dir) = &env_override {
+        let path = PathBuf::from(dir);
+        if !dir.is_empty() && path.is_absolute() {
+            return path;
+        }
+        eprintln!(
+            "loomux: LOOMUX_DATA_DIR={dir:?} is empty or not an absolute path — ignoring it \
+             and using the platform data dir instead"
+        );
     }
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("loomux")
 }
 
 /// `<user data dir>/loomux` (or `$LOOMUX_DATA_DIR` if set) — the root every
@@ -374,6 +389,18 @@ mod tests {
         let default = data_root_from(None);
         assert_eq!(default.file_name().unwrap(), "loomux");
         assert_ne!(default, Path::new(r"C:\isolated\profile"));
+    }
+
+    #[test]
+    fn data_root_rejects_empty_override() {
+        let result = data_root_from(Some(std::ffi::OsString::from("")));
+        assert_eq!(result.file_name().unwrap(), "loomux", "should fall back, not resolve to CWD");
+    }
+
+    #[test]
+    fn data_root_rejects_relative_override() {
+        let result = data_root_from(Some(std::ffi::OsString::from(r"relative\path")));
+        assert_eq!(result.file_name().unwrap(), "loomux", "should fall back, not resolve to CWD");
     }
 
     #[test]

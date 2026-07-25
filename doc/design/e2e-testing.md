@@ -111,14 +111,52 @@ variable.
 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<N>` is used
 purely to open the CDP port; per Microsoft's docs it is *appended* to the
 options WebView2 was already going to use, so it never fights the
-identifier-driven user-data-folder path above. `WEBVIEW2_USER_DATA_FOLDER`
-(a *different* WebView2 env var that can redirect the user-data folder
-outright) was deliberately **not** used for isolation here — Tauri already
-passes an explicit, non-null `userDataFolder` derived from `identifier` when
-creating the WebView2 environment, and whether an env var can override an
-explicit code-supplied value isn't confirmed by the docs read for this spike.
-The `identifier`-based fix is the one #394's own investigation already named
-as correct, so it's the one this spike relies on for safety.
+identifier-driven user-data-folder path above. (This env var is also the one
+WebView2 Runtime 150+ drops at High integrity level — see "CI status" below —
+but that's a CDP-availability problem, not an isolation problem.)
+
+`WEBVIEW2_USER_DATA_FOLDER` (a *different* WebView2 env var that can redirect
+the user-data folder outright) is deliberately **not** used for isolation
+here, now for a settled reason rather than an open question: it's confirmed
+to override an explicit code-supplied value — and, per the same closed
+WebView2Feedback#5640 thread, to keep working even at High IL, unlike
+`AdditionalBrowserArguments` ("Explicit userDataFolder via
+`WEBVIEW2_USER_DATA_FOLDER=C:\WV2Debug\UDF` … Folder was created and
+populated by WebView2 in both [elevated and non-elevated] cases"). It's not
+used here because using it would erase the one thing `e2e/fixtures.ts`
+verifies before touching anything: the identifier-derived UDF path *is* the
+observable signal that a launched process is really the E2E build and not a
+stale production one (see "Structural isolation verification" below).
+Redirecting it away with `WEBVIEW2_USER_DATA_FOLDER` would trade a real
+safety check for a different (currently unneeded) isolation property.
+
+### Structural isolation verification
+
+The two mechanisms above are real, but a build config is not self-enforcing:
+nothing stops a stale or wrongly-configured build from sitting at the exact
+path `e2e/fixtures.ts` launches by default. If that ever happened, the
+harness would be driving — and, at teardown, hard-killing — whatever's
+actually there, identifier and all, which is precisely the #394 hazard this
+whole design exists to avoid.
+
+So the isolation guarantee isn't asserted, it's checked: before
+`e2e/fixtures.ts` does anything else with a spawned process — before
+connecting Playwright, before any interaction, before any teardown decision —
+`verifyIsolatedBuild` inspects the OS process tree (`Get-CimInstance
+Win32_Process`, filtered to the exact spawned PID's own WebView2 child) and
+confirms its `--user-data-dir` really is rooted at `dev.loomux.e2e`, not
+`dev.loomux.app` or anything else. A mismatch — or no WebView2 child
+appearing at all within the timeout — throws immediately, before the
+`try`/`finally` that would otherwise call `proc.kill()` is even entered. Both
+directions were exercised directly while building this: a correctly-built E2E
+exe passes verification and the suite runs normally; a plain `tauri build
+--debug` (production identifier) sitting at the same path is refused within
+the process-tree check — in that test the second instance's WebView2
+environment creation didn't even spawn a distinguishable child process
+(consistent with #394: a shared UDF means it joined an existing browser
+process rather than starting its own), and the harness never touched it —
+the live production instance's own WebView2 process tree was confirmed
+untouched immediately afterward.
 
 ## What E2E can and cannot validate here
 
@@ -202,89 +240,103 @@ Until that's fixed, cite a local `npx playwright test` full-suite run instead
 and say so explicitly. Building the E2E binary is a real `cargo build`, so
 it's capped the same as any other local build (`-j 4`).
 
-## CI status: currently red, root-caused, not a flake
+## CI status
 
-`e2e-windows` fails on GitHub-hosted `windows-latest` today, and it's been run
-down to a specific, confirmed, upstream cause rather than left as an unknown:
+`e2e-windows` has been run down to a specific, confirmed cause rather than
+left as an unknown — and the cause is **intentional Microsoft hardening**,
+not a bug Microsoft will fix:
 
 - GitHub-hosted `windows-latest` runners execute the job at **High
   integrity level** (confirmed directly: `whoami /groups` in the job prints
   `Mandatory Label\High`). A normal dev machine's shell — where the PoC
   passes 3/3 — runs at Medium IL.
-- WebView2 Runtime 150+ has a **confirmed upstream regression**
-  ([MicrosoftEdge/WebView2Feedback#5640](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5640)):
-  the DevTools/CDP endpoint never opens when the host app runs at High IL.
-  Runtime 149 is the last known-working version; the runner's WebView2 is
-  150.0.4078.65.
+- WebView2 Runtime 150+ **intentionally drops** the `WEBVIEW2_*` env-var and
+  HKCU-policy channels for an elevated (High-IL) host process, as a
+  local-privilege-escalation hardening measure. This is
+  [MicrosoftEdge/WebView2Feedback#5640](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5640) —
+  **closed as completed on 2026-07-09**, sixteen days before this doc was
+  first written; an earlier version of this doc called it a "confirmed
+  upstream regression" and listed "wait for Microsoft to fix it upstream" as
+  a roadmap item, which was wrong on both counts and is corrected here. The
+  Microsoft maintainer's own closing comment:
+
+  > "In Runtime 150 we added a security hardening for scenarios involving an
+  > elevated (High-integrity) host process. To close a local
+  > privilege-escalation gap, WebView2 now ignores command-line switch
+  > overrides and HKCU policy values when read from an elevated process. When
+  > the host is elevated, only HKLM policy and arguments the app passes
+  > directly via the API are honored — the user-writable channels
+  > (`WEBVIEW2_*` environment variables and HKCU) are intentionally dropped.
+  > … This is by design."
+  >
+  > "Fix — switch to a channel that survives elevation: In app code
+  > (preferred): `CoreWebView2EnvironmentOptions.AdditionalBrowserArguments`
+  > … Or via HKLM policy: `HKLM\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`"
+
 - **Verified directly against this job**, not just inferred from the upstream
   report: the built exe launches and runs fine at High IL (`Responding: True`,
   a full `msedgewebview2.exe` process tree spawns — main, crashpad-handler,
   network/storage utility, gpu-process, **and a renderer** — so the app is
   actually rendering), but `netstat` shows no listener on the requested
   `--remote-debugging-port` at all, and an HTTP probe against it gets
-  `ECONNREFUSED`. This rules out a slow-start/timeout explanation (the earlier
-  hypothesis this spike tried first) and a GPU-less-CI-hang explanation
-  (`--disable-gpu` made no difference) — it's specifically the CDP listener
-  that the High-IL regression suppresses.
-- A `runas /trustlevel:0x20000` de-elevation attempt (re-launch the exe at
-  Medium IL from within the High-IL job, which needs no credential prompt
-  since it's lowering privilege) **did not** resolve it in this session's
-  testing. Root cause not fully isolated further — possibly the de-elevated
-  process still can't reach a window station/desktop the High-IL job owns, or
-  `runas /trustlevel` behaves differently in a non-interactive Actions
-  session. Not pursued further within this spike's scope.
+  `ECONNREFUSED`. Matches the maintainer's description exactly: the switch
+  reaches the WebView2 loader (it's still `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`,
+  a dropped channel) and is silently ignored, not erroring and not hanging on
+  anything GPU-related (`--disable-gpu` made no difference, ruling out that
+  earlier hypothesis).
+- **Fix applied**: `ci.yml` sets the HKLM policy value Microsoft names —
+  `HKLM\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`
+  — before launching, a machine-wide registry write on the ephemeral runner
+  VM (CI-only, nothing in product code, nothing to clean up since the VM is
+  destroyed after the job regardless).
+  <!-- RESULT: fill in after observing the CI run with this policy applied. -->
+- A `runas /trustlevel:0x20000` de-elevation attempt (tried before the by-design
+  root cause was found, back when this looked like it might be a
+  window-station/desktop-access issue) did not resolve it — expected in
+  hindsight, since de-elevating the *process* doesn't change which policy
+  channels WebView2 itself honors.
 
-This is why `e2e-windows` stays `continue-on-error: true` — a red run here is
-the runner's execution context, not signal about the change under test, and
-must never block a PR. This is different from an ordinary "flaky test"
-situation: there's nothing non-deterministic to wait out or retry away. Fixing
-it for real needs one of (roadmap, not done in this spike):
+`e2e-windows` stays `continue-on-error: true` regardless of the above result —
+even once green, a brand-new job earns its way off `continue-on-error` with a
+track record, not on day one. What's now fixed is the roadmap: "wait for
+Microsoft" was never a real option (the maintainer explicitly won't change
+by-design behavior), so the real paths are:
 
-1. A **self-hosted Windows runner** for this one job, running as a normal
-   (Medium IL) user — the straightforward fix, at the cost of infra to
-   maintain.
-2. Wait for Microsoft to fix #5640 upstream.
+1. **The HKLM policy above**, if it's confirmed working.
+2. A **self-hosted Windows runner** for this one job, running as a normal
+   (Medium IL) user, if (1) doesn't hold up.
 3. ~~Pin the E2E build's WebView2 to Fixed Version 149~~ — **investigated and
-   ruled out, not just deferred.** Verified directly against Microsoft's own
-   distribution docs and download page, not assumed:
-   - [Distribute your app and the WebView2 Runtime](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution)
-     confirms the mechanism would work in principle: `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`
-     is an *override* — quoting the reference docs exactly, "use the
-     `browserExecutableFolder` … values as replacements for the corresponding
-     values in `CreateCoreWebView2EnvironmentWithOptions` parameters" — not
-     merely a fallback for when the host app passes nothing, so it would
-     redirect Tauri/wry's environment creation to a Fixed Version folder
-     regardless of what Tauri itself passes.
-   - But the same doc states downloads are only kept for "the most-patched
-     version of the **latest and second-latest major releases**." Fetching
-     Microsoft's live download page
+   ruled out on two independent grounds, not just deferred.**
+   - It would not have worked even if a pre-150 build were available:
+     `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` is a `WEBVIEW2_*` environment
+     variable, and per the maintainer's own closing comment quoted above,
+     that whole channel is dropped at High IL — the exact same restriction
+     blocking `AdditionalBrowserArguments`. (An earlier version of this
+     section argued the opposite, that `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`
+     "would mechanically work" because it *replaces* rather than merely
+     supplements the value passed in code — true as a general statement
+     about the override's semantics, verified from
+     [the WebView2 environment-variables reference](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl?view=webview2-1.0.3719.77)
+     (misattributed in that earlier version to the *Distribution* page,
+     which doesn't contain that sentence — corrected here), but beside the
+     point once High IL drops the env var before it ever reaches that
+     override logic.)
+   - Independently: Microsoft only keeps Fixed Version downloads for the
+     latest and second-latest major releases (confirmed on
+     [the Distribution page](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution)),
+     and the live download page
      ([developer.microsoft.com/microsoft-edge/webview2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section))
-     during this investigation showed only **150.0.4078.99** as the Fixed
-     Version on offer — the *same* major as the regression, not the
-     last-known-good 149.x. Runtime 149 has already rolled off Microsoft's
-     own download window by the time this was checked, presumably because
-     Edge's ~4-week major-version cadence moved the "latest/second-latest"
-     window past it. Pinning to 150 Fixed Version would just reproduce the
-     exact same bug — there is nothing to pin to.
-   - Separately (and moot given the above, but worth recording): Tauri 2's
-     own config reference ([v2.tauri.app/reference/config](https://v2.tauri.app/reference/config/))
-     has **no** `webviewFixedRuntimePath`/fixed-runtime field — only
-     `bundle.windows.minimumWebview2Version` and `webviewInstallMode` (which
-     govern *installing* the Evergreen runtime, not redirecting environment
-     creation to a Fixed Version folder). Wiring this up would've meant
-     setting `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` by hand in the CI job — an
-     env var Tauri doesn't manage for this purpose in v2, contrary to an
-     unverified secondhand claim about Tauri v1 behavior that didn't hold up
-     against the actual v2 docs.
-   - Even if a working pre-150 build were found some other way (an
-     unofficial mirror, unsuitable for a CI supply chain), the same
-     "Runtime rolls off the download window every ~4 weeks" problem the
-     upstream reporter called "not sustainable long-term" would apply from
-     day one, not eventually.
+     offered only 150.0.4078.99 — the same major as the by-design change —
+     when checked. There would have been nothing to pin to either way.
+   - Tauri 2's own config reference has no `webviewFixedRuntimePath` field
+     (only `bundle.windows.minimumWebview2Version`/`webviewInstallMode`,
+     which govern installing Evergreen, not redirecting to a Fixed Version
+     folder) — a Tauri v1 claim that didn't hold up against the v2 docs, moot
+     given the above either way.
 
-Until (1) or (2) lands, treat `e2e-windows` red as expected, and rely on a
-local run (`npx playwright test` against the isolated profile) as this
-suite's actual signal.
+Until (1) or (2) is confirmed durable, treat `e2e-windows` red as possible and
+rely on a local run (`npx playwright test` against the isolated profile) as
+this suite's actual signal.
 
 ## Roadmap
 
@@ -293,8 +345,16 @@ suite's actual signal.
 - Add `data-testid` attributes to the highest-churn selectors (pane header,
   launcher form fields, overlay roots) so specs stop depending on class names
   and label text.
-- Parallelize (currently `workers: 1` — see `playwright.config.ts`) by
-  allocating a CDP port per worker instead of a fixed one.
+- Parallelize (currently `workers: 1` — see `playwright.config.ts`). Port
+  contention is not the blocker (a fixed port is simplest given `workers: 1`
+  has no contention to avoid today, and CI needs one static value to match
+  its HKLM policy regardless); the real blocker is that every E2E instance
+  shares one Tauri identifier, so concurrent workers would share a WebView2
+  browser process with each other. `WEBVIEW2_USER_DATA_FOLDER` is confirmed
+  to survive elevation and could isolate workers from each other, but doing
+  so would break `verifyIsolatedBuild`'s identifier-based verification (see
+  "Structural isolation verification") — parallelizing safely needs a way to
+  do both at once, e.g. a distinct identifier per worker.
 - The argv-length launch failure from the originating session is a strong
   E2E-shaped candidate (spawn with a long argv, assert the pane reaches a
   running state rather than an error) but wasn't one of this spike's three

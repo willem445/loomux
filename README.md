@@ -155,6 +155,12 @@ npx tauri build --debug --no-bundle --config src-tauri/tauri.e2e.conf.json
 npm run test:e2e
 ```
 
+**Environment variables:**
+
+| Variable | Effect |
+| --- | --- |
+| `LOOMUX_DATA_DIR` | Redirects the **entire** app-data root (`orchestration/`, `logs/`, `tabs.json`, `running.lock` — everything normally under `<platform data dir>/loomux`) to the given **absolute** path. Empty or relative values are rejected and ignored (falls back to the platform default) rather than silently resolving against the current working directory. Use it to run a second, fully isolated loomux profile side by side with a normal install — the E2E harness (`e2e/fixtures.ts`) is one example, not the only one. |
+
 ## Contributing
 
 - **[`CLAUDE.md`](CLAUDE.md)** — the hard constraints (never resize the PTY, no

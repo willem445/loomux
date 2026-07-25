@@ -10,26 +10,101 @@
 //   `identifier` override (`dev.loomux.e2e`, vs the product's
 //   `dev.loomux.app`). WebView2 keys its user-data folder (and thus its
 //   *shared browser process*, see #394) off that identifier, so a
-//   differently-identified build can never share — or hard-kill — a running
-//   production instance's WebView2 process, regardless of how this harness
-//   tears the process down.
-// Never point LOOMUX_E2E_EXE at an installed/production build.
+//   differently-identified build can never share a running production
+//   instance's WebView2 process.
+// Deliberately NOT also setting `WEBVIEW2_USER_DATA_FOLDER` to redirect the
+// user-data folder further: it's confirmed to survive elevation
+// (MicrosoftEdge/WebView2Feedback#5640: "Folder was created and populated by
+// WebView2 in both [elevated and non-elevated] cases", unlike
+// `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`), which would make it a candidate
+// for isolating concurrent E2E workers from each other in the future — but it
+// would also replace the identifier-derived path this file verifies below,
+// destroying the one observable signal that distinguishes an E2E build from
+// a stale production one. Not used here for that reason (see doc/design/
+// e2e-testing.md's roadmap on parallelization).
+//
+// None of the above is asserted and trusted blindly: `verifyIsolatedBuild`
+// below checks, from the OS process tree (not from the app's own claims),
+// that the WebView2 child process our spawn actually produced is really
+// running under the E2E identifier before anything drives or tears it down —
+// a stale/mismatched build at the default exe path is refused loudly instead
+// of silently driven and hard-killed.
 import { test as base, chromium, type Page } from "@playwright/test";
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_EXE = path.resolve(__dirname, "../src-tauri/target/debug/loomux.exe");
 const EXE = process.env.LOOMUX_E2E_EXE ?? DEFAULT_EXE;
 
-// One CDP port per worker so parallel workers (if ever enabled) don't race on
-// the same debugging endpoint.
-function cdpPort(workerIndex: number): number {
-  return 9333 + workerIndex;
+// Must match `identifier` in src-tauri/tauri.e2e.conf.json.
+const EXPECTED_IDENTIFIER = "dev.loomux.e2e";
+
+// A single fixed port, not one per worker: `workers: 1` (playwright.config.ts)
+// means there's never real port contention to avoid, and on CI the port is
+// additionally constrained by the HKLM policy value ci.yml sets (WebView2
+// Runtime 150+ drops the env-var channel at High integrity level —
+// MicrosoftEdge/WebView2Feedback#5640 — so the port has to be the SAME fixed
+// value the policy names, not something computed per worker/retry). See
+// doc/design/e2e-testing.md's roadmap on parallelization for what would
+// actually need to change to make per-worker ports meaningful again.
+const CDP_PORT = Number(process.env.LOOMUX_E2E_CDP_PORT ?? 9333);
+
+/** The command line of the WebView2 "browser process" our spawned `pid`
+ *  produced (its direct child, per WebView2's process model), or `null` if
+ *  none has appeared yet. */
+async function webview2ChildCommandLine(pid: number): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync("powershell", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter "ParentProcessId=${pid} AND Name='msedgewebview2.exe'" | Select-Object -First 1 -ExpandProperty CommandLine)`,
+    ]);
+    const line = stdout.trim();
+    return line.length > 0 ? line : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Confirms — from the OS process tree, not from anything the app itself
+ *  claims — that `pid` really did launch a WebView2 browser process rooted at
+ *  the E2E identifier's user-data folder before we do anything else with it.
+ *  Throws (without touching the process) on any mismatch or timeout: refusing
+ *  loudly beats silently driving, then hard-killing, whatever is actually at
+ *  that path (a stale/production-identifier build shares a WebView2 browser
+ *  process with a real running instance — see #394 — so a hard-kill of a
+ *  misidentified process is the exact hazard this guards against). */
+async function verifyIsolatedBuild(pid: number, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const cmdLine = await webview2ChildCommandLine(pid);
+    if (cmdLine) {
+      if (!cmdLine.includes(`\\${EXPECTED_IDENTIFIER}\\`)) {
+        throw new Error(
+          `refusing to drive or tear down this process: its WebView2 child is not running under ` +
+            `the expected E2E identifier ("${EXPECTED_IDENTIFIER}"). This exe was NOT built with the ` +
+            `E2E config, or a stale build is sitting at ${EXE}. Rebuild with:\n` +
+            `  npx tauri build --debug --no-bundle --config src-tauri/tauri.e2e.conf.json\n` +
+            `Observed WebView2 command line:\n${cmdLine}`
+        );
+      }
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error(
+    `no WebView2 child process appeared under pid ${pid} within ${timeoutMs}ms — cannot verify ` +
+      `it's the E2E build. Refusing to proceed.`
+  );
 }
 
 async function connectWithRetry(
@@ -62,9 +137,22 @@ async function connectWithRetry(
   );
 }
 
+/** `fs.rmSync` with retries: a WebView2 child process can hold a handle under
+ *  `dir` for a moment after `proc.kill()` returns (kill is fire-and-forget,
+ *  not "and it's gone"), which raises EPERM/EBUSY — `force` alone only
+ *  swallows ENOENT. Never let a teardown-cleanup error mask the test's real
+ *  failure. */
+function rmSafely(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch (err) {
+    console.error(`[e2e/fixtures] failed to remove temp dir ${dir}: ${String(err)}`);
+  }
+}
+
 export const test = base.extend<{ appPage: Page }>({
   // eslint-disable-next-line no-empty-pattern
-  appPage: async ({}, use, testInfo) => {
+  appPage: async ({}, use) => {
     if (!fs.existsSync(EXE)) {
       throw new Error(
         `loomux exe not found at ${EXE} — build it first with:\n` +
@@ -72,19 +160,20 @@ export const test = base.extend<{ appPage: Page }>({
       );
     }
 
-    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "loomux-e2e-"));
-    const port = cdpPort(testInfo.workerIndex);
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "loomux-e2e-data-"));
 
     const proc: ChildProcess = spawn(EXE, [], {
       env: {
         ...process.env,
         LOOMUX_DATA_DIR: dataDir,
-        // --disable-gpu: on a CI runner with no real GPU/driver, WebView2's
-        // Chromium renderer can hang indefinitely during GPU-process init
-        // instead of erroring — the exact symptom seen on windows-latest
-        // (process alive the whole timeout, zero output, CDP port never
-        // opens). Forces software rendering instead.
-        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --disable-gpu`,
+        // Only takes effect at Medium integrity level (a normal dev machine):
+        // WebView2 Runtime 150+ drops this env var at High IL as LPE hardening
+        // (MicrosoftEdge/WebView2Feedback#5640) — the CI job sets an HKLM
+        // policy with the same port instead (ci.yml), which survives
+        // elevation. Harmless to also set this locally; --disable-gpu is a
+        // no-op safety margin for a GPU-less CI box, unrelated to the High-IL
+        // issue.
+        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${CDP_PORT} --disable-gpu`,
       },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: false,
@@ -98,23 +187,39 @@ export const test = base.extend<{ appPage: Page }>({
       output.stderr += `\n[spawn error] ${String(err)}`;
     });
 
+    if (proc.pid === undefined) {
+      throw new Error("spawn() returned no pid — the process never started");
+    }
+    // Verify BEFORE anything else touches this process — including before the
+    // CDP connect attempt below, and definitely before the `finally` block's
+    // teardown decides whether a kill is safe.
+    await verifyIsolatedBuild(proc.pid);
+
+    // Reaching here means verifyIsolatedBuild already confirmed this
+    // process's WebView2 browser process is rooted at the E2E identifier's
+    // own user-data folder, which nothing else shares (see module doc) — so
+    // the unconditional `proc.kill()` in `finally` below is known-safe. A
+    // mismatched build throws (above) before any of this runs, so it's never
+    // driven and never killed.
     try {
-      const browser = await connectWithRetry(`http://127.0.0.1:${port}`, proc, output);
-      const context = browser.contexts()[0] ?? (await browser.waitForEvent("context"));
-      const page = context.pages()[0] ?? (await context.waitForEvent("page"));
-      await page.waitForSelector("#tab-bar", { state: "attached", timeout: 30_000 });
-      await page.waitForSelector("#workspace-stack .pane, #workspace-stack .welcome-form", {
-        timeout: 30_000,
-      });
+      const browser = await connectWithRetry(`http://127.0.0.1:${CDP_PORT}`, proc, output);
+      try {
+        const context = browser.contexts()[0] ?? (await browser.waitForEvent("context"));
+        const page = context.pages()[0] ?? (await context.waitForEvent("page"));
+        await page.waitForSelector("#tab-bar", { state: "attached", timeout: 30_000 });
+        await page.waitForSelector("#workspace-stack .pane, #workspace-stack .welcome-form", {
+          timeout: 30_000,
+        });
 
-      await use(page);
-
-      await browser.close();
+        await use(page);
+      } finally {
+        // `browser` came from connectOverCDP, so close() disconnects rather
+        // than terminates — always safe to call, success or failure.
+        await browser.close().catch(() => {});
+      }
     } finally {
-      // A hard kill here only ever tears down THIS isolated identifier's
-      // WebView2 browser process (see module doc) — never a shared one.
       proc.kill();
-      fs.rmSync(dataDir, { recursive: true, force: true });
+      rmSafely(dataDir);
     }
   },
 });

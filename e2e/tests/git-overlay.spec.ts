@@ -37,11 +37,21 @@ test("the git-view overlay docks visibly over its pane and is interactive", asyn
   expect(overlayBox!.x + overlayBox!.width).toBeLessThanOrEqual(paneBox!.x + paneBox!.width + 1);
 
   // Interactive, not just painted: it loaded real commit history for the repo
-  // the pane is rooted in, and clicking a row is live (selects it).
+  // the pane is rooted in, and clicking a row is live (moves selection).
+  // The FIRST row starts pre-selected on open (GitView's own initial-selection
+  // behavior — either the working-tree row or `commits[0]`, per src/gitview.ts),
+  // so asserting the first row gains `.selected` after clicking it is true
+  // whether or not the click did anything. Click the SECOND row instead: only
+  // a real, live click can move selection off the first row and onto it.
   const firstRow = overlay.locator(".git-row").first();
+  const secondRow = overlay.locator(".git-row").nth(1);
   await expect(firstRow).toBeVisible({ timeout: 10_000 });
-  await firstRow.click();
+  await expect(secondRow).toBeVisible();
   await expect(firstRow).toHaveClass(/selected/);
+
+  await secondRow.click();
+  await expect(secondRow).toHaveClass(/selected/);
+  await expect(firstRow).not.toHaveClass(/selected/);
 
   await pane.locator('.pane-btn[title^="Git view"]').click();
   await expect(overlay).toBeHidden();

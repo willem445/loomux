@@ -6,9 +6,18 @@ import { defineConfig } from "@playwright/test";
 // client, not a downloaded Chromium, so there's nothing to `playwright
 // install` here.
 //
-// Single worker: each test launches its own loomux.exe against its own
-// isolated profile (e2e/fixtures.ts), but they'd otherwise contend for a
-// fixed CDP port. Parallelizing across ports is a follow-up, not a PoC need.
+// Single worker: every E2E instance shares one Tauri identifier
+// (tauri.e2e.conf.json), and WebView2 keys its browser process off that
+// identifier (#394) — so concurrent instances would share a browser process
+// with EACH OTHER, not just with a production install. A fixed CDP port
+// (e2e/fixtures.ts) is a symptom of the same constraint, not the cause: it's
+// fixed because the CI job's HKLM policy workaround for WebView2 150+'s
+// High-IL env-var restriction (WebView2Feedback#5640) needs one static value,
+// not because ports themselves are scarce. Real parallelization needs
+// per-worker identifiers or an isolation mechanism that survives High IL
+// (WEBVIEW2_USER_DATA_FOLDER does — see e2e/fixtures.ts's module doc — but
+// using it would break the identifier-based build verification that same
+// file performs). See doc/design/e2e-testing.md's roadmap.
 export default defineConfig({
   testDir: "./e2e/tests",
   // CI runners are slower to first-open the CDP port than a dev machine

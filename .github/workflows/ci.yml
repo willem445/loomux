@@ -94,19 +94,34 @@ jobs:
       - name: Build app (E2E identifier, unbundled debug build)
         run: npx tauri build --debug --no-bundle --config src-tauri/tauri.e2e.conf.json
 
-      # Known-broken on this runner as of this writing (doc/design/e2e-testing.md
-      # "CI status" section): GitHub-hosted windows-latest runs jobs at High
-      # integrity level, and WebView2 Runtime 150+ has a confirmed upstream
-      # regression (MicrosoftEdge/WebView2Feedback#5640) where the CDP/DevTools
-      # endpoint never opens for a High-IL host process. Verified directly
-      # against this exact job: the app launches and renders fine (a full
-      # msedgewebview2.exe process tree spawns, including a renderer), but the
-      # requested --remote-debugging-port never starts listening. A
-      # `runas /trustlevel:0x20000` de-elevation attempt did not resolve it
-      # either. This is why the job stays continue-on-error — it is not this
-      # suite's own flakiness, it is the runner's execution context.
+      # GitHub-hosted windows-latest runs jobs at High integrity level, and
+      # WebView2 Runtime 150+ intentionally drops the WEBVIEW2_* env-var and
+      # HKCU-policy channels for an elevated host process as local-privilege-
+      # escalation hardening — by design, not a bug
+      # (MicrosoftEdge/WebView2Feedback#5640, closed as completed 2026-07-09;
+      # see doc/design/e2e-testing.md "CI status"). The one channel Microsoft
+      # names as surviving elevation is an HKLM policy — set it here, machine-
+      # wide, before launching: this is CI-only config on an ephemeral runner
+      # VM, nothing in product code, and nothing to clean up (the VM is
+      # destroyed after the job regardless). Must match e2e/fixtures.ts's
+      # `CDP_PORT` default (LOOMUX_E2E_CDP_PORT if overridden).
+      - name: Set WebView2 HKLM policy (survives High-IL, unlike the env var)
+        shell: pwsh
+        run: |
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2" `
+            -Name "AdditionalBrowserArguments" -Value "--remote-debugging-port=9333 --disable-gpu" -Type String
+
       - name: Run Playwright E2E suite
         run: npx playwright test
+
+      # If the suite above failed, surface WHY in the job output itself — not
+      # just in a comment nobody reading the failed run sees. See
+      # doc/design/e2e-testing.md "CI status" for the full writeup.
+      - name: Explain an expected-red run
+        if: failure()
+        run: |
+          echo "::warning::e2e-windows failed. If this is the known High-IL WebView2 CDP restriction (not your change), see doc/design/e2e-testing.md 'CI status' for the root cause, citations, and what was tried (HKLM policy above, runas de-elevation). This job is continue-on-error and does not gate merges."
         env:
           LOOMUX_E2E_EXE: ${{ github.workspace }}\src-tauri\target\debug\loomux.exe
 

@@ -115,12 +115,14 @@ status. The `e2e-windows` job is a fourth platform in the same sense as the
 ubuntu/windows/macos matrix above — it's CI's job to run the full suite, not
 yours. It also runs `continue-on-error: true`, so it never blocks the merge
 gate the way the three build/test jobs do; don't read a red `e2e-windows` the
-same way as a red `build` job. As of this writing it fails on **every** run
-for a root-caused, non-flaky reason: GitHub-hosted `windows-latest` executes
-the job at High integrity level, and WebView2 Runtime 150+ has a confirmed
-upstream regression (MicrosoftEdge/WebView2Feedback#5640) that blocks the
-CDP/DevTools endpoint at High IL. See the design doc's "CI status" section
-before assuming a red `e2e-windows` means anything about your change.
+same way as a red `build` job. GitHub-hosted `windows-latest` executes the job
+at High integrity level, and WebView2 Runtime 150+ intentionally drops the
+`WEBVIEW2_*` env-var channel for an elevated host process as by-design
+local-privilege-escalation hardening (MicrosoftEdge/WebView2Feedback#5640,
+closed as completed — not a bug Microsoft will fix) — `ci.yml` works around
+it with the HKLM policy Microsoft names as the supported alternative. See the
+design doc's "CI status" section for whether that's confirmed working before
+assuming a red `e2e-windows` means anything about your change.
 
 Locally, PoC-level smoke only, and only against the isolated E2E profile —
 never against a real install:
