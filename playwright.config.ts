@@ -11,7 +11,10 @@ import { defineConfig } from "@playwright/test";
 // fixed CDP port. Parallelizing across ports is a follow-up, not a PoC need.
 export default defineConfig({
   testDir: "./e2e/tests",
-  timeout: 60_000,
+  // CI runners are slower to first-open the CDP port than a dev machine
+  // (e2e/fixtures.ts itself waits up to 60s for that) — leave headroom above
+  // that plus the post-connect page-ready waits.
+  timeout: 120_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,
   workers: 1,

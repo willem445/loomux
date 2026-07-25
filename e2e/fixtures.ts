@@ -32,9 +32,23 @@ function cdpPort(workerIndex: number): number {
   return 9333 + workerIndex;
 }
 
-async function connectWithRetry(url: string, attempts = 40): Promise<Awaited<ReturnType<typeof chromium.connectOverCDP>>> {
+async function connectWithRetry(
+  url: string,
+  proc: ChildProcess,
+  output: { stdout: string; stderr: string },
+  timeoutMs = 60_000
+): Promise<Awaited<ReturnType<typeof chromium.connectOverCDP>>> {
+  const deadline = Date.now() + timeoutMs;
   let lastErr: unknown;
-  for (let i = 0; i < attempts; i++) {
+  while (Date.now() < deadline) {
+    // A dead process will never open the port — fail fast with whatever it
+    // printed instead of burning the rest of the timeout on retries.
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      throw new Error(
+        `loomux.exe exited early (code=${proc.exitCode} signal=${proc.signalCode}) before opening ` +
+          `the CDP port.\n--- stdout ---\n${output.stdout}\n--- stderr ---\n${output.stderr}`
+      );
+    }
     try {
       return await chromium.connectOverCDP(url);
     } catch (err) {
@@ -42,7 +56,10 @@ async function connectWithRetry(url: string, attempts = 40): Promise<Awaited<Ret
       await new Promise((r) => setTimeout(r, 500));
     }
   }
-  throw new Error(`could not connect to WebView2 CDP endpoint at ${url}: ${String(lastErr)}`);
+  throw new Error(
+    `could not connect to WebView2 CDP endpoint at ${url} within ${timeoutMs}ms: ${String(lastErr)}\n` +
+      `--- stdout ---\n${output.stdout}\n--- stderr ---\n${output.stderr}`
+  );
 }
 
 export const test = base.extend<{ appPage: Page }>({
@@ -64,12 +81,20 @@ export const test = base.extend<{ appPage: Page }>({
         LOOMUX_DATA_DIR: dataDir,
         WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
       },
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "pipe"],
       windowsHide: false,
+    });
+    const output = { stdout: "", stderr: "" };
+    proc.stdout?.on("data", (d: Buffer) => (output.stdout += d.toString()));
+    proc.stderr?.on("data", (d: Buffer) => (output.stderr += d.toString()));
+    // A spawn failure (e.g. bad EXE path) emits 'error' async; without a
+    // listener Node treats it as unhandled and crashes the whole worker.
+    proc.on("error", (err) => {
+      output.stderr += `\n[spawn error] ${String(err)}`;
     });
 
     try {
-      const browser = await connectWithRetry(`http://127.0.0.1:${port}`);
+      const browser = await connectWithRetry(`http://127.0.0.1:${port}`, proc, output);
       const context = browser.contexts()[0] ?? (await browser.waitForEvent("context"));
       const page = context.pages()[0] ?? (await context.waitForEvent("page"));
       await page.waitForSelector("#tab-bar", { state: "attached", timeout: 30_000 });
