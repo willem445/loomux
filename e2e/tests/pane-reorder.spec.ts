@@ -22,25 +22,54 @@ test("dragging a pane onto another's center swaps their on-screen order", async 
   expect(boxB1, "Pane B should have a bounding box").not.toBeNull();
   const aWasLeftOfB = boxA1!.x < boxB1!.x;
 
-  // Playwright's own `dragTo` (hover source -> mouse down -> move to target in
-  // steps, with actionability waits at each phase -> mouse up), rather than a
-  // hand-rolled mouse.move/down/up sequence: two attempts at hand-timed pauses
-  // around a manual sequence still failed to register the drop reliably on a
-  // CI runner (passed 100% locally every time) even though every individual
-  // mouse.* call completed without error per the failing run's trace — the
-  // sequence "worked" but the app-side drag state never armed/committed.
-  // `dragTo`'s built-in waits are more conservative than fixed pauses.
+  // Instrumentation for the CI-only failure this spec has hit twice now (a
+  // hand-rolled mouse sequence, then Playwright's own `dragTo` — both
+  // complete with zero API-level errors, at correct coordinates per the
+  // failure screenshots, but the swap never happens). Records every
+  // pointerdown/move/up the window actually receives during the drag so a
+  // third failure is diagnosable from the CI log directly instead of another
+  // guess-and-push round.
+  await page.evaluate(() => {
+    const events: unknown[] = [];
+    (window as unknown as { __e2eDrag: unknown[] }).__e2eDrag = events;
+    for (const type of ["pointerdown", "pointermove", "pointerup"]) {
+      window.addEventListener(
+        type,
+        (e) => {
+          const pe = e as PointerEvent;
+          const target = pe.target as HTMLElement | null;
+          events.push({
+            type,
+            x: pe.clientX,
+            y: pe.clientY,
+            targetClass: target?.className ?? null,
+          });
+        },
+        true
+      );
+    }
+  });
+
   await paneB.locator(".pane-header").dragTo(paneA);
 
-  await expect
-    .poll(
-      async () => {
-        const a = await paneA.boundingBox();
-        const b = await paneB.boundingBox();
-        if (!a || !b) return null;
-        return a.x < b.x;
-      },
-      { timeout: 15_000 }
-    )
-    .toBe(!aWasLeftOfB);
+  try {
+    await expect
+      .poll(
+        async () => {
+          const a = await paneA.boundingBox();
+          const b = await paneB.boundingBox();
+          if (!a || !b) return null;
+          return a.x < b.x;
+        },
+        { timeout: 15_000 }
+      )
+      .toBe(!aWasLeftOfB);
+  } catch (err) {
+    const events = await page.evaluate(
+      () => (window as unknown as { __e2eDrag: unknown[] }).__e2eDrag
+    );
+    // eslint-disable-next-line no-console
+    console.log("DRAG_DIAGNOSTIC", JSON.stringify(events));
+    throw err;
+  }
 });
