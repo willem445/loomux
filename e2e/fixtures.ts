@@ -79,7 +79,12 @@ export const test = base.extend<{ appPage: Page }>({
       env: {
         ...process.env,
         LOOMUX_DATA_DIR: dataDir,
-        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
+        // --disable-gpu: on a CI runner with no real GPU/driver, WebView2's
+        // Chromium renderer can hang indefinitely during GPU-process init
+        // instead of erroring — the exact symptom seen on windows-latest
+        // (process alive the whole timeout, zero output, CDP port never
+        // opens). Forces software rendering instead.
+        WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --disable-gpu`,
       },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: false,
