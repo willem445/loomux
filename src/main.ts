@@ -1161,9 +1161,18 @@ async function restoreSession(s: SessionInfo): Promise<void> {
         showFatal(message);
         return;
       }
+      // #412 rev-17 NB4: an orchestrator has no task brief to "keep the same" —
+      // start-fresh re-boots its control plane on the group's EXISTING board/
+      // roster/gate (never a re-read of the repo's workflow file — see
+      // create_orchestration_group's Launch::Resume contract), a worker/
+      // reviewer's start-fresh reuses its recorded task in a NEW worktree.
+      const whatItDoes =
+        orchRole.role === "orchestrator"
+          ? "Start a fresh orchestrator session instead? It reattaches to this group's existing board and roster."
+          : "Start a fresh session instead, with the same task, in a new worktree?";
       const startFresh = await confirmModal(
         "Session not resumable",
-        `${resumeFailureReason(kind)} Start a fresh session instead, with the same task?`,
+        `${resumeFailureReason(kind)} ${whatItDoes}`,
         "Start fresh"
       );
       if (!startFresh) return;

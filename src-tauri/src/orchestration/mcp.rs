@@ -12,6 +12,7 @@
 use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
 use serde_json::{json, Value};
 use std::io::Read as _;
+use std::path::Path;
 use std::sync::Arc;
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -695,10 +696,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 let effective_role = effective_block.as_ref().map(|b| b.kind);
                 let dedicated = effective_role.filter(|r| needs_dedicated_workspace(*r));
                 match dedicated {
+                    // #412 rev-17 NB3: restores the pre-PR `is_dir()` check this
+                    // branch briefly lost in the mcp.rs restructure — a planner's
+                    // roster cwd is always `group.repo` in practice, so this is
+                    // unreachable today, but a vanished recorded cwd must still
+                    // fall back to `None` (→ spawn_agent_ex's per-role default)
+                    // rather than reach it as a doomed `cwd_override`.
                     None => owner
                         .as_ref()
                         .map(|o| o.cwd.trim())
-                        .filter(|c| !c.is_empty())
+                        .filter(|c| !c.is_empty() && Path::new(c).is_dir())
                         .map(str::to_string),
                     Some(r) => {
                         let (Some(sid), Some(g), Some(b)) = (resume.as_deref(), &group, &effective_block)

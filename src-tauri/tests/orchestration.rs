@@ -2660,7 +2660,7 @@ fn concurrent_same_repo_launches_get_distinct_groups() {
         let reg = reg.clone();
         let repo = repo_path.clone();
         handles.push(std::thread::spawn(move || {
-            create_orchestration_group(&reg, &repo, rails(), None, None, 0).map(|r| r.group_id)
+            create_orchestration_group(&reg, &repo, rails(), Launch::Fresh, None, None, 0).map(|r| r.group_id)
         }));
     }
     let ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap().unwrap()).collect();
@@ -2673,7 +2673,7 @@ fn repo_paths_with_quotes_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
     reg.set_port(45999);
-    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), None, None, 0)
+    let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), Launch::Fresh, None, None, 0)
         .unwrap_err();
     assert!(err.contains("quote"), "the quote check must fire before anything else, got: {err}");
 }
@@ -10839,10 +10839,10 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     reg.set_port(45999);
     let advanced = Guardrails { advanced_orchestrator: true, ..rails() };
 
-    // ── launch: no resume session ⇒ Fresh ⇒ the repo's file is read ──
+    // ── Launch::Fresh ⇒ the repo's file is read ──
     declare("rev-approved");
-    let launched =
-        create_orchestration_group(&reg, &repo_path, advanced.clone(), None, None, 0).unwrap();
+    let launched = create_orchestration_group(&reg, &repo_path, advanced.clone(), Launch::Fresh, None, None, 0)
+        .unwrap();
     let gid = launched.group_id.clone();
     assert!(
         reg.group(&gid).unwrap().guardrails.block("rev-approved").is_some(),
@@ -10854,12 +10854,14 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     reg.end_group(&gid, false).unwrap();
     declare("rev-never-seen");
 
-    // ── resume: a session id ⇒ Resume ⇒ the PERSISTED roster stands ──
+    // ── Launch::Resume ⇒ the PERSISTED roster stands, whatever `resume_session` is
+    // (#412 rev-17: these used to be the same bool — `launch` is now independent) ──
     let (persisted_repo, persisted) = reg.load_group_file(&gid).expect("group.json");
     create_orchestration_group(
         &reg,
         &persisted_repo,
         persisted,
+        Launch::Resume,
         Some("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
         0,
@@ -10883,10 +10885,87 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     let reg2 = Arc::new(OrchRegistry::new(state2.path().to_path_buf()));
     reg2.set_port(45999);
     let relaunched =
-        create_orchestration_group(&reg2, &repo_path, advanced, None, None, 0).unwrap();
+        create_orchestration_group(&reg2, &repo_path, advanced, Launch::Fresh, None, None, 0).unwrap();
     assert!(
         reg2.group(&relaunched.group_id).unwrap().guardrails.block("rev-never-seen").is_some(),
         "editing the workflow and launching again must pick up the new roster"
+    );
+}
+
+#[test]
+fn start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_file() {
+    // #412 rev-17 blocker: `resume_recorded_session`'s `start_fresh` path
+    // passes `resume_session: None` (it mints a NEW session id, same as a
+    // fresh launch would) — before the fix, `create_orchestration_group`
+    // derived `Launch` from `resume_session.is_some()` alone, so `None` here
+    // was indistinguishable from a human at the launcher and re-read
+    // `.loomux/workflow.yml`. Proven live (rev-17's own execution): the
+    // group's roster silently swapped to whatever the repo currently
+    // declares, and its `merge_gate` spec file was DELETED when the repo no
+    // longer declares one. Both directions pinned below.
+    use std::sync::Arc;
+    let state = tempfile::tempdir().unwrap();
+    let repo = gated_repo(""); // rev-security, rev-tests, an all-pass merge gate
+    let repo_path = repo.path().to_string_lossy().replace('\\', "/");
+    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    reg.set_port(45999);
+
+    let launched = create_orchestration_group(
+        &reg,
+        &repo_path,
+        Guardrails { advanced_orchestrator: true, ..rails() },
+        Launch::Fresh,
+        None,
+        None,
+        0,
+    )
+    .unwrap();
+    let gid = launched.group_id.clone();
+    let orch_sid = reg.agent(&launched.agent_id).unwrap().session_id.clone().unwrap();
+    assert!(
+        reg.group(&gid).unwrap().guardrails.block("rev-security").is_some(),
+        "test setup sanity: the launch read the gated roster"
+    );
+    assert!(reg.merge_gate_declared(&gid), "test setup sanity: the launch declared the gate");
+    let roster_before: Vec<String> =
+        reg.group(&gid).unwrap().guardrails.blocks.iter().map(|b| b.id.clone()).collect();
+    let gate_before = reg.merge_gate(&gid);
+
+    // The human ends the session; the repo changes underneath them — a
+    // DIFFERENT roster, and the gate dropped entirely.
+    reg.end_group(&gid, false).unwrap();
+    fs::write(
+        repo.path().join(".loomux").join("workflow.yml"),
+        "version: 1\nname: changed\nblocks:\n  - id: worker\n    kind: worker\n",
+    )
+    .unwrap();
+
+    use loomux_lib::orchestration::resume_recorded_session;
+    // Fixture the session into the store so B1's existence pre-check passes
+    // (this test is about the workflow-read boundary, not that check).
+    let store = scratch_dir("start-fresh-no-reread");
+    fixture_claude_session(&store, &orch_sid, &repo_path);
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
+    let outcome = resume_recorded_session(&reg, &orch_sid, None, /* start_fresh */ true);
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
+    outcome.expect("start-fresh on an existing group must not fail");
+
+    let roster_after: Vec<String> =
+        reg.group(&gid).unwrap().guardrails.blocks.iter().map(|b| b.id.clone()).collect();
+    assert_eq!(
+        roster_before, roster_after,
+        "start-fresh must NOT re-read the workflow file and swap the roster — the human never \
+         previewed/approved 'changed'"
+    );
+    assert!(
+        reg.merge_gate_declared(&gid),
+        "start-fresh must NOT delete the merge-gate spec just because the changed file dropped it"
+    );
+    assert_eq!(
+        reg.merge_gate(&gid),
+        gate_before,
+        "the merge gate content itself must be byte-identical, not just 'still declared'"
     );
 }
 
@@ -11154,6 +11233,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
         &reg,
         &repo.path().to_string_lossy(),
         Guardrails { advanced_orchestrator: true, max_agents: 5, ..rails() },
+        Launch::Fresh,
         None,
         None,
         0,
@@ -11172,6 +11252,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
         &reg,
         &persisted_repo,
         persisted,
+        Launch::Resume,
         Some("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
         0,
@@ -11207,6 +11288,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
         &reg,
         &repo.path().to_string_lossy(),
         Guardrails { advanced_orchestrator: true, max_agents: 2, ..rails() },
+        Launch::Fresh,
         None,
         None,
         0,
@@ -11226,6 +11308,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
         &reg,
         &persisted_repo,
         persisted,
+        Launch::Resume,
         Some("11111111-2222-3333-4444-555555555555".into()),
         Some(&gid),
         0,

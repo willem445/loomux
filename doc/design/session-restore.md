@@ -423,11 +423,45 @@ confirming re-spawns fresh with the SAME recorded group/role/block/task brief
 (`start_fresh` on `resume_orch_session`/`resume_recorded_session`), cutting a new
 worktree rather than resuming the unresolvable one.
 
-**Scope, stated.** The orchestrator's own resume is NOT put through the same
-store-authoritative cwd swap: its launch cwd is always the group's repo path,
-fixed, never a worktree, so the moved/deleted-worktree failure mode can't arise
-for it structurally — a cleared orchestrator session still surfaces, just from
-inside the CLI's own `--resume` output in the pane, same as before this change.
+**`start_fresh` is a fresh CONVERSATION, never a fresh LAUNCH (#412 rev-17
+blocker, fixed).** For an orchestrator, "start fresh" must reattach to the
+group's EXISTING state — its persisted roster and merge gate, the ones the
+human previewed and approved at the actual launch — not re-read
+`.loomux/workflow.yml` as if this were a new launcher session. The first cut
+of `start_fresh` got this wrong by conflating two questions that happened to
+coincide in every case that existed before it: `resume_session.is_some()`
+used to double as "does this launch read the workflow file"
+(`create_orchestration_group` derived `Launch` from it directly). `start_fresh`
+introduced a THIRD case — an existing group, no session id to resume — where
+that derivation gives the wrong answer: `Launch::Fresh`, which silently
+swapped the group's roster to whatever the repo currently declares and could
+delete its merge-gate spec file if the repo no longer declares one. Neither
+the roster swap nor the gate deletion goes through anything a human sees; a
+two-button "Start fresh?" confirm is not the launcher's roster preview, and
+`Launch`'s own contract (`orchestration/mod.rs`) is explicit that a resume's
+consent moment is the ORIGINAL launch, not this one.
+`create_orchestration_group` now takes `launch: Launch` as its own explicit
+argument instead of inferring it — `resume_recorded_session`'s orchestrator
+branch always passes `Launch::Resume`, whether or not it's carrying a session
+id to `--resume`, because either way it is reopening a group that already
+has an approved roster and gate on disk. `tests/orchestration.rs`'s
+`start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_file` pins both
+directions (roster identity, merge-gate content) byte-for-byte across a
+repo-file change that would otherwise have been silently adopted.
+
+**Scope, stated (updated after #412 rev-17 B1 — this paragraph's second half
+described the pre-B1-fix behavior, which shipped and was then found still
+broken).** The orchestrator's own resume is NOT put through the store's cwd —
+its launch cwd is always the group's repo path, fixed, never a worktree, so
+the moved/deleted-worktree failure mode can't arise for it structurally. That
+part still holds: there is no cwd SWAP for the orchestrator. What's no longer
+true is "a cleared session still surfaces from inside the pane" — the
+orchestrator branch DOES now run the same existence-only pre-check as the
+worker/reviewer path (session genuinely absent from the store, or the store
+unreadable) before opening a pane, tagged the same way, so `start_fresh` is
+reachable for it too — closing #412's titular symptom (a cold-started
+orchestration pane that fails inside with no steering box), not just its
+worker/reviewer half. See `resume_recorded_session`'s orchestrator branch.
 Copilot's own `--resume <id>` cwd-scoping behavior is **undocumented** (the
 official reference is silent on it — see the `agent-cli-reference` skill's
 citation discipline); the fix applies the same store-lookup mechanism to it

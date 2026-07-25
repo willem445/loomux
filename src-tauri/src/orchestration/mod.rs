@@ -15441,6 +15441,7 @@ pub fn create_orchestration(
             // gated exactly like `blocks` in `create_group_ex`).
             intake: workflow::IntakeProfile::default(),
         },
+        Launch::Fresh,
         None,
         None,
         initial_workers,
@@ -15958,10 +15959,29 @@ pub fn orch_end_group(
 /// becomes live once its orchestrator is registered, so id selection and
 /// registration must be atomic against concurrent launches.
 /// `expect_group` pins restores to their recorded group id.
+///
+/// `launch` and `resume_session` are independent, deliberately (#412 rev-17):
+/// `launch` answers "may this read `.loomux/workflow.yml` and rebuild the
+/// roster/merge-gate from it" (see [`Launch`]) — `resume_session` answers
+/// "does the orchestrator pane `--resume` a specific conversation, or start a
+/// fresh one". These used to be the same bool (`resume_session.is_some()`
+/// derived `launch`), which was correct for the two cases that existed at the
+/// time — but `resume_recorded_session`'s `start_fresh` path (#412) added a
+/// THIRD: an existing, previously-launched group getting a fresh
+/// *conversation* on its orchestrator, which must still be `Launch::Resume`
+/// (never re-derive the roster/gate the human already consented to at the
+/// original launch — see `create_group_ex`'s "consent rule, not an
+/// optimization" comment) even though `resume_session` is `None`. Conflating
+/// them let a `start_fresh` on an orchestrator silently swap the group's
+/// roster to whatever the repo's workflow file currently says, and delete its
+/// merge-gate spec if the file no longer declares one — the exact provenance
+/// violation `create_group_ex`'s resume path exists to prevent, just reached
+/// through a caller that thought "no session id" meant "fresh launch".
 pub fn create_orchestration_group(
     reg: &Arc<OrchRegistry>,
     repo: &str,
     guardrails: Guardrails,
+    launch: Launch,
     resume_session: Option<String>,
     expect_group: Option<&str>,
     initial_workers: u32,
@@ -15976,10 +15996,6 @@ pub fn create_orchestration_group(
         return Err(format!("repository path does not exist: {repo}"));
     }
     let _creation = reg.creation.lock_safe();
-    // A resume reopens a recorded orchestrator session; anything else is the human
-    // at the launcher, who has just been shown what the advanced orchestrator would
-    // run. Only the latter reads the repo's workflow file (#222) — see [`Launch`].
-    let launch = if resume_session.is_some() { Launch::Resume } else { Launch::Fresh };
     let group = reg.create_group_ex(repo, guardrails, launch)?;
     if let Some(want) = expect_group {
         if group.id != want {
@@ -16332,8 +16348,26 @@ pub fn resume_recorded_session(
             }
         }
         let resume_session = (!start_fresh).then(|| session_id.to_string());
-        return create_orchestration_group(reg, &repo, guardrails, resume_session, Some(&record.group_id), 0)
-            .map(Some);
+        // ALWAYS Launch::Resume here (#412 rev-17 blocker), regardless of
+        // `start_fresh`: this is reopening an EXISTING, previously-launched
+        // group either way — a fresh CONVERSATION on it (start_fresh) is not
+        // a fresh LAUNCH of it. `resume_session: None` used to make
+        // `create_orchestration_group` derive `Launch::Fresh` from that alone,
+        // which re-read `.loomux/workflow.yml` and silently swapped the
+        // group's roster (and could delete its merge-gate spec) to whatever
+        // the repo file currently says — the exact provenance violation the
+        // resume path exists to prevent. See `create_orchestration_group`'s
+        // doc comment.
+        return create_orchestration_group(
+            reg,
+            &repo,
+            guardrails,
+            Launch::Resume,
+            resume_session,
+            Some(&record.group_id),
+            0,
+        )
+        .map(Some);
     }
 
     // Worker / reviewer: only meaningful inside a live group.
