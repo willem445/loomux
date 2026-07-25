@@ -253,11 +253,54 @@ Right-click on a terminal is now back to its pre-#370 behavior: nothing. The
 global `.pane-term` `contextmenu` `preventDefault()` in `main.ts` (which
 predates this PR) still suppresses the browser's own native menu, so a
 right-click is silently absorbed rather than doing anything — the same as
-before this issue was ever filed. Copy remains available via `Ctrl+Shift+C`
-on a selection, unaffected by the menu's removal (it was always the keydown
-path, never routed through the menu). `pasteflow.ts` keeps only the keydown
-gesture logic (`isPasteKey`/`isCopyKey`/`keyDisposition`) — no menu-shape
-code remains.
+before this issue was ever filed. Copy remains available via the keydown
+path (below), unaffected by the menu's removal — it was never routed through
+the menu. `pasteflow.ts` keeps only the keydown gesture logic
+(`isPasteKey`/`isCopyKey`/`isConditionalCopyKey`/`keyDisposition`) — no
+menu-shape code remains.
+
+### Plain Ctrl+C copies too, conditionally (#402 live-demo round 4)
+
+A further live-demo round reported copy "working in agent panes but not
+plain terminal panes." Reading the code end to end shows there is, and was,
+no pane-kind branch anywhere in this path — `pane.ts`'s keydown handler and
+`pasteflow.ts`'s `keyDisposition` are exactly one function each, called
+identically for a plain terminal pane, an agent pane, or an orchestrator
+pane. The most plausible reading of the report: an agent CLI (e.g. Claude
+Code) can have its own internal copy affordance over OSC 52 for content
+*it* selects through its own TUI — a mechanism entirely separate from xterm's
+mouse-drag text selection and loomux's Ctrl+Shift+C binding — which reads as
+"copy works here" while a plain shell, with no such CLI-level feature, only
+had the explicit `Ctrl+Shift+C` gesture. Most users reach for plain `Ctrl+C`
+first (the universal outside-a-terminal convention: select, then Ctrl+C), and
+that combo previously did nothing but send `^C` — so a mouse-selected region
+in a plain pane felt uncopiable even though the mechanism (`Ctrl+Shift+C`)
+was there the whole time.
+
+**Fix:** `isConditionalCopyKey` matches plain `Ctrl+C` (excluding
+`Ctrl+Shift+C`, which `isCopyKey` already owns, and excluding Alt, mirroring
+the paste-side AltGr guard). `keyDisposition` now takes a third parameter,
+`hasSelection` — DOM/xterm runtime state (`term.getSelection()`), not
+something derivable from the `KeyboardEvent` alone, so `pane.ts` reads it
+once per keydown and passes it in, the same discipline `plainCtrlVPastes`
+already uses for `settings.ts`'s live value:
+
+- Plain `Ctrl+C` **with** a selection → `"copy"` (and the selection is
+  cleared afterward, so the highlight doesn't linger once you keep typing).
+- Plain `Ctrl+C` **without** a selection → `"pass"` — **unconditionally**,
+  since plain Ctrl+C is the terminal's actual interrupt key. This is the
+  constraint the whole feature exists to protect: SIGINT must always be
+  reachable from the keyboard, with or without something happening to be
+  selected at the time.
+- `Ctrl+Shift+C` is unchanged: always intercepted, copies with a selection,
+  a harmless no-op without one — it was never the interrupt key, so eating
+  it unconditionally was always safe and stays that way.
+
+No pane-kind parameter was added anywhere — `keyDisposition` still only
+takes `(event, plainCtrlVPastes, hasSelection)`. `test/pasteflow.test.ts`'s
+pane-kind/selection matrix pins this directly: a "plain terminal pane" input
+and an "agent pane" input, built identically, are required to produce the
+identical disposition, proving there is no divergence left to reintroduce.
 
 ### WebView2 clipboard permission: dev vs. packaged
 
@@ -276,17 +319,21 @@ honest "Paste failed" toast (pane.ts) — never a silent no-op.
 ### Testing
 
 - `test/pasteflow.test.ts` — key matching (`Ctrl+Shift+V` always pastes;
-  plain `Ctrl+V` pastes only when the setting says so; `Ctrl+Alt+V`/AltGr and
-  `Ctrl+C` alone are never a paste/copy) and `keyDisposition`'s collapsed
-  copy/paste/pass enum.
+  plain `Ctrl+V` pastes only when the setting says so; `Ctrl+Alt+V`/AltGr is
+  never a paste), `isCopyKey`/`isConditionalCopyKey`'s split (explicit vs.
+  selection-gated copy), `keyDisposition`'s copy/paste/pass enum across every
+  `(event, setting, selection)` combination, and a pane-kind/selection matrix
+  that pins a "plain terminal pane" and an "agent pane" — built from
+  identical inputs — to the identical disposition, proving there is no
+  pane-kind branch anywhere in this path.
 - `test/settings.test.ts` — `encodeSettings`/`decodeSettings` round-trip,
   first-run/corrupt-file `null` handling, and per-key fallback so a partial or
   future-versioned hand-edit degrades gracefully instead of losing the file.
 - DOM wiring (the keydown handler, the capture-phase native-paste kill
-  switch, the toast) and the settings load/seed-on-first-run are
-  hand-validated — see the PR body for the manual steps. The double-paste,
-  right-click-paste, and menu-unreliability findings are exactly the class of
-  defect the pure suites structurally cannot see (no DOM event dispatch, no
-  xterm instance) — they surfaced only across three rounds of a real dev-build
-  live demo, which is also why the menu itself was ultimately removed rather
-  than iterated on further.
+  switch, the toast, `clearSelection()` after a copy) and the settings
+  load/seed-on-first-run are hand-validated — see the PR body for the manual
+  steps. The double-paste, right-click-paste, menu-unreliability, and
+  plain-Ctrl+C-doesn't-copy findings are exactly the class of defect the pure
+  suites structurally cannot see (no DOM event dispatch, no xterm instance,
+  no real selection state) — they surfaced only across four rounds of a real
+  dev-build live demo.

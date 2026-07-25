@@ -935,11 +935,21 @@ export class Pane implements VoiceTargetPane {
     });
 
     // Let app-level shortcuts pass through xterm untouched; handle clipboard
-    // combos here (Windows Terminal conventions — Ctrl+Shift+C/V always work;
-    // plain Ctrl+V additionally pastes when the `pasteOnPlainCtrlV` setting
-    // (default on) allows it — #370's review found the unconditional version
-    // silently broke vim's VISUAL BLOCK mode and readline's quoted-insert, so
-    // it's an opt-out, not a forced default; see settings.ts).
+    // combos here (Ctrl+Shift+C/V always work; plain Ctrl+V additionally
+    // pastes when the `pasteOnPlainCtrlV` setting (default on) allows it —
+    // #370's review found the unconditional version silently broke vim's
+    // VISUAL BLOCK mode and readline's quoted-insert, so it's an opt-out,
+    // not a forced default; see settings.ts).
+    //
+    // Plain Ctrl+C (#402 third live-demo round: copy appeared to work in
+    // agent panes but not plain terminal panes) copies too, but ONLY with an
+    // active selection — with none, it MUST fall through as the shell's
+    // interrupt, unconditionally, since Ctrl+C is the terminal's actual ^C
+    // key. There is no pane-kind branch anywhere here: this handler and
+    // `keyDisposition` are identical for a plain terminal, an agent pane, or
+    // an orchestrator pane — see keyDisposition's own doc comment
+    // (pasteflow.ts) for why a prior perceived divergence was never a
+    // pane-kind difference in this code at all.
     //
     // preventDefault() on copy/paste is load-bearing, not decoration (#402
     // live-demo finding): returning `false` from attachCustomKeyEventHandler
@@ -952,13 +962,15 @@ export class Pane implements VoiceTargetPane {
     this.term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
       if (isAppShortcut(e)) return false;
-      switch (keyDisposition(e, getSettings().pasteOnPlainCtrlV)) {
-        case "copy": {
+      const sel = this.term.getSelection();
+      switch (keyDisposition(e, getSettings().pasteOnPlainCtrlV, !!sel)) {
+        case "copy":
           e.preventDefault();
-          const sel = this.term.getSelection();
-          if (sel) void this.copyToClipboard(sel);
+          if (sel) {
+            void this.copyToClipboard(sel);
+            this.term.clearSelection();
+          }
           return false;
-        }
         case "paste":
           e.preventDefault();
           void this.pasteFromClipboard();
@@ -996,9 +1008,9 @@ export class Pane implements VoiceTargetPane {
     // Right-click on a terminal is back to its pre-#370 behavior: nothing (a
     // no-op past the global `.pane-term` contextmenu preventDefault in
     // main.ts, which only suppresses the browser's own native menu and
-    // predates this PR). Copy still works via Ctrl+Shift+C above (selection
-    // → copyToClipboard) — see doc/design/clipboard.md's #370 section for
-    // the supported copy/paste surface.
+    // predates this PR). Copy still works via Ctrl+C or Ctrl+Shift+C above
+    // (selection → copyToClipboard) — see doc/design/clipboard.md's #370
+    // section for the supported copy/paste surface.
 
     this.el.addEventListener("mousedown", () => {
       this.events.onFocus(this);

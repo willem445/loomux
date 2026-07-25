@@ -263,10 +263,14 @@ a restart — are on the **[Project tabs](features/project-tabs.html)** feature 
 
 ## Copy & paste
 
-- **Copy** — select text in a terminal, then `Ctrl+Shift+C`. There's no
-  right-click menu for this (one existed briefly; its paste path proved
-  unreliable and was removed rather than iterated on) and no copy-on-select —
-  `Ctrl+Shift+C` is the one supported gesture.
+- **Copy** — select text in a terminal, then `Ctrl+C` or `Ctrl+Shift+C`.
+  Plain `Ctrl+C` only copies when you have something selected — with nothing
+  selected it's still your terminal's interrupt key (`^C`), unchanged.
+  `Ctrl+Shift+C` always copies a selection and is otherwise a no-op, so use
+  it if you want a gesture that's never ambiguous with interrupting a
+  running process. There's no right-click menu for this (one existed
+  briefly; its paste path proved unreliable and was removed rather than
+  iterated on) and no copy-on-select.
 - **Paste** — `Ctrl+Shift+V` always pastes. Plain `Ctrl+V` also pastes by
   default — turn that off if you use vim/nvim's `Ctrl+V` **VISUAL BLOCK**
   mode, readline's quoted-insert, or run anything else in the pane that wants
@@ -315,7 +319,7 @@ this table mirrors it.
 | Git view | `Alt+G` (or the ⑂ icon) |
 | GitHub issues view | `Alt+I` (or the ◉ icon) |
 | Voice prompt | `Alt+S` (push-to-talk; `Esc` cancels) |
-| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` (`Ctrl+V` also pastes by default — [Settings](#settings)) |
+| Copy / paste | `Ctrl+C` (with a selection) / `Ctrl+Shift+C`, `Ctrl+Shift+V` (`Ctrl+V` also pastes by default — [Settings](#settings)) |
 
 Orchestrator panes add a few more (steering strip, task board, audit viewer,
 lifecycle panel) — those live in the [orchestration guide](orchestration.html).
