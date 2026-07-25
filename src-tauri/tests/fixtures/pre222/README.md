@@ -187,6 +187,16 @@ so far:
   orchestrator doesn't re-poll it. `worker.md`/`reviewer.md`/`planner.md` are untouched by this
   one.
 
+- **Compact-nudge min-context floor (benchtest finding on a live testbed run of this feature)** —
+  `orchestrator.md` only. The same run that exercised the idle-tick gate above also showed 3-4
+  real compactions, all at ~20-31% context — the lull timer's quiet-window gate firing at the
+  right moment but the wrong context level. `orchestrator.md`'s existing **Compact at lulls**
+  paragraph (#328/#329) gains a sentence naming the new floor and telling the orchestrator not to
+  call `request_compact` out of lull habit below roughly 50% — the tool itself stays
+  unconditionally available at any context level (agent judgment always wins); only loomux's own
+  unprompted heuristic nudge is gated. `worker.md`/`reviewer.md`/`planner.md` are untouched by
+  this one too (compact-nudge is orchestrator-only by default).
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
