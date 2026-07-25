@@ -12,6 +12,7 @@
 use super::{Caller, Delivery, NameSource, OrchRegistry, Role};
 use serde_json::{json, Value};
 use std::io::Read as _;
+use std::path::Path;
 use std::sync::Arc;
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -399,7 +400,7 @@ fn require_not_planner(caller: &Caller) -> Result<(), String> {
 /// worktree under any circumstance, per its existing read-only contract —
 /// and the orchestrator is exempt by construction (`spawn_agent` can never
 /// name `kind: "orchestrator"`).
-fn needs_dedicated_workspace(role: Role) -> bool {
+pub(crate) fn needs_dedicated_workspace(role: Role) -> bool {
     matches!(role, Role::Worker | Role::Reviewer)
 }
 
@@ -668,9 +669,15 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // fresh spawn. When `cwd` is omitted on a resume, inherit the
             // session's recorded workspace from the roster (`owner`, above — the
             // same last-touched record #254's block inheritance uses) instead.
-            // No recorded workspace AND the effective role needs a dedicated
-            // workspace: reject loudly, the same style as an explicit
-            // worktree=false, rather than guessing a workspace or defaulting to
+            //
+            // #412: the roster's cwd can be STALE (a worktree that moved or was
+            // deleted since the session ran) as well as merely absent — either
+            // way, before giving up, fall back to locating the session directly
+            // in its CLI's own store by id (`resolve_resume_cwd`) rather than
+            // trusting a directory that may no longer exist. Only when THAT also
+            // comes up empty, for a role that needs a dedicated workspace, is
+            // this rejected loudly — the same style as an explicit
+            // worktree=false — rather than guessing a workspace or defaulting to
             // the main clone. Planners are unaffected — `cwd` stays None and
             // `spawn_agent_ex` falls through to their existing per-role default,
             // unchanged.
@@ -678,27 +685,47 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 let inherited = owner
                     .as_ref()
                     .map(|o| o.cwd.trim())
-                    .filter(|c| !c.is_empty())
+                    .filter(|c| !c.is_empty() && Path::new(c).is_dir())
                     .map(str::to_string);
                 match inherited {
                     Some(c) => Some(c),
                     None => {
-                        let effective_role = match block.as_deref() {
-                            Some(id) => reg
-                                .group(&caller.group)
-                                .and_then(|g| g.guardrails.block(id).map(|b| b.kind)),
-                            None => Some(kind),
+                        let group = reg.group(&caller.group);
+                        let effective_block = match block.as_deref() {
+                            Some(id) => group.as_ref().and_then(|g| g.guardrails.block(id).cloned()),
+                            None => group.as_ref().and_then(|g| g.guardrails.block_for(kind).cloned()),
                         };
-                        if let Some(r) = effective_role.filter(|r| needs_dedicated_workspace(*r)) {
-                            return Err(format!(
-                                "guardrail: this {r} resume has no recorded workspace to inherit \
-                                 (#338/#359) — pass `cwd` explicitly (the session's original \
-                                 workspace). A {r} resume must never fall back to the main clone, \
-                                 which is the human's environment.",
-                                r = r.as_str(),
-                            ));
+                        let effective_role = effective_block.as_ref().map(|b| b.kind);
+                        let dedicated = effective_role.filter(|r| needs_dedicated_workspace(*r));
+                        let store_result = match (resume.as_deref(), &group, &effective_block) {
+                            (Some(sid), Some(g), Some(b)) => {
+                                let cli = super::workflow::cli_of(b, &g.guardrails.agent_cli);
+                                Some(super::resolve_resume_cwd(cli, sid))
+                            }
+                            _ => None,
+                        };
+                        match (store_result, dedicated) {
+                            (Some(Ok(c)), _) => Some(c),
+                            (store_result, Some(r)) => {
+                                // `resolve_resume_cwd`'s own tagged message when the store
+                                // lookup ran (#412c); otherwise this couldn't even be
+                                // attempted (no resolvable block/group), so name that instead.
+                                let tagged = store_result.and_then(Result::err).unwrap_or_else(|| {
+                                    "resume-not-found: no session id, group, or block to check \
+                                     against a CLI store"
+                                        .to_string()
+                                });
+                                return Err(format!(
+                                    "{tagged} This {r} resume also has no recorded workspace to \
+                                     inherit (#338/#359) — pass `cwd` explicitly (the session's \
+                                     original workspace), or confirm the session id. A {r} \
+                                     resume must never fall back to the main clone, which is the \
+                                     human's environment.",
+                                    r = r.as_str(),
+                                ));
+                            }
+                            (_, None) => None,
                         }
-                        None
                     }
                 }
             } else {

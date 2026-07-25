@@ -717,17 +717,27 @@ export const orchSessionRoles = (): Promise<SessionRoleInfo[]> =>
 /** Restore a recorded orchestration session from the session browser.
  *  Orchestrator sessions relaunch the whole group (MCP identity, task
  *  board) and return a pane spec to open; worker/reviewer rejoins arrive
- *  via the normal orch-spawn-request event. */
+ *  via the normal orch-spawn-request event.
+ *
+ *  `startFresh` (#412): when a resume can't be resolved (a tagged
+ *  `resume-not-found`/`resume-workspace-missing` error — see
+ *  `resumeFailureKind` in `resumeerror.ts`), the caller offers a "start
+ *  fresh" affordance instead of stranding the human with an opaque error.
+ *  Confirming it re-calls this with `startFresh: true`, which reuses the
+ *  SAME recorded identity (group, role, block, task brief) but mints a new
+ *  session instead of resuming the unresolvable one. */
 export async function resumeOrchSession(
   grid: Grid,
   paneEvents: PaneEvents,
   sessionId: string,
-  hint?: { group: string; role: string }
+  hint?: { group: string; role: string },
+  startFresh = false
 ): Promise<{ groupId: string } | null> {
   const spec = await invoke<OrchSpawnRequest | null>("resume_orch_session", {
     sessionId,
     groupHint: hint?.group ?? null,
     roleHint: hint?.role ?? null,
+    startFresh,
   });
   if (!spec) return null;
   // Human clicked a recorded session in the browser — focus the restored pane.

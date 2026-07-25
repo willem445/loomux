@@ -313,6 +313,94 @@ pub(crate) fn newest_new_copilot_session(
         .map(|s| s.id.clone())
 }
 
+/// Locate a session's own recorded cwd by scanning a CLI's session store
+/// directly BY ID, rather than trusting a caller's (possibly stale) cached
+/// copy (#412). This is the fix for "restore says the session can't be
+/// found, but it's plainly in the CLI's own history": Claude Code's
+/// `--resume <id>` only searches the LAUNCH cwd's project directory and its
+/// live git worktrees (per the CLI reference — "passing a session ID
+/// searches only the current project directory and its git worktrees"), so
+/// a worktree that moved or was deleted since the session ran makes the old
+/// cwd wrong, and `list_sessions`'s full-store scan (which finds the
+/// session fine, from ANY cwd) and a scoped `--resume` disagree. Reading the
+/// cwd back out of the session's OWN record sidesteps both a stale worktree
+/// path and any casing/separator drift between what loomux cached and what
+/// the CLI itself wrote, by handing the CLI back the exact string it wrote
+/// for itself.
+///
+/// `Ok(Some(cwd))` — the store has this session and it recorded a cwd.
+/// `Ok(None)` — the id isn't in this CLI's store at all (never existed here,
+/// or was cleared). `Err` only when the store's root exists but can't be
+/// listed — a real I/O problem, distinguishable from "nothing recorded yet".
+///
+/// Bounded and cheap: one directory listing of the store root, a filename
+/// check per entry, and (on a match) the same ≤60-line read `list_sessions`
+/// already pays for that one file — never a scan of every session's content.
+pub fn find_session_cwd(source: &str, session_id: &str) -> Result<Option<String>, String> {
+    if source == "copilot" {
+        return match copilot_session_state_root() {
+            Some(root) => find_copilot_session_cwd(&root, session_id),
+            None => Ok(None),
+        };
+    }
+    match claude_home() {
+        Some(h) => find_claude_session_cwd(&h.join("projects"), session_id),
+        None => Ok(None),
+    }
+}
+
+/// `~/.claude`, honoring `LOOMUX_CLAUDE_HOME` the same way `COPILOT_HOME`
+/// overrides copilot's — so an integration test can fixture a session store
+/// without touching the real one. `dirs::home_dir()` doesn't respect a `HOME`
+/// override on Windows, so this is the only way to make `find_session_cwd`'s
+/// claude half testable end-to-end (#412). Not read by `scan_claude` — that
+/// scanner is unchanged, real-home-only, out of scope here.
+fn claude_home() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("LOOMUX_CLAUDE_HOME") {
+        let p = PathBuf::from(h);
+        return (!p.as_os_str().is_empty()).then_some(p);
+    }
+    dirs::home_dir().map(|h| h.join(".claude"))
+}
+
+/// `find_session_cwd`'s claude half, taking the projects root explicitly so
+/// it's testable against a temp directory instead of the real `~/.claude`.
+fn find_claude_session_cwd(root: &Path, session_id: &str) -> Result<Option<String>, String> {
+    if !root.exists() {
+        return Ok(None); // no ~/.claude/projects yet — nothing recorded, not an error
+    }
+    let entries = fs::read_dir(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
+    for project in entries.flatten() {
+        let candidate = project.path().join(format!("{session_id}.jsonl"));
+        if candidate.is_file() {
+            let (_, cwd, _) = scan_claude_jsonl(&candidate);
+            return Ok((!cwd.is_empty()).then_some(cwd));
+        }
+    }
+    Ok(None)
+}
+
+/// `find_session_cwd`'s copilot half, taking the session-state root
+/// explicitly so it's testable against a temp directory. Unlike Claude's
+/// filename-is-the-id layout, a copilot session's directory name isn't
+/// guaranteed to equal its id (only `workspace.yaml`'s own `id:` field is
+/// authoritative — see `scan_copilot`), so this matches on the PARSED id,
+/// not the directory name.
+fn find_copilot_session_cwd(root: &Path, session_id: &str) -> Result<Option<String>, String> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    let entries = fs::read_dir(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
+    for entry in entries.flatten() {
+        if let Some(s) = read_copilot_session(&entry.path()) {
+            if s.id == session_id {
+                return Ok((!s.cwd.is_empty()).then_some(s.cwd));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn scan_copilot(out: &mut Vec<SessionInfo>) {
     let Some(root) = copilot_session_state_root() else {
         return;
@@ -413,6 +501,94 @@ mod orch_signature_tests {
             detect_orch_signature("the word loomux alone should not match").is_none(),
             "prose mentioning loomux must not mark a session"
         );
+    }
+}
+
+#[cfg(test)]
+mod resume_store_tests {
+    use super::{find_claude_session_cwd, find_copilot_session_cwd};
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Per-test scratch dir under the OS temp root: std-based, no `tempfile`
+    /// (deliberately, for this PR's new tests — matches the pattern
+    /// `tests/workflowfile.rs`/`tests/lessonsfile.rs` already use), keyed by
+    /// a tag plus this process's id so parallel test runs never collide.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("loomux-sessions-test-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn claude_session_found_by_id_across_project_dirs() {
+        // The exact shape of #412's confirmed repro: a session's project
+        // directory name has nothing to do with the id being searched for —
+        // only the FILENAME does — so a scan by id finds it regardless of
+        // which cwd it's nested under.
+        let root = scratch_dir("claude-found");
+        let proj = root.join("C--Projects-loomux-worktrees-fix-360-sessions-occlusion");
+        fs::create_dir_all(&proj).unwrap();
+        let id = "ed42fcec-c894-4db3-8a44-1363ca15f900";
+        fs::write(
+            proj.join(format!("{id}.jsonl")),
+            "{\"type\":\"user\",\"cwd\":\"C:\\\\Projects\\\\loomux-worktrees\\\\fix\\\\360-sessions-occlusion\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let found = find_claude_session_cwd(&root, id).unwrap();
+        assert_eq!(
+            found.as_deref(),
+            Some("C:\\Projects\\loomux-worktrees\\fix\\360-sessions-occlusion"),
+            "must recover the session's OWN recorded cwd, not guess one from the dirname"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_session_not_in_store_is_none_not_an_error() {
+        let root = scratch_dir("claude-missing");
+        fs::create_dir_all(root.join("C--Projects-other")).unwrap();
+        assert_eq!(find_claude_session_cwd(&root, "nope-not-here").unwrap(), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_missing_projects_root_is_none_not_an_error() {
+        let root = scratch_dir("claude-no-root").join("does-not-exist");
+        assert_eq!(find_claude_session_cwd(&root, "any-id").unwrap(), None);
+    }
+
+    #[test]
+    fn claude_store_root_unreadable_is_a_real_error() {
+        // A root that EXISTS but is a plain file (not a directory) makes
+        // `read_dir` fail for a real reason — distinguishable from "no
+        // projects yet", which must stay `Ok(None)` (previous test).
+        let root = scratch_dir("claude-unreadable");
+        let not_a_dir = root.join("not-a-dir");
+        fs::write(&not_a_dir, b"nope").unwrap();
+        assert!(find_claude_session_cwd(&not_a_dir, "any-id").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copilot_session_found_by_id_not_by_dirname() {
+        let root = scratch_dir("copilot-found");
+        // Directory name deliberately does NOT match the session id — only
+        // `workspace.yaml`'s own `id:` field is authoritative.
+        let dir = root.join("some-unrelated-dirname");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("workspace.yaml"), "id: abcd-1234\nname: work\ncwd: C:/work/x\n").unwrap();
+        let found = find_copilot_session_cwd(&root, "abcd-1234").unwrap();
+        assert_eq!(found.as_deref(), Some("C:/work/x"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copilot_session_not_found_is_none() {
+        let root = scratch_dir("copilot-missing");
+        assert_eq!(find_copilot_session_cwd(&root, "nope").unwrap(), None);
+        let _ = fs::remove_dir_all(&root);
     }
 }
 

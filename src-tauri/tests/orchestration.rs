@@ -1721,7 +1721,7 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
     // --resume`.
     let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
     reg.set_port(45999);
-    let req = resume_recorded_session(&reg, sid, None).unwrap().expect("orchestrator pane spec");
+    let req = resume_recorded_session(&reg, sid, None, false).unwrap().expect("orchestrator pane spec");
     assert_eq!(req.group_id, gid);
     assert!(req.command.starts_with("copilot "), "must relaunch copilot, got: {}", req.command);
     assert!(req.command.contains(&format!("--resume {sid}")), "must resume the recorded session");
@@ -3096,13 +3096,13 @@ fn hint_restores_sessions_unknown_to_roster_and_audit() {
     drop(g);
     let sid = "11112222-3333-4444-8555-666677778888";
     let hint = Some((gid.clone(), "orchestrator".to_string()));
-    let req = resume_recorded_session(&reg, sid, hint).unwrap().expect("pane spec");
+    let req = resume_recorded_session(&reg, sid, hint, false).unwrap().expect("pane spec");
     assert_eq!(req.group_id, gid);
     assert!(req.command.contains(&format!("--resume {sid}")));
     // A hint pointing at a nonexistent group is rejected, not trusted.
     let reg2 = Arc::new(OrchRegistry::new(tempfile::tempdir().unwrap().path().to_path_buf()));
     reg2.set_port(45999);
-    let bad = resume_recorded_session(&reg2, sid, Some(("ghost-1".into(), "orchestrator".into())));
+    let bad = resume_recorded_session(&reg2, sid, Some(("ghost-1".into(), "orchestrator".into())), false);
     assert!(bad.is_err());
 }
 
@@ -3125,7 +3125,7 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     // "App restart": new registry, nothing live.
     let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
     reg.set_port(45999);
-    let req = resume_recorded_session(&reg, &orch_sid, None).unwrap().expect("orchestrator returns a pane spec");
+    let req = resume_recorded_session(&reg, &orch_sid, None, false).unwrap().expect("orchestrator returns a pane spec");
     assert_eq!(req.group_id, gid, "restore must reattach to the recorded group (state/tasks/audit)");
     assert!(req.command.contains(&format!("--resume {orch_sid}")),
         "the orchestrator's conversation must be resumed, not cold-started");
@@ -3134,7 +3134,7 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     let g = reg.group(&gid).expect("group re-registered in memory");
     assert_eq!(g.guardrails.model_for(Role::Worker), "sonnet", "the block roster must be restored from group.json");
     // A second restore while live is refused.
-    let err = resume_recorded_session(&reg, &orch_sid, None).unwrap_err();
+    let err = resume_recorded_session(&reg, &orch_sid, None, false).unwrap_err();
     assert!(err.contains("already"), "got: {err}");
 }
 
@@ -3143,18 +3143,25 @@ fn worker_session_rejoin_requires_live_group_then_reuses_session() {
     use loomux_lib::orchestration::resume_recorded_session;
     use std::sync::Arc;
     let dir = tempfile::tempdir().unwrap();
+    // A REAL directory (#412): the worker's cwd falls back to the group repo
+    // itself here (`use_worktree: false`), and `resume_recorded_session` now
+    // verifies that cwd still exists on disk before trusting it — a fake
+    // path a real filesystem would never contain would (correctly) make the
+    // resume fail loudly, which isn't what this test is exercising.
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
     reg.set_port(45999);
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let sid = w.session_id.clone().unwrap();
     reg.mark_dead(&w.id, Some(0));
     // Group has no live agents → rejoin refused with guidance.
-    let err = resume_recorded_session(&reg, &sid, None).unwrap_err();
+    let err = resume_recorded_session(&reg, &sid, None, false).unwrap_err();
     assert!(err.contains("orchestrator"), "must point at restarting the orchestrator, got: {err}");
     // With a live orchestrator, the rejoin spawns (background) reusing the session.
     reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    assert!(resume_recorded_session(&reg, &sid, None).unwrap().is_none(),
+    assert!(resume_recorded_session(&reg, &sid, None, false).unwrap().is_none(),
         "worker rejoin panes arrive via the spawn event, not the return value");
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
@@ -3168,7 +3175,7 @@ fn worker_session_rejoin_requires_live_group_then_reuses_session() {
         assert!(std::time::Instant::now() < deadline, "rejoin did not complete: {roster}");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(resume_recorded_session(&reg, "0000-not-recorded", None).is_err());
+    assert!(resume_recorded_session(&reg, "0000-not-recorded", None, false).is_err());
 }
 
 // ---------- MCP dispatch: protocol, role filtering, cross-group access ----------
@@ -3587,6 +3594,70 @@ fn spawn_agent_mcp_rejects_a_worker_resume_with_no_cwd_and_no_recorded_workspace
     assert!(
         reg.list_agents(&g.id).as_array().unwrap().iter().all(|a| a["role"] != "worker"),
         "a rejected resume must not have spawned a worker as a side effect"
+    );
+    // #412c: distinguishable, machine-parseable tag alongside the human prose —
+    // an orchestrator reading this can branch on it instead of string-sniffing
+    // "#338".
+    assert!(
+        text.contains("resume-not-found") || text.contains("resume-store-unreadable"),
+        "error must carry a structured #412 tag, got: {text}"
+    );
+}
+
+// ───────── #412: resume resolution must be robust to a moved/deleted worktree ─────────
+//
+// The confirmed repro (issue #412, second comment): a restore pane claims a
+// session "can't be found" while the exact same session is plainly visible in
+// the session browser (which scans the CLI's WHOLE store) — because the
+// roster's cached cwd pointed at a worktree that no longer exists, and the
+// old code silently fell through to the group's main clone instead of
+// re-resolving from the CLI's own store or failing loudly.
+
+#[test]
+fn resume_recorded_session_fails_loudly_not_silently_when_the_worktree_is_gone() {
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let reg = std::sync::Arc::new(reg);
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // A REAL dedicated worktree (mirrors how every worker actually runs).
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", true, None).unwrap();
+    let sid = w.session_id.clone().unwrap();
+    let cwd_before = reg
+        .list_agents(&g.id)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == w.id.as_str())
+        .unwrap()["cwd"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(Path::new(&cwd_before).is_dir(), "test setup sanity: worktree must exist before removal");
+    reg.mark_dead(&w.id, Some(0));
+
+    // The worktree is removed from disk — the #412 scenario exactly (a
+    // merged/cleaned-up branch's worktree gone, but the roster still names
+    // its old path).
+    std::fs::remove_dir_all(&cwd_before).unwrap();
+
+    use loomux_lib::orchestration::resume_recorded_session;
+    let err = resume_recorded_session(&reg, &sid, None, false).unwrap_err();
+    // Falls back to the CLI's own store, which (in this test) genuinely has
+    // no record of a freshly-minted test session id — so the honest outcome
+    // is "not found", never a silent default to the main clone.
+    assert!(
+        err.contains("resume-not-found") || err.contains("resume-workspace-missing")
+            || err.contains("resume-store-unreadable"),
+        "must fail with a structured #412 tag, got: {err}"
+    );
+    assert!(!Path::new(&cwd_before).is_dir(), "must not resurrect the deleted worktree");
+    // No side effect: no new running worker (the OLD silent-fallback bug
+    // would have spawned one in a background thread, in the main clone).
+    let roster = reg.list_agents(&g.id);
+    assert!(
+        roster.as_array().unwrap().iter().all(|a| a["role"] != "worker" || a["status"] == "dead"),
+        "a loudly-failed resume must not have spawned a worker as a side effect, got: {roster}"
     );
 }
 
@@ -4427,9 +4498,13 @@ fn rejoined_session_restores_the_human_name_tier() {
     use loomux_lib::orchestration::resume_recorded_session;
     use std::sync::Arc;
     let dir = tempfile::tempdir().unwrap();
+    // A REAL directory (#412) — see the comment in
+    // `worker_session_rejoin_requires_live_group_then_reuses_session`.
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_string_lossy().into_owned();
     let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
     reg.set_port(45999);
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "", "t", false, None).unwrap();
     let sid = w.session_id.clone().unwrap();
@@ -4439,7 +4514,7 @@ fn rejoined_session_restores_the_human_name_tier() {
 
     // Rejoin (background spawn) must come back at the human tier, not demoted
     // to orchestrator — otherwise the "human wins" guarantee dies on restart.
-    assert!(resume_recorded_session(&reg, &sid, None).unwrap().is_none());
+    assert!(resume_recorded_session(&reg, &sid, None, false).unwrap().is_none());
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let rejoined_id = loop {
         let hit = reg

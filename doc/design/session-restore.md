@@ -342,3 +342,68 @@ decline, so the saved `tabs.json` survives for the next launch's splash (one
 habitual Escape can't wipe the session). An orchestrator launch that fails tears
 down the tab it just created (`launchOrchestratorTab`'s catch) instead of leaking
 an empty tab per retry, and re-focuses the form's own tab.
+
+### #412 hardening — resolution robustness, and failing loudly
+
+Root cause (confirmed on this machine, not inferred): a worker/reviewer resume's
+launch cwd came from the roster's cached `AgentRecord.cwd` — the directory that
+worktree was cut into at spawn time. When that worktree is later removed (its
+branch merged, `git worktree remove`), `resume_recorded_session` used to
+`.filter(|c| Path::new(c).is_dir())` the stale cwd down to `None` and let it fall
+through to `spawn_agent_ex`'s per-role default — **the group's main clone**. The
+pane then launched `claude --resume <id>` from the main clone's cwd. Per the CLI
+reference, "passing a session ID searches only the current project directory and
+its git worktrees" — Claude Code's own project-directory store is keyed off the
+*launch* cwd (`~/.claude/projects/<munged-path>/<id>.jsonl`), so a resume from the
+wrong cwd searches the wrong project directory and reports "no session found" —
+even though `list_sessions` (which walks every `~/.claude/projects/*/` directory,
+not one cwd) finds the exact same session fine, which is why the session browser
+shows it as resumable while the resume itself fails. Reproduced directly: a
+session's own `cwd` field (inside its `.jsonl`) named a worktree no longer present
+in `git worktree list` for that repo; a resume attempt recorded against the main
+clone's cwd instead failed with "no session found" for a session plainly on disk.
+
+**Resolution (`sessions::find_session_cwd`, `orchestration::resolve_resume_cwd`/
+`resolve_worker_resume_cwd`).** Locate the session directly in its CLI's store BY
+ID — a bounded scan of `~/.claude/projects/*/<id>.jsonl` (claude, filename-keyed)
+or `~/.copilot/session-state/*/workspace.yaml` (copilot, matched on the parsed
+`id:` field, since its dirname isn't guaranteed to equal the id) — and read back
+the cwd the session itself recorded. This is authoritative: it's the exact string
+the CLI already wrote for itself, so it sidesteps a stale/moved worktree AND any
+casing/separator drift between loomux's cache and the CLI's own record, without
+loomux ever having to reproduce Claude's project-directory munging algorithm.
+`resolve_worker_resume_cwd` fast-paths when the roster's cached cwd is still a
+real directory (the common case — nothing moved); only a missing/stale cached cwd
+falls through to the store scan. **Launch-cwd choice, stated:** the CLI's own
+recorded cwd wins over the roster's cached copy whenever both are known and
+differ — the store is closer to ground truth than a copy loomux made once at
+spawn time and never re-verified.
+
+**Failing loudly.** When resolution comes up empty, `resume_recorded_session`
+(worker/reviewer path) now resolves the cwd **synchronously, before** the
+background `spawn_agent_ex` thread — so an unresolvable resume returns `Err`
+straight back through the IPC call, and **no pane is ever opened** for it (no
+"normal agent pane with no steering box" to degrade into, because nothing gets
+spawned at all). The error is tagged (`resume-not-found:` / `resume-workspace-
+missing:` / `resume-store-unreadable:` / `resume-ambiguous:` — the last from
+`resolve_session_ref`'s existing prefix matching), so an orchestrator's
+`spawn_agent(resume_session:)` can branch on the tag instead of parsing prose, and
+`resumeerror.ts` (`resumeFailureKind`) does the same on the frontend. The session
+browser turns a `not-found`/`workspace-missing` failure into a confirm dialog
+("Session not resumable — Start fresh?") instead of a dead-end fatal banner;
+confirming re-spawns fresh with the SAME recorded group/role/block/task brief
+(`start_fresh` on `resume_orch_session`/`resume_recorded_session`), cutting a new
+worktree rather than resuming the unresolvable one.
+
+**Scope, stated.** The orchestrator's own resume is NOT put through the same
+store-authoritative cwd swap: its launch cwd is always the group's repo path,
+fixed, never a worktree, so the moved/deleted-worktree failure mode can't arise
+for it structurally — a cleared orchestrator session still surfaces, just from
+inside the CLI's own `--resume` output in the pane, same as before this change.
+Copilot's own `--resume <id>` cwd-scoping behavior is **undocumented** (the
+official reference is silent on it — see the `agent-cli-reference` skill's
+citation discipline); the fix applies the same store-lookup mechanism to it
+defensively (its session-state layout is flat and id-keyed, so the "wrong project
+directory" failure mode is Claude-specific by construction), but this is not
+empirically verified against a real `copilot --resume` the way the Claude repro
+above is.

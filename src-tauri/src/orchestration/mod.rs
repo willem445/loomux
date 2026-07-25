@@ -4749,16 +4749,75 @@ fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, S
     matches.sort_unstable();
     matches.dedup();
     match matches.as_slice() {
+        // Tagged (#412c) so a caller — an orchestrator's `spawn_agent(resume_session)`
+        // included — can tell "never seen it" from "seen it more than once" from
+        // "resolvable to a place that's since vanished" (`resolve_resume_cwd`, below)
+        // programmatically, without parsing prose.
         [] => Err(format!(
-            "unknown session {input:?} — no session in this group's roster matches that id or prefix"
+            "resume-not-found: unknown session {input:?} — no session in this group's roster \
+             matches that id or prefix"
         )),
         [one] => Ok(one.to_string()),
         many => Err(format!(
-            "ambiguous session prefix {input:?} — matches {} sessions, resolve with a longer prefix or the full id: {}",
+            "resume-ambiguous: ambiguous session prefix {input:?} — matches {} sessions, resolve \
+             with a longer prefix or the full id: {}",
             many.len(),
             many.join(", "),
         )),
     }
+}
+
+/// Resolve the cwd a worker/reviewer resume should launch from, authoritatively
+/// from the CLI's OWN session store (#412) — never from a cached copy alone.
+/// Claude Code's `--resume <id>` only searches the launch cwd's project
+/// directory and its live git worktrees (cli-reference: "passing a session ID
+/// searches only the current project directory and its git worktrees"), so a
+/// worktree that moved or was deleted since the session ran makes the OLD cwd
+/// wrong — and launching from it anyway either hard-fails inside the pane (if
+/// the directory is gone) or, worse, silently launches from some OTHER
+/// default (the group's main clone) whose project store never contained this
+/// session, which is exactly how "the session is plainly in the CLI's own
+/// history, but resume says it can't find it" happens. See
+/// `sessions::find_session_cwd` for the store lookup itself.
+///
+/// Tagged, distinguishable errors (#412c) so a caller can tell "resolvable,
+/// but its home is gone" (`resume-workspace-missing`) from "never existed
+/// here" (`resume-not-found`) from "couldn't even check"
+/// (`resume-store-unreadable`), and offer — or automate — a fresh start
+/// instead of stranding the caller with an opaque string. "Ambiguous" doesn't
+/// arise at this layer: a session id names at most one file in the store, by
+/// construction — that outcome is scoped to `resolve_session_ref`'s prefix
+/// matching, above.
+pub(crate) fn resolve_resume_cwd(cli: &str, session_id: &str) -> Result<String, String> {
+    match crate::sessions::find_session_cwd(cli, session_id) {
+        Ok(Some(cwd)) if Path::new(&cwd).is_dir() => Ok(cwd),
+        Ok(Some(cwd)) => Err(format!(
+            "resume-workspace-missing: session {session_id} is recorded in the {cli} session \
+             history under {cwd:?}, but that directory no longer exists on disk — the worktree \
+             or workspace may have been removed. Start fresh instead of resuming."
+        )),
+        Ok(None) => Err(format!(
+            "resume-not-found: session {session_id} was not found in the {cli} session history \
+             on this machine — it may have been cleared, or the record is stale."
+        )),
+        Err(e) => Err(format!("resume-store-unreadable: could not read the {cli} session store: {e}")),
+    }
+}
+
+/// Resolve a worker/reviewer resume's launch cwd: prefer a still-valid
+/// caller/roster-supplied cwd when there is one (the common case — nothing
+/// moved since the session ran, so this is a cheap no-op), falling back to
+/// `resolve_resume_cwd`'s store lookup when it's missing, empty, or points at
+/// a directory that's gone (#412).
+pub(crate) fn resolve_worker_resume_cwd(
+    cli: &str,
+    session_id: &str,
+    roster_cwd: Option<&str>,
+) -> Result<String, String> {
+    if let Some(c) = roster_cwd.filter(|c| !c.trim().is_empty() && Path::new(c).is_dir()) {
+        return Ok(c.to_string());
+    }
+    resolve_resume_cwd(cli, session_id)
 }
 
 /// Normalize a caller-supplied pane name (#95r): trim, drop control characters
@@ -16164,6 +16223,7 @@ pub fn resume_recorded_session(
     reg: &Arc<OrchRegistry>,
     session_id: &str,
     hint: Option<(String, String)>, // (group_id, role) from transcript signatures
+    start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
     let record = reg
         .session_roles()
@@ -16206,15 +16266,17 @@ pub fn resume_recorded_session(
         let (repo, guardrails) = reg
             .load_group_file(&record.group_id)
             .ok_or("group.json is missing for this orchestration")?;
-        return create_orchestration_group(
-            reg,
-            &repo,
-            guardrails,
-            Some(session_id.to_string()),
-            Some(&record.group_id),
-            0,
-        )
-        .map(Some);
+        // No store-existence pre-check here (unlike the worker/reviewer path
+        // below): the orchestrator's launch cwd is always `repo`, fixed —
+        // never a worktree — so #412's confirmed failure mode (a resume
+        // launched from a cwd whose project store never held this session)
+        // can't arise for it the same way. A cleared/unreadable store still
+        // surfaces — just from inside the CLI's own `--resume` output in the
+        // pane, same as before this change — rather than a second,
+        // speculative check here.
+        let resume_session = (!start_fresh).then(|| session_id.to_string());
+        return create_orchestration_group(reg, &repo, guardrails, resume_session, Some(&record.group_id), 0)
+            .map(Some);
     }
 
     // Worker / reviewer: only meaningful inside a live group.
@@ -16245,7 +16307,6 @@ pub fn resume_recorded_session(
         .merged_records(&record.group_id)
         .into_iter()
         .find(|r| r.session.as_deref() == Some(session_id));
-    let cwd = matched.as_ref().map(|r| r.cwd.clone()).filter(|c| Path::new(c).is_dir());
     let restore_source = matched.as_ref().map(|r| r.name_source);
     let reg2 = reg.clone();
     let sid = session_id.to_string();
@@ -16279,9 +16340,31 @@ pub fn resume_recorded_session(
             }
             known
         });
+    // Resolve the launch cwd SYNCHRONOUSLY, before the background spawn below,
+    // and authoritatively (#412): a stale/missing roster cwd (a moved or
+    // deleted worktree) must fail the resume LOUDLY, back to the human who
+    // clicked it, right now — not silently, several audit lines deep in a
+    // background thread whose only trace is a message in the orchestrator's
+    // own pane (which nobody may be looking at). `start_fresh` skips all of
+    // this: a fresh spawn cuts its own new worktree and needs no prior cwd.
+    let (resume_session, cwd_override, use_worktree, task) = if start_fresh {
+        (None, None, true, record.task.clone())
+    } else {
+        let group = reg.group(&record.group_id).ok_or("group vanished during resume")?;
+        let resolved_block = match block.as_deref() {
+            Some(id) => group.guardrails.block(id).cloned(),
+            None => group.guardrails.block_for(role).cloned(),
+        };
+        let cli = resolved_block
+            .map(|b| workflow::cli_of(&b, &group.guardrails.agent_cli).to_string())
+            .unwrap_or_else(|| group.guardrails.agent_cli.clone());
+        let cwd = resolve_worker_resume_cwd(&cli, session_id, matched.as_ref().map(|r| r.cwd.as_str()))?;
+        (Some(sid.clone()), Some(cwd), false, String::new())
+    };
     std::thread::spawn(move || {
         if let Err(e) = reg2.spawn_agent_ex(
-            &group_id, role, block, &name, "", false, None, None, Some(sid.clone()), cwd, restore_source,
+            &group_id, role, block, &name, &task, use_worktree, None, None, resume_session, cwd_override,
+            restore_source,
         ) {
             reg2.audit(&group_id, "loomux", "error",
                 json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));
@@ -16329,9 +16412,10 @@ pub fn resume_orch_session(
     session_id: String,
     group_hint: Option<String>,
     role_hint: Option<String>,
+    start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
     let hint = group_hint.zip(role_hint);
-    resume_recorded_session(reg.inner(), &session_id, hint)
+    resume_recorded_session(reg.inner(), &session_id, hint, start_fresh)
 }
 
 // ---------- merge-gate link resolution ----------
