@@ -234,11 +234,10 @@ isolated profile while iterating is fine locally, always via
 `e2e/fixtures.ts`'s isolation (never point `LOOMUX_E2E_EXE` at an installed
 build, never skip the `tauri.e2e.conf.json` identifier override). The full
 suite as "it passes" evidence is CI's job — cite the `e2e-windows` job's run,
-not a local one, **once it's actually green there** (see "CI status" below —
-today it fails on every run for a reason unrelated to the code under test).
-Until that's fixed, cite a local `npx playwright test` full-suite run instead
-and say so explicitly. Building the E2E binary is a real `cargo build`, so
-it's capped the same as any other local build (`-j 4`).
+not a local one (see "CI status" below for the HKLM policy fix that makes
+this hold in practice, not just in principle). Building the E2E binary is a
+real `cargo build`, so it's capped the same as any other local build
+(`-j 4`).
 
 ## CI status
 
@@ -284,59 +283,78 @@ not a bug Microsoft will fix:
   a dropped channel) and is silently ignored, not erroring and not hanging on
   anything GPU-related (`--disable-gpu` made no difference, ruling out that
   earlier hypothesis).
-- **Fix applied**: `ci.yml` sets the HKLM policy value Microsoft names —
-  `HKLM\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`
-  — before launching, a machine-wide registry write on the ephemeral runner
-  VM (CI-only, nothing in product code, nothing to clean up since the VM is
-  destroyed after the job regardless).
-  <!-- RESULT: fill in after observing the CI run with this policy applied. -->
+- **Fix applied and confirmed working.** `ci.yml` sets the HKLM policy value
+  Microsoft names — `HKLM\Software\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments`
+  — before launching: a machine-wide registry write on the ephemeral runner VM
+  (CI-only, nothing in product code, nothing to clean up since the VM is
+  destroyed after the job regardless). The first attempt set it as a plain
+  value directly under `...\WebView2`, which had no effect (still
+  `ECONNREFUSED`) — `AdditionalBrowserArguments` isn't in Microsoft's
+  *published* WebView2 policy reference at all, so the fix comment named the
+  policy without its registry shape. Every documented policy in that same
+  family (`BrowserExecutableFolder`, `ChannelSearchKind`, `DowngradeVersion`,
+  `ReleaseChannel{Preference,s}`) stores itself as a **key**, not a value,
+  containing one Value-Name/Value pair per app (name = exe name/AUMID, or
+  `*` for all apps). Restructuring the write to match that convention
+  (`...\WebView2\AdditionalBrowserArguments` as the key, `loomux.exe` as the
+  value name) fixed it: the CDP port opened, and 2 of 3 specs passed in CI on
+  the very next run (the third had an unrelated drag-timing flake, since
+  fixed — see `pane-reorder.spec.ts`).
 - A `runas /trustlevel:0x20000` de-elevation attempt (tried before the by-design
   root cause was found, back when this looked like it might be a
   window-station/desktop-access issue) did not resolve it — expected in
   hindsight, since de-elevating the *process* doesn't change which policy
   channels WebView2 itself honors.
 
-`e2e-windows` stays `continue-on-error: true` regardless of the above result —
-even once green, a brand-new job earns its way off `continue-on-error` with a
-track record, not on day one. What's now fixed is the roadmap: "wait for
+`e2e-windows` stays `continue-on-error: true` even now that it's green — a
+brand-new job earns its way off `continue-on-error` with a track record, not
+on day one (see Roadmap). What's now fixed is the roadmap itself: "wait for
 Microsoft" was never a real option (the maintainer explicitly won't change
-by-design behavior), so the real paths are:
+by-design behavior). The HKLM policy is the actual fix; a self-hosted runner
+remains the fallback if it ever stops holding up (e.g. a future WebView2
+version tightens the HKLM channel too). For the record, a Fixed-Version-149
+pin was also investigated and ruled out on two independent grounds, not just
+deferred:
 
-1. **The HKLM policy above**, if it's confirmed working.
-2. A **self-hosted Windows runner** for this one job, running as a normal
-   (Medium IL) user, if (1) doesn't hold up.
-3. ~~Pin the E2E build's WebView2 to Fixed Version 149~~ — **investigated and
-   ruled out on two independent grounds, not just deferred.**
-   - It would not have worked even if a pre-150 build were available:
-     `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` is a `WEBVIEW2_*` environment
-     variable, and per the maintainer's own closing comment quoted above,
-     that whole channel is dropped at High IL — the exact same restriction
-     blocking `AdditionalBrowserArguments`. (An earlier version of this
-     section argued the opposite, that `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`
-     "would mechanically work" because it *replaces* rather than merely
-     supplements the value passed in code — true as a general statement
-     about the override's semantics, verified from
-     [the WebView2 environment-variables reference](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl?view=webview2-1.0.3719.77)
-     (misattributed in that earlier version to the *Distribution* page,
-     which doesn't contain that sentence — corrected here), but beside the
-     point once High IL drops the env var before it ever reaches that
-     override logic.)
-   - Independently: Microsoft only keeps Fixed Version downloads for the
-     latest and second-latest major releases (confirmed on
-     [the Distribution page](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution)),
-     and the live download page
-     ([developer.microsoft.com/microsoft-edge/webview2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section))
-     offered only 150.0.4078.99 — the same major as the by-design change —
-     when checked. There would have been nothing to pin to either way.
-   - Tauri 2's own config reference has no `webviewFixedRuntimePath` field
-     (only `bundle.windows.minimumWebview2Version`/`webviewInstallMode`,
-     which govern installing Evergreen, not redirecting to a Fixed Version
-     folder) — a Tauri v1 claim that didn't hold up against the v2 docs, moot
-     given the above either way.
+- It would not have worked even if a pre-150 build were available:
+  `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` is a `WEBVIEW2_*` environment
+  variable, and per the maintainer's own closing comment quoted above,
+  that whole channel is dropped at High IL — the exact same restriction
+  blocking `AdditionalBrowserArguments`. (An earlier version of this
+  section argued the opposite, that `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`
+  "would mechanically work" because it *replaces* rather than merely
+  supplements the value passed in code — true as a general statement
+  about the override's semantics, verified from
+  [the WebView2 environment-variables reference](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl?view=webview2-1.0.3719.77)
+  (misattributed in that earlier version to the *Distribution* page,
+  which doesn't contain that sentence — corrected here), but beside the
+  point once High IL drops the env var before it ever reaches that
+  override logic.)
+- Independently: Microsoft only keeps Fixed Version downloads for the
+  latest and second-latest major releases (confirmed on
+  [the Distribution page](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution)),
+  and the live download page
+  ([developer.microsoft.com/microsoft-edge/webview2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section))
+  offered only 150.0.4078.99 — the same major as the by-design change —
+  when checked. There would have been nothing to pin to either way.
+- Tauri 2's own config reference has no `webviewFixedRuntimePath` field
+  (only `bundle.windows.minimumWebview2Version`/`webviewInstallMode`,
+  which govern installing Evergreen, not redirecting to a Fixed Version
+  folder) — a Tauri v1 claim that didn't hold up against the v2 docs, moot
+  given the above either way.
 
-Until (1) or (2) is confirmed durable, treat `e2e-windows` red as possible and
-rely on a local run (`npx playwright test` against the isolated profile) as
-this suite's actual signal.
+If a future run goes red again for a CDP-connection reason (not a spec-logic
+one), re-check the HKLM policy first — that's the thing actually holding this
+up, not "wait and see."
+
+**On the job's per-push cost**: running a full debug `tauri build` plus the
+suite costs a few minutes of Windows runner time on every push regardless of
+pass/fail. Gating the job to path-filtered triggers (`e2e/**`, `src/**`) or a
+schedule was considered as a mitigation for a job that would otherwise be
+*guaranteed* red — but with the HKLM fix, a run now produces a real,
+actionable result (pass/fail on the actual specs) rather than a foregone
+conclusion, so that trade-off no longer applies and the job stays on every
+push like the other three.
 
 ## Roadmap
 

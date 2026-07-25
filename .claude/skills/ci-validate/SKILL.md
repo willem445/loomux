@@ -119,10 +119,12 @@ same way as a red `build` job. GitHub-hosted `windows-latest` executes the job
 at High integrity level, and WebView2 Runtime 150+ intentionally drops the
 `WEBVIEW2_*` env-var channel for an elevated host process as by-design
 local-privilege-escalation hardening (MicrosoftEdge/WebView2Feedback#5640,
-closed as completed — not a bug Microsoft will fix) — `ci.yml` works around
-it with the HKLM policy Microsoft names as the supported alternative. See the
-design doc's "CI status" section for whether that's confirmed working before
-assuming a red `e2e-windows` means anything about your change.
+closed as completed — not a bug Microsoft will fix). `ci.yml` works around it
+with the HKLM policy Microsoft names as the supported alternative — confirmed
+working (see the design doc's "CI status" section) — so a red `e2e-windows`
+today most likely means a real spec/app problem, not the runner's execution
+context. Still `continue-on-error` regardless: a new job earns required-check
+status with a track record, not on day one.
 
 Locally, PoC-level smoke only, and only against the isolated E2E profile —
 never against a real install:

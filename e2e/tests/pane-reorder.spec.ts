@@ -35,18 +35,29 @@ test("dragging a pane onto another's center swaps their on-screen order", async 
 
   await page.mouse.move(headerBox!.x + headerBox!.width / 2, headerBox!.y + headerBox!.height / 2);
   await page.mouse.down();
+  // A brief pause after mousedown: on a slower/differently-scheduled CI
+  // machine, the pointerdown handler that arms grid.ts's drag state needs to
+  // actually run before the first pointermove arrives, or the move is missed
+  // entirely and the drag never starts.
+  await page.waitForTimeout(100);
   // Multiple intermediate steps: grid.ts only arms the drag past a pixel
   // threshold (DRAG_THRESHOLD_PX), so a single jump could land before the
   // drop-zone hit-test logic ever runs.
   await page.mouse.move(targetCenterX, targetCenterY, { steps: 20 });
+  // Likewise before mouseup: give the last pointermove's hit-test/indicator
+  // update a moment to actually land before the drop commits.
+  await page.waitForTimeout(100);
   await page.mouse.up();
 
   await expect
-    .poll(async () => {
-      const a = await paneA.boundingBox();
-      const b = await paneB.boundingBox();
-      if (!a || !b) return null;
-      return a.x < b.x;
-    })
+    .poll(
+      async () => {
+        const a = await paneA.boundingBox();
+        const b = await paneB.boundingBox();
+        if (!a || !b) return null;
+        return a.x < b.x;
+      },
+      { timeout: 15_000 }
+    )
     .toBe(!aWasLeftOfB);
 });
