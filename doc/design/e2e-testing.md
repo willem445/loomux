@@ -171,6 +171,18 @@ teardown now reduces by waiting for both the host process and its WebView2
 child to actually disappear (not just calling `kill()` and moving on) before
 the next spec starts.
 
+One more residual, left narrowed rather than fully closed: `verifyIsolatedBuild`
+verifies the *app* is ours — the spawned pid's own WebView2 child is rooted
+at the E2E identifier — it does not additionally cross-check that the CDP
+endpoint the harness then connects to (a fixed `127.0.0.1:<port>`) belongs to
+that exact verified process. A foreign listener on the same port would still
+be attached to. This fails safely rather than silently — the `#tab-bar`
+selector wait gates everything downstream, so a wrong endpoint reads as a
+confusing timeout, not a wrong-app drive, and `browser.close()` on a
+`connectOverCDP` connection disconnects rather than terminates (never closes
+someone else's browser) — but a `/json/version` identity cross-check before
+handing back the page would close it properly; not implemented here.
+
 ## What E2E can and cannot validate here
 
 Honestly, up front:

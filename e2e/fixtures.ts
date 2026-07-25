@@ -30,14 +30,27 @@
 // a stale/mismatched build at the default exe path is refused loudly instead
 // of silently driven and hard-killed.
 //
-// Known residual risk (untested, documented rather than engineered around):
-// WebView2 shares one browser process per user-data folder (#394's own
-// premise). If a previous spec's browser process hasn't finished exiting
-// before the next spec spawns, the new instance can join that still-live
-// process instead of spawning its own child, and `verifyIsolatedBuild` would
-// see no child and refuse. `waitForExit` below (called from teardown) reduces
-// the window by waiting for both the host process and its WebView2 child to
-// actually disappear before returning, but does not eliminate it.
+// Known residual risks (documented rather than fully closed):
+// - (untested) WebView2 shares one browser process per user-data folder
+//   (#394's own premise). If a previous spec's browser process hasn't
+//   finished exiting before the next spec spawns, the new instance can join
+//   that still-live process instead of spawning its own child, and
+//   `verifyIsolatedBuild` would see no child and refuse. `waitForExit` below
+//   (called from teardown) reduces the window by waiting for both the host
+//   process and its WebView2 child to actually disappear before returning,
+//   but does not eliminate it.
+// - `verifyIsolatedBuild` verifies the APP is ours (the spawned pid's own
+//   WebView2 child is rooted at the E2E identifier) — it does not
+//   additionally cross-check that the CDP endpoint `connectWithRetry` then
+//   connects to (`127.0.0.1:${CDP_PORT}`) belongs to that exact verified
+//   process. A foreign listener on the same port would still be attached to.
+//   In practice this fails safely rather than silently: `page.waitForSelector
+//   ("#tab-bar", ...)` gates everything downstream, so a wrong endpoint reads
+//   as a confusing selector timeout, not a wrong-app drive, and
+//   `browser.close()` on a `connectOverCDP` connection disconnects rather
+//   than terminates (never closes someone else's browser). A `/json/version`
+//   identity cross-check before handing back the page would close this
+//   properly; not implemented here.
 import { test as base, chromium, type Page } from "@playwright/test";
 import { type ChildProcess, execFile, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
