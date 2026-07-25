@@ -1194,6 +1194,124 @@ own workflow file raise a finding in the pane would have merged green (rev-14 F2
 now runs `npm test` on all three platforms, which is also what makes every other pure-module
 test in `test/` a gate rather than a convention.
 
+## Intake as data: the `intake:` block (#382 P1)
+
+`.loomux/workflow.yml` gained a second top-level block, `intake:`, the missing
+sibling of `gates:` — "where work comes from" beside "what gates it". This
+section documents the slice as it landed: **schema, parsing, resolution and
+persistence only.** Nothing yet renders it into a template, nothing yet reads
+it in `gh.rs`'s label allow-list or `idle_tick_notice()`, and the
+`board`/`none` sources have no runtime. Those are P2 (template
+parameterization, serialized behind #329/#398's golden re-bless), P4 (consumer
+rewiring) and a Phase B follow-on, each its own reviewable PR. What this slice
+guarantees is that a resolved profile exists and is stable, so those later
+slices — and #332's host-side intake poller, landing in parallel — have a
+single, persisted contract to build against instead of re-deriving one.
+
+```yaml
+intake:
+  source: github-labels        # github-labels (default) | board | none
+  labels:
+    ready:       agent-ready            # "build this"
+    investigate: agent-investigation    # "look, don't build"
+    owned:       agent-managed          # "mine" ownership marker
+    prototype:   agent-prototype        # demo-gated; optional
+```
+
+Every field is optional and falls back to the built-in default independently —
+a repo can override `labels.ready:` alone and inherit `investigate`/`owned`/
+`prototype` unchanged, and can omit `intake:` entirely, which resolves to
+`workflow::builtin_intake_profile()` exactly.
+
+### Why it is inert vocabulary, not a capability
+
+Same argument as `blocks:` (*Capability closure*, above), applied to a smaller
+surface: `source:` selects from a closed three-value enum (`kind_from_str`'s
+"reject, never coerce" shape — `intake_source_from_str`), and every label is
+sanitized through `sanitize_id`, the same conservative `[A-Za-z0-9_-]`
+alphabet a block id gets, rejected rather than rewritten so an author's typo
+surfaces as an error instead of a label their repo's real GitHub labels no
+longer match.
+
+**There is no spelling under `intake:` that can disable the human merge
+gate.** That gate lives in the `gh` PATH shim, keyed to group markers
+(`autonomous`, `merge_grants/pr-<N>`, …) — not to this file — and `intake:`'s
+wire type (`RawIntake`, `RawIntakeLabels`) carries `deny_unknown_fields` with
+no `human_gate:`-shaped field defined on it at any nesting level. A
+`human_gate: false` (top-level, under `intake:`, or under `intake.labels:`) is
+therefore a hard parse error by construction, not a line this schema has to
+specifically recognize and refuse — the same guarantee `gates:` already gives
+the merge gate it *does* declare (a `gates.merge` clause is data the shim
+reads; nothing in `gates:` can waive the marker-keyed human gate either).
+`intake_human_gate_spelling_is_a_deny_unknown_fields_error` and its siblings
+in `tests/workflow.rs` pin this at every nesting level the schema offers.
+
+### The golden self-reference trap, dodged early
+
+`builtin_intake_profile()` is a checked-in function returning a fixed,
+independent value — not derived from the parser, not derived from anything
+`parse_workflow` does with an absent `intake:` key. This is deliberate, ahead
+of P2's byte-golden fixture work: if the const *were* built by asking the
+parser to resolve an empty file, a bug in "what absent resolves to" and a
+matching bug in "what the const says" could move together and the tests would
+still pass — the exact self-reference bug rev-11 F1 found in the pre-#222
+golden pin. Keeping the const and the parse-time default derivation as two
+independent expressions of "today's vocabulary"
+(`builtin_intake_profile_matches_todays_github_label_vocabulary` pins the
+const's bytes directly) means either one drifting from the other is a visible
+test failure now, not a landmine for whoever writes the P2 byte-golden.
+
+### Resolution and persistence — the same gate `blocks` rides
+
+`Guardrails` gained `intake: workflow::IntakeProfile`, resolved and gated
+**exactly like `blocks`**: a repo's declared `intake:` block takes effect only
+on a fresh launch (`Launch::Fresh`) with `advanced_orchestrator` on — the
+moment the human has been shown the launcher preview. A resume never re-reads
+the file; the profile in `group.json` (a `"intake": { "source", "labels" }`
+object beside `"blocks"`) is what runs, pinned for the same consent reason
+*A resumed group runs the roster it was launched with* argues for the roster:
+nobody is shown anything at resume time, so a `git pull` between launch and
+resume must not be able to swap the intake vocabulary a session is already
+running under.
+
+One deliberate difference from `blocks`: the resolved profile is **available
+regardless of the toggle** — `Guardrails::default().intake` is the built-in
+profile, so a group running the built-in 4-block roster (advanced orchestrator
+off, or on with no declared file) still has a well-defined intake profile for
+#332's poller to read. Toggling advanced mode on decides whether a repo's
+*override* takes effect, not whether a profile exists at all.
+
+Absent `intake` in an old `group.json` (one written before this field
+existed) resolves to the built-in default on read — the same migration
+guarantee `#[serde(default)]` gives `blocks`.
+
+The resume-drift audit (`audit_workflow_drift`) compares intake alongside the
+roster, not just the roster: a repo can rename its label vocabulary without
+touching a single block, and that must be as visible in the trail as a roster
+edit is. A `workflow-changed-since-launch` audit entry now carries
+`intake_running`/`intake_on_disk` beside `running`/`on_disk`, and fires on an
+intake-only edit even when the pinned roster is untouched
+(`intake_only_drift_is_audited_even_when_the_roster_is_unchanged`).
+
+### A field can never be added to the intake schema unnoticed
+
+The three `human_gate` denial tests (above) pin that a handful of specific
+spellings are absent from `intake:`'s vocabulary. They do not, by themselves,
+guard against a *new*, differently-named, gate-shaped field being added later
+(`auto_merge:`, `skip_review:`, …) — that field would pass every existing
+test, because nothing asserted the *set* of fields these types accept, only
+that a few reserved spellings are missing from it.
+
+`workflow.rs` closes that gap with a compile-time pin
+(`intake_schema_field_inventory_is_exhaustively_named`): an exhaustive
+struct-pattern destructure over `RawWorkflow`, `RawIntake` and
+`RawIntakeLabels`, naming every field each type has today with no `..` to
+swallow the rest. Rust's exhaustiveness rule turns a field added to any of
+the three without being named in the matching destructure into a **compile
+error**, not a silently passing test — forcing whoever adds the field to
+look at this file and confirm, in the same PR, that it cannot weaken the
+human gate before the inventory can be updated to accept it.
+
 ## Still to come
 
 - **`no-live-agents-on-pr`** (#197 Scope A.1) — "no agent tied to this PR is still
