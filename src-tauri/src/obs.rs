@@ -380,15 +380,19 @@ mod tests {
 
     #[test]
     fn data_root_honors_env_override() {
-        let overridden = data_root_from(Some(std::ffi::OsString::from(r"C:\isolated\profile")));
-        assert_eq!(overridden, Path::new(r"C:\isolated\profile"));
+        // An absolute path on whatever platform the suite runs on (this repo's
+        // CI matrix runs backend tests on ubuntu/macos/windows even though the
+        // shipped app is Windows-only) — `temp_dir()` is always absolute.
+        let isolated = std::env::temp_dir().join("loomux-isolated-profile-test");
+        let overridden = data_root_from(Some(isolated.clone().into_os_string()));
+        assert_eq!(overridden, isolated);
     }
 
     #[test]
     fn data_root_falls_back_to_platform_data_dir() {
         let default = data_root_from(None);
         assert_eq!(default.file_name().unwrap(), "loomux");
-        assert_ne!(default, Path::new(r"C:\isolated\profile"));
+        assert_ne!(default, std::env::temp_dir().join("loomux-isolated-profile-test"));
     }
 
     #[test]
