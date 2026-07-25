@@ -22,32 +22,15 @@ test("dragging a pane onto another's center swaps their on-screen order", async 
   expect(boxB1, "Pane B should have a bounding box").not.toBeNull();
   const aWasLeftOfB = boxA1!.x < boxB1!.x;
 
-  const headerB = paneB.locator(".pane-header");
-  const headerBox = await headerB.boundingBox();
-  expect(headerBox).not.toBeNull();
-
-  // Re-read A's box right before dragging: it's the drop TARGET, so drag onto
-  // its live center rather than a value captured before the split settled.
-  const targetBox = await paneA.boundingBox();
-  expect(targetBox).not.toBeNull();
-  const targetCenterX = targetBox!.x + targetBox!.width / 2;
-  const targetCenterY = targetBox!.y + targetBox!.height / 2;
-
-  await page.mouse.move(headerBox!.x + headerBox!.width / 2, headerBox!.y + headerBox!.height / 2);
-  await page.mouse.down();
-  // A brief pause after mousedown: on a slower/differently-scheduled CI
-  // machine, the pointerdown handler that arms grid.ts's drag state needs to
-  // actually run before the first pointermove arrives, or the move is missed
-  // entirely and the drag never starts.
-  await page.waitForTimeout(100);
-  // Multiple intermediate steps: grid.ts only arms the drag past a pixel
-  // threshold (DRAG_THRESHOLD_PX), so a single jump could land before the
-  // drop-zone hit-test logic ever runs.
-  await page.mouse.move(targetCenterX, targetCenterY, { steps: 20 });
-  // Likewise before mouseup: give the last pointermove's hit-test/indicator
-  // update a moment to actually land before the drop commits.
-  await page.waitForTimeout(100);
-  await page.mouse.up();
+  // Playwright's own `dragTo` (hover source -> mouse down -> move to target in
+  // steps, with actionability waits at each phase -> mouse up), rather than a
+  // hand-rolled mouse.move/down/up sequence: two attempts at hand-timed pauses
+  // around a manual sequence still failed to register the drop reliably on a
+  // CI runner (passed 100% locally every time) even though every individual
+  // mouse.* call completed without error per the failing run's trace — the
+  // sequence "worked" but the app-side drag state never armed/committed.
+  // `dragTo`'s built-in waits are more conservative than fixed pauses.
+  await paneB.locator(".pane-header").dragTo(paneA);
 
   await expect
     .poll(
