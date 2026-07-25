@@ -29,15 +29,15 @@ use loomux_lib::orchestration::{
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     paste_held_notice, question_held_notice, held_delivery_notice,
-    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
-    sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
-    should_flush_before_paste,
+    prompt_wait_detected, question_hold_predicate, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
+    retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
+    should_flush_before_paste, should_flush_before_paste_now,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentRecord, AttentionItem, Caller, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
+    AgentRecord, AttentionItem, Caller, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -8721,9 +8721,17 @@ fn prompt_wait_detected_spots_prompts_not_chatter() {
 // pipeline, not a pre-cleaned string.
 const FIX_CLAUDE_ASK: &str = include_str!("fixtures/attention/claude-askuserquestion.txt");
 const FIX_COPILOT_ASK: &str = include_str!("fixtures/attention/copilot-question.txt");
-// #420: a genuine multi-choice (non-yes/no) Copilot question — the shape the
-// issue's "silently selects the first option" hazard is actually about, as
-// opposed to copilot-question.txt's y/n-plus-extra-option permission prompt.
+// #420 rev-15 N3: a genuine multi-choice (non-yes/no) Copilot question, built
+// to exercise a DIFFERENT detector signal than copilot-question.txt (whose
+// pointer sits in the last painted lines and carries a footer, so it already
+// matches `has_pointer_option`/`has_menu_footer` — signals `pos-pointer-last-
+// line.txt` and `claude-askuserquestion.txt` already cover). Here the trailing
+// "Copilot is thinking..." status line pushes the pointer+numbered option OUT
+// of the last-3-lines window (no footer either), so ONLY the structured
+// `has_numbered_menu` signal (the `❯ 1.` substring, read across the whole
+// 12-line window, not just the last 3) can catch it — a rev-15-neutralized
+// `has_numbered_menu` makes this specific fixture undetected while the other
+// three positives keep passing.
 const FIX_COPILOT_MULTICHOICE: &str = include_str!("fixtures/attention/copilot-multichoice-question.txt");
 const FIX_STREAMING: &str = include_str!("fixtures/attention/streaming-output.txt");
 const FIX_IDLE_BOX: &str = include_str!("fixtures/attention/idle-input-box.txt");
@@ -8765,12 +8773,242 @@ fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
         prompt_wait_detected(&strip_ansi(FIX_POS_PTR_LAST.as_bytes())),
         "a pointer as the last painted line is a genuine prompt-wait"
     );
-    // #420: a numbered/radio-select Copilot question with no yes/no framing at
-    // all — the case a delivery landing mid-dialog would silently answer by
-    // selecting whichever option the Enter lands on (usually the first).
+    // #420 rev-15 N3: a numbered/radio-select Copilot question whose pointer
+    // has scrolled out of the last-3-lines window (a trailing status line
+    // follows it) — only `has_numbered_menu`'s whole-window substring check
+    // catches this, not the pointer/footer signals the other fixtures above
+    // already exercise. This is the case a delivery landing mid-dialog would
+    // silently answer by selecting whichever option the Enter lands on.
     assert!(
         prompt_wait_detected(&strip_ansi(FIX_COPILOT_MULTICHOICE.as_bytes())),
         "a numbered multi-choice Copilot question must be recognized as needing the human"
+    );
+}
+
+// ---------- #420 rev-15 B4/N1/N2: question_hold_predicate ----------
+//
+// `wait_for_question_clear`'s old production-bound form took a concrete
+// `&PtyManager`, so nothing but a live pty could ever exercise it — a test
+// could disable the whole guard and every existing test still passed
+// (rev-15's neutralized-predicate finding). `question_hold_predicate` is the
+// fix: fully generic over every external read, so these tests drive the
+// REAL decision logic with scripted closures, no PtyManager, no real PTY.
+// Each test below reds if the corresponding gate (growth/shown/answered) is
+// removed from the implementation.
+
+#[test]
+fn question_hold_predicate_ignores_self_echo_of_our_own_just_pasted_text() {
+    // rev-15 N1: the pre-Enter/retry checkpoints read the tail AFTER loomux's
+    // own paste — so a delivered prompt that happens to contain phrasing
+    // `prompt_wait_detected` matches ("(y/n)", "do you want to run") sits,
+    // echoed and unsubmitted, in that exact tail. Without the growth gate
+    // this would hold the delivery on ITSELF, deterministically, forever: no
+    // NEW output has painted since our own paste settled (`total() ==
+    // baseline`), so this must NOT read as a live question.
+    let pred = question_hold_predicate(
+        || Some(b"Do you want to run npm test? (y/n)".to_vec()),
+        || 100, // no growth past the baseline captured when our paste settled
+        Some(100),
+        || 0,
+        || false,
+        0,
+    );
+    assert!(!pred(), "no growth since our own paste settled must read as self-echo, not a live question");
+}
+
+#[test]
+fn question_hold_predicate_holds_for_a_real_dialog_painted_after_the_paste() {
+    // Same matching tail as above, but NEW output has arrived since the
+    // baseline — the CLI painted something after our paste settled, so this
+    // is a genuine live dialog and must hold.
+    let pred = question_hold_predicate(
+        || Some(b"Do you want to run npm test? (y/n)".to_vec()),
+        || 500, // grew past the baseline
+        Some(100),
+        || 0,
+        || false,
+        0,
+    );
+    assert!(pred(), "new output since the paste settled, matching a question, must hold");
+}
+
+#[test]
+fn question_hold_predicate_pre_paste_checkpoint_has_no_self_echo_risk() {
+    // The pre-paste checkpoint runs before this delivery has written
+    // anything — `paste_baseline_total: None` — so a live question already
+    // on screen must hold regardless of the (irrelevant) output-total
+    // reading; there is nothing of OURS on screen yet to be confused with.
+    let pred = question_hold_predicate(
+        || Some(b"Do you want to run npm test? (y/n)".to_vec()),
+        || 42, // arbitrary — no baseline to compare against
+        None,
+        || 0,
+        || false,
+        0,
+    );
+    assert!(pred(), "pre-paste checkpoint: no self-echo possible, a live question must hold");
+}
+
+#[test]
+fn question_hold_predicate_releases_the_instant_a_human_answers() {
+    // rev-15 N2: `prompt_wait_detected` reads a byte ring with no notion of
+    // "answered" — a resolved dialog's stale menu text can sit inside the
+    // last-12-line scan window until enough NEW output scrolls it out, so a
+    // bare detector match would keep holding an already-answered question
+    // all the way to the cap. Release must key on the human's own action: a
+    // keystroke landed after this hold began, and it wasn't left sitting
+    // unsubmitted (they actually pressed something, not just started
+    // typing) — must release even though the stale tail still matches.
+    let pred = question_hold_predicate(
+        || Some(b"Allow Copilot to run npm test? (y/n)".to_vec()),
+        || 500,
+        Some(100),
+        || 12_345, // a keystroke after held_since_ms
+        || false,  // ...and it wasn't left sitting unsubmitted
+        1_000,     // held_since_ms
+    );
+    assert!(!pred(), "a human's own answered-and-submitted keystroke must release even if the stale tail still matches");
+}
+
+#[test]
+fn question_hold_predicate_does_not_release_on_an_unsubmitted_keystroke() {
+    // Started typing (the box now holds their line) but hasn't submitted —
+    // not an answer yet, must keep holding.
+    let pred = question_hold_predicate(
+        || Some(b"Allow Copilot to run npm test? (y/n)".to_vec()),
+        || 500,
+        Some(100),
+        || 12_345,
+        || true, // still sitting in the box, unsubmitted
+        1_000,
+    );
+    assert!(pred(), "typing without submitting is not an answer — must keep holding");
+}
+
+#[test]
+fn question_hold_predicate_ignores_a_keystroke_from_before_this_hold_began() {
+    // A stale keystroke timestamp from before THIS hold started must not be
+    // read as "they just answered" — otherwise any pane with a keystroke
+    // history at all would never hold.
+    let pred = question_hold_predicate(
+        || Some(b"Allow Copilot to run npm test? (y/n)".to_vec()),
+        || 500,
+        Some(100),
+        || 500, // before held_since_ms
+        || false,
+        1_000,  // held_since_ms
+    );
+    assert!(pred(), "a keystroke from before this hold started is not a fresh answer");
+}
+
+#[test]
+fn question_hold_predicate_is_false_for_ordinary_output_and_a_closed_pty() {
+    let ordinary = question_hold_predicate(
+        || Some(b"Running cargo test...\ntest result: ok. 42 passed".to_vec()),
+        || 500, None, || 0, || false, 0,
+    );
+    assert!(!ordinary(), "ordinary streaming output must not read as a question");
+
+    let closed = question_hold_predicate(|| None, || 500, None, || 0, || false, 0);
+    assert!(!closed(), "a closed/gone pane must never block delivery");
+}
+
+#[test]
+fn question_hold_predicate_wired_into_the_generic_hold_loop_releases_when_answered() {
+    // #40 lesson, applied to #420: exercise the LOOP, not just the pure
+    // decision. `hold_for_human_input` is the same generic block-until-clear
+    // loop the box-occupied guard already uses (and already integration-
+    // tests, e.g. `output_growth_never_flips_input_pending`); here the
+    // predicate itself is `question_hold_predicate`, and its "answered"
+    // signal flips after a few polls — proving the two compose correctly
+    // end to end, no PtyManager involved.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let polls = AtomicU64::new(0);
+    let pred = question_hold_predicate(
+        || Some(FIX_COPILOT_ASK.as_bytes().to_vec()),
+        || 500,
+        Some(100),
+        move || if polls.fetch_add(1, Ordering::Relaxed) >= 3 { 999_999 } else { 0 },
+        || false,
+        0,
+    );
+    let out = hold_for_human_input(&pred, Duration::from_secs(5), HB_POLL);
+    match out {
+        PasteDecision::Paste { held_ms } => {
+            assert!(held_ms < 4000, "must release once answered, well under the cap, got {held_ms}ms");
+        }
+        other => panic!("expected Paste after the human answers, got {other:?}"),
+    }
+}
+
+// ---------- #420 rev-15 B1/B2: flush + retry gating ----------
+
+#[test]
+fn should_flush_before_paste_now_is_suppressed_by_a_live_question() {
+    // rev-15 B1: the stranded-text flush is the FIRST write `deliver_prompt`
+    // makes — before the interactive-question checkpoint that follows it
+    // ever runs. Without this gate, a question already on screen from BEFORE
+    // this delivery started would eat the flush's Enter.
+    assert!(
+        should_flush_before_paste(Some(false), false),
+        "sanity: the base decision alone would flush here"
+    );
+    assert!(
+        !should_flush_before_paste_now(Some(false), false, true),
+        "a live question must suppress the flush even when the base decision says to flush"
+    );
+    assert!(
+        should_flush_before_paste_now(Some(false), false, false),
+        "with no question active, the base decision still governs"
+    );
+}
+
+#[test]
+fn retry_gate_holds_for_a_question_before_a_human_typing_check_would_matter() {
+    // rev-15 B2: a question appearing in the retry window means HOLD, not
+    // retry — `retry_gate` is what `deliver_prompt`'s retry loop now
+    // dispatches on for EVERY spaced retry, replacing the unconditional
+    // `ptys.write_bytes(pty_id, submit)` this PR's own review found.
+    assert_eq!(
+        retry_gate(false, PasteDecision::Abort { held_ms: 120_000 }),
+        RetryGate::SkipQuestionPending,
+        "a question that never cleared within the cap must skip this retry, not blind-fire it"
+    );
+    assert_eq!(
+        retry_gate(false, PasteDecision::Paste { held_ms: 0 }),
+        RetryGate::Write,
+        "no question in the way — write the retry"
+    );
+    assert_eq!(
+        retry_gate(false, PasteDecision::Paste { held_ms: 500 }),
+        RetryGate::Write,
+        "a question that cleared within the cap still ends in a write, just held first"
+    );
+    // Human-typing always wins, regardless of what the question decision
+    // says — same precedence the original retry loop always had.
+    assert_eq!(
+        retry_gate(true, PasteDecision::Paste { held_ms: 0 }),
+        RetryGate::SkipHumanTyping,
+        "a human typing in the pane must win even over an already-clear question"
+    );
+}
+
+// ---------- #420 rev-15 B3: pre-Enter abort must leave a traceable outcome ----------
+
+#[test]
+fn a_recorded_unconfirmed_outcome_makes_the_next_deliverys_flush_fire() {
+    // rev-15 B3: the pre-Enter abort pastes text and then withholds the
+    // Enter — the ONLY way the next delivery's stranded-text flush can see
+    // that text is stranded is if THIS delivery recorded `confirmed: false`
+    // (`deliver_prompt` now does, via `last_delivery.lock_safe().insert(...)`
+    // right before the abort's `return` — see mod.rs). This test pins the
+    // DOWNSTREAM consequence: given that recorded outcome, and no human typing
+    // since, the next delivery's flush decision must fire.
+    let recorded_on_abort = false; // DeliveryOutcome::confirmed, as the abort now records it
+    assert!(
+        should_flush_before_paste_now(Some(recorded_on_abort), false, false),
+        "a delivery aborted pre-Enter must leave a `confirmed: false` outcome that the NEXT \
+         delivery's flush decision reads as stranded text to clear"
     );
 }
 

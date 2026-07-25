@@ -195,6 +195,22 @@ impl PtyManager {
         Some(buf.ring.iter().copied().collect())
     }
 
+    /// Bounded snapshot of the rolling output tail (raw bytes, ANSI included):
+    /// only the last `max_bytes`, not the whole (up to 256 KB) ring. For a
+    /// caller that polls frequently and only cares what's on screen right now
+    /// (a live prompt/question is always the last thing painted) — `output_tail`
+    /// clones the entire ring every call, which is measurable waste under this
+    /// lock at a 250ms poll cadence held for up to two minutes (#420 rev-15 N4).
+    /// Reads from the back of the `VecDeque` so the cost is `O(max_bytes)`, not
+    /// `O(ring length)`.
+    pub fn output_tail_bounded(&self, id: u32, max_bytes: usize) -> Option<Vec<u8>> {
+        let ptys = self.ptys.lock_safe();
+        let buf = ptys.get(&id)?.output.lock_safe();
+        let mut v: Vec<u8> = buf.ring.iter().rev().take(max_bytes).copied().collect();
+        v.reverse();
+        Some(v)
+    }
+
     /// Unix-ms of the last human keystroke into this pty (0 = never).
     pub fn last_user_input_ms(&self, id: u32) -> Option<u64> {
         let ptys = self.ptys.lock_safe();

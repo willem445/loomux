@@ -1,7 +1,7 @@
-[36m●[0m Which approach should I take for the retry logic?
+[36m●[0m Which retry strategy should the client use?
 
-│ [36m❯[0m 1. Exponential backoff with jitter
+│ [36m❯[0m 1. Exponential backoff with jitter
 │   2. Fixed delay, three retries
 │   3. No retry — surface the error immediately
 
-[2mUse arrow keys · Enter to select · Esc to cancel[0m
+Copilot is thinking...

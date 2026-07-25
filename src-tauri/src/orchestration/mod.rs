@@ -1284,6 +1284,14 @@ const HUMAN_INPUT_POLL: Duration = Duration::from_millis(250);
 const QUESTION_HOLD_MAX: Duration = Duration::from_secs(120);
 /// Poll interval while holding for the question to clear.
 const QUESTION_HOLD_POLL: Duration = Duration::from_millis(250);
+/// Bytes of the pane's live output tail scanned for a pending question
+/// (rev-15 N4): `prompt_wait_detected` only ever reads the last ~12 non-empty
+/// lines, so a bounded trailing slice is enough — matches the attention
+/// path's own trailing-window precedent (`pane_attention_inputs_from`, which
+/// trims to this same size for the identical "the prompt is at the end"
+/// reason), instead of cloning the whole (up to 256 KB) output ring on every
+/// 250ms poll for up to two minutes.
+const QUESTION_SCAN_TAIL_BYTES: usize = 4096;
 
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
@@ -5457,6 +5465,57 @@ pub fn should_flush_before_paste(prev_confirmed: Option<bool>, human_typed_since
     matches!(prev_confirmed, Some(false)) && !human_typed_since
 }
 
+/// Whether the stranded-text flush should ACTUALLY press its Enter right now
+/// (#420 rev-15 B1) — `should_flush_before_paste`'s decision, additionally
+/// gated on there being no live interactive question on screen. The flush's
+/// Enter is the FIRST write `deliver_prompt` makes; without this gate it fires
+/// unconditionally, before the interactive-question checkpoint that follows
+/// it ever runs — so a question already on screen from BEFORE this delivery
+/// even started would eat that Enter and select whatever's highlighted, on
+/// the exact path this guard exists to close. A named function (not an inline
+/// `&&` at the call site) so the combination is independently testable and
+/// can't be silently dropped by a future edit to either input.
+pub fn should_flush_before_paste_now(
+    prev_confirmed: Option<bool>,
+    human_typed_since: bool,
+    question_active: bool,
+) -> bool {
+    should_flush_before_paste(prev_confirmed, human_typed_since) && !question_active
+}
+
+/// What a spaced submit retry should do this iteration (#420 rev-15 B2):
+/// `deliver_prompt`'s retry loop used to press Enter unconditionally once the
+/// human-typing check passed — exactly the window (a few seconds after the
+/// first submit) Copilot most often paints a permission/question dialog. A
+/// question appearing here means HOLD, not retry, so a fresh
+/// `PasteDecision` (already gated on `prompt_wait_detected` and capped, same
+/// as every other checkpoint) is threaded through as its own case rather than
+/// being collapsed into a bool — the caller's audit text differs by WHY a
+/// retry didn't fire, same as every other checkpoint in this function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryGate {
+    /// Neither a human's line nor a question is in the way — press Enter.
+    Write,
+    /// A human typed into this pane since the first submit; their line may be
+    /// sitting in the box.
+    SkipHumanTyping,
+    /// A live question was still on screen when the hold for it capped out.
+    SkipQuestionPending,
+}
+
+/// Decide `RetryGate` for one spaced retry: the human-typing check always
+/// wins (checked first, same order the original retry loop always used), and
+/// only when it passes does the question hold's outcome matter.
+pub fn retry_gate(human_typed_since_submit: bool, question_decision: PasteDecision) -> RetryGate {
+    if human_typed_since_submit {
+        return RetryGate::SkipHumanTyping;
+    }
+    match question_decision {
+        PasteDecision::Paste { .. } => RetryGate::Write,
+        PasteDecision::Abort { .. } => RetryGate::SkipQuestionPending,
+    }
+}
+
 /// How a single human write into a pane's input changes box occupancy (#111).
 /// Classified from the keystroke's *content*, which is what tells a line still
 /// sitting in the box from one already submitted — an output-byte heuristic
@@ -5752,22 +5811,124 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
     )
 }
 
-/// Production wrapper: hold prompt delivery to `pty_id` while a Copilot-style
-/// interactive question is on screen (#420), using the shipped cap/poll.
-/// Reuses `hold_for_human_input`'s generic block-until-clear-or-capped loop —
-/// same shape as `wait_for_box_clear`, just with `prompt_wait_detected` over
-/// the live output tail as the "still occupied" predicate instead of the input
-/// box's pending-keystroke flag. A closed pty or unreadable tail reads as "no
+/// The live interactive-question guard's hold decision (#420), generic over
+/// every external read so it's integration-tested with scripted closures —
+/// no `PtyManager`, no real PTY (rev-15 B4: the old production-bound version
+/// of this predicate could never be exercised by a test that disabled it,
+/// since nothing but a live pty could drive it; this generic form is what a
+/// test drives directly, and the production wrapper below just supplies real
+/// closures over `ptys`).
+///
+/// - `tail()` — raw (ANSI-included) bytes of the pane's current output tail.
+/// - `total()` — the pane's monotonic output byte count.
+/// - `paste_baseline_total` — `None` for a checkpoint that runs BEFORE this
+///   delivery has written anything (nothing of ours is on screen yet to be
+///   confused with a real dialog); `Some(byte count captured right after OUR
+///   OWN paste settled)` for a checkpoint that runs after it (pre-Enter, each
+///   retry). Required so those checkpoints can't mistake the echo of the text
+///   THEY JUST DELIVERED for a live dialog (rev-15 N1): a delivered prompt
+///   that happens to contain "(y/n)" or "do you want to run" would otherwise
+///   hold ITSELF, deterministically, forever, since the tail always contains
+///   the just-pasted text sitting unsubmitted in the box. A match only counts
+///   as "live" if NEW output has painted since that baseline.
+/// - `last_input_ms()` / `input_pending()` — the same human-keystroke signals
+///   the box-occupied guard (#111) already reads. `held_since_ms` is this
+///   hold's own start time (captured once, by the caller, before the first
+///   poll) — a keystroke only counts as "the human answered" (rev-15 N2,
+///   releasing the hold immediately even if the STALE menu text hasn't
+///   scrolled out of `prompt_wait_detected`'s last-12-line window yet) if it
+///   landed after THIS hold began and didn't leave a fresh line sitting
+///   unsubmitted (i.e. they actually submitted something, not just started
+///   typing).
+pub fn question_hold_predicate<T, I, A, P>(
+    tail: T,
+    total: I,
+    paste_baseline_total: Option<u64>,
+    last_input_ms: A,
+    input_pending: P,
+    held_since_ms: u64,
+) -> impl Fn() -> bool
+where
+    T: Fn() -> Option<Vec<u8>>,
+    I: Fn() -> u64,
+    A: Fn() -> u64,
+    P: Fn() -> bool,
+{
+    move || {
+        let grew = paste_baseline_total.is_none_or(|baseline| total() > baseline);
+        if !grew {
+            return false;
+        }
+        let shown = tail().is_some_and(|out| prompt_wait_detected(&strip_ansi(&out)));
+        if !shown {
+            return false;
+        }
+        let answered = last_input_ms() > held_since_ms && !input_pending();
+        !answered
+    }
+}
+
+/// Production wrapper: hold prompt delivery to `pty_id` while a live
+/// interactive question is on screen (#420), reusing `hold_for_human_input`'s
+/// generic block-until-clear-or-capped loop exactly like `wait_for_box_clear`
+/// does, just with `question_hold_predicate` (bound to this pane, via
+/// `output_tail_bounded` — rev-15 N4) as the "still occupied" predicate.
+/// `paste_baseline_total` is threaded straight through — see
+/// `question_hold_predicate`'s doc for what `None` vs `Some` means at each
+/// call site. Owns the delivery-held badge around the wait (the SAME shape
+/// every other hold in this function uses: pre-check with zero elapsed hold,
+/// so the badge only fires for a hold that actually happens) so every caller
+/// — the pre-paste checkpoint, the pre-Enter checkpoint, and each spaced
+/// retry (rev-15 B2) — gets identical badge/hold behavior from one place
+/// instead of re-deriving it. A closed pty or unreadable tail reads as "no
 /// question" so a dead/gone pane never blocks the thread.
-fn wait_for_question_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecision {
-    hold_for_human_input(
-        || {
-            ptys.output_tail(pty_id)
-                .is_some_and(|out| prompt_wait_detected(&strip_ansi(&out)))
-        },
-        QUESTION_HOLD_MAX,
-        QUESTION_HOLD_POLL,
-    )
+fn wait_for_question_clear(
+    ptys: &crate::pty::PtyManager,
+    pty_id: u32,
+    paste_baseline_total: Option<u64>,
+    emit_held: &impl Fn(HeldReason),
+    emit_held_cleared: &impl Fn(),
+) -> PasteDecision {
+    let predicate = question_hold_predicate(
+        || ptys.output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES),
+        || ptys.output_total(pty_id).unwrap_or(0),
+        paste_baseline_total,
+        || ptys.last_user_input_ms(pty_id).unwrap_or(0),
+        || ptys.input_pending(pty_id).unwrap_or(false),
+        now_ms(),
+    );
+    let will_hold = predicate();
+    if will_hold {
+        emit_held(HeldReason::InteractiveQuestion);
+    }
+    let decision = hold_for_human_input(&predicate, QUESTION_HOLD_MAX, QUESTION_HOLD_POLL);
+    if will_hold {
+        emit_held_cleared();
+    }
+    decision
+}
+
+/// One-shot "is a question on screen right now" snapshot (#420 rev-15 B1) —
+/// for a checkpoint that just needs to know NOW, not hold-and-wait: the
+/// stranded-text flush must not blind-Enter into a live dialog, but it's not
+/// itself the guard responsible for holding — the pre-paste checkpoint that
+/// immediately follows it owns that. Built on `question_hold_predicate` with
+/// `held_since_ms` pinned to "now" so the answered-by-human early-release
+/// logic (only meaningful for an in-progress hold) can never fire here —
+/// there's no hold in progress to have started.
+fn question_active_now(
+    ptys: &crate::pty::PtyManager,
+    pty_id: u32,
+    paste_baseline_total: Option<u64>,
+) -> bool {
+    question_hold_predicate(
+        || ptys.output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES),
+        || ptys.output_total(pty_id).unwrap_or(0),
+        paste_baseline_total,
+        || ptys.last_user_input_ms(pty_id).unwrap_or(0),
+        || ptys.input_pending(pty_id).unwrap_or(false),
+        now_ms(),
+    )()
 }
 
 /// Why a prompt delivery is currently being held for human input (#246): the
@@ -5815,7 +5976,7 @@ pub fn delivery_held_detail(agent_id: &str, reason: HeldReason) -> String {
             "Prompt delivery to {agent_id} is paused — submit or clear the text in this pane's box to continue."
         ),
         HeldReason::InteractiveQuestion => format!(
-            "Prompt delivery to {agent_id} is paused — Copilot is asking a question, answer it to release delivery."
+            "Prompt delivery to {agent_id} is paused — an interactive question is on screen, answer it to release delivery."
         ),
     }
 }
@@ -5889,16 +6050,22 @@ pub fn paste_held_notice(agent_id: &str) -> String {
 }
 
 /// The notice delivered to the orchestrator when a delivery to `agent_id` was
-/// held and aborted because Copilot has an interactive question on screen
-/// (#420). Distinct wording from `paste_held_notice`: the recovery move isn't
-/// "wait for a human's typed line to clear", it's "a human needs to ANSWER the
-/// question" — re-sending sooner won't help until that happens, and the
+/// held and aborted because an interactive question is on screen (#420) — any
+/// CLI's, not just Copilot's (the detector this hold is built on,
+/// `prompt_wait_detected`, already covers Claude Code's `AskUserQuestion`
+/// too, rev-15 N5), so the wording doesn't name one. Distinct wording from
+/// `paste_held_notice`: the recovery move isn't "wait for a human's typed
+/// line to clear", it's "a human needs to ANSWER the question" — the
 /// orchestrator must not try to answer it programmatically itself (that is
 /// exactly the silently-wrong-answer hazard this hold exists to prevent).
+/// Explicitly warns against an immediate re-send (rev-15 N5): loomux has no
+/// way to know the question was actually answered — a re-send before it has
+/// been just re-runs this same hold-then-abort cycle and burns another
+/// `QUESTION_HOLD_MAX` wait for nothing.
 pub fn question_held_notice(agent_id: &str) -> String {
     format!(
-        "[loomux] delivery to {agent_id} held: Copilot is asking a question — \
-         answer it to release delivery, then re-send"
+        "[loomux] delivery to {agent_id} held: an interactive question is on screen — \
+         wait for it to be answered before re-sending (re-sending while it's still up just holds again)"
     )
 }
 
@@ -14709,13 +14876,27 @@ impl OrchRegistry {
             // only if no human has typed since that delivery (else the box may
             // hold a person's line, which must never be blind-submitted — the
             // pre-paste hold above already waited for them to go quiet).
+            //
+            // #420 rev-15 B1: this Enter used to fire unconditionally — the
+            // FIRST write this thread makes, before the interactive-question
+            // checkpoint below ever runs. A question already on screen (from
+            // BEFORE this delivery even started) would eat that Enter and
+            // select whatever's highlighted, on the very path this PR exists
+            // to guard. `question_active_now` is a plain snapshot — not a
+            // hold — because holding here would be redundant: if it's active,
+            // this flush is skipped (nothing lost — the previous delivery's
+            // text just stays put a little longer) and the pre-paste
+            // checkpoint immediately below is the one that actually holds,
+            // aborts, and notifies.
             let prev = last_delivery.lock_safe().get(&pty_id).cloned();
             let human_typed_since = prev
                 .as_ref()
                 .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
                 .unwrap_or(false);
-            if should_flush_before_paste(prev.as_ref().map(|o| o.confirmed), human_typed_since)
-                && ptys.write_bytes(pty_id, submit).is_ok()
+            let question_active_at_flush = question_active_now(&ptys, pty_id, None);
+            if should_flush_before_paste_now(
+                prev.as_ref().map(|o| o.confirmed), human_typed_since, question_active_at_flush,
+            ) && ptys.write_bytes(pty_id, submit).is_ok()
             {
                 append_audit(&root, &group, "loomux", "delivery-flush",
                     json!({ "to": agent, "reason": "previous delivery unconfirmed" }));
@@ -14765,16 +14946,11 @@ impl OrchRegistry {
             // whichever option is highlighted. Hold for `prompt_wait_detected` to
             // clear (the human answers) before pasting; if it never does, abort
             // without pasting, same recovery shape as the box-occupied guard.
-            let will_hold_question = ptys
-                .output_tail(pty_id)
-                .is_some_and(|out| prompt_wait_detected(&strip_ansi(&out)));
-            if will_hold_question {
-                emit_held(HeldReason::InteractiveQuestion);
-            }
-            let question_decision = wait_for_question_clear(&ptys, pty_id);
-            if will_hold_question {
-                emit_held_cleared();
-            }
+            // Nothing of ours is on screen yet at this point in the delivery, so
+            // there's no self-echo risk to gate against (`paste_baseline_total:
+            // None` — see `question_hold_predicate`).
+            let question_decision =
+                wait_for_question_clear(&ptys, pty_id, None, &emit_held, &emit_held_cleared);
             match question_decision {
                 PasteDecision::Paste { held_ms } if held_ms > 0 => {
                     append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
@@ -14838,6 +15014,12 @@ impl OrchRegistry {
             // the input box until a human presses Enter.
             let submit_start = std::time::Instant::now();
             let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
+            // #420 rev-15 N1: the byte count right after our own paste
+            // settled, BEFORE this loop (or anything else) can add to it —
+            // the growth baseline the pre-enter question checkpoint below
+            // uses to tell a live dialog from the echo of the text we
+            // ourselves just delivered (see `question_hold_predicate`).
+            let paste_settled_total = last_total;
             let mut last_change = std::time::Instant::now();
             // Whether the pane went quiet before we press Enter. If it never
             // does (busy CLI, hit SUBMIT_MAX_WAIT), the Enter lands mid-stream
@@ -14885,20 +15067,15 @@ impl OrchRegistry {
             // Re-check right before the first Enter (#420): the paste above may
             // have taken long enough for a question to appear since the
             // pre-paste check, and the Enter below would select whichever option
-            // is now highlighted rather than merely submitting text. Unlike the
-            // pre-paste guard, an abort HERE leaves the already-pasted text
-            // sitting unsubmitted in the box — safe: the next delivery's
-            // stranded-text flush (#81/#84) or the human's own Enter handles it.
-            let will_hold_question_preenter = ptys
-                .output_tail(pty_id)
-                .is_some_and(|out| prompt_wait_detected(&strip_ansi(&out)));
-            if will_hold_question_preenter {
-                emit_held(HeldReason::InteractiveQuestion);
-            }
-            let question_decision_preenter = wait_for_question_clear(&ptys, pty_id);
-            if will_hold_question_preenter {
-                emit_held_cleared();
-            }
+            // is now highlighted rather than merely submitting text. Guarded
+            // against self-echo (rev-15 N1) via `paste_settled_total` — this
+            // checkpoint's tail necessarily contains our OWN just-pasted, not-
+            // yet-submitted text, so a bare `prompt_wait_detected` match here
+            // would otherwise be indistinguishable from a genuine live dialog;
+            // only NEW output since the paste settled counts.
+            let question_decision_preenter = wait_for_question_clear(
+                &ptys, pty_id, Some(paste_settled_total), &emit_held, &emit_held_cleared,
+            );
             match question_decision_preenter {
                 PasteDecision::Paste { held_ms } if held_ms > 0 => {
                     append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
@@ -14910,6 +15087,19 @@ impl OrchRegistry {
                     append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
                         "to": agent, "stage": "pre-enter", "held_ms": held_ms,
                     }));
+                    // #420 rev-15 B3: unlike the pre-paste abort, the text IS
+                    // already pasted at this point — only the Enter was
+                    // withheld. It's sitting unsubmitted in the box, exactly
+                    // the shape the stranded-text flush (#81/#84) exists to
+                    // clear on the NEXT delivery — but only if that delivery
+                    // can see it. Recording nothing here would leave
+                    // `last_delivery` holding whatever outcome (or none) an
+                    // EARLIER delivery left, so the next delivery's flush
+                    // could wrongly conclude nothing needs clearing and
+                    // append its own paste onto this one's abandoned text.
+                    last_delivery.lock_safe().insert(pty_id, DeliveryOutcome {
+                        confirmed: false, submit_sent_ms: now_ms(), from: delivery_from,
+                    });
                     if let Some(reg) = reg {
                         reg.notify_delivery_held(&group, &agent, target_is_orchestrator, HeldReason::InteractiveQuestion);
                     }
@@ -14969,15 +15159,55 @@ impl OrchRegistry {
 
             for delay in SUBMIT_RETRY_DELAYS {
                 std::thread::sleep(delay);
-                // A human typing in this pane means the box may hold THEIR
-                // half-written text — a blind Enter would submit it.
-                if ptys.last_user_input_ms(pty_id).unwrap_or(0) > submit_sent_ms {
+                // #420 rev-15 B2: these Enters used to fire unconditionally on
+                // a timer, in exactly the window (a few seconds after the
+                // first submit, while the agent is starting its turn) Copilot
+                // most often paints a permission/question dialog — this PR's
+                // own premise made concrete on the path it left unguarded. A
+                // question appearing here means HOLD, not retry: re-check and
+                // wait for it to clear (capped, same as every other
+                // checkpoint) before pressing this retry's Enter; if it never
+                // clears, stop retrying rather than risk a later retry
+                // blind-selecting an option. `submit_baseline` (captured right
+                // before the FIRST Enter) is the self-echo growth baseline
+                // (rev-15 N1) for every retry — they're all still trying to
+                // land the SAME already-pasted text, so nothing before that
+                // point can be new. `retry_gate` names the decision so the
+                // human-typing-first ordering can't silently drift; the human-
+                // typing check stays cheap and short-circuits BEFORE touching
+                // the (potentially minutes-long) question hold, exactly as it
+                // did before this PR — a human mid-line means skip now, not
+                // spend up to `QUESTION_HOLD_MAX` finding that out.
+                let human_typed_since_submit = ptys.last_user_input_ms(pty_id).unwrap_or(0) > submit_sent_ms;
+                if human_typed_since_submit {
                     append_audit(&root, &group, "loomux", "submit-retries-skipped",
                         json!({ "to": agent, "reason": "human typing in pane" }));
                     break;
                 }
-                if ptys.write_bytes(pty_id, submit).is_err() {
-                    break;
+                let question_decision = wait_for_question_clear(
+                    &ptys, pty_id, Some(submit_baseline), &emit_held, &emit_held_cleared,
+                );
+                match retry_gate(human_typed_since_submit, question_decision) {
+                    RetryGate::SkipHumanTyping => unreachable!("checked above"),
+                    RetryGate::SkipQuestionPending => {
+                        let PasteDecision::Abort { held_ms } = question_decision else { unreachable!() };
+                        append_audit(&root, &group, "loomux", "submit-retries-skipped", json!({
+                            "to": agent, "reason": "question pending", "held_ms": held_ms,
+                        }));
+                        break;
+                    }
+                    RetryGate::Write => {
+                        if let PasteDecision::Paste { held_ms } = question_decision {
+                            if held_ms > 0 {
+                                append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
+                                    "to": agent, "stage": "retry", "held_ms": held_ms, "outcome": "cleared",
+                                }));
+                            }
+                        }
+                        if ptys.write_bytes(pty_id, submit).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             // Record the outcome so the next delivery to this pane can flush a
