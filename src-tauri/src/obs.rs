@@ -67,18 +67,64 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 static LOG_DIR_OVERRIDE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// `<user data dir>/loomux/logs`. Falls back to the temp dir when the platform
-/// has no data dir, mirroring `OrchRegistry::default_root` so crash logs and
-/// orchestration state live under the same `loomux/` root.
+/// Guards the rejection warning below to once per process: `data_root_from`
+/// is called from every `logs_dir()`/`state_dir()`/`default_root()` call —
+/// unbounded over the process lifetime, including once per breadcrumb write
+/// — not once at startup.
+static WARNED_BAD_DATA_DIR: std::sync::Once = std::sync::Once::new();
+
+/// The `data_root()` decision, taking the env var reading as a parameter so
+/// it's testable without mutating real process env (`std::env::set_var` is
+/// both `unsafe` and cross-thread-global — not worth it for a one-branch
+/// decision when the branch itself can just be a pure function).
+///
+/// An empty or relative override is rejected rather than used as-is: every
+/// consumer of this root treats persistence as best-effort (never a hard
+/// failure), so a bad value wouldn't error — it would silently redirect
+/// orchestration state, logs, and tabs into whatever the process's current
+/// working directory happens to be (often a git repo). Falling back to the
+/// platform data dir keeps that failure mode from being silent: the
+/// rejection prints once to stderr (not routed through `breadcrumb()`, which
+/// itself calls back into this function via `logs_dir()` — that would
+/// recurse). The durable, always-checkable record of what root a run actually
+/// used is the `data_root=` startup breadcrumb (`lib.rs`), not this warning.
+fn data_root_from(env_override: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(dir) = &env_override {
+        let path = PathBuf::from(dir);
+        if !dir.is_empty() && path.is_absolute() {
+            return path;
+        }
+        WARNED_BAD_DATA_DIR.call_once(|| {
+            eprintln!(
+                "loomux: LOOMUX_DATA_DIR={dir:?} is empty or not an absolute path — ignoring it \
+                 and using the platform data dir instead"
+            );
+        });
+    }
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("loomux")
+}
+
+/// `<user data dir>/loomux` (or `$LOOMUX_DATA_DIR` if set) — the root every
+/// persisted-state singleton (`orchestration/`, `logs/`, `tabs.json`, …) lives
+/// under. A dev instance and a production install share this root by default,
+/// which means they also share `running.lock` and every other singleton in it
+/// (#394); the env override lets a dev/test run point at its own tree instead
+/// — e.g. an isolated profile for E2E runs — without touching the platform
+/// data dir at all.
+pub fn data_root() -> PathBuf {
+    data_root_from(std::env::var_os("LOOMUX_DATA_DIR"))
+}
+
+/// `<data root>/logs`. Mirrors `OrchRegistry::default_root` so crash logs and
+/// orchestration state live under the same root.
 pub fn logs_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = LOG_DIR_OVERRIDE.lock().unwrap().clone() {
         return dir;
     }
-    dirs::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("loomux")
-        .join("logs")
+    data_root().join("logs")
 }
 
 // ---------- timestamps ----------
@@ -341,6 +387,35 @@ mod tests {
         let out = f();
         *LOG_DIR_OVERRIDE.lock().unwrap() = None;
         out
+    }
+
+    #[test]
+    fn data_root_honors_env_override() {
+        // An absolute path on whatever platform the suite runs on (this repo's
+        // CI matrix runs backend tests on ubuntu/macos/windows even though the
+        // shipped app is Windows-only) — `temp_dir()` is always absolute.
+        let isolated = std::env::temp_dir().join("loomux-isolated-profile-test");
+        let overridden = data_root_from(Some(isolated.clone().into_os_string()));
+        assert_eq!(overridden, isolated);
+    }
+
+    #[test]
+    fn data_root_falls_back_to_platform_data_dir() {
+        let default = data_root_from(None);
+        assert_eq!(default.file_name().unwrap(), "loomux");
+        assert_ne!(default, std::env::temp_dir().join("loomux-isolated-profile-test"));
+    }
+
+    #[test]
+    fn data_root_rejects_empty_override() {
+        let result = data_root_from(Some(std::ffi::OsString::from("")));
+        assert_eq!(result.file_name().unwrap(), "loomux", "should fall back, not resolve to CWD");
+    }
+
+    #[test]
+    fn data_root_rejects_relative_override() {
+        let result = data_root_from(Some(std::ffi::OsString::from(r"relative\path")));
+        assert_eq!(result.file_name().unwrap(), "loomux", "should fall back, not resolve to CWD");
     }
 
     #[test]

@@ -107,3 +107,41 @@ iteration:
 The PR's checks are green on all three platforms. That — not a local `cargo
 test` run, capped or not — is the evidence a worker cites for "the suite
 passes" in a PR description or a `done` report.
+
+## E2E (Playwright) is CI's job, same line
+
+See `doc/design/e2e-testing.md` for the mechanism, isolation model, and CI
+status. The `e2e-windows` job is a fourth platform in the same sense as the
+ubuntu/windows/macos matrix above — it's CI's job to run the full suite, not
+yours. It also runs `continue-on-error: true`, so it never blocks the merge
+gate the way the three build/test jobs do; don't read a red `e2e-windows` the
+same way as a red `build` job. GitHub-hosted `windows-latest` executes the job
+at High integrity level, and WebView2 Runtime 150+ intentionally drops the
+`WEBVIEW2_*` env-var channel for an elevated host process as by-design
+local-privilege-escalation hardening (MicrosoftEdge/WebView2Feedback#5640,
+closed as completed — not a bug Microsoft will fix). `ci.yml` works around it
+with the HKLM policy Microsoft names as the supported alternative — confirmed
+working (see the design doc's "CI status" section) — so a red `e2e-windows`
+today most likely means a real spec/app problem, not the runner's execution
+context. Still `continue-on-error` regardless: a new job earns required-check
+status with a track record, not on day one.
+
+Locally, PoC-level smoke only, and only against the isolated E2E profile —
+never against a real install:
+
+- A single spec file (`npx playwright test e2e/tests/<name>.spec.ts`) to
+  sanity-check a change before pushing is fine, same "quick local iteration"
+  line as a single `cargo test`/`node --test` file above.
+- The exe under test must always be the `tauri.e2e.conf.json`-identifier
+  build (`npx tauri build --debug --no-bundle --config
+  src-tauri/tauri.e2e.conf.json`) launched through `e2e/fixtures.ts`'s
+  `LOOMUX_DATA_DIR` + isolated-profile handling. Never point `LOOMUX_E2E_EXE`
+  at an installed build or skip the identifier override — that's the fix for
+  #394's shared-WebView2-process hazard, and skipping it locally reintroduces
+  exactly the collision-with-a-running-instance risk it exists to prevent.
+- The full `npx playwright test` suite as "it passes" evidence is CI's job,
+  same as the backend/frontend suites above — cite the `e2e-windows` run, not
+  a local one, **once that job is actually green** for a given push. While
+  it's failing on the known High-IL/WebView2 issue above, cite a local
+  full-suite run instead and say explicitly that `e2e-windows` is expected-red
+  for the documented reason, not silently ignore it.

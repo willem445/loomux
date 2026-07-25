@@ -61,3 +61,89 @@ jobs:
       - name: Test backend
         run: cargo test --locked
         working-directory: src-tauri
+
+  # E2E PoC (spike, doc/design/e2e-testing.md): drives the real WebView2
+  # webview over CDP (Playwright's native WebView2 support). Windows-only —
+  # that's the only platform CDP-over-WebView2 covers, and it's this project's
+  # Windows-10 baseline anyway. Runs against an isolated profile
+  # (`tauri.e2e.conf.json`'s `dev.loomux.e2e` identifier + `LOOMUX_DATA_DIR`),
+  # never a real install (issue #394 overlap — see e2e/fixtures.ts).
+  # continue-on-error while flakiness is unknown: this must never red the
+  # merge gate on its own — drop it once the suite has a track record.
+  e2e-windows:
+    name: E2E (Playwright, experimental)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build app (E2E identifier, unbundled debug build)
+        run: npx tauri build --debug --no-bundle --config src-tauri/tauri.e2e.conf.json
+
+      # GitHub-hosted windows-latest runs jobs at High integrity level, and
+      # WebView2 Runtime 150+ intentionally drops the WEBVIEW2_* env-var and
+      # HKCU-policy channels for an elevated host process as local-privilege-
+      # escalation hardening — by design, not a bug
+      # (MicrosoftEdge/WebView2Feedback#5640, closed as completed 2026-07-09;
+      # see doc/design/e2e-testing.md "CI status"). The one channel Microsoft
+      # names as surviving elevation is an HKLM policy — set it here, machine-
+      # wide, before launching: this is CI-only config on an ephemeral runner
+      # VM, nothing in product code, and nothing to clean up (the VM is
+      # destroyed after the job regardless). Must match e2e/fixtures.ts's
+      # `CDP_PORT` default (LOOMUX_E2E_CDP_PORT if overridden).
+      #
+      # `AdditionalBrowserArguments` isn't itself in Microsoft's *published*
+      # WebView2 policy reference (learn.microsoft.com/deployedge/
+      # microsoft-edge-webview-policies only lists BrowserExecutableFolder,
+      # ChannelSearchKind, DowngradeVersion, ReleaseChannel{Preference,s}) --
+      # the maintainer's fix comment named it without the registry shape. All
+      # of those *published*, structurally-identical "Loader Override
+      # Settings" policies share one convention: the policy name is a KEY, not
+      # a value, containing one Value-Name/Value pair per app (Value Name =
+      # exe name or AUMID, or "*" for all apps) -- e.g.
+      # `...\WebView2\BrowserExecutableFolder` with value name "*" and the
+      # folder path as the data. This follows that same documented shape.
+      - name: Set WebView2 HKLM policy (survives High-IL, unlike the env var)
+        shell: pwsh
+        run: |
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments" `
+            -Name "loomux.exe" -Value "--remote-debugging-port=9333 --disable-gpu" -Type String
+
+      - name: Run Playwright E2E suite
+        run: npx playwright test
+        env:
+          LOOMUX_E2E_EXE: ${{ github.workspace }}\src-tauri\target\debug\loomux.exe
+
+      # If the suite above failed, surface a pointer to the debugging docs in
+      # the job output itself — not just in a comment nobody reading the
+      # failed run sees. The HKLM policy fix (above) is confirmed working, so
+      # a red run here is most likely a real spec/app problem now, not the
+      # runner's execution context — this is a pointer to check, not a
+      # default explanation. See doc/design/e2e-testing.md "CI status".
+      - name: Note where to start debugging a red run
+        if: failure()
+        run: |
+          echo "::warning::e2e-windows failed. This job is continue-on-error and does not gate merges, but treat this as a real signal first -- the CI-side HKLM policy workaround for WebView2's High-IL restriction is confirmed working (see doc/design/e2e-testing.md 'CI status'), so a red run here is unlikely to be that issue recurring. Check the specs/app first."
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7

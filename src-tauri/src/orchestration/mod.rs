@@ -5808,12 +5808,9 @@ impl OrchRegistry {
         self.self_arc.lock_safe().upgrade()
     }
 
-    /// Default persistent root: `<user data dir>/loomux/orchestration`.
+    /// Default persistent root: `<data root>/orchestration` (see `obs::data_root`).
     pub fn default_root() -> PathBuf {
-        dirs::data_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("loomux")
-            .join("orchestration")
+        crate::obs::data_root().join("orchestration")
     }
 
     pub fn set_app(&self, app: AppHandle) {

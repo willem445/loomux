@@ -30,9 +30,10 @@ pub fn run() {
     obs::breadcrumb(
         "startup",
         &format!(
-            "v{} unclean_prev={}",
+            "v{} unclean_prev={} data_root={}",
             env!("CARGO_PKG_VERSION"),
-            startup.unclean
+            startup.unclean,
+            obs::data_root().display()
         ),
     );
     let startup_notice = obs::StartupNotice(std::sync::Mutex::new(startup.notice()));

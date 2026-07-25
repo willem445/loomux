@@ -1,0 +1,38 @@
+// Shared page-interaction helpers for the E2E PoC specs. There are no
+// `data-testid` hooks in the frontend yet (see doc/design/e2e-testing.md), so
+// selectors are structural: label text inside `.dlg-field` wrappers, and
+// class names read straight out of src/launcher.ts, src/pane.ts, src/grid.ts.
+import { type Page } from "@playwright/test";
+
+/** The most recently opened "New pane" launcher form (there can be more than
+ *  one welcome-form on screen across empty tabs/panes at once). */
+function latestWelcomeForm(page: Page) {
+  return page.locator(".welcome-form").last();
+}
+
+/** Fills out and submits the launcher form to turn a welcome pane into a
+ *  plain shell (terminal) pane — never an agent/orchestrator kind, so this
+ *  never spawns a real agent CLI. */
+export async function createTerminalPane(
+  page: Page,
+  opts: { name: string; repo?: string }
+): Promise<void> {
+  const form = latestWelcomeForm(page);
+
+  await form.locator('.dlg-field:has(.dlg-label:has-text("Kind")) select').selectOption("terminal");
+  await form.locator('.dlg-field:has(.dlg-label:has-text("Pane name")) input').fill(opts.name);
+  if (opts.repo) {
+    await form.locator('.dlg-field:has(.dlg-label:has-text("Repository")) input').fill(opts.repo);
+  }
+  await form.locator(".dlg-btn.primary").click();
+
+  // Every pane (even an unconfigured welcome one) already has a `.pane-term`
+  // div in the DOM (src/pane.ts), so its count can't signal "submit
+  // finished" — wait for the launcher form itself to be torn down instead.
+  await form.waitFor({ state: "detached", timeout: 15_000 });
+}
+
+/** The `.pane` ancestor of a pane whose header title matches `name`. */
+export function paneByName(page: Page, name: string) {
+  return page.locator(".pane", { has: page.locator(".pane-title", { hasText: name }) });
+}
