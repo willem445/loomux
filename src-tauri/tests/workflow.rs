@@ -3493,20 +3493,26 @@ fn write_instruction_files_sweeps_stale_files_on_a_builtin_roster_render() {
     // on-disk workflow file extra credibility when a later orchestrator
     // found it and (wrongly) adopted it as this group's config.
     let (reg, _d) = test_registry();
-    let repo = Repo::new(); // no .loomux/ at all — builtin roster
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n  - id: process\n    kind: worker\n    prompt: Process.\n  \
+         - id: advisor\n    kind: worker\n    prompt: Advise.\n  \
+         - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n",
+    );
+    // A REAL earlier render actually writes these — not a manual seed —
+    // so the sweep's own ownership manifest (rev-10 review, N2) legitimately
+    // knows loomux, not a human, generated them.
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let group_dir = reg.state_root().join(&g.id);
+    assert!(group_dir.join("process.md").exists(), "the custom roster's own earlier render");
+    assert!(group_dir.join("advisor.md").exists(), "the custom roster's own earlier render");
+    assert!(group_dir.join("rev-security.md").exists(), "the custom roster's own earlier render");
 
-    // Seed stale files exactly as an earlier custom-roster life would have
-    // left them.
-    fs::write(group_dir.join("process.md"), "stale process persona").unwrap();
-    fs::write(group_dir.join("advisor.md"), "stale advisor persona").unwrap();
-    fs::write(group_dir.join("rev-security.md"), "stale reviewer persona").unwrap();
-
-    // Re-render: a resumed launch on the SAME repo re-renders the SAME group
-    // dir with the persisted (still builtin here) roster.
-    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
-    reg.create_group_ex(&repo.path(), persisted, Launch::Resume).unwrap();
+    // The workflow file goes away / the toggle reverts between sessions: a
+    // resumed launch on the SAME repo re-renders the SAME group dir, now
+    // with the builtin roster — #255's "resume never re-derives from
+    // workflow.yml" contract, simulated by handing the resume call a
+    // builtin `Guardrails` directly rather than the persisted custom one.
+    reg.create_group_ex(&repo.path(), rails(), Launch::Resume).unwrap();
 
     assert!(!group_dir.join("process.md").exists(), "stale block file must be swept");
     assert!(!group_dir.join("advisor.md").exists(), "stale block file must be swept");
@@ -3536,21 +3542,25 @@ fn write_instruction_files_sweeps_only_undeclared_blocks_on_a_custom_roster_rend
     // block's file (and the class files) alone.
     let (reg, _d) = test_registry();
     let repo = Repo::new().workflow(
-        "version: 1\nblocks:\n  - id: rev-sec\n    kind: reviewer\n    prompt: Security only.\n",
+        "version: 1\nblocks:\n  - id: rev-sec\n    kind: reviewer\n    prompt: Security only.\n  \
+         - id: old-reviewer\n    kind: reviewer\n    prompt: Retired persona.\n",
     );
+    // A REAL earlier render writes both — the sweep's ownership manifest
+    // (rev-10 review, N2) needs a genuine prior generation to work from, not
+    // a manual seed, or it would (correctly) refuse to touch a file it never
+    // saw itself write.
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let group_dir = reg.state_root().join(&g.id);
     assert!(group_dir.join("rev-sec.md").exists(), "the declared block's own file exists");
+    assert!(group_dir.join("old-reviewer.md").exists(), "the other block's earlier render");
 
-    // Seed a stale file for a block this roster does NOT declare (an
-    // earlier custom-roster life's leftover).
-    fs::write(group_dir.join("old-reviewer.md"), "a block no longer declared").unwrap();
-
-    // Resume with the SAME persisted (custom) roster — #255's "pinned on
-    // resume" contract: `create_group_ex` never re-derives blocks itself on
-    // a resume, the caller supplies them, exactly as the real resume path
-    // reads them back from `load_group_file` before calling this.
-    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    // The roster changes between sessions: `old-reviewer` is no longer
+    // declared. #255's "pinned on resume" contract means `create_group_ex`
+    // never re-derives blocks itself on a resume — the caller supplies the
+    // roster it should now run, simulated here by dropping the block from
+    // the persisted guardrails before handing them back in.
+    let (_, mut persisted) = reg.load_group_file(&g.id).unwrap();
+    persisted.blocks.retain(|b| b.id != "old-reviewer");
     reg.create_group_ex(&repo.path(), persisted, Launch::Resume).unwrap();
 
     assert!(!group_dir.join("old-reviewer.md").exists(), "undeclared block file must be swept");

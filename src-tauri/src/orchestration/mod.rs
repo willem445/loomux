@@ -3131,6 +3131,26 @@ pub fn resume_kickoff_notice(ledger_embed: Option<&str>) -> String {
     )
 }
 
+/// rev-10 review (N3), round 7: the read-and-degrade half of a verbose
+/// reinjection's contract text, pulled out of the `to_reinject` audit loop
+/// so it's directly unit-testable — the loop's caller (`self.audit(...)`
+/// on `None`) is the only part that still needs `&self`. `contract_on_
+/// system_layer` short-circuits to `None` without even touching the
+/// filesystem (the common case never pays for a read it wouldn't use);
+/// otherwise a missing OR EMPTY read both degrade to `None` (the slim
+/// notice shape) rather than embedding nothing under a "here is your
+/// contract" heading — see `compact_reinjection_notice`'s doc for what a
+/// `Some`/`None` return produces.
+pub fn reinject_contract_text(instructions_path: &Path, contract_on_system_layer: bool) -> Option<String> {
+    if contract_on_system_layer {
+        return None;
+    }
+    match fs::read_to_string(instructions_path) {
+        Ok(s) if !s.trim().is_empty() => Some(s),
+        _ => None,
+    }
+}
+
 /// Autonomous mode (#83): whether autonomous-era spend has crossed the group's
 /// token budget and idle ticking must be suspended. Pure so the metering rule is
 /// unit-testable. `spend_since_enable` is the delta from the enable-time usage
@@ -10440,6 +10460,33 @@ impl OrchRegistry {
                         // gated native-skip (now folded into this one, since
                         // `compact_hook_native_notice_delivered` can no
                         // longer be `true` by the time that check would run).
+                        //
+                        // rev-10 review (B1, blocking): this site runs BEFORE
+                        // the delivery-confirmation block below, every tick —
+                        // so if a busy-then-quiet resolution had ALREADY
+                        // decided a loomux reinjection (`compact_reinject_
+                        // attempted_ms` set, `compact_pending` still `true`
+                        // throughout that phase by design) before this
+                        // SessionStart evidence arrived, leaving those two
+                        // fields untouched here left the confirmation phase
+                        // live against a `compact_pending` this block just
+                        // set back to `false`. On a LATER tick that phase
+                        // would still fire on its own: a late-confirmed
+                        // delivery double-audits the same compaction as
+                        // resolved twice, an unconfirmed one RETRIES the
+                        // loomux reinjection after native `additionalContext`
+                        // already re-grounded the agent (the exact double-
+                        // delivery N3 exists to prevent), and an exhausted
+                        // one falsely reports "reinjection-abandoned" for a
+                        // compaction that in fact succeeded. Worse,
+                        // `compact_pending = false` here let a fresh
+                        // PreCompact marker re-arm a whole new cycle while
+                        // that stale confirmation phase was still retrying —
+                        // breaking the "one confirmation phase at a time"
+                        // invariant the block below documents. This is a
+                        // delivery-phase terminal path exactly like the two
+                        // in that block, so it clears the same two fields.
+                        let reinject_already_dispatched = a.compact_reinject_attempted_ms.is_some();
                         a.compact_pending = false;
                         a.compact_pending_baseline_tokens = None;
                         a.compact_pending_baseline_marker_count = None;
@@ -10448,8 +10495,22 @@ impl OrchRegistry {
                         a.compact_pending_armed_ms = None;
                         a.compact_pending_evidence = None;
                         a.compact_hook_native_notice_delivered = false;
+                        a.compact_reinject_attempted_ms = None;
+                        a.compact_reinject_attempts = 0;
                         a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
-                        to_hook_native_skip.push((a.id.clone(), a.group.clone()));
+                        // A loomux reinjection prompt may already have been
+                        // PASTED (fire-and-forget, on an earlier tick) before
+                        // this native evidence arrived — that delivery
+                        // already happened, so it was not "skipped", and
+                        // auditing it as such would be false. The genuine
+                        // skip case (no reinjection was ever dispatched for
+                        // this compaction) is the only one that gets that
+                        // audit line; `compact-hook-evidence sessionstart-
+                        // compact` above already records that evidence was
+                        // seen either way.
+                        if !reinject_already_dispatched {
+                            to_hook_native_skip.push((a.id.clone(), a.group.clone()));
+                        }
                     }
                 }
 
@@ -10949,8 +11010,33 @@ impl OrchRegistry {
             // contract does NOT already ride its CLI's system-prompt layer
             // — see `compact_reinjection_notice`'s doc. The common case
             // never pays for a read it wouldn't use.
-            let contract_text = (!contract_on_system_layer)
-                .then(|| fs::read_to_string(&instructions_path).unwrap_or_default());
+            //
+            // rev-10 review (N3), round 7: the path this reads was already
+            // computed with a fallback to the class file if the block that
+            // owns it is gone from the roster (same `g.block(&a.block).map(
+            // ..).unwrap_or_else(..)` shape `kickoff_prompt` uses) — but a
+            // READ can still come back empty (or fail outright) if that
+            // fallback file was itself never written for this exact case, or
+            // is momentarily missing (e.g. the #423 sweep reclaiming a
+            // block's file out from under a still-live agent). `unwrap_or_
+            // default()` used to turn that into a verbose notice with an
+            // EMPTY contract body, silently — worse than no notice at all,
+            // since it *looks* like re-grounding happened.
+            //
+            // `reinject_contract_text` is the pure read-and-degrade half,
+            // pulled out so it's directly unit-testable without needing a
+            // live `contract_on_system_layer = false` agent (the Copilot-
+            // native-persona / `~/.copilot/agents`-unwritable cases) wired
+            // up end to end. Loud instead of silent: an empty or unreadable
+            // read degrades to the slim notice shape (no embed), audited —
+            // never silently swallowed.
+            let contract_text = reinject_contract_text(&instructions_path, contract_on_system_layer);
+            if contract_text.is_none() && !contract_on_system_layer {
+                self.audit(&group, "loomux", "compact-reinjection-contract-unreadable", json!({
+                    "agent": id,
+                    "path": instructions_path.display().to_string(),
+                }));
+            }
             // Missing/empty ledger reads as "" and `directive_ledger_embed`
             // turns that into `None` — nothing embeds for a pane that never
             // called `note_directive`, so this is a no-op for every session
@@ -13712,8 +13798,67 @@ impl OrchRegistry {
             self.write_block_instructions(g, b, persona.as_ref(), &vars)?;
             current.insert(b.instructions_file());
         }
-        self.sweep_stale_instruction_files(g, &current);
+        // rev-10 review (N2), round 7: `current` alone can't tell a stale
+        // GENERATED file apart from a same-named file a human happens to
+        // have dropped in the group dir — a block literally named `notes`
+        // generates `notes.md`, indistinguishable by filename alone from a
+        // human's own notes file. See the manifest helpers' doc for why
+        // that's tracked side-channel instead of stamped into the
+        // instructions files themselves.
+        let known = self.read_generated_instructions_manifest(g);
+        self.sweep_stale_instruction_files(g, &current, &known);
+        self.write_generated_instructions_manifest(g, &current);
         Ok(())
+    }
+
+    /// #423 review (N2): where `write_instruction_files` records, side-
+    /// channel, which filenames IT generated on the immediately preceding
+    /// render — the sweep's ownership proof. A first cut of the sweep
+    /// matched on filename shape alone (a reserved class name, or a string
+    /// that round-trips through `sanitize_id`) — cheap, but unable to tell
+    /// a stale generated `notes.md` (from a block once named `notes`) apart
+    /// from a human's own `notes.md` sitting in the same dir, since nothing
+    /// about the file itself says who wrote it.
+    ///
+    /// The obvious fix — stamp an ownership marker into the instructions
+    /// file's own first line — was rejected: that file's bytes are not
+    /// private bookkeeping. They are what `persona_inject` hands a CLI's
+    /// native `--agent`/custom-agent-file flag verbatim, what `kickoff_
+    /// prompt`/`compact_reinjection_notice` read back into a live prompt,
+    /// and exactly what `tests/fixtures/pre222` pins BYTE-FOR-BYTE for
+    /// every default group. A marker line would leak into every one of
+    /// those surfaces, not just this one.
+    ///
+    /// So ownership lives beside the instructions files instead, in a
+    /// small manifest file this pair of functions owns exclusively: never
+    /// read by an agent, a CLI, or any other product path. The contract is
+    /// simple by construction — `write_instruction_files` reads what it
+    /// recorded LAST render, asks the sweep to reconcile disk against it,
+    /// then overwrites it with THIS render's `current` set. A file the
+    /// sweep may ever delete must therefore have appeared in `current` on
+    /// the immediately preceding render — which a human-authored file,
+    /// never written by this mechanism, structurally never can.
+    ///
+    /// Accepted trade-off: a generated file that went stale BEFORE this
+    /// manifest existed (no prior render recorded it) lingers forever,
+    /// never being swept — acceptable because #423's sweep has not shipped
+    /// to any real group yet, so there is no pre-manifest stale file this
+    /// could ever need to reach.
+    fn generated_instructions_manifest_path(&self, g: &GroupInfo) -> PathBuf {
+        self.group_dir(&g.id).join(".instruction-files-manifest")
+    }
+
+    fn read_generated_instructions_manifest(&self, g: &GroupInfo) -> HashSet<String> {
+        fs::read_to_string(self.generated_instructions_manifest_path(g))
+            .map(|s| s.lines().filter(|l| !l.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    fn write_generated_instructions_manifest(&self, g: &GroupInfo, current: &HashSet<String>) {
+        let mut names: Vec<&String> = current.iter().collect();
+        names.sort();
+        let body = names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join("\n");
+        let _ = fs::write(self.generated_instructions_manifest_path(g), body);
     }
 
     /// #423: reclaim per-block instruction files a PREVIOUS roster (built-in
@@ -13732,22 +13877,30 @@ impl OrchRegistry {
     /// Removing the leftover file means a future phantom-roster read finds
     /// nothing on disk to corroborate it.
     ///
-    /// Deletes ONLY files matching the exact naming pattern `write_
+    /// Deletes a name only when ALL THREE hold: it is NOT in `current` (not
+    /// part of this render), it IS in `known` — `write_instruction_files`'s
+    /// own record of what it generated last render (see the manifest
+    /// helpers' doc — the ownership proof a human-dropped file can never
+    /// satisfy), and it matches the exact naming pattern `write_
     /// instruction_files` itself generates — one of the four reserved class
-    /// names, or `sanitize_id`'s own safe alphabet plus `.md` (a block
-    /// id can never contain anything else) — and ONLY when that name is NOT
-    /// in `current`. Every other file in the group dir (`group.json`,
-    /// `state.json`, `agents.json`, `audit.jsonl`, `ledger-*.log`, the
-    /// `hooks/` subdirectory, anything else) is untouched: this walks the
-    /// top-level directory only (`read_dir`, not recursive) and the pattern
-    /// match is deliberately narrow rather than "any `.md` file", so a
-    /// human-dropped note file with an `.md` extension would survive too
-    /// unless it happened to collide with a reserved class name or a
-    /// currently-live block id (in which case it wouldn't be stale to begin
-    /// with — it would be overwritten by the write loop above, not swept).
-    /// Best-effort and audited, never fatal: a sweep failure must not block
-    /// a group from booting.
-    fn sweep_stale_instruction_files(&self, g: &GroupInfo, current: &HashSet<String>) {
+    /// names, or `sanitize_id`'s own safe alphabet plus `.md` (kept as
+    /// defense-in-depth even though `known` alone would already exclude
+    /// anything this mechanism didn't write). Every other file in the
+    /// group dir (`group.json`, `state.json`, `agents.json`,
+    /// `audit.jsonl`, `ledger-*.log`, the `hooks/` subdirectory, the
+    /// manifest file itself, anything else) is untouched — this walks the
+    /// top-level directory only (`read_dir`, not recursive). Best-effort
+    /// and audited, never fatal: a sweep failure must not block a group
+    /// from booting.
+    ///
+    /// rev-10 review (N3), round 7, cross-item corner named: sweeping a
+    /// block's file out from under a still-live agent spawned under that
+    /// block (roster changed mid-life, agent didn't) means a LATER compact
+    /// reinjection for that agent can find its own instructions file gone.
+    /// Mitigated, not prevented, on the reinjection side — see
+    /// `reinject_contract_text`'s doc — which degrades that read loudly to
+    /// the slim notice shape instead of embedding an empty contract.
+    fn sweep_stale_instruction_files(&self, g: &GroupInfo, current: &HashSet<String>, known: &HashSet<String>) {
         let dir = self.group_dir(&g.id);
         let Ok(entries) = fs::read_dir(&dir) else { return };
         let mut removed = Vec::new();
@@ -13758,6 +13911,9 @@ impl OrchRegistry {
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
             if current.contains(name) {
+                continue;
+            }
+            if !known.contains(name) {
                 continue;
             }
             let Some(stem) = name.strip_suffix(".md") else { continue };

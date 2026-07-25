@@ -30,7 +30,7 @@ use loomux_lib::orchestration::{
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     paste_held_notice, question_held_notice, held_delivery_notice,
-    prompt_wait_detected, question_hold_predicate, mask_own_paste, resolve_paste_gate, resolve_ref_url,
+    prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_contract_text, resolve_paste_gate, resolve_ref_url,
     resume_kickoff_notice, rotate_audit_if_needed,
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
@@ -5770,6 +5770,73 @@ fn compact_nudge_tick_fast_compact_both_hook_events_in_one_poll_gap_resolves_not
 }
 
 #[test]
+fn compact_nudge_tick_sessionstart_evidence_after_a_reinject_was_already_decided_clears_the_confirmation_phase() {
+    // rev-10 review (B1, blocking), round 7: the SessionStart terminal path
+    // runs BEFORE the delivery-confirmation block, every tick — reachable
+    // ordering matching the incident's own ~2-minute gap: a PreCompact arm
+    // resolves into a DECIDED loomux reinjection (busy-then-quiet, trusted)
+    // before any SessionStart marker exists, then the SessionStart marker
+    // lands on a LATER tick. If the SessionStart block only cleared the arm
+    // fields (not `compact_reinject_attempted_ms`/`attempts`), the
+    // confirmation phase stayed live against a `compact_pending` it had
+    // already reset to `false` — retrying, double-confirming, or falsely
+    // abandoning a compaction that in fact succeeded via native evidence.
+    let (reg, _d, gid, oid) = compact_nudge_setup(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty = HashMap::new();
+
+    // Arm via PreCompact, quiet immediately — resolves into a DECIDED
+    // loomux reinjection on this same tick (same shape as `compact_nudge_
+    // tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection`).
+    let precompact_marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&precompact_marker, started_ms, 1_000);
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on the reinjection's own delivery to confirm");
+    assert!(a.compact_reinject_attempted_ms.is_some(), "a loomux reinjection was already DECIDED");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+
+    // SessionStart evidence lands later — the delivery-confirmation phase
+    // is still live (no `confirmed` delivery map passed) when it does.
+    let sessionstart_marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.sessionstart-compact.json"));
+    write_hook_marker(&sessionstart_marker, started_ms, 120_000);
+    assert!(reg.compact_nudge_tick(121_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "the sessionstart terminal path resolves it");
+    assert!(a.compact_reinject_attempted_ms.is_none(), "B1: the confirmation-phase bookkeeping must clear too");
+    assert_eq!(a.compact_reinject_attempts, 0);
+    // The reinjection prompt already went out (attempt #1, above) — that
+    // was not "skipped", so it must not be double-counted as a fresh
+    // native-skip.
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 0);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "no retry");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-confirmed"), 0, "no stale double-confirm");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-abandoned"), 0);
+
+    // A late-arriving confirmation for the ORIGINAL (now-cleared) attempt
+    // must not resurrect the confirmation phase.
+    let late_confirm = confirmed_delivery(&oid, 1_000);
+    assert!(reg.compact_nudge_tick(122_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &late_confirm).is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-confirmed"), 0, "nothing left to confirm");
+
+    // Ticking well past ARM_PENDING_TIMEOUT_MS must never falsely abandon a
+    // compaction that already resolved via native evidence.
+    assert!(reg
+        .compact_nudge_tick(121_000 + 6 * 60_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new())
+        .is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 0);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-abandoned"), 0);
+
+    // A genuinely NEW compaction can still re-arm cleanly — the state
+    // machine is not wedged.
+    write_hook_marker(&precompact_marker, started_ms, 121_000 + 6 * 60_000 + 1_000);
+    assert!(reg
+        .compact_nudge_tick(121_000 + 6 * 60_000 + 2_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new())
+        .is_empty());
+    assert!(reg.agent(&oid).unwrap().compact_pending, "a fresh marker can re-arm a new cycle");
+}
+
+#[test]
 fn compact_nudge_tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection() {
     // rev-4 review (N3): the fallback half of the same fix. A PreCompact
     // marker with NO SessionStart marker (a hook config that only wires the
@@ -6442,6 +6509,47 @@ fn compact_reinjection_notice_embeds_the_instructions_verbatim_when_the_contract
     assert!(n.contains(instructions), "must embed the FULL instructions text, not a pointer to go read it");
     assert!(n.contains("list_tasks") && n.contains("get_state") && n.contains("list_agents"), "got: {n}");
     assert!(!n.contains("directive ledger"), "None must embed nothing — no ledger header for an agent that never used it");
+}
+
+#[test]
+fn reinject_contract_text_on_system_layer_never_touches_the_filesystem() {
+    // The common case: a path that doesn't exist would be an `Err` if this
+    // ever actually read it — the short-circuit must return `None` without
+    // trying.
+    assert_eq!(reinject_contract_text(Path::new("C:/does/not/exist.md"), true), None);
+}
+
+#[test]
+fn reinject_contract_text_reads_the_file_when_the_contract_is_not_on_the_system_layer() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("worker.md");
+    fs::write(&p, "You are a worker...\nNever merge without a gate.").unwrap();
+    assert_eq!(
+        reinject_contract_text(&p, false),
+        Some("You are a worker...\nNever merge without a gate.".to_string())
+    );
+}
+
+#[test]
+fn reinject_contract_text_degrades_to_none_not_empty_string_when_unreadable_or_empty() {
+    // rev-10 review (N3), round 7: this is the fix itself, isolated — a
+    // missing file (e.g. the #423 sweep reclaiming a block's file out from
+    // under a still-live agent) and an empty-but-present file must BOTH
+    // degrade to `None` (the slim notice shape), never `Some("")` (a
+    // verbose notice with nothing embedded under it, which used to happen
+    // silently via `unwrap_or_default()`).
+    let d = tempfile::tempdir().unwrap();
+    assert_eq!(
+        reinject_contract_text(&d.path().join("gone.md"), false),
+        None,
+        "a missing file must not become Some(\"\")"
+    );
+    let empty = d.path().join("empty.md");
+    fs::write(&empty, "").unwrap();
+    assert_eq!(reinject_contract_text(&empty, false), None, "an empty file must not become Some(\"\")");
+    let whitespace_only = d.path().join("whitespace.md");
+    fs::write(&whitespace_only, "   \n\n  ").unwrap();
+    assert_eq!(reinject_contract_text(&whitespace_only, false), None, "whitespace-only must not read as real content");
 }
 
 #[test]
