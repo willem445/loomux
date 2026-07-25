@@ -244,13 +244,45 @@ it for real needs one of (roadmap, not done in this spike):
    (Medium IL) user — the straightforward fix, at the cost of infra to
    maintain.
 2. Wait for Microsoft to fix #5640 upstream.
-3. Pin the E2E build's WebView2 to **Fixed Version 149** via the
-   `BrowserExecutableFolder` policy — the one workaround reported in the
-   upstream issue, explicitly called "not sustainable long-term" by its own
-   reporter (tracks an old runtime indefinitely, diverging from what real
-   users actually run).
+3. ~~Pin the E2E build's WebView2 to Fixed Version 149~~ — **investigated and
+   ruled out, not just deferred.** Verified directly against Microsoft's own
+   distribution docs and download page, not assumed:
+   - [Distribute your app and the WebView2 Runtime](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution)
+     confirms the mechanism would work in principle: `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER`
+     is an *override* — quoting the reference docs exactly, "use the
+     `browserExecutableFolder` … values as replacements for the corresponding
+     values in `CreateCoreWebView2EnvironmentWithOptions` parameters" — not
+     merely a fallback for when the host app passes nothing, so it would
+     redirect Tauri/wry's environment creation to a Fixed Version folder
+     regardless of what Tauri itself passes.
+   - But the same doc states downloads are only kept for "the most-patched
+     version of the **latest and second-latest major releases**." Fetching
+     Microsoft's live download page
+     ([developer.microsoft.com/microsoft-edge/webview2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download-section))
+     during this investigation showed only **150.0.4078.99** as the Fixed
+     Version on offer — the *same* major as the regression, not the
+     last-known-good 149.x. Runtime 149 has already rolled off Microsoft's
+     own download window by the time this was checked, presumably because
+     Edge's ~4-week major-version cadence moved the "latest/second-latest"
+     window past it. Pinning to 150 Fixed Version would just reproduce the
+     exact same bug — there is nothing to pin to.
+   - Separately (and moot given the above, but worth recording): Tauri 2's
+     own config reference ([v2.tauri.app/reference/config](https://v2.tauri.app/reference/config/))
+     has **no** `webviewFixedRuntimePath`/fixed-runtime field — only
+     `bundle.windows.minimumWebview2Version` and `webviewInstallMode` (which
+     govern *installing* the Evergreen runtime, not redirecting environment
+     creation to a Fixed Version folder). Wiring this up would've meant
+     setting `WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` by hand in the CI job — an
+     env var Tauri doesn't manage for this purpose in v2, contrary to an
+     unverified secondhand claim about Tauri v1 behavior that didn't hold up
+     against the actual v2 docs.
+   - Even if a working pre-150 build were found some other way (an
+     unofficial mirror, unsuitable for a CI supply chain), the same
+     "Runtime rolls off the download window every ~4 weeks" problem the
+     upstream reporter called "not sustainable long-term" would apply from
+     day one, not eventually.
 
-Until one of those lands, treat `e2e-windows` red as expected, and rely on a
+Until (1) or (2) lands, treat `e2e-windows` red as expected, and rely on a
 local run (`npx playwright test` against the isolated profile) as this
 suite's actual signal.
 
