@@ -31,4 +31,10 @@ export default defineConfig({
   reporter: process.env.CI
     ? [["list"], ["html", { outputFolder: "playwright-report", open: "never" }]]
     : "list",
+  // Screenshots/traces make a CI-only failure diagnosable from the report
+  // artifact instead of blind-guessing another fix from the assertion alone.
+  use: {
+    screenshot: "only-on-failure",
+    trace: "retain-on-failure",
+  },
 });
