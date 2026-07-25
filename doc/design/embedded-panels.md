@@ -645,6 +645,36 @@ the first place; none of these are, so the panel's outer box keeps
 resizing exactly as smoothly as before, only its rows stop costing
 anything until the drag ends.
 
+**`.resizing` must come off on every way a drag can end, not just
+`mouseup` — `dragsession.ts` (post-merge review finding).** The first cut
+of fix 2 removed `.resizing` only from a `mouseup` handler, mirroring
+grid.ts's own pre-existing `dragging`-class pattern exactly — but the
+consequence of stranding it is not the same. A drag that ends WITHOUT a
+`mouseup` (Alt-Tab away mid-drag fires window `blur`; the mouse button is
+still physically down, but the browser never delivers a matching up event
+to a window that no longer has focus) used to leave grid.ts's `dragging`
+class stuck — a cosmetic leftover highlight, low stakes. The identical gap
+on `.resizing` strands `content-visibility: hidden` on a docked view's own
+list — a REAL stuck state (the list stays invisible) until some later,
+unrelated resize happens to touch that side again. `startDragSession`
+(`src/dragsession.ts`) is the fix, shared rather than forked: one helper
+wires `mousemove` + THREE end signals (`mouseup`, window `blur`, `Escape`)
+and guarantees its `onEnd` callback fires exactly once regardless of which
+one actually ends the drag, tearing down whatever `mousedown`-time state
+the caller applied. Every divider in the codebase (grid.ts's pane splits,
+both embed-slot and overlay dividers here) now goes through it — including
+grid.ts's own, so the precedent gets the same fix rather than the new code
+diverging from it. Ending early is treated exactly like a normal release
+(whatever size the drag reached stands); this fixes the STRANDED-STATE bug
+only, not a "cancel and restore the pre-drag size" feature nothing asked
+for. `test/dragsession.test.ts` pins the exactly-once/all-listeners-removed
+guarantee against a plain fake event target (mirrors `domutil.ts`'s
+narrow-interface testability pattern — `startDragSession` takes an
+injectable target, defaulting to `window`, precisely so this is
+unit-testable without a real DOM); the Alt-Tab-away scenario itself is
+manual-validation step 21, since nothing short of a real window losing
+focus can confirm the browser-level behavior the pure test assumes.
+
 **Task board and issues: the same discipline where it's free, not the same
 windowing.** `.resizing`'s `content-visibility` rule (fix 2) costs nothing
 extra to extend to `.tasks-list`/`.issues-list` and is applied to both.
@@ -914,3 +944,16 @@ lifecycle panel):**
     expected (follow's own poll is on a 1.5s timer, independent of the
     drag), but worth a look since it's the one path that combines both
     fixes.
+21. With the audit log (or any docked view) open, start dragging its
+    divider, then Alt-Tab away to a different application WITHOUT releasing
+    the mouse button (or otherwise blur the loomux window mid-drag) — then
+    Alt-Tab back. The list must be fully visible and interactive, not a
+    blank/empty panel (the `.resizing` class — `content-visibility: hidden`
+    — must have been removed on the window `blur`, not left stranded
+    waiting for a `mouseup` the window never receives with focus
+    elsewhere). Repeat for a plain grid split's divider — dragging it and
+    Alt-Tabbing away should leave the `dragging` highlight class cleared
+    too (cosmetic there, but confirms the shared fix covers grid.ts as
+    well). `test/dragsession.test.ts` pins the underlying exactly-once/
+    listeners-removed guarantee against a fake event target; this step is
+    the one real-DOM confirmation nothing in that pure suite can give.

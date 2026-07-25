@@ -62,6 +62,7 @@ import {
   type EmbedSide,
 } from "./embedsplit";
 import { embedToggleAction } from "./embedtoggle";
+import { startDragSession } from "./dragsession";
 import { showContextMenu, type MenuItem } from "./contextmenu";
 import {
   exitDiagnosticLine,
@@ -1952,14 +1953,11 @@ export class Pane implements VoiceTargetPane {
         overlay().style.height = `${h}px`;
         this.updateTermShift();
       };
-      const up = () => {
+      const end = () => {
         div.classList.remove("dragging");
         overlay().classList.remove("resizing");
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
       };
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
+      startDragSession({ onMove: move, onEnd: end });
     });
     return div;
   }
@@ -2139,11 +2137,9 @@ export class Pane implements VoiceTargetPane {
         beforeEl.style.flex = `${grow.growBefore} 1 0`;
         afterEl.style.flex = `${grow.growAfter} 1 0`;
       };
-      const up = () => {
+      const end = () => {
         slot.dividerEl.classList.remove("dragging");
         slot.panelEl.classList.remove("resizing");
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
         // Terminal (one per drag, not per mousemove) — mirrors grid.ts's own
         // split divider: persist the settled fraction so a restore
         // reproduces THIS size, not the one before the drag. `frac` is
@@ -2155,8 +2151,7 @@ export class Pane implements VoiceTargetPane {
         slot.frac = fracFromGrow(counterpartGrow, panelGrow);
         this.events.onRecordChanged(this);
       };
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
+      startDragSession({ onMove: move, onEnd: end });
     });
   }
 

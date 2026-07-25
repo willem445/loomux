@@ -15,6 +15,7 @@ import { dropZoneFor, indicatorFor, zoneToPlacement, type DropZone } from "./lay
 import { dockChipAttention } from "./attention";
 import { planGroupMinimize } from "./group";
 import { shouldFocusNewPane, shouldRestoreFocus, shouldPreserveMaximize } from "./panefocus";
+import { startDragSession } from "./dragsession";
 
 type Dir = "row" | "column";
 
@@ -488,18 +489,20 @@ export class Grid {
         before.style.flex = `${newB} 1 0`;
         after.style.flex = `${growTotal - newB} 1 0`;
       };
-      const up = () => {
+      const end = () => {
         div.classList.remove("dragging");
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
         // A finished divider drag changed the flex weights that layoutSnapshot
         // captures — persist them so a restore reproduces THIS split, not the
         // pre-drag one (#194 P4). Terminal (one per drag), not per-mousemove, so
-        // no write storm; persistTabs dedups an unchanged snapshot.
+        // no write storm; persistTabs dedups an unchanged snapshot. Fires from
+        // mouseup OR a drag that ends without one (window blur, Escape) —
+        // `startDragSession` (#361 review: this divider's own copy of the same
+        // gap left a stranded `dragging` class when a drag lost mouseup, a
+        // cosmetic issue here but a real stuck state on the embed/overlay
+        // dividers that share this pattern — fixed once, for all of them).
         this.onChange();
       };
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
+      startDragSession({ onMove: move, onEnd: end });
     });
     return div;
   }
