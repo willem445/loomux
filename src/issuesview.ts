@@ -143,6 +143,7 @@ export class IssuesView {
   private createBtn: HTMLButtonElement;
   private refreshBtn: HTMLButtonElement;
   private embedBtn: HTMLButtonElement;
+  private closeBtn: HTMLButtonElement;
   /** The open create-issue form, if any (kept to one at a time). */
   private formEl: HTMLElement | null = null;
   /** The open detail pane, if any (issue or PR). */
@@ -213,11 +214,12 @@ export class IssuesView {
     // pane's embed-panel slot.
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
     this.embedBtn.addEventListener("click", () => this.host.onEmbedMenu?.(this.embedBtn));
-    this.setPanelActive(false);
 
-    const closeBtn = el("button", "pane-btn close", "✕");
-    closeBtn.title = "Back to terminal (Esc)";
-    closeBtn.addEventListener("click", () => this.host.onClose());
+    this.closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
+    this.closeBtn.title = "Back to terminal (Esc)";
+    this.closeBtn.addEventListener("click", () => this.host.onClose());
+    // Now that both buttons `setPanelActive` touches exist.
+    this.setPanelActive(false);
 
     head.append(
       modeToggle,
@@ -226,7 +228,7 @@ export class IssuesView {
       this.createBtn,
       this.refreshBtn,
       this.embedBtn,
-      closeBtn
+      this.closeBtn
     );
 
     // -- list + overlays --
@@ -262,6 +264,11 @@ export class IssuesView {
     this.embedBtn.title = active
       ? "Un-embed — back to a floating overlay"
       : "Embed beside the terminal (resizes this pane)";
+    // The overlay toggle (this button, Esc, the pane header's own issues
+    // button) is disabled while docked (#361 user-demo finding — see
+    // embedtoggle.ts): only un-embedding closes a docked view now.
+    this.closeBtn.disabled = active;
+    this.closeBtn.title = active ? "Docked — un-embed it (side menu) to close" : "Back to terminal (Esc)";
   }
 
   /** Switch between the issues and PR lists. No-op if already there; otherwise

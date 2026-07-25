@@ -285,6 +285,7 @@ export class GitView {
   private pullBtn: HTMLButtonElement;
   private pushBtn: HTMLButtonElement;
   private embedBtn: HTMLButtonElement;
+  private closeBtn: HTMLButtonElement;
   private graphListEl: HTMLElement;
   private diffHeadEl: HTMLElement;
   private diffBodyEl: HTMLElement;
@@ -357,10 +358,10 @@ export class GitView {
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
     this.embedBtn.hidden = !!host.embedded;
     this.embedBtn.addEventListener("click", () => this.host.onEmbedMenu?.(this.embedBtn));
-    const closeBtn = el("button", "pane-btn close", "✕");
-    closeBtn.title = "Back to terminal (Esc)";
-    closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
-    closeBtn.addEventListener("click", () => this.host.onClose());
+    this.closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
+    this.closeBtn.title = "Back to terminal (Esc)";
+    this.closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
+    this.closeBtn.addEventListener("click", () => this.host.onClose());
     head.append(
       this.headTitleEl,
       this.headWorktreeEl,
@@ -370,7 +371,7 @@ export class GitView {
       pushBtn,
       fetchBtn,
       this.embedBtn,
-      closeBtn
+      this.closeBtn
     );
     this.graphListEl = el("div", "git-graph-list");
     graph.append(head, this.graphListEl);
@@ -451,6 +452,14 @@ export class GitView {
     this.embedBtn.title = active
       ? "Un-embed — back to a floating overlay"
       : "Embed beside the terminal (resizes this pane)";
+    // The overlay toggle (this button, Esc, and the pane header's own git
+    // button) is disabled while docked (#361 user-demo finding — see
+    // embedtoggle.ts): closing/reopening a docked view isn't a supported
+    // action anymore, only un-embedding is. Disabled here as the visible
+    // affordance for THIS button; `Pane.syncEmbedToggleButton` mirrors it on
+    // the pane header's own button.
+    this.closeBtn.disabled = active;
+    this.closeBtn.title = active ? "Docked — un-embed it (side menu) to close" : "Back to terminal (Esc)";
   }
 
   // ---------- resizable sub-panes ----------

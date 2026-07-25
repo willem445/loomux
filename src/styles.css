@@ -611,6 +611,37 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane:hover .pane-btn, .pane-btn:focus-visible { opacity: 1; }
 .pane-btn:hover { background: var(--panel-2); color: var(--text); }
 .pane-btn.close:hover { color: var(--danger); }
+/* A docked view's overlay toggle is disabled outright (#361 user-demo
+   finding — see embedtoggle.ts): dim it further than the plain hover-reveal
+   opacity and drop the pointer cursor, so it reads as unavailable rather
+   than just currently-inactive. */
+.pane:hover .pane-btn:disabled, .pane-btn:disabled:focus-visible { opacity: 0.35; }
+.pane-btn:disabled { cursor: default; }
+.pane-btn:disabled:hover { background: none; color: var(--text-dim); }
+
+/* Drag-suspend discipline (#361 user-demo finding): a docked/overlaid
+   panel's OWN scrollable list is what's expensive to reflow on every
+   divider-drag mousemove frame once it holds a lot of rows — the drag
+   itself just changes the panel's own box (driven by flex-grow / an
+   explicit height), which has nothing to do with the list's CONTENT. The
+   host toggles `.resizing` on the panel/overlay for the duration of a drag
+   (pane.ts's `wireEmbedDivider` / `makeOverlayDivider`) — `content-visibility:
+   hidden` skips layout AND paint of a listed view's rows entirely while
+   dragging (the outer box, sized by flex-grow/height, is unaffected — flex
+   items with an explicit `flex-basis: 0` were never sized from their
+   content to begin with) and the browser lays them out ONCE, normally, the
+   moment the class comes off on release. Applied to every list class large
+   enough to matter today; trivially extensible to a future one. */
+.pane-embed-panel.resizing .audit-list,
+.pane-embed-panel.resizing .tasks-list,
+.pane-embed-panel.resizing .issues-list,
+.pane-embed-panel.resizing .group-list,
+.git-overlay.resizing .audit-list,
+.git-overlay.resizing .tasks-list,
+.git-overlay.resizing .issues-list,
+.git-overlay.resizing .group-list {
+  content-visibility: hidden;
+}
 
 /* The terminal's breathing room must live on .xterm itself, not on
    .pane-term: the fit addon subtracts the terminal element's own padding,
@@ -2037,6 +2068,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border: 2px solid var(--bg-app); background-clip: padding-box;
 }
 .audit-empty { padding: 22px 16px; color: var(--text-dim); line-height: 1.5; }
+/* Rendered-window backfill hint (#361 user-demo finding — auditwindow.ts):
+   only the newest slice of a long log renders by default; this marks that
+   scrolling up loads more, rather than the log silently appearing to stop. */
+.audit-window-hint {
+  padding: 6px 10px; text-align: center;
+  color: var(--text-dim); font-size: 10.5px; font-style: italic;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
 
 .audit-row { padding: 1px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.03); }
 .audit-top {

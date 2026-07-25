@@ -205,6 +205,7 @@ export class GroupView {
   private onResize?: () => void;
   private getRepo?: () => string | null;
   private embedBtn: HTMLButtonElement;
+  private closeBtn: HTMLButtonElement;
 
   constructor(
     private groupId: string,
@@ -236,11 +237,12 @@ export class GroupView {
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
     this.embedBtn.addEventListener("click", () => opts.onEmbedMenu?.(this.embedBtn));
     head.append(this.embedBtn);
+    this.closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
+    this.closeBtn.title = "Close (Alt+O)";
+    this.closeBtn.addEventListener("click", opts.onClose);
+    head.append(this.closeBtn);
+    // Now that both buttons `setPanelActive` touches exist.
     this.setPanelActive(false);
-    const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
-    close.title = "Close (Alt+O)";
-    close.addEventListener("click", opts.onClose);
-    head.append(close);
 
     this.summaryEl = el("div", "group-summary");
 
@@ -582,6 +584,11 @@ export class GroupView {
     this.embedBtn.title = active
       ? "Un-embed — back to a floating overlay"
       : "Embed beside the terminal (resizes this pane)";
+    // The overlay toggle (this button, the pane header's own group button)
+    // is disabled while docked (#361 user-demo finding — see embedtoggle.ts):
+    // only un-embedding closes a docked panel now.
+    this.closeBtn.disabled = active;
+    this.closeBtn.title = active ? "Docked — un-embed it (side menu) to close" : "Close (Alt+O)";
   }
 
   dispose(): void {

@@ -61,6 +61,7 @@ import {
   EMBED_SIDES,
   type EmbedSide,
 } from "./embedsplit";
+import { embedToggleAction } from "./embedtoggle";
 import { showContextMenu, type MenuItem } from "./contextmenu";
 import {
   exitDiagnosticLine,
@@ -356,6 +357,28 @@ function isRestorableEmbedKind(kind: EmbedKind): kind is "tasks" | "audit" | "gr
   return (RESTORABLE_EMBED_KINDS as readonly string[]).includes(kind);
 }
 
+/** Human label for the toast a no-op'd toggle shows (`embedToggleAction`,
+ *  below) — matches each header button's own name for the kind. */
+const EMBED_TOGGLE_LABEL: Record<EmbedKind, string> = {
+  tasks: "The task board",
+  git: "The git view",
+  issues: "The issues view",
+  audit: "The audit log",
+  group: "The group lifecycle panel",
+};
+
+/** Each kind's PANE HEADER toggle button's normal (undocked) title —
+ *  restored by `syncEmbedToggleButton` whenever a kind un-docks; the single
+ *  source of truth so the constructor's initial assignment and the restore
+ *  can't drift apart. */
+const EMBED_TOGGLE_TITLE: Record<EmbedKind, string> = {
+  tasks: "Task board (Alt+T)",
+  git: "Git view (Alt+G)",
+  issues: "GitHub issues (Alt+I)",
+  audit: "Audit log (Alt+A)",
+  group: "Group lifecycle (Alt+O)",
+};
+
 /** One embeddable view's plumbing, registered once that view is lazily
  *  constructed. Lets the generic engine (`openView`/`closeView`/`toggleView`/
  *  `embedViewAtSide`/`reclampViewFloor`) treat all five views uniformly
@@ -424,9 +447,11 @@ export class Pane implements VoiceTargetPane {
    *  full-screen TUIs repaint from scratch, flooding scrollback with
    *  duplicate frames. */
   private gitOverlay: HTMLElement | null = null;
+  private gitBtn: HTMLButtonElement;
   /** GitHub issues view (any pane in a git repo), same overlay mechanics. */
   private issuesView: IssuesView | null = null;
   private issuesOverlay: HTMLElement | null = null;
+  private issuesBtn: HTMLButtonElement;
   /** Task board (orchestrator panes only), same overlay mechanics. */
   private tasksView: TasksView | null = null;
   private tasksOverlay: HTMLElement | null = null;
@@ -684,7 +709,7 @@ export class Pane implements VoiceTargetPane {
     this.tasksBtn = document.createElement("button");
     this.tasksBtn.className = "pane-btn";
     this.tasksBtn.innerHTML = TASKS_ICON;
-    this.tasksBtn.title = "Task board (Alt+T)";
+    this.tasksBtn.title = EMBED_TOGGLE_TITLE.tasks;
     this.tasksBtn.hidden = true; // shown for orchestrator panes in start()
     this.tasksBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -695,7 +720,7 @@ export class Pane implements VoiceTargetPane {
     this.auditBtn = document.createElement("button");
     this.auditBtn.className = "pane-btn";
     this.auditBtn.innerHTML = AUDIT_ICON;
-    this.auditBtn.title = "Audit log (Alt+A)";
+    this.auditBtn.title = EMBED_TOGGLE_TITLE.audit;
     this.auditBtn.hidden = true; // shown for orchestration panes in start()
     this.auditBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -706,7 +731,7 @@ export class Pane implements VoiceTargetPane {
     this.groupBtn = document.createElement("button");
     this.groupBtn.className = "pane-btn";
     this.groupBtn.innerHTML = GROUP_ICON;
-    this.groupBtn.title = "Group lifecycle (Alt+O)";
+    this.groupBtn.title = EMBED_TOGGLE_TITLE.group;
     this.groupBtn.hidden = true; // shown for orchestrator panes in start()
     this.groupBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -750,25 +775,25 @@ export class Pane implements VoiceTargetPane {
     // terminal and are sized from its height, so they mean nothing on a pane that
     // has no terminal. CSS hides them on a files pane (#214) — see the toggles,
     // which refuse the hotkey path for the same reason.
-    const issuesBtn = document.createElement("button");
-    issuesBtn.className = "pane-btn pty-only";
-    issuesBtn.innerHTML = ISSUES_ICON;
-    issuesBtn.title = "GitHub issues (Alt+I)";
-    issuesBtn.addEventListener("click", (e) => {
+    this.issuesBtn = document.createElement("button");
+    this.issuesBtn.className = "pane-btn pty-only";
+    this.issuesBtn.innerHTML = ISSUES_ICON;
+    this.issuesBtn.title = EMBED_TOGGLE_TITLE.issues;
+    this.issuesBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       this.toggleIssuesView();
     });
-    header.appendChild(issuesBtn);
+    header.appendChild(this.issuesBtn);
 
-    const gitBtn = document.createElement("button");
-    gitBtn.className = "pane-btn pty-only";
-    gitBtn.innerHTML = GIT_ICON;
-    gitBtn.title = "Git view (Alt+G)";
-    gitBtn.addEventListener("click", (e) => {
+    this.gitBtn = document.createElement("button");
+    this.gitBtn.className = "pane-btn pty-only";
+    this.gitBtn.innerHTML = GIT_ICON;
+    this.gitBtn.title = EMBED_TOGGLE_TITLE.git;
+    this.gitBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       this.toggleGitView();
     });
-    header.appendChild(gitBtn);
+    header.appendChild(this.gitBtn);
 
     // File-editor overlay (#174). Unconditional — every pane type gets it,
     // including plain terminals (unlike the orchestration-gated buttons above).
@@ -1918,6 +1943,10 @@ export class Pane implements VoiceTargetPane {
       const startY = e.clientY;
       const startH = overlay().offsetHeight;
       div.classList.add("dragging");
+      // Same drag-suspend discipline as the embed-slot dividers (#361
+      // user-demo finding) — the overlay's own height-drag hits the exact
+      // same "reflow a huge list on every mousemove" cost.
+      overlay().classList.add("resizing");
       const move = (ev: MouseEvent) => {
         const h = this.overlayClamp(startH + (ev.clientY - startY), floor?.());
         overlay().style.height = `${h}px`;
@@ -1925,6 +1954,7 @@ export class Pane implements VoiceTargetPane {
       };
       const up = () => {
         div.classList.remove("dragging");
+        overlay().classList.remove("resizing");
         window.removeEventListener("mousemove", move);
         window.removeEventListener("mouseup", up);
       };
@@ -2091,6 +2121,17 @@ export class Pane implements VoiceTargetPane {
       const growBefore = parseFloat(beforeEl.style.flexGrow || "1");
       const growAfter = parseFloat(afterEl.style.flexGrow || "1");
       slot.dividerEl.classList.add("dragging");
+      // Suspend layout of the docked panel's OWN content for the duration of
+      // the drag (#361 user-demo finding: a large unvirtualized list — e.g.
+      // thousands of audit entries — makes every mousemove frame reflow the
+      // whole list just because the container's cross-axis size changed,
+      // even though nothing about the list's OWN content did). `.resizing`
+      // (styles.css) applies `content-visibility: hidden` to the known heavy
+      // list classes, so the browser skips their layout/paint entirely while
+      // dragging and does ONE normal reflow when it's removed on release —
+      // the terminal side of the divider is never touched by this class, so
+      // its own resize/PTY-fit path is completely unaffected.
+      slot.panelEl.classList.add("resizing");
       const move = (ev: MouseEvent) => {
         const pos = horizontal ? ev.clientX : ev.clientY;
         const { beforeFloorPx, afterFloorPx } = this.dividerFloors(slot.side);
@@ -2100,6 +2141,7 @@ export class Pane implements VoiceTargetPane {
       };
       const up = () => {
         slot.dividerEl.classList.remove("dragging");
+        slot.panelEl.classList.remove("resizing");
         window.removeEventListener("mousemove", move);
         window.removeEventListener("mouseup", up);
         // Terminal (one per drag, not per mousemove) — mirrors grid.ts's own
@@ -2227,12 +2269,62 @@ export class Pane implements VoiceTargetPane {
     }
   }
 
+  /** The pane-header toggle button for `kind` — the button `syncEmbedToggleButton`
+   *  disables/retitles while docked. `null` for a kind that never gets one
+   *  (there is none today; kept total for a future kind that might not). */
+  private embedToggleBtn(kind: EmbedKind): HTMLButtonElement | null {
+    switch (kind) {
+      case "tasks":
+        return this.tasksBtn;
+      case "audit":
+        return this.auditBtn;
+      case "group":
+        return this.groupBtn;
+      case "git":
+        return this.gitBtn;
+      case "issues":
+        return this.issuesBtn;
+    }
+  }
+
+  /** Reflect `kind`'s CURRENT dock state on its pane-header toggle button
+   *  (#361 user-demo finding): disabled + retitled while docked, since the
+   *  plain overlay toggle is deliberately unsupported then
+   *  (`embedtoggle.ts`). Called everywhere a kind's dock state changes
+   *  (`embedViewAtSide`, `unembedView`, `restoreEmbeds`) — the pane-level
+   *  counterpart to what each view's own `setPanelActive` already does for
+   *  its INTERNAL embed/close buttons. */
+  private syncEmbedToggleButton(kind: EmbedKind): void {
+    const btn = this.embedToggleBtn(kind);
+    if (!btn) return;
+    const docked = this.sideOf(kind) !== null;
+    btn.disabled = docked;
+    btn.title = docked
+      ? `${EMBED_TOGGLE_LABEL[kind]} is docked — un-embed it (its side menu) to use this`
+      : EMBED_TOGGLE_TITLE[kind];
+  }
+
   /** Toggle `kind`'s view open/closed, in whichever mode it's currently set
    *  to. The shared entry point every embeddable view's public hotkey
    *  method (`toggleTasksView`, `toggleGitView`, …) delegates to after its
-   *  own view-specific gating and lazy `ensureXView()`. */
+   *  own view-specific gating and lazy `ensureXView()` — and, by extension,
+   *  every OTHER thing that can ask a view to toggle: a header button, a
+   *  keybinding (main.ts), a view's own internal ✕ / Escape handler
+   *  (`onClose`, wired straight back to the matching `toggleXView`), and
+   *  `pane-meta`'s branch-name click. Routing all of them through this ONE
+   *  function is what makes the docked no-op below (#361 user-demo finding)
+   *  actually cover every entry point, rather than needing the same guard
+   *  copy-pasted into each caller — a single missed copy would silently
+   *  reintroduce the bug for just that one entry point. See
+   *  `embedtoggle.ts`'s own doc comment for why a docked view's toggle is
+   *  disabled outright rather than fixed to correctly close/reopen it. */
   private toggleView(kind: EmbedKind): void {
-    if (this.isViewVisible(kind)) this.closeView(kind);
+    const action = embedToggleAction(this.sideOf(kind) !== null, this.isViewVisible(kind));
+    if (action === "noop") {
+      showToast(`${EMBED_TOGGLE_LABEL[kind]} is docked — un-embed it (its side menu) to use this toggle.`, "info");
+      return;
+    }
+    if (action === "close") this.closeView(kind);
     else this.openView(kind);
   }
 
@@ -2302,9 +2394,11 @@ export class Pane implements VoiceTargetPane {
     // Evict whoever (if anyone) is currently on the TARGET side.
     const targetSlot = this.embedSlots![side];
     if (targetSlot.kind !== null) {
-      this.embedRegistry.get(targetSlot.kind)?.setPanelActive(false);
-      this.closeView(targetSlot.kind);
+      const evicted = targetSlot.kind;
+      this.embedRegistry.get(evicted)?.setPanelActive(false);
+      this.closeView(evicted);
       targetSlot.kind = null;
+      this.syncEmbedToggleButton(evicted);
     }
     const wasOverlayOpen = !entry.overlayEl.hidden;
     if (wasOverlayOpen) entry.overlayEl.hidden = true; // it's about to move into the slot
@@ -2312,6 +2406,7 @@ export class Pane implements VoiceTargetPane {
     targetSlot.frac = clampEmbedFrac(targetSlot.frac);
     entry.setPanelActive(true);
     this.openView(kind); // docking always shows it
+    this.syncEmbedToggleButton(kind);
     // Right's occupancy just changed (moved onto it, off it, or evicted
     // from it) — left's composed far-side floor depends on that (see
     // dividerFloors's "left" case), so reclamp it too.
@@ -2330,6 +2425,7 @@ export class Pane implements VoiceTargetPane {
     if (wasVisible) this.closeView(kind);
     this.embedSlots![side].kind = null;
     entry.setPanelActive(false);
+    this.syncEmbedToggleButton(kind);
     if (wasVisible) this.openView(kind);
     if (side === "right") this.reclampSlotDivider("left");
     this.events.onRecordChanged(this);
@@ -2370,6 +2466,7 @@ export class Pane implements VoiceTargetPane {
       slot.frac = clampEmbedFrac(e.share);
       entry.setPanelActive(true);
       this.openView(e.view);
+      this.syncEmbedToggleButton(e.view);
     }
   }
 

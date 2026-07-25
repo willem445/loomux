@@ -467,6 +467,59 @@ had only for itself: retract whichever host was opening (the correct SLOT
 for a docked view, or the overlay), let the error surface (global handler
 shows a banner).
 
+## Overlay toggle vs. dock: disabled, not fixed (#361 user-demo finding)
+
+A live demo surfaced a real bug: with a view docked, clicking its OWN
+overlay toggle — the pane header's button, the matching keybinding
+(Alt+G/T/A/O/I), or the view's own internal ✕/Escape (`onClose`, wired
+straight back to the same `toggleXView`) — closed/reparented the view but
+left the SLOT's own panel+divider sitting there visible and empty: a black,
+dead rectangle where the view used to be. Root cause: `toggleView`'s
+close/open decision and the SLOT's own open/closed state are two
+independently-driven pieces of visibility for the SAME view — the toggle
+flips the view's own `hidden` flag (`GitView`/`IssuesView`'s own duplicate
+of it; see *Reuse, not a fork* below) and, separately, `closeView` flips the
+slot's `panelEl.hidden` — and while every path THIS review traced kept the
+two in lockstep, that's a standing tax on every future change to either
+side, with a large surface of entry points (five views × header button ×
+keybinding × internal close × Escape × `pane-meta`'s branch-name click) any
+one of which reintroduces the same bug if it ever forgets to.
+
+The fix removes the tax instead of continuing to pay it: **while a view is
+docked, its overlay toggle is disabled outright — a no-op, not a fixed
+close/reopen.** `embedToggleAction(docked, visible)` (`embedtoggle.ts`, pure
+and DOM-free) is the single decision every toggle path now goes through —
+`docked` wins unconditionally, so a docked view's toggle can never again
+race or drift out of sync with its slot, because it no longer DOES
+anything to either piece of state. The only way to make a docked view stop
+sharing space with the terminal is the explicit **Un-embed** action in its
+side menu, which already goes through `unembedView` — a single, correct,
+already-tested code path — and the plain toggle works normally again the
+moment it does.
+
+**The single choke point is what makes the fix actually cover every entry
+point.** `Pane.toggleView(kind)` is the one function EVERY toggle path
+already funneled through before this fix (each view's public
+`toggleXView()` method — itself called by the header button, `main.ts`'s
+keybinding dispatch, and the view's own `onClose`/Escape handler) — so
+putting `embedToggleAction`'s guard there, once, closes off the whole class
+at the root rather than requiring the same check copy-pasted into five
+views' worth of buttons and handlers, each one a chance to miss.
+
+**Visible affordance, not just a silent no-op.** A no-op keybinding or
+metadata click (the branch-name label isn't a real `<button>`, so it can't
+be `disabled`) shows a toast (`showToast`, the same mechanism
+`refuseOverlay` already uses for "isn't available in a ___ pane") — "The
+git view is docked — un-embed it (its side menu) to use this toggle." Every
+REAL button gets a stronger, persistent affordance: the pane header's own
+toggle button (`Pane.syncEmbedToggleButton`) and each view's own internal ✕
+(extended into every view's existing `setPanelActive`, the same hook that
+already updates the embed button's icon on every dock/undock) are both
+`disabled` and retitled while docked, restored the moment it un-embeds.
+`.pane-btn:disabled` (styles.css) dims further than the plain hover-reveal
+opacity and drops the pointer cursor, so a docked toggle reads as
+unavailable rather than merely inactive.
+
 ## Coexistence (#361 NB-4), generalized to N slots
 
 `Pane.closeOtherOverlays(except)` loops every `EmbedKind` and closes ONLY
@@ -531,6 +584,80 @@ created lazily and left in the DOM afterward, hidden via the app-wide
 `[hidden] { display: none !important; }` rule rather than
 created/destroyed — the same reuse idiom every overlay in `pane.ts` already
 used for itself, now applied to three slots instead of one.
+
+## Performance: bounding a docked panel's own render cost (#361 user-demo)
+
+Docking makes a panel's OWN scrollable list a real flex sibling that
+resizes continuously while a divider is dragged — that's the whole point
+(*The PTY-resize boundary*, above). It also surfaced a cost overlay mode
+mostly hid: a floating overlay's HEIGHT rarely got dragged past a screenful,
+but a docked panel is now resized as casually as a grid split, and a demo
+with a long-running group's audit log — 2735 entries, one live DOM row
+each — was measurably laggy to drag once docked. The lag isn't from any
+`render()` call during the drag (nothing calls it — no view has a
+`ResizeObserver` reacting to its own container size, `GitView` included);
+it's the browser's OWN layout engine, forced to re-lay-out thousands of DOM
+nodes on every single `mousemove` frame just because their SHARED
+ANCESTOR's cross-axis size changed, even though nothing about any
+individual row's own content did. Two independent fixes, addressing two
+different halves of that cost:
+
+**1. Bound the row count, don't just tolerate it — `auditwindow.ts`.** The
+audit log is the one view in this set with a genuinely unbounded growth
+path: `audit.jsonl` is append-only for the life of a group, unlike the task
+board (curated — done items get cleared) or the issues list (bounded by
+whatever the repo actually has open). Rather than ever holding the full log
+in the DOM, `AuditView` renders only the newest `AUDIT_WINDOW_SIZE` (300)
+MATCHING (post-filter) entries by default; scrolling near the top of the
+list backfills another `AUDIT_WINDOW_STEP` (300) further back
+(`maybeBackfill`), preserving the human's scroll position across the
+rebuild (`scrollTop` is restored by the height DELTA the newly-prepended
+rows added, not reset to 0). The pure decision, `nextWindowStart`, is
+DOM-free and covers the three cases that matter: a filter change
+invalidates the old window index outright (reset to the newest slice); new
+entries arriving while the human is AT THE TAIL (`nearBottom`, following)
+slide the window forward to stay capped, so a long follow session never
+re-grows past the cap; new entries arriving while the human has scrolled up
+to read history leave the window exactly where it is — a follow poll must
+never yank someone's place in the backlog out from under them just because
+new entries landed at a tail they aren't looking at. `test/auditwindow.test.ts`
+pins all three, plus the backfill step and its floor at 0.
+
+**2. Suspend layout of a docked panel's content for the DURATION of a
+drag, not just bound its steady-state size — the `.resizing` class.** Even
+at 300 rows, dragging fires `mousemove` at display refresh rate, and every
+tick still forces a reflow that has nothing to do with what the human is
+actually watching (the DIVIDER's position, not the list's internal
+layout). `Pane.wireEmbedDivider`'s mousedown adds `resizing` to the SLOT's
+own `panelEl` (never to `beforeEl`/`counterpartEl` — the terminal side of
+any divider is never touched by this); `makeOverlayDivider` does the same
+to the overlay host for the identical cost during a plain (non-docked)
+overlay height-drag. `styles.css` scopes `content-visibility: hidden` to
+each heavy view's own list class under `.resizing`
+(`.audit-list`/`.tasks-list`/`.issues-list`/`.group-list`) — the browser
+skips layout AND paint of the rows entirely while the class is present, and
+lays them out ONCE, normally, the instant it's removed on release. This is
+safe specifically because every one of those list elements sizes itself via
+an explicit `flex: 1` (`flex-basis: 0`, never `auto`) from its OWN flex
+parent — `content-visibility: hidden` implies `contain: size`, which only
+changes an element's size if that size was ever DERIVED from its content in
+the first place; none of these are, so the panel's outer box keeps
+resizing exactly as smoothly as before, only its rows stop costing
+anything until the drag ends.
+
+**Task board and issues: the same discipline where it's free, not the same
+windowing.** `.resizing`'s `content-visibility` rule (fix 2) costs nothing
+extra to extend to `.tasks-list`/`.issues-list` and is applied to both.
+Row-windowing (fix 1) is NOT extended to either, on purpose: the task board
+is actively curated by the orchestrator/human (done items get cleared,
+#120) rather than growing forever, and the issues list is bounded by
+whatever GitHub actually returns for the repo — neither has audit's
+specific "genuinely unbounded, append-only, thousands over a long session"
+shape, and windowing either would trade away seeing the full board/list for
+a problem that (today) doesn't reproduce there. If a repo's issue count or
+a board's task count ever grows large enough to reproduce the same
+symptom, `auditwindow.ts`'s pattern is the one to reach for — it isn't
+audit-specific in its logic, only in its current wiring.
 
 ## Persisted shape
 
@@ -736,3 +863,54 @@ lifecycle panel):**
     relaunch — confirm it comes back as the floating overlay (the
     documented, deliberate scope boundary above), not docked and not
     missing entirely.
+
+**Overlay toggle vs. dock (#361 user-demo finding):**
+
+14. Dock a view (any of the five) to any edge and leave it open. Click the
+    PANE HEADER's own toggle button for that view (not its embed button —
+    the plain header icon, e.g. the git/task-board/audit/group/issues
+    button) — nothing should happen: no black/empty area where the panel
+    was, the button should already read as visibly dimmer/disabled, and
+    hovering it should show a tooltip like "…is docked — un-embed it (its
+    side menu) to use this". This is the exact bug: before the fix, this
+    click closed/reparented the view but left the slot's own panel+divider
+    sitting there empty.
+15. Same setup — press the matching KEYBINDING (Alt+G/T/A/O/I) instead of
+    clicking the button. A toast should appear ("… is docked — un-embed it
+    …") and nothing else should change. Repeat via the view's own internal
+    ✕ button (should be visibly disabled with a matching tooltip) and, for
+    git, the pane header's branch-name label (not a real button, so no
+    disabled state — but clicking it should also just toast, not close
+    anything).
+16. Open the embed menu and click **Un-embed** — the view returns to the
+    floating overlay, and the SAME header button / keybinding / internal ✕
+    that just no-op'd should now close it normally; re-toggling should
+    reopen it normally. Confirm this for at least two different views, not
+    just one — the fix is centralized, but worth confirming it isn't
+    accidentally view-specific.
+
+**Audit log performance while docked (#361 user-demo finding):**
+
+17. On a group with a large audit log (a long-running session, or grep
+    `audit.jsonl`'s line count directly to confirm it's in the hundreds or
+    thousands), dock the audit log to any edge. Drag its divider hard, back
+    and forth, repeatedly — it should feel as smooth as dragging any other
+    docked view's divider, with no visible stutter tied to the log's size.
+    Compare against dragging the SAME divider before this fix (or against
+    another, smaller view's divider) if you want a direct before/after
+    feel.
+18. While docked and open, scroll the audit list to the very top — a small
+    italic line ("N earlier entries — scroll up to load more") should
+    appear, and scrolling further should load more of the backlog, keeping
+    your place (the view should NOT jump back to the top or bottom when
+    older entries are prepended).
+19. Turn on live-follow (▶ follow) while scrolled up reading old entries —
+    new entries arriving must NOT yank your scroll position back to the
+    tail. Scroll back down to the bottom yourself — follow should resume
+    normal live-tailing (auto-scroll to newest) from there, same as before
+    this change.
+20. Drag the divider while the audit log is actively following (new entries
+    arriving during the drag) — should stay smooth; no correctness issue
+    expected (follow's own poll is on a 1.5s timer, independent of the
+    drag), but worth a look since it's the one path that combines both
+    fixes.

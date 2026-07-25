@@ -86,6 +86,7 @@ export class TasksView {
   private disposed = false;
 
   private embedBtn: HTMLButtonElement;
+  private closeBtn: HTMLButtonElement;
 
   constructor(
     private groupId: string,
@@ -123,12 +124,13 @@ export class TasksView {
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
     this.embedBtn.addEventListener("click", () => opts.onEmbedMenu(this.embedBtn));
     head.append(this.embedBtn);
-    this.setPanelActive(false);
 
-    const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
-    close.title = "Close (Alt+T)";
-    close.addEventListener("click", opts.onClose);
-    head.append(close);
+    this.closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
+    this.closeBtn.title = "Close (Alt+T)";
+    this.closeBtn.addEventListener("click", opts.onClose);
+    head.append(this.closeBtn);
+    // Now that both buttons `setPanelActive` touches exist.
+    this.setPanelActive(false);
 
     this.listEl = el("div", "tasks-list");
 
@@ -185,6 +187,11 @@ export class TasksView {
     this.embedBtn.title = active
       ? "Un-embed — back to a floating overlay"
       : "Embed beside the terminal (resizes this pane)";
+    // The overlay toggle (this button, the pane header's own board button)
+    // is disabled while docked (#361 user-demo finding — see embedtoggle.ts):
+    // only un-embedding closes a docked board now.
+    this.closeBtn.disabled = active;
+    this.closeBtn.title = active ? "Docked — un-embed it (side menu) to close" : "Close (Alt+T)";
   }
 
   dispose(): void {

@@ -7,11 +7,16 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { asObject, str, summarize, type AuditEntry } from "./auditsummary";
+import { nextWindowStart, backfillWindowStart } from "./auditwindow";
 
 export type { AuditEntry };
 
 /** How often live-follow re-polls the backend. */
 const FOLLOW_MS = 1500;
+
+/** How close to the top of the list counts as "asking for more history"
+ *  (mirrors the existing `nearBottom` follow-tail threshold below). */
+const BACKFILL_THRESHOLD_PX = 40;
 
 /** Empty-string filter value = "any". */
 interface Filters {
@@ -77,6 +82,7 @@ export class AuditView {
   private followBtn: HTMLButtonElement;
   private countEl: HTMLElement;
   private embedBtn: HTMLButtonElement;
+  private closeBtn: HTMLButtonElement;
 
   private entries: AuditEntry[] = [];
   private filters: Filters = { actor: "", action: "", agent: "", search: "" };
@@ -91,6 +97,15 @@ export class AuditView {
   /** Signature of the entry set the filter dropdowns were last built from, so
    *  a no-op follow poll doesn't rebuild (and disrupt) an open dropdown. */
   private lastOptionsSig = "";
+  /** Index into the CURRENT filtered array the rendered window starts at
+   *  (#361 user-demo finding — auditwindow.ts) — everything from here to the
+   *  end renders; only render a bounded tail rather than the full,
+   *  potentially-thousands-long log. */
+  private windowStart = 0;
+  /** The filter signature `windowStart` was last computed against, so a
+   *  genuine filter change (which invalidates the old index) is
+   *  distinguishable from new entries simply having arrived. */
+  private lastFilterSig = "";
 
   constructor(
     private groupId: string,
@@ -119,12 +134,13 @@ export class AuditView {
     this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
     this.embedBtn.addEventListener("click", () => opts.onEmbedMenu?.(this.embedBtn));
     head.append(this.embedBtn);
-    this.setPanelActive(false);
 
-    const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
-    close.title = "Close (Alt+A)";
-    close.addEventListener("click", opts.onClose);
-    head.append(close);
+    this.closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
+    this.closeBtn.title = "Close (Alt+A)";
+    this.closeBtn.addEventListener("click", opts.onClose);
+    head.append(this.closeBtn);
+    // Now that both buttons `setPanelActive` touches exist.
+    this.setPanelActive(false);
 
     // Filter bar.
     const filterBar = el("div", "audit-filters");
@@ -143,6 +159,7 @@ export class AuditView {
     filterBar.append(this.actorSel, this.actionSel, this.agentSel, this.searchInput);
 
     this.listEl = el("div", "audit-list");
+    this.listEl.addEventListener("scroll", () => this.maybeBackfill());
 
     this.el.append(head, filterBar, this.listEl);
   }
@@ -172,6 +189,11 @@ export class AuditView {
     this.embedBtn.title = active
       ? "Un-embed — back to a floating overlay"
       : "Embed beside the terminal (resizes this pane)";
+    // The overlay toggle (this button, the pane header's own audit button)
+    // is disabled while docked (#361 user-demo finding — see embedtoggle.ts):
+    // only un-embedding closes a docked log now.
+    this.closeBtn.disabled = active;
+    this.closeBtn.title = active ? "Docked — un-embed it (side menu) to close" : "Close (Alt+A)";
   }
 
   dispose(): void {
@@ -292,6 +314,17 @@ export class AuditView {
     const nearBottom =
       this.listEl.scrollHeight - this.listEl.scrollTop - this.listEl.clientHeight < 40;
 
+    // Only the newest WINDOW_SIZE matching entries render by default — the
+    // log is append-only and can grow into the thousands over a long
+    // session, and a full unbounded DOM list is genuinely slow to reflow on
+    // every divider-drag frame once docked (#361 user-demo finding).
+    // `maybeBackfill` (on scroll-to-top) is the other place this advances.
+    const filterSig = JSON.stringify(this.filters);
+    const filterChanged = filterSig !== this.lastFilterSig;
+    this.lastFilterSig = filterSig;
+    this.windowStart = nextWindowStart(filtered.length, this.windowStart, filterChanged, nearBottom);
+    const windowed = filtered.slice(this.windowStart);
+
     this.listEl.replaceChildren();
     if (this.entries.length === 0) {
       this.listEl.appendChild(el("div", "audit-empty", "No audit entries yet for this group."));
@@ -301,9 +334,33 @@ export class AuditView {
       this.listEl.appendChild(el("div", "audit-empty", "No entries match the current filters."));
       return;
     }
-    for (const e of filtered) this.listEl.appendChild(this.renderRow(e));
+    if (this.windowStart > 0) {
+      const older = this.windowStart;
+      this.listEl.appendChild(
+        el("div", "audit-window-hint", `${older} earlier ${older === 1 ? "entry" : "entries"} — scroll up to load more`)
+      );
+    }
+    for (const e of windowed) this.listEl.appendChild(this.renderRow(e));
 
     if (this.follow && nearBottom) this.listEl.scrollTop = this.listEl.scrollHeight;
+  }
+
+  /** Scrolling near the top asks for more of the backlog (#361 user-demo
+   *  finding — the windowed render above). Forces the next `render()` to
+   *  rebuild (bypassing its no-op-skip signature check, the same trick the
+   *  expand/collapse click handler below already uses) and preserves the
+   *  human's scroll position across the rebuild — without this, replacing
+   *  the list's children resets `scrollTop` to 0, which would immediately
+   *  re-trigger this same backfill on the NEXT scroll event, in a loop. */
+  private maybeBackfill(): void {
+    if (this.windowStart === 0) return;
+    if (this.listEl.scrollTop > BACKFILL_THRESHOLD_PX) return;
+    this.windowStart = backfillWindowStart(this.windowStart);
+    const prevScrollHeight = this.listEl.scrollHeight;
+    const prevScrollTop = this.listEl.scrollTop;
+    this.lastSig = ""; // force the rebuild even though the underlying data hasn't changed
+    this.render();
+    this.listEl.scrollTop = prevScrollTop + (this.listEl.scrollHeight - prevScrollHeight);
   }
 
   private renderRow(e: AuditEntry): HTMLElement {
