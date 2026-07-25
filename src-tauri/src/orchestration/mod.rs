@@ -2900,6 +2900,77 @@ pub fn auto_compact_banner_detected(cli: &str, tail: &str) -> bool {
     subs.iter().any(|s| last_line.contains(s))
 }
 
+/// #428 (round 9): stable substrings Copilot's own CLI paints once a
+/// compaction FINISHES — the completion-side counterpart of `auto_compact_
+/// banner_substrings` (which covers the RUNNING side, Claude only so far).
+/// Same per-CLI-data discipline: an unsupported CLI gets an empty slice,
+/// never a buried `if cli == "copilot"` in the detection/pipeline code.
+///
+/// Text captured directly from the live incident #428 reports (the user's
+/// own screen observation, quoted in the issue body — not reconstructed
+/// from memory): Copilot paints "Compaction completed", "A new checkpoint
+/// has been added to your session.", and "Use /session checkpoints N to
+/// view the compaction summary." Only the first two are used for
+/// matching — the third contains a checkpoint NUMBER that changes every
+/// time (`N`), so its literal text never repeats and can't be a stable
+/// substring.
+///
+/// Same fragility this repo already accepts for the running-side banner:
+/// UI text, not a documented API, and could change wording in a future
+/// Copilot CLI release with no notice. This is deliberately an
+/// ACCELERATOR, not the only path — `compact_nudge_tick`'s busy-then-quiet
+/// resolver keeps running regardless of whether this ever matches, so a
+/// wording change degrades this feature back to today's slower (but
+/// still-correct) resolution, never to a hang. If this stops firing,
+/// re-verify the exact strings against a current Copilot CLI build first
+/// — that is the changelog-watch this fragility calls for, not a broader
+/// pattern match.
+fn copilot_compaction_marker_substrings(cli: &str) -> &'static [&'static str] {
+    match cli {
+        "copilot" => &["Compaction completed", "A new checkpoint has been added to your session"],
+        _ => &[],
+    }
+}
+
+/// #428 (round 9): whether Copilot's pane output shows its OWN compaction-
+/// completion paint — the fast terminal-path analog of Claude's
+/// SessionStart(compact) hook marker (round 7), for a CLI that ships no
+/// post-compact hook of any kind (no `postCompact` event; `sessionStart`
+/// never fires on compact — both docs-confirmed in earlier #417 rounds).
+///
+/// Pure substring scan over the WHOLE tail, deliberately NOT last-line-
+/// anchored like `auto_compact_banner_detected`: that anchoring works
+/// because Claude's running-side banner is a continuously-redrawn spinner
+/// (the literal last thing on screen while it runs); Copilot's completion
+/// message is a static block printed ONCE, so by the time a later tick
+/// reads the pane the agent may already have produced more output after
+/// it — anchoring to the last line would miss a real match, not just
+/// filter false ones.
+///
+/// Provenance instead comes entirely from the CALLER's gating
+/// (`compact_nudge_tick`): only checked while an arm is already open with
+/// no reinjection yet decided (so a stale mention from an already-resolved
+/// compaction can never resurrect anything), and only after `compact_
+/// inference_guard_until_ms` has passed — the same cooldown `human_typed_
+/// compact_detected`/`auto_compact_banner_detected` use so loomux's own
+/// recent paste can't satisfy its own detector. That cooldown is belt-
+/// and-braces here specifically: loomux never writes either matched
+/// sentence into anything it pastes (`compact_reinjection_notice`'s three
+/// shapes, `compact_escalation_notice`, or the bare `/compact` command) —
+/// checked against those functions' actual bodies, not assumed — so there
+/// is no loomux-authored echo this could ever match to begin with. The
+/// residual risk is the same class `auto_compact_banner_detected`'s own
+/// doc accepts: an agent's own conversational prose happening to discuss
+/// this exact wording — judged narrow given these are two specific, full
+/// sentences, not one generic word.
+pub fn copilot_compaction_marker_detected(cli: &str, tail: &str) -> bool {
+    let subs = copilot_compaction_marker_substrings(cli);
+    if subs.is_empty() {
+        return false;
+    }
+    subs.iter().any(|s| tail.contains(s))
+}
+
 /// Directive ledger (#329 expansion): the ledger section embedded verbatim in
 /// the post-compact re-grounding notice, or `None` for an empty/missing
 /// ledger — nothing is embedded rather than a header with nothing under it.
@@ -10535,6 +10606,14 @@ impl OrchRegistry {
         // audited distinctly so "no reinjection fired" reads as a deliberate
         // choice, not a silently dropped one.
         let mut to_hook_native_skip: Vec<(String, String)> = Vec::new();
+        // #428 (round 9): an arm resolved by Copilot's own compaction-
+        // completion paint rather than a busy-then-quiet observation —
+        // audited distinctly (`compact-resolved-copilot-marker`) so the
+        // timeline reads as "the CLI's own screen told us" rather than
+        // "loomux inferred it from output going quiet", the same
+        // provenance distinction `to_hook_armed` already draws for
+        // marker-file evidence vs. inference.
+        let mut to_copilot_marker_resolved: Vec<(String, String)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
             for a in agents.values_mut() {
@@ -10751,6 +10830,101 @@ impl OrchRegistry {
                         // seen either way.
                         if !reinject_already_dispatched {
                             to_hook_native_skip.push((a.id.clone(), a.group.clone()));
+                        }
+                    }
+                }
+
+                // #428 (round 9): Copilot's own compaction-completion paint
+                // as a fast terminal path. GitHub ships Copilot a `preCompact`
+                // hook (arms exactly like Claude's, above) but NO post-
+                // compact signal at all — no `postCompact` event, and its
+                // `sessionStart` fires only on startup|resume|new, never
+                // compact (both docs-confirmed in earlier #417 rounds). So
+                // an armed Copilot cycle's ONLY resolution before this round
+                // was busy-then-quiet — and a compact that finishes while the
+                // pane is genuinely idle (nobody prompts it) produces no
+                // busy-then-quiet of its own, so it rides the full
+                // `ARM_PENDING_TIMEOUT_MS` to a FALSE timeout every time. The
+                // live incident (#428): preCompact evidence at +0s, badge
+                // stuck at "awaiting evidence" for 240s, resolved only
+                // because the user happened to type a question into the
+                // pane (busy-then-quiet, coincidentally, 60s before the
+                // 300s false-timeout would have fired).
+                //
+                // RESOLUTION SEMANTICS differ from the SessionStart block
+                // above: Copilot has no native `additionalContext` delivery
+                // (unlike Claude, its own `--agent` custom-agent file is the
+                // only durable channel, and compaction doesn't touch that),
+                // so this marker proves the compaction FINISHED, never that
+                // re-grounding was delivered. It therefore does NOT skip
+                // reinjection (no `to_hook_native_skip`) — it converts the
+                // ARM straight into a DECIDED reinjection, the exact same
+                // action the busy-then-quiet "confirmed" branch below takes,
+                // just without waiting for a quiet tick to observe it.
+                //
+                // ACCELERATOR, NOT REPLACEMENT: this is UI text Copilot
+                // paints, not a documented API (see `copilot_compaction_
+                // marker_detected`'s own doc for the fragility this
+                // inherits and the exact strings, captured from #428's own
+                // incident report, not reconstructed from memory) — busy-
+                // then-quiet below still runs unconditionally as the
+                // fallback, so a future Copilot release changing this
+                // wording degrades back to today's (slower, but correct)
+                // behavior, never to a hang.
+                //
+                // PROVENANCE (#424/#427 lesson, named explicitly in #428's
+                // own comment): gated on `a.compact_pending` — an arm must
+                // already be open, so a stale mention from a LONG-past,
+                // already-resolved compaction sitting in scrollback can
+                // never resurrect anything (no B1 risk: nothing here can
+                // set `compact_pending` true from `false`, only consume an
+                // ALREADY-true one) — and on `now >= a.compact_inference_
+                // guard_until_ms`, the same cooldown gate `human_typed_
+                // compact_detected`/`auto_compact_banner_detected` use to
+                // keep loomux's own recent paste from satisfying its own
+                // detector. That cooldown is belt-and-braces here: loomux
+                // never writes either matched sentence into anything it
+                // pastes (`compact_reinjection_notice`'s three shapes,
+                // `compact_escalation_notice`, or the bare `/compact`
+                // command) — checked, not assumed, against those exact
+                // functions' bodies — so there is no loomux-authored echo
+                // this could ever match in the first place.
+                //
+                // rev-10's B1 lesson, applied here too: this site runs
+                // BEFORE the delivery-confirmation block immediately below,
+                // every tick — so if a busy-then-quiet resolution (or an
+                // earlier marker match) already decided a reinjection
+                // (`compact_reinject_attempted_ms` is `Some`), that
+                // confirmation phase is already live and must be left
+                // completely alone: no re-deciding, no touching its fields.
+                // Gating on `.is_none()` makes this a genuine no-op in that
+                // case, not a reset — the exact ordering hazard B1 named.
+                if a.compact_pending
+                    && a.compact_reinject_attempted_ms.is_none()
+                    && now >= a.compact_inference_guard_until_ms
+                {
+                    if let Some((tail, _)) = manual_signals.get(&a.id) {
+                        if copilot_compaction_marker_detected(g.cli_for(a.role), tail) {
+                            a.compact_pending_baseline_tokens = None;
+                            a.compact_pending_baseline_marker_count = None;
+                            a.compact_pending_trusted = false;
+                            a.compact_seen_busy = false;
+                            a.compact_pending_armed_ms = None;
+                            a.compact_pending_evidence = None;
+                            a.compact_hook_native_notice_delivered = false;
+                            a.compact_reinject_attempts = 1;
+                            a.compact_reinject_attempted_ms = Some(now);
+                            let instructions = self.group_dir(&a.group).join(
+                                g.block(&a.block)
+                                    .map(|b| b.instructions_file())
+                                    .unwrap_or_else(|| a.role.instructions_file().to_string()),
+                            );
+                            let ledger = self.ledger_path(&a.group, &a.id);
+                            to_reinject.push((
+                                a.id.clone(), a.group.clone(), instructions, ledger,
+                                1, a.contract_carrier,
+                            ));
+                            to_copilot_marker_resolved.push((a.id.clone(), a.group.clone()));
                         }
                     }
                 }
@@ -11319,6 +11493,12 @@ impl OrchRegistry {
             self.audit(&group, "loomux", "compact-reinjection-skipped-native", json!({
                 "agent": id,
                 "reason": "SessionStart hook already delivered native additionalContext for this compaction",
+            }));
+        }
+        for (id, group) in to_copilot_marker_resolved {
+            self.audit(&group, "loomux", "compact-resolved-copilot-marker", json!({
+                "agent": id,
+                "reason": "Copilot's own compaction-completion paint resolved the arm without waiting for busy-then-quiet",
             }));
         }
         nudged

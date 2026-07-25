@@ -18,7 +18,7 @@ use loomux_lib::orchestration::{
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
     CompactionStatus,
-    auto_compact_banner_detected, compaction_confirmed, directive_ledger_embed, ledger_capped,
+    auto_compact_banner_detected, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
     human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, resolve_output_text,
@@ -6004,6 +6004,148 @@ fn copilot_precompact_marker_gets_the_same_b1_restart_protection() {
 }
 
 #[test]
+fn copilot_compaction_marker_resolves_the_arm_even_while_the_pane_stays_busy() {
+    // #428 (round 9): the exact live-incident shape, reproduced. Marker
+    // text is quoted directly from the issue's own report of the user's
+    // live observation (its body and comment), not reconstructed from
+    // memory. Continuously busy every tick (never quiet) is the fast-path
+    // proof: this must be a TERMINAL path resolved at marker-consume, not
+    // merely a faster busy-then-quiet that happened to get lucky.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty_tail: HashMap<String, (String, u64)> = HashMap::new();
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    // Arm: precompact evidence, pane already busy — matches the issue's
+    // own "+0s" timeline.
+    let busy: HashMap<String, u64> = [(oid.clone(), 500_000u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(1_000, &busy, &empty_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "armed, waiting on resolution");
+    assert!(a.compact_reinject_attempted_ms.is_none(), "not yet decided — no marker seen yet");
+
+    // The marker appears now — resolved on THIS tick, with the pane STILL
+    // busy (never went quiet in between).
+    let tail_with_marker: HashMap<String, (String, u64)> = [(
+        oid.clone(),
+        ("A new checkpoint has been added to your session.".to_string(), 2_000),
+    )]
+    .into_iter()
+    .collect();
+    let still_busy: HashMap<String, u64> = [(oid.clone(), 900_000u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(2_000, &still_busy, &tail_with_marker, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_pending, "still pending — waiting on the reinjection's own delivery to confirm");
+    assert!(
+        a.compact_reinject_attempted_ms.is_some(),
+        "the marker decided a reinjection immediately — no quiet tick needed"
+    );
+    assert_eq!(a.compact_reinject_attempts, 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-resolved-copilot-marker"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 0);
+
+    // Ticking well past ARM_PENDING_TIMEOUT_MS (5 min), still no marker,
+    // still busy — must never time out something already resolved. Also
+    // proves the delivery-confirmation phase (not this new block) is what
+    // now owns resolution — exactly like every other terminal path.
+    let confirmed = confirmed_delivery(&oid, 2_000);
+    assert!(reg
+        .compact_nudge_tick(2_000 + 6 * 60_000, &still_busy, &empty_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed)
+        .is_empty());
+    assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 0);
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "confirmed delivery resolves it cleanly");
+}
+
+#[test]
+fn copilot_compaction_marker_with_no_arm_is_a_no_op() {
+    // #428, the B1-shaped safety check: a marker sighting alone must never
+    // conjure an arm out of nothing. The whole block is gated on `a.
+    // compact_pending`, which nothing here can set `true` from `false` —
+    // a stale mention from a long-past, already-resolved compaction
+    // sitting in scrollback must never resurrect anything.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    let tail_with_marker: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("Compaction completed".to_string(), 1_000))].into_iter().collect();
+    let empty: HashMap<String, u64> = HashMap::new();
+    assert!(reg.compact_nudge_tick(1_000, &empty, &tail_with_marker, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "no arm existed — the marker alone must never create one");
+    assert_eq!(audit_count(&reg, &gid, "compact-resolved-copilot-marker"), 0);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 0);
+}
+
+#[test]
+fn copilot_compaction_marker_while_a_reinjection_is_already_in_flight_is_a_no_op() {
+    // rev-10's B1 lesson, applied to the new terminal path: once busy-
+    // then-quiet already decided a reinjection (`compact_reinject_
+    // attempted_ms` is `Some`), a LATER marker sighting for the SAME cycle
+    // must never re-decide or reset it — no double dispatch, no lost
+    // attempt count, no fresh audit line for something that was already
+    // resolved.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty_outputs: HashMap<String, u64> = HashMap::new();
+    let empty_tail: HashMap<String, (String, u64)> = HashMap::new();
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    // Arm + quiet resolves into the confirmation phase via ordinary
+    // busy-then-quiet, same shape as `copilot_precompact_hook_marker_is_
+    // trusted_evidence_too`.
+    assert!(reg.compact_nudge_tick(1_000, &empty_outputs, &empty_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(reg.compact_nudge_tick(2_000, &empty_outputs, &empty_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_reinject_attempted_ms.is_some(), "already decided via busy-then-quiet");
+    assert_eq!(a.compact_reinject_attempts, 1);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+
+    // The marker appears NOW, for the same still-open cycle, delivery not
+    // yet confirmed.
+    let tail_with_marker: HashMap<String, (String, u64)> =
+        [(oid.clone(), ("Compaction completed".to_string(), 3_000))].into_iter().collect();
+    assert!(reg.compact_nudge_tick(3_000, &empty_outputs, &tail_with_marker, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert_eq!(a.compact_reinject_attempts, 1, "must not double-dispatch");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "no second reinjection");
+    assert_eq!(
+        audit_count(&reg, &gid, "compact-resolved-copilot-marker"), 0,
+        "already in flight — this is a no-op, not a fresh resolution"
+    );
+}
+
+#[test]
+fn copilot_busy_then_quiet_still_resolves_when_the_marker_never_appears() {
+    // #428 regression pin: the marker is an ACCELERATOR, not a
+    // replacement — with no marker ever painted (a future Copilot build
+    // changed the wording, or this tick's read simply missed it), the
+    // pre-existing busy-then-quiet resolution must keep working exactly
+    // as it did before this round.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let empty_tail: HashMap<String, (String, u64)> = HashMap::new();
+
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+
+    let busy: HashMap<String, u64> = [(oid.clone(), 500_000u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(1_000, &busy, &empty_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(reg.agent(&oid).unwrap().compact_reinject_attempted_ms.is_none(), "not yet — no marker, no quiet tick yet");
+
+    // The pane goes quiet (same total as the last baseline = no growth) —
+    // busy-then-quiet resolves it, unchanged from before this round.
+    let quiet: HashMap<String, u64> = [(oid.clone(), 500_000u64)].into_iter().collect();
+    assert!(reg.compact_nudge_tick(2_000, &quiet, &empty_tail, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    let a = reg.agent(&oid).unwrap();
+    assert!(a.compact_reinject_attempted_ms.is_some(), "busy-then-quiet still resolves with no marker present");
+    assert_eq!(audit_count(&reg, &gid, "compact-resolved-copilot-marker"), 0);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
+}
+
+#[test]
 fn compact_nudge_tick_does_paste_slash_compact_into_a_copilot_pane() {
     // #417 correction round 2: an earlier round of this feature asserted
     // Copilot has no `/compact` command at all and pinned a NEGATIVE test
@@ -6689,6 +6831,27 @@ fn auto_compact_banner_detected_matches_claudes_stable_substring_only() {
     assert!(!auto_compact_banner_detected("claude", "editing src/compact_nudge.rs"), "unrelated pane text must not match");
     assert!(!auto_compact_banner_detected("claude", ""));
     assert!(!auto_compact_banner_detected("copilot", "Compacting conversation"), "no known banner for copilot yet — never guessed");
+}
+
+#[test]
+fn copilot_compaction_marker_detected_matches_either_stable_sentence_only() {
+    // #428 (round 9): the completion-side counterpart. Text quoted
+    // directly from the issue's own report, not reconstructed.
+    assert!(copilot_compaction_marker_detected("copilot", "Compaction completed"));
+    assert!(copilot_compaction_marker_detected(
+        "copilot",
+        "A new checkpoint has been added to your session."
+    ));
+    assert!(
+        !copilot_compaction_marker_detected("copilot", "Use /session checkpoints 3 to view the compaction summary."),
+        "the checkpoint-number fragment is deliberately not matched — it's never stable text"
+    );
+    assert!(!copilot_compaction_marker_detected("copilot", "editing src/compact_nudge.rs"), "unrelated pane text must not match");
+    assert!(!copilot_compaction_marker_detected("copilot", ""));
+    assert!(
+        !copilot_compaction_marker_detected("claude", "Compaction completed"),
+        "no known completion marker for claude — it has SessionStart instead, never guessed"
+    );
 }
 
 #[test]

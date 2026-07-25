@@ -2685,6 +2685,68 @@ identical in both modes, at no added design cost to covering both. The audit
 (`claude-fallback-persona-dropped`) now fires for any non-empty persona on this fallback path,
 mode-tagged in its own payload rather than scoped by mode.
 
+### Round 9 (#428): Copilot's own terminal path — a completion-marker accelerator
+
+Live incident, audit-verified: a Copilot orchestrator's compact arm sat at "awaiting evidence
+(hook-confirmed)" for 240 seconds — `preCompact` hook evidence landed at +0s, but nothing resolved
+it until the user happened to type a question into the pane, triggering busy-then-quiet 60 seconds
+before the 300-second `ARM_PENDING_TIMEOUT_MS` would have false-timed-out it instead. On a pane
+that stays genuinely idle after compaction (nobody prompts it), that false timeout is not a near
+miss, it is deterministic — round 7 closed this exact class for Claude (`SessionStart(compact)` as
+an instant terminal path); Copilot never had an equivalent, because GitHub ships it no post-compact
+signal of any kind: no `postCompact` event, and `sessionStart` fires only on `startup|resume|new`,
+never `compact` (both docs-confirmed in earlier #417 rounds).
+
+**Updated terminal-path asymmetry table** (distinct from the delivery-channel matrix above — this
+is about how FAST an arm resolves, not what re-grounding channel it uses once resolved):
+
+| | terminal-path signal | resolution semantics |
+|---|---|---|
+| Claude | `SessionStart(compact)` hook marker — instant, structural | Marker consumption IS proof re-grounding was delivered (native `additionalContext`) — resolves straight to done, no reinjection needed (round 7) |
+| Copilot | its own compaction-completion PAINT ("Compaction completed" / "A new checkpoint has been added to your session.") — an accelerator, not a hook; busy-then-quiet is still the fallback | The paint proves compaction FINISHED, never that re-grounding was delivered (Copilot has no native `additionalContext` channel) — converts the ARM into a DECIDED reinjection immediately, the same action busy-then-quiet's "confirmed" branch already takes, just without waiting for a quiet tick to observe it (round 9) |
+
+**Design constraints, all satisfied:**
+
+- **Accelerator, not replacement.** This is UI text Copilot happens to paint, not a documented API
+  — `copilot_compaction_marker_substrings`'s own doc states the fragility explicitly and points at
+  the exact strings to re-verify if this stops firing. Busy-then-quiet runs completely
+  unconditionally regardless of whether the marker ever matches, so a future Copilot release
+  changing this wording degrades back to today's (slower, but correct) resolution — never to a
+  hang. Mirrors `auto_compact_banner_substrings`' existing accepted fragility for the RUNNING side.
+- **Resolution semantics, correctly asymmetric.** Unlike Claude's SessionStart block, the new
+  Copilot block does not skip reinjection — it decides one, reusing the exact "confirmed" logic
+  the busy-then-quiet resolver already runs (same instructions-path/ledger-path construction, same
+  `to_reinject` push), just triggered by the marker instead of a quiet observation.
+- **The rev-10 B1 lesson, re-applied.** Gated on `a.compact_reinject_attempted_ms.is_none()` — if a
+  reinjection is already in flight (decided by busy-then-quiet or an earlier marker match for the
+  SAME cycle), this block is a genuine no-op: no re-deciding, no touching those fields, the exact
+  ordering hazard B1 named for the SessionStart block applies identically here.
+- **Provenance (#424/#427).** Gated on `a.compact_pending` (an arm must already be open — a stale
+  mention from a long-resolved compaction in scrollback can never resurrect anything; nothing here
+  can set `compact_pending` true from `false`) and on `now >= a.compact_inference_guard_until_ms`
+  (the same cooldown `human_typed_compact_detected`/`auto_compact_banner_detected` use). Checked,
+  not assumed, that loomux never writes either matched sentence into anything it pastes
+  (`compact_reinjection_notice`'s three shapes, `compact_escalation_notice`, the bare `/compact`
+  command) — grepped those functions' actual bodies before claiming there is no loomux-authored
+  echo this could ever match.
+- **Fixture provenance.** Both matched sentences are quoted directly from #428's own issue body and
+  comment (the user's live screen observation), not reconstructed from memory. A third fragment the
+  issue also quotes — "Use /session checkpoints N to view the compaction summary." — is deliberately
+  NOT matched: `N` is a checkpoint number that changes every time, so that literal text never
+  repeats.
+
+**Tests:** the fast-path proof (`copilot_compaction_marker_resolves_the_arm_even_while_the_pane_
+stays_busy` — armed, continuously busy every tick, never quiet, marker still resolves it on the
+exact tick it's observed); the B1-shaped no-op (`copilot_compaction_marker_with_no_arm_is_a_no_op`);
+the ordering-hazard no-op (`copilot_compaction_marker_while_a_reinjection_is_already_in_flight_is_
+a_no_op`); the regression pin (`copilot_busy_then_quiet_still_resolves_when_the_marker_never_
+appears`); and a pure-function test for the detector itself. Mutation bar per #424 discipline,
+verified: neutralizing `copilot_compaction_marker_detected` to always return `false` reds exactly
+two tests — the pure-function test and the fast-path integration test — and no others, confirming
+the fallback path is genuinely independent of the new detector.
+
+Closes #428.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged
