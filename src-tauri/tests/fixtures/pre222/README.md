@@ -138,6 +138,21 @@ so far:
   same way — but only durable state already offloaded comes back, which is what the ledger is
   for.
 
+- **#423, an unloaded workflow config is not this group's roster** — `orchestrator.md` only. A
+  live incident: an orchestrator found an untracked, leftover custom-workflow config on disk
+  (from an earlier custom-roster session on the same repo checkout) and adopted its declared
+  blocks and process steps as though they were this group's actual config — dispatching work
+  the built-in template's own funnel discipline would have refused. A new paragraph, right
+  after the `{{WORKFLOW}}` substitution point (so it reaches EVERY default group, not only
+  ones with a declared workflow): a custom workflow config is this group's roster only when
+  the kickoff itself named it (the `{{WORKFLOW}}` paragraph above, non-empty); a config merely
+  found on disk some other way is not, and must not be adopted — mention the discrepancy to
+  the human once and continue with the roster actually in effect. (Deliberately avoids the
+  literal token `workflow.yml`, which `the_default_rendering_never_names_the_gate_machinery`
+  refuses in a default rendering for an unrelated, still-valid reason — a default group has no
+  gate/verdict mechanism to be sent after; this paragraph is about the OPPOSITE case, so it
+  says "a custom workflow config" instead.)
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

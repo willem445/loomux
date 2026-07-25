@@ -13685,6 +13685,12 @@ impl OrchRegistry {
             ("BLOCK_NOTE", ""),
         ];
         let dir = self.group_dir(&g.id);
+        // #423: the authoritative set of instruction filenames this roster
+        // owns, built up alongside the writes below — the sweep at the end
+        // reconciles the group dir against exactly this set, never a
+        // separately-derived one that could drift from what actually got
+        // written.
+        let mut current: HashSet<String> = HashSet::new();
         for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
             // Skip the classes the roster covers — a block whose id is a class
             // name owns that class's file (ids are reserved per class, see
@@ -13699,12 +13705,77 @@ impl OrchRegistry {
             }
             fs::write(dir.join(role.instructions_file()), render_template(role.template(), &vars))
                 .map_err(|e| e.to_string())?;
+            current.insert(role.instructions_file().to_string());
         }
         for b in &g.guardrails.blocks {
             let persona = self.resolve_persona_or_audit(g, b);
             self.write_block_instructions(g, b, persona.as_ref(), &vars)?;
+            current.insert(b.instructions_file());
         }
+        self.sweep_stale_instruction_files(g, &current);
         Ok(())
+    }
+
+    /// #423: reclaim per-block instruction files a PREVIOUS roster (built-in
+    /// or custom) left behind but the CURRENT one (`current`, built by
+    /// `write_instruction_files` alongside its own writes) no longer owns.
+    ///
+    /// The live incident this closes: a group dir that had run a custom
+    /// `.loomux/workflow.yml` roster in an earlier session (declaring a
+    /// `process` block, say) still had `process.md` sitting on disk once
+    /// that workflow file was removed and the group reverted to the
+    /// built-in roster. A later orchestrator, finding the ORIGINAL
+    /// `workflow.yml` untracked on disk (not loaded — the toggle was off —
+    /// but still readable), adopted its declared blocks as real config —
+    /// and the stale `process.md` file lent that phantom roster extra
+    /// credibility, corroborating a belief the actual kickoff never gave it.
+    /// Removing the leftover file means a future phantom-roster read finds
+    /// nothing on disk to corroborate it.
+    ///
+    /// Deletes ONLY files matching the exact naming pattern `write_
+    /// instruction_files` itself generates — one of the four reserved class
+    /// names, or `sanitize_id`'s own safe alphabet plus `.md` (a block
+    /// id can never contain anything else) — and ONLY when that name is NOT
+    /// in `current`. Every other file in the group dir (`group.json`,
+    /// `state.json`, `agents.json`, `audit.jsonl`, `ledger-*.log`, the
+    /// `hooks/` subdirectory, anything else) is untouched: this walks the
+    /// top-level directory only (`read_dir`, not recursive) and the pattern
+    /// match is deliberately narrow rather than "any `.md` file", so a
+    /// human-dropped note file with an `.md` extension would survive too
+    /// unless it happened to collide with a reserved class name or a
+    /// currently-live block id (in which case it wouldn't be stale to begin
+    /// with — it would be overwritten by the write loop above, not swept).
+    /// Best-effort and audited, never fatal: a sweep failure must not block
+    /// a group from booting.
+    fn sweep_stale_instruction_files(&self, g: &GroupInfo, current: &HashSet<String>) {
+        let dir = self.group_dir(&g.id);
+        let Ok(entries) = fs::read_dir(&dir) else { return };
+        let mut removed = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if current.contains(name) {
+                continue;
+            }
+            let Some(stem) = name.strip_suffix(".md") else { continue };
+            let is_class_file = matches!(name, "orchestrator.md" | "worker.md" | "reviewer.md" | "planner.md");
+            // Round-trips through the SAME sanitizer a block id is validated
+            // with — if it strips anything, this was never a filename
+            // `write_instruction_files` could have generated.
+            let is_block_shaped = workflow::sanitize_id(stem).as_deref() == Some(stem);
+            if !(is_class_file || is_block_shaped) {
+                continue;
+            }
+            if fs::remove_file(&path).is_ok() {
+                removed.push(name.to_string());
+            }
+        }
+        if !removed.is_empty() {
+            self.audit(&g.id, "loomux", "stale-instruction-files-swept", json!({ "files": removed }));
+        }
     }
 
     /// [`resolve_persona`](Self::resolve_persona), with the failure policy

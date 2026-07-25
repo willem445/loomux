@@ -3482,6 +3482,107 @@ fn the_default_rendering_never_names_the_gate_machinery(
     }
 }
 
+// ────────── #423: sweep stale per-block instruction files on render ──────────
+
+#[test]
+fn write_instruction_files_sweeps_stale_files_on_a_builtin_roster_render() {
+    // #423's live incident, the hygiene half: a group dir that ran a CUSTOM
+    // roster in an earlier session (declaring, say, a `process` block) still
+    // had `process.md` sitting on disk once that workflow file was removed
+    // and the group reverted to the built-in roster — lending a phantom
+    // on-disk workflow file extra credibility when a later orchestrator
+    // found it and (wrongly) adopted it as this group's config.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new(); // no .loomux/ at all — builtin roster
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let group_dir = reg.state_root().join(&g.id);
+
+    // Seed stale files exactly as an earlier custom-roster life would have
+    // left them.
+    fs::write(group_dir.join("process.md"), "stale process persona").unwrap();
+    fs::write(group_dir.join("advisor.md"), "stale advisor persona").unwrap();
+    fs::write(group_dir.join("rev-security.md"), "stale reviewer persona").unwrap();
+
+    // Re-render: a resumed launch on the SAME repo re-renders the SAME group
+    // dir with the persisted (still builtin here) roster.
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    reg.create_group_ex(&repo.path(), persisted, Launch::Resume).unwrap();
+
+    assert!(!group_dir.join("process.md").exists(), "stale block file must be swept");
+    assert!(!group_dir.join("advisor.md").exists(), "stale block file must be swept");
+    assert!(!group_dir.join("rev-security.md").exists(), "stale block file must be swept");
+    // The four class files are the CURRENT builtin roster's own files —
+    // still present (rewritten, not swept).
+    for class_file in ["orchestrator.md", "worker.md", "reviewer.md", "planner.md"] {
+        assert!(group_dir.join(class_file).exists(), "{class_file} is the current roster's own file");
+    }
+    // Never touched: every other file a real group dir actually holds.
+    assert!(group_dir.join("group.json").exists(), "never touches group state");
+    assert!(group_dir.join("audit.jsonl").exists(), "never touches the audit log");
+
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap();
+    let swept: Vec<&str> = audit.lines().filter(|l| l.contains("stale-instruction-files-swept")).collect();
+    assert_eq!(swept.len(), 1, "the sweep is audited exactly once: {audit}");
+    for name in ["process.md", "advisor.md", "rev-security.md"] {
+        assert!(swept[0].contains(name), "the audit line must name what it swept: {}", swept[0]);
+    }
+}
+
+#[test]
+fn write_instruction_files_sweeps_only_undeclared_blocks_on_a_custom_roster_render() {
+    // The other half: a custom roster's own render must ALSO reconcile
+    // against whatever the group dir already holds — sweeping a block this
+    // roster no longer declares, while leaving every currently-declared
+    // block's file (and the class files) alone.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n  - id: rev-sec\n    kind: reviewer\n    prompt: Security only.\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let group_dir = reg.state_root().join(&g.id);
+    assert!(group_dir.join("rev-sec.md").exists(), "the declared block's own file exists");
+
+    // Seed a stale file for a block this roster does NOT declare (an
+    // earlier custom-roster life's leftover).
+    fs::write(group_dir.join("old-reviewer.md"), "a block no longer declared").unwrap();
+
+    // Resume with the SAME persisted (custom) roster — #255's "pinned on
+    // resume" contract: `create_group_ex` never re-derives blocks itself on
+    // a resume, the caller supplies them, exactly as the real resume path
+    // reads them back from `load_group_file` before calling this.
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    reg.create_group_ex(&repo.path(), persisted, Launch::Resume).unwrap();
+
+    assert!(!group_dir.join("old-reviewer.md").exists(), "undeclared block file must be swept");
+    assert!(group_dir.join("rev-sec.md").exists(), "the currently-declared block's file survives");
+    assert!(group_dir.join("orchestrator.md").exists(), "the class file for the role with no custom block survives");
+    assert!(group_dir.join("group.json").exists(), "never touches group state");
+}
+
+#[test]
+fn sweep_never_touches_a_filename_that_is_not_block_instruction_shaped() {
+    // The pattern match itself, isolated: a `.md` file whose stem is not a
+    // block-id-shaped string (anything `sanitize_id` would strip a
+    // character from — a space, a dot) is never even ELIGIBLE for the
+    // sweep, regardless of whether it happens to be "stale" relative to
+    // the current roster. This is what makes the sweep safe against
+    // anything other than a filename `write_instruction_files` itself
+    // could have generated.
+    let (reg, _d) = test_registry();
+    let repo = Repo::new();
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let group_dir = reg.state_root().join(&g.id);
+
+    fs::write(group_dir.join("release notes.md"), "not block-id-shaped: a space").unwrap();
+    fs::write(group_dir.join("v1.2.3.md"), "not block-id-shaped: dots").unwrap();
+
+    let (_, persisted) = reg.load_group_file(&g.id).unwrap();
+    reg.create_group_ex(&repo.path(), persisted, Launch::Resume).unwrap();
+
+    assert!(group_dir.join("release notes.md").exists(), "never eligible for the sweep");
+    assert!(group_dir.join("v1.2.3.md").exists(), "never eligible for the sweep");
+}
+
 #[test]
 fn a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares() {
     // The invariant the empty case rests on, asserted on the template SOURCE — the
