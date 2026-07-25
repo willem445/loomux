@@ -125,6 +125,40 @@ fn real_repo() -> tempfile::TempDir {
     dir
 }
 
+/// Std-based scratch dir under the OS temp root — not `tempfile` (#412's own
+/// new tests use this pattern deliberately, matching `tests/workflowfile.rs`/
+/// `tests/lessonsfile.rs`), keyed by a tag plus this process's id so parallel
+/// test runs never collide. The caller is responsible for cleanup.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("loomux-orch-test-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Fixture a claude session store entry: `<root>/<project>/<id>.jsonl` with a
+/// `cwd` field, exactly the shape `find_session_cwd`'s claude half scans
+/// (#412). `project` only needs to be SOME directory name — the scan is by
+/// filename, never by reversing the munged project-dir name back to a path.
+fn fixture_claude_session(root: &std::path::Path, id: &str, cwd: &str) {
+    let proj = root.join("Some-Project-Dir");
+    fs::create_dir_all(&proj).unwrap();
+    fs::write(
+        proj.join(format!("{id}.jsonl")),
+        format!("{{\"type\":\"user\",\"cwd\":{cwd:?},\"message\":{{\"content\":\"hi\"}}}}\n"),
+    )
+    .unwrap();
+}
+
+/// Fixture a copilot session-state entry: `<root>/<anything>/workspace.yaml`
+/// carrying `id:`/`cwd:` fields — matched by the PARSED id, never the
+/// directory name (#412, mirroring `find_session_cwd`'s copilot half).
+fn fixture_copilot_session(root: &std::path::Path, id: &str, cwd: &str) {
+    let dir = root.join("some-session-dir");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("workspace.yaml"), format!("id: {id}\nname: fixture\ncwd: {cwd}\n")).unwrap();
+}
+
 // ---------- registry: guardrails, isolation, persistence, audit ----------
 
 #[test]
@@ -1718,10 +1752,18 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
     }
     // "App restart": a new registry restores the whole copilot orchestration
     // from the recorded session, resuming its conversation via `copilot
-    // --resume`.
+    // --resume`. The orchestrator branch now pre-checks the session actually
+    // resolves in copilot's OWN store before opening a pane for it (#412
+    // review B1) — fixture it there, thread-local so no other concurrently
+    // running test's copilot lookups are affected.
+    let store = scratch_dir("copilot-orch-restore");
+    fixture_copilot_session(&store, sid, &repo_path);
+    loomux_lib::sessions::set_copilot_session_state_root_for_test(Some(store.clone()));
     let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
     reg.set_port(45999);
     let req = resume_recorded_session(&reg, sid, None, false).unwrap().expect("orchestrator pane spec");
+    loomux_lib::sessions::set_copilot_session_state_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
     assert_eq!(req.group_id, gid);
     assert!(req.command.starts_with("copilot "), "must relaunch copilot, got: {}", req.command);
     assert!(req.command.contains(&format!("--resume {sid}")), "must resume the recorded session");
@@ -3096,10 +3138,19 @@ fn hint_restores_sessions_unknown_to_roster_and_audit() {
     drop(g);
     let sid = "11112222-3333-4444-8555-666677778888";
     let hint = Some((gid.clone(), "orchestrator".to_string()));
+    // The orchestrator branch pre-checks the session resolves in its CLI's
+    // OWN store before opening a pane (#412 review B1) — fixture it.
+    let store = scratch_dir("hint-restore-claude");
+    fixture_claude_session(&store, sid, &repo_path);
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
     let req = resume_recorded_session(&reg, sid, hint, false).unwrap().expect("pane spec");
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
     assert_eq!(req.group_id, gid);
     assert!(req.command.contains(&format!("--resume {sid}")));
-    // A hint pointing at a nonexistent group is rejected, not trusted.
+    // A hint pointing at a nonexistent group is rejected, not trusted — this
+    // fails on the group lookup itself, before any store check, so no
+    // fixture is needed here.
     let reg2 = Arc::new(OrchRegistry::new(tempfile::tempdir().unwrap().path().to_path_buf()));
     reg2.set_port(45999);
     let bad = resume_recorded_session(&reg2, sid, Some(("ghost-1".into(), "orchestrator".into())), false);
@@ -3122,10 +3173,18 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
         let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
         orch_sid = orch.session_id.unwrap();
     }
-    // "App restart": new registry, nothing live.
+    // "App restart": new registry, nothing live. Fixture the session into
+    // claude's store so the orchestrator branch's existence pre-check
+    // (#412 review B1) finds it, same as the other two orchestrator-resume
+    // tests above.
+    let store = scratch_dir("orch-full-restore");
+    fixture_claude_session(&store, &orch_sid, &repo_path);
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
     let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
     reg.set_port(45999);
     let req = resume_recorded_session(&reg, &orch_sid, None, false).unwrap().expect("orchestrator returns a pane spec");
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
     assert_eq!(req.group_id, gid, "restore must reattach to the recorded group (state/tasks/audit)");
     assert!(req.command.contains(&format!("--resume {orch_sid}")),
         "the orchestrator's conversation must be resumed, not cold-started");
@@ -3641,16 +3700,17 @@ fn resume_recorded_session_fails_loudly_not_silently_when_the_worktree_is_gone()
     // its old path).
     std::fs::remove_dir_all(&cwd_before).unwrap();
 
+    // An EMPTY fixture store (#412 review N6): pins exactly which tag this
+    // reproduces (`resume-not-found`) instead of accepting any of three, and
+    // is hermetic — it doesn't depend on this session's random uuid genuinely
+    // being absent from whatever machine happens to run the suite.
+    let store = scratch_dir("worktree-gone-empty-store");
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
     use loomux_lib::orchestration::resume_recorded_session;
     let err = resume_recorded_session(&reg, &sid, None, false).unwrap_err();
-    // Falls back to the CLI's own store, which (in this test) genuinely has
-    // no record of a freshly-minted test session id — so the honest outcome
-    // is "not found", never a silent default to the main clone.
-    assert!(
-        err.contains("resume-not-found") || err.contains("resume-workspace-missing")
-            || err.contains("resume-store-unreadable"),
-        "must fail with a structured #412 tag, got: {err}"
-    );
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
+    assert!(err.starts_with("resume-not-found:"), "must fail with the not-found tag, got: {err}");
     assert!(!Path::new(&cwd_before).is_dir(), "must not resurrect the deleted worktree");
     // No side effect: no new running worker (the OLD silent-fallback bug
     // would have spawned one in a background thread, in the main clone).
@@ -3659,6 +3719,74 @@ fn resume_recorded_session_fails_loudly_not_silently_when_the_worktree_is_gone()
         roster.as_array().unwrap().iter().all(|a| a["role"] != "worker" || a["status"] == "dead"),
         "a loudly-failed resume must not have spawned a worker as a side effect, got: {roster}"
     );
+}
+
+#[test]
+fn resume_recorded_session_recovers_via_the_store_when_the_roster_cwd_is_stale() {
+    // The fix's actual, user-visible success path (#412 review B2): when the
+    // roster's cached cwd is gone but the session genuinely IS in the CLI's
+    // own store (recorded under some OTHER, still-real directory — the
+    // ordinary case: the worktree moved, or loomux's cached copy just
+    // disagrees with what the CLI itself wrote), the resume must SUCCEED,
+    // launched from the STORE's cwd — not fail, and not silently default to
+    // the main clone.
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let reg = std::sync::Arc::new(reg);
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", true, None).unwrap();
+    let sid = w.session_id.clone().unwrap();
+    let stale_cwd = reg
+        .list_agents(&g.id)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == w.id.as_str())
+        .unwrap()["cwd"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    reg.mark_dead(&w.id, Some(0));
+    std::fs::remove_dir_all(&stale_cwd).unwrap();
+
+    // The store's OWN record: a DIFFERENT, still-real directory — never the
+    // deleted one, never `group.repo` — so a passing assertion can only mean
+    // the store's cwd was actually used, not a coincidence.
+    let real_cwd = scratch_dir("store-recovers-real-cwd");
+    assert_ne!(Path::new(&real_cwd), repo.path());
+    let store = scratch_dir("store-recovers-claude-store");
+    fixture_claude_session(&store, &sid, &real_cwd.to_string_lossy());
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
+
+    use loomux_lib::orchestration::resume_recorded_session;
+    let outcome = resume_recorded_session(&reg, &sid, None, false);
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
+    assert!(outcome.is_ok(), "must succeed once the store resolves it, got: {outcome:?}");
+
+    // Worker/reviewer rejoins spawn in a background thread — poll for it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let resumed_cwd = loop {
+        let roster = reg.list_agents(&g.id);
+        let hit = roster
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["session"] == json!(sid) && a["status"] == "running")
+            .map(|a| a["cwd"].as_str().unwrap().to_string());
+        if let Some(cwd) = hit {
+            break cwd;
+        }
+        assert!(std::time::Instant::now() < deadline, "resumed worker never appeared: {roster}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        Path::new(&resumed_cwd),
+        real_cwd.as_path(),
+        "must launch from the STORE's recorded cwd, not the deleted one and not the main clone"
+    );
+    let _ = fs::remove_dir_all(&real_cwd);
 }
 
 // ───────── follow-up finding: a FRESH worker spawn's cwd is the other half of the #338 door ─────────

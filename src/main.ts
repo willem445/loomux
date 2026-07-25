@@ -802,6 +802,17 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     // 2. Rejoin each resumable delegate INTO the now-live group. Sequential (not
     //    concurrent) so the group settles live before each rejoin and we don't
     //    fan out a spawn burst; a single member's failure doesn't sink the rest.
+    //
+    //    #412 review N5: this is a BATCH restore, not the single-session-browser
+    //    click `restoreSession` handles — a confirm dialog per failed member (one
+    //    click could pop several in a row) would be worse UX than the session
+    //    browser's single-target "Start fresh?", so this stays a toast rather than
+    //    reusing that dialog. It DOES reuse resumeerror.ts's classification so the
+    //    toast is specific about what happened and points at the fix (the session
+    //    browser) instead of a raw error string — a `not-found`/`workspace-missing`
+    //    member is dropped for good this pass (its whole point is that resuming it
+    //    would have failed anyway); it's still resumable/start-freshable later from
+    //    the session browser, same as any other unresolvable session.
     for (const member of plan.rejoin) {
       try {
         await resumeOrchSession(ws.grid, eventsFor(ws), member.sessionId, {
@@ -809,7 +820,12 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
           role: member.role,
         });
       } catch (err) {
-        showToast(`Couldn't rejoin a ${member.role}: ${String(err)}`, "info");
+        const message = String(err);
+        const kind = resumeFailureKind(message);
+        const reason = offersStartFresh(kind)
+          ? `${resumeFailureReason(kind)} Resumable from the session browser.`
+          : message;
+        showToast(`Couldn't rejoin a ${member.role}: ${reason}`, "info");
       }
     }
     // 3. Report members we can't bring back — a captured delegate with no

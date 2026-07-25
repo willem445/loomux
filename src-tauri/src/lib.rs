@@ -12,7 +12,7 @@ mod metrics;
 mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pty; // pub: Job-Object integration test links `assign_kill_on_close_job`
-mod sessions;
+pub mod sessions; // pub: the #412 resume-hardening integration tests fixture its store-lookup test seams
 mod uistate; // durable UI state (project tabs, #63) — atomic tabs.json store
 pub mod usage; // pub: exercised by orchestration integration tests
 pub mod voice; // voice-prompt prototype (#58); pub: pure helpers are unit-tested

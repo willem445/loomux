@@ -368,16 +368,44 @@ clone's cwd instead failed with "no session found" for a session plainly on disk
 ID — a bounded scan of `~/.claude/projects/*/<id>.jsonl` (claude, filename-keyed)
 or `~/.copilot/session-state/*/workspace.yaml` (copilot, matched on the parsed
 `id:` field, since its dirname isn't guaranteed to equal the id) — and read back
-the cwd the session itself recorded. This is authoritative: it's the exact string
-the CLI already wrote for itself, so it sidesteps a stale/moved worktree AND any
-casing/separator drift between loomux's cache and the CLI's own record, without
-loomux ever having to reproduce Claude's project-directory munging algorithm.
-`resolve_worker_resume_cwd` fast-paths when the roster's cached cwd is still a
-real directory (the common case — nothing moved); only a missing/stale cached cwd
-falls through to the store scan. **Launch-cwd choice, stated:** the CLI's own
-recorded cwd wins over the roster's cached copy whenever both are known and
-differ — the store is closer to ground truth than a copy loomux made once at
-spawn time and never re-verified.
+the cwd the session itself recorded. This is the best available signal, not a
+guarantee (#412 review N2): it's the exact string the CLI already wrote for
+itself, so it sidesteps a stale/moved worktree AND any casing/separator drift
+between loomux's cache and the CLI's own record, without loomux ever having to
+reproduce Claude's project-directory munging algorithm — but the recorded
+`cwd` is not always the directory `--resume` actually searches (see
+`find_session_cwd`'s doc comment in `sessions.rs` for the `.claude/worktrees`
+case this doesn't cover: 2 of 691 real sessions on the machine this was
+verified against).
+
+**Testability.** The claude/copilot store roots are each overridable via a
+`thread_local!` seam (`set_claude_projects_root_for_test`/
+`set_copilot_session_state_root_for_test`, both `sessions.rs`), scoped to the
+calling thread only — deliberately NOT a process-wide env var (#412 review
+B2): Rust's default test harness runs each `#[test]` on its own OS thread, so
+a thread-local set inside one test's body can never be read by a concurrently
+running test the way a `std::env::set_var` mutation could (real,
+unsynchronized-mutation undefined behavior across threads, which is why that
+function is `unsafe` as of recent Rust editions — not just a style concern).
+`tests/orchestration.rs`'s `fixture_claude_session`/`fixture_copilot_session`
+helpers write the on-disk shape these seams point at.
+
+**Launch-cwd choice, stated (corrected after #412 review N1 — this section
+previously claimed the opposite of what the code does).** The roster's cached
+cwd wins whenever it's still a real directory on disk — `resolve_worker_resume_cwd`
+returns it directly, without ever consulting the store. Only a missing, empty, or
+no-longer-existing cached cwd falls through to the store scan. This is
+deliberate, not merely the cheap path: a live worktree the roster still points
+at IS the session's current home, and is strictly better evidence than the
+store's possibly-stale snapshot of where that same session happened to run
+*at some point* — the store is consulted only because loomux's cache has gone
+stale (the one case it's actually needed), never used to second-guess a cache
+entry that's still checked out. A caveat this stance accepts: if the roster's
+cwd and the store's cwd disagree while BOTH still exist as real directories
+(e.g. a worktree re-added at a different path than the one the session
+originally ran under), the roster wins even though it may not be the exact
+directory the CLI itself would search — a narrower case than the #412 repro
+(worktree gone entirely), left unhandled by design rather than by omission.
 
 **Failing loudly.** When resolution comes up empty, `resume_recorded_session`
 (worker/reviewer path) now resolves the cwd **synchronously, before** the
