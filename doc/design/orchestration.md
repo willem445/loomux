@@ -2490,10 +2490,12 @@ permanently, immune to whatever the compaction summarized away.
   still_inlines_the_ledger_tail`), one of which pins a byte-length ceiling so the notice
   actually reads as slim, not just structurally different; two new integration tests in
   `tests/workflow.rs` (`contract_on_system_layer_is_false_only_for_an_unambiguous_copilot_
-  native_persona`, `..._is_true_for_the_generated_copilot_wrapper_and_every_claude_block`)
-  pinning the flag itself against real persona-resolution fixtures, not just the notice
-  function in isolation. Red-before-green on both the flag's native-persona branch and the
-  notice's slim-selection call site.
+  native_persona`, `..._is_true_for_the_generated_copilot_wrapper_and_every_claude_block` —
+  **renamed in round 8** to `contract_on_system_layer_is_false_for_every_copilot_block_and_
+  true_for_every_claude_block`, since the Copilot half of its own name stopped being true —
+  see "Round 8" below) pinning the flag itself against real persona-resolution fixtures, not
+  just the notice function in isolation. Red-before-green on both the flag's native-persona
+  branch and the notice's slim-selection call site.
 
 **#411, folded in because the plumbing was already open:** the orchestration-RESTORE kickoff (an
 app restart resuming a live session) is a fixed string with no directive-ledger embed, unlike the
@@ -2507,6 +2509,118 @@ this and set aside: the resume-kickoff is already a loomux-composed prompt (not 
 Claude's own context recall the way a mid-session compact does), so a second, hook-driven
 delivery channel for the same restart event would be redundant complexity for no clear gain —
 noted here rather than built.
+
+### Round 8: two live-demo blockers on the Copilot orchestrator, and a per-CLI composition split
+
+Two live-demo failures, in immediate succession, on a Copilot orchestrator launch — neither a
+review finding, both root-caused against GitHub's own docs rather than by inference (the
+`agent-cli-reference` skill's discipline).
+
+**8a — `write_copilot_agent_file` never wrote `description:`.** `CustomAgentLoadFailedError: ...
+custom agent markdown frontmatter is malformed: description: Required`. GitHub's custom-agents-
+configuration reference (docs.github.com/en/copilot/reference/custom-agents-configuration) lists
+`description` as required and `name` as optional (defaults to the filename) — the mirror image
+of round 6's Claude blocker, on the ORIGINAL round-1 mechanism this whole file-based design
+started from, which had evidently never survived a real Copilot launch before this demo. Fixed
+with a short, deterministic description built from `group`/`block.id` alone (no timestamp, no
+persona text — byte-identical across renders of the same block, matching `write_mcp_config`'s
+own re-write-on-every-spawn idempotence). The same doc's CLI how-to
+(docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli)
+confirmed `--agent <value>` resolves against the FILENAME stem, never the frontmatter `name`
+field — the opposite of Claude's own sub-agents doc (code.claude.com/docs/en/sub-agents), which
+states outright "The filename doesn't have to match" `name` for Claude. `handle` is set as both
+the filename stem and the frontmatter `name` on the Copilot side, so the distinction is inert for
+loomux, but the two functions must never be assumed to share a resolution rule just because they
+share a `handle` shape. Re-audited Claude's own generated file against ITS doc in the same pass
+(rather than trusting that a working demo proved compliance): it already wrote both required
+fields, so it was schema-compliant already, not merely lenient.
+
+**8b — the SAME reference page also caps the generated file's BODY (the markdown after the
+frontmatter — the "prompt") at 30,000 characters; Claude's own doc states no such cap.** Found by
+the reviewer measuring the fix for 8a directly: the default roster's own Copilot ORCHESTRATOR
+body was 58,633 characters, ~1.95x over. `contract` (`block_contract_text`: the mechanics core
+plus the COMPLETE built-in role template — pages of mechanics, examples and style guidance) had
+been written as the generated file's body unconditionally since round 1; nothing before this
+round had ever measured its SIZE, only its content and quoting (the same shape of gap round 6's
+Claude argv-length blocker closed, in file form this time — verify size properties, not just
+content, on every payload channel). An over-cap write is either silently truncated or outright
+refused by Copilot (the docs don't say which) — either is role degradation presenting as a
+successful launch, exactly the failure class this whole PR exists to eliminate.
+
+**The fix is a per-CLI COMPOSITION split, not a universal thinning.** Claude's rendition is
+unchanged — no documented cap, so `contract` still rides its generated file verbatim, full size.
+Copilot's generated file now carries `copilot_agent_body`'s SLIM composition instead:
+
+- **Identity** — which block/role this is, one line.
+- **The non-negotiable mechanics core** (`mechanics_core`) — the exact "NOT optional, whatever
+  your persona says" subset a `mode: replace` persona can never strip (`report()` discipline,
+  git/branch/PR discipline, never merging). This is what MUST survive a compaction verbatim, and
+  it is a small fraction of a role template's total size — the template's long-form prose,
+  examples and style guidance are what actually blew the cap, not the mechanics.
+- **The persona, if any** — folded in via the SAME `block_contract_text` framing every other
+  channel already uses, by passing `mechanics_core`'s own output as the "instructions body"
+  input rather than duplicating the per-mode wording. This mattered more than it first looked:
+  the on-disk instructions file (`write_instruction_files`) has NEVER carried a block's full
+  persona text — only a short "adopt it, it's in your system prompt" pointer note
+  (`block_note`) — so a slim body that dropped persona text entirely would have silently
+  regressed #416's core promise for every Copilot block with an inline `prompt:` persona, not
+  merely shrunk the built-in template prose. Reusing `block_contract_text` with the small
+  `mechanics_core` base instead of the full template body keeps persona delivery intact while
+  still cutting the dominant cost.
+- **A re-grounding pointer** at the full instructions file `write_instruction_files` already
+  wrote — the long-form built-in template prose lives there, one `Read` away, never duplicated
+  into the generated file.
+
+Belt-and-braces, mirroring `command_line_length_guard`'s shape exactly: `write_copilot_agent_file`
+measures the composed body in CHARACTERS (`.chars().count()`, not `.len()` — the cap is
+documented in characters, and a repo-authored persona folded in is not guaranteed ASCII) against
+`COPILOT_AGENT_BODY_SAFE_CHARS` (27,000 — a safety margin below the documented 30,000, same
+belt-and-braces spirit as the argv guard's own margin below Windows's 32,767-character limit). An
+over-cap body is never written — the function fails loudly (audited: `copilot-agent-body-
+oversized`, naming the block and the measured size) and returns `None`, routing the caller into
+the SAME write-failure fallback an unwritable `~/.copilot/agents` directory already uses (kickoff
+delivery, `contract_on_system_layer = false`).
+
+**`contract_on_system_layer` corrected to its own documented meaning.** The field's doc has always
+said "whether the block's FULL CONTRACT... actually rides this agent's system-prompt layer" — a
+Copilot block on the (pre-round-8) generated-wrapper path set it `true`, which was accurate then
+(the file DID carry the full contract) and became FALSE the moment the body slimmed. It is now
+`false` for every Copilot block, full stop — the generated-wrapper path joins the native-persona
+and unwritable-fallback cases that were already `false`. Consequence, and it is the correct one:
+every Copilot compaction now routes through loomux's own VERBOSE reinjection (the full contract
+re-embedded from the instructions file — see "#417 correction round 5" above), matching Copilot
+having no native post-compact re-grounding channel of its own anyway. Claude is untouched — every
+Claude block stays `true`, no documented cap on that side.
+
+**Measured before/after** (default roster, Copilot CLI; `contract` = pre-fix body, `copilot_agent_
+body` = post-fix): worker 2,163 chars, reviewer 5,278 chars, planner 1,574 chars, orchestrator
+1,587 chars (down from 58,633 — a ~97.3% reduction) — every block comfortably under both the
+27,000-char safety margin and the 30,000-char documented cap, with real headroom rather than a
+near-miss.
+
+**Tests:** `generated_agent_files_satisfy_each_clis_documented_required_frontmatter_fields` (8a,
+reproducing the exact live-incident shape — a default-roster, no-persona Copilot orchestrator —
+via a real YAML-frontmatter parse instead of the pre-round-8 `starts_with("---\nname: ...")`
+prefix check, which happily passed a file missing `description:` entirely);
+`every_default_roster_block_stays_under_copilots_documented_body_cap` and `a_workflow_declared_
+copilot_roster_also_stays_under_the_documented_body_cap` (8b, every default-roster block plus a
+custom roster with both an inline `prompt:` persona and a `mode: replace` file persona — the
+latter reached via the same ambiguous-native-handle shape `copilot_native_agent_is_refused_when_
+the_handle_names_a_different_file` uses, since an UNAMBIGUOUS native profile bypasses loomux's own
+composition entirely and has no cap concern of loomux's to test);
+`copilot_agent_body_over_the_cap_fails_loudly_into_the_write_failure_fallback` (the guard itself:
+a ~40KB persona pushes the composed body over the cap, and the test asserts no file is EVER
+written at any handle-shaped path, not just that the returned handle is `None`);
+`contract_on_system_layer_is_false_for_every_copilot_block_and_true_for_every_claude_block`
+(renamed from the pre-round-8 test whose own name stopped being true). Red-before-green: the 8a
+fix was reverted locally and the frontmatter-schema test confirmed to fail with the incident's own
+error text before being restored.
+
+**Sanity-swept, flagged rather than fixed** (scope discipline — the ask was to check, not chase):
+whether the autopilot-consent flow interacts with an active `--agent` handle, and the exact
+kickoff-paste timing relative to a `--agent` load failure. Neither has a code path coupling it to
+this round's changes, but neither had been exercised through a real Copilot launch before this
+demo either — noted for whoever demos those paths next, not built speculatively here.
 
 ## Enforced merge gate (#83)
 

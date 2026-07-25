@@ -4566,9 +4566,21 @@ pub struct Caller {
 ///
 /// | block persona | claude | copilot |
 /// |---|---|---|
-/// | none | contract → generated file + `--agent` | contract → generated file + `--agent` |
-/// | `prompt:` (inline) | contract+persona → generated file + `--agent` | contract+persona → generated file + `--agent` |
+/// | none | contract → generated file + `--agent` | slim (mechanics core + pointer) → generated file + `--agent` |
+/// | `prompt:` (inline) | contract+persona → generated file + `--agent` | slim+persona → generated file + `--agent` |
 /// | `profile: .github/agents/x.md` | n/a — Claude has no repo-authored persona convention | `--agent x` (native, unwrapped — see `persona_inject`) |
+///
+/// **Round 8:** Copilot's row is no longer symmetric with Claude's — GitHub's
+/// own custom-agents-configuration reference caps the generated file's BODY
+/// at 30,000 characters (documented; Claude has no such cap), and the FULL
+/// contract routinely exceeds it (the default roster's own orchestrator
+/// measured 58,633 chars). Copilot's generated file now carries a SLIM
+/// composition (`copilot_agent_body`: identity + `mechanics_core` + persona,
+/// if any, via the same [`block_contract_text`] framing, + a pointer to the
+/// full instructions file) instead of the raw contract — a per-CLI
+/// composition decision, not a universal thinning; Claude's row is
+/// unchanged. `contract_on_system_layer` is `false` for every Copilot row
+/// as of this split (see that field's doc).
 ///
 /// (Claude's write-failure fallback — `~/.claude/agents` unwritable — is
 /// `--append-system-prompt-file <instructions file>`, not shown above; still
@@ -4580,9 +4592,11 @@ pub struct Caller {
 /// pre-#222 command, byte for byte) and the built-in mechanics/template body
 /// never reached a system-prompt layer on ANY row — only a repo's own persona
 /// text did. `contract` (see [`block_contract_text`]) closes that: it is
-/// ALWAYS present and ALWAYS what rides on the CLI's native custom-agent
-/// mechanism now, with a configured persona folded in as an addendum rather
-/// than the sole payload.
+/// ALWAYS present and ALWAYS what rides on Claude's native custom-agent
+/// mechanism (round 8 note above: Copilot's own generated file carries a
+/// slim COMPOSITION derived from the same inputs, not `contract` directly),
+/// with a configured persona folded in as an addendum rather than the sole
+/// payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PersonaInject {
     /// Claude `--agent <name>`: activates a loomux-generated
@@ -4613,9 +4627,11 @@ pub struct PersonaInject {
     pub claude_append_system_prompt_file: Option<PathBuf>,
     /// Copilot `--agent <name>` — either a user-authored `.github/agents/*.md`
     /// (native, unwrapped) or a loomux-generated `~/.copilot/agents/*.agent.md`
-    /// carrying the contract (#416; see `OrchRegistry::write_copilot_agent_file`).
-    /// loomux never writes a generated file into the repo's own
-    /// `.github/agents/` (see `profiles::is_copilot_native`).
+    /// (#416; see `OrchRegistry::write_copilot_agent_file`) carrying a SLIM
+    /// composition as of round 8 (`copilot_agent_body`), not the raw
+    /// contract — see that function's doc for why. loomux never writes a
+    /// generated file into the repo's own `.github/agents/` (see
+    /// `profiles::is_copilot_native`).
     pub copilot_agent: Option<String>,
     /// Extra pre-approved tool patterns from the persona's `allow:`. Widens
     /// only *within* the capability class: deny rules beat allow rules on both
@@ -4633,18 +4649,23 @@ pub struct PersonaInject {
     /// above carried it (both `--agent <generated file>` and `--append-
     /// system-prompt-file` are launch-time system-prompt construction, per
     /// Claude's own CLI reference — neither is a conversation-history
-    /// artifact a compaction could touch) and for a Copilot block on the
-    /// generated-file path (`write_copilot_agent_file` succeeded); `false`
-    /// for a Copilot block using a user-authored native
-    /// `.github/agents/*.md` persona (only the user's OWN file rides
-    /// `--agent`, never loomux's contract — the documented #416 residual
-    /// gap) and for the rare `~/.copilot/agents`-unwritable fallback (only
-    /// the persona text, not the full contract, reaches the kickoff).
-    /// Consumed post-spawn by `compact_reinjection_notice`'s slim/verbose
-    /// choice (round #417 correction 5): a compaction can only dilute what
-    /// ISN'T already durable on the system-prompt layer, so only an agent
-    /// where this is `false` needs the contract re-embedded verbatim after
-    /// one.
+    /// artifact a compaction could touch); as of round 8, `false` for
+    /// EVERY Copilot block, full stop — a user-authored native
+    /// `.github/agents/*.md` persona never carried loomux's contract to
+    /// begin with (documented #416 residual gap), the `~/.copilot/agents`-
+    /// unwritable fallback only ever gets the persona text via the
+    /// kickoff, and the generated-file path (`write_copilot_agent_file`)
+    /// now carries only a SLIM composition, never the FULL contract (see
+    /// `copilot_agent_body`'s doc — GitHub's documented 30,000-character
+    /// body cap made the old "full contract, always" promise unkeepable
+    /// for Copilot specifically). Consumed post-spawn by `compact_
+    /// reinjection_notice`'s slim/verbose choice (round #417 correction
+    /// 5): a compaction can only dilute what ISN'T already durable on the
+    /// system-prompt layer, so only an agent where this is `false` needs
+    /// the contract re-embedded verbatim after one — which, as of round 8,
+    /// is every Copilot agent, matching that CLI having no native post-
+    /// compact re-grounding channel anyway (see the capability matrix in
+    /// this module's #417 design notes).
     pub contract_on_system_layer: bool,
 }
 
@@ -4659,9 +4680,11 @@ pub struct ResolvedPersona {
     pub text: String,
     /// The handle a native `--agent` flag names.
     pub name: String,
-    /// One-line description. Required by Claude's generated custom-agent
-    /// file's frontmatter schema; Copilot's generated file has no
-    /// equivalent field (see `write_copilot_agent_file`'s doc).
+    /// One-line description, consumed by Claude's generated custom-agent
+    /// file's frontmatter (required by its schema). Copilot's generated
+    /// file has its OWN `description`, as of round 8 — but built
+    /// deterministically from `group`/`block.id` by `write_copilot_agent_
+    /// file` directly, never from this persona-sourced field.
     pub description: String,
     pub mode: profiles::ProfileMode,
     pub allow: Vec<String>,
@@ -4711,6 +4734,76 @@ pub fn block_contract_text(instructions_body: &str, persona: Option<&ResolvedPer
              does not override the loomux mechanics above:\n\n{text}\n"
         ),
     }
+}
+
+/// GitHub's custom-agents-configuration reference (docs.github.com/en/
+/// copilot/reference/custom-agents-configuration): "The prompt can be a
+/// maximum of 30,000 characters" — confirmed to mean the markdown BODY
+/// only (everything after the closing `---`), not the frontmatter. Claude's
+/// own sub-agents doc (code.claude.com/docs/en/sub-agents) documents no
+/// such cap for its own generated file's body — this limit is Copilot-
+/// specific, which is why `copilot_agent_body` composes a slimmer text
+/// than `write_claude_agent_file` writes for the identical block.
+const COPILOT_AGENT_BODY_DOCUMENTED_CAP_CHARS: usize = 30_000;
+
+/// Safety margin below the documented cap — same belt-and-braces spirit as
+/// `command_line_length_guard`'s margin below Windows's 32,767-character
+/// `CreateProcessW` limit. `copilot_agent_body`'s composed text should sit
+/// far below even this in ordinary operation (a few KB); the margin exists
+/// for the case a workflow-declared persona is itself unusually large.
+const COPILOT_AGENT_BODY_SAFE_CHARS: usize = 27_000;
+
+/// Round 8 review (B1, blocking): the full block CONTRACT (`block_contract_
+/// text` — mechanics core + the COMPLETE built-in role template, which is
+/// pages of mechanics, examples and style guidance) routinely exceeds
+/// Copilot's documented 30,000-character body cap — measured 58,633 chars
+/// for the default roster's own orchestrator, ~1.95x over. Writing that as
+/// the generated file's body risks silent truncation or an outright load
+/// failure (Copilot's own docs don't say which); either is role
+/// degradation presenting as a successful launch, exactly the failure
+/// class this whole PR exists to eliminate.
+///
+/// So Copilot's system-prompt layer carries a SLIM composition instead,
+/// built by COMPOSITION rather than by amputating the full contract:
+///
+/// - **Identity** — which block/role this is, one line.
+/// - **The non-negotiable mechanics core** ([`mechanics_core`]) — the same
+///   "NOT optional, whatever your persona says" subset a `mode: replace`
+///   persona can never strip: `report()` discipline, git/branch/PR
+///   discipline, never merging. This is the part that MUST survive a
+///   compaction verbatim, and it is a small fraction of a role template's
+///   total size (the template's long-form prose, examples and style
+///   guidance are what actually blow the cap, not the mechanics).
+/// - **The persona, if any** — folded in via the SAME [`block_contract_
+///   text`] framing every other channel uses (passing `mechanics_core`'s
+///   own output as the "instructions body" input reuses its per-mode
+///   wording verbatim rather than duplicating it), so a workflow-declared
+///   persona's identity/instructions are never silently dropped from every
+///   durable channel just because the built-in template prose was cut.
+/// - **A re-grounding pointer** at the full instructions file `write_
+///   instruction_files` already wrote — the long-form built-in template
+///   prose lives there, one `Read` away, rather than duplicated here.
+///
+/// `contract_on_system_layer` is `false` for the caller as a result (see
+/// that field's doc) — the FULL contract no longer rides this file, so a
+/// real compaction still needs loomux's own verbose reinjection to
+/// re-embed it from the instructions file. This is a per-CLI composition
+/// decision: Claude's rendition (no documented cap) is unchanged.
+fn copilot_agent_body(block: &workflow::Block, persona: Option<&ResolvedPersona>, instructions_path: &Path) -> String {
+    let mechanics_only = mechanics_core(block.kind, block.role_hint.as_deref());
+    let slim_contract = block_contract_text(&mechanics_only, persona);
+    format!(
+        "You are `{}` (block id `{}`) — the {} for this loomux-orchestrated group.\n\n\
+         {slim_contract}\n\n\
+         This is a SLIM system-prompt copy, kept well under Copilot's documented agent-body \
+         limit. Your FULL role instructions — the complete built-in role template, and this \
+         block's own notes — live in `{}`. Read that file for anything beyond the mechanics \
+         above; treat it as authoritative whenever this summary and it disagree.\n",
+        block.name,
+        block.id,
+        block.kind.as_str(),
+        instructions_path.display(),
+    )
 }
 
 /// Payload asking the frontend to open a pane for an agent. Also the return
@@ -14996,6 +15089,16 @@ impl OrchRegistry {
     /// both, so the distinction is inert for loomux either way, but it is
     /// why the Claude and Copilot functions must never be assumed to share
     /// a resolution rule just because they share a `handle` shape.
+    ///
+    /// The SAME doc's "Supported frontmatter fields" table and its
+    /// surrounding prose name no maximum length for a subagent's markdown
+    /// body anywhere — unlike Copilot's own custom-agents-configuration
+    /// reference, which caps the equivalent body at 30,000 characters (see
+    /// `copilot_agent_body`'s doc). That asymmetry is why `contract` is
+    /// written here VERBATIM, full size, while Copilot's generated file
+    /// gets a composed, deliberately-slimmer text instead of this same
+    /// `contract` value — a per-CLI decision the docs justify, not an
+    /// oversight to reconcile.
     fn write_claude_agent_file(&self, group: &str, block: &workflow::Block, contract: &str, description: &str) -> Option<String> {
         let dir = self.claude_agents_dir()?;
         fs::create_dir_all(&dir).ok()?;
@@ -15056,24 +15159,72 @@ impl OrchRegistry {
     /// simultaneously the `--agent` value, the filename stem, and the
     /// frontmatter `name` — correct for Copilot's filename-keyed resolution,
     /// and harmless extra information for a field the docs say is optional.
-    fn write_copilot_agent_file(&self, group: &str, block: &workflow::Block, contract: &str) -> Option<String> {
+    ///
+    /// Round 8 review (B1, blocking): the SAME custom-agents-configuration
+    /// reference also caps the agent BODY (the markdown after the
+    /// frontmatter, i.e. the prompt) at 30,000 characters — "The prompt can
+    /// be a maximum of 30,000 characters" — while Claude's own sub-agents
+    /// doc states no such limit (see `write_claude_agent_file`'s doc). The
+    /// FULL block contract (`block_contract_text`: mechanics core + the
+    /// complete built-in role template) routinely exceeds that for the
+    /// default roster's own orchestrator — measured 58,633 chars, ~1.95x
+    /// over — before this fix; an over-cap write is either silently
+    /// truncated or rejected by Copilot, either of which is role
+    /// degradation presenting as a successful launch. So the body written
+    /// here is `copilot_agent_body`'s SLIM composition, never the raw
+    /// `contract` (see that function's doc for what it keeps vs. defers to
+    /// the instructions file) — a per-CLI decision; Claude's rendition is
+    /// unchanged. `contract_on_system_layer` is `false` for every Copilot
+    /// block as of this composition (set by the caller in `persona_inject`)
+    /// — the FULL contract no longer rides this file, so a real compaction
+    /// still needs loomux's own verbose reinjection to re-embed it; see
+    /// `PersonaInject::contract_on_system_layer`'s doc.
+    ///
+    /// Belt-and-braces, mirroring `command_line_length_guard`'s shape: a
+    /// composed body over `COPILOT_AGENT_BODY_SAFE_CHARS` fails LOUDLY here
+    /// (audited, naming the block and the measured size) rather than ever
+    /// writing a file Copilot might truncate or refuse — `None` routes the
+    /// caller to the existing write-failure fallback (kickoff delivery,
+    /// `contract_on_system_layer = false`, verbose re-grounding), exactly
+    /// like an unwritable directory already does.
+    fn write_copilot_agent_file(
+        &self,
+        group: &str,
+        block: &workflow::Block,
+        persona: Option<&ResolvedPersona>,
+    ) -> Option<String> {
         let dir = self.copilot_agents_dir()?;
         fs::create_dir_all(&dir).ok()?;
         let handle = format!("loomux-{group}-{}", block.id);
-        // `contract` is already built from loomux's own trusted templates plus
-        // (if any) a persona already sanitized at resolution time
-        // (`workflow::sanitize_persona`, applied in `resolve_persona`) — no
-        // further escaping needed for a file body. The frontmatter split in
-        // `profiles::parse_profile` only ever looks at the FIRST `\n---`
-        // after the opening one, so a `---` line anywhere inside `contract`
-        // itself is inert. `group`/`block.id` are both loomux-internal
-        // identifiers (sanitized elsewhere), never repo-authored free text,
-        // but `description` is still quoted the same way the Claude path
-        // quotes ITS (persona-sourced) description — cheap, uniform defense
-        // against a stray YAML-significant character either way.
+        let instructions_path = self.group_dir(group).join(block.instructions_file());
+        let body_text = copilot_agent_body(block, persona, &instructions_path);
+        // `.chars().count()`, not `.len()`: the documented cap is in
+        // CHARACTERS, and loomux's own trusted prose is ASCII, but a
+        // repo-authored persona folded in via `block_contract_text` is not
+        // guaranteed to be — a multi-byte character must count once, not
+        // once per UTF-8 byte, or this guard would trip early on non-ASCII
+        // text that is nowhere near the real cap.
+        let body_chars = body_text.chars().count();
+        if body_chars > COPILOT_AGENT_BODY_SAFE_CHARS {
+            self.audit(group, "loomux", "copilot-agent-body-oversized", json!({
+                "block": block.id,
+                "chars": body_chars,
+                "safe_limit": COPILOT_AGENT_BODY_SAFE_CHARS,
+                "documented_cap": COPILOT_AGENT_BODY_DOCUMENTED_CAP_CHARS,
+            }));
+            return None;
+        }
+        // `group`/`block.id` are both loomux-internal identifiers
+        // (sanitized elsewhere), never repo-authored free text, but
+        // `description` is still quoted the same way the Claude path
+        // quotes ITS (persona-sourced) description — cheap, uniform
+        // defense against a stray YAML-significant character either way.
+        // The frontmatter split in `profiles::parse_profile` only ever
+        // looks at the FIRST `\n---` after the opening one, so a `---`
+        // line anywhere inside `body_text` itself is inert.
         let description = format!("loomux {} agent for group {group}", block.id);
         let body = format!(
-            "---\nname: {handle}\ndescription: {}\n---\n{contract}\n",
+            "---\nname: {handle}\ndescription: {}\n---\n{body_text}\n",
             yaml_double_quoted(&description)
         );
         let path = dir.join(format!("{handle}.agent.md"));
@@ -15142,14 +15293,20 @@ impl OrchRegistry {
                 return out;
             }
             // #416: every OTHER copilot block — the default roster, an inline
-            // `prompt:` persona, or an ambiguous native handle — now gets the
-            // durable contract via a loomux-generated custom-agent file,
-            // where before it got nothing (default roster) or a kickoff-
-            // prompt paste (inline `prompt:`).
-            match self.write_copilot_agent_file(group, block, contract) {
+            // `prompt:` persona, or an ambiguous native handle — now gets a
+            // durable (round 8: SLIM, not full — see `copilot_agent_body`'s
+            // doc) contract via a loomux-generated custom-agent file, where
+            // before it got nothing (default roster) or a kickoff-prompt
+            // paste (inline `prompt:`).
+            match self.write_copilot_agent_file(group, block, persona) {
                 Some(handle) => {
                     out.copilot_agent = Some(handle);
-                    out.contract_on_system_layer = true;
+                    // Round 8: `false`, not `true` — the generated file no
+                    // longer carries the FULL contract (`copilot_agent_
+                    // body`'s doc explains why), so this must stay honest
+                    // per `contract_on_system_layer`'s own documented
+                    // meaning: a real compaction still needs loomux's own
+                    // verbose reinjection to re-embed the full contract.
                 }
                 None => {
                     // `~/.copilot/agents` unwritable — fall back to the

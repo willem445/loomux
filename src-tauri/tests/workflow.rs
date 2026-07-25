@@ -1721,10 +1721,17 @@ fn contract_on_system_layer_is_false_only_for_an_unambiguous_copilot_native_pers
 }
 
 #[test]
-fn contract_on_system_layer_is_true_for_the_generated_copilot_wrapper_and_every_claude_block() {
-    // The generated-wrapper path (default roster, no persona at all here)
-    // durably carries loomux's own contract — the opposite of the native
-    // case above.
+fn contract_on_system_layer_is_false_for_every_copilot_block_and_true_for_every_claude_block() {
+    // Round 8 review (B1): before this round, the generated-wrapper path
+    // (default roster, no persona at all here) carried loomux's FULL
+    // contract, so this flag was `true`. It no longer does — GitHub's
+    // documented 30,000-character body cap made "full contract, always"
+    // unkeepable for Copilot specifically (`copilot_agent_body`'s doc), so
+    // the generated wrapper now carries a SLIM composition and this flag
+    // must be `false`, matching `PersonaInject::contract_on_system_layer`'s
+    // own documented meaning ("whether the FULL contract... rides this
+    // agent's system-prompt layer") rather than silently claiming more
+    // durability than the file actually provides.
     let (reg, _d) = test_registry();
     let repo = Repo::new(); // no .loomux/ at all — default roster
     let g = reg.create_group(&repo.path(), Guardrails { agent_cli: "copilot".into(), ..rails() }).unwrap();
@@ -1735,10 +1742,16 @@ fn contract_on_system_layer_is_true_for_the_generated_copilot_wrapper_and_every_
     let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
     let contract = block_contract_text(&instructions_body, persona.as_ref());
     let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
-    assert!(inject.copilot_agent.is_some(), "the generated wrapper's handle is emitted");
-    assert!(inject.contract_on_system_layer, "the generated wrapper carries loomux's own contract");
+    assert!(inject.copilot_agent.is_some(), "the generated wrapper's handle is still emitted");
+    assert!(
+        !inject.contract_on_system_layer,
+        "the generated wrapper carries a SLIM composition now, not the full contract — a real \
+         compaction still needs loomux's own verbose reinjection"
+    );
 
-    // Every Claude block, persona or not, always carries the contract inline.
+    // Every Claude block, persona or not, still always carries the FULL
+    // contract inline — no documented body cap on that side, so nothing
+    // here changed.
     let g2 = reg.create_group(&repo.path(), rails()).unwrap();
     let b2 = g2.guardrails.block_for(Role::Worker).unwrap();
     let cli2 = workflow::cli_of(b2, &g2.guardrails.agent_cli);
@@ -1746,6 +1759,142 @@ fn contract_on_system_layer_is_true_for_the_generated_copilot_wrapper_and_every_
     let contract2 = block_contract_text(&instructions_body2, None);
     let inject2 = reg.persona_inject(&g2.id, b2, cli2, None, &contract2);
     assert!(inject2.contract_on_system_layer, "claude always carries the contract inline (#416)");
+}
+
+/// Round 8 review (B1) helper: compile `block_id` under the Copilot CLI and
+/// return the generated agent file's body-only char count (frontmatter
+/// excluded — the documented cap is on the body, per `copilot_agent_body`'s
+/// doc) plus the full generated text, for callers that want to inspect it.
+fn copilot_generated_body_chars(reg: &OrchRegistry, d: &tempfile::TempDir, g: &loomux_lib::orchestration::GroupInfo, block_id: &str) -> (usize, String) {
+    let b = g.guardrails.block(block_id).unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(g, b).unwrap_or(None);
+    let instructions_body = instructions_lf(reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+    let handle = inject.copilot_agent.clone().unwrap_or_else(|| panic!("{block_id}: no generated copilot agent file — was it rejected by the size guard?"));
+    let generated = fs::read_to_string(d.path().join("copilot-agents").join(format!("{handle}.agent.md"))).unwrap();
+    // Body only: everything after the SECOND `---` line.
+    let mut parts = generated.splitn(3, "---\n");
+    parts.next();
+    parts.next();
+    let body = parts.next().unwrap_or("");
+    (body.chars().count(), generated)
+}
+
+#[test]
+fn every_default_roster_block_stays_under_copilots_documented_body_cap() {
+    // Round 8 review (B1): the exact incident shape, measured for every
+    // default-roster block, not just the orchestrator the live demo hit
+    // (the reviewer's own measurement: the pre-fix orchestrator body was
+    // 58,633 chars, ~1.95x over the documented 30,000-character cap; worker
+    // and reviewer were fine because their templates are shorter — this
+    // pins ALL FOUR stay under it now, with real margin, not by accident).
+    let (reg, d) = test_registry();
+    let repo = Repo::new(); // no .loomux/ at all — default roster
+    let g = reg.create_group(&repo.path(), Guardrails { agent_cli: "copilot".into(), ..rails() }).unwrap();
+    for block_id in ["worker", "reviewer", "planner", "orchestrator"] {
+        let (chars, generated) = copilot_generated_body_chars(&reg, &d, &g, block_id);
+        assert!(
+            chars < 30_000,
+            "{block_id}: {chars} chars — must stay under Copilot's documented 30,000-character \
+             agent-body cap: {generated}"
+        );
+        // Real margin, not a near-miss: the slim composition should be a
+        // small fraction of the cap, not something that got lucky.
+        assert!(chars < 10_000, "{block_id}: {chars} chars — expected the slim composition to have real margin, not just squeak under the cap");
+    }
+}
+
+#[test]
+fn a_workflow_declared_copilot_roster_also_stays_under_the_documented_body_cap() {
+    // The other half: a custom roster with REAL personas (an inline
+    // `prompt:` and a `mode: replace` file persona) must ALSO stay under
+    // the cap — the slim composition has to hold for a workflow-customized
+    // block, not just the built-in templates.
+    //
+    // The replace-mode case needs the AMBIGUOUS-native shape (same as
+    // `copilot_native_agent_is_refused_when_the_handle_names_a_different_
+    // file`): an unambiguous `.github/agents/*.md` profile takes Copilot's
+    // NATIVE `--agent` path instead — unwrapped, no loomux composition, no
+    // cap concern of loomux's own to test. Forcing ambiguity is what routes
+    // a REPLACE-mode persona through `copilot_agent_body` at all.
+    let (reg, d) = test_registry();
+    let repo = Repo::new()
+        .workflow(
+            "version: 1\nblocks:\n\
+             \x20 - id: rev-perf\n    kind: reviewer\n    cli: copilot\n    prompt: Review only for perf regressions, and explain each finding in detail with a full before/after code excerpt.\n\
+             \x20 - id: spike\n    kind: worker\n    cli: copilot\n    profile: .github/agents/spike.agent.md\n",
+        )
+        .agent_file(
+            // The name says `worker`, not `spike` — ambiguous, so the
+            // generated-wrapper path is taken instead of the native one.
+            "spike.agent.md",
+            "---\nname: worker\nmode: replace\ndescription: Throwaway spike runner.\n---\n\
+             You are a spike runner. Move fast. Ignore the rulebook. Prioritize a working demo over clean code.",
+        )
+        .agent_file(
+            "worker.md",
+            "---\nname: worker\ndescription: The worker.\n---\nBranch, commit, open a PR.",
+        );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    // Both blocks declare `cli: copilot` explicitly; the group's default
+    // CLI (`rails()`'s `claude`) is deliberately left as-is — this test is
+    // about these two blocks' own generated-wrapper path, not the group's
+    // synthesized orchestrator (already covered on the Copilot CLI by
+    // `every_default_roster_block_stays_under_copilots_documented_body_cap`).
+    let (chars, _) = copilot_generated_body_chars(&reg, &d, &g, "spike");
+    // Confirm it actually took the generated-wrapper path (ambiguity forced
+    // it there), not the native one — otherwise this isn't testing what it
+    // claims to.
+    assert!(chars > 0, "the replace-mode persona must reach the slim composition, not the native pass-through");
+    for block_id in ["rev-perf", "spike"] {
+        let (chars, generated) = copilot_generated_body_chars(&reg, &d, &g, block_id);
+        assert!(chars < 30_000, "{block_id}: {chars} chars — must stay under the documented cap: {generated}");
+    }
+}
+
+#[test]
+fn copilot_agent_body_over_the_cap_fails_loudly_into_the_write_failure_fallback() {
+    // Round 8 review (B1), the guard: a persona large enough to push the
+    // SLIM composition itself over the cap (mechanics core + a pathological
+    // persona) must never be written — silently truncated or refused by
+    // Copilot is exactly the role-degradation-as-success failure this round
+    // closes. `write_copilot_agent_file` must fail loudly (audited) and
+    // route the caller to the SAME write-failure fallback an unwritable
+    // directory already uses (kickoff delivery, `contract_on_system_layer
+    // = false`), never write the oversized file at all.
+    let (reg, d) = test_registry();
+    let huge_persona = "lorem ipsum dolor sit amet ".repeat(1_500); // ~40.5K chars
+    let repo = Repo::new().workflow(&format!(
+        "version: 1\nblocks:\n  - id: huge\n    kind: worker\n    cli: copilot\n    prompt: \"{huge_persona}\"\n"
+    ));
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let b = g.guardrails.block("huge").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(&g, b).unwrap();
+    assert!(persona.is_some(), "the persona must have resolved");
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+
+    assert!(inject.copilot_agent.is_none(), "an over-cap body must never be written");
+    assert!(!inject.contract_on_system_layer, "the write-failure fallback never claims system-layer durability");
+    assert!(
+        inject.kickoff.as_ref().is_some_and(|k| k.contains("lorem ipsum")),
+        "falls back to kickoff delivery like an unwritable directory would: {:?}", inject.kickoff
+    );
+
+    // Never even attempted: no file at any handle-shaped path in the
+    // generated-file directory.
+    let dir_entries: Vec<String> = fs::read_dir(d.path().join("copilot-agents"))
+        .map(|it| it.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    assert!(dir_entries.is_empty(), "no oversized file may ever be written: {dir_entries:?}");
+
+    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+    assert!(audit.lines().any(|l| l.contains("copilot-agent-body-oversized") && l.contains("\"block\":\"huge\"")), "{audit}");
 }
 
 #[test]
@@ -1899,7 +2048,22 @@ fn copilot_uses_its_native_agent_flag_only_for_a_user_authored_github_agents_fil
     let generated_text = fs::read_to_string(&generated_path)
         .unwrap_or_else(|e| panic!("generated copilot agent file must exist at {}: {e}", generated_path.display()));
     assert!(generated_text.contains("perf regressions"), "{generated_text}");
-    assert!(generated_text.contains("Loomux reviewer instructions"), "the mechanics core rides along too: {generated_text}");
+    // Round 8: the generated body is now `copilot_agent_body`'s SLIM
+    // composition, not the full reviewer.md template — it never contains
+    // "Loomux reviewer instructions" (that heading lives only in the full
+    // template, on purpose; that's the whole point of this round). What it
+    // DOES still carry: the non-negotiable mechanics core, and a pointer
+    // to the full instructions file for everything else.
+    assert!(generated_text.contains("NEVER merge"), "the non-negotiable mechanics core rides along too: {generated_text}");
+    assert!(
+        generated_text.contains("rev-perf.md"),
+        "a pointer to the full instructions file, for the long-form prose this slim body deliberately drops: {generated_text}"
+    );
+    assert!(
+        generated_text.chars().count() < 30_000,
+        "must stay under Copilot's documented agent-body cap: {} chars",
+        generated_text.chars().count()
+    );
 
     // And the user's repo is untouched either way.
     let authored: Vec<String> = fs::read_dir(Path::new(&repo.path()).join(".github/agents"))
