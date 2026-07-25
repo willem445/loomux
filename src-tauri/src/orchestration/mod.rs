@@ -1266,6 +1266,25 @@ const HUMAN_INPUT_HOLD_MAX: Duration = Duration::from_secs(60);
 /// Poll interval while holding for the box to clear.
 const HUMAN_INPUT_POLL: Duration = Duration::from_millis(250);
 
+// Interactive-question paste guard (#420): Copilot (and other CLIs) surface
+// numbered/radio-select questions and y/n permission prompts as an interactive
+// TUI, not as text sitting in the input box — so the guard above doesn't see
+// them. A programmatic paste+Enter landing there is worse than the box-occupied
+// case: Enter doesn't merge text, it SELECTS the highlighted option (usually
+// the first), silently steering the agent's turn in an answer nobody chose. So
+// before pasting AND before the first Enter, hold delivery while
+// `prompt_wait_detected` reads a live question off the pane's output tail —
+// same detector attention routing already uses (#6/#40) — until it clears
+// (the human answers) or the bound elapses, in which case abort rather than
+// blind-select.
+/// Bounded wait for the question to clear before aborting the delivery.
+/// Longer than [`HUMAN_INPUT_HOLD_MAX`]: reading and deciding a substantive
+/// question takes more of a human's attention than submitting an already-typed
+/// line.
+const QUESTION_HOLD_MAX: Duration = Duration::from_secs(120);
+/// Poll interval while holding for the question to clear.
+const QUESTION_HOLD_POLL: Duration = Duration::from_millis(250);
+
 // Kickoff readiness: a fixed boot delay loses the race on a loaded machine
 // (a CLI that boots slower than the delay flushes the pasted prompt along
 // with its startup stdin buffer — observed live with a reviewer spawned
@@ -5733,6 +5752,24 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
     )
 }
 
+/// Production wrapper: hold prompt delivery to `pty_id` while a Copilot-style
+/// interactive question is on screen (#420), using the shipped cap/poll.
+/// Reuses `hold_for_human_input`'s generic block-until-clear-or-capped loop —
+/// same shape as `wait_for_box_clear`, just with `prompt_wait_detected` over
+/// the live output tail as the "still occupied" predicate instead of the input
+/// box's pending-keystroke flag. A closed pty or unreadable tail reads as "no
+/// question" so a dead/gone pane never blocks the thread.
+fn wait_for_question_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecision {
+    hold_for_human_input(
+        || {
+            ptys.output_tail(pty_id)
+                .is_some_and(|out| prompt_wait_detected(&strip_ansi(&out)))
+        },
+        QUESTION_HOLD_MAX,
+        QUESTION_HOLD_POLL,
+    )
+}
+
 /// Why a prompt delivery is currently being held for human input (#246): the
 /// UI-facing counterpart to the audit-log holds above. `Typing` is
 /// `wait_for_user_quiet`'s "human is actively typing" hold (#43); `BoxOccupied`
@@ -5745,6 +5782,15 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
 pub enum HeldReason {
     Typing,
     BoxOccupied,
+    /// A question/permission TUI is on screen (#420): the pane's own agent is
+    /// mid-dialog (Copilot's numbered/radio-select question, a y/n permission
+    /// prompt, Claude's `AskUserQuestion`), and a programmatic paste+Enter would
+    /// land ON that dialog — worse than the other two reasons, because Enter
+    /// there doesn't just merge text, it SELECTS an option (the highlighted
+    /// default, usually the first) and silently steers the agent. See
+    /// `prompt_wait_detected` for the detector and `confirm_copilot_autopilot_dialog`
+    /// for why the autopilot-consent dialog specifically is exempt from this hold.
+    InteractiveQuestion,
 }
 
 impl HeldReason {
@@ -5752,6 +5798,7 @@ impl HeldReason {
         match self {
             HeldReason::Typing => "typing",
             HeldReason::BoxOccupied => "box-occupied",
+            HeldReason::InteractiveQuestion => "question",
         }
     }
 }
@@ -5766,6 +5813,9 @@ pub fn delivery_held_detail(agent_id: &str, reason: HeldReason) -> String {
         ),
         HeldReason::BoxOccupied => format!(
             "Prompt delivery to {agent_id} is paused — submit or clear the text in this pane's box to continue."
+        ),
+        HeldReason::InteractiveQuestion => format!(
+            "Prompt delivery to {agent_id} is paused — Copilot is asking a question, answer it to release delivery."
         ),
     }
 }
@@ -5836,6 +5886,32 @@ pub fn paste_held_notice(agent_id: &str) -> String {
     format!(
         "[loomux] delivery to {agent_id} held: pane has human input — re-send when clear"
     )
+}
+
+/// The notice delivered to the orchestrator when a delivery to `agent_id` was
+/// held and aborted because Copilot has an interactive question on screen
+/// (#420). Distinct wording from `paste_held_notice`: the recovery move isn't
+/// "wait for a human's typed line to clear", it's "a human needs to ANSWER the
+/// question" — re-sending sooner won't help until that happens, and the
+/// orchestrator must not try to answer it programmatically itself (that is
+/// exactly the silently-wrong-answer hazard this hold exists to prevent).
+pub fn question_held_notice(agent_id: &str) -> String {
+    format!(
+        "[loomux] delivery to {agent_id} held: Copilot is asking a question — \
+         answer it to release delivery, then re-send"
+    )
+}
+
+/// Picks the orchestrator-facing notice text for an aborted held delivery
+/// (#111/#420), dispatched by why it was held. `Typing` never aborts (its
+/// cap delivers anyway rather than holding forever), so it has no notice —
+/// callers only ever pass `BoxOccupied` or `InteractiveQuestion` here.
+#[doc(hidden)] // pub for integration tests
+pub fn held_delivery_notice(agent_id: &str, reason: HeldReason) -> String {
+    match reason {
+        HeldReason::InteractiveQuestion => question_held_notice(agent_id),
+        HeldReason::Typing | HeldReason::BoxOccupied => paste_held_notice(agent_id),
+    }
 }
 
 /// The `[loomux] channel <id> - <sender>: <text>` line loomux prefixes to a
@@ -14676,7 +14752,42 @@ impl OrchRegistry {
                     // the human's line is gone. Nothing was pasted, so there is no
                     // outcome to record for the next delivery's flush.
                     if let Some(reg) = reg {
-                        reg.notify_delivery_held(&group, &agent, target_is_orchestrator);
+                        reg.notify_delivery_held(&group, &agent, target_is_orchestrator, HeldReason::BoxOccupied);
+                    }
+                    return;
+                }
+            }
+
+            // Interactive-question paste guard (#420): a question/permission TUI
+            // reads nothing like the box-occupied case above (no keystrokes, no
+            // `input_pending`) but is just as unsafe to paste over — worse,
+            // actually, since the Enter below wouldn't merge text, it would SELECT
+            // whichever option is highlighted. Hold for `prompt_wait_detected` to
+            // clear (the human answers) before pasting; if it never does, abort
+            // without pasting, same recovery shape as the box-occupied guard.
+            let will_hold_question = ptys
+                .output_tail(pty_id)
+                .is_some_and(|out| prompt_wait_detected(&strip_ansi(&out)));
+            if will_hold_question {
+                emit_held(HeldReason::InteractiveQuestion);
+            }
+            let question_decision = wait_for_question_clear(&ptys, pty_id);
+            if will_hold_question {
+                emit_held_cleared();
+            }
+            match question_decision {
+                PasteDecision::Paste { held_ms } if held_ms > 0 => {
+                    append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
+                        "to": agent, "stage": "pre-paste", "held_ms": held_ms, "outcome": "cleared",
+                    }));
+                }
+                PasteDecision::Paste { .. } => {}
+                PasteDecision::Abort { held_ms } => {
+                    append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
+                        "to": agent, "stage": "pre-paste", "held_ms": held_ms,
+                    }));
+                    if let Some(reg) = reg {
+                        reg.notify_delivery_held(&group, &agent, target_is_orchestrator, HeldReason::InteractiveQuestion);
                     }
                     return;
                 }
@@ -14771,6 +14882,40 @@ impl OrchRegistry {
             if will_hold_typing_preenter {
                 emit_held_cleared();
             }
+            // Re-check right before the first Enter (#420): the paste above may
+            // have taken long enough for a question to appear since the
+            // pre-paste check, and the Enter below would select whichever option
+            // is now highlighted rather than merely submitting text. Unlike the
+            // pre-paste guard, an abort HERE leaves the already-pasted text
+            // sitting unsubmitted in the box — safe: the next delivery's
+            // stranded-text flush (#81/#84) or the human's own Enter handles it.
+            let will_hold_question_preenter = ptys
+                .output_tail(pty_id)
+                .is_some_and(|out| prompt_wait_detected(&strip_ansi(&out)));
+            if will_hold_question_preenter {
+                emit_held(HeldReason::InteractiveQuestion);
+            }
+            let question_decision_preenter = wait_for_question_clear(&ptys, pty_id);
+            if will_hold_question_preenter {
+                emit_held_cleared();
+            }
+            match question_decision_preenter {
+                PasteDecision::Paste { held_ms } if held_ms > 0 => {
+                    append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
+                        "to": agent, "stage": "pre-enter", "held_ms": held_ms, "outcome": "cleared",
+                    }));
+                }
+                PasteDecision::Paste { .. } => {}
+                PasteDecision::Abort { held_ms } => {
+                    append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
+                        "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+                    }));
+                    if let Some(reg) = reg {
+                        reg.notify_delivery_held(&group, &agent, target_is_orchestrator, HeldReason::InteractiveQuestion);
+                    }
+                    return;
+                }
+            }
             let submit_sent_ms = now_ms();
             // Baseline just before the first Enter, so the confirmation window
             // below measures only the burst that Enter produces.
@@ -14787,6 +14932,14 @@ impl OrchRegistry {
             // (already consented, flow changed) delivery just continues to the
             // retries. Must run before the confirm window so the dialog's Enter
             // has landed before we judge whether the turn began.
+            //
+            // NOT gated by the interactive-question guard above (#420): this dialog
+            // can only appear AFTER the kickoff Enter this thread already sent
+            // (`submit`, above), while both question-guard checkpoints run BEFORE
+            // that Enter — pre-paste and pre-first-Enter — so they never see it. Kept
+            // exempt on purpose, not by omission: this watcher answering the dialog
+            // IS a deliberate programmatic answer to a pending question, exactly the
+            // shape the general guard exists to hold for everyone else.
             if confirm_autopilot {
                 confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent, AUTOPILOT_DIALOG_WAIT);
             }
@@ -14904,20 +15057,24 @@ impl OrchRegistry {
     }
 
     /// Notify the orchestrator that a delivery to `agent_id` was HELD and
-    /// aborted because the pane holds a human's unsubmitted line (#111) — the
-    /// prompt was never pasted, so the orchestrator must re-send once the box is
-    /// clear. Same discipline as `notify_unconfirmed_delivery`: skipped for an
-    /// orchestrator target (`should_notify_paste_held` — a notice to it would
-    /// loop) and for a paused group (delivery is suppressed there anyway, so we
-    /// must not spend the notice on it). Best-effort and audited; exactly one
-    /// notice per aborted delivery (the caller invokes this once, at the abort).
+    /// aborted — either the pane holds a human's unsubmitted line (#111,
+    /// `HeldReason::BoxOccupied`) or Copilot has an interactive question on
+    /// screen (#420, `HeldReason::InteractiveQuestion`) — the prompt was never
+    /// pasted, so the orchestrator must re-send once the pane is clear/answered.
+    /// `reason` only picks the notice wording (`held_delivery_notice`); the gate
+    /// itself doesn't distinguish reasons. Same discipline as
+    /// `notify_unconfirmed_delivery`: skipped for an orchestrator target
+    /// (`should_notify_paste_held` — a notice to it would loop) and for a paused
+    /// group (delivery is suppressed there anyway, so we must not spend the
+    /// notice on it). Best-effort and audited; exactly one notice per aborted
+    /// delivery (the caller invokes this once, at the abort).
     #[doc(hidden)] // pub for integration tests
-    pub fn notify_delivery_held(&self, group: &str, agent_id: &str, target_is_orchestrator: bool) {
+    pub fn notify_delivery_held(&self, group: &str, agent_id: &str, target_is_orchestrator: bool, reason: HeldReason) {
         if !should_notify_paste_held(target_is_orchestrator) || self.is_paused(group) {
             return;
         }
-        self.audit(group, "loomux", "delivery-held-notice", json!({ "to": agent_id }));
-        let _ = self.deliver_to_orchestrator(group, &paste_held_notice(agent_id), "loomux");
+        self.audit(group, "loomux", "delivery-held-notice", json!({ "to": agent_id, "reason": reason.as_str() }));
+        let _ = self.deliver_to_orchestrator(group, &held_delivery_notice(agent_id, reason), "loomux");
     }
 
     /// Deliver to the group's orchestrator (worker reports, exit notices).

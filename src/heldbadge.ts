@@ -12,7 +12,7 @@
 // over the same state.
 
 /** Reasons the backend can hold a delivery for (see the Rust `HeldReason`). */
-export type HeldReason = "typing" | "box-occupied";
+export type HeldReason = "typing" | "box-occupied" | "question";
 
 export interface HeldPresentation {
   /** Short glyph+word label shown in the header chip. */
@@ -22,6 +22,10 @@ export interface HeldPresentation {
 const LABELS: Record<string, string> = {
   typing: "⏸ held: typing",
   "box-occupied": "⏸ held: unsubmitted text",
+  // #420: Copilot (or another agent CLI) has an interactive question/permission
+  // TUI on screen — loomux is withholding delivery so its paste+Enter doesn't
+  // silently select whichever option is highlighted.
+  question: "⏸ held: question pending",
 };
 
 /** Map a hold reason to its header-chip label. Unknown reasons fall back to a

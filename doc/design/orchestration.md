@@ -2249,6 +2249,81 @@ header chip and, via a listener, mirrors the state onto a minimized pane's **doc
   the top with 3+ options below it is missed until the user arrows down (the pointer re-enters
   the window); real menus ship footers, so this is a safe-direction miss we accept.
 
+## Interactive-question paste guard (#420)
+
+**Problem.** Copilot (and Claude Code) surface interactive questions — a numbered/radio-select
+menu, a y/n permission prompt, `AskUserQuestion` — as a TUI dialog, not as text sitting in the
+input box, so neither existing guard sees it: the quiet backstop (#43) only tracks keystroke
+recency, and the box-occupied guard (#111) only tracks keystroke *content*, and a live menu isn't
+either. When a programmatic delivery (a worker report, a kickoff, a notify-tick notice, a compact
+nudge — any `deliver_prompt` call) lands while such a dialog is up, the bracketed paste is
+harmless (menus generally ignore stray text), but the submit **Enter is not** — it doesn't merge
+text like the box-occupied case, it **selects** whichever option is currently highlighted (usually
+the first/default). That's worse than losing the delivery: it silently answers a question with an
+answer nobody chose and steers the agent's turn in an unintended direction.
+
+**Detection — reuse, don't reinvent.** `prompt_wait_detected` already exists for exactly this
+question-is-on-screen problem, built for attention routing (#6/#40, see above): it keys on
+*stable structural markers* — a numbered `1. yes` / `❯ 1.` menu, `y/n` tokens, stock permission
+phrasings, or (the harder cases it was built for) a selection pointer that *leads* a de-framed
+line, or a plain-English menu footer (`enter to select`, `use arrow keys`, `↑↓`) read from only
+the last few painted lines — rather than trying to parse option *text*, which is exactly the
+"prefer stable markers over parsing options" shape this guard needs too. It already covers
+Copilot's boxed/indented pointer and Claude's reverse-video `AskUserQuestion` (whose highlighted
+option carries no surviving glyph, only the footer). The one gap it didn't have a fixture for is a
+genuine *multi-choice* (non-yes/no) Copilot question — `copilot-multichoice-question.txt` fills
+that in; the detector needed no changes, since a leading `❯` pointer + `use arrow keys` footer
+already matches the existing signals.
+
+**Hold — same shape as the box-occupied guard, twice.** `deliver_prompt` gains a third guard,
+`wait_for_question_clear`, sitting alongside the box-occupied one: **before the paste** and
+**again right before the first Enter** (the paste/echo-wait can take long enough for a question to
+appear in between), it checks `prompt_wait_detected` over the pane's live output tail
+(`ptys.output_tail` → `strip_ansi`, the same read `confirm_copilot_autopilot_dialog` uses) and
+holds while it's true. It reuses the box-occupied guard's own generic loop verbatim —
+`hold_for_human_input`/`resolve_paste_gate`/`PasteDecision` don't care *what* "still occupied"
+means, only that the predicate clears or the bound elapses — with its own cap
+(`QUESTION_HOLD_MAX`, 120s, longer than the box guard's 60s: reading and deciding a substantive
+question takes more of a human's attention than submitting an already-typed line) and its own
+`HeldReason::InteractiveQuestion` for the badge/notice. On `Abort` the pre-paste guard pastes
+nothing (identical to box-occupied); the pre-Enter guard leaves the **already-pasted** text sitting
+unsubmitted in the box, which is safe — the next delivery's stranded-text flush (#81/#84) or the
+human's own Enter clears it once the question is answered. Either abort raises the existing
+`orch-delivery-held` badge (`heldbadge.ts` labels `question` as *"⏸ held: question pending"*) and
+a one-shot `[loomux] delivery to <id> held: Copilot is asking a question — answer it to release
+delivery, then re-send` notice to the orchestrator (`question_held_notice`, dispatched from
+`held_delivery_notice` alongside the box-occupied text) — same discipline as #111: suppressed for
+an orchestrator target (a notice to it would loop) and while paused. Delivery releases
+automatically and resumes normal ordering the moment the pane goes quiet on `prompt_wait_detected`
+(the human answered), no different from the box-occupied guard clearing when a line is submitted.
+
+**The autopilot-consent dialog is deliberately exempt — by construction, not a special case.**
+The `confirm_copilot_autopilot_dialog` watcher (#101/#179/#364, above) *answers* a specific dialog
+on purpose — that is its entire job, and it must keep doing it even though it looks, from the
+outside, exactly like the hazard this guard exists to prevent. It is exempt without any explicit
+skip because of *when* it runs: the question guard's two checkpoints are pre-paste and pre-first-
+Enter, both strictly *before* `deliver_prompt` sends the kickoff Enter that Copilot's autopilot
+dialog only appears in response to (verified live: a fresh `--autopilot` pane paints a normal
+input box, not the dialog, until that first submit). The autopilot confirm itself runs *after*
+that Enter, as a separate, targeted watch-and-answer step scoped to `copilot_autopilot_prompt_detected`
+— a narrower, differently-anchored detector than `prompt_wait_detected` — so even if the general
+guard's checkpoints ran later than they do, they key off different text and would not fight over
+the same dialog. Both facts are recorded as a comment on `HeldReason::InteractiveQuestion` and at
+the confirm call site so a future change to either ordering doesn't silently reintroduce a
+collision between "hold for the human" and "answer this one dialog on the human's behalf".
+
+**Tests.** `prompt_wait_detected_fires_on_interactive_question_fixtures` gains the multi-choice
+fixture; `delivery_held_event_names_the_pane_and_the_reason` and a new
+`delivery_held_notice_audits_the_interactive_question_reason` cover the new `HeldReason` variant
+end to end through the audit/badge payloads; `question_held_notice_names_the_agent_and_points_at_answering`
+and `held_delivery_notice_dispatches_text_by_reason` cover the new notice text and its dispatch.
+The hold/release *loop* itself is not re-tested — it's the same `hold_for_human_input` the
+box-occupied guard already exercises (proceeds-when-clear, caps-so-nothing-starves-forever,
+releases-once-the-predicate-flips), and #40's own lesson (exercise the loop, not just the pure
+detector) was already paid for there. As with the rest of `deliver_prompt`, the live paste/Enter
+behavior against a real Copilot question is validated by hand — no real PTY in test mode, and
+CLAUDE.md constraint 3 forbids spawning a real agent CLI to do it in-session.
+
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
 **Problem.** Worker reports and orchestrator kickoffs are delivered by bracketed-pasting

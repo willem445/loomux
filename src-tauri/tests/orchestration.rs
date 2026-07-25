@@ -28,7 +28,7 @@ use loomux_lib::orchestration::{
     workflow_mode_notice,
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
-    paste_held_notice,
+    paste_held_notice, question_held_notice, held_delivery_notice,
     prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste,
@@ -958,6 +958,34 @@ fn paste_held_notice_fires_only_for_a_non_orchestrator_target() {
     // Target IS the orchestrator: a notice to it is itself a delivery to it — an
     // endless loop. Never notify.
     assert!(!should_notify_paste_held(true));
+}
+
+#[test]
+fn question_held_notice_names_the_agent_and_points_at_answering() {
+    // #420: the recovery move for a question-held delivery is "answer the
+    // question", not "re-send" or "clear the box" — re-sending alone won't
+    // help until a human has actually answered.
+    let msg = question_held_notice("w-9");
+    assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
+    assert!(msg.contains("w-9"), "notice must name the held agent: {msg}");
+    assert!(msg.contains("question"), "notice must state the condition: {msg}");
+    assert!(msg.to_lowercase().contains("answer"), "notice must point at answering: {msg}");
+    assert!(!msg.contains("unsubmitted"), "question notice is not the unconfirmed one: {msg}");
+}
+
+#[test]
+fn held_delivery_notice_dispatches_text_by_reason() {
+    // #111/#420: the orchestrator-facing notice text differs by why the
+    // delivery was held — box-occupied points at re-sending, a live question
+    // points at answering. `Typing` never aborts a delivery (its cap delivers
+    // anyway), so it has no notice of its own; it falls back to the
+    // box-occupied text like any other non-question abort would.
+    assert_eq!(held_delivery_notice("w-9", HeldReason::BoxOccupied), paste_held_notice("w-9"));
+    assert_eq!(held_delivery_notice("w-9", HeldReason::InteractiveQuestion), question_held_notice("w-9"));
+    assert_ne!(
+        held_delivery_notice("w-9", HeldReason::BoxOccupied),
+        held_delivery_notice("w-9", HeldReason::InteractiveQuestion),
+    );
 }
 
 #[test]
@@ -8693,6 +8721,10 @@ fn prompt_wait_detected_spots_prompts_not_chatter() {
 // pipeline, not a pre-cleaned string.
 const FIX_CLAUDE_ASK: &str = include_str!("fixtures/attention/claude-askuserquestion.txt");
 const FIX_COPILOT_ASK: &str = include_str!("fixtures/attention/copilot-question.txt");
+// #420: a genuine multi-choice (non-yes/no) Copilot question — the shape the
+// issue's "silently selects the first option" hazard is actually about, as
+// opposed to copilot-question.txt's y/n-plus-extra-option permission prompt.
+const FIX_COPILOT_MULTICHOICE: &str = include_str!("fixtures/attention/copilot-multichoice-question.txt");
 const FIX_STREAMING: &str = include_str!("fixtures/attention/streaming-output.txt");
 const FIX_IDLE_BOX: &str = include_str!("fixtures/attention/idle-input-box.txt");
 // Finished-turn agent output that *mentions* interactive-UI cues but is not a
@@ -8732,6 +8764,13 @@ fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
     assert!(
         prompt_wait_detected(&strip_ansi(FIX_POS_PTR_LAST.as_bytes())),
         "a pointer as the last painted line is a genuine prompt-wait"
+    );
+    // #420: a numbered/radio-select Copilot question with no yes/no framing at
+    // all — the case a delivery landing mid-dialog would silently answer by
+    // selecting whichever option the Enter lands on (usually the first).
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_COPILOT_MULTICHOICE.as_bytes())),
+        "a numbered multi-choice Copilot question must be recognized as needing the human"
     );
 }
 
@@ -10279,14 +10318,14 @@ fn delivery_held_notice_fires_for_a_worker_but_not_the_orchestrator() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
     // Worker target, group live: the notice is raised and audited.
-    reg.notify_delivery_held(&g.id, &w.id, false);
+    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::BoxOccupied);
     assert!(
         reg.audit_log(&g.id).iter().any(|e| e.action == "delivery-held-notice"),
         "an aborted worker delivery must raise the held notice"
     );
 
     // Orchestrator target: suppressed (a notice to it is a delivery to it — a loop).
-    reg.notify_delivery_held(&g.id, &o.id, true);
+    reg.notify_delivery_held(&g.id, &o.id, true, HeldReason::BoxOccupied);
     assert_eq!(
         reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
         1,
@@ -10295,12 +10334,31 @@ fn delivery_held_notice_fires_for_a_worker_but_not_the_orchestrator() {
 
     // Paused group: suppressed even for a worker.
     reg.pause_group(&g.id).unwrap();
-    reg.notify_delivery_held(&g.id, &w.id, false);
+    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::BoxOccupied);
     assert_eq!(
         reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
         1,
         "a paused group must not raise the held notice"
     );
+}
+
+#[test]
+fn delivery_held_notice_audits_the_interactive_question_reason() {
+    // #420: the audit entry must carry WHY the delivery was held, distinctly
+    // from the box-occupied case, so the record (and any future filtering on
+    // it) can tell "a human left text in the box" apart from "Copilot is
+    // mid-dialog" — very different recovery moves for a human reading the log.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::InteractiveQuestion);
+    let entry = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-held-notice")
+        .expect("an aborted worker delivery must raise the held notice");
+    assert_eq!(entry.detail["reason"], json!("question"), "got: {}", entry.detail);
 }
 
 // ---------- #72: steering-strip image attachments ----------
@@ -13094,6 +13152,21 @@ fn delivery_held_event_names_the_pane_and_the_reason() {
         delivery_held_detail("w-1", HeldReason::Typing),
         delivery_held_detail("w-1", HeldReason::BoxOccupied),
         "the two hold reasons must read differently to a human watching the pane"
+    );
+
+    // #420: a third hold reason for a live interactive question, distinct from
+    // both of the above.
+    let question = delivery_held_event("w-1", "g-1", 7, HeldReason::InteractiveQuestion);
+    assert_eq!(question["reason"], json!("question"), "got: {question}");
+    assert!(
+        delivery_held_detail("w-1", HeldReason::InteractiveQuestion).to_lowercase().contains("question"),
+        "the question hold's detail must say why: {}",
+        delivery_held_detail("w-1", HeldReason::InteractiveQuestion)
+    );
+    assert_ne!(
+        delivery_held_detail("w-1", HeldReason::InteractiveQuestion),
+        delivery_held_detail("w-1", HeldReason::BoxOccupied),
+        "the question hold must read differently from the box-occupied hold"
     );
 }
 

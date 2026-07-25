@@ -7,6 +7,7 @@ import { heldPresentation } from "../src/heldbadge.ts";
 test("each known reason maps to a distinct, descriptive label", () => {
   assert.equal(heldPresentation("typing").label, "⏸ held: typing");
   assert.equal(heldPresentation("box-occupied").label, "⏸ held: unsubmitted text");
+  assert.equal(heldPresentation("question").label, "⏸ held: question pending");
 });
 
 test("an unknown reason falls back to a generic held badge, not a blank one", () => {
