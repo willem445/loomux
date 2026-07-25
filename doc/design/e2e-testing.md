@@ -172,11 +172,15 @@ first pane to exist before handing the test a `Page`. Three specs:
    constraint above.
 
 All three were run locally against a real build (`npx tauri build --debug
---no-bundle --config src-tauri/tauri.e2e.conf.json`) and pass. The
-`data_root_from` Rust helper backing the isolation env var has its own
+--no-bundle --config src-tauri/tauri.e2e.conf.json`) and pass — 3/3, repeatedly.
+The `data_root_from` Rust helper backing the isolation env var has its own
 unit tests in `obs.rs`, verified red (assertion failure, not a compile error)
 against a stub that ignored the override, then green against the real
 implementation.
+
+**They do not currently pass in CI.** See "CI status" below — this is a
+runner-execution-context issue confirmed unrelated to the specs or the app,
+not a flaky test.
 
 There are no `data-testid` hooks anywhere in the frontend yet, so every
 selector in `e2e/helpers.ts` and the specs is structural — class names and
@@ -192,18 +196,63 @@ isolated profile while iterating is fine locally, always via
 `e2e/fixtures.ts`'s isolation (never point `LOOMUX_E2E_EXE` at an installed
 build, never skip the `tauri.e2e.conf.json` identifier override). The full
 suite as "it passes" evidence is CI's job — cite the `e2e-windows` job's run,
-not a local one. Building the E2E binary is a real `cargo build`, so it's
-capped the same as any other local build (`-j 4`).
+not a local one, **once it's actually green there** (see "CI status" below —
+today it fails on every run for a reason unrelated to the code under test).
+Until that's fixed, cite a local `npx playwright test` full-suite run instead
+and say so explicitly. Building the E2E binary is a real `cargo build`, so
+it's capped the same as any other local build (`-j 4`).
 
-## Flake policy
+## CI status: currently red, root-caused, not a flake
 
-`e2e-windows` runs `continue-on-error: true` and is **not** part of the merge
-gate while its flake rate is unknown — a red run here must never block a PR.
-Once it's accumulated a track record (a rough bar: passing on ~20 consecutive
-pushes with no unexplained red), drop `continue-on-error` and fold it into the
-required checks. Until then, a worker who sees `e2e-windows` red on their own
-PR should treat it as signal worth a look (did the change actually break
-layout?) but not as a gate to fight.
+`e2e-windows` fails on GitHub-hosted `windows-latest` today, and it's been run
+down to a specific, confirmed, upstream cause rather than left as an unknown:
+
+- GitHub-hosted `windows-latest` runners execute the job at **High
+  integrity level** (confirmed directly: `whoami /groups` in the job prints
+  `Mandatory Label\High`). A normal dev machine's shell — where the PoC
+  passes 3/3 — runs at Medium IL.
+- WebView2 Runtime 150+ has a **confirmed upstream regression**
+  ([MicrosoftEdge/WebView2Feedback#5640](https://github.com/MicrosoftEdge/WebView2Feedback/issues/5640)):
+  the DevTools/CDP endpoint never opens when the host app runs at High IL.
+  Runtime 149 is the last known-working version; the runner's WebView2 is
+  150.0.4078.65.
+- **Verified directly against this job**, not just inferred from the upstream
+  report: the built exe launches and runs fine at High IL (`Responding: True`,
+  a full `msedgewebview2.exe` process tree spawns — main, crashpad-handler,
+  network/storage utility, gpu-process, **and a renderer** — so the app is
+  actually rendering), but `netstat` shows no listener on the requested
+  `--remote-debugging-port` at all, and an HTTP probe against it gets
+  `ECONNREFUSED`. This rules out a slow-start/timeout explanation (the earlier
+  hypothesis this spike tried first) and a GPU-less-CI-hang explanation
+  (`--disable-gpu` made no difference) — it's specifically the CDP listener
+  that the High-IL regression suppresses.
+- A `runas /trustlevel:0x20000` de-elevation attempt (re-launch the exe at
+  Medium IL from within the High-IL job, which needs no credential prompt
+  since it's lowering privilege) **did not** resolve it in this session's
+  testing. Root cause not fully isolated further — possibly the de-elevated
+  process still can't reach a window station/desktop the High-IL job owns, or
+  `runas /trustlevel` behaves differently in a non-interactive Actions
+  session. Not pursued further within this spike's scope.
+
+This is why `e2e-windows` stays `continue-on-error: true` — a red run here is
+the runner's execution context, not signal about the change under test, and
+must never block a PR. This is different from an ordinary "flaky test"
+situation: there's nothing non-deterministic to wait out or retry away. Fixing
+it for real needs one of (roadmap, not done in this spike):
+
+1. A **self-hosted Windows runner** for this one job, running as a normal
+   (Medium IL) user — the straightforward fix, at the cost of infra to
+   maintain.
+2. Wait for Microsoft to fix #5640 upstream.
+3. Pin the E2E build's WebView2 to **Fixed Version 149** via the
+   `BrowserExecutableFolder` policy — the one workaround reported in the
+   upstream issue, explicitly called "not sustainable long-term" by its own
+   reporter (tracks an old runtime indefinitely, diverging from what real
+   users actually run).
+
+Until one of those lands, treat `e2e-windows` red as expected, and rely on a
+local run (`npx playwright test` against the isolated profile) as this
+suite's actual signal.
 
 ## Roadmap
 

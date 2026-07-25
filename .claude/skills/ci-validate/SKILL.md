@@ -110,12 +110,17 @@ passes" in a PR description or a `done` report.
 
 ## E2E (Playwright) is CI's job, same line
 
-See `doc/design/e2e-testing.md` for the mechanism and isolation model. The
-`e2e-windows` job is a fourth platform in the same sense as the
+See `doc/design/e2e-testing.md` for the mechanism, isolation model, and CI
+status. The `e2e-windows` job is a fourth platform in the same sense as the
 ubuntu/windows/macos matrix above — it's CI's job to run the full suite, not
-yours. It also runs `continue-on-error: true` while its flake rate is
-unknown, so it never blocks the merge gate the way the three build/test jobs
-do; don't read a red `e2e-windows` the same way as a red `build` job.
+yours. It also runs `continue-on-error: true`, so it never blocks the merge
+gate the way the three build/test jobs do; don't read a red `e2e-windows` the
+same way as a red `build` job. As of this writing it fails on **every** run
+for a root-caused, non-flaky reason: GitHub-hosted `windows-latest` executes
+the job at High integrity level, and WebView2 Runtime 150+ has a confirmed
+upstream regression (MicrosoftEdge/WebView2Feedback#5640) that blocks the
+CDP/DevTools endpoint at High IL. See the design doc's "CI status" section
+before assuming a red `e2e-windows` means anything about your change.
 
 Locally, PoC-level smoke only, and only against the isolated E2E profile —
 never against a real install:
@@ -132,4 +137,7 @@ never against a real install:
   exactly the collision-with-a-running-instance risk it exists to prevent.
 - The full `npx playwright test` suite as "it passes" evidence is CI's job,
   same as the backend/frontend suites above — cite the `e2e-windows` run, not
-  a local one.
+  a local one, **once that job is actually green** for a given push. While
+  it's failing on the known High-IL/WebView2 issue above, cite a local
+  full-suite run instead and say explicitly that `e2e-windows` is expected-red
+  for the documented reason, not silently ignore it.

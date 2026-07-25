@@ -94,61 +94,17 @@ jobs:
       - name: Build app (E2E identifier, unbundled debug build)
         run: npx tauri build --debug --no-bundle --config src-tauri/tauri.e2e.conf.json
 
-      # Temporary ground-truth probe (see doc/design/e2e-testing.md CI notes):
-      # Playwright's connect timeout can't tell "process never started" from
-      # "process running but WebView2 never opens the port" apart, and the
-      # previous run's captured stdout/stderr were both silent either way.
-      # This runs the exe directly and inspects OS-level state instead.
-      - name: Diagnose WebView2 launch
-        shell: pwsh
-        run: |
-          Write-Host "--- process integrity level ---"
-          whoami /groups | Select-String "Label"
-
-          Write-Host "--- attempt 1: direct launch (elevated context, if any) ---"
-          $env:LOOMUX_DATA_DIR = "$env:RUNNER_TEMP\loomux-diag"
-          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=9999 --disable-gpu"
-          $p = Start-Process -FilePath "src-tauri\target\debug\loomux.exe" -PassThru
-          Start-Sleep -Seconds 15
-          Get-Process -Id $p.Id -ErrorAction SilentlyContinue | Format-List Id,ProcessName,Responding,HasExited
-          netstat -ano | Select-String ":9999"
-          try {
-            $resp = Invoke-WebRequest -Uri "http://127.0.0.1:9999/json/version" -UseBasicParsing -TimeoutSec 5
-            Write-Host "SUCCESS (direct): $($resp.Content)"
-          } catch {
-            Write-Host "probe failed (direct): $_"
-          }
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-
-          # WebView2 Runtime 150+ has a known regression (MicrosoftEdge/WebView2Feedback#5640):
-          # the DevTools/CDP endpoint never opens when the host app runs at High
-          # integrity level. GitHub-hosted windows-latest runs jobs as an admin
-          # account, which is plausibly why attempt 1 above fails while the same
-          # code works on a normal (Medium IL) dev machine. `runas /trustlevel:0x20000`
-          # re-launches at Medium IL without a credential prompt (de-elevating, not
-          # elevating, needs no consent) -- testing whether that's the actual fix.
-          Write-Host "--- attempt 2: de-elevated launch via runas /trustlevel:0x20000 (Medium IL) ---"
-          $launcher = "$env:RUNNER_TEMP\launch.bat"
-          $exePath = (Resolve-Path "src-tauri\target\debug\loomux.exe").Path
-          $dataDir2 = "$env:RUNNER_TEMP\loomux-diag2"
-          @"
-          @echo off
-          set LOOMUX_DATA_DIR=$dataDir2
-          set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9998 --disable-gpu
-          start "" "$exePath"
-          "@ | Set-Content -Path $launcher -Encoding ASCII
-          runas /trustlevel:0x20000 "cmd /c `"$launcher`""
-          Start-Sleep -Seconds 15
-          netstat -ano | Select-String ":9998"
-          try {
-            $resp2 = Invoke-WebRequest -Uri "http://127.0.0.1:9998/json/version" -UseBasicParsing -TimeoutSec 5
-            Write-Host "SUCCESS (de-elevated): $($resp2.Content)"
-          } catch {
-            Write-Host "probe failed (de-elevated): $_"
-          }
-          Get-Process loomux -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        continue-on-error: true
-
+      # Known-broken on this runner as of this writing (doc/design/e2e-testing.md
+      # "CI status" section): GitHub-hosted windows-latest runs jobs at High
+      # integrity level, and WebView2 Runtime 150+ has a confirmed upstream
+      # regression (MicrosoftEdge/WebView2Feedback#5640) where the CDP/DevTools
+      # endpoint never opens for a High-IL host process. Verified directly
+      # against this exact job: the app launches and renders fine (a full
+      # msedgewebview2.exe process tree spawns, including a renderer), but the
+      # requested --remote-debugging-port never starts listening. A
+      # `runas /trustlevel:0x20000` de-elevation attempt did not resolve it
+      # either. This is why the job stays continue-on-error — it is not this
+      # suite's own flakiness, it is the runner's execution context.
       - name: Run Playwright E2E suite
         run: npx playwright test
         env:
