@@ -20,7 +20,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
 use loomux_lib::orchestration::{
-    block_contract_text, Caller, Guardrails, Launch, OrchRegistry, Role,
+    block_contract_text, command_line_length_guard, Caller, Guardrails, Launch, OrchRegistry, Role,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -30,8 +30,10 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = OrchRegistry::new(dir.path().to_path_buf());
     reg.set_port(45999); // fake port so config writing works
-    // #416: never let a test write a generated Copilot custom-agent file into
-    // the REAL `~/.copilot/agents` — point it at this same disposable tree.
+    // #416/round-6: never let a test write a generated custom-agent file into
+    // the REAL `~/.claude/agents` or `~/.copilot/agents` — point both at this
+    // same disposable tree.
+    reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
     reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
     reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
     reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
@@ -336,9 +338,8 @@ fn a_workflow_file_can_never_grant_a_capability() {
 
 #[test]
 fn block_ids_names_and_personas_are_sanitized_before_any_shell_line() {
-    // Ids reach a `--agent` flag and a file name; names reach a pane title;
-    // persona bodies reach a single-quoted shell token. `sanitize_model` is the
-    // precedent — strip, don't escape.
+    // Ids reach a `--agent` flag and a file name; names reach a pane title.
+    // `sanitize_model` is the precedent — strip, don't escape.
     assert_eq!(workflow::sanitize_id("rev-security_2"), Some("rev-security_2".into()));
     assert_eq!(workflow::sanitize_id("rev; rm -rf /"), Some("revrm-rf".into()));
     assert_eq!(workflow::sanitize_id("$(whoami)"), Some("whoami".into()));
@@ -354,46 +355,55 @@ fn block_ids_names_and_personas_are_sanitized_before_any_shell_line() {
     // Control characters can't smuggle escape codes into a pane title.
     assert_eq!(workflow::sanitize_display("Sec\u{1b}[31m review\n"), "Sec[31m review");
 
-    // The persona's ONLY shell hazard is the single quote (it terminates the
-    // single-quoted token in both PowerShell and POSIX sh). It becomes a
-    // typographic apostrophe — the prose survives, the quoting can't be broken.
+    // `sanitize_persona`'s apostrophe mapping predates round #417 correction
+    // 6 (it protected the single-quoted `--agents` shell token that
+    // mechanism replaced with a generated file — see its own doc) but is
+    // kept as defense-in-depth; still verified directly since nothing else
+    // pins its behavior once no production call site's OUTPUT is asserted
+    // against a raw apostrophe anymore.
     let s = workflow::sanitize_persona("don't run '; rm -rf /");
     assert!(!s.contains('\''), "the ASCII apostrophe must not survive: {s:?}");
     assert!(s.contains("don\u{2019}t"), "the word must still read as prose: {s:?}");
-
-    // ...and the JSON payload is ASCII-escaped, so a pane whose code page isn't
-    // UTF-8 can't mangle it.
-    let json = workflow::ascii_escape_json("{\"p\":\"caf\u{e9} \u{2019}\"}");
-    assert!(json.is_ascii(), "the --agents payload must be pure ASCII: {json}");
-    assert!(json.contains("\\u00e9") && json.contains("\\u2019"));
 }
 
 #[test]
-fn a_block_name_cannot_break_out_of_the_agents_payload() {
+fn a_block_name_cannot_break_the_generated_agent_files_yaml_frontmatter() {
     // `name:` is display text — `sanitize_display` only strips control
     // characters, so an apostrophe survives it, as it should. But the name is
-    // ALSO the `description` in the `--agents` JSON, which rides inside a
-    // single-quoted shell token. A block called `Bob's review` would close that
-    // quote and leave the rest of the JSON as bare shell words.
-    let (reg, _d) = test_registry();
+    // ALSO the `description:` in the generated Claude agent file's YAML
+    // frontmatter (round #417 correction 6, replacing the pre-round-6
+    // `--agents` JSON payload this test used to check) — an unquoted colon
+    // or double quote in a description would break the frontmatter's own
+    // block-mapping parse. A block called `Bob's review: "the strict one"`
+    // exercises an apostrophe (already neutralized by `sanitize_persona` at
+    // resolution time) AND a colon-plus-double-quote (which only `yaml_
+    // double_quoted`, applied at file-write time, protects against).
+    let (reg, d) = test_registry();
     let repo = Repo::new().workflow(
-        "version: 1\nblocks:\n  - id: rev\n    name: \"Bob's review\"\n    kind: reviewer\n    prompt: Be strict.\n",
+        "version: 1\nblocks:\n  - id: rev\n    name: 'Bob''s review: \"the strict one\"'\n    kind: reviewer\n    prompt: Be strict.\n",
     );
     let g = reg.create_group(&repo.path(), rails()).unwrap();
 
-    // The name keeps its apostrophe where it is only ever displayed...
-    assert_eq!(g.guardrails.block("rev").unwrap().name, "Bob's review");
+    // The name keeps its apostrophe and quotes where it is only ever
+    // displayed...
+    assert_eq!(g.guardrails.block("rev").unwrap().name, "Bob's review: \"the strict one\"");
 
-    // ...but no ASCII apostrophe reaches the command line.
-    let (cmd, argv, _k) = compile(&reg, &g, "rev");
-    let payload = argv[argv.iter().position(|a| a == "--agents").unwrap() + 1].clone();
-    assert!(!payload.contains('\''), "the payload must not contain a raw quote: {payload}");
-    let v: Value = serde_json::from_str(&payload).expect("still valid JSON");
-    assert_eq!(v["rev"]["description"], json!("Bob\u{2019}s review"));
-
-    // The command line has exactly two single quotes: the ones loomux opened and
-    // closed around the payload.
-    assert_eq!(cmd.matches('\'').count(), 2, "the quoting must be balanced: {cmd}");
+    // ...but the generated file's frontmatter still parses: exactly one
+    // `description:` line, and the `---` closing delimiter is still found
+    // (a real YAML corruption would either merge lines or eat the
+    // delimiter).
+    let (_cmd, argv, _k) = compile(&reg, &g, "rev");
+    let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
+    let generated = fs::read_to_string(d.path().join("claude-agents").join(format!("{handle}.md"))).unwrap();
+    let lines: Vec<&str> = generated.lines().collect();
+    assert_eq!(lines[0], "---", "frontmatter must open cleanly: {generated}");
+    assert!(lines[1].starts_with("name: "), "{generated}");
+    assert_eq!(lines[3], "---", "frontmatter must close on line 4, not swallowed by an unescaped quote/colon: {generated}");
+    assert_eq!(
+        lines[2],
+        "description: \"Bob\u{2019}s review: \\\"the strict one\\\"\"",
+        "the apostrophe is already neutralized by sanitize_persona; the colon and quotes are escaped by yaml_double_quoted: {generated}"
+    );
 }
 
 #[test]
@@ -583,9 +593,9 @@ fn role_hint_grants_no_capability_to_its_block() {
     // ...and the actual compiled command lines carry the identical deny-tool
     // surface — the mechanical enforcement, not just the intermediate struct.
     // Normalize away the one legitimate difference (the block id, which rides
-    // in `--agent <id>` and the `--agents` JSON key) and the rest — including
-    // `--disallowedTools Edit Write … "Bash(git commit *)" "Bash(git push *)"`
-    // — must be byte-identical.
+    // in the generated agent file's handle behind `--agent <handle>`) and the
+    // rest — including `--disallowedTools Edit Write … "Bash(git commit *)"
+    // "Bash(git push *)"` — must be byte-identical.
     let (cmd_plain, _argv_plain, _k) = compile(&reg, &g, "plain");
     let (cmd_advisor, _argv_advisor, _k2) = compile(&reg, &g, "advisor");
     assert!(cmd_plain.contains("--disallowedTools"), "a planner IS denied write tools — the comparison must not be vacuously equal: {cmd_plain}");
@@ -978,21 +988,30 @@ fn gate_require_and_threshold_disagreeing_is_a_named_error() {
 // ───────────────────── the default roster: nothing changed ──────────────────
 
 #[test]
-fn default_roster_command_lines_now_carry_the_durable_contract_on_agents() {
+fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_claude_agent_file() {
     // Formerly "THE regression pin (#222)": a repo with no `.loomux/
     // workflow.yml` used to get the byte-for-byte pre-#222 command line —
     // NO `--agents`/`--agent`/`--settings` at all, since those only ever
     // carried a REPO persona and a default-roster block has none.
     //
-    // #416 deliberately changes that: the built-in role CONTRACT (mechanics +
+    // #416 deliberately changed that: the built-in role CONTRACT (mechanics +
     // class template — exactly the bytes written to the block's instructions
     // file) now rides the CLI's native system-prompt mechanism for EVERY
-    // block, persona or not. This is a re-blessed golden, not a regression —
-    // the gap it closes is real (see doc/design/orchestration.md's #416
-    // note): compaction could dilute the contract when it lived only in a
-    // "read this file" kickoff step. Everything ELSE about the command line
-    // (model, permission-mode, allow/deny lists) is still pinned exactly.
-    let (reg, _d) = test_registry();
+    // block, persona or not — closing a real gap (see doc/design/
+    // orchestration.md's #416 note): compaction could dilute the contract
+    // when it lived only in a "read this file" kickoff step.
+    //
+    // **Round #417 correction 6:** #416's original mechanism put the whole
+    // contract inline in `--agents '<json>'`. A live demo hit Windows
+    // CreateProcessW's hard 32,767-character command-line limit once the
+    // contract (many KB) rode argv on every block, not just short repo
+    // personas. The mechanism changed again — a loomux-generated
+    // `~/.claude/agents/<handle>.md` FILE now carries the contract, and
+    // `--agent <handle>` alone activates it — but the OUTCOME #416 promised
+    // (the durable contract on the system-prompt layer, for every block) is
+    // unchanged, and everything else about the command line (model,
+    // permission-mode, allow/deny lists) is still pinned exactly.
+    let (reg, d) = test_registry();
     let repo = Repo::new(); // no .loomux/ at all — the common case
     let g = reg.create_group(&repo.path(), rails()).unwrap();
 
@@ -1010,9 +1029,9 @@ fn default_roster_command_lines_now_carry_the_durable_contract_on_agents() {
     // persona, read back the instructions file for `contract` (already
     // written by `create_group`'s `write_instruction_files`), compile it,
     // hand it to the command builder. Returns the shell-string command PLUS
-    // the parsed `--agents` payload, so the test can check the contract's
-    // CONTENT, not just that the flag is present.
-    let line = |block_id: &str, auto_ops: bool| -> (String, Value) {
+    // the generated agent-file handle, so the test can check the contract's
+    // CONTENT on disk, not just that the flag is present.
+    let line = |block_id: &str, auto_ops: bool| -> (String, String) {
         let b = g.guardrails.block(block_id).unwrap();
         let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
         let persona = reg.resolve_persona(&g, b).unwrap();
@@ -1024,6 +1043,12 @@ fn default_roster_command_lines_now_carry_the_durable_contract_on_agents() {
         let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
         assert!(inject.kickoff.is_none(), "claude never uses the kickoff fallback");
         assert!(inject.extra_allow.is_empty(), "no persona ⇒ no extra allow patterns");
+        assert!(
+            inject.claude_append_system_prompt_file.is_none(),
+            "the generated-file path must succeed here — test_registry's override dir is writable"
+        );
+        assert!(inject.contract_on_system_layer, "the contract must be durable for every claude block");
+        let handle = inject.claude_agent.clone().expect("a generated Claude agent file handle");
         let cmd = reg.build_agent_command(
             cli,
             workflow::model_of(b, &g.guardrails.agent_cli),
@@ -1037,44 +1062,45 @@ fn default_roster_command_lines_now_carry_the_durable_contract_on_agents() {
             b.kind.is_read_only(),
             &inject,
         );
-        let payload: Value = serde_json::from_str(inject.claude_agents_json.as_deref().unwrap())
-            .expect("--agents payload must be valid JSON");
-        // #416: the payload is sanitized the same way a repo persona already
-        // was — loomux's own template prose is full of literal apostrophes
-        // ("don't"), which would otherwise close the single-quoted shell
-        // token the payload rides in.
-        assert_eq!(
-            payload[block_id]["prompt"], json!(workflow::sanitize_persona(&contract)),
-            "{block_id}'s system-prompt payload must be its instructions-file bytes, sanitized"
+        let generated_path = d.path().join("claude-agents").join(format!("{handle}.md"));
+        let generated = fs::read_to_string(&generated_path).expect("generated agent file must exist");
+        // Unlike the pre-round-6 `--agents` payload, this is a FILE, not a
+        // shell token — no apostrophe-mangling/ASCII-escaping, loomux's own
+        // template prose keeps its real apostrophes verbatim.
+        assert!(
+            generated.contains(&contract),
+            "{block_id}'s generated file must carry the contract verbatim: {generated}"
         );
-        assert_eq!(payload[block_id]["description"], json!(block_id), "no persona ⇒ description falls back to the block id");
-        (cmd, payload)
+        assert!(
+            generated.starts_with(&format!("---\nname: {handle}\ndescription: \"{block_id}\"\n---\n")),
+            "no persona ⇒ description falls back to the block id: {generated}"
+        );
+        (cmd, handle)
     };
 
-    let expect = |cmd: &str, payload: &Value, block_id: &str, model: &str, perm: &str, extra: &str| {
-        let agents_json = workflow::ascii_escape_json(
-            &serde_json::to_string(&json!({ block_id: payload[block_id] })).unwrap(),
-        );
+    let expect = |cmd: &str, handle: &str, block_id: &str, model: &str, perm: &str, extra: &str| {
         let expected = format!(
             "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
              --model {model} --permission-mode {perm} --add-dir \"C:/data/group\" \
-             --allowedTools mcp__loomux{extra} --agents '{agents_json}' --agent {block_id}"
+             --allowedTools mcp__loomux{extra} --agent {handle}"
         );
         assert_eq!(cmd, &expected, "{block_id}'s command line changed in an unexpected way");
+        assert_eq!(handle, &format!("loomux-{}-{block_id}", g.id), "handle naming convention");
+        assert!(cmd.len() < 500, "the command line must stay short now that the contract rides a file, not argv: {} chars", cmd.len());
     };
 
-    let (cmd, payload) = line("worker", true);
-    expect(&cmd, &payload, "worker", "sonnet", "auto", " \"Bash(git *)\" \"Bash(gh *)\"");
-    let (cmd, payload) = line("reviewer", false);
-    expect(&cmd, &payload, "reviewer", "sonnet", "acceptEdits", "");
-    let (cmd, payload) = line("planner", false);
+    let (cmd, handle) = line("worker", true);
+    expect(&cmd, &handle, "worker", "sonnet", "auto", " \"Bash(git *)\" \"Bash(gh *)\"");
+    let (cmd, handle) = line("reviewer", false);
+    expect(&cmd, &handle, "reviewer", "sonnet", "acceptEdits", "");
+    let (cmd, handle) = line("planner", false);
     expect(
-        &cmd, &payload, "planner", "opus", "auto",
+        &cmd, &handle, "planner", "opus", "auto",
         " \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
           \"Bash(git commit *)\" \"Bash(git push *)\"",
     );
-    let (cmd, payload) = line("orchestrator", true);
-    expect(&cmd, &payload, "orchestrator", "opus", "auto", " \"Bash(git *)\" \"Bash(gh *)\"");
+    let (cmd, handle) = line("orchestrator", true);
+    expect(&cmd, &handle, "orchestrator", "opus", "auto", " \"Bash(git *)\" \"Bash(gh *)\"");
 
     // Agent ids and instruction-file paths are unchanged too — they are in the
     // kickoff text the agent reads.
@@ -1089,6 +1115,110 @@ fn default_roster_command_lines_now_carry_the_durable_contract_on_agents() {
         !k.contains("workflow.yml"),
         "a group with no workflow file must not be told about one: {k}"
     );
+}
+
+// ─────── round #417 correction 6: the argv-length bug and its fix ───────
+
+#[test]
+fn a_thirty_kb_contract_still_produces_a_short_command_line() {
+    // The regression this whole round fixes, reproduced directly: a live
+    // demo hit Windows CreateProcessW's hard 32,767-character command-line
+    // limit once the durable contract (#416, many KB of mechanics core +
+    // template) rode `--agents` inline. A 30KB+ persona pins that the fix
+    // holds regardless of payload size — the command line stays short no
+    // matter how large the contract gets, because it never carries it.
+    let (reg, d) = test_registry();
+    let huge_persona = "x".repeat(30_000);
+    let repo = Repo::new()
+        .workflow("version: 1\nblocks:\n  - id: huge\n    kind: worker\n    cli: claude\n    profile: .github/agents/huge.md\n")
+        .agent_file("huge.md", &format!("---\nname: huge\ndescription: A huge persona.\n---\n{huge_persona}"));
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let b = g.guardrails.block("huge").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(&g, b).unwrap();
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    assert!(contract.len() > 30_000, "the contract itself must actually be huge: {} bytes", contract.len());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+    let handle = inject.claude_agent.clone().expect("a generated Claude agent file handle");
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let cmd = reg.build_agent_command(cli, "sonnet", false, cfg, None, gdir, wd, None, false, false, &inject);
+    let argv = reg.build_agent_argv(cli, "sonnet", false, cfg, None, gdir, wd, None, false, false, &inject);
+
+    assert!(cmd.len() < 1000, "the command line must stay short regardless of contract size: {} chars: {cmd}", cmd.len());
+    assert!(command_line_length_guard(&argv).is_ok(), "the guard must never trip on the fixed path");
+
+    let generated = fs::read_to_string(d.path().join("claude-agents").join(format!("{handle}.md"))).unwrap();
+    assert!(generated.len() > 30_000, "the FULL contract must still reach the agent — just via a file, not argv: {} bytes", generated.len());
+    assert!(generated.contains(&huge_persona));
+}
+
+#[test]
+fn command_line_length_guard_fails_loudly_on_an_oversized_argument() {
+    // Belt-and-braces (round #417 correction 6): a regression that puts a
+    // large blob back on argv must fail LOUDLY, pre-spawn, naming the
+    // oversized piece — never reproduce the unreadable CreateProcessW wall
+    // the user's live demo hit.
+    let ok = vec!["claude".to_string(), "--model".to_string(), "sonnet".to_string()];
+    assert!(command_line_length_guard(&ok).is_ok());
+
+    let oversized_single = vec!["claude".to_string(), "--agents".to_string(), "x".repeat(29_000)];
+    let err = command_line_length_guard(&oversized_single).unwrap_err();
+    assert!(err.contains("32,767"), "{err}");
+    assert!(err.contains("argument #2"), "must name the offending argument by index: {err}");
+
+    // Many small-but-not-individually-oversized arguments summing past the
+    // limit must ALSO trip it — the guard checks the total, not just the
+    // largest single token.
+    let many_small: Vec<String> = std::iter::repeat("x".repeat(2_000)).take(20).collect();
+    let err = command_line_length_guard(&many_small).unwrap_err();
+    assert!(err.contains("32,767"), "{err}");
+}
+
+#[test]
+fn claude_agent_file_write_failure_falls_back_to_append_system_prompt_file() {
+    // Round #417 correction 6: when `~/.claude/agents` can't be created —
+    // simulated here for REAL (a regular FILE already occupies the target
+    // path, so `fs::create_dir_all` genuinely fails, not asserted from
+    // reasoning alone) — `persona_inject` must fall back to `--append-
+    // system-prompt-file` pointed at the group's own instructions file,
+    // never silently lose the contract and never fall back to putting it
+    // on argv either.
+    let (reg, d) = test_registry();
+    let blocked_path = d.path().join("claude-agents-blocked");
+    fs::write(&blocked_path, b"not a directory").unwrap();
+    reg.set_claude_agents_dir_override(blocked_path);
+    let repo = Repo::new();
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let b = g.guardrails.block("worker").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(&g, b).unwrap();
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+
+    assert!(inject.claude_agent.is_none(), "the generated-file path must have failed");
+    assert!(inject.contract_on_system_layer, "still system-prompt-layer durable even in the fallback");
+    let path = inject.claude_append_system_prompt_file.clone().expect("must fall back to --append-system-prompt-file");
+
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let cmd = reg.build_agent_command(cli, "sonnet", false, cfg, None, gdir, wd, None, false, false, &inject);
+    let argv = reg.build_agent_argv(cli, "sonnet", false, cfg, None, gdir, wd, None, false, false, &inject);
+    assert!(cmd.contains(&format!("--append-system-prompt-file \"{}\"", path.display())), "{cmd}");
+    assert!(!cmd.contains("--agent"), "no generated-file handle when the write failed: {cmd}");
+    assert!(argv.windows(2).any(|w| w[0] == "--append-system-prompt-file"), "{argv:?}");
+    assert!(command_line_length_guard(&argv).is_ok());
+
+    // It's the SAME file `write_instruction_files` already wrote — no
+    // second file loomux has to invent or clean up.
+    assert_eq!(path, reg.state_root().join(&g.id).join(b.instructions_file()));
+    assert_eq!(lf(&fs::read_to_string(&path).unwrap()), contract);
 }
 
 #[test]
@@ -1621,8 +1751,14 @@ fn compile(reg: &OrchRegistry, g: &loomux_lib::orchestration::GroupInfo, block_i
 }
 
 #[test]
-fn claude_block_compiles_to_the_native_inline_agent_flags() {
-    let (reg, _d) = test_registry();
+fn claude_block_compiles_to_a_generated_native_agent_file() {
+    // Round #417 correction 6: Claude used to take the whole block INLINE
+    // via `--agents '<json>' --agent <id>` — no repo file, no trust problem,
+    // but also no length limit respected, which a live demo hit once the
+    // full role contract (not just a short persona) rode that payload. The
+    // mechanism is now a loomux-generated FILE (mirroring Copilot's own
+    // generated-wrapper path below), never argv.
+    let (reg, d) = test_registry();
     let repo = Repo::new().workflow(
         "version: 1\nblocks:\n\
          \x20 - id: rev-security\n    kind: reviewer\n    cli: claude\n    model: opus\n\
@@ -1631,28 +1767,27 @@ fn claude_block_compiles_to_the_native_inline_agent_flags() {
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let (cmd, argv, kickoff) = compile(&reg, &g, "rev-security");
 
-    // Claude takes the whole block INLINE: no repo file, no trust problem.
-    assert!(cmd.contains("--agent rev-security"), "the block must be activated by id: {cmd}");
-    assert!(cmd.contains("--agents '{"), "the definition must ride inline in single quotes: {cmd}");
-    assert!(kickoff.is_none(), "claude needs no kickoff fallback — the flag carries it");
+    assert!(kickoff.is_none(), "claude needs no kickoff fallback — the generated file carries it");
+    assert!(!cmd.contains("--agents"), "the pre-round-6 inline flag must never appear again");
+    let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
+    assert!(handle.starts_with(&format!("loomux-{}-rev-security", g.id)), "unexpected handle: {handle}");
+    assert!(cmd.contains(&format!("--agent {handle}")), "{cmd}");
+    assert!(cmd.len() < 500, "the command line must stay short now the contract rides a file: {} chars: {cmd}", cmd.len());
 
-    // The payload is real JSON, carries the prompt, and is pure ASCII.
-    let payload = argv[argv.iter().position(|a| a == "--agents").unwrap() + 1].clone();
-    assert!(payload.is_ascii(), "the payload must survive a non-UTF-8 code page: {payload}");
-    let v: Value = serde_json::from_str(&payload).expect("--agents must be valid JSON");
-    let prompt = v["rev-security"]["prompt"].as_str().unwrap();
-    assert!(prompt.contains("security defects"));
-    assert!(v["rev-security"]["description"].is_string(), "claude requires a description");
+    // `test_registry` points the generated-file directory at `d`'s own temp
+    // tree (never the real `~/.claude/agents`) — read it back from there.
+    let generated_path = d.path().join("claude-agents").join(format!("{handle}.md"));
+    let generated = fs::read_to_string(&generated_path)
+        .unwrap_or_else(|e| panic!("generated claude agent file must exist at {}: {e}", generated_path.display()));
+    assert!(generated.contains("security defects"));
+    assert!(generated.contains("Loomux reviewer instructions"), "the mechanics core rides along too: {generated}");
+    assert!(generated.starts_with(&format!("---\nname: {handle}\ndescription:")), "{generated}");
 
-    // The apostrophe was neutralized, not deleted: the prose still reads. On the
-    // wire it is `’` (so the token stays ASCII); decoded, it is a real
-    // typographic apostrophe.
-    assert!(!payload.contains('\''), "no ASCII apostrophe may reach the single-quoted token");
-    assert!(payload.contains("\\u2019"), "on the wire it must be an escape: {payload}");
-    assert!(prompt.contains("Don\u{2019}t"), "decoded, the word still reads as prose: {prompt}");
-
-    // The string form is the argv token wrapped in single quotes — nothing else.
-    assert!(cmd.contains(&format!("--agents '{payload}' --agent rev-security")));
+    // Unlike the pre-round-6 payload, this is a FILE — the real apostrophe
+    // (already neutralized to its typographic form by `sanitize_persona` at
+    // resolution time, same as ever) reads fine with no escape-sequence
+    // wire format to worry about.
+    assert!(generated.contains("Don\u{2019}t nitpick"), "{generated}");
 }
 
 #[test]
@@ -1679,7 +1814,7 @@ fn copilot_uses_its_native_agent_flag_only_for_a_user_authored_github_agents_fil
     assert!(cmd.contains("--agent repo-worker"), "native copilot persona: {cmd}");
     assert!(argv.windows(2).any(|w| w == ["--agent", "repo-worker"]));
     assert!(kickoff.is_none(), "the native flag carries the persona; nothing to inject");
-    assert!(!cmd.contains("--agents"), "--agents is a claude flag; copilot has no inline form");
+    assert!(!cmd.contains("--agents"), "--agents no longer exists anywhere (round #417 correction 6); copilot never had an inline form to begin with");
 
     // #416: an INLINE prompt has no user-authored file to name, but loomux must
     // still get the durable contract onto Copilot's system-prompt layer — so it
@@ -1691,7 +1826,7 @@ fn copilot_uses_its_native_agent_flag_only_for_a_user_authored_github_agents_fil
     let handle = argv[argv.iter().position(|a| a == "--agent").unwrap() + 1].clone();
     assert!(handle.starts_with(&format!("loomux-{}-rev-perf", g.id)), "unexpected handle: {handle}");
     assert!(cmd.contains(&format!("--agent {handle}")), "{cmd}");
-    assert!(!cmd.contains("--agents"), "--agents is a claude flag; copilot has no inline form");
+    assert!(!cmd.contains("--agents"), "--agents no longer exists anywhere (round #417 correction 6); copilot never had an inline form to begin with");
     // `test_registry` points the generated-file directory at `_d`'s own temp
     // tree (never the real `~/.copilot/agents`) — read it back from there.
     let generated_path = _d.path().join("copilot-agents").join(format!("{handle}.agent.md"));
@@ -1788,9 +1923,11 @@ fn replace_mode_persona_still_gets_the_mechanics_core() {
         "the persona body belongs on the CLI's persona flag, not in the loomux contract file"
     );
 
-    // ...and the persona itself still reaches the agent, via the native flag.
+    // ...and the persona itself still reaches the agent, via the native flag
+    // — round #417 correction 6: a generated file's handle, not the bare
+    // block id.
     let (cmd, _argv, _k) = compile(&reg, &g, "spike");
-    assert!(cmd.contains("--agent spike"));
+    assert!(cmd.contains(&format!("--agent loomux-{}-spike", g.id)), "{cmd}");
 
     // The spawned agent's kickoff points at that same mechanics file.
     let w = reg.spawn_agent_ex(
@@ -2557,7 +2694,8 @@ fn a_persona_file_cannot_move_a_block_into_another_capability_class() {
     // #416: --agent DOES appear (loomux's own planner.md contract, since the
     // block still gets its durable contract regardless of the rejected
     // persona) — what must never reach the CLI is the REJECTED file's text.
-    assert!(cmd.contains("--agent plan"), "the built-in contract still rides the system prompt: {cmd}");
+    // Round #417 correction 6: a generated file's handle, not the bare id.
+    assert!(cmd.contains(&format!("--agent loomux-{}-plan", g.id)), "the built-in contract still rides the system prompt: {cmd}");
     assert!(
         !cmd.contains("write access, please"),
         "the rejected persona's text reaches the CLI in no form: {cmd}"
@@ -2571,7 +2709,7 @@ fn a_persona_file_cannot_move_a_block_into_another_capability_class() {
 fn orchestrator_command(
     reg: &OrchRegistry,
     g: &loomux_lib::orchestration::GroupInfo,
-) -> (String, Option<String>) {
+) -> (String, Option<String>, String) {
     let b = g.guardrails.block_for(Role::Orchestrator).expect("a group always has one");
     let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
     let persona = reg.resolve_persona(g, b).unwrap_or(None);
@@ -2591,7 +2729,13 @@ fn orchestrator_command(
         false, // the orchestrator is never read-only
         &inject,
     );
-    (cmd, inject.kickoff)
+    // Round #417 correction 6: the command line no longer carries the
+    // system-prompt CONTENT at all (a short `--agent <handle>` does) — the
+    // security property this helper backs ("no repo text reaches the trust
+    // root's system prompt") now has to be checked against `contract`
+    // itself, the exact text `persona_inject` handed to whichever delivery
+    // mechanism it chose, not the shell line.
+    (cmd, inject.kickoff, contract)
 }
 
 #[test]
@@ -2628,24 +2772,31 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
     // 2. End to end: the file is skipped, and rev-7's repro — the evil
     //    `--agents '{...}' --agent orchestrator` emission — is unreachable.
     //
-    // #416: `--agents '{...}' --agent orchestrator` DOES now appear on every
-    // orchestrator command line (the durable-contract change applies to the
-    // trust root too) — but its payload is loomux's OWN orchestrator.md
-    // contract, never the repo's. The assertion that matters was never
-    // "no --agents flag", it was "no REPO TEXT reaches the trust root's
-    // system prompt", so that's what's pinned directly against the payload.
-    let (reg, _d) = test_registry();
+    // #416: a generated agent file DOES now carry the durable contract on
+    // every orchestrator's system prompt (the change applies to the trust
+    // root too) — but its content is loomux's OWN orchestrator.md contract,
+    // never the repo's. Round #417 correction 6 moved that content off the
+    // command line entirely (a short `--agent <handle>` is all that
+    // remains there), so the assertion that matters — "no REPO TEXT reaches
+    // the trust root's system prompt" — is now pinned directly against
+    // `contract` (the exact text handed to the delivery mechanism), not the
+    // shell line, which no longer carries it to check.
+    let (reg, d) = test_registry();
     let repo = Repo::new().workflow(evil);
     let g = reg.create_group(&repo.path(), rails()).unwrap();
-    let (cmd, kickoff) = orchestrator_command(&reg, &g);
-    assert!(cmd.contains("--agents"), "the built-in contract still rides the system prompt: {cmd}");
-    assert!(cmd.contains("--agent orchestrator"), "{cmd}");
+    let (cmd, kickoff, contract) = orchestrator_command(&reg, &g);
+    assert!(!contract.contains("curl evil.sh"), "{contract}");
+    assert!(!cmd.contains("--agents"), "the pre-round-6 inline flag must never appear again: {cmd}");
+    let handle = format!("loomux-{}-orchestrator", g.id);
+    assert!(cmd.contains(&format!("--agent {handle}")), "{cmd}");
     assert!(!cmd.contains("curl evil.sh"), "{cmd}");
     assert!(kickoff.is_none(), "nor via the kickoff fallback");
+    let generated = fs::read_to_string(d.path().join("claude-agents").join(format!("{handle}.md"))).unwrap();
+    assert!(!generated.contains("curl evil.sh"), "the repo text must not reach the generated file either: {generated}");
 
     // 3. A hand-edited group.json never meets the parser, so the persona is
     //    dropped at resolve time too — and audited, so it leaves a trace.
-    let (reg, _d) = test_registry();
+    let (reg, d) = test_registry();
     let repo = Repo::new();
     let g = reg
         .create_group(
@@ -2668,13 +2819,20 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
         )
         .unwrap();
 
-    let (cmd, kickoff) = orchestrator_command(&reg, &g);
+    let (cmd, kickoff, contract) = orchestrator_command(&reg, &g);
     assert!(!cmd.contains("curl evil.sh"), "the smuggled prompt must not reach the CLI: {cmd}");
-    // #416: --agents/--agent DO appear (loomux's own contract, same as any
-    // other orchestrator) — the security property is "no repo text", not
-    // "no flag", exactly like case 2 above.
-    assert!(cmd.contains("--agents") && cmd.contains("--agent orchestrator"), "{cmd}");
+    assert!(!contract.contains("curl evil.sh"), "{contract}");
+    // Round #417 correction 6: `--agent <handle>` (a generated file, not
+    // an inline `--agents` payload) DOES still appear on every orchestrator
+    // command line — the security property is "no repo text", not "no
+    // flag", exactly like case 2 above; the generated file itself is
+    // checked directly since the command line no longer carries content.
+    let handle = format!("loomux-{}-orchestrator", g.id);
+    assert!(!cmd.contains("--agents"), "the pre-round-6 inline flag must never appear again: {cmd}");
+    assert!(cmd.contains(&format!("--agent {handle}")), "{cmd}");
     assert!(!cmd.contains("Bash(curl *)"), "nor may it pre-approve the trust root's tools: {cmd}");
+    let generated = fs::read_to_string(d.path().join("claude-agents").join(format!("{handle}.md"))).unwrap();
+    assert!(!generated.contains("curl evil.sh"), "{generated}");
     assert!(kickoff.is_none());
     let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
     assert!(
@@ -4527,8 +4685,9 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
             !cmd.contains("--model sonnet"),
             "{block}: the launcher's per-role pick must not flatten a declared block model: {cmd}"
         );
-        // And it is *this* block that ran: the persona rode in on the same command.
-        assert!(cmd.contains(&format!("--agent {block}")), "{block}: persona must reach the CLI: {cmd}");
+        // And it is *this* block that ran: the persona rode in on the same
+        // command (round #417 correction 6: via a generated file's handle).
+        assert!(cmd.contains(&format!("--agent loomux-{}-{block}", g.id)), "{block}: persona must reach the CLI: {cmd}");
     }
 }
 
@@ -4606,8 +4765,9 @@ fn the_builtin_roster_still_honors_the_launchers_per_role_models() {
     assert!(worker.contains("--model opus"), "the launcher's worker pick decides: {worker}");
     // #416: --agent DOES appear (the built-in worker contract, same as any
     // default-roster block) — "a toggle-off group has no personas" now means
-    // no REPO text reaches it, not that the flag is absent.
-    assert!(worker.contains("--agent worker"), "the built-in contract still rides the system prompt: {worker}");
+    // no REPO text reaches it, not that the flag is absent. Round #417
+    // correction 6: a generated file's handle, not the bare block id.
+    assert!(worker.contains(&format!("--agent loomux-{}-worker", g.id)), "the built-in contract still rides the system prompt: {worker}");
     assert!(kickoff.is_none(), "a toggle-off group has no persona to fall back to a kickoff for");
     let (reviewer, _, _) = compile(&reg, &g, "reviewer");
     assert!(reviewer.contains("--model haiku"), "the launcher's reviewer pick decides: {reviewer}");

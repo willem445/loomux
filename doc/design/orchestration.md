@@ -1924,7 +1924,9 @@ neutralize for repo personas. Fixed by sanitizing at the same point personas alr
 about `write_block_instructions`'s output changed, so the `tests/fixtures/pre222` golden is
 untouched).
 
-**Per-CLI capability matrix (#416):**
+**Per-CLI capability matrix (#416, ORIGINAL — the Claude row is superseded, see
+"Round #417 correction 6" immediately below; left as-is rather than silently edited,
+per this doc's own honesty convention):**
 
 | | system-prompt mechanism | default roster (no persona) | workflow persona |
 |---|---|---|---|
@@ -1955,6 +1957,105 @@ docs — no source describes where custom-agent instructions live in Copilot's p
 architecture relative to a `/compact` event. This is the best available mechanism (a system-level
 custom-agent flag beats a conversation-turn file-read on priors), not a proven guarantee — a
 gap to note honestly rather than paper over, and easy to revisit if Copilot's own docs firm up.
+
+**Round #417 correction 6 — a live demo blocker: `--agents` put the durable contract on argv,
+and Windows CreateProcessW has a hard 32,767-character command-line limit.** The user's own
+demo, launching a Claude orchestrator in this worktree, failed outright with "loomux: failed to
+start shell" / a `CreateProcessW` error. The screenshot showed the FULL orchestrator contract
+(mechanics core + template, many KB) embedded inline in the `--agents` JSON, routed through the
+`pwsh.exe -Command` shell fallback. Root cause, confirmed rather than assumed: `--agents` only
+ever carried a SHORT repo persona before #416 (see the `## #416's actual gap` paragraph above)
+— the reviews that shipped #416 verified that token's QUOTING (the apostrophe/ASCII-escaping
+work described above) but never its LENGTH, because nothing before #416 put more than a few
+hundred bytes of persona text there. #416 widened the payload to loomux's OWN template prose on
+EVERY block, unconditionally — categorically bigger, and eventually big enough to blow the
+limit. The failing path was the `pwsh -Command` fallback (whose extra escaping layer inflates
+an already-long line further), but the direct-`CreateProcessW`-spawn path is subject to the
+identical 32,767-character hard limit — so the fix could not depend on which spawn path runs;
+it had to remove the multi-KB payload from argv on BOTH paths.
+
+**The fix, per Claude's own CLI reference (code.claude.com/docs/en/cli-reference) and its
+sub-agents doc (code.claude.com/docs/en/sub-agents), read in full for this round: the contract
+now travels by FILE, mirroring the Copilot precedent, not argv.** The reference confirms
+`--agent <name>` "activates a custom agent by name" and, per the sub-agents doc's own "Run the
+whole session as a subagent" section: passing `--agent <name>` alone "start[s] a session where
+the main thread itself takes on that subagent's system prompt... replac[ing] the default Claude
+Code system prompt entirely" — when `<name>` resolves against `.claude/agents/` (project) or
+`~/.claude/agents/` (user), both scanned automatically, no `--agents` JSON required at all. This
+is the EXACT "native custom-agent flag, file-backed" shape Copilot's `~/.copilot/agents`
+precedent already used — round 6 makes it true for Claude too, closing the gap the ORIGINAL
+`--agents '<json>'` choice opened (see `write_claude_agent_file`, `claude_agents_dir`,
+`PersonaInject::claude_agent`'s docs in `mod.rs`):
+
+- **Primary path**: `write_claude_agent_file` writes a loomux-generated, uniquely-handled
+  (`loomux-<group>-<block>`, same convention as Copilot's) `~/.claude/agents/<handle>.md` file
+  carrying the FULL contract as its markdown body, with `name`/`description` frontmatter
+  (`description` is REQUIRED by Claude's own schema, unlike Copilot's generated file, which has
+  none — `yaml_double_quoted` quotes it for YAML safety, since a repo persona's description is
+  free text and not guaranteed YAML-safe on its own). `--agent <handle>` alone activates it —
+  `--agents` is GONE from loomux's command lines entirely, for every CLI, on every path.
+- **Fallback path** (the directory is unwritable — fail-open, matching every other hook/shim
+  path in this codebase): `--append-system-prompt-file <path>`, pointed at the SAME instructions
+  file `write_instruction_files` already reliably writes to the group's own state dir — no
+  second file to invent or clean up. The reference confirms this flag "load[s] additional system
+  prompt text from a file and append[s] to the default prompt." Still launch-time system-prompt
+  construction, not a conversation-history artifact — `contract_on_system_layer` stays `true` in
+  this path too, unlike Copilot's own write-failure fallback (which has no such flag and
+  genuinely degrades to a kickoff-only paste, so `contract_on_system_layer` correctly goes
+  `false` there). Neither Claude fallback ever re-embeds the contract on argv.
+- **`--append-system-prompt-file` was #105's own mechanism, abandoned in #222/#416 purely
+  because `--agents` was newer and native** ("claude gets the native flag rather than
+  `--append-system-prompt-file`, which predates the flag" — `profiles.rs`'s own module doc,
+  reread rather than assumed for this round) — never because the file-based flag itself had a
+  functional problem. That reasoning doesn't disqualify it as today's FALLBACK: the content
+  riding it is now loomux's own trusted contract (not a repo persona needing the trust story
+  `--agents` was chosen for), and a file has no length limit remotely close to argv's.
+- **`sanitize_persona`'s apostrophe-mapping and `ascii_escape_json` — the two safeguards that
+  existed specifically for the single-quoted `--agents` shell token — are now inert (the first,
+  kept as defense-in-depth) or dead (the second, removed entirely).** Neither a generated FILE
+  nor `--append-system-prompt-file`'s path argument is a raw shell token carrying persona TEXT,
+  so the shell-quoting hazard those functions protected against no longer exists on the Claude
+  path. See `workflow::sanitize_persona`'s doc for the full reasoning on why one was kept and the
+  other removed rather than both left orphaned.
+
+**Belt-and-braces: a pre-spawn command-line length guard, independent of the file-based fix.**
+`command_line_length_guard` (`mod.rs`) checks the STRUCTURED argv form — which both spawn paths
+compile from, so one check covers both — against `WINDOWS_COMMAND_LINE_SAFETY_LIMIT` (28,000,
+comfortably under the documented 32,767, leaving headroom for the shell fallback's own quoting
+inflation). Wired into both spawn call sites (`spawn_agent_ex` and `register_orchestrator_pane`)
+right after `build_agent_argv`, returning a loud, diagnostic `Err` naming the oversized
+argument's index and byte length — never again the unreadable `CreateProcessW` wall the user's
+demo hit. This is NOT how the argv-length bug is fixed (the file-based mechanism above is that);
+it is the backstop for a FUTURE regression that puts something large on argv again, on either
+CLI — checked, not assumed, to hold for Copilot too: nothing in its command-builder branch ever
+pushes free text onto argv (`--agent <name>` is always a short handle, either a native
+`.github/agents/*.md` file's `name:` frontmatter — itself constrained to short lowercase-and-
+hyphens tokens — or loomux's own short generated handle), so Copilot never had this bug, and the
+guard confirms rather than assumes that going forward.
+
+**Updated per-CLI capability matrix (supersedes the Claude row above):**
+
+| | system-prompt mechanism | default roster (no persona) | workflow persona |
+|---|---|---|---|
+| Claude | `--agent <handle>` → generated `~/.claude/agents/<handle>.md` FILE (fallback: `--append-system-prompt-file <instructions file>`) | contract rides via generated file | contract + persona, one file (never argv, either way) |
+| Copilot, user-authored `.github/agents/*.md` | native `--agent <name>` | n/a | unchanged — `--agent` still points at the exact file loomux read (`profiles::handle_resolves_to`); mechanics-core coverage for this ONE case is still kickoff/file-read only (documented residual gap above) |
+| Copilot, no persona / inline `prompt:` | generated `--agent loomux-<group>-<block>` file | contract rides via generated file | contract + persona in the generated file |
+
+**Tests:** `a_thirty_kb_contract_still_produces_a_short_command_line` reproduces the actual
+regression shape (a 30KB+ persona) and pins both halves of the fix — the command line stays
+short AND the full contract still reaches the generated file;
+`command_line_length_guard_fails_loudly_on_an_oversized_argument` pins the backstop against both
+a single oversized argument and many small ones summing past the limit;
+`claude_agent_file_write_failure_falls_back_to_append_system_prompt_file` forces the fallback
+for REAL (a regular file occupies the target directory path, so `fs::create_dir_all` genuinely
+fails) and pins it lands on the SAME instructions file, never argv;
+`end_group_reclaims_generated_claude_agent_files` mirrors N4's Copilot cleanup test for Claude's
+own generated files. Every pre-existing test asserting the OLD `--agents '<json>'` shape (the
+golden default-roster pin, the trust-root security tests, the drift-guard matrix, the
+name-cannot-break-the-payload test) was updated to the new shape rather than deleted — the
+security PROPERTY each one pins ("no repo text reaches the trust root", "ids/names can't break
+structurally out of whatever they ride in") still holds, now checked against the generated
+file's content instead of the command line, since the command line no longer carries it.
 
 ### #417: compact hooks as a TRUSTED evidence source
 

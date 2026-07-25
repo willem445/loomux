@@ -101,8 +101,10 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = OrchRegistry::new(dir.path().to_path_buf());
     reg.set_port(45999); // fake port so config writing works
-    // #416: never let a test write a generated Copilot custom-agent file into
-    // the REAL `~/.copilot/agents` — point it at this same disposable tree.
+    // #416/round-6: never let a test write a generated custom-agent file into
+    // the REAL `~/.claude/agents` or `~/.copilot/agents` — point both at this
+    // same disposable tree.
+    reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
     reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
     reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
     reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
@@ -1670,18 +1672,18 @@ fn build_agent_argv_matches_command_line() {
     let sid = "11111111-2222-3333-4444-555555555555";
     let sessions: [(Option<&str>, bool); 3] =
         [(None, false), (Some(sid), false), (Some(sid), true)];
-    // The matrix now includes the #222 persona flags. The `--agents` payload is
-    // the only token loomux single-quotes, and it is stuffed with double quotes,
-    // spaces and escapes — so it is by far the most likely place for the two
-    // forms to drift.
-    let personas: [PersonaInject; 4] = [
+    // The matrix now includes the #222 persona flags. Round #417 correction
+    // 6 replaced the inline `--agents '<json>'` token (the one loomux used
+    // to single-quote, stuffed with double quotes/spaces/escapes — by far
+    // the likeliest place for the two forms to drift) with a short
+    // `--agent <handle>` naming a generated FILE, or (the write-failure
+    // fallback) `--append-system-prompt-file "<path>"` — a path can still
+    // contain spaces, so it's still worth its own matrix entry.
+    let personas: [PersonaInject; 5] = [
         PersonaInject::default(),
+        PersonaInject { claude_agent: Some("loomux-g-1-rev-sec".into()), ..PersonaInject::default() },
         PersonaInject {
-            claude_agents_json: Some(
-                r#"{"rev-sec":{"description":"Security review","prompt":"Look for authz holes.\nNothing else."}}"#
-                    .to_string(),
-            ),
-            claude_agent: Some("rev-sec".into()),
+            claude_append_system_prompt_file: Some(PathBuf::from("C:/data/group/rev sec.md")),
             ..PersonaInject::default()
         },
         PersonaInject { copilot_agent: Some("repo-worker".into()), ..PersonaInject::default() },
@@ -11562,6 +11564,24 @@ fn end_group_reclaims_generated_copilot_agent_files() {
 
     let generated = dir.path().join("copilot-agents").join(format!("loomux-{}-{}.agent.md", g.id, w.block));
     assert!(generated.is_file(), "the default-roster worker must have gotten a generated wrapper file: {generated:?}");
+
+    reg.end_group(&g.id, false).unwrap();
+    assert!(!generated.exists(), "the generated file must be reclaimed on group end");
+}
+
+#[test]
+fn end_group_reclaims_generated_claude_agent_files() {
+    // Round #417 correction 6's own analog of N4 above: the generated
+    // `~/.claude/agents/loomux-<group>-<block>.md` file must not outlive
+    // the group either, or it accumulates forever and clutters the user's
+    // real Claude agent list with dead groups' names, exactly the N4
+    // concern this round widened the fix for.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let generated = dir.path().join("claude-agents").join(format!("loomux-{}-{}.md", g.id, w.block));
+    assert!(generated.is_file(), "the default-roster worker must have gotten a generated agent file: {generated:?}");
 
     reg.end_group(&g.id, false).unwrap();
     assert!(!generated.exists(), "the generated file must be reclaimed on group end");

@@ -497,44 +497,31 @@ pub fn sanitize_display(s: &str) -> String {
         .collect()
 }
 
-/// Persona text ends up inside a **single-quoted** shell token (the `--agents`
-/// JSON payload). In both PowerShell and POSIX sh, a single-quoted string is
-/// fully literal *except* for the quote character itself — so `'` is the one
-/// character that could break out, and it is the only one we have to remove.
-/// Mapping it to the typographic apostrophe (U+2019) keeps the prose intact
-/// ("don't" stays readable) while making the payload structurally inert; the
-/// JSON is then ASCII-escaped ([`ascii_escape_json`]) so the command line stays
-/// pure ASCII regardless of the pane's code page.
+/// Strips characters that could be structurally hazardous wherever persona
+/// text ends up — a generated agent FILE (Claude's `~/.claude/agents/*.md`,
+/// round #417 correction 6; Copilot's `~/.copilot/agents/*.agent.md`, #416)
+/// or PTY-typed kickoff text (Copilot's write-failure fallback). Control
+/// characters other than newline/tab are dropped outright: they have no
+/// meaning in a persona and would ride straight into a terminal.
 ///
-/// Control characters other than newline/tab are dropped: they have no meaning
-/// in a persona and would ride straight into a terminal.
+/// The `'` → typographic-apostrophe (U+2019) mapping predates round 6: it
+/// protected the SINGLE-QUOTED shell token `claude --agents '<json>'` this
+/// text used to ride on, before that mechanism was replaced with a
+/// generated file (see `PersonaInject::claude_agent`'s doc for why — the
+/// argv-length bug the replacement fixes). No current consumer is a raw
+/// shell token, so this mapping is inert today — kept rather than removed,
+/// both because it costs nothing (the prose still reads fine: "don't"
+/// stays "don't", just with a curlier mark) and as defense-in-depth against
+/// a future consumer reintroducing a shell-token use without re-deriving
+/// this exact hazard from scratch. `ascii_escape_json`, which existed
+/// solely to keep the OLD `--agents` JSON payload pure-ASCII on a
+/// non-UTF-8 pane code page, had no other consumer and was removed
+/// entirely alongside that mechanism, rather than left orphaned.
 pub fn sanitize_persona(s: &str) -> String {
     s.chars()
         .map(|c| if c == '\'' { '\u{2019}' } else { c })
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect()
-}
-
-/// Escape every non-ASCII character in an already-serialized JSON string as
-/// `\uXXXX`. JSON says that is equivalent; the point is that the resulting
-/// payload is pure ASCII, so it survives a Windows pane whose code page is not
-/// UTF-8. (Used on the `claude --agents` payload, which is the only place
-/// loomux puts free text on a command line.)
-pub fn ascii_escape_json(json: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(json.len());
-    let mut buf = [0u16; 2];
-    for c in json.chars() {
-        if c.is_ascii() {
-            out.push(c);
-            continue;
-        }
-        // Astral-plane chars (emoji in a persona) need both surrogates.
-        for unit in c.encode_utf16(&mut buf) {
-            let _ = write!(out, "\\u{unit:04x}");
-        }
-    }
-    out
 }
 
 /// Confine a `profile:` path to the repo. A workflow file is repo-authored input

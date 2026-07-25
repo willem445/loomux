@@ -58,8 +58,10 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = OrchRegistry::new(dir.path().to_path_buf());
     reg.set_port(45999);
-    // #416: never let a test write a generated Copilot custom-agent file into
-    // the REAL `~/.copilot/agents` — point it at this same disposable tree.
+    // #416/round-6: never let a test write a generated custom-agent file into
+    // the REAL `~/.claude/agents` or `~/.copilot/agents` — point both at this
+    // same disposable tree.
+    reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
     reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
     reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
     reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));

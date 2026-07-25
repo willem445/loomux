@@ -2939,6 +2939,67 @@ pub fn directive_ledger_embed(ledger: &str, cap_bytes: usize, ledger_path: &str)
     })
 }
 
+/// YAML double-quoted scalar for a generated Claude subagent file's
+/// `description:` field (round #417 correction 6 — `write_claude_agent_
+/// file`). Claude's own subagent-file schema REQUIRES `description`
+/// (unlike loomux's generated Copilot file, which has none at all — see
+/// `write_copilot_agent_file`'s doc), and the value can be a repo-authored
+/// persona's free text, not guaranteed YAML-safe on its own — an unquoted
+/// value containing `: ` would break the frontmatter's block-mapping parse.
+/// Escapes `\` and `"` for a valid double-quoted YAML flow scalar, and
+/// collapses newlines to spaces since a description is documented as one
+/// line.
+fn yaml_double_quoted(s: &str) -> String {
+    let escaped = s.replace('\\', "\\\\").replace('"', "\\\"").replace(['\n', '\r'], " ");
+    format!("\"{escaped}\"")
+}
+
+/// Round #417 correction 6, the belt-and-braces half of the fix: Windows
+/// `CreateProcessW` has a HARD 32,767-character command-line limit — exceed
+/// it and the OS itself refuses to start the process with an unreadable
+/// `CreateProcessW error=87` (or similar), no matter which spawn path runs
+/// it (direct `CreateProcessW`, or the `pwsh.exe -Command` shell fallback,
+/// whose extra quoting/escaping layer can only make an oversized line
+/// WORSE, never better). This is exactly the bug the file-based Claude
+/// system-prompt fix above closes at the SOURCE (the multi-KB role
+/// contract no longer rides argv at all, on either CLI) — this guard is
+/// the backstop for the failure mode itself, so a FUTURE regression (some
+/// other large value landing on argv again) fails loudly and diagnosably,
+/// pre-spawn, instead of reproducing the exact unreadable wall the user's
+/// live demo hit.
+///
+/// Checked against the STRUCTURED argv form (`build_agent_argv`'s output),
+/// which both spawn paths are built from (`build_agent_command`'s shell
+/// string is the same atoms, just shell-quoted — quoting can only ADD
+/// length, never remove it, so a command line that's already too long
+/// unquoted is too long quoted too; this one check covers both paths by
+/// construction). `WINDOWS_COMMAND_LINE_SAFETY_LIMIT` sits well under the
+/// documented 32,767 to leave headroom for the shell fallback's own
+/// escaping inflation and any UTF-16 surrogate-pair expansion, without
+/// hair-splitting the exact OS boundary.
+const WINDOWS_COMMAND_LINE_SAFETY_LIMIT: usize = 28_000;
+
+pub fn command_line_length_guard(argv: &[String]) -> Result<(), String> {
+    let total: usize = argv.iter().map(|a| a.chars().count() + 1).sum(); // +1 per token: a rough separator estimate
+    let Some((idx, oversized)) = argv.iter().enumerate().max_by_key(|(_, a)| a.chars().count()) else {
+        return Ok(());
+    };
+    let oversized_len = oversized.chars().count();
+    if oversized_len > WINDOWS_COMMAND_LINE_SAFETY_LIMIT || total > WINDOWS_COMMAND_LINE_SAFETY_LIMIT {
+        let preview: String = oversized.chars().take(80).collect();
+        return Err(format!(
+            "agent launch command line is too long to spawn safely — Windows CreateProcessW's \
+             hard limit is 32,767 characters; loomux refuses at {WINDOWS_COMMAND_LINE_SAFETY_LIMIT} \
+             to leave a safety margin. argument #{idx} alone is {oversized_len} characters (starts: \
+             {preview:?}...); the full command line is approximately {total} characters across {} \
+             arguments. This should never happen after the #417 correction-6 file-based system-prompt \
+             fix — if it does, something is putting large content directly on argv again.",
+            argv.len()
+        ));
+    }
+    Ok(())
+}
+
 /// #417: the freshness discriminator for a compact-lifecycle hook marker —
 /// the marker FILE's own mtime, not a timestamp encoded in its content (the
 /// generic hook script just creates/truncates it; no clock-formatting logic
@@ -4490,14 +4551,32 @@ pub struct Caller {
 /// than the sole payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PersonaInject {
-    /// Claude `--agents '<json>'`: the inline block definition, carrying
-    /// [`block_contract_text`]'s output. Already persona-sanitized and
-    /// ASCII-escaped, so it is safe inside the single-quoted shell token
-    /// `build_agent_command` wraps it in.
-    pub claude_agents_json: Option<String>,
-    /// Claude `--agent <id>`: activates the block defined above. Always set
-    /// together with `claude_agents_json`.
+    /// Claude `--agent <name>`: activates a loomux-generated
+    /// `~/.claude/agents/<name>.md` FILE carrying [`block_contract_text`]'s
+    /// output (round #417 correction 6; see `OrchRegistry::
+    /// write_claude_agent_file`). **Never paired with `claude_agents_json`
+    /// (removed this round) — the contract travels by FILE now, never argv.**
+    /// The doc's own CLI reference confirms `--agent <name>` alone starts a
+    /// session "where the main thread itself takes on that subagent's
+    /// system prompt... replac[ing] the default Claude Code system prompt
+    /// entirely" when the name resolves against `~/.claude/agents/` or
+    /// `.claude/agents/` — the exact file-based mechanism Copilot's
+    /// `~/.copilot/agents` precedent already established, now mirrored for
+    /// Claude instead of the pre-round-6 inline-JSON flag. `None` only when
+    /// `write_claude_agent_file` fails (directory unwritable) — see
+    /// `claude_append_system_prompt_file` for that fallback.
     pub claude_agent: Option<String>,
+    /// Claude `--append-system-prompt-file <path>`: the fallback ONLY when
+    /// `write_claude_agent_file` fails. Points at the SAME instructions file
+    /// `write_instruction_files` already reliably writes to the group's own
+    /// state dir (never a second file loomux has to invent or clean up) —
+    /// docs-confirmed to "load additional system prompt text from a file and
+    /// append to the default prompt", so this stays system-prompt-layer
+    /// durable (`contract_on_system_layer` stays `true`) even in this rare
+    /// path, unlike Copilot's equivalent fallback (which has no such flag
+    /// and degrades to a kickoff-only paste). Never set together with
+    /// `claude_agent`.
+    pub claude_append_system_prompt_file: Option<PathBuf>,
     /// Copilot `--agent <name>` — either a user-authored `.github/agents/*.md`
     /// (native, unwrapped) or a loomux-generated `~/.copilot/agents/*.agent.md`
     /// carrying the contract (#416; see `OrchRegistry::write_copilot_agent_file`).
@@ -4511,14 +4590,19 @@ pub struct PersonaInject {
     /// Persona body for the **kickoff-prompt fallback** — reached only when
     /// `~/.copilot/agents` is unwritable (the generated file above is the
     /// normal #416 path). Delivered as text in the kickoff, which every CLI
-    /// reads.
+    /// reads. Claude has no equivalent: its own write-failure fallback
+    /// (`claude_append_system_prompt_file`) never needs one.
     pub kickoff: Option<String>,
     /// Whether the block's full CONTRACT (mechanics + persona, [`block_
     /// contract_text`]) actually rides this agent's system-prompt layer —
-    /// `true` for every Claude block (`--agents` always carries it) and for
-    /// a Copilot block on the generated-file path (`write_copilot_agent_
-    /// file` succeeded); `false` for a Copilot block using a user-authored
-    /// native `.github/agents/*.md` persona (only the user's OWN file rides
+    /// `true` for EVERY Claude block regardless of which of the two paths
+    /// above carried it (both `--agent <generated file>` and `--append-
+    /// system-prompt-file` are launch-time system-prompt construction, per
+    /// Claude's own CLI reference — neither is a conversation-history
+    /// artifact a compaction could touch) and for a Copilot block on the
+    /// generated-file path (`write_copilot_agent_file` succeeded); `false`
+    /// for a Copilot block using a user-authored native
+    /// `.github/agents/*.md` persona (only the user's OWN file rides
     /// `--agent`, never loomux's contract — the documented #416 residual
     /// gap) and for the rare `~/.copilot/agents`-unwritable fallback (only
     /// the persona text, not the full contract, reaches the kickoff).
@@ -4749,6 +4833,11 @@ pub struct OrchRegistry {
     /// reader can be pointed at a fixture tree without touching global env —
     /// safe under parallel test execution.
     claude_projects_dir: Mutex<Option<PathBuf>>,
+    /// Test-only override of Claude's own custom-agent directory
+    /// (`~/.claude/agents`) — the generated per-block contract file (round
+    /// #417 correction 6) writes here. `None` in production. Mirrors
+    /// `copilot_agents_dir_override`, which mirrors `claude_projects_dir`.
+    claude_agents_dir_override: Mutex<Option<PathBuf>>,
     /// Test-only override of Copilot's own custom-agent directory
     /// (`~/.copilot/agents`) — the generated per-block contract file (#416)
     /// writes here. `None` in production. Mirrors `claude_projects_dir`.
@@ -6608,6 +6697,7 @@ impl OrchRegistry {
             compact_nudge_times: Mutex::new(HashMap::new()),
             pending_max_notice: Mutex::new(HashMap::new()),
             claude_projects_dir: Mutex::new(None),
+            claude_agents_dir_override: Mutex::new(None),
             copilot_agents_dir_override: Mutex::new(None),
             compact_hook_dir_override: Mutex::new(None),
             copilot_hooks_dir_override: Mutex::new(None),
@@ -6627,6 +6717,14 @@ impl OrchRegistry {
     #[doc(hidden)]
     pub fn set_claude_projects_dir(&self, dir: PathBuf) {
         *self.claude_projects_dir.lock_safe() = Some(dir);
+    }
+
+    /// Point the generated Claude custom-agent file at a specific directory,
+    /// instead of `~/.claude/agents`. Test-only seam (see
+    /// `claude_agents_dir_override`).
+    #[doc(hidden)]
+    pub fn set_claude_agents_dir_override(&self, dir: PathBuf) {
+        *self.claude_agents_dir_override.lock_safe() = Some(dir);
     }
 
     /// Point the generated Copilot custom-agent file at a specific directory,
@@ -6652,6 +6750,21 @@ impl OrchRegistry {
     #[doc(hidden)]
     pub fn set_copilot_hooks_dir_override(&self, dir: PathBuf) {
         *self.copilot_hooks_dir_override.lock_safe() = Some(dir);
+    }
+
+    /// Claude's own custom-agent directory (`~/.claude/agents`, per its own
+    /// CLI reference — user-level scope, priority 4 in ITS `--agent`
+    /// resolution order, below `.claude/agents/` project-level and the now-
+    /// unused `--agents` CLI flag), or the test override. Never the repo's
+    /// `.claude/agents/`, for the SAME reason `copilot_agents_dir` never
+    /// writes into `.github/agents/`: a generated file there would dirty the
+    /// user's git tree with something they didn't author. `None` only if the
+    /// home directory can't be resolved at all.
+    fn claude_agents_dir(&self) -> Option<PathBuf> {
+        if let Some(dir) = self.claude_agents_dir_override.lock_safe().clone() {
+            return Some(dir);
+        }
+        dirs::home_dir().map(|h| h.join(".claude").join("agents"))
     }
 
     /// Copilot's own custom-agent directory (`~/.copilot/agents`, per its
@@ -13156,22 +13269,30 @@ impl OrchRegistry {
         // policy is simply "cleaned up on group end", no per-image bookkeeping.
         let _ = fs::remove_dir_all(self.attachments_dir(group));
 
-        // rev-4 review (N4): reclaim any #416 generated Copilot custom-agent
-        // files this group's members ever got (`write_copilot_agent_file`) —
-        // otherwise they accumulate in `~/.copilot/agents` forever and
-        // clutter the user's Copilot agent list with dead groups' names.
-        // Best-effort per member (a handle a member never actually got a
-        // file for is just a missing-file no-op); harmless to attempt for a
-        // Claude-only group too, since none of its handles were ever
-        // written. NOT swept for orphans from a group that never reaches
-        // `end_group` at all (a crash, or state deleted out from under
-        // loomux) — a stray tiny markdown file the user can delete by hand
-        // is a cosmetic cost, not a resource or security one, so a startup
-        // reconciliation sweep is left as a deliberate follow-up rather than
-        // built speculatively here.
+        // rev-4 review (N4; widened round #417 correction 6 for Claude's own
+        // generated files): reclaim any generated custom-agent files this
+        // group's members ever got — `write_copilot_agent_file` (#416) and
+        // `write_claude_agent_file` (round 6) — otherwise they accumulate in
+        // `~/.copilot/agents`/`~/.claude/agents` forever and clutter each
+        // CLI's own agent list with dead groups' names. Best-effort per
+        // member (a handle a member never actually got a file for is just a
+        // missing-file no-op) and per CLI (a Claude-only group's Copilot
+        // sweep, and vice versa, are both harmless no-ops against a
+        // directory that never held that group's handles). NOT swept for
+        // orphans from a group that never reaches `end_group` at all (a
+        // crash, or state deleted out from under loomux) — a stray tiny
+        // markdown file the user can delete by hand is a cosmetic cost, not
+        // a resource or security one, so a startup reconciliation sweep is
+        // left as a deliberate follow-up rather than built speculatively
+        // here.
         if let Some(dir) = self.copilot_agents_dir() {
             for a in &members {
                 let _ = fs::remove_file(dir.join(format!("loomux-{group}-{}.agent.md", a.block)));
+            }
+        }
+        if let Some(dir) = self.claude_agents_dir() {
+            for a in &members {
+                let _ = fs::remove_file(dir.join(format!("loomux-{group}-{}.md", a.block)));
             }
         }
 
@@ -14548,6 +14669,47 @@ impl OrchRegistry {
         }));
     }
 
+    /// Generate (or refresh) a loomux-owned Claude custom-agent file carrying
+    /// `contract` (round #417 correction 6, replacing the pre-round-6
+    /// inline `--agents '<json>'` payload — see `PersonaInject::claude_
+    /// agent`'s doc for why: Windows `CreateProcessW` has a hard
+    /// 32,767-character command-line limit, the full role contract is many
+    /// KB, and it can no longer ride argv on EITHER spawn path). Written
+    /// into Claude's OWN user-level agent directory (`~/.claude/agents`,
+    /// see [`claude_agents_dir`](Self::claude_agents_dir)), mirroring
+    /// `write_copilot_agent_file` exactly — never the repo's
+    /// `.claude/agents/`, same "don't dirty the user's git tree" reasoning.
+    /// Its handle is unique per group+block so concurrent groups never
+    /// collide, and it is rewritten on every spawn (like `write_mcp_
+    /// config`) so an edited template/persona applies to the next agent
+    /// without restarting the group. `description` is REQUIRED by Claude's
+    /// own subagent-file schema (unlike Copilot's generated file, which has
+    /// none at all). Returns the `--agent` handle, or `None` when the
+    /// directory can't be created/written (fail-open — the caller falls
+    /// back to `--append-system-prompt-file` rather than failing the spawn).
+    fn write_claude_agent_file(&self, group: &str, block: &workflow::Block, contract: &str, description: &str) -> Option<String> {
+        let dir = self.claude_agents_dir()?;
+        fs::create_dir_all(&dir).ok()?;
+        let handle = format!("loomux-{group}-{}", block.id);
+        // `contract` is already control-character-clean (any persona text
+        // folded into it was already sanitized at resolution time — see
+        // `resolve_persona`'s `sanitize_persona` call) — and unlike the
+        // pre-round-6 `--agents` JSON payload, this is a FILE, not a shell
+        // token, so no apostrophe-mangling/ASCII-escaping pass is needed
+        // here either: loomux's own template prose keeps its real
+        // apostrophes. `description` IS quoted (`yaml_double_quoted`),
+        // since — unlike `contract`, loomux's own trusted text — it can
+        // carry a repo-authored persona's free-text description, which is
+        // not guaranteed YAML-safe (a bare colon would break the mapping).
+        let body = format!(
+            "---\nname: {handle}\ndescription: {}\n---\n{contract}\n",
+            yaml_double_quoted(description)
+        );
+        let path = dir.join(format!("{handle}.md"));
+        fs::write(&path, body).ok()?;
+        Some(handle)
+    }
+
     /// Generate (or refresh) a loomux-owned Copilot custom-agent file carrying
     /// `contract` (#416) — written into Copilot's OWN user-level agent
     /// directory (`~/.copilot/agents`, see [`copilot_agents_dir`]
@@ -14662,28 +14824,36 @@ impl OrchRegistry {
         }
 
         // Claude (and the fallback adapter): the durable contract ALWAYS
-        // rides inline now — every block, persona or not. `description` is
-        // required by the CLI's schema.
-        //
-        // Unlike a repo persona (already `sanitize_persona`d in
-        // `resolve_persona`), `contract` is loomux's OWN template prose —
-        // which is full of literal ASCII apostrophes ("don't", "aren't")
-        // that were never a hazard while this text only ever reached the
-        // agent via a file read. Riding inside the `--agents` payload's
-        // SINGLE-quoted shell token, an un-sanitized apostrophe closes that
-        // quote early, same as an unsanitized persona would. Sanitize here,
-        // not at the source: the instructions FILE (and the copilot-agent
-        // file below, which is a file on disk, not a shell token) keep the
-        // real apostrophe for a human/agent reading prose.
+        // rides the system-prompt layer now — every block, persona or not
+        // — but as of round #417 correction 6, by FILE, never argv. The
+        // pre-round-6 design put the whole contract inline in `--agents
+        // '<json>'`; a live demo hit Windows CreateProcessW's hard
+        // 32,767-character command-line limit, because the full role
+        // contract (mechanics core + template, many KB) is categorically
+        // bigger than the short repo personas `--agents` was designed to
+        // carry before #416 widened its payload to loomux's own template
+        // text on every block. See `PersonaInject::claude_agent`'s doc for
+        // the mechanism and citation. `description` is required by the
+        // file schema either way.
         let description = persona
             .map(|p| p.description.trim())
             .filter(|d| !d.is_empty())
             .unwrap_or(block.id.as_str());
-        let sanitized_contract = workflow::sanitize_persona(contract);
-        let payload = json!({ &block.id: { "description": description, "prompt": sanitized_contract } });
-        out.claude_agents_json =
-            Some(workflow::ascii_escape_json(&serde_json::to_string(&payload).unwrap_or_default()));
-        out.claude_agent = Some(block.id.clone());
+        match self.write_claude_agent_file(group, block, contract, description) {
+            Some(handle) => out.claude_agent = Some(handle),
+            None => {
+                // `~/.claude/agents` unwritable — fall back to `--append-
+                // system-prompt-file` pointed at the instructions file
+                // `write_instruction_files` ALREADY reliably wrote to this
+                // group's own state dir (no second file to invent or
+                // clean up). Still system-prompt-layer durable either way
+                // — see `claude_append_system_prompt_file`'s doc — so this
+                // fallback, unlike Copilot's kickoff-text one, never needs
+                // `contract_on_system_layer` to go `false`.
+                out.claude_append_system_prompt_file =
+                    Some(self.group_dir(group).join(block.instructions_file()));
+            }
+        }
         out.contract_on_system_layer = true;
         out
     }
@@ -14883,34 +15053,28 @@ impl OrchRegistry {
                          \"Bash(git commit *)\" \"Bash(git push *)\"",
                     );
                 }
-                // Claude's native custom agent (#222). Unlike Copilot, Claude
-                // takes the whole block **inline** — `--agents '<json>'` defines
-                // it, `--agent <id>` activates it — so loomux can hand a
-                // synthesized persona straight to the CLI with zero repo files
-                // and zero trust problem. (This replaces PR #105's
-                // `--append-system-prompt-file`, which predates the flag.)
-                //
-                // The payload rides inside SINGLE quotes. That is the whole
-                // quoting story: in both PowerShell and POSIX sh a single-quoted
-                // string is literal except for `'` itself — which
-                // `workflow::sanitize_persona` has already removed — and
-                // `workflow::ascii_escape_json` has made the payload pure ASCII,
-                // so a non-UTF-8 pane code page cannot mangle it either.
-                //
-                // The shell-string form assumes the fallback shell is PowerShell
-                // (Windows) or sh (POSIX) — the same assumption the copilot branch
-                // above already documents at its `@"` here-string note, and the
-                // one `default_shell()` makes: powershell.exe ships with every
-                // supported Windows build. Bare `cmd.exe` gives `'` no meaning and
-                // would mangle this, but reaching it requires powershell.exe to be
-                // absent from PATH. The primary path is unaffected either way:
-                // direct spawn uses `build_agent_argv`, where the payload is one
-                // literal token and no shell parses it at all.
-                if let Some(json) = &persona.claude_agents_json {
-                    cmd.push_str(&format!(" --agents '{json}'"));
-                }
+                // Claude's native custom agent, by FILE (round #417
+                // correction 6, replacing the pre-round-6 inline `--agents
+                // '<json>' --agent <id>` pair — see `PersonaInject::
+                // claude_agent`'s doc: the inline JSON payload put the
+                // whole role contract on argv, and Windows CreateProcessW's
+                // hard 32,767-character command-line limit made that a
+                // real, demo-blocking bug once the contract grew past a
+                // short persona's size). `--agent <handle>` alone now
+                // activates a loomux-generated `~/.claude/agents/<handle>.md`
+                // file — the SAME "native custom-agent flag, file-backed"
+                // shape Copilot's `--agent` already used, just newly true
+                // for Claude too. Only a short handle ever reaches argv;
+                // the contract itself never does, on either spawn path.
                 if let Some(agent) = &persona.claude_agent {
                     cmd.push_str(&format!(" --agent {agent}"));
+                } else if let Some(path) = &persona.claude_append_system_prompt_file {
+                    // Fallback (round #417 correction 6): `~/.claude/agents`
+                    // was unwritable — append the group's own instructions
+                    // file to Claude's system prompt instead. Still a
+                    // FILE, never argv, so the length bug can't resurface
+                    // here either.
+                    cmd.push_str(&format!(" --append-system-prompt-file \"{}\"", path.display()));
                 }
                 cmd
             }
@@ -15049,15 +15213,12 @@ impl OrchRegistry {
                     push(&mut a, "Bash(git commit *)");
                     push(&mut a, "Bash(git push *)");
                 }
-                if let Some(json) = &persona.claude_agents_json {
-                    push(&mut a, "--agents");
-                    // One literal argv token: no shell, so no quoting at all.
-                    // The string form wraps this same payload in single quotes.
-                    push(&mut a, json);
-                }
                 if let Some(agent) = &persona.claude_agent {
                     push(&mut a, "--agent");
                     push(&mut a, agent);
+                } else if let Some(path) = &persona.claude_append_system_prompt_file {
+                    push(&mut a, "--append-system-prompt-file");
+                    a.push(path.display().to_string());
                 }
             }
         }
@@ -15364,6 +15525,10 @@ impl OrchRegistry {
             role.is_read_only(),
             &inject,
         );
+        // Round #417 correction 6: fail loudly, pre-spawn, rather than
+        // handing CreateProcessW a command line it will refuse with an
+        // unreadable OS error — see `command_line_length_guard`'s doc.
+        command_line_length_guard(&argv)?;
 
         let entry = AgentEntry {
             id: agent_id.clone(),
@@ -15465,7 +15630,8 @@ impl OrchRegistry {
                 "source": if block.profile.is_some() { "profile" } else { "prompt" },
                 "mode": p.mode.as_str(),
                 "delivery": if inject.copilot_agent.is_some() { "copilot --agent" }
-                    else if inject.claude_agent.is_some() { "claude --agents" }
+                    else if inject.claude_agent.is_some() { "claude --agent" }
+                    else if inject.claude_append_system_prompt_file.is_some() { "claude --append-system-prompt-file" }
                     else if inject.kickoff.is_some() { "kickoff" }
                     else { "none" },
             })),
@@ -17536,6 +17702,10 @@ fn register_orchestrator_pane(
         false,
         &inject,
     );
+    // Round #417 correction 6: see `command_line_length_guard`'s doc — the
+    // orchestrator's own pane must fail loudly pre-spawn too, not just
+    // worker/reviewer/planner panes through `spawn_agent_ex`.
+    command_line_length_guard(&argv)?;
     let entry = AgentEntry {
         id: agent_id.clone(),
         group: group.id.clone(),
