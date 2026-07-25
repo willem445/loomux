@@ -2289,9 +2289,14 @@ whitespace runs, an artifact of that logging path, not of the terminal itself; w
 and footer are exactly as captured). It's Claude Code's, not Copilot's — but `prompt_wait_detected`
 and `has_numbered_menu` are CLI-agnostic by construction (the whole guard is, per N5), so a
 verified-real multi-choice menu grounds the signal against reality regardless of which CLI painted
-it. `copilot-multichoice-question.txt` stays for the DIFFERENT thing it isolates (the signal alone,
-footer-less, scrolled out of the prose-guard's last-3-line window) but is not itself the
-"proven against reality" fixture — `claude-mcp-approval.txt` is.
+it. **Correction (rev-19 n2):** this capture's footer survived intact too, so it witnesses `has_
+numbered_menu` combined WITH `has_menu_footer`, not `has_numbered_menu` alone — it is not a
+sole-signal witness, and the fixture/test comments were fixed to say so plainly rather than imply
+otherwise. Sole-signal isolation for `has_numbered_menu` specifically is still what
+`copilot-multichoice-question.txt` is for (synthetic, footer/pointer deliberately absent, scrolled
+out of the prose-guard's last-3-line window) — the two fixtures are complementary, not redundant:
+one proves the combined real-world shape, the other proves the one signal that shape's footer would
+otherwise mask ever being exercised alone.
 
 **What this detector does NOT catch (rev-15 N3).** `prompt_wait_detected` is structural-marker-only
 by design (see above) — a **free-text ask** ("What should I name the new module?") carries none of
@@ -2314,25 +2319,28 @@ DELAYS`, +2.5s/+7s after the first Enter) fired unconditionally, in exactly the 
 often paints its permission dialog after processing a submitted prompt (B2). Both are now gated
 through the SAME mechanism as pre-paste/pre-Enter, not a bespoke check each:
 
-- `question_hold_predicate(tail, total, paste_baseline_total) -> impl Fn() -> bool` is the core
-  decision, generic over every external read (no `PtyManager` bound into it) — the fix for B4's
-  finding that the OLD `wait_for_question_clear` bound a concrete `&PtyManager`, so a test that
-  fully disabled the guard's predicate still passed the entire suite (495/495) unchanged: nothing
-  exercised the *wiring*, only presentation/notice text. This generic form is driven directly by
-  tests with scripted closures — no PTY, no app handle — closing that gap; disabling either
-  remaining signal (growth-gate, detector) now fails a dedicated test, confirmed by neutralizing
-  each locally and re-running (rev-19's own mutation method, turned on the fix itself).
-- `wait_for_question_clear(ptys, pty_id, paste_baseline_total, emit_held, emit_held_cleared)` binds
-  it to a live pane and reuses `hold_for_human_input`'s generic block-until-clear-or-capped loop
-  verbatim (same cap `QUESTION_HOLD_MAX` = 120s, longer than the box guard's 60s: reading and
-  deciding a substantive question takes more of a human's attention than submitting an
-  already-typed line) — called at the pre-paste checkpoint, the pre-Enter checkpoint, AND now each
-  spaced retry (via `retry_gate`, below, and gated on `!confirmed` — see N8), so all four
-  Enter-adjacent sites share one hold implementation instead of four independently-reasoned checks.
-- `question_active_now(ptys, pty_id, paste_baseline_total)` is the one-shot (non-holding) form used
-  by the stranded-text flush: a plain snapshot, not a wait, because holding there would be
-  redundant — if a question is active, the flush is skipped and the pre-paste checkpoint
-  immediately following it is the one that actually holds/aborts/notifies.
+- `question_hold_predicate(tail, pasted_text) -> impl Fn() -> bool` is the core decision, generic
+  over the tail read (no `PtyManager` bound into it) — the fix for B4's finding that the OLD
+  `wait_for_question_clear` bound a concrete `&PtyManager`, so a test that fully disabled the
+  guard's predicate still passed the entire suite (495/495) unchanged: nothing exercised the
+  *wiring*, only presentation/notice text. This generic form is driven directly by tests with
+  scripted closures — no PTY, no app handle — closing that gap; disabling either remaining signal
+  (the content mask, the detector) now fails a dedicated test, confirmed by neutralizing each
+  locally and re-running (rev-19's own mutation method, turned on the fix itself).
+  `pasted_text: Option<String>` replaced an earlier `paste_baseline_total: Option<u64>` byte-count
+  parameter — see B-A below for why the growth-delta approach was replaced with content-masking,
+  not just re-timed.
+- `wait_for_question_clear(ptys, pty_id, pasted_text, emit_held, emit_held_cleared)` binds it to a
+  live pane and reuses `hold_for_human_input`'s generic block-until-clear-or-capped loop verbatim
+  (same cap `QUESTION_HOLD_MAX` = 120s, longer than the box guard's 60s: reading and deciding a
+  substantive question takes more of a human's attention than submitting an already-typed line) —
+  called at the pre-paste checkpoint, the pre-Enter checkpoint, AND now each spaced retry (via
+  `retry_gate`, below, and gated on `!confirmed` — see N8), so all four Enter-adjacent sites share
+  one hold implementation instead of four independently-reasoned checks.
+- `question_active_now(ptys, pty_id, pasted_text)` is the one-shot (non-holding) form used by the
+  stranded-text flush: a plain snapshot, not a wait, because holding there would be redundant — if
+  a question is active, the flush is skipped and the pre-paste checkpoint immediately following it
+  is the one that actually holds/aborts/notifies.
 - `flush_stranded_text(ptys, pty_id, prev_confirmed, human_typed_since, submit) -> bool` (rev-19
   R3) is the flush's check-AND-write as one function — `deliver_prompt` calls it directly, so an
   integration test driving THIS function (not a reimplementation of its logic) against a real
@@ -2382,36 +2390,50 @@ quiet-gate machinery (built to debounce a *frontend badge* against redraw flicke
 longer observation window) — this guard only needs "is the menu still painted right now", which the
 detector itself already answers without any human-input signal at all.
 
-**Self-echo (rev-15 N1, unchanged by R1).** The pre-Enter and retry checkpoints necessarily read the
-tail AFTER loomux's own bracketed paste — so a delivered prompt that happens to contain phrasing
-`prompt_wait_detected` matches (`(y/n)`, "do you want to run", "1. yes" — ordinary agent-to-agent
-traffic: *"copilot asked `Do you want to run npm test?` and I can't answer"*) would otherwise hold
-the delivery on **itself**, deterministically and unrecoverably, since re-sending the identical text
-reproduces the identical false match. `question_hold_predicate`'s `paste_baseline_total` parameter
-closes this: `None` for the pre-paste checkpoint (nothing of ours is on screen yet, so any match is
-real); `Some(byte count captured once OUR OWN paste has genuinely settled)` for pre-Enter and every
-retry — see R2 immediately below for what "genuinely settled" now means. A match only counts as live
-if the pane's output total has grown since that baseline — i.e. the CLI painted something NEW, not
-just our own paste sitting there. Provenance-based, matching this function's own precedent for the
-identical hazard (`delivery_from`/`compact_inference_guard_until_ms`, PR #329 round 7: *"loomux's
-own paste's echo must never satisfy loomux's own detectors"*).
+**Self-echo is excluded by CONTENT, not by byte-count delta (rev-15 N1, rewritten rev-19 B-A).** The
+pre-Enter and retry checkpoints necessarily read the tail AFTER loomux's own bracketed paste — so a
+delivered prompt that happens to contain phrasing `prompt_wait_detected` matches (`(y/n)`, "do you
+want to run", "1. yes" — ordinary agent-to-agent traffic: *"copilot asked `Do you want to run npm
+test?` and I can't answer"*) would otherwise hold the delivery on **itself**, deterministically and
+unrecoverably, since re-sending the identical text reproduces the identical false match.
 
-**The self-echo baseline must reflect a genuinely SETTLED paste, not an early guess (rev-19 R2).**
-The first cut captured `paste_settled_total` right after the echo-verify step confirmed only
-`ECHO_MIN_BYTES` (8) bytes had echoed, plus a flat `PASTE_SUBMIT_DELAY` (500ms) — for a large
-prompt, the baseline could be snapshotted well before the paste had actually finished rendering, so
-its OWN tail-end echo (still arriving after the snapshot) read as "new" output and self-held the
-delivery — N1's exact hazard, reintroduced by an inaccurate baseline. Fix: the baseline is now
-captured AFTER the existing "wait for the pane to go quiet before Enter" loop (which already waits
-for `SUBMIT_QUIET` — 1000ms — of no output growth), with an ADDITIONAL bounded wait
-(`PASTE_SETTLE_EXTRA_WAIT`, 3s) if growth since the paste write hasn't yet reached the pasted byte
-count (`paste.len()` — we know exactly what we sent, so this is a real floor, not a guess). This
-directly closes the "500ms after 8 bytes" gap. **Residual, stated plainly:** a dialog that renders
-and fully settles WHILE our own paste is still within this same settle window is still baked into
-the baseline — an inherent limit of any delta-based gate — but the window that can happen in has
-shrunk from a flat 500ms to "until our own known paste length has genuinely plateaued", and any
-dialog that appears or persists AFTER that point is unambiguously new growth the checkpoints hold
-on.
+Two earlier rounds tried to solve this with a byte-count GROWTH baseline (rev-15: snapshot the
+output total right after the paste, hold only if it grew since; rev-19 round 3/R2: move the snapshot
+to after the pane genuinely settles, extending the wait if growth hadn't reached the pasted byte
+count). **Both were wrong in the same way, proven by a scratch test against a real `PtyManager`:** a
+byte-count baseline is ALWAYS one number marking ONE point in time as "before" — it cannot represent
+"this delta is our own paste, that delta is their dialog" when both arrive in the same window. The
+canonical #420 timeline is exactly that: loomux pastes, Copilot processes it and paints a dialog
+*while the paste is still settling* — whichever moment the checkpoint snapshots, the dialog either
+gets baked into the baseline (round 3, `grew == false`, invisible forever) or the growth check
+passes for the wrong reason. Moving WHEN the snapshot is taken cannot fix a comparison that is
+structurally the wrong axis.
+
+The actual fix (rev-19 B-A): `deliver_prompt` knows the EXACT text it pasted (`text: &str`, captured
+into the delivery thread as `pasted_text`). `mask_own_paste(tail, pasted_text)` removes every line of
+the tail that exactly matches one of `pasted_text`'s own lines (trim + lowercase compared, matching
+`prompt_wait_detected`'s own line normalization) BEFORE the detector ever runs. `question_hold_
+predicate` takes `pasted_text: Option<String>` instead of a growth baseline — `None` for the
+pre-paste checkpoint (nothing of ours is on screen yet, so nothing to mask); `Some(the pasted text)`
+for pre-Enter and every retry. A paste whose own prose happens to contain "(y/n)" masks itself away
+to nothing (every line of the tail IS a pasted line); a dialog painted alongside — or during, or
+after — that same paste survives masking untouched, because its lines are NOT among the ones we
+pasted, regardless of the exact moment it rendered. This removes the timing dependency entirely: no
+snapshot, no settle-wait, no window to get baked into. The now-unused settle-baseline machinery
+(`paste_write_before`, `PASTE_SETTLE_EXTRA_WAIT`) was deleted along with it — the underlying "wait
+for the pane to go quiet before Enter" loop stays, since `submit_confirmed`'s `reached_quiet` still
+needs it for an unrelated reason (rev-32).
+
+Content-masking has its own honest limit: it depends on the tail rendering our OWN lines closely
+enough to match (trim + lowercase). A CLI that reformats a long pasted line differently than we sent
+it (aggressive re-wrapping, whitespace normalization beyond trim) could leave a residual, unmasked
+fragment of our own text — a narrower, DIFFERENT failure mode than delta-based baselines had, not
+eliminated in principle, but no longer structurally guaranteed to miss the canonical #420 timeline
+the way a byte-count comparison was. Pinned by `question_hold_predicate_on_a_real_ptymanager_holds_
+for_a_dialog_seeded_alongside_a_large_paste_but_not_for_the_pastes_own_matching_text` — rev-19's own
+scratch-test shape, run against a real `PtyManager` (not scripted closures), reproducing exactly the
+regression the review found: a seeded dialog alongside a large paste holds; the same large paste
+alone, its own text matching the detector, does not.
 
 **Retries skip entirely once the submit is confirmed (rev-19 N8).** A CONFIRMED delivery is done —
 its Enter landed, its turn started, there is nothing left to retry. Running the retry loop (and its
@@ -2433,6 +2455,26 @@ for real. `retry_gate` now takes only the question decision and has exactly two 
 needs to re-destructure the original `PasteDecision` either) — human-typing precedence is enforced
 entirely by the caller's own early `break`, which is structurally guaranteed correct (not "checked
 above" trusted by comment) rather than something a match arm could get wrong.
+
+**The test harness must not be able to leak a real process (rev-19 B-B).** `PtyManager::register_
+fake_for_test` (pty.rs, backing the R3 real-PTY tests above) opens a REAL ConPTY pair + spawns a
+trivial child so `master`/`killer` are genuine — the first cut spawned `cmd.exe /c pause>nul`
+(Windows) with `_job: None`, i.e. a command that waits for input FOREVER, enrolled in NEITHER the
+kill-on-close Job Object (#78) NOR anything else that would tear it down if a test panicked or the
+process was itself killed mid-run. rev-19 found 13 orphaned `cmd.exe` + 13 `OpenConsole.exe` on the
+machine this was built on (11 traced to this worktree), holding `target/debug` open and failing the
+next `cargo build` with "used by another process" — exactly the local-machine damage class the
+resource discipline exists to prevent; CI never sees it (fresh runners each time), which is why it
+went unnoticed there. Fixed with two independent layers, matching production `spawn_pty` rather than
+inventing a test-only shortcut: (1) the spawned command now exits immediately on its own (`cmd /c
+exit 0` / `sh -c true`) — nothing in this harness needs the child to stay alive, since `write_bytes`/
+`output_tail`/`output_total` never touch it, only `master`/`killer`, which just need to be real
+objects to satisfy `PtyHandle`'s fields; (2) on Windows, the SAME kill-on-close Job Object production
+spawns use (`assign_kill_on_close_job`) is assigned here too, so even if a test panics mid-run,
+dropping the `PtyHandle` (however that happens) closes the job's last handle and the kernel reaps the
+subtree — structural, not dependent on any test's own cleanup code running. Verified: a full
+`cargo test --locked -j 4` run (all binaries) shows zero `cmd.exe` and zero non-application
+`OpenConsole.exe` processes before and after.
 
 **Cost (rev-15 N4).** Each checkpoint used to clone the FULL (up to 256 KB) output ring and
 `strip_ansi` all of it every 250ms poll, for up to 120s, across up to four sites per delivery.
@@ -2497,15 +2539,21 @@ on the WRONG option of some OTHER dialog that happens to be up at the same momen
 correct direction for the same reason the rest of this guard exists.
 
 **Tests.** Pure-decision coverage: `prompt_wait_detected_fires_on_interactive_question_fixtures`
-(detector, including the rev-15 N3 and rev-19 N11 fixtures); `question_hold_predicate_*` — growth
-gate (N1), pre-paste's no-baseline case, closed-pty/no-match cases, activity-can-never-release
+(detector, including the rev-15 N3 and rev-19 N11 fixtures); `question_hold_predicate_*` —
+self-echo masking, pre-paste's no-mask case, closed-pty/no-match cases, activity-can-never-release
 (rev-19 R1 — `question_hold_predicate_ignores_activity_the_menu_is_still_open` polls a
 still-matching tail five times with no way to feed it an input signal, since the parameter no
 longer exists), two-consecutive-clear-reads-to-release, and immediate release when never shown a
 question (rev-19 N10) — each reds if its corresponding signal is removed from the implementation,
 verified by neutralizing it locally and re-running (rev-19's own mutation method, run against the
-fix itself before every push). `should_flush_before_paste_now_is_suppressed_by_a_live_question`
-(B1); `retry_gate_holds_for_a_question_or_writes_once_clear` (B2/N9);
+fix itself before every push). `mask_own_paste_removes_exactly_our_own_lines`/`..._leaves_nothing_
+when_the_tail_is_only_our_own_paste` cover the masking function directly; `question_hold_predicate_
+on_a_real_ptymanager_holds_for_a_dialog_seeded_alongside_a_large_paste_but_not_for_the_pastes_own_
+matching_text` (rev-19 B-A) reproduces rev-19's own scratch-test shape against a REAL `PtyManager` —
+the exact regression the review found (a dialog seeded alongside a large paste holds; the same large
+paste alone, its own text matching the detector, does not) — reverting the masking to a bypass reds
+both this test and the self-echo test above, confirmed locally. `should_flush_before_paste_now_is_
+suppressed_by_a_live_question` (B1); `retry_gate_holds_for_a_question_or_writes_once_clear` (B2/N9);
 `a_recorded_unconfirmed_outcome_makes_the_next_deliverys_flush_fire` (B3's downstream consequence).
 Wiring coverage: `question_hold_predicate_wired_into_the_generic_hold_loop_releases_once_the_menu_
 clears_twice` and `..._releases_immediately_when_already_clear` drive the REAL `hold_for_human_input`
@@ -2515,7 +2563,9 @@ the identical generic loop. `flush_stranded_text_does_not_enter_when_a_question_
 enters_when_no_question_is_showing` and `record_aborted_preenter_outcome_makes_the_next_deliverys_
 flush_actually_fire` (rev-19 R3) drive the ACTUAL functions `deliver_prompt` calls against a real
 `PtyManager` (`register_fake_for_test`), proving the flush's wiring end to end and the abort-record's
-downstream consequence through the real recorder/reader pair, not a fabricated literal.
+downstream consequence through the real recorder/reader pair, not a fabricated literal (rev-19 n1:
+this pins the recorder's behavior via the real extraction, NOT that `deliver_prompt` calls it — see
+below for that honest gap).
 `delivery_held_event_names_the_pane_and_the_reason` and
 `delivery_held_notice_audits_the_interactive_question_reason` cover the `HeldReason` variant end to
 end through the audit/badge payloads; `question_held_notice_names_the_agent_and_points_at_answering`

@@ -1210,15 +1210,6 @@ const ATTENTION_RECENT_INPUT_MS: u64 = 6000;
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
 const PASTE_SUBMIT_DELAY: Duration = Duration::from_millis(500);
-/// Bounded EXTRA wait (#420 rev-19 R2), on top of the existing quiet-wait
-/// loop, for output growth since our own paste write to reach at least the
-/// pasted byte count before trusting `paste_settled_total` as the
-/// interactive-question guard's self-echo baseline. Small and separate from
-/// `SUBMIT_MAX_WAIT` (45s, a different concern — a busy CLI ignoring the
-/// whole submit): this only closes the gap between "output stopped growing"
-/// and "our own known paste has actually finished echoing", which should
-/// normally already be satisfied by the time the quiet-wait loop exits.
-const PASTE_SETTLE_EXTRA_WAIT: Duration = Duration::from_secs(3);
 
 // Submission discipline: copilot ignores Enter while its agent is running
 // (the pasted text just sits in the input box — observed live with a worker
@@ -5904,26 +5895,53 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
     )
 }
 
+/// Remove every line of `tail` that exactly matches one of `pasted_text`'s
+/// own lines (rev-19 B-A). This is the self-echo exclusion for the
+/// interactive-question guard — CONTENT-based, not byte-COUNT-based. A round
+/// that gated on "has the pane's output total grown since a baseline
+/// snapshot" was proven broken twice: the baseline is always ONE number, so
+/// it can only mark a single point in time as "before" — a dialog that
+/// renders WHILE the paste is still echoing (the canonical #420 timeline:
+/// loomux pastes, Copilot processes it, paints a dialog, all before loomux's
+/// own settle-wait finishes) gets baked into whichever snapshot the
+/// checkpoint happened to take, and reads as "no growth" — invisible —
+/// forever after. No amount of moving WHEN the snapshot is taken closes that
+/// gap, because delta-vs-one-number can't distinguish "still my own paste
+/// settling" from "their dialog, appeared in the same window" — both are
+/// just "more bytes since X." Content can: `deliver_prompt` knows EXACTLY
+/// what it pasted. Masking out only the lines that are OUR OWN text (trim +
+/// lowercase compared, matching `prompt_wait_detected`'s own line
+/// normalization) leaves whatever the CLI itself painted — including a
+/// dialog that rendered mid-paste — fully visible to the detector; a paste
+/// whose own text happens to contain "(y/n)" or "do you want to run" masks
+/// itself away to nothing, because every line of it IS a pasted line.
+pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
+    let pasted_lines: std::collections::HashSet<String> = pasted_text
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .filter(|l| !l.is_empty())
+        .collect();
+    tail.lines()
+        .filter(|l| !pasted_lines.contains(&l.trim().to_lowercase()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The live interactive-question guard's hold decision (#420), generic over
-/// every external read so it's integration-tested with scripted closures —
-/// no `PtyManager`, no real PTY (rev-15 B4: the old production-bound version
-/// of this predicate could never be exercised by a test that disabled it,
-/// since nothing but a live pty could drive it; this generic form is what a
-/// test drives directly, and the production wrapper below just supplies real
-/// closures over `ptys`).
+/// the tail read so it's integration-tested with a scripted closure — no
+/// `PtyManager`, no real PTY (rev-15 B4: the old production-bound version of
+/// this predicate could never be exercised by a test that disabled it, since
+/// nothing but a live pty could drive it; this generic form is what a test
+/// drives directly, and the production wrapper below just supplies a real
+/// closure over `ptys`).
 ///
 /// - `tail()` — raw (ANSI-included) bytes of the pane's current output tail.
-/// - `total()` — the pane's monotonic output byte count.
-/// - `paste_baseline_total` — `None` for a checkpoint that runs BEFORE this
-///   delivery has written anything (nothing of ours is on screen yet to be
-///   confused with a real dialog); `Some(byte count captured right after OUR
-///   OWN paste settled)` for a checkpoint that runs after it (pre-Enter, each
-///   retry). Required so those checkpoints can't mistake the echo of the text
-///   THEY JUST DELIVERED for a live dialog (rev-15 N1): a delivered prompt
-///   that happens to contain "(y/n)" or "do you want to run" would otherwise
-///   hold ITSELF, deterministically, forever, since the tail always contains
-///   the just-pasted text sitting unsubmitted in the box. A match only counts
-///   as "live" if NEW output has painted since that baseline.
+/// - `pasted_text` — `None` for a checkpoint that runs BEFORE this delivery
+///   has written anything (nothing of ours is on screen yet to mask);
+///   `Some(the exact text this delivery pasted)` for a checkpoint that runs
+///   after it (pre-Enter, each retry) — `mask_own_paste` (above) strips our
+///   own lines out of the tail before the detector ever sees it (rev-15 N1 /
+///   rev-19 B-A).
 ///
 /// **Release is STATE-based, not ACTIVITY-based (rev-19 R1).** An earlier cut
 /// released the hold on a human keystroke (a submitted, non-sitting one). That
@@ -5943,20 +5961,21 @@ fn wait_for_box_clear(ptys: &crate::pty::PtyManager, pty_id: u32) -> PasteDecisi
 /// immediately (`ever_shown` gates the two-poll requirement to only kick in
 /// once a real hold has genuinely started — see `wait_for_question_clear`'s
 /// own fast-path for why a never-active hold must not pay any extra latency).
-pub fn question_hold_predicate<T, I>(
-    tail: T,
-    total: I,
-    paste_baseline_total: Option<u64>,
-) -> impl Fn() -> bool
+pub fn question_hold_predicate<T>(tail: T, pasted_text: Option<String>) -> impl Fn() -> bool
 where
     T: Fn() -> Option<Vec<u8>>,
-    I: Fn() -> u64,
 {
     let ever_shown = std::cell::Cell::new(false);
     let consecutive_clear = std::cell::Cell::new(0u32);
     move || {
-        let grew = paste_baseline_total.is_none_or(|baseline| total() > baseline);
-        let shown = grew && tail().is_some_and(|out| prompt_wait_detected(&strip_ansi(&out)));
+        let shown = tail().is_some_and(|out| {
+            let stripped = strip_ansi(&out);
+            let masked = match &pasted_text {
+                Some(p) => mask_own_paste(&stripped, p),
+                None => stripped,
+            };
+            prompt_wait_detected(&masked)
+        });
         if shown {
             ever_shown.set(true);
             consecutive_clear.set(0);
@@ -5976,26 +5995,25 @@ where
 /// generic block-until-clear-or-capped loop exactly like `wait_for_box_clear`
 /// does, just with `question_hold_predicate` (bound to this pane, via
 /// `output_tail_bounded` — rev-15 N4) as the "still occupied" predicate.
-/// `paste_baseline_total` is threaded straight through — see
-/// `question_hold_predicate`'s doc for what `None` vs `Some` means at each
-/// call site. Owns the delivery-held badge around the wait (the SAME shape
-/// every other hold in this function uses: pre-check with zero elapsed hold,
-/// so the badge only fires for a hold that actually happens) so every caller
-/// — the pre-paste checkpoint, the pre-Enter checkpoint, and each spaced
-/// retry (rev-15 B2) — gets identical badge/hold behavior from one place
-/// instead of re-deriving it. A closed pty or unreadable tail reads as "no
-/// question" so a dead/gone pane never blocks the thread.
+/// `pasted_text` is threaded straight through — see `question_hold_predicate`'s
+/// doc for what `None` vs `Some` means at each call site. Owns the
+/// delivery-held badge around the wait (the SAME shape every other hold in
+/// this function uses: pre-check with zero elapsed hold, so the badge only
+/// fires for a hold that actually happens) so every caller — the pre-paste
+/// checkpoint, the pre-Enter checkpoint, and each spaced retry (rev-15 B2) —
+/// gets identical badge/hold behavior from one place instead of re-deriving
+/// it. A closed pty or unreadable tail reads as "no question" so a dead/gone
+/// pane never blocks the thread.
 fn wait_for_question_clear(
     ptys: &crate::pty::PtyManager,
     pty_id: u32,
-    paste_baseline_total: Option<u64>,
+    pasted_text: Option<&str>,
     emit_held: &impl Fn(HeldReason),
     emit_held_cleared: &impl Fn(),
 ) -> PasteDecision {
     let predicate = question_hold_predicate(
         || ptys.output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES),
-        || ptys.output_total(pty_id).unwrap_or(0),
-        paste_baseline_total,
+        pasted_text.map(str::to_string),
     );
     let will_hold = predicate();
     if will_hold {
@@ -6016,15 +6034,10 @@ fn wait_for_question_clear(
 /// is exactly a one-shot read: its two-consecutive-clear release requirement
 /// only engages once a hold has actually observed a question at least once
 /// (`ever_shown`), so a lone call just answers "is it shown right now".
-fn question_active_now(
-    ptys: &crate::pty::PtyManager,
-    pty_id: u32,
-    paste_baseline_total: Option<u64>,
-) -> bool {
+fn question_active_now(ptys: &crate::pty::PtyManager, pty_id: u32, pasted_text: Option<&str>) -> bool {
     question_hold_predicate(
         || ptys.output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES),
-        || ptys.output_total(pty_id).unwrap_or(0),
-        paste_baseline_total,
+        pasted_text.map(str::to_string),
     )()
 }
 
@@ -14885,6 +14898,13 @@ impl OrchRegistry {
         // as opposed to a human or another agent's message reaching this
         // same pane through the same delivery pipeline.
         let delivery_from = from.to_string();
+        // #420 rev-19 B-A: an owned copy of the exact text this delivery is
+        // about to paste, so the pre-Enter/retry question checkpoints can
+        // mask it out of the pane's tail before running the detector
+        // (`mask_own_paste`) — content-based self-echo exclusion, not a
+        // byte-count baseline (see `question_hold_predicate`'s doc for why
+        // that approach was replaced).
+        let pasted_text = text.to_string();
         let last_delivery = self.last_delivery.clone();
         // Captured for the unconfirmed-delivery notice (#103): whether this
         // target is the orchestrator (a notice to it would loop, so it's
@@ -15067,10 +15087,6 @@ impl OrchRegistry {
             // flushed the paste with its startup stdin buffer — retype.
             let mut echoed = false;
             let mut attempts = 0u32;
-            // #420 rev-19 R2: the byte count right before the LAST (the one
-            // that stuck) paste write — the reference point the post-settle
-            // baseline below measures our own paste's expected echo against.
-            let mut paste_write_before = 0u64;
             while attempts < ECHO_ATTEMPTS {
                 attempts += 1;
                 let Some(before) = ptys.output_total(pty_id) else {
@@ -15078,7 +15094,6 @@ impl OrchRegistry {
                         json!({ "to": agent, "reason": "terminal closed before delivery" }));
                     return;
                 };
-                paste_write_before = before;
                 if ptys.write_bytes(pty_id, &paste).is_err() {
                     append_audit(&root, &group, "loomux", "prompt-failed",
                         json!({ "to": agent, "reason": "terminal closed before delivery" }));
@@ -15137,45 +15152,17 @@ impl OrchRegistry {
                     }
                 }
             }
-            // #420 rev-19 R2: the byte count once our OWN paste has genuinely
-            // finished echoing — not "500ms after the first 8 bytes echoed"
-            // (rev-15's cut), which under-baked large prompts: capturing the
-            // baseline that early meant a big paste's own tail-end echo,
-            // still arriving AFTER the snapshot, read as "new" output and
-            // self-held the delivery (N1's exact hazard, reintroduced by an
-            // inaccurate baseline). The quiet-wait loop above already waited
-            // for output to plateau; additionally require growth since our
-            // own write to have reached at least the pasted byte count (we
-            // know exactly what we sent) — extending the wait, bounded, if it
-            // hasn't. Fail-soft: some CLIs redraw with fewer bytes than raw
-            // input (compacted whitespace, wrapped differently), so this
-            // never blocks forever — it just stops trusting a plateau that
-            // arrived suspiciously early.
-            let expected_paste_floor = paste_write_before + paste.len() as u64;
-            let settle_deadline = std::time::Instant::now() + PASTE_SETTLE_EXTRA_WAIT;
-            while last_total < expected_paste_floor && std::time::Instant::now() < settle_deadline {
-                std::thread::sleep(Duration::from_millis(150));
-                match ptys.output_total(pty_id) {
-                    Some(t) => last_total = t,
-                    None => {
-                        append_audit(&root, &group, "loomux", "prompt-failed",
-                            json!({ "to": agent, "reason": "terminal closed before submit" }));
-                        return;
-                    }
-                }
-            }
-            // The growth baseline the pre-enter/retry question checkpoints
-            // use to tell a live dialog from the echo of the text we
-            // ourselves just delivered (rev-15 N1, see `question_hold_predicate`).
-            // A dialog that renders and fully settles WHILE our own paste is
-            // still within this same settle window is still baked into this
-            // baseline (an inherent limit of any delta-based gate) — but the
-            // window that can happen in has shrunk from "500ms after the
-            // first 8 echoed bytes" to "until our own known paste length has
-            // genuinely plateaued" (rev-19 R2), and any dialog that appears
-            // or persists AFTER this point is unambiguously new growth the
-            // checkpoints below will hold on.
-            let paste_settled_total = last_total;
+            // #420 rev-19 B-A: the pre-Enter/retry question checkpoints below
+            // no longer need a growth BASELINE at all — they mask our own
+            // pasted text out of the tail by CONTENT (`mask_own_paste`), not
+            // by comparing byte counts against a snapshot. A snapshot-based
+            // gate (rev-15/rev-19-round-3's approach) was proven broken
+            // twice: it can only mark ONE point in time as "before", so a
+            // dialog that renders while the paste is still settling gets
+            // baked into whichever number the checkpoint happened to
+            // snapshot, and reads as invisible forever after. Content
+            // doesn't have that blind spot — masking works regardless of
+            // WHEN the dialog appeared relative to our own paste settling.
             // Re-check right before the first Enter: the human may have
             // started typing during the quiet-wait above, and a blind Enter
             // would submit their line. Hold again until they're quiet (#43).
@@ -15199,13 +15186,14 @@ impl OrchRegistry {
             // have taken long enough for a question to appear since the
             // pre-paste check, and the Enter below would select whichever option
             // is now highlighted rather than merely submitting text. Guarded
-            // against self-echo (rev-15 N1) via `paste_settled_total` — this
-            // checkpoint's tail necessarily contains our OWN just-pasted, not-
-            // yet-submitted text, so a bare `prompt_wait_detected` match here
-            // would otherwise be indistinguishable from a genuine live dialog;
-            // only NEW output since the paste settled counts.
+            // against self-echo (rev-15 N1 / rev-19 B-A) via `mask_own_paste` —
+            // this checkpoint's tail necessarily contains our OWN just-pasted,
+            // not-yet-submitted text, so a bare `prompt_wait_detected` match
+            // here would otherwise be indistinguishable from a genuine live
+            // dialog; masking out our own known lines leaves only what the CLI
+            // itself painted, whenever it painted it.
             let question_decision_preenter = wait_for_question_clear(
-                &ptys, pty_id, Some(paste_settled_total), &emit_held, &emit_held_cleared,
+                &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
             );
             match question_decision_preenter {
                 PasteDecision::Paste { held_ms } if held_ms > 0 => {
@@ -15308,12 +15296,12 @@ impl OrchRegistry {
                     // retry: re-check and wait for it to clear (capped, same as
                     // every other checkpoint) before pressing this retry's
                     // Enter; if it never clears, stop retrying rather than risk
-                    // a later retry blind-selecting an option. `submit_baseline`
-                    // (captured right before the FIRST Enter) is the self-echo
-                    // growth baseline (rev-15 N1) for every retry — they're all
-                    // still trying to land the SAME already-pasted text, so
-                    // nothing before that point can be new. The human-typing
-                    // check stays cheap and short-circuits BEFORE touching the
+                    // a later retry blind-selecting an option. `pasted_text`
+                    // (rev-19 B-A) is the self-echo content mask for every
+                    // retry — they're all still trying to land the SAME
+                    // already-pasted text, so masking it out leaves only
+                    // whatever the CLI itself painted. The human-typing check
+                    // stays cheap and short-circuits BEFORE touching the
                     // (potentially minutes-long) question hold, exactly as it
                     // did before this PR — a human mid-line means skip now, not
                     // spend up to `QUESTION_HOLD_MAX` finding that out; `retry_
@@ -15325,7 +15313,7 @@ impl OrchRegistry {
                         break;
                     }
                     let question_decision = wait_for_question_clear(
-                        &ptys, pty_id, Some(submit_baseline), &emit_held, &emit_held_cleared,
+                        &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
                     );
                     match retry_gate(question_decision) {
                         RetryGate::SkipQuestionPending { held_ms } => {

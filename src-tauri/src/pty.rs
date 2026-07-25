@@ -262,6 +262,24 @@ impl PtyManager {
     /// production `spawn_pty` requires — and without a real agent CLI
     /// (CLAUDE.md constraint 3: the trivial child is a bare shell that does
     /// nothing, never an agent). Returns the shared write-capture buffer.
+    ///
+    /// rev-19 B-B: the child MUST NOT be able to outlive this handle. Two
+    /// independent layers, matching production `spawn_pty` exactly rather
+    /// than inventing a test-only shortcut: (1) the spawned command exits
+    /// immediately on its own (`cmd /c exit 0` / `sh -c true`, not a
+    /// wait-for-input command like the original `pause>nul`, which blocked
+    /// forever and was the actual leak — nothing in this harness needs the
+    /// child to stay alive, since `write_bytes`/`output_tail`/`output_total`
+    /// never touch it, only `master`/`killer`, which just need to be REAL
+    /// objects to satisfy `PtyHandle`'s fields); (2) on Windows, the SAME
+    /// kill-on-close Job Object (#78, `assign_kill_on_close_job`) production
+    /// spawns use is assigned here too — `_job: None` (the original cut)
+    /// opted every fake OUT of that safety net, so a test panic mid-run (no
+    /// `Drop` reached, or the process itself killed) could still orphan the
+    /// child. With the job assigned, closing the LAST handle to it (this
+    /// `PtyHandle` being dropped, however that happens) kills the subtree at
+    /// the kernel level — structural, not dependent on any test's own
+    /// cleanup code running.
     #[doc(hidden)] // pub for integration tests
     pub fn register_fake_for_test(&self, id: u32, initial_output: &[u8]) -> Arc<Mutex<Vec<u8>>> {
         let pty_system = native_pty_system();
@@ -270,17 +288,23 @@ impl PtyManager {
             .expect("openpty");
         let mut cmd = if cfg!(windows) {
             let mut c = CommandBuilder::new("cmd.exe");
-            c.args(["/c", "pause>nul"]);
+            c.args(["/c", "exit", "0"]);
             c
         } else {
             let mut c = CommandBuilder::new("sh");
-            c.args(["-c", "sleep 300"]);
+            c.args(["-c", "true"]);
             c
         };
         cmd.cwd(std::env::temp_dir());
         let child = pair.slave.spawn_command(cmd).expect("spawn trivial child for fake pty");
         drop(pair.slave);
         let killer = child.clone_killer();
+
+        #[cfg(target_os = "windows")]
+        let job = match child.process_id() {
+            Some(pid) => assign_kill_on_close_job(pid),
+            None => None,
+        };
 
         struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
         impl Write for CaptureWriter {
@@ -306,7 +330,7 @@ impl PtyManager {
                 output,
                 user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 #[cfg(target_os = "windows")]
-                _job: None,
+                _job: job,
                 input_box_len: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 shell_kind: ShellKind::PowerShell,
             },

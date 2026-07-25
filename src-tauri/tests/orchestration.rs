@@ -29,7 +29,7 @@ use loomux_lib::orchestration::{
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     paste_held_notice, question_held_notice, held_delivery_notice,
-    prompt_wait_detected, question_hold_predicate, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
+    prompt_wait_detected, question_hold_predicate, mask_own_paste, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     record_aborted_preenter_outcome, recorded_confirmed,
@@ -8756,9 +8756,15 @@ const FIX_COPILOT_MULTICHOICE: &str = include_str!("fixtures/attention/copilot-m
 // #420 rev-19 N11: a REAL captured interactive-question menu — Claude Code's
 // MCP-server approval dialog, verbatim from a live session's own audit log
 // (respacing only, see the note above; wording, numbering, and footer are
-// exactly as captured). Grounds `has_numbered_menu` (and, incidentally,
-// `has_menu_footer`, since this real capture's footer also survived) against
-// an actual screen paint, not an imagined one.
+// exactly as captured). rev-19 n2 correction: this capture's footer survived
+// too, so it witnesses `has_numbered_menu` AND `has_menu_footer` TOGETHER,
+// not `has_numbered_menu` in isolation — it is NOT a sole-signal witness.
+// Sole-signal isolation for `has_numbered_menu` specifically is what
+// `copilot-multichoice-question.txt` (above) is built for (synthetic, with
+// the footer/pointer deliberately absent). What this fixture grounds is
+// simpler and narrower: that the COMBINED shape `has_numbered_menu`/`has_
+// menu_footer` already cover is something a real CLI genuinely paints, not
+// only something imagined to test the detector's branches.
 const FIX_CLAUDE_MCP_APPROVAL: &str = include_str!("fixtures/attention/claude-mcp-approval.txt");
 const FIX_STREAMING: &str = include_str!("fixtures/attention/streaming-output.txt");
 const FIX_IDLE_BOX: &str = include_str!("fixtures/attention/idle-input-box.txt");
@@ -8811,8 +8817,10 @@ fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
         "a numbered multi-choice Copilot question must be recognized as needing the human"
     );
     // #420 rev-19 N11: the REAL captured menu (see the fixture's own doc
-    // comment for provenance) — proves `has_numbered_menu` against an actual
-    // screen paint, not an imagined one.
+    // comment for provenance and the n2 correction — it witnesses
+    // `has_numbered_menu` combined with `has_menu_footer`, not either signal
+    // alone) — proves that combined shape against an actual screen paint,
+    // not an imagined one.
     assert!(
         prompt_wait_detected(&strip_ansi(FIX_CLAUDE_MCP_APPROVAL.as_bytes())),
         "a real captured multi-choice menu must be recognized as needing the human"
@@ -8835,48 +8843,46 @@ fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
 // replies (#179) structurally CANNOT release a hold anymore — there is no
 // input left in the type to fool it with. Release requires the SAME detector
 // that raised the hold to read false on two CONSECUTIVE polls.
+//
+// rev-19 B-A: self-echo exclusion is now CONTENT-based (`mask_own_paste`),
+// not byte-COUNT-based — the predicate takes `pasted_text: Option<String>`
+// instead of a growth baseline. A byte-count baseline can only mark ONE point
+// in time as "before"; a dialog that renders WHILE the paste is still
+// settling gets baked into whichever number a checkpoint happened to
+// snapshot and reads as invisible forever. Masking doesn't have that blind
+// spot: `deliver_prompt` knows exactly what it pasted, so removing those
+// exact lines from the tail leaves whatever the CLI itself painted, no
+// matter when it painted it relative to our own paste's timing.
 
 #[test]
 fn question_hold_predicate_ignores_self_echo_of_our_own_just_pasted_text() {
     // rev-15 N1: the pre-Enter/retry checkpoints read the tail AFTER loomux's
     // own paste — so a delivered prompt that happens to contain phrasing
     // `prompt_wait_detected` matches ("(y/n)", "do you want to run") sits,
-    // echoed and unsubmitted, in that exact tail. Without the growth gate
-    // this would hold the delivery on ITSELF, deterministically, forever: no
-    // NEW output has painted since our own paste settled (`total() ==
-    // baseline`), so this must NOT read as a live question.
-    let pred = question_hold_predicate(
-        || Some(b"Do you want to run npm test? (y/n)".to_vec()),
-        || 100, // no growth past the baseline captured when our paste settled
-        Some(100),
-    );
-    assert!(!pred(), "no growth since our own paste settled must read as self-echo, not a live question");
+    // echoed and unsubmitted, in that exact tail. Masked out (every line of
+    // the tail IS a pasted line here), this must NOT read as a live question.
+    let text = "Do you want to run npm test? (y/n)";
+    let pred = question_hold_predicate(move || Some(text.as_bytes().to_vec()), Some(text.to_string()));
+    assert!(!pred(), "our own pasted text, masked out, must read as self-echo, not a live question");
 }
 
 #[test]
-fn question_hold_predicate_holds_for_a_real_dialog_painted_after_the_paste() {
-    // Same matching tail as above, but NEW output has arrived since the
-    // baseline — the CLI painted something after our paste settled, so this
-    // is a genuine live dialog and must hold.
-    let pred = question_hold_predicate(
-        || Some(b"Do you want to run npm test? (y/n)".to_vec()),
-        || 500, // grew past the baseline
-        Some(100),
-    );
-    assert!(pred(), "new output since the paste settled, matching a question, must hold");
+fn question_hold_predicate_holds_for_a_real_dialog_appended_after_our_own_paste() {
+    // The tail contains BOTH our own pasted text AND a genuinely separate
+    // dialog painted after it — masking removes only our own lines, leaving
+    // the dialog fully visible to the detector.
+    let pasted = "please rerun the deploy script and let me know how it goes";
+    let tail = format!("{pasted}\n\nDo you want to run npm test? (y/n)");
+    let pred = question_hold_predicate(move || Some(tail.as_bytes().to_vec()), Some(pasted.to_string()));
+    assert!(pred(), "a dialog appended after our own (masked-out) paste must still hold");
 }
 
 #[test]
 fn question_hold_predicate_pre_paste_checkpoint_has_no_self_echo_risk() {
     // The pre-paste checkpoint runs before this delivery has written
-    // anything — `paste_baseline_total: None` — so a live question already
-    // on screen must hold regardless of the (irrelevant) output-total
-    // reading; there is nothing of OURS on screen yet to be confused with.
-    let pred = question_hold_predicate(
-        || Some(b"Do you want to run npm test? (y/n)".to_vec()),
-        || 42, // arbitrary — no baseline to compare against
-        None,
-    );
+    // anything — `pasted_text: None` — so a live question already on screen
+    // must hold; there is nothing of OURS on screen yet to mask.
+    let pred = question_hold_predicate(|| Some(b"Do you want to run npm test? (y/n)".to_vec()), None);
     assert!(pred(), "pre-paste checkpoint: no self-echo possible, a live question must hold");
 }
 
@@ -8884,11 +8890,11 @@ fn question_hold_predicate_pre_paste_checkpoint_has_no_self_echo_risk() {
 fn question_hold_predicate_is_false_for_ordinary_output_and_a_closed_pty() {
     let ordinary = question_hold_predicate(
         || Some(b"Running cargo test...\ntest result: ok. 42 passed".to_vec()),
-        || 500, None,
+        None,
     );
     assert!(!ordinary(), "ordinary streaming output must not read as a question");
 
-    let closed = question_hold_predicate(|| None, || 500, None);
+    let closed = question_hold_predicate(|| None, None);
     assert!(!closed(), "a closed/gone pane must never block delivery");
 }
 
@@ -8899,7 +8905,7 @@ fn question_hold_predicate_ignores_activity_the_menu_is_still_open() {
     // terminal-query reply to fool the release with. As long as the SAME
     // matching tail is observed, the predicate must hold no matter how many
     // times it's polled.
-    let pred = question_hold_predicate(|| Some(FIX_COPILOT_ASK.as_bytes().to_vec()), || 500, None);
+    let pred = question_hold_predicate(|| Some(FIX_COPILOT_ASK.as_bytes().to_vec()), None);
     for i in 0..5 {
         assert!(pred(), "poll {i}: menu still on screen — must never release regardless of poll count");
     }
@@ -8916,7 +8922,6 @@ fn question_hold_predicate_requires_two_consecutive_clear_reads_to_release() {
             let n = call.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n == 0 { Some(FIX_COPILOT_ASK.as_bytes().to_vec()) } else { Some(b"idle input box".to_vec()) }
         },
-        || 500,
         None,
     );
     assert!(pred(), "poll 1: question shown -> hold");
@@ -8932,7 +8937,7 @@ fn question_hold_predicate_releases_on_first_poll_when_never_shown_a_question() 
     // hold has actually observed a question at least once; it must never
     // penalize the overwhelmingly common "nothing to hold for" case with an
     // artificial delay.
-    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), || 500, None);
+    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), None);
     assert!(!pred(), "never shown a question — the very first call must release immediately");
 }
 
@@ -8941,7 +8946,7 @@ fn question_hold_predicate_wired_into_the_generic_hold_loop_releases_immediately
     // rev-19 N10, through the REAL hold_for_human_input loop (not just the
     // predicate in isolation): held_ms must be 0 — no cap ride — when the
     // question was already gone at hold start.
-    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), || 500, None);
+    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), None);
     let out = hold_for_human_input(&pred, Duration::from_secs(5), HB_POLL);
     assert_eq!(out, PasteDecision::Paste { held_ms: 0 }, "already-clear must release on the very first check, no cap ride");
 }
@@ -8961,7 +8966,6 @@ fn question_hold_predicate_wired_into_the_generic_hold_loop_releases_once_the_me
             let n = polls.fetch_add(1, Ordering::Relaxed);
             if n < 3 { Some(FIX_COPILOT_ASK.as_bytes().to_vec()) } else { Some(b"idle input box".to_vec()) }
         },
-        || 500,
         None,
     );
     let out = hold_for_human_input(&pred, Duration::from_secs(5), HB_POLL);
@@ -8971,6 +8975,62 @@ fn question_hold_predicate_wired_into_the_generic_hold_loop_releases_once_the_me
         }
         other => panic!("expected Paste once the menu clears, got {other:?}"),
     }
+}
+
+// ---------- #420 rev-19 B-A: mask_own_paste + the exact real-PtyManager scratch shape rev-19 used ----------
+
+#[test]
+fn mask_own_paste_removes_exactly_our_own_lines() {
+    let pasted = "please rerun the deploy script and let me know how it goes\nit failed last time (y/n) was never even asked";
+    let tail = format!("{pasted}\n\nDo you want to run npm test? (y/n)");
+    let masked = mask_own_paste(&tail, pasted);
+    assert!(!masked.contains("rerun the deploy script"), "our own pasted lines must be removed: {masked}");
+    assert!(masked.to_lowercase().contains("do you want to run npm test"), "the dialog's own line must survive: {masked}");
+}
+
+#[test]
+fn mask_own_paste_leaves_nothing_when_the_tail_is_only_our_own_paste() {
+    let pasted = "Do you want to run npm test? (y/n) — that's literally what my report says";
+    let masked = mask_own_paste(pasted, pasted);
+    assert!(!prompt_wait_detected(&masked), "a paste that IS only our own text must mask away to nothing question-shaped: {masked:?}");
+}
+
+#[test]
+fn question_hold_predicate_on_a_real_ptymanager_holds_for_a_dialog_seeded_alongside_a_large_paste_but_not_for_the_pastes_own_matching_text() {
+    // rev-19 B-A's own reproduction shape, pinned here against a REAL
+    // PtyManager (not scripted closures) so the whole path — output_tail_
+    // bounded, strip_ansi, mask_own_paste, prompt_wait_detected — is
+    // exercised together, the same way rev-19's scratch test demonstrated
+    // the round-3 regression.
+    let large_paste = "Please review the attached report and let me know if the retry logic \
+        looks right. The deploy failed twice yesterday and once the day before, and I want to \
+        make sure we're not silently retrying into a broken state. Let me know your thoughts \
+        whenever you get a chance — no rush, but I'd like this DONE before the next release."
+        .to_string();
+
+    // Case 1: a genuine dialog seeded ALONGSIDE the large paste (the
+    // canonical #420 timeline — Copilot painted a dialog while/after loomux
+    // pasted) — must hold.
+    let pm = PtyManager::default();
+    let seeded_dialog_tail = format!("{large_paste}\n\nDo you want to run npm test? (y/n)");
+    pm.register_fake_for_test(10, seeded_dialog_tail.as_bytes());
+    let pred1 = question_hold_predicate(
+        || pm.output_tail_bounded(10, 4096),
+        Some(large_paste.clone()),
+    );
+    assert!(pred1(), "a dialog seeded alongside a large paste must still be detected as active");
+
+    // Case 2: the large paste ALONE, on screen with nothing else — even
+    // though its OWN prose carries a matching phrase ("(y/n)"), proving
+    // masking, not luck.
+    let self_matching_paste = format!("{large_paste}\nDo you want to run npm test? (y/n)");
+    let pm2 = PtyManager::default();
+    pm2.register_fake_for_test(11, self_matching_paste.as_bytes());
+    let pred2 = question_hold_predicate(
+        || pm2.output_tail_bounded(11, 4096),
+        Some(self_matching_paste.clone()),
+    );
+    assert!(!pred2(), "a large paste whose OWN text matches the detector must mask away to not-held");
 }
 
 // ---------- #420 rev-15 B1 / rev-19 N9: flush + retry gating ----------
@@ -9078,14 +9138,21 @@ fn flush_stranded_text_enters_when_no_question_is_showing() {
 
 #[test]
 fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire() {
-    // rev-19 R3(b): chains the REAL recorder, the REAL reader pattern
-    // `deliver_prompt` uses (`prev.as_ref().map(|o| o.confirmed)`, mirrored
-    // here as `recorded_confirmed`), and the REAL flush function — not a
-    // literal `false` a test fabricates itself. Deleting the call
-    // `deliver_prompt` makes to `record_aborted_preenter_outcome` is exactly
-    // the rev-19 mutation this must catch: nothing would be recorded, and
-    // this test's `flush_stranded_text` call would find `recorded_confirmed`
-    // still `None` and correctly refuse to fire — reding the assertion below.
+    // rev-19 R3(b): chains the REAL recorder (`record_aborted_preenter_
+    // outcome`), the REAL reader pattern `deliver_prompt` uses
+    // (`prev.as_ref().map(|o| o.confirmed)`, mirrored here as `recorded_
+    // confirmed`), and the REAL flush function — not a literal `false` a
+    // test fabricates itself (rev-19's "tautology" finding against the
+    // previous round's version of this test). What this DOES pin: that
+    // `record_aborted_preenter_outcome`'s own insert is correctly read back
+    // by `recorded_confirmed` and correctly drives `flush_stranded_text` to
+    // fire — i.e. the recorder's behavior and the downstream consequence,
+    // exercised through the real extraction rather than a hand-picked bool.
+    // rev-19 n1 correction: what this does NOT pin is that `deliver_prompt`
+    // itself calls `record_aborted_preenter_outcome` at its one call site —
+    // deleting THAT line reds no test (confirmed by trying it and
+    // reverting); that gap is the disposition table's own honest residual,
+    // not something this test closes.
     let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
     let pty_id = 3;
 
