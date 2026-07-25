@@ -22,54 +22,31 @@ test("dragging a pane onto another's center swaps their on-screen order", async 
   expect(boxB1, "Pane B should have a bounding box").not.toBeNull();
   const aWasLeftOfB = boxA1!.x < boxB1!.x;
 
-  // Instrumentation for the CI-only failure this spec has hit twice now (a
-  // hand-rolled mouse sequence, then Playwright's own `dragTo` — both
-  // complete with zero API-level errors, at correct coordinates per the
-  // failure screenshots, but the swap never happens). Records every
-  // pointerdown/move/up the window actually receives during the drag so a
-  // third failure is diagnosable from the CI log directly instead of another
-  // guess-and-push round.
-  await page.evaluate(() => {
-    const events: unknown[] = [];
-    (window as unknown as { __e2eDrag: unknown[] }).__e2eDrag = events;
-    for (const type of ["pointerdown", "pointermove", "pointerup"]) {
-      window.addEventListener(
-        type,
-        (e) => {
-          const pe = e as PointerEvent;
-          const target = pe.target as HTMLElement | null;
-          events.push({
-            type,
-            x: pe.clientX,
-            y: pe.clientY,
-            targetClass: target?.className ?? null,
-          });
-        },
-        true
-      );
-    }
-  });
+  // Root-caused via a CI-only failure (see git history on this file for the
+  // investigation): dragging from `.pane-header`'s overall center is NOT safe
+  // — the header packs ~9 icon buttons (editor/issues/git/file-edit/split
+  // ×2/minimize/maximize/close) against a short title, so the header's true
+  // midpoint can land on a button rather than empty space depending on
+  // exactly how wide the rendered buttons/title are. Locally that midpoint
+  // happened to fall clear; on the CI runner it landed on a button's SVG
+  // icon (confirmed by instrumenting pointer events: the pointerdown target
+  // was inside a `<button>`) — and `Grid.onPointerDown` (src/grid.ts)
+  // explicitly refuses to start a drag when the target is inside
+  // `button, input, .pane-meta-item`, by design (so clicking a header button
+  // never accidentally starts a reorder). `.pane-title` is always
+  // left-anchored ahead of every button, so it's a stable, button-free grab
+  // point regardless of header width.
+  await paneB.locator(".pane-title").dragTo(paneA);
 
-  await paneB.locator(".pane-header").dragTo(paneA);
-
-  try {
-    await expect
-      .poll(
-        async () => {
-          const a = await paneA.boundingBox();
-          const b = await paneB.boundingBox();
-          if (!a || !b) return null;
-          return a.x < b.x;
-        },
-        { timeout: 15_000 }
-      )
-      .toBe(!aWasLeftOfB);
-  } catch (err) {
-    const events = await page.evaluate(
-      () => (window as unknown as { __e2eDrag: unknown[] }).__e2eDrag
-    );
-    // eslint-disable-next-line no-console
-    console.log("DRAG_DIAGNOSTIC", JSON.stringify(events));
-    throw err;
-  }
+  await expect
+    .poll(
+      async () => {
+        const a = await paneA.boundingBox();
+        const b = await paneB.boundingBox();
+        if (!a || !b) return null;
+        return a.x < b.x;
+      },
+      { timeout: 15_000 }
+    )
+    .toBe(!aWasLeftOfB);
 });
