@@ -13839,11 +13839,21 @@ impl OrchRegistry {
     /// the immediately preceding render — which a human-authored file,
     /// never written by this mechanism, structurally never can.
     ///
-    /// Accepted trade-off: a generated file that went stale BEFORE this
-    /// manifest existed (no prior render recorded it) lingers forever,
-    /// never being swept — acceptable because #423's sweep has not shipped
-    /// to any real group yet, so there is no pre-manifest stale file this
-    /// could ever need to reach.
+    /// Accepted trade-off, stated honestly (rev-10 review, N2a — the first
+    /// wording claimed there was no pre-manifest stale file to worry about,
+    /// which reversed the actual reason this is safe): a group upgrading
+    /// INTO this manifest mechanism has real, already-stale files sitting
+    /// on disk RIGHT NOW, precisely because nothing recorded ownership
+    /// before now — that is #423's whole starting incident. Its first
+    /// render under this code sees an empty manifest (nothing recorded
+    /// yet), so those pre-existing leftovers are never swept: they
+    /// grandfather in and linger permanently. #423's sweep only ever
+    /// applies going forward, to a file that goes stale AFTER a render has
+    /// recorded it as `current` at least once. Accepted deliberately —
+    /// matching "known" files to "current" and refusing anything else is
+    /// what makes the sweep safe against a human's own file with the same
+    /// name; the cost is a one-time gap for whatever a repo already had
+    /// lying around before this shipped.
     fn generated_instructions_manifest_path(&self, g: &GroupInfo) -> PathBuf {
         self.group_dir(&g.id).join(".instruction-files-manifest")
     }
@@ -13858,7 +13868,13 @@ impl OrchRegistry {
         let mut names: Vec<&String> = current.iter().collect();
         names.sort();
         let body = names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join("\n");
-        let _ = fs::write(self.generated_instructions_manifest_path(g), body);
+        // rev-10 review (N2b): the #133 durable-write convention for
+        // anything in this directory — a torn write here only degrades to
+        // "the sweep skips a name it should've caught this render" (fail-
+        // safe already), but the atomic temp+rename+fsync path is the
+        // established convention, not a special case worth a plain
+        // `fs::write`.
+        let _ = atomic_write(&self.generated_instructions_manifest_path(g), body.as_bytes());
     }
 
     /// #423: reclaim per-block instruction files a PREVIOUS roster (built-in
