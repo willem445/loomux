@@ -2277,6 +2277,22 @@ whole-window substring check specifically, distinct from the pointer/footer sign
 three positive fixtures already pin (rev-15 N3: an earlier version of this fixture matched via the
 SAME two signals `copilot-question.txt` already covered and so proved nothing new).
 
+**Fixture provenance — real where reality is reachable (rev-19 N11).** Every Copilot-flavored
+fixture in this set is a plausible, hand-built approximation of Copilot's TUI style, not a verified
+live capture: an exhaustive search of this repo's history and every loomux group's audit-log archive
+on the machine this fix was built on turned up no real captured Copilot multi-choice menu anywhere,
+and CLAUDE.md constraint 3 forbids spawning a real Copilot CLI to obtain one in-session. Rather than
+leave `has_numbered_menu` proven only against an imagined paint, `claude-mcp-approval.txt` grounds it
+against a REAL one: a verbatim capture of Claude Code's MCP-server-approval dialog from a live
+session's own audit log (respaced only — the `get_output` MCP tool's logged `text` field collapses
+whitespace runs, an artifact of that logging path, not of the terminal itself; wording, numbering,
+and footer are exactly as captured). It's Claude Code's, not Copilot's — but `prompt_wait_detected`
+and `has_numbered_menu` are CLI-agnostic by construction (the whole guard is, per N5), so a
+verified-real multi-choice menu grounds the signal against reality regardless of which CLI painted
+it. `copilot-multichoice-question.txt` stays for the DIFFERENT thing it isolates (the signal alone,
+footer-less, scrolled out of the prose-guard's last-3-line window) but is not itself the
+"proven against reality" fixture — `claude-mcp-approval.txt` is.
+
 **What this detector does NOT catch (rev-15 N3).** `prompt_wait_detected` is structural-marker-only
 by design (see above) — a **free-text ask** ("What should I name the new module?") carries none of
 those markers, so a delivery lands on top of it and the pasted text is submitted *as the answer to
@@ -2298,61 +2314,125 @@ DELAYS`, +2.5s/+7s after the first Enter) fired unconditionally, in exactly the 
 often paints its permission dialog after processing a submitted prompt (B2). Both are now gated
 through the SAME mechanism as pre-paste/pre-Enter, not a bespoke check each:
 
-- `question_hold_predicate(tail, total, paste_baseline_total, last_input_ms, input_pending,
-  held_since_ms) -> impl Fn() -> bool` is the core decision, generic over every external read (no
-  `PtyManager` bound into it) — the fix for B4's finding that the OLD `wait_for_question_clear`
-  bound a concrete `&PtyManager`, so a test that fully disabled the guard's predicate still passed
-  the entire suite (495/495) unchanged: nothing exercised the *wiring*, only presentation/notice
-  text. This generic form is driven directly by tests with scripted closures — no PTY, no app
-  handle — closing that gap; disabling any one of its three signals (below) now fails a dedicated
-  test.
+- `question_hold_predicate(tail, total, paste_baseline_total) -> impl Fn() -> bool` is the core
+  decision, generic over every external read (no `PtyManager` bound into it) — the fix for B4's
+  finding that the OLD `wait_for_question_clear` bound a concrete `&PtyManager`, so a test that
+  fully disabled the guard's predicate still passed the entire suite (495/495) unchanged: nothing
+  exercised the *wiring*, only presentation/notice text. This generic form is driven directly by
+  tests with scripted closures — no PTY, no app handle — closing that gap; disabling either
+  remaining signal (growth-gate, detector) now fails a dedicated test, confirmed by neutralizing
+  each locally and re-running (rev-19's own mutation method, turned on the fix itself).
 - `wait_for_question_clear(ptys, pty_id, paste_baseline_total, emit_held, emit_held_cleared)` binds
   it to a live pane and reuses `hold_for_human_input`'s generic block-until-clear-or-capped loop
   verbatim (same cap `QUESTION_HOLD_MAX` = 120s, longer than the box guard's 60s: reading and
   deciding a substantive question takes more of a human's attention than submitting an
   already-typed line) — called at the pre-paste checkpoint, the pre-Enter checkpoint, AND now each
-  spaced retry (via `retry_gate`, below), so all four Enter-adjacent sites share one hold
-  implementation instead of four independently-reasoned checks.
+  spaced retry (via `retry_gate`, below, and gated on `!confirmed` — see N8), so all four
+  Enter-adjacent sites share one hold implementation instead of four independently-reasoned checks.
 - `question_active_now(ptys, pty_id, paste_baseline_total)` is the one-shot (non-holding) form used
   by the stranded-text flush: a plain snapshot, not a wait, because holding there would be
   redundant — if a question is active, the flush is skipped and the pre-paste checkpoint
   immediately following it is the one that actually holds/aborts/notifies.
+- `flush_stranded_text(ptys, pty_id, prev_confirmed, human_typed_since, submit) -> bool` (rev-19
+  R3) is the flush's check-AND-write as one function — `deliver_prompt` calls it directly, so an
+  integration test driving THIS function (not a reimplementation of its logic) against a real
+  `PtyManager` proves the wiring, not just the decision. `record_aborted_preenter_outcome`/
+  `recorded_confirmed` are the analogous extraction for the pre-Enter abort's outcome-record (B3):
+  the former is what `deliver_prompt`'s abort branch now calls instead of inlining the
+  `last_delivery.insert`, the latter mirrors the exact read `deliver_prompt`'s flush step performs
+  (`prev.as_ref().map(|o| o.confirmed)`). Both are exercised against
+  `PtyManager::register_fake_for_test` (pty.rs) — a REAL ConPTY pair + a trivial spawned child (so
+  `master`/`killer` are genuine) whose output ring is manually seeded and whose writes are captured
+  into a plain buffer, letting an integration test drive the exact `PtyManager` methods
+  `deliver_prompt` calls without a real Tauri `AppHandle` (unavailable headless — `tauri::test`'s
+  `MockRuntime` isn't the concrete `Wry` runtime production `spawn_pty` requires) or a real agent
+  CLI (CLAUDE.md constraint 3 — the fake's child is a bare `cmd`/`sh` no-op, never an agent).
+  **Residual, stated plainly:** these tests prove `flush_stranded_text`/`record_aborted_preenter_
+  outcome` behave correctly, and (for the flush) that `deliver_prompt`'s call site can't be
+  half-bypassed internally — but nothing in this codebase's test infrastructure can prove
+  `deliver_prompt` itself calls `record_aborted_preenter_outcome` at its one call site (deleting
+  that single line reds no test, confirmed by trying it and reverting) — that specific link is
+  code-review evidence only, the same boundary every other piece of `deliver_prompt` already
+  accepts (see "Tests" below and the design note this section opens with).
 - `should_flush_before_paste_now(prev_confirmed, human_typed_since, question_active)` (B1) and
-  `retry_gate(human_typed_since_submit, question_decision) -> RetryGate` (B2) are named pure
-  decisions — not inline `&&`s at the call sites — so the flush-suppression and the retry
-  precedence (human-typing always checked first and short-circuits before the, potentially
-  120s-long, question hold — same order the original retry loop always used) are independently
-  testable and can't silently drift apart from each other on a future edit.
+  `retry_gate(question_decision) -> RetryGate` (B2, rev-19 N9: no longer takes a human-typing flag
+  — see below) are named pure decisions — not inline `&&`s at the call sites — so the
+  flush-suppression and the retry outcome are independently testable and can't silently drift apart
+  from each other on a future edit.
 
-**Self-echo (rev-15 N1).** The pre-Enter and retry checkpoints necessarily read the tail AFTER
-loomux's own bracketed paste — so a delivered prompt that happens to contain phrasing
+**Release is STATE-based, not ACTIVITY-based (rev-19 R1, replacing the original N2 fix).** The
+first cut released the hold on a human keystroke (submitted, not left sitting) landing after the
+hold began. Round 3's review found this wrong on both ends: not sufficient — an arrow key
+*navigating the still-open menu* (`classify_human_input` reads it as `Neutral`, no text left
+sitting, since it doesn't add or submit anything) satisfied the old condition and let the freed
+Enter fire straight into the still-open dialog — and not necessary, since xterm's own automatic
+terminal-query replies (#179's own precedent: `ESC]11;rgb:...`/DCS `XTVERSION` replies) can stamp a
+pane's keystroke-recency clock with no human present at all. **Human activity is dropped from the
+decision entirely.** `question_hold_predicate` now takes no input-related parameters whatsoever —
+the only thing that can say the question is gone is the SAME detector that said it was there:
+`prompt_wait_detected` reading false. A single false read isn't trusted alone (a redraw mid-flicker
+could transiently miss the menu) — release requires it read false on `QUESTION_RELEASE_CONSECUTIVE_
+CLEAR_POLLS` (2) consecutive polls. This only engages once a hold has genuinely observed a question
+at least once (`ever_shown`, internal `Cell` state) — a checkpoint that starts already-clear
+releases on its very first check, no artificial delay (rev-19 N10; pinned by
+`question_hold_predicate_wired_into_the_generic_hold_loop_releases_immediately_when_already_clear`,
+which asserts `held_ms == 0` through the REAL `hold_for_human_input` loop, not just the predicate in
+isolation). This is deliberately a lighter mechanism than attention routing's `waiting_ack`/
+quiet-gate machinery (built to debounce a *frontend badge* against redraw flicker across a much
+longer observation window) — this guard only needs "is the menu still painted right now", which the
+detector itself already answers without any human-input signal at all.
+
+**Self-echo (rev-15 N1, unchanged by R1).** The pre-Enter and retry checkpoints necessarily read the
+tail AFTER loomux's own bracketed paste — so a delivered prompt that happens to contain phrasing
 `prompt_wait_detected` matches (`(y/n)`, "do you want to run", "1. yes" — ordinary agent-to-agent
 traffic: *"copilot asked `Do you want to run npm test?` and I can't answer"*) would otherwise hold
 the delivery on **itself**, deterministically and unrecoverably, since re-sending the identical text
 reproduces the identical false match. `question_hold_predicate`'s `paste_baseline_total` parameter
 closes this: `None` for the pre-paste checkpoint (nothing of ours is on screen yet, so any match is
-real); `Some(byte count captured right after OUR OWN write settled)` for pre-Enter (`paste_settled_
-total`, captured before the "wait for quiet" loop mutates it) and every retry (`submit_baseline`,
-captured once before the first Enter — every retry targets the SAME already-pasted text, so nothing
-before that point can be new for any of them). A match only counts as live if the pane's output
-total has grown since that baseline — i.e. the CLI painted something NEW, not just our own paste
-sitting there. Provenance-based, matching this function's own precedent for the identical hazard
-(`delivery_from`/`compact_inference_guard_until_ms`, PR #329 round 7: *"loomux's own paste's echo
-must never satisfy loomux's own detectors"*).
+real); `Some(byte count captured once OUR OWN paste has genuinely settled)` for pre-Enter and every
+retry — see R2 immediately below for what "genuinely settled" now means. A match only counts as live
+if the pane's output total has grown since that baseline — i.e. the CLI painted something NEW, not
+just our own paste sitting there. Provenance-based, matching this function's own precedent for the
+identical hazard (`delivery_from`/`compact_inference_guard_until_ms`, PR #329 round 7: *"loomux's
+own paste's echo must never satisfy loomux's own detectors"*).
 
-**Release keys on the human's action, not on redraw (rev-15 N2).** `prompt_wait_detected` reads a
-byte ring with no notion of "answered" — an answered dialog's stale menu text can sit inside the
-last-12-line scan window until enough NEW output scrolls it out (e.g. answering with "No, tell
-Copilot what to do differently" and the agent then pausing before its next line), so a bare
-detector-cleared-or-not predicate would ride the full 120s cap on an already-resolved dialog.
-`question_hold_predicate`'s `last_input_ms`/`input_pending`/`held_since_ms` inputs add a second,
-independent release signal: a keystroke that lands in the pane AFTER this specific hold began, and
-doesn't leave a fresh line sitting unsubmitted (i.e. they actually pressed something, not just
-started typing) releases immediately, regardless of what the stale tail still says. This is
-deliberately a lighter mechanism than attention routing's `waiting_ack`/quiet-gate machinery (which
-exists to debounce a *frontend badge* against redraw flicker) — the interactive-question guard only
-needs "did the human just act here", which the box-occupied guard's own keystroke-content tracking
-already provides for free (`last_user_input_ms`/`input_pending`, #111).
+**The self-echo baseline must reflect a genuinely SETTLED paste, not an early guess (rev-19 R2).**
+The first cut captured `paste_settled_total` right after the echo-verify step confirmed only
+`ECHO_MIN_BYTES` (8) bytes had echoed, plus a flat `PASTE_SUBMIT_DELAY` (500ms) — for a large
+prompt, the baseline could be snapshotted well before the paste had actually finished rendering, so
+its OWN tail-end echo (still arriving after the snapshot) read as "new" output and self-held the
+delivery — N1's exact hazard, reintroduced by an inaccurate baseline. Fix: the baseline is now
+captured AFTER the existing "wait for the pane to go quiet before Enter" loop (which already waits
+for `SUBMIT_QUIET` — 1000ms — of no output growth), with an ADDITIONAL bounded wait
+(`PASTE_SETTLE_EXTRA_WAIT`, 3s) if growth since the paste write hasn't yet reached the pasted byte
+count (`paste.len()` — we know exactly what we sent, so this is a real floor, not a guess). This
+directly closes the "500ms after 8 bytes" gap. **Residual, stated plainly:** a dialog that renders
+and fully settles WHILE our own paste is still within this same settle window is still baked into
+the baseline — an inherent limit of any delta-based gate — but the window that can happen in has
+shrunk from a flat 500ms to "until our own known paste length has genuinely plateaued", and any
+dialog that appears or persists AFTER that point is unambiguously new growth the checkpoints hold
+on.
+
+**Retries skip entirely once the submit is confirmed (rev-19 N8).** A CONFIRMED delivery is done —
+its Enter landed, its turn started, there is nothing left to retry. Running the retry loop (and its
+question-hold machinery) regardless used to be harmless under the ORIGINAL "Enter on an empty box is
+a no-op" premise (`SUBMIT_RETRY_DELAYS`'s own comment) — the premise this PR's entire existence
+disproves. Concretely: a successful, CONFIRMED delivery to a Copilot pane that then asks an
+unrelated question (nothing to do with this delivery) would show a false "held: question pending"
+badge and hold the pane's per-pty delivery mutex for up to `QUESTION_HOLD_MAX`, blocking every OTHER
+delivery queued behind it — for a delivery that already landed. `deliver_prompt`'s retry loop is now
+wrapped in `if !confirmed { ... }`: this guard protects deliveries in flight, it is not a general
+question-watcher for a pane that's already done receiving this one.
+
+**No dead `unreachable!()` in thread code (rev-19 N9).** `RetryGate` used to carry a
+`SkipHumanTyping` variant the caller could never actually reach (the retry loop already `break`s on
+human-typing BEFORE calling `retry_gate` at all), matched with an `unreachable!()` — a latent panic
+sitting in a detached thread, waiting for some future reordering of the caller to make it reachable
+for real. `retry_gate` now takes only the question decision and has exactly two outcomes
+(`Write { held_ms }` / `SkipQuestionPending { held_ms }`, carrying the duration so the caller never
+needs to re-destructure the original `PasteDecision` either) — human-typing precedence is enforced
+entirely by the caller's own early `break`, which is structurally guaranteed correct (not "checked
+above" trusted by comment) rather than something a match arm could get wrong.
 
 **Cost (rev-15 N4).** Each checkpoint used to clone the FULL (up to 256 KB) output ring and
 `strip_ansi` all of it every 250ms poll, for up to 120s, across up to four sites per delivery.
@@ -2363,9 +2443,14 @@ the `strip_ansi` pass to a fixed, small size regardless of how much the pane has
 
 **Latency and ordering (rev-15 N7, documented not re-engineered).** The worst-case hold chain for a
 single delivery now stacks the human-quiet backstop (up to `USER_QUIET_MAX_HOLD` = 90s), the
-box-occupied guard (`HUMAN_INPUT_HOLD_MAX` = 60s), and the interactive-question guard at BOTH
-checkpoints (`QUESTION_HOLD_MAX` = 120s each) — several minutes in the pathological case where each
-condition is independently true and re-triggers at the next checkpoint. Deliveries are serialized
+box-occupied guard (`HUMAN_INPUT_HOLD_MAX` = 60s), and the interactive-question guard at the
+pre-paste and pre-Enter checkpoints (`QUESTION_HOLD_MAX` = 120s each) — several minutes in the
+pathological case where each condition is independently true and re-triggers at the next
+checkpoint. The retries add a further, BOUNDED exposure only while `!confirmed` (rev-19 N8 caps
+this to the unconfirmed case, not every delivery): each spaced retry can also hold up to
+`QUESTION_HOLD_MAX` before giving up, though in practice a still-unconfirmed delivery reaching the
+retries has already survived the pre-Enter checkpoint, so this rarely compounds rather than
+replaces that hold. Deliveries are serialized
 per pane by the existing `delivery` mutex (`std::sync::Mutex`, not FIFO on Windows — see the #43
 section's own "Ordering is best-effort" note, which this compounds rather than introduces), so N
 queued deliveries to the same pane can each stall for up to this chain and release out of send
@@ -2412,26 +2497,37 @@ on the WRONG option of some OTHER dialog that happens to be up at the same momen
 correct direction for the same reason the rest of this guard exists.
 
 **Tests.** Pure-decision coverage: `prompt_wait_detected_fires_on_interactive_question_fixtures`
-(detector, including the rev-15 N3 fixture); `question_hold_predicate_*` (rev-15 B4/N1/N2 — growth
-gate, answered-by-human release, pre-paste's no-baseline case, closed-pty/no-match cases — each reds
-if its corresponding signal is removed from the implementation, verified by neutralizing it locally
-and re-running); `should_flush_before_paste_now_is_suppressed_by_a_live_question` (B1);
-`retry_gate_holds_for_a_question_before_a_human_typing_check_would_matter` (B2);
-`a_recorded_unconfirmed_outcome_makes_the_next_deliverys_flush_fire` (B3's downstream consequence —
-that the outcome `deliver_prompt` now records on a pre-Enter abort is exactly what
-`should_flush_before_paste_now` needs to see to flush the next delivery). Wiring coverage:
-`question_hold_predicate_wired_into_the_generic_hold_loop_releases_when_answered` drives the REAL
-`hold_for_human_input` loop with the real predicate and an async "answered" signal (#40's own
-lesson: exercise the loop, not just the pure decision) — matching the box-occupied guard's own
-`output_growth_never_flips_input_pending`-style coverage of the identical generic loop.
+(detector, including the rev-15 N3 and rev-19 N11 fixtures); `question_hold_predicate_*` — growth
+gate (N1), pre-paste's no-baseline case, closed-pty/no-match cases, activity-can-never-release
+(rev-19 R1 — `question_hold_predicate_ignores_activity_the_menu_is_still_open` polls a
+still-matching tail five times with no way to feed it an input signal, since the parameter no
+longer exists), two-consecutive-clear-reads-to-release, and immediate release when never shown a
+question (rev-19 N10) — each reds if its corresponding signal is removed from the implementation,
+verified by neutralizing it locally and re-running (rev-19's own mutation method, run against the
+fix itself before every push). `should_flush_before_paste_now_is_suppressed_by_a_live_question`
+(B1); `retry_gate_holds_for_a_question_or_writes_once_clear` (B2/N9);
+`a_recorded_unconfirmed_outcome_makes_the_next_deliverys_flush_fire` (B3's downstream consequence).
+Wiring coverage: `question_hold_predicate_wired_into_the_generic_hold_loop_releases_once_the_menu_
+clears_twice` and `..._releases_immediately_when_already_clear` drive the REAL `hold_for_human_input`
+loop with the real predicate (#40's own lesson: exercise the loop, not just the pure decision) —
+matching the box-occupied guard's own `output_growth_never_flips_input_pending`-style coverage of
+the identical generic loop. `flush_stranded_text_does_not_enter_when_a_question_is_showing`/`..._
+enters_when_no_question_is_showing` and `record_aborted_preenter_outcome_makes_the_next_deliverys_
+flush_actually_fire` (rev-19 R3) drive the ACTUAL functions `deliver_prompt` calls against a real
+`PtyManager` (`register_fake_for_test`), proving the flush's wiring end to end and the abort-record's
+downstream consequence through the real recorder/reader pair, not a fabricated literal.
 `delivery_held_event_names_the_pane_and_the_reason` and
 `delivery_held_notice_audits_the_interactive_question_reason` cover the `HeldReason` variant end to
 end through the audit/badge payloads; `question_held_notice_names_the_agent_and_points_at_answering`
 and `held_delivery_notice_dispatches_text_by_reason` cover the notice text and its dispatch. What
-remains untested (and can only be, per CLAUDE.md constraint 3 and the "no real PTY in test mode"
-convention the rest of `deliver_prompt` already lives with): that `deliver_prompt`'s four sites
-actually CALL the right function with the right arguments in the right order — that is code-review
-evidence, not test evidence, same boundary every other guard in this function already accepts.
+remains untested, and stated plainly rather than silently accepted (per CLAUDE.md constraint 3 and
+the "no real PTY in test mode" convention the rest of `deliver_prompt` already lives with): that
+`deliver_prompt`'s call site for `record_aborted_preenter_outcome` (a single line) is actually
+present — deleting it reds no test, confirmed by trying it and reverting — and that the retry loop's
+`if !confirmed { ... }` wrap (N8) is correctly placed. Both are code-review evidence, the same
+boundary every other guard in this function already accepts; the flush's equivalent wiring gap is
+closed (see `flush_stranded_text` above) because its check-and-write collapse into ONE function with
+nothing left for `deliver_prompt` to get wrong beyond calling it.
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 

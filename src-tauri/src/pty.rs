@@ -247,6 +247,72 @@ impl PtyManager {
             let _ = h.killer.kill();
         }
     }
+
+    /// Test-only harness (#420 rev-19 R3): register a pty backed by a REAL
+    /// ConPTY pair + a trivial spawned child (so `master`/`killer` are
+    /// genuine, matching production shape exactly) but whose OUTPUT ring is
+    /// manually seeded and whose writes are captured into a plain `Vec<u8>`
+    /// instead of the child's stdin — deterministic, inspectable content with
+    /// no dependency on any real shell's own rendering or timing. This is
+    /// what lets an integration test drive the ACTUAL `PtyManager` methods
+    /// (`write_bytes`, `output_tail`/`output_tail_bounded`, `output_total`,
+    /// ...) that orchestration code (e.g. `deliver_prompt`'s stranded-text
+    /// flush) calls, without a real Tauri `AppHandle` — unavailable headless,
+    /// since `tauri::test`'s `MockRuntime` isn't the concrete `Wry` runtime
+    /// production `spawn_pty` requires — and without a real agent CLI
+    /// (CLAUDE.md constraint 3: the trivial child is a bare shell that does
+    /// nothing, never an agent). Returns the shared write-capture buffer.
+    #[doc(hidden)] // pub for integration tests
+    pub fn register_fake_for_test(&self, id: u32, initial_output: &[u8]) -> Arc<Mutex<Vec<u8>>> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+            .expect("openpty");
+        let mut cmd = if cfg!(windows) {
+            let mut c = CommandBuilder::new("cmd.exe");
+            c.args(["/c", "pause>nul"]);
+            c
+        } else {
+            let mut c = CommandBuilder::new("sh");
+            c.args(["-c", "sleep 300"]);
+            c
+        };
+        cmd.cwd(std::env::temp_dir());
+        let child = pair.slave.spawn_command(cmd).expect("spawn trivial child for fake pty");
+        drop(pair.slave);
+        let killer = child.clone_killer();
+
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock_safe().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let ring: VecDeque<u8> = initial_output.iter().copied().collect();
+        let output = Arc::new(Mutex::new(OutputBuf { ring, total: initial_output.len() as u64 }));
+
+        self.ptys.lock_safe().insert(
+            id,
+            PtyHandle {
+                master: pair.master,
+                writer: Box::new(CaptureWriter(captured.clone())),
+                killer,
+                output,
+                user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                #[cfg(target_os = "windows")]
+                _job: None,
+                input_box_len: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                shell_kind: ShellKind::PowerShell,
+            },
+        );
+        captured
+    }
 }
 
 #[derive(Clone, Serialize)]
