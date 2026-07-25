@@ -10905,13 +10905,23 @@ impl OrchRegistry {
                 {
                     if let Some((tail, _)) = manual_signals.get(&a.id) {
                         if copilot_compaction_marker_detected(g.cli_for(a.role), tail) {
+                            // rev-21 review: match the SIBLING busy-then-
+                            // quiet "confirmed" branch's exact field-reset
+                            // inventory below — that branch does NOT clear
+                            // `compact_pending_evidence`/`compact_hook_
+                            // native_notice_delivered` (both fields stay
+                            // meaningful through the delivery-confirmation
+                            // phase; e.g. `compact_pending_evidence` is
+                            // what keeps a hook-armed cycle's "hook" chip
+                            // label through that phase). Two paths that
+                            // both enter the SAME phase must reset the SAME
+                            // fields, or which one resolved an arm silently
+                            // changes what the phase looks like afterward.
                             a.compact_pending_baseline_tokens = None;
                             a.compact_pending_baseline_marker_count = None;
                             a.compact_pending_trusted = false;
                             a.compact_seen_busy = false;
                             a.compact_pending_armed_ms = None;
-                            a.compact_pending_evidence = None;
-                            a.compact_hook_native_notice_delivered = false;
                             a.compact_reinject_attempts = 1;
                             a.compact_reinject_attempted_ms = Some(now);
                             let instructions = self.group_dir(&a.group).join(

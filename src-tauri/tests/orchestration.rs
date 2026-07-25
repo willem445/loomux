@@ -6046,6 +6046,12 @@ fn copilot_compaction_marker_resolves_the_arm_even_while_the_pane_stays_busy() {
     assert_eq!(audit_count(&reg, &gid, "compact-resolved-copilot-marker"), 1);
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1);
     assert_eq!(audit_count(&reg, &gid, "compact-arm-timeout"), 0);
+    // rev-21 review: this path must reset the SAME fields the sibling
+    // busy-then-quiet "confirmed" branch resets, no more — `compact_
+    // pending_evidence` (the "hook" chip label) stays put through the
+    // confirmation phase either way, so which path resolved the arm never
+    // changes what the badge shows afterward.
+    assert_eq!(a.compact_pending_evidence, Some("hook"), "the hook chip label must survive into the confirmation phase");
 
     // Ticking well past ARM_PENDING_TIMEOUT_MS (5 min), still no marker,
     // still busy — must never time out something already resolved. Also
