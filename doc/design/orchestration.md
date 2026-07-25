@@ -2675,13 +2675,15 @@ its instructions file after ANY compaction or context loss, independent of wheth
 reinjection notice arrives — cheap insurance (a couple hundred bytes) against a missed or delayed
 delivery, never a replacement for the primary channel.
 
-**N3b.** Claude's `--append-system-prompt-file` write-failure fallback points at the instructions
-file, which is mechanics/template only — a `mode: replace` block's actual persona text lives only
-in `contract` (the thing that just failed to write), so that specific combination silently dropped
-the persona before this delta. Now audited (`claude-fallback-persona-dropped`), scoped narrowly to
-`mode: replace` per the review — append-mode's similar, pre-existing, wider gap (its persona isn't
-in the instructions file either) is out of this round's stated scope and left flagged, not fixed,
-in the code comment at the call site.
+**N3b, widened by rev-18.** Claude's `--append-system-prompt-file` write-failure fallback points
+at the instructions file, which is mechanics/template only — a block's actual persona text lives
+only in `contract` (the thing that just failed to write), so this specific combination silently
+dropped the persona before N3b. Landed narrowly scoped to `mode: replace`; rev-18 pointed out the
+scope had no reason to stop there — `render_block_instructions`'s append branch ALSO only ever
+writes a short "adopt your persona" pointer note, never the persona's own words, so the gap is
+identical in both modes, at no added design cost to covering both. The audit
+(`claude-fallback-persona-dropped`) now fires for any non-empty persona on this fallback path,
+mode-tagged in its own payload rather than scoped by mode.
 
 ## Enforced merge gate (#83)
 

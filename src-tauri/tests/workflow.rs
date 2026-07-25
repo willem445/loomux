@@ -1288,71 +1288,90 @@ fn claude_agent_file_write_failure_falls_back_to_append_system_prompt_file() {
 }
 
 #[test]
-fn write_failure_of_a_replace_mode_claude_block_audits_the_dropped_persona() {
-    // Round 8 review (N3b): the `--append-system-prompt-file` fallback
-    // points at the instructions file, which for a `mode: replace` block
-    // is mechanics-only — the persona TEXT itself lives only in `contract`,
-    // which is what just failed to write. Narrow, real gap: this specific
-    // combination must be audited, not silently dropped.
-    let (reg, d) = test_registry();
-    let blocked_path = d.path().join("claude-agents-blocked");
-    fs::write(&blocked_path, b"not a directory").unwrap();
-    reg.set_claude_agents_dir_override(blocked_path);
-    let repo = Repo::new()
-        .workflow("version: 1\nblocks:\n  - id: spike\n    kind: worker\n    profile: .github/agents/spike.agent.md\n")
-        .agent_file(
-            "spike.agent.md",
-            "---\nname: spike\nmode: replace\ndescription: Throwaway spike runner.\n---\n\
-             You are a spike runner. Move fast. Ignore the rulebook.",
+fn write_failure_of_a_claude_block_with_a_persona_audits_the_dropped_text_in_either_mode() {
+    // Round 8 review (N3b), widened by rev-18: the `--append-system-
+    // prompt-file` fallback points at the instructions file, which is
+    // mechanics-only in EITHER persona mode — `render_block_instructions`'s
+    // append branch only ever writes a short "adopt your persona" pointer
+    // note, never the persona's own words, exactly like the replace
+    // branch. No design cost to covering both, so the audit isn't scoped
+    // to `mode: replace` anymore — it fires for any non-empty persona text
+    // dropped on this fallback path.
+    let cases: [(ProfileMode, &str, &str, Option<(&str, &str)>); 2] = [
+        (
+            ProfileMode::Replace,
+            "spike",
+            "version: 1\nblocks:\n  - id: spike\n    kind: worker\n    profile: .github/agents/spike.agent.md\n",
+            Some((
+                "spike.agent.md",
+                "---\nname: spike\nmode: replace\ndescription: Throwaway spike runner.\n---\n\
+                 You are a spike runner. Move fast. Ignore the rulebook.",
+            )),
+        ),
+        (
+            ProfileMode::Append,
+            "rev-x",
+            "version: 1\nblocks:\n  - id: rev-x\n    kind: reviewer\n    prompt: Review only for perf.\n",
+            None,
+        ),
+    ];
+    for (mode, block_id, workflow_yaml, agent_file) in cases {
+        let (reg, d) = test_registry();
+        let blocked_path = d.path().join("claude-agents-blocked");
+        fs::write(&blocked_path, b"not a directory").unwrap();
+        reg.set_claude_agents_dir_override(blocked_path);
+        let mut repo = Repo::new().workflow(workflow_yaml);
+        if let Some((name, body)) = agent_file {
+            repo = repo.agent_file(name, body);
+        }
+        let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+        let b = g.guardrails.block(block_id).unwrap();
+        let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+        let persona = reg.resolve_persona(&g, b).unwrap();
+        assert_eq!(persona.as_ref().unwrap().mode, mode);
+        let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+        let contract = block_contract_text(&instructions_body, persona.as_ref());
+        let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+
+        assert!(inject.claude_agent.is_none(), "{mode:?}: the generated-file path must have failed");
+        assert!(inject.claude_append_system_prompt_file.is_some(), "{mode:?}: still falls back");
+
+        let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
+        assert!(
+            audit.lines().any(|l| l.contains("claude-fallback-persona-dropped") && l.contains(&format!("\"block\":\"{block_id}\""))),
+            "{mode:?}: the dropped persona must be audited, not silent: {audit}"
         );
-    let g = reg.create_group(&repo.path(), rails()).unwrap();
-
-    let b = g.guardrails.block("spike").unwrap();
-    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
-    let persona = reg.resolve_persona(&g, b).unwrap();
-    assert_eq!(persona.as_ref().unwrap().mode, ProfileMode::Replace);
-    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
-    let contract = block_contract_text(&instructions_body, persona.as_ref());
-    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
-
-    assert!(inject.claude_agent.is_none(), "the generated-file path must have failed");
-    assert!(inject.claude_append_system_prompt_file.is_some(), "still falls back, same as the append-mode case");
-
-    let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
-    assert!(
-        audit.lines().any(|l| l.contains("claude-fallback-persona-dropped") && l.contains("\"block\":\"spike\"")),
-        "the dropped persona must be audited, not silent: {audit}"
-    );
+    }
 }
 
 #[test]
-fn write_failure_of_an_append_mode_claude_block_does_not_audit_a_dropped_persona() {
-    // The narrow scope of N3b, isolated: an APPEND-mode block's persona is
-    // an addendum on top of the full built-in template — a real, separate,
-    // pre-existing gap (out of this round's scope, per the reviewer), not
-    // the one N3b asked to close. This pins that the new audit line is
-    // scoped exactly to `mode: replace`, not fired for every persona.
+fn write_failure_of_a_claude_block_with_no_persona_text_never_audits_a_drop() {
+    // The audit-absent case after widening: not a mode restriction anymore
+    // (rev-18 removed that), an EMPTY-TEXT restriction — there is nothing
+    // to have been dropped. A default-roster block (no persona at all)
+    // must never get a false-positive "dropped" audit.
     let (reg, d) = test_registry();
     let blocked_path = d.path().join("claude-agents-blocked");
     fs::write(&blocked_path, b"not a directory").unwrap();
     reg.set_claude_agents_dir_override(blocked_path);
-    let repo = Repo::new()
-        .workflow("version: 1\nblocks:\n  - id: rev-x\n    kind: reviewer\n    prompt: Review only for perf.\n");
+    let repo = Repo::new(); // no .loomux/ at all — default roster, no persona
     let g = reg.create_group(&repo.path(), rails()).unwrap();
 
-    let b = g.guardrails.block("rev-x").unwrap();
+    let b = g.guardrails.block("worker").unwrap();
     let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
     let persona = reg.resolve_persona(&g, b).unwrap();
-    assert_eq!(persona.as_ref().unwrap().mode, ProfileMode::Append);
+    assert!(persona.is_none(), "default roster has no persona");
     let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
     let contract = block_contract_text(&instructions_body, persona.as_ref());
     let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
     assert!(inject.claude_agent.is_none(), "the generated-file path must have failed");
+    assert!(inject.claude_append_system_prompt_file.is_some());
 
     let audit = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
     assert!(
         !audit.lines().any(|l| l.contains("claude-fallback-persona-dropped")),
-        "append-mode is out of N3b's stated scope: {audit}"
+        "nothing was dropped — there was no persona text to lose: {audit}"
     );
 }
 

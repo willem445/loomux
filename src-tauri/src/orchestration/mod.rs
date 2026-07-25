@@ -4739,14 +4739,14 @@ pub struct PersonaInject {
     /// append to the default prompt", so this stays system-prompt-layer
     /// durable (`ContractCarrier::SystemLayerFull`) even in this rare path,
     /// unlike Copilot's equivalent fallback (which has no such flag and
-    /// degrades to a kickoff-only paste). Round 8 review (N3b): the
-    /// instructions file this points at is the MECHANICS/template body
-    /// only — a `mode: replace` block's actual persona TEXT never lands
-    /// there (only in `contract`, which is what failed to write) — so this
-    /// specific combination (write failure + replace-mode persona) is
-    /// audited (`claude-fallback-persona-dropped`) at the `persona_inject`
-    /// call site, narrowly scoped to that one gap rather than reworked
-    /// here. Never set together with `claude_agent`.
+    /// degrades to a kickoff-only paste). Round 8 review (N3b, widened by
+    /// rev-18): the instructions file this points at is the MECHANICS/
+    /// template body only — a block's actual persona TEXT never lands
+    /// there (only in `contract`, which is what failed to write) — true in
+    /// EITHER persona mode, so this combination (write failure + any
+    /// non-empty persona) is audited (`claude-fallback-persona-dropped`)
+    /// at the `persona_inject` call site. Never set together with
+    /// `claude_agent`.
     pub claude_append_system_prompt_file: Option<PathBuf>,
     /// Copilot `--agent <name>` — either a user-authored `.github/agents/*.md`
     /// (native, unwrapped) or a loomux-generated `~/.copilot/agents/*.agent.md`
@@ -15518,20 +15518,27 @@ impl OrchRegistry {
                 // fallback, unlike Copilot's kickoff-text one, never needs
                 // `contract_carrier` to drop below `SystemLayerFull`.
                 //
-                // Round 8 review (N3b): that fallback file is mechanics/
-                // template ONLY — a `mode: replace` block's actual persona
-                // TEXT lives in `contract` (which is what just failed to
-                // write), never in the instructions file. Narrow, real gap:
-                // audited rather than silently dropped. Not fixed by
-                // appending the persona into the instructions file itself —
-                // that file has other writers (`write_instruction_files`)
-                // and a per-fallback mutation of shared state is a bigger
-                // change than this narrow case warrants.
-                if persona.is_some_and(|p| p.mode == profiles::ProfileMode::Replace && !p.text.trim().is_empty()) {
+                // Round 8 review (N3b, widened by rev-18): that fallback
+                // file is mechanics/template ONLY — a block's actual
+                // persona TEXT lives in `contract` (which is what just
+                // failed to write), never in the instructions file, in
+                // EITHER mode — `render_block_instructions`'s append
+                // branch only ever writes a short "adopt your persona"
+                // pointer note (`block_note`), never the persona's own
+                // words. The audit isn't scoped to `mode: replace` (no
+                // design cost to covering both — same file, same gap,
+                // same missing text) — audited rather than silently
+                // dropped. Not fixed by appending the persona into the
+                // instructions file itself — that file has other writers
+                // (`write_instruction_files`) and a per-fallback mutation
+                // of shared state is a bigger change than this gap
+                // warrants.
+                if persona.is_some_and(|p| !p.text.trim().is_empty()) {
                     self.audit(group, "loomux", "claude-fallback-persona-dropped", json!({
                         "block": block.id,
+                        "mode": persona.map(|p| p.mode.as_str()),
                         "reason": "~/.claude/agents unwritable; the --append-system-prompt-file \
-                                    fallback carries mechanics only, never a replace-mode persona's own text",
+                                    fallback carries mechanics only, never a persona's own text",
                     }));
                 }
                 out.claude_append_system_prompt_file =
