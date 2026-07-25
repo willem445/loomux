@@ -69,7 +69,7 @@
 //!     kind: reviewer
 //!     cli: claude
 //!     model: opus
-//!     prompt: |            # -> claude --agents '{...}' --agent rev-security
+//!     prompt: |            # -> generated ~/.claude/agents/*.md + claude --agent
 //!       Review ONLY for security defects: injection, authz, secrets.
 //!
 //!   - id: advisor            # role_hint: OPTIONAL, INERT (#250/#324) — picks
@@ -132,8 +132,10 @@ pub struct Block {
     pub cli: String,
     /// Model for this block. Empty = the kind's default for the resolved CLI.
     pub model: String,
-    /// Inline persona (the `prompt:` key). Compiled to `claude --agents` JSON,
-    /// or injected into the kickoff prompt on CLIs with no inline flag.
+    /// Inline persona (the `prompt:` key). Compiled into a loomux-generated
+    /// custom-agent FILE on both CLIs (round #417 correction 6 for Claude;
+    /// #416 for Copilot), or — on a directory-write failure — Claude's
+    /// `--append-system-prompt-file` / Copilot's kickoff-prompt paste.
     pub prompt: Option<String>,
     /// Repo-relative path to a persona file (the `profile:` key), e.g.
     /// `.github/agents/worker.md`. A `.github/agents/*.md` file is what lets a
@@ -182,8 +184,9 @@ impl Block {
         BUILTIN_IDS.contains(&self.id.as_str())
     }
 
-    /// A block with no persona behaves exactly like a pre-#222 role: nothing to
-    /// compile into `--agents` / `--agent`, nothing to inject into the kickoff.
+    /// A block with no persona behaves exactly like a pre-#222 role: no persona
+    /// text to fold into the generated custom-agent file, nothing to inject
+    /// into the kickoff — the CONTRACT itself still always compiles (#416).
     pub fn has_persona(&self) -> bool {
         self.prompt.is_some() || self.profile.is_some()
     }
@@ -444,11 +447,12 @@ pub fn builtin_roster(agent_cli: &str) -> Vec<Block> {
 /// and nothing legible needs more.
 pub const MAX_ID_CHARS: usize = 48;
 
-/// Block ids reach the shell (a `--agent <id>` flag, a `--agents` JSON key) and
-/// the filesystem (`<id>.md` in the group dir). Keep them to a conservative
-/// identifier alphabet so neither surface can be escaped — the `sanitize_model`
-/// precedent, applied to identity. Returns `None` for an id with no usable
-/// characters left.
+/// Block ids reach the shell (folded into a generated custom-agent file's
+/// `loomux-<group>-<id>` handle, behind a `--agent <handle>` flag) and the
+/// filesystem (`<id>.md` in the group dir, and as part of that generated
+/// file's own name). Keep them to a conservative identifier alphabet so
+/// neither surface can be escaped — the `sanitize_model` precedent, applied
+/// to identity. Returns `None` for an id with no usable characters left.
 ///
 /// The *parser* rejects an id this would have changed rather than accepting the
 /// rewrite (see `parse_workflow`); this is the last-resort filter for ids that

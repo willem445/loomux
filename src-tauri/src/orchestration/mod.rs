@@ -2169,8 +2169,9 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 /// **Already slim, verified consistent with `compact_reinjection_notice`'s
 /// round-5 correction:** this `ctx` line was ALREADY the terse shape that
 /// correction brought the Rust-side notice to — it names the contract as
-/// durable (`--agents`) rather than re-embedding it, and points at (never
-/// inlines) the ledger path. It stays a bare pointer rather than an
+/// durable (`--agent`, a generated custom-agent file) rather than
+/// re-embedding it, and points at (never inlines) the ledger path. It
+/// stays a bare pointer rather than an
 /// inlined tail like the Rust side's belt-and-braces ledger embed: this
 /// script is one generic file for the whole machine (constraint #8 again),
 /// and embedding a properly-capped, line-safe tail would duplicate
@@ -2220,7 +2221,7 @@ if [ -n \"$group_dir\" ] && [ -n \"$agent_id\" ]; then\n\
       ;;\n\
     sessionstart-compact)\n\
       touch \"$group_dir/hooks/$agent_id.sessionstart-compact.json\" 2>/dev/null\n\
-      ctx=\"[loomux] Session resumed after a compact. Your durable role contract already rides in the system prompt (--agents) -- trust it over any summary above. Re-sync live state now: list_tasks, get_state, list_agents. Directive ledger (if any): ${group_dir}/ledger-${agent_id}.log\"\n\
+      ctx=\"[loomux] Session resumed after a compact. Your durable role contract already rides in the system prompt (--agent, a generated custom-agent file) -- trust it over any summary above. Re-sync live state now: list_tasks, get_state, list_agents. Directive ledger (if any): ${group_dir}/ledger-${agent_id}.log\"\n\
       printf '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"%s\"}}\\n' \"$ctx\"\n\
       ;;\n\
   esac\n\
@@ -3058,9 +3059,10 @@ pub fn ledger_capped(ledger: &str, cap_bytes: usize) -> (String, usize) {
 ///
 /// **Slim (the common case, `contract_text: None`):** since #416, the
 /// block's full CONTRACT rides the CLI's own system-prompt layer for both
-/// supported CLIs — Claude's `--agents` (every block, unconditionally) and
-/// Copilot's generated `~/.copilot/agents/*.agent.md` (the default roster
-/// and inline `prompt:` blocks). Both CLIs' own docs confirm compaction
+/// supported CLIs — Claude's generated `~/.claude/agents/*.md` (round #417
+/// correction 6; every block, unconditionally) and Copilot's generated
+/// `~/.copilot/agents/*.agent.md` (the default roster and inline `prompt:`
+/// blocks). Both CLIs' own docs confirm compaction
 /// only ever touches CONVERSATION history, never the system prompt: Claude
 /// Code's hooks reference frames `PreCompact`/`SessionStart` purely in terms
 /// of conversation summarization, and Copilot's context-management page
@@ -4526,21 +4528,33 @@ pub struct Caller {
 }
 
 /// A block's durable role CONTRACT plus any workflow persona, compiled down to
-/// what each agent CLI can actually consume (#222, restructured #416).
+/// what each agent CLI can actually consume (#222, restructured #416, moved
+/// off argv onto a file for Claude in round #417 correction 6).
 ///
-/// The investigation's load-bearing asymmetry: **Claude takes a definition
-/// inline** (`--agents '<json>' --agent <id>`), so loomux can synthesize one
-/// with zero repo files. **Copilot cannot** — its `--agent` resolves a *name*
-/// against a known directory, so engaging one needs either a file the user
-/// already wrote (`.github/agents/`) or one loomux generates itself into
-/// Copilot's OWN user-level agent directory (`~/.copilot/agents` — never the
-/// repo's `.github/agents/`, which would dirty the user's git tree). Hence:
+/// **Both CLIs are symmetric now, as of round 6** — each has its own native
+/// `--agent <name>` flag resolving a NAME against a known user-level
+/// directory (`~/.claude/agents` / `~/.copilot/agents`), so engaging one
+/// needs either a file the user already wrote (`.github/agents/*.md`,
+/// Copilot only — Claude has no equivalent repo-authored convention) or one
+/// loomux generates itself into the CLI's OWN user-level agent directory
+/// (never the repo's `.github/agents/`, which would dirty the user's git
+/// tree). Before round 6, Claude was the odd one out — it took a definition
+/// INLINE (`--agents '<json>' --agent <id>`), which is exactly what put the
+/// full contract on argv and blew Windows `CreateProcessW`'s 32,767-character
+/// limit once #416 widened that payload from a short persona to loomux's own
+/// template prose. Hence:
 ///
 /// | block persona | claude | copilot |
 /// |---|---|---|
-/// | none | contract → `--agents` + `--agent` | contract → generated file + `--agent` |
-/// | `prompt:` (inline) | contract+persona → `--agents` + `--agent` | contract+persona → generated file + `--agent` |
-/// | `profile: .github/agents/x.md` | contract+persona → `--agents` + `--agent` | `--agent x` (native, unwrapped — see `persona_inject`) |
+/// | none | contract → generated file + `--agent` | contract → generated file + `--agent` |
+/// | `prompt:` (inline) | contract+persona → generated file + `--agent` | contract+persona → generated file + `--agent` |
+/// | `profile: .github/agents/x.md` | n/a — Claude has no repo-authored persona convention | `--agent x` (native, unwrapped — see `persona_inject`) |
+///
+/// (Claude's write-failure fallback — `~/.claude/agents` unwritable — is
+/// `--append-system-prompt-file <instructions file>`, not shown above; still
+/// a file, never argv. Copilot's write-failure fallback is a kickoff-text
+/// paste, the one case where the contract does NOT reach the system-prompt
+/// layer — see `contract_on_system_layer`'s doc.)
 ///
 /// Before #416, the `none` row emitted nothing at all on either CLI (the
 /// pre-#222 command, byte for byte) and the built-in mechanics/template body
@@ -4620,11 +4634,14 @@ pub struct PersonaInject {
 #[derive(Clone, Debug)]
 #[doc(hidden)] // pub for integration tests: they compile a block exactly as spawn does
 pub struct ResolvedPersona {
-    /// The persona body (sanitized for a shell line).
+    /// The persona body (`sanitize_persona`d — see that function's doc for
+    /// what still needs stripping now that no consumer is a raw shell line).
     pub text: String,
     /// The handle a native `--agent` flag names.
     pub name: String,
-    /// One-line description for the `--agents` JSON (Claude requires it).
+    /// One-line description. Required by Claude's generated custom-agent
+    /// file's frontmatter schema; Copilot's generated file has no
+    /// equivalent field (see `write_copilot_agent_file`'s doc).
     pub description: String,
     pub mode: profiles::ProfileMode,
     pub allow: Vec<String>,
@@ -4638,9 +4655,9 @@ pub struct ResolvedPersona {
 /// instructions file) plus, when a workflow persona is configured, that
 /// persona folded in as the SAME composition the file/kickoff pair used to
 /// split across two channels — now unified into one string so a CLI that can
-/// carry it at the system-prompt layer (Claude's `--agents`, a generated
-/// Copilot `--agent` file) gets the WHOLE contract structurally, not just the
-/// instructions-file half of it.
+/// carry it at the system-prompt layer (a generated custom-agent FILE on
+/// both Claude and Copilot, each behind its own `--agent <handle>`) gets the
+/// WHOLE contract structurally, not just the instructions-file half of it.
 ///
 /// This is what closes the actual gap behind #416: `persona_inject` already
 /// compiled a *repo persona* onto `--agents`, but never the built-in
@@ -13678,8 +13695,8 @@ impl OrchRegistry {
     /// the pure half of [`write_block_instructions`], split out (#416) so the
     /// exact bytes written to the instructions file are ALSO what
     /// [`persona_inject`](Self::persona_inject) hands the CLI's own native
-    /// custom-agent flag (`--agents` on Claude, a generated `--agent` file on
-    /// Copilot). Two channels computing the same text independently is
+    /// custom-agent flag — a generated `--agent <handle>` file on both Claude
+    /// and Copilot. Two channels computing the same text independently is
     /// exactly the silent-divergence risk this repo's conventions warn about
     /// (see `profiles.rs`'s `model:` note) — one function, called from both
     /// sites, makes it structurally impossible for the file an agent is told
@@ -15740,9 +15757,11 @@ impl OrchRegistry {
     /// `persona` is the **kickoff fallback** (#222): the persona body of a block
     /// whose CLI has no inline custom-agent flag and no user-authored
     /// `.github/agents` file to name — i.e. Copilot with an inline `prompt:`.
-    /// `None` on Claude (its persona rode in on `--agents`), on a native Copilot
-    /// `--agent`, and for every block of the default roster — which is why a
-    /// group with no workflow file gets the same kickoff text it always did.
+    /// `None` on Claude (its persona always rides in a generated custom-agent
+    /// file, or — write-failure fallback — `--append-system-prompt-file`;
+    /// never the kickoff), on a native Copilot `--agent`, and for every block
+    /// of the default roster — which is why a group with no workflow file
+    /// gets the same kickoff text it always did.
     #[doc(hidden)] // pub for integration tests
     pub fn kickoff_prompt(
         &self,

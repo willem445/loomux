@@ -17,9 +17,19 @@
 //!   `role:`/`kind:` frontmatter survives only as a **compatibility check** —
 //!   if a file says `kind: planner` and a `worker` block points at it, that is
 //!   an error rather than a silent capability change.
-//! - Claude no longer gets `--append-system-prompt-file`. `claude --agents
-//!   '<json>' --agent <id>` (which post-dates #105) carries the persona
-//!   natively; see `persona_inject` in `mod.rs`.
+//! - Claude's persona delivery has changed mechanism twice since #105:
+//!   `claude --agents '<json>' --agent <id>` (#222, post-dating #105)
+//!   carried it inline for a time, until round #417 correction 6 moved it
+//!   BACK to a file — `--agent <handle>` alone, naming a loomux-generated
+//!   `~/.claude/agents/<handle>.md` — after a live demo showed the inline
+//!   payload (widened by #416 to carry the full role contract, not just a
+//!   short persona) could exceed Windows `CreateProcessW`'s 32,767-character
+//!   command-line limit. `--append-system-prompt-file` itself is back too,
+//!   as the write-failure fallback (see `PersonaInject::claude_append_
+//!   system_prompt_file`'s doc in `mod.rs`) — the #222 move away from it was
+//!   about `--agents` being newer and native, never about the file-based
+//!   flag having a functional problem, so nothing disqualified it from
+//!   returning as a fallback. See `persona_inject` in `mod.rs`.
 //!
 //! ```markdown
 //! ---
