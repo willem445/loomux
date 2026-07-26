@@ -1069,6 +1069,18 @@ const MAX_WATCHDOG_STALL_MINUTES: u32 = 1440;
 /// gate is measured in minutes, not seconds — a 60s wake is cheap and precise
 /// enough. See `start_idle_tick` / `run_idle_tick`.
 const IDLE_TICK_INTERVAL: Duration = Duration::from_secs(60);
+/// Round 10 (#428 follow-up, user-directed): the compact-nudge loop's poll
+/// cadence WHILE any agent has a compact arm open — evidence (marker files,
+/// the Copilot completion-paint detector) only gets consumed on this
+/// thread's own wake, so riding the full `IDLE_TICK_INTERVAL` (60s) while an
+/// outcome is already effectively decided (hook-confirmed, just waiting on
+/// the poll) is exactly the residual UX gap a live user re-test caught: the
+/// badge sits in "awaiting evidence" limbo for up to a minute per poll even
+/// though nothing is actually undecided anymore. Idle cost is zero — this
+/// is only ever consulted while `any_compact_pending()` is true, which is
+/// false for the overwhelming majority of a session's wall-clock time (no
+/// compaction in flight). See `compact_nudge_poll_interval`.
+const COMPACT_NUDGE_FAST_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Autonomous mode (#83): default output-quiet window before an idle tick fires,
 /// when the group's `idle_tick_minutes` guardrail isn't set. Lowered from the
 /// original 15 to **5** after a live test: a human who turns autonomous mode on
@@ -11655,6 +11667,19 @@ impl OrchRegistry {
             .collect()
     }
 
+    /// Round 10 (#428 follow-up): whether ANY agent, in any group, currently
+    /// has a compact arm open (`AgentEntry::compact_pending`) — the single
+    /// input `compact_nudge_poll_interval` needs to pick the loop's next
+    /// sleep. Deliberately registry-wide, not per-group/per-agent: the
+    /// compact-nudge thread is one loop serving every group, so the fast
+    /// cadence has to be "on" if it would help ANYONE waiting, off only when
+    /// truly nobody is. A stale read is impossible by construction — this
+    /// takes the same lock `compact_nudge_tick` itself locks, read fresh
+    /// every call, never cached.
+    pub fn any_compact_pending(&self) -> bool {
+        self.agents.lock_safe().values().any(|a| a.compact_pending)
+    }
+
     /// One full compact-nudge cycle: read pty counters, then tick. Called on a
     /// timer by `start_compact_nudge`; `now` injected so tests drive it
     /// deterministically.
@@ -17766,18 +17791,41 @@ pub fn start_idle_tick(reg: Arc<OrchRegistry>) {
     });
 }
 
-/// Background loop for compact-nudge (#287): every `IDLE_TICK_INTERVAL` it
-/// pastes `/compact` for any eligible pane (default: the orchestrator, on
-/// Claude Code) that has gone output-quiet past its group's
-/// `compact_nudge_minutes` — the same idleness signal `idle_tick_tick`
-/// reads, not a second one. Off by default (`compact_nudge_minutes == 0`);
-/// non-Claude CLIs and paused groups are skipped inside `run_compact_nudge` /
-/// `compact_nudge_tick`. Reuses `IDLE_TICK_INTERVAL`'s cadence — a 60s wake is
-/// cheap and plenty precise for a minutes-scale quiet gate. Started once at
-/// app setup.
+/// Round 10 (#428 follow-up): which cadence the compact-nudge loop's NEXT
+/// sleep should use — pure so the selection is directly testable without
+/// spinning up the thread/registry. `any_pending` is the ONLY input: no
+/// hysteresis, no latch, no memory of a PREVIOUS tick's state — an arm that
+/// opens and closes within one wake is simply seen or not seen on the wake
+/// that actually happens to land, exactly like every other observation this
+/// tick makes. That simplicity is deliberate: a debounced/latched cadence
+/// would need its own state to get wrong, for a problem ("thrash") that
+/// doesn't otherwise exist here — recomputing fresh every iteration already
+/// can't oscillate faster than the loop itself runs.
+pub fn compact_nudge_poll_interval(any_pending: bool) -> Duration {
+    if any_pending { COMPACT_NUDGE_FAST_POLL_INTERVAL } else { IDLE_TICK_INTERVAL }
+}
+
+/// Background loop for compact-nudge (#287): normally wakes every
+/// `IDLE_TICK_INTERVAL` to paste `/compact` for any eligible pane (default:
+/// the orchestrator, on Claude Code) that has gone output-quiet past its
+/// group's `compact_nudge_minutes` — the same idleness signal `idle_tick_
+/// tick` reads, not a second one. Off by default (`compact_nudge_minutes ==
+/// 0`); non-Claude CLIs and paused groups are skipped inside `run_compact_
+/// nudge` / `compact_nudge_tick`.
+///
+/// Round 10: the sleep is now COMPUTED each iteration
+/// (`compact_nudge_poll_interval`) rather than the fixed constant — while
+/// `any_compact_pending()` is true anywhere in the registry, this thread
+/// wakes on `COMPACT_NUDGE_FAST_POLL_INTERVAL` (10s) instead, so hook/marker
+/// evidence gets consumed within seconds on both CLIs rather than riding out
+/// the full 60s idle cadence. The interval is read BEFORE the sleep, from
+/// whatever the previous tick left the registry in (or the empty state at
+/// first launch) — so an arm opening mid-sleep is caught on the very next
+/// wake, and the loop drops back to the normal cadence the wake after the
+/// last open arm resolves. Started once at app setup.
 pub fn start_compact_nudge(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(IDLE_TICK_INTERVAL);
+        std::thread::sleep(compact_nudge_poll_interval(reg.any_compact_pending()));
         reg.run_compact_nudge(now_ms());
     });
 }

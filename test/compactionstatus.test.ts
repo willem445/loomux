@@ -41,9 +41,28 @@ test("compactionStatusLabel: #417 hook-sourced evidence beats trusted/unconfirme
     compactionStatusLabel({ status: "armed", trusted: true, source: "hook" }),
     "compact armed (hook-confirmed)"
   );
+});
+
+test("compactionStatusLabel: round 10 — hook-confirmed awaiting_evidence reads as progress, not limbo", () => {
+  // #428 follow-up, user-directed: a live re-test showed "compact awaiting
+  // evidence (hook-confirmed)" read as stuck even though a hook had already
+  // confirmed the outcome directly — only loomux's own poll was left to
+  // consume the marker. The non-hook awaiting_evidence cases are genuinely
+  // still undecided (busy-then-quiet hasn't resolved either way), so their
+  // wording is unchanged — this is scoped to the hook source only.
   assert.equal(
     compactionStatusLabel({ status: "awaiting_evidence", trusted: true, source: "hook" }),
-    "compact awaiting evidence (hook-confirmed)"
+    "compact confirmed — finalizing"
+  );
+  assert.equal(
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: true, source: null }),
+    "compact awaiting evidence",
+    "unchanged: a genuinely undecided trusted arm"
+  );
+  assert.equal(
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: false, source: null }),
+    "compact awaiting evidence (unconfirmed)",
+    "unchanged: a genuinely undecided, unconfirmed arm"
   );
 });
 

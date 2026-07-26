@@ -18,7 +18,19 @@ export function compactionStatusLabel(status: CompactionStatus): string | null {
     case "armed":
       return `compact ${armedQualifier(status)}`;
     case "awaiting_evidence":
-      return `compact awaiting evidence${evidenceQualifier(status)}`;
+      // Round 10 (#428 follow-up, user-directed): a hook-sourced arm sets
+      // `compact_seen_busy` immediately at arm time (see the backend's
+      // `compaction_status` doc), so it lands HERE, not "armed", on the
+      // very first tick — this is the phase a live user re-test sat in
+      // for up to the evidence-poll cadence, and "awaiting evidence"
+      // reads as stuck even though the outcome is already decided: a
+      // hook told loomux directly that compaction happened, resolution
+      // is inevitable, it's just waiting on the poll that consumes the
+      // marker. The non-hook cases below are genuinely still waiting on
+      // an outcome (busy-then-quiet hasn't resolved either way yet), so
+      // their wording is unchanged.
+      if (status.source === "hook") return "compact confirmed — finalizing";
+      return `compact awaiting evidence${status.trusted ? "" : " (unconfirmed)"}`;
     case "reinjecting":
       return `re-grounding (attempt ${status.attempt}/${status.max_attempts})`;
     case "abandoned":
@@ -38,7 +50,11 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
         ? "loomux pasted /compact itself — waiting to observe the pane go busy"
         : "loomux believes a compact started (banner or manual typing) — waiting to observe the pane go busy";
     case "awaiting_evidence":
-      if (status.source === "hook") return "a PreCompact/SessionStart hook confirmed this directly — no inference needed, waiting for quiet to resolve";
+      // Round 10: a hook already confirmed the compaction directly — there
+      // is no inference left to run and no outcome left undecided, only
+      // loomux's own poll left to consume the marker and hand off the
+      // (already-decided) re-grounding.
+      if (status.source === "hook") return "a hook confirmed this compaction directly — wrapping up the re-grounding handoff now";
       return status.trusted
         ? "busy observed — waiting for quiet to resolve"
         : "busy observed — waiting for quiet, then a confirmed token drop or compact_boundary marker before trusting it";
@@ -55,11 +71,6 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
 function armedQualifier(status: { trusted: boolean; source: string | null }): string {
   if (status.source === "hook") return "armed (hook-confirmed)";
   return status.trusted ? "armed" : "armed (unconfirmed)";
-}
-
-function evidenceQualifier(status: { trusted: boolean; source: string | null }): string {
-  if (status.source === "hook") return " (hook-confirmed)";
-  return status.trusted ? "" : " (unconfirmed)";
 }
 
 function lostReasonLabel(reason: string): string {

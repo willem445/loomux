@@ -2747,6 +2747,52 @@ the fallback path is genuinely independent of the new detector.
 
 Closes #428.
 
+### Round 10 (#428 follow-up, user-directed polish): the evidence-poll cadence, and badge honesty
+
+Round 9's marker fix worked — a user re-test's own audit showed `compact-resolved-copilot-marker`
+firing on a genuinely idle pane — but the residual UX was the EVIDENCE POLL CADENCE, not the state
+machine: `start_compact_nudge`'s loop only ever woke on `IDLE_TICK_INTERVAL` (60s, shared by
+convention with `start_idle_tick`'s own loop, though the two are structurally independent threads),
+so a hook marker or the Copilot completion-paint sat unconsumed for up to that whole window even
+though the eventual outcome was already effectively decided. The user read the resulting limbo as
+"still unfixed."
+
+**Adaptive poll cadence.** `compact_nudge_poll_interval(any_pending: bool) -> Duration` is the pure
+decision `start_compact_nudge`'s loop now makes every iteration in place of the fixed constant:
+`COMPACT_NUDGE_FAST_POLL_INTERVAL` (10s) while `OrchRegistry::any_compact_pending()` is true
+anywhere in the registry, `IDLE_TICK_INTERVAL` (60s, unchanged) otherwise. `any_compact_pending`
+is a fresh registry-wide scan (`self.agents.lock_safe().values().any(|a| a.compact_pending)`) —
+deliberately whole-registry rather than per-group, since one thread serves every group and the
+fast cadence should be "on" if it would help ANY of them. No hysteresis or latch: the interval is
+recomputed from scratch every loop iteration with no memory of a previous tick, which is also the
+answer to "won't a rapidly opening/closing arm thrash the timer?" — recomputing fresh every
+iteration cannot oscillate faster than the loop itself already runs, so there is no additional
+state to get wrong. Idle cost is zero: the fast branch is only ever taken while a real compaction
+cycle is genuinely in flight, which is a small fraction of a session's wall-clock time.
+
+**Badge honesty.** `awaiting_evidence` with `source: "hook"` is the phase a hook-sourced arm lands
+in IMMEDIATELY (it sets `compact_seen_busy` at arm time — see `compaction_status`'s doc — so it
+skips "armed" entirely on the very first tick) and is exactly the phase the live re-test sat in.
+The label read as stuck ("compact awaiting evidence (hook-confirmed)") even though the outcome was
+already decided: a hook told loomux directly that compaction happened, and resolution was only
+ever a matter of the next poll consuming the marker. `compactionstatus.ts` now special-cases this
+one state: `"compact confirmed — finalizing"`, tooltip "a hook confirmed this compaction directly
+— wrapping up the re-grounding handoff now". The three other `awaiting_evidence` variants (no
+source, trusted; no source, unconfirmed) are genuinely still waiting on an outcome busy-then-quiet
+hasn't resolved either way yet, so their wording is untouched — this is a targeted relabeling of
+one state that stopped being honest, not a vocabulary overhaul.
+
+**No state-machine decision changed** — the 12th consecutive round on this PR to make that claim,
+and it holds: every `compact_pending`/`compact_reinject_*`/`ContractCarrier` transition, every
+arm/confirm/timeout/abandon condition, is byte-identical to round 9. Only how OFTEN the loop reads
+the outcome, and how the human-facing label narrates one already-decided phase, changed.
+
+**Tests:** `compact_nudge_poll_interval_is_fast_only_while_something_is_pending` (the cadence
+decision, both directions); `any_compact_pending_is_true_only_while_an_arm_is_actually_open` (proven
+against a real registry through the whole arm-through-confirmation lifecycle, not just the pure
+function); the frontend label/tooltip test split so the hook-sourced case's new wording and the
+three unchanged variants are each pinned separately.
+
 ## Enforced merge gate (#83)
 
 Template guidance is not a security boundary. A live incident proved it: an orchestrator merged

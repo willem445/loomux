@@ -18,7 +18,7 @@ use loomux_lib::orchestration::{
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
     CompactionStatus,
-    auto_compact_banner_detected, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
+    auto_compact_banner_detected, compact_nudge_poll_interval, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
     human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
     exit_cause, exit_diagnostic, resolve_output_text,
@@ -6858,6 +6858,40 @@ fn copilot_compaction_marker_detected_matches_either_stable_sentence_only() {
         !copilot_compaction_marker_detected("claude", "Compaction completed"),
         "no known completion marker for claude — it has SessionStart instead, never guessed"
     );
+}
+
+#[test]
+fn compact_nudge_poll_interval_is_fast_only_while_something_is_pending() {
+    // Round 10 (#428 follow-up, user-directed): a live re-test showed the
+    // badge sitting in "awaiting evidence" limbo for up to a full poll cycle
+    // even after a hook had already confirmed the outcome — the poll
+    // thread's own cadence was the bottleneck, not the state machine. This
+    // is the pure decision `start_compact_nudge`'s loop makes every
+    // iteration, both directions pinned.
+    assert_eq!(compact_nudge_poll_interval(true), Duration::from_secs(10));
+    assert_eq!(compact_nudge_poll_interval(false), Duration::from_secs(60));
+}
+
+#[test]
+fn any_compact_pending_is_true_only_while_an_arm_is_actually_open() {
+    // The single input `compact_nudge_poll_interval` needs — proven against
+    // a real registry, not just the pure function in isolation: opens the
+    // moment an arm does (including through the whole delivery-confirmation
+    // phase, which still benefits from fast polling), closes the moment the
+    // last open cycle actually resolves.
+    let (reg, _d, gid, oid) = compact_nudge_setup_copilot(20);
+    assert!(!reg.any_compact_pending(), "nothing armed yet");
+
+    let started_ms = reg.agent(&oid).unwrap().started_ms;
+    let marker = reg.state_root().join(&gid).join("hooks").join(format!("{oid}.precompact.json"));
+    write_hook_marker(&marker, started_ms, 1_000);
+    let empty = HashMap::new();
+    assert!(reg.compact_nudge_tick(1_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    assert!(reg.any_compact_pending(), "the precompact arm just opened (still true through the confirmation phase)");
+
+    let confirmed = confirmed_delivery(&oid, 2_000);
+    assert!(reg.compact_nudge_tick(2_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed).is_empty());
+    assert!(!reg.any_compact_pending(), "resolved and confirmed — nothing left open, fast polling has no reason to continue");
 }
 
 #[test]
