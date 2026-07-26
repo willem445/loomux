@@ -1027,14 +1027,17 @@ export class Pane implements VoiceTargetPane {
         // closed as "track in vscode#224488" rather than fixed, and VS
         // Code's own sideload of this same conpty build still has open
         // resize-duplication reports). `reflowCursorLine` (xterm.js#5234,
-        // off by default because normal shells repaint themselves) is the
-        // only lever that measurably helps: verified via test/xterm-reflow
-        // .test.ts that it moves the echo off the stale row in the
-        // documented repro. Not a confirmed complete fix -- see PR #430
-        // for what to still watch for by eye. Not enabled outside this
-        // conpty branch: normal shells against a non-quirked host already
-        // repaint their own prompt line, and forcing a reflow there could
-        // fight that repaint instead of nothing at all.
+        // off by default because normal shells repaint themselves) is a
+        // measurable mitigation, not a confirmed complete fix: verified via
+        // test/xterm-reflow.test.ts that it corrects the cursor's ROW on a
+        // resize in both directions, but xterm.js#5522 (merged, milestone
+        // 7.0.0) documents that it will NEVER correct the cursor's COLUMN,
+        // by design. It does also prevent real content loss on a narrowing
+        // resize (measured, not just row placement). Residual + upstream
+        // watch tracked in #432. Not enabled outside this conpty branch:
+        // normal shells against a non-quirked host already repaint their
+        // own prompt line, and forcing a reflow there could fight that
+        // repaint instead of nothing at all.
         this.term.options.reflowCursorLine = true;
       }
     } catch {

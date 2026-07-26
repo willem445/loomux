@@ -80,39 +80,66 @@ PR author flagged an open question in the same breath as introducing it:
 where it started ... maybe this behavior is expected?"
 (xtermjs/xterm.js#5234).
 
-### Known limitation: narrowing resizes
+### Precise characterization: row fixed, column not, in both directions
 
-`test/xterm-reflow.test.ts` pins both the mitigation (a **widening** resize
-puts the echo back on the geometrically correct row) and a known gap: the
-same config replayed with a **narrowing** resize still produces a garbled
-layout (the echo splits across two rows around a stray run of blank
-padding, worse than merely landing on the wrong row). Watch for this by eye
-particularly when *shrinking* a pane mid-stream; growing a pane is the
-better-covered direction.
+`test/xterm-reflow.test.ts` measures the actual cursor position after a
+resize (not just where a subsequent write happens to land, which can hide
+or exaggerate the real defect depending on incidental row-width alignment).
+The result, confirmed on both a **widening** and a **narrowing** resize:
+
+- **Row: corrected by `reflowCursorLine`, in both directions.** Without the
+  option the row stays stale; with it, the row matches what a fully-correct
+  reflow would produce.
+- **Column: never corrected, in either direction.** This is not a bug
+  pending an upstream fix -- xterm.js#5522 (merged, milestone 7.0.0, not
+  yet released) documents it as intentional, closing xterm.js#5295
+  ("Cursor is incorrectly positioned on reflow of cursor line"): *"this
+  will not move the cursor position, only the line contents."* Installed
+  6.0.0 predates that note (it lands in 7.0.0's typings only), but the
+  behavior it documents is already what 6.0.0 does.
+- **A real, partial upside on narrowing:** without `reflowCursorLine`, a
+  narrowing resize doesn't reflow the cursor's line at all, and content
+  beyond the old (wider) row's boundary becomes unreachable -- measured 72
+  of 120 characters survive. With the option, all 120 survive, even though
+  the column is still wrong. Not full correctness, but real content
+  preservation loomux gets from this bump that it didn't have before.
+
+So: don't read "the row is fixed" as "the cursor ends up right" -- only the
+row does. Whether a subsequent write visibly splits across a row boundary
+or merely lands at the wrong column within the right row is incidental (how
+far the always-wrong column sits from the new row's width), not a
+widen-vs-narrow asymmetry in the underlying defect. Watch for wrong-column
+placement by eye in both directions; narrowing additionally used to lose
+content outright, which this mitigation fixes.
 
 ## What loomux can still do (follow-up, not this PR)
 
-The investigation's own loomux-side aggravators are now the more valuable
-lever, precisely because there is no complete upstream fix to lean on:
+Tracked in #432 (filed alongside this PR):
 
-- **Resize-storm coalescing** -- a divider drag issues a `ResizePseudoConsole`
-  roughly every 16ms for the whole drag (`pane.ts`'s fit debounce,
-  `grid.ts`'s `makeDivider`); coalescing to one resize on drag-end shrinks
-  the window in which xterm's and conpty's row models can diverge.
-- **Serializing resize behind the write queue** -- `fit.fit()` applies
-  synchronously while `term.write()` is parsed asynchronously; deferring the
-  resize until pending writes are parsed prevents bytes received under the
-  old geometry from being parsed under the new one.
-- **Not latching `sentSize` before the resize IPC resolves** (`pane.ts`) --
-  a single failed `ResizePseudoConsole` currently leaves xterm out of sync
-  with conpty until the next size change.
+- The cursor-column residual above -- nothing to *do* yet (upstream has
+  declined to fix it as of milestone 7.0.0), just watch for a future change
+  of position.
+- The investigation's own loomux-side aggravators, now the more valuable
+  lever precisely because there is no complete upstream fix to lean on:
+  - **Resize-storm coalescing** -- a divider drag issues a
+    `ResizePseudoConsole` roughly every 16ms for the whole drag (`pane.ts`'s
+    fit debounce, `grid.ts`'s `makeDivider`); coalescing to one resize on
+    drag-end shrinks the window in which xterm's and conpty's row models
+    can diverge.
+  - **Serializing resize behind the write queue** -- `fit.fit()` applies
+    synchronously while `term.write()` is parsed asynchronously; deferring
+    the resize until pending writes are parsed prevents bytes received
+    under the old geometry from being parsed under the new one.
+  - **Not latching `sentSize` before the resize IPC resolves** (`pane.ts`)
+    -- a single failed `ResizePseudoConsole` currently leaves xterm out of
+    sync with conpty until the next size change.
 
-These are scoped to a separate PR (loomux issue tracker: the hardening
-follow-up referenced from #430).
+## Changelog watch (tracked in #432)
 
-## Changelog watch
-
-Re-check microsoft/vscode#224488 (or its successor) periodically: if VS
-Code's conpty.dll sideload effort lands a real fix and re-enables it, the
-same fix likely applies here and the mitigation above may become
-unnecessary or replaceable.
+- **microsoft/vscode#224488** (or its successor) -- if VS Code's conpty.dll
+  sideload effort lands a real fix and re-enables it, the same fix likely
+  applies here and the mitigation above may become unnecessary or
+  replaceable.
+- **xterm.js#5295 / #5522** -- the cursor-column gap. Upstream has declined
+  to fix it as of milestone 7.0.0 (documented as intentional, not tracked
+  as a bug); re-check if that ever changes.

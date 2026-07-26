@@ -18,43 +18,59 @@
 // VS Code issue is itself closed with the same conpty.dll sideload disabled
 // in Insiders over open resize-duplication reports against the very conpty
 // build loomux ships (1.22.250204002). Bumping @xterm/xterm alone does NOT
-// fix #430 -- the first test below pins that (still red on a stock v6 bump).
+// fix #430 -- pinned below (still red on a stock v6 bump).
 //
-// The only lever that measurably helps is xterm.js#5234's `reflowCursorLine`
+// The lever that measurably helps is xterm.js#5234's `reflowCursorLine`
 // option (added in 6.0.0, off by default "because shells usually handle this
-// themselves" -- which conpty's resize-quirk explicitly does not): it makes
-// xterm reflow the cursor's own line like everything else. pane.ts sets it
-// alongside windowsPty, gated to the conpty branch. It is NOT a confirmed
-// complete fix upstream (its own author: "results in the cursor being in a
-// different place than where it started ... maybe this behavior is
-// expected?") -- see the PR for what a human should still watch for by eye.
+// themselves" -- which conpty's resize-quirk explicitly does not). pane.ts
+// sets it alongside windowsPty, gated to the conpty branch.
+//
+// PRECISE characterization (measured, not assumed -- see #430 follow-up
+// issue for the tracker this feeds): reflowCursorLine fixes the cursor's
+// ROW in BOTH resize directions, and fixes the COLUMN in NEITHER direction,
+// by design: xterm.js#5522 (merged, milestone 7.0.0, not yet released)
+// documents "this will not move the cursor position, only the line
+// contents" against xterm.js#5295 ("Cursor is incorrectly positioned on
+// reflow of cursor line"). So the row lands right; the column does not, on
+// every resize, regardless of direction. Whether a subsequent write visibly
+// SPLITS across a row boundary is incidental -- it depends on how far the
+// (always wrong) column sits from the new row's width, not on a real
+// widen-vs-narrow asymmetry in the underlying defect.
+//
+// There is a real, if partial, upside worth pinning too: WITHOUT
+// reflowCursorLine, a narrowing resize doesn't reflow the cursor's line at
+// all, and content beyond the old (wider) row boundary becomes unreachable
+// -- verified below as content loss (72 of 120 characters survive). WITH
+// the option, the same resize preserves all of it (see the content-
+// preservation test), even though the cursor still ends up in the wrong
+// column.
 //
 // The VT stream below is hand-constructed from the upstream repro shape
-// (wrapped output, a live width change, continued output at the old cursor)
-// per xterm.js#5319 / microsoft/terminal#18725's minimal repro description
-// -- not a captured real PTY trace (no safe repro was constructed for a live
-// capture; see the PR description).
+// (wrapped output, a live width change) per xterm.js#5319 / microsoft/
+// terminal#18725's minimal repro description -- not a captured real PTY
+// trace (no safe repro was constructed for a live capture; see the PR
+// description).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import pkg from "@xterm/headless";
-import type { Terminal as TerminalType } from "@xterm/headless";
 const { Terminal } = pkg;
 
-const MARKER = "EchoMark";
+const CONTENT = "PROMPT> " + "w".repeat(120); // one long wrapped "prompt line", 128 cols
 
-function write(term: TerminalType, data: string): Promise<void> {
+function write(term: InstanceType<typeof Terminal>, data: string): Promise<void> {
   return new Promise((resolve) => term.write(data, resolve));
 }
 
-/** Replays: a wrapped "prompt line" streamed with no trailing newline (so the
- *  cursor stays ON the wrapped line -- the row xterm's reflow refuses to
- *  touch by default), a layout resize (the divider-drag/maximize trigger
- *  traced through grid.ts/pane.ts -- never a PTY-only resize), then
- *  continued output at the old cursor position -- standing in for whatever
- *  conpty's VT passthrough sends assuming the buffer already reflowed. */
-async function replay(reflowCursorLine: boolean) {
+/** Streams CONTENT with no trailing newline (so the cursor stays ON the
+ *  wrapped line -- the row xterm's reflow refuses to touch by default),
+ *  then a layout resize (the divider-drag/maximize trigger traced through
+ *  grid.ts/pane.ts -- never a PTY-only resize). Returns the cursor's actual
+ *  position after the resize plus what a fully-correct reflow would have
+ *  produced, and a count of how many of the 120 'w' characters are still
+ *  present anywhere in the buffer (content-preservation check). */
+async function replay(cols0: number, cols1: number, reflowCursorLine: boolean) {
   const term = new Terminal({
-    cols: 40,
+    cols: cols0,
     rows: 24,
     scrollback: 1000,
     allowProposedApi: true,
@@ -63,80 +79,87 @@ async function replay(reflowCursorLine: boolean) {
   // Matches pane.ts's start(): the sideloaded conpty build pty.rs reports.
   term.options.windowsPty = { backend: "conpty", buildNumber: 22621 };
 
-  const content = "PROMPT> " + "w".repeat(120); // 128 cols, wraps at width 40
-  await write(term, content);
-
-  term.resize(80, 24);
-  await write(term, MARKER);
+  await write(term, CONTENT);
+  term.resize(cols1, 24);
 
   const buf = term.buffer.active;
   const rows: string[] = [];
+  let wCount = 0;
   for (let y = 0; y < buf.length; y++) {
-    rows.push(buf.getLine(y)?.translateToString(true) ?? "");
+    const s = buf.getLine(y)?.translateToString(true) ?? "";
+    rows.push(s);
+    for (const ch of s) if (ch === "w") wCount++;
   }
-  const markerRow = rows.findIndex((r) => r.includes(MARKER));
-  // Geometrically correct row once the 128-char line is laid out at the NEW
-  // width (80): floor(128 / 80) = row 1. Any other row means the echo landed
-  // on stale, pre-resize geometry -- the bug.
-  const expectedRow = Math.floor(content.length / 80);
-  return { markerRow, expectedRow, rows };
+  const expectedRow = Math.floor(CONTENT.length / cols1);
+  const expectedCol = CONTENT.length - expectedRow * cols1;
+  return { cursorY: buf.cursorY, cursorX: buf.cursorX, expectedRow, expectedCol, wCount, rows };
 }
 
-test("#430: pane.ts's conpty windowsPty + reflowCursorLine config reflows the cursor's wrapped line on resize", async () => {
-  const { markerRow, expectedRow, rows } = await replay(true);
+test("#430: reflowCursorLine corrects the cursor ROW on a widening resize (stock v6 bump alone does not)", async () => {
+  const withFix = await replay(40, 80, true);
   assert.equal(
-    markerRow,
-    expectedRow,
-    `echo landed on row ${markerRow}, expected the reflowed row ${expectedRow}. Buffer:\n${rows.join("\n")}`
+    withFix.cursorY,
+    withFix.expectedRow,
+    `cursor row ${withFix.cursorY}, expected the reflowed row ${withFix.expectedRow}.\n${withFix.rows.join("\n")}`
   );
-});
 
-test("#430: without reflowCursorLine (a stock @xterm/xterm 6.0.0 bump), the bug still reproduces", async () => {
-  const { markerRow, expectedRow } = await replay(false);
+  const withoutFix = await replay(40, 80, false);
   assert.notEqual(
-    markerRow,
-    expectedRow,
-    "expected the echo on a stale row (the bug) when reflowCursorLine is left at its xterm default"
+    withoutFix.cursorY,
+    withoutFix.expectedRow,
+    "expected the row bug to reproduce (stale row) when reflowCursorLine is left at its xterm default"
   );
 });
 
-test("#430 KNOWN LIMITATION: reflowCursorLine does not fix a NARROWING resize (widening only, verified above)", async () => {
-  // Mirror of replay() above but shrinking cols instead of growing them --
-  // the direction xterm.js#5234's own author flagged as unresolved ("results
-  // in the cursor being in a different place than where it started"). This
-  // pins the CURRENT (imperfect) behavior, not the desired one: with the
-  // reflow forced on, the echo doesn't just land on a stale row -- it gets
-  // split across two rows with a stray run of blank padding, which is worse
-  // than merely "wrong row". If a future @xterm/xterm release fixes
-  // narrowing too, this test starts failing -- that's the point: replace
-  // this assertion with an equality check like the widening test above
-  // instead of loosening it, and drop the mention of this case from the PR
-  // template. Until then, this is what to still watch for by eye per-pane
-  // (docs/design or the PR's manual-check list).
-  const term = new Terminal({
-    cols: 80,
-    rows: 24,
-    scrollback: 1000,
-    allowProposedApi: true,
-    reflowCursorLine: true,
-  });
-  term.options.windowsPty = { backend: "conpty", buildNumber: 22621 };
-
-  const content = "PROMPT> " + "w".repeat(120);
-  await write(term, content);
-  term.resize(40, 24); // narrower, not wider
-  await write(term, MARKER);
-
-  const buf = term.buffer.active;
-  const rows: string[] = [];
-  for (let y = 0; y < buf.length; y++) {
-    rows.push(buf.getLine(y)?.translateToString(true) ?? "");
-  }
-  const markerRow = rows.findIndex((r) => r.includes(MARKER));
+test("#430: reflowCursorLine corrects the cursor ROW on a narrowing resize too (row fix is not widen-only)", async () => {
+  const withFix = await replay(80, 40, true);
   assert.equal(
-    markerRow,
-    -1,
-    `expected the known-limitation split (marker not intact on any single row); ` +
-      `it landed intact on row ${markerRow} -- narrowing may have been fixed upstream, see the comment above.\n${rows.join("\n")}`
+    withFix.cursorY,
+    withFix.expectedRow,
+    `cursor row ${withFix.cursorY}, expected the reflowed row ${withFix.expectedRow}.\n${withFix.rows.join("\n")}`
+  );
+
+  const withoutFix = await replay(80, 40, false);
+  assert.notEqual(
+    withoutFix.cursorY,
+    withoutFix.expectedRow,
+    "expected the row bug to reproduce (stale row) when reflowCursorLine is left at its xterm default"
+  );
+});
+
+test("#430 KNOWN LIMITATION: reflowCursorLine never corrects the cursor COLUMN, by design (xterm.js#5522)", async () => {
+  // Row-only-honest: the two tests above prove the ROW lands right. This
+  // proves the COLUMN does not, in EITHER direction, with the option on --
+  // xterm.js#5522 documents this is intentional ("will not move the cursor
+  // position, only the line contents"), not a bug pending a fix. Don't read
+  // the widening tests above as "the cursor ends up right" -- only the row
+  // does.
+  for (const [cols0, cols1] of [
+    [40, 80],
+    [80, 40],
+  ] as const) {
+    const r = await replay(cols0, cols1, true);
+    assert.notEqual(
+      r.cursorX,
+      r.expectedCol,
+      `cols ${cols0}->${cols1}: expected the column to still be wrong (cursorX=${r.cursorX}, ` +
+        `a correct reflow would put it at ${r.expectedCol}) -- if this now passes, xterm.js has ` +
+        `shipped a real cursor-column fix; update this test and doc/design/xterm-resize-reflow.md.`
+    );
+  }
+});
+
+test("#430: reflowCursorLine prevents content loss on a narrowing resize (a real win, even though the column stays wrong)", async () => {
+  const withoutFix = await replay(80, 40, false);
+  assert.ok(
+    withoutFix.wCount < 120,
+    `sanity check: content loss should reproduce without the option (saw ${withoutFix.wCount}/120)`
+  );
+
+  const withFix = await replay(80, 40, true);
+  assert.equal(
+    withFix.wCount,
+    120,
+    `expected all content to survive the reflow with reflowCursorLine on (saw ${withFix.wCount}/120)`
   );
 });
