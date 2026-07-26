@@ -4749,16 +4749,107 @@ fn resolve_session_ref(records: &[AgentRecord], input: &str) -> Result<String, S
     matches.sort_unstable();
     matches.dedup();
     match matches.as_slice() {
+        // Tagged (#412c) so a caller — an orchestrator's `spawn_agent(resume_session)`
+        // included — can tell "never seen it" from "seen it more than once" from
+        // "resolvable to a place that's since vanished" (`resolve_resume_cwd`, below)
+        // programmatically, without parsing prose.
         [] => Err(format!(
-            "unknown session {input:?} — no session in this group's roster matches that id or prefix"
+            "resume-not-found: unknown session {input:?} — no session in this group's roster \
+             matches that id or prefix"
         )),
         [one] => Ok(one.to_string()),
         many => Err(format!(
-            "ambiguous session prefix {input:?} — matches {} sessions, resolve with a longer prefix or the full id: {}",
+            "resume-ambiguous: ambiguous session prefix {input:?} — matches {} sessions, resolve \
+             with a longer prefix or the full id: {}",
             many.len(),
             many.join(", "),
         )),
     }
+}
+
+/// Resolve the cwd a worker/reviewer resume should launch from, authoritatively
+/// from the CLI's OWN session store (#412) — never from a cached copy alone.
+/// Claude Code's `--resume <id>` only searches the launch cwd's project
+/// directory and its live git worktrees (cli-reference: "passing a session ID
+/// searches only the current project directory and its git worktrees"), so a
+/// worktree that moved or was deleted since the session ran makes the OLD cwd
+/// wrong — and launching from it anyway either hard-fails inside the pane (if
+/// the directory is gone) or, worse, silently launches from some OTHER
+/// default (the group's main clone) whose project store never contained this
+/// session, which is exactly how "the session is plainly in the CLI's own
+/// history, but resume says it can't find it" happens. See
+/// `sessions::find_session_cwd` for the store lookup itself.
+///
+/// Tagged, distinguishable errors (#412c) so a caller can tell "resolvable,
+/// but its home is gone" (`resume-workspace-missing`) from "never existed
+/// here" (`resume-not-found`) from "couldn't even check"
+/// (`resume-store-unreadable`), and offer — or automate — a fresh start
+/// instead of stranding the caller with an opaque string. "Ambiguous" doesn't
+/// arise at this layer: a session id names at most one file in the store, by
+/// construction — that outcome is scoped to `resolve_session_ref`'s prefix
+/// matching, above.
+pub(crate) fn resolve_resume_cwd(cli: &str, session_id: &str) -> Result<String, String> {
+    match crate::sessions::find_session_cwd(cli, session_id) {
+        Ok(Some(cwd)) if Path::new(&cwd).is_dir() => Ok(cwd),
+        // Found the session, but its record carries no cwd at all (a session
+        // whose first ≤60 lines never mention one) — distinct from "not
+        // found": the session exists, its workspace is merely unknown, which
+        // is closer to "gone" than to "never existed here" (#412 review N6).
+        Ok(Some(cwd)) if cwd.is_empty() => Err(format!(
+            "resume-workspace-missing: session {session_id} is recorded in the {cli} session \
+             history, but it recorded no working directory — there is nowhere to resume it from. \
+             Start fresh instead of resuming."
+        )),
+        Ok(Some(cwd)) => Err(format!(
+            "resume-workspace-missing: session {session_id} is recorded in the {cli} session \
+             history under {cwd:?}, but that directory no longer exists on disk — the worktree \
+             or workspace may have been removed. Start fresh instead of resuming."
+        )),
+        Ok(None) => Err(format!(
+            "resume-not-found: session {session_id} was not found in the {cli} session history \
+             on this machine — it may have been cleared, or the record is stale."
+        )),
+        Err(e) => Err(format!("resume-store-unreadable: could not read the {cli} session store: {e}")),
+    }
+}
+
+/// Resolve a worker/reviewer resume's launch cwd: prefer a still-valid
+/// caller/roster-supplied cwd when there is one (the common case — nothing
+/// moved since the session ran, so this is a cheap no-op), falling back to
+/// `resolve_resume_cwd`'s store lookup when it's missing, empty, or points at
+/// a directory that's gone (#412).
+///
+/// `group_repo` is the group's main clone. The pre-existing roster fast path
+/// already tolerated a recorded cwd equal to it (a worker/reviewer spawned
+/// directly through the registry API with `use_worktree: false`, bypassing
+/// the MCP-layer guardrail — several tests rely on exactly this) — that gap
+/// predates this PR and is left alone. What must NOT happen is the NEW store
+/// fallback resolving into the main clone on its own: a store-only match is
+/// weaker evidence (it's a fallback specifically because nothing else is
+/// known) and accepting `group_repo` there would let the fallback quietly
+/// recreate the "resume into the human's own clone" failure #338/#359 exist
+/// to prevent (#412 review N3). So the rejection applies ONLY to the store
+/// result. Callers must reach this ONLY for a role `needs_dedicated_workspace`
+/// — an orchestrator/planner resume has no such restriction and must not call
+/// this at all.
+pub(crate) fn resolve_worker_resume_cwd(
+    cli: &str,
+    session_id: &str,
+    roster_cwd: Option<&str>,
+    group_repo: &str,
+) -> Result<String, String> {
+    if let Some(c) = roster_cwd.filter(|c| !c.trim().is_empty() && Path::new(c).is_dir()) {
+        return Ok(c.to_string());
+    }
+    let cwd = resolve_resume_cwd(cli, session_id)?;
+    if Path::new(&cwd) == Path::new(group_repo) {
+        return Err(format!(
+            "resume-workspace-missing: session {session_id}'s only recorded workspace is the \
+             group's main clone ({group_repo}) — a dedicated-workspace resume must never launch \
+             there (#338/#359). Start fresh to cut a new worktree instead."
+        ));
+    }
+    Ok(cwd)
 }
 
 /// Normalize a caller-supplied pane name (#95r): trim, drop control characters
@@ -15350,6 +15441,7 @@ pub fn create_orchestration(
             // gated exactly like `blocks` in `create_group_ex`).
             intake: workflow::IntakeProfile::default(),
         },
+        Launch::Fresh,
         None,
         None,
         initial_workers,
@@ -15867,10 +15959,29 @@ pub fn orch_end_group(
 /// becomes live once its orchestrator is registered, so id selection and
 /// registration must be atomic against concurrent launches.
 /// `expect_group` pins restores to their recorded group id.
+///
+/// `launch` and `resume_session` are independent, deliberately (#412 rev-17):
+/// `launch` answers "may this read `.loomux/workflow.yml` and rebuild the
+/// roster/merge-gate from it" (see [`Launch`]) — `resume_session` answers
+/// "does the orchestrator pane `--resume` a specific conversation, or start a
+/// fresh one". These used to be the same bool (`resume_session.is_some()`
+/// derived `launch`), which was correct for the two cases that existed at the
+/// time — but `resume_recorded_session`'s `start_fresh` path (#412) added a
+/// THIRD: an existing, previously-launched group getting a fresh
+/// *conversation* on its orchestrator, which must still be `Launch::Resume`
+/// (never re-derive the roster/gate the human already consented to at the
+/// original launch — see `create_group_ex`'s "consent rule, not an
+/// optimization" comment) even though `resume_session` is `None`. Conflating
+/// them let a `start_fresh` on an orchestrator silently swap the group's
+/// roster to whatever the repo's workflow file currently says, and delete its
+/// merge-gate spec if the file no longer declares one — the exact provenance
+/// violation `create_group_ex`'s resume path exists to prevent, just reached
+/// through a caller that thought "no session id" meant "fresh launch".
 pub fn create_orchestration_group(
     reg: &Arc<OrchRegistry>,
     repo: &str,
     guardrails: Guardrails,
+    launch: Launch,
     resume_session: Option<String>,
     expect_group: Option<&str>,
     initial_workers: u32,
@@ -15885,10 +15996,6 @@ pub fn create_orchestration_group(
         return Err(format!("repository path does not exist: {repo}"));
     }
     let _creation = reg.creation.lock_safe();
-    // A resume reopens a recorded orchestrator session; anything else is the human
-    // at the launcher, who has just been shown what the advanced orchestrator would
-    // run. Only the latter reads the repo's workflow file (#222) — see [`Launch`].
-    let launch = if resume_session.is_some() { Launch::Resume } else { Launch::Fresh };
     let group = reg.create_group_ex(repo, guardrails, launch)?;
     if let Some(want) = expect_group {
         if group.id != want {
@@ -16164,6 +16271,7 @@ pub fn resume_recorded_session(
     reg: &Arc<OrchRegistry>,
     session_id: &str,
     hint: Option<(String, String)>, // (group_id, role) from transcript signatures
+    start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
     let record = reg
         .session_roles()
@@ -16206,11 +16314,56 @@ pub fn resume_recorded_session(
         let (repo, guardrails) = reg
             .load_group_file(&record.group_id)
             .ok_or("group.json is missing for this orchestration")?;
+        // Existence-only pre-check (#412 review B1): the orchestrator's
+        // launch cwd is always `repo`, fixed — never a worktree — so #412's
+        // confirmed CWD-MISMATCH failure mode can't arise for it the same
+        // way as the worker/reviewer path below, and this never swaps the
+        // launch cwd. But the EXISTENCE failure mode (the session cleared
+        // from the CLI's history, or the store unreadable, while loomux's
+        // own roster still names it) is exactly as reachable for an
+        // orchestrator as for a worker — skipping it here left #412's
+        // TITULAR bug (a cold-started orchestration pane that fails inside
+        // with no steering box) open, and made `start_fresh` unreachable
+        // dead code for this branch, since nothing here ever returned a
+        // tagged error for `resumeFailureKind` to recognize.
+        if !start_fresh {
+            let cli = guardrails
+                .block_for(Role::Orchestrator)
+                .map(|b| workflow::cli_of(b, &guardrails.agent_cli).to_string())
+                .unwrap_or_else(|| guardrails.agent_cli.clone());
+            match crate::sessions::find_session_cwd(&cli, session_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(format!(
+                        "resume-not-found: session {session_id} was not found in the {cli} \
+                         session history on this machine — it may have been cleared, or the \
+                         record is stale. Start a fresh orchestrator for this group instead."
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "resume-store-unreadable: could not read the {cli} session store: {e}"
+                    ));
+                }
+            }
+        }
+        let resume_session = (!start_fresh).then(|| session_id.to_string());
+        // ALWAYS Launch::Resume here (#412 rev-17 blocker), regardless of
+        // `start_fresh`: this is reopening an EXISTING, previously-launched
+        // group either way — a fresh CONVERSATION on it (start_fresh) is not
+        // a fresh LAUNCH of it. `resume_session: None` used to make
+        // `create_orchestration_group` derive `Launch::Fresh` from that alone,
+        // which re-read `.loomux/workflow.yml` and silently swapped the
+        // group's roster (and could delete its merge-gate spec) to whatever
+        // the repo file currently says — the exact provenance violation the
+        // resume path exists to prevent. See `create_orchestration_group`'s
+        // doc comment.
         return create_orchestration_group(
             reg,
             &repo,
             guardrails,
-            Some(session_id.to_string()),
+            Launch::Resume,
+            resume_session,
             Some(&record.group_id),
             0,
         )
@@ -16245,7 +16398,6 @@ pub fn resume_recorded_session(
         .merged_records(&record.group_id)
         .into_iter()
         .find(|r| r.session.as_deref() == Some(session_id));
-    let cwd = matched.as_ref().map(|r| r.cwd.clone()).filter(|c| Path::new(c).is_dir());
     let restore_source = matched.as_ref().map(|r| r.name_source);
     let reg2 = reg.clone();
     let sid = session_id.to_string();
@@ -16279,9 +16431,50 @@ pub fn resume_recorded_session(
             }
             known
         });
+    // Resolve the launch cwd SYNCHRONOUSLY, before the background spawn below,
+    // and authoritatively (#412): a stale/missing roster cwd (a moved or
+    // deleted worktree) must fail the resume LOUDLY, back to the human who
+    // clicked it, right now — not silently, several audit lines deep in a
+    // background thread whose only trace is a message in the orchestrator's
+    // own pane (which nobody may be looking at). `start_fresh` skips all of
+    // this: a fresh spawn cuts its own new worktree and needs no prior cwd.
+    let (resume_session, cwd_override, use_worktree, task) = if start_fresh {
+        // #412 review N6: name the OLD branch when known — the worktree is
+        // gone, but a `workspace-missing` resume almost always means the
+        // BRANCH still holds the prior work (the worktree was merely
+        // removed, e.g. after a merge, or cleared independently of the
+        // branch itself), and a fresh agent with no idea that branch exists
+        // is liable to redo it from scratch.
+        let task = match &record.branch {
+            Some(b) if !b.trim().is_empty() => format!(
+                "{}\n\n(Restarted fresh after its previous session/worktree became unresumable. \
+                 Its prior work may still be on branch '{b}' — check it before redoing anything.)",
+                record.task
+            ),
+            _ => record.task.clone(),
+        };
+        (None, None, true, task)
+    } else {
+        let group = reg.group(&record.group_id).ok_or("group vanished during resume")?;
+        let resolved_block = match block.as_deref() {
+            Some(id) => group.guardrails.block(id).cloned(),
+            None => group.guardrails.block_for(role).cloned(),
+        };
+        let cli = resolved_block
+            .map(|b| workflow::cli_of(&b, &group.guardrails.agent_cli).to_string())
+            .unwrap_or_else(|| group.guardrails.agent_cli.clone());
+        let cwd = resolve_worker_resume_cwd(
+            &cli,
+            session_id,
+            matched.as_ref().map(|r| r.cwd.as_str()),
+            &group.repo,
+        )?;
+        (Some(sid.clone()), Some(cwd), false, String::new())
+    };
     std::thread::spawn(move || {
         if let Err(e) = reg2.spawn_agent_ex(
-            &group_id, role, block, &name, "", false, None, None, Some(sid.clone()), cwd, restore_source,
+            &group_id, role, block, &name, &task, use_worktree, None, None, resume_session, cwd_override,
+            restore_source,
         ) {
             reg2.audit(&group_id, "loomux", "error",
                 json!({ "what": "session rejoin failed", "session": sid, "err": e.clone() }));
@@ -16329,9 +16522,10 @@ pub fn resume_orch_session(
     session_id: String,
     group_hint: Option<String>,
     role_hint: Option<String>,
+    start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
     let hint = group_hint.zip(role_hint);
-    resume_recorded_session(reg.inner(), &session_id, hint)
+    resume_recorded_session(reg.inner(), &session_id, hint, start_fresh)
 }
 
 // ---------- merge-gate link resolution ----------

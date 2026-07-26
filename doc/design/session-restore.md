@@ -342,3 +342,130 @@ decline, so the saved `tabs.json` survives for the next launch's splash (one
 habitual Escape can't wipe the session). An orchestrator launch that fails tears
 down the tab it just created (`launchOrchestratorTab`'s catch) instead of leaking
 an empty tab per retry, and re-focuses the form's own tab.
+
+### #412 hardening — resolution robustness, and failing loudly
+
+Root cause (confirmed on this machine, not inferred): a worker/reviewer resume's
+launch cwd came from the roster's cached `AgentRecord.cwd` — the directory that
+worktree was cut into at spawn time. When that worktree is later removed (its
+branch merged, `git worktree remove`), `resume_recorded_session` used to
+`.filter(|c| Path::new(c).is_dir())` the stale cwd down to `None` and let it fall
+through to `spawn_agent_ex`'s per-role default — **the group's main clone**. The
+pane then launched `claude --resume <id>` from the main clone's cwd. Per the CLI
+reference, "passing a session ID searches only the current project directory and
+its git worktrees" — Claude Code's own project-directory store is keyed off the
+*launch* cwd (`~/.claude/projects/<munged-path>/<id>.jsonl`), so a resume from the
+wrong cwd searches the wrong project directory and reports "no session found" —
+even though `list_sessions` (which walks every `~/.claude/projects/*/` directory,
+not one cwd) finds the exact same session fine, which is why the session browser
+shows it as resumable while the resume itself fails. Reproduced directly: a
+session's own `cwd` field (inside its `.jsonl`) named a worktree no longer present
+in `git worktree list` for that repo; a resume attempt recorded against the main
+clone's cwd instead failed with "no session found" for a session plainly on disk.
+
+**Resolution (`sessions::find_session_cwd`, `orchestration::resolve_resume_cwd`/
+`resolve_worker_resume_cwd`).** Locate the session directly in its CLI's store BY
+ID — a bounded scan of `~/.claude/projects/*/<id>.jsonl` (claude, filename-keyed)
+or `~/.copilot/session-state/*/workspace.yaml` (copilot, matched on the parsed
+`id:` field, since its dirname isn't guaranteed to equal the id) — and read back
+the cwd the session itself recorded. This is the best available signal, not a
+guarantee (#412 review N2): it's the exact string the CLI already wrote for
+itself, so it sidesteps a stale/moved worktree AND any casing/separator drift
+between loomux's cache and the CLI's own record, without loomux ever having to
+reproduce Claude's project-directory munging algorithm — but the recorded
+`cwd` is not always the directory `--resume` actually searches (see
+`find_session_cwd`'s doc comment in `sessions.rs` for the `.claude/worktrees`
+case this doesn't cover: 2 of 691 real sessions on the machine this was
+verified against).
+
+**Testability.** The claude/copilot store roots are each overridable via a
+`thread_local!` seam (`set_claude_projects_root_for_test`/
+`set_copilot_session_state_root_for_test`, both `sessions.rs`), scoped to the
+calling thread only — deliberately NOT a process-wide env var (#412 review
+B2): Rust's default test harness runs each `#[test]` on its own OS thread, so
+a thread-local set inside one test's body can never be read by a concurrently
+running test the way a `std::env::set_var` mutation could (real,
+unsynchronized-mutation undefined behavior across threads, which is why that
+function is `unsafe` as of recent Rust editions — not just a style concern).
+`tests/orchestration.rs`'s `fixture_claude_session`/`fixture_copilot_session`
+helpers write the on-disk shape these seams point at.
+
+**Launch-cwd choice, stated (corrected after #412 review N1 — this section
+previously claimed the opposite of what the code does).** The roster's cached
+cwd wins whenever it's still a real directory on disk — `resolve_worker_resume_cwd`
+returns it directly, without ever consulting the store. Only a missing, empty, or
+no-longer-existing cached cwd falls through to the store scan. This is
+deliberate, not merely the cheap path: a live worktree the roster still points
+at IS the session's current home, and is strictly better evidence than the
+store's possibly-stale snapshot of where that same session happened to run
+*at some point* — the store is consulted only because loomux's cache has gone
+stale (the one case it's actually needed), never used to second-guess a cache
+entry that's still checked out. A caveat this stance accepts: if the roster's
+cwd and the store's cwd disagree while BOTH still exist as real directories
+(e.g. a worktree re-added at a different path than the one the session
+originally ran under), the roster wins even though it may not be the exact
+directory the CLI itself would search — a narrower case than the #412 repro
+(worktree gone entirely), left unhandled by design rather than by omission.
+
+**Failing loudly.** When resolution comes up empty, `resume_recorded_session`
+(worker/reviewer path) now resolves the cwd **synchronously, before** the
+background `spawn_agent_ex` thread — so an unresolvable resume returns `Err`
+straight back through the IPC call, and **no pane is ever opened** for it (no
+"normal agent pane with no steering box" to degrade into, because nothing gets
+spawned at all). The error is tagged (`resume-not-found:` / `resume-workspace-
+missing:` / `resume-store-unreadable:` / `resume-ambiguous:` — the last from
+`resolve_session_ref`'s existing prefix matching), so an orchestrator's
+`spawn_agent(resume_session:)` can branch on the tag instead of parsing prose, and
+`resumeerror.ts` (`resumeFailureKind`) does the same on the frontend. The session
+browser turns a `not-found`/`workspace-missing` failure into a confirm dialog
+("Session not resumable — Start fresh?") instead of a dead-end fatal banner;
+confirming re-spawns fresh with the SAME recorded group/role/block/task brief
+(`start_fresh` on `resume_orch_session`/`resume_recorded_session`), cutting a new
+worktree rather than resuming the unresolvable one.
+
+**`start_fresh` is a fresh CONVERSATION, never a fresh LAUNCH (#412 rev-17
+blocker, fixed).** For an orchestrator, "start fresh" must reattach to the
+group's EXISTING state — its persisted roster and merge gate, the ones the
+human previewed and approved at the actual launch — not re-read
+`.loomux/workflow.yml` as if this were a new launcher session. The first cut
+of `start_fresh` got this wrong by conflating two questions that happened to
+coincide in every case that existed before it: `resume_session.is_some()`
+used to double as "does this launch read the workflow file"
+(`create_orchestration_group` derived `Launch` from it directly). `start_fresh`
+introduced a THIRD case — an existing group, no session id to resume — where
+that derivation gives the wrong answer: `Launch::Fresh`, which silently
+swapped the group's roster to whatever the repo currently declares and could
+delete its merge-gate spec file if the repo no longer declares one. Neither
+the roster swap nor the gate deletion goes through anything a human sees; a
+two-button "Start fresh?" confirm is not the launcher's roster preview, and
+`Launch`'s own contract (`orchestration/mod.rs`) is explicit that a resume's
+consent moment is the ORIGINAL launch, not this one.
+`create_orchestration_group` now takes `launch: Launch` as its own explicit
+argument instead of inferring it — `resume_recorded_session`'s orchestrator
+branch always passes `Launch::Resume`, whether or not it's carrying a session
+id to `--resume`, because either way it is reopening a group that already
+has an approved roster and gate on disk. `tests/orchestration.rs`'s
+`start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_file` pins both
+directions (roster identity, merge-gate content) byte-for-byte across a
+repo-file change that would otherwise have been silently adopted.
+
+**Scope, stated (updated after #412 rev-17 B1 — this paragraph's second half
+described the pre-B1-fix behavior, which shipped and was then found still
+broken).** The orchestrator's own resume is NOT put through the store's cwd —
+its launch cwd is always the group's repo path, fixed, never a worktree, so
+the moved/deleted-worktree failure mode can't arise for it structurally. That
+part still holds: there is no cwd SWAP for the orchestrator. What's no longer
+true is "a cleared session still surfaces from inside the pane" — the
+orchestrator branch DOES now run the same existence-only pre-check as the
+worker/reviewer path (session genuinely absent from the store, or the store
+unreadable) before opening a pane, tagged the same way, so `start_fresh` is
+reachable for it too — closing #412's titular symptom (a cold-started
+orchestration pane that fails inside with no steering box), not just its
+worker/reviewer half. See `resume_recorded_session`'s orchestrator branch.
+Copilot's own `--resume <id>` cwd-scoping behavior is **undocumented** (the
+official reference is silent on it — see the `agent-cli-reference` skill's
+citation discipline); the fix applies the same store-lookup mechanism to it
+defensively (its session-state layout is flat and id-keyed, so the "wrong project
+directory" failure mode is Claude-specific by construction), but this is not
+empirically verified against a real `copilot --resume` the way the Claude repro
+above is.

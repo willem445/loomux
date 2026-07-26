@@ -18,7 +18,7 @@ import {
   type PtyExit,
   type SessionInfo,
 } from "./pty";
-import { modal } from "./modal";
+import { modal, confirmModal } from "./modal";
 import { SubmitLatch } from "./panesetup";
 import {
   dirtyBuffers,
@@ -56,6 +56,7 @@ import {
 import { tabAttention, sameAttention, findPaneByPty } from "./tabroute";
 import { encodeTabs, decodeTabs, type PersistedTabs, type PersistedLayoutNode, type PersistedPane } from "./tabstore";
 import { decideRestore } from "./restoredecision";
+import { resumeFailureKind, offersStartFresh, resumeFailureReason } from "./resumeerror";
 import {
   planLayoutRestore,
   planPaneRestore,
@@ -801,6 +802,17 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     // 2. Rejoin each resumable delegate INTO the now-live group. Sequential (not
     //    concurrent) so the group settles live before each rejoin and we don't
     //    fan out a spawn burst; a single member's failure doesn't sink the rest.
+    //
+    //    #412 review N5: this is a BATCH restore, not the single-session-browser
+    //    click `restoreSession` handles — a confirm dialog per failed member (one
+    //    click could pop several in a row) would be worse UX than the session
+    //    browser's single-target "Start fresh?", so this stays a toast rather than
+    //    reusing that dialog. It DOES reuse resumeerror.ts's classification so the
+    //    toast is specific about what happened and points at the fix (the session
+    //    browser) instead of a raw error string — a `not-found`/`workspace-missing`
+    //    member is dropped for good this pass (its whole point is that resuming it
+    //    would have failed anyway); it's still resumable/start-freshable later from
+    //    the session browser, same as any other unresolvable session.
     for (const member of plan.rejoin) {
       try {
         await resumeOrchSession(ws.grid, eventsFor(ws), member.sessionId, {
@@ -808,7 +820,12 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
           role: member.role,
         });
       } catch (err) {
-        showToast(`Couldn't rejoin a ${member.role}: ${String(err)}`, "info");
+        const message = String(err);
+        const kind = resumeFailureKind(message);
+        const reason = offersStartFresh(kind)
+          ? `${resumeFailureReason(kind)} Resumable from the session browser.`
+          : message;
+        showToast(`Couldn't rejoin a ${member.role}: ${reason}`, "info");
       }
     }
     // 3. Report members we can't bring back — a captured delegate with no
@@ -1118,11 +1135,18 @@ async function restoreSession(s: SessionInfo): Promise<void> {
     const owning = tabs.workspaceForGroup(orchRole.group_id);
     const ws = owning ?? tabs.activeWorkspace;
     if (owning && owning.id !== tabs.activeTabId) tabs.switchTo(owning.id);
+    const hint = { group: orchRole.group_id, role: orchRole.role };
+    // #412: the resume/rejoin machinery never opens a pane speculatively — a
+    // failure throws BEFORE anything is spawned (see `resolve_worker_resume_cwd`
+    // in the backend), so there is never a degraded plain pane to clean up
+    // here; there is only "opened" or "didn't, with a reason". A tagged
+    // not-found/workspace-missing failure gets an actionable choice instead of
+    // just a fatal banner: retry as a FRESH session, reusing the same
+    // recorded group/role/block/task brief the resume would have rejoined.
+    const attempt = (startFresh: boolean) =>
+      resumeOrchSession(ws.grid, eventsFor(ws), s.id, hint, startFresh);
     try {
-      const restored = await resumeOrchSession(ws.grid, eventsFor(ws), s.id, {
-        group: orchRole.group_id,
-        role: orchRole.role,
-      });
+      const restored = await attempt(false);
       // Bind the restored group to this tab so its rejoined workers spawn here
       // and focus/attention resolve here (#63); idempotent when the tab already
       // owned it. Pane lookups scan live panes, so there's no per-pty binding.
@@ -1131,7 +1155,36 @@ async function restoreSession(s: SessionInfo): Promise<void> {
         persistTabs();
       }
     } catch (err) {
-      showFatal(String(err));
+      const message = String(err);
+      const kind = resumeFailureKind(message);
+      if (!offersStartFresh(kind)) {
+        showFatal(message);
+        return;
+      }
+      // #412 rev-17 NB4: an orchestrator has no task brief to "keep the same" —
+      // start-fresh re-boots its control plane on the group's EXISTING board/
+      // roster/gate (never a re-read of the repo's workflow file — see
+      // create_orchestration_group's Launch::Resume contract), a worker/
+      // reviewer's start-fresh reuses its recorded task in a NEW worktree.
+      const whatItDoes =
+        orchRole.role === "orchestrator"
+          ? "Start a fresh orchestrator session instead? It reattaches to this group's existing board and roster."
+          : "Start a fresh session instead, with the same task, in a new worktree?";
+      const startFresh = await confirmModal(
+        "Session not resumable",
+        `${resumeFailureReason(kind)} ${whatItDoes}`,
+        "Start fresh"
+      );
+      if (!startFresh) return;
+      try {
+        const restored = await attempt(true);
+        if (restored) {
+          tabs.bindGroup(restored.groupId, ws.id);
+          persistTabs();
+        }
+      } catch (err2) {
+        showFatal(String(err2));
+      }
     }
     return;
   }
