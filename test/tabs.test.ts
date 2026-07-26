@@ -5,7 +5,7 @@
 // driven with a fake workspace (CLAUDE.md test convention). Run `npm test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { TabManager, type ManagedWorkspace } from "../src/tabs.ts";
+import { TabManager, dropTargetIndex, type ManagedWorkspace } from "../src/tabs.ts";
 import { tabCounts, type TabPaneInfo } from "../src/tabcounts.ts";
 
 /** A lightweight ManagedWorkspace that records the visibility/focus/dispose
@@ -344,4 +344,150 @@ test("restore indexes activeIndex against the restored tabs, not the pre-splash 
   tabs.closeTab(seed.id);
   assert.equal(tabs.activeTabId, restored[activeIndex].id, "the saved active tab, not an off-by-one neighbor");
   assert.equal(tabs.get(seed.id), undefined, "the seed is gone");
+});
+
+// ---------- moveTab (#379: drag-to-reorder) ----------
+//
+// `tabs.tabs`'s array order IS the display order and (via snapshot(), see
+// tabstore.test.ts's encode/decode round-trip) the persisted order — so these
+// tests are the entire reorder model. The tab strip's drag handling and the
+// keyboard alternative both just call moveTab with a clamped target index.
+
+test("moveTab moves a tab from the middle to the front", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  const b = tabs.newTab(false);
+  const c = tabs.newTab(false);
+  tabs.moveTab(c.id, 0);
+  assert.deepEqual(tabs.tabs.map((w) => w.id), [c.id, a.id, b.id]);
+});
+
+test("moveTab moves a tab from the front to the end", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  const b = tabs.newTab(false);
+  const c = tabs.newTab(false);
+  tabs.moveTab(a.id, 2);
+  assert.deepEqual(tabs.tabs.map((w) => w.id), [b.id, c.id, a.id]);
+});
+
+test("moveTab shifts the tabs between the old and new slot, not just a swap", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  const b = tabs.newTab(false);
+  const c = tabs.newTab(false);
+  const d = tabs.newTab(false);
+  tabs.moveTab(a.id, 2);
+  assert.deepEqual(tabs.tabs.map((w) => w.id), [b.id, c.id, a.id, d.id]);
+});
+
+test("moveTab clamps an out-of-range target index instead of throwing", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  const b = tabs.newTab(false);
+  tabs.moveTab(a.id, 999);
+  assert.deepEqual(tabs.tabs.map((w) => w.id), [b.id, a.id]);
+  tabs.moveTab(a.id, -50);
+  assert.deepEqual(tabs.tabs.map((w) => w.id), [a.id, b.id]);
+});
+
+test("moveTab is a no-op for an unknown id", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  const b = tabs.newTab(false);
+  tabs.moveTab("not-a-real-id", 0);
+  assert.deepEqual(tabs.tabs.map((w) => w.id), [a.id, b.id]);
+});
+
+test("moveTab to the same slot is a no-op and does not emit", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  tabs.newTab(false);
+  let emits = 0;
+  tabs.onChange(() => emits++);
+  tabs.moveTab(a.id, 0);
+  assert.equal(emits, 0);
+});
+
+test("moveTab preserves activeTabId and each workspace's visibility across a reorder", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  const b = tabs.newTab(false);
+  tabs.moveTab(a.id, 1);
+  assert.equal(tabs.activeTabId, a.id);
+  assert.equal(onlyVisible(tabs).id, a.id);
+  assert.equal(b.visible, false);
+});
+
+test("moveTab notifies onChange listeners so the strip re-renders in the new order", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  tabs.newTab(false);
+  let emits = 0;
+  tabs.onChange(() => emits++);
+  tabs.moveTab(a.id, 1);
+  assert.equal(emits, 1);
+});
+
+// ---------- moveActiveTab (#379: keyboard alternative) ----------
+
+test("moveActiveTab(1) moves the active tab one slot right", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  const b = tabs.newTab(false);
+  tabs.moveActiveTab(1);
+  assert.deepEqual(tabs.tabs.map((w) => w.id), [b.id, a.id]);
+  assert.equal(tabs.activeTabId, a.id, "still active after moving");
+});
+
+test("moveActiveTab(-1) at the front is a no-op", () => {
+  const { tabs } = makeManager();
+  const a = tabs.newTab();
+  tabs.newTab(false);
+  tabs.moveActiveTab(-1);
+  assert.equal(tabs.tabs[0].id, a.id);
+});
+
+// ---------- dropTargetIndex (#379: drag-drop index math) ----------
+
+test("dropTargetIndex: dropping before a later tab lands the dragged tab right there", () => {
+  // a b c d, drag a and drop on c's LEADING edge -> b c-shifted-left... a ends
+  // up immediately before c: b a c d.
+  assert.equal(dropTargetIndex(["a", "b", "c", "d"], "a", "c", true), 1);
+});
+
+test("dropTargetIndex: dropping after a later tab lands the dragged tab right after it", () => {
+  // a b c d, drag a, drop on c's TRAILING edge -> b c a d.
+  assert.equal(dropTargetIndex(["a", "b", "c", "d"], "a", "c", false), 2);
+});
+
+test("dropTargetIndex: dropping before an earlier tab (dragging backward)", () => {
+  // a b c d, drag d, drop on b's LEADING edge -> a d b c.
+  assert.equal(dropTargetIndex(["a", "b", "c", "d"], "d", "b", true), 1);
+});
+
+test("dropTargetIndex: dropping after an earlier tab (dragging backward)", () => {
+  // a b c d, drag d, drop on b's TRAILING edge -> a b d c.
+  assert.equal(dropTargetIndex(["a", "b", "c", "d"], "d", "b", false), 2);
+});
+
+test("dropTargetIndex feeds moveTab to land the dragged tab exactly beside the target", () => {
+  const cases: [draggedIdx: number, overIdx: number, before: boolean][] = [
+    [0, 2, true],
+    [0, 2, false],
+    [3, 1, true],
+    [3, 1, false],
+    [2, 3, false],
+  ];
+  for (const [draggedIdx, overIdx, before] of cases) {
+    const { tabs } = makeManager();
+    const ids = [0, 1, 2, 3].map((i) => tabs.newTab(i === 0).id);
+    const draggedId = ids[draggedIdx];
+    const overId = ids[overIdx];
+    tabs.moveTab(draggedId, dropTargetIndex(ids, draggedId, overId, before));
+
+    const finalIds = tabs.tabs.map((w) => w.id);
+    const gap = finalIds.indexOf(draggedId) - finalIds.indexOf(overId);
+    assert.equal(gap, before ? -1 : 1, `dragged tab ${draggedIdx}->${overIdx} before=${before}`);
+  }
 });

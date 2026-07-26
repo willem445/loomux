@@ -7,7 +7,7 @@
 // Pure tab state lives in TabManager (tabs.ts); this module renders it and turns
 // interactions into TabManager / backend calls, re-rendering on onChange.
 
-import type { TabManager, ManagedWorkspace } from "./tabs";
+import { dropTargetIndex, type TabManager, type ManagedWorkspace } from "./tabs";
 import { safeStyleDeclarations, compositeScale, type PreviewNode, type PreviewFit } from "./tabroute";
 import { makeRenameCommit } from "./panerename";
 import { swapEditor } from "./domutil";
@@ -41,6 +41,12 @@ const PREVIEW_REFRESH_MS = 700;
 const PREVIEW_MIN_SCALE = 0.16;
 const PREVIEW_MAX_SCALE = 1;
 
+/** Pixels the pointer must travel from the mousedown before a tab-strip drag
+ *  starts (#379's pointer-based rework) — matches grid.ts's own
+ *  DRAG_THRESHOLD_PX, keeping a plain click (switch tab, open the rename
+ *  input) from turning into a reorder attempt at the slightest hand tremor. */
+const DRAG_THRESHOLD_PX = 6;
+
 /** Live per-tab status pulled from the backend for a bound group. */
 interface TabStatus {
   agents: number;
@@ -64,6 +70,11 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
    *  takes a deliberate second action. */
   private closeArmedId: string | null = null;
   private closeArmTimer: number | null = null;
+  /** The tab id mid-drag (#379), or null. Held on the strip rather than
+   *  per-tab DOM state so `render()` (and any other tab's own hit-testing,
+   *  see `wireDrag`) can tell a drag is in progress without threading a
+   *  reference through every tab element. */
+  private draggingId: string | null = null;
 
   private el: HTMLElement;
   private tabs: TabManager<T>;
@@ -166,6 +177,15 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
   private render(): void {
     // Don't stomp an in-flight rename input.
     if (this.renamingId) return;
+    // Don't rebuild out from under an in-flight drag (#379) — replacing the
+    // dragged tab's DOM node mid-gesture (e.g. a status poll's re-render
+    // landing between pointerdown and pointerup) would detach the element the
+    // live pointermove/pointerup closures still reference, silently killing
+    // the CSS feedback (dimming, drop indicators) with no visible error.
+    // `onTabPointerDown`'s own `finish()` clears `draggingId` itself, before
+    // calling `moveTab`, so the reorder's own resulting render still goes
+    // through.
+    if (this.draggingId) return;
     this.el.replaceChildren();
 
     for (const ws of this.tabs.tabs) {
@@ -317,6 +337,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
         this.closePreview();
         this.openMenu(ws, e.clientX, e.clientY);
       });
+      this.wireDrag(tab, ws.id);
       this.el.appendChild(tab);
     }
 
@@ -326,6 +347,120 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     add.title = "New tab (Ctrl+Shift+T)";
     add.addEventListener("click", () => this.onNewTab());
     this.el.appendChild(add);
+  }
+
+  /** Wire drag-to-reorder for one tab element via POINTER events (#379,
+   *  reworked in #402's fourth live-demo round). The original mechanism used
+   *  native HTML5 `draggable="true"` drag-and-drop; in real WebView2 usage it
+   *  "grabbed" (dragstart fired, the tab dimmed) but never accepted a drop
+   *  anywhere — a failure that neither manual `DragEvent` dispatch nor
+   *  Playwright's CDP-driven `locator.dragTo()` could reproduce in
+   *  `e2e/tests/tab-reorder.spec.ts`, tried against the code both with and
+   *  without the dragenter/dropEffect fix from the prior review round. Both
+   *  techniques succeeded every time regardless, which points at the gap
+   *  living in how native HTML5 DnD initiates against a REAL OS-level mouse
+   *  gesture inside a WebView2-hosted Tauri window — a layer CDP's synthetic
+   *  input never touches, so it could never have caught this. `src/grid.ts`'s
+   *  own pane-reorder drag already avoids that whole layer (raw
+   *  `pointerdown`/`pointermove`/`pointerup`, no native DnD at all) and IS
+   *  E2E-verified reliable (`e2e/tests/pane-reorder.spec.ts`); this mirrors
+   *  that exact mechanism — a drag threshold, hit-testing by iterating live
+   *  element rects, `Escape` to cancel — instead of native
+   *  draggable/dragstart/dragover/drop, which is removed entirely. The pure
+   *  index math (`dropTargetIndex`/`moveTab`, tabs.ts) is untouched — only
+   *  the DOM trigger mechanism changed, so `test/tabs.test.ts`'s coverage of
+   *  it still stands. The dragged tab dims and the hovered tab shows a thin
+   *  accent line on whichever edge the drop would land on (CSS
+   *  `.dragging`/`.drag-before`/`.drag-after`, unchanged from the native-DnD
+   *  version) — same "target shows where it lands" convention as the
+   *  split-drag drop zones (layout.ts). */
+  private wireDrag(tab: HTMLElement, wsId: string): void {
+    tab.addEventListener("pointerdown", (e) => this.onTabPointerDown(e, tab, wsId));
+  }
+
+  private onTabPointerDown(down: PointerEvent, tab: HTMLElement, wsId: string): void {
+    if (down.button !== 0) return;
+    // The swatch/close buttons keep their own click behavior — never start a
+    // drag from them (mirrors grid.ts's own onPointerDown button exclusion).
+    if ((down.target as HTMLElement).closest("button")) return;
+    if (this.tabs.count < 2) return; // nothing to reorder into
+
+    const startX = down.clientX;
+    const startY = down.clientY;
+    let started = false;
+    let hover: { id: string; before: boolean } | null = null;
+
+    const hitTest = (x: number, y: number): { id: string; before: boolean } | null => {
+      for (const el of Array.from(this.el.querySelectorAll<HTMLElement>(".tab"))) {
+        const id = el.dataset.wsId;
+        if (!id || id === wsId) continue;
+        const r = el.getBoundingClientRect();
+        if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+        return { id, before: x < r.left + r.width / 2 };
+      }
+      return null;
+    };
+
+    const clearIndicators = (): void => {
+      for (const el of this.el.querySelectorAll(".drag-before, .drag-after")) {
+        el.classList.remove("drag-before", "drag-after");
+      }
+    };
+
+    const start = (): void => {
+      started = true;
+      this.closePreview();
+      this.draggingId = wsId;
+      tab.classList.add("dragging");
+      // Native HTML5 drag gave a "grabbing" OS cursor for free; a pointer-
+      // based drag has to supply its own — same body-class convention
+      // grid.ts's pane-drag uses (`dragging-pane`/styles.css).
+      document.body.classList.add("dragging-tab");
+    };
+
+    const move = (ev: PointerEvent): void => {
+      if (!started) {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < DRAG_THRESHOLD_PX) return;
+        start();
+      }
+      hover = hitTest(ev.clientX, ev.clientY);
+      clearIndicators();
+      if (hover) {
+        const target = this.el.querySelector<HTMLElement>(`.tab[data-ws-id="${hover.id}"]`);
+        target?.classList.toggle("drag-before", hover.before);
+        target?.classList.toggle("drag-after", !hover.before);
+      }
+    };
+
+    const finish = (commit: boolean): void => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("keydown", onKey, true);
+      // Clear BEFORE moveTab: its emit() → render() checks draggingId and
+      // skips the rebuild while a drag is in flight (see render()) — the
+      // commit itself must not be mistaken for still-dragging, or the
+      // reorder never paints until some unrelated later render fires.
+      this.draggingId = null;
+      tab.classList.remove("dragging");
+      document.body.classList.remove("dragging-tab");
+      clearIndicators();
+      if (commit && started && hover) {
+        const ids = this.tabs.tabs.map((w) => w.id);
+        this.tabs.moveTab(wsId, dropTargetIndex(ids, wsId, hover.id, hover.before));
+      }
+    };
+    const up = (): void => finish(true);
+    const onKey = (ev: KeyboardEvent): void => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        ev.stopPropagation();
+        finish(false);
+      }
+    };
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("keydown", onKey, true);
   }
 
   /** Poll each group-bound tab for its live status; re-render if anything moved. */
