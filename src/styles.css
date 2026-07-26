@@ -892,9 +892,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 
 /* xterm.js 6.0's viewport draws its own (VS Code base) scrollbar widget
    instead of a native overflow scrollbar, so the old `::-webkit-scrollbar`
-   pseudo-elements no longer match anything. The v6 widget only exposes
-   slider colors (no width/radius) via ITheme.scrollbarSlider* — set in
-   TERM_THEME (pane.ts) instead of here. */
+   pseudo-elements no longer match anything. ITheme only exposes slider
+   *colors* (scrollbarSlider* — set in TERM_THEME, pane.ts); width/radius
+   have no ITheme knob, but the widget is still a real DOM element
+   (`.xterm .xterm-scrollable-element > .scrollbar` in the bundled
+   xterm.css), so a plain CSS rule against that selector could still
+   restyle it if the new default width/shape ever needs revisiting. */
 
 /* ---------- session browser ---------- */
 #sessions {

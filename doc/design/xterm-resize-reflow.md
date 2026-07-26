@@ -64,9 +64,12 @@ resize using similar logic to conpty") as an upstream fix already released in
 It defaults to `false` ("shells usually handle this themselves" -- exactly
 the assumption conpty's resize-quirk breaks). Setting it `true` makes xterm
 reflow the cursor's own line like every other line, instead of leaving it in
-place. `@xterm/xterm` 5.x never shipped this option -- there is no smaller
-upgrade that gets it; 6.0.0 is the first release that has it, so the v6 bump
-is taken **for `reflowCursorLine`**, not because v6 itself is "the fix" for
+place. No **stable** `@xterm/xterm` 5.x release shipped this option (5.5.0's
+typings have zero mentions of it; the only stable 5.x releases are 5.4.0 and
+5.5.0) -- it first shipped in a `5.6.0-beta.*` prerelease (xterm.js#5295 was
+filed against `5.6.0-beta.96`), which isn't a production dependency choice,
+so 6.0.0 is the first **stable** release that has it and the v6 bump is
+taken **for `reflowCursorLine`**, not because v6 itself is "the fix" for
 #430.
 
 `pane.ts` sets `reflowCursorLine: true` alongside `windowsPty`, gated to the
