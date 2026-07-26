@@ -890,13 +890,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .orch-compose-status.show { visibility: visible; }
 
-.xterm-viewport::-webkit-scrollbar { width: 10px; }
-.xterm-viewport::-webkit-scrollbar-track { background: transparent; }
-.xterm-viewport::-webkit-scrollbar-thumb {
-  background: #262634; border-radius: 5px;
-  border: 2px solid var(--bg-term); background-clip: padding-box;
-}
-.xterm-viewport::-webkit-scrollbar-thumb:hover { background: #333345; border: 2px solid var(--bg-term); background-clip: padding-box; }
+/* xterm.js 6.0's viewport draws its own (VS Code base) scrollbar widget
+   instead of a native overflow scrollbar, so the old `::-webkit-scrollbar`
+   pseudo-elements no longer match anything. ITheme only exposes slider
+   *colors* (scrollbarSlider* — set in TERM_THEME, pane.ts); width/radius
+   have no ITheme knob, but the widget is still a real DOM element
+   (`.xterm .xterm-scrollable-element > .scrollbar` in the bundled
+   xterm.css), so a plain CSS rule against that selector could still
+   restyle it if the new default width/shape ever needs revisiting. */
 
 /* ---------- session browser ---------- */
 #sessions {
