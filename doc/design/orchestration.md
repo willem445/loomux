@@ -1380,13 +1380,18 @@ limit.
   standalone `/compact` token (the terminal echoes typed input like any other line) — gated
   by `MANUAL_COMPACT_DETECT_WINDOW_MS` against the pane's `last_user_input_ms` so the tail's
   bounded ring buffer can't replay an ALREADY-handled compact and re-trigger detection.
-  Resolution delivers `compact_reinjection_notice`, which embeds the pane's ACTUAL kickoff
-  instructions file — read back verbatim from the durable file `write_instruction_files`
-  already writes at spawn, not a pointer telling the agent to go re-read it (the issue's
-  explicit preference: no reliance on the agent locating a file). This supersedes #287's
-  optional immediate post-paste notice entirely — sending both would be redundant, and the
-  immediate version risked landing while compaction was still running; the mandatory version
-  only ever fires once compaction is actually observed to be done.
+  Resolution delivers `compact_reinjection_notice`, which — AT THE TIME #328/#329 were built —
+  always embedded the pane's ACTUAL kickoff instructions file, read back verbatim from the
+  durable file `write_instruction_files` already writes at spawn, not a pointer telling the
+  agent to go re-read it (the issue's explicit preference: no reliance on the agent locating a
+  file). **This full-embedding default no longer holds — see "#417 correction round 5: slimming
+  the re-grounding notice" below**, which changed the FACTS this decision rested on (#416 gave
+  the contract a durable home OUTSIDE this notice entirely, for almost every agent) rather than
+  reversing the reasoning itself: "no reliance on the agent locating a file" is exactly as true
+  as ever for the one case that still gets the full embedding. This supersedes #287's optional
+  immediate post-paste notice entirely — sending both would be redundant, and the immediate
+  version risked landing while compaction was still running; the mandatory version only ever
+  fires once compaction is actually observed to be done.
 - **Template.** The orchestrator persona's existing "Compact at lulls" invariant (predating
   even #287 — it used to tell the orchestrator to type `/compact` itself) is rewritten to
   call `request_compact()` as the primary mechanism, name the offload checklist as a
@@ -1397,7 +1402,11 @@ limit.
   Only full re-injection is built — it is both the stated default AND the recommended,
   more-robust option (no reliance on the agent finding a file), so a second mode whose whole
   purpose is being the less-recommended alternative wasn't worth the added config surface
-  here. Revisit if a real need for the pointer mode shows up.
+  here. **Revisit if a real need for the pointer mode shows up** — #416 turned out to BE that
+  need: not a config knob a human toggles, but a per-agent FACT (`AgentEntry::contract_on_
+  system_layer`) about whether the contract has a durable home outside this notice at all. See
+  "#417 correction round 5" below — still no config surface, since the choice is now something
+  loomux already knows at spawn time, not a preference to expose.
 
 ### #329 expansion: the directive ledger and the fourth trigger path
 
@@ -1869,6 +1878,936 @@ ever" invariant is unaffected).
 kickoff doesn't embed the directive ledger the way a `/compact` reinjection does — filed as
 [#411](https://github.com/willem445/loomux/issues/411), a known scope boundary (a different code
 path, `spawn_agent_ex`'s resume branch, not `compact_nudge_tick`).
+
+### #416/#417: a durable system-prompt contract, and compact hooks as a trusted evidence source
+
+Everything above this point hardens **detection and recovery**: infer that a compaction
+happened (banner, token drop, `compact_boundary` marker) and re-inject the role contract +
+ledger once it's confirmed. #416 and #417 attack the two remaining soft spots that survived
+seven review rounds of that machinery: the contract itself never lived anywhere structurally
+durable, and every detection path was inference, never direct evidence. Neither issue
+restructures the #329 state machine (rev-48/50 judged the core sound) — both land as new
+capability at its existing seams.
+
+**#416's actual gap, found by re-deriving the history rather than assuming it.** loomux
+already migrated away from `--append-system-prompt-file` once, in #222/#105: `claude --agents
+'<json>' --agent <id>` replaced it, because it lets loomux synthesize a persona inline with zero
+repo files and zero trust problem (see `profiles.rs`'s module doc and `persona_inject`'s doc).
+The natural assumption is that this closed #416 already — it didn't. Reading `persona_inject`
+before this change: `--agents` only ever carried a **repo-authored persona's** text
+(`ResolvedPersona.text`), and only when a block had one (`prompt:`/`profile:` in
+`.loomux/workflow.yml`). The built-in role contract — `mechanics_core` plus the class template,
+the actual "you are a worker, here is `report()`, here is the git discipline" text — reached an
+agent exactly one way: the kickoff prompt says "First read your role instructions: `<path>`",
+and the agent's own `Read` tool call puts that text into the conversation as a **tool result**,
+not the system prompt. That's a plain conversation turn, exactly as compressible by a summarizer
+as anything else — which is what the user's live v0.10.0 incident actually proved: not that
+`--agents` was broken, but that the default roster (the common case — no workflow file) never
+used it for the one thing that mattered, and a workflow-customized block's `--agents` payload
+carried only the *persona*, never loomux's own mechanics on top of it.
+
+The fix is additive to the existing mechanism, not a second one: `block_contract_text`
+(`mod.rs`) unifies `render_block_instructions`'s output (the exact bytes the instructions FILE
+gets — refactored out of `write_block_instructions` so file and system-prompt payload can never
+diverge) with a configured persona, folded in as an addendum (`mode: append`) or alongside the
+non-overridable mechanics core (`mode: replace`) — the same composition the file/kickoff pair
+already did, just unified into one string. `persona_inject` now emits `--agents`/`--agent` for
+**every** Claude block, persona or not — the trust-root orchestrator included (`--agents` now
+always appears on its command line too; what stays absent is repo TEXT, never the flag itself —
+see `a_repo_file_can_never_author_the_orchestrators_persona`, updated rather than weakened). One
+sharp-edged bug surfaced immediately doing this: loomux's own template prose is full of literal
+apostrophes ("don't", "aren't") that were never a hazard while this text only ever reached an
+agent via a file read — riding inside `--agents`'s single-quoted shell token, an unescaped `'`
+closes that quote early, exactly the hazard `workflow::sanitize_persona` already exists to
+neutralize for repo personas. Fixed by sanitizing at the same point personas already are, in
+`persona_inject`, never at the source (the instructions file keeps real apostrophes — nothing
+about `write_block_instructions`'s output changed, so the `tests/fixtures/pre222` golden is
+untouched).
+
+**Per-CLI capability matrix (#416, ORIGINAL — the Claude row is superseded, see
+"Round #417 correction 6" immediately below; left as-is rather than silently edited,
+per this doc's own honesty convention):**
+
+| | system-prompt mechanism | default roster (no persona) | workflow persona |
+|---|---|---|---|
+| Claude | `--agents '<json>' --agent <id>` | contract rides inline (new) | contract + persona, one payload (new: contract was previously absent) |
+| Copilot, user-authored `.github/agents/*.md` | native `--agent <name>` | n/a | unchanged — `--agent` still points at the exact file loomux read (`profiles::handle_resolves_to`); mechanics-core coverage for this ONE case is still kickoff/file-read only (documented residual gap below) |
+| Copilot, no persona / inline `prompt:` | generated `--agent loomux-<group>-<block>` file | contract rides via generated file (new) | contract + persona in the generated file (new: previously nothing for no-persona, kickoff-only for inline `prompt:`) |
+
+Copilot's `--agent <name>` resolves a NAME against a fixed directory precedence
+(`~/.copilot/agents` → repo `.github/agents/` → org), confirmed against current upstream docs —
+never an arbitrary path. loomux was already careful never to write a generated persona into the
+repo's own `.github/agents/` (that would dirty the user's git tree with a file they didn't
+author — `profiles::is_copilot_native`'s reasoning). `~/.copilot/agents` is the other end of that
+same precedence chain: Copilot's OWN user-level convention, not a loomux invention, exactly as
+`~/.claude/agents` is for Claude — so writing loomux's generated wrapper there (`OrchRegistry::
+write_copilot_agent_file`, test-overridable via `set_copilot_agents_dir_override`, mirroring
+`set_claude_projects_dir`) closes the SAME gap Claude had, for the SAME reason, without touching
+anything the user authored. The one deliberately NOT closed this round: a user's own native
+`.github/agents/*.md` persona still gets loomux's mechanics core only via the kickoff/file-read
+path, not the system-prompt layer — synthesizing a wrapper around a user-authored file would
+trade the carefully-reasoned `handle_resolves_to` trust property (the `--agent` flag resolves to
+**exactly the file loomux read and kind-checked**, nothing else) for coverage this one case
+doesn't have yet. Worth closing, not free, left as follow-up.
+
+**Honesty note, since this is a claim about a CLI loomux doesn't control:** whether a Copilot
+custom-agent file's content survives Copilot's OWN compaction/summarization structurally (the
+way `--agents` unambiguously is Claude's system-prompt layer) is **not confirmed** by Copilot's
+docs — no source describes where custom-agent instructions live in Copilot's prompt
+architecture relative to a `/compact` event. This is the best available mechanism (a system-level
+custom-agent flag beats a conversation-turn file-read on priors), not a proven guarantee — a
+gap to note honestly rather than paper over, and easy to revisit if Copilot's own docs firm up.
+
+**Round #417 correction 6 — a live demo blocker: `--agents` put the durable contract on argv,
+and Windows CreateProcessW has a hard 32,767-character command-line limit.** The user's own
+demo, launching a Claude orchestrator in this worktree, failed outright with "loomux: failed to
+start shell" / a `CreateProcessW` error. The screenshot showed the FULL orchestrator contract
+(mechanics core + template, many KB) embedded inline in the `--agents` JSON, routed through the
+`pwsh.exe -Command` shell fallback. Root cause, confirmed rather than assumed: `--agents` only
+ever carried a SHORT repo persona before #416 (see the `## #416's actual gap` paragraph above)
+— the reviews that shipped #416 verified that token's QUOTING (the apostrophe/ASCII-escaping
+work described above) but never its LENGTH, because nothing before #416 put more than a few
+hundred bytes of persona text there. #416 widened the payload to loomux's OWN template prose on
+EVERY block, unconditionally — categorically bigger, and eventually big enough to blow the
+limit. The failing path was the `pwsh -Command` fallback (whose extra escaping layer inflates
+an already-long line further), but the direct-`CreateProcessW`-spawn path is subject to the
+identical 32,767-character hard limit — so the fix could not depend on which spawn path runs;
+it had to remove the multi-KB payload from argv on BOTH paths.
+
+**The fix, per Claude's own CLI reference (code.claude.com/docs/en/cli-reference) and its
+sub-agents doc (code.claude.com/docs/en/sub-agents), read in full for this round: the contract
+now travels by FILE, mirroring the Copilot precedent, not argv.** The reference confirms
+`--agent <name>` "activates a custom agent by name" and, per the sub-agents doc's own "Run the
+whole session as a subagent" section: passing `--agent <name>` alone "start[s] a session where
+the main thread itself takes on that subagent's system prompt... replac[ing] the default Claude
+Code system prompt entirely" — when `<name>` resolves against `.claude/agents/` (project) or
+`~/.claude/agents/` (user), both scanned automatically, no `--agents` JSON required at all. This
+is the EXACT "native custom-agent flag, file-backed" shape Copilot's `~/.copilot/agents`
+precedent already used — round 6 makes it true for Claude too, closing the gap the ORIGINAL
+`--agents '<json>'` choice opened (see `write_claude_agent_file`, `claude_agents_dir`,
+`PersonaInject::claude_agent`'s docs in `mod.rs`):
+
+- **Primary path**: `write_claude_agent_file` writes a loomux-generated, uniquely-handled
+  (`loomux-<group>-<block>`, same convention as Copilot's) `~/.claude/agents/<handle>.md` file
+  carrying the FULL contract as its markdown body, with `name`/`description` frontmatter
+  (`description` is REQUIRED by Claude's own schema, unlike Copilot's generated file, which has
+  none — `yaml_double_quoted` quotes it for YAML safety, since a repo persona's description is
+  free text and not guaranteed YAML-safe on its own). `--agent <handle>` alone activates it —
+  `--agents` is GONE from loomux's command lines entirely, for every CLI, on every path.
+- **Fallback path** (the directory is unwritable — fail-open, matching every other hook/shim
+  path in this codebase): `--append-system-prompt-file <path>`, pointed at the SAME instructions
+  file `write_instruction_files` already reliably writes to the group's own state dir — no
+  second file to invent or clean up. The reference confirms this flag "load[s] additional system
+  prompt text from a file and append[s] to the default prompt." Still launch-time system-prompt
+  construction, not a conversation-history artifact — `contract_on_system_layer` stays `true` in
+  this path too, unlike Copilot's own write-failure fallback (which has no such flag and
+  genuinely degrades to a kickoff-only paste, so `contract_on_system_layer` correctly goes
+  `false` there). Neither Claude fallback ever re-embeds the contract on argv.
+- **`--append-system-prompt-file` was #105's own mechanism, abandoned in #222/#416 purely
+  because `--agents` was newer and native** ("claude gets the native flag rather than
+  `--append-system-prompt-file`, which predates the flag" — `profiles.rs`'s own module doc,
+  reread rather than assumed for this round) — never because the file-based flag itself had a
+  functional problem. That reasoning doesn't disqualify it as today's FALLBACK: the content
+  riding it is now loomux's own trusted contract (not a repo persona needing the trust story
+  `--agents` was chosen for), and a file has no length limit remotely close to argv's.
+- **`sanitize_persona`'s apostrophe-mapping and `ascii_escape_json` — the two safeguards that
+  existed specifically for the single-quoted `--agents` shell token — are now inert (the first,
+  kept as defense-in-depth) or dead (the second, removed entirely).** Neither a generated FILE
+  nor `--append-system-prompt-file`'s path argument is a raw shell token carrying persona TEXT,
+  so the shell-quoting hazard those functions protected against no longer exists on the Claude
+  path. See `workflow::sanitize_persona`'s doc for the full reasoning on why one was kept and the
+  other removed rather than both left orphaned.
+
+**Belt-and-braces: a pre-spawn command-line length guard, independent of the file-based fix.**
+`command_line_length_guard` (`mod.rs`) checks the STRUCTURED argv form — which both spawn paths
+compile from, so one check covers both — against `WINDOWS_COMMAND_LINE_SAFETY_LIMIT` (28,000,
+comfortably under the documented 32,767, leaving headroom for the shell fallback's own quoting
+inflation). Wired into both spawn call sites (`spawn_agent_ex` and `register_orchestrator_pane`)
+right after `build_agent_argv`, returning a loud, diagnostic `Err` naming the oversized
+argument's index and byte length — never again the unreadable `CreateProcessW` wall the user's
+demo hit. This is NOT how the argv-length bug is fixed (the file-based mechanism above is that);
+it is the backstop for a FUTURE regression that puts something large on argv again, on either
+CLI — checked, not assumed, to hold for Copilot too: nothing in its command-builder branch ever
+pushes free text onto argv (`--agent <name>` is always a short handle, either a native
+`.github/agents/*.md` file's `name:` frontmatter — itself constrained to short lowercase-and-
+hyphens tokens — or loomux's own short generated handle), so Copilot never had this bug, and the
+guard confirms rather than assumes that going forward.
+
+**Updated per-CLI capability matrix (supersedes the Claude row above):**
+
+| | system-prompt mechanism | default roster (no persona) | workflow persona |
+|---|---|---|---|
+| Claude | `--agent <handle>` → generated `~/.claude/agents/<handle>.md` FILE (fallback: `--append-system-prompt-file <instructions file>`) | contract rides via generated file | contract + persona, one file (never argv, either way) |
+| Copilot, user-authored `.github/agents/*.md` | native `--agent <name>` | n/a | unchanged — `--agent` still points at the exact file loomux read (`profiles::handle_resolves_to`); mechanics-core coverage for this ONE case is still kickoff/file-read only (documented residual gap above) |
+| Copilot, no persona / inline `prompt:` | generated `--agent loomux-<group>-<block>` file | contract rides via generated file | contract + persona in the generated file |
+
+**Tests:** `a_thirty_kb_contract_still_produces_a_short_command_line` reproduces the actual
+regression shape (a 30KB+ persona) and pins both halves of the fix — the command line stays
+short AND the full contract still reaches the generated file;
+`command_line_length_guard_fails_loudly_on_an_oversized_argument` pins the backstop against both
+a single oversized argument and many small ones summing past the limit;
+`claude_agent_file_write_failure_falls_back_to_append_system_prompt_file` forces the fallback
+for REAL (a regular file occupies the target directory path, so `fs::create_dir_all` genuinely
+fails) and pins it lands on the SAME instructions file, never argv;
+`end_group_reclaims_generated_claude_agent_files` mirrors N4's Copilot cleanup test for Claude's
+own generated files. Every pre-existing test asserting the OLD `--agents '<json>'` shape (the
+golden default-roster pin, the trust-root security tests, the drift-guard matrix, the
+name-cannot-break-the-payload test) was updated to the new shape rather than deleted — the
+security PROPERTY each one pins ("no repo text reaches the trust root", "ids/names can't break
+structurally out of whatever they ride in") still holds, now checked against the generated
+file's content instead of the command line, since the command line no longer carries it.
+
+### #417: compact hooks as a TRUSTED evidence source
+
+**Correction (this section originally claimed Copilot has no compaction hooks at all — that
+was wrong, and the record should say so plainly rather than quietly editing history.** An
+earlier round asserted this based on Copilot's changelog and an open feature-request issue that
+turned out to be stale/misleading; the user supplied the authoritative reference —
+[docs.github.com/en/copilot/reference/hooks-reference](https://docs.github.com/en/copilot/reference/hooks-reference)
+— which documents 14 hook events including `preCompact`, with a payload nearly identical to
+Claude's. Read in full before correcting this section. Copilot IS wired into the hook tier as
+of this correction; see below for exactly how much of #417 that covers and how much it doesn't.
+
+Claude Code has a `PreCompact` hook (fires before manual AND auto compaction) and a
+`SessionStart` hook with `matcher: "compact"` whose output can inject `additionalContext`
+natively.
+
+**Copilot's real event table** (per the reference above): `preCompact` fires with `{sessionId,
+timestamp, cwd, transcriptPath, trigger: "manual"|"auto", customInstructions}` — structurally
+the same evidence Claude's version gives. **There is no `postCompact` event of any kind** (the
+docs are silent on one existing at all), and `sessionStart`'s `source` field is documented as
+taking **exactly** `"startup" | "resume" | "new"` — no `"compact"` value, and no other mention
+of compaction triggering it. This is a confirmed negative, not an open question: Copilot has a
+trusted ARM signal but no trusted CONFIRM/native-re-grounding signal the way Claude's
+`SessionStart(compact)` gives one. Per the #413 tier model, Copilot's hook wiring below covers
+the ARM half of #417 only; the CONFIRM half already had a trust bypass that doesn't need a
+second signal (see the bullet list below) — Copilot does not fall back to the pre-#417
+inference tier the way this section originally (wrongly) implied it would need to.
+
+**Provisioning, without touching the user's own settings.** Claude Code's `--settings
+<file-or-json>` flag loads an ADDITIONAL settings layer Claude Code itself composes over
+project/user settings — so "never clobber the user's own hooks" is a property of the CLI flag,
+not something loomux re-implements by hand-parsing and merging their `.claude/settings.json`
+(which loomux never touches). The generated hook config lives in its OWN file
+(`write_hook_settings_file`, `<agent-id>-hooks.json`) — deliberately SEPARATE from
+`--mcp-config`'s file (`write_mcp_config`), rather than one file under two flags: an earlier
+revision folded `hooks` into the same JSON `--mcp-config`/`--strict-mcp-config` already point at,
+which only stays safe while each flag's reader happens to ignore the other's top-level keys — a
+schema assumption neither this file nor Claude Code's own docs pin down, and a future release
+tightening either reader's validation would be a silent breakage no local test could catch (rev-4
+review, N2). Two small generated files, one per flag, costs one extra `fs::write` per Claude
+spawn and removes that risk entirely. Absent a resolvable `sh` interpreter (`resolve_hook_sh`,
+mirroring the `.cmd` shim delegators' `winpath::resolve_sh` reasoning — never trusting a bare
+`sh` on PATH, which Windows doesn't guarantee), `write_hook_settings_file` returns `None` and
+`--settings` is omitted entirely — never pointed at an empty file, fail-open, same policy as a
+missing gh/git shim.
+
+The hook `command` for each event explicitly invokes the resolved `sh` against ONE generic
+script (`COMPACT_HOOK_SCRIPT`, written once per machine to a `compacthook/` dir sibling to
+`ghshim/`) with the event name, this group's state dir, and this agent's id as literal argv —
+so the script itself carries zero repo/group-specific text (constraint #8) and no new env var
+is needed to tell it which agent it's running for. It does exactly two things, both fail-open
+(every path exits 0 — a hook's nonzero exit can block the CLI's own lifecycle event):
+`precompact` creates/truncates a marker file at `<group_dir>/hooks/<agent_id>.precompact.json`;
+`sessionstart-compact` does the same for its own marker AND prints Claude's native
+`additionalContext` JSON shape with a fixed, generic re-grounding line (pointing at the ledger
+path by convention, not by reading it — keeping the script free of any ledger-parsing/truncation
+logic, which stays Rust-side in `directive_ledger_embed` to avoid two implementations of the same
+cap/truncation rule drifting apart).
+
+**Hybrid, argued rather than assumed:** native `additionalContext` is race-free (no delivery/hold
+window — the whole class of bug rounds 4-6 fixed) but necessarily minimal (a hook script has no
+business re-implementing `directive_ledger_embed`'s cap/truncation logic in shell). Whether
+loomux's own tick-driven reinjection ALSO fires depends on which marker confirmed the
+compaction (rev-4 review, N3 — see below): a PreCompact-only arm never delivered native
+context (only the `sessionstart-compact` script branch emits `additionalContext`), so loomux's
+reinjection is the ONLY re-grounding channel and still fires normally; a SessionStart-confirmed
+arm already got native re-grounding, so loomux's reinjection is SKIPPED for it — pasting it
+anyway would be a duplicate, spending exactly the context tokens native delivery exists to save.
+What #417 actually replaces is the ARM/CONFIRM evidence, not the reinjection delivery itself
+(which now runs, or doesn't, per the rule above):
+
+- `read_hook_marker_ts` reads a marker FILE's mtime (not a timestamp encoded in its content —
+  the generic script never needs portable clock-formatting logic this way). `AgentEntry.
+  compact_hook_precompact_seen_ms`/`compact_hook_sessionstart_seen_ms` bookkeep the freshest
+  marker already consumed.
+- Checked in `compact_nudge_tick`'s per-agent loop, right after the existing rebaseline/growth
+  block and before every pre-existing arm site (loomux-initiated, manual, banner) — a FRESH
+  PreCompact marker arms exactly like the loomux-initiated path (`compact_pending_trusted =
+  true`, no `inferred_compaction_confirmed` gate) and is treated as already busy (the compaction
+  itself IS the busy half, whether or not it happened to clear the byte-growth floor). A FRESH
+  SessionStart(compact) marker is even stronger — direct proof Claude Code restarted the session
+  BECAUSE of a compact — so it arms-and-confirms unconditionally (covers a hook config with only
+  SessionStart wired, or a PreCompact marker this tick loop raced past). With the pane already
+  quiet (the common case — nothing typed since the hook fired), arm and resolve-into-reinjection
+  happen on the SAME tick, closing the gap faster than a banner/manual arm ever could (those
+  always need a LATER quiet observation).
+- `AgentEntry.compact_pending_evidence: Option<&'static str>` (`Some("hook")`) rides alongside
+  `compact_pending_trusted` purely for visibility — audited as its own event
+  (`compact-hook-evidence`, distinct from `compact-nudge`/`compact-reinjection`) and threaded
+  through `compaction_status`'s new `source` field so the lifecycle chip (`compactionstatus.ts`)
+  reads "armed (hook-confirmed)" rather than conflating a direct signal with the
+  loomux-initiated trusted arm that happens to look identical in every OTHER field.
+
+**Copilot wiring (correction round).** `compact_hook_cli_supported(cli)` (`claude | copilot`) was
+introduced this round as a NEW, broader admission gate for `compact_nudge_tick`'s per-agent loop
+— at the time, deliberately kept distinct from `compact_nudge_cli_supported` (which this round
+left claude-only), on the premise that Copilot has no `/compact` command to paste. **That premise
+was wrong — see "rev-4 review round 4 (Copilot `/compact` correction)" below, which widened
+`compact_nudge_cli_supported` itself and collapsed the two gates back into one function**; this
+paragraph is left as-is (rather than silently edited) as the record of what this round actually
+believed and built. What's still accurate: before THIS round's admission-gate widening, the
+loop's own top-of-function gate WAS the narrower `/compact`-paste gate, so a copilot agent never
+reached ANY of the loop's logic, hook-evidence included — and once admitted, a Copilot
+`preCompact` marker is read and consumed by the EXACT SAME code the Claude `precompact` case
+uses — "one mechanism, two writers": the marker-file convention
+(`<group_dir>/hooks/<agent_id>.precompact.json`), the `ts >= a.started_ms` freshness gate, and
+delete-on-consume are all CLI-agnostic already, so no new state-machine code was needed, only the
+gate change plus provisioning.
+
+- **Trust class.** A Copilot `preCompact` marker sets `compact_pending_trusted = true`, the same
+  evidence class as Claude's — a hook is equally trustworthy regardless of which CLI's hook fired
+  it. Since Copilot has no compact-sourced `SessionStart` (confirmed absent, see above),
+  `compact_hook_native_notice_delivered` never gets set for it, so N3's suppression never
+  applies — loomux's own reinjection is (correctly) the ONLY re-grounding channel for a Copilot
+  compaction, same shape as Claude's precompact-only case.
+- **Provisioning is a single, GLOBAL, machine-wide file**, not one per agent or group — the
+  opposite of Claude's per-agent `--settings` file. Copilot's own hook-config precedence list
+  (policy → repo `.github/hooks/` → **user-level `~/.copilot/hooks/*.json` (or `$COPILOT_HOME/
+  hooks`)** → inline settings → plugins) is loaded automatically; loomux writes exactly one
+  small, idempotent, always-rewritten file there (`ensure_copilot_compact_hook`,
+  `loomux-compact.json`) — never the repo's `.github/hooks/`, for the same reason a generated
+  file never lands in `.github/agents/` (#416): it would dirty the user's git tree with
+  something they didn't author. Unlike Claude's `--settings` (unverified merge semantics — see
+  below), Copilot's docs EXPLICITLY confirm multiple hook-config sources are additive: "When the
+  same event appears in multiple sources, all hook entries from all sources are run" — so this
+  file is proven, not merely argued, never to clobber a user's own hooks.
+- **Self-scoping via env-var presence, not `cwd`/session matching.** Because the config is
+  global, EVERY Copilot session on the machine loads it — a human's own, non-loomux session
+  included. The brief's suggested fix was matching the hook payload's `cwd` against known loomux
+  worktrees, or a registration file the script re-reads. Both were set aside for a THIRD option
+  that's simpler and already the codebase's own convention: the hook script (both the `bash` and
+  `powershell` command variants, run via `type: "command"`'s two OS-specific fields — Copilot
+  itself picks the one for its host OS, so loomux never resolves its own interpreter path the
+  way Claude's hook command does) checks for `LOOMUX_GROUP_DIR`/`LOOMUX_AGENT_ID` in its OWN
+  inherited environment and no-ops silently if either is absent. This is the EXACT idiom the
+  gh/git shims already use (`LOOMUX_GROUP_DIR` unset ⇒ "not a loomux pane, refuse/no-op") —
+  reused here rather than invented fresh, and it avoids both alternatives' failure modes: a
+  registration file needs extra I/O and a staleness/race window on every hook invocation; a
+  static list baked in at generation time goes stale the moment a new group spawns after the
+  file was last written. Env-var inheritance has neither problem — it's always current for the
+  actual process the hook runs inside. `agent_pane_env` now sets `LOOMUX_AGENT_ID` alongside the
+  pre-existing `LOOMUX_GROUP_DIR` on every agent pane for exactly this purpose (Claude's own hook
+  command never needed it, since its per-agent `--settings` file bakes the agent id into its own
+  argv instead).
+- **No payload parsing, deliberately.** The hook script never reads the JSON Copilot pipes to it
+  at all — the marker file's mere existence (at `read_hook_marker_ts`'s mtime) is the whole
+  signal. This sidesteps a real wrinkle in the reference docs: every event ships in TWO payload
+  shapes, camelCase (`sessionId`, `transcriptPath`) and a VS-Code-compatible snake_case one
+  (`session_id`, `transcript_path`, plus a `hook_event_name` field) — a script that needed to
+  read `trigger`/`sessionId` would have to handle both. Since nothing here needs the payload's
+  content, that casing distinction never has to be gotten right, and there is no parser in
+  loomux's own code to test either way (see `ensure_copilot_compact_hook_writes_an_additive_
+  generic_precompact_entry`'s own note on this).
+- **Cleanup and orphans.** Unlike the per-group `--settings`/generated-agent files, this ONE
+  config file is not per-group at all, so there's nothing to reclaim per `end_group` — it stays
+  installed for the lifetime of the machine's Copilot install, the same way the gh/git shims and
+  the Claude hook script itself are never uninstalled per group either. No new orphan-sweep
+  surface here.
+
+**Demo-script checks, since the docs' own precision doesn't replace live verification:**
+1. Trigger a real Copilot compaction and confirm the `preCompact` marker actually appears under
+   `<group state dir>/hooks/<agent-id>.precompact.json` and the lifecycle chip reads
+   "armed (hook-confirmed)".
+2. Watch what `sessionStart`'s `source` value actually reads immediately after that compaction,
+   in practice — the docs say `startup|resume|new` with nothing indicating compaction, but CLI
+   behavior can outrun docs; if a live session ever shows an unexpected value there, that is the
+   signal a native-re-grounding path could be wired for Copilot too, symmetric with Claude's.
+3. **(#417 correction round 5)** For that same real Copilot compaction, confirm the generated
+   `~/.copilot/agents/loomux-<group>-<block>.agent.md` content is STILL what the agent acts on
+   afterward — the one soft spot the docs don't specifically pin down (they confirm "original
+   user instructions" survive compaction generally, not an `agent.md` FILE'S specific region of
+   the prompt architecture). If it isn't, `contract_on_system_layer` is wrong for the generated-
+   wrapper path and the slim notice is under-informing that agent — the signal to revert this
+   one path to verbose, not evidence against the Claude side (whose `--agents` system-prompt
+   durability is separately and more directly confirmed).
+
+Nothing about the resolution logic itself — busy-then-quiet, the confirm gate, the
+delivery-confirmation retry/abandon bounds, the per-agent arm-timeout — changed; the hook is
+purely a new, stronger way to reach the SAME `compact_pending`/`compact_seen_busy`/
+`compact_pending_trusted` triple every pre-existing arm site already writes.
+
+**Merge semantics — updated with the authoritative reference (rev-4 review round 3).** Claude
+Code's own hooks reference (code.claude.com/docs/en/hooks), read in full for this round, settles
+the general question this section originally hedged on: hook configuration from every documented
+source — user (`~/.claude/settings.json`), project (`.claude/settings.json`,
+`.claude/settings.local.json`), managed policy settings, plugin `hooks/hooks.json`, and
+skill/agent frontmatter — is **additive, not replacing**. Two direct quotes: "All matching hooks
+run in parallel, and identical handlers are deduplicated automatically" (dedup is by exact command
+string/args or URL — never by event), and "When a plugin is enabled, its hooks merge with your
+user and project hooks." Nothing in the reference describes any source REPLACING another's
+entries for the same event.
+
+**The one residual, stated precisely (not a general hedge anymore):** the reference's own
+location/precedence table does not list `--settings` as a source at all — it documents the six
+sources above, and loomux's generated file rides on a CLI flag the table is simply silent about.
+Given every OTHER documented source is additive, and `--settings` is Claude Code's own mechanism
+for layering settings in from outside those standard file locations, the strong prior is that it
+composes the same way — but this ONE specific gap (an undocumented flag's exact interaction with
+an otherwise-fully-documented additive model) is what the "never spawn a real agent CLI to test"
+constraint prevents this change from closing empirically. The demo script asks for a quick live
+confirmation of this specific point, not a full investigation of merge behavior in general (that
+question is now answered by the docs). If `--settings` turns out to be the one source that
+doesn't compose the way every other one does, the consequence is not cosmetic: a user's own hook
+for the same event (say, a `PreToolUse` denial) would stop firing the moment loomux's file is
+added — worth a quick explicit check, not assumed either way.
+
+**rev-4 review round — one blocking fix, three follow-on hardening items:**
+
+- **B1 (blocking): a live restart could arm a spurious, ungrounded reinjection.** Marker files are
+  never deleted on their own, `AgentEntry.compact_hook_*_seen_ms` is in-memory (resets to `None`
+  on every restart), and agent ids come from an in-memory counter — so a fresh boot can mint an id
+  a PREVIOUS process already used, while that old process's marker file sits untouched on disk.
+  The very first tick after such a restart would have read it as "fresh evidence" (`ts >
+  None.unwrap_or(0)` is true for any real mtime), arming TRUSTED with no compaction having
+  happened. Fixed with three layers, since this is the TRUSTED tier and a false positive here is
+  worse than one in the inference tiers: (1) `ts >= a.started_ms` — a marker can only be evidence
+  for a compaction that happened during THIS agent's own lifetime (`>=`, not `>`: both timestamps
+  are millisecond-resolution real wall clock, so a marker written in the same millisecond an
+  agent started is still legitimately its own); (2) delete-on-consume — an actually-used marker is
+  removed from disk immediately, independent of whether the in-memory bookkeeping survives a
+  future restart; (3) a regression test (`compact_nudge_tick_ignores_a_hook_marker_older_than_
+  the_agent_itself`) simulating the exact sequence — a fresh `AgentEntry`, the same agent id, an
+  old marker already present.
+- **N2: split the shared `--mcp-config`/`--settings` file.** Covered above — two small generated
+  files now, removing the schema-drift risk of one file serving two flags with two different
+  readers.
+- **N3: suppress loomux's own reinjection when native re-grounding already landed.** Covered
+  above — `AgentEntry.compact_hook_native_notice_delivered` tracks specifically whether the
+  SessionStart hook (the one script branch that emits `additionalContext`) confirmed THIS pending
+  cycle; when it did, the resolution audits `compact-reinjection-skipped-native` and clears
+  straight to a terminal state instead of pasting a duplicate notice. A PreCompact-only arm (no
+  SessionStart marker seen) is unaffected — loomux's reinjection remains the only channel and
+  still fires, proven by its own test
+  (`compact_nudge_tick_a_precompact_only_arm_still_gets_loomuxs_own_reinjection`) alongside the
+  positive case (`compact_nudge_tick_treats_a_sessionstart_hook_marker_as_an_immediate_confirm`,
+  updated for the new terminal-resolution shape).
+- **N4: reclaim generated Copilot agent files on group end.** Without this, a #416-generated
+  `~/.copilot/agents/loomux-<group>-<block>.agent.md` outlives the group it was written for,
+  accumulating forever and cluttering the user's real Copilot agent list with dead groups' names.
+  `end_group` now sweeps every member's handle (`end_group_reclaims_generated_copilot_agent_
+  files`), best-effort and harmless to attempt even for a Claude-only group (no handle was ever
+  written for it). **Deliberately NOT built this round:** a startup sweep reconciling orphans from
+  a group that never reaches `end_group` at all (a crash, or state deleted out from under loomux).
+  A stray tiny markdown file the user can delete by hand is a cosmetic cost, not a resource or
+  security one — a reconciliation sweep is real, if modest, additional complexity (enumerating
+  every group's state to know which handles are still legitimate) for a narrow, self-correcting-
+  by-hand failure mode, so it's left as a deliberate follow-up rather than built speculatively.
+- **Test-infra fix found along the way (not reviewer-flagged, surfaced by chasing an intermittent
+  local flake):** `compact_hook_dir()` derives from `self.root.parent()`, which for
+  `test_registry()`'s disposable tempdir is the SHARED SYSTEM TEMP DIRECTORY — so every test that
+  spawns a Claude agent (the common case across the whole suite) was writing/reading the SAME real
+  script file, racing every other such test. Fixed with a test-only override
+  (`compact_hook_dir_override`/`set_compact_hook_dir_override`, mirroring the existing
+  `copilot_agents_dir_override`/`claude_projects_dir` pattern), wired into all four `test_registry`
+  helpers. Confirmed via 5 consecutive full-suite runs with no failures, after having reproduced
+  the flake reliably enough to trace it.
+
+**rev-4 review round 3 (safety):** Claude's hooks reference confirms `PreCompact` is a BLOCKING
+event — exit code 2, or `{"decision": "block", "reason": "..."}`, prevents the compaction from
+happening at all. Copilot's own reference documents the identical behavior for its `preCompact`.
+A hook script whose marker-write logic can fail in a way that escalates to a nonzero/blocking
+exit would mean a bug in loomux's OWN generated script could block a user's compaction outright —
+categorically worse than the "no signal, falls back to the pre-#417 inference tier" degrade this
+feature is supposed to guarantee on any failure. Auditing both scripts under REAL execution (not
+just reasoning about shell semantics) found a genuine bug: the original marker write used a bare
+`: > "$path"` redirect, and POSIX makes a redirect that fails to open its target FATAL for a
+non-interactive shell — it aborts the whole script before ever reaching the trailing `exit 0`,
+and even the `2>/dev/null` on that SAME line never gets applied (the shell fails to set up the
+first redirect before it can process the second). This is exactly the shape of failure a full
+disk, a permissions problem, or a stale/deleted group directory could trigger — not a contrived
+edge case. Fixed by writing the marker with `touch` instead: `touch`'s own failure is an ordinary
+COMMAND failure (its own error handling, not the shell's redirection machinery), which a
+non-interactive shell reports and continues past normally. Both real-execution tests
+(`compact_hook_script_sh_exits_zero_when_the_marker_dir_cant_be_created`,
+`copilot_precompact_hook_bash_exits_zero_when_the_marker_dir_cant_be_created`) caught the ORIGINAL
+`: >` version failing for real (process exit code 1, not 0) before this fix — genuine
+red-before-green, not asserted after the fact. The PowerShell hook command was additionally
+hardened with `try`/`catch` and `-ErrorAction Stop` around both `New-Item` calls, since
+PowerShell's default error preference makes whether a given cmdlet failure is terminating
+somewhat provider-dependent; forcing it to always be terminating and unconditionally swallowing
+it in the `catch` removes that ambiguity, pinned by a Windows-only real-execution test
+(`copilot_precompact_hook_powershell_exits_zero_when_the_marker_dir_cant_be_created`).
+
+**rev-4 review round 3 (matcher precision):** Claude's `SessionStart` fires with exactly five
+`source` values: `startup`, `resume`, `clear`, `compact`, `fork`. loomux's hook config matcher is
+the exact string `"compact"` (letters-only matcher syntax, so it's an EXACT match against the
+source, not a prefix/regex) — verified to fire on that source alone. The other four are
+deliberately NOT wired into this hook, each for a stated reason rather than left unconsidered:
+`startup`/`clear` need no re-grounding here at all, since a fresh/cleared session already gets
+loomux's own FULL kickoff prompt (not this hook) as its first turn; `resume` is handled by a
+SEPARATE, already-shipped mechanism (`resume_kickoff_notice`, #411, above) rather than this hook —
+the two were never meant to be the same delivery path, and adding a second, hook-driven channel
+for the identical event would be redundant complexity for no clear gain (the same reasoning #411's
+own note already gives for not building a native resume hook); `fork` is deliberately left
+unwired because a forked session INHERITS its parent's context verbatim (per the docs) rather than
+summarizing or reloading it — nothing is diluted by forking, so there is nothing here to
+re-ground. Finally, the reference notes `SessionStart`/`Setup` typically fire BEFORE MCP servers
+finish connecting — a non-issue for this hook specifically, since its script needs zero MCP
+connectivity: it only ever writes a marker file and (for `sessionstart-compact`) prints a fixed,
+generic string to stdout.
+
+**rev-4 review round 4 (Copilot `/compact` correction) — another wrong claim, corrected plainly
+rather than edited away.** The "Copilot wiring (correction round)" subsection above widened
+`compact_nudge_tick`'s admission gate to Copilot but deliberately kept `compact_nudge_cli_
+supported` (the narrower "has a `/compact` loomux can paste" gate) claude-only, on the premise
+that Copilot has no `/compact` command at all — re-asserted explicitly at the two sites that
+actually paste it, and pinned by a NEGATIVE test
+(`compact_nudge_tick_never_pastes_slash_compact_into_a_copilot_pane`) proving loomux would never
+type it into a Copilot pane. **That premise was wrong.** GitHub's own CLI command reference
+([docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference))
+documents `/compact [FOCUS-INSTRUCTIONS]`: "Summarize the conversation history to reduce context
+window usage. Optionally provide focus instructions to steer the summary." — a real, built-in
+Copilot CLI command, identical in spirit (and near-identical in syntax) to Claude's own.
+
+The linked context-management page
+([docs.github.com/en/copilot/concepts/agents/copilot-cli/context-management#compaction](https://docs.github.com/en/copilot/concepts/agents/copilot-cli/context-management#compaction))
+additionally documents Copilot's AUTOMATIC compaction: it begins in the background at roughly
+80% context-window usage, and if compaction hasn't finished by roughly 95%, Copilot pauses and
+waits for it rather than proceeding. This confirms the `preCompact` hook's own `trigger:
+"manual"|"auto"` field (read in full during the previous correction round) covers BOTH paths —
+loomux's trusted-arm handling already treats every fresh marker identically regardless of
+`trigger`, since the marker's mere existence (not its parsed payload) is the whole signal, so no
+code change was needed for the auto-compaction path specifically — it was already covered, just
+not yet documented as confirmed.
+
+**The fix:** `compact_nudge_cli_supported` widens to `matches!(cli, "claude" | "copilot")`. Since
+this makes it identical to `compact_hook_cli_supported` for both currently-supported CLIs, the
+two gates collapsed back into one function — keeping both as separate stubs with identical
+bodies would be exactly the unneeded duplication CLAUDE.md's no-premature-abstraction guidance
+warns against. The heuristic/requested-fire sites' own re-check of the (now-removed) narrower
+gate is gone too — the loop's single top-of-function admission gate already guarantees `/compact`
+paste capability for anything that reaches those sites. `request_compact`'s own CLI-gate error
+message no longer hardcodes "Claude-Code-only" (a copilot caller is now accepted; the check
+itself is retained as belt-and-braces against a hand-edited or pre-existing group.json with an
+unsupported CLI string, since `Guardrails::clamped()` and `spawn_agent`'s own per-role validation
+mean no group/agent created through the current API can ever reach it with an unsupported value —
+see `request_compact_now_accepts_a_copilot_caller`'s sibling test note in `tests/orchestration.rs`
+for why no integration test exercises that branch directly anymore).
+
+**Updated capability matrix for #417** (supersedes the informal claims embedded in the
+"Copilot wiring" prose above — that section's ARM/CONFIRM analysis is otherwise unchanged, only
+the `/compact`-paste row was wrong):
+
+| | `preCompact`/`PreCompact` hook | `/compact` loomux can paste | native re-grounding on resume |
+|---|---|---|---|
+| Claude | ✓ (arms trusted) | ✓ | ✓ — `SessionStart(compact)` injects `additionalContext` natively |
+| Copilot | ✓ (arms trusted — covers both `trigger: "manual"` and `trigger: "auto"`, i.e. Copilot's own ~80%/~95% automatic compaction too) | ✓ (as of this correction) | ✗ — no compact-sourced `SessionStart` equivalent; reinjection is always via loomux's own delivery, one tick later than Claude's native path |
+
+**Tests flipped red-before-green:** the negative test above inverted to
+`compact_nudge_tick_does_paste_slash_compact_into_a_copilot_pane` (proving the paste now fires);
+a second, previously-negative test (`compact_nudge_skips_a_cli_with_no_compact_equivalent`) that
+made the identical wrong claim for the plain heuristic-fire path inverted to
+`compact_nudge_no_longer_skips_copilot_which_has_its_own_compact_equivalent`; and a new full-loop
+test (`compact_nudge_tick_copilot_full_loop_paste_then_hook_confirms_then_reinjects`) chains both
+of #417's Copilot halves back-to-back for the same agent — the loomux-initiated paste (trusted by
+provenance, resolved via busy-then-quiet) followed by an independent `preCompact` hook marker
+(trusted by the hook itself, resolved via the delivery-confirmation phase) — proving the
+detection/recovery loop closes end to end via either path, exactly as it already did for Claude.
+`deliver_prompt` itself needed no change: its `/compact`-paste call site was already routing
+through the same CLI-aware-but-content-agnostic delivery machinery (`submit_sequence(cli)` for
+the Enter/focus-in sequence, `bracketed_paste` for the text) used for every other prompt this
+registry ever sends to any pane — nothing in that path singles out Claude, or ever did.
+
+**#417 correction round 5: slimming the re-grounding notice.** User-directed, after #416/#417
+docs verification, not a wrong-claim correction like rounds 2/4 above — the underlying FACTS
+this notice's design rested on changed (#416 landed after #328/#329's original "always embed
+the full instructions file" decision), so the notice is revisited rather than retracted. Once
+the block's full CONTRACT rides the CLI's own system-prompt layer for almost every agent (#416:
+Claude's `--agents`, unconditionally, for every block; Copilot's generated `~/.copilot/agents/
+*.agent.md` for the default roster and inline `prompt:` blocks), re-embedding that same text
+verbatim in the post-compact notice is pure waste — the agent's system prompt already holds it,
+permanently, immune to whatever the compaction summarized away.
+
+- **Both CLIs' own docs confirm compaction only touches conversation history, never the system
+  prompt.** Claude Code's hooks reference frames `PreCompact`/`SessionStart` entirely in terms
+  of summarizing the CONVERSATION; Copilot's context-management page
+  (docs.github.com/en/copilot/concepts/agents/copilot-cli/context-management#compaction) is
+  more directly on point — its 4-step compaction process explicitly states the summarizer
+  preserves "original user instructions" as one of the things a compaction keeps. Between the
+  two, there's a solid basis for trusting the system-prompt layer survives structurally; the
+  one soft spot (Copilot's docs don't specifically confirm an `agent.md` FILE'S region of the
+  prompt architecture, as opposed to instructions given inline) is covered by the demo script
+  below, not asserted blind.
+- **One flag, decided once, at spawn:** `PersonaInject::contract_on_system_layer` — `true` for
+  the Claude branch (unconditionally: the contract always rides `--agents` now) and for a
+  Copilot block on the generated-wrapper path (`write_copilot_agent_file` succeeded); `false`
+  for a Copilot block resolving to an unambiguous user-authored native `.github/agents/*.md`
+  persona (only the user's OWN file rides `--agent` — the documented #416 residual gap, see the
+  per-CLI capability matrix above) and for the rare `~/.copilot/agents`-unwritable fallback
+  (only the persona text, not the full mechanics-core contract, reaches the kickoff in that
+  failure case). Copied onto `AgentEntry.contract_on_system_layer` at spawn and never mutated —
+  a persona/workflow-file edit takes effect on the agent's NEXT spawn, same as every other
+  `persona_inject` output.
+- **`compact_reinjection_notice` picks ONE of exactly two shapes from that single flag** —
+  never from which of the six trigger paths (loomux-initiated, agent-requested,
+  threshold-escalation, manual `/compact`, the auto-compact banner, or a trusted hook marker)
+  detected the compaction, and never from hook-tier vs. inference-tier detection. System-layer
+  durability is a LAUNCHER property of this agent, not a property of how loomux happened to
+  notice the compaction — so there is exactly one notice per agent, not one per detection path:
+  - **Slim (`contract_text: None`, the common case):** never re-embeds the contract. States
+    plainly that it already rides the system prompt and survives structurally, then re-syncs
+    only what actually ISN'T durable anywhere but a live query: `list_tasks` (task board),
+    `get_state` (durable state), `list_agents` (roster). The directive ledger gets BOTH a named
+    path pointer AND its tail still inlined verbatim (`directive_ledger_embed`, unchanged,
+    same cap) — belt-and-braces, since a directive is qualitatively different from every other
+    re-sync target: a tool call can re-derive the task board or durable state on demand, but a
+    directive already given can never be re-asked for, so it stays the one thing worth paying
+    the extra bytes to inline rather than merely point at.
+  - **Verbose (`contract_text: Some(text)`, the one documented exception):** unchanged from
+    #328/#329 — the full instructions-file text, read back and embedded verbatim, plus the
+    ledger, for the one case that has no system-prompt-layer copy of the contract to trust
+    instead.
+- **The instructions file is only read back when it's actually going to be used.** The
+  reinjection call site now checks `contract_on_system_layer` BEFORE calling
+  `fs::read_to_string` on the instructions path at all — the common (slim) case never pays for
+  a read whose result it would then throw away.
+- **The SessionStart(compact) native `additionalContext` line was ALREADY this slim** — verified,
+  not changed. It already named the contract as durable (`--agents`) rather than re-embedding
+  it, and already pointed at (never inlined) the ledger path rather than parsing/truncating it
+  in shell — deliberately: this one script is generic for the whole machine (constraint #8), and
+  duplicating `directive_ledger_embed`'s capped-tail truncation logic in POSIX shell would be
+  exactly the two-implementations-drifting-apart risk that function's own doc already argues
+  against for the Rust side. So the two channels agree on CONTENT — the contract is durable,
+  re-sync via `list_tasks`/`get_state`/`list_agents`, the ledger's location — without being
+  byte-identical strings, and whichever one fires for a given agent, that agent gets the same
+  information either way.
+- **Tests:** the two pre-existing pure-function tests renamed and repointed at the verbose
+  branch (`compact_reinjection_notice_embeds_the_instructions_verbatim_when_the_contract_is_
+  not_durable`, `compact_reinjection_notice_verbose_folds_in_the_ledger_when_present`); two new
+  slim-branch tests
+  (`compact_reinjection_notice_is_slim_when_the_contract_rides_the_system_layer`, `..._slim_
+  still_inlines_the_ledger_tail`), one of which pins a byte-length ceiling so the notice
+  actually reads as slim, not just structurally different; two new integration tests in
+  `tests/workflow.rs` (`contract_on_system_layer_is_false_only_for_an_unambiguous_copilot_
+  native_persona`, `..._is_true_for_the_generated_copilot_wrapper_and_every_claude_block` —
+  **renamed in round 8** to `contract_on_system_layer_is_false_for_every_copilot_block_and_
+  true_for_every_claude_block`, since the Copilot half of its own name stopped being true —
+  see "Round 8" below) pinning the flag itself against real persona-resolution fixtures, not
+  just the notice function in isolation. Red-before-green on both the flag's native-persona
+  branch and the notice's slim-selection call site.
+
+**#411, folded in because the plumbing was already open:** the orchestration-RESTORE kickoff (an
+app restart resuming a live session) is a fixed string with no directive-ledger embed, unlike the
+post-compact reinjection notice — filed separately in #411 during #329's own testing as a
+deliberate scope cut. Since `directive_ledger_embed`/`DIRECTIVE_LEDGER_EMBED_CAP_BYTES` needed no
+changes to reuse, `resume_kickoff_notice` (mirroring `compact_reinjection_notice`'s exact shape)
+folds the SAME ledger embed into the resume-kickoff string — a missing/empty ledger reproduces
+the pre-#411 fixed string byte-for-byte, so a group that never calls `note_directive` sees no
+change. A SessionStart(resume)-sourced native hook was considered as an alternative delivery for
+this and set aside: the resume-kickoff is already a loomux-composed prompt (not relying on
+Claude's own context recall the way a mid-session compact does), so a second, hook-driven
+delivery channel for the same restart event would be redundant complexity for no clear gain —
+noted here rather than built.
+
+### Round 8: two live-demo blockers on the Copilot orchestrator, and a per-CLI composition split
+
+Two live-demo failures, in immediate succession, on a Copilot orchestrator launch — neither a
+review finding, both root-caused against GitHub's own docs rather than by inference (the
+`agent-cli-reference` skill's discipline).
+
+**8a — `write_copilot_agent_file` never wrote `description:`.** `CustomAgentLoadFailedError: ...
+custom agent markdown frontmatter is malformed: description: Required`. GitHub's custom-agents-
+configuration reference (docs.github.com/en/copilot/reference/custom-agents-configuration) lists
+`description` as required and `name` as optional (defaults to the filename) — the mirror image
+of round 6's Claude blocker, on the ORIGINAL round-1 mechanism this whole file-based design
+started from, which had evidently never survived a real Copilot launch before this demo. Fixed
+with a short, deterministic description built from `group`/`block.id` alone (no timestamp, no
+persona text — byte-identical across renders of the same block, matching `write_mcp_config`'s
+own re-write-on-every-spawn idempotence). The same doc's CLI how-to
+(docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli)
+confirmed `--agent <value>` resolves against the FILENAME stem, never the frontmatter `name`
+field — the opposite of Claude's own sub-agents doc (code.claude.com/docs/en/sub-agents), which
+states outright "The filename doesn't have to match" `name` for Claude. `handle` is set as both
+the filename stem and the frontmatter `name` on the Copilot side, so the distinction is inert for
+loomux, but the two functions must never be assumed to share a resolution rule just because they
+share a `handle` shape. Re-audited Claude's own generated file against ITS doc in the same pass
+(rather than trusting that a working demo proved compliance): it already wrote both required
+fields, so it was schema-compliant already, not merely lenient.
+
+**8b — the SAME reference page also caps the generated file's BODY (the markdown after the
+frontmatter — the "prompt") at 30,000 characters; Claude's own doc states no such cap.** Found by
+the reviewer measuring the fix for 8a directly: the default roster's own Copilot ORCHESTRATOR
+body was 58,633 characters, ~1.95x over. `contract` (`block_contract_text`: the mechanics core
+plus the COMPLETE built-in role template — pages of mechanics, examples and style guidance) had
+been written as the generated file's body unconditionally since round 1; nothing before this
+round had ever measured its SIZE, only its content and quoting (the same shape of gap round 6's
+Claude argv-length blocker closed, in file form this time — verify size properties, not just
+content, on every payload channel). An over-cap write is either silently truncated or outright
+refused by Copilot (the docs don't say which) — either is role degradation presenting as a
+successful launch, exactly the failure class this whole PR exists to eliminate.
+
+**The fix is a per-CLI COMPOSITION split, not a universal thinning.** Claude's rendition is
+unchanged — no documented cap, so `contract` still rides its generated file verbatim, full size.
+Copilot's generated file now carries `copilot_agent_body`'s SLIM composition instead:
+
+- **Identity** — which block/role this is, one line.
+- **The non-negotiable mechanics core** (`mechanics_core`) — the exact "NOT optional, whatever
+  your persona says" subset a `mode: replace` persona can never strip (`report()` discipline,
+  git/branch/PR discipline, never merging). This is what MUST survive a compaction verbatim, and
+  it is a small fraction of a role template's total size — the template's long-form prose,
+  examples and style guidance are what actually blew the cap, not the mechanics.
+- **The persona, if any** — folded in via the SAME `block_contract_text` framing every other
+  channel already uses, by passing `mechanics_core`'s own output as the "instructions body"
+  input rather than duplicating the per-mode wording. This mattered more than it first looked:
+  the on-disk instructions file (`write_instruction_files`) has NEVER carried a block's full
+  persona text — only a short "adopt it, it's in your system prompt" pointer note
+  (`block_note`) — so a slim body that dropped persona text entirely would have silently
+  regressed #416's core promise for every Copilot block with an inline `prompt:` persona, not
+  merely shrunk the built-in template prose. Reusing `block_contract_text` with the small
+  `mechanics_core` base instead of the full template body keeps persona delivery intact while
+  still cutting the dominant cost.
+- **A re-grounding pointer** at the full instructions file `write_instruction_files` already
+  wrote — the long-form built-in template prose lives there, one `Read` away, never duplicated
+  into the generated file.
+
+Belt-and-braces, mirroring `command_line_length_guard`'s shape exactly: `write_copilot_agent_file`
+measures the composed body in CHARACTERS (`.chars().count()`, not `.len()` — the cap is
+documented in characters, and a repo-authored persona folded in is not guaranteed ASCII) against
+`COPILOT_AGENT_BODY_SAFE_CHARS` (27,000 — a safety margin below the documented 30,000, same
+belt-and-braces spirit as the argv guard's own margin below Windows's 32,767-character limit). An
+over-cap body is never written — the function fails loudly (audited: `copilot-agent-body-
+oversized`, naming the block and the measured size) and returns `None`, routing the caller into
+the SAME write-failure fallback an unwritable `~/.copilot/agents` directory already uses (kickoff
+delivery, `contract_on_system_layer = false`).
+
+**`contract_on_system_layer` corrected to its own documented meaning.** The field's doc has always
+said "whether the block's FULL CONTRACT... actually rides this agent's system-prompt layer" — a
+Copilot block on the (pre-round-8) generated-wrapper path set it `true`, which was accurate then
+(the file DID carry the full contract) and became FALSE the moment the body slimmed. It is now
+`false` for every Copilot block, full stop — the generated-wrapper path joins the native-persona
+and unwritable-fallback cases that were already `false`. Consequence, and it is the correct one:
+every Copilot compaction now routes through loomux's own VERBOSE reinjection (the full contract
+re-embedded from the instructions file — see "#417 correction round 5" above), matching Copilot
+having no native post-compact re-grounding channel of its own anyway. Claude is untouched — every
+Claude block stays `true`, no documented cap on that side.
+
+**Measured before/after** (default roster, Copilot CLI; `contract` = pre-fix body, `copilot_agent_
+body` = post-fix): worker 2,163 chars, reviewer 5,278 chars, planner 1,574 chars, orchestrator
+1,587 chars (down from 58,633 — a ~97.3% reduction) — every block comfortably under both the
+27,000-char safety margin and the 30,000-char documented cap, with real headroom rather than a
+near-miss.
+
+**Tests:** `generated_agent_files_satisfy_each_clis_documented_required_frontmatter_fields` (8a,
+reproducing the exact live-incident shape — a default-roster, no-persona Copilot orchestrator —
+via a real YAML-frontmatter parse instead of the pre-round-8 `starts_with("---\nname: ...")`
+prefix check, which happily passed a file missing `description:` entirely);
+`every_default_roster_block_stays_under_copilots_documented_body_cap` and `a_workflow_declared_
+copilot_roster_also_stays_under_the_documented_body_cap` (8b, every default-roster block plus a
+custom roster with both an inline `prompt:` persona and a `mode: replace` file persona — the
+latter reached via the same ambiguous-native-handle shape `copilot_native_agent_is_refused_when_
+the_handle_names_a_different_file` uses, since an UNAMBIGUOUS native profile bypasses loomux's own
+composition entirely and has no cap concern of loomux's to test);
+`copilot_agent_body_over_the_cap_fails_loudly_into_the_write_failure_fallback` (the guard itself:
+a ~40KB persona pushes the composed body over the cap, and the test asserts no file is EVER
+written at any handle-shaped path, not just that the returned handle is `None`);
+`contract_on_system_layer_is_false_for_every_copilot_block_and_true_for_every_claude_block`
+(renamed from the pre-round-8 test whose own name stopped being true; renamed AGAIN in the
+rev-16 reviewer delta below, to `contract_carrier_is_system_layer_core_for_the_copilot_
+generated_wrapper_and_full_for_claude`, once this exact assertion's own premise stopped being
+true a second time). Red-before-green: the 8a fix was reverted locally and the
+frontmatter-schema test confirmed to fail with the incident's own error text before being
+restored.
+
+**Sanity-swept, flagged rather than fixed** (scope discipline — the ask was to check, not chase):
+whether the autopilot-consent flow interacts with an active `--agent` handle, and the exact
+kickoff-paste timing relative to a `--agent` load failure. Neither has a code path coupling it to
+this round's changes, but neither had been exercised through a real Copilot launch before this
+demo either — noted for whoever demos those paths next, not built speculatively here.
+
+### Round 8 reviewer delta (rev-16): the lossy bool becomes `ContractCarrier`, plus N3a/N3b
+
+**N2, the substantive finding.** The round-8 B1 fix (above) set the pre-enum bool
+`contract_on_system_layer` to `false` for the Copilot generated-wrapper's happy path — accurate
+in the narrow sense that the FULL contract no longer rode there, but it collapsed a genuine
+THREE-state fact into two. Before round 8, "full contract" (Claude) and "kickoff only" (Copilot's
+residual gaps) were the only two states that existed, so the bool was lossless. Round 8's own
+slimming introduced a real third state — a durable CORE (identity + `mechanics_core` + a pointer)
+that is neither "full" nor "nothing" — and forcing it into the same bucket as genuinely
+undurable agents meant EVERY Copilot compaction paid for a full verbose re-embed of the whole
+instructions file (tens of KB), right after a compaction meant to reclaim exactly that context,
+and directly counter to round 5's own user-directed slimming principle.
+
+Fixed by replacing the bool with `ContractCarrier { SystemLayerFull, SystemLayerCore,
+KickoffOnly }`, threaded through `PersonaInject`, `AgentEntry`, and a new `reinject_shape`
+(replacing `reinject_contract_text`) that returns a matching `ReinjectShape { Slim, Pointer,
+Verbose(String) }` for `compact_reinjection_notice` to render:
+
+- `SystemLayerFull` → `Slim` — nothing to re-embed or point at (Claude, always).
+- `SystemLayerCore` → `Pointer` — re-read the full instructions file; never re-embed it (Copilot's
+  generated-wrapper happy path, round 8's new third state).
+- `KickoffOnly` → `Verbose(text)` — the true fallback, full embed, nothing else is durable
+  (Copilot native persona, unwritable directory, or an over-cap body the write guard refused). A
+  failed read in this state degrades to `Pointer`, never `Slim` — `Slim` would falsely claim
+  durability this agent doesn't have; `Pointer` ("go read the file") stays honest even when the
+  read attempt itself failed, and the caller audits that specific degradation
+  (`compact-reinjection-contract-unreadable`) since a genuine `SystemLayerCore` agent's `Pointer`
+  shape is the CORRECT outcome, not something to flag.
+
+**This also closes N1 structurally, not just for this round.** rev-16 named the staleness of the
+`AgentEntry::contract_on_system_layer` doc and the `to_reinject` processing comment as a 3-round
+pattern on this PR — both described a binary fact the bool could still technically hold even
+after round 8 changed what was actually true. An enum can't drift the same way: there is no
+fourth state for a stale comment to silently describe, and every match arm that used to read
+`if contract_on_system_layer { .. } else { .. }` is now an exhaustive 3-way match the compiler
+enforces.
+
+**Persistence checked, not assumed.** `AgentRecord` (`agents.json`, the one roster structure
+actually written to disk) does not carry this fact at all — `AgentEntry` (where it rides at
+runtime) derives only `Clone, Debug`, no `Serialize`/`Deserialize`, and is recomputed fresh by
+`persona_inject` on every spawn and every resume. So there is no serde migration surface for this
+field, and no compat shim was built for one — confirmed by reading the actual persistence code,
+not assumed from the field's name.
+
+**N3a.** Both `write_claude_agent_file` and `copilot_agent_body` now append a short,
+CLI-agnostic self-check clause (`compaction_self_check_clause`) instructing the agent to re-read
+its instructions file after ANY compaction or context loss, independent of whether loomux's own
+reinjection notice arrives — cheap insurance (a couple hundred bytes) against a missed or delayed
+delivery, never a replacement for the primary channel.
+
+**N3b, widened by rev-18.** Claude's `--append-system-prompt-file` write-failure fallback points
+at the instructions file, which is mechanics/template only — a block's actual persona text lives
+only in `contract` (the thing that just failed to write), so this specific combination silently
+dropped the persona before N3b. Landed narrowly scoped to `mode: replace`; rev-18 pointed out the
+scope had no reason to stop there — `render_block_instructions`'s append branch ALSO only ever
+writes a short "adopt your persona" pointer note, never the persona's own words, so the gap is
+identical in both modes, at no added design cost to covering both. The audit
+(`claude-fallback-persona-dropped`) now fires for any non-empty persona on this fallback path,
+mode-tagged in its own payload rather than scoped by mode.
+
+### Round 9 (#428): Copilot's own terminal path — a completion-marker accelerator
+
+Live incident, audit-verified: a Copilot orchestrator's compact arm sat at "awaiting evidence
+(hook-confirmed)" for 240 seconds — `preCompact` hook evidence landed at +0s, but nothing resolved
+it until the user happened to type a question into the pane, triggering busy-then-quiet 60 seconds
+before the 300-second `ARM_PENDING_TIMEOUT_MS` would have false-timed-out it instead. On a pane
+that stays genuinely idle after compaction (nobody prompts it), that false timeout is not a near
+miss, it is deterministic — round 7 closed this exact class for Claude (`SessionStart(compact)` as
+an instant terminal path); Copilot never had an equivalent, because GitHub ships it no post-compact
+signal of any kind: no `postCompact` event, and `sessionStart` fires only on `startup|resume|new`,
+never `compact` (both docs-confirmed in earlier #417 rounds).
+
+**Updated terminal-path asymmetry table** (distinct from the delivery-channel matrix above — this
+is about how FAST an arm resolves, not what re-grounding channel it uses once resolved):
+
+| | terminal-path signal | resolution semantics |
+|---|---|---|
+| Claude | `SessionStart(compact)` hook marker — instant, structural | Marker consumption IS proof re-grounding was delivered (native `additionalContext`) — resolves straight to done, no reinjection needed (round 7) |
+| Copilot | its own compaction-completion PAINT ("Compaction completed" / "A new checkpoint has been added to your session.") — an accelerator, not a hook; busy-then-quiet is still the fallback | The paint proves compaction FINISHED, never that re-grounding was delivered (Copilot has no native `additionalContext` channel) — converts the ARM into a DECIDED reinjection immediately, the same action busy-then-quiet's "confirmed" branch already takes, just without waiting for a quiet tick to observe it (round 9) |
+
+**Design constraints, all satisfied:**
+
+- **Accelerator, not replacement.** This is UI text Copilot happens to paint, not a documented API
+  — `copilot_compaction_marker_substrings`'s own doc states the fragility explicitly and points at
+  the exact strings to re-verify if this stops firing. Busy-then-quiet runs completely
+  unconditionally regardless of whether the marker ever matches, so a future Copilot release
+  changing this wording degrades back to today's (slower, but correct) resolution — never to a
+  hang. Mirrors `auto_compact_banner_substrings`' existing accepted fragility for the RUNNING side.
+- **Resolution semantics, correctly asymmetric.** Unlike Claude's SessionStart block, the new
+  Copilot block does not skip reinjection — it decides one, reusing the exact "confirmed" logic
+  the busy-then-quiet resolver already runs (same instructions-path/ledger-path construction, same
+  `to_reinject` push), just triggered by the marker instead of a quiet observation.
+- **The rev-10 B1 lesson, re-applied.** Gated on `a.compact_reinject_attempted_ms.is_none()` — if a
+  reinjection is already in flight (decided by busy-then-quiet or an earlier marker match for the
+  SAME cycle), this block is a genuine no-op: no re-deciding, no touching those fields, the exact
+  ordering hazard B1 named for the SessionStart block applies identically here.
+- **Provenance (#424/#427).** Gated on `a.compact_pending` (an arm must already be open — a stale
+  mention from a long-resolved compaction in scrollback can never resurrect anything; nothing here
+  can set `compact_pending` true from `false`) and on `now >= a.compact_inference_guard_until_ms`
+  (the same cooldown `human_typed_compact_detected`/`auto_compact_banner_detected` use). Checked,
+  not assumed, that loomux never writes either matched sentence into anything it pastes
+  (`compact_reinjection_notice`'s three shapes, `compact_escalation_notice`, the bare `/compact`
+  command) — grepped those functions' actual bodies before claiming there is no loomux-authored
+  echo this could ever match.
+- **Fixture provenance.** Both matched sentences are quoted directly from #428's own issue body and
+  comment (the user's live screen observation), not reconstructed from memory. A third fragment the
+  issue also quotes — "Use /session checkpoints N to view the compaction summary." — is deliberately
+  NOT matched: `N` is a checkpoint number that changes every time, so that literal text never
+  repeats.
+
+**Tests:** the fast-path proof (`copilot_compaction_marker_resolves_the_arm_even_while_the_pane_
+stays_busy` — armed, continuously busy every tick, never quiet, marker still resolves it on the
+exact tick it's observed); the B1-shaped no-op (`copilot_compaction_marker_with_no_arm_is_a_no_op`);
+the ordering-hazard no-op (`copilot_compaction_marker_while_a_reinjection_is_already_in_flight_is_
+a_no_op`); the regression pin (`copilot_busy_then_quiet_still_resolves_when_the_marker_never_
+appears`); and a pure-function test for the detector itself. Mutation bar per #424 discipline,
+verified: neutralizing `copilot_compaction_marker_detected` to always return `false` reds exactly
+two tests — the pure-function test and the fast-path integration test — and no others, confirming
+the fallback path is genuinely independent of the new detector.
+
+Closes #428.
+
+### Round 10 (#428 follow-up, user-directed polish): the evidence-poll cadence, and badge honesty
+
+Round 9's marker fix worked — a user re-test's own audit showed `compact-resolved-copilot-marker`
+firing on a genuinely idle pane — but the residual UX was the EVIDENCE POLL CADENCE, not the state
+machine: `start_compact_nudge`'s loop only ever woke on `IDLE_TICK_INTERVAL` (60s, shared by
+convention with `start_idle_tick`'s own loop, though the two are structurally independent threads),
+so a hook marker or the Copilot completion-paint sat unconsumed for up to that whole window even
+though the eventual outcome was already effectively decided. The user read the resulting limbo as
+"still unfixed."
+
+**Adaptive poll cadence.** `compact_nudge_poll_interval(any_pending: bool) -> Duration` is the pure
+decision `start_compact_nudge`'s loop now makes every iteration in place of the fixed constant:
+`COMPACT_NUDGE_FAST_POLL_INTERVAL` (10s) while `OrchRegistry::any_compact_pending()` is true
+anywhere in the registry, `IDLE_TICK_INTERVAL` (60s, unchanged) otherwise. `any_compact_pending`
+is a fresh registry-wide scan (`self.agents.lock_safe().values().any(|a| a.compact_pending)`) —
+deliberately whole-registry rather than per-group, since one thread serves every group and the
+fast cadence should be "on" if it would help ANY of them. No hysteresis or latch: the interval is
+recomputed from scratch every loop iteration with no memory of a previous tick, which is also the
+answer to "won't a rapidly opening/closing arm thrash the timer?" — recomputing fresh every
+iteration cannot oscillate faster than the loop itself already runs, so there is no additional
+state to get wrong. Idle cost is zero: the fast branch is only ever taken while a real compaction
+cycle is genuinely in flight, which is a small fraction of a session's wall-clock time.
+
+**The fast-poll scope is registry-wide, and that breadth is deliberate** (rev-25 review, named
+explicitly rather than left implicit): one pending arm ANYWHERE in the registry upgrades the poll
+cadence for EVERY agent everywhere, not just the one that's actually waiting — `agent_compact_
+signals` (what runs more often at the faster cadence) reads every agent's full pty tail, capped at
+`OUTPUT_RING_CAP` = 256 KiB, and ANSI-strips it, gated only on the agent having a live pty, not on
+being pending or otherwise eligible. Measured bound: ≤ 256 KiB × 6 wakes/min ≈ 1.5 MiB/min per
+agent at the fast cadence — sub-1 MiB/s in aggregate even across a large fleet (tens of agents) —
+and the window this can run for at all is bounded by the state machine itself
+(`ARM_PENDING_TIMEOUT_MS`, 5 min, or up to `MAX_REINJECT_ATTEMPTS` × `REINJECT_CONFIRM_TIMEOUT_MS`,
+15 min, if a resolved arm's retries all stall) — under ~20 minutes worst case, never unbounded, and
+in the normal case seconds rather than minutes since most arms resolve on the very next fast wake.
+Two cheap options if this bound ever needs tightening in practice, neither built speculatively
+here: scope the fast cadence per-group instead of registry-wide, or have `agent_compact_signals`
+skip the tail read for an agent that is neither pending nor otherwise eligible for compact-nudge's
+inference detectors.
+
+**Badge honesty.** `awaiting_evidence` with `source: "hook"` is the phase a hook-sourced arm lands
+in IMMEDIATELY (it sets `compact_seen_busy` at arm time — see `compaction_status`'s doc — so it
+skips "armed" entirely on the very first tick) and is exactly the phase the live re-test sat in.
+The label read as stuck ("compact awaiting evidence (hook-confirmed)") even though the outcome was
+already decided: a hook told loomux directly that compaction happened, and resolution was only
+ever a matter of the next poll consuming the marker. `compactionstatus.ts` now special-cases this
+one state: `"compact confirmed — finalizing"`, tooltip "a hook confirmed this compaction directly
+— wrapping up the re-grounding handoff now". The three other `awaiting_evidence` variants (no
+source, trusted; no source, unconfirmed) are genuinely still waiting on an outcome busy-then-quiet
+hasn't resolved either way yet, so their wording is untouched — this is a targeted relabeling of
+one state that stopped being honest, not a vocabulary overhaul.
+
+**No state-machine decision changed** — the 12th consecutive round on this PR to make that claim,
+and it holds: every `compact_pending`/`compact_reinject_*`/`ContractCarrier` transition, every
+arm/confirm/timeout/abandon condition, is byte-identical to round 9. Only how OFTEN the loop reads
+the outcome, and how the human-facing label narrates one already-decided phase, changed.
+
+**Tests:** `compact_nudge_poll_interval_is_fast_only_while_something_is_pending` (the cadence
+decision, both directions); `any_compact_pending_is_true_only_while_an_arm_is_actually_open` (proven
+against a real registry through the whole arm-through-confirmation lifecycle, not just the pure
+function); the frontend label/tooltip test split so the hook-sourced case's new wording and the
+three unchanged variants are each pinned separately.
 
 ## Enforced merge gate (#83)
 

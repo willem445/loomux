@@ -69,7 +69,7 @@
 //!     kind: reviewer
 //!     cli: claude
 //!     model: opus
-//!     prompt: |            # -> claude --agents '{...}' --agent rev-security
+//!     prompt: |            # -> generated ~/.claude/agents/*.md + claude --agent
 //!       Review ONLY for security defects: injection, authz, secrets.
 //!
 //!   - id: advisor            # role_hint: OPTIONAL, INERT (#250/#324) — picks
@@ -132,8 +132,10 @@ pub struct Block {
     pub cli: String,
     /// Model for this block. Empty = the kind's default for the resolved CLI.
     pub model: String,
-    /// Inline persona (the `prompt:` key). Compiled to `claude --agents` JSON,
-    /// or injected into the kickoff prompt on CLIs with no inline flag.
+    /// Inline persona (the `prompt:` key). Compiled into a loomux-generated
+    /// custom-agent FILE on both CLIs (round #417 correction 6 for Claude;
+    /// #416 for Copilot), or — on a directory-write failure — Claude's
+    /// `--append-system-prompt-file` / Copilot's kickoff-prompt paste.
     pub prompt: Option<String>,
     /// Repo-relative path to a persona file (the `profile:` key), e.g.
     /// `.github/agents/worker.md`. A `.github/agents/*.md` file is what lets a
@@ -182,8 +184,9 @@ impl Block {
         BUILTIN_IDS.contains(&self.id.as_str())
     }
 
-    /// A block with no persona behaves exactly like a pre-#222 role: nothing to
-    /// compile into `--agents` / `--agent`, nothing to inject into the kickoff.
+    /// A block with no persona behaves exactly like a pre-#222 role: no persona
+    /// text to fold into the generated custom-agent file, nothing to inject
+    /// into the kickoff — the CONTRACT itself still always compiles (#416).
     pub fn has_persona(&self) -> bool {
         self.prompt.is_some() || self.profile.is_some()
     }
@@ -444,11 +447,12 @@ pub fn builtin_roster(agent_cli: &str) -> Vec<Block> {
 /// and nothing legible needs more.
 pub const MAX_ID_CHARS: usize = 48;
 
-/// Block ids reach the shell (a `--agent <id>` flag, a `--agents` JSON key) and
-/// the filesystem (`<id>.md` in the group dir). Keep them to a conservative
-/// identifier alphabet so neither surface can be escaped — the `sanitize_model`
-/// precedent, applied to identity. Returns `None` for an id with no usable
-/// characters left.
+/// Block ids reach the shell (folded into a generated custom-agent file's
+/// `loomux-<group>-<id>` handle, behind a `--agent <handle>` flag) and the
+/// filesystem (`<id>.md` in the group dir, and as part of that generated
+/// file's own name). Keep them to a conservative identifier alphabet so
+/// neither surface can be escaped — the `sanitize_model` precedent, applied
+/// to identity. Returns `None` for an id with no usable characters left.
 ///
 /// The *parser* rejects an id this would have changed rather than accepting the
 /// rewrite (see `parse_workflow`); this is the last-resort filter for ids that
@@ -497,44 +501,31 @@ pub fn sanitize_display(s: &str) -> String {
         .collect()
 }
 
-/// Persona text ends up inside a **single-quoted** shell token (the `--agents`
-/// JSON payload). In both PowerShell and POSIX sh, a single-quoted string is
-/// fully literal *except* for the quote character itself — so `'` is the one
-/// character that could break out, and it is the only one we have to remove.
-/// Mapping it to the typographic apostrophe (U+2019) keeps the prose intact
-/// ("don't" stays readable) while making the payload structurally inert; the
-/// JSON is then ASCII-escaped ([`ascii_escape_json`]) so the command line stays
-/// pure ASCII regardless of the pane's code page.
+/// Strips characters that could be structurally hazardous wherever persona
+/// text ends up — a generated agent FILE (Claude's `~/.claude/agents/*.md`,
+/// round #417 correction 6; Copilot's `~/.copilot/agents/*.agent.md`, #416)
+/// or PTY-typed kickoff text (Copilot's write-failure fallback). Control
+/// characters other than newline/tab are dropped outright: they have no
+/// meaning in a persona and would ride straight into a terminal.
 ///
-/// Control characters other than newline/tab are dropped: they have no meaning
-/// in a persona and would ride straight into a terminal.
+/// The `'` → typographic-apostrophe (U+2019) mapping predates round 6: it
+/// protected the SINGLE-QUOTED shell token `claude --agents '<json>'` this
+/// text used to ride on, before that mechanism was replaced with a
+/// generated file (see `PersonaInject::claude_agent`'s doc for why — the
+/// argv-length bug the replacement fixes). No current consumer is a raw
+/// shell token, so this mapping is inert today — kept rather than removed,
+/// both because it costs nothing (the prose still reads fine: "don't"
+/// stays "don't", just with a curlier mark) and as defense-in-depth against
+/// a future consumer reintroducing a shell-token use without re-deriving
+/// this exact hazard from scratch. `ascii_escape_json`, which existed
+/// solely to keep the OLD `--agents` JSON payload pure-ASCII on a
+/// non-UTF-8 pane code page, had no other consumer and was removed
+/// entirely alongside that mechanism, rather than left orphaned.
 pub fn sanitize_persona(s: &str) -> String {
     s.chars()
         .map(|c| if c == '\'' { '\u{2019}' } else { c })
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect()
-}
-
-/// Escape every non-ASCII character in an already-serialized JSON string as
-/// `\uXXXX`. JSON says that is equivalent; the point is that the resulting
-/// payload is pure ASCII, so it survives a Windows pane whose code page is not
-/// UTF-8. (Used on the `claude --agents` payload, which is the only place
-/// loomux puts free text on a command line.)
-pub fn ascii_escape_json(json: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(json.len());
-    let mut buf = [0u16; 2];
-    for c in json.chars() {
-        if c.is_ascii() {
-            out.push(c);
-            continue;
-        }
-        // Astral-plane chars (emoji in a persona) need both surrogates.
-        for unit in c.encode_utf16(&mut buf) {
-            let _ = write!(out, "\\u{unit:04x}");
-        }
-    }
-    out
 }
 
 /// Confine a `profile:` path to the repo. A workflow file is repo-authored input

@@ -17,15 +17,52 @@ test("compactionStatusLabel: none omits the row entirely", () => {
 });
 
 test("compactionStatusLabel: armed names the trust source", () => {
-  assert.equal(compactionStatusLabel({ status: "armed", trusted: true }), "compact armed");
-  assert.equal(compactionStatusLabel({ status: "armed", trusted: false }), "compact armed (unconfirmed)");
+  assert.equal(compactionStatusLabel({ status: "armed", trusted: true, source: null }), "compact armed");
+  assert.equal(compactionStatusLabel({ status: "armed", trusted: false, source: null }), "compact armed (unconfirmed)");
 });
 
 test("compactionStatusLabel: awaiting_evidence names the trust source", () => {
-  assert.equal(compactionStatusLabel({ status: "awaiting_evidence", trusted: true }), "compact awaiting evidence");
   assert.equal(
-    compactionStatusLabel({ status: "awaiting_evidence", trusted: false }),
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: true, source: null }),
+    "compact awaiting evidence"
+  );
+  assert.equal(
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: false, source: null }),
     "compact awaiting evidence (unconfirmed)"
+  );
+});
+
+test("compactionStatusLabel: #417 hook-sourced evidence beats trusted/unconfirmed wording", () => {
+  // A hook-confirmed arm IS trusted (no inference gate), but the label must
+  // still distinguish it from the loomux-initiated trusted arm — a human
+  // watching the panel should be able to tell "a hook told us" from "loomux
+  // decided to compact" at a glance.
+  assert.equal(
+    compactionStatusLabel({ status: "armed", trusted: true, source: "hook" }),
+    "compact armed (hook-confirmed)"
+  );
+});
+
+test("compactionStatusLabel: round 10 — hook-confirmed awaiting_evidence reads as progress, not limbo", () => {
+  // #428 follow-up, user-directed: a live re-test showed "compact awaiting
+  // evidence (hook-confirmed)" read as stuck even though a hook had already
+  // confirmed the outcome directly — only loomux's own poll was left to
+  // consume the marker. The non-hook awaiting_evidence cases are genuinely
+  // still undecided (busy-then-quiet hasn't resolved either way), so their
+  // wording is unchanged — this is scoped to the hook source only.
+  assert.equal(
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: true, source: "hook" }),
+    "compact confirmed — finalizing"
+  );
+  assert.equal(
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: true, source: null }),
+    "compact awaiting evidence",
+    "unchanged: a genuinely undecided trusted arm"
+  );
+  assert.equal(
+    compactionStatusLabel({ status: "awaiting_evidence", trusted: false, source: null }),
+    "compact awaiting evidence (unconfirmed)",
+    "unchanged: a genuinely undecided, unconfirmed arm"
   );
 });
 
@@ -36,10 +73,19 @@ test("compactionStatusLabel: reinjecting shows the bounded attempt count", () =>
   );
 });
 
-test("compactionStatusLabel: abandoned names the two real lost-outcome reasons", () => {
+test("compactionStatusLabel: abandoned names the three real lost-outcome reasons", () => {
   assert.equal(
     compactionStatusLabel({ status: "abandoned", reason: "arm-timeout", since_ms: 0 }),
     "compact timed out (no evidence)"
+  );
+  // Round 7: a PreCompact-only hook arm can still legitimately time out if
+  // the agent's own turn never settles — but hook evidence WAS seen, so the
+  // label must say so rather than falsely claiming none was recorded. (A
+  // SessionStart-evidenced arm resolves immediately now and never reaches
+  // "abandoned" at all — see the backend's compact_nudge_tick doc.)
+  assert.equal(
+    compactionStatusLabel({ status: "abandoned", reason: "arm-timeout-with-evidence", since_ms: 0 }),
+    "compact timed out after hook evidence — resolution never observed"
   );
   assert.equal(
     compactionStatusLabel({ status: "abandoned", reason: "reinjection-abandoned", since_ms: 0 }),
@@ -55,12 +101,15 @@ test("compactionStatusLabel: abandoned names the two real lost-outcome reasons",
 
 test("compactionStatusTitle: every non-none status has an explanatory tooltip", () => {
   const statuses: CompactionStatus[] = [
-    { status: "armed", trusted: true },
-    { status: "armed", trusted: false },
-    { status: "awaiting_evidence", trusted: true },
-    { status: "awaiting_evidence", trusted: false },
+    { status: "armed", trusted: true, source: null },
+    { status: "armed", trusted: false, source: null },
+    { status: "armed", trusted: true, source: "hook" },
+    { status: "awaiting_evidence", trusted: true, source: null },
+    { status: "awaiting_evidence", trusted: false, source: null },
+    { status: "awaiting_evidence", trusted: true, source: "hook" },
     { status: "reinjecting", attempt: 1, max_attempts: 3 },
     { status: "abandoned", reason: "arm-timeout", since_ms: 0 },
+    { status: "abandoned", reason: "arm-timeout-with-evidence", since_ms: 0 },
     { status: "abandoned", reason: "reinjection-abandoned", since_ms: 0 },
   ];
   for (const s of statuses) {

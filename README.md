@@ -174,10 +174,29 @@ npm run test:e2e
 src-tauri/src/
   pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
   sessions.rs       agent session discovery (one scan_* fn per agent source)
-  orchestration/    agent groups: registry, guardrails, MCP server, audit
+  orchestration/    agent groups: registry, guardrails, MCP server, audit. Compact-survival is
+    layered (#329, #416, #417): a durable role CONTRACT riding the CLI's own system-prompt layer
+    (a generated `~/.claude/agents`/`~/.copilot/agents` custom-agent file on both CLIs — Claude's
+    own inline `--agents` JSON flag was replaced with a file in a later correction round after a
+    live demo hit Windows CreateProcessW's 32,767-character command-line limit) is the primary
+    defense against compaction diluting it; both Claude's `PreCompact`/`SessionStart` hooks AND Copilot's own
+    `preCompact` hook are TRUSTED evidence sources for detecting a compaction (no banner/
+    token-drop guessing needed once configured) — Claude additionally gets a native
+    `SessionStart(compact)` re-grounding signal Copilot's docs confirm has no equivalent, so a
+    Copilot compaction always closes via loomux's own reinjection instead. Both CLIs have a real
+    `/compact` command loomux can nudge at a natural lull or on request (Copilot's confirmed via
+    its own CLI command reference, one tick later than Claude's since it lacks that native
+    re-grounding signal); banner/token-drop/marker inference remains the fallback tier for
+    hook-less setups. Since the CONTRACT itself now durably rides the system-prompt layer for
+    almost every agent, the mandatory post-compact re-grounding notice is SLIM by default (a
+    re-sync pointer to the task board/durable state/roster, plus the directive ledger tail
+    inlined) rather than re-embedding instructions the agent's system prompt already holds
+    permanently — full verbatim re-embedding is now reserved for the one documented case where
+    a Copilot block's contract does NOT ride `--agent` (a user-authored native
+    `.github/agents/*.md` persona). See doc/design/orchestration.md's Compact-nudge section.
     workflow.rs     the block model (#222): a repo's agent roster as data — `<repo>/.loomux/workflow.yml` parse + validation. A block's id is the agent's identity; `kind` is its CAPABILITY CLASS, and stays a closed 4-variant enum, so a repo file can declare five reviewers with five prompts but can never grant one write access. An optional `role_hint` (#250/#324: `advisor` | `process`) rides alongside `kind` for persona/template/badge selection only — inert w.r.t. capability, which keeps keying exclusively off `kind`. Also the ENFORCED merge gate (#222/#197): reviewer-attributed verdicts (pass | fail | escalate) as durable state, and the pure gate decision the `gh` shim mirrors — `gh pr merge` is refused until every reviewer the gate names has recorded a pass, and no human grant or autonomous marker can open it. See doc/design/workflows.md and doc/design/supervisor-skills.md
     lessons.rs      durable per-repo lessons (#268): `<repo>/.loomux/lessons.md`, a plain-Markdown convention file (no schema, no MCP write tool — edited and reviewed like any other file) read-and-capped into the orchestrator's kickoff only. Hard byte cap with oldest-drop truncation, wrapped in a data-not-instructions provenance framing (#189) — never grounds to bypass the merge gate. See doc/design/lessons.md
-    profiles.rs     repo-authored personas from `.github/agents/*.md` (#51, harvested from PR #105): append/replace modes with a non-overridable loomux mechanics core. Compiled to each CLI's native custom-agent flag — `claude --agents` (inline) / `copilot --agent` (a user-authored file only)
+    profiles.rs     repo-authored personas from `.github/agents/*.md` (#51, harvested from PR #105): append/replace modes with a non-overridable loomux mechanics core. Compiled to each CLI's native custom-agent flag — `claude --agent`/`copilot --agent` (both resolve a NAME against a user/project agent-file directory; a user-authored file resolves unwrapped) — and (#416) the built-in role contract itself now rides the SAME native flag for every block, persona or not: a block with no user-authored file gets a loomux-generated file in the CLI's own user-level agent directory (`~/.claude/agents` or `~/.copilot/agents`, never the repo's `.github/agents/`). Claude's inline `--agents '<json>'` flag was the original #416 mechanism; it was replaced with the same file-based approach Copilot always used after a live demo hit Windows CreateProcessW's 32,767-character command-line limit once the full contract, not just a short persona, rode it
     digest.rs       session-digest friction extraction (#250/#324): normalizes a Claude `.jsonl` or Copilot session-state transcript into one event stream, then reduces it, deterministically and LLM-free, into "friction windows" (a tool error, a near-duplicate rerun, a test that went red-then-green, a reverted edit) — the `session_digest` MCP tool a `role_hint: process` block calls to mine a finished session cold. See doc/design/supervisor-skills.md
   obs.rs            crash observability: panic hook, breadcrumb log, unclean-exit notice; `data_root()` — the `<data dir>/loomux` root, overridable via `LOOMUX_DATA_DIR` (#394) for an isolated profile
   voice.rs          voice prompts (#58): mic capture (cpal) -> local whisper.cpp subprocess

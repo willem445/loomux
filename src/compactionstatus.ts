@@ -16,8 +16,20 @@ export function compactionStatusLabel(status: CompactionStatus): string | null {
     case "none":
       return null;
     case "armed":
-      return `compact ${status.trusted ? "armed" : "armed (unconfirmed)"}`;
+      return `compact ${armedQualifier(status)}`;
     case "awaiting_evidence":
+      // Round 10 (#428 follow-up, user-directed): a hook-sourced arm sets
+      // `compact_seen_busy` immediately at arm time (see the backend's
+      // `compaction_status` doc), so it lands HERE, not "armed", on the
+      // very first tick — this is the phase a live user re-test sat in
+      // for up to the evidence-poll cadence, and "awaiting evidence"
+      // reads as stuck even though the outcome is already decided: a
+      // hook told loomux directly that compaction happened, resolution
+      // is inevitable, it's just waiting on the poll that consumes the
+      // marker. The non-hook cases below are genuinely still waiting on
+      // an outcome (busy-then-quiet hasn't resolved either way yet), so
+      // their wording is unchanged.
+      if (status.source === "hook") return "compact confirmed — finalizing";
       return `compact awaiting evidence${status.trusted ? "" : " (unconfirmed)"}`;
     case "reinjecting":
       return `re-grounding (attempt ${status.attempt}/${status.max_attempts})`;
@@ -33,10 +45,16 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
     case "none":
       return null;
     case "armed":
+      if (status.source === "hook") return "a PreCompact/SessionStart hook confirmed this directly — waiting to observe the pane go busy";
       return status.trusted
         ? "loomux pasted /compact itself — waiting to observe the pane go busy"
         : "loomux believes a compact started (banner or manual typing) — waiting to observe the pane go busy";
     case "awaiting_evidence":
+      // Round 10: a hook already confirmed the compaction directly — there
+      // is no inference left to run and no outcome left undecided, only
+      // loomux's own poll left to consume the marker and hand off the
+      // (already-decided) re-grounding.
+      if (status.source === "hook") return "a hook confirmed this compaction directly — wrapping up the re-grounding handoff now";
       return status.trusted
         ? "busy observed — waiting for quiet to resolve"
         : "busy observed — waiting for quiet, then a confirmed token drop or compact_boundary marker before trusting it";
@@ -47,10 +65,25 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
   }
 }
 
+/** "hook-confirmed" beats "armed"/"armed (unconfirmed)" (#417) — a human
+ *  watching the panel should be able to tell a hook-confirmed compaction
+ *  from an inferred/loomux-initiated one at a glance. */
+function armedQualifier(status: { trusted: boolean; source: string | null }): string {
+  if (status.source === "hook") return "armed (hook-confirmed)";
+  return status.trusted ? "armed" : "armed (unconfirmed)";
+}
+
 function lostReasonLabel(reason: string): string {
   switch (reason) {
     case "arm-timeout":
       return "timed out (no evidence)";
+    case "arm-timeout-with-evidence":
+      // Round 7: a PreCompact-only hook arm (no SessionStart wired) can
+      // still legitimately time out if the agent's own turn never settles
+      // — but hook evidence WAS seen, so "no evidence" would be wrong. A
+      // SessionStart-evidenced arm resolves immediately now and never
+      // reaches this label at all — see compact_nudge_tick's own doc.
+      return "timed out after hook evidence — resolution never observed";
     case "reinjection-abandoned":
       return "re-grounding lost";
     default:
@@ -62,6 +95,8 @@ function lostReasonTitle(reason: string): string {
   switch (reason) {
     case "arm-timeout":
       return "an arm never reached a busy-then-quiet resolution within the bound — released so a new compaction can arm";
+    case "arm-timeout-with-evidence":
+      return "a hook confirmed this compaction directly, but the pane never settled within the bound to resolve it — released so a new compaction can arm";
     case "reinjection-abandoned":
       return "a decided reinjection's delivery never confirmed despite retries — released so a new compaction can arm";
     default:
