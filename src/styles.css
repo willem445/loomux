@@ -611,6 +611,39 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane:hover .pane-btn, .pane-btn:focus-visible { opacity: 1; }
 .pane-btn:hover { background: var(--panel-2); color: var(--text); }
 .pane-btn.close:hover { color: var(--danger); }
+/* A docked view's overlay toggle is disabled outright (#361 user-demo
+   finding — see embedtoggle.ts): dim it further than the plain hover-reveal
+   opacity and drop the pointer cursor, so it reads as unavailable rather
+   than just currently-inactive. */
+.pane:hover .pane-btn:disabled, .pane-btn:disabled:focus-visible { opacity: 0.35; }
+.pane-btn:disabled { cursor: default; }
+.pane-btn:disabled:hover { background: none; color: var(--text-dim); }
+
+/* Drag-suspend discipline (#361 user-demo finding): a docked/overlaid
+   panel's OWN scrollable list is what's expensive to reflow on every
+   divider-drag mousemove frame once it holds a lot of rows — the drag
+   itself just changes the panel's own box (driven by flex-grow / an
+   explicit height), which has nothing to do with the list's CONTENT. The
+   host toggles `.resizing` on the panel/overlay for the duration of a drag
+   (pane.ts's `wireEmbedDivider` / `makeOverlayDivider`) — `content-visibility:
+   hidden` skips layout AND paint of a listed view's rows entirely while
+   dragging (the outer box, sized by flex-grow/height, is unaffected — flex
+   items with an explicit `flex-basis: 0` were never sized from their
+   content to begin with) and the browser lays them out ONCE, normally, the
+   moment the class comes off on release. Applied to every list class large
+   enough to matter today; trivially extensible to a future one. */
+.pane-embed-panel.resizing .audit-list,
+.pane-embed-panel.resizing .tasks-list,
+.pane-embed-panel.resizing .issues-list,
+.pane-embed-panel.resizing .group-list,
+.pane-embed-panel.resizing .fileedit-tree,
+.git-overlay.resizing .audit-list,
+.git-overlay.resizing .tasks-list,
+.git-overlay.resizing .issues-list,
+.git-overlay.resizing .group-list,
+.git-overlay.resizing .fileedit-tree {
+  content-visibility: hidden;
+}
 
 /* The terminal's breathing room must live on .xterm itself, not on
    .pane-term: the fit addon subtracts the terminal element's own padding,
@@ -641,6 +674,93 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   transition: transform 0.18s var(--ease);
 }
 .pane-term .xterm { height: 100%; padding: 6px 2px 4px 10px; }
+
+/* ---------- embedded panels (#361) ---------- */
+/* A discrete, user-initiated alternative to a floating overlay: up to THREE
+   of the task board / git / issues / audit log / group lifecycle panel —
+   one each on the left, right, and bottom edges (never the file editor —
+   see doc/design/embedded-panels.md's "What's embeddable, and what isn't")
+   — rendered as REAL flex siblings of the terminal, so all of them stay
+   fully visible together and the terminal's own box genuinely resizes. See
+   the design note for why that's the legitimate side of the
+   no-PTY-resize-for-chrome rule (CLAUDE.md constraint 1), not a violation
+   of it.
+
+   NESTED, not a flat row, mirroring `Pane.ensureEmbedHost`'s own structure
+   exactly (see its doc comment for the full picture and why nesting, not a
+   flat 5-child row, is what keeps every divider's own drag math a plain
+   two-element pair):
+     .pane-embed-host   (column)  — bottom spans the row's FULL width
+       .pane-embed-row    (row)    — left | center
+         .pane-embed-panel.side-left
+         .pane-embed-divider.side-left
+         .pane-embed-center (row)  — term | right
+           .pane-embed-term-wrap (see Pane.embedTermWrapEl's doc comment:
+             .pane-term            exists ONLY so the right divider never
+                                    writes .style.flex onto .pane-term
+                                    itself — #361 right-dock lag fix)
+           .pane-embed-divider.side-right
+           .pane-embed-panel.side-right
+       .pane-embed-divider.side-bottom
+       .pane-embed-panel.side-bottom
+   `.pane-embed-host` takes over `.pane-term`'s old role as `.pane`'s direct
+   flex:1 child; with every slot's divider/panel `[hidden]`, the nested
+   structure lays out identically to `.pane-term` being that child directly.
+   Only one view occupies any given slot (`Pane.embedSlots`), but up to
+   three slots can be occupied AT ONCE, one per side. */
+.pane-embed-host {
+  display: flex; flex-direction: column; flex: 1; min-height: 0;
+}
+.pane-embed-row {
+  display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; min-width: 0;
+}
+.pane-embed-center {
+  display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; min-width: 0;
+}
+/* Exists solely so the right divider's drag has a WRAPPER to resize instead
+   of `.pane-term` directly (#361 right-dock expand-left lag fix) — sized
+   identically to how `.pane-term` used to sit directly in this row. */
+.pane-embed-term-wrap {
+  display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; min-width: 0;
+}
+.pane-embed-panel {
+  flex: 1 1 0; min-height: 0; min-width: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-app);
+}
+/* Base rule: bottom's own orientation (a horizontal bar between the row and
+   the bottom slot). Left/right override to a vertical bar below. */
+.pane-embed-divider {
+  flex: none; height: 6px; cursor: row-resize;
+  background: transparent; border-radius: 3px;
+  transition: background 0.18s var(--ease);
+}
+.pane-embed-divider.side-left, .pane-embed-divider.side-right {
+  height: auto; width: 6px; cursor: col-resize; align-self: stretch;
+}
+.pane-embed-divider:hover, .pane-embed-divider.dragging { background: var(--accent-dim); }
+.pane-embed-divider.dragging { background: var(--accent); }
+
+/* `reclampViewFloor`'s content-driven floor-grow protection (the group
+   panel's fixed chrome growing after it opens — a suspended-budget banner,
+   say) only ever resizes a divider for the BOTTOM slot and the floating
+   overlay: those two host modes route through the view's own `floorPx()`.
+   Left/right deliberately use a fixed WIDTH constant instead (#361's
+   left/right simplification — a view's floorPx() measures vertical chrome,
+   which doesn't transfer to "how narrow can this go"), so nothing widens a
+   left/right divider when the group panel's HEIGHT-wise content grows.
+   Scroll rather than clip when that happens (#361 rev-58 NB3) — a bounded
+   fix, not a second floor-grow mechanism for a width-only floor. */
+.pane-embed-panel.side-left .group-view,
+.pane-embed-panel.side-right .group-view {
+  overflow-y: auto;
+}
+
+/* Every embeddable view's own embed toggle (task board / git / issues /
+   audit / group, each in its own header) reads as pressed once the pane's
+   embed-panel slot is actually showing it — unscoped by header class since
+   all five headers already force `.pane-btn` to opacity:1 for themselves. */
+.pane-btn.embed.active { color: var(--accent); }
 
 /* ---------- orchestrator steering strip (#43, option C) ---------- */
 /* Docked under the ORCHESTRATOR pane's terminal. Styled like the task board's
@@ -1959,6 +2079,14 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   border: 2px solid var(--bg-app); background-clip: padding-box;
 }
 .audit-empty { padding: 22px 16px; color: var(--text-dim); line-height: 1.5; }
+/* Rendered-window backfill hint (#361 user-demo finding — auditwindow.ts):
+   only the newest slice of a long log renders by default; this marks that
+   scrolling up loads more, rather than the log silently appearing to stop. */
+.audit-window-hint {
+  padding: 6px 10px; text-align: center;
+  color: var(--text-dim); font-size: 10.5px; font-style: italic;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
 
 .audit-row { padding: 1px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.03); }
 .audit-top {

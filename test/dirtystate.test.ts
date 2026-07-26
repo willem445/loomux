@@ -16,6 +16,7 @@ import {
   isDoaRevival,
   withDeadline,
   QUIT_FLUSH_TIMEOUT_MS,
+  shouldConfirmDiscardBeforeClose,
   type PaneBufferReport,
 } from "../src/dirtystate.ts";
 
@@ -30,6 +31,19 @@ test("isDirty reflects buffer vs last-saved", () => {
 test("closeDecision confirms only when dirty", () => {
   assert.equal(closeDecision(false), "close");
   assert.equal(closeDecision(true), "confirm");
+});
+
+test("shouldConfirmDiscardBeforeClose: docked always skips the confirm, dirty or not (#361 user-demo finding)", () => {
+  // The bug this prevents: a "yes" on the discard dialog would drop real
+  // edits for a toggle click that (while docked) doesn't actually close
+  // anything — Un-embed is the only thing that does.
+  assert.equal(shouldConfirmDiscardBeforeClose(true, true), false);
+  assert.equal(shouldConfirmDiscardBeforeClose(true, false), false);
+});
+
+test("shouldConfirmDiscardBeforeClose: not docked falls back to the plain #219 rule", () => {
+  assert.equal(shouldConfirmDiscardBeforeClose(false, true), true);
+  assert.equal(shouldConfirmDiscardBeforeClose(false, false), false);
 });
 
 test("reload-after-replace guard: a clean buffer reloads, a dirty one confirms", () => {
@@ -136,6 +150,18 @@ test("the quit confirm names WHERE each buffer is — and marks the hidden ones"
     "loomux · pane.ts — src/pane.ts",
     "docs · claude · fix (Alt+F editor) — README.md",
   ]);
+});
+
+test("a DOCKED editor gets its own call-out too (#361 scope increase) — not mislabeled as the floating overlay", () => {
+  // A docked editor looks like a permanent fixture of the pane, not something someone
+  // opened — the least likely of the three hosts to be remembered as "still holding
+  // edits", so it needs the same explicit call-out an overlay already got.
+  const lines = dirtyBufferLines(
+    dirtyBuffers([
+      report({ tab: "loomux", pane: "claude · fix", host: "docked", file: "src/git.ts", dirty: true }),
+    ])
+  );
+  assert.deepEqual(lines, ["loomux · claude · fix (docked editor) — src/git.ts"]);
 });
 
 // ---------- a pane whose process just died (#219) ----------

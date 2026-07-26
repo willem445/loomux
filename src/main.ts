@@ -54,7 +54,14 @@ import {
   type AttentionItem,
 } from "./orchestration";
 import { tabAttention, sameAttention, findPaneByPty } from "./tabroute";
-import { encodeTabs, decodeTabs, type PersistedTabs, type PersistedLayoutNode, type PersistedPane } from "./tabstore";
+import {
+  encodeTabs,
+  decodeTabs,
+  type PersistedTabs,
+  type PersistedLayoutNode,
+  type PersistedPane,
+  type PersistedEmbed,
+} from "./tabstore";
 import { decideRestore } from "./restoredecision";
 import { resumeFailureKind, offersStartFresh, resumeFailureReason } from "./resumeerror";
 import {
@@ -63,6 +70,7 @@ import {
   agentResumeCommand,
   agentFreshCommand,
   shouldRespawnFresh,
+  findResumedPaneIndex,
   type RestoreAction,
   type SessionResumable,
 } from "./panerestore";
@@ -530,6 +538,7 @@ async function openActionPane(
         sessionId: null,
         role: null,
         file: null,
+        embeds: [],
       };
       let pane: Pane;
       const content = dormantCard(
@@ -646,6 +655,11 @@ async function openActionPane(
         sessionId: a.sessionId,
         role: a.role,
         file: null,
+        // The docked-view preferences (#361) ride along too, so re-capturing
+        // a still-dormant tab (Resume never clicked) reproduces them byte
+        // for byte, and resumeDormantGroup can reapply them once the pane
+        // they belong to is actually resumed.
+        embeds: a.embeds,
       };
       const content = dormantCard(
         "Resume group",
@@ -745,6 +759,31 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     const captured = orchRecords
       .filter((r) => r.sessionId !== null)
       .map((r) => ({ sessionId: r.sessionId as string, role: r.role ?? "worker" }));
+    // The docked-view preferences (#361) aren't part of the resume plan
+    // itself (planGroupResume only orders/gates on session id + role) —
+    // they're captured UI preferences, reapplied below once each member's
+    // pane actually comes back, by matching sessionId the same way the plan
+    // itself does.
+    const embedsBySession = new Map<string, PersistedEmbed[]>();
+    for (const r of orchRecords) {
+      if (r.sessionId && r.embeds.length) embedsBySession.set(r.sessionId, r.embeds);
+    }
+    // resumeOrchSession only returns the group id — "the pane itself is located
+    // later by scanning live panes" (orchestration.ts) — so this does the same,
+    // matching on the session id we just asked it to resume. The dormant-
+    // exclusion DECISION (a stale placeholder for this same member carries the
+    // identical captured session id and must never shadow the real match) is
+    // the pure, tested `findResumedPaneIndex` (panerestore.ts); only the live
+    // pane traversal itself is wiring, hand-validated like the rest of this
+    // function's grid access.
+    const findResumedPane = (sessionId: string): Pane | undefined => {
+      const panes = ws.grid.allPanes();
+      const idx = findResumedPaneIndex(
+        panes.map((p) => ({ isDormant: p.isDormant, sessionId: p.capture()?.sessionId ?? null })),
+        sessionId
+      );
+      return idx === -1 ? undefined : panes[idx];
+    };
     // Captured members with no resumable id (e.g. a copilot delegate — copilot
     // mints its own session id after boot, so there's nothing to --resume). They
     // can't be brought back, but they WERE live at close, so they're counted in the
@@ -793,7 +832,11 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
         group: groupId,
         role: "orchestrator",
       });
-      if (restored) tabs.bindGroup(restored.groupId, ws.id);
+      if (restored) {
+        tabs.bindGroup(restored.groupId, ws.id);
+        const embeds = embedsBySession.get(plan.orchestrator.sessionId);
+        if (embeds) findResumedPane(plan.orchestrator.sessionId)?.restoreEmbeds(embeds);
+      }
     } catch (err) {
       // Recoverable (retry the button) — a toast, not the app-crash banner (MED-3).
       showToast(`Couldn't resume group: ${String(err)}`, "error");
@@ -819,6 +862,8 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
           group: groupId,
           role: member.role,
         });
+        const embeds = embedsBySession.get(member.sessionId);
+        if (embeds) findResumedPane(member.sessionId)?.restoreEmbeds(embeds);
       } catch (err) {
         const message = String(err);
         const kind = resumeFailureKind(message);

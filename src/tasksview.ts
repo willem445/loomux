@@ -85,9 +85,12 @@ export class TasksView {
   private unlisten: UnlistenFn | null = null;
   private disposed = false;
 
+  private embedBtn: HTMLButtonElement;
+  private closeBtn: HTMLButtonElement;
+
   constructor(
     private groupId: string,
-    opts: { onClose: () => void }
+    opts: { onClose: () => void; onEmbedMenu: (anchor: HTMLElement) => void }
   ) {
     this.el = el("div", "tasks-view");
 
@@ -113,10 +116,21 @@ export class TasksView {
     this.deleteSelectedBtn.addEventListener("click", () => this.onDeleteSelected());
     head.append(this.deleteSelectedBtn);
 
-    const close = el("button", "pane-btn close", "✕") as HTMLButtonElement;
-    close.title = "Close (Alt+T)";
-    close.addEventListener("click", opts.onClose);
-    head.append(close);
+    // Embed side-picker: switch between the floating overlay and any of the
+    // pane's (up to three) embed slots (#361) — a discrete, user-initiated
+    // layout change, like a split (see doc/design/embedded-panels.md).
+    // setPanelActive() below keeps the icon/tooltip in sync with whether the
+    // pane currently has this docked, regardless of which side.
+    this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
+    this.embedBtn.addEventListener("click", () => opts.onEmbedMenu(this.embedBtn));
+    head.append(this.embedBtn);
+
+    this.closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
+    this.closeBtn.title = "Close (Alt+T)";
+    this.closeBtn.addEventListener("click", opts.onClose);
+    head.append(this.closeBtn);
+    // Now that both buttons `setPanelActive` touches exist.
+    this.setPanelActive(false);
 
     this.listEl = el("div", "tasks-list");
 
@@ -153,9 +167,31 @@ export class TasksView {
     });
   }
 
-  /** Called by the pane whenever the overlay is (re)opened. */
+  /** Called by the pane whenever the view is (re)opened, in either mode. */
   show(): void {
     void this.refresh();
+  }
+
+  /** Reflect which mode the pane currently has this view mounted in —
+   *  called on creation and on every embed/un-embed. Pure display state; the
+   *  pane owns the actual toggle (it has to move the view between an overlay
+   *  host and the pane's single embed-panel slot). Named `setPanelActive`,
+   *  not `setEmbedded`, across every embeddable view (#361 generalization) —
+   *  `GitView` already has an unrelated ctor option called `embedded`
+   *  (#217: is this view hosted as a whole content PANE?), and reusing that
+   *  word for a same-named but different-meaning method on the same class
+   *  would read as the two being connected when they aren't. */
+  setPanelActive(active: boolean): void {
+    this.embedBtn.classList.toggle("active", active);
+    this.embedBtn.textContent = active ? "⬓" : "⬒";
+    this.embedBtn.title = active
+      ? "Un-embed — back to a floating overlay"
+      : "Embed beside the terminal (resizes this pane)";
+    // The overlay toggle (this button, the pane header's own board button)
+    // is disabled while docked (#361 user-demo finding — see embedtoggle.ts):
+    // only un-embedding closes a docked board now.
+    this.closeBtn.disabled = active;
+    this.closeBtn.title = active ? "Docked — un-embed it (side menu) to close" : "Close (Alt+T)";
   }
 
   dispose(): void {

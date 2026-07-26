@@ -19,6 +19,20 @@ export function closeDecision(dirty: boolean): CloseDecision {
   return dirty ? "confirm" : "close";
 }
 
+/** Should the discard-confirm dialog appear before closing (#361 user-demo
+ *  finding — the file editor's overlay/embed toggle)? DOCKED wins
+ *  unconditionally: the underlying toggle is a no-op while docked
+ *  (`embedToggleAction`, embedtoggle.ts — only "Un-embed" actually closes a
+ *  docked view now), so popping "discard unsaved changes?" ahead of a click
+ *  that won't close anything would be worse than merely unnecessary — a
+ *  "yes" answer would discard real edits for NO reason, since the panel
+ *  stays open regardless of the answer. Not docked falls back to the plain
+ *  #219 rule (`closeDecision`) unchanged. */
+export function shouldConfirmDiscardBeforeClose(docked: boolean, dirty: boolean): boolean {
+  if (docked) return false;
+  return closeDecision(dirty) === "confirm";
+}
+
 /** Whether the file changed on disk since it was opened: the hash captured at
  *  read time no longer matches the current on-disk hash. The backend enforces
  *  this on write (returning a `conflict` error); this mirror lets the frontend
@@ -58,9 +72,12 @@ export function discardEdits(saved: string): string {
 // ---------- who is holding unsaved work (#219) ----------
 
 /** Where an unsaved buffer lives. The human needs to be told which: an editor PANE is
- *  visibly an editor, while an OVERLAY is the Alt+F editor tucked inside a terminal or
- *  agent pane — which is precisely the one you forget you left open. */
-export type DirtyHost = "pane" | "overlay";
+ *  visibly an editor; an OVERLAY is the Alt+F editor floating over a terminal or agent
+ *  pane, dismissed and easy to forget; DOCKED (#361 scope increase) is that same Alt+F
+ *  editor sharing space with the terminal as a permanent-looking side panel — visually
+ *  the LEAST likely of the three to read as "still open, still holding edits", since it
+ *  looks like a fixture of the pane rather than something you opened and could close. */
+export type DirtyHost = "pane" | "overlay" | "docked";
 
 /** One pane's unsaved-work report, as the DOM layer sees it. A pane with no editor at
  *  all reports nothing; a pane with a clean one reports `dirty: false`. */
@@ -140,11 +157,17 @@ export function withDeadline(work: Promise<unknown>, ms: number): Promise<"done"
 }
 
 /** One line per unsaved buffer for that confirm — "tab · pane — file", with the Alt+F
- *  overlays marked, since "which pane is that even in?" is the whole difficulty of the
- *  overlay case. */
+ *  overlay/docked cases marked, since "which pane is that even in?" is the whole
+ *  difficulty of both — a docked editor looks like part of the pane's furniture, not
+ *  something someone opened, so it needs the same call-out an overlay already got. */
 export function dirtyBufferLines(dirty: readonly DirtyBuffer[]): string[] {
   return dirty.map((d) => {
-    const where = d.host === "overlay" ? `${d.pane} (Alt+F editor)` : d.pane;
+    const where =
+      d.host === "overlay"
+        ? `${d.pane} (Alt+F editor)`
+        : d.host === "docked"
+          ? `${d.pane} (docked editor)`
+          : d.pane;
     return `${d.tab} · ${where} — ${d.file ?? "unsaved file"}`;
   });
 }

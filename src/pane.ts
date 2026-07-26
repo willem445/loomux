@@ -51,6 +51,20 @@ import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import {
+  embedDragGrow,
+  fracFromGrow,
+  clampEmbedFrac,
+  embedSideFloors,
+  embedCenterFloor,
+  DEFAULT_EMBED_FRAC,
+  EMBED_MIN_PANEL_PX,
+  EMBED_SIDES,
+  type EmbedSide,
+} from "./embedsplit";
+import { embedToggleAction } from "./embedtoggle";
+import { startDragSession } from "./dragsession";
+import { showContextMenu, type MenuItem } from "./contextmenu";
+import {
   exitDiagnosticLine,
   keepOpenOnExit,
   type ExitInfo,
@@ -322,6 +336,111 @@ export interface PaneEvents {
   onDisconnectChannel: (pane: Pane) => void;
 }
 
+/** Every view that can occupy a pane's embed-panel slot (#361) — a real flex
+ *  sibling of the terminal instead of a floating overlay. `"editor"` is the
+ *  file-editor OVERLAY (`FileEditView` hosted on a normal pane) — distinct
+ *  from the #217 editor CONTENT PANE (a whole pane, `host.embedded`), which
+ *  stays exactly what it was: the strictly-better path for "keep an editor
+ *  open beside my agent" that made embedding the overlay unnecessary in the
+ *  single-view (#361) round. A later round added it anyway (user-directed
+ *  scope increase) once the multi-slot generalization made "one more
+ *  dockable view" cheap to reason about — see doc/design/embedded-panels.md's
+ *  "What's embeddable, and what isn't". */
+type EmbedKind = "tasks" | "git" | "issues" | "audit" | "group" | "editor";
+
+const EMBED_KINDS: readonly EmbedKind[] = ["tasks", "git", "issues", "audit", "group", "editor"];
+
+/** The subset of `EmbedKind`s whose embed preference is captured for a whole-
+ *  session-restart restore (`Pane.capture()` / `Pane.restoreEmbeds`) — every
+ *  kind here restores when docked on an ORCHESTRATOR pane specifically
+ *  (`kind === "orch"` in `capture()`), because only orch panes stay DORMANT
+ *  across a restart and so have a natural "captured, then reapplied once the
+ *  real pane exists" hook (`main.ts`'s `resumeDormantGroup`). `issues` is the
+ *  one kind still excluded: embeddable on every pane kind, same as
+ *  `git`/`editor`, but with no equivalent restore hook on a PLAIN
+ *  terminal/agent pane (unchanged limitation — see
+ *  doc/design/embedded-panels.md's "Why only these kinds survive a restart"
+ *  — nothing about `issues` itself is different, there's simply no reason
+ *  yet to special-case it further than `git`/`editor` already are: restoring
+ *  it on an orch pane specifically would be exactly as easy to add). A
+ *  restored `editor`/`git` never restores their OWN content (which file was
+ *  open, which commit was selected) — only the DOCK preference (side +
+ *  share), identical to how a restored `group`/`tasks`/`audit` never
+ *  restores ITS scroll position or filter either. */
+const RESTORABLE_EMBED_KINDS: readonly EmbedKind[] = ["tasks", "audit", "group", "git", "editor"];
+
+function isRestorableEmbedKind(kind: EmbedKind): kind is "tasks" | "audit" | "group" | "git" | "editor" {
+  return (RESTORABLE_EMBED_KINDS as readonly string[]).includes(kind);
+}
+
+/** Human label for the toast a no-op'd toggle shows (`embedToggleAction`,
+ *  below) — matches each header button's own name for the kind. */
+const EMBED_TOGGLE_LABEL: Record<EmbedKind, string> = {
+  tasks: "The task board",
+  git: "The git view",
+  issues: "The issues view",
+  audit: "The audit log",
+  group: "The group lifecycle panel",
+  editor: "The file editor",
+};
+
+/** Each kind's PANE HEADER toggle button's normal (undocked) title —
+ *  restored by `syncEmbedToggleButton` whenever a kind un-docks; the single
+ *  source of truth so the constructor's initial assignment and the restore
+ *  can't drift apart. */
+const EMBED_TOGGLE_TITLE: Record<EmbedKind, string> = {
+  tasks: "Task board (Alt+T)",
+  git: "Git view (Alt+G)",
+  issues: "GitHub issues (Alt+I)",
+  audit: "Audit log (Alt+A)",
+  group: "Group lifecycle (Alt+O)",
+  editor: "File editor (Alt+F)",
+};
+
+/** One embeddable view's plumbing, registered once that view is lazily
+ *  constructed. Lets the generic engine (`openView`/`closeView`/`toggleView`/
+ *  `embedViewAtSide`/`reclampViewFloor`) treat all five views uniformly
+ *  without hardcoding any one view's class. */
+interface EmbedEntry {
+  /** The view's own floating-overlay host (unchanged pre-#361 mechanics). */
+  overlayEl: HTMLElement;
+  /** The view's own root element — moved between `overlayEl` and whichever
+   *  `EmbedSide`'s panel it's currently docked to. */
+  viewEl: HTMLElement;
+  /** Called every time the view becomes visible, in either mode. */
+  show: () => void;
+  /** Called every time the view is about to become hidden, in either mode —
+   *  extra per-view cleanup beyond hiding its host (e.g. `GitView.hide()`
+   *  dismisses an open context menu). Optional: most views need nothing
+   *  beyond the generic hide. */
+  hide?: () => void;
+  /** Reflect whether this view is currently docked to ANY embed slot —
+   *  updates the view's own header toggle button. Side-agnostic on purpose:
+   *  the button reads "embedded" vs "floating," not which edge. */
+  setPanelActive: (active: boolean) => void;
+  /** The live floor (px) for the OVERLAY height clamp, and for the BOTTOM
+   *  slot's own height floor specifically (unchanged from the
+   *  pre-multi-slot design). Most views share the generic default
+   *  (`EMBED_MIN_PANEL_PX`); the group panel measures its own fixed chrome
+   *  (`Pane.groupFloor`). NOT used for the left/right slots' WIDTH floor —
+   *  see `EMBED_MIN_PANEL_PX`'s own doc comment in embedsplit.ts for why
+   *  that one deliberately stays a fixed constant instead. */
+  floorPx: () => number;
+}
+
+/** One embed slot's live DOM + state — one instance per `EmbedSide`, created
+ *  together in `ensureEmbedHost`. `kind`/`frac` are `null`/default when the
+ *  slot is empty; `panelEl`/`dividerEl` exist permanently once created,
+ *  hidden when empty (the same "create once, toggle `hidden`, never
+ *  destroy" idiom every overlay in this file already uses). */
+interface EmbedSlotState {
+  side: EmbedSide;
+  kind: EmbedKind | null;
+  frac: number;
+  panelEl: HTMLElement;
+  dividerEl: HTMLElement;
+}
+
 export class Pane implements VoiceTargetPane {
   readonly el: HTMLElement;
   readonly term: Terminal;
@@ -341,15 +460,16 @@ export class Pane implements VoiceTargetPane {
   private watchedPath: string | null = null;
   /** Lazily created git view; null until the first toggle. */
   private gitView: GitView | null = null;
-  private gitDivider: HTMLElement | null = null;
   /** Floating container for the git view + divider. It overlays the top of
    *  the terminal instead of shrinking it: resizing the PTY makes ConPTY and
    *  full-screen TUIs repaint from scratch, flooding scrollback with
    *  duplicate frames. */
   private gitOverlay: HTMLElement | null = null;
+  private gitBtn: HTMLButtonElement;
   /** GitHub issues view (any pane in a git repo), same overlay mechanics. */
   private issuesView: IssuesView | null = null;
   private issuesOverlay: HTMLElement | null = null;
+  private issuesBtn: HTMLButtonElement;
   /** Task board (orchestrator panes only), same overlay mechanics. */
   private tasksView: TasksView | null = null;
   private tasksOverlay: HTMLElement | null = null;
@@ -368,6 +488,62 @@ export class Pane implements VoiceTargetPane {
   private fileEditView: FileEditView | null = null;
   private fileEditOverlay: HTMLElement | null = null;
   private fileEditBtn: HTMLButtonElement;
+  /** Every view registered as embeddable so far (#361), keyed by kind. Built
+   *  lazily — one entry per view, added the first time that view's own
+   *  `ensureXView()` runs — so a pane that never opens (say) the group panel
+   *  never pays for its entry. The generic open/close/toggle engine below
+   *  (`openView`/`closeView`/`toggleView`/`embedViewAtSide`/`unembedView`)
+   *  treats every kind uniformly through this registry instead of hardcoding
+   *  any one view's class — see doc/design/embedded-panels.md. */
+  private embedRegistry = new Map<EmbedKind, EmbedEntry>();
+  /** Up to THREE simultaneous embed slots — left, right, bottom (#361
+   *  generalization from a single bottom-only slot) — each independently
+   *  holding at most one view. `null` = nothing embedded anywhere; every
+   *  view opens as its floating overlay by default (unchanged pre-#361
+   *  behavior). Docking a kind that's already embedded elsewhere, or
+   *  docking a DIFFERENT kind onto an already-occupied side, SWAPS that
+   *  ONE slot's occupant (`embedViewAtSide`) — the other two slots are
+   *  untouched either way. Created together, lazily, in `ensureEmbedHost`. */
+  private embedSlots: Record<EmbedSide, EmbedSlotState> | null = null;
+  /** Lazily created wrapper that turns `termEl` into a flex sibling of the
+   *  left/right/bottom embed slots instead of the pane's direct flex:1
+   *  child. Created once, on the first embed of ANY kind, and left in place
+   *  afterward — with every slot's panel/divider `hidden`, `termEl` alone in
+   *  the nested structure lays out identically to being `.pane`'s direct
+   *  child (see `ensureEmbedHost`'s own doc comment for the exact
+   *  structure, a two-level nesting: `embedHostEl` > [`embedRowEl`,
+   *  bottom's divider + slot] and `embedRowEl` > [left's divider + slot,
+   *  `embedCenterEl`], `embedCenterEl` > [`embedTermWrapEl` (containing
+   *  `termEl`), right's divider + slot]). Bottom spans the row's full width
+   *  rather than sitting only beside term — the simpler of the two
+   *  corner-layout choices (see
+   *  doc/design/embedded-panels.md's "Layout" section). Nested, not a flat
+   *  5-child row, so every divider's two sides are a real, single DOM
+   *  element pair (grid.ts's own nested-split-tree shape) — the left
+   *  divider's far side is `embedCenterEl` as ONE element, not "term plus
+   *  whatever's on the right," which is what keeps each divider's own
+   *  drag math a plain two-element `embedDragGrow` call (see
+   *  `dividerPair`/`dividerFloors`). */
+  private embedHostEl: HTMLElement | null = null;
+  private embedRowEl: HTMLElement | null = null;
+  private embedCenterEl: HTMLElement | null = null;
+  /** Thin, permanent wrapper around `termEl` inside `embedCenterEl` — exists
+   *  ONLY so the right divider's drag math never writes `.style.flex`
+   *  directly onto `termEl` itself (#361 user-demo finding: right-docked
+   *  expand-left lag). Left's and bottom's far side is always a WRAPPER
+   *  (`embedCenterEl`/`embedRowEl`) that resizes `termEl` only as an
+   *  indirect, computed consequence of ITS OWN flex-grow changing —
+   *  `termEl`'s own inline style is never touched by their drags. Before
+   *  this wrapper existed, right's divider was the ONE exception: its
+   *  `beforeEl` WAS `termEl` directly (there was nothing else for it to be,
+   *  since `embedCenterEl`'s row is exactly `[termEl, right's divider,
+   *  right's panel]`), so `termEl` — the same node `resizeObs` OBSERVES —
+   *  had its OWN `.style.flex` rewritten on every mousemove tick, uniquely
+   *  among the three dividers. `embedTermWrapEl` removes that one
+   *  structural asymmetry: right's `beforeEl` is now this wrapper, matching
+   *  left/bottom's shape exactly, and `termEl` fills it via its own
+   *  pre-existing `flex: 1` rule, unaffected either way. */
+  private embedTermWrapEl: HTMLElement | null = null;
   /** Fold-group toggle (orchestrator panes only, #46): minimizes every
    *  worker/reviewer pane in the group to the dock, or restores them all. */
   private groupMinBtn: HTMLButtonElement;
@@ -569,7 +745,7 @@ export class Pane implements VoiceTargetPane {
     this.tasksBtn = document.createElement("button");
     this.tasksBtn.className = "pane-btn";
     this.tasksBtn.innerHTML = TASKS_ICON;
-    this.tasksBtn.title = "Task board (Alt+T)";
+    this.tasksBtn.title = EMBED_TOGGLE_TITLE.tasks;
     this.tasksBtn.hidden = true; // shown for orchestrator panes in start()
     this.tasksBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -580,7 +756,7 @@ export class Pane implements VoiceTargetPane {
     this.auditBtn = document.createElement("button");
     this.auditBtn.className = "pane-btn";
     this.auditBtn.innerHTML = AUDIT_ICON;
-    this.auditBtn.title = "Audit log (Alt+A)";
+    this.auditBtn.title = EMBED_TOGGLE_TITLE.audit;
     this.auditBtn.hidden = true; // shown for orchestration panes in start()
     this.auditBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -591,7 +767,7 @@ export class Pane implements VoiceTargetPane {
     this.groupBtn = document.createElement("button");
     this.groupBtn.className = "pane-btn";
     this.groupBtn.innerHTML = GROUP_ICON;
-    this.groupBtn.title = "Group lifecycle (Alt+O)";
+    this.groupBtn.title = EMBED_TOGGLE_TITLE.group;
     this.groupBtn.hidden = true; // shown for orchestrator panes in start()
     this.groupBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -635,25 +811,25 @@ export class Pane implements VoiceTargetPane {
     // terminal and are sized from its height, so they mean nothing on a pane that
     // has no terminal. CSS hides them on a files pane (#214) — see the toggles,
     // which refuse the hotkey path for the same reason.
-    const issuesBtn = document.createElement("button");
-    issuesBtn.className = "pane-btn pty-only";
-    issuesBtn.innerHTML = ISSUES_ICON;
-    issuesBtn.title = "GitHub issues (Alt+I)";
-    issuesBtn.addEventListener("click", (e) => {
+    this.issuesBtn = document.createElement("button");
+    this.issuesBtn.className = "pane-btn pty-only";
+    this.issuesBtn.innerHTML = ISSUES_ICON;
+    this.issuesBtn.title = EMBED_TOGGLE_TITLE.issues;
+    this.issuesBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       this.toggleIssuesView();
     });
-    header.appendChild(issuesBtn);
+    header.appendChild(this.issuesBtn);
 
-    const gitBtn = document.createElement("button");
-    gitBtn.className = "pane-btn pty-only";
-    gitBtn.innerHTML = GIT_ICON;
-    gitBtn.title = "Git view (Alt+G)";
-    gitBtn.addEventListener("click", (e) => {
+    this.gitBtn = document.createElement("button");
+    this.gitBtn.className = "pane-btn pty-only";
+    this.gitBtn.innerHTML = GIT_ICON;
+    this.gitBtn.title = EMBED_TOGGLE_TITLE.git;
+    this.gitBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       this.toggleGitView();
     });
-    header.appendChild(gitBtn);
+    header.appendChild(this.gitBtn);
 
     // File-editor overlay (#174). Unconditional — every pane type gets it,
     // including plain terminals (unlike the orchestration-gated buttons above).
@@ -1603,49 +1779,38 @@ export class Pane implements VoiceTargetPane {
       return;
     }
     if (this.refuseOverlay("The git view")) return;
-    if (!this.gitView) {
-      this.gitView = new GitView({
-        getCwd: () => this.cwdRaw,
-        onClose: () => this.toggleGitView(),
-        onRepoAction: () => {
-          if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
-        },
-      });
-      this.gitDivider = this.makeOverlayDivider(() => this.gitOverlay!);
-      this.gitOverlay = document.createElement("div");
-      this.gitOverlay.className = "git-overlay";
-      this.gitOverlay.hidden = true;
-      this.gitOverlay.append(this.gitView.el, this.gitDivider);
-      this.el.appendChild(this.gitOverlay);
-    }
-    try {
-      if (this.gitView.visible) {
-        this.gitView.hide();
-        this.gitOverlay!.hidden = true;
-        this.updateTermShift();
-        this.focus();
-      } else {
-        if (this.issuesView?.visible) this.toggleIssuesView();
-        if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-        if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-        if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-        if (this.fileEditView?.visible) this.toggleFileEditView();
-        // Terminal keeps a fixed visible share at the bottom; the overlay
-        // covers the rest.
-        const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-        this.gitOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-        this.gitOverlay!.hidden = false;
-        this.gitView.show();
-        this.updateTermShift();
-      }
-    } catch (err) {
-      // Never leave the pane half-toggled: retract the overlay fully, then
-      // let the error surface (global handler shows a banner).
-      this.gitView?.hide();
-      if (this.gitOverlay) this.gitOverlay.hidden = true;
-      this.termEl.style.transform = "";
-      throw err;
-    }
+    this.ensureGitView();
+    this.toggleView("git");
+  }
+
+  /** Lazily construct the git view and register it into `embedRegistry`
+   *  (#361) — the error-recovery `openView` wraps every `show()` in (never
+   *  leave the pane half-toggled) generalizes what was originally a
+   *  git-specific `try`/`catch` here, since a `refresh()` failure was the
+   *  one case any view's `show()` could throw synchronously. */
+  private ensureGitView(): void {
+    if (this.gitView) return;
+    this.gitView = new GitView({
+      getCwd: () => this.cwdRaw,
+      onClose: () => this.toggleGitView(),
+      onRepoAction: () => {
+        if (this.cwdRaw) void this.refreshDir(this.cwdRaw);
+      },
+      onEmbedMenu: (anchor) => this.showEmbedMenu("git", anchor),
+    });
+    this.gitOverlay = document.createElement("div");
+    this.gitOverlay.className = "git-overlay";
+    this.gitOverlay.hidden = true;
+    this.gitOverlay.append(this.gitView.el, this.makeOverlayDivider(() => this.gitOverlay!));
+    this.el.appendChild(this.gitOverlay);
+    this.embedRegistry.set("git", {
+      overlayEl: this.gitOverlay,
+      viewEl: this.gitView.el,
+      show: () => this.gitView!.show(),
+      hide: () => this.gitView!.hide(),
+      setPanelActive: (active) => this.gitView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
   }
 
   /** Keep the overlay tall enough that its bottom drag bar stays grabbable and
@@ -1665,18 +1830,144 @@ export class Pane implements VoiceTargetPane {
     return Math.max(OVERLAY_MIN_H, measured);
   }
 
-  /** Re-apply the height clamp to the open group overlay (its content height may
-   *  have changed since it was sized). Only touches the height when the clamp
-   *  actually moves it — typically a bump UP when the measured floor grew (the
-   *  suspended banner appeared) — so it never fights the user's chosen size. */
-  private reclampGroupOverlay(): void {
-    if (!this.groupOverlay || this.groupOverlay.hidden) return;
-    const cur = this.groupOverlay.offsetHeight;
-    const clamped = this.overlayClamp(cur, this.groupFloor());
+  /** Re-apply `kind`'s floor to whichever host it's CURRENTLY shown in (#361
+   *  generalizes what was originally `reclampGroupOverlay`, the only view
+   *  whose floor can grow after it opens — the suspended banner appearing
+   *  inside the group panel, #83 rev-58). Only touches the host when the
+   *  floor actually moves it — typically a bump UP — so it never fights the
+   *  human's chosen size. In embed mode this nudges the divider's flex-grow
+   *  via `embedDragGrow` with a zero delta, which — because a size already
+   *  BELOW the new floor makes `sizePanel - minPanelPx` negative — still
+   *  produces exactly the corrective nudge; see embedsplit.ts. */
+  private reclampViewFloor(kind: EmbedKind): void {
+    const side = this.sideOf(kind);
+    if (side) {
+      this.reclampSlotDivider(side);
+      return;
+    }
+    const entry = this.embedRegistry.get(kind);
+    if (!entry || entry.overlayEl.hidden) return;
+    const cur = entry.overlayEl.offsetHeight;
+    const clamped = this.overlayClamp(cur, entry.floorPx());
     if (clamped !== cur) {
-      this.groupOverlay.style.height = `${clamped}px`;
+      entry.overlayEl.style.height = `${clamped}px`;
       this.updateTermShift();
     }
+  }
+
+  /** Which `EmbedSide` (if any) `kind` currently occupies. Only three sides
+   *  exist, so a linear scan is simpler and safer than keeping a second,
+   *  separately-maintained reverse-lookup map in sync with `embedSlots`. */
+  private sideOf(kind: EmbedKind): EmbedSide | null {
+    if (!this.embedSlots) return null;
+    for (const side of EMBED_SIDES) {
+      if (this.embedSlots[side].kind === kind) return side;
+    }
+    return null;
+  }
+
+  /** The OTHER element in `side`'s divider pair — i.e. not the slot's own
+   *  panel. Left's counterpart is the composite `embedCenterEl`; right's and
+   *  bottom's are the plain `termEl` / `embedRowEl` (see `ensureEmbedHost`'s
+   *  doc comment for the nested structure this reflects). */
+  private counterpartEl(side: EmbedSide): HTMLElement {
+    switch (side) {
+      case "left":
+        return this.embedCenterEl!;
+      case "right":
+        return this.embedTermWrapEl!;
+      case "bottom":
+        return this.embedRowEl!;
+    }
+  }
+
+  /** `side`'s divider pair as `{beforeEl, afterEl}` (the two elements a drag
+   *  redistributes flex-grow between) plus which screen axis it drags along.
+   *  "Before" is whichever element sits physically before the divider in
+   *  reading order — left's own slot for `"left"` (dragging right grows it),
+   *  `embedTermWrapEl` for `"right"` (dragging right grows IT, shrinking the
+   *  slot — NEVER `termEl` directly; see `embedTermWrapEl`'s own doc
+   *  comment), the row for `"bottom"` (dragging down grows it). Matches
+   *  `embedDragGrow`'s convention (`before` grows with a positive delta)
+   *  exactly, mirroring grid.ts's own split-divider math. */
+  private dividerPair(side: EmbedSide): { beforeEl: HTMLElement; afterEl: HTMLElement; horizontal: boolean } {
+    const slot = this.embedSlots![side];
+    switch (side) {
+      case "left":
+        return { beforeEl: slot.panelEl, afterEl: this.embedCenterEl!, horizontal: true };
+      case "right":
+        return { beforeEl: this.embedTermWrapEl!, afterEl: slot.panelEl, horizontal: true };
+      case "bottom":
+        return { beforeEl: this.embedRowEl!, afterEl: slot.panelEl, horizontal: false };
+    }
+  }
+
+  /** The `embedDragGrow` floor pair for `side`'s divider, evaluated LIVE
+   *  (the group panel's floor can grow after it opens; the left divider's
+   *  far-side floor depends on whether right is CURRENTLY occupied). See
+   *  embedsplit.ts's `embedSideFloors`/`embedCenterFloor` for the actual
+   *  precedence math this only ever plugs live values into. */
+  private dividerFloors(side: EmbedSide): { beforeFloorPx: number; afterFloorPx: number } {
+    if (side === "left") {
+      const right = this.embedSlots!.right;
+      const rightFloorPx = right.kind !== null ? EMBED_MIN_PANEL_PX : null;
+      return { beforeFloorPx: EMBED_MIN_PANEL_PX, afterFloorPx: embedCenterFloor(rightFloorPx) };
+    }
+    if (side === "right") return embedSideFloors("right", EMBED_MIN_PANEL_PX);
+    // bottom
+    const bottomKind = this.embedSlots!.bottom.kind;
+    const panelFloorPx = bottomKind ? this.embedRegistry.get(bottomKind)!.floorPx() : EMBED_MIN_PANEL_PX;
+    return embedSideFloors("bottom", panelFloorPx);
+  }
+
+  /** Set `side`'s divider pair directly from the slot's own PANEL share
+   *  (`frac` — always "how much of the pair the panel itself gets," never
+   *  "before" or "after," since which one the panel physically is differs
+   *  per side). Position-agnostic on purpose: `flex-grow` only encodes a
+   *  ratio, not which sibling is which, so this never needs to know
+   *  before/after itself — only `dividerPair`'s drag handler does. */
+  private applySlotGrow(side: EmbedSide, frac: number): void {
+    const slot = this.embedSlots![side];
+    const clamped = clampEmbedFrac(frac);
+    slot.panelEl.style.flex = `${clamped} 1 0`;
+    this.counterpartEl(side).style.flex = `${1 - clamped} 1 0`;
+  }
+
+  /** Re-apply `side`'s CURRENT floors to its CURRENT sizes (a zero-delta
+   *  "drag") — the correction for a floor that grew (or, for left, whose
+   *  composed far-side floor changed because right's occupancy changed)
+   *  since the slot was last sized. Only touches it when the clamp actually
+   *  moves it, so it never fights the human's chosen size. Zero delta still
+   *  produces a real nudge when a side is already below its (possibly new)
+   *  floor, because `sizeAfter - minAfterPx` (or the before equivalent) goes
+   *  negative in `embedDragGrow`'s own clamp — see embedsplit.ts. */
+  private reclampSlotDivider(side: EmbedSide): void {
+    if (!this.embedSlots) return;
+    const slot = this.embedSlots[side];
+    if (slot.kind === null || slot.panelEl.hidden) return;
+    const { beforeEl, afterEl, horizontal } = this.dividerPair(side);
+    const sizeBefore = horizontal ? beforeEl.offsetWidth : beforeEl.offsetHeight;
+    const sizeAfter = horizontal ? afterEl.offsetWidth : afterEl.offsetHeight;
+    const growBefore = parseFloat(beforeEl.style.flexGrow || "1");
+    const growAfter = parseFloat(afterEl.style.flexGrow || "1");
+    const { beforeFloorPx, afterFloorPx } = this.dividerFloors(side);
+    const grow = embedDragGrow(sizeBefore, sizeAfter, growBefore, growAfter, 0, beforeFloorPx, afterFloorPx);
+    if (grow.growBefore === growBefore && grow.growAfter === growAfter) return;
+    beforeEl.style.flex = `${grow.growBefore} 1 0`;
+    afterEl.style.flex = `${grow.growAfter} 1 0`;
+    const panelGrow = parseFloat(slot.panelEl.style.flexGrow || "1");
+    const counterpartGrow = parseFloat(this.counterpartEl(side).style.flexGrow || "1");
+    slot.frac = fracFromGrow(counterpartGrow, panelGrow);
+    this.updateTermShift();
+    // Left's counterpart IS `embedCenterEl`, which nests right's own
+    // divider pair (`termEl` | right's panel) — a change to left's split
+    // just changed embedCenterEl's own box size, and the term/right split
+    // inside it is a plain CSS flex-grow ratio that does NOT know about
+    // right's floor on its own. Re-run right's clamp against its new box so
+    // it can't end up below its floor just because left grew (#361 rev-58
+    // NB2) — a no-op (see the early-return above) when right isn't
+    // occupied or wasn't actually pushed under its floor.
+    if (side === "left") this.reclampSlotDivider("right");
   }
 
   /** Horizontal drag handle on an overlay's bottom edge. `floor` (optional) is a
@@ -1689,18 +1980,20 @@ export class Pane implements VoiceTargetPane {
       const startY = e.clientY;
       const startH = overlay().offsetHeight;
       div.classList.add("dragging");
+      // Same drag-suspend discipline as the embed-slot dividers (#361
+      // user-demo finding) — the overlay's own height-drag hits the exact
+      // same "reflow a huge list on every mousemove" cost.
+      overlay().classList.add("resizing");
       const move = (ev: MouseEvent) => {
         const h = this.overlayClamp(startH + (ev.clientY - startY), floor?.());
         overlay().style.height = `${h}px`;
         this.updateTermShift();
       };
-      const up = () => {
+      const end = () => {
         div.classList.remove("dragging");
-        window.removeEventListener("mousemove", move);
-        window.removeEventListener("mouseup", up);
+        overlay().classList.remove("resizing");
       };
-      window.addEventListener("mousemove", move);
-      window.addEventListener("mouseup", up);
+      startDragSession({ onMove: move, onEnd: end });
     });
     return div;
   }
@@ -1711,66 +2004,520 @@ export class Pane implements VoiceTargetPane {
    *  the PTY; only one overlay is open at a time. */
   toggleIssuesView(): void {
     if (this.refuseOverlay("The issues view")) return;
-    if (!this.issuesView) {
-      this.issuesView = new IssuesView({
-        getCwd: () => this.cwdRaw,
-        onClose: () => this.toggleIssuesView(),
-      });
-      this.issuesOverlay = document.createElement("div");
-      this.issuesOverlay.className = "git-overlay";
-      this.issuesOverlay.hidden = true;
-      this.issuesOverlay.append(
-        this.issuesView.el,
-        this.makeOverlayDivider(() => this.issuesOverlay!)
-      );
-      this.el.appendChild(this.issuesOverlay);
-    }
-    if (this.issuesView.visible) {
-      this.issuesView.hide();
-      this.issuesOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
+    this.ensureIssuesView();
+    this.toggleView("issues");
+  }
+
+  /** Lazily construct the issues view and register it into `embedRegistry`
+   *  (#361). */
+  private ensureIssuesView(): void {
+    if (this.issuesView) return;
+    this.issuesView = new IssuesView({
+      getCwd: () => this.cwdRaw,
+      onClose: () => this.toggleIssuesView(),
+      onEmbedMenu: (anchor) => this.showEmbedMenu("issues", anchor),
+    });
+    this.issuesOverlay = document.createElement("div");
+    this.issuesOverlay.className = "git-overlay";
+    this.issuesOverlay.hidden = true;
+    this.issuesOverlay.append(
+      this.issuesView.el,
+      this.makeOverlayDivider(() => this.issuesOverlay!)
+    );
+    this.el.appendChild(this.issuesOverlay);
+    this.embedRegistry.set("issues", {
+      overlayEl: this.issuesOverlay,
+      viewEl: this.issuesView.el,
+      show: () => this.issuesView!.show(),
+      hide: () => this.issuesView!.hide(),
+      setPanelActive: (active) => this.issuesView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
+  }
+
+  /** Toggle the task board open/closed (`Alt+T`, and the board's own ✕) — in
+   *  EITHER mode. Which mode/side it opens in is a separate, persisted
+   *  preference (see `embedViewAtSide`); this never changes it. */
+  toggleTasksView(): void {
+    if (!this.orchGroup || this.tasksBtn.hidden) return;
+    this.ensureTasksView();
+    this.toggleView("tasks");
+  }
+
+  /** Lazily construct the task board and register it into `embedRegistry`
+   *  (#361). */
+  private ensureTasksView(): void {
+    if (this.tasksView) return;
+    this.tasksView = new TasksView(this.orchGroup!, {
+      onClose: () => this.toggleTasksView(),
+      onEmbedMenu: (anchor) => this.showEmbedMenu("tasks", anchor),
+    });
+    this.tasksOverlay = document.createElement("div");
+    this.tasksOverlay.className = "git-overlay";
+    this.tasksOverlay.hidden = true;
+    this.tasksOverlay.append(this.tasksView.el, this.makeOverlayDivider(() => this.tasksOverlay!));
+    this.el.appendChild(this.tasksOverlay);
+    this.embedRegistry.set("tasks", {
+      overlayEl: this.tasksOverlay,
+      viewEl: this.tasksView.el,
+      show: () => this.tasksView!.show(),
+      setPanelActive: (active) => this.tasksView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
+  }
+
+  // ==================== #361: the generic embed engine ====================
+  // Shared by every EmbedKind (tasks/git/issues/audit/group) through
+  // `embedRegistry` — see doc/design/embedded-panels.md for the full design,
+  // including why this is the legitimate side of the no-PTY-resize-for-chrome
+  // rule (CLAUDE.md constraint 1) and why the file-editor overlay is
+  // deliberately NOT part of this set.
+
+  /** Lazily promote `termEl` from being `.pane`'s own direct flex:1 child to
+   *  living inside a NESTED flex structure alongside up to three embed
+   *  slots — left, right, bottom (#361 generalization from a single
+   *  bottom-only slot). Created once, on the first embed of ANY kind, and
+   *  left in place afterward: with every slot's panel/divider `[hidden]`
+   *  (`display: none !important`, styles.css), `termEl` alone lays out
+   *  identically to being `.pane`'s direct child, so there is nothing to
+   *  undo when nothing is embedded.
+   *
+   *  The structure, two levels of nesting deep:
+   *  ```
+   *  embedHostEl (column)
+   *    embedRowEl (row, the width axis)
+   *      left divider + slot        (hidden unless occupied)
+   *      embedCenterEl (row)
+   *        embedTermWrapEl > termEl (see its own doc comment: this wrapper
+   *                                  is what keeps termEl's OWN inline style
+   *                                  untouched by the right divider's drag)
+   *        right divider + slot     (hidden unless occupied)
+   *    bottom divider + slot        (hidden unless occupied)
+   *  ```
+   *  Bottom spans the row's FULL width (a sibling of `embedRowEl`, not
+   *  nested inside it) rather than sitting only beside `termEl` — the
+   *  simpler of the two corner-layout choices (see
+   *  doc/design/embedded-panels.md's "Layout" section). NESTED, not a flat
+   *  5-child row, so every divider's two sides are a real, single DOM
+   *  element pair — see `dividerPair`/`dividerFloors` for why that's what
+   *  keeps each divider's own drag math a plain two-element
+   *  `embedDragGrow` call instead of a "sum of several siblings" problem. */
+  private ensureEmbedHost(): void {
+    if (this.embedHostEl) return;
+    const host = document.createElement("div");
+    host.className = "pane-embed-host";
+    this.el.insertBefore(host, this.termEl);
+
+    const row = document.createElement("div");
+    row.className = "pane-embed-row";
+    const center = document.createElement("div");
+    center.className = "pane-embed-center";
+
+    const termWrap = document.createElement("div");
+    termWrap.className = "pane-embed-term-wrap";
+    termWrap.appendChild(this.termEl);
+
+    const left = this.makeEmbedSlot("left");
+    const right = this.makeEmbedSlot("right");
+    const bottom = this.makeEmbedSlot("bottom");
+
+    center.append(termWrap, right.dividerEl, right.panelEl);
+    row.append(left.panelEl, left.dividerEl, center);
+    host.append(row, bottom.dividerEl, bottom.panelEl);
+
+    this.embedHostEl = host;
+    this.embedRowEl = row;
+    this.embedCenterEl = center;
+    this.embedTermWrapEl = termWrap;
+    this.embedSlots = { left, right, bottom };
+  }
+
+  /** Build one embed slot's permanent (created-once, `hidden`-toggled) DOM:
+   *  its panel and its divider. */
+  private makeEmbedSlot(side: EmbedSide): EmbedSlotState {
+    const panelEl = document.createElement("div");
+    panelEl.className = `pane-embed-panel side-${side}`;
+    panelEl.hidden = true;
+    const dividerEl = document.createElement("div");
+    dividerEl.className = `pane-embed-divider side-${side}`;
+    dividerEl.hidden = true;
+    const slot: EmbedSlotState = { side, kind: null, frac: DEFAULT_EMBED_FRAC, panelEl, dividerEl };
+    this.wireEmbedDivider(slot);
+    return slot;
+  }
+
+  /** Draggable divider for one embed slot. Mirrors grid.ts's own
+   *  split-divider math exactly (embedsplit.ts) — the terminal's box
+   *  genuinely resizes here (a real flex layout, not an
+   *  absolutely-positioned overlay), so the SAME frame-debounced
+   *  ResizeObserver → applyFit() path a grid split's divider drag already
+   *  drives fires on every real size change, for all three sides alike. */
+  private wireEmbedDivider(slot: EmbedSlotState): void {
+    slot.dividerEl.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const { beforeEl, afterEl, horizontal } = this.dividerPair(slot.side);
+      const startPos = horizontal ? e.clientX : e.clientY;
+      const sizeBefore = horizontal ? beforeEl.offsetWidth : beforeEl.offsetHeight;
+      const sizeAfter = horizontal ? afterEl.offsetWidth : afterEl.offsetHeight;
+      const growBefore = parseFloat(beforeEl.style.flexGrow || "1");
+      const growAfter = parseFloat(afterEl.style.flexGrow || "1");
+      slot.dividerEl.classList.add("dragging");
+      // Suspend layout of the docked panel's OWN content for the duration of
+      // the drag (#361 user-demo finding: a large unvirtualized list — e.g.
+      // thousands of audit entries — makes every mousemove frame reflow the
+      // whole list just because the container's cross-axis size changed,
+      // even though nothing about the list's OWN content did). `.resizing`
+      // (styles.css) applies `content-visibility: hidden` to the known heavy
+      // list classes, so the browser skips their layout/paint entirely while
+      // dragging and does ONE normal reflow when it's removed on release —
+      // the terminal side of the divider is never touched by this class, so
+      // its own resize/PTY-fit path is completely unaffected.
+      slot.panelEl.classList.add("resizing");
+      const move = (ev: MouseEvent) => {
+        const pos = horizontal ? ev.clientX : ev.clientY;
+        const { beforeFloorPx, afterFloorPx } = this.dividerFloors(slot.side);
+        const grow = embedDragGrow(sizeBefore, sizeAfter, growBefore, growAfter, pos - startPos, beforeFloorPx, afterFloorPx);
+        beforeEl.style.flex = `${grow.growBefore} 1 0`;
+        afterEl.style.flex = `${grow.growAfter} 1 0`;
+      };
+      const end = () => {
+        slot.dividerEl.classList.remove("dragging");
+        slot.panelEl.classList.remove("resizing");
+        // Terminal (one per drag, not per mousemove) — mirrors grid.ts's own
+        // split divider: persist the settled fraction so a restore
+        // reproduces THIS size, not the one before the drag. `frac` is
+        // always the PANEL's own share regardless of which side of the pair
+        // it physically is (see `applySlotGrow`'s doc comment) —
+        // `fracFromGrow(counterpartGrow, panelGrow)` extracts exactly that.
+        const panelGrow = parseFloat(slot.panelEl.style.flexGrow || "1");
+        const counterpartGrow = parseFloat(this.counterpartEl(slot.side).style.flexGrow || "1");
+        slot.frac = fracFromGrow(counterpartGrow, panelGrow);
+        this.events.onRecordChanged(this);
+      };
+      startDragSession({ onMove: move, onEnd: end });
+    });
+  }
+
+  /** Whether `kind`'s view is currently on screen, in EITHER mode. */
+  private isViewVisible(kind: EmbedKind): boolean {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return false;
+    const side = this.sideOf(kind);
+    return side ? !this.embedSlots![side].panelEl.hidden : !entry.overlayEl.hidden;
+  }
+
+  /** Close `kind`'s view, in whichever mode it's currently shown. Does NOT
+   *  un-dock it — a docked-but-closed view stays docked (`slot.kind` is
+   *  untouched), exactly mirroring how a never-embedded view stays parked
+   *  in its own hidden overlay between opens. `unembedView` is the
+   *  separate, explicit action that actually clears a slot. */
+  private closeView(kind: EmbedKind): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    entry.hide?.();
+    const side = this.sideOf(kind);
+    if (side) {
+      const slot = this.embedSlots![side];
+      slot.dividerEl.hidden = true;
+      slot.panelEl.hidden = true;
+      // Return the view to its OWN overlay host (#361 rev-38 blocker): a
+      // slot's panel must never retain a closed/evicted occupant's element.
+      // `openView`'s embedded branch below also self-enforces this with
+      // `replaceChildren` (belt and suspenders — a panel can never hold
+      // more than one child regardless of what called it), but parking the
+      // element back in its OWN overlay (rather than just detaching it) is
+      // what keeps it reachable and correctly `hidden` the next time THIS
+      // view opens as an overlay, exactly where a never-embedded view
+      // already lives between opens.
+      entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
     } else {
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.issuesOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-      this.issuesOverlay!.hidden = false;
-      this.issuesView.show();
-      this.updateTermShift();
+      entry.overlayEl.hidden = true;
+    }
+    this.updateTermShift();
+    this.focus();
+  }
+
+  /** Close every OTHER floating overlay before `kind` opens AS AN OVERLAY:
+   *  they genuinely collide, only one floating panel fits over the
+   *  terminal. `editor` (the file editor) is just another `EmbedKind` now
+   *  (#361 scope increase) and needs no special-casing here anymore — it's
+   *  covered by the loop below like every other kind. Never called for an
+   *  embed-mode open (see `openView`) — the whole point of embedding is that
+   *  it does NOT collide with a floating panel (#361 NB-4), for any of the
+   *  (now up to three, simultaneous) docked views alike. A docked view is
+   *  therefore left alone by this loop (`this.sideOf(kind) === null` guards
+   *  it, mirroring how it's never the one with an open overlay anyway). */
+  private closeOtherOverlays(except?: EmbedKind): void {
+    for (const kind of EMBED_KINDS) {
+      if (kind === except) continue;
+      const entry = this.embedRegistry.get(kind);
+      if (entry && this.sideOf(kind) === null && !entry.overlayEl.hidden) this.closeView(kind);
     }
   }
 
-  /** Toggle the task board overlay (orchestrator panes). Same no-resize
-   *  overlay mechanics as the git view; only one overlay is open at a time. */
-  toggleTasksView(): void {
-    if (!this.orchGroup || this.tasksBtn.hidden) return;
-    if (!this.tasksView) {
-      this.tasksView = new TasksView(this.orchGroup, { onClose: () => this.toggleTasksView() });
-      this.tasksOverlay = document.createElement("div");
-      this.tasksOverlay.className = "git-overlay";
-      this.tasksOverlay.hidden = true;
-      this.tasksOverlay.append(this.tasksView.el, this.makeOverlayDivider(() => this.tasksOverlay!));
-      this.el.appendChild(this.tasksOverlay);
+  /** Show `kind`'s view in whichever mode it's currently set to. Wraps the
+   *  view's own `show()` in the same never-leave-the-pane-half-toggled
+   *  recovery `toggleGitView` originally had for itself — generalized here
+   *  because any view's `show()` (a refresh that can throw) has the same
+   *  failure shape, not just git's. */
+  private openView(kind: EmbedKind): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    const side = this.sideOf(kind);
+    try {
+      if (side) {
+        const slot = this.embedSlots![side];
+        // `replaceChildren`, not `appendChild` (#361 rev-38 blocker): a
+        // slot's panel may only ever hold ONE occupant, and this makes that
+        // an invariant of the call itself rather than something every
+        // caller has to get right by first evicting whoever was there —
+        // even if a future code path forgot to, this can't leave two views
+        // stacked and both visible.
+        slot.panelEl.replaceChildren(entry.viewEl);
+        this.applySlotGrow(side, slot.frac);
+        slot.dividerEl.hidden = false;
+        slot.panelEl.hidden = false;
+        // The share just applied may be stale (a restored preference
+        // captured under a smaller floor, a floor that grew while closed,
+        // or — for left specifically — the OTHER slot's occupancy having
+        // changed since) — reclamp against the CURRENT floor immediately,
+        // the same correction a content-driven floor growth applies while
+        // already open (#361 rev-38 NB3; see `reclampViewFloor`).
+        this.reclampViewFloor(kind);
+      } else {
+        this.closeOtherOverlays(kind);
+        entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
+        const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
+        entry.overlayEl.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip, entry.floorPx())}px`;
+        entry.overlayEl.hidden = false;
+      }
+      entry.show();
+      this.updateTermShift();
+    } catch (err) {
+      entry.hide?.();
+      if (side) {
+        const slot = this.embedSlots![side];
+        slot.dividerEl.hidden = true;
+        slot.panelEl.hidden = true;
+        entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
+      } else {
+        entry.overlayEl.hidden = true;
+      }
+      this.termEl.style.transform = "";
+      throw err;
     }
-    if (!this.tasksOverlay!.hidden) {
-      this.tasksOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
-    } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.tasksOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-      this.tasksOverlay!.hidden = false;
-      this.tasksView.show();
-      this.updateTermShift();
+  }
+
+  /** The pane-header toggle button for `kind` — the button `syncEmbedToggleButton`
+   *  disables/retitles while docked. `null` for a kind that never gets one
+   *  (there is none today; kept total for a future kind that might not). */
+  private embedToggleBtn(kind: EmbedKind): HTMLButtonElement | null {
+    switch (kind) {
+      case "tasks":
+        return this.tasksBtn;
+      case "audit":
+        return this.auditBtn;
+      case "group":
+        return this.groupBtn;
+      case "git":
+        return this.gitBtn;
+      case "issues":
+        return this.issuesBtn;
+      case "editor":
+        return this.fileEditBtn;
+    }
+  }
+
+  /** Reflect `kind`'s CURRENT dock state on its pane-header toggle button
+   *  (#361 user-demo finding): disabled + retitled while docked, since the
+   *  plain overlay toggle is deliberately unsupported then
+   *  (`embedtoggle.ts`). Called everywhere a kind's dock state changes
+   *  (`embedViewAtSide`, `unembedView`, `restoreEmbeds`) — the pane-level
+   *  counterpart to what each view's own `setPanelActive` already does for
+   *  its INTERNAL embed/close buttons. */
+  private syncEmbedToggleButton(kind: EmbedKind): void {
+    const btn = this.embedToggleBtn(kind);
+    if (!btn) return;
+    const docked = this.sideOf(kind) !== null;
+    btn.disabled = docked;
+    btn.title = docked
+      ? `${EMBED_TOGGLE_LABEL[kind]} is docked — un-embed it (its side menu) to use this`
+      : EMBED_TOGGLE_TITLE[kind];
+  }
+
+  /** Toggle `kind`'s view open/closed, in whichever mode it's currently set
+   *  to. The shared entry point every embeddable view's public hotkey
+   *  method (`toggleTasksView`, `toggleGitView`, …) delegates to after its
+   *  own view-specific gating and lazy `ensureXView()` — and, by extension,
+   *  every OTHER thing that can ask a view to toggle: a header button, a
+   *  keybinding (main.ts), a view's own internal ✕ / Escape handler
+   *  (`onClose`, wired straight back to the matching `toggleXView`), and
+   *  `pane-meta`'s branch-name click. Routing all of them through this ONE
+   *  function is what makes the docked no-op below (#361 user-demo finding)
+   *  actually cover every entry point, rather than needing the same guard
+   *  copy-pasted into each caller — a single missed copy would silently
+   *  reintroduce the bug for just that one entry point. See
+   *  `embedtoggle.ts`'s own doc comment for why a docked view's toggle is
+   *  disabled outright rather than fixed to correctly close/reopen it. */
+  private toggleView(kind: EmbedKind): void {
+    const action = embedToggleAction(this.sideOf(kind) !== null, this.isViewVisible(kind));
+    if (action === "noop") {
+      showToast(`${EMBED_TOGGLE_LABEL[kind]} is docked — un-embed it (its side menu) to use this toggle.`, "info");
+      return;
+    }
+    if (action === "close") this.closeView(kind);
+    else this.openView(kind);
+  }
+
+  /** Show the side-picker menu (#361) — a view's own header embed button,
+   *  clicked. Left/Right/Bottom (the currently-docked one, if any, checked),
+   *  plus "Un-embed" when it's docked anywhere. Built and shown here, not in
+   *  each view: the views don't need to know `EmbedSide` exists at all, only
+   *  that clicking their button asks the pane "where should I go?" — same
+   *  division of responsibility the rest of this engine already keeps
+   *  (views are dumb UI; the pane owns embed state). Reuses
+   *  `contextmenu.ts`'s existing `showContextMenu` rather than a bespoke
+   *  dropdown. */
+  private showEmbedMenu(kind: EmbedKind, anchor: HTMLElement): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    const currentSide = this.sideOf(kind);
+    const rect = anchor.getBoundingClientRect();
+    const SIDE_LABEL: Record<EmbedSide, string> = { left: "Embed left", right: "Embed right", bottom: "Embed bottom" };
+    const items: MenuItem<EmbedSide | "unembed">[] = EMBED_SIDES.map((side) => ({
+      label: (currentSide === side ? "✓ " : "") + SIDE_LABEL[side],
+      action: side,
+    }));
+    if (currentSide !== null) {
+      items.push({ label: "", separator: true }, { label: "Un-embed — back to a floating overlay", action: "unembed" });
+    }
+    showContextMenu(rect.left, rect.bottom + 4, items, (action) => {
+      if (action === "unembed") this.unembedView(kind);
+      else this.embedViewAtSide(kind, action);
+    });
+  }
+
+  /** Dock `kind` to `side` (#361) — the side-picker menu's action. Docking
+   *  onto an OCCUPIED side SWAPS that ONE slot's occupant: whoever was there
+   *  is CLOSED outright, not demoted back to an overlay (a silent reopen
+   *  elsewhere would be a more surprising UX than "the slot now shows what
+   *  you asked for, and the previous occupant is closed — the same one
+   *  click that opened it reopens it") — the OTHER two slots are always
+   *  left untouched. If `kind` is already docked to a DIFFERENT side, it
+   *  moves (leaves that side first). Either way the slot's occupant +
+   *  fraction are a PERSISTED preference (tabs.json, via
+   *  `onRecordChanged`). A discrete, user-initiated layout change (see
+   *  doc/design/embedded-panels.md) — never fired from a resize or a
+   *  refresh. */
+  private embedViewAtSide(kind: EmbedKind, side: EmbedSide): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    this.ensureEmbedHost();
+    const currentSide = this.sideOf(kind);
+    if (currentSide === side) {
+      // Already docked here — just make sure it's actually showing (it may
+      // be docked-but-closed).
+      if (!this.isViewVisible(kind)) this.openView(kind);
+      return;
+    }
+    // Leave whichever OTHER side this kind currently occupies, if any.
+    // `closeView` MUST run before the slot is nulled out (#361 rev-58
+    // blocking finding): it looks up `sideOf(kind)` itself to find which
+    // slot to hide, so nulling first makes it take the OVERLAY branch
+    // instead — the origin slot's now-empty panel+divider stay visible.
+    // Mirrors the order the target-eviction block below (and `unembedView`)
+    // already used correctly.
+    if (currentSide !== null) {
+      const wasVisible = this.isViewVisible(kind);
+      if (wasVisible) this.closeView(kind);
+      this.embedSlots![currentSide].kind = null;
+    }
+    // Evict whoever (if anyone) is currently on the TARGET side.
+    const targetSlot = this.embedSlots![side];
+    if (targetSlot.kind !== null) {
+      const evicted = targetSlot.kind;
+      this.embedRegistry.get(evicted)?.setPanelActive(false);
+      this.closeView(evicted);
+      targetSlot.kind = null;
+      this.syncEmbedToggleButton(evicted);
+    }
+    const wasOverlayOpen = !entry.overlayEl.hidden;
+    if (wasOverlayOpen) entry.overlayEl.hidden = true; // it's about to move into the slot
+    targetSlot.kind = kind;
+    targetSlot.frac = clampEmbedFrac(targetSlot.frac);
+    entry.setPanelActive(true);
+    this.openView(kind); // docking always shows it
+    this.syncEmbedToggleButton(kind);
+    // Right's occupancy just changed (moved onto it, off it, or evicted
+    // from it) — left's composed far-side floor depends on that (see
+    // dividerFloors's "left" case), so reclamp it too.
+    if (side === "right" || currentSide === "right") this.reclampSlotDivider("left");
+    this.events.onRecordChanged(this);
+  }
+
+  /** Un-dock `kind` (#361) — back to the floating overlay, staying open if
+   *  it was. A no-op if it isn't currently docked anywhere. */
+  private unembedView(kind: EmbedKind): void {
+    const entry = this.embedRegistry.get(kind);
+    if (!entry) return;
+    const side = this.sideOf(kind);
+    if (side === null) return;
+    const wasVisible = this.isViewVisible(kind);
+    if (wasVisible) this.closeView(kind);
+    this.embedSlots![side].kind = null;
+    entry.setPanelActive(false);
+    this.syncEmbedToggleButton(kind);
+    if (wasVisible) this.openView(kind);
+    if (side === "right") this.reclampSlotDivider("left");
+    this.events.onRecordChanged(this);
+  }
+
+  /** Reapply persisted embed preferences (#361) — called once, right after
+   *  a resumed/restored orch pane is wired up with its group, so every view
+   *  that was docked and open when the layout was captured comes back the
+   *  same way, on the same side. Entries naming a kind this pane can't show
+   *  right now (the gating button is hidden) are silently skipped — restore
+   *  doesn't carry this far for git/issues either (see main.ts's
+   *  `resumeDormantGroup`); only orchestration-family kinds
+   *  (tasks/audit/group) are ever restored this way today — see
+   *  `PersistedPane.embeds`'s decode. */
+  restoreEmbeds(embeds: readonly { view: EmbedKind; side: EmbedSide; share: number }[]): void {
+    if (!this.orchGroup) return;
+    for (const e of embeds) {
+      switch (e.view) {
+        case "tasks":
+          if (this.tasksBtn.hidden) continue;
+          this.ensureTasksView();
+          break;
+        case "audit":
+          if (this.auditBtn.hidden) continue;
+          this.ensureAuditView();
+          break;
+        case "group":
+          if (this.groupBtn.hidden) continue;
+          this.ensureGroupView();
+          break;
+        case "git":
+          // Restoring a group's orchestrator pane means it's PTY-backed by
+          // definition (a content pane is never `kind === "orch"`), so git's
+          // button is never CSS-hidden here the way tasks/audit/group's own
+          // JS-gated buttons can be — no `.hidden` check needed.
+          this.ensureGitView();
+          break;
+        case "editor":
+          this.ensureFileEditView();
+          break;
+        default:
+          continue; // issues isn't captured for restore today — see RESTORABLE_EMBED_KINDS
+      }
+      this.ensureEmbedHost();
+      const entry = this.embedRegistry.get(e.view)!;
+      const slot = this.embedSlots![e.side];
+      slot.kind = e.view;
+      slot.frac = clampEmbedFrac(e.share);
+      entry.setPanelActive(true);
+      this.openView(e.view);
+      this.syncEmbedToggleButton(e.view);
     }
   }
 
@@ -1779,80 +2526,89 @@ export class Pane implements VoiceTargetPane {
    *  open at a time. */
   toggleAuditView(): void {
     if (!this.orchGroup || this.auditBtn.hidden) return;
-    if (!this.auditView) {
-      this.auditView = new AuditView(this.orchGroup, { onClose: () => this.toggleAuditView() });
-      this.auditOverlay = document.createElement("div");
-      this.auditOverlay.className = "git-overlay";
-      this.auditOverlay.hidden = true;
-      this.auditOverlay.append(this.auditView.el, this.makeOverlayDivider(() => this.auditOverlay!));
-      this.el.appendChild(this.auditOverlay);
-    }
-    if (!this.auditOverlay!.hidden) {
-      this.auditOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
-    } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.auditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-      this.auditOverlay!.hidden = false;
-      this.auditView.show();
-      this.updateTermShift();
-    }
+    this.ensureAuditView();
+    this.toggleView("audit");
+  }
+
+  /** Lazily construct the audit view and register it into `embedRegistry`
+   *  (#361). */
+  private ensureAuditView(): void {
+    if (this.auditView) return;
+    this.auditView = new AuditView(this.orchGroup!, {
+      onClose: () => this.toggleAuditView(),
+      onEmbedMenu: (anchor) => this.showEmbedMenu("audit", anchor),
+    });
+    this.auditOverlay = document.createElement("div");
+    this.auditOverlay.className = "git-overlay";
+    this.auditOverlay.hidden = true;
+    this.auditOverlay.append(this.auditView.el, this.makeOverlayDivider(() => this.auditOverlay!));
+    this.el.appendChild(this.auditOverlay);
+    this.embedRegistry.set("audit", {
+      overlayEl: this.auditOverlay,
+      viewEl: this.auditView.el,
+      show: () => this.auditView!.show(),
+      setPanelActive: (active) => this.auditView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
   }
 
   /** Toggle the group lifecycle panel overlay (orchestrator panes). Same
    *  no-resize overlay mechanics as the other views; only one is open. */
   toggleGroupView(): void {
     if (!this.orchGroup || this.groupBtn.hidden) return;
-    if (!this.groupView) {
-      this.groupView = new GroupView(this.orchGroup, {
-        onClose: () => this.toggleGroupView(),
-        // Mirror the header's fold-group toggle inside the lifecycle panel (#46).
-        onToggleMinimize: () => this.events.onToggleGroupMinimize(this),
-        // Content grew (e.g. the suspended banner appeared) — re-clamp so the
-        // footer never slides under overflow:hidden (#83 rev-58).
-        onResize: () => this.reclampGroupOverlay(),
-        // The orchestrator pane's cwd IS the group's repo (create_orchestration
-        // opens it there) — the workflow toggle's ON-confirm preview reads it
-        // live rather than snapshotting at open time (#316).
-        getRepo: () => this.cwdRaw,
-      });
-      this.groupOverlay = document.createElement("div");
-      this.groupOverlay.className = "git-overlay";
-      this.groupOverlay.hidden = true;
-      this.groupOverlay.append(
-        this.groupView.el,
-        this.makeOverlayDivider(() => this.groupOverlay!, () => this.groupFloor())
-      );
-      this.el.appendChild(this.groupOverlay);
-    }
-    if (!this.groupOverlay!.hidden) {
-      this.groupOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
-    } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.fileEditView?.visible) this.toggleFileEditView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.groupOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip, this.groupFloor())}px`;
-      this.groupOverlay!.hidden = false;
-      this.groupView.show();
-      this.updateTermShift();
-    }
+    this.ensureGroupView();
+    this.toggleView("group");
   }
 
-  /** Toggle the file-editor overlay (#174): file tree + code editor +
-   *  search/replace. Ungated — works in every pane type, plain terminals
-   *  included. Same no-resize overlay mechanics as the git/audit views; only
-   *  one overlay is open at a time. The tree roots at the pane's live cwd. */
+  /** Lazily construct the group lifecycle view and register it into
+   *  `embedRegistry` (#361) — its floor is its own measured chrome
+   *  (`groupFloor`), not the generic default, so the footer/suspended
+   *  banner never clip in either hosting mode. */
+  private ensureGroupView(): void {
+    if (this.groupView) return;
+    this.groupView = new GroupView(this.orchGroup!, {
+      onClose: () => this.toggleGroupView(),
+      // Mirror the header's fold-group toggle inside the lifecycle panel (#46).
+      onToggleMinimize: () => this.events.onToggleGroupMinimize(this),
+      // Content grew (e.g. the suspended banner appeared) — re-clamp
+      // whichever host is currently active so the footer never slides under
+      // overflow:hidden (#83 rev-58; generalized to embed mode by #361).
+      onResize: () => this.reclampViewFloor("group"),
+      // The orchestrator pane's cwd IS the group's repo (create_orchestration
+      // opens it there) — the workflow toggle's ON-confirm preview reads it
+      // live rather than snapshotting at open time (#316).
+      getRepo: () => this.cwdRaw,
+      onEmbedMenu: (anchor) => this.showEmbedMenu("group", anchor),
+    });
+    this.groupOverlay = document.createElement("div");
+    this.groupOverlay.className = "git-overlay";
+    this.groupOverlay.hidden = true;
+    this.groupOverlay.append(
+      this.groupView.el,
+      this.makeOverlayDivider(() => this.groupOverlay!, () => this.groupFloor())
+    );
+    this.el.appendChild(this.groupOverlay);
+    this.embedRegistry.set("group", {
+      overlayEl: this.groupOverlay,
+      viewEl: this.groupView.el,
+      show: () => this.groupView!.show(),
+      // Stops the poll timer `show()` starts (#361 rev-38 NB2) — without
+      // this, every close/eviction left it running, and swapping the embed
+      // slot turned what was a rare pre-existing leak into an easy one to
+      // hit on every reopen.
+      hide: () => this.groupView!.hide(),
+      setPanelActive: (active) => this.groupView!.setPanelActive(active),
+      floorPx: () => this.groupFloor(),
+    });
+  }
+
+  /** Toggle the file-editor overlay (#174). Ungated — works in every pane
+   *  type, plain terminals included. Same no-resize overlay mechanics as the
+   *  other views, and (#361 scope increase) the same embed contract:
+   *  dockable to any of the three slots, its toggle disabled while docked,
+   *  single-occupant per slot — see doc/design/embedded-panels.md for why
+   *  this changed (and what didn't: the #217 content-pane editor is a fully
+   *  separate instance/class-option, `host.embedded`, untouched by this). */
   toggleFileEditView(): void {
     // Alt+F on an editor pane: the pane already IS the file editor. Same for a files
     // pane, whose surface is the file MANAGER — a sibling of the editor, and the pane
@@ -1863,39 +2619,43 @@ export class Pane implements VoiceTargetPane {
       return;
     }
     if (this.refuseOverlay("The file editor")) return;
-    if (!this.fileEditView) {
-      this.fileEditView = new FileEditView({
-        getCwd: () => this.cwdRaw,
-        onClose: () => this.toggleFileEditView(),
-        isAgentWorktree: () =>
-          this.orchRoleName === "worker" || this.orchRoleName === "reviewer",
-      });
-      this.fileEditOverlay = document.createElement("div");
-      this.fileEditOverlay.className = "git-overlay";
-      this.fileEditOverlay.hidden = true;
-      this.fileEditOverlay.append(
-        this.fileEditView.el,
-        this.makeOverlayDivider(() => this.fileEditOverlay!)
-      );
-      this.el.appendChild(this.fileEditOverlay);
-    }
-    if (this.fileEditView.visible) {
-      this.fileEditView.hide();
-      this.fileEditOverlay!.hidden = true;
-      this.updateTermShift();
-      this.focus();
-    } else {
-      if (this.issuesView?.visible) this.toggleIssuesView();
-      if (this.gitView?.visible) this.toggleGitView();
-      if (this.tasksOverlay && !this.tasksOverlay.hidden) this.toggleTasksView();
-      if (this.auditOverlay && !this.auditOverlay.hidden) this.toggleAuditView();
-      if (this.groupOverlay && !this.groupOverlay.hidden) this.toggleGroupView();
-      const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
-      this.fileEditOverlay!.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip)}px`;
-      this.fileEditOverlay!.hidden = false;
-      this.fileEditView.show();
-      this.updateTermShift();
-    }
+    this.ensureFileEditView();
+    this.toggleView("editor");
+  }
+
+  /** Lazily construct the file editor and register it into `embedRegistry`
+   *  (#361 scope increase). `isDocked` lets `FileEditView.requestClose` skip
+   *  the #219 discard-confirm dialog while docked, since the underlying
+   *  toggle no-ops then anyway — see `FileEditHost.isDocked`'s own doc
+   *  comment for why that ordering matters (a "yes" on that dialog would
+   *  otherwise discard real edits for a click that doesn't actually close
+   *  anything). */
+  private ensureFileEditView(): void {
+    if (this.fileEditView) return;
+    this.fileEditView = new FileEditView({
+      getCwd: () => this.cwdRaw,
+      onClose: () => this.toggleFileEditView(),
+      isAgentWorktree: () =>
+        this.orchRoleName === "worker" || this.orchRoleName === "reviewer",
+      onEmbedMenu: (anchor) => this.showEmbedMenu("editor", anchor),
+      isDocked: () => this.sideOf("editor") !== null,
+    });
+    this.fileEditOverlay = document.createElement("div");
+    this.fileEditOverlay.className = "git-overlay";
+    this.fileEditOverlay.hidden = true;
+    this.fileEditOverlay.append(
+      this.fileEditView.el,
+      this.makeOverlayDivider(() => this.fileEditOverlay!)
+    );
+    this.el.appendChild(this.fileEditOverlay);
+    this.embedRegistry.set("editor", {
+      overlayEl: this.fileEditOverlay,
+      viewEl: this.fileEditView.el,
+      show: () => this.fileEditView!.show(),
+      hide: () => this.fileEditView!.hide(),
+      setPanelActive: (active) => this.fileEditView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
   }
 
   /** Open this pane's workspace folder in the configured external editor.
@@ -2006,6 +2766,27 @@ export class Pane implements VoiceTargetPane {
           : kind === "workflow"
             ? this.workflowPaneView?.openPathRel ?? null
             : null,
+      // Every view CURRENTLY docked (#361), and at what side + share of the
+      // split — up to three entries, one per occupied slot. Empty = nothing
+      // embedded — every view opens as its floating overlay (the default).
+      // Only the orchestration-family kinds (tasks/audit/group) are
+      // captured for restore: git/issues are available on every pane kind,
+      // but nothing short-lived like a plain terminal restore has the
+      // natural "captured, then reapplied once the real pane exists" hook
+      // orch panes get from staying dormant — see
+      // doc/design/embedded-panels.md's persistence section. The share
+      // mirrors how a split's own `weight` is already persisted as a
+      // flex-grow ratio rather than a pixel size — not new geometry-
+      // persistence territory, the same one grid.layoutSnapshot() occupies.
+      embeds:
+        kind === "orch" && this.embedSlots
+          ? EMBED_SIDES.flatMap((side) => {
+              const slot = this.embedSlots![side];
+              return slot.kind !== null && isRestorableEmbedKind(slot.kind)
+                ? [{ view: slot.kind, side, share: slot.frac }]
+                : [];
+            })
+          : [],
     };
   }
 
@@ -2232,16 +3013,24 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** What this pane is holding, for the app-quit guard's enumeration (#219): its editor's
-   *  buffer — the pane's own (an editor pane) or its Alt+F overlay's — labelled with
-   *  the tab and pane it lives in, so the confirm can say WHERE. Null when the pane has no
-   *  editor with a file open at all. */
+   *  buffer — the pane's own (an editor pane), its Alt+F overlay's, or that same Alt+F
+   *  editor DOCKED (#361 scope increase) — labelled with the tab and pane it lives in, so
+   *  the confirm can say WHERE. Null when the pane has no editor with a file open at all. */
   bufferReport(tab: string): PaneBufferReport | null {
     const report = this.unsavedHolder()?.bufferReport();
     if (!report) return null;
-    // "pane" vs "overlay" is what the quit confirm needs to say WHERE the work is: a
-    // content pane is visibly what it is, while an Alt+F overlay is tucked inside a
-    // terminal that looks like any other.
-    const host: DirtyHost = this.editorPaneView || this.workflowPaneView ? "pane" : "overlay";
+    // "pane" vs "overlay" vs "docked" is what the quit confirm needs to say WHERE the
+    // work is: a content pane is visibly what it is; an Alt+F overlay is tucked inside a
+    // terminal that looks like any other; a DOCKED Alt+F editor looks like a permanent
+    // fixture of the pane rather than something someone opened — `sideOf` only applies
+    // when the holder actually IS `fileEditView` (the `editorPaneView`/`workflowPaneView`
+    // branch above already took the "pane" case, so reaching here means it is).
+    const host: DirtyHost =
+      this.editorPaneView || this.workflowPaneView
+        ? "pane"
+        : this.sideOf("editor") !== null
+          ? "docked"
+          : "overlay";
     return { tab, pane: this.name, host, file: report.file, dirty: report.dirty };
   }
 
