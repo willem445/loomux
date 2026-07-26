@@ -5591,6 +5591,81 @@ fn intake_gate_off_fires_unconditionally_exactly_like_before_332() {
         "gate OFF must fire unconditionally, matching pre-#332 behavior");
     assert!(!audit_line_contains(&reg, &gid, "idle-tick-skipped", "fallback"),
         "a disabled gate must never produce a skip");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"gate_enabled\":false"),
+        "a bypass fire (gate off) must be observably distinct from a gated fire — the #429 \
+         benchtest finding was exactly that these two looked identical in the audit log");
+}
+
+// ---------- #429 benchtest follow-up: suppressed/heartbeat observability ----------
+//
+// rev-95's live testbed run (loomux-testbed-cc077f09) showed six idle ticks in a row,
+// each with `intake_summary: null`, EVERY one still delivering the full generic wake
+// prompt — "the gate computes but does not gate". The gate's actual fire/skip DECISION
+// was already correct (proved by the suite above); what was missing is that a skip, a
+// real-signal fire, and a fallback-only fire were audited identically, so nobody could
+// tell them apart after the fact. These tests pin the three new audit fields
+// (`suppressed`, `heartbeat`, `gate_enabled`) that make the three cases distinguishable,
+// and the transition/consecutive-tick shapes the fix brief asked for directly.
+
+#[test]
+fn intake_gate_null_intake_is_suppressed_and_audited() {
+    let (reg, _d, gid, _oid) = autonomous_setup_with_gate(5, 180); // generous fallback
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    assert!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty).is_empty(),
+        "null intake + no other reason must suppress, not deliver");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 0, "a suppressed tick is never counted as a fire");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick-skipped", "\"suppressed\":true"),
+        "a suppressed tick must be observably marked, not just implied by the action name");
+}
+
+#[test]
+fn intake_gate_heartbeat_fires_after_consecutive_suppressed_ticks() {
+    // intake_minutes=10, fallback=30 → the bounded backstop comes due after exactly 2
+    // consecutive suppressed ticks (each skip re-arms the gate 10 minutes out), proving
+    // "after N consecutive suppressed ticks, deliver a real wake anyway" against the
+    // ACTUAL per-tick cadence rather than one big wall-clock jump.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(10, 30);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    let tick1 = FAR + 15 * 60_000 + 1;
+    assert!(reg.idle_tick_tick(tick1, &empty, &empty).is_empty(), "1st consecutive suppressed tick");
+    let tick2 = tick1 + 10 * 60_000;
+    assert!(reg.idle_tick_tick(tick2, &empty, &empty).is_empty(), "2nd consecutive suppressed tick");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 0, "still nothing but suppressions so far");
+
+    let tick3 = tick2 + 10 * 60_000;
+    assert_eq!(reg.idle_tick_tick(tick3, &empty, &empty), vec![oid.clone()],
+        "the bounded fallback must deliver a real wake once it comes due, even with nothing new — \
+         a gate bug (or a genuinely quiet group) must never silence the orchestrator forever");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"heartbeat\":true"),
+        "a fallback-only fire must be marked as a heartbeat, distinct from a real signal");
+}
+
+#[test]
+fn intake_gate_transition_from_suppressed_to_signal_fires_immediately_with_summary_embedded() {
+    // (null, null, intake) → the signal must fire on the very next eligible tick, not
+    // wait for the heartbeat's consecutive-tick count — a fresh signal is never held
+    // hostage by the backstop timer just because prior ticks were suppressed.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(10, 180); // generous fallback: won't fire on its own
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    let tick1 = FAR + 15 * 60_000 + 1;
+    assert!(reg.idle_tick_tick(tick1, &empty, &empty).is_empty(), "1st: null intake, suppressed");
+    let tick2 = tick1 + 10 * 60_000;
+    assert!(reg.idle_tick_tick(tick2, &empty, &empty).is_empty(), "2nd: null intake, suppressed");
+
+    reg.seed_intake_pending(&gid, "issue #77 labeled agent-ready (\"Fix the thing\")");
+    let tick3 = tick2 + 10 * 60_000;
+    assert_eq!(reg.idle_tick_tick(tick3, &empty, &empty), vec![oid.clone()],
+        "a fresh intake signal must fire immediately, not wait out the fallback window");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "issue #77 labeled agent-ready"),
+        "the delivered notice must carry the summary so the orchestrator acts on it directly");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"heartbeat\":false"),
+        "a real-signal fire must never be mistaken for a heartbeat");
 }
 
 #[test]

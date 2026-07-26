@@ -10662,7 +10662,15 @@ impl OrchRegistry {
         let intake_pending = self.intake_pending.lock_safe().clone();
         let last_fired = self.idle_tick_last_fired_ms.lock_safe().clone();
 
-        let mut to_notify: Vec<(String, String)> = Vec::new();
+        // (id, group, gate_enabled, heartbeat) — `gate_enabled` is false only for
+        // the `intake_minutes == 0` bypass (pre-#332 legacy fire); `heartbeat` is
+        // true only when the gate fired SOLELY because the bounded fallback came
+        // due (no intake signal, no pending CI watch, no watchdog stall) — the
+        // rev-95 benchtest finding (#429) showed a delivered wake and a suppressed
+        // one are otherwise indistinguishable in the audit log, which is exactly
+        // how "the gate computes but does not gate" went unnoticed: both fields
+        // are carried through to the audit entry below purely for observability.
+        let mut to_notify: Vec<(String, String, bool, bool)> = Vec::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
@@ -10733,7 +10741,7 @@ impl OrchRegistry {
                         // The gate is off for this group: fire exactly as #332
                         // never happened.
                         a.idle_tick_notified = true;
-                        to_notify.push((a.id.clone(), a.group.clone()));
+                        to_notify.push((a.id.clone(), a.group.clone(), false, false));
                         continue;
                     }
                     // #329 coexistence note (rev-31 finding 2): this whole `if` is scoped to
@@ -10756,7 +10764,14 @@ impl OrchRegistry {
                     let fallback_due = intake::idle_tick_fallback_due(group_last_fired, now, fallback_minutes);
                     if intake::idle_tick_gate(has_intake_signal, has_pending_notification, has_watchdog_stall, fallback_due) {
                         a.idle_tick_notified = true;
-                        to_notify.push((a.id.clone(), a.group.clone()));
+                        // Heartbeat = the ONLY reason this fired is the bounded
+                        // fallback — no real signal, no pending watch, no stall.
+                        // `idle_tick_notice` still renders the same generic prompt
+                        // (there's nothing to embed), but the audit entry below
+                        // marks it distinctly so a null-summary fire is never
+                        // silently mistaken for a real signal, or vice versa.
+                        let heartbeat = !has_intake_signal && !has_pending_notification && !has_watchdog_stall;
+                        to_notify.push((a.id.clone(), a.group.clone(), true, heartbeat));
                     } else {
                         a.idle_tick_notified = true;
                         a.idle_tick_skip_rearm_ms = now + intake_minutes as u64 * 60_000;
@@ -10771,11 +10786,11 @@ impl OrchRegistry {
         }
 
         for (group, reason) in skipped {
-            self.audit(&group, "loomux", "idle-tick-skipped", json!({ "reason": reason }));
+            self.audit(&group, "loomux", "idle-tick-skipped", json!({ "reason": reason, "suppressed": true }));
         }
 
         let mut notified = Vec::new();
-        for (id, group) in to_notify {
+        for (id, group, gate_enabled, heartbeat) in to_notify {
             // Record the delivery for the per-hour backstop, pruning to the window.
             // This ring is in-memory only (like `spawn_times`): a restart resets
             // the window, which is the safe direction — the cap is a runaway
@@ -10797,7 +10812,13 @@ impl OrchRegistry {
             // it up alongside something else; either way the orchestrator is
             // about to see it in the notice below.
             let intake_summary = self.intake_pending.lock_safe().remove(&group);
-            self.audit(&group, "loomux", "idle-tick", json!({ "orchestrator": id, "intake_summary": intake_summary }));
+            self.audit(&group, "loomux", "idle-tick", json!({
+                "orchestrator": id,
+                "intake_summary": intake_summary,
+                "gate_enabled": gate_enabled,
+                "suppressed": false,
+                "heartbeat": heartbeat,
+            }));
             let text = idle_tick_notice(intake_summary.as_deref());
             let _ = self.deliver_to_orchestrator(&group, &text, "loomux");
             notified.push(id);

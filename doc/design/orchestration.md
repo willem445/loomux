@@ -1351,6 +1351,30 @@ check-state transitions.
   persistently-failing `gh` isn't retried every 60s), and the bounded fallback covers the group
   regardless — a poller outage can make the gate less useful, never silence the orchestrator past
   the fallback's own interval.
+- **#429 benchtest finding: the gate computed but the audit couldn't tell you so.** A live
+  testbed session (`loomux-testbed-cc077f09`) logged six idle ticks over ~45 minutes, every one
+  with `intake_summary: null`, and every one still delivered — the generic "run your monitoring
+  cadence" prompt, with zero token economy over pre-#332 behavior. Root cause: `intake_summary`
+  being `None` was never actually distinguishable, in the audit, from "the gate wasn't consulted
+  at all" (the `intake_poll_minutes == 0` bypass, which fires the identical unconditional
+  legacy path) versus "the gate WAS consulted and correctly found nothing new, but fired anyway
+  because the bounded fallback (or a pending CI watch, or a watchdog stall) had a separate,
+  legitimate reason to." All three cases produced the same `idle-tick` audit shape and the same
+  delivered prompt — so from the outside, "the gate computes but does not gate." The fix adds
+  three observability fields to the SAME audit entries (no behavior change to the gate's actual
+  fire/skip decision, which was already correct): `gate_enabled` (false only for the
+  `intake_poll_minutes == 0` bypass), `suppressed` (true on the skip path — `idle-tick-skipped`
+  now states this explicitly instead of leaving it implied by the action name), and `heartbeat`
+  (true when a fire's ONLY reason was the bounded fallback — no intake signal, no pending watch,
+  no stall — so it's never mistaken for a real signal in hindsight). Separately and NOT fixed
+  here: `intake_poll_minutes` has no setter (`orch_set_*`) anywhere in the product today — the
+  doc comment on the field itself says the poller and setter were meant to land in separate
+  P2-P4 PRs, and the setter never has. Every real autonomous group therefore runs the
+  `gate_enabled: false` bypass unconditionally, which is the far more likely explanation for the
+  benchtest's six-for-six null fires than any bug in the gate's own decision logic (verified
+  correct by the existing `intake_gate_*` suite). Filed as a follow-up rather than folded in here
+  — it's a new public contract (a command, an ACL grant, a settings toggle), not a delivery-logic
+  fix, and this PR's brief scoped it out.
 
 **Coexistence with compact-nudge (below):** the two mechanisms are fully decoupled — compact-nudge
 runs as its own background thread (`start_compact_nudge`/`run_compact_nudge`/`compact_nudge_tick`),
