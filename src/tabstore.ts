@@ -105,22 +105,21 @@ export interface PersistedPane {
    *  entries, one per occupied edge (left/right/bottom), each naming which
    *  view and its share of that edge's split. Empty = nothing docked, every
    *  view opens as its floating overlay (the pre-#361 default). Only the
-   *  orchestration-family views are ever captured here
-   *  (`PersistedEmbedView`); git/issues are embeddable on every pane kind
-   *  but have no restore hook to carry them through (see
-   *  doc/design/embedded-panels.md's persistence section). Absent from any
-   *  snapshot written before #361 (or before the multi-slot
-   *  generalization), which both decode as `[]` — same as a pane that was
-   *  simply never docked. */
+   *  views named in `PersistedEmbedView` are ever captured here; `issues` is
+   *  embeddable on every pane kind but has no restore hook to carry it
+   *  through (see doc/design/embedded-panels.md's persistence section).
+   *  Absent from any snapshot written before #361 (or before the
+   *  multi-slot/git+editor generalizations), which all decode as `[]` —
+   *  same as a pane that was simply never docked. */
   embeds: PersistedEmbed[];
 }
 
-/** The orchestration-family views a pane's embed preference can name (#361)
- *  — a subset of `pane.ts`'s own `EmbedKind` (git/issues aren't restorable
- *  today, so they're not representable here at all). Kept local rather than
- *  imported from pane.ts: tabstore.ts is the pure persistence layer pane.ts
- *  depends ON, not the reverse. */
-export type PersistedEmbedView = "tasks" | "audit" | "group";
+/** The views a pane's embed preference can name (#361) — a subset of
+ *  `pane.ts`'s own `EmbedKind` (`issues` isn't restorable today, so it's not
+ *  representable here at all — see the field comment above). Kept local
+ *  rather than imported from pane.ts: tabstore.ts is the pure persistence
+ *  layer pane.ts depends ON, not the reverse. */
+export type PersistedEmbedView = "tasks" | "audit" | "group" | "git" | "editor";
 
 /** Which edge of the terminal a docked view sits on (#361) — mirrors
  *  `pane.ts`'s own `EmbedSide`, kept local for the same reason
@@ -207,7 +206,7 @@ export function encodeTabs(state: PersistedTabs): string {
   });
 }
 
-const EMBED_VIEWS: readonly PersistedEmbedView[] = ["tasks", "audit", "group"];
+const EMBED_VIEWS: readonly PersistedEmbedView[] = ["tasks", "audit", "group", "git", "editor"];
 const EMBED_SIDES: readonly PersistedEmbedSide[] = ["left", "right", "bottom"];
 
 function isEmbedView(v: unknown): v is PersistedEmbedView {

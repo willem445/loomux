@@ -66,7 +66,7 @@ import {
   type TreeNode,
 } from "./filetreemodel";
 import { fileIconSvg, folderIconSvg } from "./fileicons";
-import { closeDecision, discardEdits, type ConflictChoice } from "./dirtystate";
+import { closeDecision, discardEdits, shouldConfirmDiscardBeforeClose, type ConflictChoice } from "./dirtystate";
 import { detectEol, applyEol, textDiffers, type Eol } from "./eol";
 import { createEditor, type EditorWidget } from "./editorwidget";
 import { showToast } from "./toast";
@@ -102,6 +102,20 @@ export interface FileEditHost {
    *  terminal or a running agent); an editor PANE adopts it as the pane's root, so
    *  the title and the persisted layout follow what's actually on screen. */
   onRootChanged?(root: string): void;
+  /** Open the side-picker menu (#361): Left/Right/Bottom/Un-embed. Absent (like
+   *  `onEmbedMenu` on every other embeddable view) when this host has no terminal
+   *  to share space with — an editor PANE (`embedded: true`), which never offers
+   *  the embed button at all. */
+  onEmbedMenu?(anchor: HTMLElement): void;
+  /** Is this view CURRENTLY docked to an embed slot (#361), on ANY side? Lets
+   *  `requestClose` skip the discard-confirm dialog entirely while docked — the
+   *  underlying toggle is a no-op then (`embedToggleAction`), so popping "discard
+   *  unsaved changes?" for a click that won't actually close anything would be
+   *  worse than pointless: a "yes" would discard real edits for NO reason (the
+   *  panel stays open either way). Undefined/absent (the overlay-only, pre-#361
+   *  shape) behaves as "never docked" — unchanged behavior for any host that
+   *  doesn't implement it. */
+  isDocked?(): boolean;
 }
 
 const TREE_W_KEY = "loomux.fileedit.treeW";
@@ -141,6 +155,8 @@ export class FileEditView {
   private fileLabel: HTMLElement;
   private dirtyDot: HTMLElement;
   private saveBtn: HTMLButtonElement;
+  private embedBtn: HTMLButtonElement;
+  private closeBtn: HTMLButtonElement;
   private findBtn: HTMLButtonElement;
   private agentBanner: HTMLElement;
 
@@ -276,12 +292,30 @@ export class FileEditView {
     this.saveBtn.disabled = true;
     this.saveBtn.addEventListener("click", () => void this.save());
 
-    const closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
-    closeBtn.title = "Close (Esc)";
-    closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
-    closeBtn.addEventListener("click", () => void this.requestClose());
+    // Embed side-picker (#361): switch between the floating overlay and any of
+    // the pane's (up to three) embed slots — never on a content pane
+    // (`host.embedded`), which has no terminal to share space with at all.
+    this.embedBtn = el("button", "pane-btn embed", "⬒") as HTMLButtonElement;
+    this.embedBtn.hidden = !!host.embedded;
+    this.embedBtn.addEventListener("click", () => this.host.onEmbedMenu?.(this.embedBtn));
 
-    head.append(rootWrap, spacer, this.fileLabel, this.dirtyDot, this.findBtn, this.saveBtn, closeBtn);
+    this.closeBtn = el("button", "pane-btn close", "✕") as HTMLButtonElement;
+    this.closeBtn.title = "Close (Esc)";
+    this.closeBtn.hidden = !!host.embedded; // pane content — the PANE's ✕ is the close affordance
+    this.closeBtn.addEventListener("click", () => void this.requestClose());
+    // Now that both buttons `setPanelActive` touches exist.
+    this.setPanelActive(false);
+
+    head.append(
+      rootWrap,
+      spacer,
+      this.fileLabel,
+      this.dirtyDot,
+      this.findBtn,
+      this.saveBtn,
+      this.embedBtn,
+      this.closeBtn
+    );
 
     // ---- agent-worktree banner (subtle, non-blocking) ----
     this.agentBanner = el(
@@ -438,6 +472,27 @@ export class FileEditView {
     // worker frees its own registry entry and its results are ready on reopen;
     // its batches paint into the hidden tree harmlessly.
     clearTimeout(this.searchTimer);
+  }
+
+  /** Reflect whether the pane currently has this view in its embed-panel
+   *  slot (#361) — pure display state on the header's toggle button, same
+   *  shape as every other embeddable view. `active` is always false for a
+   *  content-pane host (`host.embedded`): `embedBtn`/`closeBtn` are hidden
+   *  there and this is never called with `true`. */
+  setPanelActive(active: boolean): void {
+    this.embedBtn.classList.toggle("active", active);
+    this.embedBtn.textContent = active ? "⬓" : "⬒";
+    this.embedBtn.title = active
+      ? "Un-embed — back to a floating overlay"
+      : "Embed beside the terminal (resizes this pane)";
+    // The overlay toggle (this button, Esc, the pane header's own file-editor
+    // button) is disabled while docked (#361 user-demo finding — see
+    // embedtoggle.ts): only un-embedding closes a docked editor now.
+    // `requestClose` also skips the discard-confirm entirely while docked
+    // (checked separately, via `host.isDocked`), so a "yes" on that dialog
+    // never fires for a click that wouldn't actually close anything.
+    this.closeBtn.disabled = active;
+    this.closeBtn.title = active ? "Docked — un-embed it (side menu) to close" : "Close (Esc)";
   }
 
   dispose(): void {
@@ -738,7 +793,12 @@ export class FileEditView {
   }
 
   private async requestClose(): Promise<void> {
-    if (this.isDirtyNow() && closeDecision(true) === "confirm") {
+    // `shouldConfirmDiscardBeforeClose` (dirtystate.ts) is what actually
+    // decides — docked always skips the confirm; `onClose` below still
+    // runs regardless, so the toast/disabled-button affordance every other
+    // docked view's toggle gets (Pane.toggleView's embedToggleAction guard)
+    // applies here too.
+    if (shouldConfirmDiscardBeforeClose(this.host.isDocked?.() ?? false, this.isDirtyNow())) {
       const ok = await this.confirmDiscard();
       if (!ok) return;
     }

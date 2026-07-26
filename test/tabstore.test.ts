@@ -490,6 +490,37 @@ test("embed preferences ({view, side, share}), one per docked edge, round-trip t
   ]);
 });
 
+test("git and editor are valid embed views too (#361 scope increase), round-trip like any other kind", () => {
+  const orch: PersistedPane = {
+    paneKind: "orch",
+    name: "orchestrator",
+    cwd: "/repo",
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: "orch-1",
+    role: "orchestrator",
+    file: null,
+    embeds: [
+      { view: "git", side: "left", share: 0.35 },
+      { view: "editor", side: "right", share: 0.4 },
+    ],
+  };
+  const state: PersistedTabs = {
+    tabs: [
+      { name: "t", color: null, groupId: "g", layout: { kind: "leaf", weight: 1, pane: orch } },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const leaf = back?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [
+    { view: "git", side: "left", share: 0.35 },
+    { view: "editor", side: "right", share: 0.4 },
+  ]);
+});
+
 test("an old snapshot with no embeds key decodes it as [] (overlay mode, unchanged)", () => {
   // A pre-#361 file never wrote the key at all — additive, like `role` and the
   // files root before it: no schema bump, no decoder branch needed.
@@ -529,7 +560,7 @@ test("a malformed entry inside a valid embeds array is dropped, not the whole ar
             role: "orchestrator",
             embeds: [
               { view: "group", side: "bottom", share: 0.4 }, // valid
-              { view: "git", side: "left", share: 0.3 }, // not a RESTORABLE kind
+              { view: "issues", side: "left", share: 0.3 }, // not a RESTORABLE kind
               { view: "tasks", side: "sideways", share: 0.3 }, // bad side
               { view: "audit", side: "right", share: "big" }, // bad share
               "not even an object",

@@ -226,6 +226,23 @@ test("captured embed preferences (#361), one per docked side, ride the dormant p
   });
 });
 
+test("git and editor dock preferences ride the dormant placeholder too (#361 scope increase)", () => {
+  const embeds = [
+    { view: "git" as const, side: "left" as const, share: 0.3 },
+    { view: "editor" as const, side: "right" as const, share: 0.35 },
+  ];
+  const action = planPaneRestore(
+    pane({ paneKind: "orch", name: "orchestrator", sessionId: "s1", role: "orchestrator", embeds })
+  );
+  assert.deepEqual(action, {
+    type: "dormant-group",
+    name: "orchestrator",
+    sessionId: "s1",
+    role: "orchestrator",
+    embeds,
+  });
+});
+
 // ---------- #361 whole-group resume: locating the resumed pane ----------
 
 test("findResumedPaneIndex matches a live pane by session id", () => {

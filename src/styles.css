@@ -636,10 +636,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane-embed-panel.resizing .tasks-list,
 .pane-embed-panel.resizing .issues-list,
 .pane-embed-panel.resizing .group-list,
+.pane-embed-panel.resizing .fileedit-tree,
 .git-overlay.resizing .audit-list,
 .git-overlay.resizing .tasks-list,
 .git-overlay.resizing .issues-list,
-.git-overlay.resizing .group-list {
+.git-overlay.resizing .group-list,
+.git-overlay.resizing .fileedit-tree {
   content-visibility: hidden;
 }
 
@@ -693,7 +695,10 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
          .pane-embed-panel.side-left
          .pane-embed-divider.side-left
          .pane-embed-center (row)  — term | right
-           .pane-term
+           .pane-embed-term-wrap (see Pane.embedTermWrapEl's doc comment:
+             .pane-term            exists ONLY so the right divider never
+                                    writes .style.flex onto .pane-term
+                                    itself — #361 right-dock lag fix)
            .pane-embed-divider.side-right
            .pane-embed-panel.side-right
        .pane-embed-divider.side-bottom
@@ -711,6 +716,12 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .pane-embed-center {
   display: flex; flex-direction: row; flex: 1 1 0; min-height: 0; min-width: 0;
+}
+/* Exists solely so the right divider's drag has a WRAPPER to resize instead
+   of `.pane-term` directly (#361 right-dock expand-left lag fix) — sized
+   identically to how `.pane-term` used to sit directly in this row. */
+.pane-embed-term-wrap {
+  display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; min-width: 0;
 }
 .pane-embed-panel {
   flex: 1 1 0; min-height: 0; min-width: 0;

@@ -16,6 +16,7 @@ import {
   isDoaRevival,
   withDeadline,
   QUIT_FLUSH_TIMEOUT_MS,
+  shouldConfirmDiscardBeforeClose,
   type PaneBufferReport,
 } from "../src/dirtystate.ts";
 
@@ -30,6 +31,19 @@ test("isDirty reflects buffer vs last-saved", () => {
 test("closeDecision confirms only when dirty", () => {
   assert.equal(closeDecision(false), "close");
   assert.equal(closeDecision(true), "confirm");
+});
+
+test("shouldConfirmDiscardBeforeClose: docked always skips the confirm, dirty or not (#361 user-demo finding)", () => {
+  // The bug this prevents: a "yes" on the discard dialog would drop real
+  // edits for a toggle click that (while docked) doesn't actually close
+  // anything — Un-embed is the only thing that does.
+  assert.equal(shouldConfirmDiscardBeforeClose(true, true), false);
+  assert.equal(shouldConfirmDiscardBeforeClose(true, false), false);
+});
+
+test("shouldConfirmDiscardBeforeClose: not docked falls back to the plain #219 rule", () => {
+  assert.equal(shouldConfirmDiscardBeforeClose(false, true), true);
+  assert.equal(shouldConfirmDiscardBeforeClose(false, false), false);
 });
 
 test("reload-after-replace guard: a clean buffer reloads, a dirty one confirms", () => {

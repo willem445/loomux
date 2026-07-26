@@ -47,10 +47,11 @@ edge. So:
   possible dividers alike — see *Divider mechanics* below for exactly what
   that means, because "one resize on release" turns out not to be it.
 - **A docked panel's own internal changes never reach the PTY — with one
-  narrow, bounded, and named exception.** For four of the five views (task
-  board, git, issues, audit), refreshing a list, expanding a row, typing in
-  a filter — none of it changes the panel's MINIMUM size, so none of it
-  touches `termEl`. Verified per view below, not assumed. **The group panel
+  narrow, bounded, and named exception.** For five of the six views (task
+  board, git, issues, audit, the file editor), refreshing a list, expanding
+  a row, typing in a filter — none of it changes the panel's MINIMUM size,
+  so none of it touches `termEl`. Verified per view below, not assumed.
+  **The group panel
   is the one view whose own fixed chrome can genuinely grow after it opens**
   (the suspended-budget banner appearing) — `reclampViewFloor`, generalized
   from the pre-#361 `reclampGroupOverlay` that has always done the
@@ -274,34 +275,105 @@ rather than an overlay?). That is a *different concept* from this feature
 (a view sharing space with a terminal that's still right there), and the
 two are easy to conflate on the same class. So every embeddable view's
 runtime toggle method is named **`setPanelActive(active: boolean)`**, not
-`setEmbedded` — applied uniformly to all five views (including `TasksView`,
-which has no collision of its own, for one consistent interface across the
-set) so a reader never has to remember which view's method means what.
+`setEmbedded` — applied uniformly to all six views (including `TasksView`
+and `FileEditView`, neither of which has a collision of its own, for one
+consistent interface across the set) so a reader never has to remember
+which view's method means what. `FileEditView` in particular already had
+an UNRELATED `embedded` ctor option of its own (the #217 content-pane
+flag) before it became embeddable via this engine — the exact same naming
+trap `GitView` hit, avoided the same way.
 
 ## What's embeddable, and what isn't
 
-Five views are embeddable: the **task board**, **git**, **GitHub issues**,
-the **audit log**, and the **group lifecycle panel** ("lifecycle status" in
-the issue — the panel behind `GroupView`'s overlay toggle). All five are
-wired through one generic engine in `pane.ts` (`EmbedKind`, `EmbedEntry`,
-`embedRegistry`, `openView`/`closeView`/`toggleView`/`embedViewAtSide`/
-`unembedView`) — see *The generic engine*, below. Any THREE of the five may
-be docked at once, one per edge; the other two (or however many aren't
-docked) stay available as floating overlays.
+**Six** views are embeddable: the **task board**, **git**, **GitHub
+issues**, the **audit log**, the **group lifecycle panel** ("lifecycle
+status" in the issue — the panel behind `GroupView`'s overlay toggle), and
+the **file editor** overlay (`Alt+F`). All six are wired through one
+generic engine in `pane.ts` (`EmbedKind`, `EmbedEntry`, `embedRegistry`,
+`openView`/`closeView`/`toggleView`/`embedViewAtSide`/`unembedView`) — see
+*The generic engine*, below. Any THREE of the six may be docked at once,
+one per edge; the rest (however many aren't docked) stay available as
+floating overlays.
 
-**The file-editor overlay (`Alt+F`) is deliberately NOT embeddable.** It
-already has a strictly better path to the same outcome: the editor
-**content pane** (#217, `FileEditView`'s `embedded` mode — the very flag
-this note's naming section discusses). A content pane gives the editor the
-whole of its own pane — full width, a real tab-bar entry, state that
-survives a session restore the normal way — where a same-pane sub-panel
-would give it a narrower strip that competes with the terminal (and now
-potentially two OTHER docked panels) for room, and disappears the moment
-the pane closes. "Open in editor pane" (the file browser's row action) is
-the answer to "I want to keep this editor open beside my agent"; embedding
-the *overlay* version would be a strictly worse version of a feature that
-already exists. The overlay stays exactly what it was: a quick look, `Esc`
-to dismiss.
+**Git was part of the generic engine from the same round that generalized
+past the task board** — it needed nothing new for this round beyond
+verifying it: `toggleGitView` already routed through `Pane.toggleView`
+(so the docked-toggle no-op applies to it by construction, same as every
+other kind), and its own `setPanelActive` already disabled/retitled its
+internal ✕ while docked. The one thing this round added for git is
+restorability (below).
+
+**The file editor was excluded through three prior rounds, on a real
+argument that this round's user-directed scope increase overrides rather
+than invalidates.** The original case: the editor **content pane** (#217,
+`FileEditView`'s `embedded` mode — the very flag this note's naming section
+discusses) is a STRICTLY BETTER answer to "I want to keep an editor open
+long-term beside my agent" — full pane width, a real tab-bar entry, state
+that survives a session restore the normal way. None of that changed, and
+the content pane remains the right tool for that job; "Open in editor
+pane" (the file browser's row action) still creates a wholly separate
+`FileEditView` instance (`Pane.editorPaneView` — never the same object as
+the dockable overlay's `Pane.fileEditView`, so there is no risk of the two
+colliding or one spawning a duplicate of the other). What the exclusion
+argument didn't account for is a DIFFERENT use case every other docked
+view already serves: a quick, SAME-PANE edit while continuing to watch the
+terminal, without giving up a whole separate pane's width for it — exactly
+what "dock it beside the agent" already means for git/tasks/audit/issues.
+The user asked for it directly, having used the other five; that is a
+refinement on work already in flight, not drift, and folds into this PR
+per this repo's own policy on user-directed scope increases.
+
+**The file editor's unsaved-buffer lifecycle (#219) is preserved, not
+bypassed, by embedding it** — see *#219 interaction*, below, for the one
+place embedding actually touches that lifecycle (the toggle-close path)
+and the reasoning for why every OTHER #219 guarantee (pane-kill, tab-close,
+app-quit) needed no changes at all.
+
+## #219 interaction: what embedding touches, and what it doesn't
+
+The file editor is the one embeddable view that can hold real, irreplaceable
+human work (an unsaved buffer) — every #219 guarantee about that had to be
+re-checked against "now it can also be docked," not assumed safe.
+
+**Unaffected, by construction: pane-kill, tab-close, and app-quit.** All
+three go through `Pane.unsavedHolder()` — `this.editorPaneView ??
+this.workflowPaneView ?? this.fileEditView` — which returns the SAME
+`FileEditView` INSTANCE regardless of whether it's currently an overlay,
+docked to an edge, or hidden. `canDiscard()`/`bufferReport()` (called from
+there) only ever ask `isDirtyNow()` — never the display mode — so
+`confirmClose()` (pane-kill/tab-close) and the app-quit guard's
+`dirtyBuffers()` enumeration are exactly as correct for a DOCKED editor as
+they always were for the overlay one, with zero code changes needed. This
+was verified by reading `unsavedHolder()`'s own call sites, not assumed
+from the shared-instance argument alone.
+
+**The one place embedding DOES touch #219: the toggle-close path
+(Escape/✕/header-button/keybinding) — because it's the one #219 path that
+was never actually about destroying the buffer.** Before #361, `Alt+F`
+toggling the overlay CLOSED (hid) it without ever asking about unsaved
+edits — correctly, because hiding doesn't touch the buffer, only
+`dispose()` (pane teardown, guarded by `confirmClose()` above) does. The
+view's OWN internal ✕/Escape (`requestClose`), though, DOES ask first via
+`confirmDiscard()` — a UX courtesy layer above the toggle, not a
+data-safety requirement, since a "yes" there ACTUALLY reverts the buffer
+(`revertBuffer()`) even though the resulting hide is just as non-destructive
+as Alt+F's. Once docked views' toggles became no-ops (the OTHER #361
+user-demo finding, above), this courtesy layer became a hazard: `Escape`
+on a DOCKED, dirty editor would ask "discard unsaved changes?", a "yes"
+would ACTUALLY DISCARD the buffer, and then the underlying toggle would
+no-op anyway (the panel stays open, undocked only via the side menu) — a
+real edits loss for a click that didn't even close anything.
+
+**The fix: `shouldConfirmDiscardBeforeClose(docked, dirty)`
+(`dirtystate.ts`, pure) — docked wins outright, skipping the confirm
+dialog entirely rather than letting it fire ahead of a no-op.**
+`FileEditView.requestClose` calls it before ever showing
+`confirmDiscard()`; when docked, it goes straight to `this.host.onClose()`
+(`Pane.toggleFileEditView` → `Pane.toggleView("editor")`), which is where
+the SAME toast/disabled-button affordance every other docked view's
+toggle already shows takes over. Undocked, the decision falls back to the
+plain #219 rule (`closeDecision`), unchanged. `test/dirtystate.test.ts`
+pins both branches.
 
 ## The generic engine
 
@@ -481,7 +553,7 @@ flips the view's own `hidden` flag (`GitView`/`IssuesView`'s own duplicate
 of it; see *Reuse, not a fork* below) and, separately, `closeView` flips the
 slot's `panelEl.hidden` — and while every path THIS review traced kept the
 two in lockstep, that's a standing tax on every future change to either
-side, with a large surface of entry points (five views × header button ×
+side, with a large surface of entry points (six views × header button ×
 keybinding × internal close × Escape × `pane-meta`'s branch-name click) any
 one of which reintroduces the same bug if it ever forgets to.
 
@@ -577,6 +649,15 @@ survives the move untouched. Verified per view, not assumed:
   wired into the registry's `hide` callback so `closeView` stops it on
   every close, from every edge, in either mode. `show()` also defensively
   clears any stray timer before arming a new one.
+- **`FileEditView`** (#361 scope increase) — the most STATEFUL view here:
+  an open file's buffer, dirty tracking, tree/search state, an in-flight
+  content-search enumeration. None of it is display-mode-aware; `show()`/
+  `hide()` never touch the buffer at all (only `dispose()`, pane teardown,
+  does — see *#219 interaction*, above). `hide()` already cleared its
+  search timer pre-#361 (the overlay-vs-#217-content-pane duality this view
+  already had); nothing new needed there for docking. The one addition is
+  `setPanelActive`, matching every other view's shape exactly — disables +
+  retitles its own ✕ while docked, same as the other five.
 
 The overlay host (`.git-overlay`, one per view — unchanged) and each edge's
 slot (`.pane-embed-panel.side-*` / `.pane-embed-divider.side-*`) are all
@@ -675,19 +756,80 @@ unit-testable without a real DOM); the Alt-Tab-away scenario itself is
 manual-validation step 21, since nothing short of a real window losing
 focus can confirm the browser-level behavior the pure test assumes.
 
-**Task board and issues: the same discipline where it's free, not the same
-windowing.** `.resizing`'s `content-visibility` rule (fix 2) costs nothing
-extra to extend to `.tasks-list`/`.issues-list` and is applied to both.
-Row-windowing (fix 1) is NOT extended to either, on purpose: the task board
-is actively curated by the orchestrator/human (done items get cleared,
-#120) rather than growing forever, and the issues list is bounded by
-whatever GitHub actually returns for the repo — neither has audit's
-specific "genuinely unbounded, append-only, thousands over a long session"
-shape, and windowing either would trade away seeing the full board/list for
-a problem that (today) doesn't reproduce there. If a repo's issue count or
-a board's task count ever grows large enough to reproduce the same
-symptom, `auditwindow.ts`'s pattern is the one to reach for — it isn't
-audit-specific in its logic, only in its current wiring.
+**Task board, issues, and the file editor's tree: the same discipline where
+it's free, not the same windowing.** `.resizing`'s `content-visibility`
+rule (fix 2) costs nothing extra to extend to `.tasks-list`/`.issues-list`/
+`.fileedit-tree` (added alongside the #361 scope increase that made the
+editor dockable — its tree can genuinely hold as many rows as a large
+repo has files) and is applied to all three. Row-windowing (fix 1) is NOT
+extended to any of them, on purpose: the task board is actively curated by
+the orchestrator/human (done items get cleared, #120) rather than growing
+forever, the issues list is bounded by whatever GitHub actually returns
+for the repo, and the file tree only ever renders the CURRENTLY EXPANDED
+folders (the tree itself is not a flat unbounded list the way the audit
+log is) — none of the three has audit's specific "genuinely unbounded,
+append-only, thousands over a long session" shape, and windowing any of
+them would trade away seeing the full board/list/tree for a problem that
+(today) doesn't reproduce there. If a repo's issue count, a board's task
+count, or a single folder's file count ever grows large enough to
+reproduce the same symptom, `auditwindow.ts`'s pattern is the one to reach
+for — it isn't audit-specific in its logic, only in its current wiring.
+
+## Right-dock expand-left lag (#361 user-demo finding) — `embedTermWrapEl`
+
+A live demo found the three dividers were NOT actually symmetric: dragging
+the RIGHT divider LEFT (growing the right-docked panel, shrinking the
+terminal) lagged; the identical gesture on the LEFT or BOTTOM divider did
+not. Two of the reviewer's three suspected mechanisms were ruled out by
+reading the code, not by guessing: `.resizing` (the drag-perf fix, above)
+is applied to `slot.panelEl` from the SAME unconditional line in
+`wireEmbedDivider` regardless of `side` — no per-side branch skips it. And
+the `content-visibility` CSS selectors (`.pane-embed-panel.resizing
+.audit-list`, etc.) match on the PANEL'S class, not the SIDE — a docked
+view's list sits in the identical wrapper shape whichever edge it's on.
+Both were confirmed false, not assumed false.
+
+**The one CONFIRMED structural asymmetry:** before this fix, `dividerPair`
+and `counterpartEl` used `termEl` ITSELF as the right divider's `beforeEl`
+— there was nothing else for it to be, since `embedCenterEl`'s row was
+exactly `[termEl, right's divider, right's panel]`. That made right the
+ONLY one of the three dividers whose drag handler wrote `.style.flex`
+directly onto `termEl` — the exact node `resizeObs` observes — on every
+single `mousemove`. Left's and bottom's far side has always been a WRAPPER
+(`embedCenterEl` / `embedRowEl` respectively) that resizes `termEl` only as
+an INDIRECT, computed consequence of the wrapper's OWN flex-grow changing;
+`termEl`'s own inline style is never touched by their drags at all. `grep`
+confirms this directly: before this fix, `termEl.style.flex` was written in
+exactly one place in the entire codebase — the right divider's `move`
+handler.
+
+**Honesty about what this note can and can't claim.** This environment
+cannot launch `npm run tauri dev` (#394 — a live GUI the human must drive)
+and had no working interactive-browser tool available this session, so
+there is no measured before/after frame-timing number to report here — the
+diagnosis above is a code-level one, not a profiled one. What IS true
+without needing a profiler: the asymmetry existed, and it existed on
+EXACTLY the divider that lagged. The fix removes it outright rather than
+leaving it as an unverified correlation: `embedTermWrapEl`, a thin,
+permanent wrapper created once in `ensureEmbedHost` around `termEl` inside
+`embedCenterEl` (`embedCenterEl` > `embedTermWrapEl` > `termEl`, instead of
+`embedCenterEl` > `termEl` directly). The right divider's `beforeEl`
+(`dividerPair`) and `counterpartEl` both now point at `embedTermWrapEl`,
+never `termEl` — matching left's and bottom's shape EXACTLY: all three
+dividers now resize `termEl` only indirectly, through a wrapper's own
+flex-grow, and `termEl`'s own inline style is never written by ANY divider
+drag. `termEl` fills the wrapper via its own pre-existing `flex: 1` rule
+(`.pane-term`), unaffected either way — the wrapper adds one CSS rule
+(`.pane-embed-term-wrap`, mirroring `.pane-embed-center`'s own `flex: 1 1 0;
+min-height: 0; min-width: 0;` shape) and no behavior change when nothing is
+docked (a single flex child fills its parent identically whether or not
+there's an extra pass-through wrapper in between).
+
+If the human's own re-validation (this round explicitly includes "right-
+dock expand-left smooth" as a check) still finds it laggy after this fix,
+that would mean the asymmetry above, though real, wasn't the (or the only)
+cause — worth a follow-up with an actual profiler trace at that point,
+which this session's tooling couldn't produce.
 
 ## Persisted shape
 
@@ -703,10 +845,14 @@ were added. Malformed individual entries are dropped, not the whole array;
 two entries claiming the SAME side are also de-duplicated (first wins) —
 `test/tabstore.test.ts` pins both.
 
-**`PersistedEmbedView` is `"tasks" | "audit" | "group"` — a strict subset of
-`pane.ts`'s own `EmbedKind`.** Only the orchestration-family views are
-representable in the persisted shape at all; `git`/`issues` are never
-written here. See *Why only three views survive a restart*, below.
+**`PersistedEmbedView` is `"tasks" | "audit" | "group" | "git" | "editor"`
+— every `EmbedKind` except `"issues"`.** `git` and `editor` joined this
+round (#361 scope increase) once it became clear the thing that actually
+gated restorability was never "is this an orchestration-family view" — it
+was "is this docked on an ORCHESTRATOR pane," which `git`/`editor` satisfy
+exactly as well as `tasks`/`audit`/`group` do. `issues` remains the one
+excluded kind, for a reason that has nothing to do with what kind of view
+it is — see *Why these kinds survive a whole-group resume*, below.
 
 **Migrated from BOTH earlier shapes, neither of which ever shipped in a
 release.** This PR generalized twice within the same review cycle — first
@@ -725,34 +871,54 @@ silently dropped preference on the next boot after a stray hand-edited or
 pre-rebase tabs.json. `test/tabstore.test.ts` pins every migration path and
 the precedence between them.
 
-**Why only three views survive a whole-group resume.** Orchestration panes
-are never auto-resumed on app restart (`panerestore.ts`'s `dormant-group` —
-the human clicks Resume, deliberately, to avoid a credit/process-storm on
-every boot). That dormancy is what gives `tasks`/`audit`/`group` a natural
-restore hook: the docked-view preferences ride the SAME path `role` and
-`sessionId` already ride — captured into the dormant placeholder's record
-(`main.ts`'s `case "dormant-group"`), read back off it in
-`resumeDormantGroup`, and matched — by session id, the same key
-`planGroupResume` itself matches on — to the pane that comes back once
-`resumeOrchSession` actually resolves (`Pane.restoreEmbeds`, plural — it
-iterates every entry and re-docks each to its own recorded edge).
-`git`/`issues` are embeddable on EVERY pane kind (including a plain
-terminal), but a plain terminal restore has no dormant-placeholder
-indirection at all — it re-spawns directly, immediately, with nothing
-"captured, then reapplied later" to hook a preference onto. Threading that
-through would mean adding an embeds field to every other `RestoreAction`
-variant (`spawn-terminal`/`fresh-agent`/`dormant-agent`/…) and a matching
-apply-call at each of `main.ts`'s several live-pane-creation sites — real
-additional plumbing, not a small extension of what orch panes already have.
-So `Pane.capture()` only ever writes an `embeds` entry for a currently-
-docked kind that is BOTH orchestration-family AND on a pane where `kind ===
-"orch"` (`isRestorableEmbedKind`); docking git or issues to any pane is
-fully functional for the pane's live lifetime, including moving between
-tabs, but does not survive a full app quit + relaunch. This is a real,
-deliberate scope boundary, not an oversight — if it needs to move, the
-extension point is exactly the "captured, then reapplied once the real pane
-exists" pattern `tasks`/`audit`/`group` already use, just without the
-dormancy step to hang it on.
+**Why these kinds survive a whole-group resume, and `issues` doesn't.**
+Orchestration panes are never auto-resumed on app restart (`panerestore.ts`'s
+`dormant-group` — the human clicks Resume, deliberately, to avoid a
+credit/process-storm on every boot). That dormancy is what gives a docked
+view a natural restore hook, and it has NOTHING to do with which view it
+is: the docked-view preferences ride the SAME path `role` and `sessionId`
+already ride — captured into the dormant placeholder's record (`main.ts`'s
+`case "dormant-group"`), read back off it in `resumeDormantGroup`, and
+matched — by session id, the same key `planGroupResume` itself matches on
+— to the pane that comes back once `resumeOrchSession` actually resolves
+(`Pane.restoreEmbeds`, plural — it iterates every entry and re-docks each
+to its own recorded edge). `Pane.capture()` writes an `embeds` entry for a
+currently-docked kind that is BOTH in `RESTORABLE_EMBED_KINDS` AND on a
+pane where `kind === "orch"` — the FIRST half is what `tasks`/`audit`/
+`group`/`git`/`editor` all satisfy and `issues` doesn't; the SECOND half
+(an orch pane specifically) is what every one of them needs regardless.
+
+`git`, `editor`, and `issues` are ALL embeddable on EVERY pane kind
+(including a plain terminal), not just orchestrator panes — but only an
+ORCHESTRATOR pane has the dormant-placeholder indirection above at all; a
+plain terminal/agent pane restore has none of it — it re-spawns directly,
+immediately, with nothing "captured, then reapplied later" to hook a
+preference onto. Threading that through would mean adding an embeds field
+to every other `RestoreAction` variant (`spawn-terminal`/`fresh-agent`/
+`dormant-agent`/…) and a matching apply-call at each of `main.ts`'s several
+live-pane-creation sites — real additional plumbing, a materially bigger
+lift than widening `RESTORABLE_EMBED_KINDS` was. So docking `git`/`editor`/
+`issues` on a PLAIN pane is fully functional for the pane's live lifetime
+(including moving between tabs) but does not survive a full app quit +
+relaunch, regardless of which of the three it is — that limitation is
+about the PANE, not the view. Docking any of the three on an ORCHESTRATOR
+pane specifically DOES now survive, except `issues` — which was left out
+of `RESTORABLE_EMBED_KINDS` simply because this round's ask was `git` and
+`editor`, not because there's a technical reason it couldn't join them:
+the exact same one-line widening that added `git`/`editor` would add it
+too, whenever that's actually wanted.
+
+A restored `git`/`editor` never restores its OWN content (which commit was
+selected; which file was open) — only the DOCK preference (side + share),
+identical to how a restored `group`/`tasks`/`audit` never restores its own
+scroll position or filter either. For the editor specifically: this is the
+SAME rule #217's own `openPathRel` doc comment already states for the
+content-pane case ("the buffer is deliberately never persisted... the
+file is re-read from disk on restore") — nothing new needed here, the
+dockable overlay's restore simply never carries a file path at all, so a
+restored docked editor comes back the same way it does after ANY session
+restart today: root-less, showing "Pick a folder to browse," exactly
+where a freshly-docked one starts.
 
 **This is the one place today a captured per-pane UI preference is threaded
 through a whole-group resume** — every OTHER overlay's open/closed state has
@@ -872,7 +1038,9 @@ lifecycle panel):**
     git/issues/file-editor there (`refuseOverlay`, unchanged) — there is no
     terminal on a content pane to share space with.
 
-**Restart survival (orchestration-family views only):**
+**Restart survival (`tasks`/`audit`/`group`/`git`/`editor`, on an
+ORCHESTRATOR pane specifically — not `issues`, and not any of the five on a
+plain terminal/agent pane):**
 
 12. Dock the task board left and the group panel bottom, quit and relaunch
     loomux with that group's tab still around — it should restore dormant
@@ -889,39 +1057,60 @@ lifecycle panel):**
     before quitting (near its floor) — on Resume it should come back at
     least as tall as the group panel's CURRENT measured chrome, not
     clipped, even if that floor grew between sessions.
-13. Embed git or issues on a plain terminal or agent pane, then quit and
-    relaunch — confirm it comes back as the floating overlay (the
-    documented, deliberate scope boundary above), not docked and not
-    missing entirely.
+13. Dock git RIGHT and the file editor BOTTOM on an orchestrator pane (#361
+    scope increase), quit and relaunch, Resume — both should come back
+    docked on their original edges, same as step 12. The editor should come
+    back with NO file open (root-less, "Pick a folder to browse") — it
+    never persists which file was open, matching the #217 content-pane
+    editor's own documented behavior; only the dock side/share round-trips.
+14. Embed git, the file editor, or issues on a PLAIN terminal or agent pane
+    (not an orchestrator pane), then quit and relaunch — confirm all three
+    come back as the floating overlay (the documented, deliberate scope
+    boundary above: no dormant-placeholder hook exists for a non-orch pane
+    at all), not docked and not missing entirely.
+15. Embed issues on an ORCHESTRATOR pane specifically, quit and relaunch —
+    confirm it ALSO comes back as the floating overlay, not docked. This is
+    the one case in this list that's expected to NOT survive even on an orch
+    pane — `issues` was deliberately left out of `RESTORABLE_EMBED_KINDS`
+    this round (see the design note's persistence section for why that's a
+    scoping choice, not a technical limitation).
 
 **Overlay toggle vs. dock (#361 user-demo finding):**
 
-14. Dock a view (any of the five) to any edge and leave it open. Click the
+16. Dock a view (any of the six) to any edge and leave it open. Click the
     PANE HEADER's own toggle button for that view (not its embed button —
-    the plain header icon, e.g. the git/task-board/audit/group/issues
-    button) — nothing should happen: no black/empty area where the panel
-    was, the button should already read as visibly dimmer/disabled, and
-    hovering it should show a tooltip like "…is docked — un-embed it (its
-    side menu) to use this". This is the exact bug: before the fix, this
-    click closed/reparented the view but left the slot's own panel+divider
-    sitting there empty.
-15. Same setup — press the matching KEYBINDING (Alt+G/T/A/O/I) instead of
+    the plain header icon, e.g. the git/task-board/audit/group/issues/
+    file-editor button) — nothing should happen: no black/empty area where
+    the panel was, the button should already read as visibly
+    dimmer/disabled, and hovering it should show a tooltip like "…is docked
+    — un-embed it (its side menu) to use this". This is the exact bug:
+    before the fix, this click closed/reparented the view but left the
+    slot's own panel+divider sitting there empty.
+17. Same setup — press the matching KEYBINDING (Alt+G/T/A/O/I/F) instead of
     clicking the button. A toast should appear ("… is docked — un-embed it
     …") and nothing else should change. Repeat via the view's own internal
     ✕ button (should be visibly disabled with a matching tooltip) and, for
     git, the pane header's branch-name label (not a real button, so no
     disabled state — but clicking it should also just toast, not close
-    anything).
-16. Open the embed menu and click **Un-embed** — the view returns to the
+    anything). For the file editor specifically: make the buffer DIRTY
+    first, THEN press Escape or click the (disabled) ✕ — the discard-confirm
+    dialog must NOT appear at all; it should behave exactly like every
+    other docked view's toggle (toast/no-op), never popping "discard unsaved
+    changes?" for a click that wouldn't actually close anything (#361
+    scope-increase finding — `shouldConfirmDiscardBeforeClose`).
+18. Open the embed menu and click **Un-embed** — the view returns to the
     floating overlay, and the SAME header button / keybinding / internal ✕
     that just no-op'd should now close it normally; re-toggling should
     reopen it normally. Confirm this for at least two different views, not
     just one — the fix is centralized, but worth confirming it isn't
-    accidentally view-specific.
+    accidentally view-specific. For the file editor: un-embed it WITH a
+    dirty buffer, then close it via Escape/✕ — the discard-confirm dialog
+    SHOULD appear now (undocked behaves exactly as it always has), and
+    declining should leave it open with the edits intact.
 
 **Audit log performance while docked (#361 user-demo finding):**
 
-17. On a group with a large audit log (a long-running session, or grep
+19. On a group with a large audit log (a long-running session, or grep
     `audit.jsonl`'s line count directly to confirm it's in the hundreds or
     thousands), dock the audit log to any edge. Drag its divider hard, back
     and forth, repeatedly — it should feel as smooth as dragging any other
@@ -929,22 +1118,22 @@ lifecycle panel):**
     Compare against dragging the SAME divider before this fix (or against
     another, smaller view's divider) if you want a direct before/after
     feel.
-18. While docked and open, scroll the audit list to the very top — a small
+20. While docked and open, scroll the audit list to the very top — a small
     italic line ("N earlier entries — scroll up to load more") should
     appear, and scrolling further should load more of the backlog, keeping
     your place (the view should NOT jump back to the top or bottom when
     older entries are prepended).
-19. Turn on live-follow (▶ follow) while scrolled up reading old entries —
+21. Turn on live-follow (▶ follow) while scrolled up reading old entries —
     new entries arriving must NOT yank your scroll position back to the
     tail. Scroll back down to the bottom yourself — follow should resume
     normal live-tailing (auto-scroll to newest) from there, same as before
     this change.
-20. Drag the divider while the audit log is actively following (new entries
+22. Drag the divider while the audit log is actively following (new entries
     arriving during the drag) — should stay smooth; no correctness issue
     expected (follow's own poll is on a 1.5s timer, independent of the
     drag), but worth a look since it's the one path that combines both
     fixes.
-21. With the audit log (or any docked view) open, start dragging its
+23. With the audit log (or any docked view) open, start dragging its
     divider, then Alt-Tab away to a different application WITHOUT releasing
     the mouse button (or otherwise blur the loomux window mid-drag) — then
     Alt-Tab back. The list must be fully visible and interactive, not a
@@ -957,3 +1146,47 @@ lifecycle panel):**
     well). `test/dragsession.test.ts` pins the underlying exactly-once/
     listeners-removed guarantee against a fake event target; this step is
     the one real-DOM confirmation nothing in that pure suite can give.
+
+**Right-dock expand-left smoothness (#361 user-demo finding — no automated
+test possible; this environment has no live-app measurement tool):**
+
+24. Dock any view RIGHT. Drag its divider LEFT (growing the panel,
+    shrinking the terminal), then RIGHT (shrinking the panel back) — both
+    directions should feel exactly as smooth as dragging a LEFT-docked or
+    BOTTOM-docked view's divider in either direction. This is the specific
+    gesture reported laggy before `embedTermWrapEl`. If it's still
+    noticeably worse than left/bottom, the confirmed structural asymmetry
+    this fix removed wasn't the only (or the real) cause — flag for a
+    follow-up with an actual profiler trace, which this session's tooling
+    couldn't produce (see the design note's "Right-dock expand-left lag"
+    section for exactly what was and wasn't verifiable here).
+
+**Git view and file editor as newly-dockable views (#361 scope increase):**
+
+25. Dock git to any edge — should behave identically to every other view in
+    every respect already covered above (side-picker menu, single-occupant
+    swap, divider math, restart survival on an orch pane). Nothing new to
+    verify here beyond confirming it: git was already wired into this
+    engine from an earlier round.
+26. Dock the file editor to any edge. Open a file, edit it (don't save) so
+    the dirty dot appears — the pane should resize and the divider should
+    drag exactly like any other docked view's, with no PTY-resize
+    irregularity tied to having an unsaved buffer open.
+27. With the SAME dirty, docked editor: kill the PANE itself (its ✕, or a
+    dock-chip ✕ if minimized, or Ctrl+Shift+W) — the #219 discard-confirm
+    dialog MUST appear (this is the real data-loss risk the toggle-no-op
+    change above deliberately does NOT touch — see the design note's "#219
+    interaction" section). Decline it — the pane must stay open, edits
+    intact, still docked. Confirm it — the pane (and the docked editor with
+    it) closes.
+28. Same setup once more: quit the WHOLE APP with a dirty, docked editor
+    open somewhere — the app-quit guard's consolidated dirty-buffer prompt
+    must list it (labelled the same way an Alt+F overlay's buffer always
+    has been — "pane" vs "overlay" labelling is unchanged by docking).
+    Cancelling the quit must leave the buffer exactly as it was.
+29. Open a SECOND file while the editor is docked (via the tree, or "Go to
+    file") — should behave identically to overlay mode: if the current
+    buffer is dirty, the SAME #219 discard-confirm gates the switch (this
+    path was never routed through the toggle at all, so it was never at
+    risk from this round's toggle-no-op change — confirming that is the
+    point of this step).

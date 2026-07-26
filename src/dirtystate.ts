@@ -19,6 +19,20 @@ export function closeDecision(dirty: boolean): CloseDecision {
   return dirty ? "confirm" : "close";
 }
 
+/** Should the discard-confirm dialog appear before closing (#361 user-demo
+ *  finding — the file editor's overlay/embed toggle)? DOCKED wins
+ *  unconditionally: the underlying toggle is a no-op while docked
+ *  (`embedToggleAction`, embedtoggle.ts — only "Un-embed" actually closes a
+ *  docked view now), so popping "discard unsaved changes?" ahead of a click
+ *  that won't close anything would be worse than merely unnecessary — a
+ *  "yes" answer would discard real edits for NO reason, since the panel
+ *  stays open regardless of the answer. Not docked falls back to the plain
+ *  #219 rule (`closeDecision`) unchanged. */
+export function shouldConfirmDiscardBeforeClose(docked: boolean, dirty: boolean): boolean {
+  if (docked) return false;
+  return closeDecision(dirty) === "confirm";
+}
+
 /** Whether the file changed on disk since it was opened: the hash captured at
  *  read time no longer matches the current on-disk hash. The backend enforces
  *  this on write (returning a `conflict` error); this mirror lets the frontend
