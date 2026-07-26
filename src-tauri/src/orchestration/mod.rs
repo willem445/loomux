@@ -11676,6 +11676,33 @@ impl OrchRegistry {
     /// truly nobody is. A stale read is impossible by construction — this
     /// takes the same lock `compact_nudge_tick` itself locks, read fresh
     /// every call, never cached.
+    ///
+    /// rev-25 review, cost of that breadth named explicitly (deliberate, not
+    /// overlooked): ONE pending arm anywhere upgrades the poll cadence for
+    /// EVERY agent everywhere, not just the affected one — `agent_compact_
+    /// signals` (what the faster cadence makes run more often) reads every
+    /// agent's FULL pty tail (`PtyManager::output_tail`, capped at
+    /// `OUTPUT_RING_CAP` = 256 KiB) and ANSI-strips it, gated only on having
+    /// a pty at all, not on pending/eligibility. Measured bound: at 6
+    /// wakes/min (the 10s fast cadence) that's ≤ 256 KiB × 6 = 1.5 MiB/min
+    /// PER AGENT, sub-1 MiB/s in aggregate even for a large fleet (tens of
+    /// agents); normal sessions see this for seconds, not minutes, since
+    /// most arms resolve on the very next fast wake. The theoretical worst
+    /// case for how long the elevated cadence can run at all is bounded by
+    /// the state machine itself — `ARM_PENDING_TIMEOUT_MS` (5 min) if an arm
+    /// never resolves, or up to `MAX_REINJECT_ATTEMPTS` (3) ×
+    /// `REINJECT_CONFIRM_TIMEOUT_MS` (5 min) if it resolves just before
+    /// timing out and then every retry stalls — under 20 minutes either way,
+    /// never unbounded. If this bound ever needs tightening in practice, two
+    /// cheap options, neither built speculatively here: (a) scope the fast
+    /// cadence per-group instead of registry-wide (this fn becomes `any_
+    /// compact_pending_in(group)`, and `start_compact_nudge` would need one
+    /// loop iteration per group or a per-group sleep instead of one shared
+    /// sleep); (b) have `agent_compact_signals` skip the tail read entirely
+    /// for an agent that is neither `compact_pending` nor otherwise
+    /// eligible for compact-nudge's inference detectors, so the elevated
+    /// cadence's extra cost lands only on agents it could possibly matter
+    /// for.
     pub fn any_compact_pending(&self) -> bool {
         self.agents.lock_safe().values().any(|a| a.compact_pending)
     }

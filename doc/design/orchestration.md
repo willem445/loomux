@@ -2770,6 +2770,22 @@ iteration cannot oscillate faster than the loop itself already runs, so there is
 state to get wrong. Idle cost is zero: the fast branch is only ever taken while a real compaction
 cycle is genuinely in flight, which is a small fraction of a session's wall-clock time.
 
+**The fast-poll scope is registry-wide, and that breadth is deliberate** (rev-25 review, named
+explicitly rather than left implicit): one pending arm ANYWHERE in the registry upgrades the poll
+cadence for EVERY agent everywhere, not just the one that's actually waiting — `agent_compact_
+signals` (what runs more often at the faster cadence) reads every agent's full pty tail, capped at
+`OUTPUT_RING_CAP` = 256 KiB, and ANSI-strips it, gated only on the agent having a live pty, not on
+being pending or otherwise eligible. Measured bound: ≤ 256 KiB × 6 wakes/min ≈ 1.5 MiB/min per
+agent at the fast cadence — sub-1 MiB/s in aggregate even across a large fleet (tens of agents) —
+and the window this can run for at all is bounded by the state machine itself
+(`ARM_PENDING_TIMEOUT_MS`, 5 min, or up to `MAX_REINJECT_ATTEMPTS` × `REINJECT_CONFIRM_TIMEOUT_MS`,
+15 min, if a resolved arm's retries all stall) — under ~20 minutes worst case, never unbounded, and
+in the normal case seconds rather than minutes since most arms resolve on the very next fast wake.
+Two cheap options if this bound ever needs tightening in practice, neither built speculatively
+here: scope the fast cadence per-group instead of registry-wide, or have `agent_compact_signals`
+skip the tail read for an agent that is neither pending nor otherwise eligible for compact-nudge's
+inference detectors.
+
 **Badge honesty.** `awaiting_evidence` with `source: "hook"` is the phase a hook-sourced arm lands
 in IMMEDIATELY (it sets `compact_seen_busy` at arm time — see `compaction_status`'s doc — so it
 skips "armed" entirely on the very first tick) and is exactly the phase the live re-test sat in.
