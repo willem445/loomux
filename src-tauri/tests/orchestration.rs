@@ -28,21 +28,23 @@ use loomux_lib::orchestration::{
     workflow_mode_notice,
     GhGate, GitTagPush,
     normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
-    paste_held_notice,
-    prompt_wait_detected, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
-    sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
-    should_flush_before_paste,
+    paste_held_notice, question_held_notice, held_delivery_notice,
+    prompt_wait_detected, question_hold_predicate, mask_own_paste, resolve_paste_gate, resolve_ref_url, rotate_audit_if_needed,
+    retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
+    should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
+    record_aborted_preenter_outcome, recorded_confirmed,
     should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentRecord, AttentionItem, Caller, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision,
+    AgentRecord, AttentionItem, Caller, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
 };
+use loomux_lib::pty::PtyManager;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -958,6 +960,34 @@ fn paste_held_notice_fires_only_for_a_non_orchestrator_target() {
     // Target IS the orchestrator: a notice to it is itself a delivery to it — an
     // endless loop. Never notify.
     assert!(!should_notify_paste_held(true));
+}
+
+#[test]
+fn question_held_notice_names_the_agent_and_points_at_answering() {
+    // #420: the recovery move for a question-held delivery is "answer the
+    // question", not "re-send" or "clear the box" — re-sending alone won't
+    // help until a human has actually answered.
+    let msg = question_held_notice("w-9");
+    assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
+    assert!(msg.contains("w-9"), "notice must name the held agent: {msg}");
+    assert!(msg.contains("question"), "notice must state the condition: {msg}");
+    assert!(msg.to_lowercase().contains("answer"), "notice must point at answering: {msg}");
+    assert!(!msg.contains("unsubmitted"), "question notice is not the unconfirmed one: {msg}");
+}
+
+#[test]
+fn held_delivery_notice_dispatches_text_by_reason() {
+    // #111/#420: the orchestrator-facing notice text differs by why the
+    // delivery was held — box-occupied points at re-sending, a live question
+    // points at answering. `Typing` never aborts a delivery (its cap delivers
+    // anyway), so it has no notice of its own; it falls back to the
+    // box-occupied text like any other non-question abort would.
+    assert_eq!(held_delivery_notice("w-9", HeldReason::BoxOccupied), paste_held_notice("w-9"));
+    assert_eq!(held_delivery_notice("w-9", HeldReason::InteractiveQuestion), question_held_notice("w-9"));
+    assert_ne!(
+        held_delivery_notice("w-9", HeldReason::BoxOccupied),
+        held_delivery_notice("w-9", HeldReason::InteractiveQuestion),
+    );
 }
 
 #[test]
@@ -8693,6 +8723,49 @@ fn prompt_wait_detected_spots_prompts_not_chatter() {
 // pipeline, not a pre-cleaned string.
 const FIX_CLAUDE_ASK: &str = include_str!("fixtures/attention/claude-askuserquestion.txt");
 const FIX_COPILOT_ASK: &str = include_str!("fixtures/attention/copilot-question.txt");
+// #420 rev-15 N3: a genuine multi-choice (non-yes/no) Copilot question, built
+// to exercise a DIFFERENT detector signal than copilot-question.txt (whose
+// pointer sits in the last painted lines and carries a footer, so it already
+// matches `has_pointer_option`/`has_menu_footer` — signals `pos-pointer-last-
+// line.txt` and `claude-askuserquestion.txt` already cover). Here the trailing
+// "Copilot is thinking..." status line pushes the pointer+numbered option OUT
+// of the last-3-lines window (no footer either), so ONLY the structured
+// `has_numbered_menu` signal (the `❯ 1.` substring, read across the whole
+// 12-line window, not just the last 3) can catch it — a rev-15-neutralized
+// `has_numbered_menu` makes this specific fixture undetected while the other
+// three positives keep passing.
+//
+// #420 rev-19 N11: this fixture (and copilot-question.txt above it) is a
+// PLAUSIBLE, hand-built approximation of Copilot's TUI style, not a verified
+// live capture — an exhaustive search of this repo's history and every
+// group's audit-log archive on this machine turned up no real captured
+// Copilot multi-choice menu, and CLAUDE.md constraint 3 forbids spawning a
+// real Copilot CLI to obtain one in-session. `claude-mcp-approval.txt`
+// (below) is what actually closes that gap: a REAL numbered-menu capture
+// from a live session's own audit log, verbatim (respaced only — the
+// `get_output` MCP tool's logged `text` field collapses whitespace runs, a
+// pre-existing artifact of that logging path, not of the terminal itself).
+// It's Claude Code's, not Copilot's, but `prompt_wait_detected` and
+// `has_numbered_menu` are CLI-agnostic by construction (the whole guard is,
+// per rev-15 N5) — a verified-real multi-choice menu proves the signal
+// against reality regardless of which CLI painted it. This file remains
+// useful for the DIFFERENT thing it isolates (the signal alone, footer-less,
+// scrolled out of the prose-guard's last-3-line window) but is explicitly
+// NOT the "proven against reality" fixture; that's the one below.
+const FIX_COPILOT_MULTICHOICE: &str = include_str!("fixtures/attention/copilot-multichoice-question.txt");
+// #420 rev-19 N11: a REAL captured interactive-question menu — Claude Code's
+// MCP-server approval dialog, verbatim from a live session's own audit log
+// (respacing only, see the note above; wording, numbering, and footer are
+// exactly as captured). rev-19 n2 correction: this capture's footer survived
+// too, so it witnesses `has_numbered_menu` AND `has_menu_footer` TOGETHER,
+// not `has_numbered_menu` in isolation — it is NOT a sole-signal witness.
+// Sole-signal isolation for `has_numbered_menu` specifically is what
+// `copilot-multichoice-question.txt` (above) is built for (synthetic, with
+// the footer/pointer deliberately absent). What this fixture grounds is
+// simpler and narrower: that the COMBINED shape `has_numbered_menu`/`has_
+// menu_footer` already cover is something a real CLI genuinely paints, not
+// only something imagined to test the detector's branches.
+const FIX_CLAUDE_MCP_APPROVAL: &str = include_str!("fixtures/attention/claude-mcp-approval.txt");
 const FIX_STREAMING: &str = include_str!("fixtures/attention/streaming-output.txt");
 const FIX_IDLE_BOX: &str = include_str!("fixtures/attention/idle-input-box.txt");
 // Finished-turn agent output that *mentions* interactive-UI cues but is not a
@@ -8733,6 +8806,370 @@ fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
         prompt_wait_detected(&strip_ansi(FIX_POS_PTR_LAST.as_bytes())),
         "a pointer as the last painted line is a genuine prompt-wait"
     );
+    // #420 rev-15 N3: a numbered/radio-select Copilot question whose pointer
+    // has scrolled out of the last-3-lines window (a trailing status line
+    // follows it) — only `has_numbered_menu`'s whole-window substring check
+    // catches this, not the pointer/footer signals the other fixtures above
+    // already exercise. This is the case a delivery landing mid-dialog would
+    // silently answer by selecting whichever option the Enter lands on.
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_COPILOT_MULTICHOICE.as_bytes())),
+        "a numbered multi-choice Copilot question must be recognized as needing the human"
+    );
+    // #420 rev-19 N11: the REAL captured menu (see the fixture's own doc
+    // comment for provenance and the n2 correction — it witnesses
+    // `has_numbered_menu` combined with `has_menu_footer`, not either signal
+    // alone) — proves that combined shape against an actual screen paint,
+    // not an imagined one.
+    assert!(
+        prompt_wait_detected(&strip_ansi(FIX_CLAUDE_MCP_APPROVAL.as_bytes())),
+        "a real captured multi-choice menu must be recognized as needing the human"
+    );
+}
+
+// ---------- #420 rev-19 R1/B4: question_hold_predicate ----------
+//
+// `wait_for_question_clear`'s old production-bound form took a concrete
+// `&PtyManager`, so nothing but a live pty could ever exercise it — a test
+// could disable the whole guard and every existing test still passed
+// (rev-15's neutralized-predicate finding). `question_hold_predicate` is the
+// fix: fully generic over every external read, so these tests drive the REAL
+// decision logic with scripted closures, no PtyManager, no real PTY.
+//
+// rev-19 R1: release is now STATE-based, not activity-based — the predicate
+// no longer takes ANY human-input signal at all (the old `last_input_ms`/
+// `input_pending`/`held_since_ms` params are gone from the signature), so an
+// arrow key navigating the still-open menu or xterm's automatic OSC/DCS query
+// replies (#179) structurally CANNOT release a hold anymore — there is no
+// input left in the type to fool it with. Release requires the SAME detector
+// that raised the hold to read false on two CONSECUTIVE polls.
+//
+// rev-19 B-A: self-echo exclusion is now CONTENT-based (`mask_own_paste`),
+// not byte-COUNT-based — the predicate takes `pasted_text: Option<String>`
+// instead of a growth baseline. A byte-count baseline can only mark ONE point
+// in time as "before"; a dialog that renders WHILE the paste is still
+// settling gets baked into whichever number a checkpoint happened to
+// snapshot and reads as invisible forever. Masking doesn't have that blind
+// spot: `deliver_prompt` knows exactly what it pasted, so removing those
+// exact lines from the tail leaves whatever the CLI itself painted, no
+// matter when it painted it relative to our own paste's timing.
+
+#[test]
+fn question_hold_predicate_ignores_self_echo_of_our_own_just_pasted_text() {
+    // rev-15 N1: the pre-Enter/retry checkpoints read the tail AFTER loomux's
+    // own paste — so a delivered prompt that happens to contain phrasing
+    // `prompt_wait_detected` matches ("(y/n)", "do you want to run") sits,
+    // echoed and unsubmitted, in that exact tail. Masked out (every line of
+    // the tail IS a pasted line here), this must NOT read as a live question.
+    let text = "Do you want to run npm test? (y/n)";
+    let pred = question_hold_predicate(move || Some(text.as_bytes().to_vec()), Some(text.to_string()));
+    assert!(!pred(), "our own pasted text, masked out, must read as self-echo, not a live question");
+}
+
+#[test]
+fn question_hold_predicate_holds_for_a_real_dialog_appended_after_our_own_paste() {
+    // The tail contains BOTH our own pasted text AND a genuinely separate
+    // dialog painted after it — masking removes only our own lines, leaving
+    // the dialog fully visible to the detector.
+    let pasted = "please rerun the deploy script and let me know how it goes";
+    let tail = format!("{pasted}\n\nDo you want to run npm test? (y/n)");
+    let pred = question_hold_predicate(move || Some(tail.as_bytes().to_vec()), Some(pasted.to_string()));
+    assert!(pred(), "a dialog appended after our own (masked-out) paste must still hold");
+}
+
+#[test]
+fn question_hold_predicate_pre_paste_checkpoint_has_no_self_echo_risk() {
+    // The pre-paste checkpoint runs before this delivery has written
+    // anything — `pasted_text: None` — so a live question already on screen
+    // must hold; there is nothing of OURS on screen yet to mask.
+    let pred = question_hold_predicate(|| Some(b"Do you want to run npm test? (y/n)".to_vec()), None);
+    assert!(pred(), "pre-paste checkpoint: no self-echo possible, a live question must hold");
+}
+
+#[test]
+fn question_hold_predicate_is_false_for_ordinary_output_and_a_closed_pty() {
+    let ordinary = question_hold_predicate(
+        || Some(b"Running cargo test...\ntest result: ok. 42 passed".to_vec()),
+        None,
+    );
+    assert!(!ordinary(), "ordinary streaming output must not read as a question");
+
+    let closed = question_hold_predicate(|| None, None);
+    assert!(!closed(), "a closed/gone pane must never block delivery");
+}
+
+#[test]
+fn question_hold_predicate_ignores_activity_the_menu_is_still_open() {
+    // rev-19 R1: no input signal exists in the type anymore for an arrow key
+    // (a `HumanInput::Neutral` write — no text left sitting) or an automatic
+    // terminal-query reply to fool the release with. As long as the SAME
+    // matching tail is observed, the predicate must hold no matter how many
+    // times it's polled.
+    let pred = question_hold_predicate(|| Some(FIX_COPILOT_ASK.as_bytes().to_vec()), None);
+    for i in 0..5 {
+        assert!(pred(), "poll {i}: menu still on screen — must never release regardless of poll count");
+    }
+}
+
+#[test]
+fn question_hold_predicate_requires_two_consecutive_clear_reads_to_release() {
+    // rev-19 R1: a single false read could be a transient mid-redraw miss —
+    // release requires the detector to read false TWICE in a row once a hold
+    // has genuinely started.
+    let call = std::sync::atomic::AtomicU32::new(0);
+    let pred = question_hold_predicate(
+        move || {
+            let n = call.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 { Some(FIX_COPILOT_ASK.as_bytes().to_vec()) } else { Some(b"idle input box".to_vec()) }
+        },
+        None,
+    );
+    assert!(pred(), "poll 1: question shown -> hold");
+    assert!(pred(), "poll 2: first clear read -> still hold (only one so far)");
+    assert!(!pred(), "poll 3: second consecutive clear read -> release");
+}
+
+#[test]
+fn question_hold_predicate_releases_on_first_poll_when_never_shown_a_question() {
+    // rev-19 N10: a checkpoint that starts already-clear (the question was
+    // answered, or never existed, before this hold began) must release
+    // IMMEDIATELY — the two-consecutive-clear requirement only engages once a
+    // hold has actually observed a question at least once; it must never
+    // penalize the overwhelmingly common "nothing to hold for" case with an
+    // artificial delay.
+    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), None);
+    assert!(!pred(), "never shown a question — the very first call must release immediately");
+}
+
+#[test]
+fn question_hold_predicate_wired_into_the_generic_hold_loop_releases_immediately_when_already_clear() {
+    // rev-19 N10, through the REAL hold_for_human_input loop (not just the
+    // predicate in isolation): held_ms must be 0 — no cap ride — when the
+    // question was already gone at hold start.
+    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), None);
+    let out = hold_for_human_input(&pred, Duration::from_secs(5), HB_POLL);
+    assert_eq!(out, PasteDecision::Paste { held_ms: 0 }, "already-clear must release on the very first check, no cap ride");
+}
+
+#[test]
+fn question_hold_predicate_wired_into_the_generic_hold_loop_releases_once_the_menu_clears_twice() {
+    // #40 lesson, applied to #420: exercise the LOOP, not just the pure
+    // decision. `hold_for_human_input` is the same generic block-until-clear
+    // loop the box-occupied guard already uses; here the predicate shows a
+    // question for a few polls, then the detector itself genuinely clears —
+    // proving the state-based release (rev-19 R1) composes correctly with
+    // the real loop, no PtyManager involved.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let polls = AtomicU32::new(0);
+    let pred = question_hold_predicate(
+        move || {
+            let n = polls.fetch_add(1, Ordering::Relaxed);
+            if n < 3 { Some(FIX_COPILOT_ASK.as_bytes().to_vec()) } else { Some(b"idle input box".to_vec()) }
+        },
+        None,
+    );
+    let out = hold_for_human_input(&pred, Duration::from_secs(5), HB_POLL);
+    match out {
+        PasteDecision::Paste { held_ms } => {
+            assert!(held_ms < 4000, "must release once the menu clears, well under the cap, got {held_ms}ms");
+        }
+        other => panic!("expected Paste once the menu clears, got {other:?}"),
+    }
+}
+
+// ---------- #420 rev-19 B-A: mask_own_paste + the exact real-PtyManager scratch shape rev-19 used ----------
+
+#[test]
+fn mask_own_paste_removes_exactly_our_own_lines() {
+    let pasted = "please rerun the deploy script and let me know how it goes\nit failed last time (y/n) was never even asked";
+    let tail = format!("{pasted}\n\nDo you want to run npm test? (y/n)");
+    let masked = mask_own_paste(&tail, pasted);
+    assert!(!masked.contains("rerun the deploy script"), "our own pasted lines must be removed: {masked}");
+    assert!(masked.to_lowercase().contains("do you want to run npm test"), "the dialog's own line must survive: {masked}");
+}
+
+#[test]
+fn mask_own_paste_leaves_nothing_when_the_tail_is_only_our_own_paste() {
+    let pasted = "Do you want to run npm test? (y/n) — that's literally what my report says";
+    let masked = mask_own_paste(pasted, pasted);
+    assert!(!prompt_wait_detected(&masked), "a paste that IS only our own text must mask away to nothing question-shaped: {masked:?}");
+}
+
+#[test]
+fn question_hold_predicate_on_a_real_ptymanager_holds_for_a_dialog_seeded_alongside_a_large_paste_but_not_for_the_pastes_own_matching_text() {
+    // rev-19 B-A's own reproduction shape, pinned here against a REAL
+    // PtyManager (not scripted closures) so the whole path — output_tail_
+    // bounded, strip_ansi, mask_own_paste, prompt_wait_detected — is
+    // exercised together, the same way rev-19's scratch test demonstrated
+    // the round-3 regression.
+    let large_paste = "Please review the attached report and let me know if the retry logic \
+        looks right. The deploy failed twice yesterday and once the day before, and I want to \
+        make sure we're not silently retrying into a broken state. Let me know your thoughts \
+        whenever you get a chance — no rush, but I'd like this DONE before the next release."
+        .to_string();
+
+    // Case 1: a genuine dialog seeded ALONGSIDE the large paste (the
+    // canonical #420 timeline — Copilot painted a dialog while/after loomux
+    // pasted) — must hold.
+    let pm = PtyManager::default();
+    let seeded_dialog_tail = format!("{large_paste}\n\nDo you want to run npm test? (y/n)");
+    pm.register_fake_for_test(10, seeded_dialog_tail.as_bytes());
+    let pred1 = question_hold_predicate(
+        || pm.output_tail_bounded(10, 4096),
+        Some(large_paste.clone()),
+    );
+    assert!(pred1(), "a dialog seeded alongside a large paste must still be detected as active");
+
+    // Case 2: the large paste ALONE, on screen with nothing else — even
+    // though its OWN prose carries a matching phrase ("(y/n)"), proving
+    // masking, not luck.
+    let self_matching_paste = format!("{large_paste}\nDo you want to run npm test? (y/n)");
+    let pm2 = PtyManager::default();
+    pm2.register_fake_for_test(11, self_matching_paste.as_bytes());
+    let pred2 = question_hold_predicate(
+        || pm2.output_tail_bounded(11, 4096),
+        Some(self_matching_paste.clone()),
+    );
+    assert!(!pred2(), "a large paste whose OWN text matches the detector must mask away to not-held");
+}
+
+// ---------- #420 rev-15 B1 / rev-19 N9: flush + retry gating ----------
+
+#[test]
+fn should_flush_before_paste_now_is_suppressed_by_a_live_question() {
+    // rev-15 B1: the stranded-text flush is the FIRST write `deliver_prompt`
+    // makes — before the interactive-question checkpoint that follows it
+    // ever runs. Without this gate, a question already on screen from BEFORE
+    // this delivery started would eat the flush's Enter.
+    assert!(
+        should_flush_before_paste(Some(false), false),
+        "sanity: the base decision alone would flush here"
+    );
+    assert!(
+        !should_flush_before_paste_now(Some(false), false, true),
+        "a live question must suppress the flush even when the base decision says to flush"
+    );
+    assert!(
+        should_flush_before_paste_now(Some(false), false, false),
+        "with no question active, the base decision still governs"
+    );
+}
+
+#[test]
+fn retry_gate_holds_for_a_question_or_writes_once_clear() {
+    // rev-15 B2: a question appearing in the retry window means HOLD, not
+    // retry. rev-19 N9: `retry_gate` only ever sees the question hold's
+    // outcome now — the caller's own human-typing check already `break`s
+    // BEFORE this is ever called (see mod.rs's retry loop), so there is no
+    // `SkipHumanTyping` arm left to be dead code with an `unreachable!()`
+    // panic risk sitting in it on a detached thread.
+    assert_eq!(
+        retry_gate(PasteDecision::Abort { held_ms: 120_000 }),
+        RetryGate::SkipQuestionPending { held_ms: 120_000 },
+        "a question that never cleared within the cap must skip this retry, not blind-fire it"
+    );
+    assert_eq!(
+        retry_gate(PasteDecision::Paste { held_ms: 0 }),
+        RetryGate::Write { held_ms: 0 },
+        "no question in the way — write the retry"
+    );
+    assert_eq!(
+        retry_gate(PasteDecision::Paste { held_ms: 500 }),
+        RetryGate::Write { held_ms: 500 },
+        "a question that cleared within the cap still ends in a write, just held first"
+    );
+}
+
+// ---------- #420 rev-15 B3 / rev-19 R3: pre-Enter abort must leave a traceable outcome ----------
+
+#[test]
+fn a_recorded_unconfirmed_outcome_makes_the_next_deliverys_flush_fire() {
+    // rev-15 B3: the pre-Enter abort pastes text and then withholds the
+    // Enter — the ONLY way the next delivery's stranded-text flush can see
+    // that text is stranded is if THIS delivery recorded `confirmed: false`.
+    // This test pins the DOWNSTREAM consequence: given that recorded
+    // outcome, and no human typing since, the next delivery's flush decision
+    // must fire. See `record_aborted_preenter_outcome_makes_the_next_
+    // deliverys_flush_actually_fire` below for the end-to-end version that
+    // also proves the recording itself happens (not just its consequence).
+    let recorded_on_abort = false; // DeliveryOutcome::confirmed, as the abort now records it
+    assert!(
+        should_flush_before_paste_now(Some(recorded_on_abort), false, false),
+        "a delivery aborted pre-Enter must leave a `confirmed: false` outcome that the NEXT \
+         delivery's flush decision reads as stranded text to clear"
+    );
+}
+
+// ---------- #420 rev-19 R3: real-PTY wiring tests ----------
+//
+// `flush_stranded_text`/`record_aborted_preenter_outcome` are the EXACT
+// functions `deliver_prompt` calls (not reimplementations of their logic) —
+// these tests drive them against a REAL `PtyManager` backed by a real ConPTY
+// child (`PtyManager::register_fake_for_test`, pty.rs), with no real Tauri
+// AppHandle (unavailable headless) and no real agent CLI (CLAUDE.md
+// constraint 3: the fake's child is a bare `cmd`/`sh` no-op). Mutating either
+// function to bypass its check reds one of these.
+
+#[test]
+fn flush_stranded_text_does_not_enter_when_a_question_is_showing() {
+    let pm = PtyManager::default();
+    let captured = pm.register_fake_for_test(1, FIX_COPILOT_ASK.as_bytes());
+
+    let fired = flush_stranded_text(&pm, 1, Some(false), false, b"\r");
+
+    assert!(!fired, "must not press Enter while a question is on screen");
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "no bytes should have reached the pty: {:?}",
+        captured.lock().unwrap()
+    );
+}
+
+#[test]
+fn flush_stranded_text_enters_when_no_question_is_showing() {
+    let pm = PtyManager::default();
+    let captured = pm.register_fake_for_test(2, b"ordinary streaming output, nothing pending");
+
+    let fired = flush_stranded_text(&pm, 2, Some(false), false, b"\r");
+
+    assert!(fired, "no question on screen — the stranded flush must fire");
+    assert_eq!(&*captured.lock().unwrap(), b"\r");
+}
+
+#[test]
+fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire() {
+    // rev-19 R3(b): chains the REAL recorder (`record_aborted_preenter_
+    // outcome`), the REAL reader pattern `deliver_prompt` uses
+    // (`prev.as_ref().map(|o| o.confirmed)`, mirrored here as `recorded_
+    // confirmed`), and the REAL flush function — not a literal `false` a
+    // test fabricates itself (rev-19's "tautology" finding against the
+    // previous round's version of this test). What this DOES pin: that
+    // `record_aborted_preenter_outcome`'s own insert is correctly read back
+    // by `recorded_confirmed` and correctly drives `flush_stranded_text` to
+    // fire — i.e. the recorder's behavior and the downstream consequence,
+    // exercised through the real extraction rather than a hand-picked bool.
+    // rev-19 n1 correction: what this does NOT pin is that `deliver_prompt`
+    // itself calls `record_aborted_preenter_outcome` at its one call site —
+    // deleting THAT line reds no test (confirmed by trying it and
+    // reverting); that gap is the disposition table's own honest residual,
+    // not something this test closes.
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    let pty_id = 3;
+
+    record_aborted_preenter_outcome(&last_delivery, pty_id, "w-1".to_string());
+
+    let prev_confirmed = recorded_confirmed(&last_delivery, pty_id);
+    assert_eq!(prev_confirmed, Some(false), "an aborted pre-Enter delivery must record itself as unconfirmed");
+
+    let pm = PtyManager::default();
+    let captured = pm.register_fake_for_test(pty_id, b"idle input box, nothing pending");
+    let fired = flush_stranded_text(&pm, pty_id, prev_confirmed, false, b"\r");
+
+    assert!(
+        fired,
+        "the outcome recorded on a pre-Enter abort must make the NEXT delivery's flush actually press Enter"
+    );
+    assert_eq!(&*captured.lock().unwrap(), b"\r");
 }
 
 #[test]
@@ -10279,14 +10716,14 @@ fn delivery_held_notice_fires_for_a_worker_but_not_the_orchestrator() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
     // Worker target, group live: the notice is raised and audited.
-    reg.notify_delivery_held(&g.id, &w.id, false);
+    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::BoxOccupied);
     assert!(
         reg.audit_log(&g.id).iter().any(|e| e.action == "delivery-held-notice"),
         "an aborted worker delivery must raise the held notice"
     );
 
     // Orchestrator target: suppressed (a notice to it is a delivery to it — a loop).
-    reg.notify_delivery_held(&g.id, &o.id, true);
+    reg.notify_delivery_held(&g.id, &o.id, true, HeldReason::BoxOccupied);
     assert_eq!(
         reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
         1,
@@ -10295,12 +10732,31 @@ fn delivery_held_notice_fires_for_a_worker_but_not_the_orchestrator() {
 
     // Paused group: suppressed even for a worker.
     reg.pause_group(&g.id).unwrap();
-    reg.notify_delivery_held(&g.id, &w.id, false);
+    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::BoxOccupied);
     assert_eq!(
         reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
         1,
         "a paused group must not raise the held notice"
     );
+}
+
+#[test]
+fn delivery_held_notice_audits_the_interactive_question_reason() {
+    // #420: the audit entry must carry WHY the delivery was held, distinctly
+    // from the box-occupied case, so the record (and any future filtering on
+    // it) can tell "a human left text in the box" apart from "Copilot is
+    // mid-dialog" — very different recovery moves for a human reading the log.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::InteractiveQuestion);
+    let entry = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-held-notice")
+        .expect("an aborted worker delivery must raise the held notice");
+    assert_eq!(entry.detail["reason"], json!("question"), "got: {}", entry.detail);
 }
 
 // ---------- #72: steering-strip image attachments ----------
@@ -13094,6 +13550,21 @@ fn delivery_held_event_names_the_pane_and_the_reason() {
         delivery_held_detail("w-1", HeldReason::Typing),
         delivery_held_detail("w-1", HeldReason::BoxOccupied),
         "the two hold reasons must read differently to a human watching the pane"
+    );
+
+    // #420: a third hold reason for a live interactive question, distinct from
+    // both of the above.
+    let question = delivery_held_event("w-1", "g-1", 7, HeldReason::InteractiveQuestion);
+    assert_eq!(question["reason"], json!("question"), "got: {question}");
+    assert!(
+        delivery_held_detail("w-1", HeldReason::InteractiveQuestion).to_lowercase().contains("question"),
+        "the question hold's detail must say why: {}",
+        delivery_held_detail("w-1", HeldReason::InteractiveQuestion)
+    );
+    assert_ne!(
+        delivery_held_detail("w-1", HeldReason::InteractiveQuestion),
+        delivery_held_detail("w-1", HeldReason::BoxOccupied),
+        "the question hold must read differently from the box-occupied hold"
     );
 }
 
