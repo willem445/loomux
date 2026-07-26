@@ -153,6 +153,31 @@ so far:
   gate/verdict mechanism to be sent after; this paragraph is about the OPPOSITE case, so it
   says "a custom workflow config" instead.)
 
+- **#398, terse decision-grade reports** — all four files. Every `report(...)` tool-doc bullet now
+  teaches the structured shape (`outcome`/`ref`/`detail_url`/`note`, the note hard-capped ~500
+  chars by the tool itself) instead of the free-text `status`/`summary` pair — every role's report
+  is a **notification, not the record**: the full detail (PR body/comment, issue comment, review
+  body) is posted to GitHub FIRST, and the report just points at it. The legacy shape still works
+  (soft-deprecated: accepted, but no longer taught). `worker.md`'s **Review findings** section and
+  `orchestrator.md`'s worker-reports-a-PR step 2 both flip the request-changes loop the other way:
+  the orchestrator routes one line ("read the findings and revisit"), never the findings
+  themselves — the worker reads them off the PR directly.
+
+- **#398 benchtest follow-up: terse reports still triggered reflexive `gh` re-reads** (live
+  testbed run, loomux-testbed-cc077f09). The testbed's audit + transcript forensics showed the
+  orchestrator re-reading a PR's diff/body/comments/mergeable-state repeatedly across
+  consecutive same-verdict reports (25 `gh` calls across one PR's review lifecycle, several of
+  them exact repeats). `orchestrator.md` gains an **"act on the report, don't re-derive it"**
+  rule right where `report(...)` is first introduced (read the artifact only when the next
+  action needs its CONTENT — CI/mergeable state for a merge, nothing for a routing hand-off)
+  and step 2's worker-reports-a-PR hand-back is tightened to an explicit one-line template with
+  a named, bounded exception (an ADDITIVE delta only — context the reviewer lacked — never a
+  restatement). `worker.md`/`reviewer.md`'s `report(...)` bullets gain mandatory per-outcome
+  examples for what earns `note` space; `reviewer.md`'s is reserved for orchestrator-decision-
+  relevant facts (needs-human-decision, cross-PR conflict, accepted residual+tradeoff, a
+  blocker's one-sentence mechanism) and explicitly never a findings summary. `planner.md` is
+  untouched by this one.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

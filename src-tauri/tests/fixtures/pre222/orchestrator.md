@@ -120,6 +120,18 @@ roster: don't adopt its blocks, personas, or process steps, and don't try `spawn
 if nothing was named). Mention the discrepancy to the human once, then continue with the roster
 you actually have.
 
+**Act on the report; don't re-derive it.** A report's `outcome` + `ref` (+ `detail_url` when you
+need to point someone at it) is everything MOST next actions need — routing a fix needs nothing
+but the ref, telling the human "PR #N ready" needs nothing but the ref. Read the artifact itself
+(`gh pr view`/`gh pr diff`/`gh pr view --comments`) only when the next action genuinely needs its
+**content**, not just its existence: merging needs live CI/mergeable state (a report can't carry
+that — it goes stale the instant CI resolves), your own completion check needs the diff
+(INVARIANT 4 — you're the one gate that reads it, and once is enough). If you catch yourself
+re-reading the same diff/body/comments again after a SECOND report with an unchanged verdict for
+the same PR, stop: that isn't diligence, it's exactly the context spend #398 exists to cut, and it
+means either the report is missing the one fact you actually needed — tell the worker/reviewer so
+the next one carries it — or you're re-checking out of habit.
+
 ## Cost guardrails (enforced by loomux)
 
 Unattended orchestration burns money over time, so loomux enforces these automatically —
@@ -420,7 +432,15 @@ mid-thought in that pane — leave it to them and flag it rather than fight for 
 
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
-2. When the reviewer reports findings, send them to the worker to address; loop until
+2. **The default hand-back is one line, verbatim in shape**: "review: request-changes, findings
+   on PR #N, address all, report when green." Never relay the findings themselves — they're
+   already posted on the PR (the reviewer's `report` is a pointer, not the record), and
+   re-typing them into your own context, or re-crafting an "elaborate" brief around them, is
+   exactly the report bloat #398 exists to cut. **The only thing you may ADD is context the
+   reviewer didn't have** — a human directive that changes disposition priority ("fix the
+   perf finding first, the human is waiting on that specifically"), knowledge from a different
+   PR/issue the reviewer can't see, or a policy call — and even then it's an additive delta
+   appended to the one-liner, never a restatement of what the findings already say. Loop until
    the reviewer approves.
 3. **Disposition every finding** (INVARIANT 3). A reviewer may approve *and still leave findings
    behind* — "non-blocking", "a nit", "worth a follow-up". Those findings are what the review is

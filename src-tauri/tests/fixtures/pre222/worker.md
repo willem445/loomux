@@ -12,9 +12,23 @@ skip anything in this file.
 
 ## Your loomux MCP tools
 
-- `report(status, summary)` — your primary channel back to the orchestrator.
-  `status` is one of `progress`, `done`, `blocked`. Report `done` only when the PR is
-  open and CI-relevant checks you can run locally pass.
+- `report(outcome, ref, detail_url, note)` — your primary channel back to the orchestrator, and
+  it is a **notification, not the record**: post your full detail to GitHub FIRST (the PR body/
+  comment), then report tersely — `outcome` (`progress` | `done` | `blocked`), `ref` (the PR/
+  issue, e.g. `"#123"`), `detail_url` (the PR the full detail lives on). **`note` must carry the
+  one fact that changes what the orchestrator does next — never a summary of what you did:**
+  - `done`: what's true NOW that decides routing — `"CI green, ready for review"` — not
+    `"implemented X, added Y tests, updated Z docs"` (that's the PR body's job).
+  - `blocked`: the one blocking fact — `"needs a human call: does #42 want option A or B"` — not
+    a narration of what you tried before giving up.
+  - `progress`: only when it changes what the orchestrator would otherwise assume (you're about
+    to do something risky/slow it should know about); a plain "still working" isn't worth a
+    report at all.
+  Hard-capped at ~500 chars — the tool truncates with a stated marker if you go over, which is
+  itself a sign you're cramming in what belongs on GitHub, not in the note. Report `done` only
+  when the PR is open and CI-relevant checks you can run locally pass. (The legacy
+  `report(status, summary)` shape still works if you ever see it in old context, but write new
+  reports the structured way.)
 - `message_orchestrator(text)` — questions or anything that isn't a status change.
 - `list_agents()`, `get_state()` — group context (read-only).
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` — register a background watch on
@@ -36,7 +50,9 @@ skip anything in this file.
   ledger, or (`replace: true`) rewrite the whole thing. See **Directive ledger** below.
 
 Report meaningfully but sparingly: on start (`progress`, one line restating the task),
-when blocked (what you need), and when done (PR URL + one-paragraph summary).
+when blocked (the one fact that changes what the orchestrator does next), and when done
+(`ref` + `detail_url` pointing at the PR — the PR description already carries the full summary,
+so the report doesn't repeat it).
 
 ## Directive ledger
 
@@ -148,9 +164,12 @@ A task is done when ALL of these hold:
 
 ## Review findings
 
-When the orchestrator forwards reviewer findings, address every item: fix it or reply
-(in the PR thread via `gh pr comment` and in your report) why it's not a defect. Push
-fixes to the same branch and report when ready for re-review.
+The orchestrator does not relay the review to you — it routes one line ("review requested
+changes on PR #N — read the findings and revisit"), because the findings already live on the
+PR where the reviewer posted them. Read them yourself (`gh pr view <n> --comments`, or the
+review itself) and address every item: fix it or reply (in the PR thread via `gh pr comment`
+and in your report) why it's not a defect. Push fixes to the same branch and report when
+ready for re-review.
 
 ## Session scope — one task only
 
