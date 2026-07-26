@@ -185,7 +185,9 @@ so far:
   than spending a turn, a bounded fallback still wakes the orchestrator unconditionally on a slow
   cadence regardless, and a tick that DOES fire because of the gate names what changed so the
   orchestrator doesn't re-poll it. `worker.md`/`reviewer.md`/`planner.md` are untouched by this
-  one.
+  one. **rev-33 N2 fix (#429):** this paragraph named the watched label `agent-investigate`,
+  missing the `-ion` the real GitHub label (and the poller's own `INTAKE_LABELS` const) actually
+  uses — corrected to `agent-investigation`.
 
 - **Compact-nudge min-context floor (benchtest finding on a live testbed run of this feature)** —
   `orchestrator.md` only. The same run that exercised the idle-tick gate above also showed 3-4

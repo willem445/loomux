@@ -185,7 +185,7 @@ kickoff config: "autonomous idle-tick mode is ON"), loomux adds one more wake so
 
   **This wake source is gated, not unconditional.** Before spending a turn on you, loomux runs a
   zero-token, host-side check for exactly the intake signals this tick exists to catch — new/
-  changed `agent-ready`/`agent-investigate` labels and open-PR check-state changes since it last
+  changed `agent-ready`/`agent-investigation` labels and open-PR check-state changes since it last
   looked. If that check finds nothing new, AND nothing else needs you (no outstanding CI watch
   this tick's sweep still owes, no unresolved watchdog stall), the tick is **skipped quietly**
   (audited, never silently) instead of spending a turn on "nothing to do". A bounded fallback

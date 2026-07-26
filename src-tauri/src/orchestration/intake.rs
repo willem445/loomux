@@ -263,6 +263,68 @@ pub fn intake_wake_summary(labels: &[LabelSignal], prs: &[PrCheckSignal]) -> Str
     summary
 }
 
+/// Cap on how many poll "blocks" [`PendingIntake`] keeps before it starts
+/// dropping the oldest — see that type's doc for the growth this bounds.
+pub const MAX_PENDING_INTAKE_BLOCKS: usize = 5;
+
+/// A group's not-yet-delivered intake summary, bounded (rev-33 finding B2,
+/// #429). `intake_wake_summary` already bounds any ONE poll's findings
+/// (`MAX_SIGNALS_IN_SUMMARY`, with a stated "+N more"), but the poller and
+/// the idle tick run on independent clocks: a group whose orchestrator stays
+/// output-active for hours (the idle tick's quiet window never clears, so
+/// nothing ever consumes/clears this) keeps accumulating a fresh bounded
+/// block on every scan regardless — a live 8h output-active run measured
+/// ~12KB accumulated into one pending string, contradicting the whole
+/// "bounded notice" rationale #332 was built on. `push` keeps at most
+/// [`MAX_PENDING_INTAKE_BLOCKS`] blocks (newest first out the front when
+/// full — the newest findings are the most actionable), and `render` states
+/// how many older ones it dropped rather than growing, or shrinking,
+/// silently — the same "no silent caps" discipline `intake_wake_summary`
+/// itself already applies within a single poll.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingIntake {
+    blocks: std::collections::VecDeque<String>,
+    dropped: usize,
+}
+
+impl PendingIntake {
+    /// Fold one poll's already-bounded summary in. A no-op for an empty
+    /// summary (nothing new that scan) — never pushes an empty block.
+    pub fn push(&mut self, summary: String) {
+        if summary.is_empty() {
+            return;
+        }
+        self.blocks.push_back(summary);
+        while self.blocks.len() > MAX_PENDING_INTAKE_BLOCKS {
+            self.blocks.pop_front();
+            self.dropped += 1;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// The text `idle_tick_notice` embeds and the audit records — empty
+    /// string if nothing is pending. States what got dropped, if anything,
+    /// as its own leading clause rather than silently thinning the history.
+    pub fn render(&self) -> String {
+        if self.blocks.is_empty() {
+            return String::new();
+        }
+        let joined: Vec<&str> = self.blocks.iter().map(String::as_str).collect();
+        if self.dropped > 0 {
+            format!(
+                "(+{} earlier finding(s) dropped for space — see the intake-signal audit trail); {}",
+                self.dropped,
+                joined.join("; ")
+            )
+        } else {
+            joined.join("; ")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The gate
 // ---------------------------------------------------------------------------
@@ -650,5 +712,73 @@ mod tests {
         assert_eq!(effective_intake_poll_minutes(Some(45), false), 45,
             "an explicit value is honored even while supervised — only the smart DEFAULT is \
              autonomous-gated, not a value someone actually set");
+    }
+
+    // ---------- PendingIntake (rev-33 finding B2: bounded accumulation) ----------
+
+    #[test]
+    fn empty_pending_renders_empty() {
+        assert!(PendingIntake::default().is_empty());
+        assert_eq!(PendingIntake::default().render(), "");
+    }
+
+    #[test]
+    fn pushing_an_empty_summary_is_a_no_op() {
+        let mut p = PendingIntake::default();
+        p.push(String::new());
+        assert!(p.is_empty(), "an empty poll finding nothing new must never create a block");
+    }
+
+    #[test]
+    fn a_single_push_renders_verbatim_with_no_dropped_marker() {
+        let mut p = PendingIntake::default();
+        p.push("issue #1 labeled agent-ready (\"Do X\")".to_string());
+        assert_eq!(p.render(), "issue #1 labeled agent-ready (\"Do X\")");
+    }
+
+    #[test]
+    fn multiple_pushes_within_the_cap_join_in_order_with_no_dropped_marker() {
+        let mut p = PendingIntake::default();
+        p.push("a".to_string());
+        p.push("b".to_string());
+        p.push("c".to_string());
+        assert_eq!(p.render(), "a; b; c");
+    }
+
+    #[test]
+    fn pushes_beyond_the_cap_drop_the_oldest_and_state_the_count() {
+        // MAX_PENDING_INTAKE_BLOCKS + 3 pushes: the three oldest must be gone,
+        // the newest MAX must survive, and the render must say what it dropped
+        // — never a silent shrink, mirroring intake_wake_summary's own "+N more".
+        let mut p = PendingIntake::default();
+        for i in 0..MAX_PENDING_INTAKE_BLOCKS + 3 {
+            p.push(format!("block{i}"));
+        }
+        let rendered = p.render();
+        assert!(rendered.starts_with("(+3 earlier finding(s) dropped"), "got: {rendered}");
+        assert!(!rendered.contains("block0"), "the oldest must actually be gone: {rendered}");
+        assert!(!rendered.contains("block2"), "got: {rendered}");
+        assert!(rendered.contains("block3"), "the oldest SURVIVING block must still be present: {rendered}");
+        assert!(rendered.contains(&format!("block{}", MAX_PENDING_INTAKE_BLOCKS + 2)),
+            "the newest block must always survive: {rendered}");
+    }
+
+    #[test]
+    fn accumulation_is_bounded_regardless_of_how_many_polls_ever_pushed() {
+        // The rev-33 finding directly: an output-active group can push hundreds
+        // of poll findings before anything ever consumes the pending state. The
+        // rendered text's length must be bounded by the block cap, not by how
+        // many times `push` was called.
+        let mut p = PendingIntake::default();
+        for i in 0..500 {
+            p.push(format!("issue #{i} labeled agent-ready (\"finding number {i}, a moderately long title to be realistic\")"));
+        }
+        let rendered = p.render();
+        let one_block_upper_bound = 200; // generous per-block ceiling used in this test's own titles
+        assert!(
+            rendered.len() < one_block_upper_bound * (MAX_PENDING_INTAKE_BLOCKS + 1),
+            "500 pushes must not translate into 500 blocks' worth of bytes: {} bytes",
+            rendered.len()
+        );
     }
 }
