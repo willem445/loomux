@@ -6,6 +6,7 @@
 //! `rustc-link-arg-tests` (see build.rs / test.manifest), which cargo only
 //! applies to integration-test targets.
 
+use loomux_lib::orchestration::intake;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::workflow;
@@ -424,6 +425,72 @@ fn max_agents_change_survives_launcher_relaunch() {
     let v: Value =
         serde_json::from_str(&fs::read_to_string(reg.state_root().join(&gid).join("group.json")).unwrap()).unwrap();
     assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9, "resume re-persists the honored cap");
+}
+
+#[test]
+fn intake_gate_config_survives_launcher_relaunch() {
+    // rev-33 N4: `create_group_ex`'s "honor the persisted value on a relaunch"
+    // block already covers `max_agents` (see the test above), `idle_tick_
+    // minutes`, `compact_nudge_*` — but `intake_poll_minutes`/`idle_tick_
+    // fallback_minutes` were missing from it entirely. A launcher relaunch
+    // (Launch::Fresh, the launcher's bare caller Guardrails — no UI field for
+    // either) silently reset a hand-edited `Some(0)` opt-out back to `None`
+    // (the gate switching back ON) and a custom fallback cadence back to the
+    // default, every single time. Mirrors `max_agents_change_survives_
+    // launcher_relaunch`'s exact restart-a-fresh-registry shape.
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg
+            .create_group(
+                "C:/tmp/repo",
+                Guardrails { intake_poll_minutes: Some(0), idle_tick_fallback_minutes: 45, ..rails() },
+            )
+            .unwrap();
+        gid = g.id.clone();
+    }
+    // A fresh registry (app restart) + a real launcher relaunch on the same
+    // repo, with the LAUNCHER'S bare defaults (it has no field for either
+    // knob): the persisted opt-out/cadence must win, not the launcher's.
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid, "restart resumes the same group");
+    assert_eq!(g.guardrails.intake_poll_minutes, Some(0),
+        "a hand-edited opt-out must survive a launcher relaunch, not silently reset to the smart default");
+    assert_eq!(g.guardrails.idle_tick_fallback_minutes, 45,
+        "a custom fallback cadence must likewise survive a launcher relaunch");
+}
+
+#[test]
+fn intake_gate_absent_config_still_smart_defaults_after_relaunch() {
+    // The other direction of the same fix: a group that never set an explicit
+    // value (`None` on disk, `rails()`'s bare default) must still resolve to
+    // the smart default after a relaunch — the N4 fix reads the persisted
+    // value through unchanged, it must never coerce `None` into `Some(0)` (or
+    // vice versa) along the way.
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+    }
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid, "restart resumes the same group");
+    assert_eq!(g.guardrails.intake_poll_minutes, None,
+        "absent must stay absent across a relaunch, not get pinned to some resolved value");
+    reg.set_autonomous(&gid, true).unwrap();
+    assert_eq!(
+        intake::effective_intake_poll_minutes(reg.group(&gid).unwrap().guardrails.intake_poll_minutes, true),
+        5, // DEFAULT_INTAKE_POLL_MINUTES — private to the lib, so pinned by value here
+        "the smart default must still apply post-relaunch once autonomous mode is on"
+    );
 }
 
 #[test]

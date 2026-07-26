@@ -305,6 +305,19 @@ impl PendingIntake {
         self.blocks.is_empty()
     }
 
+    /// Whether `push` has ever dropped a block to stay within the cap. Read
+    /// by `idle_tick_tick` (rev-33 finding N7) to route delivery to the
+    /// sweep-bearing wake text instead of `render()`'s own "act on this
+    /// directly, don't re-poll" framing: `render()`'s dropped-block clause
+    /// points a human reader at "the intake-signal audit trail", but no MCP
+    /// tool lets an AGENT read the audit log — that pointer is a dead end in
+    /// a delivered prompt. A real sweep re-discovers everything regardless
+    /// of what got dropped, so it's strictly better than trusting a summary
+    /// that's already admitted to being incomplete.
+    pub fn dropped_any(&self) -> bool {
+        self.dropped > 0
+    }
+
     /// The text `idle_tick_notice` embeds and the audit records — empty
     /// string if nothing is pending. States what got dropped, if anything,
     /// as its own leading clause rather than silently thinning the history.

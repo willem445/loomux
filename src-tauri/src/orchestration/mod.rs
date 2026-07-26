@@ -98,16 +98,26 @@ pub fn max_agents_notice(from: u32, to: u32) -> String {
 /// orchestrator to do both in the same breath. The `Some` branch never mentions
 /// polling labels or re-sweeping PRs at all; only re-sync (context may have
 /// compacted) survives into it, since that's never redundant with a summary.
-pub fn idle_tick_notice(intake_summary: Option<&str>) -> String {
+///
+/// `summary_incomplete` (rev-33 finding N7) is `intake::PendingIntake::dropped_
+/// any()` — true when the accumulated summary itself admits it dropped older
+/// findings to stay bounded (`PendingIntake::render`'s own leading clause
+/// points a human at "the intake-signal audit trail", but no MCP tool lets an
+/// AGENT read the audit log — a dead end in a delivered prompt). When true,
+/// the summary is routed to the SWEEP-bearing text instead of the "act on this
+/// directly" one: a real sweep re-discovers everything regardless of what got
+/// dropped, which is strictly better than trusting a summary that already
+/// admits it's incomplete.
+pub fn idle_tick_notice(intake_summary: Option<&str>, summary_incomplete: bool) -> String {
     match intake_summary.filter(|s| !s.is_empty()) {
-        Some(s) => format!(
+        Some(s) if !summary_incomplete => format!(
             "[loomux] idle tick: you have been idle and autonomous mode is on. The host-side \
              intake poll already found: {s} — act on that directly (spawn/drive the named work, \
              check the named PR) instead of re-polling labels or re-sweeping open PRs. Re-sync \
              first if your context may have compacted (list_tasks, list_agents, get_state). You \
              will get this at most once per idle window; producing any output resets the clock."
         ),
-        None => "[loomux] idle tick: you have been idle and autonomous mode is on. Run your \
+        _ => "[loomux] idle tick: you have been idle and autonomous mode is on. Run your \
      monitoring cadence now — re-sync (list_tasks, list_agents, get_state), poll \
      for labeled intake (agent-ready / agent-investigate) and START that work, and \
      re-check your open PRs (CI + new comments). You will get this at most once per \
@@ -10899,9 +10909,14 @@ impl OrchRegistry {
             // it up alongside something else; either way the orchestrator is
             // about to see it in the notice below. Rendered from the bounded
             // `PendingIntake` (rev-33 B2) to the plain string every downstream
-            // consumer (the audit, `idle_tick_notice`) already expects.
-            let intake_summary =
-                self.intake_pending.lock_safe().remove(&group).map(|p| p.render()).filter(|s| !s.is_empty());
+            // consumer (the audit, `idle_tick_notice`) already expects — but
+            // `dropped_any` is read BEFORE that render consumes the struct, so
+            // `idle_tick_notice` (rev-33 N7) can route a saturated summary to
+            // the sweep-bearing text instead of pointing the orchestrator at
+            // an audit trail it has no tool to read.
+            let pending = self.intake_pending.lock_safe().remove(&group);
+            let summary_incomplete = pending.as_ref().is_some_and(intake::PendingIntake::dropped_any);
+            let intake_summary = pending.map(|p| p.render()).filter(|s| !s.is_empty());
             self.audit(&group, "loomux", "idle-tick", json!({
                 "orchestrator": id,
                 "intake_summary": intake_summary,
@@ -10909,7 +10924,7 @@ impl OrchRegistry {
                 "suppressed": false,
                 "heartbeat": heartbeat,
             }));
-            let text = idle_tick_notice(intake_summary.as_deref());
+            let text = idle_tick_notice(intake_summary.as_deref(), summary_incomplete);
             let _ = self.deliver_to_orchestrator(&group, &text, "loomux");
             notified.push(id);
         }
@@ -20306,20 +20321,20 @@ mod idle_tick_notice_tests {
 
     #[test]
     fn without_an_intake_summary_reads_exactly_as_before_332() {
-        let n = idle_tick_notice(None);
+        let n = idle_tick_notice(None, false);
         assert!(n.starts_with("[loomux] idle tick: you have been idle"), "got: {n}");
         assert!(!n.contains("host-side intake poll"), "must not claim a finding that doesn't exist: {n}");
     }
 
     #[test]
     fn an_empty_summary_is_treated_like_none() {
-        let n = idle_tick_notice(Some(""));
+        let n = idle_tick_notice(Some(""), false);
         assert!(!n.contains("host-side intake poll"), "an empty summary must not add a dangling clause: {n}");
     }
 
     #[test]
     fn a_present_summary_tells_the_orchestrator_not_to_repoll_it() {
-        let n = idle_tick_notice(Some("issue #42 labeled agent-ready (\"Do the thing\")"));
+        let n = idle_tick_notice(Some("issue #42 labeled agent-ready (\"Do the thing\")"), false);
         assert!(n.contains("host-side intake poll already found"), "got: {n}");
         assert!(n.contains("issue #42 labeled agent-ready"), "got: {n}");
         assert!(n.contains("instead of re-polling"), "must tell the orchestrator not to redo the work: {n}");
@@ -20331,8 +20346,29 @@ mod idle_tick_notice_tests {
         // "poll for labeled intake / re-check your open PRs" (the sweep-yourself
         // case) must never appear alongside "act on it directly instead of
         // re-polling" (the summary case).
-        let n = idle_tick_notice(Some("issue #42 labeled agent-ready (\"Do the thing\")"));
+        let n = idle_tick_notice(Some("issue #42 labeled agent-ready (\"Do the thing\")"), false);
         assert!(!n.contains("poll for labeled intake"), "got: {n}");
         assert!(!n.contains("re-check your open PRs"), "got: {n}");
+    }
+
+    #[test]
+    fn an_incomplete_summary_is_routed_to_the_sweep_bearing_text_not_the_dead_end_pointer() {
+        // rev-33 N7: `render()`'s dropped-block clause points a human at "the
+        // intake-signal audit trail", but no MCP tool lets an AGENT read the
+        // audit log — a dead end in a delivered prompt. `summary_incomplete:
+        // true` must route to the full sweep text instead, exactly like `None`.
+        let dropped_summary = "(+3 earlier finding(s) dropped for space — see the intake-signal \
+             audit trail); issue #42 labeled agent-ready (\"Do the thing\")";
+        let n = idle_tick_notice(Some(dropped_summary), true);
+        assert!(n.contains("poll for labeled intake"), "must fall back to a real sweep: {n}");
+        assert!(n.contains("re-check your open PRs"), "got: {n}");
+        assert!(!n.contains("intake-signal audit trail"), "must not hand the agent a dead-end pointer: {n}");
+        assert!(!n.contains("instead of re-polling"), "must not also claim the summary is trustworthy enough to act on alone: {n}");
+    }
+
+    #[test]
+    fn a_complete_summary_is_unaffected_by_the_incomplete_flag_when_false() {
+        let n = idle_tick_notice(Some("issue #42 labeled agent-ready (\"Do the thing\")"), false);
+        assert!(n.contains("instead of re-polling"), "an ordinary (non-truncated) summary keeps the act-directly framing: {n}");
     }
 }
