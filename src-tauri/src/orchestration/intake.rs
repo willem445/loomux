@@ -267,6 +267,35 @@ pub fn intake_wake_summary(labels: &[LabelSignal], prs: &[PrCheckSignal]) -> Str
 // The gate
 // ---------------------------------------------------------------------------
 
+/// Smart-default resolution for the gate's poll cadence (#429, user-directed
+/// fix for the benchtest finding that the gate shipped default-OFF with no
+/// setter anywhere to turn it on — meaning it could never actually engage for
+/// any real autonomous group). Resolved fresh wherever `intake_poll_minutes`
+/// is consulted, never baked into `Guardrails::clamped()`, so a group that
+/// flips autonomous mode ON gets the gate immediately — same "resolve at
+/// gate-evaluation time" lesson `compact_nudge_context_floor_met` already
+/// established for the min-context floor's own smart default.
+/// - `config: None` (unset — absent from group.json, or never explicitly
+///   set) resolves to `DEFAULT_INTAKE_POLL_MINUTES` while `autonomous`, so the
+///   dead-default trap (autonomous ON, gate silently off) is structurally
+///   impossible without an explicit opt-out. Resolves to `0` (inert) while
+///   NOT autonomous — a supervised group never idle-ticks, so there is
+///   nothing for the poller to feed either way.
+/// - `config: Some(0)` is an explicit, deliberate opt-out: stays `0`
+///   regardless of `autonomous` — an operator who wants the polling load off
+///   even while autonomous gets exactly that, with no smart default
+///   overriding their choice.
+/// - `config: Some(n)`, `n > 0`, is an explicit cadence: returned as-is
+///   (already clamped to range in `Guardrails::clamped()`), regardless of
+///   `autonomous` — a value a human bothered to set is never second-guessed.
+pub fn effective_intake_poll_minutes(config: Option<u32>, autonomous: bool) -> u32 {
+    match config {
+        None if autonomous => super::DEFAULT_INTAKE_POLL_MINUTES,
+        None => 0,
+        Some(explicit) => explicit,
+    }
+}
+
 /// Whether an idle tick that has already cleared its quiet-window threshold
 /// (`idle_tick_should_fire`) should actually wake the orchestrator, or skip
 /// quietly and wait. `has_intake_signal` is the host-side poll's own finding;
@@ -590,5 +619,36 @@ mod tests {
         last.insert("g1".to_string(), 1_000u64);
         assert!(due_intake_polls(1_000 + 4 * 60_000, &groups, &last).is_empty(), "under 5 min must not be due yet");
         assert_eq!(due_intake_polls(1_000 + 5 * 60_000, &groups, &last), vec!["g1".to_string()]);
+    }
+
+    // ---------- effective_intake_poll_minutes (#429 smart default) ----------
+
+    #[test]
+    fn unset_config_smart_defaults_on_while_autonomous() {
+        assert_eq!(effective_intake_poll_minutes(None, true), super::super::DEFAULT_INTAKE_POLL_MINUTES,
+            "the dead-default trap (autonomous ON, gate silently off) must be structurally \
+             impossible without an explicit opt-out");
+    }
+
+    #[test]
+    fn unset_config_is_inert_while_supervised() {
+        assert_eq!(effective_intake_poll_minutes(None, false), 0,
+            "a supervised group never idle-ticks, so there is nothing for the poller to feed");
+    }
+
+    #[test]
+    fn explicit_zero_is_deliberate_opt_out_even_while_autonomous() {
+        assert_eq!(effective_intake_poll_minutes(Some(0), true), 0,
+            "an explicit opt-out must never be overridden by the smart default");
+        assert_eq!(effective_intake_poll_minutes(Some(0), false), 0);
+    }
+
+    #[test]
+    fn explicit_nonzero_is_honored_over_the_smart_default_in_both_directions() {
+        assert_eq!(effective_intake_poll_minutes(Some(45), true), 45,
+            "a human-set cadence is never second-guessed while autonomous");
+        assert_eq!(effective_intake_poll_minutes(Some(45), false), 45,
+            "an explicit value is honored even while supervised — only the smart DEFAULT is \
+             autonomous-gated, not a value someone actually set");
     }
 }

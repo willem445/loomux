@@ -5197,10 +5197,19 @@ fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
 
 /// An autonomous group with a live (Running, headless) orchestrator. Returns
 /// (reg, tempdir, group id, orchestrator id). Autonomous mode is ON, so
-/// `idle_tick_tick` considers it.
+/// `idle_tick_tick` considers it. Intake gate explicitly OPTED OUT
+/// (`intake_poll_minutes: Some(0)`) — this helper exists to test the base
+/// #83 idle-tick mechanism (quiet window, activity floor, latch, per-hour
+/// cap) in isolation; a group that wants the #429 smart default or an
+/// explicit cadence uses `autonomous_setup_with_gate` instead. Without this,
+/// EVERY multi-tick test below would silently start exercising the intake
+/// gate too the moment #429's smart default shipped, since `rails()`'s
+/// unset `intake_poll_minutes` now means "on while autonomous," not "off".
 fn autonomous_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
     let (reg, dir) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let g = reg
+        .create_group("C:/tmp/repo", Guardrails { intake_poll_minutes: Some(0), ..rails() })
+        .unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     reg.set_autonomous(&g.id, true).unwrap();
     (reg, dir, g.id, o.id)
@@ -5470,11 +5479,13 @@ fn a_higher_activity_floor_treats_bigger_growth_as_noise() {
 
 // ---------- idle-tick intake gate (#332): host-side, zero-token pre-check ----------
 
-/// An autonomous group with the intake gate ON: `intake_poll_minutes` nonzero (so
-/// `idle_tick_tick` consults `intake::idle_tick_gate` instead of firing
-/// unconditionally) and a caller-chosen `fallback_minutes`. Returns (reg, tempdir,
-/// group id, orchestrator id) — the same shape as `autonomous_setup`.
-fn autonomous_setup_with_gate(intake_poll_minutes: u32, fallback_minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+/// An autonomous group with a caller-chosen `intake_poll_minutes` (tri-state:
+/// `Some(n)` for an explicit cadence — `n == 0` is the explicit opt-out,
+/// `n > 0` an explicit value — or `None` to exercise the #429 smart default,
+/// which resolves to `DEFAULT_INTAKE_POLL_MINUTES` since this helper always
+/// turns autonomous mode on) and a caller-chosen `fallback_minutes`. Returns
+/// (reg, tempdir, group id, orchestrator id) — the same shape as `autonomous_setup`.
+fn autonomous_setup_with_gate(intake_poll_minutes: Option<u32>, fallback_minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
     let (reg, dir) = test_registry();
     let g = reg
         .create_group(
@@ -5501,7 +5512,7 @@ fn audit_line_contains(reg: &OrchRegistry, group: &str, action: &str, needle: &s
 #[test]
 fn intake_gate_skips_a_quiet_tick_then_fires_once_a_signal_lands() {
     // Gate ON, generous fallback (won't fire on its own inside this test).
-    let (reg, _d, gid, oid) = autonomous_setup_with_gate(5, 180);
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(5), 180);
     let empty = HashMap::new();
     // Establish a reference fire point so the fallback isn't trivially due against
     // the unseeded (0) default — see `seed_idle_tick_last_fired`'s doc.
@@ -5530,7 +5541,7 @@ fn intake_gate_fires_regardless_when_a_ci_watch_is_outstanding() {
     // The lost-notification-degrades-to-poll-on-sweep invariant (orchestrator.md):
     // an outstanding CI watch means the tick's fallback-sweep duty still has a job,
     // even with zero label/PR news.
-    let (reg, _d, gid, oid) = autonomous_setup_with_gate(5, 180);
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(5), 180);
     reg.seed_idle_tick_last_fired(&gid, FAR);
     reg.register_notification(&gid, &oid, notify::Condition::PrChecks { pr: 7 }, "watch it".into(), 60).unwrap();
 
@@ -5545,7 +5556,7 @@ fn intake_gate_fires_regardless_when_a_watchdog_stall_is_unresolved() {
     let g = reg
         .create_group(
             "C:/tmp/repo",
-            Guardrails { intake_poll_minutes: 5, idle_tick_fallback_minutes: 180, watchdog_stall_minutes: 10, ..rails() },
+            Guardrails { intake_poll_minutes: Some(5), idle_tick_fallback_minutes: 180, watchdog_stall_minutes: 10, ..rails() },
         )
         .unwrap();
     let oid = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap().id;
@@ -5568,7 +5579,7 @@ fn intake_gate_fallback_fires_unconditionally_once_it_comes_due() {
     // No intake signal, no pending notification, no watchdog stall — but enough
     // real time has passed since the last fire that the bounded fallback covers it,
     // so a poller bug (or a permanently-quiet group) can never silence the tick.
-    let (reg, _d, gid, oid) = autonomous_setup_with_gate(5, 30); // 30 min = the floor
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(5), 30); // 30 min = the floor
     reg.seed_idle_tick_last_fired(&gid, FAR);
     let empty = HashMap::new();
 
@@ -5582,10 +5593,12 @@ fn intake_gate_fallback_fires_unconditionally_once_it_comes_due() {
 
 #[test]
 fn intake_gate_off_fires_unconditionally_exactly_like_before_332() {
-    // intake_poll_minutes: 0 is the literal off switch — an upgraded group's
-    // group.json (no such key, decodes to 0) must reproduce today's behavior
-    // byte for byte, never silently start skipping ticks.
-    let (reg, _d, gid, oid) = autonomous_setup_with_gate(0, 30);
+    // #429 reversed the migration-safety default (absent/None now smart-
+    // defaults ON while autonomous — see the next test), but the explicit
+    // opt-out must still work exactly like the pre-#429 "off" behavior for an
+    // operator who deliberately wants the polling load off: `Some(0)` is that
+    // explicit opt-out, distinct from `None`.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(0), 30);
     let empty = HashMap::new();
     assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()],
         "gate OFF must fire unconditionally, matching pre-#332 behavior");
@@ -5609,7 +5622,7 @@ fn intake_gate_off_fires_unconditionally_exactly_like_before_332() {
 
 #[test]
 fn intake_gate_null_intake_is_suppressed_and_audited() {
-    let (reg, _d, gid, _oid) = autonomous_setup_with_gate(5, 180); // generous fallback
+    let (reg, _d, gid, _oid) = autonomous_setup_with_gate(Some(5), 180); // generous fallback
     reg.seed_idle_tick_last_fired(&gid, FAR);
     let empty = HashMap::new();
 
@@ -5626,7 +5639,7 @@ fn intake_gate_heartbeat_fires_after_consecutive_suppressed_ticks() {
     // consecutive suppressed ticks (each skip re-arms the gate 10 minutes out), proving
     // "after N consecutive suppressed ticks, deliver a real wake anyway" against the
     // ACTUAL per-tick cadence rather than one big wall-clock jump.
-    let (reg, _d, gid, oid) = autonomous_setup_with_gate(10, 30);
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(10), 30);
     reg.seed_idle_tick_last_fired(&gid, FAR);
     let empty = HashMap::new();
 
@@ -5649,7 +5662,7 @@ fn intake_gate_transition_from_suppressed_to_signal_fires_immediately_with_summa
     // (null, null, intake) → the signal must fire on the very next eligible tick, not
     // wait for the heartbeat's consecutive-tick count — a fresh signal is never held
     // hostage by the backstop timer just because prior ticks were suppressed.
-    let (reg, _d, gid, oid) = autonomous_setup_with_gate(10, 180); // generous fallback: won't fire on its own
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(10), 180); // generous fallback: won't fire on its own
     reg.seed_idle_tick_last_fired(&gid, FAR);
     let empty = HashMap::new();
 
@@ -5669,6 +5682,37 @@ fn intake_gate_transition_from_suppressed_to_signal_fires_immediately_with_summa
 }
 
 #[test]
+fn intake_gate_smart_default_activates_while_autonomous_and_reproduces_the_benchtest_scenario() {
+    // User-directed fix (option 1): the gate must be ON by default the moment a group is
+    // autonomous, with NO config at all — `intake_poll_minutes: None`. This end-to-end
+    // reproduction pins the actual reported shape: `loomux-testbed-cc077f09` logged SIX
+    // idle ticks in a row with `intake_summary: null`, every one still delivering a wake.
+    // On this fix, the same six null ticks must now be suppressed (zero wake prompts,
+    // `suppressed:true` each time) and only the 7th — the bounded heartbeat — delivers.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(None, 45); // smart default cadence (5 min) x fallback
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    let mut now = FAR + 15 * 60_000 + 1;
+    for i in 1..=6 {
+        assert!(reg.idle_tick_tick(now, &empty, &empty).is_empty(),
+            "consecutive suppressed tick {i}/6 — no config was set, only autonomous mode");
+        now += 5 * 60_000; // DEFAULT_INTAKE_POLL_MINUTES, smart-defaulted with no config at all
+    }
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 0,
+        "zero wake prompts delivered across all six null-intake ticks — this is the exact \
+         benchtest finding, now fixed");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick-skipped"), 6);
+
+    assert_eq!(reg.idle_tick_tick(now, &empty, &empty), vec![oid.clone()],
+        "the 7th tick is the bounded heartbeat — a gate bug (or a genuinely quiet group) must \
+         never silence the orchestrator forever, even under the smart default");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"heartbeat\":true"));
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"gate_enabled\":true"),
+        "the smart default counts as the gate being genuinely engaged, not the legacy bypass");
+}
+
+#[test]
 fn intake_gate_skip_for_one_group_never_starves_another_groups_tick_in_the_same_scan() {
     // rev-31 finding 2 (#329 coexistence seam), written while #329 was still not
     // in this tree: `idle_tick_tick` scans every autonomous orchestrator in ONE
@@ -5679,9 +5723,15 @@ fn intake_gate_skip_for_one_group_never_starves_another_groups_tick_in_the_same_
     // — the skip must never short-circuit the scan. See the test right below
     // for the direct #329 cross-feature check, now that #329 has landed and
     // `compact_nudge_tick` is real code in this tree, not a description of one.
-    let (reg, _d, gid_gated, _oid_gated) = autonomous_setup_with_gate(5, 180);
+    let (reg, _d, gid_gated, _oid_gated) = autonomous_setup_with_gate(Some(5), 180);
     reg.seed_idle_tick_last_fired(&gid_gated, FAR);
-    let g2 = reg.create_group("C:/tmp/repo-plain", rails()).unwrap(); // gate OFF (default)
+    // #429: `rails()`'s default `intake_poll_minutes: None` now smart-defaults ON the
+    // moment a group is autonomous — so "plain, gate OFF" needs an EXPLICIT opt-out
+    // (`Some(0)`) to keep meaning what this test's comment says, instead of silently
+    // also becoming a gated group via the new default.
+    let g2 = reg
+        .create_group("C:/tmp/repo-plain", Guardrails { intake_poll_minutes: Some(0), ..rails() })
+        .unwrap(); // gate explicitly OFF
     let oid_plain = reg.spawn_agent(&g2.id, Role::Orchestrator, "orch2", "", false, None).unwrap().id;
     reg.set_autonomous(&g2.id, true).unwrap();
 
@@ -5712,7 +5762,7 @@ fn intake_gate_skip_never_starves_a_coexisting_compact_nudge_for_the_same_agent(
         .create_group(
             "C:/tmp/repo",
             Guardrails {
-                intake_poll_minutes: 5,
+                intake_poll_minutes: Some(5),
                 idle_tick_fallback_minutes: 180,
                 compact_nudge_minutes: 20,
                 compact_nudge_roles: vec!["orchestrator".to_string()],
@@ -5809,6 +5859,12 @@ fn compact_rails(minutes: u32, roles: &[&str]) -> Guardrails {
     Guardrails {
         compact_nudge_minutes: minutes,
         compact_nudge_roles: roles.iter().map(|s| s.to_string()).collect(),
+        // #429: explicit opt-out — this helper is for compact-nudge/idle-tick
+        // coexistence tests, not the intake gate; without this, `rails()`'s
+        // unset `intake_poll_minutes` smart-defaults ON the moment
+        // `set_autonomous` is called and a repeated idle-tick assertion below
+        // would silently start exercising suppression instead.
+        intake_poll_minutes: Some(0),
         ..rails()
     }
 }

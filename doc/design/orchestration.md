@@ -1290,8 +1290,10 @@ check-state transitions.
 
 - **A second, independently-clocked poller.** `start_intake_poller` (`INTAKE_POLL_SCAN_INTERVAL`,
   60s wake, the `start_notify_poller`/`start_idle_tick` shape) calls `poll_intake`, which — for
-  every **autonomous** group with `Guardrails.intake_poll_minutes` nonzero and due
-  (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval idiom) — shells out
+  every **autonomous** group whose EFFECTIVE `intake_poll_minutes`
+  (`intake::effective_intake_poll_minutes` — #429's smart default, resolved fresh every scan) is
+  nonzero and due (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval
+  idiom) — shells out
   to `gh issue list --json number,title,labels` and `gh pr list --json
   number,title,statusCheckRollup` (via the existing `gh_capture` helper `poll_watches` already
   uses; no new subprocess plumbing) and diffs the result against that group's last-seen state
@@ -1331,15 +1333,23 @@ check-state transitions.
   actually have refreshed the poller's findings — unlike the #83 latch, which only clears on the
   orchestrator producing real output, a *skip* means it produced none, so nothing else would ever
   clear it.
-- **`intake_poll_minutes` is the one field in this whole guardrail struct where 0 means "off,"
-  literally** — every other minutes-guardrail in `Guardrails` (`idle_tick_minutes`,
-  `watchdog_stall_minutes`, …) treats 0 as "unset → coerce to a default." This field inverts that
-  convention on purpose: the gate is new, opt-in behavior layered on an existing tick, and an
-  upgraded group's `group.json` (written before this field existed, so it decodes to 0) must
-  reproduce today's unconditional-tick behavior byte for byte rather than silently start skipping
-  ticks the human never asked to have gated. `idle_tick_fallback_minutes`, by contrast, follows
-  the normal idiom (0 → default, then clamped `30..=10080` min) — it is the backstop *for* the
-  gate, so it must never be configurable to "off."
+- **`intake_poll_minutes` is tri-state (`Option<u32>`), smart-defaulted ON while autonomous
+  (#429)** — the same "let a real value distinguish from absence" idiom
+  `compact_nudge_min_context_percent`/`context_window_tokens_override` already use in this
+  struct, resolved fresh at gate-evaluation time (`intake::effective_intake_poll_minutes`), never
+  baked into `Guardrails::clamped()`, so a group that flips autonomous mode ON gets the gate
+  immediately with no re-launch. `None` (unset — absent from `group.json`, or never explicitly
+  set) resolves to `DEFAULT_INTAKE_POLL_MINUTES` (5, matching `DEFAULT_IDLE_TICK_MINUTES` — the
+  poller need not run more often than the tick it feeds) whenever the group is autonomous, and to
+  `0` (inert) while supervised. `Some(0)` is an explicit, deliberate opt-out — the escape hatch
+  for an operator who wants the polling load off even while autonomous, set by hand-editing
+  `group.json` (there is no live setter for this field, same precedent as
+  `context_window_tokens_override`). `Some(n)`, `n > 0`, is an explicit cadence, clamped to
+  `1..=1440`. This is a deliberate REVERSAL of the field's original migration-safety stance (an
+  upgraded group's pre-#429 `group.json`, with no such key, used to decode to `0`/off byte for
+  byte) — see the #429 finding below for why. `idle_tick_fallback_minutes`, by contrast, still
+  follows the normal idiom (0 → default, then clamped `30..=10080` min) — it is the backstop *for*
+  the gate, so it must never be configurable to "off."
 - **When the tick DOES fire because of the gate**, the notice (`idle_tick_notice`, now taking an
   `Option<&str>` intake summary) states what changed — issue numbers, PR state deltas — so the
   orchestrator can act on it directly instead of re-polling the exact thing loomux already
@@ -1351,30 +1361,28 @@ check-state transitions.
   persistently-failing `gh` isn't retried every 60s), and the bounded fallback covers the group
   regardless — a poller outage can make the gate less useful, never silence the orchestrator past
   the fallback's own interval.
-- **#429 benchtest finding: the gate computed but the audit couldn't tell you so.** A live
-  testbed session (`loomux-testbed-cc077f09`) logged six idle ticks over ~45 minutes, every one
-  with `intake_summary: null`, and every one still delivered — the generic "run your monitoring
-  cadence" prompt, with zero token economy over pre-#332 behavior. Root cause: `intake_summary`
-  being `None` was never actually distinguishable, in the audit, from "the gate wasn't consulted
-  at all" (the `intake_poll_minutes == 0` bypass, which fires the identical unconditional
-  legacy path) versus "the gate WAS consulted and correctly found nothing new, but fired anyway
-  because the bounded fallback (or a pending CI watch, or a watchdog stall) had a separate,
-  legitimate reason to." All three cases produced the same `idle-tick` audit shape and the same
-  delivered prompt — so from the outside, "the gate computes but does not gate." The fix adds
-  three observability fields to the SAME audit entries (no behavior change to the gate's actual
-  fire/skip decision, which was already correct): `gate_enabled` (false only for the
-  `intake_poll_minutes == 0` bypass), `suppressed` (true on the skip path — `idle-tick-skipped`
-  now states this explicitly instead of leaving it implied by the action name), and `heartbeat`
-  (true when a fire's ONLY reason was the bounded fallback — no intake signal, no pending watch,
-  no stall — so it's never mistaken for a real signal in hindsight). Separately and NOT fixed
-  here: `intake_poll_minutes` has no setter (`orch_set_*`) anywhere in the product today — the
-  doc comment on the field itself says the poller and setter were meant to land in separate
-  P2-P4 PRs, and the setter never has. Every real autonomous group therefore runs the
-  `gate_enabled: false` bypass unconditionally, which is the far more likely explanation for the
-  benchtest's six-for-six null fires than any bug in the gate's own decision logic (verified
-  correct by the existing `intake_gate_*` suite). Filed as a follow-up rather than folded in here
-  — it's a new public contract (a command, an ACL grant, a settings toggle), not a delivery-logic
-  fix, and this PR's brief scoped it out.
+- **#429 benchtest finding: the gate computed but the audit couldn't tell you so — and it could
+  never actually engage in the first place.** A live testbed session
+  (`loomux-testbed-cc077f09`) logged six idle ticks over ~45 minutes, every one with
+  `intake_summary: null`, and every one still delivered — the generic "run your monitoring
+  cadence" prompt, with zero token economy over pre-#332 behavior. First pass added three
+  observability fields to the `idle-tick`/`idle-tick-skipped` audit entries — `gate_enabled`,
+  `suppressed`, `heartbeat` — so a skip, a real-signal fire, and a fallback-only heartbeat fire
+  are no longer indistinguishable after the fact. But re-examining the exact reported scenario
+  (a fresh testbed group, autonomous toggled on mid-session, no special config) surfaced the
+  REAL root cause underneath: `intake_poll_minutes` defaulted to `0` (off) with **no setter
+  anywhere in the product** to turn it on — not a command, not a UI toggle, not an
+  autonomous-mode side effect. Every real autonomous group ran the `gate_enabled: false` legacy
+  bypass unconditionally; the observability fix alone would have reproduced the identical
+  six-for-six null-tick behavior on a re-soak, just with a `gate_enabled:false` audit line
+  explaining why. The gate's own fire/skip decision, once actually engaged, was correct the whole
+  time (verified by the pre-existing `intake_gate_*` suite).
+  User-directed fix (option 1, over adding a setter/UI): `intake_poll_minutes` is now
+  smart-defaulted ON the moment a group is autonomous (see the field's own doc bullet above) —
+  the dead-default trap (autonomous ON, gate silently off) is now structurally impossible without
+  an explicit `Some(0)` opt-out written by hand into `group.json`. `gate_enabled: false` in the
+  audit now means exactly one of two things: a supervised group (the gate is autonomous-only by
+  construction), or a deliberate opt-out — never "nobody ever turned this on."
 
 **Coexistence with compact-nudge (below):** the two mechanisms are fully decoupled — compact-nudge
 runs as its own background thread (`start_compact_nudge`/`run_compact_nudge`/`compact_nudge_tick`),

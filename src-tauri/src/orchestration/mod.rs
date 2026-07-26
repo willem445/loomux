@@ -1232,11 +1232,16 @@ const DIRECTIVE_LEDGER_MAX_BYTES: usize = 64 * 1024;
 /// closer to a message than to a terse notification field, hence this and
 /// not the smaller `notify::NOTICE_FIELD_CAP`).
 const DIRECTIVE_ENTRY_MAX_CHARS: usize = 2000;
+/// Idle-tick intake gate (#332/#429): the smart default `intake_poll_minutes`
+/// resolves to whenever a group is autonomous and hasn't set an explicit
+/// value — matches `DEFAULT_IDLE_TICK_MINUTES` (the idle tick's own
+/// quiet-window default) rather than inventing a new cadence: the poller
+/// need not run more often than the tick it feeds ever fires anyway.
+const DEFAULT_INTAKE_POLL_MINUTES: u32 = DEFAULT_IDLE_TICK_MINUTES;
 /// Idle-tick intake gate (#332): upper bound on `intake_poll_minutes` when a
-/// group opts in (nonzero) — mirrors `MAX_IDLE_TICK_MINUTES`. Unlike that
-/// field, `intake_poll_minutes` itself defaults to **0 (off)** — see
-/// `Guardrails::intake_poll_minutes`'s doc for why the semantics deliberately
-/// diverge from every other minutes-guardrail in this struct.
+/// group sets an explicit value — mirrors `MAX_IDLE_TICK_MINUTES`. See
+/// `Guardrails::intake_poll_minutes`'s doc for its tri-state semantics
+/// (unset = smart default while autonomous, `Some(0)` = explicit opt-out).
 const MAX_INTAKE_POLL_MINUTES: u32 = 1440;
 /// Idle-tick intake gate (#332): default bounded fallback — an idle tick fires
 /// unconditionally at least this often even with no intake signal, no pending
@@ -2037,17 +2042,37 @@ pub struct Guardrails {
     /// Idle-tick intake gate (#332): how often the host-side, zero-token
     /// poller (`gh issue list` / `gh pr list`, no LLM turn) checks this
     /// group's intake signals (new/changed `agent-ready`/`agent-investigation`
-    /// labels, open-PR check-state transitions) since it last looked. **`0`
-    /// means the gate is OFF, literally** — no poll, no gate, an idle tick
-    /// fires exactly as it did before this field existed. That's the opposite
-    /// convention from `idle_tick_minutes` (where 0 means "unset → default"):
-    /// this is a brand-new, opt-in gating behavior layered on TOP of an
-    /// existing tick, so an upgraded group's existing `group.json` (which has
-    /// no such key, hence decodes to 0) must reproduce today's behavior
-    /// byte-for-byte rather than silently start skipping ticks. Nonzero is
-    /// clamped to `1..=MAX_INTAKE_POLL_MINUTES`. See `idle_tick_gate` /
+    /// labels, open-PR check-state transitions) since it last looked.
+    ///
+    /// **Smart-defaulted while autonomous (#429, user-directed): tri-state,
+    /// `Option<u32>`** — the same "let a real value distinguish from absence"
+    /// idiom `compact_nudge_min_context_percent`/`context_window_tokens_
+    /// override` already use in this struct. Resolved fresh wherever it's
+    /// consulted (`intake::effective_intake_poll_minutes`), never here in
+    /// `clamped()`, so a group that flips autonomous mode ON gets the gate
+    /// immediately with no re-launch:
+    /// - `None` (unset — absent from group.json, or never explicitly set):
+    ///   the gate is ON at `DEFAULT_INTAKE_POLL_MINUTES` whenever the group is
+    ///   autonomous — a live testbed benchtest (#429) found the gate shipping
+    ///   default-OFF meant it could never actually engage for any real group
+    ///   (no setter/UI ever set this field above 0), defeating #332's whole
+    ///   economy-by-default purpose. `0`-equivalent (inert) while supervised:
+    ///   intake polling only ever matters for an autonomous group's idle tick.
+    /// - `Some(0)`: explicit opt-out — the gate stays off even while
+    ///   autonomous, for an operator who wants #332's polling load off
+    ///   deliberately. There is no live setter for this field (same
+    ///   precedent as `context_window_tokens_override`): the escape hatch is
+    ///   hand-editing group.json.
+    /// - `Some(n)`, `n > 0`: an explicit cadence, clamped to
+    ///   `1..=MAX_INTAKE_POLL_MINUTES`.
+    ///
+    /// This REVERSES the field's original migration-safety stance (an
+    /// upgraded group's pre-#429 `group.json`, with no such key, used to
+    /// decode to `0`/off byte-for-byte) — deliberately: the #429 benchtest
+    /// showed byte-for-byte invisibility was itself the defect, and the user
+    /// directed the smart default over preserving it. See `idle_tick_gate` /
     /// `OrchRegistry::poll_intake`.
-    pub intake_poll_minutes: u32,
+    pub intake_poll_minutes: Option<u32>,
     /// Idle-tick intake gate (#332): the bounded unconditional fallback — an
     /// idle tick fires regardless of the gate at least this often, so a
     /// poller bug or a permanently-quiet group can never silence the
@@ -2162,12 +2187,16 @@ impl Guardrails {
         // Compact-nudge (#328): 0 stays 0 (off) — only cap a too-large value.
         self.compact_context_threshold_percent =
             self.compact_context_threshold_percent.min(MAX_COMPACT_CONTEXT_THRESHOLD_PERCENT);
-        // #332: 0 is a real, deliberate value here (the gate is off) — unlike
-        // every other minutes-guardrail in this struct, it is NOT coerced to a
-        // default. Only a nonzero value gets clamped into range.
-        if self.intake_poll_minutes != 0 {
-            self.intake_poll_minutes = self.intake_poll_minutes.clamp(1, MAX_INTAKE_POLL_MINUTES);
-        }
+        // #429: tri-state, same shape as `compact_nudge_min_context_percent`
+        // just above — `None` (smart default) and `Some(0)` (explicit
+        // opt-out) both pass through untouched; only an explicit nonzero
+        // value gets clamped into range. The smart default itself resolves
+        // in `intake::effective_intake_poll_minutes` at gate-evaluation time,
+        // not here, so a group that flips autonomous ON later gets the gate
+        // immediately with no re-normalization pass needed.
+        self.intake_poll_minutes = self.intake_poll_minutes.map(|explicit| {
+            if explicit == 0 { 0 } else { explicit.clamp(1, MAX_INTAKE_POLL_MINUTES) }
+        });
         // The fallback, by contrast, follows the idle_tick_minutes idiom
         // exactly: 0 = unset → default, then clamped — this backstop must
         // never be configurable to "never fire".
@@ -8385,9 +8414,11 @@ impl OrchRegistry {
                 // The resolved intake profile (#382 P1). Absent → the
                 // built-in default, same migration guarantee as `blocks`.
                 intake: read_intake(g),
-                // Idle-tick intake gate (#332): absent → 0 → the gate stays OFF
-                // (not "→ default" — see the field's own doc for why).
-                intake_poll_minutes: g["intake_poll_minutes"].as_u64().unwrap_or(0) as u32,
+                // Idle-tick intake gate (#332/#429): absent/null → None — the
+                // smart default resolves at gate-evaluation time (not here),
+                // matching `compact_nudge_min_context_percent`'s tri-state load
+                // just above.
+                intake_poll_minutes: g["intake_poll_minutes"].as_u64().map(|v| v as u32),
                 // The fallback backstop: absent → 0 → clamped() maps to the default.
                 idle_tick_fallback_minutes: g["idle_tick_fallback_minutes"].as_u64().unwrap_or(0) as u32,
             },
@@ -9548,7 +9579,9 @@ impl OrchRegistry {
 
     /// This scan's candidate groups for the intake poller: every AUTONOMOUS
     /// group (a non-autonomous group never idle-ticks, so polling for it
-    /// would spend a `gh` round-trip nobody reads) with `intake_poll_minutes`
+    /// would spend a `gh` round-trip nobody reads) whose effective
+    /// `intake_poll_minutes` (#429: smart-defaulted ON while autonomous unless
+    /// explicitly opted out — see `intake::effective_intake_poll_minutes`) is
     /// nonzero, paired with its repo path for the `gh` call.
     fn intake_poll_config(&self) -> (HashMap<String, u32>, HashMap<String, String>) {
         let autonomous = self.autonomous_groups.lock_safe().clone();
@@ -9558,8 +9591,9 @@ impl OrchRegistry {
             if !autonomous.contains(id) {
                 continue;
             }
-            if g.guardrails.intake_poll_minutes > 0 {
-                minutes.insert(id.clone(), g.guardrails.intake_poll_minutes);
+            let effective = intake::effective_intake_poll_minutes(g.guardrails.intake_poll_minutes, true);
+            if effective > 0 {
+                minutes.insert(id.clone(), effective);
                 repos.insert(id.clone(), g.repo.clone());
             }
         }
@@ -10640,7 +10674,14 @@ impl OrchRegistry {
                     (
                         g.guardrails.idle_tick_minutes,
                         g.guardrails.idle_activity_floor_bytes,
-                        g.guardrails.intake_poll_minutes,
+                        // #429: smart-defaulted ON while autonomous unless the
+                        // group explicitly opted out (`Some(0)`) or set its own
+                        // cadence — inert (0) while supervised, matching the
+                        // pre-#429 legacy-bypass path exactly for those groups.
+                        intake::effective_intake_poll_minutes(
+                            g.guardrails.intake_poll_minutes,
+                            autonomous.contains(id),
+                        ),
                         g.guardrails.idle_tick_fallback_minutes,
                     ),
                 )
@@ -18484,10 +18525,13 @@ pub fn create_orchestration(
             // overrides it (only takes effect with `advanced_orchestrator` on,
             // gated exactly like `blocks` in `create_group_ex`).
             intake: workflow::IntakeProfile::default(),
-            // #332: off by default even for a brand-new launch — the gate is a new
-            // behavior layered on an existing tick, not a bundled-in default; a
-            // human opts a group in via group.json.
-            intake_poll_minutes: 0,
+            // #429: unset at launch — the smart default (DEFAULT_INTAKE_POLL_
+            // MINUTES) applies automatically the moment the group is autonomous,
+            // with zero config, same idiom as compact_nudge_min_context_percent
+            // above. There is no live setter; an operator who wants the gate off
+            // even while autonomous opts out by hand-editing group.json to an
+            // explicit `Some(0)`.
+            intake_poll_minutes: None,
             // #332: 0 → clamped() applies DEFAULT_IDLE_TICK_FALLBACK_MINUTES.
             idle_tick_fallback_minutes: 0,
         },
