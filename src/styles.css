@@ -890,13 +890,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .orch-compose-status.show { visibility: visible; }
 
-.xterm-viewport::-webkit-scrollbar { width: 10px; }
-.xterm-viewport::-webkit-scrollbar-track { background: transparent; }
-.xterm-viewport::-webkit-scrollbar-thumb {
-  background: #262634; border-radius: 5px;
-  border: 2px solid var(--bg-term); background-clip: padding-box;
-}
-.xterm-viewport::-webkit-scrollbar-thumb:hover { background: #333345; border: 2px solid var(--bg-term); background-clip: padding-box; }
+/* xterm.js 6.0's viewport draws its own (VS Code base) scrollbar widget
+   instead of a native overflow scrollbar, so the old `::-webkit-scrollbar`
+   pseudo-elements no longer match anything. The v6 widget only exposes
+   slider colors (no width/radius) via ITheme.scrollbarSlider* — set in
+   TERM_THEME (pane.ts) instead of here. */
 
 /* ---------- session browser ---------- */
 #sessions {

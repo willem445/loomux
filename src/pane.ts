@@ -284,6 +284,11 @@ const TERM_THEME = {
   cursor: "#7aa2f7",
   cursorAccent: "#0b0b10",
   selectionBackground: "#2d3450",
+  // xterm.js 6.0 replaced the native viewport scrollbar with its own widget
+  // (see styles.css); these are the only scrollbar knobs it exposes.
+  scrollbarSliderBackground: "#262634",
+  scrollbarSliderHoverBackground: "#333345",
+  scrollbarSliderActiveBackground: "#3d3d52",
   black: "#15161e",
   red: "#f7768e",
   green: "#9ece6a",
@@ -1012,6 +1017,25 @@ export class Pane implements VoiceTargetPane {
           backend: "conpty",
           buildNumber: backend.conpty_build,
         };
+        // #430: the resize-quirk conpty this sideloads never repaints on
+        // resize (that's the point of the quirk flag), so xterm's own
+        // default of never reflowing the cursor's own line leaves it on
+        // stale pre-resize geometry -- exactly where PSReadLine's next
+        // repaint lands wrong. xterm.js has no complete fix for this
+        // (xterm.js#5321 was reverted wholesale by #5358 after bricking
+        // buffers in VS Code; xterm.js#5319 -- this exact symptom -- was
+        // closed as "track in vscode#224488" rather than fixed, and VS
+        // Code's own sideload of this same conpty build still has open
+        // resize-duplication reports). `reflowCursorLine` (xterm.js#5234,
+        // off by default because normal shells repaint themselves) is the
+        // only lever that measurably helps: verified via test/xterm-reflow
+        // .test.ts that it moves the echo off the stale row in the
+        // documented repro. Not a confirmed complete fix -- see PR #430
+        // for what to still watch for by eye. Not enabled outside this
+        // conpty branch: normal shells against a non-quirked host already
+        // repaint their own prompt line, and forcing a reflow there could
+        // fight that repaint instead of nothing at all.
+        this.term.options.reflowCursorLine = true;
       }
     } catch {
       // Backend info is a tuning hint only — never block the terminal on it.
