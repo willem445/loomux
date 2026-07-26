@@ -217,7 +217,7 @@ Honestly, up front:
 
 `e2e/fixtures.ts` spawns the isolated-identifier build, waits for the CDP
 port, connects via `chromium.connectOverCDP`, and waits for `#tab-bar` plus a
-first pane to exist before handing the test a `Page`. Three specs:
+first pane to exist before handing the test a `Page`. Four specs:
 
 1. **`pane-reorder.spec.ts`** — splits a tab into two plain shell panes, drags
    one onto the other's center (`Grid.swap` in `src/grid.ts`), asserts their
@@ -233,13 +233,69 @@ first pane to exist before handing the test a `Page`. Three specs:
    (not clipped/mis-z-ordered) and interactive (loads real commit rows,
    clicking one selects it). Stand-in for the task-board overlay per the
    constraint above.
+4. **`tab-reorder.spec.ts`** (added #402, live-demo round 5) — creates a
+   third tab, drags the first onto the third, asserts the tab strip's
+   rendered order actually changes. Added specifically because a human
+   reported "grab works, drop refused everywhere" against `src/tabbar.ts`'s
+   tab-strip drag in real use, a symptom the pure `moveTab`/`dropTargetIndex`
+   suite (`test/tabs.test.ts`) and two prior rounds of code-level DOM-wiring
+   fixes couldn't resolve. See "A native-HTML5-DnD lesson" immediately below
+   — this spec is also why the tab-strip drag mechanism itself changed.
 
-All three were run locally against a real build (`npx tauri build --debug
---no-bundle --config src-tauri/tauri.e2e.conf.json`) and pass — 3/3, repeatedly.
+All four were run locally against a real build (`npx tauri build --debug
+--no-bundle --config src-tauri/tauri.e2e.conf.json`) and pass, repeatedly.
 The `data_root_from` Rust helper backing the isolation env var has its own
 unit tests in `obs.rs`, verified red (assertion failure, not a compile error)
 against a stub that ignored the override, then green against the real
 implementation.
+
+### A native-HTML5-DnD lesson (#402, tab-reorder)
+
+`tab-reorder.spec.ts` exists because a human reported the tab strip's
+drag-to-reorder (#379) as "grab works, drop refused everywhere" in real use —
+after the pure index-arithmetic tests already passed and a code-level
+DOM-wiring fix (missing `dragenter`/`dropEffect`) had already shipped. Writing
+the spec surfaced something more useful than a repro: **neither manual
+`DragEvent` dispatch (`element.dispatchEvent(new DragEvent(...))` with a real
+`DataTransfer`) nor Playwright's CDP-driven `locator.dragTo()` could ever
+reproduce a failure** against `src/tabbar.ts`'s original native
+`draggable="true"` HTML5 drag-and-drop — both consistently succeeded, with
+*and* without the dragenter/dropEffect fix, across a clean single drag, an
+exact-center drop (a genuine tie in the app's own before/after math, not a
+failure), and a slow, jittery multi-target drag meant to mimic a real hand.
+
+The likely explanation: CDP's `Input.dispatchMouseEvent` (what
+`locator.dragTo()` uses under the hood) injects events at the browser's own
+input layer, and Chromium's internal drag-and-drop implementation reacts to
+that layer directly — it does not depend on the same native-OS mouse-message
+path a REAL hardware drag takes through a Tauri-hosted WebView2 window. If
+whatever's broken lives in that native-OS-to-WebView2 initiation step (as
+opposed to anything in `src/tabbar.ts`'s own event handlers), CDP-simulated
+input structurally cannot see it — manual `DragEvent` dispatch bypasses the
+same layer even more directly, going straight to the app's listeners without
+any native drag session at all. **Both are excellent tools for testing an
+app's own drag-event handling; neither can tell you whether a real user's
+native HTML5 drag ever reaches that handling in a WebView2 desktop app.**
+
+The fix sidesteps the question entirely rather than resolving it: it drops
+native HTML5 DnD for the tab strip and reimplements the reorder with the same
+POINTER-EVENT mechanism (`pointerdown`/`pointermove`/`pointerup`, a drag
+threshold, manual hit-testing) that `src/grid.ts`'s pane-reorder drag already
+uses — a mechanism this same E2E suite has verified reliable since the
+original spike (`pane-reorder.spec.ts`) and that never depends on the browser
+initiating anything; the app owns the entire gesture from the first pixel of
+movement. `tab-reorder.spec.ts` now uses `locator.dragTo()` too, the same way
+`pane-reorder.spec.ts` does, and reliably passes.
+
+**Takeaway for future specs in this repo**: if a real drag-and-drop feature
+uses native `draggable="true"`/`dragstart`/`dragover`/`drop`, do not trust a
+passing Playwright spec (via either `dragTo()`/`dragAndDrop()` or manual
+`DragEvent` dispatch) as proof it works in the real, packaged desktop app —
+this harness cannot distinguish "the handlers are correct" from "the browser
+ever calls them" for that specific mechanism. Prefer pointer-event-based drag
+implementations for anything reorderable in this codebase; they're both more
+reliable in practice (per this investigation) and the only kind of drag this
+harness can meaningfully validate end to end.
 
 **They do not currently pass in CI.** See "CI status" below — this is a
 runner-execution-context issue confirmed unrelated to the specs or the app,
