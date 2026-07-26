@@ -152,6 +152,18 @@ test("the quit confirm names WHERE each buffer is — and marks the hidden ones"
   ]);
 });
 
+test("a DOCKED editor gets its own call-out too (#361 scope increase) — not mislabeled as the floating overlay", () => {
+  // A docked editor looks like a permanent fixture of the pane, not something someone
+  // opened — the least likely of the three hosts to be remembered as "still holding
+  // edits", so it needs the same explicit call-out an overlay already got.
+  const lines = dirtyBufferLines(
+    dirtyBuffers([
+      report({ tab: "loomux", pane: "claude · fix", host: "docked", file: "src/git.ts", dirty: true }),
+    ])
+  );
+  assert.deepEqual(lines, ["loomux · claude · fix (docked editor) — src/git.ts"]);
+});
+
 // ---------- a pane whose process just died (#219) ----------
 
 const exited = (code: number | null, expected = false) => ({ exit_code: code, expected });

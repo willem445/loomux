@@ -339,13 +339,30 @@ re-checked against "now it can also be docked," not assumed safe.
 three go through `Pane.unsavedHolder()` — `this.editorPaneView ??
 this.workflowPaneView ?? this.fileEditView` — which returns the SAME
 `FileEditView` INSTANCE regardless of whether it's currently an overlay,
-docked to an edge, or hidden. `canDiscard()`/`bufferReport()` (called from
-there) only ever ask `isDirtyNow()` — never the display mode — so
-`confirmClose()` (pane-kill/tab-close) and the app-quit guard's
-`dirtyBuffers()` enumeration are exactly as correct for a DOCKED editor as
-they always were for the overlay one, with zero code changes needed. This
-was verified by reading `unsavedHolder()`'s own call sites, not assumed
-from the shared-instance argument alone.
+docked to an edge, or hidden. `canDiscard()` (called from there) only ever
+asks `isDirtyNow()` — never the display mode — so `confirmClose()`
+(pane-kill/tab-close) and the app-quit guard's `dirtyBuffers()` enumeration
+are exactly as correct for a DOCKED editor as they always were for the
+overlay one, with zero logic changes needed. This was verified by reading
+`unsavedHolder()`'s own call sites, not assumed from the shared-instance
+argument alone.
+
+**Cosmetic-but-real: the quit confirm's WHERE label (rev-27 finding).**
+`bufferReport()`'s dirty DETERMINATION never needed the display mode (the
+paragraph above) — but the LABEL it attaches (`DirtyHost`) does, since the
+whole point of the label is telling the human WHERE to go look. Before this
+fix, a docked editor's buffer reported as `"overlay"` — accurate enough to
+not be WRONG (it is still the same Alt+F editor, not a content pane), but
+missing the one fact a docked editor's own quirk makes worth stating: it
+LOOKS like a permanent fixture of the pane rather than something you
+opened and could still be holding edits in, exactly the opposite instinct
+an overlay (something you visibly dismissed) gives you. `DirtyHost` grew a
+third value, `"docked"`, and `bufferReport()` sets it via `this.sideOf(
+"editor") !== null` (reachable only in the branch that already ruled out
+the content-pane case, so it's unambiguous which holder is being asked
+about); `dirtyBufferLines` labels it `"(docked editor)"`, alongside the
+existing `"(Alt+F editor)"` for a plain overlay. `test/dirtystate.test.ts`
+pins the new label.
 
 **The one place embedding DOES touch #219: the toggle-close path
 (Escape/✕/header-button/keybinding) — because it's the one #219 path that

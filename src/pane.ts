@@ -3013,16 +3013,24 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** What this pane is holding, for the app-quit guard's enumeration (#219): its editor's
-   *  buffer — the pane's own (an editor pane) or its Alt+F overlay's — labelled with
-   *  the tab and pane it lives in, so the confirm can say WHERE. Null when the pane has no
-   *  editor with a file open at all. */
+   *  buffer — the pane's own (an editor pane), its Alt+F overlay's, or that same Alt+F
+   *  editor DOCKED (#361 scope increase) — labelled with the tab and pane it lives in, so
+   *  the confirm can say WHERE. Null when the pane has no editor with a file open at all. */
   bufferReport(tab: string): PaneBufferReport | null {
     const report = this.unsavedHolder()?.bufferReport();
     if (!report) return null;
-    // "pane" vs "overlay" is what the quit confirm needs to say WHERE the work is: a
-    // content pane is visibly what it is, while an Alt+F overlay is tucked inside a
-    // terminal that looks like any other.
-    const host: DirtyHost = this.editorPaneView || this.workflowPaneView ? "pane" : "overlay";
+    // "pane" vs "overlay" vs "docked" is what the quit confirm needs to say WHERE the
+    // work is: a content pane is visibly what it is; an Alt+F overlay is tucked inside a
+    // terminal that looks like any other; a DOCKED Alt+F editor looks like a permanent
+    // fixture of the pane rather than something someone opened — `sideOf` only applies
+    // when the holder actually IS `fileEditView` (the `editorPaneView`/`workflowPaneView`
+    // branch above already took the "pane" case, so reaching here means it is).
+    const host: DirtyHost =
+      this.editorPaneView || this.workflowPaneView
+        ? "pane"
+        : this.sideOf("editor") !== null
+          ? "docked"
+          : "overlay";
     return { tab, pane: this.name, host, file: report.file, dirty: report.dirty };
   }
 
