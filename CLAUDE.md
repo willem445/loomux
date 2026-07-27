@@ -83,6 +83,19 @@ decision rule, the `-j 4` local-cap details, and the draft-PR-early CI flow.
    exact gate shouldn't fire again — but if `allow-scripts` (or any other
    gate) ever fires for something new, the answer is still to ask, not to
    decide.
+   **If you're staring at an `allow-scripts` warning right now:** the
+   `package.json` entry pins esbuild to an exact version
+   (`"esbuild@0.25.12": true`) on purpose, not by oversight — it's the safer
+   of npm's two forms (a name-only entry would silently cover every future
+   version too). That means a routine `esbuild` version bump (pulled in via
+   `vite` or a direct upgrade) makes the gate fire again for the new version
+   — that is the pin working as designed, not a fix that broke. The right
+   response is the same as for a brand-new package: stop and get a fresh
+   human approval for the new version. Do not bump the pinned version
+   yourself, do not switch it to a name-only entry to make the warning stop
+   recurring, and do not add any other package's entry alongside it —
+   widening this the "convenient" way is exactly the self-approval this
+   constraint exists to prevent.
 
 ## Code conventions
 
