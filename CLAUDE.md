@@ -70,6 +70,19 @@ decision rule, the `-j 4` local-cap details, and the draft-PR-early CI flow.
    behavior that only makes sense for developing loomux itself belongs in
    `.loomux/` config or the dev docs, not the product. Precedent: the shared
    `CARGO_TARGET_DIR` cache was removed for violating this (#263).
+9. **Never self-approve a security/install gate** (npm's `allow-scripts`
+   review, a `gh` shim confirmation, anything else that exists to make a
+   human or the orchestrator decide). If one fires, stop and
+   `message_orchestrator`/`report("blocked", …)` instead of running the
+   approve command yourself — even a narrowly-scoped approval is a security
+   decision, and it isn't yours to make unprompted. Precedent: #357 — a
+   worker hit npm's `allow-scripts` gate for esbuild's postinstall, ran `npm
+   approve-scripts esbuild` to unblock itself, and that was correctly flagged
+   and reverted. The repo now pre-declares the one approval the build
+   genuinely needs (`package.json`'s `allowScripts` field, committed) so this
+   exact gate shouldn't fire again — but if `allow-scripts` (or any other
+   gate) ever fires for something new, the answer is still to ask, not to
+   decide.
 
 ## Code conventions
 
