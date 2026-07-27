@@ -39,6 +39,11 @@ export interface SessionRecord {
   /** Carried through only for the D2 card's display copy — unused by the
    *  matching logic itself. */
   title: string;
+  /** The scanner's own ready-to-run resume command (`SessionInfo.resume_command`
+   *  — e.g. `claude --resume <id>`), carried through only for the D2 card's
+   *  fallback when the dormant placeholder recorded no command/argv of its
+   *  own to rewrite via `agentResumeCommand`. Unused by the matching logic. */
+  resumeCommand: string;
 }
 
 /** Just enough of a live, null-id agent pane to decide adoption — main.ts

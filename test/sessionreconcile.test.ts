@@ -17,6 +17,7 @@ const session = (over: Partial<SessionRecord>): SessionRecord => ({
   cwd: "C:\\repo",
   modifiedMs: 1_000,
   title: "some task",
+  resumeCommand: "claude --resume s1",
   ...over,
 });
 

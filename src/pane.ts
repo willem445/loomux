@@ -2829,6 +2829,17 @@ export class Pane implements VoiceTargetPane {
     return this.launchedCommand;
   }
 
+  /** The agent CLI program this pane was launched with — the first token of
+   *  its launch command, lower-cased, same derivation launcher.ts uses to
+   *  probe/autopilot a program (#440). "claude" | "copilot" | null for a
+   *  plain shell, an unrecognized program, or before launch. Used by the
+   *  session reconciler to match this pane's cwd against `listSessions()`'s
+   *  `source` without re-deriving the parse elsewhere. */
+  get agentCli(): "claude" | "copilot" | null {
+    const first = this.spawnCommand?.trim().split(/\s+/)[0]?.toLowerCase();
+    return first === "claude" || first === "copilot" ? first : null;
+  }
+
   /** This pane's recorded agent session id, or null when none has been minted,
    *  named on its command line, or learned yet (#440). Read by the reconciler
    *  to build its plain-data pane projection and to decide whether a pane is

@@ -2977,6 +2977,16 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   font-size: 12.5px; font-weight: 600;
 }
 .dormant-btn:hover { background: rgba(122, 162, 247, 0.28); }
+/* D2 (#440): the "we found your last session" option, appended beside plain
+   Start once the background prefetch resolves a match. Green accent — same
+   "positive/live" palette as .tab-orch.live / .task-btn.approve — signals it's
+   the recommended action without shrinking Start next to it. */
+.dormant-btn-secondary {
+  border-color: #3f5a2e;
+  background: rgba(158, 206, 106, 0.16);
+  color: #b4e878;
+}
+.dormant-btn-secondary:hover { background: rgba(158, 206, 106, 0.28); }
 
 /* Cold-boot restore splash: a centered card over a dimmed backdrop, before any
    tab exists. Pure overlay — no PTY, no layout change. */
