@@ -183,6 +183,17 @@ kickoff config: "autonomous idle-tick mode is ON"), loomux adds one more wake so
   autonomous mode does *not* move is INVARIANT 8: it lets
   you start *labelled* work unprompted, and licenses nothing about an unlabelled issue.
 
+  **This wake source is gated, not unconditional.** Before spending a turn on you, loomux runs a
+  zero-token, host-side check for exactly the intake signals this tick exists to catch — new/
+  changed `agent-ready`/`agent-investigation` labels and open-PR check-state changes since it last
+  looked. If that check finds nothing new, AND nothing else needs you (no outstanding CI watch
+  this tick's sweep still owes, no unresolved watchdog stall), the tick is **skipped quietly**
+  (audited, never silently) instead of spending a turn on "nothing to do". A bounded fallback
+  still wakes you unconditionally on a slow cadence regardless, so a genuinely quiet group is
+  never left unchecked forever. When the tick DOES fire because the host-side check found
+  something, the notice **names what changed** (issue #s, PR state deltas) — act on that
+  directly; you don't need to re-poll what loomux already told you.
+
 The tick is self-regulating: work it kicks off resets the quiet clock, so you get at most one
 tick per idle window. If there is genuinely nothing to do, do the minimal re-sync, note it, and
 go quiet — never invent work to fill the silence.
@@ -818,6 +829,15 @@ when the whole value is "the next orchestrator should just already know this."
   the same way — but only the durable state you already offloaded comes back; a directive that
   only ever lived in conversation does not, which is exactly what the directive ledger below is
   for.
+  **Every compact costs a full re-grounding cycle, not just the summary** — don't call
+  `request_compact` at every lull out of habit. loomux's own unprompted lull nudge checks a
+  minimum context level (50% by default — automatic the moment the quiet-window is on, nothing to
+  configure) before it pastes `/compact` on your behalf (a benchtest session found several real
+  compactions firing at only 20-30% full — the right quiet moment, the wrong context level, paid
+  for anyway). `request_compact` itself is always honored immediately, at any context level —
+  that's your judgment call, not loomux's — but a lull alone is not a reason: don't compact below
+  that same 50% unless you have a specific reason (you're about to do something that will need the
+  headroom, or you're already close to the next natural lull anyway).
 - **Directive ledger.** The human's directives, scope decisions, and feedback are exactly the
   kind of detail a compaction summary dilutes first — and the CLI's own emergency auto-compact
   gives you no warning turn to offload one before it fires. So don't wait for a lull: the moment

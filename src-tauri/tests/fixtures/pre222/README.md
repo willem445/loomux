@@ -178,6 +178,39 @@ so far:
   blocker's one-sentence mechanism) and explicitly never a findings summary. `planner.md` is
   untouched by this one.
 
+- **#332, event-driven intake wake** — `orchestrator.md` only. The **Autonomous mode (idle-tick)**
+  section gains a paragraph naming the host-side gate: a zero-token poll checks for new
+  intake-label/PR-check-state signals before an idle tick fires, a tick with nothing new (and no
+  other wake reason — a pending CI watch, a watchdog stall) is skipped quietly and audited rather
+  than spending a turn, a bounded fallback still wakes the orchestrator unconditionally on a slow
+  cadence regardless, and a tick that DOES fire because of the gate names what changed so the
+  orchestrator doesn't re-poll it. `worker.md`/`reviewer.md`/`planner.md` are untouched by this
+  one. **rev-33 N2 fix (#429):** this paragraph named the watched label `agent-investigate`,
+  missing the `-ion` the real GitHub label (and the poller's own `INTAKE_LABELS` const) actually
+  uses — corrected to `agent-investigation`.
+
+- **Compact-nudge min-context floor (benchtest finding on a live testbed run of this feature)** —
+  `orchestrator.md` only. The same run that exercised the idle-tick gate above also showed 3-4
+  real compactions, all at ~20-31% context — the lull timer's quiet-window gate firing at the
+  right moment but the wrong context level. `orchestrator.md`'s existing **Compact at lulls**
+  paragraph (#328/#329) gains a sentence naming the new floor and telling the orchestrator not to
+  call `request_compact` out of lull habit below roughly 50% — the tool itself stays
+  unconditionally available at any context level (agent judgment always wins); only loomux's own
+  unprompted heuristic nudge is gated. `worker.md`/`reviewer.md`/`planner.md` are untouched by
+  this one too (compact-nudge is orchestrator-only by default).
+
+- **Smart-default re-blessing (rev-65's review of the min-context floor above)** —
+  `orchestrator.md` only. The floor as first shipped was a plain `u32` defaulting to `0`
+  (off) — a re-benchtest at default config would have reproduced the exact over-compaction
+  the floor exists to fix, since nothing turns it on without a manual setter call.
+  `compact_nudge_min_context_percent` is now tri-state (`Option<u32>`: unset → the 50%
+  smart default applies automatically the moment the quiet-window (`compact_nudge_minutes`)
+  is on; explicit `0` → floor disabled; explicit `N` → `N`), resolved fresh on every gate
+  check rather than baked in at group creation, so turning the quiet-window on later still
+  gets the default with no re-launch. `orchestrator.md`'s **Compact at lulls** paragraph is
+  reworded to say the floor is "automatic the moment the quiet-window is on, nothing to
+  configure" instead of describing a value the operator would otherwise have had to set.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

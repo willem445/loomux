@@ -6,6 +6,7 @@
 //! `rustc-link-arg-tests` (see build.rs / test.manifest), which cargo only
 //! applies to integration-test targets.
 
+use loomux_lib::orchestration::intake;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::workflow;
@@ -15,7 +16,8 @@ use loomux_lib::orchestration::{
     channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
     COMPACT_HOOK_SCRIPT, COPILOT_PRECOMPACT_HOOK_BASH, COPILOT_PRECOMPACT_HOOK_POWERSHELL,
-    compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_role_allowed,
+    compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_context_floor_met,
+    compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
     CompactionStatus,
     auto_compact_banner_detected, compact_nudge_poll_interval, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
@@ -423,6 +425,72 @@ fn max_agents_change_survives_launcher_relaunch() {
     let v: Value =
         serde_json::from_str(&fs::read_to_string(reg.state_root().join(&gid).join("group.json")).unwrap()).unwrap();
     assert_eq!(v["guardrails"]["max_agents"].as_u64().unwrap(), 9, "resume re-persists the honored cap");
+}
+
+#[test]
+fn intake_gate_config_survives_launcher_relaunch() {
+    // rev-33 N4: `create_group_ex`'s "honor the persisted value on a relaunch"
+    // block already covers `max_agents` (see the test above), `idle_tick_
+    // minutes`, `compact_nudge_*` — but `intake_poll_minutes`/`idle_tick_
+    // fallback_minutes` were missing from it entirely. A launcher relaunch
+    // (Launch::Fresh, the launcher's bare caller Guardrails — no UI field for
+    // either) silently reset a hand-edited `Some(0)` opt-out back to `None`
+    // (the gate switching back ON) and a custom fallback cadence back to the
+    // default, every single time. Mirrors `max_agents_change_survives_
+    // launcher_relaunch`'s exact restart-a-fresh-registry shape.
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg
+            .create_group(
+                "C:/tmp/repo",
+                Guardrails { intake_poll_minutes: Some(0), idle_tick_fallback_minutes: 45, ..rails() },
+            )
+            .unwrap();
+        gid = g.id.clone();
+    }
+    // A fresh registry (app restart) + a real launcher relaunch on the same
+    // repo, with the LAUNCHER'S bare defaults (it has no field for either
+    // knob): the persisted opt-out/cadence must win, not the launcher's.
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid, "restart resumes the same group");
+    assert_eq!(g.guardrails.intake_poll_minutes, Some(0),
+        "a hand-edited opt-out must survive a launcher relaunch, not silently reset to the smart default");
+    assert_eq!(g.guardrails.idle_tick_fallback_minutes, 45,
+        "a custom fallback cadence must likewise survive a launcher relaunch");
+}
+
+#[test]
+fn intake_gate_absent_config_still_smart_defaults_after_relaunch() {
+    // The other direction of the same fix: a group that never set an explicit
+    // value (`None` on disk, `rails()`'s bare default) must still resolve to
+    // the smart default after a relaunch — the N4 fix reads the persisted
+    // value through unchanged, it must never coerce `None` into `Some(0)` (or
+    // vice versa) along the way.
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+    }
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid, "restart resumes the same group");
+    assert_eq!(g.guardrails.intake_poll_minutes, None,
+        "absent must stay absent across a relaunch, not get pinned to some resolved value");
+    reg.set_autonomous(&gid, true).unwrap();
+    assert_eq!(
+        intake::effective_intake_poll_minutes(reg.group(&gid).unwrap().guardrails.intake_poll_minutes, true),
+        5, // DEFAULT_INTAKE_POLL_MINUTES — private to the lib, so pinned by value here
+        "the smart default must still apply post-relaunch once autonomous mode is on"
+    );
 }
 
 #[test]
@@ -5196,10 +5264,19 @@ fn watchdog_stall_resets_when_the_agent_reports_or_messages() {
 
 /// An autonomous group with a live (Running, headless) orchestrator. Returns
 /// (reg, tempdir, group id, orchestrator id). Autonomous mode is ON, so
-/// `idle_tick_tick` considers it.
+/// `idle_tick_tick` considers it. Intake gate explicitly OPTED OUT
+/// (`intake_poll_minutes: Some(0)`) — this helper exists to test the base
+/// #83 idle-tick mechanism (quiet window, activity floor, latch, per-hour
+/// cap) in isolation; a group that wants the #429 smart default or an
+/// explicit cadence uses `autonomous_setup_with_gate` instead. Without this,
+/// EVERY multi-tick test below would silently start exercising the intake
+/// gate too the moment #429's smart default shipped, since `rails()`'s
+/// unset `intake_poll_minutes` now means "on while autonomous," not "off".
 fn autonomous_setup() -> (OrchRegistry, tempfile::TempDir, String, String) {
     let (reg, dir) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let g = reg
+        .create_group("C:/tmp/repo", Guardrails { intake_poll_minutes: Some(0), ..rails() })
+        .unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     reg.set_autonomous(&g.id, true).unwrap();
     (reg, dir, g.id, o.id)
@@ -5467,6 +5544,315 @@ fn a_higher_activity_floor_treats_bigger_growth_as_noise() {
         "a growth >= the floor (11 KB) is activity and re-arms the latch");
 }
 
+// ---------- idle-tick intake gate (#332): host-side, zero-token pre-check ----------
+
+/// An autonomous group with a caller-chosen `intake_poll_minutes` (tri-state:
+/// `Some(n)` for an explicit cadence — `n == 0` is the explicit opt-out,
+/// `n > 0` an explicit value — or `None` to exercise the #429 smart default,
+/// which resolves to `DEFAULT_INTAKE_POLL_MINUTES` since this helper always
+/// turns autonomous mode on) and a caller-chosen `fallback_minutes`. Returns
+/// (reg, tempdir, group id, orchestrator id) — the same shape as `autonomous_setup`.
+fn autonomous_setup_with_gate(intake_poll_minutes: Option<u32>, fallback_minutes: u32) -> (OrchRegistry, tempfile::TempDir, String, String) {
+    let (reg, dir) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails { intake_poll_minutes, idle_tick_fallback_minutes: fallback_minutes, ..rails() },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_autonomous(&g.id, true).unwrap();
+    (reg, dir, g.id, o.id)
+}
+
+/// Whether `audit.jsonl` contains a line for `action` whose raw JSON also
+/// contains `needle` — a coarser version of `audit_count` that lets a test
+/// assert on the SHAPE of one entry (e.g. the skip reason, the intake summary
+/// folded into an `idle-tick` entry) without parsing full JSON.
+fn audit_line_contains(reg: &OrchRegistry, group: &str, action: &str, needle: &str) -> bool {
+    fs::read_to_string(reg.state_root().join(group).join("audit.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.contains(&format!("\"{action}\"")) && l.contains(needle))
+}
+
+#[test]
+fn intake_gate_skips_a_quiet_tick_then_fires_once_a_signal_lands() {
+    // Gate ON, generous fallback (won't fire on its own inside this test).
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(5), 180);
+    let empty = HashMap::new();
+    // Establish a reference fire point so the fallback isn't trivially due against
+    // the unseeded (0) default — see `seed_idle_tick_last_fired`'s doc.
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+
+    // Quiet window elapsed, nothing new, no other wake reason, fallback not due:
+    // the tick must be SKIPPED, not fired — and the skip is audited with a reason.
+    assert!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty).is_empty(),
+        "nothing new + no other wake reason + fallback not due must SKIP, not fire");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 0, "a skip must never be counted as a fire");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick-skipped", "fallback"),
+        "the skip must be audited with its reason, not silent");
+
+    // The host-side poller finds something: seed the pending summary a real
+    // `poll_intake` would have composed, then the NEXT quiet window must fire —
+    // and the notice must carry the summary (folded into the audited entry).
+    reg.seed_intake_pending(&gid, "issue #42 labeled agent-ready (\"Do the thing\")");
+    assert_eq!(reg.idle_tick_tick(FAR + 2 * (15 * 60_000 + 1), &empty, &empty), vec![oid.clone()],
+        "an intake signal must fire even though nothing else changed");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "issue #42 labeled agent-ready"),
+        "the fired tick's audit entry must carry what the intake poll found");
+}
+
+#[test]
+fn intake_gate_fires_regardless_when_a_ci_watch_is_outstanding() {
+    // The lost-notification-degrades-to-poll-on-sweep invariant (orchestrator.md):
+    // an outstanding CI watch means the tick's fallback-sweep duty still has a job,
+    // even with zero label/PR news.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(5), 180);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    reg.register_notification(&gid, &oid, notify::Condition::PrChecks { pr: 7 }, "watch it".into(), 60).unwrap();
+
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty), vec![oid.clone()],
+        "a pending notification must force a fire even with no intake signal");
+}
+
+#[test]
+fn intake_gate_fires_regardless_when_a_watchdog_stall_is_unresolved() {
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails { intake_poll_minutes: Some(5), idle_tick_fallback_minutes: 180, watchdog_stall_minutes: 10, ..rails() },
+        )
+        .unwrap();
+    let oid = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap().id;
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.seed_idle_tick_last_fired(&g.id, FAR);
+    // Drive a REAL watchdog stall on a worker in the same group — the gate reads
+    // `AgentEntry.watchdog_notified`, not a test-only backdoor.
+    reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    let watch_set = std::collections::HashSet::new();
+    let fired = reg.watchdog_tick(FAR, &HashMap::new(), &watch_set);
+    assert!(!fired.is_empty(), "sanity: the worker must actually be flagged stalled");
+
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty), vec![oid.clone()],
+        "an unresolved watchdog stall must force a fire even with no intake signal");
+}
+
+#[test]
+fn intake_gate_fallback_fires_unconditionally_once_it_comes_due() {
+    // No intake signal, no pending notification, no watchdog stall — but enough
+    // real time has passed since the last fire that the bounded fallback covers it,
+    // so a poller bug (or a permanently-quiet group) can never silence the tick.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(5), 30); // 30 min = the floor
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    // Just under the fallback: still skipped.
+    assert!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty).is_empty());
+    // Past the fallback (30 min since the seeded last-fire): fires even with
+    // nothing new.
+    assert_eq!(reg.idle_tick_tick(FAR + 30 * 60_000 + 1, &empty, &empty), vec![oid.clone()],
+        "the bounded fallback must fire regardless once its own interval elapses");
+}
+
+#[test]
+fn intake_gate_off_fires_unconditionally_exactly_like_before_332() {
+    // #429 reversed the migration-safety default (absent/None now smart-
+    // defaults ON while autonomous — see the next test), but the explicit
+    // opt-out must still work exactly like the pre-#429 "off" behavior for an
+    // operator who deliberately wants the polling load off: `Some(0)` is that
+    // explicit opt-out, distinct from `None`.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(0), 30);
+    let empty = HashMap::new();
+    assert_eq!(reg.idle_tick_tick(FAR, &empty, &empty), vec![oid.clone()],
+        "gate OFF must fire unconditionally, matching pre-#332 behavior");
+    assert!(!audit_line_contains(&reg, &gid, "idle-tick-skipped", "fallback"),
+        "a disabled gate must never produce a skip");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"gate_enabled\":false"),
+        "a bypass fire (gate off) must be observably distinct from a gated fire — the #429 \
+         benchtest finding was exactly that these two looked identical in the audit log");
+}
+
+// ---------- #429 benchtest follow-up: suppressed/heartbeat observability ----------
+//
+// rev-95's live testbed run (loomux-testbed-cc077f09) showed six idle ticks in a row,
+// each with `intake_summary: null`, EVERY one still delivering the full generic wake
+// prompt — "the gate computes but does not gate". The gate's actual fire/skip DECISION
+// was already correct (proved by the suite above); what was missing is that a skip, a
+// real-signal fire, and a fallback-only fire were audited identically, so nobody could
+// tell them apart after the fact. These tests pin the three new audit fields
+// (`suppressed`, `heartbeat`, `gate_enabled`) that make the three cases distinguishable,
+// and the transition/consecutive-tick shapes the fix brief asked for directly.
+
+#[test]
+fn intake_gate_null_intake_is_suppressed_and_audited() {
+    let (reg, _d, gid, _oid) = autonomous_setup_with_gate(Some(5), 180); // generous fallback
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    assert!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty).is_empty(),
+        "null intake + no other reason must suppress, not deliver");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 0, "a suppressed tick is never counted as a fire");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick-skipped", "\"suppressed\":true"),
+        "a suppressed tick must be observably marked, not just implied by the action name");
+}
+
+#[test]
+fn intake_gate_heartbeat_fires_after_consecutive_suppressed_ticks() {
+    // intake_minutes=10, fallback=30 → the bounded backstop comes due after exactly 2
+    // consecutive suppressed ticks (each skip re-arms the gate 10 minutes out), proving
+    // "after N consecutive suppressed ticks, deliver a real wake anyway" against the
+    // ACTUAL per-tick cadence rather than one big wall-clock jump.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(10), 30);
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    let tick1 = FAR + 15 * 60_000 + 1;
+    assert!(reg.idle_tick_tick(tick1, &empty, &empty).is_empty(), "1st consecutive suppressed tick");
+    let tick2 = tick1 + 10 * 60_000;
+    assert!(reg.idle_tick_tick(tick2, &empty, &empty).is_empty(), "2nd consecutive suppressed tick");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 0, "still nothing but suppressions so far");
+
+    let tick3 = tick2 + 10 * 60_000;
+    assert_eq!(reg.idle_tick_tick(tick3, &empty, &empty), vec![oid.clone()],
+        "the bounded fallback must deliver a real wake once it comes due, even with nothing new — \
+         a gate bug (or a genuinely quiet group) must never silence the orchestrator forever");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"heartbeat\":true"),
+        "a fallback-only fire must be marked as a heartbeat, distinct from a real signal");
+}
+
+#[test]
+fn intake_gate_transition_from_suppressed_to_signal_fires_immediately_with_summary_embedded() {
+    // (null, null, intake) → the signal must fire on the very next eligible tick, not
+    // wait for the heartbeat's consecutive-tick count — a fresh signal is never held
+    // hostage by the backstop timer just because prior ticks were suppressed.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(10), 180); // generous fallback: won't fire on its own
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    let tick1 = FAR + 15 * 60_000 + 1;
+    assert!(reg.idle_tick_tick(tick1, &empty, &empty).is_empty(), "1st: null intake, suppressed");
+    let tick2 = tick1 + 10 * 60_000;
+    assert!(reg.idle_tick_tick(tick2, &empty, &empty).is_empty(), "2nd: null intake, suppressed");
+
+    reg.seed_intake_pending(&gid, "issue #77 labeled agent-ready (\"Fix the thing\")");
+    let tick3 = tick2 + 10 * 60_000;
+    assert_eq!(reg.idle_tick_tick(tick3, &empty, &empty), vec![oid.clone()],
+        "a fresh intake signal must fire immediately, not wait out the fallback window");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "issue #77 labeled agent-ready"),
+        "the delivered notice must carry the summary so the orchestrator acts on it directly");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"heartbeat\":false"),
+        "a real-signal fire must never be mistaken for a heartbeat");
+}
+
+#[test]
+fn intake_gate_smart_default_activates_while_autonomous_and_reproduces_the_benchtest_scenario() {
+    // User-directed fix (option 1): the gate must be ON by default the moment a group is
+    // autonomous, with NO config at all — `intake_poll_minutes: None`. This end-to-end
+    // reproduction pins the actual reported shape: `loomux-testbed-cc077f09` logged SIX
+    // idle ticks in a row with `intake_summary: null`, every one still delivering a wake.
+    // On this fix, the same six null ticks must now be suppressed (zero wake prompts,
+    // `suppressed:true` each time) and only the 7th — the bounded heartbeat — delivers.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(None, 45); // smart default cadence (5 min) x fallback
+    reg.seed_idle_tick_last_fired(&gid, FAR);
+    let empty = HashMap::new();
+
+    let mut now = FAR + 15 * 60_000 + 1;
+    for i in 1..=6 {
+        assert!(reg.idle_tick_tick(now, &empty, &empty).is_empty(),
+            "consecutive suppressed tick {i}/6 — no config was set, only autonomous mode");
+        now += 5 * 60_000; // DEFAULT_INTAKE_POLL_MINUTES, smart-defaulted with no config at all
+    }
+    assert_eq!(audit_count(&reg, &gid, "idle-tick"), 0,
+        "zero wake prompts delivered across all six null-intake ticks — this is the exact \
+         benchtest finding, now fixed");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick-skipped"), 6);
+
+    assert_eq!(reg.idle_tick_tick(now, &empty, &empty), vec![oid.clone()],
+        "the 7th tick is the bounded heartbeat — a gate bug (or a genuinely quiet group) must \
+         never silence the orchestrator forever, even under the smart default");
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"heartbeat\":true"));
+    assert!(audit_line_contains(&reg, &gid, "idle-tick", "\"gate_enabled\":true"),
+        "the smart default counts as the gate being genuinely engaged, not the legacy bypass");
+}
+
+#[test]
+fn intake_gate_skip_for_one_group_never_starves_another_groups_tick_in_the_same_scan() {
+    // rev-31 finding 2 (#329 coexistence seam), written while #329 was still not
+    // in this tree: `idle_tick_tick` scans every autonomous orchestrator in ONE
+    // pass, and any other per-tick mechanism sharing this loop needs a SKIP
+    // decision for one agent to have ZERO effect on any other agent processed in
+    // the same call. A gated-and-skipped group and a plain (gate-off) group,
+    // ticked in the SAME `idle_tick_tick` call, must each resolve independently
+    // — the skip must never short-circuit the scan. See the test right below
+    // for the direct #329 cross-feature check, now that #329 has landed and
+    // `compact_nudge_tick` is real code in this tree, not a description of one.
+    let (reg, _d, gid_gated, _oid_gated) = autonomous_setup_with_gate(Some(5), 180);
+    reg.seed_idle_tick_last_fired(&gid_gated, FAR);
+    // #429: `rails()`'s default `intake_poll_minutes: None` now smart-defaults ON the
+    // moment a group is autonomous — so "plain, gate OFF" needs an EXPLICIT opt-out
+    // (`Some(0)`) to keep meaning what this test's comment says, instead of silently
+    // also becoming a gated group via the new default.
+    let g2 = reg
+        .create_group("C:/tmp/repo-plain", Guardrails { intake_poll_minutes: Some(0), ..rails() })
+        .unwrap(); // gate explicitly OFF
+    let oid_plain = reg.spawn_agent(&g2.id, Role::Orchestrator, "orch2", "", false, None).unwrap().id;
+    reg.set_autonomous(&g2.id, true).unwrap();
+
+    let empty = HashMap::new();
+    let fired = reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &empty);
+    assert_eq!(fired, vec![oid_plain.clone()],
+        "the gated group must skip (nothing new) while the plain group in the SAME scan still \
+         fires unconditionally — one group's skip must never starve another's tick");
+}
+
+#[test]
+fn intake_gate_skip_never_starves_a_coexisting_compact_nudge_for_the_same_agent() {
+    // rev-31 finding 2, re-verified against #329's ACTUAL final shape (now
+    // merged): compact-nudge is NOT woven into `idle_tick_tick` at all — it is
+    // its own background thread/function (`start_compact_nudge` /
+    // `run_compact_nudge` / `compact_nudge_tick`) with its own anti-nag latch
+    // (`compact_nudge_notified`) and its own output baseline
+    // (`compact_nudge_last_output_total`, deliberately separate from this
+    // gate's `last_output_total` — see that field's doc for the rev-24 finding
+    // this avoids). The only thing the two mechanisms share is a READ of
+    // `AgentEntry.last_progress_ms`, and this gate's skip path never writes to
+    // it differently depending on the gate's verdict. So the direct proof: the
+    // SAME agent, gated-and-skipped on `idle_tick_tick`, must still get a real
+    // `compact_nudge_tick` fire in the same tick window — the skip has zero
+    // effect on the coexisting mechanism.
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                intake_poll_minutes: Some(5),
+                idle_tick_fallback_minutes: 180,
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                ..rails()
+            },
+        )
+        .unwrap();
+    let oid = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap().id;
+    reg.set_autonomous(&g.id, true).unwrap();
+    reg.seed_idle_tick_last_fired(&g.id, FAR);
+
+    let empty = HashMap::new();
+    let now = FAR + 15 * 60_000 + 1;
+    assert!(reg.idle_tick_tick(now, &empty, &empty).is_empty(),
+        "sanity: the intake gate must actually skip here (nothing new, fallback not due)");
+    assert_eq!(
+        reg.compact_nudge_tick(now, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![oid.clone()],
+        "a gated idle-tick SKIP for this exact agent, at this exact tick, must not stop the \
+         coexisting compact-nudge check from firing for it — the two are fully independent"
+    );
+}
+
 #[test]
 fn idle_tick_status_is_honest_about_latch_and_cap() {
     // rev-59 LOW: eligible_in_secs must never render a lying 0 while a non-time gate
@@ -5540,6 +5926,12 @@ fn compact_rails(minutes: u32, roles: &[&str]) -> Guardrails {
     Guardrails {
         compact_nudge_minutes: minutes,
         compact_nudge_roles: roles.iter().map(|s| s.to_string()).collect(),
+        // #429: explicit opt-out — this helper is for compact-nudge/idle-tick
+        // coexistence tests, not the intake gate; without this, `rails()`'s
+        // unset `intake_poll_minutes` smart-defaults ON the moment
+        // `set_autonomous` is called and a repeated idle-tick assertion below
+        // would silently start exercising suppression instead.
+        intake_poll_minutes: Some(0),
         ..rails()
     }
 }
@@ -6678,6 +7070,182 @@ fn compact_escalation_notice_names_the_percent_and_the_recovery_move() {
     assert!(n.starts_with("[loomux]"));
     assert!(n.contains("87%"), "got: {n}");
     assert!(n.contains("request_compact"), "got: {n}");
+}
+
+// ---------- compact-nudge min-context floor (benchtest finding + smart default) ----------
+
+#[test]
+fn compact_nudge_context_floor_met_unset_applies_the_smart_default_only_when_nudge_is_on() {
+    // None (unset) + parent feature ON: the 50% smart default applies —
+    // zero config needed to get the fix a live benchtest showed was missing.
+    assert!(!compact_nudge_context_floor_met(Some(30), None, 20), "30% is under the smart default (50%)");
+    assert!(compact_nudge_context_floor_met(Some(60), None, 20), "60% clears the smart default (50%)");
+    // None (unset) + parent feature OFF: inert — there's nothing to gate
+    // either way (the heuristic itself never fires when compact_nudge_minutes
+    // is 0), but the function must still read as "met" on its own terms.
+    assert!(compact_nudge_context_floor_met(Some(5), None, 0));
+}
+
+#[test]
+fn compact_nudge_context_floor_met_explicit_zero_disables_regardless_of_parent() {
+    assert!(compact_nudge_context_floor_met(Some(1), Some(0), 20), "explicit Some(0) = disabled, any reading passes");
+    assert!(compact_nudge_context_floor_met(None, Some(0), 20));
+}
+
+#[test]
+fn compact_nudge_context_floor_met_explicit_value_gates_at_that_value() {
+    assert!(!compact_nudge_context_floor_met(Some(30), Some(70), 20), "below an explicit 70% floor");
+    assert!(compact_nudge_context_floor_met(Some(70), Some(70), 20), "exactly at an explicit floor allows it");
+    assert!(compact_nudge_context_floor_met(Some(80), Some(70), 20));
+}
+
+#[test]
+fn compact_nudge_context_floor_met_fails_open_with_no_reading() {
+    // A missing/stale context reading must never silently disable the whole
+    // heuristic nudge — degrade, don't deny (the same posture #332's intake
+    // gate takes on a `gh` failure) — true under every floor state.
+    assert!(compact_nudge_context_floor_met(None, None, 20), "smart default, no reading");
+    assert!(compact_nudge_context_floor_met(None, Some(70), 20), "explicit floor, no reading");
+}
+
+#[test]
+fn compact_nudge_heuristic_fire_gated_by_the_smart_default_with_zero_config() {
+    // The whole point of the smart default: enabling ONLY compact_nudge_minutes
+    // (no min-context field touched at all — `..rails()`'s derived None) must
+    // already reproduce the fix the benchtest needed.
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                // compact_nudge_min_context_percent deliberately untouched — None.
+                ..rails()
+            },
+        )
+        .unwrap();
+    assert_eq!(reg.group(&g.id).unwrap().guardrails.compact_nudge_min_context_percent, None,
+        "sanity: nothing configured it — still unset after clamped()");
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let empty = HashMap::new();
+
+    // Below the smart default (50%): the lull alone must not fire.
+    let low_context: HashMap<String, u32> = [(o.id.clone(), 30u32)].into_iter().collect();
+    assert!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &low_context, &HashMap::new(), &HashMap::new(), &HashMap::new())
+            .is_empty(),
+        "context 30% is under the smart 50% default — the heuristic nudge must not fire, with NO config"
+    );
+    assert_eq!(audit_count(&reg, &g.id, "compact-nudge"), 0);
+
+    // Above the smart default: fires normally.
+    let high_context: HashMap<String, u32> = [(o.id.clone(), 60u32)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &high_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![o.id.clone()],
+        "context 60% clears the smart 50% default — the heuristic nudge fires"
+    );
+}
+
+#[test]
+fn compact_nudge_heuristic_fire_gated_by_an_explicit_min_context_percent() {
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                compact_nudge_min_context_percent: Some(70),
+                ..rails()
+            },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let empty = HashMap::new();
+    let mid_context: HashMap<String, u32> = [(o.id.clone(), 60u32)].into_iter().collect();
+    assert!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &mid_context, &HashMap::new(), &HashMap::new(), &HashMap::new())
+            .is_empty(),
+        "60% clears the smart default but not an explicit 70% floor"
+    );
+    let high_context: HashMap<String, u32> = [(o.id.clone(), 75u32)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &high_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![o.id.clone()]
+    );
+}
+
+#[test]
+fn compact_nudge_heuristic_fire_not_gated_when_explicitly_disabled() {
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                compact_nudge_min_context_percent: Some(0), // explicit opt-out
+                ..rails()
+            },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let empty = HashMap::new();
+    let low_context: HashMap<String, u32> = [(o.id.clone(), 5u32)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &low_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![o.id.clone()],
+        "explicit Some(0) must restore the pre-smart-default behavior — fire on the lull alone"
+    );
+}
+
+#[test]
+fn compact_nudge_request_compact_fires_below_the_smart_default_agent_judgment_wins() {
+    // The floor gates loomux's OWN unprompted (lull-timer) judgment only — an
+    // agent that explicitly asked via `request_compact` is always honored,
+    // regardless of context%, even under the zero-config smart default.
+    let (reg, _d) = test_registry();
+    let g = reg
+        .create_group(
+            "C:/tmp/repo",
+            Guardrails {
+                compact_nudge_minutes: 20,
+                compact_nudge_roles: vec!["orchestrator".to_string()],
+                ..rails()
+            },
+        )
+        .unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.request_compact(&o.id).unwrap();
+
+    let empty = HashMap::new();
+    let low_context: HashMap<String, u32> = [(o.id.clone(), 10u32)].into_iter().collect();
+    assert_eq!(
+        reg.compact_nudge_tick(FAR, &empty, &HashMap::new(), &low_context, &HashMap::new(), &HashMap::new(), &HashMap::new()),
+        vec![o.id.clone()],
+        "an agent-requested compact must fire even at 10% context — the floor never gates request_compact"
+    );
+}
+
+#[test]
+fn compact_nudge_min_context_percent_stays_unset_when_the_parent_heuristic_is_off() {
+    // None + compact_nudge_minutes == 0: nothing to gate, and clamped() must
+    // NOT resolve the smart default just because the field is unset — the
+    // resolution is deliberately deferred to gate-evaluation time.
+    let g = Guardrails { compact_nudge_minutes: 0, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, None);
+}
+
+#[test]
+fn compact_nudge_min_context_percent_explicit_values_survive_clamping() {
+    let g = Guardrails { compact_nudge_min_context_percent: Some(0), ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, Some(0), "an explicit 0 (opt-out) must survive, not become None");
+    let g = Guardrails { compact_nudge_min_context_percent: Some(250), ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, Some(100), "clamps to the 100% ceiling");
+    let g = Guardrails { compact_nudge_min_context_percent: None, ..rails() }.clamped();
+    assert_eq!(g.compact_nudge_min_context_percent, None, "unset stays unset — clamped() never resolves it");
 }
 
 #[test]
