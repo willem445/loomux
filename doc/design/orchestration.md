@@ -884,20 +884,26 @@ byte-count baselines for the interactive-question guard). The fix is a real sign
 
 ### The docs facts (per the `agent-cli-reference` skill)
 
-- **Claude Code hooks reference** (code.claude.com/docs/en/hooks): `UserPromptSubmit` fires "when
-  you submit a prompt, before Claude processes it", supports **no matcher** (always fires on
-  every submission), and the stdin JSON payload carries the submitted text under **`user_input`**
-  (not `user_prompt` — an earlier planning draft had the field name wrong; corrected here against
-  the live doc). **Safety-critical**: exit code 2 "blocks prompt processing and erases the
-  prompt", and on exit 0 anything printed to **stdout is added as context Claude can see**.
-  Hook commands receive input "piped via stdin as JSON" (confirmed separately, "How Hook Commands
-  Receive Input"). Default timeout for this event is 30s.
+- **Claude Code hooks reference** (code.claude.com/docs/en/hooks, "UserPromptSubmit input"
+  section, fetched and grepped directly against the raw page — round 1 review caught an earlier
+  draft of this note citing `user_input` as the documented field, which does not appear anywhere
+  on the page): `UserPromptSubmit` fires "when you submit a prompt, before Claude processes it",
+  supports **no matcher** (always fires on every submission), and the stdin JSON payload carries
+  the submitted text under **`prompt`** — verbatim, "UserPromptSubmit hooks receive the `prompt`
+  field containing the text the user submitted." `user_input`/`user_prompt` are tolerated as
+  legacy/cross-CLI fallback field names only, never treated as primary. **Safety-critical**: exit
+  code 2 "blocks prompt processing and erases the prompt", and on exit 0 anything printed to
+  **stdout is added as context Claude can see**. Hook commands receive input "piped via stdin as
+  JSON" (confirmed separately, "How Hook Commands Receive Input"). Default timeout for this event
+  is 30s.
 - **Copilot hooks reference** (docs.github.com/en/copilot/reference/hooks-reference):
   `userPromptSubmitted` fires when "The user submits a prompt"; documented field names are
   `prompt` (camelCase: `sessionId`/`timestamp`/`cwd`/`prompt`) or `prompt` again under the
   VS-Code-compatible shape (`hook_event_name`/`session_id`/`timestamp`/`cwd`/`prompt`). The
-  event is **notification-only** — "No" output is processed, so there is no exit-code-erases-
-  the-prompt hazard on this side the way there is for Claude.
+  event's row in the page's own events table reads "Output processed: **No**" (re-verified
+  directly against the raw page, not the rendered summary — the table has an `Event` / `Fires
+  when` / `Output processed` / `Cloud agent` header row), so there is no exit-code-erases-the-
+  prompt hazard on this side the way there is for Claude.
 - **Docs-silent residuals** (named, not papered over):
   - **Copilot's payload TRANSPORT** for `userPromptSubmitted` is not documented — unlike
     Claude's explicit "stdin as JSON" contract, the Copilot reference gives field names but never
@@ -933,8 +939,9 @@ event to that existing machinery:
 
 - **Claude (content tier).** The script's `promptsubmit` arm appends the FULL stdin JSON verbatim
   (plus a trailing newline) to the marker. `promptsubmit_records_since(content, offset)` parses
-  each line, pulling text from `user_input` (primary) or `user_prompt`/`prompt` (legacy/cross-CLI
-  fallback) — an unparseable line (a torn write mid-`>>`, racing a poll) degrades to `text: None`
+  each line, pulling text from `prompt` (the documented field — see "The docs facts" above) or
+  `user_input`/`user_prompt` (legacy/cross-CLI fallback only, never primary) — an unparseable
+  line (a torn write mid-`>>`, racing a poll) degrades to `text: None`
   rather than being dropped, so a torn read never silently loses a whole poll cycle's evidence.
   `prompt_landed(records, pasted)` normalizes both sides (trim + collapse all whitespace runs,
   which also washes out CRLF-vs-LF) and does **containment**: a record whose text CONTAINS the
@@ -957,6 +964,19 @@ BEFORE it pastes anything (not before the Enter; before the paste). `promptsubmi
 only looks at bytes after that offset. A record from an EARLIER delivery to the same pane, or a
 human's own submitted prompt, sits entirely before this delivery's own baseline and can never
 satisfy it — by construction, not by a timing assumption.
+
+**Residual, named by round 1 review (N2), not hardened against**: the script's append is two
+separate writes (`{ cat; printf '\n'; } >> marker` is one shell redirection, but the underlying
+`write(2)` calls for the JSON body and the trailing newline are not atomic against a concurrent
+reader). `promptsubmit_marker_len` could theoretically snapshot mid-append of a PRE-baseline
+record; the remnant then parses, post-offset, as a non-empty non-JSON tail line — `text: None` —
+which resolves to `PromptLandedMatch::Existence` and confirms this delivery on the strength of an
+older record's own leftover tail. The window is microscopic (a delivery's baseline snapshot would
+have to land in the handful of microseconds between two writes belonging to a DIFFERENT firing),
+and only ever promotes to the weaker existence tier (a torn Claude record can't produce a false
+CONTENT match, since the containment check needs a complete, valid JSON `prompt` value) — so it's
+recorded here as a known, accepted gap rather than fixed with an offset-vs-last-newline check that
+would add complexity for a hazard this narrow.
 
 ### The precedence, and the property that actually fixes the reported bug
 
@@ -982,12 +1002,28 @@ dialog that appeared since. `confirm_source` (`"hook"` / `"burst"` / `"none"`) a
 `confirm_merged` ride the `prompt-typed` audit event so the two failure directions stay
 distinguishable after the fact.
 
+**The final re-check (added round 1 review, B3 — plan-14 step 4 had specified it and the first
+push omitted it).** Each retry's own hook poll can be followed by `wait_for_question_clear`, which
+holds for up to `QUESTION_HOLD_MAX` (120s). A hook record landing during that hold — or fired by
+the LAST retry's own Enter, after the loop's own last poll of it — is invisible to every poll that
+already ran. Left unchecked, `confirmed` stays `false` and the unconfirmed notice fires with the
+proof already sitting on disk, unread: precisely the false-unconfirm class this feature exists to
+erase, surviving on the one path the plan named to close. `apply_final_hook_recheck` (pure) runs
+once more, right before `DeliveryOutcome` is recorded and `notify_unconfirmed_delivery` is called
+— a no-op when already confirmed (never re-litigates a decision already made) or when the hook has
+nothing new to say.
+
 ### Both-directions scorecard
 
-- **False confirm**: requires a hook record after the delivery's own baseline whose text
-  CONTAINS the pasted text — an output burst, a dialog repaint, or a spinner tick writes no such
-  record. The burst tier is untouched, so its existing (narrow) false-confirm exposure is
-  unchanged, not widened.
+- **False confirm**: on the Claude CONTENT tier, requires a hook record after the delivery's own
+  baseline whose text CONTAINS the pasted text — an output burst, a dialog repaint, or a spinner
+  tick writes no such record. **Residual, named by round 1 review (N1)**: the Copilot EXISTENCE
+  tier has no content check at all — ANY post-baseline record confirms, so a human submitting
+  their own prompt into that same pane during the confirm window or a retry's sleep (a span of
+  several seconds) would false-confirm loomux's delivery. This is the precision cost the "Two
+  confirmation tiers" section already names; it is real and unmitigated on Copilot, not merely a
+  theoretical residual the way the Claude tier's is. The burst tier itself is untouched, so its
+  own (narrow) false-confirm exposure is unchanged, not widened.
 - **False unconfirm**: for a hook-provisioned CLI, a landed prompt fires the hook deterministically
   per the docs' own "always fires" contract, independent of the pane's output-quiet timing — the
   busy-pane class from the field-evidence session disappears. A CLI outside the hook seam (or a
@@ -1010,11 +1046,22 @@ trusted evidence source" below) and only appends through `>> "$marker"` once tha
 is openable; on a `touch` failure it drains stdin to `/dev/null` instead of leaving it unread.
 Either way, the append's target is the marker file or `/dev/null` — never the script's own
 inherited stdout. Pinned by real-execution tests (the induced-failure `mkdir` case from #417's
-own harness, extended to this arm) with MUTATION evidence: a version of this arm that leaks
-stdin to stdout (a single stray `cat` with no redirect) fails the "no stdout" assertion for real,
-and a version of `resolve_submit_confirmation` that re-gates the hook tier on `reached_quiet`
-fails the busy-pane pin for real — both mutations were run and reverted; see the PR body for the
-exact commands and failure lines.
+own harness, extended to this arm, plus a happy-path test proving two firings append rather than
+overwrite) with MUTATION evidence: a version of this arm that leaks stdin to stdout (a single
+stray `cat` ahead of the touch-gate — a realistic typo, not a contrived one) fails the "no
+stdout" assertion on BOTH real-execution tests, and a version of `resolve_submit_confirmation`
+that re-gates the hook tier on `reached_quiet` fails the busy-pane pin — both mutations were run
+and reverted; see the PR body for the exact commands and failure lines. **Honesty note (round 1
+review corrected an inaccurate claim here)**: the `touch`-gate itself is defense-in-depth, not a
+mutation-demonstrated regression catch on the `sh` this repo's tests actually run under — verified
+directly, POSIX's fatal-on-redirection-error rule applies to *special built-ins* (a bare `: >`,
+which the PRE-EXISTING `compact_hook_script...` test already pins) and not to ordinary utilities
+or compound groups, so `{ cat; printf '\n'; } >> "$marker"` alone was confirmed NOT to abort this
+script under the same induced `mkdir` failure. The gate is kept anyway for consistency with this
+module's established style and because that POSIX distinction cannot be relied on across every
+`sh` implementation this script might run under — but the claim that a mutation of THIS PR's own
+construct demonstrates the gate catching a live regression was false and has been removed from
+the code comment that used to make it (`COMPACT_HOOK_SCRIPT`'s doc).
 
 ### What this does NOT change (the #445 seam)
 

@@ -2420,12 +2420,36 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 /// `>>` open on a possibly-nonexistent parent dir (the SAME fatal-
 /// redirection-error hazard `: > "$path"` had) — once `touch` proves the
 /// path is openable, the single grouped `{ cat; printf '\n'; } >> "$marker"`
-/// append is safe. Pinned by `promptsubmit_hook_script_sh_exits_zero_and_
-/// prints_nothing_when_the_marker_dir_cant_be_created`, with mutation
-/// evidence (`promptsubmit_hook_script_mutation_bare_redirect_can_abort_
-/// before_exit_0`) proving the `touch`-gate is load-bearing: reverting this
-/// arm to a bare `>>` (the exact class of bug `: > "$path"` already was)
-/// makes that induced-failure test fail for real.
+/// append is safe. Real-execution pins:
+/// `promptsubmit_hook_script_sh_exits_zero_and_prints_nothing_when_the_
+/// marker_dir_cant_be_created` (induced `mkdir` failure — exit 0 AND empty
+/// stdout) and `promptsubmit_hook_script_sh_appends_stdin_verbatim_with_no_
+/// stdout` (the happy path — two firings append, they don't overwrite, and
+/// stdout stays empty on the successful path too). Mutation-verified (PR
+/// #451 body has the exact commands/output): a stray unredirected `cat`
+/// ahead of the touch-gate — a realistic typo that would leak the submitted
+/// prompt straight into Claude's own context — reds both tests. **Honesty
+/// note, found by review**: on this shell (git-bash `sh.exe`, and per POSIX
+/// itself), the FATAL-on-redirection-error rule applies to *special
+/// built-ins* like a bare `: >`, not to ordinary utilities or compound
+/// groups — so `{ cat; printf '\n'; } >> "$marker"` alone, without the
+/// `touch` gate, was verified NOT to abort this script on the induced
+/// `mkdir` failure either (confirmed directly, not assumed). The `touch`
+/// gate is kept as defense-in-depth / consistency with the rest of this
+/// module's established style (never trust a shell's exact redirection-
+/// error semantics across every `sh` implementation this might run under),
+/// not because a mutation here demonstrates a live regression on THIS
+/// shell — that would be a false claim, exactly the kind #451 round 1
+/// review caught this doc comment making about a test that didn't exist.
+///
+/// **Naming, kept imprecise on purpose (#112):** this file is still named
+/// `compact-hook.sh` (see `ensure_compact_hook_script`) and this constant is
+/// still `COMPACT_HOOK_SCRIPT`, even though the `promptsubmit` arm below
+/// means "compact" no longer describes everything this script does.
+/// Renaming either would strand any already-spawned agent whose generated
+/// `--settings`/`loomux-compact.json` still points at the OLD path/name —
+/// so both stay, generic-lifecycle-hook-script-not-just-compact in
+/// substance even though the names say otherwise.
 #[doc(hidden)] // pub for integration tests: they run this script for real
 pub const COMPACT_HOOK_SCRIPT: &str = "#!/bin/sh\n\
 event=\"$1\"\n\
@@ -6631,9 +6655,15 @@ pub fn submit_confirmed(reached_quiet: bool, baseline_total: u64, observed_total
 //
 // The fix is an AUTHORITATIVE signal, not a retuned threshold: Claude Code's
 // `UserPromptSubmit` hook fires "when you submit a prompt, before Claude
-// processes it" (code.claude.com/docs/en/hooks, "UserPromptSubmit" section),
-// with no matcher (always fires) and the submitted text on stdin as JSON under
-// the `user_input` field. Copilot's `userPromptSubmitted` fires when "The user
+// processes it" (code.claude.com/docs/en/hooks, "UserPromptSubmit input"
+// section — fetched and grepped directly, not inferred), with no matcher
+// (always fires) and the submitted text on stdin as JSON under the `prompt`
+// field ("UserPromptSubmit hooks receive the `prompt` field containing the
+// text the user submitted" — verbatim). `user_input`/`user_prompt` are
+// tolerated as legacy/cross-CLI fallback field names only, never the
+// documented one — round 1 review caught this module citing `user_input` as
+// primary, which the live page does not contain at all. Copilot's
+// `userPromptSubmitted` fires when "The user
 // submits a prompt" (docs.github.com/en/copilot/reference/hooks-reference,
 // "userPromptSubmitted" section) but that page does NOT document the payload
 // TRANSPORT for this event (unlike Claude's stdin-JSON contract, which the
@@ -6688,8 +6718,11 @@ pub struct PromptSubmitRecord {
 /// (an empty tail) rather than panicking the delivery thread.
 ///
 /// Each non-empty line is one record. Valid JSON with a recognized text
-/// field (`user_input` — the documented Claude field; `user_prompt`/`prompt`
-/// tolerated as legacy/cross-CLI fallbacks) yields `text: Some(..)`.
+/// field (`prompt` — the documented Claude field, per the "UserPromptSubmit
+/// input" section of code.claude.com/docs/en/hooks: "UserPromptSubmit hooks
+/// receive the `prompt` field containing the text the user submitted";
+/// `user_input`/`user_prompt` tolerated as legacy/cross-CLI fallbacks only)
+/// yields `text: Some(..)`.
 /// Anything else non-empty (Copilot's existence-only marker line, or a
 /// trailing line still mid-`>>` when this races the hook script's own
 /// write) yields `text: None` rather than being dropped — losing a whole
@@ -6702,9 +6735,9 @@ pub fn promptsubmit_records_since(content: &str, offset: usize) -> Vec<PromptSub
         .filter(|l| !l.trim().is_empty())
         .map(|line| {
             let text = serde_json::from_str::<Value>(line).ok().and_then(|v| {
-                v.get("user_input")
+                v.get("prompt")
+                    .or_else(|| v.get("user_input"))
                     .or_else(|| v.get("user_prompt"))
-                    .or_else(|| v.get("prompt"))
                     .and_then(|t| t.as_str())
                     .map(|s| s.to_string())
             });
@@ -6822,6 +6855,44 @@ pub fn resolve_submit_confirmation(
         return (true, ConfirmSource::Burst);
     }
     (false, ConfirmSource::None)
+}
+
+/// The FINAL hook re-check `deliver_prompt` runs right before recording
+/// `DeliveryOutcome` and deciding the unconfirmed notice (#112 plan-14 step
+/// 4; added in round-1 review, B3 — the accepted plan required it and the
+/// first push omitted it). Pure, so the property is directly pinnable
+/// independent of any PTY/thread plumbing, the same way `resolve_submit_
+/// confirmation` is.
+///
+/// Why this exists as a SEPARATE check from the confirm window/retry loop's
+/// own polls: each retry can hold for `wait_for_question_clear` — up to
+/// `QUESTION_HOLD_MAX` (120s) — after its own hook poll. A hook record
+/// landing during that hold, or fired by the LAST retry's own Enter (after
+/// the loop's own last poll of it), is invisible to every poll that ran
+/// before it. Without this final check, `confirmed` would stay `false` and
+/// the unconfirmed notice would fire with the proof already sitting on
+/// disk, unread — exactly the false-unconfirm class this feature exists to
+/// erase, surviving on the one path plan-14 explicitly named to close it.
+///
+/// A no-op when already `confirmed` (a decision already made is never
+/// re-litigated — matches `resolve_submit_confirmation`'s own "hook tier
+/// only overrides toward MORE confirmed, never less" posture) and when
+/// `hook_match` is `None` (nothing new to say).
+#[doc(hidden)] // pub for integration tests
+pub fn apply_final_hook_recheck(
+    confirmed: bool,
+    confirm_source: ConfirmSource,
+    confirm_merged: bool,
+    hook_match: PromptLandedMatch,
+) -> (bool, ConfirmSource, bool) {
+    if confirmed {
+        return (confirmed, confirm_source, confirm_merged);
+    }
+    match hook_match {
+        PromptLandedMatch::None => (confirmed, confirm_source, confirm_merged),
+        PromptLandedMatch::Existence => (true, ConfirmSource::Hook, false),
+        PromptLandedMatch::Content { merged } => (true, ConfirmSource::Hook, merged),
+    }
 }
 
 /// The `promptsubmit` hook marker path for one agent — a sibling of the
@@ -16070,6 +16141,12 @@ impl OrchRegistry {
     /// Write (or refresh) the generic hook script, returning its path or
     /// `None` if it can't be written. Idempotent/always-rewritten, like
     /// `write_shim` — cheap, and keeps it current if loomux itself updated.
+    ///
+    /// Still named `compact-hook.sh` even though #112 added a `promptsubmit`
+    /// arm that has nothing to do with compaction — see `COMPACT_HOOK_
+    /// SCRIPT`'s doc ("Naming, kept imprecise on purpose") for why the name
+    /// stays: an already-spawned agent's `--settings`/hooks-config command
+    /// bakes in this exact path, and renaming would strand it.
     fn ensure_compact_hook_script(&self) -> Option<PathBuf> {
         let dir = self.compact_hook_dir();
         fs::create_dir_all(&dir).ok()?;
@@ -16216,7 +16293,12 @@ impl OrchRegistry {
     /// file (still one small global file, same additive-merge guarantee) —
     /// existence-only, per `COPILOT_PROMPTSUBMIT_HOOK_BASH`'s doc: the
     /// payload transport for this event isn't documented, so the command
-    /// never attempts to read it.
+    /// never attempts to read it. The file stays named `loomux-compact.json`
+    /// for the same reason `compact-hook.sh` stays named that (see
+    /// `COMPACT_HOOK_SCRIPT`'s doc): this is a rewrite-in-place, single
+    /// well-known path every Copilot session on the box already resolves —
+    /// renaming it would just mean the OLD file (with the OLD hook set)
+    /// sits there stale until the next write, not a clean cutover.
     fn ensure_copilot_compact_hook(&self) -> bool {
         let Some(dir) = self.copilot_hooks_dir() else { return false };
         if fs::create_dir_all(&dir).is_err() {
@@ -18302,6 +18384,17 @@ impl OrchRegistry {
                         }
                     }
                 }
+            }
+            // #112 (plan-14 step 4 / rev-20 round-1 B3) — see
+            // `apply_final_hook_recheck`'s doc for why this final poll,
+            // separate from the confirm window/retry loop's own polls
+            // above, is required. Skip the poll (not just the update) when
+            // already confirmed — no I/O needed to reach the same no-op the
+            // pure fn would return anyway.
+            if !confirmed {
+                let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+                (confirmed, confirm_source, confirm_merged) =
+                    apply_final_hook_recheck(confirmed, confirm_source, confirm_merged, hook_match);
             }
             // Record the outcome so the next delivery to this pane can flush a
             // prompt still stranded in the box (#81/#84).

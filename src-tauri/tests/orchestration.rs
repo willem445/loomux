@@ -17,9 +17,9 @@ use loomux_lib::orchestration::{
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
     COMPACT_HOOK_SCRIPT, COPILOT_PRECOMPACT_HOOK_BASH, COPILOT_PRECOMPACT_HOOK_POWERSHELL,
     COPILOT_PROMPTSUBMIT_HOOK_BASH, COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL,
-    ConfirmSource, PromptLandedMatch, PromptSubmitRecord, poll_promptsubmit_hook,
-    promptsubmit_marker_len, promptsubmit_marker_path, promptsubmit_records_since,
-    prompt_landed, resolve_submit_confirmation,
+    ConfirmSource, PromptLandedMatch, PromptSubmitRecord, apply_final_hook_recheck,
+    poll_promptsubmit_hook, promptsubmit_marker_len, promptsubmit_marker_path,
+    promptsubmit_records_since, prompt_landed, resolve_submit_confirmation,
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_context_floor_met,
     compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
@@ -6945,7 +6945,7 @@ fn promptsubmit_hook_script_sh_exits_zero_and_prints_nothing_when_the_marker_dir
         .stderr(Stdio::piped())
         .spawn()
         .expect("sh must run");
-    child.stdin.take().unwrap().write_all(br#"{"user_input":"do the thing"}"#).unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"prompt":"do the thing"}"#).unwrap();
     let output = child.wait_with_output().unwrap();
     assert_eq!(
         output.status.code(),
@@ -6976,7 +6976,7 @@ fn promptsubmit_hook_script_sh_appends_stdin_verbatim_with_no_stdout() {
     fs::create_dir_all(&group_dir).unwrap();
     let script_path = td.path().join("compact-hook.sh");
     fs::write(&script_path, COMPACT_HOOK_SCRIPT).unwrap();
-    let payload = r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","user_input":"implement #112"}"#;
+    let payload = r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","prompt":"implement #112"}"#;
 
     // Two firings, to prove APPEND (not overwrite) — the whole point of a
     // byte-offset baseline.
@@ -7080,7 +7080,7 @@ fn copilot_promptsubmit_hook_powershell_exits_zero_when_the_marker_dir_cant_be_c
 
 #[test]
 fn promptsubmit_records_since_parses_jsonl_and_tolerates_a_partial_trailing_line() {
-    let content = "{\"user_input\":\"first\"}\n{\"user_input\":\"second\"}\n{\"user_inp";
+    let content = "{\"prompt\":\"first\"}\n{\"prompt\":\"second\"}\n{\"prom";
     let all = promptsubmit_records_since(content, 0);
     assert_eq!(all.len(), 3, "the torn trailing line still counts as existence evidence, not dropped");
     assert_eq!(all[0].text.as_deref(), Some("first"));
@@ -7104,19 +7104,34 @@ fn promptsubmit_records_since_parses_jsonl_and_tolerates_a_partial_trailing_line
 
 #[test]
 fn promptsubmit_records_since_tolerates_unknown_fields_and_legacy_field_names() {
-    // The documented Claude field is `user_input` — but a copilot VS-Code-
-    // compatible payload or a future SDK rename is tolerated via fallback
-    // field names, and unrelated fields never break parsing.
-    let content = "{\"session_id\":\"x\",\"user_input\":\"a\"}\n\
-                   {\"prompt\":\"b\"}\n\
+    // The documented Claude field is `prompt` — verbatim from the live
+    // hooks reference (code.claude.com/docs/en/hooks, "UserPromptSubmit
+    // input"): "UserPromptSubmit hooks receive the `prompt` field
+    // containing the text the user submitted." `user_input`/`user_prompt`
+    // are tolerated fallback field names only (neither appears anywhere on
+    // that page — round 1 review caught an earlier version of this module
+    // citing `user_input` as primary, which was simply wrong), and
+    // unrelated fields never break parsing.
+    let content = "{\"session_id\":\"x\",\"prompt\":\"a\"}\n\
+                   {\"user_input\":\"b\"}\n\
                    {\"user_prompt\":\"c\"}\n\
                    {\"hook_event_name\":\"UserPromptSubmit\"}\n";
     let records = promptsubmit_records_since(content, 0);
     assert_eq!(records.len(), 4);
-    assert_eq!(records[0].text.as_deref(), Some("a"));
-    assert_eq!(records[1].text.as_deref(), Some("b"));
-    assert_eq!(records[2].text.as_deref(), Some("c"));
+    assert_eq!(records[0].text.as_deref(), Some("a"), "the documented field, `prompt`");
+    assert_eq!(records[1].text.as_deref(), Some("b"), "legacy fallback `user_input`");
+    assert_eq!(records[2].text.as_deref(), Some("c"), "legacy fallback `user_prompt`");
     assert_eq!(records[3].text, None, "no recognized text field at all — existence only");
+}
+
+#[test]
+fn promptsubmit_records_since_prefers_the_documented_field_over_legacy_fallbacks() {
+    // If a single record somehow carried more than one of these fields, the
+    // documented `prompt` field must win — the fallbacks exist for CLIs/
+    // versions that DON'T send `prompt`, never to shadow it when it's present.
+    let content = "{\"prompt\":\"real\",\"user_input\":\"stale-or-wrong\"}\n";
+    let records = promptsubmit_records_since(content, 0);
+    assert_eq!(records[0].text.as_deref(), Some("real"));
 }
 
 #[test]
@@ -7227,6 +7242,50 @@ fn resolve_submit_confirmation_hook_checked_before_burst() {
     );
 }
 
+// ─── #112 round-1 review B3: the final hook re-check before the unconfirmed notice ───
+
+#[test]
+fn apply_final_hook_recheck_confirms_on_a_late_hook_match() {
+    // The core B3 fix, pinned directly: a hook record that only landed
+    // AFTER the confirm window and every retry poll (e.g. during a 120s
+    // question hold, or fired by the last retry's own Enter) must still
+    // flip an unconfirmed delivery to confirmed on this final check.
+    assert_eq!(
+        apply_final_hook_recheck(false, ConfirmSource::None, false, PromptLandedMatch::Existence),
+        (true, ConfirmSource::Hook, false),
+    );
+    assert_eq!(
+        apply_final_hook_recheck(false, ConfirmSource::None, false, PromptLandedMatch::Content { merged: true }),
+        (true, ConfirmSource::Hook, true),
+        "the merged flag from the LATE match must ride through, not just true/false confirmed",
+    );
+}
+
+#[test]
+fn apply_final_hook_recheck_is_a_no_op_with_no_new_evidence() {
+    assert_eq!(
+        apply_final_hook_recheck(false, ConfirmSource::None, false, PromptLandedMatch::None),
+        (false, ConfirmSource::None, false),
+        "nothing new to say must leave the delivery unconfirmed, not invent evidence",
+    );
+}
+
+#[test]
+fn apply_final_hook_recheck_never_relitigates_an_already_confirmed_delivery() {
+    // A delivery the burst tier already confirmed must be left exactly as
+    // it was — this is a FINAL check for the unconfirmed case only, never a
+    // chance to downgrade or silently relabel a decision already made.
+    assert_eq!(
+        apply_final_hook_recheck(true, ConfirmSource::Burst, false, PromptLandedMatch::None),
+        (true, ConfirmSource::Burst, false),
+    );
+    assert_eq!(
+        apply_final_hook_recheck(true, ConfirmSource::Burst, false, PromptLandedMatch::Existence),
+        (true, ConfirmSource::Burst, false),
+        "already confirmed via burst must not be relabeled to hook by a coincidental late record",
+    );
+}
+
 #[test]
 fn poll_promptsubmit_hook_degrades_to_none_for_a_missing_or_unreadable_file() {
     let td = tempfile::tempdir().unwrap();
@@ -7241,7 +7300,7 @@ fn poll_promptsubmit_hook_respects_a_baseline_that_excludes_a_stale_record() {
     // never satisfy confirmation, even though its text matches exactly.
     let td = tempfile::tempdir().unwrap();
     let marker = td.path().join("agent.promptsubmit.jsonl");
-    fs::write(&marker, "{\"user_input\":\"implement #112\"}\n").unwrap();
+    fs::write(&marker, "{\"prompt\":\"implement #112\"}\n").unwrap();
     let baseline = promptsubmit_marker_len(&marker);
 
     assert_eq!(
@@ -7254,7 +7313,7 @@ fn poll_promptsubmit_hook_respects_a_baseline_that_excludes_a_stale_record() {
     // does confirm.
     use std::io::Write as _;
     let mut f = std::fs::OpenOptions::new().append(true).open(&marker).unwrap();
-    f.write_all(b"{\"user_input\":\"implement #112\"}\n").unwrap();
+    f.write_all(b"{\"prompt\":\"implement #112\"}\n").unwrap();
     drop(f);
     assert_eq!(
         poll_promptsubmit_hook(&marker, baseline, "implement #112"),
