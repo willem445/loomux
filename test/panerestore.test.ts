@@ -9,6 +9,8 @@ import {
   planLayoutRestore,
   agentResumeCommand,
   agentFreshCommand,
+  stripSoloMcpFlags,
+  appendSoloMcpArgs,
   sessionIdFromCommand,
   adoptableSessionId,
   hasForkSession,
@@ -445,6 +447,100 @@ test("resume falls back to argv when there is no string command", () => {
 
 test("resume with neither command nor argv best-efforts a bare claude --resume", () => {
   assert.deepEqual(agentResumeCommand(null, null, "s5"), { command: "claude --resume s5" });
+});
+
+// ---------- solo channel-identity MCP flags (#439) ----------
+// A restored solo agent pane's recorded command can carry the flags
+// `soloPrepare` appended at launch — they point at a `configs/solo-N.json`
+// deleted at the pane's last exit. Replaying them hard-errors claude and
+// authenticates nothing on copilot; stripSoloMcpFlags removes them so the
+// caller (main.ts) can re-mint a fresh identity instead.
+
+test("stripSoloMcpFlags removes claude's solo MCP flags and reports the CLI", () => {
+  assert.deepEqual(
+    stripSoloMcpFlags(
+      'claude --model opus --mcp-config "C:/Users/w/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__loomux --resume abc',
+      null
+    ),
+    { cli: "claude", command: "claude --model opus --resume abc" }
+  );
+});
+
+test("stripSoloMcpFlags removes copilot's solo MCP flags and reports the CLI", () => {
+  assert.deepEqual(
+    stripSoloMcpFlags(
+      'copilot --additional-mcp-config "@C:/Users/w/AppData/Roaming/loomux/orchestration/__solo__/configs/solo-11.json" --allow-tool loomux',
+      null
+    ),
+    { cli: "copilot", command: "copilot" }
+  );
+});
+
+test("stripSoloMcpFlags is a no-op (cli: null) on a command with no solo identity", () => {
+  // A custom command, or a channel-tools-off launch: nothing to re-mint, and the
+  // command must come back byte-identical (no accidental reflow of unrelated flags).
+  assert.deepEqual(stripSoloMcpFlags("claude --model opus --resume abc", null), {
+    cli: null,
+    command: "claude --model opus --resume abc",
+  });
+});
+
+test("stripSoloMcpFlags handles the argv form the same way", () => {
+  assert.deepEqual(
+    stripSoloMcpFlags(null, [
+      "claude",
+      "--mcp-config",
+      "C:/configs/solo-6.json",
+      "--strict-mcp-config",
+      "--allowedTools",
+      "mcp__loomux",
+      "--resume",
+      "abc",
+    ]),
+    { cli: "claude", argv: ["claude", "--resume", "abc"] }
+  );
+  assert.deepEqual(stripSoloMcpFlags(null, ["copilot", "--resume", "abc"]), {
+    cli: null,
+    argv: ["copilot", "--resume", "abc"],
+  });
+});
+
+test("stripSoloMcpFlags on neither command nor argv reports no CLI and nothing to append to", () => {
+  assert.deepEqual(stripSoloMcpFlags(null, null), { cli: null });
+  assert.deepEqual(stripSoloMcpFlags("", []), { cli: null });
+});
+
+test("appendSoloMcpArgs appends a freshly-minted identity's flags to a cleaned command", () => {
+  assert.deepEqual(
+    appendSoloMcpArgs("claude --model opus --resume abc", undefined, '--mcp-config "C:/new/solo-9.json" --strict-mcp-config --allowedTools mcp__loomux'),
+    { command: 'claude --model opus --resume abc --mcp-config "C:/new/solo-9.json" --strict-mcp-config --allowedTools mcp__loomux' }
+  );
+});
+
+test("appendSoloMcpArgs works on the argv form, tokenizing mcpArgs", () => {
+  assert.deepEqual(appendSoloMcpArgs(undefined, ["claude", "--resume", "abc"], "--additional-mcp-config @/new/solo-9.json --allow-tool loomux"), {
+    argv: ["claude", "--resume", "abc", "--additional-mcp-config", "@/new/solo-9.json", "--allow-tool", "loomux"],
+  });
+});
+
+test("strip + append round-trips: a resumed claude command replaces the dead path with a fresh one, never the recorded one", () => {
+  // This is the actual bug (#439): agentResumeCommand alone keeps EVERY flag
+  // except the session ones, so the dead --mcp-config path survives it intact.
+  const recorded =
+    'claude --mcp-config "C:/dead/configs/solo-6.json" --strict-mcp-config --allowedTools mcp__loomux --session-id old';
+  const resumed = agentResumeCommand(recorded, null, "new-session");
+  assert.match(resumed.command!, /dead\/configs\/solo-6\.json/, "sanity: the dead path is still there pre-strip");
+  // The fix: strip the dead flags, then append a freshly-minted config's flags.
+  const stripped = stripSoloMcpFlags(resumed.command, resumed.argv);
+  assert.equal(stripped.cli, "claude");
+  const final = appendSoloMcpArgs(
+    stripped.command,
+    stripped.argv,
+    '--mcp-config "C:/fresh/configs/solo-42.json" --strict-mcp-config --allowedTools mcp__loomux'
+  );
+  assert.doesNotMatch(final.command!, /dead\/configs\/solo-6\.json/, "the dead path must never survive restore");
+  assert.match(final.command!, /fresh\/configs\/solo-42\.json/, "a freshly-minted path replaces it");
+  assert.match(final.command!, /--resume new-session/, "still a real resume, never a replayed prompt");
 });
 
 // ---------- layout plan: reconstructible round-trip ----------

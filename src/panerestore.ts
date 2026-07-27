@@ -303,6 +303,81 @@ export function agentFreshCommand(
   return { command: `claude --session-id ${sessionId}` };
 }
 
+/** The two CLIs `solo_prepare` (mod.rs:10441) mints a channel identity for —
+ *  the only ones whose recorded command can carry the flags `stripSoloMcpFlags`
+ *  below recognizes. */
+export type SoloCli = "claude" | "copilot";
+
+/** Remove a recorded agent command's solo channel-identity MCP flags (#439):
+ *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__loomux`
+ *  (claude) or `--additional-mcp-config @<path> --allow-tool loomux`
+ *  (copilot) — the exact, contiguous suffix `launcher.ts:1343` appends via
+ *  `soloPrepare`'s `mcp_args`. That path is guaranteed gone by the time ANY
+ *  restore replays it: agent exit deletes the config file and clears the
+ *  token (mod.rs:18236), so replaying it hard-errors claude (missing file)
+ *  and authenticates nothing on copilot. This never inspects the path
+ *  itself — only the fixed flag tokens either CLI's mint always emits — so a
+ *  config file that happens to live under a "solo"-named folder can't be
+ *  mistaken for one.
+ *
+ *  Returns which CLI's flags were found (null when the command carried none
+ *  — nothing to re-mint, command/argv pass through unchanged) alongside the
+ *  command/argv with that group of tokens removed. The caller (main.ts)
+ *  re-mints a FRESH identity via `soloPrepare` for the returned `cli` and
+ *  appends its `mcp_args` with `appendSoloMcpArgs`; on a failed re-mint it
+ *  uses this function's output as-is, so the pane still boots — delivery-only,
+ *  never replaying the dead path (the same best-effort contract
+ *  `launcher.ts:1337` already states for a fresh launch). */
+export function stripSoloMcpFlags(
+  command: string | null | undefined,
+  argv: string[] | null | undefined
+): { cli: SoloCli | null; command?: string; argv?: string[] } {
+  const strip = (tokens: string[]): { cli: SoloCli | null; tokens: string[] } => {
+    for (let i = 0; i < tokens.length; i++) {
+      if (
+        tokens[i] === "--mcp-config" &&
+        tokens[i + 2] === "--strict-mcp-config" &&
+        tokens[i + 3] === "--allowedTools" &&
+        tokens[i + 4] === "mcp__loomux"
+      ) {
+        return { cli: "claude", tokens: [...tokens.slice(0, i), ...tokens.slice(i + 5)] };
+      }
+      if (
+        tokens[i] === "--additional-mcp-config" &&
+        tokens[i + 2] === "--allow-tool" &&
+        tokens[i + 3] === "loomux"
+      ) {
+        return { cli: "copilot", tokens: [...tokens.slice(0, i), ...tokens.slice(i + 4)] };
+      }
+    }
+    return { cli: null, tokens };
+  };
+  if (command && command.trim()) {
+    const { cli, tokens } = strip(command.trim().split(/\s+/));
+    return { cli, command: tokens.join(" ") };
+  }
+  if (argv && argv.length) {
+    const { cli, tokens } = strip(argv);
+    return { cli, argv: tokens };
+  }
+  return { cli: null };
+}
+
+/** Append a freshly-minted solo identity's `mcp_args` (`soloPrepare`'s return
+ *  value — always a plain flag string, even for the argv form: solo panes
+ *  are never argv-spawned today, but this mirrors agentResumeCommand's
+ *  dual-form contract for consistency) to a command already cleaned by
+ *  `stripSoloMcpFlags`. Pure concatenation, kept here so main.ts's restore
+ *  call site is just: strip → await soloPrepare → append → open pane. */
+export function appendSoloMcpArgs(
+  command: string | undefined,
+  argv: string[] | undefined,
+  mcpArgs: string
+): { command?: string; argv?: string[] } {
+  if (argv) return { argv: [...argv, ...mcpArgs.split(/\s+/).filter(Boolean)] };
+  return { command: [command, mcpArgs].filter((s) => s && s.trim()).join(" ") };
+}
+
 /** Extract the session id a spawn command carries via `--session-id <id>` or
  *  `--resume <id>` (both the space and `=` forms). Used to populate an
  *  orchestration pane's recorded session id from its backend-built command
