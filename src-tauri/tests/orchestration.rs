@@ -17313,3 +17313,214 @@ fn workflow_status_shapes_differ_for_a_workflow_group_and_a_builtin_group() {
         );
     }
 }
+
+// ───────── #385: merge-gate hot-reload ─────────
+//
+// Before this fix, `sync_merge_gate` only ever ran at group create/resume and
+// on the live `set_advanced_orchestrator` toggle (#316) — so an in-place edit
+// to an ALREADY-RUNNING group's `.loomux/workflow.yml` never took effect until
+// one of those two discrete events happened again. `run_workflow_gate_reload`
+// is the new trigger: a periodic background pass (`reload_merge_gate_if_
+// changed`, called on a timer by `start_workflow_gate_reload`) that re-derives
+// each advanced-orchestrator group's gate from the CURRENT file and re-arms it
+// through the exact same `sync_merge_gate` seam the other two callers use —
+// these tests call it directly rather than sleeping through the real
+// `WORKFLOW_GATE_POLL_INTERVAL`, the same "drive the tick function, don't wait
+// on the thread" pattern `idle_tick_tick`/`run_disk_monitor` already use above.
+//
+// This is a SECURITY GATE: a reload path that can leave the gate OPEN on a
+// malformed/unreadable/vanished file would be worse than the bug it fixes, so
+// half of these pin the fail-closed side as hard as the happy path.
+
+/// Overwrite a gated repo's workflow file in place — the test's stand-in for
+/// a human (or an editor's atomic save) editing `.loomux/workflow.yml` while
+/// the group is already running.
+fn edit_workflow(repo: &Path, contents: &str) {
+    fs::write(repo.join(".loomux").join("workflow.yml"), contents).unwrap();
+}
+
+#[test]
+fn run_workflow_gate_reload_picks_up_an_edited_also_clause_without_a_relaunch() {
+    // The literal #385 repro: the human edits workflow.yml to DROP the
+    // `also: [ci-green]` clause mid-session. No relaunch, no toggle — the next
+    // reload pass alone must reflect the edit.
+    let (reg, d, repo, gid) = gated_group("    also: [ci-green]\n");
+    let before = reg.merge_gate(&gid).expect("armed at launch");
+    assert_eq!(before.also, vec!["ci-green".to_string()], "test setup sanity");
+
+    edit_workflow(
+        repo.path(),
+        "version: 1\nname: focused-review\n\
+         blocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+         \x20 - id: rev-tests\n    kind: reviewer\n    prompt: Test quality only.\n\
+         gates:\n  merge:\n    reviewers: [rev-security, rev-tests]\n",
+    );
+    reg.run_workflow_gate_reload();
+
+    let after = reg.merge_gate(&gid).expect("still armed — just the also: clause dropped");
+    assert!(after.also.is_empty(), "the edit removed ci-green — the reload must reflect that: {after:?}");
+    assert_eq!(after.reviewers, vec!["rev-security".to_string(), "rev-tests".to_string()]);
+    let _ = &d;
+}
+
+#[test]
+fn run_workflow_gate_reload_does_not_rewrite_or_reaudit_an_unchanged_file() {
+    // The "simpler, no invalidation to get wrong" argument for re-deriving
+    // instead of caching only holds if an UNCHANGED file really is a no-op —
+    // otherwise every tick would spam `audit.jsonl` (#240 discipline) forever
+    // for every advanced-orchestrator group, whether its file ever moves or
+    // not. `reload_merge_gate_if_changed` compares against the gate already
+    // armed before writing anything.
+    let (reg, _d, _repo, gid) = gated_group("    also: [ci-green]\n");
+    let declared_before =
+        reg.audit_log(&gid).iter().filter(|e| e.action == "merge-gate-declared").count();
+    assert_eq!(declared_before, 1, "one arm at launch");
+
+    reg.run_workflow_gate_reload();
+    reg.run_workflow_gate_reload();
+    reg.run_workflow_gate_reload();
+
+    let declared_after =
+        reg.audit_log(&gid).iter().filter(|e| e.action == "merge-gate-declared").count();
+    assert_eq!(declared_after, 1, "an unedited file must never re-declare the same gate");
+}
+
+#[test]
+fn run_workflow_gate_reload_retains_the_last_known_gate_on_malformed_yaml() {
+    // Fail-closed case 1 (explicitly called for by #385): a mid-edit or
+    // mid-write can leave workflow.yml syntactically broken for one tick. That
+    // must never read as "no gate" — a syntax error is not consent to widen
+    // what a running session enforces, the same rule `create_group`'s
+    // `merge-gate-retained` branch already applies at launch.
+    let (reg, _d, repo, gid) = gated_group("");
+    let before = reg.merge_gate(&gid).expect("armed at launch");
+
+    edit_workflow(repo.path(), "version: 1\nname: broken\nblocks:\n  - id: mystery\n    kind: wizard\n");
+    reg.run_workflow_gate_reload();
+
+    assert_eq!(
+        reg.merge_gate(&gid),
+        Some(before),
+        "a malformed file must retain the last-known gate, not clear or corrupt it"
+    );
+    assert!(reg.merge_gate_declared(&gid), "the gate file itself must still be present and usable");
+}
+
+#[test]
+fn run_workflow_gate_reload_retains_the_gate_when_the_workflow_file_vanishes_mid_session() {
+    // Fail-closed case 2, and the one place reload's semantics deliberately
+    // diverge from a FRESH LAUNCH's: at launch, no workflow file is a
+    // legitimate zero-config choice and clears any stale gate. Mid-session,
+    // with a gate already armed, a file disappearing is indistinguishable
+    // from an editor's ordinary unlink-then-recreate save — so it must NOT
+    // read as "the repo just declared no gate". This is #385's explicit
+    // "file deleted mid-session" fail-closed case.
+    let (reg, _d, repo, gid) = gated_group("");
+    let before = reg.merge_gate(&gid).expect("armed at launch");
+
+    fs::remove_file(repo.path().join(".loomux").join("workflow.yml")).unwrap();
+    reg.run_workflow_gate_reload();
+
+    assert_eq!(
+        reg.merge_gate(&gid),
+        Some(before),
+        "a vanished file mid-session must retain the last-known gate — only an explicit \
+         toggle-off (or a fresh relaunch, where no file is a real choice) may clear it"
+    );
+    assert!(reg.merge_gate_declared(&gid));
+}
+
+#[test]
+fn run_workflow_gate_reload_arms_a_gate_that_appears_mid_session() {
+    // The strictly SAFE direction of drift — a file gaining a `gates.merge` it
+    // didn't declare before — must also take effect live, and must audit when
+    // the newly-named reviewers can't be satisfied by the running roster, the
+    // same `merge-gate-unsatisfiable` check `set_advanced_orchestrator`'s live
+    // toggle already runs (#316).
+    let (reg, _d) = test_registry();
+    let repo = tempfile::tempdir().unwrap();
+    let loomux_dir = repo.path().join(".loomux");
+    fs::create_dir_all(&loomux_dir).unwrap();
+    fs::write(
+        loomux_dir.join("workflow.yml"),
+        "version: 1\nname: plain\nblocks:\n  - id: worker\n    kind: worker\n",
+    )
+    .unwrap();
+    let g = reg
+        .create_group(&repo.path().to_string_lossy(), Guardrails { advanced_orchestrator: true, ..rails() })
+        .unwrap();
+    assert!(!reg.merge_gate_declared(&g.id), "no gates.merge declared yet");
+
+    // `rev-security` must be declared as a real `reviewer` block HERE — a
+    // gate naming a block this same file doesn't declare fails to PARSE at
+    // all (`parse_workflow`'s own validation), which would exercise the
+    // fail-closed path above, not this one. The "unsatisfiable" case this
+    // test wants is different: the file is perfectly valid, but the ROSTER
+    // this reload deliberately never touches (roster reload is out of #385's
+    // scope — see `reload_merge_gate_if_changed`'s doc comment) is still the
+    // one-block roster from the FIRST launch, which never spawned a reviewer
+    // at all.
+    fs::write(
+        loomux_dir.join("workflow.yml"),
+        "version: 1\nname: plain\nblocks:\n  - id: worker\n    kind: worker\n\
+         \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+         gates:\n  merge:\n    reviewers: [rev-security]\n",
+    )
+    .unwrap();
+    reg.run_workflow_gate_reload();
+
+    assert!(reg.merge_gate_declared(&g.id), "the gate must arm the moment the file declares one");
+    assert_eq!(reg.merge_gate(&g.id).unwrap().reviewers, vec!["rev-security".to_string()]);
+    let entries = reg.audit_log(&g.id);
+    assert!(
+        entries.iter().any(|e| e.action == "merge-gate-unsatisfiable"),
+        "the pinned one-block roster cannot spawn 'rev-security' — that must be audited, not silent: {entries:?}"
+    );
+}
+
+#[test]
+fn run_workflow_gate_reload_skips_groups_with_the_toggle_off() {
+    // The gate is scoped to workflow mode (#229): a group that never turned it
+    // on has no live gate to keep in sync, even if its repo's workflow.yml
+    // declares one — reload must not reach past that boundary any more than
+    // the launch path does.
+    let (reg, _d) = test_registry();
+    let repo = gated_repo("");
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    assert!(!g.guardrails.advanced_orchestrator);
+    assert!(!reg.merge_gate_declared(&g.id));
+
+    reg.run_workflow_gate_reload();
+
+    assert!(!reg.merge_gate_declared(&g.id), "a plain group must never have a gate armed under it");
+}
+
+#[test]
+fn run_workflow_gate_reload_skips_paused_groups() {
+    // Same reasoning `watchdog_tick`/`idle_tick_tick` already apply to every
+    // other background pass: a paused group is inactive by the human's own
+    // choice, so it should not get live background work done to it either.
+    let (reg, _d, repo, gid) = gated_group("    also: [ci-green]\n");
+    reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&gid).unwrap();
+    let before = reg.merge_gate(&gid).unwrap();
+
+    edit_workflow(
+        repo.path(),
+        "version: 1\nname: focused-review\n\
+         blocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+         \x20 - id: rev-tests\n    kind: reviewer\n    prompt: Test quality only.\n\
+         gates:\n  merge:\n    reviewers: [rev-security, rev-tests]\n",
+    );
+    reg.run_workflow_gate_reload();
+
+    assert_eq!(
+        reg.merge_gate(&gid),
+        Some(before),
+        "a paused group must not be reloaded until the human resumes it"
+    );
+}

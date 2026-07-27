@@ -41,7 +41,10 @@ Every rung is a complete tool on its own — climb when you're ready:
    a proposed skills/lessons PR, never auto-merged. The active workflow, its
    roster, and its armed merge gate are always visible in the group's
    lifecycle panel, and the toggle that turns it on is a live control — flip
-   it mid-session, no relaunch needed.
+   it mid-session, no relaunch needed. A hand-edit to `.loomux/workflow.yml`'s
+   `gates.merge` takes effect the same way: no relaunch, no toggle flip, just
+   save the file — the merge gate is re-derived from it live, fail-closed if
+   the file goes missing or stops parsing mid-session.
 
 Plus a git view, GitHub issues, a file editor, a file explorer, and voice
 prompts — one keystroke away on any rung, never disturbing the shell

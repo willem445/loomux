@@ -519,6 +519,54 @@ is `merge gate requires all of|N of [<reviewers>]` plus a ` · `-joined
 `also:` list when the gate declares one, or `no merge gate declared` when it
 doesn't.
 
+### Hot-reloading a manual file edit (#385)
+
+The live toggle above only re-syncs the gate on a discrete human action
+(flip it off, flip it on). Between #316 and #385, a **third** way the file
+could get out of sync with the armed gate went unaddressed: a human hand-edits
+`.loomux/workflow.yml` while `advanced_orchestrator` is already `true` and
+never touches the toggle. Before #385, nothing ever re-read the file after
+launch/resume in that case — the `merge_gate` spec the shim enforces stayed
+whatever it was at the last launch or toggle flip, so an edit meant to loosen
+an unsatisfiable condition (the incident that opened #385: a `ci-green` clause
+in a repo with no CI to satisfy it) silently had no effect, and the human had
+to merge manually.
+
+The fix is a periodic background pass — `run_workflow_gate_reload`, on the
+same `start_X`/timer shape as the idle reaper, the watchdog, the disk monitor,
+etc. (`src-tauri/src/orchestration/mod.rs`'s "background loop" section) —
+that, for every non-paused `advanced_orchestrator` group, re-derives the gate
+from the CURRENT file and re-arms it through the *exact same* `sync_merge_gate`
+call the fresh-launch and live-toggle paths already use. Not a second
+gate-writing mechanism, just a third trigger for the one that exists: compare
+the freshly-loaded gate against the one already armed (`self.merge_gate`,
+which reads the spec file back), and only write + audit when they differ — an
+unedited file costs one small read-and-parse and nothing else, no invalidation
+state to track, and no audit-log spam every poll.
+
+**Deliberately asymmetric with launch/toggle-ON, and the asymmetry is the
+point.** A file that parses syncs exactly what it declares, even if that
+*widens* the gate (drops a reviewer, drops an `also:` clause, or removes
+`gates.merge` entirely) — a human's own edit is real consent, same as
+"removing a gate from the workflow really removes it" already reads at launch.
+But a file that stops parsing, or vanishes entirely, is treated differently
+here than at launch: at launch "no file" is a legitimate zero-config choice
+(there was never a gate to lose), while an *already-armed* gate whose file
+goes missing or unreadable mid-session is indistinguishable from an editor's
+ordinary unlink-then-recreate save — so the reload retains the last-known gate
+rather than reading that blip as consent to open it. This is the "file deleted
+mid-session" fail-closed case #385 called for explicitly; it self-heals the
+moment the file is next readable and the reload sees it differs from what's
+armed.
+
+Only the gate reloads — the roster (`guardrails.blocks`) stays
+launch/toggle-pinned, for the same reason a live delegate's persona doesn't
+change underneath it (above): reloading the roster live has a much larger
+blast radius (already-spawned agents, in-flight worktrees) that #385 is not
+scoped to. A gate whose reviewers the pinned roster can't spawn is audited
+(`merge-gate-unsatisfiable`), never silently armed anyway — the same check
+the live toggle already runs.
+
 ### Three secondary outcomes
 
 Each chosen so the launcher never has to invent a failure the engine doesn't have:
