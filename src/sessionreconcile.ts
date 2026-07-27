@@ -54,25 +54,26 @@ export interface ReconcilePane {
   key: string;
   cli: Cli;
   cwd: string;
-  /** Pane.spawnedAt — when this pane's current process was spawned. A
-   *  session transcript modified BEFORE this can't be the one this pane just
-   *  started; it predates the pane's own existence. */
-  spawnedAtMs: number;
+  /** `Pane.firstInputAt` — when the HUMAN's first input (keystroke/paste)
+   *  reached this pane's current process, NOT when the process was spawned
+   *  (review round 2, B2). A session transcript is only created once
+   *  prompted (#194 BUG-1's "never prompted → no transcript" fact) — gating
+   *  on spawn time instead left a pane adoption-eligible for its ENTIRE
+   *  idle-before-first-prompt lifetime (seconds to hours), during which any
+   *  unrelated same-CLI/same-cwd session modified after spawn (a sibling
+   *  terminal, a pane closed moments earlier) was a sole, UNCONTESTED false
+   *  match — refusal-on-contest can't fire when there's nothing to contest
+   *  against. Gating on first input instead collapses that window to the
+   *  genuinely narrow race where the pane's OWN transcript is also usually
+   *  in flight (making a collision CONTESTED, and therefore refused — see
+   *  the design note's accepted-residual section). */
+  eligibleSinceMs: number;
 }
 
 export interface SessionAdoption {
   key: string;
   sessionId: string;
 }
-
-/** Slack before a pane's spawn time a session's `modifiedMs` is still allowed
- *  to land at — clock-skew tolerance (the frontend's Date.now() vs the
- *  backend's file-mtime read), not a real "the session predates the pane"
- *  case. Generous on purpose: the asymmetric failure here (refusing a real
- *  match) is silent and costs nothing but a missed adoption the D2 card
- *  catches next boot; the other direction (accepting a genuinely stale match)
- *  is the one this whole module exists to prevent. */
-const SPAWN_SLACK_MS = 5_000;
 
 /** Case- and separator-insensitive cwd equality (Windows: `C:\repo`,
  *  `c:/repo/`, and `C:\REPO\` are the same folder). Backslash-vs-forward-
@@ -92,9 +93,16 @@ function normalizeCwd(cwd: string): string {
  *
  *  A candidate must: match the pane's CLI exactly (never cross claude/
  *  copilot); match the pane's cwd (normalized); have `modifiedMs` no earlier
- *  than the pane's spawn time (minus slack); and not already be in `claimed`
- *  — session ids already recorded on some OTHER pane, live or persisted, so
- *  a second null-id pane in the same folder can't re-adopt an id that's
+ *  than `eligibleSinceMs` — STRICT, no tolerance/slack of any kind (review
+ *  round 2, B1: `eligibleSinceMs` and a transcript's mtime are both read off
+ *  the same OS clock at a point strictly before the CLI could have written
+ *  that transcript, so nothing legitimate ever lands before it; any slack
+ *  can only ever admit a session that predates — and therefore cannot
+ *  belong to — this pane, which is exactly the wrong direction for the
+ *  settled refuse-on-ambiguity policy: it WIDENS acceptance, when every
+ *  other knob in this module narrows it); and not already be in `claimed` —
+ *  session ids already recorded on some OTHER pane, live or persisted, so a
+ *  second null-id pane in the same folder can't re-adopt an id that's
  *  already spoken for. */
 export function planSessionAdoption(
   panes: readonly ReconcilePane[],
@@ -106,7 +114,7 @@ export function planSessionAdoption(
       (s) =>
         s.cli === pane.cli &&
         normalizeCwd(s.cwd) === normalizeCwd(pane.cwd) &&
-        s.modifiedMs >= pane.spawnedAtMs - SPAWN_SLACK_MS &&
+        s.modifiedMs >= pane.eligibleSinceMs &&
         !claimed.has(s.id)
     );
 

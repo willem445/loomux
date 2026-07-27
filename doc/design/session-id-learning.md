@@ -97,10 +97,11 @@ prompted"* fails with "No conversation found...") is consistent with "no
 transcript until at least one prompt" — but that is a labeled *observation*
 against this codebase's own prior investigation, not a documented contract.
 Option B's design does not depend on the exact instant: it's a lazy re-scan
-triggered by the pane having *produced output* (a proxy for "has been used"),
-retried on a slow interval rather than assumed to succeed on the first pass —
-so nothing breaks if the transcript in fact appears earlier or later than that
-observation suggests.
+triggered by the pane having received its first HUMAN INPUT (not merely
+produced output — see **Review round 2 hardening** below for why that
+distinction matters), retried on a slow interval rather than assumed to
+succeed on the first pass — so nothing breaks if the transcript in fact
+appears earlier or later than that observation suggests.
 
 ## Ambiguity policy: refuse, never guess
 
@@ -134,6 +135,91 @@ who clicks it or doesn't. Newest-wins there isn't a guess loomux is making on
 the human's behalf — it's the literal meaning of "resume the most recent
 session in this folder," read and confirmed by the person who clicked it.
 
+## Review round 2 hardening (B1/B2/B3)
+
+A first review pass (head `6c5a776`) confirmed the *contested*-match refusal
+above is sound, then found three ways the matcher could still adopt a WRONG
+session through *uncontested* inputs — i.e. paths that never reached the
+refusal logic at all because nothing was there to contest against. All three
+fixes move strictly in the refusal direction (narrower acceptance), never the
+reverse — the same asymmetry argument that motivated refuse-over-guess above:
+a missed adoption costs nothing the D2 card doesn't already cover; a wrong one
+is silent and undetectable.
+
+**B1 — no slack of any kind on the eligibility boundary.** The matcher
+originally allowed a session modified up to 5 seconds before the pane's own
+eligibility instant, reasoned as clock-skew tolerance. It isn't one: the
+eligibility timestamp and a transcript's `modified_ms` are both read off the
+same OS clock, at a point strictly before the CLI could have written that
+transcript — so nothing legitimate ever lands earlier, and any slack can only
+ever admit a *foreign, pre-existing* session into the candidate set. Concrete
+failure the slack enabled: close a claude conversation in a folder, then open
+a fresh custom `claude` pane in the same folder within the slack window — the
+dead session becomes the fresh pane's sole, uncontested, silently-adopted
+match. Fixed by removing the slack outright (not shrinking it — see
+`sessionreconcile.ts`'s `planSessionAdoption` doc comment); the boundary is
+now a strict `>=`.
+
+**B2 — eligibility gated on first INPUT, not first output.** A claude/copilot
+TUI produces output — its banner — within about a second of spawn, long
+before any transcript exists (the "never prompted → no transcript" fact
+above). Gating reconcile-candidacy on "has produced output" therefore left a
+pane eligible for its ENTIRE idle-before-first-prompt lifetime — minutes to
+hours — with provably no transcript of its own to be found, during which any
+single unrelated same-CLI/same-cwd session modified after spawn (a sibling
+terminal in that repo, a same-folder pane closed moments earlier) became a
+sole, uncontested false match; refusal-on-contest cannot fire when there is
+nothing to contest against. Fixed by gating on `Pane.firstInputAt` — the
+timestamp of the human's first keystroke/paste into the CURRENT process
+(`src/pane.ts`, set once per spawn) — instead of `hasReceivedOutput`. This
+collapses the exposure from the pane's whole idle lifetime down to the
+genuinely narrow window right after a prompt is sent, in which the pane's OWN
+transcript is *also* usually about to appear (turning a same-window collision
+CONTESTED, and therefore refused, rather than uncontested and silently
+adopted).
+
+**Accepted residual (named, not silently left implicit, per review):** a small
+race remains even after B2 — a foreign session in the same folder could be
+modified in the seconds between this pane's first prompt and its own
+transcript first landing in a `listSessions()` scan, and if that foreign
+session is the sole candidate at scan time, it is adopted. This is inherent to
+option B as specced (a heuristic scan, not an exact per-process signal — see
+option C above for the exact-but-costlier alternative); it is not eliminated,
+only narrowed from "the pane's entire unprompted lifetime" to "a few seconds
+around its first prompt." The periodic re-scan means an uncontested miss at
+one pass can still self-correct... but an uncontested WRONG adoption at one
+pass is not retried or revisited — same as any other adoption, it is treated
+as settled. No slack/epsilon was added to narrow this further (matching B1's
+reasoning: `firstInputAt` is recorded in the renderer before the input even
+reaches the PTY, so the pane's own transcript can only be written strictly
+after it — a tolerance window here would only ever widen acceptance, the
+forbidden direction).
+
+**B3 — a `--fork-session` line must never acquire a LEARNED id either.** The
+spawn-time guard (option A's `adoptableSessionId`) already refused to adopt an
+id a fork-carrying line names for itself. But this PR's new attach points —
+the reconciler and the D2 button — could each independently give such a pane
+a DIFFERENT, freshly-learned id, which is just as wrong: per the CLI
+reference, `--fork-session` mints a NEW id on every resume, so any id attached
+to that line is stale on the pane's very next restart, and (D2 specifically)
+the button would spawn `… --fork-session --resume <id>`, which forks to a
+third id at click time — recording something that looks authoritative while
+being wrong immediately. Two fix shapes were possible: strip `--fork-session`
+from the rewritten command (making the resume/fresh commands deliberately
+NOT fork, overriding what the line asked for), or exclude such panes/records
+from ever acquiring a learned id at all, leaving them honestly
+unrecorded/dormant-eligible. **Chosen: exclusion** — overriding the human's
+explicit `--fork-session` intent by silently dropping the flag felt like a
+second instance of the exact objection that already bars rewriting a command
+line the human owns (option A's design above); leaving the pane dormant (with
+its plain Start button, or nothing extra from D2) is the honest degradation,
+consistent with every other refusal in this design. `Pane.hasForkSession`
+(reused from `panerestore.ts`'s new `hasForkSession`, which — fixed in the
+same round — scans BOTH `command` and `argv` rather than whichever is
+non-empty) excludes such panes from `reconcileCandidates` in `main.ts`, and
+the D2 enrichment checks the same predicate on the dormant record's
+command/argv before ever offering the button.
+
 ## D2: the dormant card, when reconciliation comes up empty (or hasn't run yet)
 
 A pane can still end up dormant with no recorded id — reconciliation hasn't
@@ -164,8 +250,8 @@ the point of an optimistic restore. Nothing in this issue's fix reopens that:
   **after** `restoreSessionTabs` has already returned and every pane is open.
   `restoreSessionTabs` itself never awaits the reconciler.
 - The reconciler is a no-op (a cheap in-memory filter, no I/O) on every check
-  where no null-id agent pane with output exists — the ordinary case once a
-  boot's panes have all resumed cleanly.
+  where no null-id, prompted, non-forking agent pane exists — the ordinary
+  case once a boot's panes have all resumed cleanly.
 - The D2 lookup is resolved asynchronously per dormant card, strictly after
   `openActionPane` has already returned the live pane object to the grid.
 
@@ -186,9 +272,11 @@ the point of an optimistic restore. Nothing in this issue's fix reopens that:
 
 | Concern | File | Notes |
 | --- | --- | --- |
-| Guarded line-extraction (option A) | `src/panerestore.ts` — `adoptableSessionId` | `--fork-session`-aware sibling of the existing unguarded `sessionIdFromCommand`. Unit-tested. |
+| Guarded line-extraction (option A) | `src/panerestore.ts` — `adoptableSessionId`, `hasForkSession` | `--fork-session`-aware sibling of the existing unguarded `sessionIdFromCommand`; `hasForkSession` scans both `command` and `argv`, shared by A's guard and B3's exclusion below. Unit-tested. |
 | Learn-on-spawn fallback | `src/pane.ts` — `start()` / `respawnFresh()` | Falls back to `adoptableSessionId` when the caller doesn't already know the id. |
-| Post-start matcher (option B) + D2 lookup | `src/sessionreconcile.ts` | Pure, DOM/IPC-free — `planSessionAdoption` (refusal-biased) and `dormantResumeCandidate` (advisory). Unit-tested. |
-| Reconciler wiring | `src/main.ts` — `reconcileSessionIds` | Two triggers (prefetch-chained one-shot + periodic), single-flight, throttled, boot-path-safe. |
-| D2 card | `src/main.ts` — the `dormant-agent` case of `openActionPane`, `addDormantCardAction` | Renders synchronously; enriches asynchronously. |
+| First-input timestamp (B2) | `src/pane.ts` — `firstInputMs` / `firstInputAt`, set in the one `term.onData` handler | Reset to null on every `start`/`respawnFresh`; survives a respawn's listener reuse. |
+| Fork exclusion (B3) | `src/pane.ts` — `hasForkSession` getter | Reads the live pane's own recorded command/argv via the shared helper above. |
+| Post-start matcher (option B) + D2 lookup | `src/sessionreconcile.ts` | Pure, DOM/IPC-free — `planSessionAdoption` (refusal-biased, strict no-slack boundary) and `dormantResumeCandidate` (advisory). Unit-tested. |
+| Reconciler wiring | `src/main.ts` — `reconcileSessionIds`, `reconcileCandidates` | Two triggers (prefetch-chained one-shot + periodic), single-flight, throttled, boot-path-safe; candidacy gated on `firstInputAt` + `!hasForkSession`. |
+| D2 card | `src/main.ts` — the `dormant-agent` case of `openActionPane`, `addDormantCardAction` | Renders synchronously; enriches asynchronously; skips enrichment for a fork-carrying record. |
 | D1c fix | `src/main.ts` — `restoreSession` | One-line: pass the id already in hand. |

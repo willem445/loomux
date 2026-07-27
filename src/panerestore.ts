@@ -327,6 +327,26 @@ export function sessionIdFromCommand(command: string | null, argv: string[] | nu
   return null;
 }
 
+/** True when a command/argv line carries `--fork-session` — checked across
+ *  BOTH representations unconditionally, not just whichever one is non-empty
+ *  (review NB1: a command-only check misses an argv-only fork flag, since
+ *  `sessionIdFromCommand`'s own id-extraction already falls through to argv
+ *  when the command yields nothing — the fork check must scan the same
+ *  ground the id extraction does, or a line like `argv: ["claude",
+ *  "--resume", "x", "--fork-session"]` with a non-empty but flag-free
+ *  `command` string would slip the id through while missing the flag).
+ *  Shared by `adoptableSessionId` below (refuses to name an id on a forking
+ *  line) and by the #440 reconciler/D2 exclusion in main.ts (refuses to
+ *  EVER attach a *learned* id to a forking line either — see the design
+ *  note's fork-session section for why exclusion, not id-stripping, is the
+ *  chosen fix). */
+export function hasForkSession(command: string | null, argv: string[] | null): boolean {
+  const has = (tokens: string[]): boolean => tokens.includes("--fork-session");
+  if (command && command.trim() && has(command.trim().split(/\s+/))) return true;
+  if (argv && argv.length && has(argv)) return true;
+  return false;
+}
+
 /** Extract the session id a CUSTOM command line names, for ADOPTING it as the
  *  pane's recorded session id (#440 D1/D1c) — a human-typed `claude --resume
  *  <id>` or `claude --session-id <id>` line already names its own session, so
@@ -341,12 +361,7 @@ export function sessionIdFromCommand(command: string | null, argv: string[] | nu
  *  a wrong id — worse than recording none, since a wrong id silently resumes
  *  into the wrong (or someone else's) transcript next boot. */
 export function adoptableSessionId(command: string | null, argv: string[] | null): string | null {
-  const forksSession = (tokens: string[]): boolean => tokens.includes("--fork-session");
-  if (command && command.trim()) {
-    if (forksSession(command.trim().split(/\s+/))) return null;
-  } else if (argv && argv.length) {
-    if (forksSession(argv)) return null;
-  }
+  if (hasForkSession(command, argv)) return null;
   return sessionIdFromCommand(command, argv);
 }
 

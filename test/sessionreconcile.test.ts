@@ -25,7 +25,7 @@ const pane = (over: Partial<ReconcilePane>): ReconcilePane => ({
   key: "p1",
   cli: "claude",
   cwd: "C:\\repo",
-  spawnedAtMs: 500,
+  eligibleSinceMs: 500,
   ...over,
 });
 
@@ -41,19 +41,31 @@ test("no matching session -> no adoption (empty candidate list)", () => {
   assert.deepEqual(out, []);
 });
 
-test("a session modified BEFORE the pane spawned is excluded (can't be this pane's)", () => {
+test("a session modified BEFORE the pane's eligibleSinceMs is excluded (can't be this pane's)", () => {
   const out = planSessionAdoption(
-    [pane({ spawnedAtMs: 10_000 })],
-    [session({ modifiedMs: 1_000 })], // well before spawn, outside slack
+    [pane({ eligibleSinceMs: 10_000 })],
+    [session({ modifiedMs: 1_000 })], // well before eligibility
     new Set()
   );
   assert.deepEqual(out, []);
 });
 
-test("a session modified just before spawn, within clock-skew slack, still matches", () => {
+test("a session modified even 1ms before eligibleSinceMs is excluded — NO slack of any kind (review round 2, B1)", () => {
+  // Was previously admitted by a 5s clock-skew slack; the slack is gone
+  // entirely (not shrunk) because it could only ever admit a session that
+  // predates — and so cannot belong to — this pane.
   const out = planSessionAdoption(
-    [pane({ spawnedAtMs: 10_000 })],
-    [session({ modifiedMs: 9_000 })], // 1s before spawn — within the 5s slack
+    [pane({ eligibleSinceMs: 10_000 })],
+    [session({ modifiedMs: 9_999 })],
+    new Set()
+  );
+  assert.deepEqual(out, []);
+});
+
+test("a session modified exactly AT eligibleSinceMs matches (the boundary is inclusive, not exclusive)", () => {
+  const out = planSessionAdoption(
+    [pane({ eligibleSinceMs: 10_000 })],
+    [session({ modifiedMs: 10_000 })],
     new Set()
   );
   assert.deepEqual(out, [{ key: "p1", sessionId: "s1" }]);

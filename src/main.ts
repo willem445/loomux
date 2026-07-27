@@ -74,6 +74,7 @@ import {
   agentFreshCommand,
   shouldRespawnFresh,
   findResumedPaneIndex,
+  hasForkSession,
   type RestoreAction,
   type SessionResumable,
 } from "./panerestore";
@@ -573,8 +574,14 @@ async function openActionPane(
       // already rendered/returned, off the existing background prefetch — never
       // blocking this pane's open on a `listSessions()` scan (#342). A folder
       // with no match keeps today's plain-Start-only wording.
+      //
+      // A --fork-session line is excluded outright (review round 2, B3): the
+      // button would attach candidate.id to a line that mints a DIFFERENT id
+      // on its very next resume, recording something wrong-but-authoritative-
+      // looking instead of honestly nothing. Such a card stays plain-Start-
+      // only — same exclusion `reconcileCandidates` applies automatically.
       const cli = a.command?.trim().split(/\s+/)[0]?.toLowerCase();
-      if (a.cwd && (cli === "claude" || cli === "copilot")) {
+      if (a.cwd && (cli === "claude" || cli === "copilot") && !hasForkSession(a.command, a.argv)) {
         void sessionsPrefetch.then(() => {
           if (pane.isDisposed || !pane.isDormant) return; // Start already clicked, or pane closed
           const candidate = dormantResumeCandidate({ cli, cwd: a.cwd }, toRecords(sessions.cached));
@@ -1255,11 +1262,26 @@ const sessionsPrefetch: Promise<void> = sessions.refresh().catch(() => {
 // an ordinary boot with every id already recorded costs nothing beyond that
 // cheap in-memory filter — no `listSessions()` re-scan, no persistTabs().
 
-/** Null-id, non-dormant agent panes that have actually produced output —
- *  the earliest point a transcript could exist for them to match against
- *  (#194 BUG-1's same "never prompted → no transcript" fact, cited in the
- *  design note). Panes with no recognized CLI or no cwd yet can't be
- *  matched and are excluded before the caller even checks non-emptiness. */
+/** Null-id, non-dormant agent panes that have actually been PROMPTED — the
+ *  earliest point a transcript could exist for them to match against (#194
+ *  BUG-1's same "never prompted → no transcript" fact, cited in the design
+ *  note). Gated on `firstInputAt`, NOT `hasReceivedOutput` (review round 2,
+ *  B2): a claude/copilot TUI produces output — its banner — within about a
+ *  second of spawn, long before any transcript exists, so gating on output
+ *  left a pane adoption-eligible for its entire idle-before-first-prompt
+ *  lifetime with provably no transcript of its own in the scan — a window
+ *  wide enough for an unrelated same-CLI/same-cwd session to be a sole,
+ *  UNCONTESTED false match. `firstInputAt` narrows that to "has this pane
+ *  actually been typed into," which is also the earliest a transcript search
+ *  is worth running at all.
+ *
+ *  A `--fork-session` line is excluded outright (B3, same review round):
+ *  such a line invalidates whatever id it's given on its very next resume,
+ *  so it must stay unrecorded/dormant-eligible rather than risk acquiring an
+ *  id that looks authoritative but silently discards itself later — see
+ *  `Pane.hasForkSession`'s comment and the design note. Panes with no
+ *  recognized CLI or no cwd yet can't be matched and are excluded before the
+ *  caller even checks non-emptiness. */
 function reconcileCandidates(): Pane[] {
   return tabs.tabs
     .flatMap((ws) => ws.grid.allPanes())
@@ -1270,8 +1292,9 @@ function reconcileCandidates(): Pane[] {
         p.sessionId === null &&
         p.agentCli !== null &&
         p.workdir !== null &&
-        p.spawnedAt !== null &&
-        p.hasReceivedOutput
+        p.firstInputAt !== null &&
+        p.ptyId !== null && // input can queue before the PTY attaches; the key below needs it
+        !p.hasForkSession
     );
 }
 
@@ -1329,11 +1352,13 @@ async function reconcileSessionIds(): Promise<void> {
     const keyed = new Map<string, Pane>();
     const planPanes: ReconcilePane[] = [];
     for (const p of candidates) {
-      // ptyId is guaranteed non-null: hasReceivedOutput can only be true
-      // after a successful spawn attached a ptyId.
+      // ptyId is guaranteed non-null here: `reconcileCandidates` filters on it
+      // explicitly (input can queue and set firstInputAt slightly before the
+      // PTY finishes attaching, so this can't be inferred from firstInputAt
+      // alone — see that function's filter).
       const key = String(p.ptyId);
       keyed.set(key, p);
-      planPanes.push({ key, cli: p.agentCli!, cwd: p.workdir!, spawnedAtMs: p.spawnedAt! });
+      planPanes.push({ key, cli: p.agentCli!, cwd: p.workdir!, eligibleSinceMs: p.firstInputAt! });
     }
     const adoptions = planSessionAdoption(planPanes, records, claimedSessionIds());
     if (!adoptions.length) return;

@@ -11,6 +11,7 @@ import {
   agentFreshCommand,
   sessionIdFromCommand,
   adoptableSessionId,
+  hasForkSession,
   shouldRespawnFresh,
   findResumedPaneIndex,
   AUTO_RESUME_AGENTS,
@@ -312,6 +313,26 @@ test("adoptableSessionId refuses to adopt when --fork-session is present (a NEW 
   assert.equal(adoptableSessionId("claude --resume def --fork-session", null), null);
   assert.equal(sessionIdFromCommand("claude --resume def --fork-session", null), "def");
   assert.equal(adoptableSessionId(null, ["claude", "--resume", "def", "--fork-session"]), null);
+});
+
+test("hasForkSession scans BOTH command and argv, not just whichever is non-empty (review NB1)", () => {
+  // The bug this pins: a caller with a non-empty `command` string that has no
+  // flag of its own, but a SEPARATE `argv` that carries --fork-session, used
+  // to skip the argv check entirely (mirroring sessionIdFromCommand's own
+  // command-then-argv-fallback precedence for the id, but only in the id
+  // extraction — the OLD fork check stopped at "command is non-empty",
+  // never falling through to check argv too). Both directions must catch it.
+  assert.equal(hasForkSession("claude", ["claude", "--resume", "x", "--fork-session"]), true);
+  assert.equal(hasForkSession("claude --fork-session", []), true);
+  assert.equal(hasForkSession("claude --resume x", ["claude", "--resume", "x"]), false);
+  assert.equal(hasForkSession(null, null), false);
+});
+
+test("adoptableSessionId refuses via the argv-only fork flag too, even with a flag-free command string", () => {
+  // Concrete regression for NB1: command alone names no flags and yields no id
+  // of its own, so extraction falls through to argv and would have returned
+  // "x" despite the fork flag sitting right there in argv.
+  assert.equal(adoptableSessionId("claude", ["claude", "--resume", "x", "--fork-session"]), null);
 });
 
 // ---------- BUG-1: resume vs fresh when the conversation is gone ----------
