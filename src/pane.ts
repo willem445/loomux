@@ -80,6 +80,7 @@ import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
+import { adoptableSessionId } from "./panerestore";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -625,6 +626,13 @@ export class Pane implements VoiceTargetPane {
   private spawnArgv: string[] | null = null;
   private spawnShellKind: ShellKind | null = null;
   private agentSessionId: string | null = null;
+  /** Wall-clock time this pane's current process was spawned (#440). The
+   *  session-reconciler needs it to refuse matching a session transcript that
+   *  predates the spawn — otherwise a stale, already-resumed conversation in
+   *  the same folder could get silently wired onto a brand-new pane. Reset on
+   *  every `start`/`respawnFresh`, never on `adoptSessionId` (adopting an id
+   *  doesn't respawn anything). */
+  private spawnedAtMs: number | null = null;
   private shiftTimer: number | undefined;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
@@ -1034,7 +1042,15 @@ export class Pane implements VoiceTargetPane {
     this.spawnCommand = opts.command ?? null;
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
-    this.agentSessionId = opts.sessionId ?? null;
+    // #440: a caller (the launcher, an orch spawn) that already knows the id
+    // wins outright. Otherwise, learn it from the command/argv line itself —
+    // a human-typed `claude --resume <id>` / `--session-id <id>` custom
+    // command already names its own session (D1); adoptableSessionId is the
+    // guarded extractor (refuses on --fork-session). A bare `claude` line, or
+    // one with no session flag, yields null here — the reconciler (main.ts)
+    // is the OTHER half of D1, catching that case post-start.
+    this.agentSessionId = opts.sessionId ?? adoptableSessionId(opts.command ?? null, opts.argv ?? null);
+    this.spawnedAtMs = Date.now();
     if (opts.badge) this.setBadge(opts.badge);
     if (opts.orchAgent) this.orchAgent = opts.orchAgent;
     if (opts.channelAgent) this.channelAgentInfo = opts.channelAgent;
@@ -1183,7 +1199,11 @@ export class Pane implements VoiceTargetPane {
     this.spawnCommand = opts.command ?? null;
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
-    this.agentSessionId = opts.sessionId ?? null;
+    // Same learn-it-from-the-line fallback as start() (#440) — a fresh respawn
+    // (BUG-1 backstop, or a dormant Start with a recorded command) can equally
+    // carry a self-naming --resume/--session-id.
+    this.agentSessionId = opts.sessionId ?? adoptableSessionId(opts.command ?? null, opts.argv ?? null);
+    this.spawnedAtMs = Date.now();
     if (opts.cwd) {
       this.cwdRaw = opts.cwd;
       void this.refreshDir(opts.cwd);
@@ -2807,6 +2827,35 @@ export class Pane implements VoiceTargetPane {
    *  identity yet; a plain terminal stays not-capable regardless. */
   get isAgentPane(): boolean {
     return this.launchedCommand;
+  }
+
+  /** This pane's recorded agent session id, or null when none has been minted,
+   *  named on its command line, or learned yet (#440). Read by the reconciler
+   *  to build its plain-data pane projection and to decide whether a pane is
+   *  even a candidate for adoption (only null-id agent panes are). */
+  get sessionId(): string | null {
+    return this.agentSessionId;
+  }
+
+  /** When this pane's process was last spawned (#440) — the reconciler refuses
+   *  to match a session transcript whose `modified_ms` predates this, so a
+   *  stale same-folder conversation never gets silently wired onto a fresh
+   *  pane. Null before the pane has ever been started (a welcome pane). */
+  get spawnedAt(): number | null {
+    return this.spawnedAtMs;
+  }
+
+  /** Record a session id the reconciler LEARNED for this pane post-start
+   *  (#440 D1 option B) — the bare-`claude`-line case adoptableSessionId can't
+   *  cover. Idempotent/no-op once an id is already recorded: an id already in
+   *  hand (minted, adopted from the line, or a prior adoption) is never
+   *  overwritten by a later reconciler pass — that would risk cross-wiring a
+   *  pane that has since gained its own id onto a different transcript. The
+   *  caller (main.ts) is responsible for persisting the layout afterward;
+   *  this only updates the live pane's in-memory record. */
+  adoptSessionId(id: string): void {
+    if (this.agentSessionId !== null) return;
+    this.agentSessionId = id;
   }
 
   /** Whether this pane's process has emitted a single byte since it spawned

@@ -1242,7 +1242,13 @@ async function restoreSession(s: SessionInfo): Promise<void> {
     (s.source === "claude" ? "claude · " : "copilot · ") +
     (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);
   const pane = await ws.grid.openPane(
-    { name, cwd: s.cwd || undefined, command: s.resume_command },
+    // #440 D1c: pass the id we're already holding. Without this, a session
+    // restored by hand from the Sessions sidebar came back DORMANT on the
+    // NEXT boot anyway — the exact self-perpetuating trap the issue reports
+    // (nothing here ever recorded the id, even though it drove this very
+    // resume) — even though step 2's adoptableSessionId fallback would also
+    // catch it via `--resume` on resume_command: certainty over inference.
+    { name, cwd: s.cwd || undefined, command: s.resume_command, sessionId: s.id },
     eventsFor(ws),
     ws.grid.paneCount >= 2 ? "column" : "row"
   );
