@@ -636,9 +636,12 @@ export class Pane implements VoiceTargetPane {
    *  uncontested false match. Gating on first input instead means a pane with
    *  nothing typed into it yet is never even a reconcile candidate — see
    *  `sessionreconcile.ts`'s `ReconcilePane.eligibleSinceMs`. Set ONCE per
-   *  spawn (the first `term.onData` after `start`/`respawnFresh` resets it to
-   *  null); never touched by `adoptSessionId` (adopting an id doesn't respawn
-   *  or re-prompt anything). */
+   *  spawn via `markFirstInput()` (review round 3, B2-R: from `term.onKey` and
+   *  the two `term.paste()` sites — deliberately NOT `term.onData`, which
+   *  also fires for data xterm generates on its own with no key pressed; see
+   *  `markFirstInput`'s comment). Reset to null at the top of both `start()`
+   *  and `respawnFresh()`; never touched by `adoptSessionId` (adopting an id
+   *  doesn't respawn or re-prompt anything). */
   private firstInputMs: number | null = null;
   private shiftTimer: number | undefined;
   private fit = new FitAddon();
@@ -1040,6 +1043,19 @@ export class Pane implements VoiceTargetPane {
     this.setName("shell");
   }
 
+  /** Mark the human's first input into this pane's CURRENT process (#440 B2;
+   *  review round 3, B2-R). Idempotent — only the FIRST call after a
+   *  `start`/`respawnFresh` resets `firstInputMs` to null does anything.
+   *  Called from `term.onKey` (real keyboard events only) and from both
+   *  `this.term.paste(...)` call sites (`pasteFromClipboard`,
+   *  `pasteToTerminal` — loomux owns paste entirely, #402, so these two are
+   *  the only paste vectors). Deliberately NEVER called from `term.onData`
+   *  — see that handler's comment for why it can't tell a keystroke from
+   *  data xterm generated on its own. */
+  private markFirstInput(): void {
+    this.firstInputMs ??= Date.now();
+  }
+
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
   async start(opts: PaneOptions = {}, takeFocus = true): Promise<void> {
     this.setName(opts.name ?? "shell");
@@ -1134,15 +1150,23 @@ export class Pane implements VoiceTargetPane {
     // Everything is wired before the process exists: input queues in the
     // ordered writer until the PTY is ready, and the output router buffers
     // until we attach.
-    this.term.onData((data) => {
-      // #440 B2: registered ONCE here (never re-registered on a respawn —
-      // `respawnFresh` reuses this same terminal/listener), so this closure
-      // outlives any single spawn. `firstInputMs` is reset to null at the top
-      // of both `start()` and `respawnFresh()`, so this still correctly marks
-      // the first input of the CURRENT process, not the pane's lifetime.
-      if (this.firstInputMs === null) this.firstInputMs = Date.now();
-      this.writer.write(data);
-    });
+    this.term.onData((data) => this.writer.write(data));
+    // #440 B2 (review round 3, B2-R): `onData` is NOT a human-input signal —
+    // it fires for EVERYTHING the terminal sends to the PTY, including data
+    // xterm generates entirely on its own with no key pressed: OSC 10/11
+    // color-query replies, a primary-DA reply, focus reports. `wasUserInput`
+    // (xterm's own internal flag) gates only scroll-to-bottom and xterm's
+    // internal `_onUserInput` — never `onData`. This is the EXACT #179
+    // mechanism recurring: Copilot queries the terminal's colors at boot,
+    // xterm auto-answers, and that answer used to get misread as human input
+    // (there, by the backend's box-occupancy tracker; here, by this pane's
+    // own firstInputMs). `onKey` is the fix: it fires ONLY for genuine
+    // keyboard events, never for data the terminal manufactures itself — a
+    // structural guarantee, not a pattern match against an open set of
+    // possible auto-reply shapes (which is why this doesn't try to filter
+    // `onData` by escape-sequence prefix instead: bracketed paste itself
+    // starts with ESC, so a naive filter would misfire on real pastes).
+    this.term.onKey(() => this.markFirstInput());
     this.resizeObs.observe(this.termEl);
     // A background (orchestrator-driven) spawn must not pull focus from the
     // pane the human is typing in (#117); grid.openPane decides takeFocus.
@@ -3302,7 +3326,10 @@ export class Pane implements VoiceTargetPane {
       showToast("Paste failed — click the pane and try again.");
       return;
     }
-    if (res.text) this.term.paste(res.text);
+    if (res.text) {
+      this.markFirstInput(); // #440 B2-R: a clipboard paste IS human input, same as a keystroke
+      this.term.paste(res.text);
+    }
   }
 
   /** Build the loomux steering strip and dock it under the terminal (#43,
@@ -3590,7 +3617,10 @@ export class Pane implements VoiceTargetPane {
   pasteToTerminal(text: string): void {
     if (this.disposed) return; // pane closed during transcription — drop it
     const t = text.trim();
-    if (t) this.term.paste(t);
+    if (t) {
+      this.markFirstInput(); // #440 B2-R: a dictated transcript is human input too
+      this.term.paste(t);
+    }
   }
 
   /** Surface a voice status/error on the strip (compose targets have one). */

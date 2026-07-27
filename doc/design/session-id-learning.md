@@ -98,7 +98,7 @@ transcript until at least one prompt" — but that is a labeled *observation*
 against this codebase's own prior investigation, not a documented contract.
 Option B's design does not depend on the exact instant: it's a lazy re-scan
 triggered by the pane having received its first HUMAN INPUT (not merely
-produced output — see **Review round 2 hardening** below for why that
+produced output — see **Review hardening, rounds 2–3** below for why that
 distinction matters), retried on a slow interval rather than assumed to
 succeed on the first pass — so nothing breaks if the transcript in fact
 appears earlier or later than that observation suggests.
@@ -135,7 +135,7 @@ who clicks it or doesn't. Newest-wins there isn't a guess loomux is making on
 the human's behalf — it's the literal meaning of "resume the most recent
 session in this folder," read and confirmed by the person who clicked it.
 
-## Review round 2 hardening (B1/B2/B3)
+## Review hardening, rounds 2–3 (B1/B2/B2-R/B3)
 
 A first review pass (head `6c5a776`) confirmed the *contested*-match refusal
 above is sound, then found three ways the matcher could still adopt a WRONG
@@ -194,6 +194,82 @@ reasoning: `firstInputAt` is recorded in the renderer before the input even
 reaches the PTY, so the pane's own transcript can only be written strictly
 after it — a tolerance window here would only ever widen acceptance, the
 forbidden direction).
+
+**B2-R (review round 3) — `onData` is not a human-input signal; `firstInputAt`
+was sourced from it anyway.** B2's own implementation set `firstInputMs` from
+`term.onData`, reasoning that "the pane already routes every keystroke"
+through it. That's true, but incomplete: `onData` fires for **everything**
+the terminal sends toward the PTY, not only human input — xterm's internal
+`wasUserInput` flag gates only scroll-to-bottom and xterm's own private
+`_onUserInput` event, never the public `onData` fired below it (verified
+against the bundled `@xterm/xterm/lib/xterm.js`: `CoreService
+.triggerDataEvent` always ends in an unconditional `this._onData.fire(e)`).
+Data that reaches `onData` with no key pressed includes:
+
+- **OSC 10/11/4 color-query replies and the `ESC[>q` version reply** — per
+  #179's own investigation, exactly what GitHub Copilot sends at boot,
+  and xterm answers automatically.
+- **Primary/Secondary Device Attributes replies** (`CSI c` / `CSI >c`) —
+  a capability query many TUIs issue at startup, CLI-agnostic.
+- **Focus reports** (`ESC[I` / `ESC[O`) once focus reporting is enabled.
+
+This is **the same mechanism as #179**, recurring one layer up: there, the
+backend's box-occupancy tracker misread Copilot's boot queries as typed
+content; here, B2's `firstInputMs` would do the same thing to the
+reconciler's eligibility gate. For copilot specifically (and any claude build
+that probes at boot), `firstInputMs` collapsed back to roughly spawn time —
+silently reopening the exact uncontested-window B2 was built to close, for
+the one CLI already on record for triggering it.
+
+**Fix: `term.onKey` + the app's own paste sites, never `onData`, for this
+specific purpose.** `onKey`'s event payload is `{key, domEvent}` (verified in
+the bundled lib) — it can only fire from xterm's own keydown handler bound to
+a REAL `KeyboardEvent`, which nothing auto-generated ever has. `Pane.ts` marks
+`firstInputMs` from `term.onKey` and from both `this.term.paste(...)` call
+sites (`pasteFromClipboard`, `pasteToTerminal` — loomux owns paste entirely,
+#402, so these are the only two paste vectors) instead. `onData` still does
+its original job (forwarding to the PTY) — it's just no longer read as a
+human-input signal.
+
+**Explicitly rejected: pattern-filtering `onData` for escape sequences.** A
+denylist that tries to recognize "this looks like an auto-reply" against
+`onData`'s stream would be a denylist against an OPEN set of possible query/
+reply shapes — and missing one is exactly how #179 happened the first time.
+Structural exclusion (a different event, not a filter on the same one) is the
+only fix that doesn't reopen the same class of gap it's meant to close.
+
+**Reuse check (asked explicitly, confirmed rather than assumed):** the
+backend already has a "did a human actually type this" notion —
+`classify_human_input` (`src-tauri/src/orchestration/mod.rs`) — built for
+#179 itself, for the steering-box-occupancy tracker. It is NOT reused here,
+and shouldn't be: it operates on raw bytes already written to the PTY and
+classifies them by **pattern-matching and skipping known escape-sequence
+shapes** (bracketed-paste markers, OSC/DCS query-reply bodies, CSI sequences)
+— exactly the denylist-against-an-open-set approach just rejected above, and
+it exists on that side of the fence because the backend has no access to
+xterm's own event model at all, only the byte stream `write_pty` receives.
+The frontend has something strictly better available — `onKey`'s structural
+guarantee — so reaching for the backend's approach here would be trading a
+precise, source-guaranteed signal for a heuristic one for no reason.
+
+**Verified, not assumed — including where verification stopped.** Probed
+directly against the installed `@xterm/headless` 6.0.0 (`test/xterm-
+humaninput.test.ts`): a `CSI c` / `CSI >c` Device Attributes query written
+into a terminal auto-replies via `onData` with zero `onKey` involvement —
+`@xterm/headless` has no `onKey` at all (confirmed: absent from its
+prototype), a DOM-keyboard-event-only feature that is simply unreachable
+without a real `KeyboardEvent`, which is the exact property the fix relies
+on. The copilot-specific OSC 10/11/4 shapes #179 names could **not** be
+reproduced in this harness: `@xterm/headless` has no renderer/theme service,
+so color-resolution queries silently produce no reply regardless of `theme`/
+terminator options (checked empirically across several variations, not
+assumed from a single failed attempt) — a real, different limitation of the
+headless package from the "no onKey" one, and distinct from either being a
+flaw in the fix itself. DA is used as the CLI-agnostic, verified stand-in for
+the same underlying fact (an auto-reply reaches `onData` with no human
+input); the copilot-specific shapes are covered instead by a hand-validation
+item run against the real app, where xterm has an actual renderer to answer
+color queries from.
 
 **B3 — a `--fork-session` line must never acquire a LEARNED id either.** The
 spawn-time guard (option A's `adoptableSessionId`) already refused to adopt an
@@ -274,7 +350,7 @@ the point of an optimistic restore. Nothing in this issue's fix reopens that:
 | --- | --- | --- |
 | Guarded line-extraction (option A) | `src/panerestore.ts` — `adoptableSessionId`, `hasForkSession` | `--fork-session`-aware sibling of the existing unguarded `sessionIdFromCommand`; `hasForkSession` scans both `command` and `argv`, shared by A's guard and B3's exclusion below. Unit-tested. |
 | Learn-on-spawn fallback | `src/pane.ts` — `start()` / `respawnFresh()` | Falls back to `adoptableSessionId` when the caller doesn't already know the id. |
-| First-input timestamp (B2) | `src/pane.ts` — `firstInputMs` / `firstInputAt`, set in the one `term.onData` handler | Reset to null on every `start`/`respawnFresh`; survives a respawn's listener reuse. |
+| First-input timestamp (B2, corrected B2-R) | `src/pane.ts` — `firstInputMs` / `firstInputAt` / `markFirstInput()`, called from `term.onKey` and both `term.paste()` sites — NEVER `term.onData` | Reset to null on every `start`/`respawnFresh`; survives a respawn's listener reuse. `test/xterm-humaninput.test.ts` pins the underlying xterm fact this depends on. |
 | Fork exclusion (B3) | `src/pane.ts` — `hasForkSession` getter | Reads the live pane's own recorded command/argv via the shared helper above. |
 | Post-start matcher (option B) + D2 lookup | `src/sessionreconcile.ts` | Pure, DOM/IPC-free — `planSessionAdoption` (refusal-biased, strict no-slack boundary) and `dormantResumeCandidate` (advisory). Unit-tested. |
 | Reconciler wiring | `src/main.ts` — `reconcileSessionIds`, `reconcileCandidates` | Two triggers (prefetch-chained one-shot + periodic), single-flight, throttled, boot-path-safe; candidacy gated on `firstInputAt` + `!hasForkSession`. |
