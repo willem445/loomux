@@ -327,6 +327,29 @@ export function sessionIdFromCommand(command: string | null, argv: string[] | nu
   return null;
 }
 
+/** Extract the session id a CUSTOM command line names, for ADOPTING it as the
+ *  pane's recorded session id (#440 D1/D1c) — a human-typed `claude --resume
+ *  <id>` or `claude --session-id <id>` line already names its own session, so
+ *  loomux can learn it without minting anything or rewriting the line.
+ *
+ *  Unlike `sessionIdFromCommand` above (used UNGUARDED for orchestration
+ *  capture, where the command line is backend-built and never carries
+ *  `--fork-session`), this refuses to adopt when `--fork-session` is also
+ *  present: per the CLI reference (`--fork-session` — "When resuming, create a
+ *  new session ID instead of reusing the original"), the id named on the line
+ *  is NOT the id the running process ends up with, so adopting it would record
+ *  a wrong id — worse than recording none, since a wrong id silently resumes
+ *  into the wrong (or someone else's) transcript next boot. */
+export function adoptableSessionId(command: string | null, argv: string[] | null): string | null {
+  const forksSession = (tokens: string[]): boolean => tokens.includes("--fork-session");
+  if (command && command.trim()) {
+    if (forksSession(command.trim().split(/\s+/))) return null;
+  } else if (argv && argv.length) {
+    if (forksSession(argv)) return null;
+  }
+  return sessionIdFromCommand(command, argv);
+}
+
 /** The runtime backstop decision (#194 BUG-1): a resumed agent pane whose PTY
  *  just exited — should we respawn it FRESH in place instead of stranding a dead
  *  pane? Yes for any UNEXPECTED non-zero exit — a `--resume` against a missing/
