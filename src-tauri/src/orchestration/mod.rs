@@ -2403,6 +2403,29 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 /// the_marker_dir_cant_be_created`, which runs this exact script under an
 /// induced `mkdir` failure and asserts the real process exit code — the
 /// ORIGINAL `: >` version of this script failed that test for real.
+///
+/// **#112's `promptsubmit` arm carries a STRICTER safety bar than either
+/// event above**: Claude's hooks reference documents `UserPromptSubmit` exit
+/// code 2 as not merely blocking but ERASING the user's submitted prompt, and
+/// on exit 0 any stdout the hook prints is injected as context the model
+/// sees. So this arm must (a) exit 0 unconditionally, on every path,
+/// including every I/O failure, exactly like `precompact`/`sessionstart-
+/// compact` above, AND (b) never write anything to its OWN stdout — the
+/// touch-then-append is therefore structured so the append's target is
+/// EITHER the marker file (`>> "$marker"`) or, on a `touch` failure,
+/// `/dev/null` (`cat >/dev/null 2>&1`, which also drains stdin so the
+/// hook's caller never blocks on a full pipe) — never the script's inherited
+/// stdout. The gate is `touch` first (an ORDINARY command failure per the
+/// reasoning above, safely reported and continued past) rather than a bare
+/// `>>` open on a possibly-nonexistent parent dir (the SAME fatal-
+/// redirection-error hazard `: > "$path"` had) — once `touch` proves the
+/// path is openable, the single grouped `{ cat; printf '\n'; } >> "$marker"`
+/// append is safe. Pinned by `promptsubmit_hook_script_sh_exits_zero_and_
+/// prints_nothing_when_the_marker_dir_cant_be_created`, with mutation
+/// evidence (`promptsubmit_hook_script_mutation_bare_redirect_can_abort_
+/// before_exit_0`) proving the `touch`-gate is load-bearing: reverting this
+/// arm to a bare `>>` (the exact class of bug `: > "$path"` already was)
+/// makes that induced-failure test fail for real.
 #[doc(hidden)] // pub for integration tests: they run this script for real
 pub const COMPACT_HOOK_SCRIPT: &str = "#!/bin/sh\n\
 event=\"$1\"\n\
@@ -2418,6 +2441,14 @@ if [ -n \"$group_dir\" ] && [ -n \"$agent_id\" ]; then\n\
       touch \"$group_dir/hooks/$agent_id.sessionstart-compact.json\" 2>/dev/null\n\
       ctx=\"[loomux] Session resumed after a compact. Your durable role contract already rides in the system prompt (--agent, a generated custom-agent file) -- trust it over any summary above. Re-sync live state now: list_tasks, get_state, list_agents. Directive ledger (if any): ${group_dir}/ledger-${agent_id}.log\"\n\
       printf '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"%s\"}}\\n' \"$ctx\"\n\
+      ;;\n\
+    promptsubmit)\n\
+      marker=\"$group_dir/hooks/$agent_id.promptsubmit.jsonl\"\n\
+      if touch \"$marker\" 2>/dev/null; then\n\
+        { cat; printf '\\n'; } >> \"$marker\" 2>/dev/null\n\
+      else\n\
+        cat >/dev/null 2>&1\n\
+      fi\n\
       ;;\n\
   esac\n\
 fi\n\
@@ -2476,6 +2507,48 @@ pub const COPILOT_PRECOMPACT_HOOK_POWERSHELL: &str =
      New-Item -ItemType Directory -Force -Path $hooksDir -ErrorAction Stop | Out-Null; \
      $marker = Join-Path $hooksDir ($env:LOOMUX_AGENT_ID + '.precompact.json'); \
      New-Item -ItemType File -Force -Path $marker -ErrorAction Stop | Out-Null \
+     } } catch {}; exit 0";
+
+/// #112's `userPromptSubmitted` hook (bash half) — an EXISTENCE-only marker,
+/// same shape and same reasoning as `COPILOT_PRECOMPACT_HOOK_BASH` above
+/// ("no payload parsing needed", per that constant's own doc): Copilot's
+/// hooks reference (docs.github.com/en/copilot/reference/hooks-reference)
+/// documents `userPromptSubmitted`'s field names (`prompt`, camelCase, or
+/// `hook_event_name`/`prompt`, the VS-Code-compatible shape) but does NOT
+/// document the payload's TRANSPORT for this event the way it nails down
+/// Claude's stdin-JSON contract — so this arm never attempts to read or
+/// capture the prompt text at all; it appends a single non-JSON marker line
+/// (`.`) to the SAME per-agent `.promptsubmit.jsonl` file the Claude script
+/// writes real JSON records into. `promptsubmit_records_since` treats any
+/// non-empty, non-JSON line as an existence record (`text: None` —
+/// `PromptSubmitRecord`'s doc), so the Copilot and Claude tiers share one
+/// reader; Copilot just degrades to `PromptLandedMatch::Existence` rather
+/// than ever reaching `Content`. Also notification-only per the reference
+/// ("No" output is processed for this event) — there is no exit-2-erases-
+/// the-prompt hazard here the way there is for Claude's `UserPromptSubmit`,
+/// but the same touch-gate discipline is kept anyway for consistency with
+/// every other marker write in this module and because Copilot's OWN docs
+/// still document `preCompact` as blocking (the precedent this constant
+/// already follows).
+pub const COPILOT_PROMPTSUBMIT_HOOK_BASH: &str =
+    "if [ -n \"$LOOMUX_GROUP_DIR\" ] && [ -n \"$LOOMUX_AGENT_ID\" ]; then \
+     mkdir -p \"$LOOMUX_GROUP_DIR/hooks\" 2>/dev/null; \
+     marker=\"$LOOMUX_GROUP_DIR/hooks/$LOOMUX_AGENT_ID.promptsubmit.jsonl\"; \
+     if touch \"$marker\" 2>/dev/null; then printf '.\\n' >> \"$marker\" 2>/dev/null; fi; \
+     fi; exit 0";
+
+/// The `powershell` half of the same hook entry — see `COPILOT_PROMPTSUBMIT_
+/// HOOK_BASH`'s doc for why this is existence-only (no payload capture).
+/// `try`/`catch` + `-ErrorAction Stop` mirrors `COPILOT_PRECOMPACT_HOOK_
+/// POWERSHELL` exactly: PowerShell has no POSIX-style fatal-redirection-error
+/// hazard, so the touch-gate here is belt-and-braces consistency, not a
+/// correctness requirement the way it is for the `sh` arm above.
+pub const COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL: &str =
+    "try { if ($env:LOOMUX_GROUP_DIR -and $env:LOOMUX_AGENT_ID) { \
+     $hooksDir = Join-Path $env:LOOMUX_GROUP_DIR 'hooks'; \
+     New-Item -ItemType Directory -Force -Path $hooksDir -ErrorAction Stop | Out-Null; \
+     $marker = Join-Path $hooksDir ($env:LOOMUX_AGENT_ID + '.promptsubmit.jsonl'); \
+     Add-Content -Path $marker -Value '.' -ErrorAction Stop \
      } } catch {}; exit 0";
 
 /// Claude Code's permission mode for an (un)attended agent: its native `auto`
@@ -6542,6 +6615,248 @@ pub struct DeliveryConfirmation {
 /// `deliver_prompt`.
 pub fn submit_confirmed(reached_quiet: bool, baseline_total: u64, observed_total: u64) -> bool {
     reached_quiet && observed_total.saturating_sub(baseline_total) >= SUBMIT_CONFIRM_MIN_BYTES
+}
+
+// ─────────────────────── #112: real prompt-landed hook signal ───────────────────────
+//
+// `submit_confirmed` above trusts ANY output burst after Enter as evidence the
+// prompt landed — error repaints, dialog interactions, and spinner ticks all
+// clear its 24-byte bar, so the two live failures in #112's issue body were both
+// recorded confirmed while the task was in fact destroyed (false confirm). The
+// SAME missing signal produces the inverse failure too: a busy pane that never
+// reaches quiet skips this heuristic entirely (`while reached_quiet && ...` in
+// `deliver_prompt`), which is why 4 of 5 spawns drew a spurious "unconfirmed"
+// notice in the #112 field-evidence comment even though every one had actually
+// landed (false unconfirm).
+//
+// The fix is an AUTHORITATIVE signal, not a retuned threshold: Claude Code's
+// `UserPromptSubmit` hook fires "when you submit a prompt, before Claude
+// processes it" (code.claude.com/docs/en/hooks, "UserPromptSubmit" section),
+// with no matcher (always fires) and the submitted text on stdin as JSON under
+// the `user_input` field. Copilot's `userPromptSubmitted` fires when "The user
+// submits a prompt" (docs.github.com/en/copilot/reference/hooks-reference,
+// "userPromptSubmitted" section) but that page does NOT document the payload
+// TRANSPORT for this event (unlike Claude's stdin-JSON contract, which the
+// hooks reference nails down explicitly) — so the Copilot arm never attempts to
+// capture prompt text at all (see `PromptSubmitRecord`'s doc); it degrades to
+// an existence+offset marker, still strictly better than the burst heuristic
+// for a busy pane, at the cost of the content-match precision Claude's tier
+// gets. This is a DOCS-SILENT residual, not an assumption papered over.
+//
+// A second docs-silent residual: whether a submission that gets swallowed/
+// misparsed as an unknown slash command (the exact `/model`-merge failure
+// #112's issue documents) still fires `UserPromptSubmit` at all. Neither
+// reference page says. If it doesn't fire, that case stays *unconfirmed* under
+// this design — the correct, safe direction (rev-32's own "never false-confirm"
+// property, preserved) — so this is left unresolved rather than guessed at.
+//
+// SAFETY-CRITICAL per the hooks reference: exit code 2 on `UserPromptSubmit`
+// "blocks prompt processing and erases the prompt", and on exit 0 anything
+// printed to stdout "is added as context Claude can see". `COMPACT_HOOK_
+// SCRIPT`'s new `promptsubmit` arm (below) is therefore held to the SAME
+// unconditional-exit-0/no-stdout discipline the file's own doc already argues
+// for `precompact`/`sessionstart-compact`, extended here to a case where the
+// hazard of getting it wrong is destroying the user's own prompt, not merely
+// skipping a compact.
+
+/// A single `promptsubmit` hook record, read from `<agent-id>.promptsubmit.
+/// jsonl` in the group's `hooks/` dir (#112) — one JSON line per
+/// `UserPromptSubmit`/`userPromptSubmitted` firing since the marker file was
+/// created, appended by the SAME generic hook script/Copilot command that
+/// already write `.precompact.json`/`.sessionstart-compact.json` there (see
+/// `COMPACT_HOOK_SCRIPT`'s doc).
+///
+/// `text` is `None` for every Copilot record and for an unparseable (e.g.
+/// torn mid-write) line — see the module doc above for why Copilot's payload
+/// transport is never read at all. A `None` record still counts as evidence
+/// *something* fired (the existence tier — `PromptLandedMatch::Existence`);
+/// it just can't be matched against what THIS delivery pasted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub struct PromptSubmitRecord {
+    pub text: Option<String>,
+}
+
+/// Parse `content` (a `promptsubmit` marker file's full text) into the
+/// records written since byte `offset` — the delivery's OWN baseline,
+/// snapshotted before it pasted anything, so a record from an earlier
+/// delivery to the same pane (or a human's own prompt) can never satisfy
+/// THIS delivery's confirmation by construction. `offset` is clamped via
+/// `str::get` rather than sliced directly: a torn read racing a concurrent
+/// write could land mid-character on a multi-byte UTF-8 boundary, and an
+/// out-of-bounds/invalid-boundary offset degrades to "no new records yet"
+/// (an empty tail) rather than panicking the delivery thread.
+///
+/// Each non-empty line is one record. Valid JSON with a recognized text
+/// field (`user_input` — the documented Claude field; `user_prompt`/`prompt`
+/// tolerated as legacy/cross-CLI fallbacks) yields `text: Some(..)`.
+/// Anything else non-empty (Copilot's existence-only marker line, or a
+/// trailing line still mid-`>>` when this races the hook script's own
+/// write) yields `text: None` rather than being dropped — losing a whole
+/// poll cycle's worth of existence evidence to a torn read would be exactly
+/// the false-unconfirm failure mode this feature exists to close.
+#[doc(hidden)] // pub for integration tests
+pub fn promptsubmit_records_since(content: &str, offset: usize) -> Vec<PromptSubmitRecord> {
+    let tail = content.get(offset..).unwrap_or("");
+    tail.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let text = serde_json::from_str::<Value>(line).ok().and_then(|v| {
+                v.get("user_input")
+                    .or_else(|| v.get("user_prompt"))
+                    .or_else(|| v.get("prompt"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            });
+            PromptSubmitRecord { text }
+        })
+        .collect()
+}
+
+/// Normalize prompt text for a landed-signal comparison: trim, collapse every
+/// run of whitespace (including CR/LF, so CRLF-vs-LF and any TUI/JSON
+/// re-wrapping wash out) to a single space. Deliberately NOT case-folding —
+/// unlike an on-screen echo check (rejected in the design note precisely for
+/// rendering fragility), this compares the raw text loomux itself pasted
+/// against the JSON payload's OWN copy of that same text; case should already
+/// agree, and folding it would only widen false positives.
+fn normalize_prompt_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The three tiers a delivery's `promptsubmit` hook records can resolve to
+/// against the text it pasted, in ascending strength:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub enum PromptLandedMatch {
+    /// No record since baseline is any kind of evidence.
+    None,
+    /// A record fired since baseline, but its tier never captures text at
+    /// all (every Copilot record today — see `PromptSubmitRecord`'s doc), so
+    /// there is nothing to match content against. Trusted on the strength of
+    /// the baseline alone: the hook is documented to fire unconditionally on
+    /// every submission, and the baseline already excludes every record but
+    /// the ones THIS delivery's own submit could have produced.
+    Existence,
+    /// A record's own (normalized) text CONTAINS this delivery's normalized
+    /// paste — the strongest tier. `merged: true` means containment, not
+    /// equality: the exact "prompt merged with human-typed `/model`" shape
+    /// from #112's own issue body, still counted as landed (the agent DID
+    /// receive the task text — plan-14 decision #3) but flagged so the audit
+    /// can distinguish a clean submit from a merged one.
+    Content { merged: bool },
+}
+
+/// Resolve `records` (already filtered to since-baseline by
+/// `promptsubmit_records_since`) against `pasted` — the pure decision half
+/// of the hook confirmation tier. An empty normalized `pasted` (should never
+/// happen — `deliver_prompt` never pastes empty text) resolves to `None`
+/// rather than trivially matching every record via an empty-string
+/// containment check.
+#[doc(hidden)] // pub for integration tests
+pub fn prompt_landed(records: &[PromptSubmitRecord], pasted: &str) -> PromptLandedMatch {
+    let norm_pasted = normalize_prompt_text(pasted);
+    if norm_pasted.is_empty() {
+        return PromptLandedMatch::None;
+    }
+    let mut existence = false;
+    for r in records {
+        match &r.text {
+            Some(t) => {
+                let norm_t = normalize_prompt_text(t);
+                if norm_t.contains(&norm_pasted) {
+                    return PromptLandedMatch::Content { merged: norm_t != norm_pasted };
+                }
+            }
+            None => existence = true,
+        }
+    }
+    if existence { PromptLandedMatch::Existence } else { PromptLandedMatch::None }
+}
+
+/// Which tier confirmed a delivery — carried into the `prompt-typed` audit
+/// event (`confirm_source`) so the two failure directions stay distinguishable
+/// after the fact: `"hook"` means the authoritative signal fired (this
+/// feature doing its job), `"burst"` means the rev-32 output-heuristic
+/// fallback caught it (hook not configured, not supported for this CLI, or
+/// genuinely never fired), `"none"` means neither did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmSource {
+    Hook,
+    Burst,
+    None,
+}
+
+impl ConfirmSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfirmSource::Hook => "hook",
+            ConfirmSource::Burst => "burst",
+            ConfirmSource::None => "none",
+        }
+    }
+}
+
+/// The confirmation precedence (#112) — pure, so the property that actually
+/// fixes the reported bug is independently pinnable: hook confirmation is
+/// checked FIRST and is NOT gated on `reached_quiet`. Today's burst heuristic
+/// only ever runs `while reached_quiet && ...` in `deliver_prompt` — a busy
+/// pane that never reaches quiet skips confirmation entirely, which is
+/// exactly the false-unconfirm class #112's field-evidence comment
+/// documents (4 of 5 spawns). The hook doesn't share that blind spot: it
+/// fires off the CLI's own submit lifecycle, independent of loomux's output-
+/// quiet timing. `submit_confirmed` (the burst tier) keeps its EXACT
+/// existing shape and gating as the fallback — nothing about its own
+/// false-confirm posture changes.
+#[doc(hidden)] // pub for integration tests
+pub fn resolve_submit_confirmation(
+    hook_match: PromptLandedMatch,
+    reached_quiet: bool,
+    baseline_total: u64,
+    observed_total: u64,
+) -> (bool, ConfirmSource) {
+    if !matches!(hook_match, PromptLandedMatch::None) {
+        return (true, ConfirmSource::Hook);
+    }
+    if submit_confirmed(reached_quiet, baseline_total, observed_total) {
+        return (true, ConfirmSource::Burst);
+    }
+    (false, ConfirmSource::None)
+}
+
+/// The `promptsubmit` hook marker path for one agent — a sibling of the
+/// `.precompact.json`/`.sessionstart-compact.json` markers in the same
+/// group's `hooks/` dir (`read_hook_marker_ts`'s doc). JSONL, not a single
+/// overwritten file: unlike the compact markers (where only the LATEST
+/// firing's mtime matters), confirmation here needs to see every record
+/// since a per-delivery baseline OFFSET, so appending (never truncating) is
+/// required.
+#[doc(hidden)] // pub for integration tests
+pub fn promptsubmit_marker_path(root: &Path, group: &str, agent_id: &str) -> PathBuf {
+    root.join(group).join("hooks").join(format!("{agent_id}.promptsubmit.jsonl"))
+}
+
+/// This delivery's baseline byte length into the `promptsubmit` marker,
+/// snapshotted before it pastes anything (see `promptsubmit_records_since`'s
+/// doc for why). `0` for a missing file — no hook has fired for this agent
+/// this session, and offset 0 is a safe baseline (every record in the file,
+/// once one exists, counts).
+#[doc(hidden)] // pub for integration tests
+pub fn promptsubmit_marker_len(path: &Path) -> usize {
+    fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0)
+}
+
+/// Read the `promptsubmit` marker and resolve it against `pasted` since
+/// `offset` — the impure half of the hook confirmation tier
+/// (`promptsubmit_records_since` + `prompt_landed` are the pure decision).
+/// A missing/unreadable file resolves to `PromptLandedMatch::None`, the same
+/// "hook never fired / isn't configured" degrade every other reader in this
+/// module uses (`read_hook_marker_ts`'s doc) — never an error the delivery
+/// thread has to branch on.
+#[doc(hidden)] // pub for integration tests
+pub fn poll_promptsubmit_hook(path: &Path, offset: usize, pasted: &str) -> PromptLandedMatch {
+    let Ok(content) = fs::read_to_string(path) else { return PromptLandedMatch::None };
+    prompt_landed(&promptsubmit_records_since(&content, offset), pasted)
 }
 
 /// Whether to flush a previous delivery's stranded text (a single submit press)
@@ -15810,6 +16125,14 @@ impl OrchRegistry {
     /// `None` when no `sh` is resolvable — the agent then has no hooks
     /// configured at all, same as before this feature existed (fail-open, not
     /// a spawn failure).
+    ///
+    /// #112 adds `UserPromptSubmit`, the real prompt-landed signal
+    /// (`deliver_prompt`'s confirm phase — see the `resolve_submit_
+    /// confirmation` doc). Per the hooks reference, `UserPromptSubmit`
+    /// "does NOT support matchers and always fires on every prompt
+    /// submission" — unlike `SessionStart` above, no `matcher` key is
+    /// written at all (one was silently ignored anyway, per the docs; this
+    /// mirrors reality rather than adding a key the CLI would discard).
     fn compact_hook_settings(&self, group: &str, agent_id: &str) -> Option<Value> {
         let script = self.ensure_compact_hook_script()?;
         let sh = self.resolve_hook_sh()?;
@@ -15822,6 +16145,7 @@ impl OrchRegistry {
         Some(json!({
             "PreCompact": [{ "hooks": [{ "type": "command", "command": cmd("precompact") }] }],
             "SessionStart": [{ "matcher": "compact", "hooks": [{ "type": "command", "command": cmd("sessionstart-compact") }] }],
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": cmd("promptsubmit") }] }],
         }))
     }
 
@@ -15887,6 +16211,12 @@ impl OrchRegistry {
     ///
     /// Returns `false` (never fatal — fail-open, same as a missing gh/git
     /// shim) when the hooks directory can't be created/written.
+    ///
+    /// #112 adds `userPromptSubmitted` alongside `preCompact` in the SAME
+    /// file (still one small global file, same additive-merge guarantee) —
+    /// existence-only, per `COPILOT_PROMPTSUBMIT_HOOK_BASH`'s doc: the
+    /// payload transport for this event isn't documented, so the command
+    /// never attempts to read it.
     fn ensure_copilot_compact_hook(&self) -> bool {
         let Some(dir) = self.copilot_hooks_dir() else { return false };
         if fs::create_dir_all(&dir).is_err() {
@@ -15899,6 +16229,12 @@ impl OrchRegistry {
                     "type": "command",
                     "bash": COPILOT_PRECOMPACT_HOOK_BASH,
                     "powershell": COPILOT_PRECOMPACT_HOOK_POWERSHELL,
+                    "timeoutSec": 10,
+                }],
+                "userPromptSubmitted": [{
+                    "type": "command",
+                    "bash": COPILOT_PROMPTSUBMIT_HOOK_BASH,
+                    "powershell": COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL,
                     "timeoutSec": 10,
                 }],
             },
@@ -17675,6 +18011,16 @@ impl OrchRegistry {
                 }
             }
 
+            // #112: this delivery's OWN baseline into the `promptsubmit` hook
+            // marker, snapshotted right before it pastes anything — see
+            // `promptsubmit_records_since`'s doc for why a byte offset (not a
+            // sequence number the shell script would have to maintain) makes
+            // a record from an EARLIER delivery to this same pane, or a
+            // human's own prompt, unable to satisfy THIS delivery's
+            // confirmation by construction.
+            let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent);
+            let hook_baseline = promptsubmit_marker_len(&hook_marker_path);
+
             // Echo-verified typing: paste, then require the TUI to emit
             // output (its input box redrawing). No echo means the CLI
             // flushed the paste with its startup stdin buffer — retype.
@@ -17844,27 +18190,38 @@ impl OrchRegistry {
                 confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent, AUTOPILOT_DIALOG_WAIT);
             }
 
-            // Confirm the submit landed: watch for the output burst of the box
-            // clearing / the turn starting (#81/#84). Measured off the first
-            // Enter, before the spaced retries, so the signal is that Enter's
-            // effect and not a retry's. Only trusted when the pane reached quiet
-            // first — on a busy pane that never did, the Enter landed mid-stream
-            // and that stream would false-confirm (rev-32), so we skip the
-            // window and leave it unconfirmed. A miss here is safe: the next
-            // delivery's flush just no-ops on an empty box.
+            // Confirm the submit landed (#112 rewrite): the AUTHORITATIVE tier
+            // first — a `promptsubmit` hook record since `hook_baseline`,
+            // checked on every poll of this window regardless of
+            // `reached_quiet` (see `resolve_submit_confirmation`'s doc for why
+            // that's the property that erases the false-unconfirm class the
+            // #112 field-evidence comment documents: a busy pane that never
+            // reaches quiet used to skip confirmation ENTIRELY). Falls back to
+            // rev-32's exact existing output-burst heuristic — the box
+            // clearing / the turn starting (#81/#84) — which stays gated on
+            // `reached_quiet` exactly as before: on a busy pane that never
+            // reached quiet, the Enter landed mid-stream and that stream would
+            // false-confirm, so the burst tier alone is still skipped there. A
+            // miss on BOTH tiers is safe: the next delivery's flush just
+            // no-ops on an empty box.
             let confirm_deadline = std::time::Instant::now() + SUBMIT_CONFIRM_WINDOW;
             let mut confirmed = false;
-            while reached_quiet && std::time::Instant::now() < confirm_deadline {
-                std::thread::sleep(Duration::from_millis(100));
-                match ptys.output_total(pty_id) {
-                    Some(t) => {
-                        if submit_confirmed(reached_quiet, submit_baseline, t) {
-                            confirmed = true;
-                            break;
-                        }
-                    }
-                    None => break,
+            let mut confirm_source = ConfirmSource::None;
+            let mut confirm_merged = false;
+            loop {
+                let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+                let Some(observed_total) = ptys.output_total(pty_id) else { break };
+                let (c, src) = resolve_submit_confirmation(hook_match, reached_quiet, submit_baseline, observed_total);
+                if c {
+                    confirmed = true;
+                    confirm_source = src;
+                    confirm_merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
+                    break;
                 }
+                if std::time::Instant::now() >= confirm_deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
 
             // #420 rev-19 N8: a CONFIRMED delivery is done — its Enter landed,
@@ -17880,6 +18237,24 @@ impl OrchRegistry {
             if !confirmed {
                 for delay in SUBMIT_RETRY_DELAYS {
                     std::thread::sleep(delay);
+                    // #112: a hook record landing during a retry's sleep means
+                    // the ORIGINAL Enter actually worked — some CLIs can take
+                    // longer than `SUBMIT_CONFIRM_WINDOW` to emit the hook
+                    // under load, exactly the busy-pane case this feature
+                    // exists for. Stop retrying immediately (plan-14 design:
+                    // "a hook match also breaks out of the retry loop
+                    // immediately") rather than risk a redundant Enter
+                    // blind-selecting whatever now sits highlighted in an
+                    // unrelated dialog.
+                    let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+                    if !matches!(hook_match, PromptLandedMatch::None) {
+                        confirmed = true;
+                        confirm_source = ConfirmSource::Hook;
+                        confirm_merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
+                        append_audit(&root, &group, "loomux", "submit-retries-skipped",
+                            json!({ "to": agent, "reason": "hook confirmed since last check" }));
+                        break;
+                    }
                     // #420 rev-15 B2: these Enters used to fire unconditionally
                     // on a timer, in exactly the window (a few seconds after the
                     // first submit, while the agent is starting its turn)
@@ -17941,12 +18316,24 @@ impl OrchRegistry {
                 "echoed": echoed,
                 "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
                 "submit_confirmed": confirmed,
+                // #112: which tier confirmed (or didn't) — "hook" is the
+                // authoritative prompt-landed signal doing its job, "burst"
+                // is rev-32's output-heuristic fallback, "none" is neither.
+                "confirm_source": confirm_source.as_str(),
+                // Set only when confirm_source is "hook" AND the hook's own
+                // record text was a strict superset of what we pasted — the
+                // "prompt merged with human-typed /model" shape from #112's
+                // issue body: still landed, but worth distinguishing in the
+                // audit from a clean, exact submit.
+                "confirm_merged": confirm_merged,
             }));
             // Delivery outcome breadcrumb — timing + flags only, never the text.
             crate::obs::breadcrumb(
                 "delivery",
                 &format!(
-                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} confirmed={confirmed} attempts={attempts} waited_ms={}",
+                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} confirmed={confirmed} \
+                     confirm_source={} attempts={attempts} waited_ms={}",
+                    confirm_source.as_str(),
                     start.elapsed().as_millis() as u64
                 ),
             );
