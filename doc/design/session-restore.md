@@ -142,9 +142,24 @@ half:
 - `stripSoloMcpFlags(command, argv)` recognizes the exact, contiguous flag
   group either CLI's mint emits and removes it, reporting which CLI it
   belonged to (`null` — nothing to re-mint — for a custom command or a
-  channel-tools-off launch, which never had the flags to begin with).
+  channel-tools-off launch, which never had the flags to begin with). The
+  minted path is a real Windows profile path and the backend quotes it
+  *because* a username can contain a space ("Will H") — review round 1 (B1)
+  caught a naive `.split(/\s+/)` tokenizer fracturing that quoted path across
+  two tokens, silently failing the fixed-offset match and letting the dead
+  path straight through. The fix excises the flag group with a regex against
+  the **original string** (`"[^"]*"|\S+` for the path group) rather than a
+  tokenize/rejoin round trip — which also settled a second finding (N1,
+  escalated to blocking) in the same move: a `cli: null` command — the common
+  case, every restore that never had a solo identity — now comes back
+  byte-identical, including whitespace runs inside unrelated quoted flags,
+  instead of being silently reflowed by a `.split/.join`.
 - `appendSoloMcpArgs(command, argv, mcpArgs)` appends a freshly-minted
-  identity's flags back on.
+  identity's flags back on. Its argv-form branch (latent — solo panes are
+  never argv-spawned today) tokenizes `mcpArgs` quote-aware too
+  (`splitQuotedTokens`), stripping the quotes rather than embedding them
+  literally in an argv element (N2) — a spaced fresh path lands as one clean
+  element, not two with stray `"` characters glued on.
 
 `main.ts`'s `remintSoloIdentity` composes them with the actual I/O: strip →
 `await soloPrepare(cli, cwd, name)` (best-effort, same contract a live launch

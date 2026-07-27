@@ -308,73 +308,120 @@ export function agentFreshCommand(
  *  below recognizes. */
 export type SoloCli = "claude" | "copilot";
 
+// The minted config path is always a real Windows profile path
+// (`C:\Users\<username>\AppData\Roaming\loomux\orchestration\__solo__\configs\
+// solo-N.json`, mod.rs:10451) and the backend quotes it (mod.rs:10454, 10458)
+// precisely because a username CAN contain a space ("Will H", "John Smith") —
+// this is not a hypothetical, it's the shape of real field data (CLAUDE.md
+// constraint 8: no this-machine assumptions). These match the quoted-path
+// group as ONE unit (`"[^"]*"` or a bare no-space token) rather than naively
+// splitting on whitespace, and excise the match FROM THE ORIGINAL STRING —
+// never a tokenize/rejoin round trip — so nothing outside the matched region
+// is touched: a `cli: null` command (no solo flags at all) comes back
+// byte-identical, and the surviving remainder of a matched command keeps
+// whatever whitespace it already had (#439 review B1 + N1).
+const CLAUDE_SOLO_MCP_RE =
+  /(^|\s)--mcp-config\s+("[^"]*"|\S+)\s+--strict-mcp-config\s+--allowedTools\s+mcp__loomux(?=\s|$)/;
+const COPILOT_SOLO_MCP_RE =
+  /(^|\s)--additional-mcp-config\s+("[^"]*"|\S+)\s+--allow-tool\s+loomux(?=\s|$)/;
+
 /** Remove a recorded agent command's solo channel-identity MCP flags (#439):
  *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__loomux`
  *  (claude) or `--additional-mcp-config @<path> --allow-tool loomux`
- *  (copilot) — the exact, contiguous suffix `launcher.ts:1343` appends via
+ *  (copilot) — the exact, contiguous flag group `launcher.ts:1343` appends via
  *  `soloPrepare`'s `mcp_args`. That path is guaranteed gone by the time ANY
  *  restore replays it: agent exit deletes the config file and clears the
  *  token (mod.rs:18236), so replaying it hard-errors claude (missing file)
- *  and authenticates nothing on copilot. This never inspects the path
- *  itself — only the fixed flag tokens either CLI's mint always emits — so a
+ *  and authenticates nothing on copilot. This never inspects the path's
+ *  CONTENT — only the fixed flag tokens either CLI's mint always emits — so a
  *  config file that happens to live under a "solo"-named folder can't be
- *  mistaken for one.
+ *  mistaken for one; it only has to tolerate the path containing whitespace,
+ *  which the quoted-path regex above does.
  *
  *  Returns which CLI's flags were found (null when the command carried none
- *  — nothing to re-mint, command/argv pass through unchanged) alongside the
- *  command/argv with that group of tokens removed. The caller (main.ts)
- *  re-mints a FRESH identity via `soloPrepare` for the returned `cli` and
- *  appends its `mcp_args` with `appendSoloMcpArgs`; on a failed re-mint it
- *  uses this function's output as-is, so the pane still boots — delivery-only,
- *  never replaying the dead path (the same best-effort contract
- *  `launcher.ts:1337` already states for a fresh launch). */
+ *  — nothing to re-mint) alongside the command/argv with that group excised.
+ *  On `cli: null` the command/argv are returned EXACTLY as given — no
+ *  reflow, no whitespace normalization, no trim — because most restores never
+ *  had a solo identity at all, and this function must never be the thing that
+ *  mutates their command line. The caller (main.ts) re-mints a FRESH identity
+ *  via `soloPrepare` for the returned `cli` and appends its `mcp_args` with
+ *  `appendSoloMcpArgs`; on a failed re-mint it uses this function's output
+ *  as-is, so the pane still boots — delivery-only, never replaying the dead
+ *  path (the same best-effort contract `launcher.ts:1337` already states for
+ *  a fresh launch). */
 export function stripSoloMcpFlags(
   command: string | null | undefined,
   argv: string[] | null | undefined
 ): { cli: SoloCli | null; command?: string; argv?: string[] } {
-  const strip = (tokens: string[]): { cli: SoloCli | null; tokens: string[] } => {
-    for (let i = 0; i < tokens.length; i++) {
-      if (
-        tokens[i] === "--mcp-config" &&
-        tokens[i + 2] === "--strict-mcp-config" &&
-        tokens[i + 3] === "--allowedTools" &&
-        tokens[i + 4] === "mcp__loomux"
-      ) {
-        return { cli: "claude", tokens: [...tokens.slice(0, i), ...tokens.slice(i + 5)] };
-      }
-      if (
-        tokens[i] === "--additional-mcp-config" &&
-        tokens[i + 2] === "--allow-tool" &&
-        tokens[i + 3] === "loomux"
-      ) {
-        return { cli: "copilot", tokens: [...tokens.slice(0, i), ...tokens.slice(i + 4)] };
-      }
+  if (command) {
+    const claude = CLAUDE_SOLO_MCP_RE.exec(command);
+    if (claude) {
+      return {
+        cli: "claude",
+        command: command.slice(0, claude.index) + command.slice(claude.index + claude[0].length),
+      };
     }
-    return { cli: null, tokens };
-  };
-  if (command && command.trim()) {
-    const { cli, tokens } = strip(command.trim().split(/\s+/));
-    return { cli, command: tokens.join(" ") };
+    const copilot = COPILOT_SOLO_MCP_RE.exec(command);
+    if (copilot) {
+      return {
+        cli: "copilot",
+        command: command.slice(0, copilot.index) + command.slice(copilot.index + copilot[0].length),
+      };
+    }
+    return { cli: null, command }; // untouched — see doc comment above
   }
   if (argv && argv.length) {
-    const { cli, tokens } = strip(argv);
-    return { cli, argv: tokens };
+    // The argv form never needs quote-awareness: each element is already
+    // discrete (a spaced path is still exactly one array element), so the
+    // fixed-offset scan below can't be fooled by whitespace the way naively
+    // re-splitting a STRING can.
+    for (let i = 0; i < argv.length; i++) {
+      if (
+        argv[i] === "--mcp-config" &&
+        argv[i + 2] === "--strict-mcp-config" &&
+        argv[i + 3] === "--allowedTools" &&
+        argv[i + 4] === "mcp__loomux"
+      ) {
+        return { cli: "claude", argv: [...argv.slice(0, i), ...argv.slice(i + 5)] };
+      }
+      if (argv[i] === "--additional-mcp-config" && argv[i + 2] === "--allow-tool" && argv[i + 3] === "loomux") {
+        return { cli: "copilot", argv: [...argv.slice(0, i), ...argv.slice(i + 4)] };
+      }
+    }
+    return { cli: null, argv }; // untouched, same guarantee as the command branch
   }
   return { cli: null };
 }
 
+/** Quote-aware tokenizer for a flag STRING (`soloPrepare`'s `mcp_args`, always
+ *  a string) destined for an argv ARRAY: a whole double-quoted run becomes
+ *  ONE element with its quotes stripped — never a literal `"` surviving into
+ *  argv — so a spaced path (the same real case as above) can't fracture
+ *  across two elements the way a plain `.split(/\s+/)` would (#439 review N2). */
+function splitQuotedTokens(s: string): string[] {
+  const tokens: string[] = [];
+  const re = /"([^"]*)"|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(s)) !== null) tokens.push(m[1] !== undefined ? m[1] : m[2]);
+  return tokens;
+}
+
 /** Append a freshly-minted solo identity's `mcp_args` (`soloPrepare`'s return
- *  value — always a plain flag string, even for the argv form: solo panes
- *  are never argv-spawned today, but this mirrors agentResumeCommand's
- *  dual-form contract for consistency) to a command already cleaned by
- *  `stripSoloMcpFlags`. Pure concatenation, kept here so main.ts's restore
- *  call site is just: strip → await soloPrepare → append → open pane. */
+ *  value — always a plain flag string) to a command already cleaned by
+ *  `stripSoloMcpFlags`. For the argv form, `mcpArgs` is tokenized
+ *  quote-aware (`splitQuotedTokens`) rather than split on whitespace, so a
+ *  freshly-minted path with a space in it lands as one argv element with no
+ *  literal quotes — solo panes are never argv-spawned today (`launcher.ts`
+ *  only ever builds a string command), so this path is latent, but it must
+ *  still be CORRECT rather than merely unexercised (#439 review N2). Pure
+ *  concatenation, kept here so main.ts's restore call site is just: strip →
+ *  await soloPrepare → append → open pane. */
 export function appendSoloMcpArgs(
   command: string | undefined,
   argv: string[] | undefined,
   mcpArgs: string
 ): { command?: string; argv?: string[] } {
-  if (argv) return { argv: [...argv, ...mcpArgs.split(/\s+/).filter(Boolean)] };
+  if (argv) return { argv: [...argv, ...splitQuotedTokens(mcpArgs)] };
   return { command: [command, mcpArgs].filter((s) => s && s.trim()).join(" ") };
 }
 
