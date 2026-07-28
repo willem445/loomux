@@ -1173,10 +1173,11 @@ either still findable at the tail end of the pane's output, or it isn't.
   round 3, below, adds a precondition on HOW the window ended (naturally, not via an early exit)
   that round 2's own first pass omitted.
 
-This is what makes Tier 1 worth building where the hook wasn't: burst does not run at all when
-Tier 1 governs (its evidence is too weak to arbitrate against a box-based read), so a healthy
-delivery is decided by the SAME signal in both directions, not raced against a weaker fallback
-that can only ever say yes.
+This is what makes Tier 1 worth building where the hook wasn't: burst never decides when Tier 1
+governs (its evidence is too weak to arbitrate against a box-based read — though it is still
+evaluated every tick, purely to record `tier3_burst_would_confirm` in the audit trail), so a
+healthy delivery is decided by the SAME signal in both directions, not raced against a weaker
+fallback that can only ever say yes.
 
 #### The precondition problem: `echoed` is a proxy, and Claude Code collapses long pastes
 
@@ -1245,7 +1246,11 @@ and fully processed by a CLI whose hook simply never fired for that one turn (a 
 distinct from Finding 1's timing race) would still false-alarm here, just only after waiting out
 the whole busy period, not at 45 seconds. Measurable via the same independent audit fields: a
 `Failed` delivery no hook ever later corroborates, for the life of the pty, is a real signature
-future analysis can look for.
+future analysis can look for. **Stated plainly, not left implicit**: on such a pane this `Failed`
+verdict is PERMANENT — Tier 2's late-hook correction (below) is the only mechanism that can ever
+retract a `Failed` verdict, and by definition it never arrives on a pane whose hook doesn't fire,
+so the one hole in a feature whose whole promise is "an away human returns to a trustworthy
+record" is exactly this: a false alarm, on a hook-less pane, that nothing will ever correct.
 
 **The guard that makes this safe to ship**: a pane can be quiet because it's holding a question
 FOR THE HUMAN (an `AskUserQuestion`, a permission prompt) — output stops, the pane sits still,

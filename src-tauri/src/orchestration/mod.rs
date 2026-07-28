@@ -7149,7 +7149,9 @@ pub fn poll_promptsubmit_hook(path: &Path, offset: usize, pasted: &str) -> Promp
 /// flush decision), and an old monitor matching the RE-SEND's own hook
 /// record and announcing a false "no re-send needed" correction — exactly
 /// backwards, since the re-send is why anything landed at all. Checked
-/// first, every tick, before even reading the hook marker.
+/// first, every tick, before acting on anything it reads (the hook marker
+/// read still executes on a superseded tick; it just can never produce a
+/// write or a notify).
 #[allow(clippy::too_many_arguments)]
 fn run_late_confirmation_monitor(
     app: AppHandle,
