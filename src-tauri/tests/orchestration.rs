@@ -17,9 +17,10 @@ use loomux_lib::orchestration::{
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
     COMPACT_HOOK_SCRIPT, COPILOT_PRECOMPACT_HOOK_BASH, COPILOT_PRECOMPACT_HOOK_POWERSHELL,
     COPILOT_PROMPTSUBMIT_HOOK_BASH, COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL,
-    ConfirmSource, PromptLandedMatch, PromptSubmitRecord, apply_final_hook_recheck,
+    ConfirmSource, DeliveryConfirmState, PromptLandedMatch, PromptSubmitRecord,
+    box_holds_paste, confirm_state_for, delivery_confirmed_late_notice,
     poll_promptsubmit_hook, promptsubmit_marker_len, promptsubmit_marker_path,
-    promptsubmit_records_since, prompt_landed, resolve_submit_confirmation,
+    promptsubmit_records_since, prompt_landed,
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_context_floor_met,
     compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
@@ -7191,99 +7192,90 @@ fn prompt_landed_never_trivially_matches_empty_pasted_text() {
     assert_eq!(prompt_landed(&records, "   \n\t  "), PromptLandedMatch::None);
 }
 
-#[test]
-fn resolve_submit_confirmation_hook_wins_even_when_never_reached_quiet() {
-    // #112's core fix, pinned directly: the false-unconfirm class from the
-    // field-evidence comment (4 of 5 spawns) is a BUSY pane that never
-    // reaches quiet — `reached_quiet: false` here — which used to skip
-    // confirmation ENTIRELY. Hook confirmation must NOT be gated on it.
-    let (confirmed, source) = resolve_submit_confirmation(
-        PromptLandedMatch::Existence, /* reached_quiet */ false, 1000, 1000, /* no burst growth at all */
-    );
-    assert!(confirmed, "a hook match must confirm regardless of reached_quiet");
-    assert_eq!(source, ConfirmSource::Hook);
+// ───────────────────── #112 round 2: Tier 1 (box consumption) + 3-state ─────────────────────
 
-    let (confirmed2, source2) = resolve_submit_confirmation(
-        PromptLandedMatch::Content { merged: false }, false, 1000, 1000,
-    );
-    assert!(confirmed2);
-    assert_eq!(source2, ConfirmSource::Hook);
+#[test]
+fn box_holds_paste_detects_presence_and_absence_at_the_tail_end() {
+    let pasted = "implement #112 end to end";
+    // Present, verbatim, at the tail end -- still holding.
+    assert!(box_holds_paste("some earlier output\n> implement #112 end to end", pasted));
+    // Gone -- the box redrew to something else entirely.
+    assert!(!box_holds_paste("some earlier output\n[thinking...]", pasted));
 }
 
 #[test]
-fn resolve_submit_confirmation_falls_back_to_the_burst_heuristic_unchanged() {
-    // No hook evidence at all: the exact rev-32 `submit_confirmed` shape is
-    // the fallback, with its EXACT existing gating (still off if not quiet).
-    assert_eq!(
-        resolve_submit_confirmation(PromptLandedMatch::None, true, 1000, 1024),
-        (true, ConfirmSource::Burst),
-    );
-    assert_eq!(
-        resolve_submit_confirmation(PromptLandedMatch::None, true, 1000, 1010),
-        (false, ConfirmSource::None),
-        "burst tier's own false-confirm posture (< SUBMIT_CONFIRM_MIN_BYTES) must be untouched",
-    );
-    assert_eq!(
-        resolve_submit_confirmation(PromptLandedMatch::None, false, 1000, 100_000),
-        (false, ConfirmSource::None),
-        "burst tier must still refuse a busy pane that never reached quiet — rev-32 unchanged",
-    );
+fn box_holds_paste_tolerates_crlf_and_whitespace_noise() {
+    let pasted = "line one\nline two";
+    assert!(box_holds_paste("boxed:\r\nline one\r\nline two\r\n", pasted));
 }
 
 #[test]
-fn resolve_submit_confirmation_hook_checked_before_burst() {
-    // Even when the burst heuristic WOULD also confirm, the hook tier is
-    // reported as the source — `confirm_source` in the audit must reflect
-    // which signal actually fired, not just whichever the precedence lands
-    // on last.
-    assert_eq!(
-        resolve_submit_confirmation(PromptLandedMatch::Existence, true, 1000, 100_000),
-        (true, ConfirmSource::Hook),
-    );
-}
-
-// ─── #112 round-1 review B3: the final hook re-check before the unconfirmed notice ───
-
-#[test]
-fn apply_final_hook_recheck_confirms_on_a_late_hook_match() {
-    // The core B3 fix, pinned directly: a hook record that only landed
-    // AFTER the confirm window and every retry poll (e.g. during a 120s
-    // question hold, or fired by the last retry's own Enter) must still
-    // flip an unconfirmed delivery to confirmed on this final check.
-    assert_eq!(
-        apply_final_hook_recheck(false, ConfirmSource::None, false, PromptLandedMatch::Existence),
-        (true, ConfirmSource::Hook, false),
-    );
-    assert_eq!(
-        apply_final_hook_recheck(false, ConfirmSource::None, false, PromptLandedMatch::Content { merged: true }),
-        (true, ConfirmSource::Hook, true),
-        "the merged flag from the LATE match must ride through, not just true/false confirmed",
-    );
+fn box_holds_paste_ignores_a_match_scrolled_out_of_the_tail_window() {
+    // The whole point of windowing on the TAIL END: once enough new content
+    // has appeared after our paste, its presence far earlier in the buffer
+    // must not still read as "still holding" -- that would mean Tier 1 could
+    // never confirm a delivery that got accepted and echoed into scrollback
+    // history, which is exactly the false-negative the tail-end restriction
+    // (vs. "appears anywhere") exists to prevent.
+    let pasted = "short prompt";
+    let filler = "x ".repeat(500); // far more than BOX_TAIL_WINDOW_SLACK + len(pasted)
+    let tail = format!("short prompt\n{filler}\n[a fresh empty prompt]");
+    assert!(!box_holds_paste(&tail, pasted));
 }
 
 #[test]
-fn apply_final_hook_recheck_is_a_no_op_with_no_new_evidence() {
-    assert_eq!(
-        apply_final_hook_recheck(false, ConfirmSource::None, false, PromptLandedMatch::None),
-        (false, ConfirmSource::None, false),
-        "nothing new to say must leave the delivery unconfirmed, not invent evidence",
-    );
+fn box_holds_paste_never_trivially_matches_an_empty_paste() {
+    assert!(!box_holds_paste("anything at all sitting in the tail", ""));
+    assert!(!box_holds_paste("anything at all sitting in the tail", "   \n\t  "));
 }
 
 #[test]
-fn apply_final_hook_recheck_never_relitigates_an_already_confirmed_delivery() {
-    // A delivery the burst tier already confirmed must be left exactly as
-    // it was — this is a FINAL check for the unconfirmed case only, never a
-    // chance to downgrade or silently relabel a decision already made.
-    assert_eq!(
-        apply_final_hook_recheck(true, ConfirmSource::Burst, false, PromptLandedMatch::None),
-        (true, ConfirmSource::Burst, false),
-    );
-    assert_eq!(
-        apply_final_hook_recheck(true, ConfirmSource::Burst, false, PromptLandedMatch::Existence),
-        (true, ConfirmSource::Burst, false),
-        "already confirmed via burst must not be relabeled to hook by a coincidental late record",
-    );
+fn box_holds_paste_is_the_documented_precondition_check_and_post_enter_signal_alike() {
+    // The SAME function serves both of Tier 1's uses -- verified by using it
+    // for both without any special-casing needed.
+    let pasted = "the orchestrator's kickoff brief";
+    let pre_enter_tail = "> the orchestrator's kickoff brief";
+    assert!(box_holds_paste(pre_enter_tail, pasted), "precondition check: literal text present");
+    let post_enter_tail_accepted = "[loomux] thinking...";
+    assert!(!box_holds_paste(post_enter_tail_accepted, pasted), "post-Enter: box consumed it");
+}
+
+#[test]
+fn confirm_state_for_maps_each_source_to_the_correct_three_state_outcome() {
+    // Pinned directly: a mutation swapping any one of these arms is exactly
+    // backwards and must fail this test, not just some downstream behavior.
+    assert_eq!(confirm_state_for(ConfirmSource::Box), DeliveryConfirmState::Confirmed);
+    assert_eq!(confirm_state_for(ConfirmSource::Hook), DeliveryConfirmState::Confirmed);
+    assert_eq!(confirm_state_for(ConfirmSource::Burst), DeliveryConfirmState::Confirmed);
+    assert_eq!(confirm_state_for(ConfirmSource::BoxVeto), DeliveryConfirmState::Failed);
+    assert_eq!(confirm_state_for(ConfirmSource::Idle), DeliveryConfirmState::Failed);
+    assert_eq!(confirm_state_for(ConfirmSource::None), DeliveryConfirmState::Pending);
+}
+
+#[test]
+fn confirm_source_and_state_as_str_cover_every_variant() {
+    for (src, state, src_str, state_str) in [
+        (ConfirmSource::Box, DeliveryConfirmState::Confirmed, "box", "confirmed"),
+        (ConfirmSource::Hook, DeliveryConfirmState::Confirmed, "hook", "confirmed"),
+        (ConfirmSource::Burst, DeliveryConfirmState::Confirmed, "burst", "confirmed"),
+        (ConfirmSource::BoxVeto, DeliveryConfirmState::Failed, "box_veto", "failed"),
+        (ConfirmSource::Idle, DeliveryConfirmState::Failed, "idle", "failed"),
+        (ConfirmSource::None, DeliveryConfirmState::Pending, "none", "pending"),
+    ] {
+        assert_eq!(src.as_str(), src_str);
+        assert_eq!(state.as_str(), state_str);
+        assert_eq!(confirm_state_for(src), state);
+    }
+}
+
+#[test]
+fn delivery_confirmed_late_notice_names_the_agent_and_reads_as_a_correction() {
+    let notice = delivery_confirmed_late_notice("w-13");
+    assert!(notice.contains("w-13"));
+    assert!(notice.to_lowercase().contains("correction"), "{notice}");
+    // Must NOT read as a fresh success notice -- it corrects a specific
+    // prior alarm, so it should reference that the earlier one was wrong.
+    assert!(notice.to_lowercase().contains("wrong") || notice.to_lowercase().contains("unconfirmed"), "{notice}");
 }
 
 #[test]
