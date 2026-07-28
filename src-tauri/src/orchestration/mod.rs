@@ -7007,10 +7007,17 @@ pub fn poll_promptsubmit_hook(path: &Path, offset: usize, pasted: &str) -> Promp
 ///   human is ALSO byte-quiet the whole time, so failing to exclude it would
 ///   fire the alarm on exactly the case (the human away, answering later)
 ///   this whole redesign exists to protect. Once BOTH hold, this is the
-///   first and only point `failed` is declared for this delivery: audited,
-///   `DeliveryOutcome` updated, and (unlike the hook-match branch) the
-///   `unconfirmed` notice is sent for the FIRST time here — under this
-///   design it was never sent early, so there is nothing to correct yet.
+///   first and only point `failed` is declared for this delivery: audited
+///   under its OWN action (`delivery-failed-idle` — deliberately not
+///   `delivery-confirmed-late`, the hook branch's success action, so a
+///   failure never files itself under a success action name) and, unlike
+///   the hook-match branch, the `unconfirmed` notice is sent for the FIRST
+///   time here — under this design it was never sent early, so there is
+///   nothing to correct yet. `DeliveryOutcome` is NOT re-written here: the
+///   original `prompt-typed` audit already recorded `confirmed: false` for
+///   the `Pending` state this delivery started this monitor in, and nothing
+///   about reaching `Failed` changes that value — re-inserting the same
+///   `false` would be a no-op, not a correctness requirement.
 #[allow(clippy::too_many_arguments)]
 fn run_late_confirmation_monitor(
     app: AppHandle,
@@ -7089,7 +7096,14 @@ fn run_late_confirmation_monitor(
             continue; // waiting on the human, not idle for this purpose
         }
         failed = true;
-        append_audit(&root, &group, "loomux", "delivery-confirmed-late", json!({
+        // Own action name, deliberately distinct from the hook-match branch
+        // above ("delivery-confirmed-late" is that branch's SUCCESS action)
+        // — this one declares a FAILURE, and the audit's primary key is the
+        // action string, not the `confirm_state` detail buried inside it. A
+        // failure recording itself under a success action would defeat the
+        // whole point of the independent per-tier audit fields: nobody
+        // greps details before the action name tells them what happened.
+        append_audit(&root, &group, "loomux", "delivery-failed-idle", json!({
             "to": agent, "confirm_source": "idle", "confirm_state": "failed",
         }));
         if let Some(r) = &reg {
@@ -18689,7 +18703,8 @@ impl OrchRegistry {
                 // decided, so a live run can compare what EVERY tier said,
                 // not just the winner. `tier1_governed` is false whenever
                 // this delivery's paste didn't verify literally in the box
-                // (a long/collapsed paste — see `tier1_governs`'s doc).
+                // (a long/collapsed paste — see the `tier1_governs` precondition
+                // check's own comment, above, right before the first Enter).
                 "tier1_governed": tier1_governs,
                 "tier1_still_holding_at_end": tier1_reading == Some(true),
                 "tier2_hook_matched": tier_hook_matched,
