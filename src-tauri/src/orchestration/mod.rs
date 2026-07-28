@@ -1363,6 +1363,16 @@ const LATE_MONITOR_POLL: Duration = Duration::from_secs(5);
 /// trusts at this timescale) rather than a semantic "I see an idle prompt"
 /// observation, because that's what it actually is.
 const PENDING_IDLE_QUIET: Duration = Duration::from_secs(60);
+/// #112 round 3 (rev-20 B1): a hard cap on how long a single late-
+/// confirmation monitor thread stays alive with nothing resolved.
+/// Deliberately generous — the live episode this design responds to needed
+/// 38+ minutes — but not infinite: an abandoned pane (a killed agent whose
+/// pty somehow never reports closed, or a `Pending` delivery that never
+/// resolves and never goes idle because it keeps seeing brief unrelated
+/// output) must not hold a poller forever. Combined with the supersession
+/// check (`late_monitor_tick`'s doc), this bounds live monitors to at most
+/// one per pane most of the time, for at most this long.
+const LATE_MONITOR_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
 
 // Human-typing backstop (#43, option A): even with the loomux compose strip,
 // a human can still type directly into the terminal. Before the paste AND
@@ -1415,6 +1425,18 @@ const QUESTION_HOLD_POLL: Duration = Duration::from_millis(250);
 /// reason), instead of cloning the whole (up to 256 KB) output ring on every
 /// 250ms poll for up to two minutes.
 const QUESTION_SCAN_TAIL_BYTES: usize = 4096;
+/// #112 round 3 (rev-20 N1): the late-confirmation monitor's OWN question
+/// scan window — deliberately larger than `QUESTION_SCAN_TAIL_BYTES`. That
+/// constant was sized for the 250ms-cadence pre-Enter/retry checkpoints,
+/// where a bigger read on every poll adds up; the monitor polls once every
+/// `LATE_MONITOR_POLL` (5s), so a much larger read costs nothing measurable
+/// there. It needs the extra room: a dialog rendered above a long,
+/// literally-rendered paste (Tier 1 governing a multi-KB brief) sits
+/// chronologically BEFORE that paste in the tail, so a 4KB window could be
+/// entirely paste-plus-chrome and miss the dialog entirely — exactly the
+/// wrong direction to be wrong in, since missing a live question is what
+/// lets the idle trigger fire while the human is still expected to answer.
+const LATE_MONITOR_QUESTION_SCAN_BYTES: usize = 32 * 1024;
 /// How many CONSECUTIVE polls `prompt_wait_detected` must read false before
 /// the interactive-question guard releases (rev-19 R1): release is state-
 /// based (is the menu still on screen?), not activity-based (did a keystroke
@@ -6913,6 +6935,133 @@ pub fn confirm_state_for(source: ConfirmSource) -> DeliveryConfirmState {
     }
 }
 
+/// #112 round 3 (rev-20 B3): may Tier 1's own box-consumption reading be
+/// trusted to decide anything RIGHT NOW? Any human input since OUR OWN
+/// submit contaminates the reading in BOTH directions — a box that cleared
+/// because the human typed/submitted/cancelled their own line reads
+/// identically to one the CLI cleared for our delivery, and a box that's
+/// STILL occupied because the human is mid-edit reads identically to one
+/// the CLI never took. Once contaminated, Tier 1 must decline for the rest
+/// of this delivery's decision (the delivery falls to `Pending`, and the
+/// question-guarded late monitor decides from there) — this is what makes
+/// the design note's "closed via `last_user_input_ms`" claim actually true
+/// rather than aspirational.
+#[doc(hidden)] // pub for integration tests
+pub fn tier1_trusted(last_user_input_ms: u64, submit_sent_ms: u64) -> bool {
+    last_user_input_ms <= submit_sent_ms
+}
+
+/// #112 round 3 (rev-20 B2 + B3): the ONE decision point for whether Tier
+/// 1's accumulated reading may become an authoritative veto
+/// (`ConfirmSource::BoxVeto`) at the end of the confirm+retry window. Pure
+/// so the polarity — arguably the single most important property in this
+/// redesign — is directly pinnable rather than an inline `if` a future edit
+/// could silently invert (exactly the shape round 1 shipped and failed
+/// live: unpinnable wiring nobody could assert a property against).
+///
+/// A veto requires ALL of:
+/// - nothing else already decided this delivery (`confirm_source ==
+///   ConfirmSource::None`);
+/// - Tier 1 governs this delivery at all (`tier1_governs`);
+/// - Tier 1's own reading, at the end, was "still holding"
+///   (`tier1_reading == Some(true)`);
+/// - the confirm+retry window ran to NATURAL exhaustion —
+///   `window_exhausted_naturally`. An early exit for a question on screen,
+///   a human typing, or a failed retry write all mean the box's state
+///   cannot be trusted as evidence of NON-acceptance: a question may be
+///   intercepting Enter rather than refusing it, and a human mid-edit means
+///   the box's contents aren't about our delivery either way. B2's fix:
+///   ANY early exit leaves the delivery `Pending`, never `Failed` — the
+///   question-guarded late monitor (`late_monitor_tick`) is what's allowed
+///   to decide from there, because unlike this one-shot end-of-window
+///   check, it re-observes the question state on every subsequent poll;
+/// - Tier 1 is still trusted at the end (`tier1_trusted_at_end` —
+///   B3's fix: no human input since our own submit).
+///
+/// Never returns anything OTHER than the input `confirm_source` unchanged
+/// when any condition fails — this function can only ever produce
+/// `BoxVeto`, never invent a different outcome or downgrade an existing
+/// one.
+#[doc(hidden)] // pub for integration tests
+pub fn final_window_outcome(
+    confirm_source: ConfirmSource,
+    tier1_governs: bool,
+    tier1_reading: Option<bool>,
+    window_exhausted_naturally: bool,
+    tier1_trusted_at_end: bool,
+) -> ConfirmSource {
+    if matches!(confirm_source, ConfirmSource::None)
+        && tier1_governs
+        && tier1_reading == Some(true)
+        && window_exhausted_naturally
+        && tier1_trusted_at_end
+    {
+        ConfirmSource::BoxVeto
+    } else {
+        confirm_source
+    }
+}
+
+/// #112 round 3 (rev-20 B1): one tick's decision for the late-confirmation
+/// monitor — pure, so the precedence is directly pinnable rather than an
+/// inline `if`/`continue` chain a future edit could silently reorder.
+///
+/// - `Superseded` — a NEWER delivery to the same pane has recorded its own
+///   `DeliveryOutcome` since this monitor started (`submit_sent_ms` no
+///   longer matches what's in `last_delivery`): this monitor no longer owns
+///   anything and must exit WITHOUT writing or notifying — that's precisely
+///   the clobber/false-correction hazard (rev-20 B1) this variant exists to
+///   prevent. Checked first: even a hook match arriving on a superseded
+///   monitor's tick would be writing a confirmation for the WRONG delivery.
+/// - `Confirm` — a `promptsubmit` match arrived. `correction: true` when
+///   `already_failed` (this is upgrading an alarm that already fired, so
+///   the orchestrator needs the correction notice, not a second success
+///   notice); checked before `Expired` so a match on the very last tick
+///   before the cap still resolves the delivery rather than timing out.
+/// - `Expired` — the lifetime cap was hit with nothing resolved.
+/// - `KeepWaiting` — nothing to act on: either already `failed` (only a
+///   hook match, handled above, has anything left to do) or not yet quiet
+///   long enough / a question is on screen.
+/// - `DeclareFailed` — genuinely idle, no question, not yet failed: the
+///   ONE point this delivery is ever declared `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub enum MonitorAction {
+    Superseded,
+    Expired,
+    Confirm { merged: bool, correction: bool },
+    DeclareFailed,
+    KeepWaiting,
+}
+
+#[doc(hidden)] // pub for integration tests
+pub fn late_monitor_tick(
+    superseded: bool,
+    hook_match: PromptLandedMatch,
+    already_failed: bool,
+    expired: bool,
+    quiet_long_enough: bool,
+    showing_question: bool,
+) -> MonitorAction {
+    if superseded {
+        return MonitorAction::Superseded;
+    }
+    if !matches!(hook_match, PromptLandedMatch::None) {
+        let merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
+        return MonitorAction::Confirm { merged, correction: already_failed };
+    }
+    if expired {
+        return MonitorAction::Expired;
+    }
+    if already_failed {
+        return MonitorAction::KeepWaiting;
+    }
+    if quiet_long_enough && !showing_question {
+        return MonitorAction::DeclareFailed;
+    }
+    MonitorAction::KeepWaiting
+}
+
 /// Tier 1 (#112 round 2): does `stripped_tail` (ANSI-stripped current pane
 /// output) still hold `pasted` at its TAIL END? Deliberately "at the tail
 /// end", not "anywhere" — a CLI that echoes an ACCEPTED prompt into
@@ -6977,47 +7126,30 @@ pub fn poll_promptsubmit_hook(path: &Path, offset: usize, pasted: &str) -> Promp
     prompt_landed(&promptsubmit_records_since(&content, offset), pasted)
 }
 
-/// #112 round 2: the extended, out-of-window monitor for a delivery that
-/// finished its normal confirm/retry window still `Pending` (no tier could
-/// decide) or `Failed` via `ConfirmSource::BoxVeto` (Tier 1 vetoed, but that
-/// veto isn't infallible — see the design note's rejection-guard residual).
-/// Spawned as its OWN detached thread, deliberately NOT holding the per-pty
-/// delivery mutex `deliver_prompt`'s main closure holds for its own
-/// (bounded, ~52s) lifetime: this monitor's own lifetime is bounded only by
-/// the pty staying alive (the live #112 episode needed 38+ minutes), and
-/// holding the delivery mutex that long would block every SUBSEQUENT
-/// delivery to the same pane for as long as this one stays unresolved —
-/// exactly the kind of regression a design meant to fix false alarms must
-/// not introduce. Reads only (`output_total`, `output_tail_bounded`, the
-/// hook marker file) plus, on resolution, one notify call — none of that
-/// needs the delivery mutex, which exists to serialize WRITES.
+/// #112 round 2 (restructured round 3 per rev-20 B1 — see `late_monitor_tick`
+/// for the precedence this now runs on): the extended, out-of-window monitor
+/// for a delivery that finished its normal confirm/retry window still
+/// `Pending` or `Failed` via `ConfirmSource::BoxVeto` (Tier 1's veto isn't
+/// infallible — the design note's rejection-guard residual). Spawned as its
+/// OWN detached thread, deliberately NOT holding the per-pty delivery mutex
+/// `deliver_prompt`'s main closure holds for its own (bounded, ~52s)
+/// lifetime: this monitor's own lifetime is bounded only by
+/// `LATE_MONITOR_MAX_LIFETIME` / the pty staying alive (the live #112
+/// episode needed 38+ minutes), and holding the delivery mutex that long
+/// would block every SUBSEQUENT delivery to the same pane.
 ///
-/// Two independent things it watches for, on every `LATE_MONITOR_POLL` tick,
-/// for as long as the pty reports alive:
-/// - **A late `promptsubmit` hook match** (Tier 2, unbounded — this is what
-///   "stop requiring it in-window" means): resolves to `Confirmed`
-///   immediately, regardless of whether this delivery had already been
-///   declared `Failed`. If it had, this is a genuine correction, not a
-///   re-confirmation, and draws `notify_delivery_confirmed_late`.
-/// - **Idle-without-evidence** (only relevant while still `Pending`, i.e.
-///   before any `failed` alarm has fired yet): the pane's own output must
-///   stay quiet for `PENDING_IDLE_QUIET` AND show no live question/dialog
-///   (`prompt_wait_detected`, masked for our own paste exactly like every
-///   other checkpoint in this module) — a pane holding a question for the
-///   human is ALSO byte-quiet the whole time, so failing to exclude it would
-///   fire the alarm on exactly the case (the human away, answering later)
-///   this whole redesign exists to protect. Once BOTH hold, this is the
-///   first and only point `failed` is declared for this delivery: audited
-///   under its OWN action (`delivery-failed-idle` — deliberately not
-///   `delivery-confirmed-late`, the hook branch's success action, so a
-///   failure never files itself under a success action name) and, unlike
-///   the hook-match branch, the `unconfirmed` notice is sent for the FIRST
-///   time here — under this design it was never sent early, so there is
-///   nothing to correct yet. `DeliveryOutcome` is NOT re-written here: the
-///   original `prompt-typed` audit already recorded `confirmed: false` for
-///   the `Pending` state this delivery started this monitor in, and nothing
-///   about reaching `Failed` changes that value — re-inserting the same
-///   `false` would be a no-op, not a correctness requirement.
+/// **Round 3 fix (rev-20 B1): supersession.** If a NEWER delivery to this
+/// same pty has recorded its own `DeliveryOutcome` since this monitor
+/// started (compared by `submit_sent_ms`, the one field every delivery's
+/// outcome carries and no two deliveries share), this monitor is stale —
+/// `late_monitor_tick` returns `Superseded` and this thread exits
+/// immediately, WITHOUT writing `last_delivery` or notifying anything. Two
+/// hazards this closes at once: an old monitor overwriting a newer
+/// delivery's recorded outcome (corrupting the NEXT delivery's stranded-
+/// flush decision), and an old monitor matching the RE-SEND's own hook
+/// record and announcing a false "no re-send needed" correction — exactly
+/// backwards, since the re-send is why anything landed at all. Checked
+/// first, every tick, before even reading the hook marker.
 #[allow(clippy::too_many_arguments)]
 fn run_late_confirmation_monitor(
     app: AppHandle,
@@ -7036,6 +7168,7 @@ fn run_late_confirmation_monitor(
     reg: Option<Arc<OrchRegistry>>,
 ) {
     let ptys = app.state::<crate::pty::PtyManager>();
+    let started = std::time::Instant::now();
     let mut quiet_since: Option<std::time::Instant> = None;
     let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
     let mut failed = already_failed;
@@ -7046,37 +7179,15 @@ fn run_late_confirmation_monitor(
         // degrade in this module (never an error the caller has to handle).
         let Some(cur_total) = ptys.output_total(pty_id) else { return };
 
-        // Tier 2, unbounded: checked on every tick regardless of `failed`,
-        // because a late match is a correction either way.
-        let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
-        if !matches!(hook_match, PromptLandedMatch::None) {
-            let merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
-            last_delivery.lock_safe().insert(
-                pty_id,
-                DeliveryOutcome { confirmed: true, submit_sent_ms, from: delivery_from.clone() },
-            );
-            append_audit(&root, &group, "loomux", "delivery-confirmed-late", json!({
-                "to": agent, "confirm_source": "hook", "confirm_merged": merged, "was_failed": failed,
-            }));
-            if failed {
-                if let Some(r) = &reg {
-                    r.notify_delivery_confirmed_late(&group, &agent, target_is_orchestrator);
-                }
-            }
-            return; // resolved — nothing left for this monitor to do
-        }
+        let superseded = last_delivery
+            .lock_safe()
+            .get(&pty_id)
+            .is_some_and(|o| o.submit_sent_ms != submit_sent_ms);
 
-        if failed {
-            // Already declared failed; the only thing left to watch for is
-            // the hook-match correction above, so just keep polling.
-            continue;
-        }
-
-        // Still pending: track quiescence the same way `watchdog_tick`
-        // already does at this timescale (byte growth resets the clock),
-        // but refuse to act on "quiet" while a question is on screen — the
-        // human may be away for hours, and that pane is ALSO byte-quiet the
-        // whole time it's waiting on them.
+        // Quiescence + question-guard tracking (only meaningful once
+        // `late_monitor_tick` actually asks for them, but cheap to keep
+        // current every tick so a KeepWaiting tick doesn't lose progress
+        // toward the threshold).
         if cur_total != last_total {
             last_total = cur_total;
             quiet_since = Some(std::time::Instant::now());
@@ -7084,30 +7195,51 @@ fn run_late_confirmation_monitor(
             quiet_since = Some(std::time::Instant::now());
         }
         let quiet_long_enough = quiet_since.is_some_and(|t| t.elapsed() >= PENDING_IDLE_QUIET);
-        if !quiet_long_enough {
-            continue;
-        }
-        let showing_question = ptys
-            .output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES)
-            .map(|b| strip_ansi(&b))
-            .map(|t| prompt_wait_detected(&mask_own_paste(&t, &pasted_text)))
-            .unwrap_or(false);
-        if showing_question {
-            continue; // waiting on the human, not idle for this purpose
-        }
-        failed = true;
-        // Own action name, deliberately distinct from the hook-match branch
-        // above ("delivery-confirmed-late" is that branch's SUCCESS action)
-        // — this one declares a FAILURE, and the audit's primary key is the
-        // action string, not the `confirm_state` detail buried inside it. A
-        // failure recording itself under a success action would defeat the
-        // whole point of the independent per-tier audit fields: nobody
-        // greps details before the action name tells them what happened.
-        append_audit(&root, &group, "loomux", "delivery-failed-idle", json!({
-            "to": agent, "confirm_source": "idle", "confirm_state": "failed",
-        }));
-        if let Some(r) = &reg {
-            r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
+        let showing_question = quiet_long_enough
+            && ptys
+                .output_tail_bounded(pty_id, LATE_MONITOR_QUESTION_SCAN_BYTES)
+                .map(|b| strip_ansi(&b))
+                .map(|t| prompt_wait_detected(&mask_own_paste(&t, &pasted_text)))
+                .unwrap_or(false);
+        let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+        let expired = started.elapsed() >= LATE_MONITOR_MAX_LIFETIME;
+
+        match late_monitor_tick(superseded, hook_match, failed, expired, quiet_long_enough, showing_question) {
+            MonitorAction::Superseded | MonitorAction::Expired => return,
+            MonitorAction::KeepWaiting => continue,
+            MonitorAction::Confirm { merged, correction } => {
+                last_delivery.lock_safe().insert(
+                    pty_id,
+                    DeliveryOutcome { confirmed: true, submit_sent_ms, from: delivery_from.clone() },
+                );
+                append_audit(&root, &group, "loomux", "delivery-confirmed-late", json!({
+                    "to": agent, "confirm_source": "hook", "confirm_merged": merged, "was_failed": correction,
+                }));
+                if correction {
+                    if let Some(r) = &reg {
+                        r.notify_delivery_confirmed_late(&group, &agent, target_is_orchestrator);
+                    }
+                }
+                return; // resolved — nothing left for this monitor to do
+            }
+            MonitorAction::DeclareFailed => {
+                failed = true;
+                // Own action name, deliberately distinct from the hook-match
+                // branch above ("delivery-confirmed-late" is that branch's
+                // SUCCESS action) — this one declares a FAILURE, and the
+                // audit's primary key is the action string, not the
+                // `confirm_state` detail buried inside it. `DeliveryOutcome`
+                // is NOT re-written here: the original `prompt-typed` audit
+                // already recorded `confirmed: false` for the `Pending`
+                // state this delivery started this monitor in, and nothing
+                // about reaching `Failed` changes that value.
+                append_audit(&root, &group, "loomux", "delivery-failed-idle", json!({
+                    "to": agent, "confirm_source": "idle", "confirm_state": "failed",
+                }));
+                if let Some(r) = &reg {
+                    r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
+                }
+            }
         }
     }
 }
@@ -18522,7 +18654,16 @@ impl OrchRegistry {
                         Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
                         Some(_) => {
                             tier1_reading = Some(false);
-                            confirm_source = ConfirmSource::Box;
+                            // #112 round 3 (rev-20 B3): a box-clear caused by
+                            // the HUMAN (they typed/submitted/cancelled their
+                            // own line) reads identically to one the CLI
+                            // cleared for our delivery. Only promote to a
+                            // Box confirm when no human input has landed
+                            // since our own submit — checked fresh, right
+                            // here, not inherited from an earlier tick.
+                            if tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms) {
+                                confirm_source = ConfirmSource::Box;
+                            }
                         }
                         None => {} // pty gone — the `output_total` read just below returns None too and breaks the loop
                     }
@@ -18562,6 +18703,16 @@ impl OrchRegistry {
             // delivery mutex for up to `QUESTION_HOLD_MAX` — this guard
             // protects DELIVERIES, it is not a general question-watcher for a
             // pane that's already done receiving this one.
+            // #112 round 3 (rev-20 B2): whether the retry loop ran to
+            // NATURAL exhaustion — every delay slept, never cut short for a
+            // question on screen, a human typing, or a failed retry write.
+            // Starts true (covers the "never entered the loop at all"
+            // case, where `confirm_source` is already decided and this
+            // flag is moot) and is flipped false by the SAME three early
+            // exits `final_window_outcome` requires ruled out before a veto
+            // may fire — see that function's doc for why each one means the
+            // box's end state can't be trusted as evidence of non-acceptance.
+            let mut window_exhausted_naturally = true;
             if matches!(confirm_source, ConfirmSource::None) {
                 'retries: for delay in SUBMIT_RETRY_DELAYS {
                     std::thread::sleep(delay);
@@ -18590,10 +18741,14 @@ impl OrchRegistry {
                             Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
                             Some(_) => {
                                 tier1_reading = Some(false);
-                                confirm_source = ConfirmSource::Box;
-                                append_audit(&root, &group, "loomux", "submit-retries-skipped",
-                                    json!({ "to": agent, "reason": "box consumed since last check" }));
-                                break 'retries;
+                                // #112 round 3 (rev-20 B3): same trust gate
+                                // as the main window above.
+                                if tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms) {
+                                    confirm_source = ConfirmSource::Box;
+                                    append_audit(&root, &group, "loomux", "submit-retries-skipped",
+                                        json!({ "to": agent, "reason": "box consumed since last check" }));
+                                    break 'retries;
+                                }
                             }
                             None => {}
                         }
@@ -18621,6 +18776,11 @@ impl OrchRegistry {
                     if ptys.last_user_input_ms(pty_id).unwrap_or(0) > submit_sent_ms {
                         append_audit(&root, &group, "loomux", "submit-retries-skipped",
                             json!({ "to": agent, "reason": "human typing in pane" }));
+                        // #112 round 3 (rev-20 B2): a human mid-line means
+                        // the box's contents aren't about our delivery
+                        // either way — this is NOT natural exhaustion, so a
+                        // veto must not fire off this exit.
+                        window_exhausted_naturally = false;
                         break;
                     }
                     let question_decision = wait_for_question_clear(
@@ -18631,6 +18791,17 @@ impl OrchRegistry {
                             append_audit(&root, &group, "loomux", "submit-retries-skipped", json!({
                                 "to": agent, "reason": "question pending", "held_ms": held_ms,
                             }));
+                            // #112 round 3 (rev-20 B2 — the blocking finding):
+                            // a question on screen may be INTERCEPTING our
+                            // Enter, not refusing it — the box's "still
+                            // holds our paste" reading proves nothing about
+                            // acceptance while a dialog sits in front of it.
+                            // NOT natural exhaustion: this delivery must
+                            // land `Pending`, never `Failed`, off this exit.
+                            // The question-guarded late monitor re-observes
+                            // the question state on every subsequent poll,
+                            // which this one-shot end-of-window check can't.
+                            window_exhausted_naturally = false;
                             break;
                         }
                         RetryGate::Write { held_ms } => {
@@ -18640,6 +18811,10 @@ impl OrchRegistry {
                                 }));
                             }
                             if ptys.write_bytes(pty_id, submit).is_err() {
+                                // A failed retry write means the pty is
+                                // likely closing — the same "can't trust
+                                // this as evidence" reasoning applies.
+                                window_exhausted_naturally = false;
                                 break;
                             }
                         }
@@ -18658,16 +18833,20 @@ impl OrchRegistry {
                     }
                 }
             }
-            // Tier 1's VETO: reachable only once the whole window+retries are
-            // exhausted with NO other tier having decided, Tier 1 governs
-            // this delivery, and its own precondition-verified check never
-            // once saw the box clear. Never fired off a single early sample
-            // (see `box_holds_paste`'s doc / the design note's render-lag
-            // discussion) — this is the state at the natural end of a ~7.6s
-            // window across 15+ polls, not a snap judgment.
-            if matches!(confirm_source, ConfirmSource::None) && tier1_governs && tier1_reading == Some(true) {
-                confirm_source = ConfirmSource::BoxVeto;
-            }
+            // Tier 1's VETO (#112 round 3 — rev-20 B2/B3, see
+            // `final_window_outcome`'s doc for the full precondition list):
+            // reachable only once the whole window+retries ran to NATURAL
+            // exhaustion — never off an early exit for a question, human
+            // typing, or a failed write — with NO other tier having
+            // decided, Tier 1 governing this delivery, its own
+            // precondition-verified check never once seeing the box clear,
+            // AND no human input landing since our own submit. This is the
+            // state at the natural end of a ~7.6s window across 15+ polls,
+            // not a snap judgment.
+            let tier1_trusted_at_end = tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms);
+            confirm_source = final_window_outcome(
+                confirm_source, tier1_governs, tier1_reading, window_exhausted_naturally, tier1_trusted_at_end,
+            );
             let confirm_state = confirm_state_for(confirm_source);
             let confirmed = matches!(confirm_state, DeliveryConfirmState::Confirmed);
 
@@ -18706,7 +18885,13 @@ impl OrchRegistry {
                 // (a long/collapsed paste — see the `tier1_governs` precondition
                 // check's own comment, above, right before the first Enter).
                 "tier1_governed": tier1_governs,
-                "tier1_still_holding_at_end": tier1_reading == Some(true),
+                // #112 round 3 (rev-20 N3): `null` when Tier 1 never
+                // governed this delivery at all (nothing was ever measured,
+                // not "measured and false") — a bare `bool` here would
+                // conflate "never watched" with "watched and saw it clear",
+                // which are different facts a live-validation read needs to
+                // tell apart.
+                "tier1_still_holding_at_end": tier1_governs.then_some(tier1_reading == Some(true)),
                 "tier2_hook_matched": tier_hook_matched,
                 "tier3_burst_would_confirm": tier_burst_would_confirm,
             }));

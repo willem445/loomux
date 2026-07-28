@@ -17,10 +17,10 @@ use loomux_lib::orchestration::{
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
     COMPACT_HOOK_SCRIPT, COPILOT_PRECOMPACT_HOOK_BASH, COPILOT_PRECOMPACT_HOOK_POWERSHELL,
     COPILOT_PROMPTSUBMIT_HOOK_BASH, COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL,
-    ConfirmSource, DeliveryConfirmState, PromptLandedMatch, PromptSubmitRecord,
-    box_holds_paste, confirm_state_for, delivery_confirmed_late_notice,
-    poll_promptsubmit_hook, promptsubmit_marker_len, promptsubmit_marker_path,
-    promptsubmit_records_since, prompt_landed,
+    ConfirmSource, DeliveryConfirmState, MonitorAction, PromptLandedMatch, PromptSubmitRecord,
+    box_holds_paste, confirm_state_for, delivery_confirmed_late_notice, final_window_outcome,
+    late_monitor_tick, poll_promptsubmit_hook, promptsubmit_marker_len, promptsubmit_marker_path,
+    promptsubmit_records_since, prompt_landed, tier1_trusted,
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_context_floor_met,
     compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
@@ -7276,6 +7276,152 @@ fn delivery_confirmed_late_notice_names_the_agent_and_reads_as_a_correction() {
     // Must NOT read as a fresh success notice -- it corrects a specific
     // prior alarm, so it should reference that the earlier one was wrong.
     assert!(notice.to_lowercase().contains("wrong") || notice.to_lowercase().contains("unconfirmed"), "{notice}");
+}
+
+// ─────────── #112 round 3 (rev-20): the polarity pins for B1/B2/B3 ───────────
+
+#[test]
+fn tier1_trusted_requires_no_human_input_since_our_own_submit() {
+    assert!(tier1_trusted(1000, 1000), "input at exactly submit time is not AFTER it");
+    assert!(tier1_trusted(999, 1000), "input strictly before submit is fine");
+    assert!(!tier1_trusted(1001, 1000), "any input after submit contaminates the reading");
+}
+
+#[test]
+fn final_window_outcome_vetoes_only_on_natural_exhaustion_with_everything_else_aligned() {
+    // The one case that SHOULD veto: nothing else decided, Tier 1 governs,
+    // it never saw the box clear, the window ran to natural exhaustion, and
+    // no human touched the pane since submit.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, Some(true), true, true),
+        ConfirmSource::BoxVeto,
+    );
+}
+
+#[test]
+fn final_window_outcome_never_vetoes_off_an_early_exit_rev20_b2() {
+    // THE blocking finding, pinned directly: a question-pending or human-
+    // typing exit from the retry loop must never produce BoxVeto, no matter
+    // how "still holding" Tier 1's own reading looks. Every other input is
+    // held at the values that WOULD veto if this one flag didn't override —
+    // proving this flag alone is what's protecting the polarity.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, Some(true), /* exhausted */ false, true),
+        ConfirmSource::None,
+        "an early exit must leave the delivery Pending (None), never Failed (BoxVeto)",
+    );
+}
+
+#[test]
+fn final_window_outcome_never_vetoes_or_confirms_once_a_human_touched_the_pane_rev20_b3() {
+    // The other blocking finding: human input since submit must suppress a
+    // veto too (not just a confirm) -- Tier 1's reading is contaminated in
+    // BOTH directions, exactly as the design note (now truthfully) claims.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, Some(true), true, /* trusted */ false),
+        ConfirmSource::None,
+    );
+}
+
+#[test]
+fn final_window_outcome_never_invents_an_outcome_when_a_precondition_fails() {
+    // Tier 1 not governing this delivery at all: never vetoes even with a
+    // "still holding" reading and a natural-exhaustion, trusted window --
+    // that reading was never authoritative for this delivery to begin with.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, /* governs */ false, Some(true), true, true),
+        ConfirmSource::None,
+    );
+    // Tier 1's own reading was never "still holding" at the end (it cleared,
+    // or was never observed) -- no veto.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, Some(false), true, true),
+        ConfirmSource::None,
+    );
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, None, true, true),
+        ConfirmSource::None,
+    );
+}
+
+#[test]
+fn final_window_outcome_never_overrides_a_decision_already_made() {
+    // A veto is only for the genuinely undecided case -- an already-decided
+    // `confirm_source` (hook/burst/box already confirmed it, e.g.) must ride
+    // through completely unchanged, even with every other veto precondition
+    // satisfied.
+    for already in [ConfirmSource::Hook, ConfirmSource::Burst, ConfirmSource::Box] {
+        assert_eq!(final_window_outcome(already, true, Some(true), true, true), already);
+    }
+}
+
+#[test]
+fn late_monitor_tick_supersession_wins_over_everything_including_a_hook_match() {
+    // rev-20 B1: a stale monitor must exit before it can write or notify
+    // ANYTHING, even a hook match that would otherwise look like a genuine
+    // resolution -- that match may well be the RE-SEND's own record, and
+    // confirming off it would still be the clobber/false-correction hazard.
+    assert_eq!(
+        late_monitor_tick(
+            /* superseded */ true,
+            PromptLandedMatch::Existence,
+            /* already_failed */ true,
+            /* expired */ true,
+            /* quiet_long_enough */ true,
+            /* showing_question */ false,
+        ),
+        MonitorAction::Superseded,
+    );
+}
+
+#[test]
+fn late_monitor_tick_a_hook_match_confirms_and_flags_correction_only_when_already_failed() {
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::Existence, false, false, false, false),
+        MonitorAction::Confirm { merged: false, correction: false },
+        "upgrading a still-pending delivery is not a correction -- no alarm was ever sent",
+    );
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::Content { merged: true }, true, false, false, false),
+        MonitorAction::Confirm { merged: true, correction: true },
+        "resolving an already-failed delivery IS a correction, and the merge flag must ride through",
+    );
+}
+
+#[test]
+fn late_monitor_tick_never_declares_failed_while_a_question_is_on_screen() {
+    // The guard the human specified must hold in the monitor's own decision
+    // function, not just in the ad-hoc code that used to implement it.
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::None, false, false, true, /* showing_question */ true),
+        MonitorAction::KeepWaiting,
+        "quiet long enough is not sufficient on its own -- a visible question must override it",
+    );
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::None, false, false, true, false),
+        MonitorAction::DeclareFailed,
+        "quiet long enough AND no question is what actually declares failure",
+    );
+}
+
+#[test]
+fn late_monitor_tick_never_redeclares_failed_and_never_expires_over_a_hook_match() {
+    // Already failed, no new hook: nothing left to do but keep watching.
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::None, true, false, true, false),
+        MonitorAction::KeepWaiting,
+    );
+    // Expired AND a hook match on the same tick: the match must still win --
+    // resolving on the very last possible tick beats timing out.
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::Existence, false, true, false, false),
+        MonitorAction::Confirm { merged: false, correction: false },
+    );
+    // Expired with nothing else going on: times out.
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::None, false, true, false, false),
+        MonitorAction::Expired,
+    );
 }
 
 #[test]

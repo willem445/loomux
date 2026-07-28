@@ -1084,11 +1084,16 @@ its own scope to cover it.
   contract advantage this rejection leaned on did not, in the end, save the hook: the live
   validation that follows found the docs silent on exactly the case that mattered (mid-turn/
   queued input), so "documented" was never the safety property it looked like. The Ctrl-C
-  objection is closed for the human-cancel case (`last_user_input_ms`, the same signal the retry
-  loop already used). The submitted-vs-rejected ambiguity is NOT closed — it's named as a live
-  residual in round 2's own section, made measurable rather than solved. Overturning a
-  considered rejection without recording why is how a codebase loses its memory; this note is
-  that record.
+  objection is closed for the human-cancel case: `tier1_trusted` (a pure predicate,
+  `last_user_input_ms(pty_id) <= submit_sent_ms`) gates every point Tier 1's reading can become a
+  decision — both Box confirms in the confirm/retry loop and the end-of-window veto
+  (`final_window_outcome`) — so any human input since our own submit suppresses Tier 1 entirely
+  for the rest of that delivery, in both directions. (Round 3, rev-20 B3, found this claim
+  written here with no code behind it yet — the fourth claim-mismatch this PR produced. The
+  fix above is what makes the sentence true; it wasn't at the time it was first written.) The
+  submitted-vs-rejected ambiguity is NOT closed — it's named as a live residual in round 2's own
+  section, made measurable rather than solved. Overturning a considered rejection without
+  recording why is how a codebase loses its memory; this note is that record.
 - **Echo check** (the pasted text appears in scrollback as a user message): same rendering-
   dependence, and long pastes get collapsed/elided by TUIs in undocumented ways. **This
   specific residual — long pastes collapsing under undocumented CLI rules — resurfaced almost
@@ -1164,7 +1169,9 @@ either still findable at the tail end of the pane's output, or it isn't.
   `ConfirmSource::BoxVeto`. The "never one sample" qualifier is load-bearing: render/redraw can
   lag Enter being processed by tens of milliseconds even on a healthy accept, so a veto that fired
   on the FIRST "still there" reading would misfire on ordinary redraw lag. The existing
-  window's natural width supplies the debounce; no new constant was needed for it.
+  window's natural width supplies the debounce; no new TIME constant was needed for it — though
+  round 3, below, adds a precondition on HOW the window ended (naturally, not via an early exit)
+  that round 2's own first pass omitted.
 
 This is what makes Tier 1 worth building where the hook wasn't: burst does not run at all when
 Tier 1 governs (its evidence is too weak to arbitrate against a box-based read), so a healthy
@@ -1192,7 +1199,7 @@ hook-or-burst precedence for its initial window. **Consequence, stated plainly**
 two-sided coverage is short/literal-pastes only. Long pastes — the orchestrator briefs most
 likely to land on a busy worker and get queued, the exact population this redesign is for — don't
 get Tier 1's fast veto. They still get everything else in this design (the three-state model, the
-unbounded late hook, the idle trigger below), just not Tier 1's speed.
+long-window late hook, the idle trigger below), just not Tier 1's speed.
 
 Two options were weighed and set aside for this pass: a placeholder-pattern matcher
 (`[Pasted text #N`/`Press up to edit queued messages`) would extend Tier 1's coverage to long
@@ -1207,9 +1214,9 @@ gaps distinct from timing.
 #### Tier 2: the hook, no longer bounded by the window
 
 "Stop requiring it in-window" — a late `promptsubmit` match upgrades `Pending` (or corrects an
-already-`Failed` delivery) whenever it arrives, checked on an unbounded poll (see the idle
-trigger below for why unbounded) rather than the original ~7.6s window. If a `failed` alarm had
-already fired for this delivery, the late match is announced as a CORRECTION
+already-`Failed` delivery) whenever it arrives, checked on a poll bounded only by the pty staying
+alive and (round 3, below) a generous lifetime cap — not the original ~7.6s window. If a `failed`
+alarm had already fired for this delivery, the late match is announced as a CORRECTION
 (`delivery_confirmed_late_notice`), not a second success notice — the orchestrator needs to know
 the earlier alarm was wrong, not just that things are now fine.
 
@@ -1220,8 +1227,11 @@ monitor thread (deliberately not a continuation of the delivery thread, which ho
 delivery mutex for its own bounded lifetime — holding that mutex for the 38+ minutes the live
 episode needed would block every subsequent delivery to the same pane). It declares `Failed`
 only once the pane's own output has been quiet for `PENDING_IDLE_QUIET` (60s — its own constant,
-not `SUBMIT_QUIET`'s 1s, which is tuned for an unrelated "safe to press Enter" bar) — not on a
-fixed timeout at all. **Named plainly, per this design's own standard**: this is ANOTHER
+not `SUBMIT_QUIET`'s 1s, which is tuned for an unrelated "safe to press Enter" bar) — never on a
+fixed timeout (round 3 adds a generous lifetime CAP to the monitor thread itself, below, but
+hitting it makes the monitor give up silently — `Expired`, no notice, `Pending` stays whatever it
+already was — it never manufactures a `Failed` verdict; only genuine idle-without-evidence does
+that). **Named plainly, per this design's own standard**: this is ANOTHER
 byte-count proxy, the same category as `echoed`. Every "is this pane doing something" signal in
 this codebase reduces to `output_total` not growing (`watchdog_tick`'s stall detection is the
 same check, at a similar timescale, already trusted at production scale). It's a materially safer
@@ -1271,13 +1281,82 @@ immediately, so there was nothing to correct against a still-silent alarm).
 
 `prompt-typed` carries `confirm_state` (`confirmed`/`pending`/`failed`), `confirm_source` (which
 tier decided, if any), and three independent per-tier fields — `tier1_governed`/
-`tier1_still_holding_at_end`, `tier2_hook_matched`, `tier3_burst_would_confirm` — computed
+`tier1_still_holding_at_end` (round 3, rev-20 N3: `null` when Tier 1 never governed this delivery
+at all, not `false` — "never measured" and "measured and cleared" are different facts, and a bare
+bool would have conflated them), `tier2_hook_matched`, `tier3_burst_would_confirm` — computed
 regardless of which tier actually decided. This is the hard requirement round 1's own outcome
 argued for: a suite that pins pure functions proved nothing about whether the mechanism won any
 races in practice, because nothing recorded what LOST. A live run can now compare, per delivery,
 what every tier actually said — including a Tier-1-veto that burst would have disagreed with, or
 a hook match that arrived just after burst already won — the exact comparison this whole
 redesign exists to make possible for the next person who has to trust or distrust it.
+
+### Round 3: the enforcement details rev-20 found wrong, and why they're pinned now
+
+Round 2's live-validation review found the architecture sound (three-state model, the seam, the
+audit fields, the round-2 overturn) but three blocking defects in how it was WIRED — the exact
+"round 1 shipped unpinnable wiring and failed live" mistake this whole redesign was supposed to
+have learned from, recurring one level down.
+
+**B1 — the late monitor leaked threads and could clobber a newer delivery.** Nothing bounded
+`run_late_confirmation_monitor`'s lifetime except a hook match or the pty closing — for any pane
+without working hook coverage (not hypothetical: live validation measured ZERO hook resolutions
+across two groups), a `Pending`-then-`Failed` delivery's monitor polled forever. Worse: on a late
+hook match it wrote `last_delivery` unconditionally, so a stale monitor could overwrite a NEWER
+delivery's outcome, and could match the RE-SEND's own hook record and announce "correction: no
+re-send needed" — false, since the re-send is why anything landed. Fixed with one mechanism for
+both: each tick, if `last_delivery[pty_id]`'s `submit_sent_ms` no longer matches this monitor's
+own, a newer delivery has superseded it — exit immediately, writing and notifying nothing
+(`late_monitor_tick`'s `Superseded` branch, checked before even the hook match). A generous
+lifetime cap (`LATE_MONITOR_MAX_LIFETIME`, 4 hours — the live episode needed 38 minutes) bounds
+the one monitor that's genuinely the pane's most recent unresolved delivery.
+
+**B2 — the in-window veto was reachable through a question-pending or human-typing exit.** The
+question-holding-pane guard (above) was correctly built into the LATE monitor's idle trigger, but
+the retry loop's early exits for a live question or human typing fell straight through to the
+end-of-window veto check, which didn't know they'd happened — so `BoxVeto` (and the `Failed`
+notice) could fire while a dialog was on screen, exactly the polarity this whole redesign exists
+to forbid, reachable through the front door. Fixed: `final_window_outcome` (pure) adds a
+`window_exhausted_naturally` precondition — a veto requires the confirm+retry window ran to
+completion with NO early exit, for a question, human typing, OR a failed retry write (the pty is
+likely closing; the box's end state can't be trusted as evidence either). Any early exit leaves
+the delivery `Pending`; the question-guarded late monitor decides from there, since unlike this
+one-shot end-of-window check it re-observes the question state on every subsequent poll.
+
+**B3 — the design note's Ctrl-C claim had no code behind it.** The round-2 overturn (above)
+claimed the human-cancel case was closed via `last_user_input_ms` before any confirm-path code
+actually consulted it — a human pressing Esc/Ctrl-C during the window would clear the box (or
+leave it looking cleared) with nothing distinguishing that from OUR delivery being accepted,
+yielding a false `Box` confirm. This is the fourth instance, across this PR's review history, of
+a claim reading as authoritative while not matching the code behind it (a phantom mutation-test
+citation, a hallucinated API field name, an audit action filed under the wrong name, and now
+this) — worth naming as a pattern, not just fixing as an instance. Fixed: `tier1_trusted` (pure,
+`last_user_input_ms(pty_id) <= submit_sent_ms`) gates every point Tier 1's reading can become a
+decision — both in-loop `Box` promotions and the end-of-window veto — so any human input since
+our own submit suppresses Tier 1 for the rest of that delivery, in both directions, making the
+overturn's own sentence true rather than aspirational.
+
+All three fixes are pure, pinned functions, not inline conditionals — `tier1_trusted`,
+`final_window_outcome`, and `late_monitor_tick` (with a `MonitorAction` result type covering
+`Superseded`/`Expired`/`Confirm`/`DeclareFailed`/`KeepWaiting`) — each with a dedicated polarity
+test and, for the three properties that matter most (never-veto-off-an-early-exit, never-decide-
+after-human-input, supersession-beats-even-a-hook-match), mutation evidence: each property's
+guard was individually removed, the corresponding test reproduced red at the exact assertion, and
+the code was restored.
+
+Non-blocking findings addressed the same pass: the late monitor's own question scan now reads a
+much larger tail (`LATE_MONITOR_QUESTION_SCAN_BYTES`, 32KB vs. the 4KB `QUESTION_SCAN_TAIL_BYTES`
+the fast 250ms-cadence checkpoints use) — sized for a 5-second poll cadence, not a 250ms one, so a
+dialog rendered above a long literally-rendered paste can't fall entirely outside the read; and
+`tier1_still_holding_at_end`'s null-vs-false distinction (above). Left explicitly unaddressed:
+the correction path's own hook-coverage dependency (a `Failed` verdict on a hook-less/zero-
+coverage pane can never be corrected, since correction rides the same hook that never fires
+there — the idle-trigger residual already named above inherits this, and is now doubly
+unresolvable on such a pane; a real gap, but closing it needs the same transcript-watching or
+placeholder-signal work already deferred, not a wiring fix) and `notify_delivery_confirmed_late`'s
+own silent-suppression-leaves-no-audit-trace shape, which mirrors an existing shape in
+`notify_delivery_held`/`notify_unconfirmed_delivery` and belongs to whatever workstream addresses
+that pattern generally (#445's own future territory), not a one-off fix here.
 
 ## Decision-grade structured reports (#398)
 
