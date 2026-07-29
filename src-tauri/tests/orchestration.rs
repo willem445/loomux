@@ -17601,3 +17601,104 @@ fn run_workflow_gate_reload_never_clears_an_armed_gate_via_a_deliberately_gatele
     reg.set_advanced_orchestrator(&gid, false, "human").unwrap();
     assert!(!reg.merge_gate_declared(&gid), "the toggle-off must still clear it");
 }
+
+fn gateless_workflow_text() -> &'static str {
+    "version: 1\nname: focused-review\n\
+     blocks:\n\
+     \x20 - id: worker\n    kind: worker\n\
+     \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+     \x20 - id: rev-tests\n    kind: reviewer\n    prompt: Test quality only.\n"
+}
+
+#[test]
+fn reload_never_rearms_a_gate_after_the_toggle_has_already_turned_it_off() {
+    // #385: the toggle-off race, from rev-33's review. `run_workflow_gate_
+    // reload`'s outer filter snapshots `advanced_orchestrator` before
+    // iterating every group; if a toggle-off completes on ANOTHER thread
+    // (the human clicking the groupview button, handled by a separate Tauri
+    // command) between that snapshot and this group's own turn, the read +
+    // parse `reload_merge_gate_if_changed` does could finish AFTER the
+    // toggle-off and try to re-arm the gate it just cleared — wedging a
+    // gate back onto a group that explicitly turned workflow mode off.
+    //
+    // A genuine cross-thread race isn't deterministically reproducible in a
+    // test, so this pins the actual FIX instead: call the reload directly,
+    // as if the outer filter's snapshot were already stale, against a group
+    // whose guardrails NOW say the toggle is off. The recheck inside
+    // `reload_merge_gate_if_changed` must see that and refuse to write,
+    // regardless of what the file on disk still says.
+    let (reg, _d, repo, gid) = gated_group("");
+    assert!(reg.merge_gate_declared(&gid), "test setup sanity");
+
+    reg.set_advanced_orchestrator(&gid, false, "human").unwrap();
+    assert!(!reg.merge_gate_declared(&gid), "the toggle-off must clear it first");
+
+    // The file on disk still declares the gate untouched — exactly what a
+    // reload tick sandwiched right after the toggle-off would see.
+    reg.reload_merge_gate_if_changed(&gid);
+
+    assert!(
+        !reg.merge_gate_declared(&gid),
+        "a reload must never re-arm a gate for a group whose guardrails now say workflow mode is off"
+    );
+    let _ = &repo;
+}
+
+#[test]
+fn reload_audits_a_silently_ignored_removal_exactly_once() {
+    // rev-33: silence about a deliberate action is a failure mode this repo
+    // keeps re-learning. A human who deletes gates.merge, saves, and sees
+    // NOTHING happen will reasonably conclude the reload is broken. One
+    // audit line makes "I removed it and nothing happened" answerable from
+    // the trail — but it must fire ONCE per transition, not every tick the
+    // file happens to stay gateless (that would just be log spam, the exact
+    // thing `run_workflow_gate_reload_does_not_rewrite_or_reaudit_an_
+    // unchanged_file` already guards against for the normal case).
+    let (reg, _d, repo, gid) = gated_group("");
+    edit_workflow(repo.path(), gateless_workflow_text());
+
+    reg.run_workflow_gate_reload();
+    let warns = |reg: &OrchRegistry| {
+        reg.audit_log(&gid).iter().filter(|e| e.action == "merge-gate-removal-ignored").count()
+    };
+    assert_eq!(warns(&reg), 1, "must audit the transition exactly once");
+
+    // Repeated ticks against the SAME still-gateless file must stay quiet.
+    reg.run_workflow_gate_reload();
+    reg.run_workflow_gate_reload();
+    assert_eq!(warns(&reg), 1, "must not re-audit every tick while the file stays gateless");
+}
+
+#[test]
+fn reload_removal_audit_relatches_after_the_gate_returns_and_is_removed_again() {
+    // The latch must reset when the group leaves the "ignored removal"
+    // state, so a SECOND, later, genuinely new removal is not swallowed by
+    // the first one's now-stale latch.
+    let (reg, _d, repo, gid) = gated_group("");
+    edit_workflow(repo.path(), gateless_workflow_text());
+    reg.run_workflow_gate_reload();
+    let warns = |reg: &OrchRegistry| {
+        reg.audit_log(&gid).iter().filter(|e| e.action == "merge-gate-removal-ignored").count()
+    };
+    assert_eq!(warns(&reg), 1);
+
+    // The gate comes back (a further edit re-adds it) — this must clear the
+    // latch, and must NOT itself count as a removal.
+    edit_workflow(
+        repo.path(),
+        "version: 1\nname: focused-review\n\
+         blocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+         \x20 - id: rev-tests\n    kind: reviewer\n    prompt: Test quality only.\n\
+         gates:\n  merge:\n    reviewers: [rev-security, rev-tests]\n",
+    );
+    reg.run_workflow_gate_reload();
+    assert!(reg.merge_gate_declared(&gid), "the gate must re-arm once the file names it again");
+    assert_eq!(warns(&reg), 1, "re-arming is not a removal — the count must not move");
+
+    // Removed again — a genuinely NEW transition, must audit again.
+    edit_workflow(repo.path(), gateless_workflow_text());
+    reg.run_workflow_gate_reload();
+    assert_eq!(warns(&reg), 2, "a later, distinct removal must audit again, not stay silent forever");
+}

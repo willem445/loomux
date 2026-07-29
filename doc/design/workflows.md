@@ -592,6 +592,37 @@ change — narrower protection than the policy above (it only catches a write
 caught in the act, not one that's paused or crashed mid-truncation), but free
 and unconditional.
 
+**Silence about the ignored removal is its own failure mode, and rev-33's
+review named it.** A human who deletes `gates.merge`, saves, and sees nothing
+happen has no way to tell "the reload is broken" from "the reload correctly
+declined" — the same shape as the intake-gate incident where a suppressed
+wake read identically to a lost one. So `reload_merge_gate_if_changed` audits
+a `merge-gate-removal-ignored` line the moment it enters that state — but
+only ONCE per transition (`merge_gate_removal_warned` is the latch, cleared
+the moment the group leaves the state: the file regains `gates.merge`, or
+the gate is actually cleared via the toggle), not on every tick the file
+happens to still be gateless. A repeat audit every `WORKFLOW_GATE_POLL_
+INTERVAL` would be exactly the log-spam this feature otherwise avoids for an
+unchanged file; a LATER, genuinely new removal still audits fresh once the
+latch has cleared.
+
+**The toggle-off race.** `run_workflow_gate_reload` snapshots which groups
+have `advanced_orchestrator` on before iterating them; `set_advanced_
+orchestrator` runs independently, on whatever thread handles the Tauri
+command a groupview click dispatches to. If a toggle-off completes on that
+thread between the snapshot and this group's own turn in the loop, the
+read + parse `reload_merge_gate_if_changed` does could still finish AFTER
+the toggle-off — and, seeing the file still declare a gate the just-cleared
+`merge_gate` file no longer does, try to re-arm it. That would wedge a gate
+back onto a group that just explicitly turned workflow mode off. The safe
+direction (more enforcement, not less) — but a real bug regardless, and
+"it fails safe" is not a reason to ship a known race in security machinery.
+`reload_merge_gate_if_changed` re-reads the group's guardrails immediately
+before writing, and refuses if the toggle is no longer on — shrinking the
+window down to the gap between that recheck and the write itself, which no
+lock-free background pass can close entirely without a cross-thread lock
+this codebase doesn't otherwise need.
+
 Only the gate reloads — the roster (`guardrails.blocks`) stays
 launch/toggle-pinned, for the same reason a live delegate's persona doesn't
 change underneath it (above): reloading the roster live has a much larger
@@ -988,8 +1019,18 @@ gate too**, and the verdict store adds its own shapes. An agent with a shell can
   like `merge_grants/`. What loomux guarantees is that no *MCP surface* lets a
   non-reviewer record one (enforced twice — dispatch and registry), not that the
   filesystem forbids it.
-- **Delete the gate.** `rm $LOOMUX_GROUP_DIR/merge_gate` removes it for that group
-  until the next launch re-reads the workflow file.
+- **Delete the gate.** `rm $LOOMUX_GROUP_DIR/merge_gate` removes it for that
+  group — **but only for up to `WORKFLOW_GATE_POLL_INTERVAL` (30s), not until
+  the next launch, as of #385.** If `.loomux/workflow.yml` still declares
+  `gates.merge` (the common case — the file itself wasn't touched, just the
+  generated spec), the next background reload sees the declared gate differ
+  from the now-missing armed one and re-writes it, self-healing the deletion.
+  Deleting the workflow FILE itself (not just the spec) doesn't reopen this
+  bypass either — #385/B1 makes that retain the last-known gate rather than
+  clear it. The only way this bullet's original "until relaunch" window
+  still applies is turning workflow mode off first (which clears the gate
+  deliberately) or disabling/killing the background reload thread, which is
+  a much bigger compromise than deleting one file.
 - **Unset the group dir.** `env -u LOOMUX_GROUP_DIR gh pr merge 7` used to skip the
   workflow gate entirely — with nothing in the audit, since there is no audit log
   without a group dir. **That one is now closed**: the shim refuses *any* merge with
@@ -1019,23 +1060,40 @@ there is no gate, and the merge path is byte-for-byte what it was before #222.
 Toggle back off after a gated launch and the gate is **cleared** — it must not
 outlive the consent that authorized it.
 
-On a **resume**, the gate is pinned to the launch exactly as the roster is, and the
-argument is sharper for it. The roster pin exists so a `git pull` cannot swap a
-delegate's persona under a session the human already approved; re-reading the file on
-resume could just as easily *loosen* a gate — drop a reviewer, delete the clause —
-under a session already running with it. The gate written at launch stands; drift is
-audited (`workflow-changed-since-launch`), not applied.
+**On a resume, AT THE MOMENT OF RESUME, the gate is not re-derived** — same as the
+roster, and for the same reason: `create_group`'s resume arm does not re-read
+`.loomux/workflow.yml` to decide what gate this session runs under; it keeps
+whatever `merge_gate` already has on disk. **This is no longer the whole story
+once #385 shipped, and the difference matters.** Before #385, "not re-derived at
+resume" meant frozen for the rest of the session too, because nothing else ever
+re-read the file after launch either — a `git pull` between launch and resume
+could never loosen the gate (drop a reviewer, delete the clause) without a
+further explicit human action. That guarantee is gone: `run_workflow_gate_reload`
+(*Hot-reloading a manual file edit*, below) treats a resumed group exactly like
+any other live advanced-orchestrator group, re-deriving its gate from whatever is
+CURRENTLY on disk within `WORKFLOW_GATE_POLL_INTERVAL` of the resume completing,
+git pull or hand-edit, loosening or tightening, with no further consent moment.
+That's a decided, accepted risk (#459) — see the section below for the argument
+and for the one thing that's still absolute regardless: fail-closed. Drift
+against the file that predates a resume is still audited
+(`workflow-changed-since-launch`) independent of any of this.
 
-Within a toggled-on launch, `merge_gate` tracks the repo, with one deliberate
-asymmetry. Delete `gates.merge` (or the whole workflow file) and the gate is
-**cleared** — a group must not keep enforcing a rule its repo has walked back. But a
-workflow file that **fails to parse** keeps the last known gate, loudly
-(`merge-gate-retained` in the audit). #225's rule — *a broken file is audited and
-skipped, never fatal* — is right for the roster, where falling back to the built-in
-four blocks still lets every agent spawn. It is exactly wrong for a gate: dropping
-one because the file that declares it stopped parsing would quietly *widen* what
-the group's agents may do, and a syntax error is not consent to merge unreviewed
-code.
+Within a toggled-on launch (or a live toggle-ON), `merge_gate` tracks the repo AT
+THAT MOMENT, with one deliberate asymmetry that still holds at launch/toggle
+time: delete `gates.merge` (or the whole workflow file) and the gate is
+**cleared** — a group must not keep enforcing a rule its repo has walked back,
+and turning the toggle on IS a fresh consent moment. But a workflow file that
+**fails to parse** keeps the last known gate, loudly (`merge-gate-retained` in
+the audit). #225's rule — *a broken file is audited and skipped, never fatal* —
+is right for the roster, where falling back to the built-in four blocks still
+lets every agent spawn. It is exactly wrong for a gate: dropping one because the
+file that declares it stopped parsing would quietly *widen* what the group's
+agents may do, and a syntax error is not consent to merge unreviewed code.
+**The background reload (below) does NOT share the "delete it and it clears"
+half of this asymmetry** — that's #385/B1's own finding: on the reload path
+absence is never removal, full stop, precisely because a reload can't tell a
+deliberate deletion from a mid-write truncation the way a one-shot launch/toggle
+read can afford to assume it can.
 
 ### The gate is a property of the session, not the PR (#316)
 

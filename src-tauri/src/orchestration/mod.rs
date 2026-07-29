@@ -5693,6 +5693,17 @@ pub struct OrchRegistry {
     /// every other id this registry mints, so no `getrandom`-pulling crate
     /// is needed (CLAUDE.md constraint 2).
     channel_seq: AtomicU32,
+    /// Merge-gate hot-reload (#385/B1): groups currently sitting in "the file
+    /// no longer declares `gates.merge` but a gate is still armed" — the
+    /// edge-triggered latch for the `merge-gate-removal-ignored` audit line.
+    /// Without this, a group left in that state would re-audit every
+    /// `WORKFLOW_GATE_POLL_INTERVAL` forever (pure noise); with it, the
+    /// human gets exactly one line explaining "I removed it and nothing
+    /// happened", not an audit-log flood. Cleared the moment the group
+    /// leaves that state (the file regains `gates.merge`, or the gate is
+    /// actually cleared via the toggle), so a LATER re-entry — a fresh edit
+    /// — audits again rather than staying silent forever after the first.
+    merge_gate_removal_warned: Mutex<HashSet<String>>,
 }
 
 /// One member of a [`Channel`]: which group/agent pane is connected. Cached
@@ -8065,6 +8076,7 @@ impl OrchRegistry {
             channels: Mutex::new(HashMap::new()),
             agent_channel: Mutex::new(HashMap::new()),
             channel_seq: AtomicU32::new(0),
+            merge_gate_removal_warned: Mutex::new(HashSet::new()),
         }
     }
 
@@ -14398,12 +14410,27 @@ impl OrchRegistry {
     /// value use, so the lifecycle UI and the toggle's own confirm can never
     /// disagree.
     ///
-    /// `blocks` and `gate` are read from the group's PERSISTED/in-memory state
-    /// (the roster + the synced `merge_gate` spec file) — pinned at
-    /// launch/toggle and never silently re-read from the repo's workflow file,
-    /// the same consent rule `create_group`'s resume arm documents. `name` is a
-    /// live, best-effort, DISPLAY-ONLY read of the repo's current workflow file
-    /// (like `orch_workflow_preview`) — cosmetic, never a source of enforcement.
+    /// `blocks` is read from the group's PERSISTED/in-memory roster — pinned
+    /// at launch/toggle and never silently re-read from the repo's workflow
+    /// file, the same consent rule `create_group`'s resume arm documents.
+    /// `name` is a live, best-effort, DISPLAY-ONLY read of the repo's current
+    /// workflow file (like `orch_workflow_preview`) — cosmetic, never a
+    /// source of enforcement.
+    ///
+    /// **`gate` is NOT pinned the same way, as of #385.** It reads
+    /// `self.merge_gate` — the `merge_gate` spec file — which
+    /// `run_workflow_gate_reload`'s periodic background pass keeps in sync
+    /// with the repo's CURRENT `.loomux/workflow.yml` for any advanced-
+    /// orchestrator group (see `reload_merge_gate_if_changed`), independent
+    /// of this call and independent of launch/toggle. So this function's own
+    /// read is a plain "whatever's armed right now" — it neither re-reads
+    /// the file itself nor pins anything — and what's armed right now can
+    /// differ from what launch or the last toggle wrote. The one thing that
+    /// reload can never do is take an ALREADY-armed gate down to no gate
+    /// (#385/B1 — that still requires the explicit toggle-off), so `gate`
+    /// going from `Some` to `null` between two calls is still exactly the
+    /// signal it always was: the toggle turned off, not a background read.
+    ///
     /// `gate.satisfiable`/`missing_blocks` are recomputed fresh against the
     /// CURRENT roster on every call, never cached from whenever the gate was
     /// armed, so a roster that later regains (or loses) a named reviewer shows
@@ -16228,7 +16255,8 @@ impl OrchRegistry {
     /// launch/toggle-pinned, same as `set_advanced_orchestrator`'s doc explains
     /// for delegates already spawned under it — reloading the roster live is a
     /// separate, larger-blast-radius change this issue is not scoped to.
-    fn reload_merge_gate_if_changed(&self, id: &str) {
+    #[doc(hidden)] // pub for integration tests (#385/B1 toggle-off race + removal-audit pins)
+    pub fn reload_merge_gate_if_changed(&self, id: &str) {
         let Some(info) = self.group(id) else { return };
         let Some(text) = Self::read_workflow_stably(&info.repo) else { return };
         let Ok(wf) = workflow::parse_workflow(&text) else { return };
@@ -16236,11 +16264,50 @@ impl OrchRegistry {
         let fresh = wf.gates.get("merge").cloned();
 
         // #385/B1: see the doc comment above — absence never clears an
-        // already-armed gate on this path.
+        // already-armed gate on this path. But silence about that is its own
+        // failure mode: a human who deletes `gates.merge`, saves, and sees
+        // NOTHING happen will reasonably conclude the reload is broken,
+        // exactly like the intake-gate incident where a suppressed wake was
+        // indistinguishable from a lost one. So this audits — but only ONCE
+        // per transition into this state (`merge_gate_removal_warned` is the
+        // latch), not on every tick the file happens to still be missing
+        // `gates.merge`: a repeat audit every `WORKFLOW_GATE_POLL_INTERVAL`
+        // would be exactly the log-spam this feature already avoids for the
+        // unchanged-file case.
         if fresh.is_none() && armed.is_some() {
+            if self.merge_gate_removal_warned.lock_safe().insert(id.to_string()) {
+                self.audit(id, "loomux", "merge-gate-removal-ignored", json!({
+                    "reason": "gates.merge is absent from the current read, but a gate is \
+                               already armed. The reload path never treats absence as removal \
+                               here — it is indistinguishable from a mid-write truncation \
+                               (#385/B1) — so the gate stands. Turn workflow mode off to \
+                               actually clear it.",
+                }));
+            }
             return;
         }
+        // Any other outcome means the group has left that state (the file
+        // regained `gates.merge`, or the gate is genuinely gone) — clear the
+        // latch so a LATER removal audits again instead of staying silent
+        // forever after the first warning.
+        self.merge_gate_removal_warned.lock_safe().remove(id);
+
         if fresh.as_ref() == armed.as_ref() {
+            return;
+        }
+        // #385: re-check immediately before writing, on a FRESH read of the
+        // group's guardrails. The read+parse above takes real wall-clock
+        // time, and `set_advanced_orchestrator` runs on a different thread
+        // (a Tauri command handler, not this background pass) — a human can
+        // toggle workflow mode off while this call is in flight. Without
+        // this check, a reload that started just before the toggle-off
+        // completes could still finish just after it and wedge the gate
+        // back on for a group that just explicitly turned it off. That's
+        // the SAFE direction (more enforcement, not less) — but it is still
+        // a real bug, and "it fails safe" is not a reason to ship a known
+        // race in security machinery.
+        let Some(info) = self.group(id) else { return };
+        if !info.guardrails.advanced_orchestrator {
             return;
         }
         self.sync_merge_gate(id, fresh.as_ref());
