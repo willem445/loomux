@@ -84,6 +84,7 @@ pub fn run() {
             pty::discover_git_bash,
             sessions::list_sessions,
             sessions::record_copilot_launch_posture,
+            sessions::record_claude_launch_posture,
             git::git_repo_root,
             git::git_log,
             git::git_status,

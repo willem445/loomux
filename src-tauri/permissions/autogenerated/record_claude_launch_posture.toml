@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-record-claude-launch-posture"
+description = "Enables the record_claude_launch_posture command without any pre-configured scope."
+commands.allow = ["record_claude_launch_posture"]
+
+[[permission]]
+identifier = "deny-record-claude-launch-posture"
+description = "Denies the record_claude_launch_posture command without any pre-configured scope."
+commands.deny = ["record_claude_launch_posture"]

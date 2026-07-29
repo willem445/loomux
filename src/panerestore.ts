@@ -650,20 +650,39 @@ export function adoptableSessionId(command: string | null, argv: string[] | null
   return sessionIdFromCommand(command, argv);
 }
 
-/** The CLI program a restored `command`/`argv` would invoke — the first
- *  token, lowercased. Used (#456) to tell whether a `resume-agent`/
- *  `fresh-agent`/`dormant-agent` restore action is a copilot pane, so the
- *  autopilot-dialog watcher can be wired in for it the same way a fresh
- *  launch gets it. Deliberately minimal for THIS PR's scope, not the fuller
- *  shared CLI-derivation #452 asks for (argv-only panes losing their CLI
- *  identity to a comment instead of a real lookup) — but that minimalism is
- *  a scope call, not a design stance: this is a candidate call site for (or
- *  the seed of) #452's shared helper, not a deliberately-separate derivation
- *  meant to coexist with it. #452 has been noted that a third derivation now
- *  exists to converge when that work happens. */
+/** Normalize a launch command's first token into the bare CLI program name
+ *  (#457, closing #452's concrete named case): strips a directory prefix
+ *  (`C:\tools\copilot.exe` → `copilot.exe`, `/usr/local/bin/claude` →
+ *  `claude`) and a trailing executable extension (`.exe`/`.cmd`/`.bat`,
+ *  case-insensitive — Windows PATH resolution accepts any of them), then
+ *  lowercases. Without this, a path-qualified or `.exe`-suffixed command
+ *  silently fails every `=== "claude"`/`=== "copilot"` check downstream —
+ *  per-CLI restore behavior (the autopilot watcher, the D2 resume-candidate
+ *  card, `Pane.agentCli`) just doesn't apply, with no error, for a pane that
+ *  is unambiguously one of those two CLIs.
+ *
+ *  This is the ONE place that answers "what CLI program does this raw first
+ *  token name" — `programFromRestore` below, `main.ts`'s D2 dormant-card
+ *  sniff, and `Pane.agentCli` (`pane.ts`) all call it now rather than each
+ *  re-deriving the same first-token-lowercased logic independently (#452:
+ *  three duplicate, and until now identically-incomplete, derivations). Not
+ *  a full #452 convergence — the quoting/tokenizing grammar
+ *  (`QUOTED_OR_BARE_VALUE`) is a different axis, already converged per #471,
+ *  and the D2 card's OWN `.command`-vs-`.argv` extraction and the launcher's
+ *  `plan.command.split(/\s+/)[0]` probe step are untouched — this only
+ *  converges what happens to an already-extracted raw token. */
+export function normalizeAgentProgram(raw: string): string {
+  const base = raw.split(/[\\/]/).pop() ?? raw;
+  return base.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+}
+
+/** The CLI program a restored `command`/`argv` would invoke. Used (#456) to
+ *  tell whether a `resume-agent`/`fresh-agent`/`dormant-agent` restore
+ *  action is a copilot pane, so the autopilot-dialog watcher can be wired in
+ *  for it the same way a fresh launch gets it. */
 export function programFromRestore(command: string | null, argv: string[] | null): string | null {
   const first = command?.trim().split(/\s+/)[0] || argv?.[0];
-  return first ? first.toLowerCase() : null;
+  return first ? normalizeAgentProgram(first) : null;
 }
 
 /** Whether a restored copilot pane's command/argv actually carries

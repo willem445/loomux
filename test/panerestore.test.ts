@@ -17,6 +17,7 @@ import {
   shouldRespawnFresh,
   findResumedPaneIndex,
   programFromRestore,
+  normalizeAgentProgram,
   shouldWatchCopilotOnRestore,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
@@ -1141,6 +1142,44 @@ test("programFromRestore is null with neither a command nor argv", () => {
   assert.equal(programFromRestore(null, null), null);
   assert.equal(programFromRestore("", []), null);
   assert.equal(programFromRestore("   ", null), null);
+});
+
+// #457 (finding 3 from the design intake): the concrete named bug —
+// programFromRestore (and its two now-converged siblings, Pane.agentCli and
+// main.ts's D2 dormant-card sniff) used to compare the raw first token
+// directly against "claude"/"copilot", so a path-qualified or
+// `.exe`/`.cmd`-suffixed recorded command silently matched neither and every
+// per-CLI restore behavior (autopilot watcher, resume-candidate card,
+// Pane.agentCli) just didn't apply — no error, just silently wrong.
+test("programFromRestore recognizes an .exe-suffixed command", () => {
+  assert.equal(programFromRestore("copilot.exe --resume abc-123", null), "copilot");
+  assert.equal(programFromRestore("Claude.EXE --resume abc-123", null), "claude", "case-insensitive suffix too");
+});
+
+test("programFromRestore recognizes a path-qualified command", () => {
+  assert.equal(programFromRestore("C:\\tools\\copilot.exe --resume abc", null), "copilot");
+  assert.equal(programFromRestore("/usr/local/bin/claude --resume abc", null), "claude");
+  assert.equal(programFromRestore(null, ["C:\\tools\\copilot.exe", "--resume", "abc"]), "copilot");
+});
+
+test("normalizeAgentProgram: bare name, path-qualified, and .exe/.cmd/.bat suffixed all converge to the same lowercase program", () => {
+  for (const raw of [
+    "claude",
+    "Claude",
+    "claude.exe",
+    "CLAUDE.EXE",
+    "claude.cmd",
+    "claude.bat",
+    "C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd",
+    "/usr/local/bin/claude",
+  ]) {
+    assert.equal(normalizeAgentProgram(raw), "claude", `expected "claude" from ${JSON.stringify(raw)}`);
+  }
+});
+
+test("normalizeAgentProgram: an unrelated program is left alone (lowercased, extension stripped) — never coerced to claude/copilot", () => {
+  assert.equal(normalizeAgentProgram("bash"), "bash");
+  assert.equal(normalizeAgentProgram("PowerShell.exe"), "powershell");
 });
 
 // #456 review NB1: shouldWatchCopilotOnRestore replaces three copy-pasted
