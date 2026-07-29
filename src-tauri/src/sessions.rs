@@ -1590,6 +1590,85 @@ mod launch_intent_tests {
         clear_seam();
     }
 
+    /// THE property the module doc states but, until this test, nothing
+    /// pinned: **eviction is one shared pool across BOTH key shapes**
+    /// (`cap_and_evict` sorts on `touched_ms` alone — it has no idea
+    /// `IntentKey::Session` and `IntentKey::Cwd` are different variants).
+    /// Every eviction test above (`store_caps_and_evicts_the_least_recently_
+    /// touched_cwd`, `re_touching_a_cwd_protects_it_from_eviction`,
+    /// `conflicted_cwd_never_yields_flags_no_matter_how_much_other_activity_
+    /// follows`) only ever populated ONE key shape at a time — none of them
+    /// could have caught a shape-biased eviction change.
+    ///
+    /// This matters specifically, not generically: **eviction is exactly
+    /// where #460's own B1 finding broke this store's guarantee before** —
+    /// cap eviction silently un-conflicting a directory into a grant, caught
+    /// only by a runnable counter-test that drove the store past its cap and
+    /// asserted the SPECIFIC value the broken design produced. #457 widened
+    /// the key space eviction operates over; leaving the mixed-shape case
+    /// unpinned in the PR that does the widening is exactly how a future
+    /// "prefer evicting session keys" (or the reverse) optimization changes
+    /// LRU behavior with nothing going red.
+    ///
+    /// Both directions, because a one-directional pin could pass by
+    /// accident (e.g. a mutation that only biases eviction ONE way):
+    /// an old `Session` entry evicted by a volume of fresh `Cwd` writes, and
+    /// an old `Cwd` entry evicted by a volume of fresh `Session` writes —
+    /// each proving eviction crosses the shape boundary, not merely that it
+    /// works within one shape.
+    ///
+    /// Mutation-verified: sorting eviction by `(is_session, touched_ms)`
+    /// instead of `touched_ms` alone — biasing eviction toward `Session`
+    /// entries regardless of freshness, the exact "optimization" this test
+    /// exists to catch — leaves the FIRST direction's assertion accidentally
+    /// still true (the lone session entry gets evicted either way) but makes
+    /// the SECOND direction's assertion fail: the old `Cwd` entry survives
+    /// (a stale grant kept alive) while a freshly-written `Session` entry is
+    /// evicted instead. This is exactly why both directions are asserted,
+    /// not one.
+    #[test]
+    fn mixed_key_shapes_share_one_eviction_pool() {
+        let _d = posture_seam();
+        // Direction 1: one old Session entry, then enough fresh Cwd writes
+        // to push the store one past the cap.
+        record_claude_launch_posture_impl("sess-old", true).unwrap();
+        for i in 0..super::LAUNCH_INTENT_CAP {
+            record_copilot_launch_posture_impl(&format!("C:/work/{i}"), true).unwrap();
+        }
+        assert_eq!(
+            claude_launch_posture("sess-old"),
+            None,
+            "a Session-keyed entry must be evictable under Cwd-keyed pressure — one shared pool, \
+             not a separate, effectively-uncapped bucket per key shape"
+        );
+        assert_eq!(
+            copilot_launch_posture(&format!("C:/work/{}", super::LAUNCH_INTENT_CAP - 1)),
+            Some(true),
+            "the newest Cwd entry must survive — eviction removed exactly the oldest overall"
+        );
+        clear_seam();
+
+        // Direction 2: the reverse — one old Cwd entry, then enough fresh
+        // Session writes to push the store one past the cap.
+        let _d2 = posture_seam();
+        record_copilot_launch_posture_impl("C:/work/old", true).unwrap();
+        for i in 0..super::LAUNCH_INTENT_CAP {
+            record_claude_launch_posture_impl(&format!("sess-{i}"), true).unwrap();
+        }
+        assert_eq!(
+            copilot_launch_posture("C:/work/old"),
+            None,
+            "same property, opposite direction — a Cwd-keyed entry must be evictable under \
+             Session-keyed pressure"
+        );
+        assert_eq!(
+            claude_launch_posture(&format!("sess-{}", super::LAUNCH_INTENT_CAP - 1)),
+            Some(true),
+            "the newest Session entry must survive"
+        );
+        clear_seam();
+    }
+
     /// The restore-path regression pin (#456): a Sessions-tab resume of a
     /// copilot session must carry the SAME autopilot flags a fresh launch in
     /// that folder would, when — and only when — loomux's own record is
