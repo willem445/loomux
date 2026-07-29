@@ -9,6 +9,7 @@
 use loomux_lib::orchestration::intake;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
+use loomux_lib::orchestration::queue;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
@@ -35,15 +36,14 @@ use loomux_lib::orchestration::{
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     workflow_mode_notice,
     GhGate, GitTagPush,
-    normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
-    paste_held_notice, question_held_notice, held_delivery_notice,
+    normalize_remote_web_base, ORCHESTRATOR_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     record_aborted_preenter_outcome, recorded_confirmed,
-    should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
+    should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
@@ -1023,54 +1023,310 @@ fn paste_gate_holds_until_clear_then_pastes_or_aborts_at_the_cap() {
     assert_eq!(resolve_paste_gate(true, cap + Duration::from_millis(1), cap), PasteGate::Abort);
 }
 
+// ---------- #445: delivery queue notice vocabulary ----------
+//
+// The old `paste_held_notice`/`question_held_notice`/`held_delivery_notice`
+// (and their gate `should_notify_paste_held`) said "held: ... re-send when
+// clear" — the exact honesty defect #445 exists to fix: a delivery that hit
+// its hold cap was DESTROYED, not held, and re-sending was actively harmful
+// once queueing made it unnecessary. They are deleted; `queue::queued_notice`
+// (below) replaces them. See `queue.rs`'s own unit tests for the full
+// coverage of the new notice text — these two just pin the property that
+// specifically motivated the deletion.
+
 #[test]
-fn paste_held_notice_names_the_agent_and_the_recovery_move() {
-    let msg = paste_held_notice("w-4");
+fn queued_notice_replaces_the_deleted_re_send_wording() {
+    let msg = queue::queued_notice("w-9", queue::EnqueueReason::BoxOccupied);
     assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
-    assert!(msg.contains("w-4"), "notice must name the held agent: {msg}");
-    assert!(msg.contains("human input"), "notice must state the condition: {msg}");
-    assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
-    // Distinct from the unconfirmed notice: nothing was pasted, so it must NOT
-    // tell the orchestrator the prompt is sitting unsubmitted.
-    assert!(!msg.contains("unsubmitted"), "held notice is not the unconfirmed one: {msg}");
+    assert!(msg.contains("w-9"), "notice must name the target agent: {msg}");
+    assert!(!msg.to_lowercase().contains("re-send when clear"), "the old misleading phrasing must be gone: {msg}");
+    assert!(msg.contains("do NOT re-send"), "must warn against re-sending a queued payload: {msg}");
+
+    let msg = queue::queued_notice("w-9", queue::EnqueueReason::Question);
+    assert!(msg.contains("interactive question"), "must name the condition: {msg}");
 }
 
 #[test]
-fn paste_held_notice_fires_only_for_a_non_orchestrator_target() {
-    // A held delivery to a worker/reviewer: the prompt never landed, so the
-    // orchestrator must be told to re-send.
-    assert!(should_notify_paste_held(false));
-    // Target IS the orchestrator: a notice to it is itself a delivery to it — an
-    // endless loop. Never notify.
-    assert!(!should_notify_paste_held(true));
-}
-
-#[test]
-fn question_held_notice_names_the_agent_and_points_at_answering() {
-    // #420: the recovery move for a question-held delivery is "answer the
-    // question", not "re-send" or "clear the box" — re-sending alone won't
-    // help until a human has actually answered.
-    let msg = question_held_notice("w-9");
-    assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
-    assert!(msg.contains("w-9"), "notice must name the held agent: {msg}");
-    assert!(msg.contains("question"), "notice must state the condition: {msg}");
-    assert!(msg.to_lowercase().contains("answer"), "notice must point at answering: {msg}");
-    assert!(!msg.contains("unsubmitted"), "question notice is not the unconfirmed one: {msg}");
-}
-
-#[test]
-fn held_delivery_notice_dispatches_text_by_reason() {
-    // #111/#420: the orchestrator-facing notice text differs by why the
-    // delivery was held — box-occupied points at re-sending, a live question
-    // points at answering. `Typing` never aborts a delivery (its cap delivers
-    // anyway), so it has no notice of its own; it falls back to the
-    // box-occupied text like any other non-question abort would.
-    assert_eq!(held_delivery_notice("w-9", HeldReason::BoxOccupied), paste_held_notice("w-9"));
-    assert_eq!(held_delivery_notice("w-9", HeldReason::InteractiveQuestion), question_held_notice("w-9"));
-    assert_ne!(
-        held_delivery_notice("w-9", HeldReason::BoxOccupied),
-        held_delivery_notice("w-9", HeldReason::InteractiveQuestion),
+fn orchestrator_template_no_longer_instructs_a_re_send_on_a_held_delivery() {
+    // #445 plan step 5: delete every "re-send when clear" instruction from
+    // the live template (the frozen tests/fixtures/pre222/orchestrator.md
+    // snapshot is a DELIBERATE historical fixture for the workflow-upgrade
+    // tests and must stay untouched — this pins the LIVE template only).
+    assert!(
+        !ORCHESTRATOR_TPL.to_lowercase().contains("re-send when clear"),
+        "the live orchestrator template must not instruct re-sending a queued delivery"
     );
+    assert!(
+        ORCHESTRATOR_TPL.contains("do NOT"),
+        "the template must explicitly warn against re-sending a queued payload"
+    );
+    assert!(
+        ORCHESTRATOR_TPL.contains("queued"),
+        "the template must describe the new hold-means-queued behavior"
+    );
+}
+
+// ---------- #445: delivery queue — registry-level bookkeeping ----------
+//
+// `deliver_now`'s pipeline and the drainer thread cannot be exercised here
+// (no live pty/app handle in test mode, and CLAUDE.md forbids spawning a
+// real agent CLI) — see `queue.rs`'s module doc and the plan's own
+// "Stated honestly" section. What IS testable, and pinned below: the FIFO
+// admit/cap/coalesce bookkeeping, the front-door check (bypasses the
+// app-handle requirement precisely because it needs no live pane), the
+// dequeue/drop audit trail, and the orphan-scan derivation. Live wiring
+// (drainer actually flushing a real pane) is a hand-validation item.
+
+#[test]
+fn enqueue_text_preserves_fifo_order_across_mixed_senders() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 101u32;
+
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "here is context", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orch-2", "now go", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "a third, different ask", pty, queue::EnqueueReason::BehindQueue).unwrap();
+
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap.len(), 3);
+    // "here is context" must never be overtaken by "now go" — the exact
+    // inversion failure mode the front-door check exists to prevent.
+    assert_eq!(snap[0].payload.text(), Some("here is context"));
+    assert_eq!(snap[0].from, "orch-1");
+    assert_eq!(snap[1].payload.text(), Some("now go"));
+    assert_eq!(snap[2].payload.text(), Some("a third, different ask"));
+    // Ids are strictly increasing (the monotonic AtomicU64 — no getrandom).
+    assert!(snap[0].id < snap[1].id, "ids must increase monotonically");
+    assert!(snap[1].id < snap[2].id, "ids must increase monotonically");
+}
+
+#[test]
+fn enqueue_text_rejects_newest_at_cap_never_evicts_oldest() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 102u32;
+
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("distinct-{i}"), pty, queue::EnqueueReason::BehindQueue)
+            .unwrap();
+    }
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE);
+
+    let err = reg
+        .enqueue_text(&g.id, &w.id, "loomux", "one-too-many", pty, queue::EnqueueReason::Question)
+        .unwrap_err();
+    assert!(err.contains("NOT queued"), "must be a synchronous, truthful rejection: {err}");
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE, "depth must not change on rejection");
+    // The head is still the FIRST item ever queued — never evicted to make
+    // room, because the head may be the kickoff everything after depends on.
+    assert_eq!(reg.queue_snapshot(pty)[0].payload.text(), Some("distinct-0"));
+
+    let dropped = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-dropped" && e.detail["reason"] == json!("queue-full-at-call"))
+        .count();
+    assert_eq!(dropped, 1, "the rejection itself must be audited");
+}
+
+#[test]
+fn enqueue_text_coalesces_a_byte_identical_repeat_and_bumps_the_counter() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 103u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::BehindQueue).unwrap();
+
+    assert_eq!(reg.queue_depth(pty), 1, "byte-identical repeats must collapse, not accumulate");
+    assert_eq!(reg.queue_snapshot(pty)[0].coalesced, 2, "two duplicates coalesced into the original");
+
+    // A DIFFERENT ask must still be admitted — coalescing never guesses at
+    // semantic staleness, only exact-byte repeats.
+    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update now", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    assert_eq!(reg.queue_depth(pty), 2);
+
+    let coalesced_audits =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-coalesced").count();
+    assert_eq!(coalesced_audits, 2, "each coalesce must be individually audited");
+}
+
+#[test]
+fn enqueue_stranded_front_lands_ahead_of_already_queued_text() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 104u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "queued behind", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap.len(), 2);
+    assert_eq!(snap[0].payload, queue::QueuedPayload::StrandedSubmit, "the marker must drain FIRST");
+    assert_eq!(snap[1].payload.text(), Some("queued behind"));
+}
+
+#[test]
+fn enqueue_stranded_front_respects_the_same_cap() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 105u32;
+
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
+    }
+    let err = reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap_err();
+    assert!(err.contains("NOT queued"), "got: {err}");
+}
+
+#[test]
+fn pop_front_dequeued_removes_only_a_matching_front_id_and_audits_queued_ms() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 106u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "first", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "second", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let first_id = reg.queue_snapshot(pty)[0].id;
+    let first_enqueued_ms = reg.queue_snapshot(pty)[0].enqueued_ms;
+
+    // A stale/mismatched id must NOT pop the front (single-owner discipline
+    // — see `run_queue_drainer`'s doc).
+    reg.pop_front_dequeued(&g.id, pty, first_id + 999, first_enqueued_ms);
+    assert_eq!(reg.queue_depth(pty), 2, "a non-matching id must not pop anything");
+
+    reg.pop_front_dequeued(&g.id, pty, first_id, first_enqueued_ms);
+    assert_eq!(reg.queue_depth(pty), 1);
+    assert_eq!(reg.queue_snapshot(pty)[0].payload.text(), Some("second"));
+
+    let dequeued = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-dequeued" && e.detail["id"] == json!(first_id))
+        .expect("a real pop must be audited");
+    assert!(dequeued.detail["queued_ms"].as_u64().is_some(), "must record how long it waited");
+}
+
+#[test]
+fn drop_queue_audits_every_entry_individually_and_sends_one_coalesced_notice() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 107u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let ids: Vec<u64> = reg.queue_snapshot(pty).iter().map(|e| e.id).collect();
+
+    reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
+    assert_eq!(reg.queue_depth(pty), 0, "the whole queue must be gone");
+
+    let dropped: Vec<_> =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-dropped").collect();
+    assert_eq!(dropped.len(), 2, "each entry closes out with its OWN audit line (orphan-scan relies on this)");
+    for id in ids {
+        assert!(
+            dropped.iter().any(|e| e.detail["id"] == json!(id) && e.detail["reason"] == json!("agent-died")),
+            "entry {id} must have its own delivery-dropped line"
+        );
+    }
+    // Dropping an already-empty queue must be a true no-op — no duplicate
+    // notices or audit spam for a pane with nothing left to drop.
+    let before = reg.audit_log(&g.id).len();
+    reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
+    assert_eq!(reg.audit_log(&g.id).len(), before, "dropping an empty queue must not re-audit");
+}
+
+#[test]
+fn queue_orphans_finds_an_enqueued_entry_with_no_terminal_event() {
+    // #445 intake finding: the persistence argument claims a restart's loss
+    // is mechanically derivable from audit.jsonl — this is what makes that
+    // literally true, exercised end to end through the real audit file
+    // (not a hand-built fixture — `queue.rs`'s own unit tests already cover
+    // the pure scan logic in isolation).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 108u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "resolved", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "orphaned", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let snap = reg.queue_snapshot(pty);
+    let (resolved_id, orphaned_id) = (snap[0].id, snap[1].id);
+
+    // Simulate a restart: only the FIRST entry ever reaches a terminal
+    // audit event before the process (hypothetically) died.
+    reg.pop_front_dequeued(&g.id, pty, resolved_id, snap[0].enqueued_ms);
+
+    let orphans = reg.queue_orphans(&g.id);
+    assert_eq!(orphans.len(), 1, "exactly the unresolved entry must surface, got: {orphans:?}");
+    assert_eq!(orphans[0].id, orphaned_id);
+    assert_eq!(orphans[0].agent_id, w.id);
+}
+
+#[test]
+fn deliver_prompt_front_door_enqueues_behind_a_non_empty_queue_without_an_app_handle() {
+    // #445: the whole point of checking the queue before requiring an app
+    // handle — a queue can only be non-empty because an EARLIER delivery
+    // already had one (to spawn its drainer), so appending behind it needs
+    // no live pane of its own.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 109u32;
+    reg.set_pty_for_test(&w.id, pty);
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "already queued", pty, queue::EnqueueReason::Question).unwrap();
+    assert_eq!(reg.queue_depth(pty), 1);
+
+    reg.deliver_prompt(&w.id, "a fresh prompt", "orch", Delivery::MidSession)
+        .expect("the front door must succeed with no app handle at all");
+
+    assert_eq!(reg.queue_depth(pty), 2, "the fresh prompt must land BEHIND the existing entry");
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap[0].payload.text(), Some("already queued"), "existing entry must not be overtaken");
+    assert_eq!(snap[1].payload.text(), Some("a fresh prompt"));
+    assert_eq!(snap[1].reason, queue::EnqueueReason::BehindQueue);
+}
+
+#[test]
+fn deliver_prompt_front_door_is_a_noop_when_the_queue_is_empty() {
+    // With an EMPTY queue, the front door must step aside and let the
+    // normal direct-delivery path run — which in test mode (no real app
+    // handle) fails at that step, exactly as it always has. Proves the
+    // front door doesn't fire on every call, only when there's actually
+    // something to defer behind.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 110u32;
+    reg.set_pty_for_test(&w.id, pty);
+
+    let err = reg.deliver_prompt(&w.id, "hello", "orch", Delivery::MidSession).unwrap_err();
+    assert!(err.contains("no app handle"), "must reach the normal direct-delivery path, got: {err}");
+    assert_eq!(reg.queue_depth(pty), 0, "nothing should have been queued");
+}
+
+#[test]
+fn deliver_prompt_front_door_propagates_the_synchronous_full_error() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 111u32;
+    reg.set_pty_for_test(&w.id, pty);
+
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
+    }
+    let err = reg.deliver_prompt(&w.id, "one too many", "orch", Delivery::MidSession).unwrap_err();
+    assert!(err.contains("NOT queued"), "the ORIGINAL caller must see the truthful rejection, got: {err}");
 }
 
 #[test]
@@ -13125,57 +13381,47 @@ fn unconfirmed_notice_is_suppressed_while_the_group_is_paused() {
 }
 
 #[test]
-fn delivery_held_notice_fires_for_a_worker_but_not_the_orchestrator() {
-    // #111: a delivery aborted because the pane holds human input must nudge the
-    // orchestrator (once) to re-send — but never for an orchestrator target (that
-    // would loop) and never while paused (delivery is suppressed there anyway).
+fn notify_queue_fires_for_a_worker_but_suppresses_and_audits_for_the_orchestrator_and_while_paused() {
+    // #445: `notify_queue` is what an aborted-then-queued delivery uses to
+    // tell the orchestrator once — but never for an orchestrator target
+    // (that would loop) and never while paused (delivery is suppressed
+    // there anyway) — and EVERY suppression leaves a `notice-suppressed`
+    // audit line (the routed #451 finding this issue owns: a suppressed
+    // notification must be discoverable after the fact).
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
-    // Worker target, group live: the notice is raised and audited.
-    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::BoxOccupied);
+    // Worker target, group live: the notice actually attempts delivery (it
+    // fails at the pty step in test mode, same as every other delivery —
+    // `deliver_to_orchestrator`'s own coverage already pins the happy path).
+    reg.notify_queue(&g.id, &w.id, false, &queue::queued_notice(&w.id, queue::EnqueueReason::BoxOccupied));
     assert!(
-        reg.audit_log(&g.id).iter().any(|e| e.action == "delivery-held-notice"),
-        "an aborted worker delivery must raise the held notice"
+        reg.audit_log(&g.id).iter().all(|e| e.action != "notice-suppressed"),
+        "a live worker target must not be suppressed"
     );
 
-    // Orchestrator target: suppressed (a notice to it is a delivery to it — a loop).
-    reg.notify_delivery_held(&g.id, &o.id, true, HeldReason::BoxOccupied);
-    assert_eq!(
-        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
-        1,
-        "an orchestrator-target held delivery must not raise a notice"
-    );
-
-    // Paused group: suppressed even for a worker.
-    reg.pause_group(&g.id).unwrap();
-    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::BoxOccupied);
-    assert_eq!(
-        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
-        1,
-        "a paused group must not raise the held notice"
-    );
-}
-
-#[test]
-fn delivery_held_notice_audits_the_interactive_question_reason() {
-    // #420: the audit entry must carry WHY the delivery was held, distinctly
-    // from the box-occupied case, so the record (and any future filtering on
-    // it) can tell "a human left text in the box" apart from "Copilot is
-    // mid-dialog" — very different recovery moves for a human reading the log.
-    let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-
-    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::InteractiveQuestion);
-    let entry = reg
+    // Orchestrator target: suppressed and audited (a notice to it is a
+    // delivery to it — a loop).
+    reg.notify_queue(&g.id, &o.id, true, &queue::queued_notice(&o.id, queue::EnqueueReason::BoxOccupied));
+    let sup = reg
         .audit_log(&g.id)
         .into_iter()
-        .find(|e| e.action == "delivery-held-notice")
-        .expect("an aborted worker delivery must raise the held notice");
-    assert_eq!(entry.detail["reason"], json!("question"), "got: {}", entry.detail);
+        .find(|e| e.action == "notice-suppressed" && e.detail["to"] == json!(o.id))
+        .expect("an orchestrator-target queue notice must be suppressed AND audited");
+    assert_eq!(sup.detail["reason"], json!("target-is-orchestrator"), "got: {}", sup.detail);
+
+    // Paused group: suppressed and audited even for a worker.
+    reg.pause_group(&g.id).unwrap();
+    reg.notify_queue(&g.id, &w.id, false, &queue::queued_notice(&w.id, queue::EnqueueReason::BoxOccupied));
+    let sup = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "notice-suppressed" && e.detail["to"] == json!(w.id))
+        .next_back()
+        .expect("a paused group's queue notice must be suppressed AND audited");
+    assert_eq!(sup.detail["reason"], json!("group-paused"), "got: {}", sup.detail);
 }
 
 // ---------- #72: steering-strip image attachments ----------

@@ -19,13 +19,14 @@ pub mod lessons;
 pub mod mcp;
 pub mod notify;
 pub mod profiles;
+pub mod queue;
 pub mod report;
 pub mod workflow;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -5486,6 +5487,26 @@ pub struct OrchRegistry {
     /// before pasting (#81/#84). An `Arc` so a delivery thread can record its
     /// outcome without holding `&self`.
     last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
+    /// Per-pane FIFO delivery queue (#445): a hold-cap expiry in
+    /// `deliver_now` enqueues here instead of destroying the payload. `Arc`
+    /// for the same reason `last_delivery` is — the drainer thread
+    /// (`run_queue_drainer`) mutates it without holding `&self`. Keyed by
+    /// pty id, matching `delivery`/`last_delivery`.
+    queues: Arc<Mutex<HashMap<u32, VecDeque<queue::QueuedDelivery>>>>,
+    /// Per-registry monotonic id counter for queued deliveries — no
+    /// getrandom (CLAUDE.md constraint 2), `Arc` so the drainer can mint ids
+    /// too (a drain's own re-enqueue, e.g. seam 3's `StrandedSubmit`
+    /// conversion, needs a fresh id like any other admit).
+    queue_seq: Arc<AtomicU64>,
+    /// Panes with a live drainer thread right now, so `deliver_now`'s
+    /// enqueue-on-abort spawns at most one drainer per pane (bounded thread
+    /// lifecycle — the same leak concern raised against #451's late
+    /// monitors, answered the same way: exits on drain, never accumulates).
+    queue_draining: Arc<Mutex<HashSet<u32>>>,
+    /// Panes whose queue has already fired the one-shot "still queued"
+    /// visibility notice (#445) — cleared when the queue empties, so a LATER
+    /// long block on the same pane can notify again.
+    queue_still_notified: Arc<Mutex<HashSet<u32>>>,
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
     tasks_lock: Mutex<()>,
@@ -7246,6 +7267,933 @@ fn run_late_confirmation_monitor(
     }
 }
 
+// ─────────────────────────── #445: delivery queue ───────────────────────────
+//
+// "Hold means queued, never doomed." `deliver_prompt`'s three hold-cap seams
+// used to DESTROY the payload once their bounded wait expired (see
+// `queue.rs`'s module doc for the full argument). The fix keeps the caps —
+// they bound *thread blocking*, a legitimate concern — but changes what
+// happens AT the cap: enqueue, not destroy. This section is the impure half
+// (queue map, drainer thread); `queue.rs` is the pure policy.
+
+/// What `deliver_now` reports back to its caller — either the front door
+/// (`deliver_prompt`'s spawned thread) or the drainer (`run_queue_drainer`)
+/// — so the CALLER decides whether to enqueue, never `deliver_now` itself.
+/// That split is what lets the identical pipeline serve both a fresh
+/// delivery (abort → enqueue + notify once) and a replay (abort → leave
+/// queued, retry silently — the sender was already notified at the
+/// original enqueue, and notifying again on every 2s retry would be spam).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeliverOutcome {
+    /// Ran to a terminal state that is NOT a hold-cap abort: delivered and
+    /// resolved by #112's three-state machinery (Confirmed/Pending/Failed),
+    /// or the pty closed mid-delivery. Either way nothing is left to queue
+    /// — a closed pty has nowhere to deliver to, and a completed attempt
+    /// already entered #451's own (untouched) confirmation lifecycle.
+    Done,
+    /// A pre-paste hold (box-occupied or question) capped out — nothing was
+    /// pasted. The exact text this call was given still needs queuing.
+    AbortedPrePaste(queue::EnqueueReason),
+    /// The pre-Enter question hold capped out (seam 3): the text WAS
+    /// pasted, only the Enter was withheld. `record_aborted_preenter_outcome`
+    /// has already run (so the NEXT thing to touch this pane's box sees it
+    /// as stranded) — the caller's job is to queue a `StrandedSubmit`
+    /// marker, never the text again.
+    AbortedPreEnter,
+}
+
+/// The delivery body itself — paste, echo-verify, submit, confirm — pulled
+/// out of `deliver_prompt` (#445) so the FRONT DOOR (a fresh delivery to an
+/// empty queue) and the DRAINER (replaying a queued entry) run the exact
+/// same pipeline, never a reimplementation of it. Every parameter here is
+/// something `deliver_prompt`'s old closure used to capture; nothing about
+/// the pipeline itself changed by this extraction — see the diff against
+/// the pre-#445 version for the byte-for-byte body. `reg` is used only for
+/// the pre-existing (#103/#112) `notify_unconfirmed_delivery`/late-monitor
+/// wiring, unrelated to the queue — `deliver_now` never touches the queue
+/// itself; only its caller does, based on the returned `DeliverOutcome`.
+#[allow(clippy::too_many_arguments)]
+fn deliver_now(
+    app: AppHandle,
+    root: PathBuf,
+    group: String,
+    agent: String,
+    pty_id: u32,
+    text: String,
+    delivery_from: String,
+    confirm_autopilot: bool,
+    wait_ready: bool,
+    cli: String,
+    lock: Arc<Mutex<()>>,
+    last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
+    target_is_orchestrator: bool,
+    reg: Option<Arc<OrchRegistry>>,
+) -> DeliverOutcome {
+    let _guard = lock.lock_safe();
+    let ptys = app.state::<crate::pty::PtyManager>();
+    let paste = bracketed_paste(&text);
+    let submit = submit_sequence(&cli);
+    let pasted_text = text;
+
+    // Delivery-held badge plumbing (#246): fired around each blocking
+    // human-input hold below so a pane-header badge can appear the instant
+    // a hold starts and drop the instant it resolves. Each call site first
+    // checks (with zero elapsed hold) whether it's ABOUT to block, so the
+    // badge only shows for holds that actually happen, never for the
+    // common no-op case where the box was already clear.
+    let emit_held = |reason: HeldReason| {
+        let _ = app.emit("orch-delivery-held", delivery_held_event(&agent, &group, pty_id, reason));
+    };
+    let emit_held_cleared = || {
+        let _ = app.emit("orch-delivery-held-cleared", delivery_held_cleared_event(pty_id));
+    };
+
+    let start = std::time::Instant::now();
+    if wait_ready {
+        let mut last_len = 0usize;
+        let mut last_change = std::time::Instant::now();
+        loop {
+            std::thread::sleep(READY_POLL);
+            let Some(out) = ptys.output_tail(pty_id) else {
+                append_audit(&root, &group, "loomux", "prompt-failed",
+                    json!({ "to": agent, "reason": "terminal closed while waiting for CLI to become ready" }));
+                return DeliverOutcome::Done;
+            };
+            if out.len() != last_len {
+                last_len = out.len();
+                last_change = std::time::Instant::now();
+            }
+            if cli_ready(last_len, last_change.elapsed(), start.elapsed()) {
+                break;
+            }
+            if start.elapsed() >= READY_MAX_WAIT {
+                // Paste anyway — better a visible prompt the human
+                // can re-submit than one silently withheld.
+                break;
+            }
+        }
+    }
+
+    // Copilot autopilot consent (#101/#179): the "Enable autopilot mode"
+    // dialog does NOT open at boot — verified live against copilot 1.0.69,
+    // a fresh --autopilot pane paints a normal input box, and the consent
+    // dialog is triggered by the FIRST message submit. So the confirm is
+    // answered AFTER the kickoff Enter (below), not here: selecting its
+    // default "Enable all permissions" both enables autopilot and delivers
+    // the pending brief in one step. Watching at boot (as this used to)
+    // only burned the fail-soft wait on a dialog that never shows.
+
+    // Human-typing backstop (#43, option A): if a human is typing
+    // directly in this pane, hold the paste until they go quiet so a
+    // report can't land inside their half-typed line. Capped so a long
+    // compose session can't starve the queue.
+    let will_hold_typing_prepaste = should_hold_for_user(
+        ptys.last_user_input_ms(pty_id).unwrap_or(0), now_ms(),
+        Duration::ZERO, USER_QUIET_HOLD, USER_QUIET_MAX_HOLD,
+    );
+    if will_hold_typing_prepaste {
+        emit_held(HeldReason::Typing);
+    }
+    if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
+        append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
+            "to": agent, "stage": "pre-paste", "held_ms": held_ms,
+            "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
+        }));
+    }
+    if will_hold_typing_prepaste {
+        emit_held_cleared();
+    }
+
+    // Stranded-text flush (#81/#84): if the PREVIOUS delivery to this
+    // pane was never confirmed as submitted, its text may still be
+    // sitting in the input box — pasting now would append to it and the
+    // two prompts would merge. Press submit once to clear it first, but
+    // only if no human has typed since that delivery (else the box may
+    // hold a person's line, which must never be blind-submitted — the
+    // pre-paste hold above already waited for them to go quiet).
+    //
+    // #420 rev-15 B1: this Enter used to fire unconditionally — the
+    // FIRST write this thread makes, before the interactive-question
+    // checkpoint below ever runs. A question already on screen (from
+    // BEFORE this delivery even started) would eat that Enter and
+    // select whatever's highlighted, on the very path this PR exists
+    // to guard. `question_active_now` is a plain snapshot — not a
+    // hold — because holding here would be redundant: if it's active,
+    // this flush is skipped (nothing lost — the previous delivery's
+    // text just stays put a little longer) and the pre-paste
+    // checkpoint immediately below is the one that actually holds,
+    // aborts, and notifies.
+    let prev = last_delivery.lock_safe().get(&pty_id).cloned();
+    let human_typed_since = prev
+        .as_ref()
+        .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
+        .unwrap_or(false);
+    if flush_stranded_text(&ptys, pty_id, prev.as_ref().map(|o| o.confirmed), human_typed_since, submit) {
+        append_audit(&root, &group, "loomux", "delivery-flush",
+            json!({ "to": agent, "reason": "previous delivery unconfirmed" }));
+        std::thread::sleep(FLUSH_SETTLE);
+    }
+
+    // Human-input paste guard (#111): the quiet backstop above only waits
+    // out ACTIVE typing — it doesn't stop a paste landing on top of a line
+    // the human typed and LEFT sitting in the box. Pasting there and
+    // pressing Enter merge-submits their line with the prompt (the live
+    // `/model` + task-text collision). So hold for the box to clear
+    // (they submit or clear it); if it never does, abort WITHOUT pasting
+    // — the caller (#445) enqueues it and notifies once.
+    let will_hold_box = ptys.input_pending(pty_id).unwrap_or(false);
+    if will_hold_box {
+        emit_held(HeldReason::BoxOccupied);
+    }
+    let paste_decision = wait_for_box_clear(&ptys, pty_id);
+    if will_hold_box {
+        emit_held_cleared();
+    }
+    match paste_decision {
+        PasteDecision::Paste { held_ms } if held_ms > 0 => {
+            append_audit(&root, &group, "loomux", "delivery-held-for-input", json!({
+                "to": agent, "held_ms": held_ms, "outcome": "cleared",
+            }));
+        }
+        PasteDecision::Paste { .. } => {}
+        PasteDecision::Abort { held_ms } => {
+            append_audit(&root, &group, "loomux", "delivery-aborted-human-input", json!({
+                "to": agent, "held_ms": held_ms,
+            }));
+            return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::BoxOccupied);
+        }
+    }
+
+    // Interactive-question paste guard (#420): a question/permission TUI
+    // reads nothing like the box-occupied case above (no keystrokes, no
+    // `input_pending`) but is just as unsafe to paste over — worse,
+    // actually, since the Enter below wouldn't merge text, it would SELECT
+    // whichever option is highlighted. Hold for `prompt_wait_detected` to
+    // clear (the human answers) before pasting; if it never does, abort
+    // without pasting, same recovery shape as the box-occupied guard.
+    // Nothing of ours is on screen yet at this point in the delivery, so
+    // there's no self-echo risk to gate against (`paste_baseline_total:
+    // None` — see `question_hold_predicate`).
+    let question_decision =
+        wait_for_question_clear(&ptys, pty_id, None, &emit_held, &emit_held_cleared);
+    match question_decision {
+        PasteDecision::Paste { held_ms } if held_ms > 0 => {
+            append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
+                "to": agent, "stage": "pre-paste", "held_ms": held_ms, "outcome": "cleared",
+            }));
+        }
+        PasteDecision::Paste { .. } => {}
+        PasteDecision::Abort { held_ms } => {
+            append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
+                "to": agent, "stage": "pre-paste", "held_ms": held_ms,
+            }));
+            return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::Question);
+        }
+    }
+
+    // #112: this delivery's OWN baseline into the `promptsubmit` hook
+    // marker, snapshotted right before it pastes anything — see
+    // `promptsubmit_records_since`'s doc for why a byte offset (not a
+    // sequence number the shell script would have to maintain) makes
+    // a record from an EARLIER delivery to this same pane, or a
+    // human's own prompt, unable to satisfy THIS delivery's
+    // confirmation by construction.
+    let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent);
+    let hook_baseline = promptsubmit_marker_len(&hook_marker_path);
+
+    // Echo-verified typing: paste, then require the TUI to emit
+    // output (its input box redrawing). No echo means the CLI
+    // flushed the paste with its startup stdin buffer — retype.
+    let mut echoed = false;
+    let mut attempts = 0u32;
+    while attempts < ECHO_ATTEMPTS {
+        attempts += 1;
+        let Some(before) = ptys.output_total(pty_id) else {
+            append_audit(&root, &group, "loomux", "prompt-failed",
+                json!({ "to": agent, "reason": "terminal closed before delivery" }));
+            return DeliverOutcome::Done;
+        };
+        if ptys.write_bytes(pty_id, &paste).is_err() {
+            append_audit(&root, &group, "loomux", "prompt-failed",
+                json!({ "to": agent, "reason": "terminal closed before delivery" }));
+            return DeliverOutcome::Done;
+        }
+        let echo_deadline = std::time::Instant::now() + ECHO_WINDOW;
+        while std::time::Instant::now() < echo_deadline {
+            std::thread::sleep(Duration::from_millis(150));
+            match ptys.output_total(pty_id) {
+                Some(now_total) if now_total >= before + ECHO_MIN_BYTES => {
+                    echoed = true;
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    append_audit(&root, &group, "loomux", "prompt-failed",
+                        json!({ "to": agent, "reason": "terminal closed during delivery" }));
+                    return DeliverOutcome::Done;
+                }
+            }
+        }
+        if echoed {
+            break;
+        }
+        std::thread::sleep(ECHO_RETRY_DELAY);
+    }
+    std::thread::sleep(PASTE_SUBMIT_DELAY);
+
+    // Wait for the pane to go quiet before Enter: a busy CLI
+    // (mid-turn) ignores the submit and the prompt would sit in
+    // the input box until a human presses Enter.
+    let submit_start = std::time::Instant::now();
+    let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
+    let mut last_change = std::time::Instant::now();
+    // Whether the pane went quiet before we press Enter. If it never
+    // does (busy CLI, hit SUBMIT_MAX_WAIT), the Enter lands mid-stream
+    // and submit confirmation can't be trusted off that stream (rev-32).
+    let mut reached_quiet = false;
+    while submit_start.elapsed() < SUBMIT_MAX_WAIT {
+        std::thread::sleep(Duration::from_millis(200));
+        match ptys.output_total(pty_id) {
+            Some(t) if t != last_total => {
+                last_total = t;
+                last_change = std::time::Instant::now();
+            }
+            Some(_) => {
+                if last_change.elapsed() >= SUBMIT_QUIET {
+                    reached_quiet = true;
+                    break;
+                }
+            }
+            None => {
+                append_audit(&root, &group, "loomux", "prompt-failed",
+                    json!({ "to": agent, "reason": "terminal closed before submit" }));
+                return DeliverOutcome::Done;
+            }
+        }
+    }
+    // #420 rev-19 B-A: the pre-Enter/retry question checkpoints below
+    // no longer need a growth BASELINE at all — they mask our own
+    // pasted text out of the tail by CONTENT (`mask_own_paste`), not
+    // by comparing byte counts against a snapshot. A snapshot-based
+    // gate (rev-15/rev-19-round-3's approach) was proven broken
+    // twice: it can only mark ONE point in time as "before", so a
+    // dialog that renders while the paste is still settling gets
+    // baked into whichever number the checkpoint happened to
+    // snapshot, and reads as invisible forever after. Content
+    // doesn't have that blind spot — masking works regardless of
+    // WHEN the dialog appeared relative to our own paste settling.
+    // Re-check right before the first Enter: the human may have
+    // started typing during the quiet-wait above, and a blind Enter
+    // would submit their line. Hold again until they're quiet (#43).
+    let will_hold_typing_preenter = should_hold_for_user(
+        ptys.last_user_input_ms(pty_id).unwrap_or(0), now_ms(),
+        Duration::ZERO, USER_QUIET_HOLD, USER_QUIET_MAX_HOLD,
+    );
+    if will_hold_typing_preenter {
+        emit_held(HeldReason::Typing);
+    }
+    if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
+        append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
+            "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+            "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
+        }));
+    }
+    if will_hold_typing_preenter {
+        emit_held_cleared();
+    }
+    // Re-check right before the first Enter (#420): the paste above may
+    // have taken long enough for a question to appear since the
+    // pre-paste check, and the Enter below would select whichever option
+    // is now highlighted rather than merely submitting text. Guarded
+    // against self-echo (rev-15 N1 / rev-19 B-A) via `mask_own_paste` —
+    // this checkpoint's tail necessarily contains our OWN just-pasted,
+    // not-yet-submitted text, so a bare `prompt_wait_detected` match
+    // here would otherwise be indistinguishable from a genuine live
+    // dialog; masking out our own known lines leaves only what the CLI
+    // itself painted, whenever it painted it.
+    let question_decision_preenter = wait_for_question_clear(
+        &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
+    );
+    match question_decision_preenter {
+        PasteDecision::Paste { held_ms } if held_ms > 0 => {
+            append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
+                "to": agent, "stage": "pre-enter", "held_ms": held_ms, "outcome": "cleared",
+            }));
+        }
+        PasteDecision::Paste { .. } => {}
+        PasteDecision::Abort { held_ms } => {
+            append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
+                "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+            }));
+            // #420 rev-15 B3: unlike the pre-paste abort, the text IS
+            // already pasted at this point — only the Enter was
+            // withheld. It's sitting unsubmitted in the box, exactly
+            // the shape the stranded-text flush (#81/#84) exists to
+            // clear on the NEXT delivery — but only if that delivery
+            // can see it. Recording nothing here would leave
+            // `last_delivery` holding whatever outcome (or none) an
+            // EARLIER delivery left, so the next delivery's flush
+            // could wrongly conclude nothing needs clearing and
+            // append its own paste onto this one's abandoned text.
+            record_aborted_preenter_outcome(&last_delivery, pty_id, delivery_from);
+            return DeliverOutcome::AbortedPreEnter;
+        }
+    }
+    // #112 round 2: Tier 1's precondition, OBSERVED right here rather
+    // than assumed from `echoed` (round 1's mistake — `echoed` is a
+    // raw >=8-byte growth check with no content comparison at all,
+    // so it's satisfied identically whether the CLI echoed our
+    // LITERAL text or collapsed a long paste to a `[Pasted text #N
+    // +M lines]`-style placeholder; see the design note's "Tier 1
+    // precondition" section for the live episode that caught this).
+    // Tier 1 can only govern (two-sided) THIS delivery if our own
+    // pasted text is actually findable, verbatim, in the box right
+    // now — checked once, here, against the real tail. When it
+    // isn't (a long/collapsed paste, or the echo genuinely never
+    // landed), Tier 1 declines to govern and this delivery falls
+    // back to the round-1 hook-or-burst precedence exactly as
+    // before — audited explicitly as its own state, never silently.
+    let tier1_precondition_tail = ptys
+        .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
+        .map(|b| strip_ansi(&b));
+    let tier1_governs = tier1_precondition_tail
+        .as_deref()
+        .is_some_and(|t| box_holds_paste(t, &pasted_text));
+
+    let submit_sent_ms = now_ms();
+    // Baseline just before the first Enter, so the confirmation window
+    // below measures only the burst that Enter produces.
+    let submit_baseline = ptys.output_total(pty_id).unwrap_or(last_total);
+    let _ = ptys.write_bytes(pty_id, submit);
+
+    // Copilot autopilot consent (#101/#179): a fresh --autopilot copilot
+    // opens its "Enable autopilot mode" dialog in response to this FIRST
+    // submit (not at boot). Answer it now — Enter selects the default
+    // "Enable all permissions", which enables autopilot AND lets the brief
+    // we just submitted proceed (verified live: the pending message is not
+    // discarded). Gated to a kickoff (fresh OR resumed, #364) of an
+    // unattended copilot boot; fail-soft, so if the dialog never shows
+    // (already consented, flow changed) delivery just continues to the
+    // retries. Must run before the confirm window so the dialog's Enter
+    // has landed before we judge whether the turn began.
+    //
+    // NOT gated by the interactive-question guard above (#420): this dialog
+    // can only appear AFTER the kickoff Enter this thread already sent
+    // (`submit`, above), while both question-guard checkpoints run BEFORE
+    // that Enter — pre-paste and pre-first-Enter — so they never see it. Kept
+    // exempt on purpose, not by omission: this watcher answering the dialog
+    // IS a deliberate programmatic answer to a pending question, exactly the
+    // shape the general guard exists to hold for everyone else.
+    if confirm_autopilot {
+        confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent, AUTOPILOT_DIALOG_WAIT);
+    }
+
+    // Confirm the submit landed (#112 round 2 — three-state redesign,
+    // see the design note section of the same name). Tier 1 (box
+    // consumption) governs TWO-SIDEDLY — confirmed OR definitively
+    // vetoed — whenever `tier1_governs` verified its own precondition
+    // above; Tier 2 (the `promptsubmit` hook) can independently
+    // confirm at any point regardless of Tier 1's governance, since a
+    // positive hook match is real evidence either way; Tier 3 (burst)
+    // is consulted ONLY when Tier 1 does not govern this delivery —
+    // its own evidence is too weak to override a box-based veto, and
+    // the whole point of Tier 1 governing is that burst's usual "any
+    // growth" bar can't be trusted to arbitrate against it. Burst's
+    // OWN reading is still computed and recorded even when it isn't
+    // consulted for the decision — the independent-per-tier
+    // requirement this design owes the next live-validation pass.
+    let confirm_deadline = std::time::Instant::now() + SUBMIT_CONFIRM_WINDOW;
+    let mut confirm_source = ConfirmSource::None;
+    let mut confirm_merged = false;
+    let mut tier1_reading: Option<bool> = None; // Some(true) = still holds our paste
+    let mut tier_hook_matched = false;
+    let mut tier_burst_would_confirm = false;
+    loop {
+        let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+        if !matches!(hook_match, PromptLandedMatch::None) {
+            tier_hook_matched = true;
+        }
+        if tier1_governs {
+            match ptys.output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES).map(|b| strip_ansi(&b)) {
+                Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
+                Some(_) => {
+                    tier1_reading = Some(false);
+                    // #112 round 3 (rev-20 B3): a box-clear caused by
+                    // the HUMAN (they typed/submitted/cancelled their
+                    // own line) reads identically to one the CLI
+                    // cleared for our delivery. Only promote to a
+                    // Box confirm when no human input has landed
+                    // since our own submit — checked fresh, right
+                    // here, not inherited from an earlier tick.
+                    if tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms) {
+                        confirm_source = ConfirmSource::Box;
+                    }
+                }
+                None => {} // pty gone — the `output_total` read just below returns None too and breaks the loop
+            }
+        }
+        if matches!(confirm_source, ConfirmSource::None) && tier_hook_matched {
+            confirm_source = ConfirmSource::Hook;
+            confirm_merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
+        }
+        let Some(observed_total) = ptys.output_total(pty_id) else { break };
+        // Tier 3 (burst): computed on every tick regardless of
+        // governance (the independent-audit requirement), but only
+        // allowed to DECIDE when Tier 1 isn't governing this
+        // delivery — its evidence is too weak to arbitrate against a
+        // box-based read.
+        if submit_confirmed(reached_quiet, submit_baseline, observed_total) {
+            tier_burst_would_confirm = true;
+            if !tier1_governs && matches!(confirm_source, ConfirmSource::None) {
+                confirm_source = ConfirmSource::Burst;
+            }
+        }
+        if !matches!(confirm_source, ConfirmSource::None) {
+            break;
+        }
+        if std::time::Instant::now() >= confirm_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // #420 rev-19 N8: a CONFIRMED delivery is done — its Enter landed,
+    // its turn started, there is nothing left to retry. Running the
+    // retry loop (and its question-hold machinery) anyway used to be
+    // harmless on the old "Enter on an empty box is a no-op" premise
+    // this PR's whole existence disproves: a successful delivery to a
+    // Copilot pane that then asks an UNRELATED question would show a
+    // false "held: question pending" badge and hold the pane's
+    // delivery mutex for up to `QUESTION_HOLD_MAX` — this guard
+    // protects DELIVERIES, it is not a general question-watcher for a
+    // pane that's already done receiving this one.
+    // #112 round 3 (rev-20 B2): whether the retry loop ran to
+    // NATURAL exhaustion — every delay slept, never cut short for a
+    // question on screen, a human typing, or a failed retry write.
+    // Starts true (covers the "never entered the loop at all"
+    // case, where `confirm_source` is already decided and this
+    // flag is moot) and is flipped false by the SAME three early
+    // exits `final_window_outcome` requires ruled out before a veto
+    // may fire — see that function's doc for why each one means the
+    // box's end state can't be trusted as evidence of non-acceptance.
+    let mut window_exhausted_naturally = true;
+    if matches!(confirm_source, ConfirmSource::None) {
+        'retries: for delay in SUBMIT_RETRY_DELAYS {
+            std::thread::sleep(delay);
+            // #112: a hook record landing during a retry's sleep means
+            // the ORIGINAL Enter actually worked — some CLIs can take
+            // longer than `SUBMIT_CONFIRM_WINDOW` to emit the hook
+            // under load, exactly the busy-pane case this feature
+            // exists for. Stop retrying immediately (plan-14 design:
+            // "a hook match also breaks out of the retry loop
+            // immediately") rather than risk a redundant Enter
+            // blind-selecting whatever now sits highlighted in an
+            // unrelated dialog. Checked before Tier 1 for the same
+            // reason it's checked first in the main window above —
+            // hook evidence is real regardless of which tier governs.
+            let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+            if !matches!(hook_match, PromptLandedMatch::None) {
+                tier_hook_matched = true;
+                confirm_source = ConfirmSource::Hook;
+                confirm_merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
+                append_audit(&root, &group, "loomux", "submit-retries-skipped",
+                    json!({ "to": agent, "reason": "hook confirmed since last check" }));
+                break 'retries;
+            }
+            if tier1_governs {
+                match ptys.output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES).map(|b| strip_ansi(&b)) {
+                    Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
+                    Some(_) => {
+                        tier1_reading = Some(false);
+                        // #112 round 3 (rev-20 B3): same trust gate
+                        // as the main window above.
+                        if tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms) {
+                            confirm_source = ConfirmSource::Box;
+                            append_audit(&root, &group, "loomux", "submit-retries-skipped",
+                                json!({ "to": agent, "reason": "box consumed since last check" }));
+                            break 'retries;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            // #420 rev-15 B2: these Enters used to fire unconditionally
+            // on a timer, in exactly the window (a few seconds after the
+            // first submit, while the agent is starting its turn)
+            // Copilot most often paints a permission/question dialog —
+            // this PR's own premise made concrete on the path it left
+            // unguarded. A question appearing here means HOLD, not
+            // retry: re-check and wait for it to clear (capped, same as
+            // every other checkpoint) before pressing this retry's
+            // Enter; if it never clears, stop retrying rather than risk
+            // a later retry blind-selecting an option. `pasted_text`
+            // (rev-19 B-A) is the self-echo content mask for every
+            // retry — they're all still trying to land the SAME
+            // already-pasted text, so masking it out leaves only
+            // whatever the CLI itself painted. The human-typing check
+            // stays cheap and short-circuits BEFORE touching the
+            // (potentially minutes-long) question hold, exactly as it
+            // did before this PR — a human mid-line means skip now, not
+            // spend up to `QUESTION_HOLD_MAX` finding that out; `retry_
+            // gate` (rev-19 N9) only ever sees the question outcome,
+            // since this check has already fully handled its own case.
+            if ptys.last_user_input_ms(pty_id).unwrap_or(0) > submit_sent_ms {
+                append_audit(&root, &group, "loomux", "submit-retries-skipped",
+                    json!({ "to": agent, "reason": "human typing in pane" }));
+                // #112 round 3 (rev-20 B2): a human mid-line means
+                // the box's contents aren't about our delivery
+                // either way — this is NOT natural exhaustion, so a
+                // veto must not fire off this exit.
+                window_exhausted_naturally = false;
+                break;
+            }
+            let question_decision = wait_for_question_clear(
+                &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
+            );
+            match retry_gate(question_decision) {
+                RetryGate::SkipQuestionPending { held_ms } => {
+                    append_audit(&root, &group, "loomux", "submit-retries-skipped", json!({
+                        "to": agent, "reason": "question pending", "held_ms": held_ms,
+                    }));
+                    // #112 round 3 (rev-20 B2 — the blocking finding):
+                    // a question on screen may be INTERCEPTING our
+                    // Enter, not refusing it — the box's "still
+                    // holds our paste" reading proves nothing about
+                    // acceptance while a dialog sits in front of it.
+                    // NOT natural exhaustion: this delivery must
+                    // land `Pending`, never `Failed`, off this exit.
+                    // The question-guarded late monitor re-observes
+                    // the question state on every subsequent poll,
+                    // which this one-shot end-of-window check can't.
+                    window_exhausted_naturally = false;
+                    break;
+                }
+                RetryGate::Write { held_ms } => {
+                    if held_ms > 0 {
+                        append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
+                            "to": agent, "stage": "retry", "held_ms": held_ms, "outcome": "cleared",
+                        }));
+                    }
+                    if ptys.write_bytes(pty_id, submit).is_err() {
+                        // A failed retry write means the pty is
+                        // likely closing — the same "can't trust
+                        // this as evidence" reasoning applies.
+                        window_exhausted_naturally = false;
+                        break;
+                    }
+                }
+            }
+            // Tier 3 (burst) is measured for the independent audit
+            // field even mid-retry, matching the main window's own
+            // record-regardless-of-governance discipline.
+            if let Some(observed_total) = ptys.output_total(pty_id) {
+                if submit_confirmed(reached_quiet, submit_baseline, observed_total) {
+                    tier_burst_would_confirm = true;
+                    if !tier1_governs {
+                        confirm_source = ConfirmSource::Burst;
+                        break 'retries;
+                    }
+                }
+            }
+        }
+    }
+    // Tier 1's VETO (#112 round 3 — rev-20 B2/B3, see
+    // `final_window_outcome`'s doc for the full precondition list):
+    // reachable only once the whole window+retries ran to NATURAL
+    // exhaustion — never off an early exit for a question, human
+    // typing, or a failed write — with NO other tier having
+    // decided, Tier 1 governing this delivery, its own
+    // precondition-verified check never once seeing the box clear,
+    // AND no human input landing since our own submit. This is the
+    // state at the natural end of a ~7.6s window across 15+ polls,
+    // not a snap judgment.
+    let tier1_trusted_at_end = tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms);
+    confirm_source = final_window_outcome(
+        confirm_source, tier1_governs, tier1_reading, window_exhausted_naturally, tier1_trusted_at_end,
+    );
+    let confirm_state = confirm_state_for(confirm_source);
+    let confirmed = matches!(confirm_state, DeliveryConfirmState::Confirmed);
+
+    // Record the outcome so the next delivery to this pane can flush a
+    // prompt still stranded in the box (#81/#84). `Pending` reads as
+    // `confirmed: false` here — the SAME value it already held before
+    // #112 round 2 for an unresolved delivery — so this is not a
+    // behavior change to the flush path: a genuinely-queued prompt's
+    // box is actually empty by now anyway (Tier 1 not governing means
+    // we have no box evidence either way for THIS specific check, but
+    // a stray flush Enter on an empty/queued box is the existing,
+    // already-accepted "safe: the next delivery's flush just no-ops"
+    // posture, unchanged).
+    last_delivery
+        .lock_safe()
+        .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms, from: delivery_from.clone() });
+    append_audit(&root, &group, "loomux", "prompt-typed", json!({
+        "to": agent,
+        "cli": cli,
+        "waited_ms": start.elapsed().as_millis() as u64,
+        "attempts": attempts,
+        "echoed": echoed,
+        "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
+        "submit_confirmed": confirmed,
+        // #112 round 2: the 3-state outcome, replacing the old binary.
+        "confirm_state": confirm_state.as_str(),
+        // Which tier decided (if any) — "box"/"box_veto"/"hook"/
+        // "burst" decided it; "none" means still `pending`.
+        "confirm_source": confirm_source.as_str(),
+        "confirm_merged": confirm_merged,
+        // Independent per-tier readings (#112 round 2 hard
+        // requirement) — recorded regardless of which tier actually
+        // decided, so a live run can compare what EVERY tier said,
+        // not just the winner. `tier1_governed` is false whenever
+        // this delivery's paste didn't verify literally in the box
+        // (a long/collapsed paste — see the `tier1_governs` precondition
+        // check's own comment, above, right before the first Enter).
+        "tier1_governed": tier1_governs,
+        // #112 round 3 (rev-20 N3): `null` when Tier 1 never
+        // governed this delivery at all (nothing was ever measured,
+        // not "measured and false") — a bare `bool` here would
+        // conflate "never watched" with "watched and saw it clear",
+        // which are different facts a live-validation read needs to
+        // tell apart.
+        "tier1_still_holding_at_end": tier1_governs.then_some(tier1_reading == Some(true)),
+        "tier2_hook_matched": tier_hook_matched,
+        "tier3_burst_would_confirm": tier_burst_would_confirm,
+    }));
+    // Delivery outcome breadcrumb — timing + flags only, never the text.
+    crate::obs::breadcrumb(
+        "delivery",
+        &format!(
+            "agent={agent} pty={pty_id} outcome=typed echoed={echoed} confirm_state={} \
+             confirm_source={} attempts={attempts} waited_ms={}",
+            confirm_state.as_str(),
+            confirm_source.as_str(),
+            start.elapsed().as_millis() as u64
+        ),
+    );
+    // #112 round 2: the notice fires ONLY for `Failed`, never for
+    // `Pending` — the whole point of the three-state redesign. A
+    // `Confirmed` delivery draws nothing (as before). A `Pending`
+    // delivery (no tier decided within the window) spawns the
+    // extended monitor below and gets NO notice yet — silence is the
+    // correct behavior for "no evidence yet on a prompt that may
+    // simply be queued", not a bug to route around.
+    match confirm_state {
+        DeliveryConfirmState::Confirmed => {}
+        DeliveryConfirmState::Failed => {
+            if let Some(r) = &reg {
+                r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
+            }
+        }
+        DeliveryConfirmState::Pending => {}
+    }
+    // Spawn the extended, unbounded-by-timeout monitor for anything
+    // this window didn't resolve to `Confirmed` — a `Pending`
+    // delivery still needs its eventual answer (hook-late-match or
+    // genuine idle-without-evidence), and a `Failed` (Tier 1 veto)
+    // delivery still needs the chance to be corrected by a late hook
+    // match, since that veto isn't infallible (the rejection/error
+    // residual). Deliberately a SEPARATE thread, not a continuation
+    // of this one: this call's `_guard` holds the per-pty delivery
+    // mutex for its own (bounded) lifetime, and the monitor's own
+    // lifetime is bounded only by the pty staying alive — holding
+    // the delivery mutex that long would block every subsequent
+    // delivery to this pane. See `run_late_confirmation_monitor`'s
+    // doc for the full mechanism.
+    if !matches!(confirm_state, DeliveryConfirmState::Confirmed) {
+        let app_for_monitor = app.clone();
+        let root_for_monitor = root.clone();
+        let group_for_monitor = group.clone();
+        let agent_for_monitor = agent.clone();
+        let hook_marker_path_for_monitor = hook_marker_path.clone();
+        let pasted_text_for_monitor = pasted_text.clone();
+        let delivery_from_for_monitor = delivery_from.clone();
+        let last_delivery_for_monitor = last_delivery.clone();
+        let reg_for_monitor = reg.clone();
+        let already_failed = matches!(confirm_state, DeliveryConfirmState::Failed);
+        std::thread::spawn(move || {
+            run_late_confirmation_monitor(
+                app_for_monitor, root_for_monitor, group_for_monitor, agent_for_monitor,
+                pty_id, hook_marker_path_for_monitor, hook_baseline, pasted_text_for_monitor,
+                delivery_from_for_monitor, submit_sent_ms, target_is_orchestrator,
+                already_failed, last_delivery_for_monitor, reg_for_monitor,
+            );
+        });
+    }
+    DeliverOutcome::Done
+}
+
+/// Replay a queued `StrandedSubmit` marker (#445 seam 3): the text is
+/// already sitting in the box from an earlier paste whose Enter was
+/// withheld — press it via the SAME `flush_stranded_text` logic a normal
+/// delivery's own pre-paste step already uses (guarded by
+/// `human_typed_since`, so a person's own line is never blind-submitted).
+/// Returns whether it actually fired; `false` means the guard declined (a
+/// question reappeared, or a human is mid-line) — the caller leaves the
+/// marker queued and retries next tick, no cap, exactly like every other
+/// queued entry.
+fn drain_stranded_submit(
+    ptys: &crate::pty::PtyManager,
+    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    delivery_from: String,
+    pty_id: u32,
+    submit: &[u8],
+) -> bool {
+    let prev = last_delivery.lock_safe().get(&pty_id).cloned();
+    let prev_confirmed = prev.as_ref().map(|o| o.confirmed);
+    let human_typed_since = prev
+        .as_ref()
+        .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
+        .unwrap_or(false);
+    let flushed = flush_stranded_text(ptys, pty_id, prev_confirmed, human_typed_since, submit);
+    if flushed {
+        last_delivery.lock_safe().insert(
+            pty_id,
+            DeliveryOutcome { confirmed: true, submit_sent_ms: now_ms(), from: delivery_from },
+        );
+    }
+    flushed
+}
+
+/// The delivery-queue drainer (#445): one per pane with a non-empty queue,
+/// spawned by `OrchRegistry::ensure_drainer` the first time an abort needs
+/// somewhere to put a payload. Polls deliverability at `QUEUE_DRAIN_POLL` —
+/// no cap, no timeout, matching the standing requirement that a hold whose
+/// release condition is "a human answers" must not expire — and replays
+/// the queue's FRONT entry the instant the pane is deliverable. Exits when
+/// the queue is empty, the pty closes, or the agent dies (dropping any
+/// remaining entries with an audit line + notice — today that case is
+/// silent).
+///
+/// **Ownership discipline** (what makes the front-door check race-free):
+/// only THIS thread ever pops from the FRONT of a given pane's queue.
+/// `deliver_prompt`'s front door only ever pushes to the BACK. That
+/// single-consumer/multi-producer split is what keeps the queue non-empty
+/// for a pane's WHOLE drain (peek before acting, pop only after the
+/// attempt resolves) — without it, a fresh direct delivery could see a
+/// transient empty queue mid-drain and race the very entry this thread is
+/// still replaying, exactly the ordering inversion the front-door check
+/// exists to prevent.
+fn run_queue_drainer(reg: Arc<OrchRegistry>, app: AppHandle, group: String, pty_id: u32) {
+    let ptys = app.state::<crate::pty::PtyManager>();
+    let mut header_pending = true;
+    loop {
+        std::thread::sleep(queue::QUEUE_DRAIN_POLL);
+
+        // Pty closed: nothing left to drain to.
+        if ptys.output_total(pty_id).is_none() {
+            reg.drop_queue(&group, pty_id, queue::DropReason::AgentDied);
+            reg.queue_draining.lock_safe().remove(&pty_id);
+            reg.queue_still_notified.lock_safe().remove(&pty_id);
+            return;
+        }
+        let agent_id = reg.by_pty.lock_safe().get(&pty_id).cloned();
+        let agent = agent_id.as_ref().and_then(|id| reg.agent(id));
+        // Agent record gone or dead, but the pty somehow lingers (teardown
+        // ordering) — same treatment as a closed pty.
+        if agent.as_ref().map(|a| a.status == AgentStatus::Dead).unwrap_or(true) {
+            reg.drop_queue(&group, pty_id, queue::DropReason::AgentDied);
+            reg.queue_draining.lock_safe().remove(&pty_id);
+            reg.queue_still_notified.lock_safe().remove(&pty_id);
+            return;
+        }
+        let Some(a) = agent else { continue };
+
+        let front = reg.queues.lock_safe().get(&pty_id).and_then(|q| q.front().cloned());
+        let Some(front) = front else {
+            // Drained empty — this thread's job is done.
+            reg.queue_draining.lock_safe().remove(&pty_id);
+            reg.queue_still_notified.lock_safe().remove(&pty_id);
+            return;
+        };
+
+        // Visibility, never destruction (#445): a queue behind an
+        // unanswered question/box is the DESIGNED case for this feature,
+        // not a leak — see `queue::still_queued_notice`'s doc.
+        let already_notified = reg.queue_still_notified.lock_safe().contains(&pty_id);
+        if queue::should_fire_still_queued_notice(front.enqueued_ms, now_ms(), already_notified) {
+            reg.queue_still_notified.lock_safe().insert(pty_id);
+            let depth = reg.queues.lock_safe().get(&pty_id).map(|q| q.len()).unwrap_or(1);
+            let minutes = queue::QUEUE_STILL_QUEUED_NOTICE_AFTER.as_secs() / 60;
+            let target_is_orchestrator = a.role == Role::Orchestrator;
+            reg.notify_queue(&group, &front.agent_id, target_is_orchestrator,
+                &queue::still_queued_notice(&front.agent_id, depth, minutes));
+        }
+
+        let deliverable = !ptys.input_pending(pty_id).unwrap_or(false)
+            && !question_active_now(&ptys, pty_id, None);
+        if !deliverable {
+            continue; // keep polling — no cap
+        }
+
+        let target_is_orchestrator = a.role == Role::Orchestrator;
+        let cli = reg.cli_for_agent(&a);
+        let lock = reg
+            .delivery
+            .lock_safe()
+            .entry(pty_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let root = reg.root.clone();
+        let reg_for_call = reg.arc();
+
+        let outcome = match &front.payload {
+            queue::QueuedPayload::Text(text) => {
+                // #445: the flush header ("N deliveries queued ... are now
+                // delivering") rides on the front of the FIRST replayed
+                // text this drain sends, rather than as its own separate
+                // delivery — one paste, header then content, instead of an
+                // extra full echo/confirm cycle for a single notice line.
+                let payload = if header_pending {
+                    let (depth, coalesced) = {
+                        let queues = reg.queues.lock_safe();
+                        let q = queues.get(&pty_id);
+                        (q.map(|q| q.len()).unwrap_or(1), q.map(|q| q.iter().map(|e| e.coalesced as usize).sum()).unwrap_or(0))
+                    };
+                    format!("{}\n\n{text}", queue::flush_header_text(depth, coalesced))
+                } else {
+                    text.clone()
+                };
+                let out = deliver_now(
+                    app.clone(), root, group.clone(), front.agent_id.clone(), pty_id,
+                    payload, front.from.clone(), false, false, cli, lock,
+                    reg.last_delivery.clone(), target_is_orchestrator, reg_for_call,
+                );
+                if matches!(out, DeliverOutcome::Done) {
+                    header_pending = false;
+                }
+                out
+            }
+            queue::QueuedPayload::StrandedSubmit => {
+                let _guard = lock.lock_safe();
+                let submit = submit_sequence(&cli);
+                if drain_stranded_submit(&ptys, &reg.last_delivery, front.from.clone(), pty_id, submit) {
+                    DeliverOutcome::Done
+                } else {
+                    DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::Question)
+                }
+            }
+        };
+
+        match outcome {
+            DeliverOutcome::Done => {
+                reg.pop_front_dequeued(&group, pty_id, front.id, front.enqueued_ms);
+                reg.queue_still_notified.lock_safe().remove(&pty_id);
+            }
+            DeliverOutcome::AbortedPrePaste(_) => {
+                // Nothing pasted (or the stranded flush declined) — leave
+                // the entry at the front exactly as it was; retry next tick.
+            }
+            DeliverOutcome::AbortedPreEnter => {
+                // The Text entry WAS pasted; only the Enter was withheld.
+                // Replace it at the front with a StrandedSubmit marker so
+                // draining resumes there next tick instead of re-pasting.
+                reg.pop_front_dequeued(&group, pty_id, front.id, front.enqueued_ms);
+                let _ = reg.enqueue_stranded_front(&group, &front.agent_id, &front.from, pty_id);
+            }
+        }
+    }
+}
+
 /// Whether to flush a previous delivery's stranded text (a single submit press)
 /// before pasting the next prompt (#81/#84).
 ///
@@ -7898,62 +8846,6 @@ pub fn delivery_confirmed_late_notice(agent_id: &str) -> String {
     )
 }
 
-/// Whether a held-for-human-input delivery should raise a notice to the group's
-/// orchestrator (#111). Fires for a non-orchestrator target: the prompt was NOT
-/// delivered (the box held a human's line, so pasting was aborted rather than
-/// merge-submitting it), and the orchestrator — believing it landed — must know
-/// to re-send once the pane is clear. Suppressed when the target IS the
-/// orchestrator, exactly like the unconfirmed notice: a notice about a delivery
-/// to the orchestrator is itself a delivery to the orchestrator, an endless
-/// loop. Pure so the gate is testable; the paused-group skip and one-per-abort
-/// emission live in `notify_delivery_held`.
-pub fn should_notify_paste_held(target_is_orchestrator: bool) -> bool {
-    !target_is_orchestrator
-}
-
-/// The notice delivered to the orchestrator when a delivery to `agent_id` was
-/// held and aborted because the pane holds a human's unsubmitted line (#111).
-/// Distinct from `unconfirmed_delivery_notice`: nothing was pasted, so the move
-/// is to wait for the box to clear and re-send — not to read back a stranded
-/// prompt.
-pub fn paste_held_notice(agent_id: &str) -> String {
-    format!(
-        "[loomux] delivery to {agent_id} held: pane has human input — re-send when clear"
-    )
-}
-
-/// The notice delivered to the orchestrator when a delivery to `agent_id` was
-/// held and aborted because an interactive question is on screen (#420) — any
-/// CLI's, not just Copilot's (the detector this hold is built on,
-/// `prompt_wait_detected`, already covers Claude Code's `AskUserQuestion`
-/// too, rev-15 N5), so the wording doesn't name one. Distinct wording from
-/// `paste_held_notice`: the recovery move isn't "wait for a human's typed
-/// line to clear", it's "a human needs to ANSWER the question" — the
-/// orchestrator must not try to answer it programmatically itself (that is
-/// exactly the silently-wrong-answer hazard this hold exists to prevent).
-/// Explicitly warns against an immediate re-send (rev-15 N5): loomux has no
-/// way to know the question was actually answered — a re-send before it has
-/// been just re-runs this same hold-then-abort cycle and burns another
-/// `QUESTION_HOLD_MAX` wait for nothing.
-pub fn question_held_notice(agent_id: &str) -> String {
-    format!(
-        "[loomux] delivery to {agent_id} held: an interactive question is on screen — \
-         wait for it to be answered before re-sending (re-sending while it's still up just holds again)"
-    )
-}
-
-/// Picks the orchestrator-facing notice text for an aborted held delivery
-/// (#111/#420), dispatched by why it was held. `Typing` never aborts (its
-/// cap delivers anyway rather than holding forever), so it has no notice —
-/// callers only ever pass `BoxOccupied` or `InteractiveQuestion` here.
-#[doc(hidden)] // pub for integration tests
-pub fn held_delivery_notice(agent_id: &str, reason: HeldReason) -> String {
-    match reason {
-        HeldReason::InteractiveQuestion => question_held_notice(agent_id),
-        HeldReason::Typing | HeldReason::BoxOccupied => paste_held_notice(agent_id),
-    }
-}
-
 /// The `[loomux] channel <id> - <sender>: <text>` line loomux prefixes to a
 /// `channel_send` delivery (#271). `chan_id` and `sender_label` are
 /// backend-built (see `OrchRegistry::channel_member_label`) — never
@@ -8019,6 +8911,10 @@ impl OrchRegistry {
             seq: AtomicU32::new(0),
             delivery: Mutex::new(HashMap::new()),
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
+            queues: Arc::new(Mutex::new(HashMap::new())),
+            queue_seq: Arc::new(AtomicU64::new(0)),
+            queue_draining: Arc::new(Mutex::new(HashSet::new())),
+            queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
             pr_head_override: Mutex::new(None),
@@ -18171,14 +19067,24 @@ impl OrchRegistry {
         }
     }
 
-    /// Type `text` into an agent's CLI: audit, then bracketed paste + Enter
-    /// on a background thread (serialized so deliveries never interleave).
-    /// `delivery` classifies the call (see [`Delivery`]): a kickoff to a just-
-    /// booted CLI holds the paste until the pane has painted its UI and gone
-    /// quiet (input typed before the CLI's reader attaches is flushed and lost),
-    /// and a *fresh* copilot boot additionally answers the autopilot consent
-    /// dialog that its first submit triggers (#179); mid-session deliveries do
-    /// neither.
+    /// Type `text` into an agent's CLI: audit, then (front door permitting)
+    /// bracketed paste + Enter on a background thread (serialized so
+    /// deliveries never interleave). `delivery` classifies the call (see
+    /// [`Delivery`]): a kickoff to a just-booted CLI holds the paste until
+    /// the pane has painted its UI and gone quiet, and a *fresh* copilot
+    /// boot additionally answers the autopilot consent dialog its first
+    /// submit triggers (#179); mid-session deliveries do neither.
+    ///
+    /// **#445 front door.** If `pty_id`'s queue is already non-empty, this
+    /// call enqueues BEHIND it instead of racing the drainer for a direct
+    /// delivery — a fresh prompt must never overtake ones already waiting,
+    /// or "here's context" / "now go" can invert. See `run_queue_drainer`'s
+    /// doc for why only the drainer ever pops the FRONT of a queue, which
+    /// is what makes this check race-free. The actual delivery body —
+    /// shared by a direct delivery and every drain replay — is
+    /// `deliver_now`, below; a hold-cap abort there reports back via
+    /// `DeliverOutcome`, and enqueueing on abort happens HERE, in the
+    /// spawned thread's continuation, never inside `deliver_now` itself.
     pub fn deliver_prompt(
         &self,
         agent_id: &str,
@@ -18199,8 +19105,19 @@ impl OrchRegistry {
             return Ok(());
         }
         let pty_id = a.pty_id.ok_or("agent has no terminal yet")?;
-        let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
+
+        // #445 front door — checked before the app-handle requirement below
+        // on purpose: a non-empty queue needs no live pane to exist, only
+        // registry state, and by construction a queue can only be non-empty
+        // once an EARLIER delivery to this same pty already had a live app
+        // handle to spawn its drainer with.
+        let queue_non_empty = self.queues.lock_safe().get(&pty_id).is_some_and(|q| !q.is_empty());
+        if queue_non_empty {
+            return self.enqueue_text(&a.group, agent_id, from, text, pty_id, queue::EnqueueReason::BehindQueue);
+        }
+
+        let app = self.app.lock_safe().clone().ok_or("no app handle")?;
 
         // A booted group copilot agent is launched with `--autopilot`, so it
         // opens the "Enable autopilot mode" consent dialog; the worker thread
@@ -18220,14 +19137,11 @@ impl OrchRegistry {
             })
         };
         let wait_ready = delivery.wait_ready();
-
-        let paste = bracketed_paste(text);
         // The Enter that submits the paste is chosen per CLI: Copilot ignores a
         // bare CR on an unfocused pane, so its sequence prefixes a focus-in
         // report (#98). Resolved here — through the same per-role `cli_for` the
         // registry already uses — so the delivery thread carries the right bytes.
         let cli = self.cli_for_agent(&a);
-        let submit = submit_sequence(&cli);
         let lock = self
             .delivery
             .lock_safe()
@@ -18242,13 +19156,7 @@ impl OrchRegistry {
         // as opposed to a human or another agent's message reaching this
         // same pane through the same delivery pipeline.
         let delivery_from = from.to_string();
-        // #420 rev-19 B-A: an owned copy of the exact text this delivery is
-        // about to paste, so the pre-Enter/retry question checkpoints can
-        // mask it out of the pane's tail before running the detector
-        // (`mask_own_paste`) — content-based self-echo exclusion, not a
-        // byte-count baseline (see `question_hold_predicate`'s doc for why
-        // that approach was replaced).
-        let pasted_text = text.to_string();
+        let text_owned = text.to_string();
         let last_delivery = self.last_delivery.clone();
         // Captured for the unconfirmed-delivery notice (#103): whether this
         // target is the orchestrator (a notice to it would loop, so it's
@@ -18256,709 +19164,276 @@ impl OrchRegistry {
         // deliver the notice once it knows the submit outcome.
         let target_is_orchestrator = a.role == Role::Orchestrator;
         let reg = self.arc();
+        let app_for_thread = app.clone();
         std::thread::spawn(move || {
-            let _guard = lock.lock_safe();
-            let ptys = app.state::<crate::pty::PtyManager>();
-
-            // Delivery-held badge plumbing (#246): fired around each blocking
-            // human-input hold below so a pane-header badge can appear the
-            // instant a hold starts and drop the instant it resolves. Each
-            // call site first checks (with zero elapsed hold) whether it's
-            // ABOUT to block, so the badge only shows for holds that actually
-            // happen, never for the common no-op case where the box was
-            // already clear.
-            let emit_held = |reason: HeldReason| {
-                let _ = app.emit("orch-delivery-held", delivery_held_event(&agent, &group, pty_id, reason));
-            };
-            let emit_held_cleared = || {
-                let _ = app.emit("orch-delivery-held-cleared", delivery_held_cleared_event(pty_id));
-            };
-
-            let start = std::time::Instant::now();
-            if wait_ready {
-                let mut last_len = 0usize;
-                let mut last_change = std::time::Instant::now();
-                loop {
-                    std::thread::sleep(READY_POLL);
-                    let Some(out) = ptys.output_tail(pty_id) else {
-                        append_audit(&root, &group, "loomux", "prompt-failed",
-                            json!({ "to": agent, "reason": "terminal closed while waiting for CLI to become ready" }));
-                        return;
-                    };
-                    if out.len() != last_len {
-                        last_len = out.len();
-                        last_change = std::time::Instant::now();
-                    }
-                    if cli_ready(last_len, last_change.elapsed(), start.elapsed()) {
-                        break;
-                    }
-                    if start.elapsed() >= READY_MAX_WAIT {
-                        // Paste anyway — better a visible prompt the human
-                        // can re-submit than one silently withheld.
-                        break;
-                    }
-                }
-            }
-
-            // Copilot autopilot consent (#101/#179): the "Enable autopilot mode"
-            // dialog does NOT open at boot — verified live against copilot 1.0.69,
-            // a fresh --autopilot pane paints a normal input box, and the consent
-            // dialog is triggered by the FIRST message submit. So the confirm is
-            // answered AFTER the kickoff Enter (below), not here: selecting its
-            // default "Enable all permissions" both enables autopilot and delivers
-            // the pending brief in one step. Watching at boot (as this used to)
-            // only burned the fail-soft wait on a dialog that never shows.
-
-            // Human-typing backstop (#43, option A): if a human is typing
-            // directly in this pane, hold the paste until they go quiet so a
-            // report can't land inside their half-typed line. Capped so a long
-            // compose session can't starve the queue.
-            let will_hold_typing_prepaste = should_hold_for_user(
-                ptys.last_user_input_ms(pty_id).unwrap_or(0), now_ms(),
-                Duration::ZERO, USER_QUIET_HOLD, USER_QUIET_MAX_HOLD,
+            let outcome = deliver_now(
+                app_for_thread, root, group.clone(), agent.clone(), pty_id,
+                text_owned.clone(), delivery_from.clone(), confirm_autopilot, wait_ready, cli, lock,
+                last_delivery, target_is_orchestrator, reg.clone(),
             );
-            if will_hold_typing_prepaste {
-                emit_held(HeldReason::Typing);
-            }
-            if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
-                append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
-                    "to": agent, "stage": "pre-paste", "held_ms": held_ms,
-                    "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
-                }));
-            }
-            if will_hold_typing_prepaste {
-                emit_held_cleared();
-            }
-
-            // Stranded-text flush (#81/#84): if the PREVIOUS delivery to this
-            // pane was never confirmed as submitted, its text may still be
-            // sitting in the input box — pasting now would append to it and the
-            // two prompts would merge. Press submit once to clear it first, but
-            // only if no human has typed since that delivery (else the box may
-            // hold a person's line, which must never be blind-submitted — the
-            // pre-paste hold above already waited for them to go quiet).
-            //
-            // #420 rev-15 B1: this Enter used to fire unconditionally — the
-            // FIRST write this thread makes, before the interactive-question
-            // checkpoint below ever runs. A question already on screen (from
-            // BEFORE this delivery even started) would eat that Enter and
-            // select whatever's highlighted, on the very path this PR exists
-            // to guard. `question_active_now` is a plain snapshot — not a
-            // hold — because holding here would be redundant: if it's active,
-            // this flush is skipped (nothing lost — the previous delivery's
-            // text just stays put a little longer) and the pre-paste
-            // checkpoint immediately below is the one that actually holds,
-            // aborts, and notifies.
-            let prev = last_delivery.lock_safe().get(&pty_id).cloned();
-            let human_typed_since = prev
-                .as_ref()
-                .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
-                .unwrap_or(false);
-            if flush_stranded_text(&ptys, pty_id, prev.as_ref().map(|o| o.confirmed), human_typed_since, submit) {
-                append_audit(&root, &group, "loomux", "delivery-flush",
-                    json!({ "to": agent, "reason": "previous delivery unconfirmed" }));
-                std::thread::sleep(FLUSH_SETTLE);
-            }
-
-            // Human-input paste guard (#111): the quiet backstop above only waits
-            // out ACTIVE typing — it doesn't stop a paste landing on top of a line
-            // the human typed and LEFT sitting in the box. Pasting there and
-            // pressing Enter merge-submits their line with the prompt (the live
-            // `/model` + task-text collision). So hold for the box to clear
-            // (they submit or clear it); if it never does, abort WITHOUT pasting
-            // and nudge the orchestrator to re-send once the pane is clear.
-            let will_hold_box = ptys.input_pending(pty_id).unwrap_or(false);
-            if will_hold_box {
-                emit_held(HeldReason::BoxOccupied);
-            }
-            let paste_decision = wait_for_box_clear(&ptys, pty_id);
-            if will_hold_box {
-                emit_held_cleared();
-            }
-            match paste_decision {
-                PasteDecision::Paste { held_ms } if held_ms > 0 => {
-                    append_audit(&root, &group, "loomux", "delivery-held-for-input", json!({
-                        "to": agent, "held_ms": held_ms, "outcome": "cleared",
-                    }));
-                }
-                PasteDecision::Paste { .. } => {}
-                PasteDecision::Abort { held_ms } => {
-                    append_audit(&root, &group, "loomux", "delivery-aborted-human-input", json!({
-                        "to": agent, "held_ms": held_ms,
-                    }));
-                    // Best-effort one-shot nudge so the orchestrator re-sends once
-                    // the human's line is gone. Nothing was pasted, so there is no
-                    // outcome to record for the next delivery's flush.
-                    if let Some(reg) = reg {
-                        reg.notify_delivery_held(&group, &agent, target_is_orchestrator, HeldReason::BoxOccupied);
-                    }
-                    return;
-                }
-            }
-
-            // Interactive-question paste guard (#420): a question/permission TUI
-            // reads nothing like the box-occupied case above (no keystrokes, no
-            // `input_pending`) but is just as unsafe to paste over — worse,
-            // actually, since the Enter below wouldn't merge text, it would SELECT
-            // whichever option is highlighted. Hold for `prompt_wait_detected` to
-            // clear (the human answers) before pasting; if it never does, abort
-            // without pasting, same recovery shape as the box-occupied guard.
-            // Nothing of ours is on screen yet at this point in the delivery, so
-            // there's no self-echo risk to gate against (`paste_baseline_total:
-            // None` — see `question_hold_predicate`).
-            let question_decision =
-                wait_for_question_clear(&ptys, pty_id, None, &emit_held, &emit_held_cleared);
-            match question_decision {
-                PasteDecision::Paste { held_ms } if held_ms > 0 => {
-                    append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
-                        "to": agent, "stage": "pre-paste", "held_ms": held_ms, "outcome": "cleared",
-                    }));
-                }
-                PasteDecision::Paste { .. } => {}
-                PasteDecision::Abort { held_ms } => {
-                    append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
-                        "to": agent, "stage": "pre-paste", "held_ms": held_ms,
-                    }));
-                    if let Some(reg) = reg {
-                        reg.notify_delivery_held(&group, &agent, target_is_orchestrator, HeldReason::InteractiveQuestion);
-                    }
-                    return;
-                }
-            }
-
-            // #112: this delivery's OWN baseline into the `promptsubmit` hook
-            // marker, snapshotted right before it pastes anything — see
-            // `promptsubmit_records_since`'s doc for why a byte offset (not a
-            // sequence number the shell script would have to maintain) makes
-            // a record from an EARLIER delivery to this same pane, or a
-            // human's own prompt, unable to satisfy THIS delivery's
-            // confirmation by construction.
-            let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent);
-            let hook_baseline = promptsubmit_marker_len(&hook_marker_path);
-
-            // Echo-verified typing: paste, then require the TUI to emit
-            // output (its input box redrawing). No echo means the CLI
-            // flushed the paste with its startup stdin buffer — retype.
-            let mut echoed = false;
-            let mut attempts = 0u32;
-            while attempts < ECHO_ATTEMPTS {
-                attempts += 1;
-                let Some(before) = ptys.output_total(pty_id) else {
-                    append_audit(&root, &group, "loomux", "prompt-failed",
-                        json!({ "to": agent, "reason": "terminal closed before delivery" }));
-                    return;
-                };
-                if ptys.write_bytes(pty_id, &paste).is_err() {
-                    append_audit(&root, &group, "loomux", "prompt-failed",
-                        json!({ "to": agent, "reason": "terminal closed before delivery" }));
-                    return;
-                }
-                let echo_deadline = std::time::Instant::now() + ECHO_WINDOW;
-                while std::time::Instant::now() < echo_deadline {
-                    std::thread::sleep(Duration::from_millis(150));
-                    match ptys.output_total(pty_id) {
-                        Some(now_total) if now_total >= before + ECHO_MIN_BYTES => {
-                            echoed = true;
-                            break;
+            // #445: `deliver_now` never touches the queue — only its caller
+            // (here) decides whether an abort becomes an enqueue, because
+            // only the caller knows whether this was a FRESH delivery
+            // (notify once) or a drain replay (`run_queue_drainer` handles
+            // its own abort outcomes itself and never reaches this code).
+            let Some(r) = reg else { return };
+            match outcome {
+                DeliverOutcome::Done => {}
+                DeliverOutcome::AbortedPrePaste(reason) => {
+                    match r.enqueue_text(&group, &agent, &delivery_from, &text_owned, pty_id, reason) {
+                        Ok(()) => {
+                            r.notify_queue(&group, &agent, target_is_orchestrator, &queue::queued_notice(&agent, reason));
+                            r.ensure_drainer(app.clone(), group.clone(), pty_id);
                         }
-                        Some(_) => {}
-                        None => {
-                            append_audit(&root, &group, "loomux", "prompt-failed",
-                                json!({ "to": agent, "reason": "terminal closed during delivery" }));
-                            return;
+                        Err(_queue_full) => {
+                            r.notify_queue(&group, &agent, target_is_orchestrator,
+                                &queue::dropped_notice(&agent, 1, queue::DropReason::QueueFull));
                         }
                     }
                 }
-                if echoed {
-                    break;
-                }
-                std::thread::sleep(ECHO_RETRY_DELAY);
-            }
-            std::thread::sleep(PASTE_SUBMIT_DELAY);
-
-            // Wait for the pane to go quiet before Enter: a busy CLI
-            // (mid-turn) ignores the submit and the prompt would sit in
-            // the input box until a human presses Enter.
-            let submit_start = std::time::Instant::now();
-            let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
-            let mut last_change = std::time::Instant::now();
-            // Whether the pane went quiet before we press Enter. If it never
-            // does (busy CLI, hit SUBMIT_MAX_WAIT), the Enter lands mid-stream
-            // and submit confirmation can't be trusted off that stream (rev-32).
-            let mut reached_quiet = false;
-            while submit_start.elapsed() < SUBMIT_MAX_WAIT {
-                std::thread::sleep(Duration::from_millis(200));
-                match ptys.output_total(pty_id) {
-                    Some(t) if t != last_total => {
-                        last_total = t;
-                        last_change = std::time::Instant::now();
-                    }
-                    Some(_) => {
-                        if last_change.elapsed() >= SUBMIT_QUIET {
-                            reached_quiet = true;
-                            break;
+                DeliverOutcome::AbortedPreEnter => {
+                    match r.enqueue_stranded_front(&group, &agent, &delivery_from, pty_id) {
+                        Ok(()) => {
+                            r.notify_queue(&group, &agent, target_is_orchestrator,
+                                &queue::queued_notice(&agent, queue::EnqueueReason::Question));
+                            r.ensure_drainer(app.clone(), group.clone(), pty_id);
                         }
-                    }
-                    None => {
-                        append_audit(&root, &group, "loomux", "prompt-failed",
-                            json!({ "to": agent, "reason": "terminal closed before submit" }));
-                        return;
-                    }
-                }
-            }
-            // #420 rev-19 B-A: the pre-Enter/retry question checkpoints below
-            // no longer need a growth BASELINE at all — they mask our own
-            // pasted text out of the tail by CONTENT (`mask_own_paste`), not
-            // by comparing byte counts against a snapshot. A snapshot-based
-            // gate (rev-15/rev-19-round-3's approach) was proven broken
-            // twice: it can only mark ONE point in time as "before", so a
-            // dialog that renders while the paste is still settling gets
-            // baked into whichever number the checkpoint happened to
-            // snapshot, and reads as invisible forever after. Content
-            // doesn't have that blind spot — masking works regardless of
-            // WHEN the dialog appeared relative to our own paste settling.
-            // Re-check right before the first Enter: the human may have
-            // started typing during the quiet-wait above, and a blind Enter
-            // would submit their line. Hold again until they're quiet (#43).
-            let will_hold_typing_preenter = should_hold_for_user(
-                ptys.last_user_input_ms(pty_id).unwrap_or(0), now_ms(),
-                Duration::ZERO, USER_QUIET_HOLD, USER_QUIET_MAX_HOLD,
-            );
-            if will_hold_typing_preenter {
-                emit_held(HeldReason::Typing);
-            }
-            if let Some(held_ms) = wait_for_user_quiet(&ptys, pty_id) {
-                append_audit(&root, &group, "loomux", "delivery-held-for-user", json!({
-                    "to": agent, "stage": "pre-enter", "held_ms": held_ms,
-                    "capped": held_ms >= USER_QUIET_MAX_HOLD.as_millis() as u64,
-                }));
-            }
-            if will_hold_typing_preenter {
-                emit_held_cleared();
-            }
-            // Re-check right before the first Enter (#420): the paste above may
-            // have taken long enough for a question to appear since the
-            // pre-paste check, and the Enter below would select whichever option
-            // is now highlighted rather than merely submitting text. Guarded
-            // against self-echo (rev-15 N1 / rev-19 B-A) via `mask_own_paste` —
-            // this checkpoint's tail necessarily contains our OWN just-pasted,
-            // not-yet-submitted text, so a bare `prompt_wait_detected` match
-            // here would otherwise be indistinguishable from a genuine live
-            // dialog; masking out our own known lines leaves only what the CLI
-            // itself painted, whenever it painted it.
-            let question_decision_preenter = wait_for_question_clear(
-                &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
-            );
-            match question_decision_preenter {
-                PasteDecision::Paste { held_ms } if held_ms > 0 => {
-                    append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
-                        "to": agent, "stage": "pre-enter", "held_ms": held_ms, "outcome": "cleared",
-                    }));
-                }
-                PasteDecision::Paste { .. } => {}
-                PasteDecision::Abort { held_ms } => {
-                    append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
-                        "to": agent, "stage": "pre-enter", "held_ms": held_ms,
-                    }));
-                    // #420 rev-15 B3: unlike the pre-paste abort, the text IS
-                    // already pasted at this point — only the Enter was
-                    // withheld. It's sitting unsubmitted in the box, exactly
-                    // the shape the stranded-text flush (#81/#84) exists to
-                    // clear on the NEXT delivery — but only if that delivery
-                    // can see it. Recording nothing here would leave
-                    // `last_delivery` holding whatever outcome (or none) an
-                    // EARLIER delivery left, so the next delivery's flush
-                    // could wrongly conclude nothing needs clearing and
-                    // append its own paste onto this one's abandoned text.
-                    record_aborted_preenter_outcome(&last_delivery, pty_id, delivery_from);
-                    if let Some(reg) = reg {
-                        reg.notify_delivery_held(&group, &agent, target_is_orchestrator, HeldReason::InteractiveQuestion);
-                    }
-                    return;
-                }
-            }
-            // #112 round 2: Tier 1's precondition, OBSERVED right here rather
-            // than assumed from `echoed` (round 1's mistake — `echoed` is a
-            // raw >=8-byte growth check with no content comparison at all,
-            // so it's satisfied identically whether the CLI echoed our
-            // LITERAL text or collapsed a long paste to a `[Pasted text #N
-            // +M lines]`-style placeholder; see the design note's "Tier 1
-            // precondition" section for the live episode that caught this).
-            // Tier 1 can only govern (two-sided) THIS delivery if our own
-            // pasted text is actually findable, verbatim, in the box right
-            // now — checked once, here, against the real tail. When it
-            // isn't (a long/collapsed paste, or the echo genuinely never
-            // landed), Tier 1 declines to govern and this delivery falls
-            // back to the round-1 hook-or-burst precedence exactly as
-            // before — audited explicitly as its own state, never silently.
-            let tier1_precondition_tail = ptys
-                .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
-                .map(|b| strip_ansi(&b));
-            let tier1_governs = tier1_precondition_tail
-                .as_deref()
-                .is_some_and(|t| box_holds_paste(t, &pasted_text));
-
-            let submit_sent_ms = now_ms();
-            // Baseline just before the first Enter, so the confirmation window
-            // below measures only the burst that Enter produces.
-            let submit_baseline = ptys.output_total(pty_id).unwrap_or(last_total);
-            let _ = ptys.write_bytes(pty_id, submit);
-
-            // Copilot autopilot consent (#101/#179): a fresh --autopilot copilot
-            // opens its "Enable autopilot mode" dialog in response to this FIRST
-            // submit (not at boot). Answer it now — Enter selects the default
-            // "Enable all permissions", which enables autopilot AND lets the brief
-            // we just submitted proceed (verified live: the pending message is not
-            // discarded). Gated to a kickoff (fresh OR resumed, #364) of an
-            // unattended copilot boot; fail-soft, so if the dialog never shows
-            // (already consented, flow changed) delivery just continues to the
-            // retries. Must run before the confirm window so the dialog's Enter
-            // has landed before we judge whether the turn began.
-            //
-            // NOT gated by the interactive-question guard above (#420): this dialog
-            // can only appear AFTER the kickoff Enter this thread already sent
-            // (`submit`, above), while both question-guard checkpoints run BEFORE
-            // that Enter — pre-paste and pre-first-Enter — so they never see it. Kept
-            // exempt on purpose, not by omission: this watcher answering the dialog
-            // IS a deliberate programmatic answer to a pending question, exactly the
-            // shape the general guard exists to hold for everyone else.
-            if confirm_autopilot {
-                confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent, AUTOPILOT_DIALOG_WAIT);
-            }
-
-            // Confirm the submit landed (#112 round 2 — three-state redesign,
-            // see the design note section of the same name). Tier 1 (box
-            // consumption) governs TWO-SIDEDLY — confirmed OR definitively
-            // vetoed — whenever `tier1_governs` verified its own precondition
-            // above; Tier 2 (the `promptsubmit` hook) can independently
-            // confirm at any point regardless of Tier 1's governance, since a
-            // positive hook match is real evidence either way; Tier 3 (burst)
-            // is consulted ONLY when Tier 1 does not govern this delivery —
-            // its own evidence is too weak to override a box-based veto, and
-            // the whole point of Tier 1 governing is that burst's usual "any
-            // growth" bar can't be trusted to arbitrate against it. Burst's
-            // OWN reading is still computed and recorded even when it isn't
-            // consulted for the decision — the independent-per-tier
-            // requirement this design owes the next live-validation pass.
-            let confirm_deadline = std::time::Instant::now() + SUBMIT_CONFIRM_WINDOW;
-            let mut confirm_source = ConfirmSource::None;
-            let mut confirm_merged = false;
-            let mut tier1_reading: Option<bool> = None; // Some(true) = still holds our paste
-            let mut tier_hook_matched = false;
-            let mut tier_burst_would_confirm = false;
-            loop {
-                let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
-                if !matches!(hook_match, PromptLandedMatch::None) {
-                    tier_hook_matched = true;
-                }
-                if tier1_governs {
-                    match ptys.output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES).map(|b| strip_ansi(&b)) {
-                        Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
-                        Some(_) => {
-                            tier1_reading = Some(false);
-                            // #112 round 3 (rev-20 B3): a box-clear caused by
-                            // the HUMAN (they typed/submitted/cancelled their
-                            // own line) reads identically to one the CLI
-                            // cleared for our delivery. Only promote to a
-                            // Box confirm when no human input has landed
-                            // since our own submit — checked fresh, right
-                            // here, not inherited from an earlier tick.
-                            if tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms) {
-                                confirm_source = ConfirmSource::Box;
-                            }
-                        }
-                        None => {} // pty gone — the `output_total` read just below returns None too and breaks the loop
-                    }
-                }
-                if matches!(confirm_source, ConfirmSource::None) && tier_hook_matched {
-                    confirm_source = ConfirmSource::Hook;
-                    confirm_merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
-                }
-                let Some(observed_total) = ptys.output_total(pty_id) else { break };
-                // Tier 3 (burst): computed on every tick regardless of
-                // governance (the independent-audit requirement), but only
-                // allowed to DECIDE when Tier 1 isn't governing this
-                // delivery — its evidence is too weak to arbitrate against a
-                // box-based read.
-                if submit_confirmed(reached_quiet, submit_baseline, observed_total) {
-                    tier_burst_would_confirm = true;
-                    if !tier1_governs && matches!(confirm_source, ConfirmSource::None) {
-                        confirm_source = ConfirmSource::Burst;
-                    }
-                }
-                if !matches!(confirm_source, ConfirmSource::None) {
-                    break;
-                }
-                if std::time::Instant::now() >= confirm_deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-
-            // #420 rev-19 N8: a CONFIRMED delivery is done — its Enter landed,
-            // its turn started, there is nothing left to retry. Running the
-            // retry loop (and its question-hold machinery) anyway used to be
-            // harmless on the old "Enter on an empty box is a no-op" premise
-            // this PR's whole existence disproves: a successful delivery to a
-            // Copilot pane that then asks an UNRELATED question would show a
-            // false "held: question pending" badge and hold the pane's
-            // delivery mutex for up to `QUESTION_HOLD_MAX` — this guard
-            // protects DELIVERIES, it is not a general question-watcher for a
-            // pane that's already done receiving this one.
-            // #112 round 3 (rev-20 B2): whether the retry loop ran to
-            // NATURAL exhaustion — every delay slept, never cut short for a
-            // question on screen, a human typing, or a failed retry write.
-            // Starts true (covers the "never entered the loop at all"
-            // case, where `confirm_source` is already decided and this
-            // flag is moot) and is flipped false by the SAME three early
-            // exits `final_window_outcome` requires ruled out before a veto
-            // may fire — see that function's doc for why each one means the
-            // box's end state can't be trusted as evidence of non-acceptance.
-            let mut window_exhausted_naturally = true;
-            if matches!(confirm_source, ConfirmSource::None) {
-                'retries: for delay in SUBMIT_RETRY_DELAYS {
-                    std::thread::sleep(delay);
-                    // #112: a hook record landing during a retry's sleep means
-                    // the ORIGINAL Enter actually worked — some CLIs can take
-                    // longer than `SUBMIT_CONFIRM_WINDOW` to emit the hook
-                    // under load, exactly the busy-pane case this feature
-                    // exists for. Stop retrying immediately (plan-14 design:
-                    // "a hook match also breaks out of the retry loop
-                    // immediately") rather than risk a redundant Enter
-                    // blind-selecting whatever now sits highlighted in an
-                    // unrelated dialog. Checked before Tier 1 for the same
-                    // reason it's checked first in the main window above —
-                    // hook evidence is real regardless of which tier governs.
-                    let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
-                    if !matches!(hook_match, PromptLandedMatch::None) {
-                        tier_hook_matched = true;
-                        confirm_source = ConfirmSource::Hook;
-                        confirm_merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
-                        append_audit(&root, &group, "loomux", "submit-retries-skipped",
-                            json!({ "to": agent, "reason": "hook confirmed since last check" }));
-                        break 'retries;
-                    }
-                    if tier1_governs {
-                        match ptys.output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES).map(|b| strip_ansi(&b)) {
-                            Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
-                            Some(_) => {
-                                tier1_reading = Some(false);
-                                // #112 round 3 (rev-20 B3): same trust gate
-                                // as the main window above.
-                                if tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms) {
-                                    confirm_source = ConfirmSource::Box;
-                                    append_audit(&root, &group, "loomux", "submit-retries-skipped",
-                                        json!({ "to": agent, "reason": "box consumed since last check" }));
-                                    break 'retries;
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                    // #420 rev-15 B2: these Enters used to fire unconditionally
-                    // on a timer, in exactly the window (a few seconds after the
-                    // first submit, while the agent is starting its turn)
-                    // Copilot most often paints a permission/question dialog —
-                    // this PR's own premise made concrete on the path it left
-                    // unguarded. A question appearing here means HOLD, not
-                    // retry: re-check and wait for it to clear (capped, same as
-                    // every other checkpoint) before pressing this retry's
-                    // Enter; if it never clears, stop retrying rather than risk
-                    // a later retry blind-selecting an option. `pasted_text`
-                    // (rev-19 B-A) is the self-echo content mask for every
-                    // retry — they're all still trying to land the SAME
-                    // already-pasted text, so masking it out leaves only
-                    // whatever the CLI itself painted. The human-typing check
-                    // stays cheap and short-circuits BEFORE touching the
-                    // (potentially minutes-long) question hold, exactly as it
-                    // did before this PR — a human mid-line means skip now, not
-                    // spend up to `QUESTION_HOLD_MAX` finding that out; `retry_
-                    // gate` (rev-19 N9) only ever sees the question outcome,
-                    // since this check has already fully handled its own case.
-                    if ptys.last_user_input_ms(pty_id).unwrap_or(0) > submit_sent_ms {
-                        append_audit(&root, &group, "loomux", "submit-retries-skipped",
-                            json!({ "to": agent, "reason": "human typing in pane" }));
-                        // #112 round 3 (rev-20 B2): a human mid-line means
-                        // the box's contents aren't about our delivery
-                        // either way — this is NOT natural exhaustion, so a
-                        // veto must not fire off this exit.
-                        window_exhausted_naturally = false;
-                        break;
-                    }
-                    let question_decision = wait_for_question_clear(
-                        &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
-                    );
-                    match retry_gate(question_decision) {
-                        RetryGate::SkipQuestionPending { held_ms } => {
-                            append_audit(&root, &group, "loomux", "submit-retries-skipped", json!({
-                                "to": agent, "reason": "question pending", "held_ms": held_ms,
-                            }));
-                            // #112 round 3 (rev-20 B2 — the blocking finding):
-                            // a question on screen may be INTERCEPTING our
-                            // Enter, not refusing it — the box's "still
-                            // holds our paste" reading proves nothing about
-                            // acceptance while a dialog sits in front of it.
-                            // NOT natural exhaustion: this delivery must
-                            // land `Pending`, never `Failed`, off this exit.
-                            // The question-guarded late monitor re-observes
-                            // the question state on every subsequent poll,
-                            // which this one-shot end-of-window check can't.
-                            window_exhausted_naturally = false;
-                            break;
-                        }
-                        RetryGate::Write { held_ms } => {
-                            if held_ms > 0 {
-                                append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
-                                    "to": agent, "stage": "retry", "held_ms": held_ms, "outcome": "cleared",
-                                }));
-                            }
-                            if ptys.write_bytes(pty_id, submit).is_err() {
-                                // A failed retry write means the pty is
-                                // likely closing — the same "can't trust
-                                // this as evidence" reasoning applies.
-                                window_exhausted_naturally = false;
-                                break;
-                            }
-                        }
-                    }
-                    // Tier 3 (burst) is measured for the independent audit
-                    // field even mid-retry, matching the main window's own
-                    // record-regardless-of-governance discipline.
-                    if let Some(observed_total) = ptys.output_total(pty_id) {
-                        if submit_confirmed(reached_quiet, submit_baseline, observed_total) {
-                            tier_burst_would_confirm = true;
-                            if !tier1_governs {
-                                confirm_source = ConfirmSource::Burst;
-                                break 'retries;
-                            }
+                        Err(_queue_full) => {
+                            r.notify_queue(&group, &agent, target_is_orchestrator,
+                                &queue::dropped_notice(&agent, 1, queue::DropReason::QueueFull));
                         }
                     }
                 }
-            }
-            // Tier 1's VETO (#112 round 3 — rev-20 B2/B3, see
-            // `final_window_outcome`'s doc for the full precondition list):
-            // reachable only once the whole window+retries ran to NATURAL
-            // exhaustion — never off an early exit for a question, human
-            // typing, or a failed write — with NO other tier having
-            // decided, Tier 1 governing this delivery, its own
-            // precondition-verified check never once seeing the box clear,
-            // AND no human input landing since our own submit. This is the
-            // state at the natural end of a ~7.6s window across 15+ polls,
-            // not a snap judgment.
-            let tier1_trusted_at_end = tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms);
-            confirm_source = final_window_outcome(
-                confirm_source, tier1_governs, tier1_reading, window_exhausted_naturally, tier1_trusted_at_end,
-            );
-            let confirm_state = confirm_state_for(confirm_source);
-            let confirmed = matches!(confirm_state, DeliveryConfirmState::Confirmed);
-
-            // Record the outcome so the next delivery to this pane can flush a
-            // prompt still stranded in the box (#81/#84). `Pending` reads as
-            // `confirmed: false` here — the SAME value it already held before
-            // #112 round 2 for an unresolved delivery — so this is not a
-            // behavior change to the flush path: a genuinely-queued prompt's
-            // box is actually empty by now anyway (Tier 1 not governing means
-            // we have no box evidence either way for THIS specific check, but
-            // a stray flush Enter on an empty/queued box is the existing,
-            // already-accepted "safe: the next delivery's flush just no-ops"
-            // posture, unchanged).
-            last_delivery
-                .lock_safe()
-                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms, from: delivery_from.clone() });
-            append_audit(&root, &group, "loomux", "prompt-typed", json!({
-                "to": agent,
-                "cli": cli,
-                "waited_ms": start.elapsed().as_millis() as u64,
-                "attempts": attempts,
-                "echoed": echoed,
-                "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
-                "submit_confirmed": confirmed,
-                // #112 round 2: the 3-state outcome, replacing the old binary.
-                "confirm_state": confirm_state.as_str(),
-                // Which tier decided (if any) — "box"/"box_veto"/"hook"/
-                // "burst" decided it; "none" means still `pending`.
-                "confirm_source": confirm_source.as_str(),
-                "confirm_merged": confirm_merged,
-                // Independent per-tier readings (#112 round 2 hard
-                // requirement) — recorded regardless of which tier actually
-                // decided, so a live run can compare what EVERY tier said,
-                // not just the winner. `tier1_governed` is false whenever
-                // this delivery's paste didn't verify literally in the box
-                // (a long/collapsed paste — see the `tier1_governs` precondition
-                // check's own comment, above, right before the first Enter).
-                "tier1_governed": tier1_governs,
-                // #112 round 3 (rev-20 N3): `null` when Tier 1 never
-                // governed this delivery at all (nothing was ever measured,
-                // not "measured and false") — a bare `bool` here would
-                // conflate "never watched" with "watched and saw it clear",
-                // which are different facts a live-validation read needs to
-                // tell apart.
-                "tier1_still_holding_at_end": tier1_governs.then_some(tier1_reading == Some(true)),
-                "tier2_hook_matched": tier_hook_matched,
-                "tier3_burst_would_confirm": tier_burst_would_confirm,
-            }));
-            // Delivery outcome breadcrumb — timing + flags only, never the text.
-            crate::obs::breadcrumb(
-                "delivery",
-                &format!(
-                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} confirm_state={} \
-                     confirm_source={} attempts={attempts} waited_ms={}",
-                    confirm_state.as_str(),
-                    confirm_source.as_str(),
-                    start.elapsed().as_millis() as u64
-                ),
-            );
-            // #112 round 2: the notice fires ONLY for `Failed`, never for
-            // `Pending` — the whole point of the three-state redesign. A
-            // `Confirmed` delivery draws nothing (as before). A `Pending`
-            // delivery (no tier decided within the window) spawns the
-            // extended monitor below and gets NO notice yet — silence is the
-            // correct behavior for "no evidence yet on a prompt that may
-            // simply be queued", not a bug to route around.
-            match confirm_state {
-                DeliveryConfirmState::Confirmed => {}
-                DeliveryConfirmState::Failed => {
-                    if let Some(r) = &reg {
-                        r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
-                    }
-                }
-                DeliveryConfirmState::Pending => {}
-            }
-            // Spawn the extended, unbounded-by-timeout monitor for anything
-            // this window didn't resolve to `Confirmed` — a `Pending`
-            // delivery still needs its eventual answer (hook-late-match or
-            // genuine idle-without-evidence), and a `Failed` (Tier 1 veto)
-            // delivery still needs the chance to be corrected by a late hook
-            // match, since that veto isn't infallible (the rejection/error
-            // residual). Deliberately a SEPARATE thread, not a continuation
-            // of this one: this closure's `_guard` holds the per-pty delivery
-            // mutex for its own (bounded) lifetime, and the monitor's own
-            // lifetime is bounded only by the pty staying alive — holding
-            // the delivery mutex that long would block every subsequent
-            // delivery to this pane. See `run_late_confirmation_monitor`'s
-            // doc for the full mechanism.
-            if !matches!(confirm_state, DeliveryConfirmState::Confirmed) {
-                let app_for_monitor = app.clone();
-                let root_for_monitor = root.clone();
-                let group_for_monitor = group.clone();
-                let agent_for_monitor = agent.clone();
-                let hook_marker_path_for_monitor = hook_marker_path.clone();
-                let pasted_text_for_monitor = pasted_text.clone();
-                let delivery_from_for_monitor = delivery_from.clone();
-                let last_delivery_for_monitor = last_delivery.clone();
-                let reg_for_monitor = reg.clone();
-                let already_failed = matches!(confirm_state, DeliveryConfirmState::Failed);
-                std::thread::spawn(move || {
-                    run_late_confirmation_monitor(
-                        app_for_monitor, root_for_monitor, group_for_monitor, agent_for_monitor,
-                        pty_id, hook_marker_path_for_monitor, hook_baseline, pasted_text_for_monitor,
-                        delivery_from_for_monitor, submit_sent_ms, target_is_orchestrator,
-                        already_failed, last_delivery_for_monitor, reg_for_monitor,
-                    );
-                });
             }
         });
         Ok(())
+    }
+
+    /// Offer a NEW text payload to `pty_id`'s queue (#445) — the front-door
+    /// append (`reason: BehindQueue`) and a direct delivery's hold-cap abort
+    /// (`reason: BoxOccupied`/`Question`) both go through this. Applies
+    /// `queue::admit`'s policy (FIFO / cap-8-reject-newest / byte-identical
+    /// coalesce), audits the outcome, and returns the synchronous
+    /// `queue_full_error` on `RejectFull` so a front-door caller can
+    /// propagate it to the ORIGINAL MCP caller — the common overflow case,
+    /// since the front door itself catches deliveries 2..N before a
+    /// hold-cap abort ever needs to consult this. Never called for a
+    /// `StrandedSubmit` marker — see `enqueue_stranded_front`.
+    #[doc(hidden)] // pub for integration tests
+    pub fn enqueue_text(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        text: &str,
+        pty_id: u32,
+        reason: queue::EnqueueReason,
+    ) -> Result<(), String> {
+        let mut queues = self.queues.lock_safe();
+        let q = queues.entry(pty_id).or_default();
+        match queue::admit(q, text) {
+            queue::AdmitDecision::RejectFull => {
+                let depth = q.len();
+                drop(queues);
+                self.audit(group, "loomux", "delivery-dropped",
+                    json!({ "to": agent_id, "reason": "queue-full-at-call", "depth": depth }));
+                Err(queue::queue_full_error(agent_id, depth, reason.as_str()))
+            }
+            queue::AdmitDecision::Coalesce => {
+                if let Some(e) = q.iter_mut().rev().find(|e| e.payload.text() == Some(text)) {
+                    e.coalesced += 1;
+                }
+                let depth = q.len();
+                drop(queues);
+                self.audit(group, "loomux", "delivery-coalesced", json!({ "to": agent_id, "depth": depth }));
+                Ok(())
+            }
+            queue::AdmitDecision::Admit => {
+                let id = self.queue_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                q.push_back(queue::QueuedDelivery {
+                    id, agent_id: agent_id.to_string(), from: from.to_string(),
+                    payload: queue::QueuedPayload::Text(text.to_string()),
+                    reason, enqueued_ms: now_ms(), coalesced: 0,
+                });
+                let depth = q.len();
+                drop(queues);
+                self.audit(group, "loomux", "delivery-queued",
+                    json!({ "to": agent_id, "id": id, "reason": reason.as_str(), "depth": depth }));
+                Ok(())
+            }
+        }
+    }
+
+    /// Push a `StrandedSubmit` marker to the FRONT of `pty_id`'s queue
+    /// (#445 seam 3): the drainer's single-consumer discipline means only
+    /// it ever pops the front, so this is safe to call whether the queue
+    /// was empty (a fresh delivery's own seam-3 abort — the marker becomes
+    /// the only entry) or non-empty (the drainer converting the item it's
+    /// mid-replaying). Bounded by the SAME cap as a text enqueue — a marker
+    /// still occupies a queue slot.
+    #[doc(hidden)] // pub for integration tests
+    pub fn enqueue_stranded_front(&self, group: &str, agent_id: &str, from: &str, pty_id: u32) -> Result<(), String> {
+        let mut queues = self.queues.lock_safe();
+        let q = queues.entry(pty_id).or_default();
+        if q.len() >= queue::QUEUE_MAX_PER_PANE {
+            let depth = q.len();
+            drop(queues);
+            self.audit(group, "loomux", "delivery-dropped",
+                json!({ "to": agent_id, "reason": "queue-full-at-call", "depth": depth }));
+            return Err(queue::queue_full_error(agent_id, depth, "question"));
+        }
+        let id = self.queue_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        q.push_front(queue::QueuedDelivery {
+            id, agent_id: agent_id.to_string(), from: from.to_string(),
+            payload: queue::QueuedPayload::StrandedSubmit,
+            reason: queue::EnqueueReason::Question, enqueued_ms: now_ms(), coalesced: 0,
+        });
+        let depth = q.len();
+        drop(queues);
+        self.audit(group, "loomux", "delivery-queued",
+            json!({ "to": agent_id, "id": id, "reason": "question", "depth": depth, "marker": "stranded-submit" }));
+        Ok(())
+    }
+
+    /// Spawn `run_queue_drainer` for `pty_id` unless one is already running
+    /// — bounded thread lifecycle (#445): at most one drainer per pane,
+    /// answering the same unbounded-thread-accumulation concern raised
+    /// against #451's late monitors. `self: &Arc<Self>` (not `&self`) so it
+    /// can hand the drainer thread its own owned registry handle.
+    fn ensure_drainer(self: &Arc<Self>, app: AppHandle, group: String, pty_id: u32) {
+        let mut draining = self.queue_draining.lock_safe();
+        if !draining.insert(pty_id) {
+            return; // already running for this pane
+        }
+        drop(draining);
+        let reg = self.clone();
+        std::thread::spawn(move || run_queue_drainer(reg, app, group, pty_id));
+    }
+
+    /// Drop every entry currently queued for `pty_id` (#445): the pane's
+    /// agent died or its pty closed while entries were waiting. Audits ONE
+    /// `delivery-dropped` per entry (so each payload's own id closes out —
+    /// see `queue::orphaned_queue_entries`) plus a single coalesced notice
+    /// naming the count. Today this case is silent; this makes it loud.
+    #[doc(hidden)] // pub for integration tests
+    pub fn drop_queue(&self, group: &str, pty_id: u32, reason: queue::DropReason) {
+        let entries: Vec<queue::QueuedDelivery> =
+            self.queues.lock_safe().remove(&pty_id).map(Vec::from).unwrap_or_default();
+        if entries.is_empty() {
+            return;
+        }
+        for e in &entries {
+            self.audit(group, "loomux", "delivery-dropped",
+                json!({ "to": e.agent_id, "id": e.id, "reason": reason.as_str() }));
+        }
+        // In practice every entry in one pane's queue shares the same
+        // target — named from the last (most recent) entry.
+        if let Some(last) = entries.last() {
+            let target_is_orchestrator =
+                self.agent(&last.agent_id).map(|a| a.role == Role::Orchestrator).unwrap_or(false);
+            self.notify_queue(group, &last.agent_id, target_is_orchestrator,
+                &queue::dropped_notice(&last.agent_id, entries.len(), reason));
+        }
+    }
+
+    /// Best-effort notice for a queue event (#445) — same suppression
+    /// discipline as every other delivery notice: never to an
+    /// orchestrator-target pane (a notice about a delivery to the
+    /// orchestrator is itself a delivery to the orchestrator — a loop) or a
+    /// paused group, and every suppression leaves a `notice-suppressed`
+    /// audit line so it's discoverable after the fact instead of silently
+    /// vanishing (the routed #451 finding this issue also owns).
+    #[doc(hidden)] // pub for integration tests
+    pub fn notify_queue(&self, group: &str, agent_id: &str, target_is_orchestrator: bool, text: &str) {
+        if target_is_orchestrator {
+            self.audit(group, "loomux", "notice-suppressed",
+                json!({ "kind": "queue", "to": agent_id, "reason": "target-is-orchestrator" }));
+            return;
+        }
+        if self.is_paused(group) {
+            self.audit(group, "loomux", "notice-suppressed",
+                json!({ "kind": "queue", "to": agent_id, "reason": "group-paused" }));
+            return;
+        }
+        let _ = self.deliver_to_orchestrator(group, text, "loomux");
+    }
+
+    /// Pop `id` off the FRONT of `pty_id`'s queue if it's still there (the
+    /// normal case — see `run_queue_drainer`'s single-consumer doc for why
+    /// it always is) and audit `delivery-dequeued`. Called by the drainer
+    /// once an entry's delivery attempt reaches `DeliverOutcome::Done`.
+    #[doc(hidden)] // pub for integration tests
+    pub fn pop_front_dequeued(&self, group: &str, pty_id: u32, id: u64, enqueued_ms: u64) {
+        {
+            let mut queues = self.queues.lock_safe();
+            if let Some(q) = queues.get_mut(&pty_id) {
+                if q.front().is_some_and(|f| f.id == id) {
+                    q.pop_front();
+                }
+            }
+        }
+        self.audit(group, "loomux", "delivery-dequeued",
+            json!({ "id": id, "queued_ms": now_ms().saturating_sub(enqueued_ms) }));
+    }
+
+    /// Current queue depth for `pty_id` (0 if none exists) — a read-only
+    /// accessor for tests and any future badge (#445 PR-C). Never mutates.
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_depth(&self, pty_id: u32) -> usize {
+        self.queues.lock_safe().get(&pty_id).map(VecDeque::len).unwrap_or(0)
+    }
+
+    /// A snapshot (oldest first) of `pty_id`'s queue contents — test-only
+    /// introspection so ordering/reason/coalesce-count can be asserted
+    /// directly instead of only through side effects.
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_snapshot(&self, pty_id: u32) -> Vec<queue::QueuedDelivery> {
+        self.queues.lock_safe().get(&pty_id).map(|q| q.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    /// Test-only: bind `agent_id` to `pty_id` directly, bypassing the real
+    /// spawn/bind handshake (which needs a live Tauri window). #445's
+    /// front-door tests need SOME agent with a `pty_id` to key a queue by,
+    /// without the app-handle round trip every other pty-bound path needs.
+    #[doc(hidden)] // pub for integration tests
+    pub fn set_pty_for_test(&self, agent_id: &str, pty_id: u32) {
+        if let Some(a) = self.agents.lock_safe().get_mut(agent_id) {
+            a.pty_id = Some(pty_id);
+        }
+    }
+
+    /// Whether `pty_id`'s queue currently has a drainer thread running —
+    /// test seam for the bounded-lifecycle property (`ensure_drainer` never
+    /// double-spawns; a drainer removes itself on exit).
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_draining(&self, pty_id: u32) -> bool {
+        self.queue_draining.lock_safe().contains(&pty_id)
+    }
+
+    /// #445 intake finding: the in-memory queue's persistence argument
+    /// claims a restart's loss is "mechanically derivable from
+    /// audit.jsonl" — this makes that derivation real by scanning `group`'s
+    /// audit log for `delivery-queued` ids with no matching
+    /// `delivery-dequeued`/`delivery-dropped`. As of this PR nothing calls
+    /// this from the orchestrator's own session-start re-sync (that wiring
+    /// — a follow-up issue, filed at PR time — is what would make the loss
+    /// actually RECOVERABLE, not merely visible); until then this is a
+    /// forensic query a human or a future tool can run, not an automatic
+    /// safety net. See `queue.rs`'s module doc "Scope" section.
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_orphans(&self, group: &str) -> Vec<queue::OrphanedQueueEntry> {
+        let entries = self.audit_log(group);
+        let lines: Vec<queue::QueueAuditLine> = entries
+            .iter()
+            .map(|e| queue::QueueAuditLine {
+                action: e.action.as_str(),
+                id: e.detail.get("id").and_then(Value::as_u64),
+                agent_id: e.detail.get("to").and_then(Value::as_str),
+                reason: e.detail.get("reason").and_then(Value::as_str),
+                ts_ms: e.ts_ms,
+            })
+            .collect();
+        queue::orphaned_queue_entries(&lines)
     }
 
     /// Human steering from the loomux compose strip (#43, option C): enqueue
@@ -18997,7 +19472,19 @@ impl OrchRegistry {
         target_is_orchestrator: bool,
         confirmed: bool,
     ) {
-        if !should_notify_unconfirmed(target_is_orchestrator, confirmed) || self.is_paused(group) {
+        if !should_notify_unconfirmed(target_is_orchestrator, confirmed) {
+            // #445: every suppression path leaves a trace — a suppressed
+            // notification must be discoverable after the fact, never just
+            // vanish (the routed #451 finding this issue also owns).
+            self.audit(group, "loomux", "notice-suppressed", json!({
+                "kind": "unconfirmed-delivery", "to": agent_id,
+                "reason": if target_is_orchestrator { "target-is-orchestrator" } else { "already-confirmed" },
+            }));
+            return;
+        }
+        if self.is_paused(group) {
+            self.audit(group, "loomux", "notice-suppressed",
+                json!({ "kind": "unconfirmed-delivery", "to": agent_id, "reason": "group-paused" }));
             return;
         }
         self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({ "to": agent_id }));
@@ -19005,46 +19492,35 @@ impl OrchRegistry {
     }
 
     /// #112 round 2 — additive to the #445 seam (a NEW notice path;
-    /// `should_notify_unconfirmed`/`should_notify_paste_held` and every
-    /// `PasteGate::Abort` path are untouched by this function's existence).
-    /// Tells the orchestrator a delivery it was already told was unconfirmed
-    /// has since been proven to have landed — see
-    /// `delivery_confirmed_late_notice`'s doc for why this is framed as a
-    /// correction. Same suppression posture as `notify_unconfirmed_delivery`:
-    /// never sent for an orchestrator-target delivery (a notice about a
-    /// delivery to the orchestrator is itself a delivery to the orchestrator
-    /// — the same loop that function's doc already names) and never sent to
-    /// a paused group. Best-effort and audited; called at most once per
-    /// delivery, from the late-confirmation monitor, only when a `failed`
-    /// alarm had actually fired for this exact delivery.
+    /// `should_notify_unconfirmed` and every `PasteGate::Abort` path are
+    /// untouched by this function's existence). Tells the orchestrator a
+    /// delivery it was already told was unconfirmed has since been proven
+    /// to have landed — see `delivery_confirmed_late_notice`'s doc for why
+    /// this is framed as a correction. Same suppression posture as
+    /// `notify_unconfirmed_delivery`: never sent for an orchestrator-target
+    /// delivery (a notice about a delivery to the orchestrator is itself a
+    /// delivery to the orchestrator — the same loop that function's doc
+    /// already names) and never sent to a paused group — both suppressions
+    /// audited (#445), matching the routed #451 finding this issue owns:
+    /// review found this correction notice left NO audit trace when
+    /// suppressed, structurally the same silent-suppression class as this
+    /// issue's core defect. Best-effort and audited; called at most once
+    /// per delivery, from the late-confirmation monitor, only when a
+    /// `failed` alarm had actually fired for this exact delivery.
     #[doc(hidden)] // pub for integration tests
     pub fn notify_delivery_confirmed_late(&self, group: &str, agent_id: &str, target_is_orchestrator: bool) {
-        if target_is_orchestrator || self.is_paused(group) {
+        if target_is_orchestrator {
+            self.audit(group, "loomux", "notice-suppressed",
+                json!({ "kind": "delivery-confirmed-late", "to": agent_id, "reason": "target-is-orchestrator" }));
+            return;
+        }
+        if self.is_paused(group) {
+            self.audit(group, "loomux", "notice-suppressed",
+                json!({ "kind": "delivery-confirmed-late", "to": agent_id, "reason": "group-paused" }));
             return;
         }
         self.audit(group, "loomux", "delivery-confirmed-late-notice", json!({ "to": agent_id }));
         let _ = self.deliver_to_orchestrator(group, &delivery_confirmed_late_notice(agent_id), "loomux");
-    }
-
-    /// Notify the orchestrator that a delivery to `agent_id` was HELD and
-    /// aborted — either the pane holds a human's unsubmitted line (#111,
-    /// `HeldReason::BoxOccupied`) or Copilot has an interactive question on
-    /// screen (#420, `HeldReason::InteractiveQuestion`) — the prompt was never
-    /// pasted, so the orchestrator must re-send once the pane is clear/answered.
-    /// `reason` only picks the notice wording (`held_delivery_notice`); the gate
-    /// itself doesn't distinguish reasons. Same discipline as
-    /// `notify_unconfirmed_delivery`: skipped for an orchestrator target
-    /// (`should_notify_paste_held` — a notice to it would loop) and for a paused
-    /// group (delivery is suppressed there anyway, so we must not spend the
-    /// notice on it). Best-effort and audited; exactly one notice per aborted
-    /// delivery (the caller invokes this once, at the abort).
-    #[doc(hidden)] // pub for integration tests
-    pub fn notify_delivery_held(&self, group: &str, agent_id: &str, target_is_orchestrator: bool, reason: HeldReason) {
-        if !should_notify_paste_held(target_is_orchestrator) || self.is_paused(group) {
-            return;
-        }
-        self.audit(group, "loomux", "delivery-held-notice", json!({ "to": agent_id, "reason": reason.as_str() }));
-        let _ = self.deliver_to_orchestrator(group, &held_delivery_notice(agent_id, reason), "loomux");
     }
 
     /// Deliver to the group's orchestrator (worker reports, exit notices).

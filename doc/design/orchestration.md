@@ -4235,10 +4235,14 @@ flush_actually_fire` (rev-19 R3) drive the ACTUAL functions `deliver_prompt` cal
 downstream consequence through the real recorder/reader pair, not a fabricated literal (rev-19 n1:
 this pins the recorder's behavior via the real extraction, NOT that `deliver_prompt` calls it — see
 below for that honest gap).
-`delivery_held_event_names_the_pane_and_the_reason` and
-`delivery_held_notice_audits_the_interactive_question_reason` cover the `HeldReason` variant end to
-end through the audit/badge payloads; `question_held_notice_names_the_agent_and_points_at_answering`
-and `held_delivery_notice_dispatches_text_by_reason` cover the notice text and its dispatch. What
+`delivery_held_event_names_the_pane_and_the_reason` covers the `HeldReason` variant end to end
+through the audit/badge payloads (the LIVE "still holding" badge, unaffected by #445 below).
+**#445 update:** the notice fired once a hold's cap actually expires no longer says "held ... —
+re-send when clear" and is no longer named `held_delivery_notice`/`paste_held_notice`/
+`question_held_notice` — those were deleted along with the destroy-on-abort behavior they
+described. `notify_queue_fires_for_a_worker_but_suppresses_and_audits_for_the_orchestrator_and_
+while_paused` and `queued_notice_replaces_the_deleted_re_send_wording` cover the replacement (the
+"Delivery queue (#445)" section, below, is the full account). What
 remains untested, and stated plainly rather than silently accepted (per CLAUDE.md constraint 3 and
 the "no real PTY in test mode" convention the rest of `deliver_prompt` already lives with): that
 `deliver_prompt`'s call site for `record_aborted_preenter_outcome` (a single line) is actually
@@ -4247,6 +4251,191 @@ present — deleting it reds no test, confirmed by trying it and reverting — a
 boundary every other guard in this function already accepts; the flush's equivalent wiring gap is
 closed (see `flush_stranded_text` above) because its check-and-write collapse into ONE function with
 nothing left for `deliver_prompt` to get wrong beyond calling it.
+
+## Delivery queue (#445)
+
+**Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,
+`HUMAN_INPUT_HOLD_MAX` = 60s), pre-paste interactive-question (#420, `QUESTION_HOLD_MAX` = 120s),
+and pre-Enter interactive-question (the same guard, run again after the paste) — and until this
+PR every one of them DESTROYED the payload once its bounded wait expired: `deliver_prompt`
+returned with nothing pasted, the sender was told nothing wrong (the call itself still returned
+`Ok`), and — for a non-orchestrator target — the orchestrator got a `[loomux] delivery to <id>
+held: ... — re-send when clear` notice whose own wording claimed the opposite of what happened.
+Live audit evidence, captured from this repo's own operation and filed on #445: a worker with an
+`AskUserQuestion` on screen held two orchestrator prompts for ~120s each, then both were gone —
+`delivery-aborted-question` in the log, no trace anywhere else. The user's own words while
+waiting: *"I'm waiting for the orchestrator prompts to deliver now to the worker and I'm not
+seeing them."* They were waiting for something that no longer existed.
+
+This repo's standing requirement makes the destroy-on-abort design structurally wrong, not merely
+unfortunate: the user is frequently AWAY, an agent asks a question, and they answer minutes or
+hours later. A hold whose release condition is "a human answers" cannot have a timeout measured in
+seconds — but the caps themselves are legitimate: they bound one OS thread BLOCKING per pending
+delivery, which is a real resource concern independent of what happens to the payload. The fix
+keeps the caps and changes only the outcome at the cap: enqueue, never destroy.
+
+**Approach — a per-pane FIFO plus a drainer thread.** `OrchRegistry` gained
+`queues: Arc<Mutex<HashMap<u32, VecDeque<queue::QueuedDelivery>>>>` (keyed by pty id, same
+convention as `delivery`/`last_delivery`) and a monotonic `queue_seq: Arc<AtomicU64>` for delivery
+ids — plain `std` types, no getrandom (CLAUDE.md constraint 2). `queue.rs` is the pure half
+(`QueuedDelivery`, `EnqueueReason`/`DropReason`, `admit()`'s FIFO/cap/coalesce policy, every notice
+string, `orphaned_queue_entries`) mirroring `notify.rs`'s own pure-core/impure-wiring split; `mod.rs`
+is the impure half.
+
+- **The delivery body was extracted, not reimplemented.** `deliver_prompt`'s ~500-line paste/
+  echo/confirm pipeline is now a free function, `deliver_now(...) -> DeliverOutcome`, called
+  identically whether the caller is a fresh direct delivery (`deliver_prompt`'s spawned thread) or
+  the drainer replaying a queued entry — the SAME echo retries, submit confirmation, and #451
+  three-state lifecycle run either way, never a parallel reimplementation that could drift. Every
+  parameter is something the old closure already captured; nothing about the pipeline's OWN
+  behavior changed by the extraction — see the PR diff for the byte-for-byte body.
+- **`deliver_now` never touches the queue.** On a hold-cap abort it returns
+  `DeliverOutcome::AbortedPrePaste(reason)` (nothing pasted) or `DeliverOutcome::AbortedPreEnter`
+  (seam 3: the text WAS pasted, only the Enter was withheld — `record_aborted_preenter_outcome`
+  still runs, unchanged from #420). Only the CALLER decides whether an abort becomes an enqueue,
+  because only the caller knows whether this was a fresh delivery (notify the orchestrator once)
+  or a drain replay (`run_queue_drainer` leaves the entry queued and retries silently — the sender
+  was already notified at the ORIGINAL enqueue; renotifying on every ~2s retry would be spam).
+- **Front door.** `deliver_prompt` checks `pty_id`'s queue BEFORE requiring an app handle: if
+  non-empty, it enqueues behind the tail (`EnqueueReason::BehindQueue`) and returns — no live pane
+  needed, because a non-empty queue can only exist because an EARLIER delivery to this same pty
+  already had a live app handle to spawn the drainer with. Without this check a fresh delivery
+  could win the race to an actually-clear pane ahead of entries already waiting, inverting
+  "here's context" / "now go" — the one failure mode this design treats as a correctness bug, not
+  a style point.
+- **Single-consumer drain.** Only `run_queue_drainer` ever pops the FRONT of a pane's queue; the
+  front door only ever pushes to the BACK. The drainer peeks the front entry, attempts delivery,
+  and pops only AFTER that attempt resolves — so the queue stays non-empty for the pane's WHOLE
+  drain, which is what makes the front-door check race-free: a fresh direct delivery can never
+  observe a transiently-empty queue mid-drain and slip in ahead of an entry still being replayed.
+  The drainer polls deliverability (`!input_pending && !question_active_now`) at
+  `queue::QUEUE_DRAIN_POLL` (2s) with NO cap — the whole point — and exits when the queue empties,
+  the pty closes, or the agent dies (`drop_queue`, below). At most one drainer per pane
+  (`queue_draining: Arc<Mutex<HashSet<u32>>>`), spawned on first enqueue and self-removing on exit
+  — the same bounded-thread-lifecycle answer #451's late-confirmation monitors already established
+  for this codebase.
+- **Seam 3 (stranded pre-Enter text).** Converts to a `QueuedPayload::StrandedSubmit` marker
+  (pushed to the FRONT via `enqueue_stranded_front`, ahead of whatever else is queued — it
+  represents finishing an already-half-done paste, not a new ask) rather than a text copy. Draining
+  it (`drain_stranded_submit`) presses Enter through the EXISTING `flush_stranded_text` logic —
+  the same guard a normal delivery's own pre-paste step already uses, so a human's line typed into
+  the box in the meantime is never blind-submitted. Single-owner discipline: `last_delivery`'s
+  record of this pane is written once, by whichever of {the marker's own flush, the next delivery's
+  flush} runs first — unchanged from #420, just now also reachable from the drainer.
+- **Bounds.** `QUEUE_MAX_PER_PANE = 8`; on overflow, **reject the newest, never evict the oldest**
+  (the head may be the kickoff everything after it depends on). The COMMON overflow case — a
+  second-or-later delivery to an already-non-empty queue — is caught at the front door and returns
+  a synchronous, truthful `Err` (`queue::queue_full_error`) straight to the ORIGINAL MCP caller
+  (`send_prompt`/`report`), so a sender is told plainly rather than led to believe it queued. The
+  RARE case — the queue fills DURING a single delivery's own 60–120s hold — can't reach a
+  synchronous caller (that thread returned long ago); it's audited (`delivery-dropped`, reason
+  `queue-full-at-call`) and drawn as a loud, best-effort orchestrator notice instead. No age-based
+  EXPIRY: a queue behind an unanswered question is the designed case for this feature, not a leak,
+  so the only age-based behavior is a one-shot, non-destructive `still_queued_notice` at 30 minutes
+  (`QUEUE_STILL_QUEUED_NOTICE_AFTER`) making a forgotten blocked pane visible without touching it.
+- **Coalescing** is scoped to byte-identical `Text` payloads only (`queue::admit`), never a
+  `StrandedSubmit` marker: the queue cannot judge semantic staleness (three DIFFERENT task briefs
+  must all deliver — only a literal repeat is provably redundant), so it collapses exact repeats
+  and leaves everything else to the sender. Each drain's first delivered `Text` entry carries a
+  flush header (`queue::flush_header_text`) reporting how many were queued and how many collapsed.
+- **Ordering.** Strict FIFO by enqueue time — the front door plus the single-consumer drain are
+  jointly what make this real; the pane's per-pty `Mutex<()>` alone (the pre-#445 posture) gives no
+  such guarantee, since `std::sync::Mutex` is not fair.
+
+**Notice vocabulary — part of the fix.** The old text ("held: pane has human input — re-send when
+clear") is deleted along with `paste_held_notice`/`question_held_notice`/`held_delivery_notice`/
+`should_notify_paste_held`/the old `notify_delivery_held` method — replaced by `queue::queued_notice`
+("queued ... — delivers automatically once clear; do NOT re-send"), sent through the new
+`notify_queue` (same suppression discipline as every delivery notice: never to an
+orchestrator-target pane, never to a paused group) via `deliver_prompt`'s abort-handling
+continuation. `orchestrator.md`'s held-delivery guidance was rewritten to match: never re-send on a
+`queued` notice; only a `DROPPED` notice means the payload is actually gone.
+
+**Every suppression now leaves a trace.** The routed #451 finding this issue also owns — review
+found the late-correction notice (`notify_delivery_confirmed_late`) left no audit trace when its
+own orchestrator-target/paused-group suppression fired, structurally the same silent-suppression
+class as this issue's core defect. `notify_unconfirmed_delivery`, `notify_delivery_confirmed_late`,
+and `notify_queue` all now write a `notice-suppressed` audit line (`kind`, `to`, `reason`) on every
+suppression branch, so a suppressed notification is discoverable after the fact instead of just
+vanishing.
+
+**Persistence: in-memory only — the intake gap, resolved honestly rather than papered over.** The
+plan this PR implements originally defended the in-memory choice partly by saying a restart's loss
+is "mechanically derivable from `audit.jsonl`, and the orchestrator's session-start re-sync is the
+documented recovery." Intake caught that the SECOND clause was false: the orchestrator's documented
+re-sync (`list_tasks`, `get_state`, `list_agents`, `list_notifications`, an issue scan) does not
+scan the audit for orphaned queue entries, and no tool surfaced that view — so the claimed
+mitigation was aspirational, not real, the exact claim-vs-reality failure that cost #451 four review
+rounds. This PR resolves it as follows, not by picking one of the two options wholesale:
+- The FIRST clause is now genuinely true, not just argued: `queue::orphaned_queue_entries` (pure,
+  unit-tested) and `OrchRegistry::queue_orphans` (the impure wrapper, reading a group's real
+  `audit.jsonl` end to end, integration-tested) scan for `delivery-queued` ids with no matching
+  `delivery-dequeued`/`delivery-dropped` — the derivation the plan claimed is now a real, tested
+  function, not an assertion.
+- The SECOND clause — the orchestrator's re-sync actually CALLING it — is explicitly **not** done
+  in this PR. Wiring `queue_orphans` into the re-sync (a new MCP tool or an addition to an existing
+  one, per the `add-orch-tool` skill's cross-layer checklist) is real, separable work, and doing it
+  inside an already-large PR risked exactly the scope creep this codebase's own review culture
+  pushes back on. A follow-up issue is filed at PR time for that wiring.
+- Until that follow-up lands, **a loomux restart during a blocked window loses whatever is queued
+  at that instant.** State this plainly rather than lean on a mitigation nobody performs: the audit
+  record is forensic (a human or a future tool can run `queue_orphans` by hand), not yet an
+  automatic safety net. The other arguments for in-memory-only still stand on their own regardless
+  of this gap: pty ids are re-minted at restore (a queue keyed by pty id can't rebind across one
+  anyway — `QueuedDelivery.agent_id` is kept alongside `pty_id`'s key specifically so a durable
+  follow-up could rebind by agent, not pty), and replaying hours-stale prompts into a freshly
+  resumed session — which just re-synced from the board anyway — is as likely to confuse as help.
+  On-disk persistence (`queue.jsonl`, atomic-write discipline per #133/#240) is additive future
+  work, filed alongside the re-sync wiring follow-up, not built here.
+
+**Relationship to #451 — clean composition by construction.** #451 owns everything AFTER Enter
+(acceptance evidence, `Confirmed`/`Pending`/`Failed`, the late-correction notice); this queue owns
+everything BEFORE paste (plus the seam-3 stranded-Enter marker). A drained delivery is a fresh
+`deliver_now` call that enters #451's lifecycle exactly like a direct one — `resolve_submit_
+confirmation`, the Pending monitors, and `should_notify_unconfirmed`'s internals are untouched by
+this PR. The abort call sites #451 deliberately left alone (so its own diff stayed clean) are
+exactly the lines this PR edits, which is why this PR was sequenced to land after #451 merged.
+
+**A deliberate simplification against the plan's original framing.** The plan describes the flush
+header as "the first thing a drain delivers" — implying its own delivery attempt. This PR instead
+PREPENDS the header to the first replayed `Text` payload's own paste (one paste, header then
+content) rather than sending it as a separate delivery with its own echo/confirm cycle: materially
+the same information reaches the pane, at a fraction of the implementation risk and one fewer
+`deliver_now` call per drain. The tradeoff: a queue whose FIRST entry is a `StrandedSubmit` marker
+(seam 3 fired on a delivery to a previously-empty queue) drains with no header — there's no fresh
+paste to prepend it to, and injecting one would corrupt the stranded text's own Enter timing. Rare
+(it requires seam 3 firing before any OTHER entry existed) and not silent — every entry still gets
+its own `delivery-dequeued` audit line — but noted here as a known gap, not asserted away.
+
+**What cannot be tested here, and what closes the gap.** Exactly the residual #451's own design
+note names for the same reason: `deliver_prompt`'s thread body requires a live Tauri `AppHandle`
+and a real pty (`tauri::test`'s `MockRuntime` isn't the concrete `Wry` runtime this code needs),
+and CLAUDE.md constraint 3 forbids spawning a real agent CLI to get one. So `run_queue_drainer` and
+`deliver_now`'s full pipeline are NOT exercised by the test suite — what IS covered, and to what
+depth: `queue.rs`'s pure policy (admit/cap/coalesce/notice text/orphan-scan) unit-tested in
+isolation; the registry-level bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
+`pop_front_dequeued`, `drop_queue`, `queue_orphans`, the front-door check reaching `deliver_prompt`
+with no app handle at all) integration-tested end to end against a real `OrchRegistry` and a real
+`audit.jsonl`; the notice-suppression discipline (`notify_queue`) tested directly. The drainer's
+LIVE wiring — a real pane actually flushing on unblock — is a hand-validation item, the same bar
+#451's own non-firing tier was caught by:
+
+1. Block a worker pane with an `AskUserQuestion`; send 3 prompts (one a byte-identical duplicate)
+   → held badge, then `delivery-queued` x2 + `delivery-coalesced` x1; answer after several minutes
+   → flush header, both deliver in order, `delivery-dequeued` x2, zero duplicates.
+2. Same via a human line left sitting in the box (box-occupied path, #111).
+3. The original incident replayed: a worker `report(...)` while the ORCHESTRATOR holds a question;
+   answer much later → the report arrives with the flush header; nothing destroyed.
+4. A 9th prompt to a pane already blocked with 8 queued → synchronous, loud rejection at the MCP
+   caller (`queue_full_error`), never a silent drop.
+5. Kill an agent holding a non-empty queue → `dropped_notice` + one `delivery-dropped` audit line
+   per entry.
+6. Restart loomux with a non-empty queue → v1 loses it; verify `queue_orphans` on the surviving
+   `audit.jsonl` reports exactly the queued-without-terminal entries.
+
+**Follow-ups filed at PR time, not built here:** wiring `queue_orphans` into the orchestrator's
+session-start re-sync (the persistence-gap closer, above); on-disk queue durability; a PR-C
+queued-count pane badge on the existing `orch-delivery-held` event seam.
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
