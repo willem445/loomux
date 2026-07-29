@@ -240,42 +240,124 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
  *  disagree). */
 const QUOTED_OR_BARE_VALUE = `"[^"]*"|\\S+`;
 
-/** Excise every `--session-id`/`--resume` occurrence (space or `=` form) from
- *  the ORIGINAL command STRING — never a tokenize/`.join(" ")` round trip. The
- *  prior implementation ran `command.trim().split(/\s+/)` then rejoined with a
- *  single space, which collapses any run of whitespace INSIDE a quoted arg
- *  (a system prompt, a spaced Windows path — the recurring Windows killer:
- *  `C:\Users\Will H\...` is legal and common) on every restore, silently and
- *  permanently once the corrupted form gets persisted into the next layout
- *  snapshot (#449). This reuses the exact excise-from-original technique
- *  `stripSoloMcpFlags` below already uses for the solo MCP flags (regex.exec
- *  on the ORIGINAL string, `.slice` around the match — never a second,
- *  disagreeing parser), and the same quote-aware value grammar
- *  (`QUOTED_OR_BARE_VALUE`) — so nothing outside the matched flag(s) is ever
- *  touched: a command with no session flags at all comes back byte-identical
- *  apart from the appended flag, and one that has them loses only that flag's
- *  bytes, whitespace included. */
-const SESSION_FLAG_RE = new RegExp(
-  `(^|\\s)(?:--session-id|--resume)(?:=\\S*|\\s+(?:${QUOTED_OR_BARE_VALUE}))`,
-  "g"
-);
+/** The two flag names that name a Claude session on a recorded launch line —
+ *  the "which flag NAMES this module treats as session identity" answered in
+ *  exactly one place, not two independently-typed literals that could drift
+ *  (#471 review round 2: "the shared grammar" means the flag-name set too,
+ *  not just the value shape). `#458`/#473's `scan_copilot()` is about to
+ *  start recording `--resume=<id>` (the `=` form) for copilot panes too —
+ *  this set, and every helper below built on it, does not care which CLI
+ *  recorded the command, only the flag's literal text. */
+const SESSION_FLAG_NAMES = ["--session-id", "--resume"];
 
-function stripSessionFlagsFromCommand(command: string): string {
-  return command.replace(SESSION_FLAG_RE, "");
+/** True when `raw` — the RAW slice of ONE token, quotes included if it was a
+ *  quoted token — is a session flag written bare (no value attached: not
+ *  even a trailing `=`). A quoted token's raw slice always starts with `"`,
+ *  so a flag-looking WORD sitting inside a quoted argument (a system prompt
+ *  that happens to discuss `--resume`) can never equal a bare flag name —
+ *  this is what keeps `stripSessionFlagsFrom*` from mistaking quoted content
+ *  for a flag (#471 review round 2, case 5). */
+function isBareSessionFlag(raw: string): boolean {
+  return SESSION_FLAG_NAMES.includes(raw);
 }
 
-/** Same drop as above, but for the already-discrete `argv` array — no
- *  whitespace-collapse risk there (each element is one token already), so a
- *  plain token scan is fine and doesn't need quote-awareness. */
+/** True when `raw` is a session flag's SELF-CONTAINED `=value` token —
+ *  including an EMPTY value (`--resume=`) — so it needs no following value
+ *  token consumed. Same quote-immunity as `isBareSessionFlag` above, for the
+ *  same reason. */
+function isEqSessionFlag(raw: string): boolean {
+  return SESSION_FLAG_NAMES.some((name) => raw.startsWith(`${name}=`));
+}
+
+/** Quote-aware tokenizer WITH POSITIONS into the ORIGINAL string: a fully
+ *  double-quoted run (`"..."`) is ONE token whose range includes the quotes
+ *  (so its raw slice can never equality-match a bare flag name — see
+ *  `isBareSessionFlag`), everything else is a whitespace-delimited token.
+ *  Gaps BETWEEN tokens (whitespace, including multi-space runs) are not
+ *  tokens at all — a caller reconstructs the string by slicing the ORIGINAL
+ *  around whichever token ranges it drops, so every gap it doesn't touch
+ *  survives untouched by construction (never a `.join(" ")` reflow — the
+ *  #449 bug this whole approach exists to close). */
+function tokenizeWithPositions(command: string): Array<{ start: number; end: number }> {
+  const tokens: Array<{ start: number; end: number }> = [];
+  const re = /"[^"]*"|\S+/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(command)) !== null) {
+    tokens.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return tokens;
+}
+
+/** Excise every session-identity flag occurrence from the ORIGINAL command
+ *  STRING — never a tokenize/`.join(" ")` round trip. The property this owes
+ *  (#449, hardened across two #471 review rounds): NO session-identity flag
+ *  or its value survives into the rebuilt command, IN ANY FORM, for EITHER
+ *  flag name — and nothing else is ever touched, whitespace runs inside
+ *  unrelated quoted args (a system prompt, a spaced Windows path) included.
+ *  Concretely, every form below is covered and fixture-pinned:
+ *   - space form (`--resume abc`) — flag + its value token, both dropped;
+ *   - `=` form (`--resume=abc`, or `--resume=` with an EMPTY value) — one
+ *     self-contained token, dropped whole (round 2: the `#473`/#458 shape);
+ *   - bare/valueless (`--resume` with nothing after it, or immediately
+ *     followed by ANOTHER flag rather than a value) — the flag token alone
+ *     is dropped; a following token that itself starts with `--` is NEVER
+ *     swallowed as if it were this flag's value (round 1's blocker: the
+ *     prior split/rejoin dropped a bare flag's "value slot" unconditionally,
+ *     which silently doubled the flag on the NEXT restore — a compounding,
+ *     credit-spending corruption once the doubled id lands as a bare
+ *     positional argument, i.e. a prompt);
+ *   - repeated occurrences of either flag — each found and dropped
+ *     independently, in one pass, regardless of order;
+ *   - a flag-looking WORD sitting inside a quoted argument — never mistaken
+ *     for the flag (round 2, case 5): see `tokenizeWithPositions`.
+ *  Each drop absorbs exactly ONE leading whitespace character (mirroring
+ *  what a single flag[+value] run displaced), so untouched whitespace
+ *  elsewhere is never reflowed. */
+function stripSessionFlagsFromCommand(command: string): string {
+  const tokens = tokenizeWithPositions(command);
+  const dropRanges: Array<[number, number]> = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const raw = command.slice(tokens[i].start, tokens[i].end);
+    const bare = isBareSessionFlag(raw);
+    if (!bare && !isEqSessionFlag(raw)) continue;
+    let dropStart = tokens[i].start;
+    let dropEnd = tokens[i].end;
+    if (bare && i + 1 < tokens.length) {
+      const nextRaw = command.slice(tokens[i + 1].start, tokens[i + 1].end);
+      if (!nextRaw.startsWith("--")) {
+        dropEnd = tokens[i + 1].end; // consume the value token too
+        i++; // skip it — already accounted for
+      }
+    }
+    if (dropStart > 0 && /\s/.test(command[dropStart - 1])) dropStart -= 1;
+    dropRanges.push([dropStart, dropEnd]);
+  }
+  if (!dropRanges.length) return command;
+  let result = "";
+  let cursor = 0;
+  for (const [s, e] of dropRanges) {
+    result += command.slice(cursor, s);
+    cursor = e;
+  }
+  return result + command.slice(cursor);
+}
+
+/** Same excision, same property, for the already-discrete `argv` array — no
+ *  whitespace-collapse or quoted-substring risk there (each element is one
+ *  token already, and there's no quoting concept in an array), but the SAME
+ *  flag-name/value-form coverage: bare (never swallowing a following
+ *  element that is itself another flag), `=` form (incl. empty), and
+ *  repeated occurrences. */
 function stripSessionFlagsFromArgv(tokens: string[]): string[] {
   const out: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
-    if (t === "--session-id" || t === "--resume") {
-      i++; // drop the flag AND its separate value token
+    if (isBareSessionFlag(t)) {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith("--")) i++; // consume the value, when there is one
       continue;
     }
-    if (t.startsWith("--session-id=") || t.startsWith("--resume=")) continue; // `=` form: one token
+    if (isEqSessionFlag(t)) continue;
     out.push(t);
   }
   return out;
@@ -340,8 +422,9 @@ export type SoloCli = "claude" | "copilot";
 // precisely because a username CAN contain a space ("Will H", "John Smith") —
 // this is not a hypothetical, it's the shape of real field data (CLAUDE.md
 // constraint 8: no this-machine assumptions). These match the quoted-path
-// group as ONE unit (`QUOTED_OR_BARE_VALUE`, shared with `SESSION_FLAG_RE`
-// above) rather than naively splitting on whitespace, and excise the match
+// group as ONE unit (`QUOTED_OR_BARE_VALUE`, the same value grammar
+// `stripSessionFlagsFromCommand` above uses) rather than naively splitting on
+// whitespace, and excise the match
 // FROM THE ORIGINAL STRING — never a tokenize/rejoin round trip — so nothing
 // outside the matched region is touched: a `cli: null` command (no solo
 // flags at all) comes back byte-identical, and the surviving remainder of a

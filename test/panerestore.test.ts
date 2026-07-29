@@ -547,6 +547,124 @@ test("agentFreshCommand: argv form leaves a non-flag element's internal whitespa
   });
 });
 
+// ---------- #471 review round 2: the excision property, hardened ----------
+//
+// rev-10 found the round-1 fix missed a BARE valueless flag (`claude
+// --resume` with nothing after it): the excision regex required a value, so
+// a bare flag survived untouched and got a SECOND `--resume` appended on top
+// — and the stale id from that doubled command lands as a bare POSITIONAL
+// argument on the *next* restore, which `claude` treats as a prompt. Not
+// cosmetic: it compounds every restore cycle and silently spends the user's
+// own credits. The orchestrator additionally required: the `=` form pinned
+// per flag name explicitly (a sibling PR, #473/#458, is about to start
+// recording `--resume=<id>` for copilot panes — this module doesn't care
+// which CLI recorded the command, only the flag's literal text, so it must
+// already handle that shape), and the flag-NAME set itself pinned (a
+// mutation removing `--session-id` from recognition passed all 67 round-1
+// tests untouched).
+//
+// These pin the PROPERTY the fix now owes: for EACH flag name
+// (`--session-id`, `--resume`) and EACH form a recorded command can carry it
+// in, excising it and appending the new flag changes ONLY that occurrence's
+// own bytes — nothing else ever moves, and a flag-looking WORD inside a
+// quoted argument is never mistaken for a real flag.
+
+const SESSION_FLAG_NAMES_UNDER_TEST = ["--session-id", "--resume"];
+
+// Forms whose ENTIRE occurrence (flag + any value) is meant to disappear.
+// Deliberately excludes "bare, followed by another flag" — that form must
+// drop ONLY the flag name and leave what follows untouched, so it gets its
+// own explicitly-computed test below rather than forcing an ill-fitting
+// shared formula.
+const WHOLE_OCCURRENCE_FORMS: Array<{ label: string; build: (flag: string) => string; atEnd?: boolean }> = [
+  { label: "space form", build: (f) => `${f} old-id` },
+  { label: "space form, quoted value", build: (f) => `${f} "old id"` },
+  { label: "= form", build: (f) => `${f}=old-id` },
+  { label: "= form, EMPTY value — the #473/#458 shape", build: (f) => `${f}=` },
+  { label: "bare, end of command", build: (f) => f, atEnd: true },
+];
+
+for (const flag of SESSION_FLAG_NAMES_UNDER_TEST) {
+  for (const form of WHOLE_OCCURRENCE_FORMS) {
+    const occurrence = form.build(flag);
+    const prefix = 'claude --append-system-prompt "two  spaces  here"';
+    const suffix = form.atEnd ? "" : ' --mcp-config "C:\\Users\\Will H\\solo-6.json" --model opus';
+    const recorded = `${prefix} ${occurrence}${suffix}`;
+
+    test(`agentResumeCommand: ${flag} written as "${form.label}" is excised whole — nothing else moves`, () => {
+      const out = agentResumeCommand(recorded, null, "new-id");
+      assert.equal(out.command, `${prefix}${suffix} --resume new-id`, recorded);
+    });
+
+    test(`agentFreshCommand: ${flag} written as "${form.label}" is excised whole — nothing else moves`, () => {
+      const out = agentFreshCommand(recorded, null, "new-id");
+      assert.equal(out.command, `${prefix}${suffix} --session-id new-id`, recorded);
+    });
+  }
+
+  test(`agentResumeCommand: ${flag} written bare and immediately followed by ANOTHER flag is dropped alone — the following flag is never swallowed as its "value" (the round-1 regression)`, () => {
+    const recorded = `claude ${flag} --model opus`;
+    const out = agentResumeCommand(recorded, null, "new-id");
+    assert.equal(out.command, "claude --model opus --resume new-id", recorded);
+  });
+
+  test(`agentFreshCommand: ${flag} written bare and immediately followed by ANOTHER flag is dropped alone`, () => {
+    const recorded = `claude ${flag} --model opus`;
+    const out = agentFreshCommand(recorded, null, "new-id");
+    assert.equal(out.command, "claude --model opus --session-id new-id", recorded);
+  });
+
+  test(`agentResumeCommand: repeated ${flag} occurrences (space form, then = form) are ALL excised, not just the first`, () => {
+    const recorded = `claude ${flag} old1 ${flag}=old2 --model opus`;
+    const out = agentResumeCommand(recorded, null, "new-id");
+    assert.equal(out.command, "claude --model opus --resume new-id", recorded);
+  });
+
+  test(`agentFreshCommand: repeated ${flag} occurrences (space form, then = form) are ALL excised, not just the first`, () => {
+    const recorded = `claude ${flag} old1 ${flag}=old2 --model opus`;
+    const out = agentFreshCommand(recorded, null, "new-id");
+    assert.equal(out.command, "claude --model opus --session-id new-id", recorded);
+  });
+
+  test(`agentResumeCommand: argv form — a bare ${flag} is dropped without swallowing a following flag element`, () => {
+    assert.deepEqual(agentResumeCommand(null, ["claude", flag, "--model", "opus"], "new-id"), {
+      argv: ["claude", "--model", "opus", "--resume", "new-id"],
+    });
+  });
+
+  test(`agentFreshCommand: argv form — a bare ${flag} is dropped without swallowing a following flag element`, () => {
+    assert.deepEqual(agentFreshCommand(null, ["claude", flag, "--model", "opus"], "new-id"), {
+      argv: ["claude", "--model", "opus", "--session-id", "new-id"],
+    });
+  });
+
+  test(`agentResumeCommand: argv form — a bare ${flag} as the LAST element is dropped cleanly (no crash, no doubling)`, () => {
+    assert.deepEqual(agentResumeCommand(null, ["claude", flag], "new-id"), {
+      argv: ["claude", "--resume", "new-id"],
+    });
+  });
+}
+
+test("agentResumeCommand: a flag-looking WORD inside a quoted argument is never treated as a flag — only the real, unquoted --session-id is excised", () => {
+  const recorded =
+    'claude --append-system-prompt "please explain what --resume and --session-id do" --session-id real-old-id';
+  const out = agentResumeCommand(recorded, null, "new-id");
+  assert.equal(
+    out.command,
+    'claude --append-system-prompt "please explain what --resume and --session-id do" --resume new-id'
+  );
+});
+
+test("agentFreshCommand: a flag-looking WORD inside a quoted argument is never treated as a flag — only the real, unquoted --resume is excised", () => {
+  const recorded =
+    'claude --append-system-prompt "please explain what --resume and --session-id do" --resume real-old-id';
+  const out = agentFreshCommand(recorded, null, "new-id");
+  assert.equal(
+    out.command,
+    'claude --append-system-prompt "please explain what --resume and --session-id do" --session-id new-id'
+  );
+});
+
 // ---------- solo channel-identity MCP flags (#439) ----------
 // A restored solo agent pane's recorded command can carry the flags
 // `soloPrepare` appended at launch — they point at a `configs/solo-N.json`
