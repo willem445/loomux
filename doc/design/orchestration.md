@@ -4303,6 +4303,22 @@ is the impure half.
   could win the race to an actually-clear pane ahead of entries already waiting, inverting
   "here's context" / "now go" — the one failure mode this design treats as a correctness bug, not
   a style point.
+- **Pre-paste recheck (rev-35 review, B1 — the front door alone is not enough).** The front door
+  only protects a delivery that ARRIVES after a queue already exists; it says nothing about one
+  already IN FLIGHT — holding the per-pty delivery mutex through its own pre-paste hold — when the
+  queue forms underneath it. Live shape rev-35 traced: D1 arrives to an empty queue and holds
+  (question on screen); D2 arrives 30s later, the queue is STILL empty (D1 hasn't timed out yet),
+  so D2 ALSO takes the direct path and blocks on the same mutex; D1 times out and enqueues; D2
+  acquires the mutex, runs its OWN fresh hold, and — pre-fix — pasted the instant its hold cleared,
+  with no idea D1 was now sitting in the queue behind it. `deliver_now` now re-checks
+  `queue::queue_is_non_empty` a SECOND time, immediately before the paste (after the pre-paste
+  holds resolve, before the echo loop) — the SAME function the front door calls, so the two
+  checkpoints can never drift to different definitions of "busy." If a delivery timed out and
+  enqueued while THIS delivery was blocked on the mutex or mid-hold, the recheck catches it and
+  defers (`AbortedPrePaste(BehindQueue)`) instead of pasting. `DeliverOutcome` is the join point:
+  `deliver_now` returns the abort reason but never touches the queue itself — only the CALLER
+  decides whether to enqueue, so a drain replay (which passes `recheck_queues: None`) never defers
+  to itself.
 - **Single-consumer drain.** Only `run_queue_drainer` ever pops the FRONT of a pane's queue; the
   front door only ever pushes to the BACK. The drainer peeks the front entry, attempts delivery,
   and pops only AFTER that attempt resolves — so the queue stays non-empty for the pane's WHOLE
@@ -4338,9 +4354,28 @@ is the impure half.
   must all deliver — only a literal repeat is provably redundant), so it collapses exact repeats
   and leaves everything else to the sender. Each drain's first delivered `Text` entry carries a
   flush header (`queue::flush_header_text`) reporting how many were queued and how many collapsed.
-- **Ordering.** Strict FIFO by enqueue time — the front door plus the single-consumer drain are
-  jointly what make this real; the pane's per-pty `Mutex<()>` alone (the pre-#445 posture) gives no
-  such guarantee, since `std::sync::Mutex` is not fair.
+- **Ordering — stated to match what's actually proven, not asserted.** FIFO by enqueue time WITHIN
+  the queue itself is unconditional (`VecDeque::push_back`/`pop_front`, proven by the front-door
+  and single-consumer-drain tests). The stronger claim — that arrival order across the WHOLE pane,
+  including deliveries still in flight on the mutex, is preserved — holds for exactly **two**
+  simultaneously contending deliveries (rev-35's own reported scenario, generalized: with only two
+  contenders there is at most one waiter for the delivery mutex at any moment, so mutex-acquisition
+  order and arrival order coincide by construction, and the pre-paste recheck above closes the only
+  remaining gap). It is mutation-verified exhaustively over every reachable interleaving of
+  arrival/hold/release for two deliveries (`queue.rs`'s `b1_ordering_property` module).
+  **It is NOT proven, and is not true, for three or more simultaneously contending deliveries** —
+  `std::sync::Mutex` grants to waiters in an unspecified order, so if a third delivery arrives while
+  two others are already waiting on the mutex with the queue still empty, the ORDER in which those
+  two eventually get their turn (and therefore which of them enqueues first) is not guaranteed to
+  match arrival order, independent of anything the recheck does. `queue.rs`'s exhaustive search
+  finds this residual at three contenders even with the fix fully applied, and pins it as a known,
+  documented gap (`three_way_contention_can_still_invert_arrival_order_known_residual`) rather than
+  claiming a property that isn't achievable by a localized fix — closing it for real would mean
+  replacing raw mutex contention with a genuine FIFO ticket for ACQUIRING the delivery mutex itself,
+  a materially larger change filed as a follow-up rather than built here. In practice this residual
+  requires three-plus deliveries to a SINGLE pane to all arrive within the same seconds-scale
+  pre-paste-hold window — narrower than the two-delivery shape the live incident actually showed,
+  but real, and stated here rather than left for the next reader to discover the hard way.
 
 **Notice vocabulary — part of the fix.** The old text ("held: pane has human input — re-send when
 clear") is deleted along with `paste_held_notice`/`question_held_notice`/`held_delivery_notice`/
@@ -4412,13 +4447,16 @@ note names for the same reason: `deliver_prompt`'s thread body requires a live T
 and a real pty (`tauri::test`'s `MockRuntime` isn't the concrete `Wry` runtime this code needs),
 and CLAUDE.md constraint 3 forbids spawning a real agent CLI to get one. So `run_queue_drainer` and
 `deliver_now`'s full pipeline are NOT exercised by the test suite — what IS covered, and to what
-depth: `queue.rs`'s pure policy (admit/cap/coalesce/notice text/orphan-scan) unit-tested in
-isolation; the registry-level bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
+depth: `queue.rs`'s pure policy (admit/cap/coalesce/notice text/orphan-scan/`queue_is_non_empty`)
+unit-tested in isolation, including an exhaustive-interleaving model of the B1 recheck fix (proven
+mutation-verified for two contenders, and a DOCUMENTED, asserted-not-hidden gap at three — see
+"Ordering", above); the registry-level bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
 `pop_front_dequeued`, `drop_queue`, `queue_orphans`, the front-door check reaching `deliver_prompt`
 with no app handle at all) integration-tested end to end against a real `OrchRegistry` and a real
 `audit.jsonl`; the notice-suppression discipline (`notify_queue`) tested directly. The drainer's
-LIVE wiring — a real pane actually flushing on unblock — is a hand-validation item, the same bar
-#451's own non-firing tier was caught by:
+LIVE wiring — a real pane actually flushing on unblock, and the pre-paste recheck actually firing
+inside a real `deliver_now` call — is a hand-validation item, the same bar #451's own non-firing
+tier was caught by:
 
 1. Block a worker pane with an `AskUserQuestion`; send 3 prompts (one a byte-identical duplicate)
    → held badge, then `delivery-queued` x2 + `delivery-coalesced` x1; answer after several minutes
@@ -4432,10 +4470,18 @@ LIVE wiring — a real pane actually flushing on unblock — is a hand-validatio
    per entry.
 6. Restart loomux with a non-empty queue → v1 loses it; verify `queue_orphans` on the surviving
    `audit.jsonl` reports exactly the queued-without-terminal entries.
+7. **rev-35 B1's own scenario, live:** block a worker pane; send a prompt (D1, holds); ~30s later,
+   BEFORE D1's hold times out, send a second prompt (D2) — verify D2 also holds (not an instant
+   paste) rather than racing D1. Answer the question only after D1's hold has timed out and
+   enqueued. Verify D1 delivers before D2 (`delivery-dequeued` for D1's id precedes D2's), never the
+   inverted order the review reported.
 
 **Follow-ups filed at PR time, not built here:** wiring `queue_orphans` into the orchestrator's
-session-start re-sync (the persistence-gap closer, above); on-disk queue durability; a PR-C
-queued-count pane badge on the existing `orch-delivery-held` event seam.
+session-start re-sync (the persistence-gap closer, above, #467); on-disk queue durability (#468); a
+PR-C queued-count pane badge on the existing `orch-delivery-held` event seam; a genuine FIFO ticket
+for ACQUIRING the delivery mutex itself, closing the three-plus-simultaneous-contenders ordering
+residual named under "Ordering" above (#470, discovered while building this PR's exhaustive-interleaving
+test, reported rather than silently narrowed out of the property's scope).
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 

@@ -18,12 +18,18 @@
 //! instant the pane becomes deliverable again — no timeout, no sender
 //! action required.
 //!
-//! Everything in this module is a plain function over plain data: no lock,
-//! no registry, no `gh`. See `notify.rs`'s module doc for why this codebase
-//! splits every backend feature this way (pure policy here, impure wiring
-//! in `mod.rs`) and `doc/design/orchestration.md`'s "Delivery queue (#445)"
-//! section for the full design rationale, including the honestly-argued
-//! limits of the in-memory choice.
+//! Everything in this module is a plain function over plain data — no
+//! registry, no `gh` — with ONE deliberate exception: `queue_is_non_empty`
+//! takes the live queue-map lock directly, because it is the single
+//! decision BOTH the front door and `deliver_now`'s pre-paste recheck must
+//! consult (rev-35 review, B1) — splitting it into "pure decision" plus
+//! "impure caller" would let the two checkpoints drift to different
+//! definitions of "this pane is already spoken for," which is exactly the
+//! class of bug it exists to prevent. See `notify.rs`'s module doc for why
+//! this codebase otherwise splits every backend feature this way (pure
+//! policy here, impure wiring in `mod.rs`) and `doc/design/orchestration.md`'s
+//! "Delivery queue (#445)" section for the full design rationale, including
+//! the honestly-argued limits of the in-memory choice.
 //!
 //! **Scope, stated plainly (the persistence limitation):** this queue is
 //! in-memory only. A loomux restart during a blocked window loses whatever
@@ -37,7 +43,9 @@
 //! RECOVERABLE. Do not claim otherwise; a follow-up issue wires this
 //! function into something the orchestrator actually reads.
 
-use std::collections::VecDeque;
+use crate::obs::LockExt;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// A pane blocked for hours accumulates reports/kickoffs from at most a
@@ -185,6 +193,30 @@ pub fn admit(queue: &VecDeque<QueuedDelivery>, text: &str) -> AdmitDecision {
     AdmitDecision::Admit
 }
 
+/// Whether `pty_id`'s queue is non-empty right now — the ONE check both the
+/// front door (`deliver_prompt`, at a fresh delivery's arrival) and
+/// `deliver_now`'s pre-paste recheck (rev-35 review, B1) consult, so the two
+/// checkpoints can never silently drift to different definitions of "this
+/// pane is already spoken for."
+///
+/// **Why a SECOND check is required at all.** The front door alone only
+/// protects deliveries that ARRIVE after a queue already exists — it says
+/// nothing about a delivery already in flight (holding the pane's per-pty
+/// delivery mutex through its own pre-paste hold, `lock` in `deliver_now`)
+/// when the queue FORMS underneath it: an earlier-arriving delivery can
+/// time out its own hold, enqueue, and spawn a drainer while a
+/// later-arriving one is still blocked on the mutex or mid-hold, having
+/// already passed the front door back when the queue was still empty. Live
+/// evidence of exactly this shape is what the #445 review (rev-35) reported
+/// against the shipped PR: "now go" landing before "here's the context"
+/// because the second delivery never re-checked. Calling this again
+/// immediately before the paste closes that window; the residual gap
+/// between this call and the actual `write_bytes` is a few function calls,
+/// not a 60-120s hold.
+pub fn queue_is_non_empty(queues: &Mutex<HashMap<u32, VecDeque<QueuedDelivery>>>, pty_id: u32) -> bool {
+    queues.lock_safe().get(&pty_id).is_some_and(|q| !q.is_empty())
+}
+
 /// The synchronous, truthful error `deliver_prompt` returns when a pane's
 /// queue is already at cap — the common overflow case (the front-door check
 /// catches deliveries 2..N before this is ever consulted), and the one
@@ -197,16 +229,20 @@ pub fn queue_full_error(agent_id: &str, depth: usize, blocked_reason: &str) -> S
 }
 
 /// The `[loomux]` notice sent to the orchestrator the FIRST time a delivery
-/// enters the queue via a hold-cap expiry (never for `BehindQueue` — that is
-/// the normal, expected case once a queue exists, and needs no notice of
-/// its own). Replaces the old "held: ... re-send when clear" wording — the
-/// #445 honesty fix: the payload is safe and WILL deliver on its own: a
-/// re-send now would just create a duplicate once the drain lands.
+/// enters the queue via a hold-cap expiry OR the rev-35 B1 pre-paste recheck
+/// (`BehindQueue` reaching here means the queue filled DURING this
+/// delivery's own hold — see `queue_is_non_empty`'s doc — which is
+/// notice-worthy exactly like the other two reasons; only the SILENT
+/// front-door append, at plain arrival with no hold at all, sends no notice
+/// of its own — that path never calls this function). Replaces the old
+/// "held: ... re-send when clear" wording — the #445 honesty fix: the
+/// payload is safe and WILL deliver on its own: a re-send now would just
+/// create a duplicate once the drain lands.
 pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
     let why = match reason {
         EnqueueReason::BoxOccupied => "pane has human input",
         EnqueueReason::Question => "an interactive question is on screen",
-        EnqueueReason::BehindQueue => "queue not empty", // never actually sent — see doc above
+        EnqueueReason::BehindQueue => "another delivery to this pane was already queued",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
@@ -413,6 +449,22 @@ mod tests {
         assert_eq!(admit(&q, "distinct-0"), AdmitDecision::Coalesce);
     }
 
+    // ---------- queue_is_non_empty (rev-35 B1) ----------
+
+    #[test]
+    fn queue_is_non_empty_reads_true_only_while_something_is_actually_queued() {
+        let queues: Mutex<HashMap<u32, VecDeque<QueuedDelivery>>> = Mutex::new(HashMap::new());
+        assert!(!queue_is_non_empty(&queues, 42), "no map entry at all — must read empty");
+        queues.lock_safe().insert(42, VecDeque::new());
+        assert!(!queue_is_non_empty(&queues, 42), "an empty VecDeque — must still read empty");
+        queues.lock_safe().get_mut(&42).unwrap().push_back(text_entry(1, "hi"));
+        assert!(queue_is_non_empty(&queues, 42));
+        // A DIFFERENT pty's queue must never leak into this one's answer.
+        assert!(!queue_is_non_empty(&queues, 43), "an unrelated pty must read empty");
+        queues.lock_safe().get_mut(&42).unwrap().pop_front();
+        assert!(!queue_is_non_empty(&queues, 42), "draining back to empty must flip the answer back");
+    }
+
     // ---------- notice text ----------
 
     #[test]
@@ -542,5 +594,302 @@ mod tests {
     #[test]
     fn orphan_scan_is_empty_for_no_audit_history() {
         assert!(orphaned_queue_entries(&[]).is_empty());
+    }
+}
+
+/// #445 rev-35 B1 — the ordering PROPERTY, exhaustively, not one scenario.
+///
+/// The review's finding: `deliver_now` never re-checked the queue after its
+/// own hold, so a delivery already in flight (holding the pane's delivery
+/// mutex through a pre-paste hold) when another delivery timed out and
+/// queued could still paste directly once ITS OWN hold cleared — "now go"
+/// landing before "here's the context." The fix is the pre-paste recheck in
+/// `deliver_now` (mod.rs): immediately before pasting, re-consult
+/// `queue_is_non_empty` and defer to the queue if it now says yes.
+///
+/// `deliver_now`'s live pipeline cannot run in this test suite (no real
+/// pty/`AppHandle` — see the module doc's "Scope" section and every other
+/// `deliver_now`-adjacent doc comment for the same boundary), so this
+/// cannot execute real threads racing a real mutex. What it CAN do, and
+/// what a single hand-picked scenario test cannot: model the algorithm's
+/// actual decision rule (front door defers iff the queue is non-empty at
+/// arrival; the in-flight recheck defers iff the queue is non-empty
+/// immediately before paste) and exhaustively search every reachable
+/// interleaving of {a fresh delivery arriving, the current mutex holder's
+/// hold resolving — by timing out OR by clearing, both explored — and
+/// rechecking, the drainer popping the queue's front}, checking rev-35's
+/// own wording for the property on every terminal state: **a delivery that
+/// arrived later never lands before an earlier [arrived] delivery.**
+///
+/// **Scope: exactly 2 contending deliveries, not 3+ — argued, not assumed.**
+/// With exactly two deliveries to one pane, the per-pty delivery mutex has
+/// AT MOST one waiter at any moment: whichever arrives second is
+/// unambiguously "next" once the first releases the mutex, so arrival order
+/// and mutex-acquisition order coincide by construction — this is precisely
+/// rev-35's own 2-delivery scenario, generalized over every interleaving of
+/// arrival/hold/release for those two. With THREE OR MORE simultaneously
+/// contending, `std::sync::Mutex` grants to waiters in an unspecified
+/// order — if X and Y both arrive while a third delivery holds the mutex
+/// and the queue is still empty, whichever of X/Y the scheduler happens to
+/// grant the mutex to next runs its own hold-and-decide cycle first,
+/// independent of which of them arrived first. That is a DIFFERENT defect
+/// (mutex-acquisition fairness among simultaneous waiters, not a missing
+/// queue recheck) that a localized "recheck before paste" cannot fix — see
+/// `three_way_contention_can_still_invert_arrival_order_known_residual`,
+/// below, which documents it rather than silently dropping it. Restricting
+/// THIS property's exhaustive search to 2 is what keeps it non-vacuous: an
+/// earlier draft ran it at 3 and found violations in the FIXED run too —
+/// not because the fix was wrong, but because the property as phrased
+/// (raw arrival order, no scoping) is provably unachievable by any
+/// localized fix once 3+ contenders are possible.
+///
+/// **Deliberately MORE adversarial than the real system, not less** (within
+/// its 2-delivery scope). In production the drainer's own paste attempt
+/// shares the SAME per-pty delivery mutex as a direct delivery
+/// (`deliver_now`'s `lock` parameter), so a drain pop is actually
+/// serialized behind whatever currently holds it. This model does NOT
+/// impose that extra constraint — a `Drain` event is available any time the
+/// queue is non-empty, mutex state notwithstanding. That only WIDENS the
+/// set of interleavings explored beyond what the real mutex would ever
+/// allow; the real system's reachable states are a subset of this model's.
+/// A property proven here therefore holds a fortiori in production — this
+/// is an over-approximation of danger, not an under-approximation of it.
+///
+/// **Mutation-verified** (rev-35's ask): `defer_check_upheld_for_two_
+/// contenders` runs the search with the actual fix's decision rule and must
+/// find zero violations; `defer_check_disabled_finds_a_real_inversion` runs
+/// the IDENTICAL search with the recheck neutralized (always "paste, never
+/// defer" — base-branch behavior) and must find at least one. If the
+/// second test ever started passing (zero violations even with the recheck
+/// disabled), the first test would be proven vacuous — passing regardless
+/// of whether the fix does anything — so it is exactly as load-bearing as
+/// the property test itself.
+#[cfg(test)]
+mod b1_ordering_property {
+    use std::collections::HashMap;
+
+    #[derive(Clone)]
+    struct SimState {
+        queue: std::collections::VecDeque<char>,
+        mutex_holder: Option<char>,
+        waiting: Vec<char>,
+        not_yet_arrived: Vec<char>,
+        arrived_at: HashMap<char, usize>,
+        delivered: Vec<char>,
+        step: usize,
+    }
+
+    /// One violation of the ordering property, formatted for a failing
+    /// assertion to print directly — no need to re-run anything by hand to
+    /// see which interleaving broke it. Pure arrival-vs-arrival comparison
+    /// — see the module doc's "Scope" section for why this is valid (only)
+    /// for exactly 2 contenders, and never both queued-vs-arrival (an
+    /// earlier draft tried anchoring on `x`'s own queued-timestamp instead
+    /// of its arrival — it never fired at all, in either the fixed OR the
+    /// disabled run, because in the exact reported scenario the "victim"
+    /// always arrives BEFORE the "blocker" finishes timing out and
+    /// enqueuing; anchoring on the blocker's queued moment made the check
+    /// vacuous in both directions).
+    fn check_terminal_state(state: &SimState, violations: &mut Vec<String>) {
+        for (&x, &arrived_at_x) in &state.arrived_at {
+            for (&y, &arrived_at_y) in &state.arrived_at {
+                if x == y || arrived_at_y <= arrived_at_x {
+                    continue;
+                }
+                let px = state.delivered.iter().position(|&c| c == x);
+                let py = state.delivered.iter().position(|&c| c == y);
+                match (px, py) {
+                    (Some(px), Some(py)) if px > py => {
+                        violations.push(format!(
+                            "{x} arrived (step {arrived_at_x}) before {y} (step {arrived_at_y}), \
+                             but {y} was delivered before {x} — final order {:?}",
+                            state.delivered
+                        ));
+                    }
+                    (None, _) | (_, None) => violations.push(format!(
+                        "{x} or {y} never delivered — simulation bug, not a real finding: {state:?}"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl std::fmt::Debug for SimState {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SimState")
+                .field("queue", &self.queue)
+                .field("mutex_holder", &self.mutex_holder)
+                .field("delivered", &self.delivered)
+                .finish()
+        }
+    }
+
+    /// After a mutex holder resolves (either way — see the two branches in
+    /// `explore` below), the delivery mutex is free: pick every possible
+    /// next holder from `waiting` (`std::sync::Mutex` gives no fairness
+    /// guarantee, so ALL of them are explored, not just arrival order) and
+    /// recurse from each resulting state.
+    fn release_mutex_and_continue(s: SimState, defer_check: fn(bool) -> bool, violations: &mut Vec<String>) {
+        if s.waiting.is_empty() {
+            explore(s, defer_check, violations);
+        } else {
+            for i in 0..s.waiting.len() {
+                let mut s2 = s.clone();
+                let next = s2.waiting.remove(i);
+                s2.mutex_holder = Some(next);
+                explore(s2, defer_check, violations);
+            }
+        }
+    }
+
+    /// Exhaustively explore every event enabled from `state`, recursing on
+    /// each. `defer_check(queue_non_empty_at_recheck)` is the ONE thing that
+    /// varies between the fixed and unfixed runs — everything else (the
+    /// front door's own rule, the queue, the mutex) is identical.
+    fn explore(state: SimState, defer_check: fn(bool) -> bool, violations: &mut Vec<String>) {
+        let mut any_event = false;
+
+        // Event: a not-yet-arrived delivery arrives.
+        for i in 0..state.not_yet_arrived.len() {
+            any_event = true;
+            let mut s = state.clone();
+            let id = s.not_yet_arrived.remove(i);
+            s.step += 1;
+            s.arrived_at.insert(id, s.step);
+            if !s.queue.is_empty() {
+                // Front door: queue already non-empty — enqueue behind it.
+                s.queue.push_back(id);
+            } else if s.mutex_holder.is_none() {
+                s.mutex_holder = Some(id);
+            } else {
+                s.waiting.push(id);
+            }
+            explore(s, defer_check, violations);
+        }
+
+        // Events: the current mutex holder's hold resolves — TWO distinct,
+        // mutually exclusive ways, both real and both explored:
+        //
+        // - `HoldTimesOut`: the pre-paste hold's OWN cap (60-120s, seam 1/2
+        //   — pre-existing, unrelated to B1) expires with nothing having
+        //   cleared it. This UNCONDITIONALLY enqueues, in both the fixed
+        //   and the "disabled" runs — it is what SEEDS the queue at all,
+        //   and B1's recheck is not even reached on this path in the real
+        //   code (the seam-1/2 abort returns before ever getting there).
+        // - `HoldClears`: the pane becomes deliverable (question answered /
+        //   box emptied) before the cap. THIS is where the pre-paste
+        //   recheck (rev-35 B1) runs — `defer_check` is the ONE thing that
+        //   varies between the fixed and disabled runs.
+        //
+        // Collapsing these into one `defer_check`-gated event (an earlier
+        // draft of this model did exactly that) is wrong: it makes NOTHING
+        // able to seed the queue in the "disabled" run (nothing to compare
+        // a later arrival against), so the mutation test would vacuously
+        // find no violation regardless of whether the recheck exists.
+        if let Some(holder) = state.mutex_holder {
+            any_event = true;
+
+            let mut timed_out = state.clone();
+            timed_out.step += 1;
+            timed_out.mutex_holder = None;
+            timed_out.queue.push_back(holder);
+            release_mutex_and_continue(timed_out, defer_check, violations);
+
+            let mut cleared = state.clone();
+            cleared.step += 1;
+            cleared.mutex_holder = None;
+            if defer_check(!cleared.queue.is_empty()) {
+                cleared.queue.push_back(holder);
+            } else {
+                cleared.delivered.push(holder);
+            }
+            release_mutex_and_continue(cleared, defer_check, violations);
+        }
+
+        // Event: the drainer pops the queue's front (see the module doc
+        // above for why this is intentionally NOT gated on `mutex_holder`).
+        if !state.queue.is_empty() {
+            any_event = true;
+            let mut s = state.clone();
+            s.step += 1;
+            let id = s.queue.pop_front().expect("just checked non-empty");
+            s.delivered.push(id);
+            explore(s, defer_check, violations);
+        }
+
+        if !any_event {
+            check_terminal_state(&state, violations);
+        }
+    }
+
+    fn run_exhaustive_search(ids: &[char], defer_check: fn(bool) -> bool) -> Vec<String> {
+        let mut violations = Vec::new();
+        let initial = SimState {
+            queue: std::collections::VecDeque::new(),
+            mutex_holder: None,
+            waiting: Vec::new(),
+            not_yet_arrived: ids.to_vec(),
+            arrived_at: HashMap::new(),
+            delivered: Vec::new(),
+            step: 0,
+        };
+        explore(initial, defer_check, &mut violations);
+        violations
+    }
+
+    #[test]
+    fn defer_check_upheld_for_two_contenders_no_inversion_across_any_reachable_interleaving() {
+        let violations = run_exhaustive_search(&['A', 'B'], |queue_non_empty_at_recheck| queue_non_empty_at_recheck);
+        assert!(
+            violations.is_empty(),
+            "the FIXED algorithm produced {} ordering violation(s) across the exhaustive 2-contender search:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn defer_check_disabled_finds_a_real_inversion_for_two_contenders() {
+        // Mutation (rev-35's ask): neutralize the recheck (base-branch
+        // behavior — always paste, never defer). The IDENTICAL exhaustive
+        // 2-contender search must find at least one violation, or the test
+        // above is vacuous — passing whether or not the fix does anything.
+        let violations = run_exhaustive_search(&['A', 'B'], |_queue_non_empty_at_recheck| false);
+        assert!(
+            !violations.is_empty(),
+            "disabling the recheck must reproduce a real inversion somewhere in the 2-contender search \
+             space — if it doesn't, `defer_check_upheld_for_two_contenders_...` isn't actually testing \
+             anything"
+        );
+    }
+
+    #[test]
+    fn three_way_contention_can_still_invert_arrival_order_known_residual() {
+        // NOT a regression to fix in this PR — a DISCOVERED, DOCUMENTED
+        // residual, reported rather than silently dropped (per the module
+        // doc's "Scope" section). With 3 simultaneous contenders, this
+        // exhaustive search finds an inversion even with the B1 recheck
+        // fully applied — not because the recheck is wrong (each individual
+        // delivery, once it holds the mutex, correctly defers to whatever
+        // is already queued), but because `std::sync::Mutex` can grant the
+        // freed mutex to EITHER of two simultaneous waiters regardless of
+        // which arrived first, and that choice alone can put the
+        // later-arriving one through its own hold-and-decide cycle first.
+        // Fixing this would mean replacing raw mutex contention with a real
+        // FIFO ticket for ACQUIRING the delivery mutex itself — a
+        // materially bigger change than "re-check the queue at the paste
+        // point," and specifically NOT what was asked for as a localized
+        // fix. This test exists so the gap stays visible (asserted, not
+        // merely mentioned in a comment that can rot) rather than silently
+        // reappearing as a surprise later.
+        let violations =
+            run_exhaustive_search(&['A', 'B', 'C'], |queue_non_empty_at_recheck| queue_non_empty_at_recheck);
+        assert!(
+            !violations.is_empty(),
+            "if this ever starts passing, the 3-way mutex-fairness gap has been closed somehow — \
+             replace this test with a proper property assertion at N=3 and say how it happened, \
+             rather than deleting the coverage"
+        );
     }
 }

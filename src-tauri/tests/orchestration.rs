@@ -1049,9 +1049,13 @@ fn queued_notice_replaces_the_deleted_re_send_wording() {
 #[test]
 fn orchestrator_template_no_longer_instructs_a_re_send_on_a_held_delivery() {
     // #445 plan step 5: delete every "re-send when clear" instruction from
-    // the live template (the frozen tests/fixtures/pre222/orchestrator.md
-    // snapshot is a DELIBERATE historical fixture for the workflow-upgrade
-    // tests and must stay untouched — this pins the LIVE template only).
+    // the live template. This pins ORCHESTRATOR_TPL directly (not the
+    // tests/fixtures/pre222/orchestrator.md golden copy) — that fixture DOES
+    // get updated in this same PR, correctly: it tracks the live
+    // default-group text by design and is re-blessed whenever that text
+    // deliberately changes (`a_workflow_placeholder_must_sit_at_the_end_of_
+    // a_line_it_shares` in tests/workflow.rs enforces the re-bless; see
+    // tests/fixtures/pre222/README.md's changelog for this PR's entry).
     assert!(
         !ORCHESTRATOR_TPL.to_lowercase().contains("re-send when clear"),
         "the live orchestrator template must not instruct re-sending a queued delivery"
