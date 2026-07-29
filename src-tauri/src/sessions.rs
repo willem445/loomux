@@ -8,7 +8,7 @@
 //! sources can be added by implementing another `scan_*` function and
 //! extending `list_sessions`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
@@ -271,6 +271,145 @@ fn norm_path(s: &str) -> String {
     s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
+// ---------- copilot autopilot launch posture (#456) ----------
+//
+// A solo copilot pane launched via loomux's launcher carries its Autopilot
+// toggle state as `--autopilot --allow-all-tools --allow-all-paths` on the
+// spawned command line (`single_pane_autopilot_flags`) — but a session
+// resumed from the Sessions tab is rebuilt from scratch as a bare
+// `copilot --resume <id>` (`scan_copilot` below), reading only copilot's OWN
+// `~/.copilot/session-state` files, which know nothing about how loomux
+// originally launched it. Restoring an autopilot session that way silently
+// drops it into plain interactive mode (#456). This is loomux's own record
+// of what the toggle was set to, captured at the one moment that
+// information exists — launch time — so `scan_copilot` can re-derive the
+// posture instead of guessing.
+//
+// Keyed by cwd, not by copilot's session id: unlike Claude, copilot never
+// hands loomux a session id at launch (it mints its own, invisibly, and
+// `spawn_copilot_session_watcher` in orchestration/mod.rs learns it after
+// the fact only for GROUP agents) — a solo pane has no id to key on until
+// long after this record needs to exist. Precise per-session keying is
+// tracked as a follow-up (#457, restore-path unification) rather than
+// reimplementing that watcher machinery here.
+//
+// THE RULE THIS MODULE ENFORCES: on a permission decision, ambiguity
+// resolves to the smaller grant, never the larger one. Because the key is
+// only a cwd, TWO copilot sessions launched in the same folder at different
+// times can disagree (toggle on, then later off, or vice versa) — cwd alone
+// can't tell which record belongs to which session being restored. Ideally
+// this would resolve by matching each record against the resumed session's
+// own start time, but copilot's `workspace.yaml` documents no reliable
+// creation timestamp we can act on (undocumented internal format — see the
+// module doc's docs-not-inference rule) and the file's OS birth time is not
+// a safe proxy (copilot may rewrite it turn-to-turn, resetting it). So: a
+// cwd with only ONE posture ever recorded resolves to that posture; a cwd
+// where BOTH true and false have been recorded is permanently ambiguous and
+// resolves to `None` (no flags) — losing autopilot on restore is a shift+tab
+// away, but silently granting `--allow-all-paths` to a session the user
+// deliberately launched without it is not something they could ever notice
+// or undo.
+const COPILOT_POSTURE_CAP: usize = 300;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CopilotPostureEntry {
+    /// Normalized (`norm_path`) launch cwd.
+    cwd: String,
+    autopilot: bool,
+    recorded_ms: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct CopilotPostureStore {
+    entries: Vec<CopilotPostureEntry>,
+}
+
+thread_local! {
+    /// Test seam for `copilot_posture_path()`, same thread-scoping rationale
+    /// as `COPILOT_SESSION_STATE_ROOT_OVERRIDE` above — a real env-var
+    /// override would race a concurrently-running test on another thread.
+    static COPILOT_POSTURE_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only seam: fixture the file `copilot_posture_path()` returns, for the
+/// calling thread only. See `set_claude_projects_root_for_test` for why.
+#[doc(hidden)] // pub for integration tests
+pub fn set_copilot_posture_path_for_test(path: Option<PathBuf>) {
+    COPILOT_POSTURE_PATH_OVERRIDE.with(|c| *c.borrow_mut() = path);
+}
+
+fn copilot_posture_path() -> PathBuf {
+    if let Some(p) = COPILOT_POSTURE_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
+        return p;
+    }
+    crate::obs::data_root().join("copilot-posture.json")
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Best-effort load: a missing file is "no history yet" (empty store); a
+/// corrupt one is quarantined (via `uistate::load_or_quarantine`, the same
+/// fail-safe `tabs.json`/`settings.json` use) and treated as empty too — a
+/// lost posture history degrades to the safe "no record" behavior below,
+/// never a crash or a stale grant.
+fn load_copilot_posture() -> CopilotPostureStore {
+    crate::uistate::load_or_quarantine(&copilot_posture_path())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Record what the Autopilot toggle was set to for a solo copilot launch in
+/// `cwd`, so a later Sessions-tab resume of a session from this folder can
+/// re-derive the posture (#456) instead of guessing. Called for BOTH toggle
+/// states — recording `false` matters exactly as much as recording `true`,
+/// since a later restore must be able to tell "explicitly off" from "no
+/// record" (a folder's most recent launch always wins over an older one
+/// UNLESS that creates ambiguity — see `copilot_launch_posture`). Best-effort
+/// and capped (`COPILOT_POSTURE_CAP`, oldest evicted): this is a convenience
+/// record, not a durable-correctness store, and must never block or fail a
+/// launch.
+#[tauri::command]
+pub fn record_copilot_launch_posture(cwd: String, autopilot: bool) -> Result<(), String> {
+    record_copilot_launch_posture_impl(&cwd, autopilot)
+}
+
+fn record_copilot_launch_posture_impl(cwd: &str, autopilot: bool) -> Result<(), String> {
+    let mut store = load_copilot_posture();
+    store.entries.push(CopilotPostureEntry {
+        cwd: norm_path(cwd),
+        autopilot,
+        recorded_ms: now_ms(),
+    });
+    if store.entries.len() > COPILOT_POSTURE_CAP {
+        store.entries.sort_by_key(|e| e.recorded_ms);
+        let excess = store.entries.len() - COPILOT_POSTURE_CAP;
+        store.entries.drain(0..excess);
+    }
+    let body = serde_json::to_string(&store).map_err(|e| e.to_string())?;
+    crate::uistate::write_atomic(&copilot_posture_path(), &body)
+}
+
+/// The autopilot posture to assume for a copilot session resumed from `cwd`,
+/// per the ambiguity rule documented above the module section: `Some(v)`
+/// only when every record for this cwd agrees on `v`; `None` (no flags) when
+/// there is no record at all, OR the records disagree.
+fn copilot_launch_posture(cwd: &str) -> Option<bool> {
+    let want = norm_path(cwd);
+    if want.is_empty() {
+        return None;
+    }
+    let store = load_copilot_posture();
+    let mut values = store.entries.iter().filter(|e| e.cwd == want).map(|e| e.autopilot);
+    let first = values.next()?;
+    values.all(|v| v == first).then_some(first)
+}
+
 /// Session ids currently present under `root` — the baseline snapshot taken
 /// before spawning a copilot agent, so the session it later creates can be
 /// told apart from pre-existing ones.
@@ -477,8 +616,24 @@ fn scan_copilot(out: &mut Vec<SessionInfo>) {
         let Some(s) = read_copilot_session(&entry.path()) else {
             continue;
         };
+        // #456: re-derive the autopilot posture loomux launched this cwd
+        // with (if any unambiguous record exists — see the module section
+        // above `record_copilot_launch_posture`) rather than handing back a
+        // bare `--resume`, which silently drops a session out of autopilot
+        // on restore. Reuses the SAME flags string a fresh launch builds
+        // (`single_pane_autopilot_flags`/`COPILOT_GROUP_AUTOPILOT_FLAGS`) —
+        // one seam, never a second copy that could drift.
+        let resume_command = if copilot_launch_posture(&s.cwd) == Some(true) {
+            format!(
+                "copilot --resume {} {}",
+                s.id,
+                crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS
+            )
+        } else {
+            format!("copilot --resume {}", s.id)
+        };
         out.push(SessionInfo {
-            resume_command: format!("copilot --resume {}", s.id),
+            resume_command,
             id: s.id,
             source: "copilot".to_string(),
             title: tidy_title(&s.title, 90),
@@ -817,5 +972,163 @@ mod copilot_session_tests {
         let root = d.path().join("does-not-exist");
         assert!(copilot_session_ids(&root).is_empty());
         assert_eq!(newest_new_copilot_session(&root, &HashSet::new(), "C:/x"), None);
+    }
+}
+
+#[cfg(test)]
+mod copilot_posture_tests {
+    // #456: the copilot-launch-posture record + the `scan_copilot` ambiguity
+    // rule it feeds. Each test binds `set_copilot_posture_path_for_test` to a
+    // fresh temp file so tests never share (or race on) the real
+    // `<data root>/copilot-posture.json`.
+    use super::{
+        copilot_launch_posture, record_copilot_launch_posture_impl, scan_copilot,
+        set_copilot_posture_path_for_test, set_copilot_session_state_root_for_test,
+    };
+    use std::fs;
+
+    /// Bind the posture-store test seam to a not-yet-existing file inside a
+    /// fresh tempdir, and return the guard the caller must hold to keep the
+    /// tempdir alive for the test's duration.
+    fn posture_seam() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        set_copilot_posture_path_for_test(Some(d.path().join("copilot-posture.json")));
+        d
+    }
+
+    #[test]
+    fn no_record_is_none() {
+        let _d = posture_seam();
+        assert_eq!(copilot_launch_posture("C:/work/x"), None);
+        set_copilot_posture_path_for_test(None);
+    }
+
+    #[test]
+    fn a_single_recorded_value_round_trips() {
+        let _d = posture_seam();
+        record_copilot_launch_posture_impl("C:/work/x", true).unwrap();
+        assert_eq!(copilot_launch_posture("C:/work/x"), Some(true));
+
+        record_copilot_launch_posture_impl("C:/work/y", false).unwrap();
+        assert_eq!(copilot_launch_posture("C:/work/y"), Some(false));
+        set_copilot_posture_path_for_test(None);
+    }
+
+    #[test]
+    fn lookup_is_case_and_slash_insensitive() {
+        let _d = posture_seam();
+        record_copilot_launch_posture_impl("C:/Work/Project", true).unwrap();
+        assert_eq!(copilot_launch_posture("c:\\work\\project"), Some(true));
+        set_copilot_posture_path_for_test(None);
+    }
+
+    #[test]
+    fn empty_cwd_never_matches() {
+        let _d = posture_seam();
+        record_copilot_launch_posture_impl("", true).unwrap();
+        assert_eq!(copilot_launch_posture(""), None);
+        set_copilot_posture_path_for_test(None);
+    }
+
+    /// THE rule this whole module exists to enforce: a folder launched with
+    /// autopilot on, then later off (or vice versa), must NOT resolve to
+    /// whichever came last — that would silently hand `--allow-all-paths` to
+    /// a session the human deliberately launched without it the moment an
+    /// OLDER, differently-postured session in the same folder gets restored.
+    /// Disagreement must resolve to `None` (no flags), permanently, for that
+    /// cwd — the smaller grant, never the larger one.
+    #[test]
+    fn conflicting_records_for_the_same_cwd_resolve_to_none_not_latest() {
+        let _d = posture_seam();
+        record_copilot_launch_posture_impl("C:/work/x", true).unwrap();
+        record_copilot_launch_posture_impl("C:/work/x", false).unwrap();
+        assert_eq!(
+            copilot_launch_posture("C:/work/x"),
+            None,
+            "ambiguous history must never resolve to the larger (autopilot) grant"
+        );
+
+        // Same in the other order — order must not matter, only agreement.
+        let _d2 = posture_seam();
+        record_copilot_launch_posture_impl("C:/work/y", false).unwrap();
+        record_copilot_launch_posture_impl("C:/work/y", true).unwrap();
+        assert_eq!(copilot_launch_posture("C:/work/y"), None);
+        set_copilot_posture_path_for_test(None);
+    }
+
+    #[test]
+    fn store_caps_and_evicts_oldest() {
+        let _d = posture_seam();
+        // One past the cap, each a distinct cwd so none collide/cancel out.
+        for i in 0..=super::COPILOT_POSTURE_CAP {
+            record_copilot_launch_posture_impl(&format!("C:/work/{i}"), true).unwrap();
+        }
+        let store = super::load_copilot_posture();
+        assert_eq!(store.entries.len(), super::COPILOT_POSTURE_CAP, "must stay capped, not grow unbounded");
+        // The very first recorded (cwd "C:/work/0") is the oldest — evicted.
+        assert_eq!(copilot_launch_posture("C:/work/0"), None);
+        // The most recent survives.
+        assert_eq!(copilot_launch_posture(&format!("C:/work/{}", super::COPILOT_POSTURE_CAP)), Some(true));
+        set_copilot_posture_path_for_test(None);
+    }
+
+    /// The restore-path regression pin (#456): a Sessions-tab resume of a
+    /// copilot session must carry the SAME autopilot flags a fresh launch in
+    /// that folder would, when — and only when — loomux's own record is
+    /// unambiguous. This exercises `scan_copilot` end to end, the exact
+    /// function `list_sessions` (and so the Sessions tab / app restore) call.
+    #[test]
+    fn scan_copilot_restores_autopilot_flags_only_when_unambiguous() {
+        let session_root = tempfile::tempdir().unwrap();
+        set_copilot_session_state_root_for_test(Some(session_root.path().to_path_buf()));
+        let posture_dir = posture_seam();
+
+        let write_session = |id: &str, cwd: &str| {
+            let dir = session_root.path().join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("workspace.yaml"),
+                format!("id: {id}\nname: test session\ncwd: {cwd}\n"),
+            )
+            .unwrap();
+        };
+
+        // Unambiguous ON: the resumed command must carry the same flags a
+        // fresh launch builds (`COPILOT_GROUP_AUTOPILOT_FLAGS`).
+        write_session("sess-on", "C:/work/on");
+        record_copilot_launch_posture_impl("C:/work/on", true).unwrap();
+
+        // Unambiguous OFF: bare resume, exactly today's behavior.
+        write_session("sess-off", "C:/work/off");
+        record_copilot_launch_posture_impl("C:/work/off", false).unwrap();
+
+        // No record at all: bare resume — the pre-#456 behavior, safe default.
+        write_session("sess-unknown", "C:/work/unknown");
+
+        // Ambiguous: bare resume, per the smaller-grant-wins rule, even
+        // though the MOST RECENT record here is `true`.
+        write_session("sess-ambiguous", "C:/work/ambiguous");
+        record_copilot_launch_posture_impl("C:/work/ambiguous", false).unwrap();
+        record_copilot_launch_posture_impl("C:/work/ambiguous", true).unwrap();
+
+        let mut out = Vec::new();
+        scan_copilot(&mut out);
+        let by_id = |id: &str| out.iter().find(|s| s.id == id).unwrap();
+
+        assert_eq!(
+            by_id("sess-on").resume_command,
+            format!("copilot --resume sess-on {}", crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS)
+        );
+        assert_eq!(by_id("sess-off").resume_command, "copilot --resume sess-off");
+        assert_eq!(by_id("sess-unknown").resume_command, "copilot --resume sess-unknown");
+        assert_eq!(
+            by_id("sess-ambiguous").resume_command,
+            "copilot --resume sess-ambiguous",
+            "an ambiguous history must never grant autopilot on restore, even via the latest record"
+        );
+
+        set_copilot_session_state_root_for_test(None);
+        set_copilot_posture_path_for_test(None);
+        drop(posture_dir);
     }
 }

@@ -16,6 +16,7 @@ import {
   hasForkSession,
   shouldRespawnFresh,
   findResumedPaneIndex,
+  programFromRestore,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
   type RestoreOpenStep,
@@ -818,4 +819,23 @@ test("planLayoutRestore on a single leaf yields one root-fill step", () => {
   assert.equal(steps[0].relativeTo, null);
   assert.equal(steps[0].action.type, "spawn-terminal");
   assert.deepEqual(simShape(rebuild(steps)), actionTree(leaf(1, { paneKind: "terminal", name: "solo" })));
+});
+
+// #456: programFromRestore — which CLI a restored command/argv would invoke,
+// used to gate the copilot autopilot-dialog watcher onto restore actions the
+// same way a fresh launch gets it.
+test("programFromRestore reads the first token of a string command, lowercased", () => {
+  assert.equal(programFromRestore("copilot --resume abc-123 --autopilot", null), "copilot");
+  assert.equal(programFromRestore("Claude --resume abc-123", null), "claude");
+});
+
+test("programFromRestore falls back to argv when there's no string command", () => {
+  assert.equal(programFromRestore(null, ["copilot", "--resume", "abc-123"]), "copilot");
+  assert.equal(programFromRestore("", ["copilot", "--resume", "abc-123"]), "copilot");
+});
+
+test("programFromRestore is null with neither a command nor argv", () => {
+  assert.equal(programFromRestore(null, null), null);
+  assert.equal(programFromRestore("", []), null);
+  assert.equal(programFromRestore("   ", null), null);
 });

@@ -487,6 +487,20 @@ export function adoptableSessionId(command: string | null, argv: string[] | null
   return sessionIdFromCommand(command, argv);
 }
 
+/** The CLI program a restored `command`/`argv` would invoke — the first
+ *  token, lowercased. Used (#456) to tell whether a `resume-agent`/
+ *  `fresh-agent`/`dormant-agent` restore action is a copilot pane, so the
+ *  autopilot-dialog watcher can be wired in for it the same way a fresh
+ *  launch gets it. Deliberately minimal and single-purpose — NOT the shared
+ *  CLI-derivation helper #452 asks for (argv-only panes losing their CLI
+ *  identity to a comment instead of a real lookup); that's a broader ask
+ *  spanning more than this one restore-vs-fresh gap, tracked separately so
+ *  the two don't quietly drift into reimplementing each other. */
+export function programFromRestore(command: string | null, argv: string[] | null): string | null {
+  const first = command?.trim().split(/\s+/)[0] || argv?.[0];
+  return first ? first.toLowerCase() : null;
+}
+
 /** The runtime backstop decision (#194 BUG-1): a resumed agent pane whose PTY
  *  just exited — should we respawn it FRESH in place instead of stranding a dead
  *  pane? Yes for any UNEXPECTED non-zero exit — a `--resume` against a missing/

@@ -537,3 +537,90 @@ defensively (its session-state layout is flat and id-keyed, so the "wrong projec
 directory" failure mode is Claude-specific by construction), but this is not
 empirically verified against a real `copilot --resume` the way the Claude repro
 above is.
+
+### #456 — restoring a copilot session must not guess its autopilot posture
+
+**Root cause.** `sessions.rs::scan_copilot` rebuilds every copilot session's
+resume command from scratch — `copilot --resume <id>` — reading only
+copilot's own `~/.copilot/session-state` files, which know nothing about how
+loomux originally launched the pane. A solo copilot pane launched with the
+launcher's Autopilot toggle on carries `--autopilot --allow-all-tools
+--allow-all-paths` on its ORIGINAL command line (`single_pane_autopilot_flags`,
+#364); resuming it from the Sessions tab silently dropped all three flags,
+landing the human back in plain interactive mode with no dialog and no
+indication anything had changed — they had to notice and manually cycle
+Shift+Tab into autopilot mode. This was invisible before #364 because a solo
+pane never had TRUE autopilot to lose: pre-#364 it only carried the
+permissive tool/path flags, which a bare resume also drops, but losing "every
+tool pre-approved" reads very differently from losing "the agent keeps working
+across turns" — the regression only became observable once #364 gave solo
+panes the real mode.
+
+**Why this isn't just "carry the launch command forward" the way an app-boot
+restore can.** `panerestore.ts`'s restore actions (`resume-agent`/
+`fresh-agent`/`dormant-agent`) replay loomux's OWN persisted `PersistedPane`
+record, which already has the full original command string. The Sessions-tab
+scan is a different, independent mechanism entirely: it discovers sessions by
+reading the CLI's OWN on-disk state, which can include sessions loomux never
+launched at all (a copilot session the human ran by hand, outside loomux). It
+has no persisted command to replay — `resume_command` is synthesized from
+nothing but the session id.
+
+**The fix records loomux's own launch intent, and reads it back — never
+copilot's files, which structurally cannot know.** `sessions.rs` gains a
+small capped store (`<data root>/copilot-posture.json`, default ~300
+entries, oldest evicted) of `{cwd, autopilot, recorded_ms}`, written by
+`record_copilot_launch_posture` at the one moment this information exists:
+launch time, for BOTH toggle states (recording `false` matters as much as
+`true` — a later restore must distinguish "explicitly launched without
+autopilot" from "no record at all"). `scan_copilot` looks the session's own
+recorded cwd up in this store and, only when the record is unambiguous,
+appends the SAME `COPILOT_GROUP_AUTOPILOT_FLAGS` constant a fresh launch
+uses — one seam, never a second copy of the flag string that could drift.
+
+**The rule this store enforces, and why it isn't last-write-wins: on a
+permission decision, ambiguity resolves to the smaller grant, never the
+larger one.** The store is keyed by cwd, not by copilot's own session id —
+copilot never hands loomux a session id at launch (unlike Claude, which gets
+one minted up front); it mints its own, invisibly, discoverable only after
+the fact (`spawn_copilot_session_watcher`, group agents only). Because two
+copilot sessions launched in the same folder at different times can disagree
+(toggle on, then later off, or the reverse), a naive "most recent record
+wins" resolution reintroduces exactly the escalation this fix exists to
+avoid, just one step removed: restoring an OLDER, differently-postured
+session in that folder would silently inherit whatever the folder's LATEST
+launch happened to be — including granting `--allow-all-paths` to a session
+the human deliberately launched without it, with no way for them to notice.
+The precise fix would key on the resumed session's own start time and take
+the newest posture record at-or-before it; that needs a reliable session
+start timestamp, which copilot's `workspace.yaml` does not document (the
+official reference is silent on its internal fields — see the
+`agent-cli-reference` skill — and the file's OS birth time is not a safe
+substitute, since copilot may rewrite it turn-to-turn). So instead:
+`copilot_launch_posture(cwd)` returns `Some(v)` only when every record for
+that cwd agrees on `v`; the moment a cwd has ever recorded BOTH `true` and
+`false`, it returns `None` (no flags) **permanently** for that cwd — losing
+autopilot on restore costs a Shift+Tab, which is recoverable and visible;
+silently granting a declined permission is neither. Precise per-session
+keying (matching copilot's own session id once loomux can learn it for solo
+panes, the way `spawn_copilot_session_watcher` already does for group
+agents) is left to #457, the restore-path unification issue this fix's
+architecture question prompted — not reimplemented here, to avoid
+duplicating that work's unmerged scope (#446).
+
+**The watcher gap, closed the same way for every restore path.** Independent
+of the flags themselves, NONE of the restore paths previously started the
+fail-soft dialog-answering watcher (`confirmSoloCopilotAutopilot`) a fresh
+launch gets — only `spawnAgentPanes`/`startFromWelcome` called
+`watchCopilotAutopilotIfNeeded`. A restored kickoff is trusted no
+differently than a fresh one (the same stance #364 already took for the
+group path's `Delivery::ResumeKickoff`), so the watcher is now wired into
+all four sites that can (re)open a copilot pane: the Sessions-tab restore
+(`restoreSession`'s plain-session branch) and all three `panerestore.ts`
+actions (`resume-agent`, `fresh-agent`, and `dormant-agent`'s Start click) —
+each gated on `programFromRestore` (a minimal, single-purpose "what CLI does
+this command invoke" helper; NOT the fuller shared CLI-derivation #452 asks
+for — the two are kept deliberately separate so they don't drift into
+reimplementing each other) and on the restored command actually containing
+`--autopilot`, so the watcher never spins up its up-to-10-minute poll for a
+pane that could not possibly show the dialog it exists to answer.

@@ -96,6 +96,18 @@ export interface AgentLaunchSpec {
    *  would otherwise answer it. Independent of `channelAgent`/channel tools:
    *  the dialog must be answered regardless of whether channel tools are on. */
   watchCopilotAutopilot?: boolean;
+  /** #456: present (either `true` or `false`) whenever this pane is a
+   *  non-custom copilot solo launch — the Autopilot toggle's actual state,
+   *  recorded so a LATER Sessions-tab resume of a session from this cwd can
+   *  re-derive the posture instead of guessing (`sessions.rs::scan_copilot`).
+   *  Recorded for the OFF state too, not just ON: a later restore must be
+   *  able to tell "explicitly launched without autopilot" from "no record at
+   *  all", and disagreement between an ON and OFF record for the same folder
+   *  always resolves to no flags (never the most recent one — see that
+   *  module's ambiguity rule). `undefined` for every other CLI/kind — there's
+   *  nothing to record, and `undefined` (not `false`) is how the caller tells
+   *  "not a copilot launch" apart from "copilot launch, toggle off". */
+  copilotAutopilotPosture?: boolean;
 }
 
 /** What a submitted welcome form resolves to — the caller (main.ts) spawns the
@@ -1356,6 +1368,10 @@ export class WelcomeForm {
           // dialog must be answered whenever --autopilot is actually on the
           // command line, regardless of whether channel tools are enabled.
           watchCopilotAutopilot: !plan.isCustom && plan.autopilot && program === "copilot",
+          // #456: same gate as watchCopilotAutopilot, minus requiring the
+          // toggle to be ON — recording the OFF state matters too (see the
+          // field's own doc comment).
+          copilotAutopilotPosture: !plan.isCustom && program === "copilot" ? plan.autopilot : undefined,
         });
       }
       setDefaultAgent(plan.isCustom ? "custom" : this.agentSel.value);
