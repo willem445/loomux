@@ -79,7 +79,7 @@ import {
   shouldRespawnFresh,
   findResumedPaneIndex,
   hasForkSession,
-  programFromRestore,
+  shouldWatchCopilotOnRestore,
   type RestoreAction,
   type SessionResumable,
 } from "./panerestore";
@@ -557,19 +557,12 @@ async function openActionPane(
       );
       if (pane.ptyId !== null) remint.bind(pane.ptyId);
       // #456: a restored kickoff is trusted no differently than a fresh one
-      // (#364's own precedent for the group path) — if this is a copilot
-      // pane and its FINAL command (post `remintSoloIdentity` — the MCP
-      // re-mint above only ever touches `--mcp-config`/`--additional-mcp-
-      // config`, never `--autopilot`, but check the command that actually
-      // opened the pane, not the pre-remint one) carries `--autopilot`, the
-      // same fail-soft dialog watcher a fresh launch gets must run here too,
-      // or a resumed autopilot session silently loses it with nothing to
-      // answer the dialog if one appears.
-      if (
-        programFromRestore(remint.command ?? null, remint.argv ?? null) === "copilot" &&
-        (remint.command ?? "").includes("--autopilot") &&
-        pane.ptyId !== null
-      ) {
+      // (#364's own precedent for the group path) — checked against the
+      // FINAL command (post `remintSoloIdentity` — the MCP re-mint above
+      // only ever touches `--mcp-config`/`--additional-mcp-config`, never
+      // `--autopilot`, but the command that actually opened the pane is the
+      // correct thing to check regardless).
+      if (shouldWatchCopilotOnRestore(remint.command ?? null, remint.argv ?? null) && pane.ptyId !== null) {
         void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
           /* best-effort — see confirmSoloCopilotAutopilot's own doc comment */
         });
@@ -622,13 +615,8 @@ async function openActionPane(
         anchor
       );
       if (pane.ptyId !== null) remint.bind(pane.ptyId);
-      // #456: see the identical guard in "resume-agent" above — checked
-      // against the FINAL (post-remint) command, same reasoning.
-      if (
-        programFromRestore(remint.command ?? null, remint.argv ?? null) === "copilot" &&
-        (remint.command ?? "").includes("--autopilot") &&
-        pane.ptyId !== null
-      ) {
+      // #456: see the identical guard in "resume-agent" above.
+      if (shouldWatchCopilotOnRestore(remint.command ?? null, remint.argv ?? null) && pane.ptyId !== null) {
         void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
           /* best-effort — see confirmSoloCopilotAutopilot's own doc comment */
         });
@@ -679,17 +667,9 @@ async function openActionPane(
             if (pane.ptyId !== null) remint.bind(pane.ptyId);
             // #456: today's most-reachable copilot restore path — copilot
             // never carries a tracked session id on this build, so it always
-            // restores dormant (see panerestore.ts's `decide()`). Checked
-            // against the FINAL (post-remint) command — the #439 re-mint
-            // above only ever touches MCP-config flags, never `--autopilot`,
-            // but the command that actually opened the pane is the correct
-            // thing to check regardless — same guard as
-            // "resume-agent"/"fresh-agent" above.
-            if (
-              programFromRestore(remint.command ?? null, remint.argv ?? null) === "copilot" &&
-              (remint.command ?? "").includes("--autopilot") &&
-              pane.ptyId !== null
-            ) {
+            // restores dormant (see panerestore.ts's `decide()`). Same guard
+            // as "resume-agent"/"fresh-agent" above.
+            if (shouldWatchCopilotOnRestore(remint.command ?? null, remint.argv ?? null) && pane.ptyId !== null) {
               void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
                 /* best-effort — see confirmSoloCopilotAutopilot's own doc comment */
               });

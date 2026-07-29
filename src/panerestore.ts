@@ -491,14 +491,34 @@ export function adoptableSessionId(command: string | null, argv: string[] | null
  *  token, lowercased. Used (#456) to tell whether a `resume-agent`/
  *  `fresh-agent`/`dormant-agent` restore action is a copilot pane, so the
  *  autopilot-dialog watcher can be wired in for it the same way a fresh
- *  launch gets it. Deliberately minimal and single-purpose — NOT the shared
- *  CLI-derivation helper #452 asks for (argv-only panes losing their CLI
- *  identity to a comment instead of a real lookup); that's a broader ask
- *  spanning more than this one restore-vs-fresh gap, tracked separately so
- *  the two don't quietly drift into reimplementing each other. */
+ *  launch gets it. Deliberately minimal for THIS PR's scope, not the fuller
+ *  shared CLI-derivation #452 asks for (argv-only panes losing their CLI
+ *  identity to a comment instead of a real lookup) — but that minimalism is
+ *  a scope call, not a design stance: this is a candidate call site for (or
+ *  the seed of) #452's shared helper, not a deliberately-separate derivation
+ *  meant to coexist with it. #452 has been noted that a third derivation now
+ *  exists to converge when that work happens. */
 export function programFromRestore(command: string | null, argv: string[] | null): string | null {
   const first = command?.trim().split(/\s+/)[0] || argv?.[0];
   return first ? first.toLowerCase() : null;
+}
+
+/** Whether a restored copilot pane's command/argv actually carries
+ *  `--autopilot`, and so needs the fail-soft dialog watcher a fresh launch
+ *  gets (#456 review NB1) — checked across BOTH representations
+ *  unconditionally, the same asymmetry guard `hasForkSession` above uses:
+ *  `programFromRestore` already falls back to argv when there's no string
+ *  command, so the flag check has to scan the same ground or an argv-only
+ *  copilot autopilot pane would silently skip the watcher (latent today —
+ *  solo copilot panes are always command-string — but not by design).
+ *  Single source for the three identical inline checks that used to live in
+ *  `main.ts`'s `resume-agent`/`fresh-agent`/`dormant-agent` cases. */
+export function shouldWatchCopilotOnRestore(command: string | null, argv: string[] | null): boolean {
+  if (programFromRestore(command, argv) !== "copilot") return false;
+  const hasAutopilot = (tokens: string[]): boolean => tokens.includes("--autopilot");
+  if (command && command.trim() && hasAutopilot(command.trim().split(/\s+/))) return true;
+  if (argv && argv.length && hasAutopilot(argv)) return true;
+  return false;
 }
 
 /** The runtime backstop decision (#194 BUG-1): a resumed agent pane whose PTY

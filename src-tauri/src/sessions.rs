@@ -294,29 +294,59 @@ fn norm_path(s: &str) -> String {
 // reimplementing that watcher machinery here.
 //
 // THE RULE THIS MODULE ENFORCES: on a permission decision, ambiguity
-// resolves to the smaller grant, never the larger one. Because the key is
-// only a cwd, TWO copilot sessions launched in the same folder at different
-// times can disagree (toggle on, then later off, or vice versa) — cwd alone
-// can't tell which record belongs to which session being restored. Ideally
-// this would resolve by matching each record against the resumed session's
-// own start time, but copilot's `workspace.yaml` documents no reliable
-// creation timestamp we can act on (undocumented internal format — see the
-// module doc's docs-not-inference rule) and the file's OS birth time is not
-// a safe proxy (copilot may rewrite it turn-to-turn, resetting it). So: a
-// cwd with only ONE posture ever recorded resolves to that posture; a cwd
-// where BOTH true and false have been recorded is permanently ambiguous and
-// resolves to `None` (no flags) — losing autopilot on restore is a shift+tab
-// away, but silently granting `--allow-all-paths` to a session the user
-// deliberately launched without it is not something they could ever notice
-// or undo.
+// resolves to the smaller grant, never the larger one — and that includes
+// under STORE PRESSURE (review B1) and across FILESYSTEM CASE SENSITIVITY
+// (review B2), not just in the ordinary lookup. Because the key is only a
+// cwd, TWO copilot sessions launched in the same folder at different times
+// can disagree (toggle on, then later off, or vice versa) — cwd alone can't
+// tell which record belongs to which session being restored. Ideally this
+// would resolve by matching each record against the resumed session's own
+// start time, but copilot's `workspace.yaml` documents no reliable creation
+// timestamp we can act on (undocumented internal format — see the module
+// doc's docs-not-inference rule) and the file's OS birth time is not a safe
+// proxy (copilot may rewrite it turn-to-turn, resetting it). So: a cwd with
+// only ONE posture ever recorded resolves to that posture; a cwd where BOTH
+// true and false have been recorded is CONFLICTED and resolves to `None`
+// (no flags) — losing autopilot on restore is a shift+tab away, but silently
+// granting `--allow-all-paths` to a session the user deliberately launched
+// without it is not something they could ever notice or undo.
+//
+// Conflict is derived and stored AT WRITE TIME, as one sticky enum value per
+// cwd (`CopilotPosture::Conflicted`) — never re-derived at read time from a
+// list of raw records. This is what makes the guarantee survive eviction
+// (review B1, caught with a runnable counter-test against the original flat
+// per-write log: capping-and-evicting individual records could drop the
+// OFF half of a conflict and leave a lone ON record, silently flipping a
+// permanently-ambiguous cwd back to granting autopilot). With one entry per
+// cwd, the cap counts CWDS and evicts the least-recently-TOUCHED one whole —
+// "touched" meaning written OR re-confirmed, so an actively-used folder is
+// never the eviction target — and eviction can only ever move a cwd from
+// {True | False | Conflicted} to NO RECORD, which resolves to `None` right
+// alongside every other "nothing to go on" case. There is no path from
+// eviction to a larger grant than the cwd already had.
 const COPILOT_POSTURE_CAP: usize = 300;
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum CopilotPosture {
+    True,
+    False,
+    /// Sticky: once a cwd sees both `True` and `False` writes, it stays
+    /// `Conflicted` forever (until evicted entirely) — never flips back to a
+    /// single value no matter what's written or evicted afterward.
+    Conflicted,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct CopilotPostureEntry {
-    /// Normalized (`norm_path`) launch cwd.
+    /// The store's PERMISSION key — see `posture_key`'s doc comment for why
+    /// this is deliberately NOT the same normalization `norm_path` (session-
+    /// cwd MATCHING) uses.
     cwd: String,
-    autopilot: bool,
-    recorded_ms: u64,
+    posture: CopilotPosture,
+    /// Bumped on every write to this cwd, including a repeat of the same
+    /// value — this is what "touched" means for LRU eviction, not merely
+    /// "created".
+    touched_ms: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -364,16 +394,47 @@ fn load_copilot_posture() -> CopilotPostureStore {
         .unwrap_or_default()
 }
 
+/// Normalize a cwd into the posture store's PERMISSION key (review B2).
+/// Deliberately DIFFERENT from `norm_path` above, which is right for
+/// SESSION-CWD MATCHING (a miss there just falls back to "newest session
+/// wins" — low-stakes) but wrong reused as a permission key: `norm_path`
+/// unconditionally case-folds, which is correct on Windows (the filesystem
+/// itself is case-insensitive) but WRONG on Linux/macOS, where `/foo` and
+/// `/Foo` are genuinely different directories — folding them onto one key
+/// would let a session from one inherit the other's `--allow-all-paths`
+/// grant, a cross-directory permission leak. Case-folding here happens ONLY
+/// under `windows`; everywhere else the key is exact-match, so a
+/// case-differing path simply fails to match and resolves to `None` (no
+/// flags) — fails safe on every platform, one rule, no platform branching in
+/// the CALLERS. Trailing-separator trimming is safe unconditionally (it
+/// never collapses two distinct directories onto one key).
+///
+/// `windows` is a parameter (not `cfg!(windows)` inlined) so both branches
+/// are directly unit-testable from any host, per review B2's ask for a
+/// mutation-verified pin — see `copilot_posture_tests`.
+fn posture_key_for(s: &str, windows: bool) -> String {
+    if windows {
+        s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
+    } else {
+        s.trim_end_matches('/').to_string()
+    }
+}
+
+fn posture_key(s: &str) -> String {
+    posture_key_for(s, cfg!(windows))
+}
+
 /// Record what the Autopilot toggle was set to for a solo copilot launch in
 /// `cwd`, so a later Sessions-tab resume of a session from this folder can
 /// re-derive the posture (#456) instead of guessing. Called for BOTH toggle
 /// states — recording `false` matters exactly as much as recording `true`,
 /// since a later restore must be able to tell "explicitly off" from "no
-/// record" (a folder's most recent launch always wins over an older one
-/// UNLESS that creates ambiguity — see `copilot_launch_posture`). Best-effort
-/// and capped (`COPILOT_POSTURE_CAP`, oldest evicted): this is a convenience
-/// record, not a durable-correctness store, and must never block or fail a
-/// launch.
+/// record". A cwd with only one posture ever written stays that posture; a
+/// cwd that sees both becomes (and stays) `Conflicted` — see the module
+/// section's ambiguity rule. Best-effort and capped at `COPILOT_POSTURE_CAP`
+/// CWDS (review B1: one entry per cwd, LRU-evicted whole, never a flat log
+/// of individual writes) — this is a convenience record, not a
+/// durable-correctness store, and must never block or fail a launch.
 #[tauri::command]
 pub fn record_copilot_launch_posture(cwd: String, autopilot: bool) -> Result<(), String> {
     record_copilot_launch_posture_impl(&cwd, autopilot)
@@ -381,13 +442,24 @@ pub fn record_copilot_launch_posture(cwd: String, autopilot: bool) -> Result<(),
 
 fn record_copilot_launch_posture_impl(cwd: &str, autopilot: bool) -> Result<(), String> {
     let mut store = load_copilot_posture();
-    store.entries.push(CopilotPostureEntry {
-        cwd: norm_path(cwd),
-        autopilot,
-        recorded_ms: now_ms(),
-    });
+    let key = posture_key(cwd);
+    let now = now_ms();
+    let incoming = if autopilot { CopilotPosture::True } else { CopilotPosture::False };
+    match store.entries.iter_mut().find(|e| e.cwd == key) {
+        Some(entry) => {
+            // Already conflicted stays conflicted; a fresh disagreement
+            // BECOMES conflicted; agreement just refreshes the touch time.
+            if entry.posture != incoming {
+                entry.posture = CopilotPosture::Conflicted;
+            }
+            entry.touched_ms = now;
+        }
+        None => store.entries.push(CopilotPostureEntry { cwd: key, posture: incoming, touched_ms: now }),
+    }
     if store.entries.len() > COPILOT_POSTURE_CAP {
-        store.entries.sort_by_key(|e| e.recorded_ms);
+        // Evict the least-recently-TOUCHED cwd wholesale — never a partial
+        // record of one — until back at the cap.
+        store.entries.sort_by_key(|e| e.touched_ms);
         let excess = store.entries.len() - COPILOT_POSTURE_CAP;
         store.entries.drain(0..excess);
     }
@@ -397,17 +469,28 @@ fn record_copilot_launch_posture_impl(cwd: &str, autopilot: bool) -> Result<(), 
 
 /// The autopilot posture to assume for a copilot session resumed from `cwd`,
 /// per the ambiguity rule documented above the module section: `Some(v)`
-/// only when every record for this cwd agrees on `v`; `None` (no flags) when
-/// there is no record at all, OR the records disagree.
-fn copilot_launch_posture(cwd: &str) -> Option<bool> {
-    let want = norm_path(cwd);
+/// only when this cwd's stored posture is unambiguously `v`; `None` (no
+/// flags) when there is no record at all, OR the stored posture is
+/// `Conflicted`. Takes an already-loaded store so a caller resolving many
+/// cwds in one pass (`scan_copilot`) reads the file once, not once per
+/// session (review NB3).
+fn posture_in(store: &CopilotPostureStore, cwd: &str) -> Option<bool> {
+    let want = posture_key(cwd);
     if want.is_empty() {
         return None;
     }
-    let store = load_copilot_posture();
-    let mut values = store.entries.iter().filter(|e| e.cwd == want).map(|e| e.autopilot);
-    let first = values.next()?;
-    values.all(|v| v == first).then_some(first)
+    match store.entries.iter().find(|e| e.cwd == want)?.posture {
+        CopilotPosture::True => Some(true),
+        CopilotPosture::False => Some(false),
+        CopilotPosture::Conflicted => None,
+    }
+}
+
+/// `posture_in`, loading the store fresh — for the (rare, single-lookup)
+/// caller that doesn't already have one loaded. `scan_copilot` below loads
+/// once and calls `posture_in` directly instead.
+fn copilot_launch_posture(cwd: &str) -> Option<bool> {
+    posture_in(&load_copilot_posture(), cwd)
 }
 
 /// Session ids currently present under `root` — the baseline snapshot taken
@@ -612,6 +695,10 @@ fn scan_copilot(out: &mut Vec<SessionInfo>) {
     let Ok(entries) = fs::read_dir(&root) else {
         return;
     };
+    // #456 review NB3: one load for the whole scan, not one per session —
+    // the store is read-only here, so there's nothing to keep fresh across
+    // iterations.
+    let posture_store = load_copilot_posture();
     for entry in entries.flatten() {
         let Some(s) = read_copilot_session(&entry.path()) else {
             continue;
@@ -623,7 +710,7 @@ fn scan_copilot(out: &mut Vec<SessionInfo>) {
         // on restore. Reuses the SAME flags string a fresh launch builds
         // (`single_pane_autopilot_flags`/`COPILOT_GROUP_AUTOPILOT_FLAGS`) —
         // one seam, never a second copy that could drift.
-        let resume_command = if copilot_launch_posture(&s.cwd) == Some(true) {
+        let resume_command = if posture_in(&posture_store, &s.cwd) == Some(true) {
             format!(
                 "copilot --resume {} {}",
                 s.id,
@@ -982,7 +1069,7 @@ mod copilot_posture_tests {
     // fresh temp file so tests never share (or race on) the real
     // `<data root>/copilot-posture.json`.
     use super::{
-        copilot_launch_posture, record_copilot_launch_posture_impl, scan_copilot,
+        copilot_launch_posture, posture_key_for, record_copilot_launch_posture_impl, scan_copilot,
         set_copilot_posture_path_for_test, set_copilot_session_state_root_for_test,
     };
     use std::fs;
@@ -1015,11 +1102,49 @@ mod copilot_posture_tests {
     }
 
     #[test]
-    fn lookup_is_case_and_slash_insensitive() {
+    fn lookup_is_case_and_slash_insensitive_on_windows_only() {
+        // The real posture_key follows the actual build target (cfg!(windows)),
+        // so this end-to-end test's expectation must too — it's genuinely
+        // different behavior on Windows vs. everywhere else (review B2), not a
+        // bug on either side.
         let _d = posture_seam();
         record_copilot_launch_posture_impl("C:/Work/Project", true).unwrap();
-        assert_eq!(copilot_launch_posture("c:\\work\\project"), Some(true));
+        let looked_up = copilot_launch_posture("c:\\work\\project");
+        if cfg!(windows) {
+            assert_eq!(looked_up, Some(true), "Windows: case/slash-insensitive path equality is correct");
+        } else {
+            assert_eq!(looked_up, None, "non-Windows: a case-differing path must NOT match (review B2)");
+        }
         set_copilot_posture_path_for_test(None);
+    }
+
+    /// THE B2 property (review): a posture record only ever applies to the
+    /// EXACT directory it was recorded for — never to a merely
+    /// similarly-spelled one. Case is the concrete way this broke (review
+    /// B2): folding case in the permission key would let `/Proj` and `/proj`
+    /// — genuinely DIFFERENT directories on a case-sensitive filesystem —
+    /// collide onto one key, so a session from one could inherit the
+    /// other's `--allow-all-paths` grant. Exercised directly against BOTH
+    /// branches of `posture_key_for` (not `cfg(windows)`-gated), so this is
+    /// mutation-verified and enforced on every host that runs the suite —
+    /// including this one — rather than only on whichever OS happens to
+    /// build it.
+    #[test]
+    fn posture_key_never_folds_two_distinct_directories_into_one_on_a_case_sensitive_platform() {
+        // Windows (case-insensitive filesystem): folding is correct — these
+        // spellings genuinely name the SAME directory.
+        assert_eq!(
+            posture_key_for("C:/Work/Project", true),
+            posture_key_for("c:\\work\\project", true),
+            "same directory, different spelling, same platform key — expected on Windows"
+        );
+        // Everywhere else (case-sensitive filesystem): these are DIFFERENT
+        // directories and must never produce the same key.
+        assert_ne!(
+            posture_key_for("/home/user/Project", false),
+            posture_key_for("/home/user/project", false),
+            "different directories must never fold onto the same permission key off Windows"
+        );
     }
 
     #[test]
@@ -1057,18 +1182,94 @@ mod copilot_posture_tests {
     }
 
     #[test]
-    fn store_caps_and_evicts_oldest() {
+    fn store_caps_and_evicts_the_least_recently_touched_cwd() {
         let _d = posture_seam();
         // One past the cap, each a distinct cwd so none collide/cancel out.
         for i in 0..=super::COPILOT_POSTURE_CAP {
             record_copilot_launch_posture_impl(&format!("C:/work/{i}"), true).unwrap();
         }
         let store = super::load_copilot_posture();
-        assert_eq!(store.entries.len(), super::COPILOT_POSTURE_CAP, "must stay capped, not grow unbounded");
-        // The very first recorded (cwd "C:/work/0") is the oldest — evicted.
+        assert_eq!(store.entries.len(), super::COPILOT_POSTURE_CAP, "must stay capped, not grow unbounded — one entry per cwd");
+        // The very first recorded (cwd "C:/work/0") was never touched again — evicted.
         assert_eq!(copilot_launch_posture("C:/work/0"), None);
-        // The most recent survives.
+        // The most recently touched survives.
         assert_eq!(copilot_launch_posture(&format!("C:/work/{}", super::COPILOT_POSTURE_CAP)), Some(true));
+        set_copilot_posture_path_for_test(None);
+    }
+
+    #[test]
+    fn re_touching_a_cwd_protects_it_from_eviction() {
+        // A repeat write of the SAME value must count as a touch (bumping
+        // eviction priority), not merely dedupe silently — otherwise an
+        // actively-relaunched folder could still be evicted ahead of one
+        // nobody has opened in months, which defeats the point of LRU.
+        let _d = posture_seam();
+        record_copilot_launch_posture_impl("C:/work/active", true).unwrap();
+        for i in 0..super::COPILOT_POSTURE_CAP {
+            record_copilot_launch_posture_impl(&format!("C:/work/filler{i}"), true).unwrap();
+            // Re-confirm the active cwd on every iteration — it must never
+            // be the least-recently-touched entry.
+            record_copilot_launch_posture_impl("C:/work/active", true).unwrap();
+        }
+        assert_eq!(
+            copilot_launch_posture("C:/work/active"),
+            Some(true),
+            "a repeatedly re-touched cwd must survive eviction even under sustained store pressure"
+        );
+        set_copilot_posture_path_for_test(None);
+    }
+
+    /// THE B1 property (review): a cwd with conflicting posture history
+    /// never yields flags — no matter how much OTHER store activity happens
+    /// afterward, including enough to push the store arbitrarily far past
+    /// its cap. Mutation-verified against the pre-fix design: reverting to
+    /// "one entry per WRITE, oldest evicted individually" (rather than one
+    /// sticky `Conflicted` entry per cwd, decided at write time) makes this
+    /// red — the OFF half of the conflict ages out of the flat log first,
+    /// leaving a lone surviving ON record that resolves to `Some(true)`.
+    /// This generalizes the review's own repro (which pushed just short of
+    /// one cap's worth of other activity) by pushing several cap's worth,
+    /// proving the guarantee holds under sustained pressure, not merely at
+    /// the boundary.
+    #[test]
+    fn conflicted_cwd_never_yields_flags_no_matter_how_much_other_activity_follows() {
+        let _d = posture_seam();
+        record_copilot_launch_posture_impl("C:/work/conflicted", false).unwrap();
+        record_copilot_launch_posture_impl("C:/work/conflicted", true).unwrap();
+        assert_eq!(copilot_launch_posture("C:/work/conflicted"), None);
+
+        // The precise pressure that exposes a flat, per-write log (review
+        // B1's actual failure shape): exactly enough OTHER activity to push
+        // eviction to the boundary where it would claim just ONE record —
+        // the older of the two conflicting writes — leaving a lone survivor.
+        // A test that pushes activity far past this boundary evicts BOTH
+        // sides together and passes for the wrong reason (nothing left to
+        // resolve at all) — this exact size is what must be asserted at.
+        for i in 0..super::COPILOT_POSTURE_CAP - 1 {
+            record_copilot_launch_posture_impl(&format!("C:/other/{i}"), true).unwrap();
+        }
+        assert_eq!(
+            copilot_launch_posture("C:/work/conflicted"),
+            None,
+            "eviction at the exact boundary that claims only the older half of a conflict must \
+             not resolve the cwd to the surviving (larger-grant) half"
+        );
+
+        // Now generalize past the boundary: keep pushing activity for a long
+        // stretch afterward — the property must hold arbitrarily far out,
+        // not just at the one boundary above.
+        for round in 0..3 {
+            for i in 0..super::COPILOT_POSTURE_CAP {
+                record_copilot_launch_posture_impl(&format!("C:/later/{round}/{i}"), true).unwrap();
+            }
+        }
+        assert_eq!(
+            copilot_launch_posture("C:/work/conflicted"),
+            None,
+            "a conflicted cwd must never resolve to a grant, no matter how much other store \
+             activity happens after it — eviction may only ever move it to NO record, never to \
+             a single surviving value"
+        );
         set_copilot_posture_path_for_test(None);
     }
 
