@@ -1655,38 +1655,124 @@ export class Pane implements VoiceTargetPane {
   }
 
   private fitTimer: number | undefined;
-  /** Last grid size sent to the PTY, as `cols x rows`. Resizing ConPTY is
-   *  never free (the inbox Win10 conhost repaints the whole screen, which
-   *  TUIs then duplicate into scrollback), so same-size calls are skipped. */
+  /** Last grid size actually confirmed by the PTY, as `cols x rows`. Resizing
+   *  ConPTY is never free (the inbox Win10 conhost repaints the whole
+   *  screen, which TUIs then duplicate into scrollback), so same-size calls
+   *  are skipped. Only latches on a *successful* `resizePty` (#432 item 3) —
+   *  see `doResize`. */
   private sentSize = "";
+  /** The size of a `resizePty` call currently in flight, or null. Lets a
+   *  later fit tick tell "identical call already outstanding, don't re-send"
+   *  apart from "genuinely new size, do send" while `sentSize` hasn't
+   *  latched yet (#432 item 3). */
+  private resizePending: string | null = null;
+  /** >0 while a divider drag (grid split or this pane's own embed-slot
+   *  divider) is coalescing resizes (#432 item 1). See `beginResizeHold`. */
+  private resizeHolds = 0;
+
   private applyFit(): void {
     // Debounce: divider drags fire many resize events per frame.
     clearTimeout(this.fitTimer);
-    this.fitTimer = window.setTimeout(() => {
-      if (this.disposed || !this.termEl.isConnected) return;
-      if (this.termEl.clientWidth === 0) return; // hidden (inactive tab / maximized-behind) or unlaid — fit.fit() needs a laid-out element
-      this.fit.fit();
-      const size = `${this.term.cols}x${this.term.rows}`;
-      // The zero-width / same-size / no-pty skips live in the pure, tested
-      // shouldResizePty (panefit.ts) — THE invariant that keeps tab switches and
-      // maximize free of ConPTY repaints (#63, CLAUDE.md constraint 1).
-      if (shouldResizePty({ clientWidth: this.termEl.clientWidth, size, sentSize: this.sentSize, ptyId: this.ptyId })) {
+    this.fitTimer = window.setTimeout(() => this.doFit(), 16);
+  }
+
+  /** Begin coalescing this pane's PTY resizes: `doResize` keeps fitting
+   *  xterm's own buffer on every debounced tick (so the terminal renders at
+   *  the right size throughout a drag) but withholds the
+   *  `ResizePseudoConsole` IPC call until the last matching `endResizeHold`
+   *  releases — collapsing what would otherwise be one resize per animation
+   *  frame for the whole drag into a single call issued at drag-end (#432
+   *  item 1). Call around any drag that can change this pane's `termEl`
+   *  size: grid.ts's split divider (on every pane in the grid, since a
+   *  nested split's drag can resize leaves it doesn't directly touch) and
+   *  this pane's own `wireEmbedDivider`. The overlay height divider does
+   *  NOT call this — it never touches `termEl` (CLAUDE.md constraint 1). */
+  beginResizeHold(): void {
+    this.resizeHolds++;
+  }
+
+  /** End a hold begun by `beginResizeHold`. Once the last outstanding hold
+   *  releases, forces an immediate (non-debounced) fit so the drag's
+   *  settled size reaches the PTY right away instead of waiting out however
+   *  much of the 16ms debounce window was left. */
+  endResizeHold(): void {
+    this.resizeHolds = Math.max(0, this.resizeHolds - 1);
+    if (this.resizeHolds === 0) {
+      clearTimeout(this.fitTimer);
+      this.doFit();
+    }
+  }
+
+  private doFit(): void {
+    if (this.disposed || !this.termEl.isConnected) return;
+    if (this.termEl.clientWidth === 0) return; // hidden (inactive tab / maximized-behind) or unlaid — fit.fit() needs a laid-out element
+    // Defer the actual geometry change behind xterm's own write queue (#432
+    // item 2): `fit.fit()` resizes xterm's buffer SYNCHRONOUSLY, but
+    // `term.write()` is parsed ASYNCHRONOUSLY (xterm's internal
+    // WriteBuffer) — without this, bytes the PTY already sent under the OLD
+    // geometry could still be sitting unparsed and get interpreted under the
+    // NEW one once fit.fit() lands. `term.write("", cb)` queues an empty
+    // write, so `cb` runs only once every write already queued ahead of it
+    // has been parsed — i.e. once it's actually safe to change geometry.
+    this.term.write("", () => this.doResize());
+    // Geometry-independent UI bits run every tick, unqueued: the pane
+    // itself changed size, so keep the overlay within bounds and re-anchor
+    // the visible strip on the cursor right away rather than waiting on
+    // however much output happens to be queued.
+    const overlay = this.activeOverlay();
+    if (overlay) {
+      overlay.style.height = `${this.overlayClamp(overlay.offsetHeight)}px`;
+      this.updateTermShift();
+    }
+    // The steer box wraps to the strip's width, so a width change alters how
+    // many lines the placeholder/draft occupies. growCompose only ran on input
+    // events, so a widened pane never re-measured and the box stayed tall
+    // (#163). Re-measure here; it's a no-op on panes without a compose strip.
+    this.growCompose();
+  }
+
+  /** The write-queue-serialized half of a fit: actually resizes xterm's
+   *  buffer and, if that settled on a genuinely new size, the PTY. Runs
+   *  after `doFit`'s `term.write("", …)` callback, so re-check everything
+   *  `doFit` already checked — disposal/detach/hide can happen while this
+   *  was queued behind pending output. */
+  private doResize(): void {
+    if (this.disposed || !this.termEl.isConnected) return;
+    if (this.termEl.clientWidth === 0) return;
+    this.fit.fit();
+    const size = `${this.term.cols}x${this.term.rows}`;
+    // The zero-width / same-size / no-pty / held / already-in-flight skips
+    // live in the pure, tested shouldResizePty (panefit.ts) — THE invariant
+    // that keeps tab switches and maximize free of ConPTY repaints (#63,
+    // CLAUDE.md constraint 1).
+    if (
+      !shouldResizePty({
+        clientWidth: this.termEl.clientWidth,
+        size,
+        sentSize: this.sentSize,
+        ptyId: this.ptyId,
+        held: this.resizeHolds > 0,
+        pending: this.resizePending,
+      })
+    ) {
+      return;
+    }
+    this.resizePending = size;
+    resizePty(this.ptyId!, this.term.cols, this.term.rows).then(
+      () => {
+        if (this.resizePending === size) this.resizePending = null;
+        // Only latch on success (#432 item 3): a single failed
+        // ResizePseudoConsole used to still mark `size` as sent, leaving
+        // xterm's idea of the PTY's geometry wrong until some unrelated
+        // later size change happened to paper over it. Leaving `sentSize`
+        // stale on failure instead means the very next fit tick sees the
+        // same mismatch again and retries.
         this.sentSize = size;
-        resizePty(this.ptyId!, this.term.cols, this.term.rows).catch(() => {});
+      },
+      () => {
+        if (this.resizePending === size) this.resizePending = null;
       }
-      // The pane itself changed size: keep the overlay within bounds and
-      // re-anchor the visible strip on the cursor.
-      const overlay = this.activeOverlay();
-      if (overlay) {
-        overlay.style.height = `${this.overlayClamp(overlay.offsetHeight)}px`;
-        this.updateTermShift();
-      }
-      // The steer box wraps to the strip's width, so a width change alters how
-      // many lines the placeholder/draft occupies. growCompose only ran on input
-      // events, so a widened pane never re-measured and the box stayed tall
-      // (#163). Re-measure here; it's a no-op on panes without a compose strip.
-      this.growCompose();
-    }, 16);
+    );
   }
 
   setName(name: string): void {
@@ -2308,6 +2394,11 @@ export class Pane implements VoiceTargetPane {
       const growBefore = parseFloat(beforeEl.style.flexGrow || "1");
       const growAfter = parseFloat(afterEl.style.flexGrow || "1");
       slot.dividerEl.classList.add("dragging");
+      // Coalesce this pane's own PTY resize to one call at drag-end instead
+      // of one per animation frame for the whole drag (#432 item 1) — same
+      // mechanism grid.ts's split divider uses, scoped to just this pane
+      // since only its own termEl resizes here.
+      this.beginResizeHold();
       // Suspend layout of the docked panel's OWN content for the duration of
       // the drag (#361 user-demo finding: a large unvirtualized list — e.g.
       // thousands of audit entries — makes every mousemove frame reflow the
@@ -2329,6 +2420,7 @@ export class Pane implements VoiceTargetPane {
       const end = () => {
         slot.dividerEl.classList.remove("dragging");
         slot.panelEl.classList.remove("resizing");
+        this.endResizeHold();
         // Terminal (one per drag, not per mousemove) — mirrors grid.ts's own
         // split divider: persist the settled fraction so a restore
         // reproduces THIS size, not the one before the drag. `frac` is

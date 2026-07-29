@@ -511,6 +511,15 @@ export class Grid {
       const total = sizeB + sizeA;
       const growTotal = growB + growA;
       div.classList.add("dragging");
+      // Coalesce every pane's PTY resize to one call at drag-end instead of
+      // one per animation frame for the whole drag (#432 item 1) — a nested
+      // split's leaves can resize even though this divider only directly
+      // touches its own before/after children, so hold the whole grid
+      // rather than trying to walk the subtree. Captured once (not
+      // re-read in `end`) so begin/end stay balanced 1:1 per pane even in
+      // the vanishingly unlikely case the leaf set changes mid-drag.
+      const dragPanes = this.panes();
+      dragPanes.forEach((p) => p.beginResizeHold());
 
       const move = (ev: MouseEvent) => {
         const raw = (horizontal ? ev.clientX : ev.clientY) - startPos;
@@ -524,6 +533,7 @@ export class Grid {
       };
       const end = () => {
         div.classList.remove("dragging");
+        dragPanes.forEach((p) => p.endResizeHold());
         // A finished divider drag changed the flex weights that layoutSnapshot
         // captures — persist them so a restore reproduces THIS split, not the
         // pre-drag one (#194 P4). Terminal (one per drag), not per-mousemove, so

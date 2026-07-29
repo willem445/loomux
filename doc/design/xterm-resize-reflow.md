@@ -117,25 +117,66 @@ content outright, which this mitigation fixes.
 
 ## What loomux can still do (follow-up, not this PR)
 
-Tracked in #432 (filed alongside this PR):
+Tracked in #432 (filed alongside this PR). Section 2 of that issue -- the
+three loomux-side hardening items below -- shipped in the #432 PR itself
+(this section records what landed); section 1 (the cursor-column residual)
+remains nothing-to-do, upstream having declined to fix it.
 
 - The cursor-column residual above -- nothing to *do* yet (upstream has
   declined to fix it as of milestone 7.0.0), just watch for a future change
   of position.
 - The investigation's own loomux-side aggravators, now the more valuable
-  lever precisely because there is no complete upstream fix to lean on:
-  - **Resize-storm coalescing** -- a divider drag issues a
+  lever precisely because there is no complete upstream fix to lean on --
+  **all three shipped** (`pane.ts`'s `doFit`/`doResize`/`beginResizeHold`/
+  `endResizeHold`, `panefit.ts`'s `shouldResizePty`, `grid.ts`'s
+  `makeDivider`):
+  - **Resize-storm coalescing.** A divider drag used to issue a
     `ResizePseudoConsole` roughly every 16ms for the whole drag (`pane.ts`'s
-    fit debounce, `grid.ts`'s `makeDivider`); coalescing to one resize on
-    drag-end shrinks the window in which xterm's and conpty's row models
-    can diverge.
-  - **Serializing resize behind the write queue** -- `fit.fit()` applies
-    synchronously while `term.write()` is parsed asynchronously; deferring
-    the resize until pending writes are parsed prevents bytes received
-    under the old geometry from being parsed under the new one.
-  - **Not latching `sentSize` before the resize IPC resolves** (`pane.ts`)
-    -- a single failed `ResizePseudoConsole` currently leaves xterm out of
-    sync with conpty until the next size change.
+    fit debounce, `grid.ts`'s `makeDivider`). `Pane.beginResizeHold` /
+    `endResizeHold` now bracket every drag that can change a pane's
+    `termEl` size -- `grid.ts`'s split divider (held across every pane in
+    the grid, since a nested split's drag can resize leaves the divider
+    doesn't directly touch) and `pane.ts`'s own embed-slot divider (held on
+    just that pane). While held, `doFit`/`doResize` still fit xterm's own
+    buffer on every debounced tick, so the terminal renders at the right
+    size throughout the drag, but withhold the PTY resize; the last
+    matching `endResizeHold` forces an immediate fit, so the settled size
+    reaches the PTY right at drag-end (mouseup, or the window
+    blur/Escape paths `dragsession.ts` already treats as an end) instead of
+    once per animation frame for the whole drag. The overlay height divider
+    (`makeOverlayDivider`) was never part of this storm -- it floats over
+    the terminal and never touches `termEl` (CLAUDE.md constraint 1) -- so
+    it doesn't hold.
+  - **Serializing resize behind the write queue.** `fit.fit()` used to run
+    synchronously inside the debounce callback while `term.write()` is
+    parsed asynchronously (xterm's own `WriteBuffer`), so bytes the PTY
+    already sent under the old geometry could still be unparsed and get
+    interpreted under the new one. `doFit` now defers the geometry change
+    (`doResize`, which calls `fit.fit()` and decides on the PTY resize)
+    behind `term.write("", () => this.doResize())` -- the callback only
+    runs once every write already queued ahead of it has been parsed.
+    Geometry-independent UI (the overlay clamp, `growCompose`) stays
+    outside that queue so it still reacts immediately to a layout change.
+  - **Not latching `sentSize` before the resize IPC resolves.** A single
+    failed `ResizePseudoConsole` (still swallowed, but no longer via a bare
+    `.catch(() => {})`) used to still mark its size as sent, leaving
+    xterm's idea of the PTY's geometry wrong until some unrelated later
+    size change happened to paper over it. `sentSize` now only latches in
+    the resolved-success branch; on failure it's left as it was, so the
+    next fit tick sees the same mismatch again and retries. Because the
+    latch moved behind the IPC round-trip, a second fit tick can now land
+    while the first call is still in flight -- `resizePending` (paired with
+    `shouldResizePty`'s new `pending` check) dedups an identical repeat of
+    an outstanding call without blocking a genuinely different size that
+    arrives before the first one resolves.
+
+  The coalescing/dedup decision itself (`shouldResizePty`'s `held` and
+  `pending` handling) is covered by `test/panefit.test.ts`, mirroring how
+  the pre-existing hidden/same-size/no-pty skips are tested there. The
+  divider-drag DOM wiring (hold begin/end pairing, the write-queue
+  deferral) is hand-verified only, per this repo's convention of not
+  simulating a DOM in tests -- see the #432 PR for what to check by hand
+  (a real divider drag under load).
 
 ## Changelog watch (tracked in #432)
 
