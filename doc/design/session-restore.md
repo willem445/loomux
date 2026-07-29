@@ -121,6 +121,74 @@ tab's `groupId` binding through `resumeOrchSession`; if Phase 4's handling of
 every worker (the #78 storm). That contract lives on the `RestoreAction`
 `dormant-group` variant and must be honored in the Phase 4 rebuild.
 
+### #439 fix — a standalone agent's solo channel identity must be RE-MINTED, never replayed
+
+`agentResumeCommand`/`agentFreshCommand` keep every recorded flag except the
+session ones — which is exactly right for `--model`, `--permission-mode`, etc.,
+but wrong for one flag group: a standalone (launcher-spawned) claude/copilot
+pane with channel tools on gets a solo channel identity at launch
+(`soloPrepare`/#271 W3 addendum), and its command line carries that identity's
+MCP flags (`--mcp-config <path> --strict-mcp-config --allowedTools mcp__loomux`
+for claude, `--additional-mcp-config "@<path>" --allow-tool loomux` for
+copilot). That config file — and the identity's token — are deleted the moment
+the pane's agent process exits (same lifecycle as an orchestration member).
+Replaying the recorded flags on restore therefore points at a file that is
+**guaranteed gone**: claude hard-errors (`MCP config file not found`) and
+copilot would authenticate nothing even if the file happened to still exist.
+
+The fix is a strip-then-re-mint pair, kept in `panerestore.ts` for the pure
+half:
+
+- `stripSoloMcpFlags(command, argv)` recognizes the exact, contiguous flag
+  group either CLI's mint emits and removes it, reporting which CLI it
+  belonged to (`null` — nothing to re-mint — for a custom command or a
+  channel-tools-off launch, which never had the flags to begin with). The
+  minted path is a real Windows profile path and the backend quotes it
+  *because* a username can contain a space ("Will H") — review round 1 (B1)
+  caught a naive `.split(/\s+/)` tokenizer fracturing that quoted path across
+  two tokens, silently failing the fixed-offset match and letting the dead
+  path straight through. The fix excises the flag group with a regex against
+  the **original string** (`"[^"]*"|\S+` for the path group) rather than a
+  tokenize/rejoin round trip — which also settled a second finding (N1,
+  escalated to blocking) in the same move: a `cli: null` command — the common
+  case, every restore that never had a solo identity — now comes back
+  byte-identical, including whitespace runs inside unrelated quoted flags,
+  instead of being silently reflowed by a `.split/.join`.
+- `appendSoloMcpArgs(command, argv, mcpArgs)` appends a freshly-minted
+  identity's flags back on. Its argv-form branch (latent — solo panes are
+  never argv-spawned today) tokenizes `mcpArgs` quote-aware too
+  (`splitQuotedTokens`), stripping the quotes rather than embedding them
+  literally in an argv element (N2) — a spaced fresh path lands as one clean
+  element, not two with stray `"` characters glued on.
+
+`main.ts`'s `remintSoloIdentity` composes them with the actual I/O: strip →
+`await soloPrepare(cli, cwd, name)` (best-effort, same contract a live launch
+already states — a failed mint just leaves the flags stripped, so the pane
+boots **delivery-only** rather than not at all) → append → hand the caller a
+`command`/`argv`, a `channelAgent` carrier for `PaneOptions`, and a `bind`
+thunk to call with the pane's `ptyId` once it's spawned (mirroring the launch
+path's `channelAgentFor`/`bindSoloIfNeeded`). It is applied at all three
+places a recorded standalone-agent command gets replayed:
+
+- `resume-agent` and `fresh-agent` (the two `RestoreAction`s above) — before
+  `ws.grid.openPane`.
+- `dormant-agent`'s Start button — copilot never gets a recorded `sessionId`
+  (only claude does, at launch), so a copilot solo pane restores dormant
+  *every* time and this is its only replay point; the re-mint happens inside
+  the button's `onclick`, lazily, only if the human actually clicks Start.
+- The runtime resume-failure backstop (`tryResumeFallback`, BUG-1 above) — its
+  fresh-respawn command is built from the same recorded fields, so it can
+  carry the identical dead flags. The re-mint there is **lazy**, done only when
+  the fallback actually fires (not pre-minted alongside the initial resume
+  attempt): the common case never needs the fallback, and pre-minting one
+  "just in case" would leak an orphan `solo-N` config/token on disk for every
+  ordinary successful resume.
+
+One wrinkle worth flagging for the next reader: `Pane.start` (used by
+`openPane`/`startFromDormant`) applies `opts.channelAgent` itself, but
+`Pane.respawnFresh` does **not** — the fallback path sets it explicitly via
+`Pane.setChannelAgent` after the respawn resolves.
+
 ## Module map (this phase)
 
 | Piece | File | Role |

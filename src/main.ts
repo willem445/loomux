@@ -48,6 +48,7 @@ import {
   showPaneConnectMenu,
   disconnectPaneChannel,
   cancelPendingConnect,
+  soloPrepare,
   soloBind,
   confirmSoloCopilotAutopilot,
   SOLO_GROUP,
@@ -72,6 +73,8 @@ import {
   planPaneRestore,
   agentResumeCommand,
   agentFreshCommand,
+  stripSoloMcpFlags,
+  appendSoloMcpArgs,
   shouldRespawnFresh,
   findResumedPaneIndex,
   hasForkSession,
@@ -456,6 +459,60 @@ async function restoreDocked(
   }
 }
 
+/** Re-mint a restored agent's solo channel identity (#439) before its command
+ *  boots. A recorded resume/fresh/dormant command can carry the MCP flags
+ *  `soloPrepare` appended at ITS pane's last launch — they point at a
+ *  `configs/solo-N.json` that agent's exit already deleted (and cleared the
+ *  token for), so replaying them hard-errors claude and authenticates nothing
+ *  on copilot. `stripSoloMcpFlags` (pure, panerestore.ts) removes them and
+ *  reports which CLI they belonged to; when it reports none (a custom
+ *  command, or a channel-tools-off launch — nothing was ever minted) this is
+ *  a no-op and the command comes back unchanged.
+ *
+ *  When a solo identity WAS recorded, this re-mints a fresh one via
+ *  `soloPrepare` — same best-effort contract as a live launch
+ *  (`bindSoloIfNeeded`/launcher.ts:1337): a failed mint just leaves the
+ *  stripped command with no MCP flags at all, so the pane still boots —
+ *  delivery-only, adoptable later via Connect — rather than replaying a
+ *  guaranteed-dead path. The returned `bind` thunk must be invoked with the
+ *  pane's `ptyId` once its pty is up (a no-op when nothing was minted); the
+ *  returned `channelAgent` is the carrier `PaneOptions.channelAgent` expects
+ *  — pass it through `openPane`/`startFromDormant` (both apply it via
+ *  `Pane.start`) or, for `respawnFresh` (which does NOT apply it — #439
+ *  finding), via `Pane.setChannelAgent` explicitly. */
+async function remintSoloIdentity(
+  name: string,
+  cwd: string | undefined,
+  command: string | undefined,
+  argv: string[] | undefined
+): Promise<{
+  command?: string;
+  argv?: string[];
+  channelAgent?: { group: string; agentId: string; role: string; canSend: boolean };
+  bind: (ptyId: number) => void;
+}> {
+  const stripped = stripSoloMcpFlags(command, argv);
+  if (!stripped.cli) return { command: stripped.command, argv: stripped.argv, bind: () => {} };
+  try {
+    const prepared = await soloPrepare(stripped.cli, cwd ?? "", name);
+    const withArgs = appendSoloMcpArgs(stripped.command, stripped.argv, prepared.mcp_args);
+    return {
+      command: withArgs.command,
+      argv: withArgs.argv,
+      channelAgent: { group: SOLO_GROUP, agentId: prepared.agent_id, role: "solo", canSend: !prepared.delivery_only },
+      bind: (ptyId: number) => {
+        void soloBind(prepared.agent_id, ptyId).catch(() => {
+          /* best-effort — same as launch (launcher.ts:1337) */
+        });
+      },
+    };
+  } catch {
+    // Best-effort: the mint failed, so the pane boots with the stale flags
+    // simply gone — delivery-only until the human adopts it via Connect.
+    return { command: stripped.command, argv: stripped.argv, bind: () => {} };
+  }
+}
+
 /** Open the ONE pane a restore action describes, per the adopted hybrid. Shared
  *  by the layout replay (with the step's dir/anchor) and docked restore (default
  *  placement, then minimized by the caller). */
@@ -478,19 +535,25 @@ async function openActionPane(
       // Resume into the idle TUI — loads context, spends nothing until a prompt,
       // and NEVER carries a replayed prompt (agentResumeCommand only rewrites flags).
       const resume = agentResumeCommand(a.command, a.argv, a.sessionId);
+      // #439: the recorded command may carry a solo channel identity's MCP flags
+      // pointing at a config file this pane's own last exit already deleted (and
+      // cleared the token for) — re-mint a fresh identity before replaying it.
+      const remint = await remintSoloIdentity(a.name, a.cwd ?? undefined, resume.command, resume.argv);
       const pane = await ws.grid.openPane(
         {
           name: a.name,
           cwd: a.cwd ?? undefined,
-          command: resume.command,
-          argv: resume.argv,
+          command: remint.command,
+          argv: remint.argv,
           sessionId: a.sessionId,
+          channelAgent: remint.channelAgent,
           background: true,
         },
         events,
         dir,
         anchor
       );
+      if (pane.ptyId !== null) remint.bind(pane.ptyId);
       // Runtime backstop (BUG-1): if this `--resume` exits on a missing/deleted
       // conversation (or any resume-time CLI failure), respawn fresh in place
       // instead of stranding a dead pane. Remember the fresh opts, keyed by pane;
@@ -521,19 +584,25 @@ async function openActionPane(
       // transcript is gone) — start a fresh session in place with the same
       // identity, reusing the recorded id so it's resumable again next boot (BUG-1).
       const fresh = agentFreshCommand(a.command, a.argv, a.sessionId);
-      return ws.grid.openPane(
+      // #439: same re-mint as resume-agent — a recorded solo identity's config was
+      // deleted at this pane's last exit, so its MCP flags must never be replayed.
+      const remint = await remintSoloIdentity(a.name, a.cwd ?? undefined, fresh.command, fresh.argv);
+      const pane = await ws.grid.openPane(
         {
           name: a.name,
           cwd: a.cwd ?? undefined,
-          command: fresh.command,
-          argv: fresh.argv,
+          command: remint.command,
+          argv: remint.argv,
           sessionId: a.sessionId,
+          channelAgent: remint.channelAgent,
           background: true,
         },
         events,
         dir,
         anchor
       );
+      if (pane.ptyId !== null) remint.bind(pane.ptyId);
+      return pane;
     }
     case "dormant-agent": {
       // A best-effort CLI with no resumable id: a dormant Start placeholder in the
@@ -557,13 +626,28 @@ async function openActionPane(
         "This agent had no resumable session — start it fresh in its folder.",
         () => {
           // startFromDormant tears the card down synchronously, so a second click
-          // can't re-fire; notify once it's live so the counter reflects it.
-          void pane.startFromDormant({
-            name: a.name,
-            cwd: a.cwd ?? undefined,
-            command: a.command ?? undefined,
-            argv: a.argv ?? undefined,
-          }).then(() => onGridChanged());
+          // can't re-fire; notify once it's live so the counter reflects it. This is
+          // copilot's own restore path (it never gets a recorded session id — see
+          // launcher.ts:1321 — so it always lands here, never resume/fresh-agent),
+          // and its recorded command can carry the SAME dead solo-identity MCP
+          // flags (#439) — re-mint before replaying, just like resume/fresh-agent.
+          void (async () => {
+            const remint = await remintSoloIdentity(
+              a.name,
+              a.cwd ?? undefined,
+              a.command ?? undefined,
+              a.argv ?? undefined
+            );
+            await pane.startFromDormant({
+              name: a.name,
+              cwd: a.cwd ?? undefined,
+              command: remint.command,
+              argv: remint.argv,
+              channelAgent: remint.channelAgent,
+            });
+            if (pane.ptyId !== null) remint.bind(pane.ptyId);
+            onGridChanged();
+          })();
         }
       );
       pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
@@ -1000,7 +1084,23 @@ function tryResumeFallback(pane: Pane, exit: PtyExit): boolean {
   if (!shouldRespawnFresh(exit)) return false;
   if (Date.now() - fb.at > RESUME_FAIL_WINDOW_MS) return false; // a real session ended, not a resume failure
   showToast(`Recorded session not resumable — started a fresh ${pane.name} session.`, "info");
-  void pane.respawnFresh(fb.opts).then(() => onGridChanged());
+  // #439: fb.opts.command/argv were built (case "resume-agent", above) from the
+  // ORIGINAL recorded command, so they can carry the same dead solo-identity MCP
+  // flags — re-mint before this fresh respawn replays them. Done here, lazily, at
+  // the moment the fallback actually fires (not pre-minted when the entry was
+  // queued): the common case never needs a fallback at all, and pre-minting one
+  // "just in case" would leak an orphan solo-N config for every successful resume.
+  // respawnFresh does NOT apply opts.channelAgent (unlike Pane.start), so the
+  // channel identity is set explicitly via setChannelAgent once it's spawned.
+  void remintSoloIdentity(fb.opts.name ?? pane.name, fb.opts.cwd, fb.opts.command, fb.opts.argv).then((remint) =>
+    pane
+      .respawnFresh({ ...fb.opts, command: remint.command, argv: remint.argv })
+      .then(() => {
+        pane.setChannelAgent(remint.channelAgent ?? null);
+        if (pane.ptyId !== null) remint.bind(pane.ptyId);
+        onGridChanged();
+      })
+  );
   return true;
 }
 
