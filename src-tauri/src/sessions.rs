@@ -375,6 +375,32 @@ fn norm_path(s: &str) -> String {
 // toggle autopilot manually, per folder") on the very release that fixes
 // it — a bad trade for a few lines of migration code, so this reads the old
 // file instead of resetting.
+//
+// Migration does NOT re-derive the platform key (`posture_key`/
+// `posture_key_for`) — it copies each legacy entry's `cwd` field VERBATIM
+// into the new store (see `load_launch_intent`'s match arm below). This is
+// deliberate, not an oversight: `cfg!(windows)` is a COMPILE-TIME constant
+// baked into one built binary, so a single loomux install's write-time
+// keying and read-time keying (migration or ordinary lookup, doesn't
+// matter) are always performed by the SAME code in the SAME process —
+// there is no runtime path where they could disagree on which arm to use.
+// The only way a legacy key and a lookup could apply DIFFERENT arms is the
+// underlying file traveling between a case-folding (Windows) and a
+// case-sensitive (macOS/Linux) install — and `data_root()` resolves to
+// `dirs::data_dir()`, an OS-NATIVE per-machine path (`%APPDATA%` vs.
+// `~/Library/Application Support` vs. XDG) that does not coincide across
+// platforms by default; getting two different-OS installs to share this
+// file at all requires deliberately pointing `LOOMUX_DATA_DIR` at a synced
+// location on both. That scoping property is #460's, unchanged by this PR:
+// the original single-arm-per-store design never supported cross-platform
+// key portability, migration or not, and a verbatim-copy migration can't
+// make that any better OR any worse than it already was — it only has to
+// preserve whatever a same-binary write already produced, which it does by
+// construction. Pinned (not just asserted) by
+// `soft_migration_preserves_the_legacy_cwd_key_exactly_regardless_of_which_
+// platform_wrote_it`, mutation-verified against re-normalizing a second
+// time (see that test's own doc comment for why a same-host test alone
+// can't catch that mutation).
 const LAUNCH_INTENT_CAP: usize = 300;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
