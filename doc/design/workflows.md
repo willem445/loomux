@@ -147,9 +147,13 @@ file resolve through — so a `mode: replace` orchestrator persona cannot rewrit
 ### `allow:` is banned on a read-only class
 
 The other edge the same review found. A planner is read-only by **denying a fixed
-list** — Edit, Write, MultiEdit, NotebookEdit, `git commit`, `git push`. Deny
-beats allow on both CLIs, so an allow pattern cannot re-grant anything *on that
-list*. But it doesn't have to: `allow: Bash(python *)` is named nowhere in the
+list** — Edit, Write, NotebookEdit, `git commit`, `git push`
+(`CLAUDE_READONLY_DENY_TOOLS`/`CLAUDE_READONLY_DENY_GIT`; see #448 — `MultiEdit`
+was dropped from that list because it matches no real Claude Code tool, and the
+list is now pinned in CI against the CLI's own documented tool set so a typo or
+a stale name breaks the build instead of silently widening what a planner may
+do). Deny beats allow on both CLIs, so an allow pattern cannot re-grant anything
+*on that list*. But it doesn't have to: `allow: Bash(python *)` is named nowhere in the
 deny list, and under `auto_ops` nobody approves the call — so the planner gets a
 pre-approved shell that writes files, and the closure claim above becomes false.
 
