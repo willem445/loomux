@@ -434,12 +434,17 @@ to a pane auto-flushes a stranded prompt, so it may already have gone, and re-se
 duplicate it. If a re-send draws a *second* unconfirmed notice, stop and flag the human —
 something is wedging that pane.
 
-On a `[loomux] delivery to <id> held: pane has human input — re-send when clear` notice, your
-prompt was **not** delivered: the human had left a line typed in the box, so loomux held the
-paste rather than merge-submitting the two. Nothing of yours is stuck there (unlike the
-unconfirmed case), so do not paste to clear it. `get_output` to see what they left, give them a
-moment, and `send_prompt` again once the box is empty. If it stays occupied, the human is
-mid-thought in that pane — leave it to them and flag it rather than fight for the input box.
+On a `[loomux] delivery to <id> queued (...) — delivers automatically once clear; do NOT
+re-send` notice (#445), your prompt was held — the pane's box had human input in it, or an
+interactive question was on screen — and is now safely QUEUED, not lost. **Never re-send** on
+this notice: it would just add a second, duplicate entry behind the one already waiting. loomux
+flushes the queue itself, in order, the instant the pane becomes deliverable — no timeout, since
+the release condition is a human answering and that can take minutes or hours. The first thing a
+flush delivers is a `[loomux] N deliveries queued ...` header so you (and the pane's own agent)
+know what arrives late may be stale — read it before acting on anything that follows. Only act if
+you get a **`[loomux] ... DROPPED ...`** notice instead (the queue was already full, or the
+agent's pane closed while entries were waiting) — that one really is gone, and you do need to
+re-derive and re-send the work.
 
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
