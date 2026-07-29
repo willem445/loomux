@@ -9410,24 +9410,44 @@ impl OrchRegistry {
             // are looking at is not what their repo now says. Silence here would
             // make the pin indistinguishable from a stale read.
             //
-            // **The merge gate is pinned by the same rule, and left untouched here.**
-            // The consent argument applies to it at least as strongly as to the
-            // roster: a `git pull` between launch and resume must not be able to
-            // *loosen* the gate a session is running under (drop a reviewer, remove
-            // the clause entirely) — and re-reading the file is precisely how that
-            // would happen. The gate file written at launch stands; the drift audit
-            // tells the human the repo has moved on.
+            // **The merge gate is left untouched HERE, at this resume — but that no
+            // longer means it stays pinned for the life of the session.** Before
+            // #385 it did: nothing else ever re-read the file post-launch, so "this
+            // branch doesn't re-read it either" meant the gate really was frozen to
+            // whatever the human saw at launch, and a `git pull` between launch and
+            // resume could never loosen it (drop a reviewer, remove the clause
+            // entirely) without a further explicit human action (a relaunch, or the
+            // live toggle). That guarantee is gone. `run_workflow_gate_reload`'s
+            // periodic pass treats a resumed group exactly like any other live
+            // advanced-orchestrator group — it will read whatever's CURRENTLY on
+            // disk and re-arm the gate within `WORKFLOW_GATE_POLL_INTERVAL`, git
+            // pull or hand-edit, loosening or tightening, with no further consent
+            // moment required. That is a decided, accepted risk (#459), not an
+            // oversight: the human's call was that an agent — or anything else with
+            // filesystem access to the repo — editing `.loomux/workflow.yml` is
+            // usually legitimate, and defeating the gate this way already requires
+            // the kind of repo write access that is a bigger compromise than the
+            // gate itself. What's still guaranteed, unconditionally, is fail-closed:
+            // a malformed or vanished file always retains the last-known gate rather
+            // than opening it — see `OrchRegistry::reload_merge_gate_if_changed`.
+            // The drift audit below still tells the human the repo has moved on;
+            // it's the "and nothing acts on that until you do" half that no longer
+            // holds.
             self.audit_workflow_drift(&id, repo, &guardrails);
             // #255 (rev-1 B2 / rev-2 non-blocking #1): the roster and gate are
             // PINNED on a resume, not re-read — but they still describe a real
             // structural minimum, and a resumed session can outgrow it exactly as
             // a fresh one can (a human lowers the live cap mid-run, or just never
             // raised it to begin with). `guardrails.blocks` is already the
-            // persisted, clamped roster; the gate file on disk is the one the
-            // original launch wrote and this branch deliberately never touches —
-            // both are exactly what the pinned session is running under, so
-            // deriving from them here (rather than skipping the check because
-            // "the file wasn't re-read") is correct, not a re-read.
+            // persisted, clamped roster; the gate file on disk is whatever this
+            // group most recently had armed — the original launch's write, or a
+            // later live toggle or background reload from that same prior session
+            // (see the comment above: post-#385, that file no longer necessarily
+            // matches the ORIGINAL launch) — and this branch deliberately never
+            // re-reads `.loomux/workflow.yml` itself to derive it. Both are exactly
+            // what the pinned session is running under, so deriving from them here
+            // (rather than skipping the check because "the file wasn't re-read") is
+            // correct, not a re-read.
             //
             // Gated on `roster_is_custom`: this whole feature is about a DECLARED
             // workflow's structural need, and a group with no workflow file has
@@ -16109,6 +16129,43 @@ impl OrchRegistry {
         }
     }
 
+    /// Whether a `.loomux/workflow.yml` read for the reload path can be
+    /// trusted: the file's length agrees across a stat taken immediately
+    /// BEFORE the read and one taken immediately AFTER it, and both agree
+    /// with what was actually read. A mismatch means the file changed size
+    /// WHILE we were reading it — caught it mid-write — so nothing about its
+    /// content can be trusted this tick, not just whether `gates.merge` is
+    /// present but every field inside it (a `reviewers:` list truncated
+    /// mid-sequence reads the same way). Pure so the three-way comparison is
+    /// unit-testable with no filesystem at all (`workflow_gate_reload_tests`
+    /// below); `read_workflow_stably` is the only caller.
+    ///
+    /// This is belt-and-braces, not the fix for #385/B1 — it only catches a
+    /// write actively in flight during THIS read, at zero timing cost (one
+    /// extra stat before, one after; no sleep, no second tick). It does
+    /// nothing for a truncated file that's simply been sitting there for a
+    /// while (a crashed or paused writer) — no read-timing trick can, which
+    /// is exactly why a multi-tick debounce was rejected as "a mitigation,
+    /// not a fix": a truncation that outlasts one poll interval outlasts two
+    /// just as easily, silently. See `reload_merge_gate_if_changed`'s own
+    /// doc comment for the actual fix, which needs no timing signal at all.
+    fn workflow_read_is_stable(before_len: u64, read_len: u64, after_len: u64) -> bool {
+        before_len == read_len && read_len == after_len
+    }
+
+    /// Read `<repo>/.loomux/workflow.yml` for the reload path, stability-
+    /// checked via `workflow_read_is_stable`. `None` for "no file",
+    /// "unreadable", or "caught mid-write" alike — `reload_merge_gate_if_
+    /// changed` retains the last-known gate on all three without needing to
+    /// tell them apart, the same way it already does for a parse error.
+    fn read_workflow_stably(repo: &str) -> Option<String> {
+        let path = Path::new(repo).join(workflow::WORKFLOW_PATH);
+        let before = fs::metadata(&path).ok()?.len();
+        let text = fs::read_to_string(&path).ok()?;
+        let after = fs::metadata(&path).ok()?.len();
+        Self::workflow_read_is_stable(before, text.len() as u64, after).then_some(text)
+    }
+
     /// **#385**: re-derive one group's merge gate from the repo's CURRENT
     /// `.loomux/workflow.yml` and re-arm it through the SAME `sync_merge_gate`
     /// seam `create_group`'s fresh launch and `set_advanced_orchestrator`'s live
@@ -16120,27 +16177,48 @@ impl OrchRegistry {
     ///
     /// Deliberately asymmetric with the launch/toggle-ON path, and this
     /// asymmetry IS the fix, not a shortcut:
-    ///   - `Ok(Some(wf))` — the file parses. Sync exactly what it declares, even
-    ///     if that WIDENS the gate (drops a reviewer, drops an `also:` clause, or
-    ///     removes `gates.merge` entirely) — an edit a human can make and commit
-    ///     is real consent, the same "removing a gate from the workflow really
-    ///     removes it" contract `sync_merge_gate`'s own doc comment states.
-    ///   - `Ok(None)` — the file is GONE. Unlike a *fresh launch* (where "no
-    ///     file" is a legitimate zero-config choice — nothing was ever armed to
-    ///     lose), a workflow file vanishing out from under an ALREADY-ARMED gate
-    ///     is indistinguishable from an editor's ordinary unlink-then-recreate
-    ///     save, so this retains the last-known gate rather than reading that
-    ///     blip as consent to remove it. Same for a transient read error
-    ///     (`Err(_)`, e.g. a mid-write truncated YAML): retained, exactly like
-    ///     `create_group`'s `merge-gate-retained` branch — a file that doesn't
-    ///     parse right now is not evidence the human stopped wanting the gate.
-    ///     Both cases simply `return` without writing or auditing anything: a
-    ///     transient blip self-heals the moment the file is readable again
-    ///     (compared, then synced, on the very next tick), and re-auditing an
-    ///     unreadable file every `WORKFLOW_GATE_POLL_INTERVAL` forever would
-    ///     just be audit-log noise — the shim's own `merge-gate-workflow-
-    ///     blocked`/`merge-gate-blocked` audit lines already record every actual
-    ///     refused merge in the meantime.
+    ///   - `Ok(Some(wf))` with `wf.gates.get("merge")` present — the file
+    ///     parses AND still names a gate. Sync exactly what it declares, even
+    ///     if that WIDENS what the gate accepts (drops a reviewer, drops an
+    ///     `also:` clause) — an edit a human can make and commit is real
+    ///     consent for THAT gate's shape (#459: accepted risk, not every edit
+    ///     is adversarial and most are legitimate).
+    ///   - **`wf.gates.get("merge")` is ABSENT while a gate is CURRENTLY
+    ///     ARMED (#385/B1).** This does **not** clear the gate, and that is a
+    ///     policy decision, not a heuristic gap. `gates` — like every field
+    ///     inside a `Gate` — is `#[serde(default)]` (right for a *fresh
+    ///     launch*: a zero-config group is legitimate there), so a mid-flush
+    ///     truncation that happens to land between two top-level keys parses
+    ///     as a perfectly valid document that simply never reaches `gates:`
+    ///     — byte-for-byte indistinguishable, by type alone, from a complete
+    ///     file that genuinely declares none. **There is no in-band signal
+    ///     that can tell those two apart from the document's own bytes** —
+    ///     not a stability check (`read_workflow_stably` only catches a
+    ///     write actively in progress, not one that's paused or crashed
+    ///     mid-truncation), not a multi-tick debounce (a truncation that
+    ///     outlasts one poll outlasts two, just as silently — the reason
+    ///     rev-8's debounce proposal was rejected as a mitigation, not a
+    ///     fix). So this is resolved by POLICY instead of inference: on the
+    ///     reload path, absence of `gates.merge` carries no information and
+    ///     is never, by itself, consent to remove an already-armed gate. The
+    ///     one and only way to take an armed gate down to "no gate" is the
+    ///     explicit `set_advanced_orchestrator(..., false, ...)` toggle-off —
+    ///     a single discrete action, not something a recurring background
+    ///     read infers from whatever shape a file happens to be in right
+    ///     now. (Fresh launch keeps the opposite, permissive reading —
+    ///     `create_group`'s own `Ok(Some(wf))` arm — because there a missing
+    ///     gate really is the common, legitimate, zero-config case, not a
+    ///     race with an in-flight save; that is the "distinguish the two
+    ///     paths" #385/B1 asked for, not a change to the type's default.)
+    ///   - `Ok(None)` — the file is GONE — or an unreadable/unstable/
+    ///     unparseable read: all three retain the last-known gate for the
+    ///     same reason as the bullet above, and all three simply `return`
+    ///     without writing or auditing anything. A transient blip self-heals
+    ///     the moment the file is next read stably and parses (compared,
+    ///     then synced, on a later tick); re-auditing every
+    ///     `WORKFLOW_GATE_POLL_INTERVAL` forever would just be log noise —
+    ///     the shim's own `merge-gate-workflow-blocked`/`merge-gate-blocked`
+    ///     audit lines already record every actual refused merge meanwhile.
     ///
     /// Compares against the CURRENTLY ARMED gate (`self.merge_gate`, which reads
     /// the spec file back) before writing anything, so an unedited file — the
@@ -16152,9 +16230,17 @@ impl OrchRegistry {
     /// separate, larger-blast-radius change this issue is not scoped to.
     fn reload_merge_gate_if_changed(&self, id: &str) {
         let Some(info) = self.group(id) else { return };
-        let Ok(Some(wf)) = workflow::load_workflow(&info.repo) else { return };
+        let Some(text) = Self::read_workflow_stably(&info.repo) else { return };
+        let Ok(wf) = workflow::parse_workflow(&text) else { return };
+        let armed = self.merge_gate(id);
         let fresh = wf.gates.get("merge").cloned();
-        if fresh.as_ref() == self.merge_gate(id).as_ref() {
+
+        // #385/B1: see the doc comment above — absence never clears an
+        // already-armed gate on this path.
+        if fresh.is_none() && armed.is_some() {
+            return;
+        }
+        if fresh.as_ref() == armed.as_ref() {
             return;
         }
         self.sync_merge_gate(id, fresh.as_ref());
@@ -21402,6 +21488,40 @@ mod max_notice_tests {
         assert_eq!(take_due_max_notices(&mut p, 4_000), vec![("a".to_string(), 4, 2)]);
         assert!(p.contains_key("b"), "b keeps waiting out its own window");
         assert_eq!(take_due_max_notices(&mut p, 6_000), vec![("b".to_string(), 5, 6)]);
+    }
+}
+
+/// #385/B1: the stability check `read_workflow_stably` layers on top of a
+/// plain read — pure numeric logic, no filesystem, so it's unit-tested here
+/// rather than by trying to race a real write in an integration test (which
+/// would be exactly the kind of flaky, timing-dependent test this fix was
+/// designed to avoid depending on).
+#[cfg(test)]
+mod workflow_gate_reload_read_tests {
+    use super::*;
+
+    #[test]
+    fn agreeing_stats_and_read_are_stable() {
+        assert!(OrchRegistry::workflow_read_is_stable(120, 120, 120));
+    }
+
+    #[test]
+    fn a_shrink_between_the_before_stat_and_the_read_is_unstable() {
+        // The file was still being truncated when we read it: the pre-read
+        // stat saw the old (larger) size, the read itself caught the new one.
+        assert!(!OrchRegistry::workflow_read_is_stable(200, 120, 120));
+    }
+
+    #[test]
+    fn growth_between_the_read_and_the_after_stat_is_unstable() {
+        // The writer kept appending right after our read finished — we may
+        // have caught an early, incomplete slice of a multi-write save.
+        assert!(!OrchRegistry::workflow_read_is_stable(120, 120, 260));
+    }
+
+    #[test]
+    fn a_fully_torn_read_disagreeing_on_all_three_is_unstable() {
+        assert!(!OrchRegistry::workflow_read_is_stable(50, 120, 260));
     }
 }
 

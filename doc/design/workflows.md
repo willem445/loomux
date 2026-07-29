@@ -545,11 +545,10 @@ unedited file costs one small read-and-parse and nothing else, no invalidation
 state to track, and no audit-log spam every poll.
 
 **Deliberately asymmetric with launch/toggle-ON, and the asymmetry is the
-point.** A file that parses syncs exactly what it declares, even if that
-*widens* the gate (drops a reviewer, drops an `also:` clause, or removes
-`gates.merge` entirely) — a human's own edit is real consent, same as
-"removing a gate from the workflow really removes it" already reads at launch.
-But a file that stops parsing, or vanishes entirely, is treated differently
+point.** A file that parses AND still names a `gates.merge` syncs exactly what
+it declares, even if that *widens* what the gate accepts (drops a reviewer,
+drops an `also:` clause) — a human's own edit is real consent for that gate's
+shape. A file that stops parsing, or vanishes entirely, is treated differently
 here than at launch: at launch "no file" is a legitimate zero-config choice
 (there was never a gate to lose), while an *already-armed* gate whose file
 goes missing or unreadable mid-session is indistinguishable from an editor's
@@ -558,6 +557,40 @@ rather than reading that blip as consent to open it. This is the "file deleted
 mid-session" fail-closed case #385 called for explicitly; it self-heals the
 moment the file is next readable and the reload sees it differs from what's
 armed.
+
+**Whether an agent editing `gates.merge` live should be trusted at all is a
+separate, human-decided question — #459.** The human's call: an agent
+updating the workflow is often legitimate and wanted, and the odds of an
+agent adversarially weakening its own gate are low enough not to gate this
+feature on it. So a valid edit to an *existing* `gates.merge` — including one
+that loosens it — takes effect with no further human gesture required, and
+#459 is the durable record of that accepted risk (so it stays revisitable,
+not forgotten), not a design constraint this feature had to satisfy.
+
+**But *removing* `gates.merge` entirely is not that same case, and #385/B1
+found why the hard way.** `gates` — and every field inside a `Gate` — is
+`#[serde(default)]`, the right behavior for a fresh launch (a zero-config
+group is legitimate there) and the wrong one for a reload: a mid-flush
+truncation that happens to land between two top-level keys (a
+truncate-then-write save, a `git checkout` landing mid-flush) parses as a
+perfectly valid document that simply never reaches `gates:` — byte-for-byte
+indistinguishable, by type alone, from a complete file that genuinely
+declares none. No amount of looking harder at that one document can tell
+the two apart, and no amount of waiting can either: a truncation that
+outlasts one poll tick outlasts two just as easily and just as silently, so a
+multi-tick debounce is a mitigation, not a fix. The actual fix is a policy,
+not an inference: **on the reload path, `gates.merge` being absent while a
+gate is currently armed is never treated as removal.** It carries no
+information either way, so it changes nothing. The one path that CAN take an
+armed gate down to none is the explicit toggle-off — a single, discrete,
+attributable action, never something a recurring background read infers from
+whatever shape a file happens to be caught in. Belt-and-braces alongside that
+policy, `reload_merge_gate_if_changed` also stability-checks every read (a
+stat immediately before and after, both agreeing with what was actually
+read) so a write actively in flight can't be misread as *any* kind of
+change — narrower protection than the policy above (it only catches a write
+caught in the act, not one that's paused or crashed mid-truncation), but free
+and unconditional.
 
 Only the gate reloads — the roster (`guardrails.blocks`) stays
 launch/toggle-pinned, for the same reason a live delegate's persona doesn't

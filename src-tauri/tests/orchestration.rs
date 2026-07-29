@@ -17524,3 +17524,80 @@ fn run_workflow_gate_reload_skips_paused_groups() {
         "a paused group must not be reloaded until the human resumes it"
     );
 }
+
+#[test]
+fn run_workflow_gate_reload_retains_an_armed_gate_across_a_valid_yaml_prefix_missing_gates() {
+    // #385/B1, the concrete finding: `gates` — and every field inside a
+    // `Gate` — is `#[serde(default)]`, so cutting a well-formed workflow.yml
+    // short right before its `gates:` key parses as a perfectly VALID
+    // document, not garbage, not a YAML syntax error, that simply happens to
+    // omit `gates.merge`. That is exactly what a truncate-then-write save or
+    // a `git checkout` landing mid-flush produces, and it is byte-for-byte
+    // indistinguishable — by type alone — from a human deliberately editing
+    // the file to remove the gate entirely. Before the fix, the reloader
+    // read that absence as consent and cleared an already-armed gate for up
+    // to one poll interval; the fix is a POLICY (absence never clears an
+    // armed gate on the reload path), not a parser trick, so it must hold
+    // whether this exact text arrived by truncation or by deliberate edit —
+    // this test doesn't need to prove which one happened, only that neither
+    // one opens the gate.
+    let (reg, _d, repo, gid) = gated_group("");
+    let before = reg.merge_gate(&gid).expect("armed at launch");
+
+    let full = fs::read_to_string(repo.path().join(".loomux").join("workflow.yml")).unwrap();
+    let cut_at = full.find("gates:").expect("test fixture must declare gates:");
+    let truncated = full[..cut_at].to_string();
+    // Prove the fixture is doing what it claims — a genuine, valid YAML
+    // document, not garbage — or this test would silently be exercising the
+    // already-covered `Err`/malformed-YAML path instead of the one #385/B1
+    // is actually about.
+    assert!(
+        workflow::parse_workflow(&truncated).is_ok(),
+        "the truncated prefix must still be well-formed YAML, not garbage: {truncated:?}"
+    );
+    edit_workflow(repo.path(), &truncated);
+
+    reg.run_workflow_gate_reload();
+
+    assert_eq!(
+        reg.merge_gate(&gid),
+        Some(before),
+        "a valid document that never reaches gates.merge must retain the last-known gate — \
+         truncated or deliberate, only an explicit toggle-off may clear an armed gate"
+    );
+}
+
+#[test]
+fn run_workflow_gate_reload_never_clears_an_armed_gate_via_a_deliberately_gateless_rewrite() {
+    // The same policy, pinned from the OTHER angle: even a document that is
+    // unambiguously complete and well-formed, and unambiguously declares no
+    // `gates:` at all (not a truncation artifact — a human just rewrote the
+    // file), still does not clear an already-armed gate via the background
+    // reload. #385/B1's fix does not try to tell "deliberate" and
+    // "truncated" apart — it can't, from the bytes alone — so it treats them
+    // the same on purpose. Clearing an armed gate is only reachable through
+    // the explicit `set_advanced_orchestrator(..., false, ...)` toggle.
+    let (reg, _d, repo, gid) = gated_group("");
+    let before = reg.merge_gate(&gid).expect("armed at launch");
+
+    edit_workflow(
+        repo.path(),
+        "version: 1\nname: focused-review\n\
+         blocks:\n\
+         \x20 - id: worker\n    kind: worker\n\
+         \x20 - id: rev-security\n    kind: reviewer\n    prompt: Security only.\n\
+         \x20 - id: rev-tests\n    kind: reviewer\n    prompt: Test quality only.\n",
+    );
+    reg.run_workflow_gate_reload();
+
+    assert_eq!(
+        reg.merge_gate(&gid),
+        Some(before),
+        "a background reload must never be the thing that clears an armed gate to none"
+    );
+
+    // The explicit path still works — this is a policy about WHO may clear
+    // the gate, not a claim that it can never be cleared at all.
+    reg.set_advanced_orchestrator(&gid, false, "human").unwrap();
+    assert!(!reg.merge_gate_declared(&gid), "the toggle-off must still clear it");
+}
