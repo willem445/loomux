@@ -665,6 +665,77 @@ test("agentFreshCommand: a flag-looking WORD inside a quoted argument is never t
   );
 });
 
+// ---------- #471 review round 3: CLI-aware emission (rev-11, via #473/#458) ----------
+//
+// rev-11 traced a cross-PR oscillation: a copilot session resumed from the
+// Sessions sidebar records `--resume=<id>` (#440 D1c). #473 (#458) fixes
+// `scan_copilot()` to keep recording it in the `=` form, because copilot's
+// CLI reference says the space form does not reliably bind. But
+// agentResumeCommand was CLI-agnostic — it always appended Claude's
+// `--resume <id>` (space form) — so restoring that same pane the very next
+// time would silently rewrite the `=` form BACK to the space form, and the
+// two PRs' fixes would fight forever instead of converging.
+//
+// These pin the two additional properties rev-11 asked stated explicitly:
+// copilot's `--resume` is emitted in `=` form; copilot's `--session-id`
+// (agentFreshCommand) stays SPACE form, deliberately — NOT "made consistent"
+// with `--resume`, because the copilot CLI reference documents the two flags
+// with different forms. Claude (and any unrecognized/absent CLI) is
+// completely unaffected — every pre-existing test above uses a `claude …`
+// command and still expects the space form throughout, which is itself part
+// of the pin: it proves this change is copilot-scoped, not global.
+
+test("agentResumeCommand: copilot's --resume is emitted in the = form (space form does not reliably bind, per the CLI reference)", () => {
+  const out = agentResumeCommand("copilot --model gpt-4", null, "new-id");
+  assert.equal(out.command, "copilot --model gpt-4 --resume=new-id");
+});
+
+test("agentResumeCommand: round-trip stability — a copilot command already recording --resume=<old> (the #473/#458 shape) comes back with --resume=<new>, never oscillating back to the space form", () => {
+  const out = agentResumeCommand("copilot --resume=old-id --model gpt-4", null, "new-id");
+  assert.equal(out.command, "copilot --model gpt-4 --resume=new-id");
+});
+
+test("agentResumeCommand: copilot's --resume in = form is excised just like every other form, including EMPTY value", () => {
+  assert.equal(agentResumeCommand("copilot --resume=", null, "new-id").command, "copilot --resume=new-id");
+});
+
+test("agentResumeCommand: copilot detection is case-insensitive and reads the FIRST token only (programFromRestore's own contract)", () => {
+  const out = agentResumeCommand("Copilot --model gpt-4", null, "new-id");
+  assert.equal(out.command, "Copilot --model gpt-4 --resume=new-id");
+});
+
+test("agentResumeCommand: claude is completely unaffected by the copilot special-case — still space form", () => {
+  const out = agentResumeCommand("claude --model opus", null, "new-id");
+  assert.equal(out.command, "claude --model opus --resume new-id");
+});
+
+test("agentResumeCommand: an UNRECOGNIZED/absent CLI (no command match) also defaults to space form, same as claude", () => {
+  assert.equal(agentResumeCommand(null, null, "new-id").command, "claude --resume new-id");
+});
+
+test("agentResumeCommand: copilot argv form also emits the = form, as ONE element (not two)", () => {
+  assert.deepEqual(agentResumeCommand(null, ["copilot", "--model", "gpt-4"], "new-id"), {
+    argv: ["copilot", "--model", "gpt-4", "--resume=new-id"],
+  });
+});
+
+test("agentResumeCommand: claude argv form is unaffected — still two elements, space form", () => {
+  assert.deepEqual(agentResumeCommand(null, ["claude", "--model", "opus"], "new-id"), {
+    argv: ["claude", "--model", "opus", "--resume", "new-id"],
+  });
+});
+
+test("agentFreshCommand: copilot's --session-id STAYS space form — deliberately asymmetric with agentResumeCommand's copilot --resume, per the copilot CLI reference", () => {
+  const out = agentFreshCommand("copilot --resume=old-id --model gpt-4", null, "new-id");
+  assert.equal(out.command, "copilot --model gpt-4 --session-id new-id");
+});
+
+test("agentFreshCommand: copilot argv form also stays space form / two elements for --session-id", () => {
+  assert.deepEqual(agentFreshCommand(null, ["copilot", "--resume", "old-id"], "new-id"), {
+    argv: ["copilot", "--session-id", "new-id"],
+  });
+});
+
 // ---------- solo channel-identity MCP flags (#439) ----------
 // A restored solo agent pane's recorded command can carry the flags
 // `soloPrepare` appended at launch — they point at a `configs/solo-N.json`

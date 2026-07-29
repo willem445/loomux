@@ -368,24 +368,56 @@ function stripSessionFlagsFromArgv(tokens: string[]): string[] {
  *  the plan calls for. Pure so it's unit-tested; main.ts feeds the result to
  *  grid.openPane.
  *
- *  Only Claude has a clean resumable id (it's the only CLI we mint a session id
- *  for at launch), so this rewrites a `claude …` line: drop any recorded
- *  `--session-id`/`--resume` (both the space and `=` forms) so we never carry a
- *  stale id or double the flag, KEEP every other flag (model, the autopilot
- *  permission flag) so the resumed pane matches how it was launched, then append
- *  `--resume <id>`. Resuming into the idle TUI costs nothing until a prompt is
- *  sent — and we never append one (the no-replay rule). Prefers the string
- *  `command`; falls back to structured `argv`, then to a bare `claude --resume`. */
+ *  This function rewrites a `claude …` OR a `copilot …` line: drop any
+ *  recorded `--session-id`/`--resume` (every form `stripSessionFlagsFrom*`
+ *  covers) so we never carry a stale id or double the flag, KEEP every other
+ *  flag (model, the autopilot permission flag) so the resumed pane matches
+ *  how it was launched, then append a fresh `--resume`. Resuming into the
+ *  idle TUI costs nothing until a prompt is sent — and we never append one
+ *  (the no-replay rule).
+ *
+ *  Four properties this module holds at once (#449; the last two added on
+ *  #471 review round 3, per rev-11's trace through #473/#458's copilot
+ *  emission fix — stated explicitly here per that review, not left implicit):
+ *   1. Excision (`stripSessionFlagsFrom*`) strips a recorded session flag in
+ *      ANY form, for EITHER flag name — see those functions' own docs.
+ *   2. **copilot's `--resume` is emitted in the `=` form** (`--resume=<id>`):
+ *      per the copilot CLI reference, the space form does not reliably bind.
+ *      #473/#458 changed `scan_copilot()` to RECORD `--resume=<id>` for
+ *      exactly this reason; without this, restoring that pane through THIS
+ *      function would silently rewrite it back to the space form on every
+ *      restore — the two PRs' fixes undoing each other, oscillating forever
+ *      instead of converging.
+ *   3. **copilot's `--session-id` stays SPACE form** — `agentFreshCommand`
+ *      below, untouched. Deliberately asymmetric: the copilot CLI reference
+ *      documents `--session-id ID` in the space form specifically, so
+ *      "making the two flags consistent" would be a plausible-looking
+ *      cleanup that quietly breaks a function that is currently correct.
+ *      Pinned in `test/panerestore.test.ts` precisely so the next person who
+ *      notices the asymmetry finds a test explaining it, not a TODO.
+ *   4. A command needing no change comes back byte-identical apart from the
+ *      appended flag (#442's guarantee, general to this whole module).
+ *
+ *  Prefers the string `command`; falls back to structured `argv`, then to a
+ *  bare `claude --resume` (the historical default — a bare fallback with no
+ *  recorded command/argv at all has no CLI to detect, and every session this
+ *  project mints an id for today is claude's). */
 export function agentResumeCommand(
   command: string | null,
   argv: string[] | null,
   sessionId: string
 ): { command?: string; argv?: string[] } {
+  // copilot only: `=` form. Every other/unknown CLI (claude, or no CLI
+  // detected at all): space form, unchanged from this function's original
+  // behavior. See property 2 above for why copilot is the one exception.
+  const isCopilot = programFromRestore(command, argv) === "copilot";
   if (command && command.trim()) {
-    return { command: `${stripSessionFlagsFromCommand(command)} --resume ${sessionId}` };
+    const resumeFlag = isCopilot ? `--resume=${sessionId}` : `--resume ${sessionId}`;
+    return { command: `${stripSessionFlagsFromCommand(command)} ${resumeFlag}` };
   }
   if (argv && argv.length) {
-    return { argv: [...stripSessionFlagsFromArgv(argv), "--resume", sessionId] };
+    const stripped = stripSessionFlagsFromArgv(argv);
+    return { argv: isCopilot ? [...stripped, `--resume=${sessionId}`] : [...stripped, "--resume", sessionId] };
   }
   return { command: `claude --resume ${sessionId}` };
 }
@@ -396,7 +428,15 @@ export function agentResumeCommand(
  *  (not `--resume`), so the fresh session is created with that id and becomes
  *  resumable itself once a prompt is sent — and, like resume, never carries a
  *  prompt. Drops any stale `--resume`/`--session-id` first so we don't double or
- *  attempt a resume. */
+ *  attempt a resume.
+ *
+ *  Deliberately ALWAYS space form (`--session-id <id>`), for every CLI
+ *  including copilot — property 3 on `agentResumeCommand`'s doc comment
+ *  above. This is NOT an oversight to "make consistent" with that function's
+ *  `=`-form copilot `--resume`: the copilot CLI reference documents
+ *  `--session-id ID` specifically in the space form, so the two flags are
+ *  correctly asymmetric. `test/panerestore.test.ts` pins this explicitly so
+ *  a future cleanup pass finds the reason, not just the inconsistency. */
 export function agentFreshCommand(
   command: string | null,
   argv: string[] | null,
