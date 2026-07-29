@@ -1030,7 +1030,22 @@ gate too**, and the verdict store adds its own shapes. An agent with a shell can
   clear it. The only way this bullet's original "until relaunch" window
   still applies is turning workflow mode off first (which clears the gate
   deliberately) or disabling/killing the background reload thread, which is
-  a much bigger compromise than deleting one file.
+  a much bigger compromise than deleting one file — **or pausing the group,
+  the next bullet.**
+- **Pause the group.** `touch $LOOMUX_GROUP_DIR/paused` has no LIVE effect —
+  `run_workflow_gate_reload` (and every other background pass) checks the
+  in-memory `paused` set, not this file, and `pause_group`/`resume_group`
+  aren't reachable from any MCP surface an agent can call, only a human's
+  own groupview click. But the marker IS re-seeded into that set the next
+  time the group RESUMES (`create_group_ex`'s `if dir.join("paused").is_file()`
+  re-hydration — "a pause is a durable human safety action" surviving a
+  restart, the same contract every other guardrail marker gets). So combined
+  with the previous bullet — delete `merge_gate`, then drop this marker too
+  — an agent turns the ~30-second self-heal above into an outage that lasts
+  until the group's next resume finds the marker gone (it won't, since the
+  agent left it there) or the human notices the group reads paused and looks
+  closer. Same class as the other two bullets: a filesystem write under the
+  group dir an agent's own shell can already make, not a new API surface.
 - **Unset the group dir.** `env -u LOOMUX_GROUP_DIR gh pr merge 7` used to skip the
   workflow gate entirely — with nothing in the audit, since there is no audit log
   without a group dir. **That one is now closed**: the shim refuses *any* merge with

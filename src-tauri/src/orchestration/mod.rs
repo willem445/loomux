@@ -651,7 +651,7 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
       # when it cannot safely serialize a token (rather than dropping the clause),
       # and a hand edit or a truncation lands here too. Skipping any of them would
       # silently drop a requirement from a gate.
-      *) loomux_block_wf "malformed-gate" "the merge gate file contains a line loomux cannot parse ('$g_k') — a gate it cannot read in full is not a gate it will enforce in part. Fix .loomux/workflow.yml and relaunch the group" ;;
+      *) loomux_block_wf "malformed-gate" "the merge gate file contains a line loomux cannot parse ('$g_k') — a gate it cannot read in full is not a gate it will enforce in part. This self-heals on its own (the next background reload regenerates it) if .loomux/workflow.yml is well-formed; if the refusal persists, that file is what needs fixing. No relaunch needed either way" ;;
     esac
   done < "$gatef"
   # A gate naming nobody, or a threshold with no usable number, is a MALFORMED gate
@@ -16531,7 +16531,9 @@ impl OrchRegistry {
         let Some(gate) = self.merge_gate(group) else {
             return Some(format!(
                 "merge gate for PR #{pr}: the group's merge_gate file is MALFORMED — every merge \
-                 is refused until it is fixed (repair .loomux/workflow.yml and relaunch the group). \
+                 is refused until it is fixed. This self-heals on its own (the next background \
+                 reload regenerates it) if .loomux/workflow.yml is well-formed; if the refusal \
+                 persists, that file is what needs fixing. No relaunch needed either way. \
                  {GATE_REFUSAL_EXITS}"
             ));
         };

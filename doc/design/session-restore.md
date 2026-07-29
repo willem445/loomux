@@ -493,9 +493,16 @@ worktree rather than resuming the unresolvable one.
 
 **`start_fresh` is a fresh CONVERSATION, never a fresh LAUNCH (#412 rev-17
 blocker, fixed).** For an orchestrator, "start fresh" must reattach to the
-group's EXISTING state — its persisted roster and merge gate, the ones the
-human previewed and approved at the actual launch — not re-read
-`.loomux/workflow.yml` as if this were a new launcher session. The first cut
+group's EXISTING state — its persisted roster, and whatever its merge gate
+currently is — not re-read `.loomux/workflow.yml` itself as if this were a
+new launcher session. (Pre-#385, "existing state" and "the one the human
+previewed and approved at the actual launch" were the same thing for the
+gate, same as they still are for the roster. Post-#385 they can differ: the
+background reload (`run_workflow_gate_reload`) keeps the gate in sync with
+the CURRENT workflow file independent of any of this, so "existing" just
+means "whatever's armed right now," launch-approved or since drifted. What
+this paragraph is actually about — `start_fresh` itself never being the
+thing that re-derives either — is unaffected either way.) The first cut
 of `start_fresh` got this wrong by conflating two questions that happened to
 coincide in every case that existed before it: `resume_session.is_some()`
 used to double as "does this launch read the workflow file"
@@ -512,7 +519,8 @@ consent moment is the ORIGINAL launch, not this one.
 argument instead of inferring it — `resume_recorded_session`'s orchestrator
 branch always passes `Launch::Resume`, whether or not it's carrying a session
 id to `--resume`, because either way it is reopening a group that already
-has an approved roster and gate on disk. `tests/orchestration.rs`'s
+has a roster and gate on disk — approved at launch for the roster; for the
+gate, whatever's currently armed (see the aside above). `tests/orchestration.rs`'s
 `start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_file` pins both
 directions (roster identity, merge-gate content) byte-for-byte across a
 repo-file change that would otherwise have been silently adopted.
