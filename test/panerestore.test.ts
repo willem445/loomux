@@ -451,6 +451,102 @@ test("resume with neither command nor argv best-efforts a bare claude --resume",
   assert.deepEqual(agentResumeCommand(null, null, "s5"), { command: "claude --resume s5" });
 });
 
+// ---------- #449: property — session-flag excision must never reflow untouched bytes ----------
+//
+// The bug: the old implementation ran `command.trim().split(/\s+/)` and
+// rejoined with a single space, which collapses any whitespace RUN inside a
+// quoted arg on EVERY restore, silently and permanently (the corrupted form
+// gets persisted into the next layout snapshot). Windows paths with spaces
+// are the recurring killer in this codebase — this was #442's own blocking
+// bug, in an adjacent function of this same file — so a spaced path is the
+// MAIN fixture below, not a one-off edge case appended at the end.
+//
+// These pin the PROPERTY the fix owes, not a scenario: (1) a command with no
+// session flag comes back byte-identical apart from the appended flag, and
+// (2) a command that DOES carry one loses only that flag's own bytes — every
+// other byte, whitespace runs included, survives character-for-character.
+// A test that only ever tries single-spaced input would pass against the OLD
+// split/rejoin code too (the exact trap #439's own review called out), so
+// every fixture here carries a real internal whitespace run, most of them
+// inside a quoted Windows path.
+
+const UNTOUCHED_COMMAND_FIXTURES = [
+  // Spaced Windows path in a flag value — the common case, not the edge case.
+  'claude --append-system-prompt "C:\\Users\\Will H\\prompts\\system.txt" --model opus',
+  'claude --mcp-config "C:\\Users\\Old User\\configs\\solo-6.json" --dangerously-skip-permissions',
+  // Multiple internal whitespace runs inside one quoted value.
+  'claude --append-system-prompt "two  spaces  and  three   here"',
+  // No flags at all.
+  "claude",
+];
+
+test("agentResumeCommand: a command with NO session flag comes back byte-identical apart from the appended --resume — spaced Windows paths are the pinned case, not an edge case", () => {
+  for (const command of UNTOUCHED_COMMAND_FIXTURES) {
+    const out = agentResumeCommand(command, null, "new-id");
+    assert.equal(out.command, `${command} --resume new-id`, `must not reflow: ${command}`);
+  }
+});
+
+test("agentFreshCommand: a command with NO session flag comes back byte-identical apart from the appended --session-id — spaced Windows paths are the pinned case, not an edge case", () => {
+  for (const command of UNTOUCHED_COMMAND_FIXTURES) {
+    const out = agentFreshCommand(command, null, "new-id");
+    assert.equal(out.command, `${command} --session-id new-id`, `must not reflow: ${command}`);
+  }
+});
+
+// Fixtures: [prefix, flag, suffix] — `flag` is the exact recorded session-flag
+// substring (space or `=` form) sandwiched between two chunks that each carry
+// their OWN meaningful whitespace (a spaced quoted path, a multi-space run).
+// The property: excising `flag` and appending the new one must leave `prefix`
+// and `suffix` EXACTLY as recorded — never reflowed, never touched.
+const SESSION_FLAG_FIXTURES: Array<{ prefix: string; flag: string; suffix: string }> = [
+  {
+    prefix: 'claude --append-system-prompt "two  spaces  here"',
+    flag: " --session-id old-id",
+    suffix: ' --mcp-config "C:\\Users\\Will H\\solo-6.json" --model opus',
+  },
+  {
+    prefix: 'claude --mcp-config "C:\\Users\\Old  User\\dead\\solo-6.json"',
+    flag: " --resume=stale-id",
+    suffix: ' --append-system-prompt "trailing   run"',
+  },
+  { prefix: "claude", flag: " --session-id=old", suffix: "" },
+];
+
+test("agentResumeCommand: excises ONLY the recorded session flag's own bytes — every other byte, whitespace runs inside quoted args included, survives untouched", () => {
+  for (const { prefix, flag, suffix } of SESSION_FLAG_FIXTURES) {
+    const recorded = prefix + flag + suffix;
+    const out = agentResumeCommand(recorded, null, "new-id");
+    assert.equal(out.command, `${prefix}${suffix} --resume new-id`, `flag=${JSON.stringify(flag)}`);
+  }
+});
+
+test("agentFreshCommand: excises ONLY the recorded session flag's own bytes — every other byte, whitespace runs inside quoted args included, survives untouched", () => {
+  for (const { prefix, flag, suffix } of SESSION_FLAG_FIXTURES) {
+    const recorded = prefix + flag + suffix;
+    const out = agentFreshCommand(recorded, null, "new-id");
+    assert.equal(out.command, `${prefix}${suffix} --session-id new-id`, `flag=${JSON.stringify(flag)}`);
+  }
+});
+
+// argv path: no reflow risk (each element is already discrete), but pinned
+// explicitly per #449's own test-strategy note to cover "both the command and
+// argv paths" — an internal-whitespace argv element must survive as one
+// element, untouched, exactly like the command-string fixtures above.
+test("agentResumeCommand: argv form leaves a non-flag element's internal whitespace untouched (each element is already discrete)", () => {
+  const argv = ["claude", "--append-system-prompt", "two  spaces  here", "--session-id", "old", "--model", "opus"];
+  assert.deepEqual(agentResumeCommand(null, argv, "new-id"), {
+    argv: ["claude", "--append-system-prompt", "two  spaces  here", "--model", "opus", "--resume", "new-id"],
+  });
+});
+
+test("agentFreshCommand: argv form leaves a non-flag element's internal whitespace untouched (each element is already discrete)", () => {
+  const argv = ["claude", "--append-system-prompt", "two  spaces  here", "--resume", "old"];
+  assert.deepEqual(agentFreshCommand(null, argv, "new-id"), {
+    argv: ["claude", "--append-system-prompt", "two  spaces  here", "--session-id", "new-id"],
+  });
+});
+
 // ---------- solo channel-identity MCP flags (#439) ----------
 // A restored solo agent pane's recorded command can carry the flags
 // `soloPrepare` appended at launch — they point at a `configs/solo-N.json`

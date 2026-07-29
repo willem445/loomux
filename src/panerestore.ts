@@ -229,6 +229,58 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
   }
 }
 
+/** The value grammar shared by every "flag [=|space] value" excision in this
+ *  module: a whole double-quoted run kept as ONE unit (quotes included, so a
+ *  `.slice` excise never leaves a stray `"` behind), or a bare whitespace-free
+ *  token — the one shape every flag value recorded here uses (a session id, a
+ *  solo MCP config path, …). `CLAUDE_SOLO_MCP_RE`/`COPILOT_SOLO_MCP_RE` below
+ *  (#439) are built from this same fragment via `new RegExp` — factored out
+ *  so a future flag-value shape is taught once, not to N regexes that could
+ *  quietly drift apart (the #452 worry, one level up: two parsers that
+ *  disagree). */
+const QUOTED_OR_BARE_VALUE = `"[^"]*"|\\S+`;
+
+/** Excise every `--session-id`/`--resume` occurrence (space or `=` form) from
+ *  the ORIGINAL command STRING — never a tokenize/`.join(" ")` round trip. The
+ *  prior implementation ran `command.trim().split(/\s+/)` then rejoined with a
+ *  single space, which collapses any run of whitespace INSIDE a quoted arg
+ *  (a system prompt, a spaced Windows path — the recurring Windows killer:
+ *  `C:\Users\Will H\...` is legal and common) on every restore, silently and
+ *  permanently once the corrupted form gets persisted into the next layout
+ *  snapshot (#449). This reuses the exact excise-from-original technique
+ *  `stripSoloMcpFlags` below already uses for the solo MCP flags (regex.exec
+ *  on the ORIGINAL string, `.slice` around the match — never a second,
+ *  disagreeing parser), and the same quote-aware value grammar
+ *  (`QUOTED_OR_BARE_VALUE`) — so nothing outside the matched flag(s) is ever
+ *  touched: a command with no session flags at all comes back byte-identical
+ *  apart from the appended flag, and one that has them loses only that flag's
+ *  bytes, whitespace included. */
+const SESSION_FLAG_RE = new RegExp(
+  `(^|\\s)(?:--session-id|--resume)(?:=\\S*|\\s+(?:${QUOTED_OR_BARE_VALUE}))`,
+  "g"
+);
+
+function stripSessionFlagsFromCommand(command: string): string {
+  return command.replace(SESSION_FLAG_RE, "");
+}
+
+/** Same drop as above, but for the already-discrete `argv` array — no
+ *  whitespace-collapse risk there (each element is one token already), so a
+ *  plain token scan is fine and doesn't need quote-awareness. */
+function stripSessionFlagsFromArgv(tokens: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "--session-id" || t === "--resume") {
+      i++; // drop the flag AND its separate value token
+      continue;
+    }
+    if (t.startsWith("--session-id=") || t.startsWith("--resume=")) continue; // `=` form: one token
+    out.push(t);
+  }
+  return out;
+}
+
 /** Turn a resumed agent's recorded launch line into the command that re-opens
  *  its prior session — the "resume/reattach command from a recorded sessionId"
  *  the plan calls for. Pure so it's unit-tested; main.ts feeds the result to
@@ -247,24 +299,11 @@ export function agentResumeCommand(
   argv: string[] | null,
   sessionId: string
 ): { command?: string; argv?: string[] } {
-  const strip = (tokens: string[]): string[] => {
-    const out: string[] = [];
-    for (let i = 0; i < tokens.length; i++) {
-      const t = tokens[i];
-      if (t === "--session-id" || t === "--resume") {
-        i++; // drop the flag AND its separate value token
-        continue;
-      }
-      if (t.startsWith("--session-id=") || t.startsWith("--resume=")) continue; // `=` form: one token
-      out.push(t);
-    }
-    return out;
-  };
   if (command && command.trim()) {
-    return { command: [...strip(command.trim().split(/\s+/)), "--resume", sessionId].join(" ") };
+    return { command: `${stripSessionFlagsFromCommand(command)} --resume ${sessionId}` };
   }
   if (argv && argv.length) {
-    return { argv: [...strip(argv), "--resume", sessionId] };
+    return { argv: [...stripSessionFlagsFromArgv(argv), "--resume", sessionId] };
   }
   return { command: `claude --resume ${sessionId}` };
 }
@@ -281,24 +320,11 @@ export function agentFreshCommand(
   argv: string[] | null,
   sessionId: string
 ): { command?: string; argv?: string[] } {
-  const strip = (tokens: string[]): string[] => {
-    const out: string[] = [];
-    for (let i = 0; i < tokens.length; i++) {
-      const t = tokens[i];
-      if (t === "--session-id" || t === "--resume") {
-        i++;
-        continue;
-      }
-      if (t.startsWith("--session-id=") || t.startsWith("--resume=")) continue;
-      out.push(t);
-    }
-    return out;
-  };
   if (command && command.trim()) {
-    return { command: [...strip(command.trim().split(/\s+/)), "--session-id", sessionId].join(" ") };
+    return { command: `${stripSessionFlagsFromCommand(command)} --session-id ${sessionId}` };
   }
   if (argv && argv.length) {
-    return { argv: [...strip(argv), "--session-id", sessionId] };
+    return { argv: [...stripSessionFlagsFromArgv(argv), "--session-id", sessionId] };
   }
   return { command: `claude --session-id ${sessionId}` };
 }
@@ -314,16 +340,19 @@ export type SoloCli = "claude" | "copilot";
 // precisely because a username CAN contain a space ("Will H", "John Smith") —
 // this is not a hypothetical, it's the shape of real field data (CLAUDE.md
 // constraint 8: no this-machine assumptions). These match the quoted-path
-// group as ONE unit (`"[^"]*"` or a bare no-space token) rather than naively
-// splitting on whitespace, and excise the match FROM THE ORIGINAL STRING —
-// never a tokenize/rejoin round trip — so nothing outside the matched region
-// is touched: a `cli: null` command (no solo flags at all) comes back
-// byte-identical, and the surviving remainder of a matched command keeps
-// whatever whitespace it already had (#439 review B1 + N1).
-const CLAUDE_SOLO_MCP_RE =
-  /(^|\s)--mcp-config\s+("[^"]*"|\S+)\s+--strict-mcp-config\s+--allowedTools\s+mcp__loomux(?=\s|$)/;
-const COPILOT_SOLO_MCP_RE =
-  /(^|\s)--additional-mcp-config\s+("[^"]*"|\S+)\s+--allow-tool\s+loomux(?=\s|$)/;
+// group as ONE unit (`QUOTED_OR_BARE_VALUE`, shared with `SESSION_FLAG_RE`
+// above) rather than naively splitting on whitespace, and excise the match
+// FROM THE ORIGINAL STRING — never a tokenize/rejoin round trip — so nothing
+// outside the matched region is touched: a `cli: null` command (no solo
+// flags at all) comes back byte-identical, and the surviving remainder of a
+// matched command keeps whatever whitespace it already had (#439 review B1 +
+// N1).
+const CLAUDE_SOLO_MCP_RE = new RegExp(
+  `(^|\\s)--mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--strict-mcp-config\\s+--allowedTools\\s+mcp__loomux(?=\\s|$)`
+);
+const COPILOT_SOLO_MCP_RE = new RegExp(
+  `(^|\\s)--additional-mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--allow-tool\\s+loomux(?=\\s|$)`
+);
 
 /** Remove a recorded agent command's solo channel-identity MCP flags (#439):
  *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__loomux`
