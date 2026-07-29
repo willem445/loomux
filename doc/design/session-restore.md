@@ -641,6 +641,26 @@ evicting far past that boundary evicts both conflicting entries together and
 would pass for the wrong reason) and `re_touching_a_cwd_protects_it_from_
 eviction`; both mutation-verified against the flat-log design.
 
+**The one residual bound this doesn't close, named plainly rather than left
+for someone to rediscover while changing eviction policy later (rev-6,
+round 2 close-out).** `Conflicted` survives every partial eviction — but if
+a conflicted cwd is evicted **entirely** (it becomes the least-recently-
+touched of 300+ cwds — i.e., untouched while 300 OTHER folders were), its
+whole history, including the fact that it was ever conflicted, is gone. If
+that same folder is then explicitly re-launched, the store records the
+fresh value as if it were the folder's first-ever posture; restoring an
+OLDER session from that same folder — one whose posture disagreed with the
+fresh write — would then inherit the fresh value, because post-eviction the
+store cannot distinguish "no history" from "history that once disagreed and
+was forgotten." This is the structural floor of any CAPPED, CWD-KEYED store:
+eviction can only ever discard information, and once a cwd's entry is gone,
+there is nothing left FOR the ambiguity rule to act on. The fix is precise
+per-session-id keying (never cwd-approximated in the first place), which is
+exactly the follow-up already named above and tracked as **#457** — not
+reimplemented here. Accepted as a residual, not a claim-vs-reality gap: the
+sticky-`Conflicted` state genuinely holds for as long as the cwd's entry
+survives; this is a statement about what happens once it doesn't.
+
 **Review round 1, B2 — the permission key must not case-fold on a
 case-sensitive filesystem.** The first cut reused `norm_path` (defined
 above, for SESSION-CWD MATCHING) as the posture store's key. That function
@@ -690,3 +710,21 @@ third derivation now exists to converge when that broader work happens.
 Every site also checks that the restored command actually contains
 `--autopilot`, so the watcher never spins up its up-to-10-minute poll for a
 pane that could not possibly show the dialog it exists to answer.
+
+**Review round 2 (rev-6 close-out), the last unpinned corner: a store the
+code cannot parse.** `load_copilot_posture` already degraded a missing,
+corrupt, or wrong-shape store file to an EMPTY store — never a crash, never
+a stale grant — via the same `uistate::load_or_quarantine` + atomic
+`serde_json::from_str` this file's other stores use. rev-6 verified this by
+hand (a scratch test against a fresh store, a corrupt file, a
+valid-JSON-but-wrong-shape file — including a leftover file from this
+module's OWN pre-B1-fix schema, the concrete case a real upgrading user
+hits — and an unrecognized `posture` enum variant, all resolving to no
+flags) but nothing shipped pinned it: a future edit adding lenient
+per-entry recovery, or a new `CopilotPosture` variant resolved by a
+catch-all arm, could silently reopen exactly the grant path B1 closed, with
+nothing to fail. `any_unparseable_or_malformed_store_state_grants_nothing`
+lifts that scratch test's shape and generalizes it to the invariant —
+several distinct failure classes, several cwds each — mutation-verified
+against a lenient-per-entry-salvage regression that defaults a
+missing/unrecognized posture to `True`.

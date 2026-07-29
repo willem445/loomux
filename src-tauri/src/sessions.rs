@@ -1332,4 +1332,75 @@ mod copilot_posture_tests {
         set_copilot_posture_path_for_test(None);
         drop(posture_dir);
     }
+
+    /// THE property rev-6 asked for (round 2, close-out review of 918f1fb):
+    /// a posture-store file the code cannot fully understand — corrupt
+    /// bytes, a valid-JSON-but-wrong shape, a leftover file from this
+    /// module's OWN pre-fix schema, a malformed entry, an unrecognized
+    /// `posture` value, a truncated record — must NEVER grant flags for any
+    /// cwd. rev-6 verified this by hand with a 3-fixture scratch test
+    /// (fresh / corrupt / wrong-shape-including-a-round-1-schema-leftover /
+    /// unknown-variant, all resolving to no flags) and flagged that nothing
+    /// shipped pinned it — a future edit to the store's parsing (lenient
+    /// per-entry recovery, a new `CopilotPosture` variant handled by a
+    /// catch-all) could silently reopen exactly the grant path B1 closed,
+    /// and nothing would fail. This lifts that scratch test's shape
+    /// (`fs::write` a raw store file, assert the lookup) and generalizes it
+    /// to the INVARIANT rather than shipping isolated fixtures: asserted
+    /// over a spread of distinct failure classes AND over several cwds per
+    /// fixture, so the assertion is about what the STORE can ever produce,
+    /// not one lookup.
+    ///
+    /// The round-1-schema fixture below is the concrete, non-hypothetical
+    /// case rev-6 named: a real user upgrading past this PR has this
+    /// module's OWN pre-B1-fix file (`{cwd, autopilot, recorded_ms}`) sitting
+    /// on disk, which must degrade to "no history" rather than misreading a
+    /// stale `autopilot` field as the new `posture`.
+    ///
+    /// Mutation-verified: temporarily replacing `load_copilot_posture`'s
+    /// atomic-parse-or-empty contract with a lenient per-entry salvage that
+    /// defaults a missing/unrecognized `posture` to `True` makes this red on
+    /// exactly the fixtures that exercise that gap.
+    #[test]
+    fn any_unparseable_or_malformed_store_state_grants_nothing() {
+        let malformed_fixtures: &[(&str, &str)] = &[
+            ("not JSON at all", "this is not json{{{"),
+            ("valid JSON, wrong top-level shape entirely", r#"{"totally": "unexpected shape"}"#),
+            ("entries present but not an array", r#"{"entries": "nope"}"#),
+            (
+                "a leftover file from this module's OWN pre-B1-fix schema (rev-6's named case)",
+                r#"{"entries": [{"cwd": "c:\\work\\x", "autopilot": true, "recorded_ms": 1}]}"#,
+            ),
+            (
+                "one well-formed entry, one entry missing the posture field",
+                r#"{"entries": [
+                    {"cwd": "c:\\work\\x", "posture": "True", "touched_ms": 1},
+                    {"cwd": "c:\\work\\y", "touched_ms": 2}
+                ]}"#,
+            ),
+            (
+                "an unrecognized posture variant",
+                r#"{"entries": [{"cwd": "c:\\work\\x", "posture": "SomethingElse", "touched_ms": 1}]}"#,
+            ),
+            (
+                "an entry whose touched_ms is the wrong type",
+                r#"{"entries": [{"cwd": "c:\\work\\x", "posture": "True", "touched_ms": "soon"}]}"#,
+            ),
+            ("truncated mid-record", r#"{"entries": [{"cwd": "c:\\work\\x", "post"#),
+        ];
+
+        for (label, content) in malformed_fixtures {
+            let d = tempfile::tempdir().unwrap();
+            set_copilot_posture_path_for_test(Some(d.path().join("copilot-posture.json")));
+            fs::write(d.path().join("copilot-posture.json"), content).unwrap();
+            for cwd in ["c:/work/x", "c:/work/y", "C:/work/X", "c:/elsewhere"] {
+                assert_eq!(
+                    copilot_launch_posture(cwd),
+                    None,
+                    "malformed store ({label}) must never grant flags — cwd {cwd:?}"
+                );
+            }
+            set_copilot_posture_path_for_test(None);
+        }
+    }
 }
