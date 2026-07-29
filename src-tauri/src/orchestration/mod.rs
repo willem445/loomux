@@ -1327,6 +1327,53 @@ const SUBMIT_CONFIRM_MIN_BYTES: u64 = 24;
 /// (box clears, turn starts) before the new paste lands.
 const FLUSH_SETTLE: Duration = Duration::from_millis(400);
 
+// #112 round-2 redesign: acceptance vs. processing. A queued prompt into a
+// busy pane produces no PROCESSING evidence (no burst, no hook) for an
+// arbitrarily long time — that's normal, correct CLI behavior, not a fault.
+// Tier 1 (box consumption) answers a different, faster question — did the
+// CLI ACCEPT the paste at all — and does so two-sidedly wherever it can
+// verify its own precondition (see `box_holds_paste`'s doc). The extended
+// "is this genuinely idle, not just busy" monitor below is what replaces a
+// fixed timeout with an observed one for everything Tier 1 can't answer.
+/// How much of the pane's tail (bytes, raw/pre-strip) Tier 1 reads to check
+/// whether our own pasted text is still sitting at the box's tail end.
+/// Same sizing philosophy as `QUESTION_SCAN_TAIL_BYTES` — reused directly
+/// rather than inventing a second "how much tail matters" constant.
+const BOX_TAIL_SCAN_BYTES: usize = QUESTION_SCAN_TAIL_BYTES;
+/// Extra slack (normalized characters) added around the pasted text's own
+/// length when windowing "the tail end" for containment — covers box
+/// framing/prompt-symbol/cursor characters immediately around our text
+/// without widening the window enough to reach unrelated older output.
+const BOX_TAIL_WINDOW_SLACK: usize = 200;
+/// How long the extended post-window monitor polls before each check —
+/// cheap (a tail read + a marker-file read), so this can be fairly tight
+/// without real cost.
+const LATE_MONITOR_POLL: Duration = Duration::from_secs(5);
+/// How long the pane's own output must stay quiet — checked ONLY once the
+/// normal confirm/retry window has already closed without a decision —
+/// before "no evidence yet" is treated as "genuinely done and still no
+/// trace, so it really is lost" rather than "still busy, ask again later".
+/// Deliberately its OWN constant, not `SUBMIT_QUIET`: that 1-second bar is
+/// tuned for "safe to press Enter", an unrelated question with an unrelated
+/// false-positive cost. This one needs enough margin that an ordinary gap
+/// in a CLI's own streaming cadence (a pause between tool calls, a spinner
+/// tick) can never be mistaken for "finished and idle" — minutes, not
+/// seconds. Named plainly in the design note as a byte-count proxy (the
+/// SAME category of signal `watchdog_tick`'s stall detection already
+/// trusts at this timescale) rather than a semantic "I see an idle prompt"
+/// observation, because that's what it actually is.
+const PENDING_IDLE_QUIET: Duration = Duration::from_secs(60);
+/// #112 round 3 (rev-20 B1): a hard cap on how long a single late-
+/// confirmation monitor thread stays alive with nothing resolved.
+/// Deliberately generous — the live episode this design responds to needed
+/// 38+ minutes — but not infinite: an abandoned pane (a killed agent whose
+/// pty somehow never reports closed, or a `Pending` delivery that never
+/// resolves and never goes idle because it keeps seeing brief unrelated
+/// output) must not hold a poller forever. Combined with the supersession
+/// check (`late_monitor_tick`'s doc), this bounds live monitors to at most
+/// one per pane most of the time, for at most this long.
+const LATE_MONITOR_MAX_LIFETIME: Duration = Duration::from_secs(4 * 3600);
+
 // Human-typing backstop (#43, option A): even with the loomux compose strip,
 // a human can still type directly into the terminal. Before the paste AND
 // before the first Enter, hold delivery while the pane has seen recent
@@ -1378,6 +1425,18 @@ const QUESTION_HOLD_POLL: Duration = Duration::from_millis(250);
 /// reason), instead of cloning the whole (up to 256 KB) output ring on every
 /// 250ms poll for up to two minutes.
 const QUESTION_SCAN_TAIL_BYTES: usize = 4096;
+/// #112 round 3 (rev-20 N1): the late-confirmation monitor's OWN question
+/// scan window — deliberately larger than `QUESTION_SCAN_TAIL_BYTES`. That
+/// constant was sized for the 250ms-cadence pre-Enter/retry checkpoints,
+/// where a bigger read on every poll adds up; the monitor polls once every
+/// `LATE_MONITOR_POLL` (5s), so a much larger read costs nothing measurable
+/// there. It needs the extra room: a dialog rendered above a long,
+/// literally-rendered paste (Tier 1 governing a multi-KB brief) sits
+/// chronologically BEFORE that paste in the tail, so a 4KB window could be
+/// entirely paste-plus-chrome and miss the dialog entirely — exactly the
+/// wrong direction to be wrong in, since missing a live question is what
+/// lets the idle trigger fire while the human is still expected to answer.
+const LATE_MONITOR_QUESTION_SCAN_BYTES: usize = 32 * 1024;
 /// How many CONSECUTIVE polls `prompt_wait_detected` must read false before
 /// the interactive-question guard releases (rev-19 R1): release is state-
 /// based (is the menu still on screen?), not activity-based (did a keystroke
@@ -2403,6 +2462,53 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 /// the_marker_dir_cant_be_created`, which runs this exact script under an
 /// induced `mkdir` failure and asserts the real process exit code — the
 /// ORIGINAL `: >` version of this script failed that test for real.
+///
+/// **#112's `promptsubmit` arm carries a STRICTER safety bar than either
+/// event above**: Claude's hooks reference documents `UserPromptSubmit` exit
+/// code 2 as not merely blocking but ERASING the user's submitted prompt, and
+/// on exit 0 any stdout the hook prints is injected as context the model
+/// sees. So this arm must (a) exit 0 unconditionally, on every path,
+/// including every I/O failure, exactly like `precompact`/`sessionstart-
+/// compact` above, AND (b) never write anything to its OWN stdout — the
+/// touch-then-append is therefore structured so the append's target is
+/// EITHER the marker file (`>> "$marker"`) or, on a `touch` failure,
+/// `/dev/null` (`cat >/dev/null 2>&1`, which also drains stdin so the
+/// hook's caller never blocks on a full pipe) — never the script's inherited
+/// stdout. The gate is `touch` first (an ORDINARY command failure per the
+/// reasoning above, safely reported and continued past) rather than a bare
+/// `>>` open on a possibly-nonexistent parent dir (the SAME fatal-
+/// redirection-error hazard `: > "$path"` had) — once `touch` proves the
+/// path is openable, the single grouped `{ cat; printf '\n'; } >> "$marker"`
+/// append is safe. Real-execution pins:
+/// `promptsubmit_hook_script_sh_exits_zero_and_prints_nothing_when_the_
+/// marker_dir_cant_be_created` (induced `mkdir` failure — exit 0 AND empty
+/// stdout) and `promptsubmit_hook_script_sh_appends_stdin_verbatim_with_no_
+/// stdout` (the happy path — two firings append, they don't overwrite, and
+/// stdout stays empty on the successful path too). Mutation-verified (PR
+/// #451 body has the exact commands/output): a stray unredirected `cat`
+/// ahead of the touch-gate — a realistic typo that would leak the submitted
+/// prompt straight into Claude's own context — reds both tests. **Honesty
+/// note, found by review**: on this shell (git-bash `sh.exe`, and per POSIX
+/// itself), the FATAL-on-redirection-error rule applies to *special
+/// built-ins* like a bare `: >`, not to ordinary utilities or compound
+/// groups — so `{ cat; printf '\n'; } >> "$marker"` alone, without the
+/// `touch` gate, was verified NOT to abort this script on the induced
+/// `mkdir` failure either (confirmed directly, not assumed). The `touch`
+/// gate is kept as defense-in-depth / consistency with the rest of this
+/// module's established style (never trust a shell's exact redirection-
+/// error semantics across every `sh` implementation this might run under),
+/// not because a mutation here demonstrates a live regression on THIS
+/// shell — that would be a false claim, exactly the kind #451 round 1
+/// review caught this doc comment making about a test that didn't exist.
+///
+/// **Naming, kept imprecise on purpose (#112):** this file is still named
+/// `compact-hook.sh` (see `ensure_compact_hook_script`) and this constant is
+/// still `COMPACT_HOOK_SCRIPT`, even though the `promptsubmit` arm below
+/// means "compact" no longer describes everything this script does.
+/// Renaming either would strand any already-spawned agent whose generated
+/// `--settings`/`loomux-compact.json` still points at the OLD path/name —
+/// so both stay, generic-lifecycle-hook-script-not-just-compact in
+/// substance even though the names say otherwise.
 #[doc(hidden)] // pub for integration tests: they run this script for real
 pub const COMPACT_HOOK_SCRIPT: &str = "#!/bin/sh\n\
 event=\"$1\"\n\
@@ -2418,6 +2524,14 @@ if [ -n \"$group_dir\" ] && [ -n \"$agent_id\" ]; then\n\
       touch \"$group_dir/hooks/$agent_id.sessionstart-compact.json\" 2>/dev/null\n\
       ctx=\"[loomux] Session resumed after a compact. Your durable role contract already rides in the system prompt (--agent, a generated custom-agent file) -- trust it over any summary above. Re-sync live state now: list_tasks, get_state, list_agents. Directive ledger (if any): ${group_dir}/ledger-${agent_id}.log\"\n\
       printf '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"%s\"}}\\n' \"$ctx\"\n\
+      ;;\n\
+    promptsubmit)\n\
+      marker=\"$group_dir/hooks/$agent_id.promptsubmit.jsonl\"\n\
+      if touch \"$marker\" 2>/dev/null; then\n\
+        { cat; printf '\\n'; } >> \"$marker\" 2>/dev/null\n\
+      else\n\
+        cat >/dev/null 2>&1\n\
+      fi\n\
       ;;\n\
   esac\n\
 fi\n\
@@ -2476,6 +2590,48 @@ pub const COPILOT_PRECOMPACT_HOOK_POWERSHELL: &str =
      New-Item -ItemType Directory -Force -Path $hooksDir -ErrorAction Stop | Out-Null; \
      $marker = Join-Path $hooksDir ($env:LOOMUX_AGENT_ID + '.precompact.json'); \
      New-Item -ItemType File -Force -Path $marker -ErrorAction Stop | Out-Null \
+     } } catch {}; exit 0";
+
+/// #112's `userPromptSubmitted` hook (bash half) — an EXISTENCE-only marker,
+/// same shape and same reasoning as `COPILOT_PRECOMPACT_HOOK_BASH` above
+/// ("no payload parsing needed", per that constant's own doc): Copilot's
+/// hooks reference (docs.github.com/en/copilot/reference/hooks-reference)
+/// documents `userPromptSubmitted`'s field names (`prompt`, camelCase, or
+/// `hook_event_name`/`prompt`, the VS-Code-compatible shape) but does NOT
+/// document the payload's TRANSPORT for this event the way it nails down
+/// Claude's stdin-JSON contract — so this arm never attempts to read or
+/// capture the prompt text at all; it appends a single non-JSON marker line
+/// (`.`) to the SAME per-agent `.promptsubmit.jsonl` file the Claude script
+/// writes real JSON records into. `promptsubmit_records_since` treats any
+/// non-empty, non-JSON line as an existence record (`text: None` —
+/// `PromptSubmitRecord`'s doc), so the Copilot and Claude tiers share one
+/// reader; Copilot just degrades to `PromptLandedMatch::Existence` rather
+/// than ever reaching `Content`. Also notification-only per the reference
+/// ("No" output is processed for this event) — there is no exit-2-erases-
+/// the-prompt hazard here the way there is for Claude's `UserPromptSubmit`,
+/// but the same touch-gate discipline is kept anyway for consistency with
+/// every other marker write in this module and because Copilot's OWN docs
+/// still document `preCompact` as blocking (the precedent this constant
+/// already follows).
+pub const COPILOT_PROMPTSUBMIT_HOOK_BASH: &str =
+    "if [ -n \"$LOOMUX_GROUP_DIR\" ] && [ -n \"$LOOMUX_AGENT_ID\" ]; then \
+     mkdir -p \"$LOOMUX_GROUP_DIR/hooks\" 2>/dev/null; \
+     marker=\"$LOOMUX_GROUP_DIR/hooks/$LOOMUX_AGENT_ID.promptsubmit.jsonl\"; \
+     if touch \"$marker\" 2>/dev/null; then printf '.\\n' >> \"$marker\" 2>/dev/null; fi; \
+     fi; exit 0";
+
+/// The `powershell` half of the same hook entry — see `COPILOT_PROMPTSUBMIT_
+/// HOOK_BASH`'s doc for why this is existence-only (no payload capture).
+/// `try`/`catch` + `-ErrorAction Stop` mirrors `COPILOT_PRECOMPACT_HOOK_
+/// POWERSHELL` exactly: PowerShell has no POSIX-style fatal-redirection-error
+/// hazard, so the touch-gate here is belt-and-braces consistency, not a
+/// correctness requirement the way it is for the `sh` arm above.
+pub const COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL: &str =
+    "try { if ($env:LOOMUX_GROUP_DIR -and $env:LOOMUX_AGENT_ID) { \
+     $hooksDir = Join-Path $env:LOOMUX_GROUP_DIR 'hooks'; \
+     New-Item -ItemType Directory -Force -Path $hooksDir -ErrorAction Stop | Out-Null; \
+     $marker = Join-Path $hooksDir ($env:LOOMUX_AGENT_ID + '.promptsubmit.jsonl'); \
+     Add-Content -Path $marker -Value '.' -ErrorAction Stop \
      } } catch {}; exit 0";
 
 /// Claude Code's permission mode for an (un)attended agent: its native `auto`
@@ -6544,6 +6700,552 @@ pub fn submit_confirmed(reached_quiet: bool, baseline_total: u64, observed_total
     reached_quiet && observed_total.saturating_sub(baseline_total) >= SUBMIT_CONFIRM_MIN_BYTES
 }
 
+// ─────────────────────── #112: real prompt-landed hook signal ───────────────────────
+//
+// `submit_confirmed` above trusts ANY output burst after Enter as evidence the
+// prompt landed — error repaints, dialog interactions, and spinner ticks all
+// clear its 24-byte bar, so the two live failures in #112's issue body were both
+// recorded confirmed while the task was in fact destroyed (false confirm). The
+// SAME missing signal produces the inverse failure too: a busy pane that never
+// reaches quiet skips this heuristic entirely (`while reached_quiet && ...` in
+// `deliver_prompt`), which is why 4 of 5 spawns drew a spurious "unconfirmed"
+// notice in the #112 field-evidence comment even though every one had actually
+// landed (false unconfirm).
+//
+// The fix is an AUTHORITATIVE signal, not a retuned threshold: Claude Code's
+// `UserPromptSubmit` hook fires "when you submit a prompt, before Claude
+// processes it" (code.claude.com/docs/en/hooks, "UserPromptSubmit input"
+// section — fetched and grepped directly, not inferred), with no matcher
+// (always fires) and the submitted text on stdin as JSON under the `prompt`
+// field ("UserPromptSubmit hooks receive the `prompt` field containing the
+// text the user submitted" — verbatim). `user_input`/`user_prompt` are
+// tolerated as legacy/cross-CLI fallback field names only, never the
+// documented one — round 1 review caught this module citing `user_input` as
+// primary, which the live page does not contain at all. Copilot's
+// `userPromptSubmitted` fires when "The user
+// submits a prompt" (docs.github.com/en/copilot/reference/hooks-reference,
+// "userPromptSubmitted" section) but that page does NOT document the payload
+// TRANSPORT for this event (unlike Claude's stdin-JSON contract, which the
+// hooks reference nails down explicitly) — so the Copilot arm never attempts to
+// capture prompt text at all (see `PromptSubmitRecord`'s doc); it degrades to
+// an existence+offset marker, still strictly better than the burst heuristic
+// for a busy pane, at the cost of the content-match precision Claude's tier
+// gets. This is a DOCS-SILENT residual, not an assumption papered over.
+//
+// A second docs-silent residual: whether a submission that gets swallowed/
+// misparsed as an unknown slash command (the exact `/model`-merge failure
+// #112's issue documents) still fires `UserPromptSubmit` at all. Neither
+// reference page says. If it doesn't fire, that case stays *unconfirmed* under
+// this design — the correct, safe direction (rev-32's own "never false-confirm"
+// property, preserved) — so this is left unresolved rather than guessed at.
+//
+// SAFETY-CRITICAL per the hooks reference: exit code 2 on `UserPromptSubmit`
+// "blocks prompt processing and erases the prompt", and on exit 0 anything
+// printed to stdout "is added as context Claude can see". `COMPACT_HOOK_
+// SCRIPT`'s new `promptsubmit` arm (below) is therefore held to the SAME
+// unconditional-exit-0/no-stdout discipline the file's own doc already argues
+// for `precompact`/`sessionstart-compact`, extended here to a case where the
+// hazard of getting it wrong is destroying the user's own prompt, not merely
+// skipping a compact.
+
+/// A single `promptsubmit` hook record, read from `<agent-id>.promptsubmit.
+/// jsonl` in the group's `hooks/` dir (#112) — one JSON line per
+/// `UserPromptSubmit`/`userPromptSubmitted` firing since the marker file was
+/// created, appended by the SAME generic hook script/Copilot command that
+/// already write `.precompact.json`/`.sessionstart-compact.json` there (see
+/// `COMPACT_HOOK_SCRIPT`'s doc).
+///
+/// `text` is `None` for every Copilot record and for an unparseable (e.g.
+/// torn mid-write) line — see the module doc above for why Copilot's payload
+/// transport is never read at all. A `None` record still counts as evidence
+/// *something* fired (the existence tier — `PromptLandedMatch::Existence`);
+/// it just can't be matched against what THIS delivery pasted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub struct PromptSubmitRecord {
+    pub text: Option<String>,
+}
+
+/// Parse `content` (a `promptsubmit` marker file's full text) into the
+/// records written since byte `offset` — the delivery's OWN baseline,
+/// snapshotted before it pasted anything, so a record from an earlier
+/// delivery to the same pane (or a human's own prompt) can never satisfy
+/// THIS delivery's confirmation by construction. `offset` is clamped via
+/// `str::get` rather than sliced directly: a torn read racing a concurrent
+/// write could land mid-character on a multi-byte UTF-8 boundary, and an
+/// out-of-bounds/invalid-boundary offset degrades to "no new records yet"
+/// (an empty tail) rather than panicking the delivery thread.
+///
+/// Each non-empty line is one record. Valid JSON with a recognized text
+/// field (`prompt` — the documented Claude field, per the "UserPromptSubmit
+/// input" section of code.claude.com/docs/en/hooks: "UserPromptSubmit hooks
+/// receive the `prompt` field containing the text the user submitted";
+/// `user_input`/`user_prompt` tolerated as legacy/cross-CLI fallbacks only)
+/// yields `text: Some(..)`.
+/// Anything else non-empty (Copilot's existence-only marker line, or a
+/// trailing line still mid-`>>` when this races the hook script's own
+/// write) yields `text: None` rather than being dropped — losing a whole
+/// poll cycle's worth of existence evidence to a torn read would be exactly
+/// the false-unconfirm failure mode this feature exists to close.
+#[doc(hidden)] // pub for integration tests
+pub fn promptsubmit_records_since(content: &str, offset: usize) -> Vec<PromptSubmitRecord> {
+    let tail = content.get(offset..).unwrap_or("");
+    tail.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let text = serde_json::from_str::<Value>(line).ok().and_then(|v| {
+                v.get("prompt")
+                    .or_else(|| v.get("user_input"))
+                    .or_else(|| v.get("user_prompt"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            });
+            PromptSubmitRecord { text }
+        })
+        .collect()
+}
+
+/// Normalize prompt text for a landed-signal comparison: trim, collapse every
+/// run of whitespace (including CR/LF, so CRLF-vs-LF and any TUI/JSON
+/// re-wrapping wash out) to a single space. Deliberately NOT case-folding —
+/// unlike an on-screen echo check (rejected in the design note precisely for
+/// rendering fragility), this compares the raw text loomux itself pasted
+/// against the JSON payload's OWN copy of that same text; case should already
+/// agree, and folding it would only widen false positives.
+fn normalize_prompt_text(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The three tiers a delivery's `promptsubmit` hook records can resolve to
+/// against the text it pasted, in ascending strength:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub enum PromptLandedMatch {
+    /// No record since baseline is any kind of evidence.
+    None,
+    /// A record fired since baseline, but its tier never captures text at
+    /// all (every Copilot record today — see `PromptSubmitRecord`'s doc), so
+    /// there is nothing to match content against. Trusted on the strength of
+    /// the baseline alone: the hook is documented to fire unconditionally on
+    /// every submission, and the baseline already excludes every record but
+    /// the ones THIS delivery's own submit could have produced.
+    Existence,
+    /// A record's own (normalized) text CONTAINS this delivery's normalized
+    /// paste — the strongest tier. `merged: true` means containment, not
+    /// equality: the exact "prompt merged with human-typed `/model`" shape
+    /// from #112's own issue body, still counted as landed (the agent DID
+    /// receive the task text — plan-14 decision #3) but flagged so the audit
+    /// can distinguish a clean submit from a merged one.
+    Content { merged: bool },
+}
+
+/// Resolve `records` (already filtered to since-baseline by
+/// `promptsubmit_records_since`) against `pasted` — the pure decision half
+/// of the hook confirmation tier. An empty normalized `pasted` (should never
+/// happen — `deliver_prompt` never pastes empty text) resolves to `None`
+/// rather than trivially matching every record via an empty-string
+/// containment check.
+#[doc(hidden)] // pub for integration tests
+pub fn prompt_landed(records: &[PromptSubmitRecord], pasted: &str) -> PromptLandedMatch {
+    let norm_pasted = normalize_prompt_text(pasted);
+    if norm_pasted.is_empty() {
+        return PromptLandedMatch::None;
+    }
+    let mut existence = false;
+    for r in records {
+        match &r.text {
+            Some(t) => {
+                let norm_t = normalize_prompt_text(t);
+                if norm_t.contains(&norm_pasted) {
+                    return PromptLandedMatch::Content { merged: norm_t != norm_pasted };
+                }
+            }
+            None => existence = true,
+        }
+    }
+    if existence { PromptLandedMatch::Existence } else { PromptLandedMatch::None }
+}
+
+/// Which tier decided a delivery's outcome — carried into the `prompt-typed`
+/// audit event (`confirm_source`) so every direction stays distinguishable
+/// after the fact. #112 round 2 (three-state redesign — see the design note
+/// section of the same name): `"box"`/`"box_veto"` are Tier 1 (two-sided,
+/// only when its precondition verified — `box_holds_paste`'s doc); `"hook"`
+/// is Tier 2 (the `promptsubmit` marker, in-window or late); `"burst"` is
+/// Tier 3 (rev-32's output heuristic, last resort); `"idle"` is the extended
+/// monitor's own trigger (pane genuinely quiet, no question on screen, still
+/// no evidence — `PENDING_IDLE_QUIET`'s doc); `"none"` means nothing has
+/// decided yet (the delivery is `DeliveryConfirmState::Pending`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmSource {
+    Box,
+    Hook,
+    Burst,
+    BoxVeto,
+    Idle,
+    None,
+}
+
+impl ConfirmSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfirmSource::Box => "box",
+            ConfirmSource::Hook => "hook",
+            ConfirmSource::Burst => "burst",
+            ConfirmSource::BoxVeto => "box_veto",
+            ConfirmSource::Idle => "idle",
+            ConfirmSource::None => "none",
+        }
+    }
+}
+
+/// The three-state outcome a delivery resolves to (#112 round 2) — replacing
+/// the old confirmed/unconfirmed binary. `Pending` is the state the round-1
+/// design didn't have a name for: no evidence yet, which for a prompt queued
+/// into a busy pane is the NORMAL, CORRECT state, potentially for a long
+/// time, not a failure. Only `Failed` should ever draw the orchestrator's
+/// unconfirmed notice — never `Pending`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryConfirmState {
+    Confirmed,
+    Pending,
+    Failed,
+}
+
+impl DeliveryConfirmState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeliveryConfirmState::Confirmed => "confirmed",
+            DeliveryConfirmState::Pending => "pending",
+            DeliveryConfirmState::Failed => "failed",
+        }
+    }
+}
+
+/// Map a decided `ConfirmSource` to its `DeliveryConfirmState` — pure so the
+/// mapping itself is pinnable (a mutation swapping `BoxVeto`'s arm for
+/// `Confirmed` would be exactly backwards, and a dedicated test catches it
+/// directly rather than through some downstream consequence).
+#[doc(hidden)] // pub for integration tests
+pub fn confirm_state_for(source: ConfirmSource) -> DeliveryConfirmState {
+    match source {
+        ConfirmSource::Box | ConfirmSource::Hook | ConfirmSource::Burst => DeliveryConfirmState::Confirmed,
+        ConfirmSource::BoxVeto | ConfirmSource::Idle => DeliveryConfirmState::Failed,
+        ConfirmSource::None => DeliveryConfirmState::Pending,
+    }
+}
+
+/// #112 round 3 (rev-20 B3): may Tier 1's own box-consumption reading be
+/// trusted to decide anything RIGHT NOW? Any human input since OUR OWN
+/// submit contaminates the reading in BOTH directions — a box that cleared
+/// because the human typed/submitted/cancelled their own line reads
+/// identically to one the CLI cleared for our delivery, and a box that's
+/// STILL occupied because the human is mid-edit reads identically to one
+/// the CLI never took. Once contaminated, Tier 1 must decline for the rest
+/// of this delivery's decision (the delivery falls to `Pending`, and the
+/// question-guarded late monitor decides from there) — this is what makes
+/// the design note's "closed via `last_user_input_ms`" claim actually true
+/// rather than aspirational.
+#[doc(hidden)] // pub for integration tests
+pub fn tier1_trusted(last_user_input_ms: u64, submit_sent_ms: u64) -> bool {
+    last_user_input_ms <= submit_sent_ms
+}
+
+/// #112 round 3 (rev-20 B2 + B3): the ONE decision point for whether Tier
+/// 1's accumulated reading may become an authoritative veto
+/// (`ConfirmSource::BoxVeto`) at the end of the confirm+retry window. Pure
+/// so the polarity — arguably the single most important property in this
+/// redesign — is directly pinnable rather than an inline `if` a future edit
+/// could silently invert (exactly the shape round 1 shipped and failed
+/// live: unpinnable wiring nobody could assert a property against).
+///
+/// A veto requires ALL of:
+/// - nothing else already decided this delivery (`confirm_source ==
+///   ConfirmSource::None`);
+/// - Tier 1 governs this delivery at all (`tier1_governs`);
+/// - Tier 1's own reading, at the end, was "still holding"
+///   (`tier1_reading == Some(true)`);
+/// - the confirm+retry window ran to NATURAL exhaustion —
+///   `window_exhausted_naturally`. An early exit for a question on screen,
+///   a human typing, or a failed retry write all mean the box's state
+///   cannot be trusted as evidence of NON-acceptance: a question may be
+///   intercepting Enter rather than refusing it, and a human mid-edit means
+///   the box's contents aren't about our delivery either way. B2's fix:
+///   ANY early exit leaves the delivery `Pending`, never `Failed` — the
+///   question-guarded late monitor (`late_monitor_tick`) is what's allowed
+///   to decide from there, because unlike this one-shot end-of-window
+///   check, it re-observes the question state on every subsequent poll;
+/// - Tier 1 is still trusted at the end (`tier1_trusted_at_end` —
+///   B3's fix: no human input since our own submit).
+///
+/// Never returns anything OTHER than the input `confirm_source` unchanged
+/// when any condition fails — this function can only ever produce
+/// `BoxVeto`, never invent a different outcome or downgrade an existing
+/// one.
+#[doc(hidden)] // pub for integration tests
+pub fn final_window_outcome(
+    confirm_source: ConfirmSource,
+    tier1_governs: bool,
+    tier1_reading: Option<bool>,
+    window_exhausted_naturally: bool,
+    tier1_trusted_at_end: bool,
+) -> ConfirmSource {
+    if matches!(confirm_source, ConfirmSource::None)
+        && tier1_governs
+        && tier1_reading == Some(true)
+        && window_exhausted_naturally
+        && tier1_trusted_at_end
+    {
+        ConfirmSource::BoxVeto
+    } else {
+        confirm_source
+    }
+}
+
+/// #112 round 3 (rev-20 B1): one tick's decision for the late-confirmation
+/// monitor — pure, so the precedence is directly pinnable rather than an
+/// inline `if`/`continue` chain a future edit could silently reorder.
+///
+/// - `Superseded` — a NEWER delivery to the same pane has recorded its own
+///   `DeliveryOutcome` since this monitor started (`submit_sent_ms` no
+///   longer matches what's in `last_delivery`): this monitor no longer owns
+///   anything and must exit WITHOUT writing or notifying — that's precisely
+///   the clobber/false-correction hazard (rev-20 B1) this variant exists to
+///   prevent. Checked first: even a hook match arriving on a superseded
+///   monitor's tick would be writing a confirmation for the WRONG delivery.
+/// - `Confirm` — a `promptsubmit` match arrived. `correction: true` when
+///   `already_failed` (this is upgrading an alarm that already fired, so
+///   the orchestrator needs the correction notice, not a second success
+///   notice); checked before `Expired` so a match on the very last tick
+///   before the cap still resolves the delivery rather than timing out.
+/// - `Expired` — the lifetime cap was hit with nothing resolved.
+/// - `KeepWaiting` — nothing to act on: either already `failed` (only a
+///   hook match, handled above, has anything left to do) or not yet quiet
+///   long enough / a question is on screen.
+/// - `DeclareFailed` — genuinely idle, no question, not yet failed: the
+///   ONE point this delivery is ever declared `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub enum MonitorAction {
+    Superseded,
+    Expired,
+    Confirm { merged: bool, correction: bool },
+    DeclareFailed,
+    KeepWaiting,
+}
+
+#[doc(hidden)] // pub for integration tests
+pub fn late_monitor_tick(
+    superseded: bool,
+    hook_match: PromptLandedMatch,
+    already_failed: bool,
+    expired: bool,
+    quiet_long_enough: bool,
+    showing_question: bool,
+) -> MonitorAction {
+    if superseded {
+        return MonitorAction::Superseded;
+    }
+    if !matches!(hook_match, PromptLandedMatch::None) {
+        let merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
+        return MonitorAction::Confirm { merged, correction: already_failed };
+    }
+    if expired {
+        return MonitorAction::Expired;
+    }
+    if already_failed {
+        return MonitorAction::KeepWaiting;
+    }
+    if quiet_long_enough && !showing_question {
+        return MonitorAction::DeclareFailed;
+    }
+    MonitorAction::KeepWaiting
+}
+
+/// Tier 1 (#112 round 2): does `stripped_tail` (ANSI-stripped current pane
+/// output) still hold `pasted` at its TAIL END? Deliberately "at the tail
+/// end", not "anywhere" — a CLI that echoes an ACCEPTED prompt into
+/// scrollback/transcript history would make "appears anywhere" trivially
+/// true forever and say nothing about acceptance. Both sides normalized the
+/// same way `prompt_landed` already does (trim + collapse whitespace,
+/// washing out line-wrap/CRLF noise); containment is checked only within
+/// the last `pasted`-length-plus-slack window of the normalized tail
+/// (`BOX_TAIL_WINDOW_SLACK`), so text that's scrolled up into older output
+/// because something else happened since reads as gone even though it's
+/// technically still present somewhere earlier in the buffer.
+///
+/// This same function serves BOTH of Tier 1's uses: checked once, on the
+/// pre-Enter tail, it verifies Tier 1's own precondition (`deliver_prompt`'s
+/// `tier1_governs`); polled after Enter, it's the two-sided signal itself
+/// (`true` => still pending/vetoable, `false` => consumed/accepted).
+#[doc(hidden)] // pub for integration tests
+pub fn box_holds_paste(stripped_tail: &str, pasted: &str) -> bool {
+    let norm_pasted = normalize_prompt_text(pasted);
+    if norm_pasted.is_empty() {
+        return false; // nothing to still be holding
+    }
+    let norm_tail = normalize_prompt_text(stripped_tail);
+    let window = norm_pasted.len() + BOX_TAIL_WINDOW_SLACK;
+    let start = norm_tail.len().saturating_sub(window);
+    let recent = norm_tail.get(start..).unwrap_or(&norm_tail);
+    recent.contains(&norm_pasted)
+}
+
+/// The `promptsubmit` hook marker path for one agent — a sibling of the
+/// `.precompact.json`/`.sessionstart-compact.json` markers in the same
+/// group's `hooks/` dir (`read_hook_marker_ts`'s doc). JSONL, not a single
+/// overwritten file: unlike the compact markers (where only the LATEST
+/// firing's mtime matters), confirmation here needs to see every record
+/// since a per-delivery baseline OFFSET, so appending (never truncating) is
+/// required.
+#[doc(hidden)] // pub for integration tests
+pub fn promptsubmit_marker_path(root: &Path, group: &str, agent_id: &str) -> PathBuf {
+    root.join(group).join("hooks").join(format!("{agent_id}.promptsubmit.jsonl"))
+}
+
+/// This delivery's baseline byte length into the `promptsubmit` marker,
+/// snapshotted before it pastes anything (see `promptsubmit_records_since`'s
+/// doc for why). `0` for a missing file — no hook has fired for this agent
+/// this session, and offset 0 is a safe baseline (every record in the file,
+/// once one exists, counts).
+#[doc(hidden)] // pub for integration tests
+pub fn promptsubmit_marker_len(path: &Path) -> usize {
+    fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0)
+}
+
+/// Read the `promptsubmit` marker and resolve it against `pasted` since
+/// `offset` — the impure half of the hook confirmation tier
+/// (`promptsubmit_records_since` + `prompt_landed` are the pure decision).
+/// A missing/unreadable file resolves to `PromptLandedMatch::None`, the same
+/// "hook never fired / isn't configured" degrade every other reader in this
+/// module uses (`read_hook_marker_ts`'s doc) — never an error the delivery
+/// thread has to branch on.
+#[doc(hidden)] // pub for integration tests
+pub fn poll_promptsubmit_hook(path: &Path, offset: usize, pasted: &str) -> PromptLandedMatch {
+    let Ok(content) = fs::read_to_string(path) else { return PromptLandedMatch::None };
+    prompt_landed(&promptsubmit_records_since(&content, offset), pasted)
+}
+
+/// #112 round 2 (restructured round 3 per rev-20 B1 — see `late_monitor_tick`
+/// for the precedence this now runs on): the extended, out-of-window monitor
+/// for a delivery that finished its normal confirm/retry window still
+/// `Pending` or `Failed` via `ConfirmSource::BoxVeto` (Tier 1's veto isn't
+/// infallible — the design note's rejection-guard residual). Spawned as its
+/// OWN detached thread, deliberately NOT holding the per-pty delivery mutex
+/// `deliver_prompt`'s main closure holds for its own (bounded, ~52s)
+/// lifetime: this monitor's own lifetime is bounded only by
+/// `LATE_MONITOR_MAX_LIFETIME` / the pty staying alive (the live #112
+/// episode needed 38+ minutes), and holding the delivery mutex that long
+/// would block every SUBSEQUENT delivery to the same pane.
+///
+/// **Round 3 fix (rev-20 B1): supersession.** If a NEWER delivery to this
+/// same pty has recorded its own `DeliveryOutcome` since this monitor
+/// started (compared by `submit_sent_ms`, the one field every delivery's
+/// outcome carries and no two deliveries share), this monitor is stale —
+/// `late_monitor_tick` returns `Superseded` and this thread exits
+/// immediately, WITHOUT writing `last_delivery` or notifying anything. Two
+/// hazards this closes at once: an old monitor overwriting a newer
+/// delivery's recorded outcome (corrupting the NEXT delivery's stranded-
+/// flush decision), and an old monitor matching the RE-SEND's own hook
+/// record and announcing a false "no re-send needed" correction — exactly
+/// backwards, since the re-send is why anything landed at all. Checked
+/// first, every tick, before acting on anything it reads (the hook marker
+/// read still executes on a superseded tick; it just can never produce a
+/// write or a notify).
+#[allow(clippy::too_many_arguments)]
+fn run_late_confirmation_monitor(
+    app: AppHandle,
+    root: PathBuf,
+    group: String,
+    agent: String,
+    pty_id: u32,
+    hook_marker_path: PathBuf,
+    hook_baseline: usize,
+    pasted_text: String,
+    delivery_from: String,
+    submit_sent_ms: u64,
+    target_is_orchestrator: bool,
+    already_failed: bool,
+    last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
+    reg: Option<Arc<OrchRegistry>>,
+) {
+    let ptys = app.state::<crate::pty::PtyManager>();
+    let started = std::time::Instant::now();
+    let mut quiet_since: Option<std::time::Instant> = None;
+    let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
+    let mut failed = already_failed;
+    loop {
+        std::thread::sleep(LATE_MONITOR_POLL);
+        // The pty closing (agent exited/killed) means there is nothing left
+        // to observe, ever — exit quietly, matching every other "closed pty"
+        // degrade in this module (never an error the caller has to handle).
+        let Some(cur_total) = ptys.output_total(pty_id) else { return };
+
+        let superseded = last_delivery
+            .lock_safe()
+            .get(&pty_id)
+            .is_some_and(|o| o.submit_sent_ms != submit_sent_ms);
+
+        // Quiescence + question-guard tracking (only meaningful once
+        // `late_monitor_tick` actually asks for them, but cheap to keep
+        // current every tick so a KeepWaiting tick doesn't lose progress
+        // toward the threshold).
+        if cur_total != last_total {
+            last_total = cur_total;
+            quiet_since = Some(std::time::Instant::now());
+        } else if quiet_since.is_none() {
+            quiet_since = Some(std::time::Instant::now());
+        }
+        let quiet_long_enough = quiet_since.is_some_and(|t| t.elapsed() >= PENDING_IDLE_QUIET);
+        let showing_question = quiet_long_enough
+            && ptys
+                .output_tail_bounded(pty_id, LATE_MONITOR_QUESTION_SCAN_BYTES)
+                .map(|b| strip_ansi(&b))
+                .map(|t| prompt_wait_detected(&mask_own_paste(&t, &pasted_text)))
+                .unwrap_or(false);
+        let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+        let expired = started.elapsed() >= LATE_MONITOR_MAX_LIFETIME;
+
+        match late_monitor_tick(superseded, hook_match, failed, expired, quiet_long_enough, showing_question) {
+            MonitorAction::Superseded | MonitorAction::Expired => return,
+            MonitorAction::KeepWaiting => continue,
+            MonitorAction::Confirm { merged, correction } => {
+                last_delivery.lock_safe().insert(
+                    pty_id,
+                    DeliveryOutcome { confirmed: true, submit_sent_ms, from: delivery_from.clone() },
+                );
+                append_audit(&root, &group, "loomux", "delivery-confirmed-late", json!({
+                    "to": agent, "confirm_source": "hook", "confirm_merged": merged, "was_failed": correction,
+                }));
+                if correction {
+                    if let Some(r) = &reg {
+                        r.notify_delivery_confirmed_late(&group, &agent, target_is_orchestrator);
+                    }
+                }
+                return; // resolved — nothing left for this monitor to do
+            }
+            MonitorAction::DeclareFailed => {
+                failed = true;
+                // Own action name, deliberately distinct from the hook-match
+                // branch above ("delivery-confirmed-late" is that branch's
+                // SUCCESS action) — this one declares a FAILURE, and the
+                // audit's primary key is the action string, not the
+                // `confirm_state` detail buried inside it. `DeliveryOutcome`
+                // is NOT re-written here: the original `prompt-typed` audit
+                // already recorded `confirmed: false` for the `Pending`
+                // state this delivery started this monitor in, and nothing
+                // about reaching `Failed` changes that value.
+                append_audit(&root, &group, "loomux", "delivery-failed-idle", json!({
+                    "to": agent, "confirm_source": "idle", "confirm_state": "failed",
+                }));
+                if let Some(r) = &reg {
+                    r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
+                }
+            }
+        }
+    }
+}
+
 /// Whether to flush a previous delivery's stranded text (a single submit press)
 /// before pasting the next prompt (#81/#84).
 ///
@@ -7176,6 +7878,23 @@ pub fn unconfirmed_delivery_notice(agent_id: &str) -> String {
     format!(
         "[loomux] delivery to {agent_id} unconfirmed — the prompt may be sitting \
          unsubmitted in its pane; get_output it and re-send if needed"
+    )
+}
+
+/// #112 round 2: the correction notice for a delivery that already drew
+/// `unconfirmed_delivery_notice` but has since been proven to have landed
+/// after all — a late `promptsubmit` hook record arrived after the `failed`
+/// alarm fired (see `DeliveryConfirmState`'s doc: `Failed` is reachable via
+/// `ConfirmSource::BoxVeto`, itself not infallible — the rejection/error
+/// residual named in the design note — or via the idle-without-evidence
+/// trigger, which by construction can never rule out a coverage gap in the
+/// hook itself). Named as a correction, not a re-confirmation, so the
+/// orchestrator reads it as "stand down, the earlier alarm was wrong" rather
+/// than a second, redundant success notice.
+pub fn delivery_confirmed_late_notice(agent_id: &str) -> String {
+    format!(
+        "[loomux] correction: the earlier \"delivery to {agent_id} unconfirmed\" alarm was wrong — \
+         a prompt-landed signal for that same delivery has now arrived. It landed; no re-send needed."
     )
 }
 
@@ -15755,6 +16474,12 @@ impl OrchRegistry {
     /// Write (or refresh) the generic hook script, returning its path or
     /// `None` if it can't be written. Idempotent/always-rewritten, like
     /// `write_shim` — cheap, and keeps it current if loomux itself updated.
+    ///
+    /// Still named `compact-hook.sh` even though #112 added a `promptsubmit`
+    /// arm that has nothing to do with compaction — see `COMPACT_HOOK_
+    /// SCRIPT`'s doc ("Naming, kept imprecise on purpose") for why the name
+    /// stays: an already-spawned agent's `--settings`/hooks-config command
+    /// bakes in this exact path, and renaming would strand it.
     fn ensure_compact_hook_script(&self) -> Option<PathBuf> {
         let dir = self.compact_hook_dir();
         fs::create_dir_all(&dir).ok()?;
@@ -15810,6 +16535,14 @@ impl OrchRegistry {
     /// `None` when no `sh` is resolvable — the agent then has no hooks
     /// configured at all, same as before this feature existed (fail-open, not
     /// a spawn failure).
+    ///
+    /// #112 adds `UserPromptSubmit`, the real prompt-landed signal
+    /// (`deliver_prompt`'s confirm phase — see the `resolve_submit_
+    /// confirmation` doc). Per the hooks reference, `UserPromptSubmit`
+    /// "does NOT support matchers and always fires on every prompt
+    /// submission" — unlike `SessionStart` above, no `matcher` key is
+    /// written at all (one was silently ignored anyway, per the docs; this
+    /// mirrors reality rather than adding a key the CLI would discard).
     fn compact_hook_settings(&self, group: &str, agent_id: &str) -> Option<Value> {
         let script = self.ensure_compact_hook_script()?;
         let sh = self.resolve_hook_sh()?;
@@ -15822,6 +16555,7 @@ impl OrchRegistry {
         Some(json!({
             "PreCompact": [{ "hooks": [{ "type": "command", "command": cmd("precompact") }] }],
             "SessionStart": [{ "matcher": "compact", "hooks": [{ "type": "command", "command": cmd("sessionstart-compact") }] }],
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": cmd("promptsubmit") }] }],
         }))
     }
 
@@ -15887,6 +16621,17 @@ impl OrchRegistry {
     ///
     /// Returns `false` (never fatal — fail-open, same as a missing gh/git
     /// shim) when the hooks directory can't be created/written.
+    ///
+    /// #112 adds `userPromptSubmitted` alongside `preCompact` in the SAME
+    /// file (still one small global file, same additive-merge guarantee) —
+    /// existence-only, per `COPILOT_PROMPTSUBMIT_HOOK_BASH`'s doc: the
+    /// payload transport for this event isn't documented, so the command
+    /// never attempts to read it. The file stays named `loomux-compact.json`
+    /// for the same reason `compact-hook.sh` stays named that (see
+    /// `COMPACT_HOOK_SCRIPT`'s doc): this is a rewrite-in-place, single
+    /// well-known path every Copilot session on the box already resolves —
+    /// renaming it would just mean the OLD file (with the OLD hook set)
+    /// sits there stale until the next write, not a clean cutover.
     fn ensure_copilot_compact_hook(&self) -> bool {
         let Some(dir) = self.copilot_hooks_dir() else { return false };
         if fs::create_dir_all(&dir).is_err() {
@@ -15899,6 +16644,12 @@ impl OrchRegistry {
                     "type": "command",
                     "bash": COPILOT_PRECOMPACT_HOOK_BASH,
                     "powershell": COPILOT_PRECOMPACT_HOOK_POWERSHELL,
+                    "timeoutSec": 10,
+                }],
+                "userPromptSubmitted": [{
+                    "type": "command",
+                    "bash": COPILOT_PROMPTSUBMIT_HOOK_BASH,
+                    "powershell": COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL,
                     "timeoutSec": 10,
                 }],
             },
@@ -17675,6 +18426,16 @@ impl OrchRegistry {
                 }
             }
 
+            // #112: this delivery's OWN baseline into the `promptsubmit` hook
+            // marker, snapshotted right before it pastes anything — see
+            // `promptsubmit_records_since`'s doc for why a byte offset (not a
+            // sequence number the shell script would have to maintain) makes
+            // a record from an EARLIER delivery to this same pane, or a
+            // human's own prompt, unable to satisfy THIS delivery's
+            // confirmation by construction.
+            let hook_marker_path = promptsubmit_marker_path(&root, &group, &agent);
+            let hook_baseline = promptsubmit_marker_len(&hook_marker_path);
+
             // Echo-verified typing: paste, then require the TUI to emit
             // output (its input box redrawing). No echo means the CLI
             // flushed the paste with its startup stdin buffer — retype.
@@ -17816,6 +18577,27 @@ impl OrchRegistry {
                     return;
                 }
             }
+            // #112 round 2: Tier 1's precondition, OBSERVED right here rather
+            // than assumed from `echoed` (round 1's mistake — `echoed` is a
+            // raw >=8-byte growth check with no content comparison at all,
+            // so it's satisfied identically whether the CLI echoed our
+            // LITERAL text or collapsed a long paste to a `[Pasted text #N
+            // +M lines]`-style placeholder; see the design note's "Tier 1
+            // precondition" section for the live episode that caught this).
+            // Tier 1 can only govern (two-sided) THIS delivery if our own
+            // pasted text is actually findable, verbatim, in the box right
+            // now — checked once, here, against the real tail. When it
+            // isn't (a long/collapsed paste, or the echo genuinely never
+            // landed), Tier 1 declines to govern and this delivery falls
+            // back to the round-1 hook-or-burst precedence exactly as
+            // before — audited explicitly as its own state, never silently.
+            let tier1_precondition_tail = ptys
+                .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
+                .map(|b| strip_ansi(&b));
+            let tier1_governs = tier1_precondition_tail
+                .as_deref()
+                .is_some_and(|t| box_holds_paste(t, &pasted_text));
+
             let submit_sent_ms = now_ms();
             // Baseline just before the first Enter, so the confirmation window
             // below measures only the burst that Enter produces.
@@ -17844,27 +18626,73 @@ impl OrchRegistry {
                 confirm_copilot_autopilot_dialog(&ptys, pty_id, &root, &group, &agent, AUTOPILOT_DIALOG_WAIT);
             }
 
-            // Confirm the submit landed: watch for the output burst of the box
-            // clearing / the turn starting (#81/#84). Measured off the first
-            // Enter, before the spaced retries, so the signal is that Enter's
-            // effect and not a retry's. Only trusted when the pane reached quiet
-            // first — on a busy pane that never did, the Enter landed mid-stream
-            // and that stream would false-confirm (rev-32), so we skip the
-            // window and leave it unconfirmed. A miss here is safe: the next
-            // delivery's flush just no-ops on an empty box.
+            // Confirm the submit landed (#112 round 2 — three-state redesign,
+            // see the design note section of the same name). Tier 1 (box
+            // consumption) governs TWO-SIDEDLY — confirmed OR definitively
+            // vetoed — whenever `tier1_governs` verified its own precondition
+            // above; Tier 2 (the `promptsubmit` hook) can independently
+            // confirm at any point regardless of Tier 1's governance, since a
+            // positive hook match is real evidence either way; Tier 3 (burst)
+            // is consulted ONLY when Tier 1 does not govern this delivery —
+            // its own evidence is too weak to override a box-based veto, and
+            // the whole point of Tier 1 governing is that burst's usual "any
+            // growth" bar can't be trusted to arbitrate against it. Burst's
+            // OWN reading is still computed and recorded even when it isn't
+            // consulted for the decision — the independent-per-tier
+            // requirement this design owes the next live-validation pass.
             let confirm_deadline = std::time::Instant::now() + SUBMIT_CONFIRM_WINDOW;
-            let mut confirmed = false;
-            while reached_quiet && std::time::Instant::now() < confirm_deadline {
-                std::thread::sleep(Duration::from_millis(100));
-                match ptys.output_total(pty_id) {
-                    Some(t) => {
-                        if submit_confirmed(reached_quiet, submit_baseline, t) {
-                            confirmed = true;
-                            break;
-                        }
-                    }
-                    None => break,
+            let mut confirm_source = ConfirmSource::None;
+            let mut confirm_merged = false;
+            let mut tier1_reading: Option<bool> = None; // Some(true) = still holds our paste
+            let mut tier_hook_matched = false;
+            let mut tier_burst_would_confirm = false;
+            loop {
+                let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+                if !matches!(hook_match, PromptLandedMatch::None) {
+                    tier_hook_matched = true;
                 }
+                if tier1_governs {
+                    match ptys.output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES).map(|b| strip_ansi(&b)) {
+                        Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
+                        Some(_) => {
+                            tier1_reading = Some(false);
+                            // #112 round 3 (rev-20 B3): a box-clear caused by
+                            // the HUMAN (they typed/submitted/cancelled their
+                            // own line) reads identically to one the CLI
+                            // cleared for our delivery. Only promote to a
+                            // Box confirm when no human input has landed
+                            // since our own submit — checked fresh, right
+                            // here, not inherited from an earlier tick.
+                            if tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms) {
+                                confirm_source = ConfirmSource::Box;
+                            }
+                        }
+                        None => {} // pty gone — the `output_total` read just below returns None too and breaks the loop
+                    }
+                }
+                if matches!(confirm_source, ConfirmSource::None) && tier_hook_matched {
+                    confirm_source = ConfirmSource::Hook;
+                    confirm_merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
+                }
+                let Some(observed_total) = ptys.output_total(pty_id) else { break };
+                // Tier 3 (burst): computed on every tick regardless of
+                // governance (the independent-audit requirement), but only
+                // allowed to DECIDE when Tier 1 isn't governing this
+                // delivery — its evidence is too weak to arbitrate against a
+                // box-based read.
+                if submit_confirmed(reached_quiet, submit_baseline, observed_total) {
+                    tier_burst_would_confirm = true;
+                    if !tier1_governs && matches!(confirm_source, ConfirmSource::None) {
+                        confirm_source = ConfirmSource::Burst;
+                    }
+                }
+                if !matches!(confirm_source, ConfirmSource::None) {
+                    break;
+                }
+                if std::time::Instant::now() >= confirm_deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
 
             // #420 rev-19 N8: a CONFIRMED delivery is done — its Enter landed,
@@ -17877,9 +18705,56 @@ impl OrchRegistry {
             // delivery mutex for up to `QUESTION_HOLD_MAX` — this guard
             // protects DELIVERIES, it is not a general question-watcher for a
             // pane that's already done receiving this one.
-            if !confirmed {
-                for delay in SUBMIT_RETRY_DELAYS {
+            // #112 round 3 (rev-20 B2): whether the retry loop ran to
+            // NATURAL exhaustion — every delay slept, never cut short for a
+            // question on screen, a human typing, or a failed retry write.
+            // Starts true (covers the "never entered the loop at all"
+            // case, where `confirm_source` is already decided and this
+            // flag is moot) and is flipped false by the SAME three early
+            // exits `final_window_outcome` requires ruled out before a veto
+            // may fire — see that function's doc for why each one means the
+            // box's end state can't be trusted as evidence of non-acceptance.
+            let mut window_exhausted_naturally = true;
+            if matches!(confirm_source, ConfirmSource::None) {
+                'retries: for delay in SUBMIT_RETRY_DELAYS {
                     std::thread::sleep(delay);
+                    // #112: a hook record landing during a retry's sleep means
+                    // the ORIGINAL Enter actually worked — some CLIs can take
+                    // longer than `SUBMIT_CONFIRM_WINDOW` to emit the hook
+                    // under load, exactly the busy-pane case this feature
+                    // exists for. Stop retrying immediately (plan-14 design:
+                    // "a hook match also breaks out of the retry loop
+                    // immediately") rather than risk a redundant Enter
+                    // blind-selecting whatever now sits highlighted in an
+                    // unrelated dialog. Checked before Tier 1 for the same
+                    // reason it's checked first in the main window above —
+                    // hook evidence is real regardless of which tier governs.
+                    let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+                    if !matches!(hook_match, PromptLandedMatch::None) {
+                        tier_hook_matched = true;
+                        confirm_source = ConfirmSource::Hook;
+                        confirm_merged = matches!(hook_match, PromptLandedMatch::Content { merged: true });
+                        append_audit(&root, &group, "loomux", "submit-retries-skipped",
+                            json!({ "to": agent, "reason": "hook confirmed since last check" }));
+                        break 'retries;
+                    }
+                    if tier1_governs {
+                        match ptys.output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES).map(|b| strip_ansi(&b)) {
+                            Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
+                            Some(_) => {
+                                tier1_reading = Some(false);
+                                // #112 round 3 (rev-20 B3): same trust gate
+                                // as the main window above.
+                                if tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms) {
+                                    confirm_source = ConfirmSource::Box;
+                                    append_audit(&root, &group, "loomux", "submit-retries-skipped",
+                                        json!({ "to": agent, "reason": "box consumed since last check" }));
+                                    break 'retries;
+                                }
+                            }
+                            None => {}
+                        }
+                    }
                     // #420 rev-15 B2: these Enters used to fire unconditionally
                     // on a timer, in exactly the window (a few seconds after the
                     // first submit, while the agent is starting its turn)
@@ -17903,6 +18778,11 @@ impl OrchRegistry {
                     if ptys.last_user_input_ms(pty_id).unwrap_or(0) > submit_sent_ms {
                         append_audit(&root, &group, "loomux", "submit-retries-skipped",
                             json!({ "to": agent, "reason": "human typing in pane" }));
+                        // #112 round 3 (rev-20 B2): a human mid-line means
+                        // the box's contents aren't about our delivery
+                        // either way — this is NOT natural exhaustion, so a
+                        // veto must not fire off this exit.
+                        window_exhausted_naturally = false;
                         break;
                     }
                     let question_decision = wait_for_question_clear(
@@ -17913,6 +18793,17 @@ impl OrchRegistry {
                             append_audit(&root, &group, "loomux", "submit-retries-skipped", json!({
                                 "to": agent, "reason": "question pending", "held_ms": held_ms,
                             }));
+                            // #112 round 3 (rev-20 B2 — the blocking finding):
+                            // a question on screen may be INTERCEPTING our
+                            // Enter, not refusing it — the box's "still
+                            // holds our paste" reading proves nothing about
+                            // acceptance while a dialog sits in front of it.
+                            // NOT natural exhaustion: this delivery must
+                            // land `Pending`, never `Failed`, off this exit.
+                            // The question-guarded late monitor re-observes
+                            // the question state on every subsequent poll,
+                            // which this one-shot end-of-window check can't.
+                            window_exhausted_naturally = false;
                             break;
                         }
                         RetryGate::Write { held_ms } => {
@@ -17922,17 +18813,58 @@ impl OrchRegistry {
                                 }));
                             }
                             if ptys.write_bytes(pty_id, submit).is_err() {
+                                // A failed retry write means the pty is
+                                // likely closing — the same "can't trust
+                                // this as evidence" reasoning applies.
+                                window_exhausted_naturally = false;
                                 break;
+                            }
+                        }
+                    }
+                    // Tier 3 (burst) is measured for the independent audit
+                    // field even mid-retry, matching the main window's own
+                    // record-regardless-of-governance discipline.
+                    if let Some(observed_total) = ptys.output_total(pty_id) {
+                        if submit_confirmed(reached_quiet, submit_baseline, observed_total) {
+                            tier_burst_would_confirm = true;
+                            if !tier1_governs {
+                                confirm_source = ConfirmSource::Burst;
+                                break 'retries;
                             }
                         }
                     }
                 }
             }
+            // Tier 1's VETO (#112 round 3 — rev-20 B2/B3, see
+            // `final_window_outcome`'s doc for the full precondition list):
+            // reachable only once the whole window+retries ran to NATURAL
+            // exhaustion — never off an early exit for a question, human
+            // typing, or a failed write — with NO other tier having
+            // decided, Tier 1 governing this delivery, its own
+            // precondition-verified check never once seeing the box clear,
+            // AND no human input landing since our own submit. This is the
+            // state at the natural end of a ~7.6s window across 15+ polls,
+            // not a snap judgment.
+            let tier1_trusted_at_end = tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms);
+            confirm_source = final_window_outcome(
+                confirm_source, tier1_governs, tier1_reading, window_exhausted_naturally, tier1_trusted_at_end,
+            );
+            let confirm_state = confirm_state_for(confirm_source);
+            let confirmed = matches!(confirm_state, DeliveryConfirmState::Confirmed);
+
             // Record the outcome so the next delivery to this pane can flush a
-            // prompt still stranded in the box (#81/#84).
+            // prompt still stranded in the box (#81/#84). `Pending` reads as
+            // `confirmed: false` here — the SAME value it already held before
+            // #112 round 2 for an unresolved delivery — so this is not a
+            // behavior change to the flush path: a genuinely-queued prompt's
+            // box is actually empty by now anyway (Tier 1 not governing means
+            // we have no box evidence either way for THIS specific check, but
+            // a stray flush Enter on an empty/queued box is the existing,
+            // already-accepted "safe: the next delivery's flush just no-ops"
+            // posture, unchanged).
             last_delivery
                 .lock_safe()
-                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms, from: delivery_from });
+                .insert(pty_id, DeliveryOutcome { confirmed, submit_sent_ms, from: delivery_from.clone() });
             append_audit(&root, &group, "loomux", "prompt-typed", json!({
                 "to": agent,
                 "cli": cli,
@@ -17941,21 +18873,89 @@ impl OrchRegistry {
                 "echoed": echoed,
                 "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
                 "submit_confirmed": confirmed,
+                // #112 round 2: the 3-state outcome, replacing the old binary.
+                "confirm_state": confirm_state.as_str(),
+                // Which tier decided (if any) — "box"/"box_veto"/"hook"/
+                // "burst" decided it; "none" means still `pending`.
+                "confirm_source": confirm_source.as_str(),
+                "confirm_merged": confirm_merged,
+                // Independent per-tier readings (#112 round 2 hard
+                // requirement) — recorded regardless of which tier actually
+                // decided, so a live run can compare what EVERY tier said,
+                // not just the winner. `tier1_governed` is false whenever
+                // this delivery's paste didn't verify literally in the box
+                // (a long/collapsed paste — see the `tier1_governs` precondition
+                // check's own comment, above, right before the first Enter).
+                "tier1_governed": tier1_governs,
+                // #112 round 3 (rev-20 N3): `null` when Tier 1 never
+                // governed this delivery at all (nothing was ever measured,
+                // not "measured and false") — a bare `bool` here would
+                // conflate "never watched" with "watched and saw it clear",
+                // which are different facts a live-validation read needs to
+                // tell apart.
+                "tier1_still_holding_at_end": tier1_governs.then_some(tier1_reading == Some(true)),
+                "tier2_hook_matched": tier_hook_matched,
+                "tier3_burst_would_confirm": tier_burst_would_confirm,
             }));
             // Delivery outcome breadcrumb — timing + flags only, never the text.
             crate::obs::breadcrumb(
                 "delivery",
                 &format!(
-                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} confirmed={confirmed} attempts={attempts} waited_ms={}",
+                    "agent={agent} pty={pty_id} outcome=typed echoed={echoed} confirm_state={} \
+                     confirm_source={} attempts={attempts} waited_ms={}",
+                    confirm_state.as_str(),
+                    confirm_source.as_str(),
                     start.elapsed().as_millis() as u64
                 ),
             );
-            // Close the loop (#103): an unconfirmed delivery to a worker/reviewer
-            // may be stranded in its input box — nudge the orchestrator once so it
-            // can read the pane back and re-send. Exactly one notice per delivery:
-            // this is the single emission point, past all the submit retries.
-            if let Some(reg) = reg {
-                reg.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, confirmed);
+            // #112 round 2: the notice fires ONLY for `Failed`, never for
+            // `Pending` — the whole point of the three-state redesign. A
+            // `Confirmed` delivery draws nothing (as before). A `Pending`
+            // delivery (no tier decided within the window) spawns the
+            // extended monitor below and gets NO notice yet — silence is the
+            // correct behavior for "no evidence yet on a prompt that may
+            // simply be queued", not a bug to route around.
+            match confirm_state {
+                DeliveryConfirmState::Confirmed => {}
+                DeliveryConfirmState::Failed => {
+                    if let Some(r) = &reg {
+                        r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
+                    }
+                }
+                DeliveryConfirmState::Pending => {}
+            }
+            // Spawn the extended, unbounded-by-timeout monitor for anything
+            // this window didn't resolve to `Confirmed` — a `Pending`
+            // delivery still needs its eventual answer (hook-late-match or
+            // genuine idle-without-evidence), and a `Failed` (Tier 1 veto)
+            // delivery still needs the chance to be corrected by a late hook
+            // match, since that veto isn't infallible (the rejection/error
+            // residual). Deliberately a SEPARATE thread, not a continuation
+            // of this one: this closure's `_guard` holds the per-pty delivery
+            // mutex for its own (bounded) lifetime, and the monitor's own
+            // lifetime is bounded only by the pty staying alive — holding
+            // the delivery mutex that long would block every subsequent
+            // delivery to this pane. See `run_late_confirmation_monitor`'s
+            // doc for the full mechanism.
+            if !matches!(confirm_state, DeliveryConfirmState::Confirmed) {
+                let app_for_monitor = app.clone();
+                let root_for_monitor = root.clone();
+                let group_for_monitor = group.clone();
+                let agent_for_monitor = agent.clone();
+                let hook_marker_path_for_monitor = hook_marker_path.clone();
+                let pasted_text_for_monitor = pasted_text.clone();
+                let delivery_from_for_monitor = delivery_from.clone();
+                let last_delivery_for_monitor = last_delivery.clone();
+                let reg_for_monitor = reg.clone();
+                let already_failed = matches!(confirm_state, DeliveryConfirmState::Failed);
+                std::thread::spawn(move || {
+                    run_late_confirmation_monitor(
+                        app_for_monitor, root_for_monitor, group_for_monitor, agent_for_monitor,
+                        pty_id, hook_marker_path_for_monitor, hook_baseline, pasted_text_for_monitor,
+                        delivery_from_for_monitor, submit_sent_ms, target_is_orchestrator,
+                        already_failed, last_delivery_for_monitor, reg_for_monitor,
+                    );
+                });
             }
         });
         Ok(())
@@ -18002,6 +19002,28 @@ impl OrchRegistry {
         }
         self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({ "to": agent_id }));
         let _ = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id), "loomux");
+    }
+
+    /// #112 round 2 — additive to the #445 seam (a NEW notice path;
+    /// `should_notify_unconfirmed`/`should_notify_paste_held` and every
+    /// `PasteGate::Abort` path are untouched by this function's existence).
+    /// Tells the orchestrator a delivery it was already told was unconfirmed
+    /// has since been proven to have landed — see
+    /// `delivery_confirmed_late_notice`'s doc for why this is framed as a
+    /// correction. Same suppression posture as `notify_unconfirmed_delivery`:
+    /// never sent for an orchestrator-target delivery (a notice about a
+    /// delivery to the orchestrator is itself a delivery to the orchestrator
+    /// — the same loop that function's doc already names) and never sent to
+    /// a paused group. Best-effort and audited; called at most once per
+    /// delivery, from the late-confirmation monitor, only when a `failed`
+    /// alarm had actually fired for this exact delivery.
+    #[doc(hidden)] // pub for integration tests
+    pub fn notify_delivery_confirmed_late(&self, group: &str, agent_id: &str, target_is_orchestrator: bool) {
+        if target_is_orchestrator || self.is_paused(group) {
+            return;
+        }
+        self.audit(group, "loomux", "delivery-confirmed-late-notice", json!({ "to": agent_id }));
+        let _ = self.deliver_to_orchestrator(group, &delivery_confirmed_late_notice(agent_id), "loomux");
     }
 
     /// Notify the orchestrator that a delivery to `agent_id` was HELD and

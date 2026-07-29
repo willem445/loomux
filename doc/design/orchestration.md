@@ -855,6 +855,514 @@ box clears) rather than making the orchestrator poll terminals by hand.
   Silent-agent recovery adds the human-facing half: on a repeat unconfirmed notice for the
   same agent, stop re-sending and flag the human.
 
+## Prompt-landed signal (#112)
+
+`submit_confirmed` (above, #103) trusts ANY output burst >= `SUBMIT_CONFIRM_MIN_BYTES` within
+`SUBMIT_CONFIRM_WINDOW` after Enter as evidence the prompt landed. That heuristic is wrong in
+BOTH directions, not just the one its name suggests:
+
+- **False confirm.** Error repaints, dialog interactions, and spinner/statusline ticks all clear
+  the byte bar. Two live failures recorded this way: a prompt merged with human-typed `/model`
+  (#111) and swallowed as `Unknown command: /modelRun ...` — the error repaint after Enter
+  exceeded the threshold, so the task was destroyed but recorded confirmed; and an open `/model`
+  picker dialog similarly absorbed a delivery with no unconfirmed notice.
+- **False unconfirm.** The confirm loop only ever runs `while reached_quiet && ...` — a BUSY pane
+  that never reaches quiet before `SUBMIT_MAX_WAIT` skips confirmation entirely. Field evidence:
+  one orchestration session drew "delivery unconfirmed" notices on 4 of 5 spawns, and in all four
+  the prompt had actually landed and the agent was already executing — the notice's prescribed
+  recovery (`get_output` the pane) costs a multi-thousand-token ANSI-garbled dump on every false
+  positive (giving back exactly the spend #398 went to lengths to cut), and a signal that cries
+  wolf trains the orchestrator to stop checking, which is precisely when the one true positive
+  arrives.
+
+Both failures share one root cause: there is no AUTHORITATIVE signal for what happened to a
+pasted prompt, only an inference over the output byte stream — and #430/#432's ConPTY/xterm
+cursor desync garbles that stream further. No retuning of `SUBMIT_CONFIRM_MIN_BYTES` or the
+window fixes this; the axis itself is wrong (the same conclusion #420's design note reached about
+byte-count baselines for the interactive-question guard). The fix is a real signal, reusing the
+#417 hook seam this module already trusts for compact-lifecycle evidence.
+
+### The docs facts (per the `agent-cli-reference` skill)
+
+- **Claude Code hooks reference** (code.claude.com/docs/en/hooks, "UserPromptSubmit input"
+  section, fetched and grepped directly against the raw page — round 1 review caught an earlier
+  draft of this note citing `user_input` as the documented field, which does not appear anywhere
+  on the page): `UserPromptSubmit` fires "when you submit a prompt, before Claude processes it",
+  supports **no matcher** (always fires on every submission), and the stdin JSON payload carries
+  the submitted text under **`prompt`** — verbatim, "UserPromptSubmit hooks receive the `prompt`
+  field containing the text the user submitted." `user_input`/`user_prompt` are tolerated as
+  legacy/cross-CLI fallback field names only, never treated as primary. **Safety-critical**: exit
+  code 2 "blocks prompt processing and erases the prompt", and on exit 0 anything printed to
+  **stdout is added as context Claude can see**. Hook commands receive input "piped via stdin as
+  JSON" (confirmed separately, "How Hook Commands Receive Input"). Default timeout for this event
+  is 30s.
+- **Copilot hooks reference** (docs.github.com/en/copilot/reference/hooks-reference):
+  `userPromptSubmitted` fires when "The user submits a prompt"; documented field names are
+  `prompt` (camelCase: `sessionId`/`timestamp`/`cwd`/`prompt`) or `prompt` again under the
+  VS-Code-compatible shape (`hook_event_name`/`session_id`/`timestamp`/`cwd`/`prompt`). The
+  event's row in the page's own events table reads "Output processed: **No**" (re-verified
+  directly against the raw page, not the rendered summary — the table has an `Event` / `Fires
+  when` / `Output processed` / `Cloud agent` header row), so there is no exit-code-erases-the-
+  prompt hazard on this side the way there is for Claude.
+- **Docs-silent residuals** (named, not papered over):
+  - **Copilot's payload TRANSPORT** for `userPromptSubmitted` is not documented — unlike
+    Claude's explicit "stdin as JSON" contract, the Copilot reference gives field names but never
+    says how the command hook receives them. Rather than guess (stdin? env vars? a file?), the
+    Copilot arm never attempts to read the payload at all — see "Two confirmation tiers" below.
+  - Whether a submission that gets swallowed/misparsed as an unknown slash command (the exact
+    `/model`-merge failure this issue opened on) still fires `UserPromptSubmit` at all is not
+    stated by either reference. If it doesn't fire, that case stays **unconfirmed** under this
+    design — the safe direction (rev-32's own "never false-confirm" property, preserved) — left
+    genuinely unresolved rather than assumed either way.
+
+### Reuse, not invention: one more event on the #417 hook seam
+
+Loomux already provisions per-CLI lifecycle hooks and polls marker files for `PreCompact`/
+`SessionStart` (#417, "compact hooks as a trusted evidence source" below) — this adds ONE more
+event to that existing machinery:
+
+- `COMPACT_HOOK_SCRIPT` gains a `promptsubmit` arm on the SAME generic, per-machine `sh` script
+  (`compact-hook.sh` — the filename still says "compact" even though it now also carries this
+  event; renaming it would strand any live session whose already-generated `--settings`/hooks
+  file points at the old name, so it stays, with a comment explaining why).
+- `compact_hook_settings` gains a `UserPromptSubmit` entry in Claude's `--settings` hooks JSON —
+  no `matcher` key, since the event doesn't support one.
+- `ensure_copilot_compact_hook` gains a `userPromptSubmitted` entry in the SAME global
+  `loomux-compact.json`, alongside `preCompact` — still one small additive file, same "all hook
+  entries from all sources are run" guarantee.
+- Marker-reading precedent: a new `<agent-id>.promptsubmit.jsonl` sits alongside the existing
+  `.precompact.json`/`.sessionstart-compact.json` markers in the same `hooks/` dir.
+
+### Two confirmation tiers, because the two CLIs' docs don't give the same guarantee
+
+`PromptSubmitRecord { text: Option<String> }` is the parsed shape of one JSONL line.
+
+- **Claude (content tier).** The script's `promptsubmit` arm appends the FULL stdin JSON verbatim
+  (plus a trailing newline) to the marker. `promptsubmit_records_since(content, offset)` parses
+  each line, pulling text from `prompt` (the documented field — see "The docs facts" above) or
+  `user_input`/`user_prompt` (legacy/cross-CLI fallback only, never primary) — an unparseable
+  line (a torn write mid-`>>`, racing a poll) degrades to `text: None`
+  rather than being dropped, so a torn read never silently loses a whole poll cycle's evidence.
+  `prompt_landed(records, pasted)` normalizes both sides (trim + collapse all whitespace runs,
+  which also washes out CRLF-vs-LF) and does **containment**: a record whose text CONTAINS the
+  normalized paste counts as landed, `merged: true` when it's a strict superset — the exact
+  "prompt merged with human-typed `/model`" shape from this issue's root cause, still counted as
+  landed (the agent DID receive the task text) but flagged in the audit (`confirm_merged`) rather
+  than reported as a clean exact match.
+- **Copilot (existence tier).** Since the payload transport isn't documented, the Copilot command
+  never attempts to read or capture the prompt text — it appends a single non-JSON marker
+  character (`.`) to the SAME marker file. `promptsubmit_records_since` treats any non-empty,
+  non-JSON line as an existence record (`text: None`), so both CLIs share one reader; Copilot
+  just never reaches the `Content` tier, only `PromptLandedMatch::Existence`. Strictly better
+  than the burst heuristic for a busy pane (independent of `reached_quiet` — see below), at the
+  cost of the content-match precision Claude's tier gets.
+
+### The baseline: why a stale record can never satisfy a later delivery
+
+`deliver_prompt` snapshots `promptsubmit_marker_len(path)` — the marker's byte length — right
+BEFORE it pastes anything (not before the Enter; before the paste). `promptsubmit_records_since`
+only looks at bytes after that offset. A record from an EARLIER delivery to the same pane, or a
+human's own submitted prompt, sits entirely before this delivery's own baseline and can never
+satisfy it — by construction, not by a timing assumption.
+
+**Residual, named by round 1 review (N2), not hardened against**: the script's append is two
+separate writes (`{ cat; printf '\n'; } >> marker` is one shell redirection, but the underlying
+`write(2)` calls for the JSON body and the trailing newline are not atomic against a concurrent
+reader). `promptsubmit_marker_len` could theoretically snapshot mid-append of a PRE-baseline
+record; the remnant then parses, post-offset, as a non-empty non-JSON tail line — `text: None` —
+which resolves to `PromptLandedMatch::Existence` and confirms this delivery on the strength of an
+older record's own leftover tail. The window is microscopic (a delivery's baseline snapshot would
+have to land in the handful of microseconds between two writes belonging to a DIFFERENT firing),
+and only ever promotes to the weaker existence tier (a torn Claude record can't produce a false
+CONTENT match, since the containment check needs a complete, valid JSON `prompt` value) — so it's
+recorded here as a known, accepted gap rather than fixed with an offset-vs-last-newline check that
+would add complexity for a hazard this narrow.
+
+### The precedence, and the property that actually fixes the reported bug
+
+`resolve_submit_confirmation(hook_match, reached_quiet, baseline_total, observed_total)` is pure:
+
+```
+hook_match != None            => (true, ConfirmSource::Hook)
+submit_confirmed(reached_quiet, baseline_total, observed_total)
+                               => (true, ConfirmSource::Burst)
+otherwise                     => (false, ConfirmSource::None)
+```
+
+The load-bearing property: **hook confirmation is checked first and is NOT gated on
+`reached_quiet`.** `submit_confirmed` (the burst fallback) keeps its exact existing shape and
+gating, unchanged — nothing about its own false-confirm posture changes. `deliver_prompt`'s
+confirm window now polls the hook marker on every tick regardless of `reached_quiet` (previously
+the whole loop body — burst included — was skipped outright when the pane never reached quiet);
+between the two spaced retries it polls again and breaks out of the retry loop immediately on a
+match, on the theory that a hook match proves the ORIGINAL Enter worked (some CLIs can take
+longer than `SUBMIT_CONFIRM_WINDOW` to emit the hook under load — exactly the busy-pane case this
+feature exists for) rather than risk a redundant Enter blind-selecting an option in an unrelated
+dialog that appeared since. `confirm_source` (`"hook"` / `"burst"` / `"none"`) and
+`confirm_merged` ride the `prompt-typed` audit event so the two failure directions stay
+distinguishable after the fact.
+
+**The final re-check (added round 1 review, B3 — plan-14 step 4 had specified it and the first
+push omitted it).** Each retry's own hook poll can be followed by `wait_for_question_clear`, which
+holds for up to `QUESTION_HOLD_MAX` (120s). A hook record landing during that hold — or fired by
+the LAST retry's own Enter, after the loop's own last poll of it — is invisible to every poll that
+already ran. Left unchecked, `confirmed` stays `false` and the unconfirmed notice fires with the
+proof already sitting on disk, unread: precisely the false-unconfirm class this feature exists to
+erase, surviving on the one path the plan named to close. `apply_final_hook_recheck` (pure) runs
+once more, right before `DeliveryOutcome` is recorded and `notify_unconfirmed_delivery` is called
+— a no-op when already confirmed (never re-litigates a decision already made) or when the hook has
+nothing new to say.
+
+### Both-directions scorecard
+
+- **False confirm**: on the Claude CONTENT tier, requires a hook record after the delivery's own
+  baseline whose text CONTAINS the pasted text — an output burst, a dialog repaint, or a spinner
+  tick writes no such record. **Residual, named by round 1 review (N1)**: the Copilot EXISTENCE
+  tier has no content check at all — ANY post-baseline record confirms, so a human submitting
+  their own prompt into that same pane during the confirm window or a retry's sleep (a span of
+  several seconds) would false-confirm loomux's delivery. This is the precision cost the "Two
+  confirmation tiers" section already names; it is real and unmitigated on Copilot, not merely a
+  theoretical residual the way the Claude tier's is. The burst tier itself is untouched, so its
+  own (narrow) false-confirm exposure is unchanged, not widened.
+- **False unconfirm**: for a hook-provisioned CLI, a landed prompt fires the hook deterministically
+  per the docs' own "always fires" contract, independent of the pane's output-quiet timing — the
+  busy-pane class from the field-evidence session disappears. A CLI outside the hook seam (or a
+  session where `resolve_hook_sh` found no `sh`) keeps today's behavior exactly — a degrade, not
+  a regression.
+- **Failure containment**: a hook that never fires (old CLI build, a `disableAllHooks` policy, a
+  marker-write failure) silently degrades to the pre-existing burst tier — same fail-open posture
+  #417 already established for the compact markers.
+
+### Safety property: exit 0, print nothing, on every path
+
+Claude's `UserPromptSubmit` is the highest-stakes hook this module has ever wired: getting the
+exit code wrong doesn't just skip a signal (as a `PreCompact` marker-write failure would) — exit
+code 2 **erases the user's own prompt**, and exit 0 leaks whatever the script prints to stdout
+into the model's own context. The `promptsubmit` arm is held to a stricter bar than
+`precompact`/`sessionstart-compact`: it `touch`es the marker first (an ORDINARY command failure a
+non-interactive shell reports and continues past, per the SAME reasoning that already replaced a
+bare `: > "$path"` redirect with `touch` for the other two events — see "#417: compact hooks as a
+trusted evidence source" below) and only appends through `>> "$marker"` once that proves the path
+is openable; on a `touch` failure it drains stdin to `/dev/null` instead of leaving it unread.
+Either way, the append's target is the marker file or `/dev/null` — never the script's own
+inherited stdout. Pinned by real-execution tests (the induced-failure `mkdir` case from #417's
+own harness, extended to this arm, plus a happy-path test proving two firings append rather than
+overwrite) with MUTATION evidence: a version of this arm that leaks stdin to stdout (a single
+stray `cat` ahead of the touch-gate — a realistic typo, not a contrived one) fails the "no
+stdout" assertion on BOTH real-execution tests, and a version of `resolve_submit_confirmation`
+that re-gates the hook tier on `reached_quiet` fails the busy-pane pin — both mutations were run
+and reverted; see the PR body for the exact commands and failure lines. **Honesty note (round 1
+review corrected an inaccurate claim here)**: the `touch`-gate itself is defense-in-depth, not a
+mutation-demonstrated regression catch on the `sh` this repo's tests actually run under — verified
+directly, POSIX's fatal-on-redirection-error rule applies to *special built-ins* (a bare `: >`,
+which the PRE-EXISTING `compact_hook_script...` test already pins) and not to ordinary utilities
+or compound groups, so `{ cat; printf '\n'; } >> "$marker"` alone was confirmed NOT to abort this
+script under the same induced `mkdir` failure. The gate is kept anyway for consistency with this
+module's established style and because that POSIX distinction cannot be relied on across every
+`sh` implementation this script might run under — but the claim that a mutation of THIS PR's own
+construct demonstrates the gate catching a live regression was false and has been removed from
+the code comment that used to make it (`COMPACT_HOOK_SCRIPT`'s doc).
+
+### What this does NOT change (the #445 seam)
+
+This PR touches the *confirmation* signal and its two provisioning surfaces only. It does not
+widen, narrow, or re-time any `PasteGate::Abort` path, and `should_notify_unconfirmed` /
+`should_notify_paste_held` (their orchestrator-suppression semantics included) are byte-identical
+to before. `DeliveryOutcome`/`DeliveryConfirmation` keep their existing two-field shape — only
+the audit event gains new keys. Payload lifecycle when a delivery genuinely can't proceed (queue-
+don't-drop, flush-on-unblock, `report()`'s truthfulness) is #445's separate, not-yet-authorized
+workstream; #112 hands it a trustworthy `confirmed` primitive to build on rather than widening
+its own scope to cover it.
+
+### Alternatives considered
+
+- **Input-box-cleared check** on the ANSI-stripped tail: TUI rendering is not a documented
+  contract (the references specify hooks, not paint); per-CLI box framing is exactly what
+  breaks self-echo masking elsewhere in this module (see the paste-guard sections below); #430-
+  class desync corrupts the read; and "box cleared" can't distinguish submitted from Ctrl-C'd.
+  **Overturned in round 2 — see "Round 2: acceptance vs. processing" below.** The documented-
+  contract advantage this rejection leaned on did not, in the end, save the hook: the live
+  validation that follows found the docs silent on exactly the case that mattered (mid-turn/
+  queued input), so "documented" was never the safety property it looked like. The Ctrl-C
+  objection is closed for the human-cancel case: `tier1_trusted` (a pure predicate,
+  `last_user_input_ms(pty_id) <= submit_sent_ms`) gates every point Tier 1's reading can become a
+  decision — both Box confirms in the confirm/retry loop and the end-of-window veto
+  (`final_window_outcome`) — so any human input since our own submit suppresses Tier 1 entirely
+  for the rest of that delivery, in both directions. (Round 3, rev-20 B3, found this claim
+  written here with no code behind it yet — the fourth claim-mismatch this PR produced. The
+  fix above is what makes the sentence true; it wasn't at the time it was first written.) The
+  submitted-vs-rejected ambiguity is NOT closed — it's named as a live residual in round 2's own
+  section, made measurable rather than solved. Overturning a considered rejection without
+  recording why is how a codebase loses its memory; this note is that record.
+- **Echo check** (the pasted text appears in scrollback as a user message): same rendering-
+  dependence, and long pastes get collapsed/elided by TUIs in undocumented ways. **This
+  specific residual — long pastes collapsing under undocumented CLI rules — resurfaced almost
+  verbatim as a live finding in round 2**, this time against Tier 1's own box-consumption check,
+  not an echo check. The mechanism is different (tail-end containment, not scrollback presence)
+  but the underlying hazard this bullet named turned out to be exactly right.
+- **Turn-start signature** (spinner/thinking markers): per-version, per-CLI, localization-
+  fragile, and doesn't distinguish a real turn from an error repaint's own spinner tick.
+- **Transcript-file watching** (Claude's `transcript_path`): a real signal, but poll-based,
+  session-file-format-coupled, Claude-only, and strictly dominated by the push-based hook the
+  same vendor documents for exactly this purpose.
+- **Retuning `SUBMIT_CONFIRM_MIN_BYTES`/the window**: cannot fix both directions at once — the
+  axis (output bytes) is the wrong axis, not merely mis-calibrated.
+
+### Round 2: acceptance vs. processing — why the hook-tier design above doesn't fix #112, and what does
+
+Live validation of the design above (round 1, PR #451) found the mechanism sound but its central
+claim false: across two real orchestration groups, **zero deliveries resolved `confirm_source:
+"hook"`**. The hook fires and its records are correct (verified: one agent's marker file held a
+byte-for-byte match for 4 of its own real deliveries) — but every one of those still resolved via
+burst, and the two genuinely busy-pane cases resolved `"none"` (a false alarm) with no hook
+record at all, even after 52+ seconds.
+
+**Root cause 1 — a race the hook cannot win.** The confirm loop accepts whichever tier answers
+first. Burst's bar (`reached_quiet` already true, plus any >=24-byte growth) is met by the TUI's
+own synchronous repaint; the hook needs an OS process spawn, measured directly on the validation
+machine at 87-98ms per invocation (and Claude Code's own docs show its hook command nests inside
+Claude's OWN `sh -c` wrapper, so the real path is likely slower). Burst wins essentially every
+healthy delivery by construction, not by accident.
+
+**Root cause 2, and the one that actually reframes the fix — a logic constraint, not a tuning
+problem.** `confirmed = hook_match OR burst_match` can only ever ADD confirmations; it has no
+mechanism for the hook's ABSENCE of evidence to veto a burst false-positive. And per the live
+data, hook silence carries no information: it's silent for the majority of provably-successful
+deliveries (a `.promptsubmit.jsonl` growing from 5 to 28 lines over 38 minutes on one busy pane
+that resolved every delivery via burst; frozen at 1-2 lines for 38+ minutes on another pane that
+was genuinely working the whole time). So the false-CONFIRM direction — #112's own title — was
+never reachable by this design at ANY hook coverage rate, hook-required is off the table (it would
+convert every silently-successful delivery into a false unconfirmed — worse than the original
+bug), and the false-UNCONFIRMED direction only degrades from "wrong at 45 seconds" to "wrong,
+period" for a pane that stays busy indefinitely.
+
+#### The actual defect: treating "no evidence yet" as "probably lost"
+
+Claude Code accepts input while working and processes it later (observed directly, mid-session:
+a delivered message appeared in the pane as `[Pasted text #5 +32 lines]  paste again to expand` /
+`Press up to edit queued messages` — accepted and queued, not lost, while loomux had already
+fired an unconfirmed alarm for it). A queued prompt produces no PROCESSING evidence — no burst,
+no hook — for an arbitrarily long time, and that is normal, correct CLI behavior, not a fault. No
+signal fixes that, because there is nothing to observe yet. **The fix is semantic, not another
+oracle**: three states, not a confirmed/unconfirmed binary.
+
+- `Confirmed` — positive evidence of acceptance.
+- `Pending` — no evidence yet. The normal state for a prompt queued into a busy pane, for however
+  long that takes. Never draws the unconfirmed notice.
+- `Failed` — positive evidence of non-delivery, or a pane that's gone genuinely idle with none.
+
+#### Tier 1: box consumption — two-sided, not another OR term
+
+`echoed` (the pre-existing paste-verification check) establishes that SOME output appeared after
+the paste — a raw >=8-byte growth check (`ECHO_MIN_BYTES`), no content comparison at all. The
+first draft of Tier 1 assumed this meant "our literal text is positively in the box"; it doesn't,
+and confirming that assumption is what surfaced root cause 2's sibling for Tier 1 (below). Once a
+delivery's OWN precondition is separately, observably verified (see "The precondition problem"),
+Tier 1 is genuinely two-sided in a way the hook never was: after Enter, our KNOWN pasted text is
+either still findable at the tail end of the pane's output, or it isn't.
+
+- **Gone from the tail end** (not "gone from anywhere" — a CLI that echoes an accepted prompt
+  into scrollback/transcript history would make "anywhere" trivially true forever and prove
+  nothing) → the CLI took it, whether it's processing now or queued. `ConfirmSource::Box`.
+- **Still there, sustained across the WHOLE confirm+retry window (~7.6s across 15+ polls), never
+  just one early sample** → a real veto: the CLI never even accepted the input.
+  `ConfirmSource::BoxVeto`. The "never one sample" qualifier is load-bearing: render/redraw can
+  lag Enter being processed by tens of milliseconds even on a healthy accept, so a veto that fired
+  on the FIRST "still there" reading would misfire on ordinary redraw lag. The existing
+  window's natural width supplies the debounce; no new TIME constant was needed for it — though
+  round 3, below, adds a precondition on HOW the window ended (naturally, not via an early exit)
+  that round 2's own first pass omitted.
+
+This is what makes Tier 1 worth building where the hook wasn't: burst never decides when Tier 1
+governs (its evidence is too weak to arbitrate against a box-based read — though it is still
+evaluated every tick, purely to record `tier3_burst_would_confirm` in the audit trail), so a
+healthy delivery is decided by the SAME signal in both directions, not raced against a weaker
+fallback that can only ever say yes.
+
+#### The precondition problem: `echoed` is a proxy, and Claude Code collapses long pastes
+
+Live evidence (the same "Pasted text #5" episode above) showed the actual box, for a long
+delivered prompt, NEVER contains the literal text at all — Claude Code collapses it to a
+placeholder. `echoed`'s byte-count check is satisfied identically by the placeholder, so treating
+`echoed=true` as proof of literal presence was the SAME category of mistake as trusting the
+hook's silence: an assumption standing in for an observation, caught the SAME way, by a human
+directly inspecting a live pane rather than trusting the code's own premise. The placeholder's
+exact size/line threshold is genuinely undocumented (checked `interactive-mode`, the CLI's own
+input-mode reference — no mention).
+
+**The fix**: verify the precondition per delivery instead of assuming it. Right before Enter,
+`deliver_prompt` reads the real tail and checks whether the pasted text is ACTUALLY findable
+there (`box_holds_paste` — the same function serves this precondition check and the post-Enter
+consumption check). Found → `tier1_governs = true`, Tier 1 decides two-sidedly as above. Not
+found (a long/collapsed paste, or the echo genuinely never landed) → Tier 1 declines to govern,
+audited explicitly (`tier1_governed: false`), and this delivery falls back to the round-1
+hook-or-burst precedence for its initial window. **Consequence, stated plainly**: Tier 1's
+two-sided coverage is short/literal-pastes only. Long pastes — the orchestrator briefs most
+likely to land on a busy worker and get queued, the exact population this redesign is for — don't
+get Tier 1's fast veto. They still get everything else in this design (the three-state model, the
+long-window late hook, the idle trigger below), just not Tier 1's speed.
+
+Two options were weighed and set aside for this pass: a placeholder-pattern matcher
+(`[Pasted text #N`/`Press up to edit queued messages`) would extend Tier 1's coverage to long
+pastes, but it's undocumented, Claude-only, version-fragile TUI chrome taken on as a
+CONFIRMATION source — exactly the class this design note already rejected once, and a format
+change in a future Claude release would produce silent WRONG confirmations, not a visible
+failure. Not built. Transcript-file watching (`transcript_path`, handed to every hook payload) is
+a genuinely durable, hook-independent signal, but it's a new file format loomux doesn't parse
+anywhere today; deferred as a follow-up if live measurement later shows the hook has coverage
+gaps distinct from timing.
+
+#### Tier 2: the hook, no longer bounded by the window
+
+"Stop requiring it in-window" — a late `promptsubmit` match upgrades `Pending` (or corrects an
+already-`Failed` delivery) whenever it arrives, checked on a poll bounded only by the pty staying
+alive and (round 3, below) a generous lifetime cap — not the original ~7.6s window. If a `failed`
+alarm had already fired for this delivery, the late match is announced as a CORRECTION
+(`delivery_confirmed_late_notice`), not a second success notice — the orchestrator needs to know
+the earlier alarm was wrong, not just that things are now fine.
+
+#### The `failed` trigger: idle-without-evidence, not a timer
+
+Once the normal window closes `Pending`, `deliver_prompt` spawns a SEPARATE, unlocked, long-lived
+monitor thread (deliberately not a continuation of the delivery thread, which holds the per-pty
+delivery mutex for its own bounded lifetime — holding that mutex for the 38+ minutes the live
+episode needed would block every subsequent delivery to the same pane). It declares `Failed`
+only once the pane's own output has been quiet for `PENDING_IDLE_QUIET` (60s — its own constant,
+not `SUBMIT_QUIET`'s 1s, which is tuned for an unrelated "safe to press Enter" bar) — never on a
+fixed timeout (round 3 adds a generous lifetime CAP to the monitor thread itself, below, but
+hitting it makes the monitor give up silently — `Expired`, no notice, `Pending` stays whatever it
+already was — it never manufactures a `Failed` verdict; only genuine idle-without-evidence does
+that). **Named plainly, per this design's own standard**: this is ANOTHER
+byte-count proxy, the same category as `echoed`. Every "is this pane doing something" signal in
+this codebase reduces to `output_total` not growing (`watchdog_tick`'s stall detection is the
+same check, at a similar timescale, already trusted at production scale). It's a materially safer
+bet than `echoed` was for two reasons, not because it's a different kind of signal: (1) a
+minutes-scale margin dwarfs any transient gap in a CLI's own streaming cadence, where `echoed`'s
+failure bit at the exact granularity it operated at; (2) it's being asked to prove something byte
+count CAN support ("this pane stopped producing output") rather than something it structurally
+never could (content presence). The residual this doesn't close: idle-without-hook-evidence isn't
+PROOF of non-delivery, only the absence of the strongest proof available — a delivery accepted
+and fully processed by a CLI whose hook simply never fired for that one turn (a coverage gap
+distinct from Finding 1's timing race) would still false-alarm here, just only after waiting out
+the whole busy period, not at 45 seconds. Measurable via the same independent audit fields: a
+`Failed` delivery no hook ever later corroborates, for the life of the pty, is a real signature
+future analysis can look for. **Stated plainly, not left implicit**: on such a pane this `Failed`
+verdict is PERMANENT — Tier 2's late-hook correction (below) is the only mechanism that can ever
+retract a `Failed` verdict, and by definition it never arrives on a pane whose hook doesn't fire,
+so the one hole in a feature whose whole promise is "an away human returns to a trustworthy
+record" is exactly this: a false alarm, on a hook-less pane, that nothing will ever correct.
+
+**The guard that makes this safe to ship**: a pane can be quiet because it's holding a question
+FOR THE HUMAN (an `AskUserQuestion`, a permission prompt) — output stops, the pane sits still,
+and by pure quiescence it looks idle, but the human may be away for hours and the prompt is
+legitimately still pending. Firing `failed` there would be the exact false alarm this redesign
+exists to eliminate, in the exact circumstance (the human frequently away) it's supposed to
+protect — and worse than today's noisy alarm, because a three-state `failed` carries false
+authority. The monitor reuses `prompt_wait_detected` (mod.rs — the SAME detector #420's
+safety-critical paste guard already trusts in production, masked for our own paste via
+`mask_own_paste` exactly like every other checkpoint in this module) alongside the quiet check: a
+`Failed` transition requires quiet-for-threshold AND no question currently on screen. Its own
+known gap, already documented in its own doc comment rather than discovered here: "a footer
+wrapped across rows in a very narrow pane, or a localized/reworded footer, won't match." A pane
+quiet UNDER a dialog is also byte-quiet the whole time it's up, so the quiet clock keeps running
+underneath it by construction; the only change is refusing to ACT on that reading while the
+dialog is visible. Once the human answers, the redraw that follows is itself fresh activity, so a
+genuinely-idle-after-that pane re-earns its own quiet-for-threshold observation before the alarm
+fires — correct behavior, not a bug, and consistent with never declaring `failed` off a single
+sample anywhere in this design.
+
+#### The #445 seam, round 2: additive, deliberately widened once, surgically
+
+Round 1 kept the seam byte-identical. Round 2 crosses it once, deliberately: WHEN the unconfirmed
+notice fires changes (deferred from "end of the ~7.6s window" to "declared `Failed`", which for a
+`Pending` delivery may be much later). What does NOT change: `should_notify_unconfirmed` /
+`should_notify_paste_held` (both functions, byte-identical — the notice is still gated by the
+SAME predicate, just called at a different point in time) and every `PasteGate::Abort` path
+(untouched). The only genuinely NEW seam surface is additive: `notify_delivery_confirmed_late`,
+a new function/notice for the correction case round 1 never needed (round 1 always notified
+immediately, so there was nothing to correct against a still-silent alarm).
+
+#### Audit shape: every tier records its own reading, never just the winner
+
+`prompt-typed` carries `confirm_state` (`confirmed`/`pending`/`failed`), `confirm_source` (which
+tier decided, if any), and three independent per-tier fields — `tier1_governed`/
+`tier1_still_holding_at_end` (round 3, rev-20 N3: `null` when Tier 1 never governed this delivery
+at all, not `false` — "never measured" and "measured and cleared" are different facts, and a bare
+bool would have conflated them), `tier2_hook_matched`, `tier3_burst_would_confirm` — computed
+regardless of which tier actually decided. This is the hard requirement round 1's own outcome
+argued for: a suite that pins pure functions proved nothing about whether the mechanism won any
+races in practice, because nothing recorded what LOST. A live run can now compare, per delivery,
+what every tier actually said — including a Tier-1-veto that burst would have disagreed with, or
+a hook match that arrived just after burst already won — the exact comparison this whole
+redesign exists to make possible for the next person who has to trust or distrust it.
+
+### Round 3: the enforcement details rev-20 found wrong, and why they're pinned now
+
+Round 2's live-validation review found the architecture sound (three-state model, the seam, the
+audit fields, the round-2 overturn) but three blocking defects in how it was WIRED — the exact
+"round 1 shipped unpinnable wiring and failed live" mistake this whole redesign was supposed to
+have learned from, recurring one level down.
+
+**B1 — the late monitor leaked threads and could clobber a newer delivery.** Nothing bounded
+`run_late_confirmation_monitor`'s lifetime except a hook match or the pty closing — for any pane
+without working hook coverage (not hypothetical: live validation measured ZERO hook resolutions
+across two groups), a `Pending`-then-`Failed` delivery's monitor polled forever. Worse: on a late
+hook match it wrote `last_delivery` unconditionally, so a stale monitor could overwrite a NEWER
+delivery's outcome, and could match the RE-SEND's own hook record and announce "correction: no
+re-send needed" — false, since the re-send is why anything landed. Fixed with one mechanism for
+both: each tick, if `last_delivery[pty_id]`'s `submit_sent_ms` no longer matches this monitor's
+own, a newer delivery has superseded it — exit immediately, writing and notifying nothing
+(`late_monitor_tick`'s `Superseded` branch, checked before even the hook match). A generous
+lifetime cap (`LATE_MONITOR_MAX_LIFETIME`, 4 hours — the live episode needed 38 minutes) bounds
+the one monitor that's genuinely the pane's most recent unresolved delivery.
+
+**B2 — the in-window veto was reachable through a question-pending or human-typing exit.** The
+question-holding-pane guard (above) was correctly built into the LATE monitor's idle trigger, but
+the retry loop's early exits for a live question or human typing fell straight through to the
+end-of-window veto check, which didn't know they'd happened — so `BoxVeto` (and the `Failed`
+notice) could fire while a dialog was on screen, exactly the polarity this whole redesign exists
+to forbid, reachable through the front door. Fixed: `final_window_outcome` (pure) adds a
+`window_exhausted_naturally` precondition — a veto requires the confirm+retry window ran to
+completion with NO early exit, for a question, human typing, OR a failed retry write (the pty is
+likely closing; the box's end state can't be trusted as evidence either). Any early exit leaves
+the delivery `Pending`; the question-guarded late monitor decides from there, since unlike this
+one-shot end-of-window check it re-observes the question state on every subsequent poll.
+
+**B3 — the design note's Ctrl-C claim had no code behind it.** The round-2 overturn (above)
+claimed the human-cancel case was closed via `last_user_input_ms` before any confirm-path code
+actually consulted it — a human pressing Esc/Ctrl-C during the window would clear the box (or
+leave it looking cleared) with nothing distinguishing that from OUR delivery being accepted,
+yielding a false `Box` confirm. This is the fourth instance, across this PR's review history, of
+a claim reading as authoritative while not matching the code behind it (a phantom mutation-test
+citation, a hallucinated API field name, an audit action filed under the wrong name, and now
+this) — worth naming as a pattern, not just fixing as an instance. Fixed: `tier1_trusted` (pure,
+`last_user_input_ms(pty_id) <= submit_sent_ms`) gates every point Tier 1's reading can become a
+decision — both in-loop `Box` promotions and the end-of-window veto — so any human input since
+our own submit suppresses Tier 1 for the rest of that delivery, in both directions, making the
+overturn's own sentence true rather than aspirational.
+
+All three fixes are pure, pinned functions, not inline conditionals — `tier1_trusted`,
+`final_window_outcome`, and `late_monitor_tick` (with a `MonitorAction` result type covering
+`Superseded`/`Expired`/`Confirm`/`DeclareFailed`/`KeepWaiting`) — each with a dedicated polarity
+test and, for the three properties that matter most (never-veto-off-an-early-exit, never-decide-
+after-human-input, supersession-beats-even-a-hook-match), mutation evidence: each property's
+guard was individually removed, the corresponding test reproduced red at the exact assertion, and
+the code was restored.
+
+Non-blocking findings addressed the same pass: the late monitor's own question scan now reads a
+much larger tail (`LATE_MONITOR_QUESTION_SCAN_BYTES`, 32KB vs. the 4KB `QUESTION_SCAN_TAIL_BYTES`
+the fast 250ms-cadence checkpoints use) — sized for a 5-second poll cadence, not a 250ms one, so a
+dialog rendered above a long literally-rendered paste can't fall entirely outside the read; and
+`tier1_still_holding_at_end`'s null-vs-false distinction (above). Left explicitly unaddressed:
+the correction path's own hook-coverage dependency (a `Failed` verdict on a hook-less/zero-
+coverage pane can never be corrected, since correction rides the same hook that never fires
+there — the idle-trigger residual already named above inherits this, and is now doubly
+unresolvable on such a pane; a real gap, but closing it needs the same transcript-watching or
+placeholder-signal work already deferred, not a wiring fix) and `notify_delivery_confirmed_late`'s
+own silent-suppression-leaves-no-audit-trace shape, which mirrors an existing shape in
+`notify_delivery_held`/`notify_unconfirmed_delivery` and belongs to whatever workstream addresses
+that pattern generally (#445's own future territory), not a one-off fix here.
+
 ## Decision-grade structured reports (#398)
 
 Every worker/reviewer/planner `report(...)` lands in the orchestrator's context window, and for

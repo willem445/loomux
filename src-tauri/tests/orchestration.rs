@@ -16,6 +16,11 @@ use loomux_lib::orchestration::{
     channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
     COMPACT_HOOK_SCRIPT, COPILOT_PRECOMPACT_HOOK_BASH, COPILOT_PRECOMPACT_HOOK_POWERSHELL,
+    COPILOT_PROMPTSUBMIT_HOOK_BASH, COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL,
+    ConfirmSource, DeliveryConfirmState, MonitorAction, PromptLandedMatch, PromptSubmitRecord,
+    box_holds_paste, confirm_state_for, delivery_confirmed_late_notice, final_window_outcome,
+    late_monitor_tick, poll_promptsubmit_hook, promptsubmit_marker_len, promptsubmit_marker_path,
+    promptsubmit_records_since, prompt_landed, tier1_trusted,
     compact_escalation_should_fire, compact_nudge_cli_supported, compact_nudge_context_floor_met,
     compact_nudge_role_allowed,
     compact_reinjection_notice, compact_request_should_fire, compaction_status, context_percent_used,
@@ -1832,7 +1837,7 @@ fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
         eprintln!("SKIP claude_agent_spawn_provisions_the_compact_lifecycle_hooks: no sh.exe found via `where`");
         return;
     }
-    let (reg, _d) = test_registry();
+    let (reg, d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
@@ -1853,11 +1858,32 @@ fn claude_agent_spawn_provisions_the_compact_lifecycle_hooks() {
     assert!(precompact.contains(&w.id), "{precompact}");
     assert!(precompact.contains(&g.id), "{precompact}");
 
-    // The generic script itself was written to the shared, per-machine dir —
-    // never per-group, since it carries no group-specific text.
-    let script = reg.state_root().parent().unwrap().join("compacthook").join("compact-hook.sh");
+    // #112: the real prompt-landed signal rides the SAME `--settings` file,
+    // one more entry alongside PreCompact/SessionStart.
+    let promptsubmit_entry = &hooks_cfg["hooks"]["UserPromptSubmit"][0];
+    let promptsubmit = promptsubmit_entry["hooks"][0]["command"].as_str().unwrap().to_string();
+    assert!(promptsubmit.contains("promptsubmit"), "{promptsubmit}");
+    assert!(promptsubmit.contains(&w.id) && promptsubmit.contains(&g.id), "{promptsubmit}");
+    // Per the hooks reference, `UserPromptSubmit` "does NOT support matchers
+    // and always fires on every prompt submission" — no `matcher` key at all,
+    // unlike `SessionStart` above (which needs one to scope to compact-only
+    // starts).
+    assert!(promptsubmit_entry.get("matcher").is_none(), "UserPromptSubmit takes no matcher: {promptsubmit_entry}");
+    // The other two events must be completely untouched by this addition.
+    assert!(precompact.contains("precompact") && !precompact.contains("promptsubmit"));
+    assert!(sessionstart.contains("sessionstart-compact") && !sessionstart.contains("promptsubmit"));
+
+    // The generic script itself was written to the test's isolated
+    // `compact_hook_dir_override` (`test_registry()`'s doc: real deployments
+    // use `root.parent()/compacthook`, a machine-wide shared path this test
+    // deliberately avoids so it can't read a stale script some OTHER test
+    // left behind at that shared location — see #112 PR discussion; the
+    // pre-#112 version of this assertion read from the WRONG, non-overridden
+    // path and only ever passed by accident of whatever another test had
+    // most recently written there).
+    let script = d.path().join("compacthook").join("compact-hook.sh");
     let script_text = fs::read_to_string(&script).expect("the hook script must be written");
-    assert!(script_text.contains("precompact") && script_text.contains("sessionstart-compact"));
+    assert!(script_text.contains("precompact") && script_text.contains("sessionstart-compact") && script_text.contains("promptsubmit"));
     assert!(!script_text.contains(&g.id), "the script itself must stay generic — group specifics ride on argv only");
 }
 
@@ -6743,6 +6769,40 @@ fn ensure_copilot_compact_hook_writes_an_additive_generic_precompact_entry() {
     assert!(!dir2.path().join("copilot-hooks").join("loomux-compact.json").exists());
 }
 
+#[test]
+fn ensure_copilot_compact_hook_also_writes_the_promptsubmit_entry() {
+    // #112: the real prompt-landed signal rides the SAME global file
+    // alongside `preCompact` (still one small additive file — Copilot's own
+    // "all hook entries from all sources are run" guarantee covers both
+    // events identically).
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let cfg_path = dir.path().join("copilot-hooks").join("loomux-compact.json");
+    let cfg: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    // preCompact must be completely untouched by this addition.
+    assert!(cfg["hooks"]["preCompact"][0]["bash"].as_str().unwrap().contains("precompact.json"));
+
+    let entry = &cfg["hooks"]["userPromptSubmitted"][0];
+    assert_eq!(entry["type"], json!("command"));
+    let bash = entry["bash"].as_str().unwrap();
+    let ps1 = entry["powershell"].as_str().unwrap();
+    assert!(bash.contains("LOOMUX_GROUP_DIR") && bash.contains("LOOMUX_AGENT_ID"), "{bash}");
+    assert!(ps1.contains("LOOMUX_GROUP_DIR") && ps1.contains("LOOMUX_AGENT_ID"), "{ps1}");
+    // Existence-only: the marker path is `.promptsubmit.jsonl` (same file the
+    // Claude script writes real JSON records into), but this command never
+    // reads Copilot's own payload — the docs don't nail down its transport
+    // for this event (unlike Claude's stdin-JSON contract). Confirmed by
+    // there being no field-name text (`user_input`/`prompt`/etc) anywhere in
+    // either command string — the whole point of `PromptSubmitRecord::text`
+    // being `None` for a Copilot record.
+    assert!(bash.contains("promptsubmit.jsonl") && ps1.contains("promptsubmit.jsonl"));
+    for field in ["user_input", "user_prompt", "\"prompt\"", "stdin", "ReadToEnd"] {
+        assert!(!bash.contains(field) && !ps1.contains(field), "no payload read attempted: field={field} bash={bash} ps1={ps1}");
+    }
+}
+
 // ───────── rev-4 review round 3: PreCompact can BLOCK compaction — exit-0 safety ─────────
 //
 // Claude's own hooks reference (code.claude.com/docs/en/hooks) confirms `PreCompact` is a
@@ -6852,6 +6912,558 @@ fn copilot_precompact_hook_powershell_exits_zero_when_the_marker_dir_cant_be_cre
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+// ─────── #112: the `promptsubmit` hook arm — real-execution safety + content tests ───────
+//
+// SAFETY-CRITICAL (see `COMPACT_HOOK_SCRIPT`'s doc): `UserPromptSubmit` exit code 2
+// ERASES the user's prompt, and exit-0 stdout is injected as context the model sees.
+// So this arm is held to a STRICTER bar than precompact/sessionstart-compact above —
+// not just "always exits 0" but "never prints anything to its own stdout", on every
+// path including the induced-failure one.
+
+#[test]
+fn promptsubmit_hook_script_sh_exits_zero_and_prints_nothing_when_the_marker_dir_cant_be_created() {
+    let Some(sh) = resolve_test_sh() else {
+        eprintln!("SKIP promptsubmit_hook_script_sh_exits_zero_and_prints_nothing_when_the_marker_dir_cant_be_created: no sh found");
+        return;
+    };
+    use std::io::Write;
+    use std::process::Stdio;
+    let td = tempfile::tempdir().unwrap();
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+    let script_path = td.path().join("compact-hook.sh");
+    fs::write(&script_path, COMPACT_HOOK_SCRIPT).unwrap();
+
+    let mut child = std::process::Command::new(&sh)
+        .arg(&script_path)
+        .arg("promptsubmit")
+        .arg(blocked_group_dir.display().to_string())
+        .arg("agent-1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sh must run");
+    child.stdin.take().unwrap().write_all(br#"{"prompt":"do the thing"}"#).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "must never erase the user's prompt (exit 2) just because its own marker write failed — \
+         stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "stdout on exit 0 is injected as context the model sees — this arm must print NOTHING, \
+         got: {:?}",
+        String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+#[test]
+fn promptsubmit_hook_script_sh_appends_stdin_verbatim_with_no_stdout() {
+    let Some(sh) = resolve_test_sh() else {
+        eprintln!("SKIP promptsubmit_hook_script_sh_appends_stdin_verbatim_with_no_stdout: no sh found");
+        return;
+    };
+    use std::io::Write;
+    use std::process::Stdio;
+    let td = tempfile::tempdir().unwrap();
+    let group_dir = td.path().join("group");
+    fs::create_dir_all(&group_dir).unwrap();
+    let script_path = td.path().join("compact-hook.sh");
+    fs::write(&script_path, COMPACT_HOOK_SCRIPT).unwrap();
+    let payload = r#"{"session_id":"abc123","hook_event_name":"UserPromptSubmit","prompt":"implement #112"}"#;
+
+    // Two firings, to prove APPEND (not overwrite) — the whole point of a
+    // byte-offset baseline.
+    for _ in 0..2 {
+        let mut child = std::process::Command::new(&sh)
+            .arg(&script_path)
+            .arg("promptsubmit")
+            .arg(group_dir.display().to_string())
+            .arg("agent-1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh must run");
+        child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stdout.is_empty(), "no stdout: {:?}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    let marker = group_dir.join("hooks").join("agent-1.promptsubmit.jsonl");
+    let content = fs::read_to_string(&marker).unwrap();
+    let records = promptsubmit_records_since(&content, 0);
+    assert_eq!(records.len(), 2, "two firings must yield two APPENDED lines, not one overwritten line: {content:?}");
+    for r in &records {
+        assert_eq!(r.text.as_deref(), Some("implement #112"));
+    }
+}
+
+#[test]
+fn copilot_promptsubmit_hook_bash_exits_zero_when_the_marker_dir_cant_be_created() {
+    let Some(sh) = resolve_test_sh() else {
+        eprintln!("SKIP copilot_promptsubmit_hook_bash_exits_zero_when_the_marker_dir_cant_be_created: no sh found");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+
+    let output = std::process::Command::new(&sh)
+        .arg("-c")
+        .arg(COPILOT_PROMPTSUBMIT_HOOK_BASH)
+        .env("LOOMUX_GROUP_DIR", blocked_group_dir.display().to_string())
+        .env("LOOMUX_AGENT_ID", "agent-1")
+        .output()
+        .expect("sh must run");
+    assert_eq!(output.status.code(), Some(0), "stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn copilot_promptsubmit_hook_bash_appends_an_existence_marker() {
+    let Some(sh) = resolve_test_sh() else {
+        eprintln!("SKIP copilot_promptsubmit_hook_bash_appends_an_existence_marker: no sh found");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let group_dir = td.path().join("group");
+
+    for _ in 0..2 {
+        let output = std::process::Command::new(&sh)
+            .arg("-c")
+            .arg(COPILOT_PROMPTSUBMIT_HOOK_BASH)
+            .env("LOOMUX_GROUP_DIR", group_dir.display().to_string())
+            .env("LOOMUX_AGENT_ID", "agent-1")
+            .output()
+            .expect("sh must run");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stdout.is_empty());
+    }
+    let marker = group_dir.join("hooks").join("agent-1.promptsubmit.jsonl");
+    let content = fs::read_to_string(&marker).unwrap();
+    let records = promptsubmit_records_since(&content, 0);
+    assert_eq!(records.len(), 2, "two firings, two existence records: {content:?}");
+    assert!(records.iter().all(|r| r.text.is_none()), "Copilot never captures prompt text: {records:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn copilot_promptsubmit_hook_powershell_exits_zero_when_the_marker_dir_cant_be_created() {
+    let td = tempfile::tempdir().unwrap();
+    let blocked_group_dir = td.path().join("blocked-group-dir");
+    fs::write(&blocked_group_dir, "occupies the path; not a directory").unwrap();
+
+    let output = std::process::Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL)
+        .env("LOOMUX_GROUP_DIR", blocked_group_dir.display().to_string())
+        .env("LOOMUX_AGENT_ID", "agent-1")
+        .output()
+        .expect("powershell must run on a Windows CI runner");
+    assert_eq!(output.status.code(), Some(0), "stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(output.stdout.is_empty());
+}
+
+// ───────────────────── #112: pure decision-function tests ─────────────────────
+
+#[test]
+fn promptsubmit_records_since_parses_jsonl_and_tolerates_a_partial_trailing_line() {
+    let content = "{\"prompt\":\"first\"}\n{\"prompt\":\"second\"}\n{\"prom";
+    let all = promptsubmit_records_since(content, 0);
+    assert_eq!(all.len(), 3, "the torn trailing line still counts as existence evidence, not dropped");
+    assert_eq!(all[0].text.as_deref(), Some("first"));
+    assert_eq!(all[1].text.as_deref(), Some("second"));
+    assert_eq!(all[2].text, None, "unparseable JSON degrades to an existence-only record");
+
+    // Offset baseline: a record BEFORE the offset must never appear, even
+    // though it's syntactically identical to one after — this is the whole
+    // mechanism that makes a stale/earlier-delivery record unable to satisfy
+    // a later delivery's confirmation.
+    let first_line_len = content.find('\n').unwrap() + 1;
+    let since = promptsubmit_records_since(content, first_line_len);
+    assert_eq!(since.len(), 2);
+    assert_eq!(since[0].text.as_deref(), Some("second"));
+
+    // Offset past the end (or on an invalid boundary) degrades to "no new
+    // records" rather than panicking.
+    assert!(promptsubmit_records_since(content, content.len() + 100).is_empty());
+    assert!(promptsubmit_records_since(content, content.len()).is_empty());
+}
+
+#[test]
+fn promptsubmit_records_since_tolerates_unknown_fields_and_legacy_field_names() {
+    // The documented Claude field is `prompt` — verbatim from the live
+    // hooks reference (code.claude.com/docs/en/hooks, "UserPromptSubmit
+    // input"): "UserPromptSubmit hooks receive the `prompt` field
+    // containing the text the user submitted." `user_input`/`user_prompt`
+    // are tolerated fallback field names only (neither appears anywhere on
+    // that page — round 1 review caught an earlier version of this module
+    // citing `user_input` as primary, which was simply wrong), and
+    // unrelated fields never break parsing.
+    let content = "{\"session_id\":\"x\",\"prompt\":\"a\"}\n\
+                   {\"user_input\":\"b\"}\n\
+                   {\"user_prompt\":\"c\"}\n\
+                   {\"hook_event_name\":\"UserPromptSubmit\"}\n";
+    let records = promptsubmit_records_since(content, 0);
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0].text.as_deref(), Some("a"), "the documented field, `prompt`");
+    assert_eq!(records[1].text.as_deref(), Some("b"), "legacy fallback `user_input`");
+    assert_eq!(records[2].text.as_deref(), Some("c"), "legacy fallback `user_prompt`");
+    assert_eq!(records[3].text, None, "no recognized text field at all — existence only");
+}
+
+#[test]
+fn promptsubmit_records_since_prefers_the_documented_field_over_legacy_fallbacks() {
+    // If a single record somehow carried more than one of these fields, the
+    // documented `prompt` field must win — the fallbacks exist for CLIs/
+    // versions that DON'T send `prompt`, never to shadow it when it's present.
+    let content = "{\"prompt\":\"real\",\"user_input\":\"stale-or-wrong\"}\n";
+    let records = promptsubmit_records_since(content, 0);
+    assert_eq!(records[0].text.as_deref(), Some("real"));
+}
+
+#[test]
+fn prompt_landed_matches_exact_and_crlf_and_trailing_whitespace() {
+    let exact = vec![PromptSubmitRecord { text: Some("implement #112".to_string()) }];
+    assert_eq!(prompt_landed(&exact, "implement #112"), PromptLandedMatch::Content { merged: false });
+
+    let crlf = vec![PromptSubmitRecord { text: Some("implement\r\n#112\r\n".to_string()) }];
+    assert_eq!(prompt_landed(&crlf, "implement\n#112\n"), PromptLandedMatch::Content { merged: false },
+        "CRLF-vs-LF and trailing whitespace must wash out of the comparison");
+
+    let mismatched = vec![PromptSubmitRecord { text: Some("something else entirely".to_string()) }];
+    assert_eq!(prompt_landed(&mismatched, "implement #112"), PromptLandedMatch::None);
+}
+
+#[test]
+fn prompt_landed_containment_flags_a_merged_submission() {
+    // The exact #112 root-cause shape: our paste merged with human-typed
+    // `/model` text, and the CLI's own record shows the LARGER merged string.
+    // Still landed (the agent DID receive the task text — plan-14 decision
+    // #3), but flagged as merged rather than a clean exact match.
+    let merged = vec![PromptSubmitRecord { text: Some("/modelimplement #112".to_string()) }];
+    assert_eq!(prompt_landed(&merged, "implement #112"), PromptLandedMatch::Content { merged: true });
+
+    // The reverse — our paste is a SUPERSET of the record — must NOT match:
+    // containment only goes one direction (the record must contain what we
+    // pasted, not the other way around).
+    let too_short = vec![PromptSubmitRecord { text: Some("implement".to_string()) }];
+    assert_eq!(prompt_landed(&too_short, "implement #112"), PromptLandedMatch::None);
+}
+
+#[test]
+fn prompt_landed_existence_tier_for_textless_records() {
+    // Copilot's shape: a record fired, but carries no text at all.
+    let copilot = vec![PromptSubmitRecord { text: None }];
+    assert_eq!(prompt_landed(&copilot, "implement #112"), PromptLandedMatch::Existence);
+
+    // No records at all: nothing to trust.
+    assert_eq!(prompt_landed(&[], "implement #112"), PromptLandedMatch::None);
+
+    // A textless record mixed with a non-matching text record still resolves
+    // to Existence (never silently promoted to Content, never demoted to None).
+    let mixed = vec![
+        PromptSubmitRecord { text: Some("unrelated".to_string()) },
+        PromptSubmitRecord { text: None },
+    ];
+    assert_eq!(prompt_landed(&mixed, "implement #112"), PromptLandedMatch::Existence);
+}
+
+#[test]
+fn prompt_landed_never_trivially_matches_empty_pasted_text() {
+    // Guards the containment check: an empty normalized paste would
+    // trivially be a substring of ANY text, which must never happen (deliver_
+    // prompt never pastes empty text, but the pure fn must not rely on that).
+    let records = vec![PromptSubmitRecord { text: Some("anything at all".to_string()) }];
+    assert_eq!(prompt_landed(&records, ""), PromptLandedMatch::None);
+    assert_eq!(prompt_landed(&records, "   \n\t  "), PromptLandedMatch::None);
+}
+
+// ───────────────────── #112 round 2: Tier 1 (box consumption) + 3-state ─────────────────────
+
+#[test]
+fn box_holds_paste_detects_presence_and_absence_at_the_tail_end() {
+    let pasted = "implement #112 end to end";
+    // Present, verbatim, at the tail end -- still holding.
+    assert!(box_holds_paste("some earlier output\n> implement #112 end to end", pasted));
+    // Gone -- the box redrew to something else entirely.
+    assert!(!box_holds_paste("some earlier output\n[thinking...]", pasted));
+}
+
+#[test]
+fn box_holds_paste_tolerates_crlf_and_whitespace_noise() {
+    let pasted = "line one\nline two";
+    assert!(box_holds_paste("boxed:\r\nline one\r\nline two\r\n", pasted));
+}
+
+#[test]
+fn box_holds_paste_ignores_a_match_scrolled_out_of_the_tail_window() {
+    // The whole point of windowing on the TAIL END: once enough new content
+    // has appeared after our paste, its presence far earlier in the buffer
+    // must not still read as "still holding" -- that would mean Tier 1 could
+    // never confirm a delivery that got accepted and echoed into scrollback
+    // history, which is exactly the false-negative the tail-end restriction
+    // (vs. "appears anywhere") exists to prevent.
+    let pasted = "short prompt";
+    let filler = "x ".repeat(500); // far more than BOX_TAIL_WINDOW_SLACK + len(pasted)
+    let tail = format!("short prompt\n{filler}\n[a fresh empty prompt]");
+    assert!(!box_holds_paste(&tail, pasted));
+}
+
+#[test]
+fn box_holds_paste_never_trivially_matches_an_empty_paste() {
+    assert!(!box_holds_paste("anything at all sitting in the tail", ""));
+    assert!(!box_holds_paste("anything at all sitting in the tail", "   \n\t  "));
+}
+
+#[test]
+fn box_holds_paste_is_the_documented_precondition_check_and_post_enter_signal_alike() {
+    // The SAME function serves both of Tier 1's uses -- verified by using it
+    // for both without any special-casing needed.
+    let pasted = "the orchestrator's kickoff brief";
+    let pre_enter_tail = "> the orchestrator's kickoff brief";
+    assert!(box_holds_paste(pre_enter_tail, pasted), "precondition check: literal text present");
+    let post_enter_tail_accepted = "[loomux] thinking...";
+    assert!(!box_holds_paste(post_enter_tail_accepted, pasted), "post-Enter: box consumed it");
+}
+
+#[test]
+fn confirm_state_for_maps_each_source_to_the_correct_three_state_outcome() {
+    // Pinned directly: a mutation swapping any one of these arms is exactly
+    // backwards and must fail this test, not just some downstream behavior.
+    assert_eq!(confirm_state_for(ConfirmSource::Box), DeliveryConfirmState::Confirmed);
+    assert_eq!(confirm_state_for(ConfirmSource::Hook), DeliveryConfirmState::Confirmed);
+    assert_eq!(confirm_state_for(ConfirmSource::Burst), DeliveryConfirmState::Confirmed);
+    assert_eq!(confirm_state_for(ConfirmSource::BoxVeto), DeliveryConfirmState::Failed);
+    assert_eq!(confirm_state_for(ConfirmSource::Idle), DeliveryConfirmState::Failed);
+    assert_eq!(confirm_state_for(ConfirmSource::None), DeliveryConfirmState::Pending);
+}
+
+#[test]
+fn confirm_source_and_state_as_str_cover_every_variant() {
+    for (src, state, src_str, state_str) in [
+        (ConfirmSource::Box, DeliveryConfirmState::Confirmed, "box", "confirmed"),
+        (ConfirmSource::Hook, DeliveryConfirmState::Confirmed, "hook", "confirmed"),
+        (ConfirmSource::Burst, DeliveryConfirmState::Confirmed, "burst", "confirmed"),
+        (ConfirmSource::BoxVeto, DeliveryConfirmState::Failed, "box_veto", "failed"),
+        (ConfirmSource::Idle, DeliveryConfirmState::Failed, "idle", "failed"),
+        (ConfirmSource::None, DeliveryConfirmState::Pending, "none", "pending"),
+    ] {
+        assert_eq!(src.as_str(), src_str);
+        assert_eq!(state.as_str(), state_str);
+        assert_eq!(confirm_state_for(src), state);
+    }
+}
+
+#[test]
+fn delivery_confirmed_late_notice_names_the_agent_and_reads_as_a_correction() {
+    let notice = delivery_confirmed_late_notice("w-13");
+    assert!(notice.contains("w-13"));
+    assert!(notice.to_lowercase().contains("correction"), "{notice}");
+    // Must NOT read as a fresh success notice -- it corrects a specific
+    // prior alarm, so it should reference that the earlier one was wrong.
+    assert!(notice.to_lowercase().contains("wrong") || notice.to_lowercase().contains("unconfirmed"), "{notice}");
+}
+
+// ─────────── #112 round 3 (rev-20): the polarity pins for B1/B2/B3 ───────────
+
+#[test]
+fn tier1_trusted_requires_no_human_input_since_our_own_submit() {
+    assert!(tier1_trusted(1000, 1000), "input at exactly submit time is not AFTER it");
+    assert!(tier1_trusted(999, 1000), "input strictly before submit is fine");
+    assert!(!tier1_trusted(1001, 1000), "any input after submit contaminates the reading");
+}
+
+#[test]
+fn final_window_outcome_vetoes_only_on_natural_exhaustion_with_everything_else_aligned() {
+    // The one case that SHOULD veto: nothing else decided, Tier 1 governs,
+    // it never saw the box clear, the window ran to natural exhaustion, and
+    // no human touched the pane since submit.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, Some(true), true, true),
+        ConfirmSource::BoxVeto,
+    );
+}
+
+#[test]
+fn final_window_outcome_never_vetoes_off_an_early_exit_rev20_b2() {
+    // THE blocking finding, pinned directly: a question-pending or human-
+    // typing exit from the retry loop must never produce BoxVeto, no matter
+    // how "still holding" Tier 1's own reading looks. Every other input is
+    // held at the values that WOULD veto if this one flag didn't override —
+    // proving this flag alone is what's protecting the polarity.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, Some(true), /* exhausted */ false, true),
+        ConfirmSource::None,
+        "an early exit must leave the delivery Pending (None), never Failed (BoxVeto)",
+    );
+}
+
+#[test]
+fn final_window_outcome_never_vetoes_or_confirms_once_a_human_touched_the_pane_rev20_b3() {
+    // The other blocking finding: human input since submit must suppress a
+    // veto too (not just a confirm) -- Tier 1's reading is contaminated in
+    // BOTH directions, exactly as the design note (now truthfully) claims.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, Some(true), true, /* trusted */ false),
+        ConfirmSource::None,
+    );
+}
+
+#[test]
+fn final_window_outcome_never_invents_an_outcome_when_a_precondition_fails() {
+    // Tier 1 not governing this delivery at all: never vetoes even with a
+    // "still holding" reading and a natural-exhaustion, trusted window --
+    // that reading was never authoritative for this delivery to begin with.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, /* governs */ false, Some(true), true, true),
+        ConfirmSource::None,
+    );
+    // Tier 1's own reading was never "still holding" at the end (it cleared,
+    // or was never observed) -- no veto.
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, Some(false), true, true),
+        ConfirmSource::None,
+    );
+    assert_eq!(
+        final_window_outcome(ConfirmSource::None, true, None, true, true),
+        ConfirmSource::None,
+    );
+}
+
+#[test]
+fn final_window_outcome_never_overrides_a_decision_already_made() {
+    // A veto is only for the genuinely undecided case -- an already-decided
+    // `confirm_source` (hook/burst/box already confirmed it, e.g.) must ride
+    // through completely unchanged, even with every other veto precondition
+    // satisfied.
+    for already in [ConfirmSource::Hook, ConfirmSource::Burst, ConfirmSource::Box] {
+        assert_eq!(final_window_outcome(already, true, Some(true), true, true), already);
+    }
+}
+
+#[test]
+fn late_monitor_tick_supersession_wins_over_everything_including_a_hook_match() {
+    // rev-20 B1: a stale monitor must exit before it can write or notify
+    // ANYTHING, even a hook match that would otherwise look like a genuine
+    // resolution -- that match may well be the RE-SEND's own record, and
+    // confirming off it would still be the clobber/false-correction hazard.
+    assert_eq!(
+        late_monitor_tick(
+            /* superseded */ true,
+            PromptLandedMatch::Existence,
+            /* already_failed */ true,
+            /* expired */ true,
+            /* quiet_long_enough */ true,
+            /* showing_question */ false,
+        ),
+        MonitorAction::Superseded,
+    );
+}
+
+#[test]
+fn late_monitor_tick_a_hook_match_confirms_and_flags_correction_only_when_already_failed() {
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::Existence, false, false, false, false),
+        MonitorAction::Confirm { merged: false, correction: false },
+        "upgrading a still-pending delivery is not a correction -- no alarm was ever sent",
+    );
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::Content { merged: true }, true, false, false, false),
+        MonitorAction::Confirm { merged: true, correction: true },
+        "resolving an already-failed delivery IS a correction, and the merge flag must ride through",
+    );
+}
+
+#[test]
+fn late_monitor_tick_never_declares_failed_while_a_question_is_on_screen() {
+    // The guard the human specified must hold in the monitor's own decision
+    // function, not just in the ad-hoc code that used to implement it.
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::None, false, false, true, /* showing_question */ true),
+        MonitorAction::KeepWaiting,
+        "quiet long enough is not sufficient on its own -- a visible question must override it",
+    );
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::None, false, false, true, false),
+        MonitorAction::DeclareFailed,
+        "quiet long enough AND no question is what actually declares failure",
+    );
+}
+
+#[test]
+fn late_monitor_tick_never_redeclares_failed_and_never_expires_over_a_hook_match() {
+    // Already failed, no new hook: nothing left to do but keep watching.
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::None, true, false, true, false),
+        MonitorAction::KeepWaiting,
+    );
+    // Expired AND a hook match on the same tick: the match must still win --
+    // resolving on the very last possible tick beats timing out.
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::Existence, false, true, false, false),
+        MonitorAction::Confirm { merged: false, correction: false },
+    );
+    // Expired with nothing else going on: times out.
+    assert_eq!(
+        late_monitor_tick(false, PromptLandedMatch::None, false, true, false, false),
+        MonitorAction::Expired,
+    );
+}
+
+#[test]
+fn poll_promptsubmit_hook_degrades_to_none_for_a_missing_or_unreadable_file() {
+    let td = tempfile::tempdir().unwrap();
+    let missing = td.path().join("nope").join("agent.promptsubmit.jsonl");
+    assert_eq!(poll_promptsubmit_hook(&missing, 0, "implement #112"), PromptLandedMatch::None);
+}
+
+#[test]
+fn poll_promptsubmit_hook_respects_a_baseline_that_excludes_a_stale_record() {
+    // The end-to-end impure glue: a record from an EARLIER delivery (or a
+    // human's own prompt) sitting before this delivery's baseline offset must
+    // never satisfy confirmation, even though its text matches exactly.
+    let td = tempfile::tempdir().unwrap();
+    let marker = td.path().join("agent.promptsubmit.jsonl");
+    fs::write(&marker, "{\"prompt\":\"implement #112\"}\n").unwrap();
+    let baseline = promptsubmit_marker_len(&marker);
+
+    assert_eq!(
+        poll_promptsubmit_hook(&marker, baseline, "implement #112"),
+        PromptLandedMatch::None,
+        "a record entirely before this delivery's own baseline must not confirm it",
+    );
+
+    // A NEW record appended after the baseline (this delivery's own submit)
+    // does confirm.
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new().append(true).open(&marker).unwrap();
+    f.write_all(b"{\"prompt\":\"implement #112\"}\n").unwrap();
+    drop(f);
+    assert_eq!(
+        poll_promptsubmit_hook(&marker, baseline, "implement #112"),
+        PromptLandedMatch::Content { merged: false },
+    );
+}
+
+#[test]
+fn promptsubmit_marker_path_matches_the_hooks_dir_convention() {
+    let root = Path::new("C:/state");
+    let path = promptsubmit_marker_path(root, "group-1", "agent-1");
+    assert_eq!(path, root.join("group-1").join("hooks").join("agent-1.promptsubmit.jsonl"));
 }
 
 #[test]
