@@ -53,6 +53,8 @@ use loomux_lib::orchestration::{
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
+    CLAUDE_READONLY_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
+    COPILOT_READONLY_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
 };
 use loomux_lib::pty::PtyManager;
 use serde_json::{json, Value};
@@ -1108,9 +1110,11 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     // the CLI level, even under Auto perms — but keeps gh for the plan comment.
     let plan = reg.build_agent_command("claude", "opus", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
-    for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+    for denied in CLAUDE_READONLY_DENY_TOOLS {
         assert!(plan.contains(denied), "planner must deny the {denied} tool");
     }
+    assert!(!plan.contains("MultiEdit"),
+        "MultiEdit matches no real Claude Code tool (#448) — must not reappear in the deny list");
     assert!(plan.contains("\"Bash(git commit *)\"") && plan.contains("\"Bash(git push *)\""),
         "planner must deny git commit/push using the canonical (space-form) rule spelling");
     assert!(plan.contains("\"Bash(gh *)\""), "gh stays allowed so the planner can post its plan comment");
@@ -1121,6 +1125,69 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     // No rule may use it — that regression is what this pins down.
     assert!(!plan.contains("commit:*") && !plan.contains("push:*"),
         "no colon-mid wildcard rule (`Bash(git commit:*)`) — it is malformed and triggers the startup warning flash");
+}
+
+/// #448: the planner's read-only guarantee is spelled as string literals
+/// matched against an external tool registry that drifts underneath it (the
+/// CLI's own registry, which loomux does not control and cannot query live —
+/// see `KNOWN_CLAUDE_TOOLS`'s doc). This pins `CLAUDE_READONLY_DENY_TOOLS`
+/// against the Claude Code Tools reference snapshot so a typo or a stale name
+/// breaks CI instead of silently widening what a planner may do — exactly
+/// the failure mode that let `MultiEdit` (folded into `Edit` upstream) sit
+/// in the deny list matching nothing until a human read the CLI's own
+/// startup warning by hand.
+///
+/// Mutation evidence (red before green): temporarily re-adding "MultiEdit" —
+/// or any other typo — to `CLAUDE_READONLY_DENY_TOOLS` fails this assertion
+/// immediately, with a message naming the bad entry; removing it passes.
+/// This is exactly the property #448 asked for.
+#[test]
+fn claude_readonly_deny_tools_are_known_claude_tools() {
+    for t in CLAUDE_READONLY_DENY_TOOLS {
+        assert!(
+            KNOWN_CLAUDE_TOOLS.contains(t),
+            "{t:?} in CLAUDE_READONLY_DENY_TOOLS is not a known Claude Code tool per \
+             the Tools reference (https://code.claude.com/docs/en/tools-reference) — \
+             typo, or was the tool renamed/removed upstream? (#448)"
+        );
+    }
+}
+
+/// Sibling of `claude_readonly_deny_tools_are_known_claude_tools` for the
+/// Copilot adapter — the SAME pin, against `KNOWN_COPILOT_DENY_CATEGORIES`
+/// (the exactly-three `--deny-tool` value shapes Copilot's CLI configuration
+/// guide documents). This is the test that would have caught `edit` before
+/// it shipped: `edit` was never one of the documented shapes, so a version
+/// of `COPILOT_READONLY_DENY_TOOLS` that includes it fails here exactly the
+/// way a `MultiEdit`-style typo fails the Claude pin above — a validator
+/// that catches one and not the other is not doing its job (#448 review).
+///
+/// Mutation evidence (red before green): temporarily adding "edit" back to
+/// `COPILOT_READONLY_DENY_TOOLS` fails this assertion immediately; removing
+/// it passes.
+#[test]
+fn copilot_readonly_deny_tools_are_known_copilot_categories() {
+    for t in COPILOT_READONLY_DENY_TOOLS {
+        assert!(
+            KNOWN_COPILOT_DENY_CATEGORIES.contains(t),
+            "{t:?} in COPILOT_READONLY_DENY_TOOLS is not one of the three documented \
+             --deny-tool value shapes (shell(COMMAND) / write / MCP_SERVER(tool)) per \
+             https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli \
+             — this is exactly how `edit` should have been caught (#448)"
+        );
+    }
+}
+
+/// The consistency test (`build_agent_argv_matches_command_line`) already
+/// pins the string-vs-argv *shapes* against each other; this pins the
+/// **content** of the git-mutation denials against the exact CLI-documented
+/// spellings, so `CLAUDE_READONLY_DENY_GIT` / `COPILOT_READONLY_DENY_GIT`
+/// can't quietly grow a malformed entry (e.g. the colon-mid wildcard
+/// regression already covered above) or lose one.
+#[test]
+fn readonly_deny_git_lists_are_exactly_commit_and_push() {
+    assert_eq!(CLAUDE_READONLY_DENY_GIT, ["Bash(git commit *)", "Bash(git push *)"]);
+    assert_eq!(COPILOT_READONLY_DENY_GIT, ["shell(git commit)", "shell(git push)"]);
 }
 
 #[test]
@@ -1196,8 +1263,14 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
     let plan = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
-    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"edit\""),
-        "planner must deny copilot's write/edit tools, got: {plan}");
+    assert!(plan.contains("--deny-tool \"write\""),
+        "planner must deny copilot's write category (the documented file-modification category), got: {plan}");
+    // #448: `edit` is not one of Copilot's three documented --deny-tool value
+    // shapes (shell(COMMAND) / write / MCP_SERVER(tool)) — it was likely
+    // already as inert as MultiEdit was for Claude, so it was dropped rather
+    // than kept as an unverified entry that only looked like containment.
+    assert!(!plan.contains("--deny-tool \"edit\""),
+        "edit is not a documented copilot deny-tool value — must not reappear (#448), got: {plan}");
     assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
         "planner must deny git commit/push");
     assert!(!plan.contains("--deny-tool \"shell(gh"), "gh stays allowed for the plan comment");
@@ -1590,23 +1663,27 @@ fn build_agent_command_full_line_snapshots() {
     );
 
     // Claude planner (read_only) in a NON-auto_ops group → unattended anyway,
-    // plus the write/commit/push denials, gh still reachable.
+    // plus the write/commit/push denials, gh still reachable. Literals per
+    // CLAUDE_READONLY_DENY_TOOLS/_GIT (#448 — `MultiEdit` dropped, it matched
+    // no real Claude Code tool).
     assert_eq!(
         cmd("claude", "opus", false, true),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
          --model opus --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
-         \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
+         \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
          \"Bash(git commit *)\" \"Bash(git push *)\""
     );
 
     // Copilot planner (read_only) in a NON-auto_ops group → group autopilot
-    // (--autopilot + all tools/paths) + deny rules; gh not denied.
+    // (--autopilot + all tools/paths) + deny rules; gh not denied. Literals
+    // per COPILOT_READONLY_DENY_TOOLS/_GIT (#448 — `edit` dropped, it is not
+    // one of Copilot's three documented --deny-tool value shapes).
     assert_eq!(
         cmd("copilot", "auto", false, true),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
          --autopilot --allow-all-tools --allow-all-paths \
-         --deny-tool \"write\" --deny-tool \"edit\" \
+         --deny-tool \"write\" \
          --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\""
     );
 
@@ -1715,13 +1792,15 @@ fn build_agent_argv_snapshots() {
     );
 
     // Copilot planner (read_only): group autopilot + deny rules; @ rides the cfg.
+    // #448: `edit` dropped — not one of Copilot's three documented --deny-tool
+    // value shapes (shell(COMMAND) / write / MCP_SERVER(tool)).
     assert_eq!(
         argv("copilot", "auto", false, true),
         vec![
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
             "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
             "--autopilot", "--allow-all-tools", "--allow-all-paths", "--deny-tool", "write",
-            "--deny-tool", "edit", "--deny-tool", "shell(git commit)", "--deny-tool",
+            "--deny-tool", "shell(git commit)", "--deny-tool",
             "shell(git push)",
         ]
     );

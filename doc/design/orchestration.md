@@ -273,8 +273,16 @@ branch inside it, rather than a fresh worktree per rebase.
 ### Extending the worktree guarantee to reviewers (#359)
 
 #338 fixed the worker half of "the main clone is the human's environment" and deliberately left
-reviewers on it — a reviewer is read-only with respect to the repo's *content* (it never edits
-files or pushes), but it is not read-only with respect to the clone's *checkout state*: `gh pr
+reviewers on it — a reviewer is *told* to be read-only with respect to the repo's content (its
+template says never to edit files or push, and `gh pr diff`/`gh pr view` are enough for most
+reviews without ever needing to). **That is instruction-backed, not structural**: unlike a
+planner, a reviewer's CLI is never launched with `read_only=true` (`Role::is_read_only()` is
+`true` only for `Role::Planner` — see "What the read-only contract enforces" under the Planner
+role section further down, #448), so nothing
+at the CLI level actually denies a reviewer `Edit`/`Write`/`git commit`/`git push`; it works
+because the reviewer role is asked to stay read-only, not because it is unable to do otherwise.
+What this section is about is narrower and *is* still true regardless: a reviewer is not
+read-only with respect to the clone's *checkout state*: `gh pr
 diff`/`gh pr view` need no checkout, but a reviewer that wants to run tests locally has always
 been told "checking out the PR branch locally is fine" — in the shared main clone, the same one
 every other reviewer and the orchestrator's own `git fetch`/rebase traffic uses. That was a live
@@ -4432,21 +4440,65 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   - *Structural* (mechanical, verified by tests): a planner never gets a **worktree** —
     the spawn cwd logic runs it in `group.repo` even when `worktree: true` is passed; and
     its CLI is launched **read-only** (`build_agent_command(read_only=true)`): on Claude
-    `--disallowedTools Edit Write MultiEdit NotebookEdit` plus `Bash(git commit *)` /
-    `Bash(git push *)`, on Copilot `--deny-tool write|edit` plus `shell(git commit|push)`
-    — deny rules override the allow list / Auto perms on both CLIs. So a planner **cannot
-    edit files, commit, or push**, i.e. cannot produce code changes or push a branch.
+    `--disallowedTools Edit Write NotebookEdit` plus `Bash(git commit *)` /
+    `Bash(git push *)` (`CLAUDE_READONLY_DENY_TOOLS`/`_GIT`), on Copilot `--deny-tool write`
+    plus `shell(git commit|push)` (`COPILOT_READONLY_DENY_TOOLS`/`_GIT`) — deny rules
+    override the allow list / Auto perms on both CLIs. So a planner **cannot edit files,
+    commit, or push**, i.e. cannot produce code changes or push a branch.
     (Rule-spelling note: on Claude the `:*` wildcard is valid *only* as a trailing suffix.
     An earlier draft also passed the colon-mid forms `Bash(git commit:*)` / `Bash(git push:*)`
     as redundant spellings; those are **malformed** — Claude Code ignores them *and* prints a
     startup warning, which was the "auto deny rule" flash seen on planner boot. The canonical
     space form is the only spelling now emitted; see the plan-mode decision below.)
+
+    **#448: this list is string literals against an external, drifting registry — now
+    pinned, not just asserted.** Both CLI vendors' tool/permission surfaces are outside
+    loomux's control, and until #448 nothing checked that a denied name still matched a
+    real tool: `MultiEdit` (Claude folded it into `Edit` upstream) sat in the Claude list
+    matching nothing, its only symptom a startup warning nobody was reading
+    (`Permission deny rule "MultiEdit" matches no known tool`) — and `edit` sat in the
+    Copilot list even though the CLI's own configuration guide documents exactly three
+    `--deny-tool` value shapes (`shell(COMMAND)` / bare `write` / `MCP_SERVER(tool)`),
+    with no `edit` among them and no startup warning to catch the mistake at all. Both
+    were dropped; the guarantee on each CLI now rests only on names confirmed against
+    that CLI's official reference (Claude's
+    [Tools reference](https://code.claude.com/docs/en/tools-reference), Copilot's
+    [CLI configuration guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli),
+    both fetched as raw text and cited in #448's PR, never inferred). `Edit`/`Write`/
+    `NotebookEdit` on Claude and bare `write` on Copilot are each independently
+    confirmed to cover their CLI's whole file-modification surface, so removing the
+    unconfirmed names does not narrow the guarantee — it only removes the false
+    confidence of a denial that looked like containment but wasn't.
+    `claude_readonly_deny_tools_are_known_claude_tools` and
+    `copilot_readonly_deny_tools_are_known_copilot_categories` (`tests/orchestration.rs`)
+    pin each CLI's list against that CLI's documented set, so a future typo or a stale
+    name reintroduced into either list breaks CI instead of silently reproducing this
+    bug. **What the pin does not do:** it cannot detect a *future* upstream rename or
+    removal against an unrefreshed snapshot — only a human re-running the refresh
+    procedure documented on `KNOWN_CLAUDE_TOOLS` can catch that half; there is no
+    machine-readable tool registry either CLI exposes at runtime for loomux to query
+    instead (`cliprobe`'s `--help` probe lists flags, not tool names, and actually
+    launching a CLI to observe its own validation would count as the "spawn a real
+    agent CLI to test/validate" this repo does not do, CLAUDE.md constraint 3).
   - *Instruction-backed* (the template + kickoff `PLANNER_READONLY_NOTE`, not a sandbox):
     `gh` stays allowed (a planner needs `gh issue comment` for its deliverable), so a
     planner *could* technically run `gh pr create` or create an inert local branch — it is
     told not to, and with commit/push denied such a branch carries nothing. This is a
     deliberate trade (plan-comment-as-deliverable over a full jail), now stated honestly
     rather than presented as an absolute guarantee.
+
+  **A reviewer is NOT covered by any of the above (#448 finding).** `Role::is_read_only()`
+  returns `true` only for `Role::Planner`; `build_agent_command`/`build_agent_argv`'s
+  `read_only` parameter is `role.is_read_only()`, so a reviewer is launched with **no**
+  `--disallowedTools`/`--deny-tool` flags at all — none of `CLAUDE_READONLY_DENY_TOOLS`,
+  `COPILOT_READONLY_DENY_TOOLS`, or the worktree exemption above apply to it. The
+  "extending the worktree guarantee to reviewers" section elsewhere in this doc describes
+  a reviewer as read-only *with respect to repo content*, but that property today is
+  **instruction-backed only** (the reviewer template's own guidance not to edit files or
+  push), the same tier as the planner's `gh` carve-out above — **not** structural, and not
+  verified by any test the way the planner's denial is. Making it structural (giving
+  reviewers their own CLI-level deny flags) is a capability change, not an enforcement-
+  robustness fix, and is tracked separately rather than folded into #448.
 
   **Why not the CLI's `plan` permission mode? (the "auto deny rule" flash, #79)** A human
   reviewing the planner's first boot caught a message about an "auto deny rule" and asked

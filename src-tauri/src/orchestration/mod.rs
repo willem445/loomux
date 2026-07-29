@@ -2421,6 +2421,113 @@ pub const COPILOT_GROUP_AUTOPILOT_FLAGS: &str = "--autopilot --allow-all-tools -
 /// matches every git subcommand; a planner's denials carve commit/push back out.
 pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 
+/// Claude Code tool names Claude Code's own permission engine recognizes, per
+/// the official [Tools reference](https://code.claude.com/docs/en/tools-reference)
+/// ("The tool names are the exact strings you use in permission rules"),
+/// fetched as raw markdown (`curl .../tools-reference.md`) and grepped for the
+/// `| \`ToolName\`` table rows, verified 2026-07-28.
+///
+/// This is a point-in-time SNAPSHOT, not a live probe: Claude Code exposes no
+/// machine-readable tool list at runtime loomux could query instead (the CLI's
+/// `--help` output, which [`crate::cliprobe`] already parses for model ids,
+/// lists flags, not tool names). So what this constant catches, via
+/// `claude_readonly_deny_tools_are_known_claude_tools`, is a **typo or a stale
+/// name accidentally left in [`CLAUDE_READONLY_DENY_TOOLS`]** — exactly the
+/// #448 failure mode, where `MultiEdit` (folded into `Edit` upstream, no
+/// longer a real tool) sat in the deny list matching nothing, until a human
+/// read the CLI's own startup warning ("Permission deny rule \"MultiEdit\"
+/// matches no known tool") by hand. It does NOT catch a *future* Claude Code
+/// release silently renaming or dropping a tool out from under an unrefreshed
+/// snapshot — that half needs a human to re-run the refresh below; there is
+/// no offline way to make that half automatic.
+///
+/// Refresh procedure: `curl https://code.claude.com/docs/en/tools-reference.md
+/// | grep -oE '^\| \`[A-Za-z]+\`'`, update this list and the verified-on date.
+#[doc(hidden)] // pub for integration tests
+pub const KNOWN_CLAUDE_TOOLS: &[&str] = &[
+    "Agent", "Artifact", "AskUserQuestion", "Bash", "CronCreate", "CronDelete", "CronList",
+    "Edit", "EndConversation", "EnterPlanMode", "EnterWorktree", "ExitPlanMode", "ExitWorktree",
+    "Glob", "Grep", "ListMcpResourcesTool", "LSP", "Monitor", "NotebookEdit", "PowerShell",
+    "PushNotification", "Read", "ReadMcpResourceTool", "RemoteTrigger", "ReportFindings",
+    "ScheduleWakeup", "SendMessage", "SendUserFile", "ShareOnboardingGuide", "Skill",
+    "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate", "TodoWrite",
+    "ToolSearch", "WaitForMcpServers", "WebFetch", "WebSearch", "Workflow", "Write",
+];
+
+/// The file-editing tool names a **read-only** Claude agent (today: a
+/// planner — see [`Role::is_read_only`]) denies via `--disallowedTools`. The
+/// single source of truth for both [`OrchRegistry::build_agent_command`] and
+/// [`OrchRegistry::build_agent_argv`], so the two spellings can't
+/// independently drift (on top of the existing
+/// `build_agent_argv_matches_command_line` consistency test). Every entry
+/// here is a bare tool name, pinned against [`KNOWN_CLAUDE_TOOLS`] by
+/// `claude_readonly_deny_tools_are_known_claude_tools` — see that constant's
+/// doc for exactly what the pin does and doesn't guarantee.
+///
+/// `MultiEdit` was dropped from here in #448: Claude Code folded it into
+/// `Edit` and it no longer matches any tool, which is what printed
+/// `Permission deny rule "MultiEdit" matches no known tool` on every
+/// planner's first line of output. It was harmless — denying a nonexistent
+/// tool is a no-op, and `Edit`/`Write`/`NotebookEdit` still carry the
+/// guarantee — but it was a leftover, not a decision; now it's neither.
+pub const CLAUDE_READONLY_DENY_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
+
+/// The git-mutation subcommands a read-only Claude agent denies, scoped to
+/// the `Bash` tool (not bare tool names, so they aren't checked against
+/// [`KNOWN_CLAUDE_TOOLS`] the same way — and per the Tools reference, "Tool
+/// names containing `_` or `*` are exempt from" Claude's own startup-warning
+/// check, which these patterns' trailing `*` already satisfies). Canonical
+/// space-form spelling only (`Bash(git commit *)`, not `Bash(git commit:*)`)
+/// — the colon-mid form is malformed and triggers a startup warning of its
+/// own; see `claude_command_minimizes_init_approvals_without_bypass`.
+pub const CLAUDE_READONLY_DENY_GIT: &[&str] = &["Bash(git commit *)", "Bash(git push *)"];
+
+/// The tool-spec values `--deny-tool`/`--allow-tool` are documented to
+/// accept, per the official
+/// [CLI configuration guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli)
+/// ("Specifying which tool you want to allow or deny", fetched as raw HTML
+/// via curl and grepped, verified 2026-07-28): "To use the --deny-tool and
+/// --allow-tool options, you must specify what type of tool you want to
+/// allow or deny" followed by an exactly-three-item list — `shell(COMMAND)`,
+/// the bare category `write` ("tools—other than shell commands—permission to
+/// modify files"), and `MCP_SERVER_NAME(tool)`. This is used only by
+/// `copilot_readonly_deny_tools_are_known_copilot_categories`; Copilot's docs
+/// (unlike Claude's) don't say whether an unmatched `--deny-tool` value
+/// warns, errors, or is silently ignored, and CLAUDE.md forbids spawning a
+/// real `copilot` session to find out (a `--help` probe, the kind
+/// [`crate::cliprobe`] already does, can't settle this either — enumerating
+/// recognized deny-tool values needs an actual permission-engine run). So
+/// this list can only be pinned against what the docs enumerate, not against
+/// a live registry the way [`KNOWN_CLAUDE_TOOLS`] would be if Claude exposed
+/// one.
+#[doc(hidden)] // pub for integration tests
+pub const KNOWN_COPILOT_DENY_CATEGORIES: &[&str] = &["write"];
+
+/// The tool names a **read-only** Copilot agent denies via `--deny-tool` —
+/// see [`KNOWN_COPILOT_DENY_CATEGORIES`] for the source. Bare `write` is the
+/// only bare-category value the docs document at all.
+///
+/// `edit` was dropped from here in #448: it is not one of the three
+/// documented `--deny-tool` value shapes (the enumeration above reads as
+/// exhaustive — "you must specify what type of tool", then exactly three
+/// bullets), so it is likely already the same class of inert leftover
+/// `MultiEdit` was for Claude — and unlike Claude, Copilot's docs don't
+/// describe a startup warning that would have surfaced the mistake. Keeping
+/// an unconfirmed name here was worse than dropping it: it read as
+/// containment while only `write` was actually confirmed to provide it,
+/// which is the exact false-confidence failure #448 exists to eliminate.
+/// The guarantee now rests on `write` alone, which the docs describe as
+/// covering the *whole* non-shell file-modification category, not one named
+/// tool among several — so this is not a narrower guarantee, only an
+/// honestly-scoped one. This is a docs-only conclusion (no live copilot run
+/// backs it); if that leaves the question open enough to want a live check,
+/// that check is the human's to make, not an agent's (CLAUDE.md constraint 3).
+pub const COPILOT_READONLY_DENY_TOOLS: &[&str] = &["write"];
+
+/// The git-mutation shell commands a read-only Copilot agent denies, per the
+/// `shell(COMMAND)` spec documented alongside [`COPILOT_READONLY_DENY_TOOLS`].
+pub const COPILOT_READONLY_DENY_GIT: &[&str] = &["shell(git commit)", "shell(git push)"];
+
 /// The generic Claude PreCompact / SessionStart(compact) hook body (#417),
 /// written once per machine (`OrchRegistry::ensure_compact_hook_script`) and
 /// invoked per agent with `event`, the group's state dir, and the agent's id
@@ -17466,12 +17573,15 @@ impl OrchRegistry {
                 if read_only {
                     // Deny file writes and git mutations even under
                     // --allow-all-tools (deny takes precedence in Copilot).
-                    // `write`/`edit` are Copilot's file-modification tools;
                     // `gh` is left allowed so the plan comment can be posted.
-                    cmd.push_str(
-                        " --deny-tool \"write\" --deny-tool \"edit\" \
-                         --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\"",
-                    );
+                    // Literals live in COPILOT_READONLY_DENY_TOOLS/_GIT (see
+                    // their docs for what's verified vs. UNVERIFIED, #448).
+                    for t in COPILOT_READONLY_DENY_TOOLS {
+                        cmd.push_str(&format!(" --deny-tool \"{t}\""));
+                    }
+                    for t in COPILOT_READONLY_DENY_GIT {
+                        cmd.push_str(&format!(" --deny-tool \"{t}\""));
+                    }
                 }
                 // Copilot's native custom agent (#222). `--agent <name>` resolves
                 // the name against `.github/agents/` — it CANNOT take an inline
@@ -17552,10 +17662,15 @@ impl OrchRegistry {
                     // spelling and actually blocks commit/push, with no
                     // warning. (An earlier draft passed both spellings; the
                     // colon-mid one added nothing but the warning.)
-                    cmd.push_str(
-                        " --disallowedTools Edit Write MultiEdit NotebookEdit \
-                         \"Bash(git commit *)\" \"Bash(git push *)\"",
-                    );
+                    // Literals live in CLAUDE_READONLY_DENY_TOOLS/_GIT (see
+                    // their docs for the drift-pin test, #448).
+                    cmd.push_str(" --disallowedTools");
+                    for t in CLAUDE_READONLY_DENY_TOOLS {
+                        cmd.push_str(&format!(" {t}"));
+                    }
+                    for t in CLAUDE_READONLY_DENY_GIT {
+                        cmd.push_str(&format!(" \"{t}\""));
+                    }
                 }
                 // Claude's native custom agent, by FILE (round #417
                 // correction 6, replacing the pre-round-6 inline `--agents
@@ -17650,14 +17765,14 @@ impl OrchRegistry {
                     push(&mut a, "shell(gh:*)");
                 }
                 if read_only {
-                    push(&mut a, "--deny-tool");
-                    push(&mut a, "write");
-                    push(&mut a, "--deny-tool");
-                    push(&mut a, "edit");
-                    push(&mut a, "--deny-tool");
-                    push(&mut a, "shell(git commit)");
-                    push(&mut a, "--deny-tool");
-                    push(&mut a, "shell(git push)");
+                    for t in COPILOT_READONLY_DENY_TOOLS {
+                        push(&mut a, "--deny-tool");
+                        push(&mut a, t);
+                    }
+                    for t in COPILOT_READONLY_DENY_GIT {
+                        push(&mut a, "--deny-tool");
+                        push(&mut a, t);
+                    }
                 }
                 if let Some(agent) = &persona.copilot_agent {
                     push(&mut a, "--agent");
@@ -17710,12 +17825,12 @@ impl OrchRegistry {
                 }
                 if read_only {
                     push(&mut a, "--disallowedTools");
-                    push(&mut a, "Edit");
-                    push(&mut a, "Write");
-                    push(&mut a, "MultiEdit");
-                    push(&mut a, "NotebookEdit");
-                    push(&mut a, "Bash(git commit *)");
-                    push(&mut a, "Bash(git push *)");
+                    for t in CLAUDE_READONLY_DENY_TOOLS {
+                        push(&mut a, t);
+                    }
+                    for t in CLAUDE_READONLY_DENY_GIT {
+                        push(&mut a, t);
+                    }
                 }
                 if let Some(agent) = &persona.claude_agent {
                     push(&mut a, "--agent");
