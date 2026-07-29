@@ -27,8 +27,9 @@ pub const APP_COMMANDS: &[&str] = &[
     "dir_info",
     "change_dir",
     "discover_git_bash",
-    // sessions (1)
+    // sessions (2)
     "list_sessions",
+    "record_copilot_launch_posture",
     // git (22)
     "git_repo_root",
     "git_log",

@@ -537,3 +537,194 @@ defensively (its session-state layout is flat and id-keyed, so the "wrong projec
 directory" failure mode is Claude-specific by construction), but this is not
 empirically verified against a real `copilot --resume` the way the Claude repro
 above is.
+
+### #456 — restoring a copilot session must not guess its autopilot posture
+
+**Root cause.** `sessions.rs::scan_copilot` rebuilds every copilot session's
+resume command from scratch — `copilot --resume <id>` — reading only
+copilot's own `~/.copilot/session-state` files, which know nothing about how
+loomux originally launched the pane. A solo copilot pane launched with the
+launcher's Autopilot toggle on carries `--autopilot --allow-all-tools
+--allow-all-paths` on its ORIGINAL command line (`single_pane_autopilot_flags`,
+#364); resuming it from the Sessions tab silently dropped all three flags,
+landing the human back in plain interactive mode with no dialog and no
+indication anything had changed — they had to notice and manually cycle
+Shift+Tab into autopilot mode. This was invisible before #364 because a solo
+pane never had TRUE autopilot to lose: pre-#364 it only carried the
+permissive tool/path flags, which a bare resume also drops, but losing "every
+tool pre-approved" reads very differently from losing "the agent keeps working
+across turns" — the regression only became observable once #364 gave solo
+panes the real mode.
+
+**Why this isn't just "carry the launch command forward" the way an app-boot
+restore can.** `panerestore.ts`'s restore actions (`resume-agent`/
+`fresh-agent`/`dormant-agent`) replay loomux's OWN persisted `PersistedPane`
+record, which already has the full original command string. The Sessions-tab
+scan is a different, independent mechanism entirely: it discovers sessions by
+reading the CLI's OWN on-disk state, which can include sessions loomux never
+launched at all (a copilot session the human ran by hand, outside loomux). It
+has no persisted command to replay — `resume_command` is synthesized from
+nothing but the session id.
+
+**The fix records loomux's own launch intent, and reads it back — never
+copilot's files, which structurally cannot know.** `sessions.rs` gains a
+capped store (`<data root>/copilot-posture.json`, `COPILOT_POSTURE_CAP =
+300`) of ONE ENTRY PER CWD — `{cwd, posture, touched_ms}`, where `posture`
+is `True | False | Conflicted` — written by `record_copilot_launch_posture`
+at the one moment this information exists: launch time, for BOTH toggle
+states (recording `false` matters as much as `true` — a later restore must
+distinguish "explicitly launched without autopilot" from "no record at
+all"). `scan_copilot` looks the session's own recorded cwd up in this store
+and, only when the stored posture is unambiguously `True`, appends the SAME
+`COPILOT_GROUP_AUTOPILOT_FLAGS` constant a fresh launch uses — one seam,
+never a second copy of the flag string that could drift.
+
+**The rule this store enforces, and why it isn't last-write-wins: on a
+permission decision, ambiguity resolves to the smaller grant, never the
+larger one — and that has to hold under store pressure and across
+filesystems, not just in the ordinary lookup (review round 1, findings B1
+and B2 below).** The store is keyed by cwd, not by copilot's own session id
+— copilot never hands loomux a session id at launch (unlike Claude, which
+gets one minted up front); it mints its own, invisibly, discoverable only
+after the fact (`spawn_copilot_session_watcher`, group agents only). Because
+two copilot sessions launched in the same folder at different times can
+disagree (toggle on, then later off, or the reverse), a naive "most recent
+record wins" resolution reintroduces exactly the escalation this fix exists
+to avoid, just one step removed: restoring an OLDER, differently-postured
+session in that folder would silently inherit whatever the folder's LATEST
+launch happened to be — including granting `--allow-all-paths` to a session
+the human deliberately launched without it, with no way for them to notice.
+The precise fix would key on the resumed session's own start time and take
+the newest posture record at-or-before it; that needs a reliable session
+start timestamp, which copilot's `workspace.yaml` does not document (the
+official reference is silent on its internal fields — see the
+`agent-cli-reference` skill — and the file's OS birth time is not a safe
+substitute, since copilot may rewrite it turn-to-turn). So instead:
+`copilot_launch_posture(cwd)` returns `Some(v)` only when this cwd's stored
+posture is unambiguously `v`; the moment a cwd has ever recorded BOTH `true`
+and `false`, its posture becomes (and stays) `Conflicted`, which resolves to
+`None` (no flags) — losing autopilot on restore costs a Shift+Tab, which is
+recoverable and visible; silently granting a declined permission is neither.
+Precise per-session keying (matching copilot's own session id once loomux
+can learn it for solo panes, the way `spawn_copilot_session_watcher` already
+does for group agents) is left to #457, the restore-path unification issue
+this fix's architecture question prompted — not reimplemented here, to avoid
+duplicating that work's unmerged scope (#446).
+
+**Review round 1 (rev-34), B1 — the "permanently" claim above was false as
+first shipped, and the bug was in the store's SHAPE, not the lookup.** The
+first cut kept a flat, append-only log — one entry per WRITE, not per cwd —
+and re-derived agreement at READ time by scanning every surviving entry for
+a cwd. `copilot_launch_posture`'s lookup logic was correct; the problem is
+that eviction (oldest individual entries dropped once the log exceeded the
+cap) could remove ONE side of a conflict and leave the other as a lone
+surviving record, which the read-time re-derivation then read as
+unambiguous — silently flipping a conflicted cwd from `None` back to
+`Some(true)`. Proven with a runnable counter-test before the fix: write
+OFF then ON for one cwd (correctly `None`), push enough unrelated writes to
+evict exactly the older (OFF) entry, and the cwd resolves to `Some(true)`.
+**Fixed by moving conflict detection from read-time re-derivation to
+write-time state, stored as one sticky value per cwd** (`CopilotPosture::
+{True, False, Conflicted}` — `Conflicted` never reverts to a single value no
+matter what's written or evicted afterward), and by making the cap count
+CWDS rather than writes, evicting the least-recently-*touched* cwd
+**wholesale** (`touched_ms` bumped on every write to that cwd, including a
+repeat of the same value, so an actively-relaunched folder is never the
+eviction target). This closes the failure mode structurally: eviction can
+now only ever remove one cwd's entry ENTIRELY, moving it from `{True |
+False | Conflicted}` to NO RECORD — which resolves to `None` right alongside
+every other "nothing to go on" case. There is no state eviction can produce
+that resolves to a grant a write didn't unambiguously establish. Pinned by
+`conflicted_cwd_never_yields_flags_no_matter_how_much_other_activity_follows`
+(asserted at the EXACT eviction boundary that would expose a flat log —
+evicting far past that boundary evicts both conflicting entries together and
+would pass for the wrong reason) and `re_touching_a_cwd_protects_it_from_
+eviction`; both mutation-verified against the flat-log design.
+
+**The one residual bound this doesn't close, named plainly rather than left
+for someone to rediscover while changing eviction policy later (rev-6,
+round 2 close-out).** `Conflicted` survives every partial eviction — but if
+a conflicted cwd is evicted **entirely** (it becomes the least-recently-
+touched of 300+ cwds — i.e., untouched while 300 OTHER folders were), its
+whole history, including the fact that it was ever conflicted, is gone. If
+that same folder is then explicitly re-launched, the store records the
+fresh value as if it were the folder's first-ever posture; restoring an
+OLDER session from that same folder — one whose posture disagreed with the
+fresh write — would then inherit the fresh value, because post-eviction the
+store cannot distinguish "no history" from "history that once disagreed and
+was forgotten." This is the structural floor of any CAPPED, CWD-KEYED store:
+eviction can only ever discard information, and once a cwd's entry is gone,
+there is nothing left FOR the ambiguity rule to act on. The fix is precise
+per-session-id keying (never cwd-approximated in the first place), which is
+exactly the follow-up already named above and tracked as **#457** — not
+reimplemented here. Accepted as a residual, not a claim-vs-reality gap: the
+sticky-`Conflicted` state genuinely holds for as long as the cwd's entry
+survives; this is a statement about what happens once it doesn't.
+
+**Review round 1, B2 — the permission key must not case-fold on a
+case-sensitive filesystem.** The first cut reused `norm_path` (defined
+above, for SESSION-CWD MATCHING) as the posture store's key. That function
+unconditionally lowercases: correct for Windows, where the filesystem
+itself is case-insensitive, but wrong on Linux/macOS, where `/foo` and
+`/Foo` are genuinely different directories — folding them onto one
+permission key would let a session from one inherit the other's
+`--allow-all-paths` grant purely because of a spelling collision — a
+cross-directory permission leak that `norm_path`'s own intended use never
+had to consider (a MATCHING miss there just falls back to "newest session
+wins", low-stakes). **Fixed with a key function scoped to the permission store**
+(`posture_key`, structurally distinct from `norm_path` so the two can never
+be conflated again by a future edit): case-folding happens ONLY under
+`cfg(windows)`; everywhere else the key is exact-match, so a case-differing
+path simply fails to match and resolves to `None` — fails safe on every
+platform under one rule, with no platform branching in any CALLER. The
+underlying logic lives in `posture_key_for(s, windows: bool)`, taking the
+platform as a parameter specifically so BOTH branches are directly
+unit-testable from any single host (this fix was authored and verified
+entirely on Windows) — `posture_key_never_folds_two_distinct_directories_
+into_one_on_a_case_sensitive_platform` exercises both, mutation-verified
+against the case-folding-everywhere design.
+
+**The watcher gap, closed the same way for every restore path.** Independent
+of the flags themselves, NONE of the restore paths previously started the
+fail-soft dialog-answering watcher (`confirmSoloCopilotAutopilot`) a fresh
+launch gets — only `spawnAgentPanes`/`startFromWelcome` called
+`watchCopilotAutopilotIfNeeded`. A restored kickoff is trusted no
+differently than a fresh one (the same stance #364 already took for the
+group path's `Delivery::ResumeKickoff`), so the watcher is now wired into
+all four sites that can (re)open a copilot pane: the Sessions-tab restore
+(`restoreSession`'s plain-session branch) and all three `panerestore.ts`
+actions (`resume-agent`, `fresh-agent`, and `dormant-agent`'s Start click).
+The three `panerestore.ts` sites share one gate, `shouldWatchCopilotOnRestore`
+(review NB1 — the original cut inlined the same check three times, and
+asymmetrically: it derived "is this copilot" from BOTH `command` and `argv`
+via `programFromRestore`, but checked `--autopilot` against the string
+`command` only, which would silently skip the watcher for a hypothetical
+argv-only copilot autopilot pane). `shouldWatchCopilotOnRestore` scans both
+representations for `--autopilot`, the same shape `hasForkSession` already
+uses for `--fork-session` above, and is the single source the three call
+sites share. `programFromRestore` itself stays a minimal, single-purpose
+"what CLI does this command invoke" lookup — narrower than the fuller shared
+CLI-derivation #452 asks for, a deliberate scope call for this PR, not a
+design stance that the two should stay separate; #452 has a note that a
+third derivation now exists to converge when that broader work happens.
+Every site also checks that the restored command actually contains
+`--autopilot`, so the watcher never spins up its up-to-10-minute poll for a
+pane that could not possibly show the dialog it exists to answer.
+
+**Review round 2 (rev-6 close-out), the last unpinned corner: a store the
+code cannot parse.** `load_copilot_posture` already degraded a missing,
+corrupt, or wrong-shape store file to an EMPTY store — never a crash, never
+a stale grant — via the same `uistate::load_or_quarantine` + atomic
+`serde_json::from_str` this file's other stores use. rev-6 verified this by
+hand (a scratch test against a fresh store, a corrupt file, a
+valid-JSON-but-wrong-shape file — including a leftover file from this
+module's OWN pre-B1-fix schema, the concrete case a real upgrading user
+hits — and an unrecognized `posture` enum variant, all resolving to no
+flags) but nothing shipped pinned it: a future edit adding lenient
+per-entry recovery, or a new `CopilotPosture` variant resolved by a
+catch-all arm, could silently reopen exactly the grant path B1 closed, with
+nothing to fail. `any_unparseable_or_malformed_store_state_grants_nothing`
+lifts that scratch test's shape and generalizes it to the invariant —
+several distinct failure classes, several cwds each — mutation-verified
+against a lenient-per-entry-salvage regression that defaults a
+missing/unrecognized posture to `True`.

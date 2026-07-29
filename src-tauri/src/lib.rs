@@ -82,6 +82,7 @@ pub fn run() {
             pty::change_dir,
             pty::discover_git_bash,
             sessions::list_sessions,
+            sessions::record_copilot_launch_posture,
             git::git_repo_root,
             git::git_log,
             git::git_status,

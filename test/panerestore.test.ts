@@ -16,6 +16,8 @@ import {
   hasForkSession,
   shouldRespawnFresh,
   findResumedPaneIndex,
+  programFromRestore,
+  shouldWatchCopilotOnRestore,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
   type RestoreOpenStep,
@@ -818,4 +820,60 @@ test("planLayoutRestore on a single leaf yields one root-fill step", () => {
   assert.equal(steps[0].relativeTo, null);
   assert.equal(steps[0].action.type, "spawn-terminal");
   assert.deepEqual(simShape(rebuild(steps)), actionTree(leaf(1, { paneKind: "terminal", name: "solo" })));
+});
+
+// #456: programFromRestore — which CLI a restored command/argv would invoke,
+// used to gate the copilot autopilot-dialog watcher onto restore actions the
+// same way a fresh launch gets it.
+test("programFromRestore reads the first token of a string command, lowercased", () => {
+  assert.equal(programFromRestore("copilot --resume abc-123 --autopilot", null), "copilot");
+  assert.equal(programFromRestore("Claude --resume abc-123", null), "claude");
+});
+
+test("programFromRestore falls back to argv when there's no string command", () => {
+  assert.equal(programFromRestore(null, ["copilot", "--resume", "abc-123"]), "copilot");
+  assert.equal(programFromRestore("", ["copilot", "--resume", "abc-123"]), "copilot");
+});
+
+test("programFromRestore is null with neither a command nor argv", () => {
+  assert.equal(programFromRestore(null, null), null);
+  assert.equal(programFromRestore("", []), null);
+  assert.equal(programFromRestore("   ", null), null);
+});
+
+// #456 review NB1: shouldWatchCopilotOnRestore replaces three copy-pasted
+// inline checks in main.ts. THE property it must hold: the watcher fires
+// exactly when a restored pane is (a) copilot AND (b) actually carries
+// --autopilot on whichever representation the caller has — string command
+// or structured argv — never only one of the two representations.
+test("shouldWatchCopilotOnRestore is true only for a copilot command that carries --autopilot", () => {
+  assert.equal(shouldWatchCopilotOnRestore("copilot --resume abc --autopilot --allow-all-tools", null), true);
+  assert.equal(shouldWatchCopilotOnRestore("copilot --resume abc", null), false, "copilot, but no --autopilot");
+  assert.equal(shouldWatchCopilotOnRestore("claude --resume abc --autopilot", null), false, "not copilot");
+  assert.equal(shouldWatchCopilotOnRestore(null, null), false);
+});
+
+test("shouldWatchCopilotOnRestore scans argv for --autopilot too — not just the string command (the NB1 asymmetry)", () => {
+  // The pre-fix bug: programFromRestore falls back to argv, but the
+  // --autopilot check read only the string command — an argv-only copilot
+  // autopilot pane would silently skip the watcher. Assert the PROPERTY
+  // (checked across whichever representation is present), not just one
+  // example of it.
+  assert.equal(
+    shouldWatchCopilotOnRestore(null, ["copilot", "--resume", "abc", "--autopilot"]),
+    true,
+    "an argv-only representation must be scanned for --autopilot, same as the string form"
+  );
+  assert.equal(
+    shouldWatchCopilotOnRestore(null, ["copilot", "--resume", "abc"]),
+    false,
+    "argv present but no --autopilot token — must not fire"
+  );
+  // A non-empty but flag-free command string must not mask an argv-only flag
+  // (the same "scan both, not just whichever is non-empty" shape hasForkSession
+  // guards against for --fork-session).
+  assert.equal(
+    shouldWatchCopilotOnRestore("", ["copilot", "--resume", "abc", "--autopilot"]),
+    true
+  );
 });

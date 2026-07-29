@@ -17,6 +17,7 @@ import {
   saveSettings,
   guardAppClose,
   listSessions,
+  recordCopilotLaunchPosture,
   type PtyExit,
   type SessionInfo,
 } from "./pty";
@@ -78,6 +79,7 @@ import {
   shouldRespawnFresh,
   findResumedPaneIndex,
   hasForkSession,
+  shouldWatchCopilotOnRestore,
   type RestoreAction,
   type SessionResumable,
 } from "./panerestore";
@@ -554,6 +556,17 @@ async function openActionPane(
         anchor
       );
       if (pane.ptyId !== null) remint.bind(pane.ptyId);
+      // #456: a restored kickoff is trusted no differently than a fresh one
+      // (#364's own precedent for the group path) — checked against the
+      // FINAL command (post `remintSoloIdentity` — the MCP re-mint above
+      // only ever touches `--mcp-config`/`--additional-mcp-config`, never
+      // `--autopilot`, but the command that actually opened the pane is the
+      // correct thing to check regardless).
+      if (shouldWatchCopilotOnRestore(remint.command ?? null, remint.argv ?? null) && pane.ptyId !== null) {
+        void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
+          /* best-effort — see confirmSoloCopilotAutopilot's own doc comment */
+        });
+      }
       // Runtime backstop (BUG-1): if this `--resume` exits on a missing/deleted
       // conversation (or any resume-time CLI failure), respawn fresh in place
       // instead of stranding a dead pane. Remember the fresh opts, keyed by pane;
@@ -602,6 +615,12 @@ async function openActionPane(
         anchor
       );
       if (pane.ptyId !== null) remint.bind(pane.ptyId);
+      // #456: see the identical guard in "resume-agent" above.
+      if (shouldWatchCopilotOnRestore(remint.command ?? null, remint.argv ?? null) && pane.ptyId !== null) {
+        void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
+          /* best-effort — see confirmSoloCopilotAutopilot's own doc comment */
+        });
+      }
       return pane;
     }
     case "dormant-agent": {
@@ -646,6 +665,15 @@ async function openActionPane(
               channelAgent: remint.channelAgent,
             });
             if (pane.ptyId !== null) remint.bind(pane.ptyId);
+            // #456: today's most-reachable copilot restore path — copilot
+            // never carries a tracked session id on this build, so it always
+            // restores dormant (see panerestore.ts's `decide()`). Same guard
+            // as "resume-agent"/"fresh-agent" above.
+            if (shouldWatchCopilotOnRestore(remint.command ?? null, remint.argv ?? null) && pane.ptyId !== null) {
+              void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
+                /* best-effort — see confirmSoloCopilotAutopilot's own doc comment */
+              });
+            }
             onGridChanged();
           })();
         }
@@ -1207,6 +1235,7 @@ async function handleWelcomeSubmit(
   });
   await bindSoloIfNeeded(pane, first);
   watchCopilotAutopilotIfNeeded(pane, first);
+  recordCopilotPostureIfNeeded(first);
   reapIfExited(ws, pane);
   // The first agent converted the setup pane in place — notify so the counter
   // reflects it immediately, not only after the fan-out (#194 P4 HIGH-1). The
@@ -1229,6 +1258,7 @@ async function handleWelcomeSubmit(
     );
     await bindSoloIfNeeded(p, spec);
     watchCopilotAutopilotIfNeeded(p, spec);
+    recordCopilotPostureIfNeeded(spec);
     reapIfExited(ws, p);
     prev = p;
     d = d === "row" ? "column" : "row";
@@ -1270,6 +1300,22 @@ function watchCopilotAutopilotIfNeeded(pane: Pane, spec: AgentLaunchSpec): void 
   if (!spec.watchCopilotAutopilot || pane.ptyId === null) return;
   void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
     /* best-effort — see doc comment above */
+  });
+}
+
+/** Record a just-spawned copilot solo pane's Autopilot toggle state (#456),
+ *  fire-and-forget, so a LATER Sessions-tab resume of a session from this cwd
+ *  can rebuild the same flags instead of dropping them silently — see
+ *  `AgentLaunchSpec.copilotAutopilotPosture`'s doc comment and
+ *  `src-tauri/src/sessions.rs`'s module doc for the full mechanism and its
+ *  ambiguity rule. Skipped when there's no cwd to key on (a home-dir launch)
+ *  — nothing reliable to match a later restore against. Independent of
+ *  `watchCopilotAutopilotIfNeeded` above: this records intent regardless of
+ *  whether the toggle was on, that one only ever watches when it was. */
+function recordCopilotPostureIfNeeded(spec: AgentLaunchSpec): void {
+  if (spec.copilotAutopilotPosture === undefined || !spec.cwd) return;
+  void recordCopilotLaunchPosture(spec.cwd, spec.copilotAutopilotPosture).catch(() => {
+    /* best-effort — a lost record just means a later restore falls back to no flags */
   });
 }
 
@@ -1566,6 +1612,17 @@ async function restoreSession(s: SessionInfo): Promise<void> {
     eventsFor(ws),
     ws.grid.paneCount >= 2 ? "column" : "row"
   );
+  // #456: only when `s.resume_command` actually carries `--autopilot` (the
+  // backend appends it only for an unambiguous loomux-recorded ON posture —
+  // see sessions.rs) is there any dialog for this watcher to answer. Gating
+  // on the string avoids spinning up `confirmSoloCopilotAutopilot`'s up-to-
+  // 10-minute poll for the common case (no record, or an explicit OFF/
+  // ambiguous record) where it could only ever time out doing nothing.
+  if (s.source === "copilot" && s.resume_command.includes("--autopilot") && pane.ptyId !== null) {
+    void confirmSoloCopilotAutopilot(pane.ptyId, "copilot").catch(() => {
+      /* best-effort — see confirmSoloCopilotAutopilot's own doc comment */
+    });
+  }
   reapIfExited(ws, pane);
 }
 

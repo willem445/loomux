@@ -100,6 +100,17 @@ export const changeDir = (id: number, path: string): Promise<void> =>
 
 export const listSessions = (): Promise<SessionInfo[]> => invoke("list_sessions");
 
+/** Record what a solo copilot launch's Autopilot toggle was set to for `cwd`
+ *  (#456) — the backend's `scan_copilot` reads this back so a Sessions-tab
+ *  resume of a session from that folder can rebuild `--autopilot
+ *  --allow-all-tools --allow-all-paths` instead of a bare `--resume`, which
+ *  otherwise silently drops the session out of autopilot mode. Called for
+ *  BOTH toggle states — see `src-tauri/src/sessions.rs`'s module doc for the
+ *  ambiguity rule this feeds (disagreement always resolves to no flags,
+ *  never the most recent one). Best-effort; never blocks or fails a launch. */
+export const recordCopilotLaunchPosture = (cwd: string, autopilot: boolean): Promise<void> =>
+  invoke("record_copilot_launch_posture", { cwd, autopilot });
+
 // ---------- durable UI state: project tabs (#63) ----------
 // The tab set persists across launches through the backend (atomic temp+rename
 // write, corrupt-file quarantine — see src-tauri/src/uistate.rs), NOT
