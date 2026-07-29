@@ -277,7 +277,7 @@ fn norm_path(s: &str) -> String {
 // toggle state as `--autopilot --allow-all-tools --allow-all-paths` on the
 // spawned command line (`single_pane_autopilot_flags`) — but a session
 // resumed from the Sessions tab is rebuilt from scratch as a bare
-// `copilot --resume <id>` (`scan_copilot` below), reading only copilot's OWN
+// `copilot --resume=<id>` (`scan_copilot` below), reading only copilot's OWN
 // `~/.copilot/session-state` files, which know nothing about how loomux
 // originally launched it. Restoring an autopilot session that way silently
 // drops it into plain interactive mode (#456). This is loomux's own record
@@ -710,14 +710,33 @@ fn scan_copilot(out: &mut Vec<SessionInfo>) {
         // on restore. Reuses the SAME flags string a fresh launch builds
         // (`single_pane_autopilot_flags`/`COPILOT_GROUP_AUTOPILOT_FLAGS`) —
         // one seam, never a second copy that could drift.
+        //
+        // #458: `=`, never a space, between `--resume` and the id. Copilot's
+        // CLI reference documents the flag as optional-value —
+        // `` `-r`, `--resume[=VALUE]` `` (raw-fetched via
+        // `curl -sL https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-cli-reference/cli-command-reference`,
+        // grepped for `--resume`) — and the CLI's OWN generated hint after a
+        // `-p`/`--prompt` run is spelled the same unambiguous way: "The exit
+        // summary includes a `copilot --resume=SESSION-ID` hint for
+        // continuing the session." The docs never show `--resume <id>` as a
+        // literal invocation (one unrelated prose line pairs `--remote` with
+        // `--resume <TASK-ID>` informally, not as a syntax example), so
+        // whether today's space form is silently mis-parsed by the
+        // underlying arg parser is UNVERIFIED rather than confirmed broken —
+        // this is a "remove the latent risk for free" fix, not a confirmed
+        // live bug, and the PR says so. `--resume=<id>` is documented, costs
+        // nothing, and can never be misread as a bare `--resume` (its own
+        // documented failure mode: an interactive picker, or — where no TTY
+        // is available for one — a loud error, never a silent wrong-session
+        // attach) plus a stray positional.
         let resume_command = if posture_in(&posture_store, &s.cwd) == Some(true) {
             format!(
-                "copilot --resume {} {}",
+                "copilot --resume={} {}",
                 s.id,
                 crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS
             )
         } else {
-            format!("copilot --resume {}", s.id)
+            format!("copilot --resume={}", s.id)
         };
         out.push(SessionInfo {
             resume_command,
@@ -1318,15 +1337,36 @@ mod copilot_posture_tests {
 
         assert_eq!(
             by_id("sess-on").resume_command,
-            format!("copilot --resume sess-on {}", crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS)
+            format!("copilot --resume=sess-on {}", crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS)
         );
-        assert_eq!(by_id("sess-off").resume_command, "copilot --resume sess-off");
-        assert_eq!(by_id("sess-unknown").resume_command, "copilot --resume sess-unknown");
+        assert_eq!(by_id("sess-off").resume_command, "copilot --resume=sess-off");
+        assert_eq!(by_id("sess-unknown").resume_command, "copilot --resume=sess-unknown");
         assert_eq!(
             by_id("sess-ambiguous").resume_command,
-            "copilot --resume sess-ambiguous",
+            "copilot --resume=sess-ambiguous",
             "an ambiguous history must never grant autopilot on restore, even via the latest record"
         );
+
+        // #458 pin: whichever posture branch produced it, the emitted
+        // command must use copilot's documented `--resume=<id>` form and
+        // must never regress to a bare space, which copilot's CLI reference
+        // (`-r`, `--resume[=VALUE]`) documents as an OPTIONAL-value flag —
+        // a space-separated id risks parsing as a bare `--resume` plus a
+        // stray positional rather than the flag's value.
+        for s in &out {
+            assert!(
+                s.resume_command.contains("--resume="),
+                "resume_command must use the documented --resume=<id> form, got: {}",
+                s.resume_command
+            );
+            assert!(
+                !s.resume_command.contains("--resume "),
+                "resume_command must never use a space between --resume and the id \
+                 (copilot documents --resume as optional-value; a space form risks being \
+                 parsed as bare --resume plus a stray positional), got: {}",
+                s.resume_command
+            );
+        }
 
         set_copilot_session_state_root_for_test(None);
         set_copilot_posture_path_for_test(None);

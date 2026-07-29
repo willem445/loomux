@@ -736,3 +736,74 @@ lifts that scratch test's shape and generalizes it to the invariant —
 several distinct failure classes, several cwds each — mutation-verified
 against a lenient-per-entry-salvage regression that defaults a
 missing/unrecognized posture to `True`.
+
+### #458 — the copilot resume command used the wrong flag syntax
+
+**Root cause.** Every `resume_command` `scan_copilot` synthesized (both the
+bare and the autopilot-flag-carrying branches from #456 above) joined
+`--resume` and the session id with a space: `copilot --resume <id>`. Copilot's
+own CLI reference documents the flag as **optional-value** —
+`` `-r`, `--resume[=VALUE]` `` — and its own generated hint after a `-p`
+run spells the unambiguous form the same way: "The exit summary includes a
+`copilot --resume=SESSION-ID` hint for continuing the session." (raw-fetched:
+`curl -sL https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-cli-reference/cli-command-reference`,
+grepped for `--resume`, per the `agent-cli-reference` skill's no-WebFetch
+rule — see #453). The reference never shows `--resume <id>` as a literal
+invocation syntax (one unrelated prose line pairs `--remote` with
+`--resume <TASK-ID>` informally, describing the concept, not demonstrating
+the parse). Bare `--resume` (no value) is separately documented to open an
+interactive picker (needs a TTY) or, where no TTY is available for one, exit
+with an error — never to silently start or attach to the wrong session on
+its own. Whether today's underlying arg parser actually mis-reads the space
+form as bare-flag-plus-positional is therefore **UNVERIFIED, not
+confirmed** — CLAUDE.md constraint 3 rules out spawning a real `copilot` to
+settle it empirically, and the docs don't say either way. This fix is
+"remove a latent, plausible risk for free," not "confirmed and fixed a live
+bug," and is stated that way rather than overclaiming a repro that was never
+observed.
+
+**The fix.** Both `scan_copilot` branches now join with `=`:
+`copilot --resume=<id>` and `copilot --resume=<id> <AUTOPILOT_FLAGS>`. This
+is a pure syntax change — the #456 posture-lookup and ambiguity-resolution
+logic above is untouched, and Claude's `claude --resume <id>` is untouched
+too: Claude's own CLI reference documents `--resume` as a **required**-value
+flag (`claude --resume abc123 --fork-session`, `claude --resume
+auth-refactor` — space form, no bracket-optional notation), so there is no
+analogous risk on that path.
+
+**This fix's `panerestore.ts` reads are safe, but scoped to
+`scan_copilot`'s own emission — it does not close every copilot
+`--resume` emission path (rev-11, PR #473 review).** The frontend
+token-scanners that read a resumed command back out (`programFromRestore`,
+`shouldWatchCopilotOnRestore`, the session-id extractor) already branch on
+both `t === "--resume"` (space form, next token is the value) and
+`t.startsWith("--resume=")` (the `=` form, one token) — they were written
+defensively for exactly this kind of CLI-syntax variance, so *reading*
+either form needed no frontend change.
+
+**The residual: a copilot session resumed via the Sessions sidebar gets its
+id captured for the NEXT app boot (`main.ts`, #440 D1c) as an ordinary
+`paneKind: "agent"` pane. On that next boot, `resume-agent` calls
+`agentResumeCommand` (`panerestore.ts`), which unconditionally strips any
+recorded `--session-id`/`--resume` (either form) and re-appends the literal
+tokens `"--resume", sessionId` — the space form, unconditionally, for
+whatever CLI the command line happens to be.** `agentResumeCommand`'s own
+doc comment says "Only Claude has a clean resumable id... so this rewrites a
+`claude …` line," but the code has no CLI check — it runs the same rewrite
+on a copilot command line just as readily. So this PR's fix holds for a
+copilot session's FIRST restore (`scan_copilot`'s own emission, from the
+Sessions browser) but a copilot session resumed a SECOND time — once
+loomux's own tab-restore captured it as an agent pane — goes back through
+`agentResumeCommand` and comes out in the space form this PR removed.
+**Not fixed here**: `agentResumeCommand` becoming CLI-aware (or emitting the
+`=` form unconditionally, which would need its own doc-reference check the
+way this PR's `scan_copilot` change did) is tracked under **#471/#457**, the
+restore-path-unification work already named earlier in this document, and
+is deliberately left to that unified builder rather than duplicated here.
+
+**Pin.** `scan_copilot_restores_autopilot_flags_only_when_unambiguous`
+(`sessions.rs`) now asserts, for every session `scan_copilot` produces
+regardless of which posture branch built it, that `resume_command` contains
+`"--resume="` and never contains `"--resume "` — a future edit reverting
+`scan_copilot`'s OWN emission to the space form fails this test immediately.
+It does not and cannot pin `agentResumeCommand`'s separate emission, above.
