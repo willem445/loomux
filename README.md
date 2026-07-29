@@ -241,6 +241,7 @@ src/
   restoresplash.ts  cold-boot "restore last session?" overlay (thin DOM over restoredecision.ts, #194)
   tabcounts.ts      pure per-tab live-agent counter + live/dormant orchestration markers (DOM-free, unit-tested, #194)
   groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip (DOM-free, unit-tested, #194)
+  sessionreconcile.ts pure post-start session-id adoption matcher (refuses on any ambiguity) + the dormant card's "resume last session" candidate lookup (DOM-free, unit-tested, #440). See doc/design/session-id-learning.md
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar: source/role chips, and (#1) each session's recorded task/goal, repo, branch, and PR (when the board has one) — absent rather than guessed for a session predating the field
   sessionmeta.ts    pure session-browser task/repo-branch/PR formatting + truncation (#1) (DOM-free, unit-tested)

@@ -7,7 +7,7 @@ import { Workspace } from "./workspace";
 import { TabManager } from "./tabs";
 import { TabBar } from "./tabbar";
 import type { Pane, PaneEvents, PaneOptions } from "./pane";
-import { SessionBrowser } from "./sessions";
+import { SessionBrowser, timeAgo } from "./sessions";
 import {
   ensureOutputRouter,
   onPtyExit,
@@ -74,10 +74,17 @@ import {
   agentFreshCommand,
   shouldRespawnFresh,
   findResumedPaneIndex,
+  hasForkSession,
   type RestoreAction,
   type SessionResumable,
 } from "./panerestore";
 import { showRestoreSplash } from "./restoresplash";
+import {
+  planSessionAdoption,
+  dormantResumeCandidate,
+  type ReconcilePane,
+  type SessionRecord,
+} from "./sessionreconcile";
 import { planGroupResume } from "./groupresume";
 
 // Surface unexpected errors as a visible banner instead of a silently
@@ -560,6 +567,48 @@ async function openActionPane(
         }
       );
       pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
+      // #440 D2: this card has NO recorded session id (that's exactly why it's
+      // dormant) — but the pane's cwd might still have a matching transcript the
+      // human can name (a custom-launched agent that reconciliation hasn't run
+      // against, or ran against and found ambiguous). Resolved AFTER the card is
+      // already rendered/returned, off the existing background prefetch — never
+      // blocking this pane's open on a `listSessions()` scan (#342). A folder
+      // with no match keeps today's plain-Start-only wording.
+      //
+      // A --fork-session line is excluded outright (review round 2, B3): the
+      // button would attach candidate.id to a line that mints a DIFFERENT id
+      // on its very next resume, recording something wrong-but-authoritative-
+      // looking instead of honestly nothing. Such a card stays plain-Start-
+      // only — same exclusion `reconcileCandidates` applies automatically.
+      const cli = a.command?.trim().split(/\s+/)[0]?.toLowerCase();
+      if (a.cwd && (cli === "claude" || cli === "copilot") && !hasForkSession(a.command, a.argv)) {
+        void sessionsPrefetch.then(() => {
+          if (pane.isDisposed || !pane.isDormant) return; // Start already clicked, or pane closed
+          const candidate = dormantResumeCandidate({ cli, cwd: a.cwd }, toRecords(sessions.cached));
+          if (!candidate) return;
+          const age = timeAgo(candidate.modifiedMs);
+          const cliLabel = cli === "claude" ? "CLAUDE" : "COPILOT";
+          addDormantCardAction(
+            content,
+            "Resume last session",
+            `${cliLabel} · "${candidate.title}" · ${age}\nin ${a.cwd}`,
+            () => {
+              const rewrite =
+                a.command || (a.argv && a.argv.length)
+                  ? agentResumeCommand(a.command, a.argv, candidate.id)
+                  : { command: candidate.resumeCommand };
+              void pane
+                .startFromDormant({
+                  name: a.name,
+                  cwd: a.cwd ?? undefined,
+                  ...rewrite,
+                  sessionId: candidate.id,
+                })
+                .then(() => onGridChanged());
+            }
+          );
+        });
+      }
       return pane;
     }
     case "open-files":
@@ -710,6 +759,31 @@ function dormantCard(
   btn.addEventListener("click", () => onClick(btn));
   wrap.append(h, p, btn);
   return wrap;
+}
+
+/** Append a second action button to an ALREADY-RENDERED dormant card (#440
+ *  D2) — the resume-candidate lookup this feeds resolves asynchronously,
+ *  off the background session prefetch, strictly after `dormantCard` above
+ *  has already built and returned the card (never blocking the pane's own
+ *  open on it — #342). Styled distinctly (`dormant-btn-secondary`) so the
+ *  smarter "we found your last session" option reads as the recommended
+ *  one next to plain Start, without demoting Start to a smaller button
+ *  (each still spawns nothing until clicked). `tooltip` carries the
+ *  identifying detail (CLI · title · age · folder) the button label itself
+ *  has no room for. */
+function addDormantCardAction(
+  card: HTMLElement,
+  label: string,
+  tooltip: string,
+  onClick: (btn: HTMLButtonElement) => void
+): void {
+  const btn = document.createElement("button");
+  btn.className = "dormant-btn dormant-btn-secondary";
+  btn.type = "button";
+  btn.textContent = label;
+  btn.title = tooltip;
+  btn.addEventListener("click", () => onClick(btn));
+  card.appendChild(btn);
 }
 
 /** Groups with a resume in flight (#194 P4). A restored group tab renders one
@@ -1165,9 +1239,149 @@ const sessions = new SessionBrowser(
 // that's no longer the FIRST load. Best-effort — a failure here just means
 // the sidebar's own refresh path (open, or the ↻ button) covers it instead,
 // same as it always has.
-void sessions.refresh().catch(() => {
+const sessionsPrefetch: Promise<void> = sessions.refresh().catch(() => {
   /* best-effort warm-up; never block or fail boot on it */
 });
+
+// ---------- #440 D1 option B: post-start session-id reconciliation ----------
+//
+// adoptableSessionId (panerestore.ts, applied in Pane.start/respawnFresh)
+// only catches a custom command line that already NAMES its session. A bare
+// `claude` custom line mints its own id with nothing on the line to read —
+// the only way to learn THAT id is to watch listSessions() for a match once
+// the pane has had a chance to produce a transcript, and adopt it. That's
+// this reconciler; sessionreconcile.ts's planSessionAdoption does the actual
+// (deliberately refusal-biased — see its module comment) matching.
+//
+// #342-safe: NOTHING here runs on the boot path. The boot restore sequence
+// (`restoreSessionTabs`, above) never awaits this — it isn't even called
+// from there. The only triggers are (a) once, chained off this file's own
+// sidebar prefetch a few lines up, which already runs in the background and
+// was never on the boot-blocking path either, and (b) a periodic check
+// thereafter. Both are gated on `reconcileCandidates()` being non-empty, so
+// an ordinary boot with every id already recorded costs nothing beyond that
+// cheap in-memory filter — no `listSessions()` re-scan, no persistTabs().
+
+/** Null-id, non-dormant agent panes that have actually been PROMPTED — the
+ *  earliest point a transcript could exist for them to match against (#194
+ *  BUG-1's same "never prompted → no transcript" fact, cited in the design
+ *  note). Gated on `firstInputAt`, NOT `hasReceivedOutput` (review round 2,
+ *  B2): a claude/copilot TUI produces output — its banner — within about a
+ *  second of spawn, long before any transcript exists, so gating on output
+ *  left a pane adoption-eligible for its entire idle-before-first-prompt
+ *  lifetime with provably no transcript of its own in the scan — a window
+ *  wide enough for an unrelated same-CLI/same-cwd session to be a sole,
+ *  UNCONTESTED false match. `firstInputAt` narrows that to "has this pane
+ *  actually been typed into," which is also the earliest a transcript search
+ *  is worth running at all.
+ *
+ *  A `--fork-session` line is excluded outright (B3, same review round):
+ *  such a line invalidates whatever id it's given on its very next resume,
+ *  so it must stay unrecorded/dormant-eligible rather than risk acquiring an
+ *  id that looks authoritative but silently discards itself later — see
+ *  `Pane.hasForkSession`'s comment and the design note. Panes with no
+ *  recognized CLI or no cwd yet can't be matched and are excluded before the
+ *  caller even checks non-emptiness. */
+function reconcileCandidates(): Pane[] {
+  return tabs.tabs
+    .flatMap((ws) => ws.grid.allPanes())
+    .filter(
+      (p) =>
+        p.isAgentPane &&
+        !p.isDormant &&
+        p.sessionId === null &&
+        p.agentCli !== null &&
+        p.workdir !== null &&
+        p.firstInputAt !== null &&
+        p.ptyId !== null && // input can queue before the PTY attaches; the key below needs it
+        !p.hasForkSession
+    );
+}
+
+/** Session ids that must NOT be adopted onto a different pane: every live
+ *  pane's own recorded id, plus every dormant placeholder's captured id (a
+ *  session with no live pane is still "spoken for" — the D2 card, not this
+ *  reconciler, is how a human reclaims it). */
+function claimedSessionIds(): Set<string> {
+  const ids = new Set<string>();
+  for (const ws of tabs.tabs) {
+    for (const p of ws.grid.allPanes()) {
+      const id = p.isDormant ? p.restoreRecord?.sessionId : p.sessionId;
+      if (id) ids.add(id);
+    }
+  }
+  return ids;
+}
+
+function toRecords(list: readonly SessionInfo[]): SessionRecord[] {
+  return list.map((s) => ({
+    id: s.id,
+    cli: s.source,
+    cwd: s.cwd,
+    modifiedMs: s.modified_ms,
+    title: s.title,
+    resumeCommand: s.resume_command,
+  }));
+}
+
+let reconcileInFlight = false;
+let lastReconcileAt = 0;
+/** Floor between reconcile passes once one has run (#440 plan step 5: "at
+ *  least 60s between scans") — a fresh `listSessions()` scan is real I/O
+ *  (seconds on a long history, same cost the boot-path comment above
+ *  documents), so a null-id pane sitting there mid-conversation shouldn't
+ *  re-trigger it every tick of the periodic timer below. */
+const RECONCILE_MIN_INTERVAL_MS = 60_000;
+
+async function reconcileSessionIds(): Promise<void> {
+  // Single-flight: the periodic timer and the one-shot post-prefetch call
+  // below can otherwise overlap.
+  if (reconcileInFlight) return;
+  const candidates = reconcileCandidates();
+  if (!candidates.length) return; // the common case, every boot after the first
+  const now = Date.now();
+  if (lastReconcileAt !== 0 && now - lastReconcileAt < RECONCILE_MIN_INTERVAL_MS) return;
+  reconcileInFlight = true;
+  lastReconcileAt = now;
+  try {
+    // sessions.refresh() is itself single-flight (RefreshGate) and IS the
+    // scan #342 keeps off the boot path — safe here because this only ever
+    // runs after boot (see the module comment above).
+    await sessions.refresh();
+    const records = toRecords(sessions.cached);
+    const keyed = new Map<string, Pane>();
+    const planPanes: ReconcilePane[] = [];
+    for (const p of candidates) {
+      // ptyId is guaranteed non-null here: `reconcileCandidates` filters on it
+      // explicitly (input can queue and set firstInputAt slightly before the
+      // PTY finishes attaching, so this can't be inferred from firstInputAt
+      // alone — see that function's filter).
+      const key = String(p.ptyId);
+      keyed.set(key, p);
+      planPanes.push({ key, cli: p.agentCli!, cwd: p.workdir!, eligibleSinceMs: p.firstInputAt! });
+    }
+    const adoptions = planSessionAdoption(planPanes, records, claimedSessionIds());
+    if (!adoptions.length) return;
+    for (const a of adoptions) keyed.get(a.key)?.adoptSessionId(a.sessionId);
+    persistTabs();
+  } finally {
+    reconcileInFlight = false;
+  }
+}
+
+// One-shot: as soon as the sidebar's own prefetch above resolves, take a
+// first pass (near-instant on most boots — most panes are freshly spawned
+// and haven't produced output yet, so `reconcileCandidates()` is empty and
+// this returns immediately without a second scan). The periodic timer below
+// covers every pane that only starts qualifying later.
+void sessionsPrefetch.then(() => reconcileSessionIds());
+
+// Recurring: cheap (an in-memory filter) on every tick unless a null-id
+// agent pane with output actually exists, in which case it's still throttled
+// to RECONCILE_MIN_INTERVAL_MS by the guard above. Interval < the floor so a
+// pane that starts qualifying mid-window is picked up promptly rather than
+// waiting a full extra minute.
+setInterval(() => void reconcileSessionIds(), 20_000);
 
 async function restoreSession(s: SessionInfo): Promise<void> {
   // Recorded orchestration sessions restore into their group — MCP identity,
@@ -1242,7 +1456,13 @@ async function restoreSession(s: SessionInfo): Promise<void> {
     (s.source === "claude" ? "claude · " : "copilot · ") +
     (s.title.length > 34 ? s.title.slice(0, 34) + "…" : s.title);
   const pane = await ws.grid.openPane(
-    { name, cwd: s.cwd || undefined, command: s.resume_command },
+    // #440 D1c: pass the id we're already holding. Without this, a session
+    // restored by hand from the Sessions sidebar came back DORMANT on the
+    // NEXT boot anyway — the exact self-perpetuating trap the issue reports
+    // (nothing here ever recorded the id, even though it drove this very
+    // resume) — even though step 2's adoptableSessionId fallback would also
+    // catch it via `--resume` on resume_command: certainty over inference.
+    { name, cwd: s.cwd || undefined, command: s.resume_command, sessionId: s.id },
     eventsFor(ws),
     ws.grid.paneCount >= 2 ? "column" : "row"
   );

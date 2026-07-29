@@ -13,7 +13,10 @@ const ROLE_CHIPS: Record<string, string> = {
   reviewer: "REV",
 };
 
-function timeAgo(ms: number): string {
+/** Human "3h ago" / "just now" rendering for a `modified_ms` timestamp. Exported
+ *  for the D2 dormant-card enrichment (#440, main.ts), which wants the identical
+ *  age phrasing the sidebar itself uses for the same underlying timestamp. */
+export function timeAgo(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000);
   if (s < 60) return "just now";
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
@@ -70,6 +73,17 @@ export class SessionBrowser {
 
   get visible(): boolean {
     return !this.el.classList.contains("hidden");
+  }
+
+  /** The last-fetched session list, without triggering a scan (#440). The
+   *  session-id reconciler (main.ts) reuses this — and this class's own
+   *  single-flight `refresh()` when it needs a fresh read — instead of
+   *  running a second `listSessions()` scan of its own (#342: that scan is
+   *  real I/O, and the whole point of the boot prefetch this class already
+   *  does is to front-load it once). Empty before the first `refresh()`
+   *  resolves. */
+  get cached(): readonly SessionInfo[] {
+    return this.sessions;
   }
 
   toggle(): void {

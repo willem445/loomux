@@ -80,6 +80,7 @@ import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
+import { adoptableSessionId, hasForkSession } from "./panerestore";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -625,6 +626,23 @@ export class Pane implements VoiceTargetPane {
   private spawnArgv: string[] | null = null;
   private spawnShellKind: ShellKind | null = null;
   private agentSessionId: string | null = null;
+  /** Wall-clock time the HUMAN's first input (keystroke/paste) reached this
+   *  pane's current process — not when the process was spawned (#440; review
+   *  round 2, B2). The session-reconciler needs a boundary before which a
+   *  session transcript can't be this pane's, and gating on SPAWN time left a
+   *  pane adoption-eligible for its entire idle-before-first-prompt lifetime
+   *  (a transcript is only created once prompted — #194 BUG-1), a window in
+   *  which an unrelated same-CLI/same-cwd session could be a sole,
+   *  uncontested false match. Gating on first input instead means a pane with
+   *  nothing typed into it yet is never even a reconcile candidate — see
+   *  `sessionreconcile.ts`'s `ReconcilePane.eligibleSinceMs`. Set ONCE per
+   *  spawn via `markFirstInput()` (review round 3, B2-R: from `term.onKey` and
+   *  the two `term.paste()` sites — deliberately NOT `term.onData`, which
+   *  also fires for data xterm generates on its own with no key pressed; see
+   *  `markFirstInput`'s comment). Reset to null at the top of both `start()`
+   *  and `respawnFresh()`; never touched by `adoptSessionId` (adopting an id
+   *  doesn't respawn or re-prompt anything). */
+  private firstInputMs: number | null = null;
   private shiftTimer: number | undefined;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
@@ -1025,6 +1043,19 @@ export class Pane implements VoiceTargetPane {
     this.setName("shell");
   }
 
+  /** Mark the human's first input into this pane's CURRENT process (#440 B2;
+   *  review round 3, B2-R). Idempotent — only the FIRST call after a
+   *  `start`/`respawnFresh` resets `firstInputMs` to null does anything.
+   *  Called from `term.onKey` (real keyboard events only) and from both
+   *  `this.term.paste(...)` call sites (`pasteFromClipboard`,
+   *  `pasteToTerminal` — loomux owns paste entirely, #402, so these two are
+   *  the only paste vectors). Deliberately NEVER called from `term.onData`
+   *  — see that handler's comment for why it can't tell a keystroke from
+   *  data xterm generated on its own. */
+  private markFirstInput(): void {
+    this.firstInputMs ??= Date.now();
+  }
+
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
   async start(opts: PaneOptions = {}, takeFocus = true): Promise<void> {
     this.setName(opts.name ?? "shell");
@@ -1034,7 +1065,15 @@ export class Pane implements VoiceTargetPane {
     this.spawnCommand = opts.command ?? null;
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
-    this.agentSessionId = opts.sessionId ?? null;
+    // #440: a caller (the launcher, an orch spawn) that already knows the id
+    // wins outright. Otherwise, learn it from the command/argv line itself —
+    // a human-typed `claude --resume <id>` / `--session-id <id>` custom
+    // command already names its own session (D1); adoptableSessionId is the
+    // guarded extractor (refuses on --fork-session). A bare `claude` line, or
+    // one with no session flag, yields null here — the reconciler (main.ts)
+    // is the OTHER half of D1, catching that case post-start.
+    this.agentSessionId = opts.sessionId ?? adoptableSessionId(opts.command ?? null, opts.argv ?? null);
+    this.firstInputMs = null; // this process hasn't been typed into yet (#440 B2)
     if (opts.badge) this.setBadge(opts.badge);
     if (opts.orchAgent) this.orchAgent = opts.orchAgent;
     if (opts.channelAgent) this.channelAgentInfo = opts.channelAgent;
@@ -1112,6 +1151,22 @@ export class Pane implements VoiceTargetPane {
     // ordered writer until the PTY is ready, and the output router buffers
     // until we attach.
     this.term.onData((data) => this.writer.write(data));
+    // #440 B2 (review round 3, B2-R): `onData` is NOT a human-input signal —
+    // it fires for EVERYTHING the terminal sends to the PTY, including data
+    // xterm generates entirely on its own with no key pressed: OSC 10/11
+    // color-query replies, a primary-DA reply, focus reports. `wasUserInput`
+    // (xterm's own internal flag) gates only scroll-to-bottom and xterm's
+    // internal `_onUserInput` — never `onData`. This is the EXACT #179
+    // mechanism recurring: Copilot queries the terminal's colors at boot,
+    // xterm auto-answers, and that answer used to get misread as human input
+    // (there, by the backend's box-occupancy tracker; here, by this pane's
+    // own firstInputMs). `onKey` is the fix: it fires ONLY for genuine
+    // keyboard events, never for data the terminal manufactures itself — a
+    // structural guarantee, not a pattern match against an open set of
+    // possible auto-reply shapes (which is why this doesn't try to filter
+    // `onData` by escape-sequence prefix instead: bracketed paste itself
+    // starts with ESC, so a naive filter would misfire on real pastes).
+    this.term.onKey(() => this.markFirstInput());
     this.resizeObs.observe(this.termEl);
     // A background (orchestrator-driven) spawn must not pull focus from the
     // pane the human is typing in (#117); grid.openPane decides takeFocus.
@@ -1183,7 +1238,11 @@ export class Pane implements VoiceTargetPane {
     this.spawnCommand = opts.command ?? null;
     this.spawnArgv = opts.argv ?? null;
     this.spawnShellKind = opts.shellKind ?? null;
-    this.agentSessionId = opts.sessionId ?? null;
+    // Same learn-it-from-the-line fallback as start() (#440) — a fresh respawn
+    // (BUG-1 backstop, or a dormant Start with a recorded command) can equally
+    // carry a self-naming --resume/--session-id.
+    this.agentSessionId = opts.sessionId ?? adoptableSessionId(opts.command ?? null, opts.argv ?? null);
+    this.firstInputMs = null; // fresh process, nothing typed into it yet (#440 B2)
     if (opts.cwd) {
       this.cwdRaw = opts.cwd;
       void this.refreshDir(opts.cwd);
@@ -2809,6 +2868,61 @@ export class Pane implements VoiceTargetPane {
     return this.launchedCommand;
   }
 
+  /** The agent CLI program this pane was launched with — the first token of
+   *  its launch command, lower-cased, same derivation launcher.ts uses to
+   *  probe/autopilot a program (#440). "claude" | "copilot" | null for a
+   *  plain shell, an unrecognized program, or before launch. Used by the
+   *  session reconciler to match this pane's cwd against `listSessions()`'s
+   *  `source` without re-deriving the parse elsewhere. */
+  get agentCli(): "claude" | "copilot" | null {
+    const first = this.spawnCommand?.trim().split(/\s+/)[0]?.toLowerCase();
+    return first === "claude" || first === "copilot" ? first : null;
+  }
+
+  /** True when this pane's current launch command/argv carries `--fork-session`
+   *  (#440 B3, review round 2). The reconciler and the D2 card must NEVER
+   *  attach a learned session id to a pane whose line will fork away from it
+   *  on its very next resume — that id would look authoritative while being
+   *  wrong on every future restart (a silent, groundhog-day loss of whatever
+   *  the human did after adopting it). Such panes stay unrecorded/dormant-
+   *  eligible by exclusion here, same policy `adoptableSessionId` already
+   *  applies at spawn time — see doc/design/session-id-learning.md. */
+  get hasForkSession(): boolean {
+    return hasForkSession(this.spawnCommand, this.spawnArgv);
+  }
+
+  /** This pane's recorded agent session id, or null when none has been minted,
+   *  named on its command line, or learned yet (#440). Read by the reconciler
+   *  to build its plain-data pane projection and to decide whether a pane is
+   *  even a candidate for adoption (only null-id agent panes are). */
+  get sessionId(): string | null {
+    return this.agentSessionId;
+  }
+
+  /** When the HUMAN's first input reached this pane's CURRENT process (#440;
+   *  review round 2, B2) — not when the process was spawned. The reconciler
+   *  uses this (not spawn time) as the earliest a session transcript could be
+   *  this pane's, since a transcript is only created once prompted; see
+   *  `firstInputMs`'s field comment for why spawn time left too wide a false-
+   *  match window. Null before this process has ever received input (a
+   *  welcome pane, or an agent pane sitting idle unprompted). */
+  get firstInputAt(): number | null {
+    return this.firstInputMs;
+  }
+
+  /** Record a session id the reconciler LEARNED for this pane post-start
+   *  (#440 D1 option B) — the bare-`claude`-line case adoptableSessionId can't
+   *  cover. Idempotent/no-op once an id is already recorded: an id already in
+   *  hand (minted, adopted from the line, or a prior adoption) is never
+   *  overwritten by a later reconciler pass — that would risk cross-wiring a
+   *  pane that has since gained its own id onto a different transcript. The
+   *  caller (main.ts) is responsible for persisting the layout afterward;
+   *  this only updates the live pane's in-memory record. */
+  adoptSessionId(id: string): void {
+    if (this.agentSessionId !== null) return;
+    this.agentSessionId = id;
+  }
+
   /** Whether this pane's process has emitted a single byte since it spawned
    *  (#280/#281) — a crashed pane that never did is a DOA revival, not a
    *  crash worth keeping open to read. */
@@ -3212,7 +3326,10 @@ export class Pane implements VoiceTargetPane {
       showToast("Paste failed — click the pane and try again.");
       return;
     }
-    if (res.text) this.term.paste(res.text);
+    if (res.text) {
+      this.markFirstInput(); // #440 B2-R: a clipboard paste IS human input, same as a keystroke
+      this.term.paste(res.text);
+    }
   }
 
   /** Build the loomux steering strip and dock it under the terminal (#43,
@@ -3500,7 +3617,10 @@ export class Pane implements VoiceTargetPane {
   pasteToTerminal(text: string): void {
     if (this.disposed) return; // pane closed during transcription — drop it
     const t = text.trim();
-    if (t) this.term.paste(t);
+    if (t) {
+      this.markFirstInput(); // #440 B2-R: a dictated transcript is human input too
+      this.term.paste(t);
+    }
   }
 
   /** Surface a voice status/error on the strip (compose targets have one). */
