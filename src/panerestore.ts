@@ -229,15 +229,19 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
   }
 }
 
-/** The value grammar shared by every "flag [=|space] value" excision in this
- *  module: a whole double-quoted run kept as ONE unit (quotes included, so a
- *  `.slice` excise never leaves a stray `"` behind), or a bare whitespace-free
- *  token — the one shape every flag value recorded here uses (a session id, a
- *  solo MCP config path, …). `CLAUDE_SOLO_MCP_RE`/`COPILOT_SOLO_MCP_RE` below
- *  (#439) are built from this same fragment via `new RegExp` — factored out
- *  so a future flag-value shape is taught once, not to N regexes that could
- *  quietly drift apart (the #452 worry, one level up: two parsers that
- *  disagree). */
+/** The value/token grammar shared by every quote-aware scan in this module: a
+ *  whole double-quoted run kept as ONE unit (quotes included, so a `.slice`
+ *  excise never leaves a stray `"` behind), or a bare whitespace-free run —
+ *  the one shape every flag value AND every command token recorded here
+ *  uses (a session id, a solo MCP config path, an arbitrary CLI argument, …).
+ *  THREE call sites are built from this exact constant via `new RegExp`, not
+ *  three independently hand-typed copies of the pattern text:
+ *  `CLAUDE_SOLO_MCP_RE`/`COPILOT_SOLO_MCP_RE` further below (#439, one value
+ *  each inside a fixed flag group) and `tokenizeWithPositions` just below
+ *  (#449, the general per-token scan `stripSessionFlagsFromCommand` walks). A real
+ *  binding, checked by construction: change this constant and every call
+ *  site moves with it — the #452 worry (two parsers that quietly disagree)
+ *  this exists to actually close, not merely gesture at. */
 const QUOTED_OR_BARE_VALUE = `"[^"]*"|\\S+`;
 
 /** The two flag names that name a Claude session on a recorded launch line —
@@ -277,10 +281,17 @@ function isEqSessionFlag(raw: string): boolean {
  *  tokens at all — a caller reconstructs the string by slicing the ORIGINAL
  *  around whichever token ranges it drops, so every gap it doesn't touch
  *  survives untouched by construction (never a `.join(" ")` reflow — the
- *  #449 bug this whole approach exists to close). */
+ *  #449 bug this whole approach exists to close).
+ *
+ *  Built from `QUOTED_OR_BARE_VALUE` — the SAME grammar constant
+ *  `CLAUDE_SOLO_MCP_RE`/`COPILOT_SOLO_MCP_RE` below are built from, via
+ *  `new RegExp`, not a second hand-typed copy of the pattern text. A
+ *  genuinely converged binding, not just a co-located one: change the
+ *  constant and both call sites move together (the #452 drift concern this
+ *  is written to actually satisfy, not merely gesture at). */
 function tokenizeWithPositions(command: string): Array<{ start: number; end: number }> {
   const tokens: Array<{ start: number; end: number }> = [];
-  const re = /"[^"]*"|\S+/g;
+  const re = new RegExp(QUOTED_OR_BARE_VALUE, "g");
   let m: RegExpExecArray | null;
   while ((m = re.exec(command)) !== null) {
     tokens.push({ start: m.index, end: m.index + m[0].length });

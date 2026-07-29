@@ -499,6 +499,15 @@ test("agentFreshCommand: a command with NO session flag comes back byte-identica
 // their OWN meaningful whitespace (a spaced quoted path, a multi-space run).
 // The property: excising `flag` and appending the new one must leave `prefix`
 // and `suffix` EXACTLY as recorded — never reflowed, never touched.
+//
+// #471 review round 4 (rev-10): every irregular-whitespace fixture above this
+// point kept its multi-space runs INSIDE a quoted argument — which a
+// join-of-surviving-TOKENS reconstruction (the exact regression #449 exists
+// to prevent, since a quoted run is kept as one token either way) would
+// still have passed, undetected. The last fixture below closes that: its
+// multi-space runs sit BETWEEN bare, UNQUOTED survivor tokens, nowhere near
+// a quote — so this pins inter-token spacing itself, not one string that
+// happens to survive for an unrelated reason.
 const SESSION_FLAG_FIXTURES: Array<{ prefix: string; flag: string; suffix: string }> = [
   {
     prefix: 'claude --append-system-prompt "two  spaces  here"',
@@ -511,6 +520,14 @@ const SESSION_FLAG_FIXTURES: Array<{ prefix: string; flag: string; suffix: strin
     suffix: ' --append-system-prompt "trailing   run"',
   },
   { prefix: "claude", flag: " --session-id=old", suffix: "" },
+  {
+    // No quotes anywhere in prefix/suffix — irregular multi-space runs sit
+    // directly between bare tokens (claude/--model, --model/opus, and
+    // --dangerously-skip-permissions/--verbose in the suffix).
+    prefix: "claude   --model    opus",
+    flag: " --session-id old-id",
+    suffix: " --dangerously-skip-permissions    --verbose",
+  },
 ];
 
 test("agentResumeCommand: excises ONLY the recorded session flag's own bytes — every other byte, whitespace runs inside quoted args included, survives untouched", () => {
