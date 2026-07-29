@@ -108,6 +108,17 @@ export interface AgentLaunchSpec {
    *  nothing to record, and `undefined` (not `false`) is how the caller tells
    *  "not a copilot launch" apart from "copilot launch, toggle off". */
   copilotAutopilotPosture?: boolean;
+  /** #457: claude's counterpart to `copilotAutopilotPosture` — present
+   *  (either `true` or `false`) whenever this pane is a non-custom claude
+   *  solo launch, so a LATER Sessions-tab resume of the session THIS launch
+   *  mints (keyed by `sessionId`, not a cwd — see `sessions.rs`'s
+   *  `IntentKey::Session`) can re-derive the posture instead of the pre-#457
+   *  unconditional bare `claude --resume <id>`. Same "record OFF too, not
+   *  just ON" reasoning as the copilot field, though unlike copilot a
+   *  claude session key can never become ambiguous (a minted session id
+   *  never collides with another launch's). `undefined` for every other
+   *  CLI/kind, same meaning as `copilotAutopilotPosture`'s `undefined`. */
+  claudeAutopilotPosture?: boolean;
 }
 
 /** What a submitted welcome form resolves to — the caller (main.ts) spawns the
@@ -1372,6 +1383,9 @@ export class WelcomeForm {
           // toggle to be ON — recording the OFF state matters too (see the
           // field's own doc comment).
           copilotAutopilotPosture: !plan.isCustom && program === "copilot" ? plan.autopilot : undefined,
+          // #457: claude's counterpart — same gate, keyed by the `sessionId`
+          // minted just above instead of `cwd`.
+          claudeAutopilotPosture: !plan.isCustom && program === "claude" ? plan.autopilot : undefined,
         });
       }
       setDefaultAgent(plan.isCustom ? "custom" : this.agentSel.value);

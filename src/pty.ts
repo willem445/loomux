@@ -111,6 +111,16 @@ export const listSessions = (): Promise<SessionInfo[]> => invoke("list_sessions"
 export const recordCopilotLaunchPosture = (cwd: string, autopilot: boolean): Promise<void> =>
   invoke("record_copilot_launch_posture", { cwd, autopilot });
 
+/** Claude's counterpart to `recordCopilotLaunchPosture` (#457) — keyed by the
+ *  session id THIS launch minted rather than a cwd (`sessions.rs`'s
+ *  `IntentKey::Session`), since claude always has one. The backend's
+ *  `scan_claude` reads this back so a Sessions-tab resume of that exact
+ *  session can rebuild its autopilot flags instead of the pre-#457
+ *  unconditional bare `--resume`. Best-effort; never blocks or fails a
+ *  launch. */
+export const recordClaudeLaunchPosture = (sessionId: string, autopilot: boolean): Promise<void> =>
+  invoke("record_claude_launch_posture", { sessionId, autopilot });
+
 // ---------- durable UI state: project tabs (#63) ----------
 // The tab set persists across launches through the backend (atomic temp+rename
 // write, corrupt-file quarantine — see src-tauri/src/uistate.rs), NOT

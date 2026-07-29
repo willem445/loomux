@@ -18,6 +18,7 @@ import {
   guardAppClose,
   listSessions,
   recordCopilotLaunchPosture,
+  recordClaudeLaunchPosture,
   type PtyExit,
   type SessionInfo,
 } from "./pty";
@@ -80,6 +81,7 @@ import {
   findResumedPaneIndex,
   hasForkSession,
   shouldWatchCopilotOnRestore,
+  normalizeAgentProgram,
   type RestoreAction,
   type SessionResumable,
 } from "./panerestore";
@@ -692,7 +694,13 @@ async function openActionPane(
       // on its very next resume, recording something wrong-but-authoritative-
       // looking instead of honestly nothing. Such a card stays plain-Start-
       // only — same exclusion `reconcileCandidates` applies automatically.
-      const cli = a.command?.trim().split(/\s+/)[0]?.toLowerCase();
+      //
+      // #457: routed through the same `normalizeAgentProgram` `Pane.agentCli`/
+      // `programFromRestore` now use, instead of a fourth independent
+      // first-token derivation — a path-qualified or `.exe`-suffixed
+      // recorded command is recognized here too now.
+      const first = a.command?.trim().split(/\s+/)[0];
+      const cli = first ? normalizeAgentProgram(first) : undefined;
       if (a.cwd && (cli === "claude" || cli === "copilot") && !hasForkSession(a.command, a.argv)) {
         void sessionsPrefetch.then(() => {
           if (pane.isDisposed || !pane.isDormant) return; // Start already clicked, or pane closed
@@ -1236,6 +1244,7 @@ async function handleWelcomeSubmit(
   await bindSoloIfNeeded(pane, first);
   watchCopilotAutopilotIfNeeded(pane, first);
   recordCopilotPostureIfNeeded(first);
+  recordClaudePostureIfNeeded(first);
   reapIfExited(ws, pane);
   // The first agent converted the setup pane in place — notify so the counter
   // reflects it immediately, not only after the fan-out (#194 P4 HIGH-1). The
@@ -1259,6 +1268,7 @@ async function handleWelcomeSubmit(
     await bindSoloIfNeeded(p, spec);
     watchCopilotAutopilotIfNeeded(p, spec);
     recordCopilotPostureIfNeeded(spec);
+    recordClaudePostureIfNeeded(spec);
     reapIfExited(ws, p);
     prev = p;
     d = d === "row" ? "column" : "row";
@@ -1315,6 +1325,19 @@ function watchCopilotAutopilotIfNeeded(pane: Pane, spec: AgentLaunchSpec): void 
 function recordCopilotPostureIfNeeded(spec: AgentLaunchSpec): void {
   if (spec.copilotAutopilotPosture === undefined || !spec.cwd) return;
   void recordCopilotLaunchPosture(spec.cwd, spec.copilotAutopilotPosture).catch(() => {
+    /* best-effort — a lost record just means a later restore falls back to no flags */
+  });
+}
+
+/** Claude's counterpart to `recordCopilotPostureIfNeeded` (#457) — keyed by
+ *  the `sessionId` this launch just minted (`AgentLaunchSpec.claudeAutopilotPosture`'s
+ *  doc comment) instead of a cwd. Skipped when there's no id — a custom
+ *  command or a non-claude CLI never mints one, so there's nothing to key a
+ *  later restore on. Same best-effort, record-both-states contract as the
+ *  copilot function above. */
+function recordClaudePostureIfNeeded(spec: AgentLaunchSpec): void {
+  if (spec.claudeAutopilotPosture === undefined || !spec.sessionId) return;
+  void recordClaudeLaunchPosture(spec.sessionId, spec.claudeAutopilotPosture).catch(() => {
     /* best-effort — a lost record just means a later restore falls back to no flags */
   });
 }
