@@ -41,7 +41,13 @@ Every rung is a complete tool on its own — climb when you're ready:
    a proposed skills/lessons PR, never auto-merged. The active workflow, its
    roster, and its armed merge gate are always visible in the group's
    lifecycle panel, and the toggle that turns it on is a live control — flip
-   it mid-session, no relaunch needed.
+   it mid-session, no relaunch needed. A hand-edit to an *existing*
+   `gates.merge` clause (drop a reviewer, drop an `also:` condition) takes
+   effect the same way — no relaunch, no toggle flip, just save the file —
+   fail-closed if the file goes missing or stops parsing mid-session.
+   *Removing* `gates.merge` entirely never happens by editing the file,
+   though: that ambiguity is exactly what a mid-write truncation looks like
+   too, so only the explicit toggle-off clears an armed gate.
 
 Plus a git view, GitHub issues, a file editor, a file explorer, and voice
 prompts — one keystroke away on any rung, never disturbing the shell
