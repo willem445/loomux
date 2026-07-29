@@ -1305,7 +1305,7 @@ mod launch_intent_tests {
         claude_posture_in, copilot_launch_posture, load_launch_intent, posture_key_for,
         record_claude_launch_posture_impl, record_copilot_launch_posture_impl, scan_claude, scan_copilot,
         set_claude_projects_root_for_test, set_copilot_session_state_root_for_test,
-        set_launch_intent_path_for_test, set_legacy_copilot_posture_path_for_test,
+        set_launch_intent_path_for_test, set_legacy_copilot_posture_path_for_test, IntentKey, Posture,
     };
     use std::fs;
 
@@ -1745,13 +1745,25 @@ mod launch_intent_tests {
         set_legacy_copilot_posture_path_for_test(Some(legacy_path.clone()));
 
         // A real pre-#457 file, written in its OWN (copilot-only, cwd-only,
-        // untagged) shape — never the new store's shape.
+        // untagged) shape — never the new store's shape. The stored `cwd` is
+        // the ALREADY-NORMALIZED permission key a real write would have
+        // produced (`posture_key`, applied at write time) — computed here via
+        // `posture_key_for` rather than hand-typed, since that normalization
+        // is platform-dependent (backslash+lowercase on Windows, exact-match
+        // elsewhere per review B2) and a literal Windows-style key would only
+        // coincidentally match a lookup on non-Windows CI.
+        let migrated_key = posture_key_for("c:/work/migrated", cfg!(windows));
+        let migrated_off_key = posture_key_for("c:/work/migrated-off", cfg!(windows));
         fs::write(
             &legacy_path,
-            r#"{"entries": [
-                {"cwd": "c:\\work\\migrated", "posture": "True", "touched_ms": 1},
-                {"cwd": "c:\\work\\migrated-off", "posture": "False", "touched_ms": 2}
-            ]}"#,
+            format!(
+                r#"{{"entries": [
+                    {{"cwd": {}, "posture": "True", "touched_ms": 1}},
+                    {{"cwd": {}, "posture": "False", "touched_ms": 2}}
+                ]}}"#,
+                serde_json::to_string(&migrated_key).unwrap(),
+                serde_json::to_string(&migrated_off_key).unwrap(),
+            ),
         )
         .unwrap();
         assert!(!new_path.exists(), "precondition: the new store must not exist yet");
@@ -1779,6 +1791,91 @@ mod launch_intent_tests {
             Some(true),
             "the migrated record must survive being merged into a real write, not get dropped"
         );
+
+        set_launch_intent_path_for_test(None);
+        set_legacy_copilot_posture_path_for_test(None);
+    }
+
+    /// THE property the test above only proved for whichever platform
+    /// happened to build it: `soft_migration_reads_legacy_copilot_posture_
+    /// file_when_new_store_is_absent` computes its fixture's on-disk key via
+    /// `posture_key_for(cwd, cfg!(windows))` and reads it back through the
+    /// REAL, `cfg!(windows)`-gated `copilot_launch_posture` — so on any given
+    /// CI host it only ever exercises ONE of `posture_key_for`'s two arms,
+    /// the SAME one, on both sides. A legacy file written by a Windows
+    /// loomux (backslash, lowercased keys) and one written by a macOS/Linux
+    /// loomux (exact-match keys) are different on-disk shapes, and this test
+    /// proves migration is faithful to BOTH, unconditionally, on every host —
+    /// not by exercising the real lookup (which can't be steered off its own
+    /// build platform), but by inspecting `load_launch_intent`'s STRUCTURAL
+    /// output directly: does the migrated store contain an entry whose key
+    /// carries the legacy `cwd` string EXACTLY, untouched by any
+    /// re-normalization? Migration is a pure passthrough of the legacy
+    /// entry's `cwd` field (never re-keyed — see `load_launch_intent`'s
+    /// match arm) precisely so this holds regardless of which platform wrote
+    /// the file being migrated. Caught this exact gap: the sibling test
+    /// above passed locally on a Windows-only dev machine and failed on CI's
+    /// ubuntu/macOS runners — full-platform CI, not local verification, is
+    /// what this project treats as authoritative for platform-gated code
+    /// exactly because of failures shaped like this one.
+    ///
+    /// Mutation-verified against the exact blind spot this exists to close:
+    /// temporarily re-normalizing the migrated `cwd` (`posture_key(&e.cwd)`
+    /// instead of `e.cwd` verbatim) leaves the sibling end-to-end test
+    /// GREEN on a Windows host — `posture_key` is idempotent on an
+    /// already-Windows-normalized key, so re-normalizing it a second time is
+    /// invisible there — while THIS test goes red immediately on the
+    /// non-Windows-written key, on every host, because it is never
+    /// idempotent under the Windows arm.
+    #[test]
+    fn soft_migration_preserves_the_legacy_cwd_key_exactly_regardless_of_which_platform_wrote_it() {
+        let d = tempfile::tempdir().unwrap();
+        let new_path = d.path().join("launch-intent.json");
+        let legacy_path = d.path().join("copilot-posture.json");
+        set_launch_intent_path_for_test(Some(new_path));
+        set_legacy_copilot_posture_path_for_test(Some(legacy_path.clone()));
+
+        // BOTH arms, explicit — never `cfg!(windows)` here: the Windows arm
+        // (backslash, lowercased) and the non-Windows arm (exact-match,
+        // unmodified) of `posture_key_for`, applied to the SAME logical
+        // folder, so this fixture is what EITHER platform's pre-#457 loomux
+        // would genuinely have written for it.
+        let windows_written_key = posture_key_for("C:/Work/From-Windows", true);
+        let unix_written_key = posture_key_for("/home/user/from-unix", false);
+        assert_ne!(
+            windows_written_key, unix_written_key,
+            "precondition: the two arms must actually differ, or this test proves nothing"
+        );
+
+        fs::write(
+            &legacy_path,
+            format!(
+                r#"{{"entries": [
+                    {{"cwd": {}, "posture": "True", "touched_ms": 1}},
+                    {{"cwd": {}, "posture": "False", "touched_ms": 2}}
+                ]}}"#,
+                serde_json::to_string(&windows_written_key).unwrap(),
+                serde_json::to_string(&unix_written_key).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let migrated = load_launch_intent();
+        let has = |cwd: &str, want: Posture| {
+            migrated.entries.iter().any(|e| {
+                e.key == (IntentKey::Cwd { cli: "copilot".to_string(), cwd: cwd.to_string() })
+                    && e.autopilot == want
+            })
+        };
+        assert!(
+            has(&windows_written_key, Posture::True),
+            "a Windows-written legacy key must migrate byte-for-byte, even read on a non-Windows host"
+        );
+        assert!(
+            has(&unix_written_key, Posture::False),
+            "a non-Windows-written legacy key must migrate byte-for-byte, even read on a Windows host"
+        );
+        assert_eq!(migrated.entries.len(), 2, "no entry invented, none dropped, none merged");
 
         set_launch_intent_path_for_test(None);
         set_legacy_copilot_posture_path_for_test(None);
