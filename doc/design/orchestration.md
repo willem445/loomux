@@ -4376,6 +4376,14 @@ is the impure half.
   requires three-plus deliveries to a SINGLE pane to all arrive within the same seconds-scale
   pre-paste-hold window — narrower than the two-delivery shape the live incident actually showed,
   but real, and stated here rather than left for the next reader to discover the hard way.
+  **A second, independent mechanism can ALSO invert arrival order at three-plus contenders, and a
+  fair mutex would not close it:** when the paste-point recheck defers an in-flight delivery to the
+  queue's TAIL, that delivery loses its original arrival position, so a delivery that arrived LATER
+  and enqueues via the front door in the interim can end up ordered ahead of it — proven (rev-35,
+  round 2) using this very model run under a *simulated fair lock*, specifically to show the
+  mutex-fairness fix alone does not subsume it. #470 has been widened to cover both mechanisms
+  together (a fair lock is necessary, not sufficient); do not read the ticket-lock fix described
+  above as the whole answer to three-plus-contender ordering.
 
 **Notice vocabulary — part of the fix.** The old text ("held: pane has human input — re-send when
 clear") is deleted along with `paste_held_notice`/`question_held_notice`/`held_delivery_notice`/
@@ -4477,11 +4485,12 @@ tier was caught by:
    inverted order the review reported.
 
 **Follow-ups filed at PR time, not built here:** wiring `queue_orphans` into the orchestrator's
-session-start re-sync (the persistence-gap closer, above, #467); on-disk queue durability (#468); a
-PR-C queued-count pane badge on the existing `orch-delivery-held` event seam; a genuine FIFO ticket
-for ACQUIRING the delivery mutex itself, closing the three-plus-simultaneous-contenders ordering
-residual named under "Ordering" above (#470, discovered while building this PR's exhaustive-interleaving
-test, reported rather than silently narrowed out of the property's scope).
+session-start re-sync (the persistence-gap closer, above, #467); on-disk queue durability (#468);
+a PR-C queued-count pane badge on the existing `orch-delivery-held` event seam; the three-plus-
+simultaneous-contenders ordering residual named under "Ordering" above (#470 — discovered as a
+mutex-fairness gap while building this PR's exhaustive-interleaving test, then WIDENED on review
+(round 2) once a second, independent mechanism — defer-to-tail position loss — was proven to
+survive a fair lock; #470 now covers both, since a ticket lock alone would not have closed it).
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
