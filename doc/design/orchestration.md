@@ -4385,6 +4385,30 @@ is the impure half.
   `non_atomic_commit_still_reproduces_the_round_1_lost_wakeup` (round 1's bug still caught — this
   more-faithful model didn't weaken what round 1 already proved) and
   `unconditional_guard_removal_reproduces_the_round_2_double_drain` (round 2's bug, freshly caught).
+- **Every site that mutates `queue_draining`, `queue_still_notified`, or `queues` as a side effect
+  (#470 review round 3, NB-1) — the map a future change to this subsystem should extend, not
+  re-derive from scratch.** Produced by grepping every touch point of those three fields in
+  `mod.rs` plus every `impl Drop` across the whole `orchestration` module (`DrainerGuard` is the
+  ONLY one) — mechanically, not by inspection alone. **Treat this table as STALE** the moment a new
+  function starts touching any of the three fields, or an existing mutation moves/is removed; the
+  fix for staleness is to re-run the same grep, not to patch this table by hand from memory.
+
+  | Site | Mutates | Registration-relevant (`queue_draining`) | Represented in `drainer_lifecycle`? |
+  |---|---|---|---|
+  | `DrainerGuard::drop` (RAII, every return incl. panic) | `queue_draining` (remove) | **Yes** | **Yes** — `GuardDrops`, unconditional, `guard_checks_generation`-gated removal |
+  | `commit_exit` (3 call sites in `run_queue_drainer`) | `queue_draining`, `queues` (remove), `queue_still_notified` (remove) | **Yes** | **Yes** — the empty-queue branch / `CommitDeregisters` (`atomic_exit`-gated); `queue_still_notified`'s removal is out of the model's scope (same reasoning as the two rows below) |
+  | `ensure_drainer` | `queue_draining` (insert, fresh generation) | **Yes** | **Yes** — `Arrival`'s claim-if-unregistered branch |
+  | `withdraw_unprocessable` (`deliver_prompt`'s no-app-handle rollback — an early-return cleanup path) | `queues` (pop front, conditional on id match) | No — never touches `queue_draining`; only reachable BEFORE a drainer is ever spawned for this admission (no app/registry handle to spawn one with), so nothing it does can race a live drainer's registration | No — out of scope for the same reason: no registration state involved |
+  | `enqueue_stranded_front` (seam 3 marker conversion, `run_queue_drainer`'s `AbortedPreEnter` arm) | `queues` (push front) | No — mid-loop, run only by the current sole owner, same as `pop_front_dequeued` below | No — not a registration mutation |
+  | `run_queue_drainer`'s `DeliverOutcome::Done` arm | `queue_still_notified` (remove) | No — mid-loop, not an exit path; only reachable while this thread is still the sole registered drainer | No — deliberately: safe under the (now-correct) at-most-one-drainer invariant; if that invariant were ever broken by a DIFFERENT future bug this could stale-clear a successor's notice flag, but the worst case is one duplicate low-severity notice, not a duplicated paste or a strand |
+  | `run_queue_drainer`'s still-queued-notice fire | `queue_still_notified` (insert) | No — insertion, not removal | No — not a removal at all |
+  | `pop_front_dequeued` | `queues` (pop front) | No — not a registration removal, same mid-loop/sole-owner reasoning | Implicitly yes — this IS the model's non-empty-queue delivery transition |
+  | `drop_queue` (standalone — tests, any future non-drainer caller) | `queues` (remove) | No — its own doc states it deliberately never touches `queue_draining`, having no drainer-lifecycle context to stay consistent with | Not applicable — a different code path outside the drainer's own lifecycle |
+
+  Three sites mutate `queue_draining` itself (the registration state the at-most-one-drainer
+  invariant depends on) and all three are represented in the model. The remaining six mutate
+  `queue_still_notified` or `queues` without touching registration, and are out of the model's
+  scope for the stated reasons rather than by omission.
 - **Seam 3 (stranded pre-Enter text).** Converts to a `QueuedPayload::StrandedSubmit` marker
   (pushed to the FRONT via `enqueue_stranded_front`, ahead of whatever else is queued — it
   represents finishing an already-half-done paste, not a new ask) rather than a text copy. Draining
