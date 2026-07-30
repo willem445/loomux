@@ -3864,12 +3864,31 @@ an empty box and holds/aborts rather than merge-submitting.
   note_user_input` (the code `write_pty` now calls) gates the stamp on `classify_human_input`/
   `box_occupancy_delta` reading actual keystroke evidence (`Content`, `Submit`, or a nonzero delta —
   i.e. backspace/DEL) — reusing the #179 scanner rather than adding a second classifier. Tradeoff
-  taken deliberately: pure-`Neutral`-with-zero-delta *human* input (arrow keys, menu navigation —
-  byte-indistinguishable from an auto-reply) no longer refreshes the clock either; safe because the
-  interactive-question guard's own release (below) is already STATE-based, not activity-based, for
-  exactly this reason. `input_pending` is a separate, additive flag written under the same `ptys`
-  lock so the pair can't tear; it was already unaffected by this gate (its `Neutral` branch still
-  applies `box_occupancy_delta` regardless of whether the timestamp stamps).
+  taken deliberately, and broader than "arrow keys, menu navigation" (#496 N2 review): Tab,
+  Home/End/F-keys, Ctrl-A/E/W/K, and mouse-tracking/wheel CSI reports are all pure-`Neutral`
+  zero-delta too, so a human wheel-scrolling a pane while merely *reading* output — not just
+  navigating a menu — also stops refreshing the clock. Safe because the interactive-question
+  guard's own release (below) is already STATE-based, not activity-based, for exactly this reason,
+  and the idle tick is a notice, not an action. `input_pending` is a separate, additive flag written
+  under the same `ptys` lock so the pair can't tear; it was already unaffected by this gate (its
+  `Neutral` branch still applies `box_occupancy_delta` regardless of whether the timestamp stamps).
+  **Per-write-completeness assumption (#496 N3 review):** the classifier is stateless per write, so
+  a query reply fragmented across two `write_pty` calls would have its tail read in isolation and
+  could stamp — unreached today (xterm synthesizes a reply as one `onData` event; the frontend's
+  writer only splits above 16 KiB, far bigger than any auto-reply) and, even so, it fails toward the
+  OLD behaviour for that one write, not toward #496's bug. Written down so a future CLI reply
+  pattern that defeats it is findable, not rediscovered.
+  **The `phantom-input-gated` breadcrumb is throttled per pane (#496 N1 review):** un-throttled, the
+  same broadened `Neutral`-zero-delta class above hits this branch on every write while a human
+  actively uses a pane — arrow-key/Tab spam or wheel-scroll bursts, each a separate file-open — and
+  the flood would dilute (and could rotate out of the 2 MB `breadcrumbs.log`) the mid-session copilot
+  signal the breadcrumb exists to capture (plan §7) before the one live validation run goes looking
+  for it. `phantom_gate_tick` (pure; unit-tested with no filesystem involved, `pty.rs`) bounds
+  emission to one line per pane per 5s interval, reporting how many gated writes coalesced since the
+  last line so the rate stays visible. Restricting emission to panes with an orchestration identity
+  was the preferred fix, but that would need this per-write hot path to reach into orchestration's
+  agent registry from `pty.rs` — real new coupling, not just calling the already-shared classifier —
+  so the throttle was chosen instead, staying inside `pty.rs` with no new command wiring.
 - **Residual, and the #112 boundary.** Occupancy is inferred from keystrokes, not read from the
   box, so some cases still need true box-occupancy detection (issue #112). Splitting them by
   direction:

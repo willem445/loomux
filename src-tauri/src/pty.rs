@@ -168,6 +168,12 @@ pub struct PtyManager {
     /// "expected", so the frontend closes the pane instead of keeping it
     /// open to display an error.
     expected_exits: Arc<Mutex<HashSet<u32>>>,
+    /// Per-pane (gated-writes-since-last-emit, last-emit-unix-ms — `None`
+    /// meaning never emitted for this pane) for the throttled
+    /// `phantom-input-gated` breadcrumb (#496 N1) — see
+    /// `record_phantom_gate`/`phantom_gate_tick`. Cleaned up alongside
+    /// `expected_exits` when a pty's waiter thread reaps it.
+    neutral_gate_throttle: Arc<Mutex<HashMap<u32, (u64, Option<u64>)>>>,
 }
 
 impl PtyManager {
@@ -211,12 +217,29 @@ impl PtyManager {
     /// confirmation — all four read this same timestamp.
     ///
     /// Tradeoff, taken deliberately: pure-`Neutral`-with-zero-delta human
-    /// input (arrow keys, menu navigation — byte-indistinguishable from an
-    /// xterm auto-reply) no longer defers the tick or the flush either. This
-    /// is safe because the protection for "human mid-menu" already lives in
-    /// the STATE-based interactive-question guard (#420 rev-19 R1), which
-    /// deliberately dropped keystroke-recency from its own release decision
-    /// for this exact reason — that guard is untouched by this change.
+    /// input no longer defers the tick or the flush either — and that class
+    /// is broader than "arrow keys, menu navigation" (#496 N2 review): Tab,
+    /// Home/End/F-keys, Ctrl-A/E/W/K, and mouse-tracking/wheel CSI reports
+    /// (if a TUI enables mouse tracking) all classify `Neutral` with a zero
+    /// occupancy delta too — including a human wheel-scrolling a pane while
+    /// merely *reading* output, not steering it. This is safe because the
+    /// protection for "human mid-menu" already lives in the STATE-based
+    /// interactive-question guard (#420 rev-19 R1), which deliberately
+    /// dropped keystroke-recency from its own release decision for this
+    /// exact reason — the tick is a notice, not an action, and that guard is
+    /// untouched by this change.
+    ///
+    /// Assumption this relies on (#496 N3 review): the classifier is
+    /// stateless PER WRITE, so a query reply fragmented across two `write_pty`
+    /// calls would have its tail half read in isolation and could stamp (the
+    /// escape lead byte that makes the whole sequence read `Neutral` lives in
+    /// the first fragment). Unreached today — xterm synthesizes a query
+    /// reply as one `onData` event, and the frontend's writer only splits
+    /// writes over `PTY_WRITE_CHUNK` (16 KiB), far above any auto-reply's
+    /// size — and even if it happened, it fails toward the OLD (safe)
+    /// behaviour for that one write, not toward the bug this PR fixes. Still
+    /// written down here so a future CLI reply pattern that defeats it is
+    /// something the next reader can find, not rediscover.
     pub fn note_user_input(&self, id: u32, data: &str) {
         let classification = crate::orchestration::classify_human_input(data);
         let delta = crate::orchestration::box_occupancy_delta(data);
@@ -255,14 +278,28 @@ impl PtyManager {
         }
         // Observability for the one live gap this fix can't settle from code
         // alone (#496 plan section 7): which copilot emission recurs
-        // mid-session. Counts only, never the escape text itself (obs.rs's
-        // own invariant) — a live run greps this event's rate per pane to
-        // confirm the class (and, cross-referenced with a raw capture, name
-        // the offending sequence) without this fix depending on knowing which
-        // one it is. Emitted after the lock is released — breadcrumb does
-        // file IO and must not extend the hold on the ptys map.
+        // mid-session. Throttled (#496 N1 review — see `record_phantom_gate`)
+        // and emitted after the lock is released — breadcrumb does file IO
+        // and must not extend the hold on the ptys map.
         if !keystroke_like {
-            crate::obs::breadcrumb("phantom-input-gated", &format!("id={id}"));
+            self.record_phantom_gate(id);
+        }
+    }
+
+    fn record_phantom_gate(&self, id: u32) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let emit = {
+            let mut throttle = self.neutral_gate_throttle.lock_safe();
+            let state = throttle.get(&id).copied().unwrap_or((0, None));
+            let (emit, new_state) = phantom_gate_tick(state, now);
+            throttle.insert(id, new_state);
+            emit
+        };
+        if let Some(count) = emit {
+            crate::obs::breadcrumb("phantom-input-gated", &format!("id={id} count={count}"));
         }
     }
 
@@ -414,6 +451,69 @@ impl PtyManager {
             },
         );
         captured
+    }
+}
+
+/// Minimum spacing between `phantom-input-gated` breadcrumbs for the SAME
+/// pane (#496 N1 review). Un-throttled, arrow keys/Tab/Ctrl-nav/mouse-
+/// tracking wheel reports from a human ACTIVELY using a pane hit
+/// `note_user_input`'s gated branch on every single write — tens of
+/// file-opens per second while scrolling — and worse, the resulting flood of
+/// `id=<n>` lines dilutes and can rotate the mid-session copilot signal this
+/// breadcrumb exists to capture (plan §7) out of the 2 MB `breadcrumbs.log`
+/// before anyone goes looking, since it shares that log with every other
+/// pane's lifecycle events. Restricting emission to panes with an
+/// orchestration identity was the preferred alternative (per review), but
+/// that needs `note_user_input` (a `pty.rs`-owned, per-write hot path) to
+/// reach into orchestration's agent registry — real coupling into a
+/// different module's state, not just calling its already-shared pure
+/// classifier — so this throttle was chosen instead: it stays inside
+/// `pty.rs`, needs no new command wiring, and still bounds the log growth
+/// this finding is about. One line per pane per interval, carrying how many
+/// gated writes landed since the last line, keeps the *rate* visible without
+/// the flood.
+const PHANTOM_GATE_BREADCRUMB_MIN_INTERVAL_MS: u64 = 5_000;
+
+/// Pure throttle decision for the `phantom-input-gated` breadcrumb (#496 N1
+/// review). `state` is the pane's (gated-writes-since-last-emit,
+/// last-emit-unix-ms, or `None` if this pane has never emitted); `now_ms` is
+/// the current time. Returns `(Some(count_to_report), new_state)` when this
+/// write should emit (the count includes this write, and the counter resets
+/// to 0), or `(None, new_state)` when it should just accumulate silently
+/// until the interval has passed.
+///
+/// `last_emit_ms` is `Option`, not a bare `0` sentinel for "never emitted":
+/// stamping the pane's very first gated write always emits regardless of
+/// what `now_ms` happens to be, which a `0` sentinel only gets right by
+/// coincidence (`now_ms.saturating_sub(0)` clears any realistic interval only
+/// because real epoch-ms values are astronomically larger than the
+/// millisecond-scale interval — true in production, but it silently fails
+/// for small/synthetic `now_ms` values, exactly what a unit test needs to
+/// use so it isn't tied to wall-clock magnitudes).
+///
+/// Pulled out to a pure function, separate from `record_phantom_gate`'s
+/// locking and `obs::breadcrumb`'s file IO, so the rate-limit itself — the
+/// new logic this finding adds — is unit-testable with no filesystem
+/// involved at all (#496 N4 review: the breadcrumb's own disk write has no
+/// non-racy cross-crate test seam from an integration test — `obs.rs`'s
+/// `LOG_DIR_OVERRIDE` is `#[cfg(test)]`-internal to that crate's own unit
+/// tests, and mutating `LOOMUX_DATA_DIR` globally would race every other
+/// test in the same parallel binary — but this decision has no such
+/// dependency and can be driven directly).
+pub fn phantom_gate_tick(
+    state: (u64, Option<u64>),
+    now_ms: u64,
+) -> (Option<u64>, (u64, Option<u64>)) {
+    let (count, last_emit_ms) = state;
+    let count = count + 1;
+    let due = match last_emit_ms {
+        None => true,
+        Some(last) => now_ms.saturating_sub(last) >= PHANTOM_GATE_BREADCRUMB_MIN_INTERVAL_MS,
+    };
+    if due {
+        (Some(count), (0, Some(now_ms)))
+    } else {
+        (None, (count, last_emit_ms))
     }
 }
 
@@ -1026,6 +1126,7 @@ pub fn spawn_pty(
     // never noticed the pane).
     let ptys = state.ptys.clone();
     let expected_exits = state.expected_exits.clone();
+    let neutral_gate_throttle = state.neutral_gate_throttle.clone();
     std::thread::spawn(move || {
         let status = child.wait();
         // Snapshot the removed handle's output BEFORE it's dropped (#281): the
@@ -1043,6 +1144,7 @@ pub fn spawn_pty(
             None => (String::new(), 0),
         };
         let expected = expected_exits.lock_safe().remove(&id);
+        neutral_gate_throttle.lock_safe().remove(&id); // #496 N1: no leak per pty ever opened
         let exit_code = status.ok().map(|s| s.exit_code());
         crate::obs::breadcrumb(
             "pty-exit",
