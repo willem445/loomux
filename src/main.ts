@@ -93,6 +93,12 @@ import {
   type SessionRecord,
 } from "./sessionreconcile";
 import { planGroupResume } from "./groupresume";
+import {
+  IDLE_RESTORE_CARD_STATE,
+  errorRestoreCardState,
+  nextRestoreCardState,
+  type RestoreCardState,
+} from "./restorecard";
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -641,18 +647,30 @@ async function openActionPane(
         embeds: [],
       };
       let pane: Pane;
-      const content = dormantCard(
-        "Start",
-        a.name,
-        "This agent had no resumable session — start it fresh in its folder.",
-        () => {
-          // startFromDormant tears the card down synchronously, so a second click
-          // can't re-fire; notify once it's live so the counter reflects it. This is
-          // copilot's own restore path (it never gets a recorded session id — see
-          // launcher.ts:1321 — so it always lands here, never resume/fresh-agent),
-          // and its recorded command can carry the SAME dead solo-identity MCP
-          // flags (#439) — re-mint before replaying, just like resume/fresh-agent.
-          void (async () => {
+      // #479 B: this card's whole reason for existing IS "no resumable
+      // session" — mount it directly in the error visual (red accent,
+      // warning icon) rather than the same neutral gray a plain "Resume
+      // group" card uses, so the two are no longer visually indistinguishable
+      // (the human's own complaint). The diagnostic wording is unchanged;
+      // only the styling and the failure-handling below are new.
+      const content = dormantCard({
+        action: "Start",
+        pendingLabel: "Starting…",
+        errorTitle: "Not available to resume",
+        title: a.name,
+        body: "This agent had no resumable session — start it fresh in its folder.",
+        initial: errorRestoreCardState("This agent had no resumable session — start it fresh in its folder."),
+        onClick: async () => {
+          // startFromDormant tears the card down synchronously on success, so a
+          // second click can't re-fire; notify once it's live so the counter
+          // reflects it. This is copilot's own restore path (it never gets a
+          // recorded session id — see launcher.ts:1321 — so it always lands
+          // here, never resume/fresh-agent), and its recorded command can carry
+          // the SAME dead solo-identity MCP flags (#439) — re-mint before
+          // replaying, just like resume/fresh-agent. Wrapped in try/catch
+          // (#479 A): a failed start must land the card on its error state,
+          // never an unhandled rejection behind a spinner stuck forever.
+          try {
             const remint = await remintSoloIdentity(
               a.name,
               a.cwd ?? undefined,
@@ -677,9 +695,12 @@ async function openActionPane(
               });
             }
             onGridChanged();
-          })();
-        }
-      );
+            return { ok: true };
+          } catch (err) {
+            return { ok: false, message: String(err) };
+          }
+        },
+      });
       pane = ws.grid.openDormantPane(events, record, content, dir, anchor);
       // #440 D2: this card has NO recorded session id (that's exactly why it's
       // dormant) — but the pane's cwd might still have a matching transcript the
@@ -833,51 +854,109 @@ async function openActionPane(
         // they belong to is actually resumed.
         embeds: a.embeds,
       };
-      const content = dormantCard(
-        "Resume group",
-        a.name,
-        "Orchestration group — dormant. Resume brings the whole group back; no agents run until you do.",
-        (btn) => {
-          // In-flight guard (#194 P4 MED-3): resumeDormantGroup awaits, and the
-          // card stays until it succeeds — a second click while it's running could
-          // double-create the group (two orchestrator PTYs), the exact double-spawn
-          // the contract forbids. Disable on first click; re-enable only on failure
-          // (success disposes the card).
-          if (btn.disabled) return;
-          btn.disabled = true;
-          void resumeDormantGroup(ws).finally(() => {
-            btn.disabled = false;
-          });
-        }
-      );
+      const content = dormantCard({
+        action: "Resume group",
+        pendingLabel: "Resuming…",
+        errorTitle: "Couldn't resume this group",
+        title: a.name,
+        body: "Orchestration group — dormant. Resume brings the whole group back; no agents run until you do.",
+        // In-flight guard (#194 P4 MED-3): resumeDormantGroup awaits, and the
+        // card's own state machine holds "pending" until it settles — a second
+        // click while it's running is a no-op (nextRestoreCardState), not a
+        // double-create of the group (two orchestrator PTYs), the exact
+        // double-spawn the contract forbids. #479: unlike the old bare
+        // disable/re-enable, a genuine failure now lands on the card's error
+        // state (red, the diagnostic message from resumeDormantGroup) instead
+        // of silently reverting to the same neutral "Resume group" card with
+        // only a toast to show for it.
+        onClick: () => resumeDormantGroup(ws),
+      });
       return ws.grid.openDormantPane(events, record, content, dir, anchor);
     }
   }
 }
 
-/** The small card a dormant restore placeholder renders: a title, a one-line
- *  explanation, and the single action (Start / Resume group). The click handler
- *  receives the button so it can guard against a double-fire (MED-3). */
-function dormantCard(
-  action: string,
-  title: string,
-  body: string,
-  onClick: (btn: HTMLButtonElement) => void
-): HTMLElement {
+/** What a dormant card's action resolves to: success (the caller almost
+ *  always tears the whole card down right after, replacing it with a live
+ *  pane) or a failure with the diagnostic to show. Never a bare throw — every
+ *  call site below catches its own errors into this shape so a restore
+ *  failure always lands on the card's error state (#479) rather than an
+ *  unhandled rejection with a spinner stuck behind it. */
+type RestoreCardResult = { ok: true } | { ok: false; message: string };
+
+/** Options for `dormantCard` (#479 rework): the same small card a dormant
+ *  restore placeholder renders — title, one-line explanation, single action —
+ *  now driven by `restorecard.ts`'s pure state machine instead of a bare
+ *  disable/re-enable, so BOTH halves of #479 are one component:
+ *   (A) the click is acknowledged immediately (pending: spinner, disabled,
+ *       "click did nothing" is no longer a real possibility to worry about);
+ *   (B) a failure lands on a persistent, visually distinct error card — red
+ *       accent, warning icon, a heading that says so — carrying the
+ *       diagnostic `message` (never traded away for a cleaner-looking card,
+ *       #440) and a retry of the same action, never a spinner that just
+ *       quietly reverts to looking like nothing happened.
+ *  `initial` lets a card that already KNOWS at mount time it has nothing to
+ *  resume (the dormant-agent "no resumable session" card) start directly in
+ *  the error visual — no click needed to discover that. */
+function dormantCard(opts: {
+  action: string;
+  title: string;
+  body: string;
+  onClick: () => Promise<RestoreCardResult>;
+  initial?: RestoreCardState;
+  /** Heading shown while in the error state; defaults to `title`. */
+  errorTitle?: string;
+  /** Button label while pending; defaults to `action`. */
+  pendingLabel?: string;
+}): HTMLElement {
+  let state = opts.initial ?? IDLE_RESTORE_CARD_STATE;
+
   const wrap = document.createElement("div");
   wrap.className = "dormant-card";
+  const icon = document.createElement("div");
+  icon.className = "dormant-icon";
+  icon.textContent = "⚠"; // warning triangle — CSS shows it only in the error tone
+  icon.setAttribute("aria-hidden", "true");
   const h = document.createElement("div");
   h.className = "dormant-title";
-  h.textContent = title;
   const p = document.createElement("div");
   p.className = "dormant-body";
-  p.textContent = body;
   const btn = document.createElement("button");
   btn.className = "dormant-btn";
   btn.type = "button";
-  btn.textContent = action;
-  btn.addEventListener("click", () => onClick(btn));
-  wrap.append(h, p, btn);
+  const spinner = document.createElement("span");
+  spinner.className = "dormant-spinner";
+  spinner.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "dormant-btn-label";
+  btn.append(spinner, label);
+
+  const render = (): void => {
+    wrap.classList.toggle("dormant-card-error", state.status === "error");
+    h.textContent = state.status === "error" ? (opts.errorTitle ?? opts.title) : opts.title;
+    // The diagnostic detail (#440) IS the error message once one exists;
+    // outside "error" this is just the card's normal one-line explanation.
+    p.textContent = state.status === "error" && state.message ? state.message : opts.body;
+    btn.disabled = state.status === "pending";
+    label.textContent =
+      state.status === "pending" ? (opts.pendingLabel ?? opts.action) : opts.action;
+  };
+  render();
+
+  btn.addEventListener("click", () => {
+    const next = nextRestoreCardState(state, { type: "click" });
+    if (next === state) return; // already pending — ignore the re-entrant click (#194 P4 MED-3)
+    state = next;
+    render();
+    void opts.onClick().then((result) => {
+      state = result.ok
+        ? nextRestoreCardState(state, { type: "settle" })
+        : nextRestoreCardState(state, { type: "fail", message: result.message });
+      render();
+    });
+  });
+
+  wrap.append(icon, h, p, btn);
   return wrap;
 }
 
@@ -933,15 +1012,15 @@ const resumingGroups = new Set<string>();
  *  members are reported and skipped; the orchestrator can respawn them on demand.
  *  Members of the group that were NOT open at close stay dead — they remain
  *  resumable later from the session browser (out of scope here, by design). */
-async function resumeDormantGroup(ws: Workspace): Promise<void> {
+async function resumeDormantGroup(ws: Workspace): Promise<RestoreCardResult> {
   const groupId = tabs.groupForWorkspace(ws.id);
   if (!groupId) {
     sessions.toggle(); // no binding to resume from — let the human pick a session
-    return;
+    return { ok: true };
   }
   // Another card of this same group is already resuming — the whole group comes
   // back at once, so ignore the duplicate rather than re-run the multi-pane resume.
-  if (resumingGroups.has(groupId)) return;
+  if (resumingGroups.has(groupId)) return { ok: true };
   resumingGroups.add(groupId);
   try {
     // The member set is the CAPTURED orch panes — the tab's dormant ORCH
@@ -996,7 +1075,7 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
         "info"
       );
       sessions.toggle();
-      return;
+      return { ok: true };
     }
 
     let resumableIds = new Set<string>();
@@ -1011,14 +1090,14 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
     if (!plan.orchestrator) {
       // A stale orchestrator (transcript gone) is gated the same way delegates are:
       // fall back to the browser rather than relaunch into a dead orchestrator pane.
-      showToast(
-        plan.orchestratorUnresumable
-          ? "This group's orchestrator session has no saved conversation to resume — open the session browser."
-          : "No captured orchestrator session for this group — open the session browser.",
-        "info"
-      );
+      // #479 B: this IS a "no resumable session" outcome for this card's own
+      // action — the error state is warranted, not just a toast + redirect.
+      const message = plan.orchestratorUnresumable
+        ? "This group's orchestrator session has no saved conversation to resume — open the session browser."
+        : "No captured orchestrator session for this group — open the session browser.";
+      showToast(message, "info");
       sessions.toggle();
-      return;
+      return { ok: false, message };
     }
 
     const preexisting = ws.grid.allPanes();
@@ -1036,8 +1115,11 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
       }
     } catch (err) {
       // Recoverable (retry the button) — a toast, not the app-crash banner (MED-3).
-      showToast(`Couldn't resume group: ${String(err)}`, "error");
-      return;
+      // #479: the card itself now also lands on its error state carrying this
+      // same message, so the failure is still visible after the toast fades.
+      const message = String(err);
+      showToast(`Couldn't resume group: ${message}`, "error");
+      return { ok: false, message };
     }
     // 2. Rejoin each resumable delegate INTO the now-live group. Sequential (not
     //    concurrent) so the group settles live before each rejoin and we don't
@@ -1088,6 +1170,7 @@ async function resumeDormantGroup(ws: Workspace): Promise<void> {
       if (p.isDormant && p.dormantKind === "orch") ws.grid.closePane(p, false);
     }
     persistTabs();
+    return { ok: true };
   } finally {
     resumingGroups.delete(groupId);
   }

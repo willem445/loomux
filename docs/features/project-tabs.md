@@ -130,7 +130,11 @@ divider positions you'd dragged. Each pane comes back by kind:
   the transcript was deleted), the pane comes back as a **fresh** session in the
   same spot — same folder, same agent — instead of erroring; a best-effort CLI
   with no resumable session at all comes back as a dormant pane with a **Start**
-  button.
+  button. That card is styled as a clear error state — a red accent, a warning
+  icon, and a heading that says so — not just another neutral dormant card,
+  since "nothing to resume" is worth noticing rather than looking identical to
+  a group that's simply waiting for a click; the explanation of what happened
+  stays visible underneath, and **Start** is still the prominent next action.
 - **Orchestration panes** come back **dormant**, with a **Resume group** button —
   reviving a whole group can spawn workers and spend credits, so that stays a
   deliberate, human-triggered action. The tab keeps its group binding and shows
@@ -140,7 +144,15 @@ divider positions you'd dragged. Each pane comes back by kind:
   resumes into its idle TUI — re-registered so the orchestrator can message it,
   and spending nothing until it's given work. An idle agent that never started a
   conversation isn't restored (there's nothing to resume); the orchestrator can
-  respawn one on demand.
+  respawn one on demand. Clicking **Resume group** is acknowledged immediately —
+  the button disables and spins right away, before the relaunch (session lookup,
+  MCP config, PTY spawn, CLI boot) finishes — so there's no dead-feeling pause
+  where nothing on screen tells you the click landed. If the group's orchestrator
+  session turns out not to be resumable, the card switches to the same error
+  styling as the agent case above (with the specific reason) instead of quietly
+  reverting to looking like an untouched "Resume group" card; a toast covers the
+  in-the-moment notice, and the card itself is what's still there if you come
+  back to the tab later.
 
 **Start fresh** opens a single blank welcome tab and leaves the rest behind.
 

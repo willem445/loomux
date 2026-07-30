@@ -959,3 +959,72 @@ design-intake reply that scoped this PR:**
   every restore, never replayed — #442) or don't have a second instance yet
   to generalize from; widening the store ahead of a second real need would
   be speculative generality this PR doesn't have evidence for.
+
+### #479 — restore UX: click feedback, an unmistakable error state, and where the latency actually was
+
+Two complaints about the same screen: clicking **Resume group** on an
+orchestrator agent session had a visible lag with nothing on screen to show
+the click had registered, and the dormant-agent **Start** card ("no
+resumable session") was visually just another neutral dormant card — no
+more alarming-looking than "Resume group" waiting for a click, even though
+one of them means something is actually wrong.
+
+**Where the latency was — measured, not guessed.** `resume_recorded_session`
+(`orchestration/mod.rs`) looked up which group/role a session id belongs to
+by calling `session_roles()` unconditionally — a scan of **every** group
+ever created on this machine, live or long dead: each one's `group.json` and
+`tasks.json` read and parsed, plus its **full audit log** (`records_from_
+audit`) read and every line parsed, just to throw away every row but the one
+actually being resumed. The dormant-group Resume button always already knows
+which group it's resuming (`hint: (group_id, role)`, threaded through since
+#412) — that hint went unused for this lookup, so a resume click's latency
+scaled with the total history on the machine, not with the one group being
+restored. `session_role_in_group` (new, `orchestration/mod.rs`) reads and
+merges only the hinted group; a miss (a stale/wrong hint) falls through to
+the unchanged full scan, so a correct hint can only make this faster, never
+change what a resume resolves to. Measured in
+`resume_recorded_session_group_hint_avoids_scanning_every_other_group`
+(`tests/orchestration.rs`, 200 decoy groups × 300 audit lines each,
+red-before-green against the fast path disabled): **419ms → 42ms** on one
+dev machine, debug build — the remaining time is the orchestrator relaunch's
+own unavoidable work (MCP config mint, instruction/hook files), not session
+lookup. CLI boot time itself (the other component the issue calls out) is
+not loomux's to remove or measure — never spawn a real agent CLI to
+benchmark it (CLAUDE.md hard constraint 3); the fix here is scoped to the
+part loomux actually controls.
+
+**Feedback and the error state are one component, not two.** `restorecard.ts`
+(new) is a small, DOM-free state machine — `idle --click--> pending`,
+`pending --fail--> error`, `error --click--> pending` (retry), `* --settle-->
+idle` — unit-tested in `test/restorecard.test.ts`. `main.ts`'s `dormantCard`
+wires it to the actual card DOM:
+
+- A click is acknowledged **immediately**: the button disables and a spinner
+  shows the instant `nextRestoreCardState` returns `pending`, before the
+  underlying `onClick` (which does the real work — session lookup, MCP mint,
+  PTY spawn, CLI boot) has resolved at all. A second click while pending is a
+  no-op (the transition table returns the SAME state object), generalizing
+  the #194 P4 MED-3 double-spawn guard past its original single call site.
+- A failure **always** lands on the error state — red accent, a warning
+  icon, a heading that says so (e.g. "Couldn't resume this group") — never a
+  spinner that quietly clears back to looking like an untouched card. The
+  diagnostic message (what `resumeDormantGroup`/`startFromDormant` actually
+  threw) rides into the card's body text unchanged — the #440 lesson
+  generalized: diagnostic detail is what makes a wrongly-unresumable session
+  diagnosable, so it's never traded away for a cleaner-looking card.
+- The dormant-agent **Start** card mounts directly in the error state
+  (`errorRestoreCardState`) — it doesn't need a failed click to discover it
+  has nothing to resume, it already knows that at render time. `resumeDormant
+  Group`'s call sites were also reclassified: "no binding to resume from" /
+  "nothing captured" redirect to the session browser and settle back to idle
+  (nothing wrong with *this* card, the human's focus just moved), but "this
+  group's orchestrator session has no saved conversation" and a thrown
+  `resumeOrchSession` failure now return `{ok: false, message}` and land on
+  the error state — that IS a "no resumable session" outcome for this card's
+  own action, not a redirect.
+
+Both halves share the same `RestoreCardResult` (`{ok: true} | {ok: false,
+message: string}`) return shape from every dormant-card `onClick`, including
+`startFromDormant`'s call site, which previously had **no** error handling
+at all (an uncaught rejection on a rare spawn failure) — now caught and
+surfaced the same way.
