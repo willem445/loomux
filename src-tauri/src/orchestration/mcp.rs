@@ -286,7 +286,7 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
                     "text": { "type": "string" },
                 }),
                 &["agent_id", "text"]),
-            tool("get_output", "Read the last N lines of an agent's terminal (ANSI-stripped).",
+            tool("get_output", "Read the last N lines of an agent's terminal (ANSI-stripped; repeated spinner/redraw frames collapsed to one, so N still means N distinct lines on a busy, animated pane).",
                 json!({
                     "agent_id": { "type": "string" },
                     "lines": { "type": "integer", "description": "default 60, max 500" },

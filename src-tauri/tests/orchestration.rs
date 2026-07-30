@@ -30,7 +30,7 @@ use loomux_lib::orchestration::{
     auto_compact_banner_detected, compact_nudge_poll_interval, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
     human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
-    exit_cause, exit_diagnostic, resolve_output_text,
+    exit_cause, exit_diagnostic, resolve_output_text, format_output_tail,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_cmd, gh_shim_sh, git_shim_cmd, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
@@ -1434,6 +1434,95 @@ fn deliver_prompt_front_door_propagates_the_synchronous_full_error() {
 fn strip_ansi_removes_csi_osc_and_controls() {
     let raw = b"\x1b[31mred\x1b[0m and \x1b]0;title\x07plain\r\nnext";
     assert_eq!(strip_ansi(raw), "red and plain\nnext");
+}
+
+// #480/#496 PR-E: `get_output` on a pane mid-animation (a long-running
+// "thinking" turn, a compaction spinner) returns thousands of tokens of
+// near-identical redraw lines, because each repaint survives `strip_ansi`
+// as its own "line" — the same shape documented at `auto_compact_banner_
+// substrings` above (`✻ Thinking… (esc to interrupt · Ns · ↑ M tokens)`:
+// a leading glyph and a trailing elapsed-time/token-count suffix that both
+// change every repaint, wrapped around a stable core). A caller asking for
+// a small `lines` budget to see recent history gets back nothing but the
+// spinner burst — the informational content from *before* the burst is
+// pushed out even though it would easily fit the same budget once the
+// repeats collapse to one entry.
+fn spinner_garbled_fixture() -> String {
+    let mut s = String::new();
+    for i in 1..=5 {
+        s.push_str(&format!("real line {i}\n"));
+    }
+    // A long animated turn: ~200 redraws of the same spinner, each textually
+    // distinct (elapsed seconds + token count tick up every frame) so a
+    // byte-for-byte line dedup would never catch it — only the stable core
+    // ("Thinking…") repeating is the actual signal.
+    for i in 1..=200 {
+        s.push_str(&format!("✻ Thinking… (esc to interrupt · {i}s · ↑ {} tokens)\n", i * 7));
+    }
+    s
+}
+
+#[test]
+fn get_output_tail_is_not_swamped_by_a_spinner_burst() {
+    // A caller triaging a busy pane asks for a modest budget (well under the
+    // ~200-line spinner burst) expecting to see recent REAL activity, not
+    // 200 near-identical redraws. Before spinner-frame collapsing this is
+    // exactly what happens: the last 8 raw lines are 100% spinner, and the
+    // five real lines that led up to it are invisible at this budget —
+    // this is the actual reported cost (#480/#496 section 4 point 4), not a
+    // hypothetical. This assertion is a behavior check against `format_
+    // output_tail` as it exists right now (pre-collapsing): it fails today.
+    let fixture = spinner_garbled_fixture();
+    let out = format_output_tail(&fixture, 8);
+    assert!(
+        out.contains("real line 5"),
+        "a small `lines` budget must still be able to reach real content \
+         behind a spinner burst once repeats collapse — got only spinner \
+         noise:\n{out}"
+    );
+    // Collapsing must never LOSE the freshest frame — that's the one a
+    // triager actually needs to know the pane is still alive and how far
+    // along it is.
+    assert!(
+        out.contains("200s") || out.contains("↑ 1400 tokens"),
+        "the most recent spinner frame must survive collapsing, got:\n{out}"
+    );
+}
+
+#[test]
+fn get_output_tail_never_merges_genuinely_different_lines() {
+    // Conservatism check: two lines that share a leading glyph but say
+    // different things (not a redraw of the same frame) must both survive,
+    // verbatim, never merged into one just because they look similar.
+    let fixture = "✻ Thinking about the plan…\n✻ Thinking about the tests…\n\
+                   ✻ Thinking about the tests…\n✻ Thinking about the tests…\n";
+    let out = format_output_tail(fixture, 10);
+    assert!(out.contains("Thinking about the plan…"), "distinct line dropped, got:\n{out}");
+    assert!(out.contains("Thinking about the tests…"), "distinct line dropped, got:\n{out}");
+    // The genuine repeat (three consecutive identical cores) collapses to
+    // one entry plus a marker, never silently vanishes.
+    assert!(
+        out.to_lowercase().contains("collaps"),
+        "a collapsed run must say so, not disappear silently, got:\n{out}"
+    );
+}
+
+#[test]
+fn get_output_tail_never_merges_code_lines_that_only_differ_inside_parens() {
+    // #501 review finding N1 (rev-29): a worker pane's tail is full of code
+    // listings, rustc diagnostics, and function signatures — lines that are
+    // genuinely different but happen to end in `)` and share a prefix. None
+    // of these begin with a spinner-style leading glyph, so the trailing-
+    // paren strip must never touch them: gating that strip on "did this line
+    // actually have a leading glyph stripped" is what fixes it.
+    let fixture = "fn parse(input: &str)\nfn parse(input: &[u8])\n";
+    let out = format_output_tail(fixture, 10);
+    assert!(out.contains("fn parse(input: &str)"), "distinct signature dropped, got:\n{out}");
+    assert!(out.contains("fn parse(input: &[u8])"), "distinct signature dropped, got:\n{out}");
+    assert!(
+        !out.to_lowercase().contains("collaps"),
+        "two genuinely different lines must never be mislabeled as repeated frames, got:\n{out}"
+    );
 }
 
 #[test]
