@@ -4172,11 +4172,13 @@ retries has already survived the pre-Enter checkpoint, so this rarely compounds 
 replaces that hold. Deliveries are serialized
 per pane by the existing `delivery` mutex (`std::sync::Mutex`, not FIFO on Windows — see the #43
 section's own "Ordering is best-effort" note, which this compounds rather than introduces), so N
-queued deliveries to the same pane can each stall for up to this chain and release out of send
-order. Accepted for the same reason the #43 note already accepts its narrower version: correctness
-(never blind-select an option) matters more than strict ordering here, and the alternative — a
-shorter cap — directly trades away the time a human plausibly needs to notice and answer a
-substantive question.
+queued deliveries to the same pane can each stall for up to this chain. **Superseded by #445/#470:**
+the "release out of send order" consequence this paragraph originally accepted no longer holds — the
+delivery QUEUE (not this mutex) is what now owns arrival order, structurally, regardless of how long
+any individual hold in the chain above runs; see "Delivery queue (#445)"'s "Ordering" subsection.
+This mutex remains exactly what it always was for the *latency* concern this paragraph is about
+(each delivery can still individually stall for the full chain) — only the ordering consequence is
+superseded.
 
 **Orchestrator-target hold is silently dropped (rev-15 N6, pre-existing, more reachable now).**
 `should_notify_paste_held(true)` suppresses the held-delivery notice when the target IS the
@@ -4362,36 +4364,40 @@ is the impure half.
   must all deliver — only a literal repeat is provably redundant), so it collapses exact repeats
   and leaves everything else to the sender. Each drain's first delivered `Text` entry carries a
   flush header (`queue::flush_header_text`) reporting how many were queued and how many collapsed.
-- **Ordering — stated to match what's actually proven, not asserted.** FIFO by enqueue time WITHIN
-  the queue itself is unconditional (`VecDeque::push_back`/`pop_front`, proven by the front-door
-  and single-consumer-drain tests). The stronger claim — that arrival order across the WHOLE pane,
-  including deliveries still in flight on the mutex, is preserved — holds for exactly **two**
-  simultaneously contending deliveries (rev-35's own reported scenario, generalized: with only two
-  contenders there is at most one waiter for the delivery mutex at any moment, so mutex-acquisition
-  order and arrival order coincide by construction, and the pre-paste recheck above closes the only
-  remaining gap). It is mutation-verified exhaustively over every reachable interleaving of
-  arrival/hold/release for two deliveries (`queue.rs`'s `b1_ordering_property` module).
-  **It is NOT proven, and is not true, for three or more simultaneously contending deliveries** —
-  `std::sync::Mutex` grants to waiters in an unspecified order, so if a third delivery arrives while
-  two others are already waiting on the mutex with the queue still empty, the ORDER in which those
-  two eventually get their turn (and therefore which of them enqueues first) is not guaranteed to
-  match arrival order, independent of anything the recheck does. `queue.rs`'s exhaustive search
-  finds this residual at three contenders even with the fix fully applied, and pins it as a known,
-  documented gap (`three_way_contention_can_still_invert_arrival_order_known_residual`) rather than
-  claiming a property that isn't achievable by a localized fix — closing it for real would mean
-  replacing raw mutex contention with a genuine FIFO ticket for ACQUIRING the delivery mutex itself,
-  a materially larger change filed as a follow-up rather than built here. In practice this residual
-  requires three-plus deliveries to a SINGLE pane to all arrive within the same seconds-scale
-  pre-paste-hold window — narrower than the two-delivery shape the live incident actually showed,
-  but real, and stated here rather than left for the next reader to discover the hard way.
-  **A second, independent mechanism can ALSO invert arrival order at three-plus contenders, and a
-  fair mutex would not close it:** when the paste-point recheck defers an in-flight delivery to the
-  queue's TAIL, that delivery loses its original arrival position, so a delivery that arrived LATER
-  and enqueues via the front door in the interim can end up ordered ahead of it — proven (rev-35,
-  round 2) using this very model run under a *simulated fair lock*, specifically to show the
-  mutex-fairness fix alone does not subsume it. #470 has been widened to cover both mechanisms
-  together (a fair lock is necessary, not sufficient); do not read the ticket-lock fix described
-  above as the whole answer to three-plus-contender ordering.
+- **Ordering — closed for real by #470, not merely widened.** As originally shipped, this section
+  described a proven gap: arrival order across a whole pane (not just within the queue) held for
+  exactly two simultaneously contending deliveries, and was proven NOT to hold for three or more,
+  because a fresh, empty-queue delivery raced a raw per-pty `std::sync::Mutex` for the right to
+  attempt a direct paste — `std::sync::Mutex` grants to waiters in an unspecified order, so which of
+  several simultaneous waiters got served first was independent of arrival order. #470 was filed to
+  close that gap and, on review (round 2), was RE-SCOPED before any fix shipped: a reviewer proved,
+  using this very exhaustive-interleaving model run under a *simulated fair lock*, that simply
+  making the mutex fair is insufficient — the paste-point recheck's own "defer an in-flight
+  delivery to the queue's TAIL" step loses that delivery's arrival position whenever a LATER
+  arrival used the old front door's separate "queue already non-empty → append directly" path,
+  which never touched the mutex, fair or not, at all (NB-A). As filed, #470 would have shipped a
+  fair lock, declared ordering solved, and been wrong.
+  **What actually closes it: unify admission, don't fair the lock.** `deliver_prompt`'s front door no
+  longer has two admission paths to lose position between. EVERY delivery — including ones that end
+  up pasting with zero added latency — is pushed onto the SAME `VecDeque`, atomically with the check
+  for whether the queue was empty (`enqueue_text`'s `was_first`, decided under one lock acquisition
+  that can never observe two different answers for two racing pushes). Only the push that observes
+  an empty queue is responsible for starting `run_queue_drainer` (now the ONLY caller of
+  `deliver_now`, for both the fast/uncontended case and every replay); every other push, regardless
+  of why it arrived when it did, is already correctly positioned behind whatever got there first.
+  There is no more "defer to tail" step for a position to be lost at — a delivery's place in the
+  queue is fixed the instant it's admitted and never moves until it's delivered — and the raw
+  per-pty `Mutex<()>` `deliver_now` still locks is now redundant defense-in-depth (only one thread
+  is ever running `deliver_now` for a given pty at a time, enforced by `queue_draining`), not the
+  ordering mechanism. `queue.rs`'s `unified_admission_property` module proves this exhaustively at
+  three, four, and five simultaneous contenders (no ceiling — unlike the old algorithm, FIFO-by-
+  construction doesn't get harder at higher N) and is mutation-verified (a one-line "pop from the
+  back instead of the front" mutation reliably produces violations the same checker catches). The
+  formerly-open residual test, `b1_ordering_property::three_way_contention_can_still_invert_
+  arrival_order_known_residual`, is kept UNMODIFIED (it still correctly proves the OLD, now-replaced
+  algorithm has the gap) rather than deleted or silently repurposed — see that module's doc for why,
+  and `unified_admission_property::unified_admission_closes_ordering_at_three_contenders` for the
+  same property, same contender count, now proven closed under the new mechanism.
 
 **Notice vocabulary — part of the fix.** The old text ("held: pane has human input — re-send when
 clear") is deleted along with `paste_held_notice`/`question_held_notice`/`held_delivery_notice`/
@@ -4463,10 +4469,12 @@ note names for the same reason: `deliver_prompt`'s thread body requires a live T
 and a real pty (`tauri::test`'s `MockRuntime` isn't the concrete `Wry` runtime this code needs),
 and CLAUDE.md constraint 3 forbids spawning a real agent CLI to get one. So `run_queue_drainer` and
 `deliver_now`'s full pipeline are NOT exercised by the test suite — what IS covered, and to what
-depth: `queue.rs`'s pure policy (admit/cap/coalesce/notice text/orphan-scan/`queue_is_non_empty`)
-unit-tested in isolation, including an exhaustive-interleaving model of the B1 recheck fix (proven
-mutation-verified for two contenders, and a DOCUMENTED, asserted-not-hidden gap at three — see
-"Ordering", above); the registry-level bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
+depth: `queue.rs`'s pure policy (admit/cap/coalesce/notice text/orphan-scan) unit-tested in
+isolation, including two exhaustive-interleaving models — `b1_ordering_property` (kept as a
+historical record of the pre-#470 mutex-race algorithm and its proven two-contender fix /
+three-contender residual) and `unified_admission_property` (#470's replacement mechanism, proven
+mutation-verified at three, four, and five contenders — see "Ordering", above); the registry-level
+bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
 `pop_front_dequeued`, `drop_queue`, `queue_orphans`, the front-door check reaching `deliver_prompt`
 with no app handle at all) integration-tested end to end against a real `OrchRegistry` and a real
 `audit.jsonl`; the notice-suppression discipline (`notify_queue`) tested directly. The drainer's
@@ -4491,14 +4499,22 @@ tier was caught by:
    paste) rather than racing D1. Answer the question only after D1's hold has timed out and
    enqueued. Verify D1 delivers before D2 (`delivery-dequeued` for D1's id precedes D2's), never the
    inverted order the review reported.
+8. **#470's three-contender scenario, live:** from three different senders (e.g. two workers and
+   loomux itself), fire three prompts at the SAME blocked pane within the same few-hundred-ms
+   window, in a known order D1/D2/D3. Verify `delivery-queued` audit lines land with ids in the
+   SAME order the sends were issued (not merely that all three eventually land), and that draining
+   after the block clears produces `delivery-dequeued` in that same D1/D2/D3 order.
 
 **Follow-ups filed at PR time, not built here:** wiring `queue_orphans` into the orchestrator's
 session-start re-sync (the persistence-gap closer, above, #467); on-disk queue durability (#468);
-a PR-C queued-count pane badge on the existing `orch-delivery-held` event seam; the three-plus-
-simultaneous-contenders ordering residual named under "Ordering" above (#470 — discovered as a
-mutex-fairness gap while building this PR's exhaustive-interleaving test, then WIDENED on review
-(round 2) once a second, independent mechanism — defer-to-tail position loss — was proven to
-survive a fair lock; #470 now covers both, since a ticket lock alone would not have closed it).
+a PR-C queued-count pane badge on the existing `orch-delivery-held` event seam.
+
+**#470 — the three-plus-simultaneous-contenders ordering residual, since closed.** Discovered as a
+mutex-fairness gap while building this PR's exhaustive-interleaving test, then RE-SCOPED on review
+(round 2) once a second, independent mechanism — defer-to-tail position loss (NB-A) — was proven to
+survive a fair lock. Closed by unifying admission rather than by widening the fair-lock fix; see
+"Ordering", above, for the full argument and `queue.rs`'s `unified_admission_property` module for
+the exhaustive proof.
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
@@ -4524,16 +4540,17 @@ pasted+submitted **atomically** (whole, never interleaved). The CLI's own input 
 being shared, so by construction your prompt can't be contaminated and can't contaminate a
 report. Everything lands in the audit log (`prompt`, `from: human`).
 
-- *Ordering is best-effort, not a strict FIFO guarantee.* The correctness property is
-  atomicity — each message lands whole. Order is **not** guaranteed under rapid concurrent
-  sends: `deliver_prompt` spawns a thread per delivery that contends for the per-pty `delivery`
-  `std::sync::Mutex`, which is not fair/FIFO (SRWLOCK on Windows), so two sub-second sends — or a
-  steer racing a report — can acquire the lock out of submission order. Nothing is lost or
-  corrupted (mutual exclusion still holds); only the relative order of near-simultaneous
-  messages may flip. A strict arrival sequence would mean threading a monotonic seq/queue
-  through the shared `deliver_prompt` hot path (used by *every* delivery source — kickoffs,
-  reports, watchdog nudges, steer); not worth it for a low-impact reorder window the human can
-  avoid by letting one message land (visible in the pane) before sending a dependent correction.
+- *Ordering — this section's original tradeoff, since superseded (#445/#470).* This bullet
+  originally accepted best-effort ordering here on the grounds that threading a monotonic
+  seq/queue through the shared `deliver_prompt` hot path "wasn't worth it for a low-impact reorder
+  window." #445 threaded exactly that queue through anyway, for a different, higher-stakes reason
+  (a hold-cap timeout was DESTROYING payloads, not just reordering them), and #470 finished the job
+  by making every admission — including this strip's own steer sends — go through it: `deliver_prompt`
+  now admits EVERY delivery into `pty_id`'s `VecDeque` atomically with the check for whether it's
+  the first, so two sub-second sends (a steer racing a report) land, and drain, in the order they
+  were admitted — not the order the per-pty `delivery` mutex happened to grant. See "Delivery queue
+  (#445)"'s "Ordering" subsection for the proof. Atomicity (each message lands whole) was always the
+  correctness property this strip's own C/A design depended on and remains true regardless.
 
 - *Keyboard routing.* The strip is a plain DOM input, **not** part of xterm, so it never
   steals the terminal's keys — keystrokes only reach it while it holds focus. `Alt+P`

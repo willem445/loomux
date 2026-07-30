@@ -19,17 +19,23 @@
 //! action required.
 //!
 //! Everything in this module is a plain function over plain data — no
-//! registry, no `gh` — with ONE deliberate exception: `queue_is_non_empty`
-//! takes the live queue-map lock directly, because it is the single
-//! decision BOTH the front door and `deliver_now`'s pre-paste recheck must
-//! consult (rev-35 review, B1) — splitting it into "pure decision" plus
-//! "impure caller" would let the two checkpoints drift to different
-//! definitions of "this pane is already spoken for," which is exactly the
-//! class of bug it exists to prevent. See `notify.rs`'s module doc for why
-//! this codebase otherwise splits every backend feature this way (pure
-//! policy here, impure wiring in `mod.rs`) and `doc/design/orchestration.md`'s
-//! "Delivery queue (#445)" section for the full design rationale, including
-//! the honestly-argued limits of the in-memory choice.
+//! registry, no `gh`. Pre-#470, this module carried one deliberate
+//! exception (`queue_is_non_empty`, taking the live queue-map lock
+//! directly) because two SEPARATE checkpoints — the front door and
+//! `deliver_now`'s pre-paste recheck — both had to consult the identical
+//! live state or drift to different definitions of "this pane is already
+//! spoken for." #470 removes the exception by removing the SECOND
+//! checkpoint's reason to exist: every delivery is now admitted into the
+//! queue at arrival, in `mod.rs`'s `enqueue_text` (impure, as admission
+//! necessarily is — it mutates the live queue), and nothing downstream ever
+//! needs to re-ask "is someone else already ahead of me," because the
+//! queue's own front/back discipline makes that structurally impossible to
+//! answer wrong. See `notify.rs`'s module doc for why this codebase
+//! otherwise splits every backend feature this way (pure policy here,
+//! impure wiring in `mod.rs`) and `doc/design/orchestration.md`'s "Delivery
+//! queue (#445)" section — its "Ordering" subsection covers #470's redesign
+//! specifically — for the full design rationale, including the
+//! honestly-argued limits of the in-memory choice.
 //!
 //! **Scope, stated plainly (the persistence limitation):** this queue is
 //! in-memory only. A loomux restart during a blocked window loses whatever
@@ -43,9 +49,7 @@
 //! RECOVERABLE. Do not claim otherwise; a follow-up issue wires this
 //! function into something the orchestrator actually reads.
 
-use crate::obs::LockExt;
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 /// A pane blocked for hours accumulates reports/kickoffs from at most a
@@ -79,6 +83,16 @@ pub enum EnqueueReason {
     /// the front-door check: a fresh prompt must never overtake ones
     /// already waiting, or "here's context" / "now go" can invert.
     BehindQueue,
+    /// #470: this delivery landed ALONE at the front of an idle queue — the
+    /// front door's admission-time reason for the common, uncontended case
+    /// that's about to be attempted immediately, never itself notice-worthy
+    /// (nothing blocked it; see `queued_notice`'s doc for why this variant
+    /// never reaches that function). Distinct from `BehindQueue` purely for
+    /// audit-trail honesty: pre-#470, an entry this fast never touched the
+    /// queue at all, so its `delivery-queued` audit line would be
+    /// misleading if it claimed the SAME reason a genuinely-blocked
+    /// admission gets.
+    Arrival,
 }
 
 impl EnqueueReason {
@@ -87,6 +101,7 @@ impl EnqueueReason {
             EnqueueReason::BoxOccupied => "box-occupied",
             EnqueueReason::Question => "question",
             EnqueueReason::BehindQueue => "behind-queue",
+            EnqueueReason::Arrival => "arrival",
         }
     }
 }
@@ -193,30 +208,6 @@ pub fn admit(queue: &VecDeque<QueuedDelivery>, text: &str) -> AdmitDecision {
     AdmitDecision::Admit
 }
 
-/// Whether `pty_id`'s queue is non-empty right now — the ONE check both the
-/// front door (`deliver_prompt`, at a fresh delivery's arrival) and
-/// `deliver_now`'s pre-paste recheck (rev-35 review, B1) consult, so the two
-/// checkpoints can never silently drift to different definitions of "this
-/// pane is already spoken for."
-///
-/// **Why a SECOND check is required at all.** The front door alone only
-/// protects deliveries that ARRIVE after a queue already exists — it says
-/// nothing about a delivery already in flight (holding the pane's per-pty
-/// delivery mutex through its own pre-paste hold, `lock` in `deliver_now`)
-/// when the queue FORMS underneath it: an earlier-arriving delivery can
-/// time out its own hold, enqueue, and spawn a drainer while a
-/// later-arriving one is still blocked on the mutex or mid-hold, having
-/// already passed the front door back when the queue was still empty. Live
-/// evidence of exactly this shape is what the #445 review (rev-35) reported
-/// against the shipped PR: "now go" landing before "here's the context"
-/// because the second delivery never re-checked. Calling this again
-/// immediately before the paste closes that window; the residual gap
-/// between this call and the actual `write_bytes` is a few function calls,
-/// not a 60-120s hold.
-pub fn queue_is_non_empty(queues: &Mutex<HashMap<u32, VecDeque<QueuedDelivery>>>, pty_id: u32) -> bool {
-    queues.lock_safe().get(&pty_id).is_some_and(|q| !q.is_empty())
-}
-
 /// The synchronous, truthful error `deliver_prompt` returns when a pane's
 /// queue is already at cap — the common overflow case (the front-door check
 /// catches deliveries 2..N before this is ever consulted), and the one
@@ -229,20 +220,24 @@ pub fn queue_full_error(agent_id: &str, depth: usize, blocked_reason: &str) -> S
 }
 
 /// The `[loomux]` notice sent to the orchestrator the FIRST time a delivery
-/// enters the queue via a hold-cap expiry OR the rev-35 B1 pre-paste recheck
-/// (`BehindQueue` reaching here means the queue filled DURING this
-/// delivery's own hold — see `queue_is_non_empty`'s doc — which is
-/// notice-worthy exactly like the other two reasons; only the SILENT
-/// front-door append, at plain arrival with no hold at all, sends no notice
-/// of its own — that path never calls this function). Replaces the old
-/// "held: ... re-send when clear" wording — the #445 honesty fix: the
-/// payload is safe and WILL deliver on its own: a re-send now would just
-/// create a duplicate once the drain lands.
+/// genuinely becomes held: a fresh delivery's OWN pre-paste/pre-Enter hold
+/// (#111/#420) caps out (`BoxOccupied`/`Question` — `mod.rs`'s
+/// `run_queue_drainer` gates this to that entry's very first attempt only,
+/// never a later retry of the same entry). Never called with `BehindQueue`
+/// or `Arrival` — a delivery admitted behind an existing queue, or admitted
+/// alone and about to be attempted immediately, was never blocked by
+/// anything at the moment of admission, so there is nothing yet to
+/// announce; the eventual `flush_header_text` at drain time is what informs
+/// the recipient it was queued at all. Replaces the old "held: ... re-send
+/// when clear" wording — the #445 honesty fix: the payload is safe and WILL
+/// deliver on its own: a re-send now would just create a duplicate once the
+/// drain lands.
 pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
     let why = match reason {
         EnqueueReason::BoxOccupied => "pane has human input",
         EnqueueReason::Question => "an interactive question is on screen",
         EnqueueReason::BehindQueue => "another delivery to this pane was already queued",
+        EnqueueReason::Arrival => "just arrived",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
@@ -449,22 +444,6 @@ mod tests {
         assert_eq!(admit(&q, "distinct-0"), AdmitDecision::Coalesce);
     }
 
-    // ---------- queue_is_non_empty (rev-35 B1) ----------
-
-    #[test]
-    fn queue_is_non_empty_reads_true_only_while_something_is_actually_queued() {
-        let queues: Mutex<HashMap<u32, VecDeque<QueuedDelivery>>> = Mutex::new(HashMap::new());
-        assert!(!queue_is_non_empty(&queues, 42), "no map entry at all — must read empty");
-        queues.lock_safe().insert(42, VecDeque::new());
-        assert!(!queue_is_non_empty(&queues, 42), "an empty VecDeque — must still read empty");
-        queues.lock_safe().get_mut(&42).unwrap().push_back(text_entry(1, "hi"));
-        assert!(queue_is_non_empty(&queues, 42));
-        // A DIFFERENT pty's queue must never leak into this one's answer.
-        assert!(!queue_is_non_empty(&queues, 43), "an unrelated pty must read empty");
-        queues.lock_safe().get_mut(&42).unwrap().pop_front();
-        assert!(!queue_is_non_empty(&queues, 42), "draining back to empty must flip the answer back");
-    }
-
     // ---------- notice text ----------
 
     #[test]
@@ -598,6 +577,21 @@ mod tests {
 }
 
 /// #445 rev-35 B1 — the ordering PROPERTY, exhaustively, not one scenario.
+///
+/// **Superseded by #470 — kept as a historical record, not deleted.** This
+/// module models the algorithm `deliver_now`'s pre-paste recheck implemented:
+/// a raw per-pty mutex race for a fresh delivery, PLUS a live recheck right
+/// before pasting to defer to a queue that formed underneath it. Proven
+/// correct here for exactly 2 simultaneous contenders; the 3-contender
+/// residual this module ALSO proves (below) is exactly the defect #470's
+/// unified-admission redesign closes — see `unified_admission_property`
+/// (this file) for the model of what replaced this mechanism, and
+/// `doc/design/orchestration.md`'s Ordering subsection for the argument.
+/// Every test in this module still passes unmodified: they are pure math
+/// about an algorithm this PR stops running in production, not a live
+/// regression pin — keeping them intact is what lets `unified_admission_
+/// property`'s own mutation test point back at a REAL example of the
+/// class of bug being closed, instead of asserting it in the abstract.
 ///
 /// The review's finding: `deliver_now` never re-checked the queue after its
 /// own hold, so a delivery already in flight (holding the pane's delivery
@@ -890,6 +884,207 @@ mod b1_ordering_property {
             "if this ever starts passing, the 3-way mutex-fairness gap has been closed somehow — \
              replace this test with a proper property assertion at N=3 and say how it happened, \
              rather than deleting the coverage"
+        );
+    }
+}
+
+/// #470 — the ordering PROPERTY under UNIFIED ADMISSION, exhaustively.
+///
+/// This models `mod.rs`'s post-#470 design: `deliver_prompt`'s front door no
+/// longer has two separate admission paths (race a raw mutex when the queue
+/// looks empty; append directly when it doesn't) — EVERY delivery pushes to
+/// the BACK of the SAME queue, atomically with the check for whether the
+/// queue was empty (`enqueue_text`'s `was_first`). Whichever push observes
+/// an empty queue is the one that starts processing; every other push, no
+/// matter how it got here, is already correctly positioned behind whatever
+/// arrived first.
+///
+/// **Why this closes what a fair mutex alone does not (NB-A).** A reviewer
+/// of the original #470 filing proved that simply making the OLD per-pty
+/// mutex fair is insufficient: `b1_ordering_property`'s recheck-and-
+/// defer-to-TAIL mechanism loses a delivery's arrival position whenever a
+/// LATER arrival used the old front door's "queue already non-empty ->
+/// append directly" bypass — a path that never touched the mutex, fair or
+/// not, at all. This model has no such bypass to lose position to: there is
+/// exactly one admission function, and it is the SAME push whether the
+/// queue is empty or not. A delivery's position in `queue` is fixed the
+/// instant it's admitted and never changes until it's delivered — there is
+/// no "defer to tail" step left to model, because nothing can ever cut in
+/// front of an already-admitted entry.
+///
+/// **Why a hold-cap TIMEOUT needs no event of its own (unlike
+/// `b1_ordering_property`'s `HoldTimesOut`/`HoldClears` split).** Pre-#470,
+/// a timeout had to perform a state transition (enqueue the holder, THEN
+/// release the mutex to a waiter) because the timed-out delivery had no
+/// queue representation until that moment. Post-#470 it already has one —
+/// it's sitting at the front of `queue` from the moment it arrived — so a
+/// timeout changes nothing observable: the entry stays exactly where it
+/// is and the same thread simply tries again later. The only state-changing
+/// resolution left is delivering: popping the front and recording it, which
+/// this model represents as a single `processing`-gated event enabled
+/// whenever something is currently being attempted.
+///
+/// **The mutation knob.** `deliver_from_back` is this model's ONE toggle,
+/// in the same spirit as `b1_ordering_property`'s `defer_check`: `false` is
+/// the real #470 algorithm (always resolve the FRONT — genuine FIFO);
+/// `true` breaks the one line that makes admission order equal delivery
+/// order, popping the BACK instead, to prove the exhaustive search actually
+/// notices an inversion rather than passing vacuously. See
+/// `unified_admission_mutation_pop_from_back_finds_inversions`, below.
+#[cfg(test)]
+mod unified_admission_property {
+    use std::collections::{HashMap, VecDeque};
+
+    #[derive(Clone, Debug)]
+    struct SimState {
+        queue: VecDeque<char>,
+        processing: bool,
+        not_yet_arrived: Vec<char>,
+        arrived_at: HashMap<char, usize>,
+        delivered: Vec<char>,
+        step: usize,
+    }
+
+    /// Identical in spirit to `b1_ordering_property::check_terminal_state`:
+    /// every pair of contenders where one arrived strictly after the other
+    /// must deliver in that same order.
+    fn check_terminal_state(state: &SimState, violations: &mut Vec<String>) {
+        for (&x, &arrived_at_x) in &state.arrived_at {
+            for (&y, &arrived_at_y) in &state.arrived_at {
+                if x == y || arrived_at_y <= arrived_at_x {
+                    continue;
+                }
+                let px = state.delivered.iter().position(|&c| c == x);
+                let py = state.delivered.iter().position(|&c| c == y);
+                match (px, py) {
+                    (Some(px), Some(py)) if px > py => {
+                        violations.push(format!(
+                            "{x} arrived (step {arrived_at_x}) before {y} (step {arrived_at_y}), \
+                             but {y} was delivered before {x} — final order {:?}",
+                            state.delivered
+                        ));
+                    }
+                    (None, _) | (_, None) => violations.push(format!(
+                        "{x} or {y} never delivered — simulation bug, not a real finding: {state:?}"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn explore(state: SimState, deliver_from_back: bool, violations: &mut Vec<String>) {
+        let mut any_event = false;
+
+        // Event: a not-yet-arrived delivery arrives. #470: unconditionally
+        // pushed to the BACK — no more "queue empty -> race a mutex
+        // instead" branch. If nothing is currently being processed, this
+        // admission is what starts processing; in the real code that
+        // decision (`was_first`) is made ATOMICALLY under the same lock as
+        // the push, so modeling it as an immediate, deterministic
+        // transition (never a race between two "was_first" claimants) is
+        // faithful, not optimistic.
+        for i in 0..state.not_yet_arrived.len() {
+            any_event = true;
+            let mut s = state.clone();
+            let id = s.not_yet_arrived.remove(i);
+            s.step += 1;
+            s.arrived_at.insert(id, s.step);
+            s.queue.push_back(id);
+            if !s.processing {
+                s.processing = true;
+            }
+            explore(s, deliver_from_back, violations);
+        }
+
+        // Event: the currently-processing entry's attempt resolves by
+        // delivering. A hold-cap TIMEOUT is deliberately NOT a separate
+        // event here (see the module doc) — it changes nothing this model
+        // can observe, so omitting it loses no reachable state, only a
+        // self-loop.
+        if state.processing {
+            any_event = true;
+            let mut s = state.clone();
+            s.step += 1;
+            let id = if deliver_from_back { s.queue.pop_back() } else { s.queue.pop_front() }
+                .expect("`processing` is only ever true while `queue` is non-empty");
+            s.delivered.push(id);
+            s.processing = !s.queue.is_empty();
+            explore(s, deliver_from_back, violations);
+        }
+
+        if !any_event {
+            check_terminal_state(&state, violations);
+        }
+    }
+
+    fn run_exhaustive_search(ids: &[char], deliver_from_back: bool) -> Vec<String> {
+        let mut violations = Vec::new();
+        let initial = SimState {
+            queue: VecDeque::new(),
+            processing: false,
+            not_yet_arrived: ids.to_vec(),
+            arrived_at: HashMap::new(),
+            delivered: Vec::new(),
+            step: 0,
+        };
+        explore(initial, deliver_from_back, &mut violations);
+        violations
+    }
+
+    #[test]
+    fn unified_admission_closes_ordering_at_three_contenders() {
+        // Formerly proven OPEN by `b1_ordering_property::
+        // three_way_contention_can_still_invert_arrival_order_known_residual`
+        // (kept, unmodified — see that module's doc for why it still
+        // exists and still passes). This is the flip issue #470 asked for:
+        // the SAME property, at the SAME contender count that used to
+        // invert, now proven closed — not by widening the old recheck, but
+        // by removing the admission bypass that made widening it
+        // insufficient (NB-A).
+        let violations = run_exhaustive_search(&['A', 'B', 'C'], false);
+        assert!(
+            violations.is_empty(),
+            "unified admission produced {} ordering violation(s) at 3 contenders:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn unified_admission_closes_ordering_at_four_and_five_contenders() {
+        // #470 DoD: prove this at 3 AND 4+, not just re-run the old 3-only
+        // scope. Unlike `b1_ordering_property` (whose 2-contender ceiling
+        // was load-bearing — the property was provably unachievable past
+        // it under the old algorithm), unified admission has no such
+        // ceiling: FIFO-by-construction doesn't get harder at higher N.
+        for ids in [&['A', 'B', 'C', 'D'][..], &['A', 'B', 'C', 'D', 'E'][..]] {
+            let violations = run_exhaustive_search(ids, false);
+            assert!(
+                violations.is_empty(),
+                "unified admission produced {} ordering violation(s) at {} contenders:\n{}",
+                violations.len(),
+                ids.len(),
+                violations.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn unified_admission_mutation_pop_from_back_finds_inversions() {
+        // Mutation test, matching `b1_ordering_property::
+        // defer_check_disabled_finds_a_real_inversion_for_two_contenders`'s
+        // style: flip the ONE line that makes admission order equal
+        // delivery order (resolve the back instead of the front) and
+        // confirm the SAME exhaustive search, SAME property checker, finds
+        // real violations. If this ever started passing, the two `_closes_
+        // ordering_` tests above would be proven vacuous.
+        let violations = run_exhaustive_search(&['A', 'B', 'C'], true);
+        assert!(
+            !violations.is_empty(),
+            "popping from the BACK must reproduce a real inversion somewhere in the 3-contender \
+             search space — if it doesn't, the `_closes_ordering_` tests aren't actually testing \
+             anything"
         );
     }
 }

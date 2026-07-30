@@ -1279,10 +1279,10 @@ fn queue_orphans_finds_an_enqueued_entry_with_no_terminal_event() {
 
 #[test]
 fn deliver_prompt_front_door_enqueues_behind_a_non_empty_queue_without_an_app_handle() {
-    // #445: the whole point of checking the queue before requiring an app
-    // handle — a queue can only be non-empty because an EARLIER delivery
-    // already had one (to spawn its drainer), so appending behind it needs
-    // no live pane of its own.
+    // #445/#470: landing BEHIND an existing entry never needs an app handle
+    // of its own — a queue can only be non-empty because an EARLIER
+    // delivery already had one (to spawn its drainer), so this admission
+    // only best-effort nudges `ensure_drainer` and returns.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
@@ -1299,16 +1299,22 @@ fn deliver_prompt_front_door_enqueues_behind_a_non_empty_queue_without_an_app_ha
     let snap = reg.queue_snapshot(pty);
     assert_eq!(snap[0].payload.text(), Some("already queued"), "existing entry must not be overtaken");
     assert_eq!(snap[1].payload.text(), Some("a fresh prompt"));
-    assert_eq!(snap[1].reason, queue::EnqueueReason::BehindQueue);
+    // #470: the front door always admits with `Arrival` (it IS the arrival,
+    // whether or not it lands alone) — `depth` at admission time (not
+    // `reason`) is what distinguishes "landed behind something" from
+    // "landed alone," and this entry's own snapshot position (behind
+    // "already queued") already proves that directly.
+    assert_eq!(snap[1].reason, queue::EnqueueReason::Arrival);
 }
 
 #[test]
 fn deliver_prompt_front_door_is_a_noop_when_the_queue_is_empty() {
-    // With an EMPTY queue, the front door must step aside and let the
-    // normal direct-delivery path run — which in test mode (no real app
-    // handle) fails at that step, exactly as it always has. Proves the
-    // front door doesn't fire on every call, only when there's actually
-    // something to defer behind.
+    // #470: with an EMPTY queue, this delivery is admitted (briefly — it's
+    // now the ONLY entry) and then, because it needs an app handle to ever
+    // be processed and test mode has none, the admission is withdrawn and
+    // the call fails exactly as the pre-#470 direct path always did.
+    // Net-observable behavior is unchanged: no app handle, empty queue in
+    // -> error out, empty queue still.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
