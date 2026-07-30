@@ -12265,6 +12265,70 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
     assert_eq!(&*captured.lock().unwrap(), b"\r");
 }
 
+// ---------- #496 PR-A: the phantom-input-stamp fix ----------
+//
+// `write_pty` used to stamp `user_input_ms = now` UNCONDITIONALLY, before
+// `classify_human_input` ever ran. xterm answers a program's terminal
+// queries — colour probes, focus reports, device-attribute/cursor-position
+// replies — through that exact same write path with NO human present at all
+// (#179's boot-time instance; copilot also emits these mid-session on
+// redraw/focus churn). Those auto-replies stamped the clock just like a
+// keystroke, and that one clock feeds the autonomous idle tick's quiet
+// window, the stranded-text flush, the submit retries, and Tier-1 box
+// confirmation — so a copilot pane that only ever emits auto-replies could
+// wedge all four forever with the human never having touched the keyboard
+// (#496's reported symptom: autonomous mode halts until a human presses
+// Enter). `PtyManager::note_user_input` (the exact code `write_pty` now
+// calls) gates the stamp on `classify_human_input`/`box_occupancy_delta`
+// reading actual keystroke evidence, reusing the #179 scanner rather than
+// adding a second classifier.
+
+#[test]
+fn terminal_query_replies_do_not_stamp_user_input() {
+    let pm = PtyManager::default();
+    let id = 496_01;
+    pm.register_fake_for_test(id, b"");
+    assert_eq!(pm.last_user_input_ms(id), Some(0), "a fresh fake pty stamps nothing at all");
+
+    for (name, reply) in [
+        ("OSC 11 colour query reply (BEL-terminated)", "\x1b]11;rgb:0d0d/1111/1717\x07"),
+        ("OSC 10 colour query reply (ST-terminated)", "\x1b]10;rgb:f0f6/f0f6/fcfc\x1b\\"),
+        ("xterm focus-in report", "\x1b[I"),
+        ("DA (device attributes) reply", "\x1b[?64;1;2;6;9;15;18;21;22c"),
+        ("CPR (cursor position) reply", "\x1b[24;80R"),
+    ] {
+        pm.note_user_input(id, reply);
+        assert_eq!(
+            pm.last_user_input_ms(id),
+            Some(0),
+            "{name} is an xterm auto-reply with no human present — must NOT stamp user_input_ms \
+             (this is the #496 regression: base stamps unconditionally, so this assertion fails there)"
+        );
+    }
+}
+
+#[test]
+fn real_keystrokes_still_stamp_user_input() {
+    // Green companions for the test above: a fix that stopped the clock
+    // updating for genuine keystrokes would be far worse than #496's bug —
+    // it would make every human-typing signal in the delivery pipeline
+    // (the #111 paste guard, the question hold, the idle tick) blind.
+    for (name, data) in [("plain text", "a"), ("Enter / CR", "\r"), ("backspace", "\u{7f}")] {
+        let pm = PtyManager::default();
+        let id = 496_02;
+        pm.register_fake_for_test(id, b"");
+        assert_eq!(pm.last_user_input_ms(id), Some(0));
+
+        pm.note_user_input(id, data);
+
+        assert_ne!(
+            pm.last_user_input_ms(id),
+            Some(0),
+            "{name} is a real keystroke — user_input_ms must still be stamped"
+        );
+    }
+}
+
 #[test]
 fn prompt_wait_detected_ignores_quiet_non_prompts() {
     // Ordinary streaming output — even when it ends on a numbered summary list —

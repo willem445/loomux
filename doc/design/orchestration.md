@@ -3853,9 +3853,23 @@ an empty box and holds/aborts rather than merge-submitting.
   audited (`delivery-held-for-input`) and proceeds normally.
 - **No loops / paused.** Same discipline as #103: an orchestrator-target delivery never
   notifies (a notice to it is a delivery to it), and a **paused** group is skipped wholesale.
-- **`last_user_input_ms` is untouched.** Every human write still stamps it (the quiet backstop,
-  attention routing, and the stranded-flush guard all rely on it); `input_pending` is a separate,
-  additive flag written under the same `ptys` lock so the pair can't tear.
+- **`last_user_input_ms` is stamped only on keystroke evidence (#496 PR-A).** Originally "every
+  human write stamps it, unconditionally" — but `write_pty` runs on xterm's automatic replies to a
+  program's terminal queries too (colour probes, focus reports, DA/CPR — #179's precedent), with no
+  human present at all, and those replies classify `Neutral` with a zero `box_occupancy_delta`. A
+  copilot pane that only ever emitted such replies could hold this clock at "now" forever with the
+  human never touching the keyboard — which simultaneously deferred the autonomous idle tick's
+  quiet window (#496), suppressed the stranded-flush guard below and the submit retries, and
+  withheld Tier-1 confirmation, since all four read this same timestamp. `PtyManager::
+  note_user_input` (the code `write_pty` now calls) gates the stamp on `classify_human_input`/
+  `box_occupancy_delta` reading actual keystroke evidence (`Content`, `Submit`, or a nonzero delta —
+  i.e. backspace/DEL) — reusing the #179 scanner rather than adding a second classifier. Tradeoff
+  taken deliberately: pure-`Neutral`-with-zero-delta *human* input (arrow keys, menu navigation —
+  byte-indistinguishable from an auto-reply) no longer refreshes the clock either; safe because the
+  interactive-question guard's own release (below) is already STATE-based, not activity-based, for
+  exactly this reason. `input_pending` is a separate, additive flag written under the same `ptys`
+  lock so the pair can't tear; it was already unaffected by this gate (its `Neutral` branch still
+  applies `box_occupancy_delta` regardless of whether the timestamp stamps).
 - **Residual, and the #112 boundary.** Occupancy is inferred from keystrokes, not read from the
   box, so some cases still need true box-occupancy detection (issue #112). Splitting them by
   direction:
@@ -4099,6 +4113,13 @@ isolation). This is deliberately a lighter mechanism than attention routing's `w
 quiet-gate machinery (built to debounce a *frontend badge* against redraw flicker across a much
 longer observation window) — this guard only needs "is the menu still painted right now", which the
 detector itself already answers without any human-input signal at all.
+
+**#496 PR-A tightened the clock this section distrusts, without changing this decision.**
+`PtyManager::note_user_input` now gates `last_user_input_ms` on `classify_human_input` itself, so
+an xterm auto-reply no longer stamps it (see the box-occupancy section above). That does not make
+release activity-based again: the "not sufficient" half of the finding — an arrow key navigating a
+still-open menu reads `Neutral` too, and #496 doesn't stamp pure-`Neutral` input either — is
+untouched by tightening what the clock tracks. `question_hold_predicate` stays exactly as-is.
 
 **Self-echo is excluded by CONTENT, not by byte-count delta (rev-15 N1, rewritten rev-19 B-A).** The
 pre-Enter and retry checkpoints necessarily read the tail AFTER loomux's own bracketed paste — so a

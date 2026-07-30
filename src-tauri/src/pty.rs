@@ -188,6 +188,84 @@ impl PtyManager {
         pty.writer.write_all(bytes).map_err(|e| e.to_string())
     }
 
+    /// Record one FRONTEND-originated write for the human-input signals
+    /// (#111 box occupancy, `last_user_input_ms`) — extracted out of
+    /// `write_pty` so an integration test can drive it directly against a
+    /// real (fake) pty with no Tauri `AppHandle` (#496 PR-A). No-op if the
+    /// pty is already gone (a write can race a pane's own teardown).
+    ///
+    /// `user_input_ms` is stamped only when this write is evidence of an
+    /// actual keystroke — `classify_human_input` reads `Content`/`Submit`,
+    /// or (Neutral but) a nonzero `box_occupancy_delta` (backspace/DEL).
+    /// Before this gate the stamp was unconditional, and that was the bug
+    /// (#496): xterm answers a program's terminal queries — OSC colour
+    /// queries, DA, DSR/CPR, focus-in/out reports — through this exact same
+    /// write path with **no human present at all** (#179's boot-time
+    /// instance; copilot also emits these mid-session on redraw/focus
+    /// churn). Those replies classify `Neutral` with a zero delta — nothing
+    /// typed, nothing removed — so gating the stamp on keystroke evidence
+    /// means an auto-reply no longer refreshes `user_input_ms`. That one
+    /// unconditional stamp was one root cause behind four symptoms: it
+    /// deferred the autonomous idle tick's quiet clock forever, suppressed
+    /// the stranded-text flush and submit retries, and withheld Tier-1 box
+    /// confirmation — all four read this same timestamp.
+    ///
+    /// Tradeoff, taken deliberately: pure-`Neutral`-with-zero-delta human
+    /// input (arrow keys, menu navigation — byte-indistinguishable from an
+    /// xterm auto-reply) no longer defers the tick or the flush either. This
+    /// is safe because the protection for "human mid-menu" already lives in
+    /// the STATE-based interactive-question guard (#420 rev-19 R1), which
+    /// deliberately dropped keystroke-recency from its own release decision
+    /// for this exact reason — that guard is untouched by this change.
+    pub fn note_user_input(&self, id: u32, data: &str) {
+        let classification = crate::orchestration::classify_human_input(data);
+        let delta = crate::orchestration::box_occupancy_delta(data);
+        let keystroke_like =
+            classification != crate::orchestration::HumanInput::Neutral || delta != 0;
+        {
+            let mut ptys = self.ptys.lock_safe();
+            let Some(pty) = ptys.get_mut(&id) else { return };
+            if keystroke_like {
+                pty.user_input_ms.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+            }
+            // Track box occupancy from the keystroke's CONTENT (#111): an Enter /
+            // line-clear empties the box outright; everything else (typed text,
+            // pastes, backspace/DEL) adjusts a running character count instead of
+            // a bare flag, so a line backspaced all the way back out reads as
+            // empty again rather than staying stuck "pending" until the 60s hold
+            // aborts a delivery (#171).
+            match classification {
+                crate::orchestration::HumanInput::Submit => {
+                    pty.input_box_len.store(0, Ordering::Relaxed)
+                }
+                crate::orchestration::HumanInput::Content
+                | crate::orchestration::HumanInput::Neutral => {
+                    if delta != 0 {
+                        let cur = pty.input_box_len.load(Ordering::Relaxed);
+                        pty.input_box_len.store((cur + delta as i64).max(0), Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        // Observability for the one live gap this fix can't settle from code
+        // alone (#496 plan section 7): which copilot emission recurs
+        // mid-session. Counts only, never the escape text itself (obs.rs's
+        // own invariant) — a live run greps this event's rate per pane to
+        // confirm the class (and, cross-referenced with a raw capture, name
+        // the offending sequence) without this fix depending on knowing which
+        // one it is. Emitted after the lock is released — breadcrumb does
+        // file IO and must not extend the hold on the ptys map.
+        if !keystroke_like {
+            crate::obs::breadcrumb("phantom-input-gated", &format!("id={id}"));
+        }
+    }
+
     /// Snapshot of the rolling output tail (raw bytes, ANSI included).
     pub fn output_tail(&self, id: u32) -> Option<Vec<u8>> {
         let ptys = self.ptys.lock_safe();
@@ -1021,31 +1099,9 @@ pub fn pty_backend_info() -> PtyBackendInfo {
 
 #[tauri::command]
 pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), String> {
+    state.note_user_input(id, &data);
     let mut ptys = state.ptys.lock_safe();
     let pty = ptys.get_mut(&id).ok_or("pty not found")?;
-    pty.user_input_ms.store(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-        Ordering::Relaxed,
-    );
-    // Track box occupancy from the keystroke's CONTENT (#111): an Enter /
-    // line-clear empties the box outright; everything else (typed text,
-    // pastes, backspace/DEL) adjusts a running character count instead of a
-    // bare flag, so a line backspaced all the way back out reads as empty
-    // again rather than staying stuck "pending" until the 60s hold aborts a
-    // delivery (#171).
-    match crate::orchestration::classify_human_input(&data) {
-        crate::orchestration::HumanInput::Submit => pty.input_box_len.store(0, Ordering::Relaxed),
-        crate::orchestration::HumanInput::Content | crate::orchestration::HumanInput::Neutral => {
-            let delta = crate::orchestration::box_occupancy_delta(&data);
-            if delta != 0 {
-                let cur = pty.input_box_len.load(Ordering::Relaxed);
-                pty.input_box_len.store((cur + delta as i64).max(0), Ordering::Relaxed);
-            }
-        }
-    }
     pty.writer
         .write_all(data.as_bytes())
         .map_err(|e| e.to_string())

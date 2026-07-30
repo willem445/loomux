@@ -8828,6 +8828,16 @@ const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
 /// the #111 box-clear hold (up to its 60s abort) — the "prompt never delivered"
 /// symptom. Claude Code issues no such query, so only copilot tripped it.
 ///
+/// #496: the same auto-replies reach `write_pty` with NO human present at
+/// all, and until PR-A they *also* unconditionally re-stamped
+/// `user_input_ms` — the keystroke-recency clock everything from the
+/// autonomous idle tick to the stranded-text flush reads. This scan is now
+/// consulted for THAT gate too (`PtyManager::note_user_input`): a write
+/// classifies `Neutral` with a zero `occupancy_delta` — this skip is exactly
+/// why — and `note_user_input` treats that combination as "not a keystroke",
+/// so the timestamp isn't touched either. One classifier, two consumers; see
+/// `note_user_input` for the gate and the tradeoff it accepts.
+///
 /// Returns `(has_printable, occupancy_delta)`: the first is "did this write
 /// put visible text in the box at all" (`input_has_printable`'s job); the
 /// second is the signed change to box occupancy — one Unicode CHARACTER
@@ -9096,6 +9106,16 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
 /// immediately (`ever_shown` gates the two-poll requirement to only kick in
 /// once a real hold has genuinely started — see `wait_for_question_clear`'s
 /// own fast-path for why a never-active hold must not pay any extra latency).
+///
+/// #496 PR-A made `PtyManager::note_user_input` gate the keystroke-recency
+/// stamp itself on `classify_human_input`, so an xterm auto-reply no longer
+/// refreshes it either — the clock this comment distrusts is materially more
+/// trustworthy than it was when rev-19 R1 was written. That does NOT change
+/// this decision: release still needs to be STATE-based, because the "not
+/// sufficient" half of the finding above — an arrow key navigating a
+/// still-open menu reads `HumanInput::Neutral` too, and #496 does not stamp
+/// pure-Neutral input either — is untouched by tightening what the clock
+/// tracks. This predicate stays exactly as-is.
 pub fn question_hold_predicate<T>(tail: T, pasted_text: Option<String>) -> impl Fn() -> bool
 where
     T: Fn() -> Option<Vec<u8>>,
