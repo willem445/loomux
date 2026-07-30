@@ -16,7 +16,6 @@ import {
   loadSettings,
   saveSettings,
   guardAppClose,
-  listSessions,
   recordCopilotLaunchPosture,
   recordClaudeLaunchPosture,
   type PtyExit,
@@ -1128,7 +1127,18 @@ async function resumeDormantGroup(ws: Workspace): Promise<RestoreCardResult> {
 
     let resumableIds = new Set<string>();
     try {
-      resumableIds = new Set((await listSessions()).map((s) => s.id));
+      // #493: the SHARED session list, not a scan of this path's own. This line
+      // used to call `listSessions()` directly, and the breadcrumb log caught
+      // what that cost: a restore click ~4s into boot issued a second, fully
+      // concurrent scan of the same 826 files while the sidebar's boot prefetch
+      // was still running (12.9s + 16.7s, contending), and the group restore
+      // then waited on it — the second, unfixed half of #479's restore lag.
+      // `ensureLoaded()` reuses the prefetch's rows, or joins the prefetch if
+      // it's still in flight, and only scans if neither can answer. Freshness
+      // isn't what this check needs: it asks whether ids CAPTURED AT CLOSE still
+      // have transcripts, and a transcript the newest read already saw hasn't
+      // stopped existing since.
+      resumableIds = new Set((await sessions.ensureLoaded()).map((s) => s.id));
     } catch {
       /* empty → assume resumable below */
     }
