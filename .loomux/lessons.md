@@ -36,12 +36,13 @@ only ever `pop` an entry carrying your own marker.
 
 A comment, design note, audit label, or PR body stating something the code
 doesn't do is a defect, not a slip — it stops the next reader from checking.
-Nine instances of this shape turned up in one session (full catalogue: #461):
-an audit action labeling a failed delivery a success, and PR #489 offering a
-persona `allow:` opt-in as a regression's fix when it's actually blocked at
-*two* structural layers, the workflow parser and `persona_inject`'s #222
-capability closure (#490) — an impossible mitigation reads as an answer and
-stops the search. This entry itself first shipped with a miscount and a
+This pattern has recurred repeatedly on this repo: #461 catalogues seven
+instances from one session (e.g. an audit action labeling a failed delivery
+a success), and the batch that filed this entry produced another — PR #489
+offering a persona `allow:` opt-in as a regression's fix when it's actually
+blocked at *two* structural layers, the workflow parser and `persona_inject`'s
+#222 capability closure (#490) — an impossible mitigation reads as an answer
+and stops the search. This entry itself first shipped with a miscount and a
 one-layer version of that same claim, caught in review, not before. Delete a
 claim you can't point at code for, don't soften it; quote raw fetched text
 for CLI/API facts, never a paraphrase (#453).
