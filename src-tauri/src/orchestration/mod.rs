@@ -1171,6 +1171,59 @@ const MAX_IDLE_ACTIVITY_FLOOR_BYTES: u64 = 1024 * 1024;
 /// the tick source. With a minutes-scale quiet gate the latch already bounds this
 /// near ~one per window; the cap catches any pathological re-arm. 0 would disable it.
 const MAX_IDLE_TICKS_PER_HOUR: u32 = 6;
+/// #496 hardening: default bound (minutes) on how long human input ALONE may
+/// defer the idle tick's quiet clock past the orchestrator's last REAL
+/// output. Two independent safety heuristics keyed off the same signal — the
+/// idle tick's quiet clock and delivery's stranded-text/retry suppression,
+/// both deferred by "the pane has recent human input" — can deadlock each
+/// other if that signal is ever wrong and never clears on its own: a copilot
+/// orchestrator wedged exactly this way in #496, because xterm's own
+/// automatic replies to the program's terminal queries (OSC colour, DA,
+/// DSR/CPR, focus reports — see `pty.rs`'s `write_pty`) stamp
+/// `last_user_input_ms` with no human present, forever, and only a physical
+/// Enter recovered the group. PR-A of #496 fixes that proven mechanism at
+/// the source (gates the stamp on `classify_human_input`); this bound is the
+/// separate backstop for any refresher THAT fix doesn't model — a future
+/// IME/composition path, a different CLI's TUI, anything not yet observed.
+/// Past this many minutes of zero real output *and* zero printable input,
+/// the tick fires anyway, audited with its own reason
+/// (`IDLE_TICK_INPUT_DEFER_BOUND_REASON`) rather than silently — the exact
+/// principle `idle_tick_skip_rearm_ms`'s doc states ("a suppressed window
+/// must still come back on its own — nothing else will clear it") and
+/// `USER_QUIET_MAX_HOLD`'s doc states ("deliver anyway ... never starve"),
+/// applied here a third time to a third mechanism.
+///
+/// **Default 15 = 3x `DEFAULT_IDLE_TICK_MINUTES` (5).** This clamp is
+/// **classification-blind by design** — a guarantee must not trust the very
+/// classifier it exists to backstop — so it caps the raw timestamp
+/// regardless of what produced it: real (Content-classified — see
+/// `classify_human_input`) keystrokes are capped exactly the same as
+/// pure-Neutral traffic byte-indistinguishable from an xterm auto-reply (PR-A's
+/// tradeoff). Sustained genuine typing with zero real output for the full 15
+/// minutes is capped too, and the tick fires mid-typing — this is rare in
+/// practice (submitting produces a real output burst well inside the window,
+/// which resets the clock), and where it isn't, the human-mid-work protection
+/// is delivery's OWN hold (`USER_QUIET_MAX_HOLD`, the #420 state-based
+/// question guard) rather than an exemption in this clamp; carving Content
+/// out here would re-open the exact deadlock class this bound closes (#496:
+/// the whole point is not trusting a classification of "this is really the
+/// human"). 15 minutes of zero real output plus zero input at all — the
+/// common case this bound actually exists for — is either a genuine wedge or
+/// a human who has walked away; both are correct to tick for, and the tick is
+/// a NOTICE, not an action (it doesn't merge, spend, or spawn anything by
+/// itself), with `MAX_IDLE_TICKS_PER_HOUR` already backstopping runaway
+/// firing if something re-triggers it repeatedly. Live-tunable per group
+/// like its siblings (`Guardrails.idle_tick_input_defer_max_minutes`, 0 →
+/// this default), floored at the group's own `idle_tick_minutes` (the bound
+/// can never be tighter than the tick's own base quiet window — that would
+/// make it fire BEFORE the ordinary threshold) and capped at
+/// `MAX_IDLE_TICK_MINUTES` (24h, the same ceiling `idle_tick_minutes` uses).
+const DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES: u32 = 15;
+/// #496: the audit `reason` recorded when `idle_tick_input_defer_max_minutes`
+/// — not the ordinary quiet-window threshold — is why a tick fired: the
+/// input fold was clamped against `AgentEntry.last_output_progress_ms` and
+/// the bound elapsed. See the constant above and `idle_tick_tick`.
+const IDLE_TICK_INPUT_DEFER_BOUND_REASON: &str = "idle-tick-input-defer-bound";
 /// Compact-nudge (#287): upper bound on `compact_nudge_minutes` (24h); 0 is
 /// "off", not clamped away — see `Guardrails::clamped`.
 const MAX_COMPACT_NUDGE_MINUTES: u32 = 1440;
@@ -2051,6 +2104,18 @@ pub struct Guardrails {
     /// `set_idle_activity_floor` so a chattier CLI whose idle repaints exceed the
     /// default has a runtime remedy (rev-59). See `idle_output_is_activity`.
     pub idle_activity_floor_bytes: u64,
+    /// #496 hardening: bound (minutes) on how long human input ALONE may defer
+    /// the idle tick past the orchestrator's last REAL output-based progress —
+    /// see `DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES`'s doc for the deadlock
+    /// this closes (two independent heuristics keyed off the same fallible
+    /// "pane has human input" signal) and why the default is 15. 0 = unset →
+    /// the default; clamped to `idle_tick_minutes..=MAX_IDLE_TICK_MINUTES` in
+    /// `clamped()` — floored at the group's own tick window (never tighter
+    /// than the ordinary threshold), capped at 24h. No live setter this round
+    /// (same precedent as `context_window_tokens_override`): set at launch or
+    /// by hand-editing group.json; this PR's contract is the persisted field
+    /// plus the bounded guarantee, not a new UI control. See `idle_tick_tick`.
+    pub idle_tick_input_defer_max_minutes: u32,
     /// Compact-nudge (#287): how long an eligible pane must be idle at its input
     /// prompt (output-quiet, the SAME clock `idle_tick_minutes` reads — see
     /// `compact_nudge_tick`) before loomux pastes `/compact` for it. Unlike
@@ -2270,6 +2335,15 @@ impl Guardrails {
             self.idle_tick_minutes = DEFAULT_IDLE_TICK_MINUTES;
         }
         self.idle_tick_minutes = self.idle_tick_minutes.clamp(1, MAX_IDLE_TICK_MINUTES);
+        // #496: 0 = unset → default (3x the tick window), then floored at
+        // `idle_tick_minutes` itself — computed AFTER the line above, so this
+        // is always the group's REAL, already-normalized tick window, never a
+        // 0 that would let the bound fire before the ordinary threshold.
+        if self.idle_tick_input_defer_max_minutes == 0 {
+            self.idle_tick_input_defer_max_minutes = DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES;
+        }
+        self.idle_tick_input_defer_max_minutes =
+            self.idle_tick_input_defer_max_minutes.clamp(self.idle_tick_minutes, MAX_IDLE_TICK_MINUTES);
         // 0 = unset → default; floored at 1 (any growth = activity) so it can never
         // be a no-op that treats real bursts as noise.
         if self.idle_activity_floor_bytes == 0 {
@@ -4604,6 +4678,19 @@ pub struct AgentEntry {
     /// Seeded at spawn and whenever work is (re)assigned. See
     /// `watchdog_should_notify`.
     pub last_progress_ms: u64,
+    /// #496 hardening: Unix-ms of this agent's last OUTPUT-based quiet-clock
+    /// reset only — i.e. the last time `last_progress_ms` above moved because
+    /// the pane produced real output, never because human input deferred it.
+    /// `last_progress_ms` is the two clocks folded together (output resets
+    /// it; input can also push it forward, belt-and-suspenders); this field
+    /// is the only place that still answers "how long since real progress,
+    /// independent of how much input has arrived since" — exactly what
+    /// `Guardrails.idle_tick_input_defer_max_minutes` clamps the input fold
+    /// against, so perpetual input can defer the tick only so far past the
+    /// orchestrator's last actual output, never forever. Meaningful only for
+    /// the orchestrator's idle-tick clock (mirrors `last_progress_ms`'s own
+    /// scope); the watchdog never reads it. See `idle_tick_tick`.
+    pub last_output_progress_ms: u64,
     /// Watchdog/idle-tick: last observed value of the pane's monotonic pty
     /// output counter, so a tick can tell whether the CLI has emitted anything
     /// since the previous one even when the output ring is saturated. Exclusive
@@ -10699,6 +10786,9 @@ impl OrchRegistry {
                 idle_tick_minutes: g["idle_tick_minutes"].as_u64().unwrap_or(0) as u32,
                 // Idle-tick activity floor (#83): absent → 0 → clamped() → default.
                 idle_activity_floor_bytes: g["idle_activity_floor_bytes"].as_u64().unwrap_or(0),
+                // #496 input-defer bound: absent → 0 → clamped() → default (15m).
+                idle_tick_input_defer_max_minutes:
+                    g["idle_tick_input_defer_max_minutes"].as_u64().unwrap_or(0) as u32,
                 // Compact-nudge (#287): absent → 0 → off, exactly the conservative
                 // default a group.json written before this field existed means.
                 compact_nudge_minutes: g["compact_nudge_minutes"].as_u64().unwrap_or(0) as u32,
@@ -11042,6 +11132,27 @@ impl OrchRegistry {
                 } else {
                     persisted.idle_activity_floor_bytes.clamp(1, MAX_IDLE_ACTIVITY_FLOOR_BYTES)
                 };
+                // #496: no live setter yet (same precedent as `idle_tick_fallback_minutes`
+                // just below), but still a hand-editable, persisted guardrail — honor it
+                // on resume rather than letting a Fresh-shaped caller value (which has no
+                // way to express "I set this on disk before") silently reset it.
+                //
+                // Review fix (round 1): the floor must apply to the UNSET (0 → default)
+                // case too, not just an explicit persisted value — `clamped()` floors
+                // both, because the floor is dynamic (`idle_tick_minutes`, not a static
+                // in-range default like `idle_activity_floor_bytes`'s sibling pattern
+                // this was copied from). Resolve 0 → default FIRST, then clamp
+                // unconditionally, exactly like `clamped()` does, so a group with
+                // `idle_tick_minutes` above the 15m default (the entire pre-#500
+                // installed base, which has no `idle_tick_input_defer_max_minutes` key
+                // at all) gets the SAME bound on resume that a fresh launch gives it —
+                // never a tighter one a resumed group's own docs don't promise.
+                guardrails.idle_tick_input_defer_max_minutes = (if persisted.idle_tick_input_defer_max_minutes == 0 {
+                    DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES
+                } else {
+                    persisted.idle_tick_input_defer_max_minutes
+                })
+                .clamp(guardrails.idle_tick_minutes, MAX_IDLE_TICK_MINUTES);
                 // Compact-nudge (#287) is likewise live-adjustable and persisted;
                 // 0 is a real "off" here (not "unset"), so just re-cap it.
                 guardrails.compact_nudge_minutes =
@@ -11113,6 +11224,7 @@ impl OrchRegistry {
                 "autonomy_budget_tokens": info.guardrails.autonomy_budget_tokens,
                 "idle_tick_minutes": info.guardrails.idle_tick_minutes,
                 "idle_activity_floor_bytes": info.guardrails.idle_activity_floor_bytes,
+                "idle_tick_input_defer_max_minutes": info.guardrails.idle_tick_input_defer_max_minutes,
                 "compact_nudge_minutes": info.guardrails.compact_nudge_minutes,
                 "compact_nudge_roles": info.guardrails.compact_nudge_roles,
                 "compact_nudge_min_context_percent": info.guardrails.compact_nudge_min_context_percent,
@@ -12769,6 +12881,7 @@ impl OrchRegistry {
             idle_since_ms: None,
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
+            last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
@@ -12907,6 +13020,7 @@ impl OrchRegistry {
             idle_since_ms: None,
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
+            last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
@@ -12977,7 +13091,13 @@ impl OrchRegistry {
     /// time: output growth (the orchestrator acting) resets the quiet clock and
     /// the one-notice latch; recent human input also defers the clock (never tick
     /// while the human steers — the belt-and-suspenders gate on top of
-    /// output-silence). An orchestrator output-quiet past `IDLE_TICK_MINUTES` and
+    /// output-silence). **#496 hardening:** the input fold is clamped — input
+    /// alone can defer the clock at most `idle_tick_input_defer_max_minutes` past
+    /// the last real output (`AgentEntry.last_output_progress_ms`), so a signal
+    /// that keeps refreshing (a phantom stamp, or anything else not yet modeled)
+    /// makes the tick late, never silent forever; see
+    /// `DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES`'s doc for the deadlock this
+    /// closes. An orchestrator output-quiet past `IDLE_TICK_MINUTES` and
     /// not already latched clears the quiet-window gate — but for a group with
     /// the intake gate ON (`intake_poll_minutes > 0`, #332), clearing the quiet
     /// window is necessary, not sufficient: `intake::idle_tick_gate` decides
@@ -13006,7 +13126,7 @@ impl OrchRegistry {
         let tick_times = self.idle_tick_times.lock_safe().clone();
         // Per-group idle-tick window + activity floor (guardrails, live-adjustable).
         // Snapshot like `watchdog_tick` does its thresholds.
-        let cfg: HashMap<String, (u32, u64, u32, u32)> = self
+        let cfg: HashMap<String, (u32, u64, u32, u32, u32)> = self
             .groups
             .lock_safe()
             .iter()
@@ -13025,6 +13145,9 @@ impl OrchRegistry {
                             autonomous.contains(id),
                         ),
                         g.guardrails.idle_tick_fallback_minutes,
+                        // #496: bound on how long human input alone may defer
+                        // the tick past `last_output_progress_ms`.
+                        g.guardrails.idle_tick_input_defer_max_minutes,
                     ),
                 )
             })
@@ -13045,15 +13168,20 @@ impl OrchRegistry {
         let intake_pending = self.intake_pending.lock_safe().clone();
         let last_fired = self.idle_tick_last_fired_ms.lock_safe().clone();
 
-        // (id, group, gate_enabled, heartbeat) — `gate_enabled` is false only for
-        // the `intake_minutes == 0` bypass (pre-#332 legacy fire); `heartbeat` is
-        // true only when the gate fired SOLELY because the bounded fallback came
-        // due (no intake signal, no pending CI watch, no watchdog stall) — the
-        // rev-95 benchtest finding (#429) showed a delivered wake and a suppressed
-        // one are otherwise indistinguishable in the audit log, which is exactly
-        // how "the gate computes but does not gate" went unnoticed: both fields
-        // are carried through to the audit entry below purely for observability.
-        let mut to_notify: Vec<(String, String, bool, bool)> = Vec::new();
+        // (id, group, gate_enabled, heartbeat, input_defer_bound) — `gate_enabled`
+        // is false only for the `intake_minutes == 0` bypass (pre-#332 legacy
+        // fire); `heartbeat` is true only when the gate fired SOLELY because the
+        // bounded fallback came due (no intake signal, no pending CI watch, no
+        // watchdog stall) — the rev-95 benchtest finding (#429) showed a
+        // delivered wake and a suppressed one are otherwise indistinguishable in
+        // the audit log, which is exactly how "the gate computes but does not
+        // gate" went unnoticed: both fields are carried through to the audit
+        // entry below purely for observability. `input_defer_bound` (#496) is
+        // true only when THIS fire happened because
+        // `idle_tick_input_defer_max_minutes` capped the input fold, not because
+        // the pane was genuinely output-quiet — a tick firing for that unusual
+        // reason must say so too.
+        let mut to_notify: Vec<(String, String, bool, bool, bool)> = Vec::new();
         let mut skipped: Vec<(String, String)> = Vec::new();
         {
             let mut agents = self.agents.lock_safe();
@@ -13070,17 +13198,22 @@ impl OrchRegistry {
                 // rebaselines the counter but does NOT reset the clock, so an
                 // occasional statusline/spinner frame can't starve the tick (the
                 // bug where any stray byte demanded another full quiet window).
-                let (threshold, floor, intake_minutes, fallback_minutes) = cfg.get(&a.group).copied().unwrap_or((
-                    DEFAULT_IDLE_TICK_MINUTES,
-                    DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES,
-                    0,
-                    DEFAULT_IDLE_TICK_FALLBACK_MINUTES,
-                ));
+                let (threshold, floor, intake_minutes, fallback_minutes, input_defer_max_minutes) =
+                    cfg.get(&a.group).copied().unwrap_or((
+                        DEFAULT_IDLE_TICK_MINUTES,
+                        DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES,
+                        0,
+                        DEFAULT_IDLE_TICK_FALLBACK_MINUTES,
+                        DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES,
+                    ));
                 if let Some(&cur) = outputs.get(&a.id) {
                     let meaningful = idle_output_is_activity(a.last_output_total, cur, floor);
                     a.last_output_total = cur; // rebaseline every observation
                     if meaningful {
                         a.last_progress_ms = now;
+                        // #496: this is the ONLY place the output-only clock moves —
+                        // real progress, never input-deferred.
+                        a.last_output_progress_ms = now;
                         a.idle_tick_notified = false;
                         a.idle_tick_skip_rearm_ms = 0;
                         continue;
@@ -13091,9 +13224,29 @@ impl OrchRegistry {
                 // human is steering (mirrors attention routing's `waiting`
                 // heuristic). Not latch-clearing: human typing isn't the
                 // orchestrator acting on our notice, it just defers the window.
+                //
+                // #496 hardening: the fold is clamped so input alone can never push
+                // the quiet clock more than `input_defer_max_minutes` past the last
+                // REAL output (`last_output_progress_ms`) — two independent
+                // heuristics keying off this same "pane has human input" signal
+                // (this fold, and delivery's stranded-text/retry suppression) can
+                // deadlock if the signal is ever wrong and never clears (a copilot
+                // pane's own xterm auto-replies stamping it with no human present,
+                // #496). `input_defer_bound` records whether THIS scan's input was
+                // actually clamped — i.e. input claims to be more recent than the
+                // bound allows — so a tick that fires off the back of it can be
+                // audited with its own reason instead of reading as an ordinary
+                // quiet-window fire.
+                let mut input_defer_bound = false;
                 if let Some(&last_in) = inputs.get(&a.id) {
-                    if last_in > a.last_progress_ms {
-                        a.last_progress_ms = last_in;
+                    let bound_ms = (input_defer_max_minutes as u64) * 60_000;
+                    let cap = a.last_output_progress_ms.saturating_add(bound_ms);
+                    let effective = last_in.min(cap);
+                    if last_in > cap {
+                        input_defer_bound = true;
+                    }
+                    if effective > a.last_progress_ms {
+                        a.last_progress_ms = effective;
                     }
                 }
                 // A paused group's orchestrator is deliberately quiet; never tick
@@ -13124,7 +13277,7 @@ impl OrchRegistry {
                         // The gate is off for this group: fire exactly as #332
                         // never happened.
                         a.idle_tick_notified = true;
-                        to_notify.push((a.id.clone(), a.group.clone(), false, false));
+                        to_notify.push((a.id.clone(), a.group.clone(), false, false, input_defer_bound));
                         continue;
                     }
                     // #329 coexistence note (rev-31 finding 2): this whole `if` is scoped to
@@ -13154,7 +13307,7 @@ impl OrchRegistry {
                         // marks it distinctly so a null-summary fire is never
                         // silently mistaken for a real signal, or vice versa.
                         let heartbeat = !has_intake_signal && !has_pending_notification && !has_watchdog_stall;
-                        to_notify.push((a.id.clone(), a.group.clone(), true, heartbeat));
+                        to_notify.push((a.id.clone(), a.group.clone(), true, heartbeat, input_defer_bound));
                     } else {
                         a.idle_tick_notified = true;
                         a.idle_tick_skip_rearm_ms = now + intake_minutes as u64 * 60_000;
@@ -13173,7 +13326,7 @@ impl OrchRegistry {
         }
 
         let mut notified = Vec::new();
-        for (id, group, gate_enabled, heartbeat) in to_notify {
+        for (id, group, gate_enabled, heartbeat, input_defer_bound) in to_notify {
             // Record the delivery for the per-hour backstop, pruning to the window.
             // This ring is in-memory only (like `spawn_times`): a restart resets
             // the window, which is the safe direction — the cap is a runaway
@@ -13209,6 +13362,12 @@ impl OrchRegistry {
                 "gate_enabled": gate_enabled,
                 "suppressed": false,
                 "heartbeat": heartbeat,
+                // #496: distinct, audited reason when THIS fire happened only
+                // because `idle_tick_input_defer_max_minutes` capped a perpetually-
+                // refreshing input signal — an unusual reason a tick fired, and one
+                // that must say so rather than reading as an ordinary quiet-window
+                // fire (or, worse, going unexplained).
+                "reason": if input_defer_bound { Some(IDLE_TICK_INPUT_DEFER_BOUND_REASON) } else { None },
             }));
             let text = idle_tick_notice(intake_summary.as_deref(), summary_incomplete);
             let _ = self.deliver_to_orchestrator(&group, &text, "loomux");
@@ -19596,6 +19755,10 @@ impl OrchRegistry {
             idle_since_ms: (role != Role::Orchestrator && task.trim().is_empty()).then(now_ms),
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
+            // Meaningful only for an orchestrator (idle-tick never watches a
+            // worker/reviewer/planner) — seeded the same as `last_progress_ms`
+            // regardless of role, harmless for the roles that never read it.
+            last_output_progress_ms: now_ms(),
             last_output_total: 0,
             watchdog_notified: false,
             idle_tick_notified: false,
@@ -21105,6 +21268,10 @@ pub fn create_orchestration(
             // #83: 0 → clamped() applies DEFAULT_IDLE_ACTIVITY_FLOOR_BYTES; live-settable
             // via orch_set_idle_activity_floor.
             idle_activity_floor_bytes: 0,
+            // #496: 0 → clamped() applies DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES; no
+            // live setter this round (see the field's own doc) — a launch-time default,
+            // adjustable by hand-editing group.json.
+            idle_tick_input_defer_max_minutes: 0,
             // #287: off at launch (the conservative default); live-settable via
             // orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles.
             compact_nudge_minutes: 0,
@@ -21840,6 +22007,7 @@ fn register_orchestrator_pane(
         started_ms: now_ms(),
         last_progress_ms: now_ms(), // watchdog ignores the orchestrator; the
         // idle-tick (#83) reuses this as the orchestrator's output-quiet clock.
+        last_output_progress_ms: now_ms(), // #496: the output-only half of that clock
         last_output_total: 0,
         watchdog_notified: false,
         idle_tick_notified: false,
