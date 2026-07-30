@@ -9260,10 +9260,14 @@ impl OrchRegistry {
     /// at launch (`lib.rs`'s `setup`), matching `start_disk_monitor` et al.
     ///
     /// Conservative by construction, not merely by intent:
-    /// - Only entries literally named `loomux-<something>` are ever
+    /// - Only entries literally named `loomux-<something>.md` (which also
+    ///   covers Copilot's `loomux-<something>.agent.md`) are ever
     ///   considered — loomux's own naming convention (see `write_claude_
-    ///   agent_file`'s `handle` format), nothing else in either directory is
-    ///   touched, and this is never gated on any repo-, toolchain-, or
+    ///   agent_file`'s and `write_copilot_agent_file`'s `handle` formats,
+    ///   the only two shapes either ever writes), nothing else in either
+    ///   directory is touched (a hand-authored `loomux-notes.txt` is
+    ///   invisible to this sweep, not merely spared by the group check
+    ///   below), and this is never gated on any repo-, toolchain-, or
     ///   machine-specific path.
     /// - A candidate is reclaimed ONLY when NO directory under this
     ///   registry's own `state_root()` matches it as a `loomux-<group>[-…]`
@@ -9319,6 +9323,16 @@ impl OrchRegistry {
                     continue;
                 }
                 let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+                // #464 round-2 review N2: `write_claude_agent_file`/`write_
+                // copilot_agent_file` only ever write `<handle>.md` or
+                // `<handle>.agent.md` — never anything else. Requiring that
+                // suffix (both end in `.md`) keeps a hand-authored
+                // `loomux-notes.txt`/similar out of consideration entirely,
+                // on top of (not instead of) the `loomux-` prefix check
+                // below.
+                if !name.ends_with(".md") {
+                    continue;
+                }
                 let Some(rest) = name.strip_prefix("loomux-") else { continue };
                 let known = known_groups.iter().any(|g| {
                     rest == g.as_str()

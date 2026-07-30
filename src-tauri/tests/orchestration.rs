@@ -13451,6 +13451,13 @@ fn sweep_orphaned_agent_files_reclaims_orphans_but_refuses_a_live_group() {
     // let alone removed.
     let foreign_file = claude_dir.join("some-other-tools-agent.md");
     fs::write(&foreign_file, "not loomux's").unwrap();
+    // #464 round-2 review N2: `loomux-` prefixed but the WRONG extension —
+    // `write_claude_agent_file`/`write_copilot_agent_file` only ever write
+    // `.md`/`.agent.md`, never anything else, so a hand-authored file that
+    // merely happens to share the prefix (a note, a scratch file) must be
+    // invisible to this sweep even when it also names an orphaned group.
+    let wrong_extension_file = claude_dir.join("loomux-ghost-group-notes.txt");
+    fs::write(&wrong_extension_file, "not a generated agent file").unwrap();
 
     let result = reg.sweep_orphaned_agent_files();
     assert!(result["errors"].as_array().unwrap().is_empty(), "got: {result}");
@@ -13465,6 +13472,10 @@ fn sweep_orphaned_agent_files_reclaims_orphans_but_refuses_a_live_group() {
     assert!(!lookalike_file.exists(), "a lookalike that is not actually this group's file must be reclaimed too");
     assert!(live_file.exists(), "a still-known group's file must never be touched");
     assert!(foreign_file.exists(), "a file with no `loomux-` prefix must never be considered, let alone removed");
+    assert!(
+        wrong_extension_file.exists(),
+        "a `loomux-`-prefixed file with the wrong extension must never be considered, even when it names an orphaned group"
+    );
 }
 
 #[test]
@@ -13566,44 +13577,70 @@ fn is_live_registry_construction(line: &str) -> bool {
 /// test file, reopened the leak with zero guard.
 #[test]
 fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
+    // Recurse into subdirectories, not just the top level of `tests/`: the
+    // standard `tests/common/mod.rs`-style shared-helper layout (or any
+    // other subdirectory Rust's test harness recognizes) would otherwise
+    // sit outside this pin's scan entirely (#464 round-2 review N1) — the
+    // exact "partial enforcement, next one slips through the gap" shape
+    // this whole ticket has been about. `walkdir`-free: `tests/` is a
+    // handful of files, not worth a dependency for.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
     let tests_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
     // Exactly one file legitimately needs a raw `OrchRegistry::new(...)` per
     // registry-construction helper it defines. Add a file here ONLY when it
     // gains a helper of its own — every other construction, in every file
-    // (including brand new ones this list has never heard of), must be zero.
+    // at every depth (including brand new ones this list has never heard
+    // of), must be zero. Keyed by path RELATIVE to `tests/` (forward
+    // slashes), not bare filename, so a same-named file in a subdirectory
+    // can never collide with a top-level one.
     let sanctioned: &[(&str, usize)] = &[
         ("orchestration.rs", 1), // relaunch_registry
         ("workflow.rs", 1),      // relaunch_registry
         ("lessonsfile.rs", 1),   // test_registry
         ("prompts.rs", 1),       // test_registry
     ];
+    let mut files = Vec::new();
+    collect_rs_files(tests_dir, &mut files);
     let mut checked = 0;
-    for entry in std::fs::read_dir(tests_dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", tests_dir.display()))
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    for path in &files {
+        let rel = path
+            .strip_prefix(tests_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let sites: Vec<&str> = src.lines().filter(|l| is_live_registry_construction(l)).collect();
-        let expected = sanctioned.iter().find(|(f, _)| *f == name).map(|(_, n)| *n).unwrap_or(0);
+        let expected = sanctioned.iter().find(|(f, _)| *f == rel).map(|(_, n)| *n).unwrap_or(0);
         assert_eq!(
             sites.len(),
             expected,
-            "tests/{name}: expected exactly {expected} raw `OrchRegistry::new(...)` (its own \
+            "tests/{rel}: expected exactly {expected} raw `OrchRegistry::new(...)` (its own \
              sanctioned registry-construction helper, if any) — found {}. Every OTHER \
              construction must route through that file's `relaunch_registry`/`test_registry` \
              helper, or it leaks a generated agent file into the real ~/.claude or \
              ~/.copilot agents dir on its first spawn (#464). If this file is meant to gain its \
-             own helper, add it to `sanctioned` above with its count. All live sites found: {sites:?}",
+             own helper, add it to `sanctioned` above with its count (using its path relative to \
+             `tests/`). All live sites found: {sites:?}",
             sites.len(),
         );
         checked += 1;
     }
-    assert!(checked >= sanctioned.len(), "expected to check at least {} tests/*.rs files, only found {checked} — did the tests/ dir move?", sanctioned.len());
+    assert!(
+        checked >= sanctioned.len(),
+        "expected to check at least {} tests/**/*.rs files, only found {checked} — did the tests/ dir move?",
+        sanctioned.len()
+    );
 }
 
 #[test]
