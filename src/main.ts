@@ -661,15 +661,21 @@ async function openActionPane(
         body: "This agent had no resumable session — start it fresh in its folder.",
         initial: errorRestoreCardState("This agent had no resumable session — start it fresh in its folder."),
         onClick: async () => {
-          // startFromDormant tears the card down synchronously on success, so a
-          // second click can't re-fire; notify once it's live so the counter
-          // reflects it. This is copilot's own restore path (it never gets a
-          // recorded session id — see launcher.ts:1321 — so it always lands
-          // here, never resume/fresh-agent), and its recorded command can carry
-          // the SAME dead solo-identity MCP flags (#439) — re-mint before
-          // replaying, just like resume/fresh-agent. Wrapped in try/catch
-          // (#479 A): a failed start must land the card on its error state,
-          // never an unhandled rejection behind a spinner stuck forever.
+          // startFromDormant flips `pane.isDormant` false synchronously (so a
+          // second click / the #440 D2 prefetch can't re-fire against this
+          // same card) but keeps the placeholder ELEMENT mounted until the
+          // spawn itself settles (#479 review finding 2) — notify once it's
+          // live so the counter reflects it. This is copilot's own restore
+          // path (it never gets a recorded session id — see launcher.ts:1321
+          // — so it always lands here, never resume/fresh-agent), and its
+          // recorded command can carry the SAME dead solo-identity MCP flags
+          // (#439) — re-mint before replaying, just like resume/fresh-agent.
+          // Wrapped in try/catch (#479 A): a failed start must land the card
+          // on its error state, never an unhandled rejection behind a spinner
+          // stuck forever — and dormantCard's own render() now falls back to
+          // a toast if this card's element is ever detached by the time this
+          // settles (finding 2's structural backstop, not just this ordering
+          // fix).
           try {
             const remint = await remintSoloIdentity(
               a.name,
@@ -878,10 +884,18 @@ async function openActionPane(
 
 /** What a dormant card's action resolves to: success (the caller almost
  *  always tears the whole card down right after, replacing it with a live
- *  pane) or a failure with the diagnostic to show. Never a bare throw — every
- *  call site below catches its own errors into this shape so a restore
- *  failure always lands on the card's error state (#479) rather than an
- *  unhandled rejection with a spinner stuck behind it. */
+ *  pane) or a failure with the diagnostic to show. Every call site below
+ *  catches its OWN known failure points into this shape, and `dormantCard`'s
+ *  own click handler ALSO has a rejection handler on `onClick` itself (#479
+ *  review finding 1) as a structural backstop — so a restore failure lands on
+ *  the card's error state whether or not a given call site remembered to
+ *  catch it locally, not only when it did. This type/contract covers every
+ *  `dormantCard`'s primary action; the separate #440 D2 "Resume last
+ *  session" secondary button (`addDormantCardAction`) is NOT wired through
+ *  it — that action predates this state machine and still falls back to the
+ *  pre-#479 behavior (an uncaught rejection reaching the global error
+ *  banner) on failure, same as before this PR, not silently worse and not
+ *  newly better either. */
 type RestoreCardResult = { ok: true } | { ok: false; message: string };
 
 /** Options for `dormantCard` (#479 rework): the same small card a dormant
@@ -932,6 +946,21 @@ function dormantCard(opts: {
   btn.append(spinner, label);
 
   const render = (): void => {
+    // #479 review finding 2: a failure can arrive after the caller has
+    // already torn this card's element out of the document (the dormant-
+    // agent Start card removes its placeholder before `onClick`'s own
+    // work finishes — pane.ts's `startFromDormant` awaits the spawn before
+    // tearing down as of this same fix, but a future teardown-then-fail
+    // ordering elsewhere is exactly the class of bug that closes over, not
+    // just the two named instances). Rendering an error into a detached
+    // element is invisible — worse than the pre-PR uncaught rejection,
+    // which at least reached the global banner. A toast is the fallback
+    // surface so a caught failure is never silently swallowed by its own
+    // element being gone.
+    if (state.status === "error" && !wrap.isConnected) {
+      showToast(`${opts.errorTitle ?? opts.title}: ${state.message ?? ""}`, "error");
+      return;
+    }
     wrap.classList.toggle("dormant-card-error", state.status === "error");
     h.textContent = state.status === "error" ? (opts.errorTitle ?? opts.title) : opts.title;
     // The diagnostic detail (#440) IS the error message once one exists;
@@ -948,12 +977,31 @@ function dormantCard(opts: {
     if (next === state) return; // already pending — ignore the re-entrant click (#194 P4 MED-3)
     state = next;
     render();
-    void opts.onClick().then((result) => {
-      state = result.ok
-        ? nextRestoreCardState(state, { type: "settle" })
-        : nextRestoreCardState(state, { type: "fail", message: result.message });
-      render();
-    });
+    // #479 review finding 1: `.then` with no rejection handler left the
+    // card stuck at "pending" forever on any throw outside onClick's own
+    // internal catches — the DoD's named anti-goal ("never a stuck
+    // spinner"). The second callback below is the structural fix: every
+    // path out of `onClick` — resolve ok, resolve not-ok, or reject —
+    // reaches a `nextRestoreCardState` transition and a `render()`, so
+    // "pending" can never be a terminal state by omission. Wrapping the
+    // CALL itself in `Promise.resolve().then(...)` (not just chaining off
+    // its result) means even a synchronous throw from a future non-async
+    // `onClick` becomes a rejection this handles too, not an uncaught
+    // exception escaping the click handler.
+    void Promise.resolve()
+      .then(() => opts.onClick())
+      .then(
+        (result) => {
+          state = result.ok
+            ? nextRestoreCardState(state, { type: "settle" })
+            : nextRestoreCardState(state, { type: "fail", message: result.message });
+          render();
+        },
+        (err) => {
+          state = nextRestoreCardState(state, { type: "fail", message: String(err) });
+          render();
+        }
+      );
   });
 
   wrap.append(icon, h, p, btn);

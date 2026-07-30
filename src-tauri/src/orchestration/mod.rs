@@ -10209,21 +10209,39 @@ impl OrchRegistry {
     /// doesn't need every OTHER group's group.json/tasks.json/full audit log
     /// read and parsed just to throw away every row but one. This reads and
     /// merges exactly the one group `session_roles()` would eventually find
-    /// it in — same fields, same last-match tie-break — so a hit here is
-    /// byte-identical to what the full scan would have returned. A miss
-    /// (stale/wrong hint, or the id genuinely isn't in that group) falls
-    /// through to the unchanged full scan in the caller, so correctness never
-    /// depends on the hint being right, only speed does.
+    /// it in — same fields, same last-match tie-break, WITHIN that group.
+    ///
+    /// **Not proven equivalent to the full scan in general** (review round on
+    /// #479's PR, correcting this comment's own prior overclaim): when a
+    /// session id has an `agent-spawn` audit row in MORE than one group —
+    /// reachable today via #485 (a delegate rejoined into the wrong group
+    /// writes that row into it too) — a hit here resolves to the HINTED
+    /// group deterministically, where the full scan's `.last()` resolves to
+    /// whichever group `fs::read_dir(&self.root)` happened to enumerate last
+    /// (arbitrary iteration order, not a considered choice either). The two
+    /// can disagree in that corner. Hinted-group-wins is arguably the more
+    /// defensible rule — it's the group the clicked tab is actually bound
+    /// to — but it is a DIFFERENT tie-break, not a proof of sameness, and
+    /// this must not be sold as one until #485 removes the corner (a session
+    /// can never legitimately belong to two groups). A miss (stale/wrong
+    /// hint, or the id genuinely isn't in that group) falls through to the
+    /// unchanged full scan in the caller.
     ///
     /// Measured (`resume_recorded_session_group_hint_avoids_scanning_every_
     /// other_group`, tests/orchestration.rs, #479): with 200 decoy groups on
-    /// disk (300 audit lines each), resuming via a correct group hint took
-    /// 419ms on `resume_recorded_session`'s prior unconditional
-    /// `session_roles()` call; with this fast path in its place, 42ms — the
-    /// remainder is the orchestrator relaunch's own unavoidable work (MCP
-    /// config mint, instruction/hook files), not session lookup. Both
-    /// numbers are debug-build, one dev machine — the point is the O(groups)
-    /// term this removes, not the absolute figures.
+    /// disk (300 audit lines each — the axis this test exercises), resuming
+    /// via a correct group hint took 419ms on `resume_recorded_session`'s
+    /// prior unconditional `session_roles()` call; with this fast path in
+    /// its place, 42ms. Both numbers are debug-build, one dev machine — the
+    /// point is the O(other groups) term this removes, not the absolute
+    /// figures, and this axis (many groups, each modest) is not the only one
+    /// that matters: this fast path still reads and parses the HINTED
+    /// group's OWN full audit log (`merged_records` → `records_from_audit`,
+    /// both rotation generations, bounded at ~16 MB by the 8 MB rotate cap)
+    /// — a real, long-lived group with a near-cap audit log still pays that
+    /// cost every resume, and the 42ms figure will not reproduce for it.
+    /// What this fast path removes is strictly the OTHER groups' scans, not
+    /// the resumed group's own.
     fn session_role_in_group(&self, group_id: &str, session_id: &str) -> Option<SessionRole> {
         if !self.group_dir(group_id).join("group.json").is_file() {
             return None;
@@ -21522,8 +21540,11 @@ pub fn resume_recorded_session(
         // paying for every OTHER group's group.json/tasks.json/full audit
         // log, which `session_roles()` below pays for regardless of whether
         // its result is used. A miss (wrong/stale hint) falls through to the
-        // full scan, so this can only make a correct hint faster, never make
-        // an incorrect one wrong.
+        // full scan. This is a genuinely DIFFERENT tie-break from the full
+        // scan's, not merely a faster path to the same answer — see
+        // `session_role_in_group`'s doc comment for the #485 corner (a
+        // session id recorded in more than one group) where the two can
+        // resolve to different groups.
         .and_then(|(group_id, _)| reg.session_role_in_group(group_id, session_id))
         .or_else(|| {
             reg.session_roles()
