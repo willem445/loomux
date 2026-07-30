@@ -195,6 +195,43 @@ export function compositeScale(fits: readonly PreviewFit[], min: number, max: nu
   return Math.max(min, Math.min(max, median));
 }
 
+// ---------- orchestrator launch placement (#478) ----------
+//
+// Splitting an existing tab and picking "orchestrator" in the split's setup
+// pane opened a brand-new project tab instead of landing in the split: the
+// orchestrator branch of `handleWelcomeSubmit` (main.ts) always routed
+// through `launchOrchestratorTab`, a group-creation helper that unconditionally
+// mints its OWN tab, regardless of how the setup pane it's replacing got
+// there. That is candidate #1 from the issue — a group-creation path that
+// owns tab placement rather than the ordinary split path that respects the
+// target pane — confirmed by reading the call site, not the other candidate
+// (no split-target is ever threaded through `openAgentPane`/`grid.openPane`
+// today, so there was nothing to lose across the async round trip; it was
+// simply never consulted).
+
+/** Where a just-submitted orchestrator welcome-form should land, decided from
+ *  the tab's pane count BEFORE the setup pane converts (`Grid.paneCount`,
+ *  which counts only in-tree leaves — never the docked/minimized panes a
+ *  background agent may already have, since those don't reflect an active
+ *  split gesture).
+ *
+ *  `"split"`: the setup pane is NOT the tab's only pane, i.e. it landed via a
+ *  genuine split into an already-populated tab — every split entry point
+ *  (a pane's own "Split right/down" menu, the toolbar buttons, the keyboard
+ *  shortcuts) funnels through `openWelcomeIn`, and any of them splitting an
+ *  existing pane leaves exactly 2+ leaves in the tree by the time the form is
+ *  submitted. The gesture picked a location; honour it — convert the setup
+ *  pane in place instead of relocating the result to a new tab.
+ *
+ *  `"own-tab"`: the setup pane IS the tab's only pane (a fresh Ctrl+T tab, the
+ *  initial boot tab, or a tab drained back to welcome after its last pane
+ *  closed) — there is nothing to split into, so this keeps the pre-#478
+ *  dedicated-project-tab behavior unchanged, per the issue's DoD ("creating an
+ *  orchestrator with no split gesture ... still behaves as it does today"). */
+export function orchestratorLaunchTarget(paneCountInTab: number): "split" | "own-tab" {
+  return paneCountInTab > 1 ? "split" : "own-tab";
+}
+
 // ---------- cross-tab pane lookup (the live focus / exit / rename path) ----------
 
 /** Minimal grid surface for locating a pane by pty — the real Grid satisfies it. */
