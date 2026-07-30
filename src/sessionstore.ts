@@ -96,10 +96,13 @@ export class SessionStore {
    *  cached rows if a load has already succeeded, joins the run in flight if one
    *  is (the boot prefetch, typically), and only otherwise starts one.
    *
-   *  Rejects if the scan it depended on rejected — callers that treat "no list"
-   *  as "assume resumable" (main.ts's group restore) need to be able to tell an
-   *  empty answer from a failed one, exactly as they could when they called
-   *  `listSessions()` directly. */
+   *  Rejects if the scan it depended on rejected, instead of recording a failure
+   *  as a successful empty load. That is NOT "the caller can tell empty from
+   *  error" — main.ts's `seenAny` guard treats both alike ("assume resumable"),
+   *  and #493 left that resume-path semantic alone. It is that one transient
+   *  failure must not leave this store answering "empty, already loaded" for the
+   *  rest of the session, which would strand the sidebar and silently turn the
+   *  resumability check into a no-op with nothing to retrigger it. */
   async ensureLoaded(): Promise<readonly SessionInfo[]> {
     if (this.loadedOnce) return this.rows;
     if (this.inflight) {

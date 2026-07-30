@@ -99,8 +99,11 @@ export class SessionBrowser {
    *  only scans when neither can answer. main.ts's group-restore resumability
    *  check calls this — it used to call `listSessions()` directly, which is what
    *  made a restore click issue a second concurrent full scan and then wait on
-   *  it. Rejects if the underlying scan failed, so a caller can still
-   *  distinguish "no sessions" from "couldn't look". */
+   *  it. Rejects if the underlying scan failed rather than caching that failure
+   *  as an empty success, so the next caller retries; the call site's own
+   *  empty-vs-error handling is unchanged (main.ts's pre-existing `seenAny`
+   *  guard treats a successful empty list and a rejection ALIKE — see
+   *  doc/design/session-index.md). */
   ensureLoaded(): Promise<readonly SessionInfo[]> {
     return this.store.ensureLoaded();
   }

@@ -113,10 +113,24 @@ different:
 `ensureLoaded()` is what the restore click now calls. Freshness isn't what that
 check needs: it asks whether session ids *captured at close* still have
 transcripts, and a transcript the newest read already saw hasn't stopped
-existing since. A rejected scan still rejects, so the caller can keep
-distinguishing "no sessions" (assume nothing resumable) from "couldn't look"
-(assume everything is) exactly as it could when it called `listSessions()`
-itself.
+existing since. A rejected scan still rejects rather than being remembered as an
+empty success, so the call site's own empty-vs-error handling is unchanged from
+when it called `listSessions()` itself.
+
+That handling is easy to state too strongly, so precisely: `main.ts`'s
+pre-existing `seenAny` guard (`seenAny ? resumableIds.has(sid) : true`) treats a
+**successful empty list exactly like a rejection** — both mean "assume every
+captured id is resumable", leaving the runtime backstop (`tryResumeFallback`,
+#194 BUG-1: a `--resume` against a missing transcript exits immediately and that
+pane alone respawns fresh) to catch a doomed resume. It does *not* distinguish
+"no sessions" from "couldn't look", and #493 deliberately did not change that —
+it is resume-path semantics (#412/#440), not scan/index semantics.
+
+What the store does guarantee is narrower, and is what its tests pin: a **failed**
+scan is never cached as a successful empty load. Without that, one transient
+failure would leave the store serving an empty list for the rest of the session —
+the sidebar stuck empty until a manual ↻, and the resumability check permanently
+degraded to "assume everything is resumable" via the guard above, with no retry.
 
 The loss-safe *coalescing* of dropped refresh calls (a call arriving mid-scan
 owing exactly one trailing re-run, rev-9 review) stays in `SessionBrowser`'s

@@ -132,10 +132,13 @@ test("concurrent refresh() callers join one scan; a later one still re-reads", a
 });
 
 test("a failed scan is not remembered as loaded, and rejects its caller", async () => {
-  // main.ts's group restore distinguishes "no sessions" from "couldn't look":
-  // an empty list means "assume nothing is resumable", a rejection means
-  // "assume everything is". Caching a failure as a successful empty load would
-  // silently turn every group restore into "no saved conversation to resume".
+  // Why this matters, stated as the code actually behaves (rev-48 NB-1): main.ts's
+  // `seenAny` guard treats a successful EMPTY list and a rejection alike — both
+  // mean "assume every captured id is resumable" — so this is NOT about the caller
+  // telling empty from error. It is that a failure must not be recorded as a
+  // successful empty load: `loadedOnce` would latch, every later `ensureLoaded()`
+  // would serve `[]` without rescanning, and one transient failure would strand
+  // the sidebar empty and turn the resumability check into a permanent no-op.
   let calls = 0;
   const store = new SessionStore(() => {
     calls += 1;
