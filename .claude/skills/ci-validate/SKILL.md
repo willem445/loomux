@@ -16,20 +16,32 @@ line drawn on scope/duration, not on any mechanism's state.
 
 ## The decision rule
 
-> Quick/local iteration — a single-file test, an incremental `cargo check`,
-> a quick build to sanity-check a change? **Do it locally**, capped at `-j
-> 4` (below). There's nothing to gate this on; it's just a sane default so
-> one agent's build doesn't eat all the CPU on a machine several agents
-> share.
+> Quick/local iteration — **a single test you are actively iterating on**
+> (`cargo test -j 4 --test <target> <one_test_filter>`), an incremental
+> `cargo check`, a `tsc`/`npm run build` typecheck? **Do it locally**,
+> capped at `-j 4` (below). There's nothing to gate this on; it's just a
+> sane default so one agent's build doesn't eat all the CPU on a machine
+> several agents share.
 >
-> Full/longer-running validation — the whole suite, multi-platform proof,
-> anything you'd cite as "the suite passes" in a PR description or a `done`
-> report? **That's CI's job.** Push, open the PR, and wait for it — don't
-> run it locally on your own clock instead of waiting for CI.
+> Everything bigger — **a full `--test <target>` run (even a single
+> target), the whole suite, multi-platform proof**, anything you'd cite as
+> "the suite passes" in a PR description or a `done` report? **That's CI's
+> job.** Push, open the draft PR, and wait for it — don't run it locally on
+> your own clock instead of waiting for CI. Running the full target locally
+> "one last time before pushing" is the pattern this rule exists to stop:
+> it proves nothing CI won't prove, and it costs what CI doesn't (below).
 
 CI remains the sole authority for the CI gate. A worker citing a local run
 as full validation is citing the wrong evidence — cite the PR's CI run
 instead (see "Definition of validated" below).
+
+**Disk is the second budget, not just CPU** (human directive, 2026-07-30):
+every full local build inflates the worktree's `target/` by 5-8 GB, and a
+fleet of parallel workers doing it exhausted the workspace drive twice in
+one day (see #488; a full disk has previously destroyed a live task board,
+#133, and crashed loomux outright, #464). CI spends GitHub's disk, not this
+machine's. If your local iteration has grown a multi-GB `target/` and your
+change is pushed, `cargo clean` is a courteous exit.
 
 ## Running locally, capped
 
