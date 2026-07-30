@@ -6,9 +6,10 @@
 // NB: a tested module can't runtime-import a sibling src module (Node's ESM
 // loader won't resolve the extensionless path), so the urgency rule is inlined
 // below rather than imported from attention.ts. It is the SAME rule
-// attentionPresentation uses — blocked is the one urgent reason — and the pane
-// header / dock chip still render via attentionPresentation verbatim (main.ts
-// applies pane.setAttention, which uses it). Keep the two in lockstep.
+// attentionPresentation uses — `blocked` and `stranded` (#496 PR-C) are the
+// urgent reasons — and the pane header / dock chip still render via
+// attentionPresentation verbatim (main.ts applies pane.setAttention, which uses
+// it). Keep the two in lockstep.
 
 /** A pure description of a tab's split layout for the preview composite (#63):
  *  the split tree with each pane's serialized-HTML viewport at the leaves. Built
@@ -19,11 +20,19 @@ export type PreviewNode =
   | { kind: "split"; dir: "row" | "column"; weight: number; children: PreviewNode[] };
 
 /** Whether an attention reason is urgent, mirroring attention.ts. */
-const isUrgentReason = (reason: string): boolean => reason === "blocked";
+const isUrgentReason = (reason: string): boolean =>
+  reason === "blocked" || reason === "stranded";
 
 // Priority when several panes in one tab need attention: show the most urgent
-// reason on the tab chip. Mirrors attention.ts's ordering (blocked first).
-const REASON_PRIORITY: Record<string, number> = { blocked: 4, waiting: 3, gate: 2, report: 1 };
+// reason on the tab chip. Mirrors the backend's own ordering in
+// `attention_tick` (blocked > stranded > waiting > gate/report).
+const REASON_PRIORITY: Record<string, number> = {
+  blocked: 5,
+  stranded: 4,
+  waiting: 3,
+  gate: 2,
+  report: 1,
+};
 const reasonRank = (reason: string): number => REASON_PRIORITY[reason] ?? 0;
 
 /** The slice of a backend AttentionItem this module needs. The real

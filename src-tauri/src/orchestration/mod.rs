@@ -5143,6 +5143,8 @@ pub struct AgentEntry {
 /// event (the full current set each scan; the frontend badges panes by
 /// `pty_id`). `reason`, most- to least-urgent:
 /// - `blocked` — a worker reported it is blocked
+/// - `stranded` — a delivered prompt was never submitted (#496 PR-C): either
+///   loomux is self-healing it, or it needs the human's Enter
 /// - `waiting` — the pane is parked on a prompt (idle-with-prompt)
 /// - `report`  — a worker reported done (awaiting the human's review/merge)
 /// - `gate`    — this agent's task sits at a human merge gate on the board
@@ -5979,6 +5981,15 @@ pub struct OrchRegistry {
     /// desktop toast only once per attention onset (the event itself is
     /// re-emitted every tick and the frontend badges idempotently).
     attn_emitted: Mutex<HashMap<String, String>>,
+    /// Attention routing (#496 PR-C): agent id → the stranded-delivery state
+    /// of its pane — a delivery the late monitor declared `Failed`, and
+    /// whether loomux is self-healing it or needs the human. Latched (unlike
+    /// `waiting`, which is recomputed every scan) because the condition it
+    /// describes is a past event the pane's own output cannot re-derive:
+    /// nothing about a wedged pane changes until something submits the
+    /// prompt. Cleared by `clear_stranded` when the ledger says the delivery
+    /// resolved, and pruned in `attention_tick` when the agent stops running.
+    attn_stranded: Mutex<HashMap<String, StrandedNote>>,
     /// Groups with desktop notifications enabled (durable `notify` marker file).
     notify_groups: Mutex<HashSet<String>>,
     /// Autonomous mode (#83): groups whose orchestrator is idle-ticked to run its
@@ -7645,6 +7656,188 @@ pub fn late_monitor_tick(
     MonitorAction::KeepWaiting
 }
 
+// ────────────── #496 PR-C: actuation on a stranded delivery ──────────────
+//
+// #451 gave a delivery three honest states and #445/#470 made a held payload
+// queued-never-destroyed — but nothing ACTS on `Failed`. For an
+// orchestrator-target delivery both notices are suppressed by design (loop
+// avoidance — `should_notify_unconfirmed`/`should_notify_paste_held`), and in
+// an idle group there is no NEXT delivery whose own pre-paste flush would
+// eventually press the withheld Enter. The prompt then sits in the box until
+// a human notices and presses Enter by hand — the human being the recovery
+// mechanism, which is the defect #496 is about (observed on Claude panes as
+// well as copilot ones: the root cause is CLI-agnostic).
+//
+// The guarantee this section adds: **a delivery ends Confirmed, or a bounded
+// self-heal fires, or a human-visible attention badge is raised. No path
+// ends silent-and-wedged.**
+//
+// Two deliberate non-inventions:
+// - The re-submit is NOT a new delivery and NOT a raw write from the monitor
+//   thread. It is admitted as a `StrandedSubmit` marker at the FRONT of the
+//   pane's queue (`enqueue_stranded_front`) and pressed by the drainer —
+//   the same single-consumer path #470 made the only way anything reaches a
+//   pane, and the same marker `AbortedPreEnter` already uses. Front, not
+//   back, because the stranded text is physically in the box already:
+//   anything queued behind it must not paste on top of it. A raw write here
+//   would race the drainer mid-paste and re-open the ordering hole #470
+//   closed.
+// - The guardrails are re-used, not re-implemented: `drain_stranded_submit`
+//   → `flush_stranded_text` re-derives `human_typed_since` from the ledger
+//   and re-reads the live question state (#420) at the instant of the press.
+//   `stranded_selfheal_action` below is the TRIGGER gate, deciding whether a
+//   heal is worth admitting at all; it never becomes the last word on
+//   whether the Enter is safe.
+
+/// Why a stranded delivery could not be self-healed (#496 PR-C). Carried into
+/// the attention badge so "this pane needs you" always says what is in the
+/// way, rather than leaving the human to work it out from the pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrandedBlocker {
+    /// A human has typed into the pane since our own submit, so the box may
+    /// hold THEIR line. Never merge-submit over human-typed content — the
+    /// same rule `should_flush_before_paste` has enforced since #81/#84.
+    HumanInput,
+    /// A live interactive question owns the Enter key (#420): pressing it
+    /// would answer the question, not submit our prompt.
+    Question,
+    /// Our pasted text is no longer at the box's tail end, so there is
+    /// nothing identifiable to re-submit — the delivery still failed, and
+    /// the human still needs to know, but loomux must not press Enter into
+    /// a pane whose state it can no longer account for.
+    NotHolding,
+    /// The per-delivery heal budget (`STRANDED_SELFHEAL_MAX_HEALS`) is spent.
+    Exhausted,
+}
+
+impl StrandedBlocker {
+    /// Stable audit token — the string that lands in the audit log, kept
+    /// separate from the human-facing badge text so one can change without
+    /// silently breaking greps over the other.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StrandedBlocker::HumanInput => "human-input",
+            StrandedBlocker::Question => "question",
+            StrandedBlocker::NotHolding => "not-holding",
+            StrandedBlocker::Exhausted => "heal-budget-spent",
+        }
+    }
+}
+
+/// What to do about a delivery the late monitor just declared `Failed`
+/// (#496 PR-C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrandedAction {
+    /// The ledger says this delivery is no longer outstanding (confirmed, or
+    /// superseded by one that was). Nothing to heal and nothing to badge.
+    Resolved,
+    /// Safe: admit a bounded re-submit through the delivery queue.
+    SelfHeal,
+    /// Not safe (or budget spent): raise the pane's attention badge instead
+    /// of waiting silently.
+    Attention(StrandedBlocker),
+}
+
+/// How many self-heal submits loomux may fire for ONE stranded delivery
+/// (#496 PR-C). One, deliberately: the heal is an Enter into a pane whose
+/// state we can only observe indirectly, and the failure mode of pressing it
+/// twice (a second Enter landing on whatever the first one opened) is worse
+/// than the failure mode of not pressing it again (a badge the human
+/// already has in front of them). The bound is also structural today —
+/// `late_monitor_tick` returns `DeclareFailed` at most once per monitor,
+/// since every later tick sees `already_failed` — but that is the *caller's*
+/// precedence, and a future edit could change it without noticing this;
+/// counting explicitly means the cap survives that edit and is directly
+/// testable rather than inferred.
+pub const STRANDED_SELFHEAL_MAX_HEALS: u32 = 1;
+
+/// The one decision point for #496 PR-C: given everything known about a
+/// just-`Failed` delivery, self-heal or badge? Pure, so the precedence — and
+/// in particular that the human-content guard is checked FIRST — is directly
+/// pinnable rather than an inline `if` chain a future edit could reorder
+/// (the argument `final_window_outcome` and `late_monitor_tick` already make
+/// in this file).
+///
+/// Inputs, in the order they are consulted:
+/// - `ledger_outstanding` — the DURABLE artifact, not a pane heuristic: this
+///   pane's recorded `DeliveryOutcome` is still THIS delivery's and still
+///   unconfirmed. Anything else means the ledger already moved on (a heal
+///   that landed, a newer delivery that confirmed) and this monitor has
+///   nothing to actuate. Checked first so no pane reading can ever override
+///   what the ledger says about whether a delivery is still outstanding.
+/// - `human_typed_since` — a human keystroke landed after our submit
+///   (`tier1_trusted`'s inverse). The one absolute: loomux never submits
+///   over human-typed content, so this outranks every other input including
+///   the heal budget.
+/// - `question_on_screen` — #420's guard. False by construction at today's
+///   only call site (`late_monitor_tick` will not declare failure while a
+///   question is up), and re-checked authoritatively at press time by
+///   `flush_stranded_text`; taken as a parameter anyway so this function
+///   does not silently depend on the caller's precedence staying that way.
+/// - `box_holds_paste` — our text is still identifiable at the box's tail
+///   end (Tier 1's own signal, `box_holds_paste`).
+/// - `heals_used` / `max_heals` — the bound.
+pub fn stranded_selfheal_action(
+    ledger_outstanding: bool,
+    human_typed_since: bool,
+    question_on_screen: bool,
+    box_holds_paste: bool,
+    heals_used: u32,
+    max_heals: u32,
+) -> StrandedAction {
+    if !ledger_outstanding {
+        return StrandedAction::Resolved;
+    }
+    if human_typed_since {
+        return StrandedAction::Attention(StrandedBlocker::HumanInput);
+    }
+    if question_on_screen {
+        return StrandedAction::Attention(StrandedBlocker::Question);
+    }
+    if !box_holds_paste {
+        return StrandedAction::Attention(StrandedBlocker::NotHolding);
+    }
+    if heals_used >= max_heals {
+        return StrandedAction::Attention(StrandedBlocker::Exhausted);
+    }
+    StrandedAction::SelfHeal
+}
+
+/// One pane's stranded-delivery state (#496 PR-C), held in
+/// `OrchRegistry::attn_stranded` and rendered by `attention_tick`. Only the
+/// facts are stored; the human-facing wording is built at render time by
+/// `stranded_detail`, so the badge text lives in exactly one place next to
+/// every other attention reason's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrandedNote {
+    /// `None` — a self-heal is in flight for this pane. `Some(blocker)` —
+    /// loomux cannot act and the human must.
+    pub blocker: Option<StrandedBlocker>,
+    /// When the delivery was declared stranded (Unix-ms).
+    pub since_ms: u64,
+}
+
+/// The badge/tooltip wording for a stranded pane (#496 PR-C) — pure, and
+/// deliberately phrased as what the HUMAN should do, since the entire point
+/// of the badge is that a wedged pane is never discovered by accident.
+pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
+    match blocker {
+        None => format!("{name}'s prompt was never submitted — loomux is re-sending it"),
+        Some(StrandedBlocker::HumanInput) => {
+            format!("{name}'s prompt is stuck behind text you typed — press Enter or clear the box")
+        }
+        Some(StrandedBlocker::Question) => {
+            format!("{name}'s prompt is stuck behind a question on screen — answer it")
+        }
+        Some(StrandedBlocker::NotHolding) => {
+            format!("{name}'s prompt was never confirmed and its text is gone — check the pane")
+        }
+        Some(StrandedBlocker::Exhausted) => {
+            format!("{name}'s prompt is still unsubmitted after a self-heal — press Enter in the pane")
+        }
+    }
+}
+
 /// Tier 1 (#112 round 2): does `stripped_tail` (ANSI-stripped current pane
 /// output) still hold `pasted` at its TAIL END? Deliberately "at the tail
 /// end", not "anywhere" — a CLI that echoes an ACCEPTED prompt into
@@ -7757,6 +7950,22 @@ fn run_late_confirmation_monitor(
     let mut quiet_since: Option<std::time::Instant> = None;
     let mut last_total = ptys.output_total(pty_id).unwrap_or(0);
     let mut failed = already_failed;
+    // #496 PR-C: self-heal submits fired by THIS monitor, counted against
+    // `STRANDED_SELFHEAL_MAX_HEALS`. Per-monitor (i.e. per-delivery) — a
+    // fresh delivery to the same pane gets its own budget, which is correct:
+    // its Enter is about different text.
+    let mut heals_used = 0u32;
+    // #496 PR-C: whether our pasted text was still identifiably in the box at
+    // the moment this delivery was declared stranded. A raised badge must be
+    // able to come DOWN on evidence — a human who rescues the pane by
+    // pressing Enter themselves produces no hook record on a CLI that has
+    // none, so waiting for `Confirm` would leave the badge up until the
+    // monitor's 4h cap. The text going from present to absent is that
+    // evidence, and it is Tier 1's own signal used exactly as `deliver_prompt`
+    // uses it. Only a genuine present→absent TRANSITION clears, so a
+    // `NotHolding` badge (raised precisely because the text was already gone)
+    // is never immediately un-raised by the same reading that raised it.
+    let mut paste_seen_in_box = false;
     loop {
         std::thread::sleep(LATE_MONITOR_POLL);
         // The pty closing (agent exited/killed) means there is nothing left
@@ -7764,10 +7973,13 @@ fn run_late_confirmation_monitor(
         // degrade in this module (never an error the caller has to handle).
         let Some(cur_total) = ptys.output_total(pty_id) else { return };
 
-        let superseded = last_delivery
-            .lock_safe()
-            .get(&pty_id)
-            .is_some_and(|o| o.submit_sent_ms != submit_sent_ms);
+        // The delivery ledger — the durable artifact #496's self-heal judges
+        // from, ahead of any pane reading. `outstanding` means this pane's
+        // recorded outcome is still THIS delivery's and still unconfirmed.
+        let recorded = last_delivery.lock_safe().get(&pty_id).cloned();
+        let superseded = recorded.as_ref().is_some_and(|o| o.submit_sent_ms != submit_sent_ms);
+        let ledger_outstanding =
+            recorded.as_ref().is_some_and(|o| o.submit_sent_ms == submit_sent_ms && !o.confirmed);
 
         // Quiescence + question-guard tracking (only meaningful once
         // `late_monitor_tick` actually asks for them, but cheap to keep
@@ -7790,8 +8002,45 @@ fn run_late_confirmation_monitor(
         let expired = started.elapsed() >= LATE_MONITOR_MAX_LIFETIME;
 
         match late_monitor_tick(superseded, hook_match, failed, expired, quiet_long_enough, showing_question) {
-            MonitorAction::Superseded | MonitorAction::Expired => return,
-            MonitorAction::KeepWaiting => continue,
+            MonitorAction::Superseded => {
+                // #496 PR-C: a newer delivery owns this pane now. If IT is
+                // recorded confirmed, the pane is unwedged — including the
+                // case where this monitor's OWN self-heal landed, since
+                // `drain_stranded_submit` records the successful press as a
+                // fresh confirmed outcome. Drop the badge on the way out; a
+                // newer UNCONFIRMED outcome leaves it up, because that
+                // delivery's own monitor owns the pane's state from here.
+                if recorded.as_ref().is_some_and(|o| o.confirmed) {
+                    if let Some(r) = &reg {
+                        r.clear_stranded(&group, &agent, "superseded-confirmed");
+                    }
+                }
+                return;
+            }
+            MonitorAction::Expired => return,
+            MonitorAction::KeepWaiting => {
+                // #496 PR-C: drop a raised badge the moment the stranded
+                // text leaves the box — whoever pressed Enter (a human
+                // rescuing the pane, or our own self-heal on a CLI that
+                // reports no hook), the pane is no longer wedged and must
+                // not keep claiming it is. See `paste_seen_in_box`.
+                if paste_seen_in_box {
+                    if let Some(r) = &reg {
+                        if r.stranded_note(&agent).is_some() {
+                            let still_holds = ptys
+                                .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
+                                .map(|b| strip_ansi(&b))
+                                .map(|t| box_holds_paste(&t, &pasted_text))
+                                .unwrap_or(true);
+                            if !still_holds {
+                                paste_seen_in_box = false;
+                                r.clear_stranded(&group, &agent, "text-left-the-box");
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             MonitorAction::Confirm { merged, correction } => {
                 last_delivery.lock_safe().insert(
                     pty_id,
@@ -7800,10 +8049,13 @@ fn run_late_confirmation_monitor(
                 append_audit(&root, &group, "loomux", "delivery-confirmed-late", json!({
                     "to": agent, "confirm_source": "hook", "confirm_merged": merged, "was_failed": correction,
                 }));
-                if correction {
-                    if let Some(r) = &reg {
+                if let Some(r) = &reg {
+                    if correction {
                         r.notify_delivery_confirmed_late(&group, &agent, target_is_orchestrator);
                     }
+                    // #496 PR-C: the prompt landed after all — whatever
+                    // badge the failure raised is stale, drop it.
+                    r.clear_stranded(&group, &agent, "confirmed-late");
                 }
                 return; // resolved — nothing left for this monitor to do
             }
@@ -7823,6 +8075,41 @@ fn run_late_confirmation_monitor(
                 }));
                 if let Some(r) = &reg {
                     r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
+                }
+                // #496 PR-C: ACT on the failure instead of only announcing
+                // it — the announcement is suppressed entirely for an
+                // orchestrator target, which is exactly the case that
+                // wedged. Tier 1's own two signals decide whether a
+                // re-submit is safe: is our text still identifiably in the
+                // box (`box_holds_paste`), and has the box stayed ours
+                // since we pressed Enter (`tier1_trusted`)?
+                let holds_paste = ptys
+                    .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
+                    .map(|b| strip_ansi(&b))
+                    .map(|t| box_holds_paste(&t, &pasted_text))
+                    .unwrap_or(false);
+                let human_typed_since =
+                    !tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms);
+                paste_seen_in_box = holds_paste;
+                let action = stranded_selfheal_action(
+                    ledger_outstanding,
+                    human_typed_since,
+                    showing_question,
+                    holds_paste,
+                    heals_used,
+                    STRANDED_SELFHEAL_MAX_HEALS,
+                );
+                if let Some(r) = &reg {
+                    if r.actuate_stranded(&group, &agent, &delivery_from, pty_id, action) {
+                        heals_used += 1;
+                    }
+                } else {
+                    // No registry (a bare/headless construction): the badge
+                    // and the queue both live on it, so there is nothing to
+                    // actuate — record the decision rather than dropping it.
+                    append_audit(&root, &group, "loomux", "stranded-selfheal-skipped", json!({
+                        "to": agent, "reason": "no-registry",
+                    }));
                 }
             }
         }
@@ -8627,7 +8914,8 @@ fn deliver_now(
 /// question reappeared, or a human is mid-line) — the caller leaves the
 /// marker queued and retries next tick, no cap, exactly like every other
 /// queued entry.
-fn drain_stranded_submit(
+#[doc(hidden)] // pub for integration tests (#496 PR-C drives the REAL replay)
+pub fn drain_stranded_submit(
     ptys: &crate::pty::PtyManager,
     last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
     delivery_from: String,
@@ -9732,6 +10020,7 @@ impl OrchRegistry {
             attn_quiet: Mutex::new(HashMap::new()),
             attn_waiting_ack: Mutex::new(HashSet::new()),
             attn_emitted: Mutex::new(HashMap::new()),
+            attn_stranded: Mutex::new(HashMap::new()),
             notify_groups: Mutex::new(HashSet::new()),
             autonomous_groups: Mutex::new(HashSet::new()),
             auto_merge_groups: Mutex::new(HashSet::new()),
@@ -16562,12 +16851,20 @@ impl OrchRegistry {
         let reports = self.attn_reports.lock_safe().clone();
         let mut quiet = self.attn_quiet.lock_safe();
         let mut waiting_ack = self.attn_waiting_ack.lock_safe();
+        // #496 PR-C: latched stranded-delivery state, raised by the late
+        // monitor's actuation (`actuate_stranded`). Taken here, once, in the
+        // same lock order as the other attention maps.
+        let mut stranded = self.attn_stranded.lock_safe();
         let agents = self.agents.lock_safe();
         let mut out = Vec::new();
         for a in agents.values() {
             if a.status != AgentStatus::Running {
                 quiet.remove(&a.id);
                 waiting_ack.remove(&a.id);
+                // A pane with no running agent cannot be wedged on a prompt
+                // any more, and its note would otherwise outlive it (the map
+                // is latched — nothing else prunes it).
+                stranded.remove(&a.id);
                 continue;
             }
             // Track how long the pane's output has been stable.
@@ -16593,6 +16890,13 @@ impl OrchRegistry {
             let report = reports.get(a.id.as_str()).copied();
             let (reason, detail): (&'static str, String) = if report == Some("blocked") {
                 ("blocked", format!("{} reported blocked — it needs you", a.name))
+            } else if let Some(note) = stranded.get(a.id.as_str()) {
+                // #496 PR-C: ranked directly under `blocked` and above
+                // `waiting` — a stranded prompt is a wedged pane that will
+                // not un-wedge itself, whereas `waiting` is the pane asking
+                // a question it is happy to keep asking. Only `blocked` (an
+                // agent that explicitly said it cannot proceed) outranks it.
+                ("stranded", stranded_detail(&a.name, note.blocker))
             } else if waiting {
                 ("waiting", format!("{} is waiting on a prompt", a.name))
             } else if report == Some("done") {
@@ -20677,6 +20981,152 @@ impl OrchRegistry {
         self.audit(group, "loomux", "delivery-queued",
             json!({ "to": agent_id, "id": id, "reason": "question", "depth": depth, "marker": "stranded-submit" }));
         Ok(())
+    }
+
+    /// Admit a self-heal re-submit for a stranded delivery (#496 PR-C) — the
+    /// admission half of `actuate_stranded`, split out so the ordering
+    /// property ("the marker drains BEFORE anything queued behind it, and
+    /// nothing is pasted on top of the stranded text") is testable without
+    /// an `AppHandle`.
+    ///
+    /// Idempotent by construction: if the pane's queue ALREADY has a
+    /// `StrandedSubmit` marker at its front, this admits nothing and returns
+    /// `Ok(false)`. That case is real, not theoretical — a delivery that
+    /// aborted pre-Enter converts its own entry into exactly such a marker
+    /// (`run_queue_drainer`'s `AbortedPreEnter` arm), and a second marker
+    /// behind it would mean a second Enter into a pane the first one already
+    /// changed. Nothing is lost by declining: the marker already queued does
+    /// precisely what this call wanted done, and the drainer retries it
+    /// with no cap until it fires.
+    #[doc(hidden)] // pub for integration tests
+    pub fn admit_stranded_selfheal(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        pty_id: u32,
+    ) -> Result<bool, String> {
+        let already_marked = self
+            .queues
+            .lock_safe()
+            .get(&pty_id)
+            .and_then(|q| q.front())
+            .is_some_and(|e| matches!(e.payload, queue::QueuedPayload::StrandedSubmit));
+        if already_marked {
+            self.audit(group, "loomux", "stranded-selfheal-skipped",
+                json!({ "to": agent_id, "reason": "submit-already-queued" }));
+            return Ok(false);
+        }
+        self.enqueue_stranded_front(group, agent_id, from, pty_id)?;
+        self.audit(group, "loomux", "stranded-selfheal-submit",
+            json!({ "to": agent_id, "via": "queue-front-marker" }));
+        Ok(true)
+    }
+
+    /// Act on one `stranded_selfheal_action` decision (#496 PR-C): admit the
+    /// re-submit through the delivery queue, or raise the pane's attention
+    /// badge — and audit either way, so every self-heal attempt and every
+    /// "loomux could not act" is in the record.
+    ///
+    /// Returns whether a heal was actually admitted, which is what the late
+    /// monitor counts against `STRANDED_SELFHEAL_MAX_HEALS`: a declined
+    /// admission (a marker already queued, or a full queue) must not burn
+    /// the budget for a submit that never happened.
+    ///
+    /// The badge is raised for a heal too, not only for the blocked cases —
+    /// a delivery that needed healing at all already burned its whole
+    /// confirm window plus `PENDING_IDLE_QUIET`, and the human is entitled
+    /// to know their group wedged even when loomux recovers it. It clears on
+    /// the monitor's next tick once the ledger confirms (see
+    /// `clear_stranded`), so a successful heal is a brief badge, not a
+    /// sticky one.
+    #[doc(hidden)] // pub for integration tests
+    pub fn actuate_stranded(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        pty_id: u32,
+        action: StrandedAction,
+    ) -> bool {
+        let blocker = match action {
+            StrandedAction::Resolved => {
+                self.clear_stranded(group, agent_id, "resolved");
+                return false;
+            }
+            StrandedAction::Attention(b) => Some(b),
+            StrandedAction::SelfHeal => None,
+        };
+        let mut healed = false;
+        let blocker = match blocker {
+            Some(b) => Some(b),
+            None => match self.admit_stranded_selfheal(group, agent_id, from, pty_id) {
+                Ok(true) => {
+                    healed = true;
+                    // Best-effort nudge, the same shape `deliver_prompt`'s
+                    // behind-the-queue path uses: a drainer may already be
+                    // running for this pane, and `ensure_drainer` is
+                    // idempotent. Without an app handle (headless tests)
+                    // nothing can drain — the marker stays queued, which is
+                    // the honest state, and the badge below still fires.
+                    if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
+                        reg.ensure_drainer(app, group.to_string(), pty_id, None);
+                    }
+                    None
+                }
+                // A marker is already queued — the submit this decision
+                // wanted is pending, so present it as an in-flight heal
+                // (`None`) without counting it against the budget.
+                Ok(false) => None,
+                Err(e) => {
+                    self.audit(group, "loomux", "stranded-selfheal-skipped",
+                        json!({ "to": agent_id, "reason": "queue-full", "error": e }));
+                    Some(StrandedBlocker::Exhausted)
+                }
+            },
+        };
+        self.mark_stranded(group, agent_id, blocker);
+        healed
+    }
+
+    /// Raise (or update) a pane's stranded attention badge (#496 PR-C) and
+    /// audit it. Keeps `since_ms` from an existing note so a badge that
+    /// changes reason (heal in flight → blocked) still reports how long the
+    /// pane has been stranded.
+    #[doc(hidden)] // pub for integration tests
+    pub fn mark_stranded(&self, group: &str, agent_id: &str, blocker: Option<StrandedBlocker>) {
+        let since_ms = {
+            let mut m = self.attn_stranded.lock_safe();
+            let since_ms = m.get(agent_id).map(|n| n.since_ms).unwrap_or_else(now_ms);
+            m.insert(agent_id.to_string(), StrandedNote { blocker, since_ms });
+            since_ms
+        };
+        self.audit(group, "loomux", "stranded-attention", json!({
+            "to": agent_id,
+            "blocker": blocker.map(|b| b.as_str()).unwrap_or("self-healing"),
+            "stranded_ms": now_ms().saturating_sub(since_ms),
+        }));
+    }
+
+    /// Drop a pane's stranded badge (#496 PR-C). Audited ONLY when a badge
+    /// was actually up, so the log records state changes rather than every
+    /// poll of a healthy pane.
+    #[doc(hidden)] // pub for integration tests
+    pub fn clear_stranded(&self, group: &str, agent_id: &str, why: &str) {
+        let had = self.attn_stranded.lock_safe().remove(agent_id);
+        if let Some(note) = had {
+            self.audit(group, "loomux", "stranded-cleared", json!({
+                "to": agent_id, "why": why,
+                "stranded_ms": now_ms().saturating_sub(note.since_ms),
+            }));
+        }
+    }
+
+    /// This pane's current stranded state, if any (#496 PR-C). Test/read-only
+    /// seam; `attention_tick` reads the map directly under its own lock.
+    #[doc(hidden)] // pub for integration tests
+    pub fn stranded_note(&self, agent_id: &str) -> Option<StrandedNote> {
+        self.attn_stranded.lock_safe().get(agent_id).copied()
     }
 
     /// Spawn `run_queue_drainer` for `pty_id` unless one is already running

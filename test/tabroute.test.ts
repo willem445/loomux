@@ -64,15 +64,44 @@ test("tabAttention keeps the highest-priority reason when a tab has several", ()
   assert.deepEqual(out.get("ws-a"), { urgent: false, reason: "waiting" }, "waiting outranks report");
 });
 
-test("every attention class badges the tab (blocked/waiting/report/gate), urgent only for blocked", () => {
-  for (const reason of ["blocked", "waiting", "report", "gate"]) {
+test("every attention class badges the tab, urgent for blocked and stranded", () => {
+  for (const reason of ["blocked", "stranded", "waiting", "report", "gate"]) {
     const out = tabAttention([{ pty_id: 1, reason }], ptyMap([[1, "ws-a"]]));
     assert.deepEqual(
       out.get("ws-a"),
-      { urgent: reason === "blocked", reason },
+      { urgent: reason === "blocked" || reason === "stranded", reason },
       `${reason} must badge the tab`
     );
   }
+});
+
+test("a stranded pane outranks waiting on the tab chip but not blocked", () => {
+  // #496 PR-C: the tab chip must mirror the backend's own ranking in
+  // `attention_tick` — a wedged prompt is more urgent than a pane parked on
+  // a question, and less urgent than an agent that said it is blocked.
+  const overWaiting = tabAttention(
+    [
+      { pty_id: 1, reason: "waiting" },
+      { pty_id: 2, reason: "stranded" },
+    ],
+    ptyMap([
+      [1, "ws-a"],
+      [2, "ws-a"],
+    ])
+  );
+  assert.deepEqual(overWaiting.get("ws-a"), { urgent: true, reason: "stranded" });
+
+  const underBlocked = tabAttention(
+    [
+      { pty_id: 1, reason: "stranded" },
+      { pty_id: 2, reason: "blocked" },
+    ],
+    ptyMap([
+      [1, "ws-a"],
+      [2, "ws-a"],
+    ])
+  );
+  assert.deepEqual(underBlocked.get("ws-a"), { urgent: true, reason: "blocked" });
 });
 
 test("tabAttention ignores null-pty items and ptys not mapped to a tab", () => {

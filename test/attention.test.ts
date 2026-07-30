@@ -6,16 +6,37 @@ import { attentionPresentation, dockChipAttention } from "../src/attention.ts";
 
 test("each known reason maps to its label", () => {
   assert.equal(attentionPresentation("blocked").label, "⚠ blocked");
+  assert.equal(attentionPresentation("stranded").label, "⚠ stuck prompt");
   assert.equal(attentionPresentation("waiting").label, "⚠ waiting");
   assert.equal(attentionPresentation("report").label, "✓ reported");
   assert.equal(attentionPresentation("gate").label, "⚑ your call");
 });
 
-test("only 'blocked' is urgent", () => {
+test("'blocked' and 'stranded' are the urgent reasons", () => {
   assert.equal(attentionPresentation("blocked").urgent, true);
+  // #496 PR-C: a prompt that was delivered but never submitted wedges the
+  // pane until an Enter lands — red, not the amber of a pane that is merely
+  // parked on a question it is happy to keep asking.
+  assert.equal(attentionPresentation("stranded").urgent, true);
   for (const reason of ["waiting", "report", "gate"]) {
     assert.equal(attentionPresentation(reason).urgent, false, `${reason} not urgent`);
   }
+});
+
+test("a stranded pane's dock chip is red and keeps the backend's instruction", () => {
+  // #496 PR-C: minimizing a wedged pane must not hide it — the dock chip is
+  // the only surface left, and its tooltip carries the badge detail verbatim
+  // (which names what the human has to clear).
+  const stranded = attentionPresentation("stranded");
+  const chip = dockChipAttention("orch", {
+    label: stranded.label,
+    urgent: stranded.urgent,
+    detail: "orch's prompt is stuck behind text you typed — press Enter or clear the box",
+  });
+  assert.equal(chip.needsAttention, true);
+  assert.equal(chip.urgent, true, "a wedged pane is red on the dock too");
+  assert.match(chip.title, /stuck prompt/);
+  assert.match(chip.title, /press Enter or clear the box/);
 });
 
 test("an unknown reason falls back to a generic, non-urgent badge", () => {
