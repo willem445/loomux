@@ -57,7 +57,7 @@ use loomux_lib::orchestration::{
     CLAUDE_READONLY_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
     COPILOT_READONLY_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
 };
-use loomux_lib::pty::PtyManager;
+use loomux_lib::pty::{phantom_gate_tick, PtyManager};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -12263,6 +12263,124 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
         "the outcome recorded on a pre-Enter abort must make the NEXT delivery's flush actually press Enter"
     );
     assert_eq!(&*captured.lock().unwrap(), b"\r");
+}
+
+// ---------- #496 PR-A: the phantom-input-stamp fix ----------
+//
+// `write_pty` used to stamp `user_input_ms = now` UNCONDITIONALLY, before
+// `classify_human_input` ever ran. xterm answers a program's terminal
+// queries — colour probes, focus reports, device-attribute/cursor-position
+// replies — through that exact same write path with NO human present at all
+// (#179's boot-time instance; copilot also emits these mid-session on
+// redraw/focus churn). Those auto-replies stamped the clock just like a
+// keystroke, and that one clock feeds the autonomous idle tick's quiet
+// window, the stranded-text flush, the submit retries, and Tier-1 box
+// confirmation — so a copilot pane that only ever emits auto-replies could
+// wedge all four forever with the human never having touched the keyboard
+// (#496's reported symptom: autonomous mode halts until a human presses
+// Enter). `PtyManager::note_user_input` (the exact code `write_pty` now
+// calls) gates the stamp on `classify_human_input`/`box_occupancy_delta`
+// reading actual keystroke evidence, reusing the #179 scanner rather than
+// adding a second classifier.
+
+#[test]
+fn terminal_query_replies_do_not_stamp_user_input() {
+    let pm = PtyManager::default();
+    let id = 496_01;
+    pm.register_fake_for_test(id, b"");
+    assert_eq!(pm.last_user_input_ms(id), Some(0), "a fresh fake pty stamps nothing at all");
+
+    for (name, reply) in [
+        ("OSC 11 colour query reply (BEL-terminated)", "\x1b]11;rgb:0d0d/1111/1717\x07"),
+        ("OSC 10 colour query reply (ST-terminated)", "\x1b]10;rgb:f0f6/f0f6/fcfc\x1b\\"),
+        ("xterm focus-in report", "\x1b[I"),
+        ("DA (device attributes) reply", "\x1b[?64;1;2;6;9;15;18;21;22c"),
+        ("CPR (cursor position) reply", "\x1b[24;80R"),
+    ] {
+        pm.note_user_input(id, reply);
+        assert_eq!(
+            pm.last_user_input_ms(id),
+            Some(0),
+            "{name} is an xterm auto-reply with no human present — must NOT stamp user_input_ms \
+             (this is the #496 regression: base stamps unconditionally, so this assertion fails there)"
+        );
+    }
+}
+
+#[test]
+fn real_keystrokes_still_stamp_user_input() {
+    // Green companions for the test above: a fix that stopped the clock
+    // updating for genuine keystrokes would be far worse than #496's bug —
+    // it would make every human-typing signal in the delivery pipeline
+    // (the #111 paste guard, the question hold, the idle tick) blind.
+    for (name, data) in [("plain text", "a"), ("Enter / CR", "\r"), ("backspace", "\u{7f}")] {
+        let pm = PtyManager::default();
+        let id = 496_02;
+        pm.register_fake_for_test(id, b"");
+        assert_eq!(pm.last_user_input_ms(id), Some(0));
+
+        pm.note_user_input(id, data);
+
+        assert_ne!(
+            pm.last_user_input_ms(id),
+            Some(0),
+            "{name} is a real keystroke — user_input_ms must still be stamped"
+        );
+    }
+}
+
+#[test]
+fn phantom_gate_tick_throttles_repeated_gated_writes_per_pane() {
+    // #496 N1 review: `phantom-input-gated` used to fire on EVERY gated
+    // write — a human wheel-scrolling or holding an arrow key could hit tens
+    // per second, each a breadcrumb file-open, and the flood would dilute
+    // (and eventually rotate away) the mid-session copilot signal the
+    // breadcrumb exists to capture. `phantom_gate_tick` is the pure decision
+    // this throttles with — no filesystem involved (#496 N4 review: this is
+    // the one seam that COULD be tested purely, unlike the breadcrumb's own
+    // disk write).
+    const INTERVAL_MS: u64 = 5_000; // must match pty.rs's PHANTOM_GATE_BREADCRUMB_MIN_INTERVAL_MS
+
+    // First tick for a pane always emits (nothing to throttle against yet):
+    // `last_emit_ms` is `None` ("never emitted"), deliberately not a `0`
+    // sentinel — see `phantom_gate_tick`'s doc comment for why a bare `0`
+    // would only work by coincidence of real epoch-ms magnitudes, which
+    // small/synthetic test timestamps like this one don't have.
+    let (emit, state) = phantom_gate_tick((0, None), 1_000);
+    assert_eq!(emit, Some(1), "the first gated write for a pane must emit immediately");
+    assert_eq!(state, (0, Some(1_000)), "an emission resets the counter and records the emit time");
+
+    // A second tick milliseconds later (well inside the interval) must NOT
+    // emit — it just accumulates.
+    let (emit, state) = phantom_gate_tick(state, 1_010);
+    assert_eq!(emit, None, "a gated write inside the throttle interval must not emit");
+    assert_eq!(state, (1, Some(1_000)), "the count accumulates; last_emit_ms is unchanged");
+
+    // A third tick, still inside the interval, accumulates further.
+    let (emit, state) = phantom_gate_tick(state, 2_500);
+    assert_eq!(emit, None);
+    assert_eq!(state, (2, Some(1_000)), "count keeps accumulating across multiple throttled writes");
+
+    // A fourth tick, now past the interval, emits — and reports EVERY gated
+    // write coalesced since the last emission (this one plus the two that
+    // were throttled), not just itself, so the log line still carries the
+    // rate.
+    let (emit, state) = phantom_gate_tick(state, 1_000 + INTERVAL_MS);
+    assert_eq!(emit, Some(3), "the write that crosses the interval emits, counting every write since the last emission");
+    assert_eq!(state, (0, Some(1_000 + INTERVAL_MS)), "the counter resets and the clock re-bases on this emission");
+
+    // Exactly AT the interval boundary counts as due (>=, not >) — a
+    // deliberate off-by-one check.
+    let (emit, _) = phantom_gate_tick((0, Some(1_000)), 1_000 + INTERVAL_MS);
+    assert_eq!(emit, Some(1), "exactly at the interval boundary must emit, not wait for one more tick");
+    let (emit, _) = phantom_gate_tick((0, Some(1_000)), 1_000 + INTERVAL_MS - 1);
+    assert_eq!(emit, None, "one millisecond short of the interval must still throttle");
+
+    // Different panes are independent: seeding a fresh (0, None) state (as a
+    // brand-new pty id would have) emits immediately regardless of what
+    // another pane's clock is doing.
+    let (emit, _) = phantom_gate_tick((0, None), 1_000 + INTERVAL_MS);
+    assert_eq!(emit, Some(1), "a different pane's state is independent of this one's throttle");
 }
 
 #[test]

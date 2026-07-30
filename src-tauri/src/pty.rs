@@ -168,6 +168,12 @@ pub struct PtyManager {
     /// "expected", so the frontend closes the pane instead of keeping it
     /// open to display an error.
     expected_exits: Arc<Mutex<HashSet<u32>>>,
+    /// Per-pane (gated-writes-since-last-emit, last-emit-unix-ms — `None`
+    /// meaning never emitted for this pane) for the throttled
+    /// `phantom-input-gated` breadcrumb (#496 N1) — see
+    /// `record_phantom_gate`/`phantom_gate_tick`. Cleaned up alongside
+    /// `expected_exits` when a pty's waiter thread reaps it.
+    neutral_gate_throttle: Arc<Mutex<HashMap<u32, (u64, Option<u64>)>>>,
 }
 
 impl PtyManager {
@@ -186,6 +192,115 @@ impl PtyManager {
         let mut ptys = self.ptys.lock_safe();
         let pty = ptys.get_mut(&id).ok_or("pty not found")?;
         pty.writer.write_all(bytes).map_err(|e| e.to_string())
+    }
+
+    /// Record one FRONTEND-originated write for the human-input signals
+    /// (#111 box occupancy, `last_user_input_ms`) — extracted out of
+    /// `write_pty` so an integration test can drive it directly against a
+    /// real (fake) pty with no Tauri `AppHandle` (#496 PR-A). No-op if the
+    /// pty is already gone (a write can race a pane's own teardown).
+    ///
+    /// `user_input_ms` is stamped only when this write is evidence of an
+    /// actual keystroke — `classify_human_input` reads `Content`/`Submit`,
+    /// or (Neutral but) a nonzero `box_occupancy_delta` (backspace/DEL).
+    /// Before this gate the stamp was unconditional, and that was the bug
+    /// (#496): xterm answers a program's terminal queries — OSC colour
+    /// queries, DA, DSR/CPR, focus-in/out reports — through this exact same
+    /// write path with **no human present at all** (#179's boot-time
+    /// instance; copilot also emits these mid-session on redraw/focus
+    /// churn). Those replies classify `Neutral` with a zero delta — nothing
+    /// typed, nothing removed — so gating the stamp on keystroke evidence
+    /// means an auto-reply no longer refreshes `user_input_ms`. That one
+    /// unconditional stamp was one root cause behind four symptoms: it
+    /// deferred the autonomous idle tick's quiet clock forever, suppressed
+    /// the stranded-text flush and submit retries, and withheld Tier-1 box
+    /// confirmation — all four read this same timestamp.
+    ///
+    /// Tradeoff, taken deliberately: pure-`Neutral`-with-zero-delta human
+    /// input no longer defers the tick or the flush either — and that class
+    /// is broader than "arrow keys, menu navigation" (#496 N2 review): Tab,
+    /// Home/End/F-keys, Ctrl-A/E/W/K, and mouse-tracking/wheel CSI reports
+    /// (if a TUI enables mouse tracking) all classify `Neutral` with a zero
+    /// occupancy delta too — including a human wheel-scrolling a pane while
+    /// merely *reading* output, not steering it. This is safe because the
+    /// protection for "human mid-menu" already lives in the STATE-based
+    /// interactive-question guard (#420 rev-19 R1), which deliberately
+    /// dropped keystroke-recency from its own release decision for this
+    /// exact reason — the tick is a notice, not an action, and that guard is
+    /// untouched by this change.
+    ///
+    /// Assumption this relies on (#496 N3 review): the classifier is
+    /// stateless PER WRITE, so a query reply fragmented across two `write_pty`
+    /// calls would have its tail half read in isolation and could stamp (the
+    /// escape lead byte that makes the whole sequence read `Neutral` lives in
+    /// the first fragment). Unreached today — xterm synthesizes a query
+    /// reply as one `onData` event, and the frontend's writer only splits
+    /// writes over `PTY_WRITE_CHUNK` (16 KiB), far above any auto-reply's
+    /// size — and even if it happened, it fails toward the OLD (safe)
+    /// behaviour for that one write, not toward the bug this PR fixes. Still
+    /// written down here so a future CLI reply pattern that defeats it is
+    /// something the next reader can find, not rediscover.
+    pub fn note_user_input(&self, id: u32, data: &str) {
+        let classification = crate::orchestration::classify_human_input(data);
+        let delta = crate::orchestration::box_occupancy_delta(data);
+        let keystroke_like =
+            classification != crate::orchestration::HumanInput::Neutral || delta != 0;
+        {
+            let mut ptys = self.ptys.lock_safe();
+            let Some(pty) = ptys.get_mut(&id) else { return };
+            if keystroke_like {
+                pty.user_input_ms.store(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+            }
+            // Track box occupancy from the keystroke's CONTENT (#111): an Enter /
+            // line-clear empties the box outright; everything else (typed text,
+            // pastes, backspace/DEL) adjusts a running character count instead of
+            // a bare flag, so a line backspaced all the way back out reads as
+            // empty again rather than staying stuck "pending" until the 60s hold
+            // aborts a delivery (#171).
+            match classification {
+                crate::orchestration::HumanInput::Submit => {
+                    pty.input_box_len.store(0, Ordering::Relaxed)
+                }
+                crate::orchestration::HumanInput::Content
+                | crate::orchestration::HumanInput::Neutral => {
+                    if delta != 0 {
+                        let cur = pty.input_box_len.load(Ordering::Relaxed);
+                        pty.input_box_len.store((cur + delta as i64).max(0), Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        // Observability for the one live gap this fix can't settle from code
+        // alone (#496 plan section 7): which copilot emission recurs
+        // mid-session. Throttled (#496 N1 review — see `record_phantom_gate`)
+        // and emitted after the lock is released — breadcrumb does file IO
+        // and must not extend the hold on the ptys map.
+        if !keystroke_like {
+            self.record_phantom_gate(id);
+        }
+    }
+
+    fn record_phantom_gate(&self, id: u32) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let emit = {
+            let mut throttle = self.neutral_gate_throttle.lock_safe();
+            let state = throttle.get(&id).copied().unwrap_or((0, None));
+            let (emit, new_state) = phantom_gate_tick(state, now);
+            throttle.insert(id, new_state);
+            emit
+        };
+        if let Some(count) = emit {
+            crate::obs::breadcrumb("phantom-input-gated", &format!("id={id} count={count}"));
+        }
     }
 
     /// Snapshot of the rolling output tail (raw bytes, ANSI included).
@@ -336,6 +451,69 @@ impl PtyManager {
             },
         );
         captured
+    }
+}
+
+/// Minimum spacing between `phantom-input-gated` breadcrumbs for the SAME
+/// pane (#496 N1 review). Un-throttled, arrow keys/Tab/Ctrl-nav/mouse-
+/// tracking wheel reports from a human ACTIVELY using a pane hit
+/// `note_user_input`'s gated branch on every single write — tens of
+/// file-opens per second while scrolling — and worse, the resulting flood of
+/// `id=<n>` lines dilutes and can rotate the mid-session copilot signal this
+/// breadcrumb exists to capture (plan §7) out of the 2 MB `breadcrumbs.log`
+/// before anyone goes looking, since it shares that log with every other
+/// pane's lifecycle events. Restricting emission to panes with an
+/// orchestration identity was the preferred alternative (per review), but
+/// that needs `note_user_input` (a `pty.rs`-owned, per-write hot path) to
+/// reach into orchestration's agent registry — real coupling into a
+/// different module's state, not just calling its already-shared pure
+/// classifier — so this throttle was chosen instead: it stays inside
+/// `pty.rs`, needs no new command wiring, and still bounds the log growth
+/// this finding is about. One line per pane per interval, carrying how many
+/// gated writes landed since the last line, keeps the *rate* visible without
+/// the flood.
+const PHANTOM_GATE_BREADCRUMB_MIN_INTERVAL_MS: u64 = 5_000;
+
+/// Pure throttle decision for the `phantom-input-gated` breadcrumb (#496 N1
+/// review). `state` is the pane's (gated-writes-since-last-emit,
+/// last-emit-unix-ms, or `None` if this pane has never emitted); `now_ms` is
+/// the current time. Returns `(Some(count_to_report), new_state)` when this
+/// write should emit (the count includes this write, and the counter resets
+/// to 0), or `(None, new_state)` when it should just accumulate silently
+/// until the interval has passed.
+///
+/// `last_emit_ms` is `Option`, not a bare `0` sentinel for "never emitted":
+/// stamping the pane's very first gated write always emits regardless of
+/// what `now_ms` happens to be, which a `0` sentinel only gets right by
+/// coincidence (`now_ms.saturating_sub(0)` clears any realistic interval only
+/// because real epoch-ms values are astronomically larger than the
+/// millisecond-scale interval — true in production, but it silently fails
+/// for small/synthetic `now_ms` values, exactly what a unit test needs to
+/// use so it isn't tied to wall-clock magnitudes).
+///
+/// Pulled out to a pure function, separate from `record_phantom_gate`'s
+/// locking and `obs::breadcrumb`'s file IO, so the rate-limit itself — the
+/// new logic this finding adds — is unit-testable with no filesystem
+/// involved at all (#496 N4 review: the breadcrumb's own disk write has no
+/// non-racy cross-crate test seam from an integration test — `obs.rs`'s
+/// `LOG_DIR_OVERRIDE` is `#[cfg(test)]`-internal to that crate's own unit
+/// tests, and mutating `LOOMUX_DATA_DIR` globally would race every other
+/// test in the same parallel binary — but this decision has no such
+/// dependency and can be driven directly).
+pub fn phantom_gate_tick(
+    state: (u64, Option<u64>),
+    now_ms: u64,
+) -> (Option<u64>, (u64, Option<u64>)) {
+    let (count, last_emit_ms) = state;
+    let count = count + 1;
+    let due = match last_emit_ms {
+        None => true,
+        Some(last) => now_ms.saturating_sub(last) >= PHANTOM_GATE_BREADCRUMB_MIN_INTERVAL_MS,
+    };
+    if due {
+        (Some(count), (0, Some(now_ms)))
+    } else {
+        (None, (count, last_emit_ms))
     }
 }
 
@@ -948,6 +1126,7 @@ pub fn spawn_pty(
     // never noticed the pane).
     let ptys = state.ptys.clone();
     let expected_exits = state.expected_exits.clone();
+    let neutral_gate_throttle = state.neutral_gate_throttle.clone();
     std::thread::spawn(move || {
         let status = child.wait();
         // Snapshot the removed handle's output BEFORE it's dropped (#281): the
@@ -965,6 +1144,7 @@ pub fn spawn_pty(
             None => (String::new(), 0),
         };
         let expected = expected_exits.lock_safe().remove(&id);
+        neutral_gate_throttle.lock_safe().remove(&id); // #496 N1: no leak per pty ever opened
         let exit_code = status.ok().map(|s| s.exit_code());
         crate::obs::breadcrumb(
             "pty-exit",
@@ -1021,31 +1201,9 @@ pub fn pty_backend_info() -> PtyBackendInfo {
 
 #[tauri::command]
 pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), String> {
+    state.note_user_input(id, &data);
     let mut ptys = state.ptys.lock_safe();
     let pty = ptys.get_mut(&id).ok_or("pty not found")?;
-    pty.user_input_ms.store(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-        Ordering::Relaxed,
-    );
-    // Track box occupancy from the keystroke's CONTENT (#111): an Enter /
-    // line-clear empties the box outright; everything else (typed text,
-    // pastes, backspace/DEL) adjusts a running character count instead of a
-    // bare flag, so a line backspaced all the way back out reads as empty
-    // again rather than staying stuck "pending" until the 60s hold aborts a
-    // delivery (#171).
-    match crate::orchestration::classify_human_input(&data) {
-        crate::orchestration::HumanInput::Submit => pty.input_box_len.store(0, Ordering::Relaxed),
-        crate::orchestration::HumanInput::Content | crate::orchestration::HumanInput::Neutral => {
-            let delta = crate::orchestration::box_occupancy_delta(&data);
-            if delta != 0 {
-                let cur = pty.input_box_len.load(Ordering::Relaxed);
-                pty.input_box_len.store((cur + delta as i64).max(0), Ordering::Relaxed);
-            }
-        }
-    }
     pty.writer
         .write_all(data.as_bytes())
         .map_err(|e| e.to_string())
