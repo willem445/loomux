@@ -6886,6 +6886,23 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
     out
 }
 
+/// What `get_output` (`agent_output_tail`) actually returns for an already-
+/// `strip_ansi`'d pane render: the last `n_lines` lines, `n_lines` clamped to
+/// `[1, 500]` exactly like `agent_output_tail` always has. Factored out pure,
+/// same reasoning as `resolve_output_text` above, so `get_output`'s behavior
+/// is directly testable without a live pty/app handle. #480/#496 PR-E note:
+/// this is where spinner-frame collapsing plugs in — `get_output`'s OWN path
+/// only, strictly after the shared `strip_ansi` this function's caller
+/// already applied. Nothing here changes what `strip_ansi` returns to its
+/// other callers (`box_holds_paste`, `prompt_wait_detected`, the compact/menu
+/// detectors above) — they never call this function.
+pub fn format_output_tail(text: &str, n_lines: usize) -> String {
+    let all: Vec<&str> = text.lines().collect();
+    let n = n_lines.clamp(1, 500);
+    let start = all.len().saturating_sub(n);
+    all[start..].join("\n")
+}
+
 /// Decide whether a freshly spawned CLI is ready to receive typed input,
 /// from its output volume and how long that output has been stable. Pure so
 /// the thresholds are testable; the polling loop lives in `deliver_prompt`.
@@ -20764,10 +20781,7 @@ impl OrchRegistry {
         let ptys = app.state::<crate::pty::PtyManager>();
         let live = ptys.output_tail(pty_id).map(|raw| strip_ansi(&raw));
         let text = resolve_output_text(live, a.last_exit_tail.as_deref())?;
-        let all: Vec<&str> = text.lines().collect();
-        let n = lines.clamp(1, 500);
-        let start = all.len().saturating_sub(n);
-        Ok(all[start..].join("\n"))
+        Ok(format_output_tail(&text, lines))
     }
 
     pub fn kill_agent(&self, agent_id: &str) -> Result<(), String> {
