@@ -81,6 +81,12 @@ export type RestoreAction =
       name: string;
       sessionId: string | null;
       role: string | null;
+      /** The group this placeholder's own record names (#485) — null for a
+       *  pre-#485 snapshot. The Resume click resumes THIS group, and the
+       *  member set it plans is the tab's placeholders carrying the same
+       *  value, so a second group sharing the tab is neither swept into the
+       *  plan nor silently dropped from it. */
+      groupId: string | null;
       /** Every orchestration-family view docked to this pane (#361) — up to
        *  three, one per edge — carried the same way role and sessionId are:
        *  main.ts's resumeDormantGroup matches this back to the member it
@@ -168,6 +174,7 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
         name: pane.name,
         sessionId: pane.sessionId,
         role: pane.role,
+        groupId: pane.groupId,
         embeds: pane.embeds,
       };
     case "files":

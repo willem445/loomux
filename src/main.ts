@@ -92,7 +92,7 @@ import {
   type ReconcilePane,
   type SessionRecord,
 } from "./sessionreconcile";
-import { planGroupResume } from "./groupresume";
+import { planGroupResume, partitionByGroup } from "./groupresume";
 import {
   IDLE_RESTORE_CARD_STATE,
   errorRestoreCardState,
@@ -418,7 +418,12 @@ async function restoreSessionTabs(saved: PersistedTabs, resumable?: SessionResum
     restored.push(ws);
     tabs.renameTab(ws.id, t.name);
     tabs.setColor(ws.id, t.color);
-    if (t.groupId) tabs.bindGroup(t.groupId, ws.id);
+    // EVERY group this tab owned (#485), not just the first: a tab can hold two
+    // orchestration groups, and binding only one left the second group's
+    // rejoined panes routing into a freshly minted background tab instead of
+    // back here. `groupIds` decodes to `[groupId]` for a pre-#485 snapshot, so
+    // a single-group tab binds exactly what it always did.
+    for (const g of t.groupIds ?? (t.groupId ? [t.groupId] : [])) tabs.bindGroup(g, ws.id);
     if (t.layout) await rebuildLayout(ws, t.layout, resumable);
     if (t.docked?.length) await restoreDocked(ws, t.docked, resumable);
   }
@@ -643,6 +648,7 @@ async function openActionPane(
         shellKind: null,
         sessionId: null,
         role: null,
+        groupId: null, // an agent pane belongs to no orchestration group (#485)
         file: null,
         embeds: [],
       };
@@ -853,6 +859,9 @@ async function openActionPane(
         // the panes that were live at close (#194.5) and re-capture is exact.
         sessionId: a.sessionId,
         role: a.role,
+        // …including WHICH group it belongs to (#485): the click below resumes
+        // this placeholder's own group, not whatever group the tab is bound to.
+        groupId: a.groupId,
         file: null,
         // The docked-view preferences (#361) ride along too, so re-capturing
         // a still-dormant tab (Resume never clicked) reproduces them byte
@@ -875,7 +884,7 @@ async function openActionPane(
         // state (red, the diagnostic message from resumeDormantGroup) instead
         // of silently reverting to the same neutral "Resume group" card with
         // only a toast to show for it.
-        onClick: () => resumeDormantGroup(ws),
+        onClick: () => resumeDormantGroup(ws, record),
       });
       return ws.grid.openDormantPane(events, record, content, dir, anchor);
     }
@@ -1060,8 +1069,16 @@ const resumingGroups = new Set<string>();
  *  members are reported and skipped; the orchestrator can respawn them on demand.
  *  Members of the group that were NOT open at close stay dead — they remain
  *  resumable later from the session browser (out of scope here, by design). */
-async function resumeDormantGroup(ws: Workspace): Promise<RestoreCardResult> {
-  const groupId = tabs.groupForWorkspace(ws.id);
+async function resumeDormantGroup(
+  ws: Workspace,
+  clicked: PersistedPane
+): Promise<RestoreCardResult> {
+  // WHICH GROUP THIS CLICK RESUMES (#485): the clicked placeholder's own
+  // recorded group. Reading it off the TAB is what let a two-group tab resume
+  // group A, drop B's orchestrator without a word, and rejoin B's delegates
+  // into A. The tab binding is only the fallback for a pre-#485 snapshot,
+  // where no placeholder recorded a group at all.
+  const groupId = clicked.groupId ?? tabs.groupForWorkspace(ws.id);
   if (!groupId) {
     sessions.toggle(); // no binding to resume from — let the human pick a session
     return { ok: true };
@@ -1075,14 +1092,28 @@ async function resumeDormantGroup(ws: Workspace): Promise<RestoreCardResult> {
     // placeholders, one per orch pane that was live at close, each carrying its own
     // session id + role. This is the fix for the over-restore regression: the set
     // comes from what was captured, NEVER expanded by session_roles().
-    const orchRecords = ws.grid
-      .allPanes()
-      .filter((p) => p.isDormant && p.dormantKind === "orch")
-      .map((p) => p.restoreRecord)
-      .filter((r): r is PersistedPane => r !== null);
+    //
+    // …and only the placeholders belonging to THIS group (#485). A second
+    // group's placeholders in the same tab are not members of this plan, are
+    // not rejoined by it, and (step 4) are not cleared by it — they keep their
+    // own Resume card, which resumes their own group.
+    const myPanes = partitionByGroup(
+      ws.grid
+        .allPanes()
+        .filter((p) => p.isDormant && p.dormantKind === "orch" && p.restoreRecord !== null)
+        .map((p) => ({ pane: p, groupId: p.restoreRecord!.groupId })),
+      clicked.groupId
+    ).mine;
+    const orchRecords = myPanes.map((m) => m.pane.restoreRecord as PersistedPane);
     const captured = orchRecords
       .filter((r) => r.sessionId !== null)
-      .map((r) => ({ sessionId: r.sessionId as string, role: r.role ?? "worker" }));
+      .map((r) => ({
+        sessionId: r.sessionId as string,
+        role: r.role ?? "worker",
+        // Each member's OWN group travels into the plan (#485), so the plan
+        // itself — not this wiring — is what refuses a foreign member.
+        groupId: r.groupId,
+      }));
     // The docked-view preferences (#361) aren't part of the resume plan
     // itself (planGroupResume only orders/gates on session id + role) —
     // they're captured UI preferences, reapplied below once each member's
@@ -1133,8 +1164,24 @@ async function resumeDormantGroup(ws: Workspace): Promise<RestoreCardResult> {
       /* empty → assume resumable below */
     }
     const seenAny = resumableIds.size > 0;
-    const plan = planGroupResume(captured, (sid) => (seenAny ? resumableIds.has(sid) : true));
+    const plan = planGroupResume(
+      captured,
+      (sid) => (seenAny ? resumableIds.has(sid) : true),
+      clicked.groupId
+    );
 
+    if (plan.ambiguous) {
+      // Two orchestrators in one tab and no recorded group to tell them apart
+      // — a snapshot written before #485. Refusing is the whole point: the old
+      // behavior kept one, dropped the other silently, and rejoined the
+      // dropped group's delegates into the survivor. The session browser knows
+      // each session's real group, so send the human there.
+      const message =
+        "This tab's saved layout holds more than one orchestrator and doesn't record which group each belongs to (saved by an older build) — resume each group from the session browser.";
+      showToast(message, "error");
+      sessions.toggle();
+      return { ok: false, message };
+    }
     if (!plan.orchestrator) {
       // A stale orchestrator (transcript gone) is gated the same way delegates are:
       // fall back to the browser rather than relaunch into a dead orchestrator pane.
@@ -1214,8 +1261,14 @@ async function resumeDormantGroup(ws: Workspace): Promise<RestoreCardResult> {
     // 4. Drop the dormant ORCH placeholders that predated the resume (a mixed tab's
     //    dormant AGENT placeholders and live panes stay). The orchestrator resume
     //    already added a real pane, so this can't empty the grid.
-    for (const p of preexisting) {
-      if (p.isDormant && p.dormantKind === "orch") ws.grid.closePane(p, false);
+    //
+    //    ONLY THIS GROUP'S placeholders (#485) — literally the panes the member
+    //    set was read off (`myPanes`), so the two can't drift apart. A second
+    //    group sharing the tab keeps its own dormant card: clearing it here is
+    //    how the old sweep made the drop invisible — the tab came back looking
+    //    fully restored with one group missing from it.
+    for (const { pane } of myPanes) {
+      if (preexisting.includes(pane)) ws.grid.closePane(pane, false);
     }
     persistTabs();
     return { ok: true };

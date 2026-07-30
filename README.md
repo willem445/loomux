@@ -243,13 +243,13 @@ src/
   workspace.ts      one tab = a Grid + its own dock; hide/show, GL policy, preview composite
   tabbar.ts         the tab strip: switch/close/new, rename, color, alert chips, deterministic agent counter + orchestration markers (#194), preview
   tabroute.ts       pure tab routing + preview scale/sanitizer (unit-tested, DOM-free)
-  tabstore.ts       pure encode/decode + schema validation of the persisted tab set (tabs + per-tab pane layout + restore pref, #194)
+  tabstore.ts       pure encode/decode + schema validation of the persisted tab set (tabs + per-tab pane layout + restore pref, #194; a tab's group BINDINGS are a set and each orch pane records its own group, #485)
   settings.ts       durable app-wide settings (#370): pure encode/decode (DOM-free, unit-tested) + an in-memory singleton (getSettings/setSettings) for synchronous reads from pane.ts's keydown handler. Config-file-only -- no Settings UI exists yet
   restoredecision.ts pure restore-vs-fresh-vs-ask decision for the boot splash (DOM-free, unit-tested, #194)
   panerestore.ts    pure per-pane restore policy + layout-tree -> ordered rebuild plan + agent resume-command builder (DOM-free, unit-tested, #194)
   restoresplash.ts  cold-boot "restore last session?" overlay (thin DOM over restoredecision.ts, #194)
   tabcounts.ts      pure per-tab live-agent counter + live/dormant orchestration markers (DOM-free, unit-tested, #194)
-  groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip (DOM-free, unit-tested, #194)
+  groupresume.ts    pure whole-group resume plan: orchestrator first, delegates rejoin-or-skip, and ONE plan is ONE group -- members are partitioned by their own recorded group, a member naming another group is refused, an unattributable set fails loudly (DOM-free, unit-tested, #194/#485)
   sessionreconcile.ts pure post-start session-id adoption matcher (refuses on any ambiguity) + the dormant card's "resume last session" candidate lookup (DOM-free, unit-tested, #440). See doc/design/session-id-learning.md
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar: source/role chips, and (#1) each session's recorded task/goal, repo, branch, and PR (when the board has one) — absent rather than guessed for a session predating the field

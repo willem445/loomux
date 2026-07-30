@@ -22,6 +22,13 @@ test("recognizes every backend tag", () => {
     resumeFailureKind("resume-store-unreadable: could not read the claude session store"),
     "store-unreadable"
   );
+  assert.equal(
+    resumeFailureKind(
+      "resume-group-mismatch: session abc belongs to orchestration group g-2, not g-1 — refusing to rejoin it into another group"
+    ),
+    "group-mismatch",
+    "#485: the backend's wrong-group refusal must be classifiable, not fall through as an opaque string"
+  );
 });
 
 test("an untagged or unrelated error is null, not misclassified", () => {
@@ -39,6 +46,11 @@ test("only the two provably-unresolvable kinds offer a start-fresh affordance", 
   assert.equal(offersStartFresh("workspace-missing"), true);
   assert.equal(offersStartFresh("ambiguous"), false, "ambiguous needs a longer id, not a fresh spawn");
   assert.equal(offersStartFresh("store-unreadable"), false, "an I/O problem isn't fixed by a fresh session");
+  assert.equal(
+    offersStartFresh("group-mismatch"),
+    false,
+    "#485: a fresh session would be spawned into the same wrong group — the refusal exists to prevent exactly that"
+  );
   assert.equal(offersStartFresh(null), false);
 });
 

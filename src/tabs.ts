@@ -263,10 +263,25 @@ export class TabManager<T extends ManagedWorkspace> {
     const id = this.groupToWs.get(groupId);
     return id ? this.get(id) : undefined;
   }
-  /** The group a tab owns (inverse of bindGroup), or null for a plain tab. */
+  /** The FIRST group a tab owns (inverse of bindGroup), or null for a plain
+   *  tab. A tab can own more than one (#485) — this answers "is this an
+   *  orchestration tab, and which group represents it" for the tab strip's
+   *  badge and the close guard. Anything that acts ON a group (resuming it,
+   *  rejoining a session into it) must NOT use this: it picks one binding out
+   *  of a possibly-larger set, which is exactly how #485's cross-group
+   *  contamination started. Use `groupsForWorkspace`, or the group recorded on
+   *  the pane you are acting on. */
   groupForWorkspace(workspaceId: string): string | null {
     for (const [g, wid] of this.groupToWs) if (wid === workspaceId) return g;
     return null;
+  }
+  /** EVERY group bound to a tab, in binding order (#485) — a tab holds two
+   *  whenever an orchestrator is launched into a split of an orchestration tab,
+   *  or a restored group falls back into the active tab. Empty for a plain tab. */
+  groupsForWorkspace(workspaceId: string): string[] {
+    const out: string[] = [];
+    for (const [g, wid] of this.groupToWs) if (wid === workspaceId) out.push(g);
+    return out;
   }
 
   // ---------- per-tab attention ----------
@@ -312,13 +327,21 @@ export class TabManager<T extends ManagedWorkspace> {
    *  its captured pane LAYOUT (#194), which tab was active, and the remembered
    *  restore preference. Live PTY/buffer contents are NOT captured (tabstore.ts). */
   snapshot(): PersistedTabs {
-    const tabs = this.workspaces.map((w) => ({
-      name: w.name,
-      color: w.color,
-      groupId: this.groupForWorkspace(w.id),
-      layout: w.captureLayout(),
-      docked: w.captureDocked(),
-    }));
+    const tabs = this.workspaces.map((w) => {
+      // EVERY bound group (#485), not just the first: a two-group tab that
+      // persisted one binding came back with the second group unrouted, its
+      // panes landing in a freshly minted background tab. `groupId` still
+      // rides along for an older build to read (tabstore derives it).
+      const groupIds = this.groupsForWorkspace(w.id);
+      return {
+        name: w.name,
+        color: w.color,
+        groupId: groupIds[0] ?? null,
+        groupIds,
+        layout: w.captureLayout(),
+        docked: w.captureDocked(),
+      };
+    });
     const activeIndex = Math.max(
       0,
       this.workspaces.findIndex((w) => w.id === this.activeId)
