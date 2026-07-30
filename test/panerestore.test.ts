@@ -17,6 +17,7 @@ import {
   shouldRespawnFresh,
   findResumedPaneIndex,
   programFromRestore,
+  normalizeAgentProgram,
   shouldWatchCopilotOnRestore,
   AUTO_RESUME_AGENTS,
   type RestoreAction,
@@ -451,6 +452,308 @@ test("resume with neither command nor argv best-efforts a bare claude --resume",
   assert.deepEqual(agentResumeCommand(null, null, "s5"), { command: "claude --resume s5" });
 });
 
+// ---------- #449: property — session-flag excision must never reflow untouched bytes ----------
+//
+// The bug: the old implementation ran `command.trim().split(/\s+/)` and
+// rejoined with a single space, which collapses any whitespace RUN inside a
+// quoted arg on EVERY restore, silently and permanently (the corrupted form
+// gets persisted into the next layout snapshot). Windows paths with spaces
+// are the recurring killer in this codebase — this was #442's own blocking
+// bug, in an adjacent function of this same file — so a spaced path is the
+// MAIN fixture below, not a one-off edge case appended at the end.
+//
+// These pin the PROPERTY the fix owes, not a scenario: (1) a command with no
+// session flag comes back byte-identical apart from the appended flag, and
+// (2) a command that DOES carry one loses only that flag's own bytes — every
+// other byte, whitespace runs included, survives character-for-character.
+// A test that only ever tries single-spaced input would pass against the OLD
+// split/rejoin code too (the exact trap #439's own review called out), so
+// every fixture here carries a real internal whitespace run, most of them
+// inside a quoted Windows path.
+
+const UNTOUCHED_COMMAND_FIXTURES = [
+  // Spaced Windows path in a flag value — the common case, not the edge case.
+  'claude --append-system-prompt "C:\\Users\\Will H\\prompts\\system.txt" --model opus',
+  'claude --mcp-config "C:\\Users\\Old User\\configs\\solo-6.json" --dangerously-skip-permissions',
+  // Multiple internal whitespace runs inside one quoted value.
+  'claude --append-system-prompt "two  spaces  and  three   here"',
+  // No flags at all.
+  "claude",
+];
+
+test("agentResumeCommand: a command with NO session flag comes back byte-identical apart from the appended --resume — spaced Windows paths are the pinned case, not an edge case", () => {
+  for (const command of UNTOUCHED_COMMAND_FIXTURES) {
+    const out = agentResumeCommand(command, null, "new-id");
+    assert.equal(out.command, `${command} --resume new-id`, `must not reflow: ${command}`);
+  }
+});
+
+test("agentFreshCommand: a command with NO session flag comes back byte-identical apart from the appended --session-id — spaced Windows paths are the pinned case, not an edge case", () => {
+  for (const command of UNTOUCHED_COMMAND_FIXTURES) {
+    const out = agentFreshCommand(command, null, "new-id");
+    assert.equal(out.command, `${command} --session-id new-id`, `must not reflow: ${command}`);
+  }
+});
+
+// Fixtures: [prefix, flag, suffix] — `flag` is the exact recorded session-flag
+// substring (space or `=` form) sandwiched between two chunks that each carry
+// their OWN meaningful whitespace (a spaced quoted path, a multi-space run).
+// The property: excising `flag` and appending the new one must leave `prefix`
+// and `suffix` EXACTLY as recorded — never reflowed, never touched.
+//
+// #471 review round 4 (rev-10): every irregular-whitespace fixture above this
+// point kept its multi-space runs INSIDE a quoted argument — which a
+// join-of-surviving-TOKENS reconstruction (the exact regression #449 exists
+// to prevent, since a quoted run is kept as one token either way) would
+// still have passed, undetected. The last fixture below closes that: its
+// multi-space runs sit BETWEEN bare, UNQUOTED survivor tokens, nowhere near
+// a quote — so this pins inter-token spacing itself, not one string that
+// happens to survive for an unrelated reason.
+const SESSION_FLAG_FIXTURES: Array<{ prefix: string; flag: string; suffix: string }> = [
+  {
+    prefix: 'claude --append-system-prompt "two  spaces  here"',
+    flag: " --session-id old-id",
+    suffix: ' --mcp-config "C:\\Users\\Will H\\solo-6.json" --model opus',
+  },
+  {
+    prefix: 'claude --mcp-config "C:\\Users\\Old  User\\dead\\solo-6.json"',
+    flag: " --resume=stale-id",
+    suffix: ' --append-system-prompt "trailing   run"',
+  },
+  { prefix: "claude", flag: " --session-id=old", suffix: "" },
+  {
+    // No quotes anywhere in prefix/suffix — irregular multi-space runs sit
+    // directly between bare tokens (claude/--model, --model/opus, and
+    // --dangerously-skip-permissions/--verbose in the suffix).
+    prefix: "claude   --model    opus",
+    flag: " --session-id old-id",
+    suffix: " --dangerously-skip-permissions    --verbose",
+  },
+];
+
+test("agentResumeCommand: excises ONLY the recorded session flag's own bytes — every other byte, whitespace runs inside quoted args included, survives untouched", () => {
+  for (const { prefix, flag, suffix } of SESSION_FLAG_FIXTURES) {
+    const recorded = prefix + flag + suffix;
+    const out = agentResumeCommand(recorded, null, "new-id");
+    assert.equal(out.command, `${prefix}${suffix} --resume new-id`, `flag=${JSON.stringify(flag)}`);
+  }
+});
+
+test("agentFreshCommand: excises ONLY the recorded session flag's own bytes — every other byte, whitespace runs inside quoted args included, survives untouched", () => {
+  for (const { prefix, flag, suffix } of SESSION_FLAG_FIXTURES) {
+    const recorded = prefix + flag + suffix;
+    const out = agentFreshCommand(recorded, null, "new-id");
+    assert.equal(out.command, `${prefix}${suffix} --session-id new-id`, `flag=${JSON.stringify(flag)}`);
+  }
+});
+
+// argv path: no reflow risk (each element is already discrete), but pinned
+// explicitly per #449's own test-strategy note to cover "both the command and
+// argv paths" — an internal-whitespace argv element must survive as one
+// element, untouched, exactly like the command-string fixtures above.
+test("agentResumeCommand: argv form leaves a non-flag element's internal whitespace untouched (each element is already discrete)", () => {
+  const argv = ["claude", "--append-system-prompt", "two  spaces  here", "--session-id", "old", "--model", "opus"];
+  assert.deepEqual(agentResumeCommand(null, argv, "new-id"), {
+    argv: ["claude", "--append-system-prompt", "two  spaces  here", "--model", "opus", "--resume", "new-id"],
+  });
+});
+
+test("agentFreshCommand: argv form leaves a non-flag element's internal whitespace untouched (each element is already discrete)", () => {
+  const argv = ["claude", "--append-system-prompt", "two  spaces  here", "--resume", "old"];
+  assert.deepEqual(agentFreshCommand(null, argv, "new-id"), {
+    argv: ["claude", "--append-system-prompt", "two  spaces  here", "--session-id", "new-id"],
+  });
+});
+
+// ---------- #471 review round 2: the excision property, hardened ----------
+//
+// rev-10 found the round-1 fix missed a BARE valueless flag (`claude
+// --resume` with nothing after it): the excision regex required a value, so
+// a bare flag survived untouched and got a SECOND `--resume` appended on top
+// — and the stale id from that doubled command lands as a bare POSITIONAL
+// argument on the *next* restore, which `claude` treats as a prompt. Not
+// cosmetic: it compounds every restore cycle and silently spends the user's
+// own credits. The orchestrator additionally required: the `=` form pinned
+// per flag name explicitly (a sibling PR, #473/#458, is about to start
+// recording `--resume=<id>` for copilot panes — this module doesn't care
+// which CLI recorded the command, only the flag's literal text, so it must
+// already handle that shape), and the flag-NAME set itself pinned (a
+// mutation removing `--session-id` from recognition passed all 67 round-1
+// tests untouched).
+//
+// These pin the PROPERTY the fix now owes: for EACH flag name
+// (`--session-id`, `--resume`) and EACH form a recorded command can carry it
+// in, excising it and appending the new flag changes ONLY that occurrence's
+// own bytes — nothing else ever moves, and a flag-looking WORD inside a
+// quoted argument is never mistaken for a real flag.
+
+const SESSION_FLAG_NAMES_UNDER_TEST = ["--session-id", "--resume"];
+
+// Forms whose ENTIRE occurrence (flag + any value) is meant to disappear.
+// Deliberately excludes "bare, followed by another flag" — that form must
+// drop ONLY the flag name and leave what follows untouched, so it gets its
+// own explicitly-computed test below rather than forcing an ill-fitting
+// shared formula.
+const WHOLE_OCCURRENCE_FORMS: Array<{ label: string; build: (flag: string) => string; atEnd?: boolean }> = [
+  { label: "space form", build: (f) => `${f} old-id` },
+  { label: "space form, quoted value", build: (f) => `${f} "old id"` },
+  { label: "= form", build: (f) => `${f}=old-id` },
+  { label: "= form, EMPTY value — the #473/#458 shape", build: (f) => `${f}=` },
+  { label: "bare, end of command", build: (f) => f, atEnd: true },
+];
+
+for (const flag of SESSION_FLAG_NAMES_UNDER_TEST) {
+  for (const form of WHOLE_OCCURRENCE_FORMS) {
+    const occurrence = form.build(flag);
+    const prefix = 'claude --append-system-prompt "two  spaces  here"';
+    const suffix = form.atEnd ? "" : ' --mcp-config "C:\\Users\\Will H\\solo-6.json" --model opus';
+    const recorded = `${prefix} ${occurrence}${suffix}`;
+
+    test(`agentResumeCommand: ${flag} written as "${form.label}" is excised whole — nothing else moves`, () => {
+      const out = agentResumeCommand(recorded, null, "new-id");
+      assert.equal(out.command, `${prefix}${suffix} --resume new-id`, recorded);
+    });
+
+    test(`agentFreshCommand: ${flag} written as "${form.label}" is excised whole — nothing else moves`, () => {
+      const out = agentFreshCommand(recorded, null, "new-id");
+      assert.equal(out.command, `${prefix}${suffix} --session-id new-id`, recorded);
+    });
+  }
+
+  test(`agentResumeCommand: ${flag} written bare and immediately followed by ANOTHER flag is dropped alone — the following flag is never swallowed as its "value" (the round-1 regression)`, () => {
+    const recorded = `claude ${flag} --model opus`;
+    const out = agentResumeCommand(recorded, null, "new-id");
+    assert.equal(out.command, "claude --model opus --resume new-id", recorded);
+  });
+
+  test(`agentFreshCommand: ${flag} written bare and immediately followed by ANOTHER flag is dropped alone`, () => {
+    const recorded = `claude ${flag} --model opus`;
+    const out = agentFreshCommand(recorded, null, "new-id");
+    assert.equal(out.command, "claude --model opus --session-id new-id", recorded);
+  });
+
+  test(`agentResumeCommand: repeated ${flag} occurrences (space form, then = form) are ALL excised, not just the first`, () => {
+    const recorded = `claude ${flag} old1 ${flag}=old2 --model opus`;
+    const out = agentResumeCommand(recorded, null, "new-id");
+    assert.equal(out.command, "claude --model opus --resume new-id", recorded);
+  });
+
+  test(`agentFreshCommand: repeated ${flag} occurrences (space form, then = form) are ALL excised, not just the first`, () => {
+    const recorded = `claude ${flag} old1 ${flag}=old2 --model opus`;
+    const out = agentFreshCommand(recorded, null, "new-id");
+    assert.equal(out.command, "claude --model opus --session-id new-id", recorded);
+  });
+
+  test(`agentResumeCommand: argv form — a bare ${flag} is dropped without swallowing a following flag element`, () => {
+    assert.deepEqual(agentResumeCommand(null, ["claude", flag, "--model", "opus"], "new-id"), {
+      argv: ["claude", "--model", "opus", "--resume", "new-id"],
+    });
+  });
+
+  test(`agentFreshCommand: argv form — a bare ${flag} is dropped without swallowing a following flag element`, () => {
+    assert.deepEqual(agentFreshCommand(null, ["claude", flag, "--model", "opus"], "new-id"), {
+      argv: ["claude", "--model", "opus", "--session-id", "new-id"],
+    });
+  });
+
+  test(`agentResumeCommand: argv form — a bare ${flag} as the LAST element is dropped cleanly (no crash, no doubling)`, () => {
+    assert.deepEqual(agentResumeCommand(null, ["claude", flag], "new-id"), {
+      argv: ["claude", "--resume", "new-id"],
+    });
+  });
+}
+
+test("agentResumeCommand: a flag-looking WORD inside a quoted argument is never treated as a flag — only the real, unquoted --session-id is excised", () => {
+  const recorded =
+    'claude --append-system-prompt "please explain what --resume and --session-id do" --session-id real-old-id';
+  const out = agentResumeCommand(recorded, null, "new-id");
+  assert.equal(
+    out.command,
+    'claude --append-system-prompt "please explain what --resume and --session-id do" --resume new-id'
+  );
+});
+
+test("agentFreshCommand: a flag-looking WORD inside a quoted argument is never treated as a flag — only the real, unquoted --resume is excised", () => {
+  const recorded =
+    'claude --append-system-prompt "please explain what --resume and --session-id do" --resume real-old-id';
+  const out = agentFreshCommand(recorded, null, "new-id");
+  assert.equal(
+    out.command,
+    'claude --append-system-prompt "please explain what --resume and --session-id do" --session-id new-id'
+  );
+});
+
+// ---------- #471 review round 3: CLI-aware emission (rev-11, via #473/#458) ----------
+//
+// rev-11 traced a cross-PR oscillation: a copilot session resumed from the
+// Sessions sidebar records `--resume=<id>` (#440 D1c). #473 (#458) fixes
+// `scan_copilot()` to keep recording it in the `=` form, because copilot's
+// CLI reference says the space form does not reliably bind. But
+// agentResumeCommand was CLI-agnostic — it always appended Claude's
+// `--resume <id>` (space form) — so restoring that same pane the very next
+// time would silently rewrite the `=` form BACK to the space form, and the
+// two PRs' fixes would fight forever instead of converging.
+//
+// These pin the two additional properties rev-11 asked stated explicitly:
+// copilot's `--resume` is emitted in `=` form; copilot's `--session-id`
+// (agentFreshCommand) stays SPACE form, deliberately — NOT "made consistent"
+// with `--resume`, because the copilot CLI reference documents the two flags
+// with different forms. Claude (and any unrecognized/absent CLI) is
+// completely unaffected — every pre-existing test above uses a `claude …`
+// command and still expects the space form throughout, which is itself part
+// of the pin: it proves this change is copilot-scoped, not global.
+
+test("agentResumeCommand: copilot's --resume is emitted in the = form (space form does not reliably bind, per the CLI reference)", () => {
+  const out = agentResumeCommand("copilot --model gpt-4", null, "new-id");
+  assert.equal(out.command, "copilot --model gpt-4 --resume=new-id");
+});
+
+test("agentResumeCommand: round-trip stability — a copilot command already recording --resume=<old> (the #473/#458 shape) comes back with --resume=<new>, never oscillating back to the space form", () => {
+  const out = agentResumeCommand("copilot --resume=old-id --model gpt-4", null, "new-id");
+  assert.equal(out.command, "copilot --model gpt-4 --resume=new-id");
+});
+
+test("agentResumeCommand: copilot's --resume in = form is excised just like every other form, including EMPTY value", () => {
+  assert.equal(agentResumeCommand("copilot --resume=", null, "new-id").command, "copilot --resume=new-id");
+});
+
+test("agentResumeCommand: copilot detection is case-insensitive and reads the FIRST token only (programFromRestore's own contract)", () => {
+  const out = agentResumeCommand("Copilot --model gpt-4", null, "new-id");
+  assert.equal(out.command, "Copilot --model gpt-4 --resume=new-id");
+});
+
+test("agentResumeCommand: claude is completely unaffected by the copilot special-case — still space form", () => {
+  const out = agentResumeCommand("claude --model opus", null, "new-id");
+  assert.equal(out.command, "claude --model opus --resume new-id");
+});
+
+test("agentResumeCommand: an UNRECOGNIZED/absent CLI (no command match) also defaults to space form, same as claude", () => {
+  assert.equal(agentResumeCommand(null, null, "new-id").command, "claude --resume new-id");
+});
+
+test("agentResumeCommand: copilot argv form also emits the = form, as ONE element (not two)", () => {
+  assert.deepEqual(agentResumeCommand(null, ["copilot", "--model", "gpt-4"], "new-id"), {
+    argv: ["copilot", "--model", "gpt-4", "--resume=new-id"],
+  });
+});
+
+test("agentResumeCommand: claude argv form is unaffected — still two elements, space form", () => {
+  assert.deepEqual(agentResumeCommand(null, ["claude", "--model", "opus"], "new-id"), {
+    argv: ["claude", "--model", "opus", "--resume", "new-id"],
+  });
+});
+
+test("agentFreshCommand: copilot's --session-id STAYS space form — deliberately asymmetric with agentResumeCommand's copilot --resume, per the copilot CLI reference", () => {
+  const out = agentFreshCommand("copilot --resume=old-id --model gpt-4", null, "new-id");
+  assert.equal(out.command, "copilot --model gpt-4 --session-id new-id");
+});
+
+test("agentFreshCommand: copilot argv form also stays space form / two elements for --session-id", () => {
+  assert.deepEqual(agentFreshCommand(null, ["copilot", "--resume", "old-id"], "new-id"), {
+    argv: ["copilot", "--session-id", "new-id"],
+  });
+});
+
 // ---------- solo channel-identity MCP flags (#439) ----------
 // A restored solo agent pane's recorded command can carry the flags
 // `soloPrepare` appended at launch — they point at a `configs/solo-N.json`
@@ -839,6 +1142,44 @@ test("programFromRestore is null with neither a command nor argv", () => {
   assert.equal(programFromRestore(null, null), null);
   assert.equal(programFromRestore("", []), null);
   assert.equal(programFromRestore("   ", null), null);
+});
+
+// #457 (finding 3 from the design intake): the concrete named bug —
+// programFromRestore (and its two now-converged siblings, Pane.agentCli and
+// main.ts's D2 dormant-card sniff) used to compare the raw first token
+// directly against "claude"/"copilot", so a path-qualified or
+// `.exe`/`.cmd`-suffixed recorded command silently matched neither and every
+// per-CLI restore behavior (autopilot watcher, resume-candidate card,
+// Pane.agentCli) just didn't apply — no error, just silently wrong.
+test("programFromRestore recognizes an .exe-suffixed command", () => {
+  assert.equal(programFromRestore("copilot.exe --resume abc-123", null), "copilot");
+  assert.equal(programFromRestore("Claude.EXE --resume abc-123", null), "claude", "case-insensitive suffix too");
+});
+
+test("programFromRestore recognizes a path-qualified command", () => {
+  assert.equal(programFromRestore("C:\\tools\\copilot.exe --resume abc", null), "copilot");
+  assert.equal(programFromRestore("/usr/local/bin/claude --resume abc", null), "claude");
+  assert.equal(programFromRestore(null, ["C:\\tools\\copilot.exe", "--resume", "abc"]), "copilot");
+});
+
+test("normalizeAgentProgram: bare name, path-qualified, and .exe/.cmd/.bat suffixed all converge to the same lowercase program", () => {
+  for (const raw of [
+    "claude",
+    "Claude",
+    "claude.exe",
+    "CLAUDE.EXE",
+    "claude.cmd",
+    "claude.bat",
+    "C:\\Users\\me\\AppData\\Roaming\\npm\\claude.cmd",
+    "/usr/local/bin/claude",
+  ]) {
+    assert.equal(normalizeAgentProgram(raw), "claude", `expected "claude" from ${JSON.stringify(raw)}`);
+  }
+});
+
+test("normalizeAgentProgram: an unrelated program is left alone (lowercased, extension stripped) — never coerced to claude/copilot", () => {
+  assert.equal(normalizeAgentProgram("bash"), "bash");
+  assert.equal(normalizeAgentProgram("PowerShell.exe"), "powershell");
 });
 
 // #456 review NB1: shouldWatchCopilotOnRestore replaces three copy-pasted

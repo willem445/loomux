@@ -1096,7 +1096,9 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
     let (cmd, handle) = line("planner", false);
     expect(
         &cmd, &handle, "planner", "opus", "auto",
-        " \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
+        // #448: `MultiEdit` dropped from CLAUDE_READONLY_DENY_TOOLS — it
+        // matches no real Claude Code tool.
+        " \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
           \"Bash(git commit *)\" \"Bash(git push *)\"",
     );
     let (cmd, handle) = line("orchestrator", true);
@@ -3258,8 +3260,10 @@ fn a_read_only_block_can_never_pre_approve_a_tool_pattern() {
     // The capability-closure hole that a review caught, and the reason `allow:`
     // is banned outright on a read-only class rather than "filtered".
     //
-    // A planner is read-only by DENYING A FIXED LIST — Edit, Write, MultiEdit,
-    // NotebookEdit, `git commit`, `git push`. Deny beats allow on both CLIs, so
+    // A planner is read-only by DENYING A FIXED LIST — Edit, Write, NotebookEdit,
+    // `git commit`, `git push` (CLAUDE_READONLY_DENY_TOOLS/_GIT; #448 dropped
+    // `MultiEdit`, which matches no real Claude Code tool). Deny beats allow on
+    // both CLIs, so
     // an allow pattern cannot re-grant anything *on that list*. But it doesn't
     // have to: `allow: Bash(python *)` is named nowhere in the deny list, and
     // under auto_ops nobody approves the call — so the planner gets a

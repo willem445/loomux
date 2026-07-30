@@ -736,3 +736,226 @@ lifts that scratch test's shape and generalizes it to the invariant —
 several distinct failure classes, several cwds each — mutation-verified
 against a lenient-per-entry-salvage regression that defaults a
 missing/unrecognized posture to `True`.
+
+### #458 — the copilot resume command used the wrong flag syntax
+
+**Root cause.** Every `resume_command` `scan_copilot` synthesized (both the
+bare and the autopilot-flag-carrying branches from #456 above) joined
+`--resume` and the session id with a space: `copilot --resume <id>`. Copilot's
+own CLI reference documents the flag as **optional-value** —
+`` `-r`, `--resume[=VALUE]` `` — and its own generated hint after a `-p`
+run spells the unambiguous form the same way: "The exit summary includes a
+`copilot --resume=SESSION-ID` hint for continuing the session." (raw-fetched:
+`curl -sL https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-cli-reference/cli-command-reference`,
+grepped for `--resume`, per the `agent-cli-reference` skill's no-WebFetch
+rule — see #453). The reference never shows `--resume <id>` as a literal
+invocation syntax (one unrelated prose line pairs `--remote` with
+`--resume <TASK-ID>` informally, describing the concept, not demonstrating
+the parse). Bare `--resume` (no value) is separately documented to open an
+interactive picker (needs a TTY) or, where no TTY is available for one, exit
+with an error — never to silently start or attach to the wrong session on
+its own. Whether today's underlying arg parser actually mis-reads the space
+form as bare-flag-plus-positional is therefore **UNVERIFIED, not
+confirmed** — CLAUDE.md constraint 3 rules out spawning a real `copilot` to
+settle it empirically, and the docs don't say either way. This fix is
+"remove a latent, plausible risk for free," not "confirmed and fixed a live
+bug," and is stated that way rather than overclaiming a repro that was never
+observed.
+
+**The fix.** Both `scan_copilot` branches now join with `=`:
+`copilot --resume=<id>` and `copilot --resume=<id> <AUTOPILOT_FLAGS>`. This
+is a pure syntax change — the #456 posture-lookup and ambiguity-resolution
+logic above is untouched, and Claude's `claude --resume <id>` is untouched
+too: Claude's own CLI reference documents `--resume` as a **required**-value
+flag (`claude --resume abc123 --fork-session`, `claude --resume
+auth-refactor` — space form, no bracket-optional notation), so there is no
+analogous risk on that path.
+
+**This fix's `panerestore.ts` reads are safe, but scoped to
+`scan_copilot`'s own emission — it does not close every copilot
+`--resume` emission path (rev-11, PR #473 review).** The frontend
+token-scanners that read a resumed command back out (`programFromRestore`,
+`shouldWatchCopilotOnRestore`, the session-id extractor) already branch on
+both `t === "--resume"` (space form, next token is the value) and
+`t.startsWith("--resume=")` (the `=` form, one token) — they were written
+defensively for exactly this kind of CLI-syntax variance, so *reading*
+either form needed no frontend change.
+
+**The residual: a copilot session resumed via the Sessions sidebar gets its
+id captured for the NEXT app boot (`main.ts`, #440 D1c) as an ordinary
+`paneKind: "agent"` pane. On that next boot, `resume-agent` calls
+`agentResumeCommand` (`panerestore.ts`), which unconditionally strips any
+recorded `--session-id`/`--resume` (either form) and re-appends the literal
+tokens `"--resume", sessionId` — the space form, unconditionally, for
+whatever CLI the command line happens to be.** `agentResumeCommand`'s own
+doc comment says "Only Claude has a clean resumable id... so this rewrites a
+`claude …` line," but the code has no CLI check — it runs the same rewrite
+on a copilot command line just as readily. So this PR's fix holds for a
+copilot session's FIRST restore (`scan_copilot`'s own emission, from the
+Sessions browser) but a copilot session resumed a SECOND time — once
+loomux's own tab-restore captured it as an agent pane — goes back through
+`agentResumeCommand` and comes out in the space form this PR removed.
+**Not fixed here**: `agentResumeCommand` becoming CLI-aware (or emitting the
+`=` form unconditionally, which would need its own doc-reference check the
+way this PR's `scan_copilot` change did) is tracked under **#471/#457**, the
+restore-path-unification work already named earlier in this document, and
+is deliberately left to that unified builder rather than duplicated here.
+
+**Pin.** `scan_copilot_restores_autopilot_flags_only_when_unambiguous`
+(`sessions.rs`) now asserts, for every session `scan_copilot` produces
+regardless of which posture branch built it, that `resume_command` contains
+`"--resume="` and never contains `"--resume "` — a future edit reverting
+`scan_copilot`'s OWN emission to the space form fails this test immediately.
+It does not and cannot pin `agentResumeCommand`'s separate emission, above.
+
+### #457 — generalizing #456's launch-intent store to claude, and correcting the issue's own premise
+
+**The premise #457 was filed on is wrong, and the record should say so
+plainly rather than let the next reader generalize the wrong lesson.** The
+issue frames the pattern as "restore replays a recorded command string
+instead of re-deriving launch flags" and names that replay as the
+anti-pattern across all three restore entry points. It isn't, for the entry
+point that actually does it: `panerestore.ts`'s tab-restore actions
+(`resume-agent`/`fresh-agent`/`dormant-agent`) replay loomux's OWN
+`PersistedPane.command`, captured verbatim at launch — every flag baked into
+that string, including autopilot, survives forward by construction, which is
+exactly why #439 (MCP re-mint) and #449/#471/#458 (session-flag rotation)
+were the only surgery that path ever needed. **The actual anti-pattern —
+the one #456's own investigation named — is narrower: `scan_claude`/
+`scan_copilot` RECONSTRUCTING a resume command from the CLI VENDOR'S OWN
+session files**, which structurally cannot know what loomux originally
+launched with, because that information never lived there. Replaying a
+loomux-recorded command is the safe path; reconstructing from a foreign
+source is the one that keeps losing flags, once per flag, forever, unless
+something reads loomux's own record instead.
+
+**A new, previously-unidentified instance of the same class: `scan_claude`
+carried NO launch-intent record at all.** Every Sessions-tab resume of a
+claude session emitted a bare `claude --resume <id>` unconditionally — not
+"one flag lost" the way #456 diagnosed for copilot's autopilot posture, but
+every flag, always, for every claude session ever resumed from that tab.
+This was never filed as its own bug; it surfaced only while reading
+`scan_claude` end to end to design #457's fix.
+
+**The fix generalizes #456's `copilot-posture.json` into a two-key
+`launch-intent.json`, in place, rather than building a second parallel
+store.** The value shape (`Posture: True | False | Conflicted`) and the
+sticky-at-write-time, LRU-whole-entry-eviction machinery are lifted
+verbatim — this section is not re-litigating #456's B1/B2 findings, both
+still hold, now for both keys. What's new is the key:
+
+- **Claude solo panes key by `IntentKey::Session { id }`** — the session id
+  `launcher.ts` already mints before launch, so the record is exact, no cwd
+  approximation needed. Because a session id is unique by construction (no
+  code path mints the same id for two different launches), **a
+  `Session`-keyed entry can never become `Conflicted`** — pinned by
+  `session_keyed_entries_are_never_conflicted` (a disagreeing repeat write
+  for the same id, which should never happen in practice, resolves to the
+  latest value, never to `None`, proving there is no ambiguous state this
+  key shape can reach). This is strictly better than copilot's situation and
+  **retires, for the claude case specifically, the eviction-ambiguity
+  residual** the #456 section above named as the structural floor of any
+  capped, cwd-keyed store — that residual is a property of cwd-keying, and
+  claude no longer cwd-keys.
+- **Copilot solo panes still key by `IntentKey::Cwd { cli, cwd }`** —
+  unchanged from #456, for the unchanged reason: copilot never hands loomux
+  a session id at launch. Precise per-session keying for copilot solo
+  remains a further follow-up, not attempted here — it needs the same class
+  of watcher machinery (`spawn_copilot_session_watcher`) #456 already
+  deferred for the group-agent case.
+
+**This is a genuine, deliberate WIDENING of what a claude restore can grant
+— stated here so a reviewer weighs it, not discovers it.** Before this PR, a
+Sessions-tab claude resume carried zero flags, unconditionally; after it, a
+claude session CAN carry autopilot flags, where — and only where — loomux
+itself recorded that it should. The same rule #456 established for copilot
+governs claude identically: flags only from a recorded intent, never by
+inference, never by default. A session with no recorded intent — foreign
+(never launched by loomux at all), pre-upgrade (existed before this PR, so
+no id-keyed record could ever have been written for it), or evicted —
+resolves to nothing, exactly like an unrecorded copilot cwd. Pinned
+end-to-end (not just at the lookup helper) by
+`scan_claude_grants_nothing_to_a_session_with_no_recorded_intent` and, for
+the positive case, `scan_claude_restores_autopilot_flags_only_when_recorded`
+— the claude-side counterpart of #456's own `scan_copilot_restores_
+autopilot_flags_only_when_unambiguous`.
+
+**Soft migration, not a cold reset.** A cold reset — start `launch-intent.json`
+empty and ignore any pre-#457 `copilot-posture.json` on disk — would still be
+*safe* under the ambiguity rule (no record resolves to no flags, the smaller
+grant), but it would silently re-inflict the exact annoyance #456 was filed
+to fix ("I have to toggle autopilot manually, per folder") on the very
+release that fixes it, for every existing user, once. `load_launch_intent`
+instead reads the legacy file, read-only, when-and-only-when the new file has
+never been written on this machine (existence-gated, not
+parseability-gated — a CURRENT corrupt `launch-intent.json` degrades to
+empty and is never rescued from a possibly-stale legacy file; pinned by
+`a_corrupt_new_store_never_falls_back_to_the_legacy_file`). The very next
+write lands on the new path and carries the migrated entries forward, so the
+legacy file is read at most once per machine
+(`soft_migration_reads_legacy_copilot_posture_file_when_new_store_is_absent`).
+
+**Fixing `scan_claude`'s own test seam.** Writing this PR's claude-side pin
+surfaced a second, unrelated pre-existing gap: `scan_claude` built its
+projects root inline via `dirs::home_dir()` rather than the testable
+`claude_projects_root()` helper `find_claude_session_cwd` already used, so
+`set_claude_projects_root_for_test` silently had no effect on it — the new
+`scan_claude_*` tests failed by scanning the real machine's `~/.claude`
+directory instead of the fixture, not by a real behavior bug. Routed through
+the shared helper; behavior-preserving on the default (no-override) path,
+since both resolve to the identical `dirs::home_dir().join(".claude").join
+("projects")` when no test override is set.
+
+**CLI-name detection, converged (closing #452's concrete named instance).**
+`programFromRestore` (`panerestore.ts`), `Pane.agentCli` (`pane.ts`), and
+`main.ts`'s D2 dormant-resume-candidate sniff were three independent copies
+of the same "first token, lowercased, exact-match `claude`/`copilot`"
+derivation — and identically incomplete: a path-qualified command
+(`C:\tools\copilot.exe`) or an `.exe`/`.cmd`/`.bat`-suffixed one matched
+neither literal, so every per-CLI restore behavior gated on it (the
+autopilot watcher, the resume-candidate card, `agentCli` itself) silently
+did not apply, with no error. All three now call one new
+`normalizeAgentProgram` (`panerestore.ts`), which strips a directory prefix
+and a trailing executable extension before lowercasing. This is **not** the
+full #452 convergence — the value/quoting grammar (`QUOTED_OR_BARE_VALUE`)
+is a different axis, already converged per #471; the D2 card's own
+`.command`-vs-`.argv` extraction step and the launcher's `plan.command`
+probe are untouched; this only converges what happens to an
+already-extracted raw token. Pinned by
+`programFromRestore recognizes an .exe-suffixed command` /
+`recognizes a path-qualified command` and
+`normalizeAgentProgram: bare name, path-qualified, and .exe/.cmd/.bat
+suffixed all converge` (`test/panerestore.test.ts`) — the first pair
+red-before-green verified against the pre-fix literal-comparison logic.
+
+**Deliberately left open, named rather than silently skipped, per the
+design-intake reply that scoped this PR:**
+
+- **The Rust orchestration builder's latent copilot-resume space-form arms**
+  (`build_agent_command`/`build_agent_argv`, `orchestration/mod.rs`
+  ~18499/~18700) are a different architecture entirely — group agents
+  already re-derive their launch command from structured group state
+  (persona, session, resume, auto_ops) every time, never a replayed string,
+  so they are not an instance of THIS issue's pattern, just a separately
+  latent risk in already-correct code. Left with a breadcrumb comment at
+  both arms pointing at this section, not folded into the launch-intent
+  store — unifying a TypeScript solo-pane builder and a Rust group-agent
+  builder across that architecture boundary is a larger, separable PR.
+- **Full #452 convergence** (a single shared CLI-derivation type/module,
+  covering the D2 card's own extraction step and the launcher's probe) is
+  future work — this PR converges only the one concrete failure named above.
+- **MCP/channel-identity is not re-minted for Sessions-tab restores.** A
+  session resumed from the Sessions tab still gets no `--mcp-config`/channel
+  identity, same as before this PR — the existing "Connect" adopt-later flow
+  (`orch_solo_adopt`) is the sanctioned manual path for that, and extending
+  automatic re-mint to a third entry point (beside `resume-agent`/
+  `fresh-agent`) is a separable change.
+- **Copilot solo session ids are still never learned at spawn**, so copilot
+  stays cwd-keyed — the same residual #456 already documented, still points
+  at future work, not resolved here.
+- **The launch-intent value stays `autopilot: Posture` only** — not widened
+  to also carry channel-tools/model/other future per-CLI semantics. Those
+  either don't need persisting (MCP identity is deliberately re-minted fresh
+  every restore, never replayed — #442) or don't have a second instance yet
+  to generalize from; widening the store ahead of a second real need would
+  be speculative generality this PR doesn't have evidence for.

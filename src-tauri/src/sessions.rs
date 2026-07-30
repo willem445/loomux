@@ -165,12 +165,21 @@ fn scan_claude_jsonl(path: &Path) -> (String, String, Option<(String, Option<Str
 }
 
 fn scan_claude(out: &mut Vec<SessionInfo>) {
-    let Some(root) = dirs::home_dir().map(|h| h.join(".claude").join("projects")) else {
+    // #457: route through the SAME testable root lookup `find_claude_session_cwd`
+    // already uses, rather than a second, untestable `dirs::home_dir()` inline
+    // (the pre-existing gap that made this function unable to honor
+    // `set_claude_projects_root_for_test` at all — caught writing this PR's own
+    // `scan_claude_*` tests, which is the actual production caller/behavior on
+    // the default (no-override) path, so this is behavior-preserving there).
+    let Some(root) = claude_projects_root() else {
         return;
     };
     let Ok(projects) = fs::read_dir(&root) else {
         return;
     };
+    // #457: one load for the whole scan, not one per session — same NB3
+    // rationale `scan_copilot` below already applies to its own read.
+    let intent = load_launch_intent();
     for project in projects.flatten() {
         let Ok(files) = fs::read_dir(project.path()) else {
             continue;
@@ -200,7 +209,10 @@ fn scan_claude(out: &mut Vec<SessionInfo>) {
                 None => (None, None),
             };
             out.push(SessionInfo {
-                resume_command: format!("claude --resume {id}"),
+                // #457: re-derive loomux's own recorded launch intent
+                // (autopilot posture) instead of the pre-#457 unconditional
+                // bare resume — see the module doc above `build_resume_command`.
+                resume_command: build_resume_command("claude", id, &cwd, &intent),
                 id: id.to_string(),
                 source: "claude".to_string(),
                 title,
@@ -271,34 +283,55 @@ fn norm_path(s: &str) -> String {
     s.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
-// ---------- copilot autopilot launch posture (#456) ----------
+// ---------- launch-intent store: autopilot posture (#456, generalized #457) ----------
 //
-// A solo copilot pane launched via loomux's launcher carries its Autopilot
-// toggle state as `--autopilot --allow-all-tools --allow-all-paths` on the
-// spawned command line (`single_pane_autopilot_flags`) — but a session
-// resumed from the Sessions tab is rebuilt from scratch as a bare
-// `copilot --resume <id>` (`scan_copilot` below), reading only copilot's OWN
-// `~/.copilot/session-state` files, which know nothing about how loomux
-// originally launched it. Restoring an autopilot session that way silently
-// drops it into plain interactive mode (#456). This is loomux's own record
-// of what the toggle was set to, captured at the one moment that
-// information exists — launch time — so `scan_copilot` can re-derive the
-// posture instead of guessing.
+// #457's corrected premise, stated here because the next person to touch
+// this file should read it before touching restore paths again: replaying a
+// loomux-RECORDED launch command (the tab-restore path, `panerestore.ts`'s
+// `agentResumeCommand`/`agentFreshCommand`) is NOT the anti-pattern — it
+// carries every flag baked into that command forward by construction, so
+// the *next* per-CLI launch semantic added there survives for free. The
+// actual anti-pattern, and the one #456's investigation actually named, is
+// `scan_claude`/`scan_copilot` RECONSTRUCTING a resume command from the CLI
+// VENDOR'S OWN session files — which cannot know what loomux originally
+// launched with, because that information never lived there. This module is
+// loomux's own record of launch intent, captured at the one moment that
+// information exists (launch time), so the scanners can re-derive it
+// instead of guessing from a foreign source.
 //
-// Keyed by cwd, not by copilot's session id: unlike Claude, copilot never
-// hands loomux a session id at launch (it mints its own, invisibly, and
-// `spawn_copilot_session_watcher` in orchestration/mod.rs learns it after
-// the fact only for GROUP agents) — a solo pane has no id to key on until
-// long after this record needs to exist. Precise per-session keying is
-// tracked as a follow-up (#457, restore-path unification) rather than
-// reimplementing that watcher machinery here.
+// Before this generalization, `scan_claude` carried NO record at all: every
+// Sessions-tab resume of a claude session emitted a bare `claude --resume
+// <id>`, unconditionally — not "one flag lost" like the copilot case #456
+// diagnosed, but every flag, always. That was never identified as its own
+// bug before this file's #457 pass.
 //
-// THE RULE THIS MODULE ENFORCES: on a permission decision, ambiguity
-// resolves to the smaller grant, never the larger one — and that includes
-// under STORE PRESSURE (review B1) and across FILESYSTEM CASE SENSITIVITY
-// (review B2), not just in the ordinary lookup. Because the key is only a
-// cwd, TWO copilot sessions launched in the same folder at different times
-// can disagree (toggle on, then later off, or vice versa) — cwd alone can't
+// Keyed two ways, chosen per CLI by what loomux actually knows at launch:
+//
+//   - `IntentKey::Session` — claude solo panes always mint a session id
+//     before launch (`launcher.ts`), so the record can key on it exactly.
+//     A session id is unique by construction (no code path mints the same
+//     id for two different launches), so a `Session`-keyed entry can NEVER
+//     become `Conflicted` — see `record_claude_launch_posture_impl`, and
+//     `session_keyed_entries_are_never_conflicted` for the pin. This makes
+//     claude strictly better off than copilot here, and retires — for the
+//     claude case only — the eviction-ambiguity residual #460 documented as
+//     a follow-up for this issue.
+//   - `IntentKey::Cwd` — copilot solo panes never get an id at launch (it
+//     mints its own, invisibly, and `spawn_copilot_session_watcher` in
+//     orchestration/mod.rs learns one after the fact only for GROUP
+//     agents), so this reuses #460's original cwd-keyed, conflict-tracked
+//     machinery verbatim, just moved under this wider key type. Precise
+//     per-session keying for copilot solo is still tracked as further
+//     follow-up, not attempted here — it needs the same class of watcher
+//     machinery #460 already deferred.
+//
+// THE RULE THIS MODULE ENFORCES (#460, now binding on BOTH key shapes): on a
+// permission decision, ambiguity resolves to the smaller grant, never the
+// larger one — and that includes under STORE PRESSURE (review B1) and
+// across FILESYSTEM CASE SENSITIVITY (review B2) for the cwd-keyed half, not
+// just in the ordinary lookup. Because a `Cwd` key is only a cwd, TWO
+// copilot sessions launched in the same folder at different times can
+// disagree (toggle on, then later off, or vice versa) — cwd alone can't
 // tell which record belongs to which session being restored. Ideally this
 // would resolve by matching each record against the resumed session's own
 // start time, but copilot's `workspace.yaml` documents no reliable creation
@@ -309,68 +342,162 @@ fn norm_path(s: &str) -> String {
 // true and false have been recorded is CONFLICTED and resolves to `None`
 // (no flags) — losing autopilot on restore is a shift+tab away, but silently
 // granting `--allow-all-paths` to a session the user deliberately launched
-// without it is not something they could ever notice or undo.
+// without it is not something they could ever notice or undo. A claude
+// session with NO recorded intent (foreign, pre-upgrade with no migrated
+// record, or evicted) resolves the same way, to `None` — flags only where
+// there is a recorded intent saying so, never by inference, never by
+// default. This is a genuine behavior WIDENING versus before this PR (a
+// claude Sessions-tab restore previously carried no flags ever; now it can,
+// where — and only where — loomux itself recorded that it should).
 //
 // Conflict is derived and stored AT WRITE TIME, as one sticky enum value per
-// cwd (`CopilotPosture::Conflicted`) — never re-derived at read time from a
-// list of raw records. This is what makes the guarantee survive eviction
-// (review B1, caught with a runnable counter-test against the original flat
+// key (`Posture::Conflicted`) — never re-derived at read time from a list of
+// raw records. This is what makes the guarantee survive eviction (review
+// B1, caught with a runnable counter-test against the original flat
 // per-write log: capping-and-evicting individual records could drop the
 // OFF half of a conflict and leave a lone ON record, silently flipping a
 // permanently-ambiguous cwd back to granting autopilot). With one entry per
-// cwd, the cap counts CWDS and evicts the least-recently-TOUCHED one whole —
-// "touched" meaning written OR re-confirmed, so an actively-used folder is
-// never the eviction target — and eviction can only ever move a cwd from
-// {True | False | Conflicted} to NO RECORD, which resolves to `None` right
-// alongside every other "nothing to go on" case. There is no path from
-// eviction to a larger grant than the cwd already had.
-const COPILOT_POSTURE_CAP: usize = 300;
+// key, the cap counts ENTRIES (of either key shape, one shared pool) and
+// evicts the least-recently-TOUCHED one whole — "touched" meaning written OR
+// re-confirmed, so an actively-used folder/session is never the eviction
+// target — and eviction can only ever move a key from {True | False |
+// Conflicted} to NO RECORD, which resolves to `None` right alongside every
+// other "nothing to go on" case. There is no path from eviction to a larger
+// grant than the key already had.
+//
+// SOFT MIGRATION (#457): this store's file was `copilot-posture.json`
+// (copilot-only, cwd-only) before this PR. `load_launch_intent` below reads
+// that file, read-only, EXACTLY ONCE — only when the new file has never
+// been written on this machine — and folds its entries in as `Cwd`-keyed
+// copilot records. A cold reset (ignore the old file, start empty) would be
+// safe by the same "no record → no flags" rule above, but it would also
+// silently re-inflict the exact annoyance #456 was filed to fix ("I have to
+// toggle autopilot manually, per folder") on the very release that fixes
+// it — a bad trade for a few lines of migration code, so this reads the old
+// file instead of resetting.
+//
+// Migration does NOT re-derive the platform key (`posture_key`/
+// `posture_key_for`) — it copies each legacy entry's `cwd` field VERBATIM
+// into the new store (see `load_launch_intent`'s match arm below). This is
+// deliberate, not an oversight: `cfg!(windows)` is a COMPILE-TIME constant
+// baked into one built binary, so a single loomux install's write-time
+// keying and read-time keying (migration or ordinary lookup, doesn't
+// matter) are always performed by the SAME code in the SAME process —
+// there is no runtime path where they could disagree on which arm to use.
+// The only way a legacy key and a lookup could apply DIFFERENT arms is the
+// underlying file traveling between a case-folding (Windows) and a
+// case-sensitive (macOS/Linux) install — and `data_root()` resolves to
+// `dirs::data_dir()`, an OS-NATIVE per-machine path (`%APPDATA%` vs.
+// `~/Library/Application Support` vs. XDG) that does not coincide across
+// platforms by default; getting two different-OS installs to share this
+// file at all requires deliberately pointing `LOOMUX_DATA_DIR` at a synced
+// location on both. That scoping property is #460's, unchanged by this PR:
+// the original single-arm-per-store design never supported cross-platform
+// key portability, migration or not, and a verbatim-copy migration can't
+// make that any better OR any worse than it already was — it only has to
+// preserve whatever a same-binary write already produced, which it does by
+// construction. Pinned (not just asserted) by
+// `soft_migration_preserves_the_legacy_cwd_key_exactly_regardless_of_which_
+// platform_wrote_it`, mutation-verified against re-normalizing a second
+// time (see that test's own doc comment for why a same-host test alone
+// can't catch that mutation).
+const LAUNCH_INTENT_CAP: usize = 300;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum CopilotPosture {
+enum Posture {
     True,
     False,
-    /// Sticky: once a cwd sees both `True` and `False` writes, it stays
+    /// Sticky: once a key sees both `True` and `False` writes, it stays
     /// `Conflicted` forever (until evicted entirely) — never flips back to a
-    /// single value no matter what's written or evicted afterward.
+    /// single value no matter what's written or evicted afterward. Only
+    /// ever reached via `IntentKey::Cwd` — see the module doc's claim that a
+    /// `Session`-keyed entry can never become this.
     Conflicted,
 }
 
+/// What a launch-intent entry is keyed by — chosen per CLI, see the module
+/// doc above for why each CLI gets the shape it does.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum IntentKey {
+    /// claude solo: the session id minted at launch (`launcher.ts`) — exact,
+    /// no ambiguity possible.
+    Session { id: String },
+    /// copilot solo: the launch cwd, normalized via `posture_key` — #460's
+    /// original keying, reused verbatim under this wider enum.
+    Cwd { cli: String, cwd: String },
+}
+
 #[derive(Clone, Serialize, Deserialize)]
-struct CopilotPostureEntry {
-    /// The store's PERMISSION key — see `posture_key`'s doc comment for why
-    /// this is deliberately NOT the same normalization `norm_path` (session-
-    /// cwd MATCHING) uses.
-    cwd: String,
-    posture: CopilotPosture,
-    /// Bumped on every write to this cwd, including a repeat of the same
+struct LaunchIntentEntry {
+    key: IntentKey,
+    autopilot: Posture,
+    /// Bumped on every write to this key, including a repeat of the same
     /// value — this is what "touched" means for LRU eviction, not merely
     /// "created".
     touched_ms: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct CopilotPostureStore {
-    entries: Vec<CopilotPostureEntry>,
+struct LaunchIntentStore {
+    entries: Vec<LaunchIntentEntry>,
+}
+
+/// The pre-#457 shape of this store: copilot-only, cwd-only, no `kind` tag.
+/// Read-only migration source for `load_launch_intent` — never written
+/// again once `launch-intent.json` exists. Field names match the original
+/// exactly so `serde_json` can parse a real pre-upgrade file on disk.
+#[derive(Deserialize)]
+struct LegacyCopilotPostureEntry {
+    cwd: String,
+    posture: Posture,
+    touched_ms: u64,
+}
+
+#[derive(Default, Deserialize)]
+struct LegacyCopilotPostureStore {
+    entries: Vec<LegacyCopilotPostureEntry>,
 }
 
 thread_local! {
-    /// Test seam for `copilot_posture_path()`, same thread-scoping rationale
+    /// Test seam for `launch_intent_path()`, same thread-scoping rationale
     /// as `COPILOT_SESSION_STATE_ROOT_OVERRIDE` above — a real env-var
     /// override would race a concurrently-running test on another thread.
-    static COPILOT_POSTURE_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+    static LAUNCH_INTENT_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test seam for `legacy_copilot_posture_path()` — the pre-#457 file
+    /// `load_launch_intent`'s soft migration reads from. Separate cell from
+    /// the one above: a migration test needs to fixture BOTH paths
+    /// independently (new file absent, old file present with content).
+    static LEGACY_COPILOT_POSTURE_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Test-only seam: fixture the file `copilot_posture_path()` returns, for the
+/// Test-only seam: fixture the file `launch_intent_path()` returns, for the
 /// calling thread only. See `set_claude_projects_root_for_test` for why.
 #[doc(hidden)] // pub for integration tests
-pub fn set_copilot_posture_path_for_test(path: Option<PathBuf>) {
-    COPILOT_POSTURE_PATH_OVERRIDE.with(|c| *c.borrow_mut() = path);
+pub fn set_launch_intent_path_for_test(path: Option<PathBuf>) {
+    LAUNCH_INTENT_PATH_OVERRIDE.with(|c| *c.borrow_mut() = path);
 }
 
-fn copilot_posture_path() -> PathBuf {
-    if let Some(p) = COPILOT_POSTURE_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
+/// Test-only seam: fixture the file `legacy_copilot_posture_path()` returns,
+/// for the calling thread only — see `set_launch_intent_path_for_test`.
+#[doc(hidden)] // pub for integration tests
+pub fn set_legacy_copilot_posture_path_for_test(path: Option<PathBuf>) {
+    LEGACY_COPILOT_POSTURE_PATH_OVERRIDE.with(|c| *c.borrow_mut() = path);
+}
+
+fn launch_intent_path() -> PathBuf {
+    if let Some(p) = LAUNCH_INTENT_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
+        return p;
+    }
+    crate::obs::data_root().join("launch-intent.json")
+}
+
+/// The pre-#457 store this module's soft migration reads from, read-only —
+/// see the module doc's "SOFT MIGRATION" section.
+fn legacy_copilot_posture_path() -> PathBuf {
+    if let Some(p) = LEGACY_COPILOT_POSTURE_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
         return p;
     }
     crate::obs::data_root().join("copilot-posture.json")
@@ -383,15 +510,57 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Best-effort load: a missing file is "no history yet" (empty store); a
-/// corrupt one is quarantined (via `uistate::load_or_quarantine`, the same
-/// fail-safe `tabs.json`/`settings.json` use) and treated as empty too — a
-/// lost posture history degrades to the safe "no record" behavior below,
-/// never a crash or a stale grant.
-fn load_copilot_posture() -> CopilotPostureStore {
-    crate::uistate::load_or_quarantine(&copilot_posture_path())
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+/// Best-effort load: a missing NEW-file-and-no-legacy-file is "no history
+/// yet" (empty store); a corrupt new file is quarantined (via
+/// `uistate::load_or_quarantine`, the same fail-safe `tabs.json`/
+/// `settings.json` use) and treated as empty too — a lost intent history
+/// degrades to the safe "no record" behavior below, never a crash or a
+/// stale grant.
+///
+/// SOFT MIGRATION (#457, see module doc): when `launch-intent.json` has
+/// never been written on this machine, read `copilot-posture.json` instead
+/// — read-only, and only on this "new file doesn't exist yet" branch, never
+/// as a fallback for a new file that exists but failed to parse (that stays
+/// "quarantine and start empty", the same as every other store here — a
+/// corrupt CURRENT file must never resurrect a possibly-stale legacy one).
+/// The very next `record_*_launch_posture` write lands on the new path, so
+/// this branch is taken at most once per machine.
+fn load_launch_intent() -> LaunchIntentStore {
+    let path = launch_intent_path();
+    if path.exists() {
+        return crate::uistate::load_or_quarantine(&path)
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+    }
+    let legacy: Option<LegacyCopilotPostureStore> =
+        crate::uistate::load_or_quarantine(&legacy_copilot_posture_path())
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+    match legacy {
+        Some(store) => LaunchIntentStore {
+            entries: store
+                .entries
+                .into_iter()
+                .map(|e| LaunchIntentEntry {
+                    key: IntentKey::Cwd { cli: "copilot".to_string(), cwd: e.cwd },
+                    autopilot: e.posture,
+                    touched_ms: e.touched_ms,
+                })
+                .collect(),
+        },
+        None => LaunchIntentStore::default(),
+    }
+}
+
+/// Evict the least-recently-touched entries wholesale (never a partial
+/// record of one) until back at `LAUNCH_INTENT_CAP` — shared by both write
+/// paths (claude session-keyed, copilot cwd-keyed) so the cap is one shared
+/// pool, not tracked separately per key shape.
+fn cap_and_evict(store: &mut LaunchIntentStore) {
+    if store.entries.len() > LAUNCH_INTENT_CAP {
+        store.entries.sort_by_key(|e| e.touched_ms);
+        let excess = store.entries.len() - LAUNCH_INTENT_CAP;
+        store.entries.drain(0..excess);
+    }
 }
 
 /// Normalize a cwd into the posture store's PERMISSION key (review B2).
@@ -431,66 +600,147 @@ fn posture_key(s: &str) -> String {
 /// since a later restore must be able to tell "explicitly off" from "no
 /// record". A cwd with only one posture ever written stays that posture; a
 /// cwd that sees both becomes (and stays) `Conflicted` — see the module
-/// section's ambiguity rule. Best-effort and capped at `COPILOT_POSTURE_CAP`
-/// CWDS (review B1: one entry per cwd, LRU-evicted whole, never a flat log
-/// of individual writes) — this is a convenience record, not a
-/// durable-correctness store, and must never block or fail a launch.
+/// section's ambiguity rule. Best-effort and capped (review B1: one entry
+/// per key, LRU-evicted whole, never a flat log of individual writes) — this
+/// is a convenience record, not a durable-correctness store, and must never
+/// block or fail a launch.
 #[tauri::command]
 pub fn record_copilot_launch_posture(cwd: String, autopilot: bool) -> Result<(), String> {
     record_copilot_launch_posture_impl(&cwd, autopilot)
 }
 
 fn record_copilot_launch_posture_impl(cwd: &str, autopilot: bool) -> Result<(), String> {
-    let mut store = load_copilot_posture();
-    let key = posture_key(cwd);
+    let mut store = load_launch_intent();
+    let key = IntentKey::Cwd { cli: "copilot".to_string(), cwd: posture_key(cwd) };
     let now = now_ms();
-    let incoming = if autopilot { CopilotPosture::True } else { CopilotPosture::False };
-    match store.entries.iter_mut().find(|e| e.cwd == key) {
+    let incoming = if autopilot { Posture::True } else { Posture::False };
+    match store.entries.iter_mut().find(|e| e.key == key) {
         Some(entry) => {
             // Already conflicted stays conflicted; a fresh disagreement
             // BECOMES conflicted; agreement just refreshes the touch time.
-            if entry.posture != incoming {
-                entry.posture = CopilotPosture::Conflicted;
+            if entry.autopilot != incoming {
+                entry.autopilot = Posture::Conflicted;
             }
             entry.touched_ms = now;
         }
-        None => store.entries.push(CopilotPostureEntry { cwd: key, posture: incoming, touched_ms: now }),
+        None => store.entries.push(LaunchIntentEntry { key, autopilot: incoming, touched_ms: now }),
     }
-    if store.entries.len() > COPILOT_POSTURE_CAP {
-        // Evict the least-recently-TOUCHED cwd wholesale — never a partial
-        // record of one — until back at the cap.
-        store.entries.sort_by_key(|e| e.touched_ms);
-        let excess = store.entries.len() - COPILOT_POSTURE_CAP;
-        store.entries.drain(0..excess);
-    }
+    cap_and_evict(&mut store);
     let body = serde_json::to_string(&store).map_err(|e| e.to_string())?;
-    crate::uistate::write_atomic(&copilot_posture_path(), &body)
+    crate::uistate::write_atomic(&launch_intent_path(), &body)
 }
 
-/// The autopilot posture to assume for a copilot session resumed from `cwd`,
-/// per the ambiguity rule documented above the module section: `Some(v)`
-/// only when this cwd's stored posture is unambiguously `v`; `None` (no
-/// flags) when there is no record at all, OR the stored posture is
-/// `Conflicted`. Takes an already-loaded store so a caller resolving many
-/// cwds in one pass (`scan_copilot`) reads the file once, not once per
-/// session (review NB3).
-fn posture_in(store: &CopilotPostureStore, cwd: &str) -> Option<bool> {
+/// Record what the Autopilot toggle was set to for a solo CLAUDE launch that
+/// minted `session_id` (#457) — claude's half of the module doc's launch-
+/// intent record, keyed exactly (no ambiguity, ever) instead of by cwd.
+/// Same best-effort contract as the copilot command above. A blank id is a
+/// no-op: nothing reliable to key on (mirrors the copilot command's cwd
+/// guard, `posture_in`'s empty-string check).
+#[tauri::command]
+pub fn record_claude_launch_posture(session_id: String, autopilot: bool) -> Result<(), String> {
+    record_claude_launch_posture_impl(&session_id, autopilot)
+}
+
+fn record_claude_launch_posture_impl(session_id: &str, autopilot: bool) -> Result<(), String> {
+    if session_id.trim().is_empty() {
+        return Ok(());
+    }
+    let mut store = load_launch_intent();
+    let key = IntentKey::Session { id: session_id.to_string() };
+    let now = now_ms();
+    let incoming = if autopilot { Posture::True } else { Posture::False };
+    match store.entries.iter_mut().find(|e| e.key == key) {
+        // Deliberately NEVER sets `Conflicted` here, unlike the cwd-keyed
+        // branch above: a session id is unique by construction (no code
+        // path mints the same id for two different launches), so two writes
+        // for the same key can only be a repeat of the SAME launch's own
+        // record — there is no legitimate disagreement to detect. A repeat
+        // write just overwrites the value and refreshes the touch time.
+        // This is what makes a `Session`-keyed entry provably never
+        // `Conflicted` — see `session_keyed_entries_are_never_conflicted`.
+        Some(entry) => {
+            entry.autopilot = incoming;
+            entry.touched_ms = now;
+        }
+        None => store.entries.push(LaunchIntentEntry { key, autopilot: incoming, touched_ms: now }),
+    }
+    cap_and_evict(&mut store);
+    let body = serde_json::to_string(&store).map_err(|e| e.to_string())?;
+    crate::uistate::write_atomic(&launch_intent_path(), &body)
+}
+
+/// The recorded posture for `key`, per the ambiguity rule documented above
+/// the module section: `Some(v)` only when this key's stored posture is
+/// unambiguously `v`; `None` (no flags) when there is no record at all, OR
+/// the stored posture is `Conflicted`. Takes an already-loaded store so a
+/// caller resolving many sessions in one pass (`scan_claude`/`scan_copilot`)
+/// reads the file once, not once per session (review NB3).
+fn intent_for(store: &LaunchIntentStore, key: &IntentKey) -> Option<bool> {
+    match store.entries.iter().find(|e| &e.key == key)?.autopilot {
+        Posture::True => Some(true),
+        Posture::False => Some(false),
+        Posture::Conflicted => None,
+    }
+}
+
+/// `intent_for` for copilot's cwd-keyed half — applies the same `posture_key`
+/// normalization at lookup time that `record_copilot_launch_posture_impl`
+/// applies at write time (must stay the same normalization on both sides,
+/// or a write and its own later lookup could silently disagree). An empty
+/// cwd never matches (review B2's empty-key guard, carried forward).
+fn copilot_posture_in(store: &LaunchIntentStore, cwd: &str) -> Option<bool> {
     let want = posture_key(cwd);
     if want.is_empty() {
         return None;
     }
-    match store.entries.iter().find(|e| e.cwd == want)?.posture {
-        CopilotPosture::True => Some(true),
-        CopilotPosture::False => Some(false),
-        CopilotPosture::Conflicted => None,
-    }
+    intent_for(store, &IntentKey::Cwd { cli: "copilot".to_string(), cwd: want })
 }
 
-/// `posture_in`, loading the store fresh — for the (rare, single-lookup)
-/// caller that doesn't already have one loaded. `scan_copilot` below loads
-/// once and calls `posture_in` directly instead.
+/// `intent_for` for claude's session-keyed half. An empty id never matches,
+/// mirroring `copilot_posture_in`'s empty-cwd guard.
+fn claude_posture_in(store: &LaunchIntentStore, session_id: &str) -> Option<bool> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    intent_for(store, &IntentKey::Session { id: session_id.to_string() })
+}
+
+/// `copilot_posture_in`, loading the store fresh — for the (rare,
+/// single-lookup) caller that doesn't already have one loaded. `scan_copilot`
+/// below loads once and calls `copilot_posture_in` directly instead.
 fn copilot_launch_posture(cwd: &str) -> Option<bool> {
-    posture_in(&load_copilot_posture(), cwd)
+    copilot_posture_in(&load_launch_intent(), cwd)
+}
+
+/// The Sessions-tab resume command for `cli`/`session_id`, re-deriving
+/// loomux's own recorded launch intent (#457) instead of reconstructing from
+/// the CLI's own session files — see the module doc's corrected premise.
+/// `cwd` is only consulted for `cli == "copilot"` (the one CLI keyed by cwd
+/// rather than session id — see `IntentKey`'s doc). No record (never
+/// launched by loomux, evicted, or genuinely conflicting history) → bare
+/// resume, never a guess — #460's rule, now enforced identically for both
+/// CLIs. Reuses the SAME flag atoms a fresh launch builds
+/// (`single_pane_autopilot_flags`/`COPILOT_GROUP_AUTOPILOT_FLAGS`) — one
+/// seam, never a second copy that could drift.
+fn build_resume_command(cli: &str, session_id: &str, cwd: &str, store: &LaunchIntentStore) -> String {
+    match cli {
+        "copilot" => {
+            let base = format!("copilot --resume={session_id}"); // #458: `=` form, untouched by #457
+            if copilot_posture_in(store, cwd) == Some(true) {
+                format!("{base} {}", crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS)
+            } else {
+                base
+            }
+        }
+        _ => {
+            let base = format!("claude --resume {session_id}");
+            if claude_posture_in(store, session_id) == Some(true) {
+                format!("{base} {}", crate::orchestration::single_pane_autopilot_flags("claude"))
+            } else {
+                base
+            }
+        }
+    }
 }
 
 /// Session ids currently present under `root` — the baseline snapshot taken
@@ -695,32 +945,37 @@ fn scan_copilot(out: &mut Vec<SessionInfo>) {
     let Ok(entries) = fs::read_dir(&root) else {
         return;
     };
-    // #456 review NB3: one load for the whole scan, not one per session —
-    // the store is read-only here, so there's nothing to keep fresh across
-    // iterations.
-    let posture_store = load_copilot_posture();
+    // #456 review NB3 (now shared by scan_claude too — #457): one load for
+    // the whole scan, not one per session — the store is read-only here, so
+    // there's nothing to keep fresh across iterations.
+    let intent = load_launch_intent();
     for entry in entries.flatten() {
         let Some(s) = read_copilot_session(&entry.path()) else {
             continue;
         };
-        // #456: re-derive the autopilot posture loomux launched this cwd
-        // with (if any unambiguous record exists — see the module section
-        // above `record_copilot_launch_posture`) rather than handing back a
-        // bare `--resume`, which silently drops a session out of autopilot
-        // on restore. Reuses the SAME flags string a fresh launch builds
-        // (`single_pane_autopilot_flags`/`COPILOT_GROUP_AUTOPILOT_FLAGS`) —
-        // one seam, never a second copy that could drift.
-        let resume_command = if posture_in(&posture_store, &s.cwd) == Some(true) {
-            format!(
-                "copilot --resume {} {}",
-                s.id,
-                crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS
-            )
-        } else {
-            format!("copilot --resume {}", s.id)
-        };
+        // #457: re-derive loomux's own recorded launch intent (autopilot
+        // posture, if any unambiguous record exists) via the shared
+        // `build_resume_command` — see the module doc above. `=`, never a
+        // space, between `--resume` and the id (#458): copilot's CLI
+        // reference documents the flag as optional-value —
+        // `` `-r`, `--resume[=VALUE]` `` (raw-fetched via
+        // `curl -sL https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-cli-reference/cli-command-reference`,
+        // grepped for `--resume`) — and the CLI's OWN generated hint after a
+        // `-p`/`--prompt` run is spelled the same unambiguous way: "The exit
+        // summary includes a `copilot --resume=SESSION-ID` hint for
+        // continuing the session." The docs never show `--resume <id>` as a
+        // literal invocation (one unrelated prose line pairs `--remote` with
+        // `--resume <TASK-ID>` informally, not as a syntax example), so
+        // whether today's space form is silently mis-parsed by the
+        // underlying arg parser is UNVERIFIED rather than confirmed broken —
+        // this is a "remove the latent risk for free" fix, not a confirmed
+        // live bug, and the PR says so. `--resume=<id>` is documented, costs
+        // nothing, and can never be misread as a bare `--resume` (its own
+        // documented failure mode: an interactive picker, or — where no TTY
+        // is available for one — a loud error, never a silent wrong-session
+        // attach) plus a stray positional.
         out.push(SessionInfo {
-            resume_command,
+            resume_command: build_resume_command("copilot", &s.id, &s.cwd, &intent),
             id: s.id,
             source: "copilot".to_string(),
             title: tidy_title(&s.title, 90),
@@ -1063,31 +1318,55 @@ mod copilot_session_tests {
 }
 
 #[cfg(test)]
-mod copilot_posture_tests {
-    // #456: the copilot-launch-posture record + the `scan_copilot` ambiguity
-    // rule it feeds. Each test binds `set_copilot_posture_path_for_test` to a
-    // fresh temp file so tests never share (or race on) the real
-    // `<data root>/copilot-posture.json`.
+mod launch_intent_tests {
+    // #456/#457: the launch-intent record (claude session-keyed + copilot
+    // cwd-keyed) + the ambiguity rule it feeds `scan_claude`/`scan_copilot`.
+    // Each test binds BOTH `set_launch_intent_path_for_test` (the new store)
+    // and `set_legacy_copilot_posture_path_for_test` (the migration source)
+    // to fresh, not-yet-existing files inside a private tempdir, so tests
+    // never share (or race on) the real `<data root>` files, and never
+    // silently trigger a migration read against the real
+    // `copilot-posture.json` on the machine running the suite.
     use super::{
-        copilot_launch_posture, posture_key_for, record_copilot_launch_posture_impl, scan_copilot,
-        set_copilot_posture_path_for_test, set_copilot_session_state_root_for_test,
+        claude_posture_in, copilot_launch_posture, load_launch_intent, posture_key_for,
+        record_claude_launch_posture_impl, record_copilot_launch_posture_impl, scan_claude, scan_copilot,
+        set_claude_projects_root_for_test, set_copilot_session_state_root_for_test,
+        set_launch_intent_path_for_test, set_legacy_copilot_posture_path_for_test, IntentKey, Posture,
     };
     use std::fs;
 
-    /// Bind the posture-store test seam to a not-yet-existing file inside a
-    /// fresh tempdir, and return the guard the caller must hold to keep the
-    /// tempdir alive for the test's duration.
+    /// `claude_posture_in`, loading the store fresh — the claude-side
+    /// counterpart of `copilot_launch_posture`, test-only (no production
+    /// caller needs a fresh-load single lookup for claude; `scan_claude`
+    /// loads once for the whole scan like `scan_copilot` does).
+    #[cfg(test)]
+    fn claude_launch_posture(session_id: &str) -> Option<bool> {
+        claude_posture_in(&load_launch_intent(), session_id)
+    }
+
+    /// Bind the launch-intent store's test seams to fresh, not-yet-existing
+    /// files inside a fresh tempdir (both the new store AND the legacy
+    /// migration source, so a test that isn't specifically about migration
+    /// starts from a deterministic "no record anywhere" state), and return
+    /// the guard the caller must hold to keep the tempdir alive.
     fn posture_seam() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
-        set_copilot_posture_path_for_test(Some(d.path().join("copilot-posture.json")));
+        set_launch_intent_path_for_test(Some(d.path().join("launch-intent.json")));
+        set_legacy_copilot_posture_path_for_test(Some(d.path().join("copilot-posture.json")));
         d
+    }
+
+    fn clear_seam() {
+        set_launch_intent_path_for_test(None);
+        set_legacy_copilot_posture_path_for_test(None);
     }
 
     #[test]
     fn no_record_is_none() {
         let _d = posture_seam();
         assert_eq!(copilot_launch_posture("C:/work/x"), None);
-        set_copilot_posture_path_for_test(None);
+        assert_eq!(claude_launch_posture("some-session-id"), None, "same rule for claude's session key");
+        clear_seam();
     }
 
     #[test]
@@ -1098,7 +1377,45 @@ mod copilot_posture_tests {
 
         record_copilot_launch_posture_impl("C:/work/y", false).unwrap();
         assert_eq!(copilot_launch_posture("C:/work/y"), Some(false));
-        set_copilot_posture_path_for_test(None);
+        clear_seam();
+    }
+
+    #[test]
+    fn claude_session_key_round_trips() {
+        let _d = posture_seam();
+        record_claude_launch_posture_impl("sess-a", true).unwrap();
+        assert_eq!(claude_launch_posture("sess-a"), Some(true));
+
+        record_claude_launch_posture_impl("sess-b", false).unwrap();
+        assert_eq!(claude_launch_posture("sess-b"), Some(false));
+        // Distinct ids never collide, unlike two copilot sessions sharing a cwd.
+        assert_eq!(claude_launch_posture("sess-a"), Some(true), "sess-b's write must not disturb sess-a");
+        clear_seam();
+    }
+
+    /// THE property the orchestrator asked to see pinned explicitly (design
+    /// intake, #457): a `Session`-keyed entry can NEVER become `Conflicted`,
+    /// because a session id is unique by construction — two writes for the
+    /// SAME id can only be a repeat of the same launch's own record, never a
+    /// genuine disagreement between two different sessions the way two
+    /// copilot launches can disagree in the same cwd. A disagreeing repeat
+    /// write (which should never happen in practice, since launcher.ts
+    /// writes each minted id's record exactly once) still resolves to the
+    /// LATEST value, never to `None` — proving by observation that this key
+    /// shape has no ambiguous state to fall into, unlike `conflicting_
+    /// records_for_the_same_cwd_resolve_to_none_not_latest` below.
+    #[test]
+    fn session_keyed_entries_are_never_conflicted() {
+        let _d = posture_seam();
+        record_claude_launch_posture_impl("sess-x", true).unwrap();
+        record_claude_launch_posture_impl("sess-x", false).unwrap();
+        assert_eq!(
+            claude_launch_posture("sess-x"),
+            Some(false),
+            "a repeat write for the SAME session id overwrites (last write wins) — it must never \
+             resolve to None the way a genuinely ambiguous cwd-keyed record does"
+        );
+        clear_seam();
     }
 
     #[test]
@@ -1115,7 +1432,7 @@ mod copilot_posture_tests {
         } else {
             assert_eq!(looked_up, None, "non-Windows: a case-differing path must NOT match (review B2)");
         }
-        set_copilot_posture_path_for_test(None);
+        clear_seam();
     }
 
     /// THE B2 property (review): a posture record only ever applies to the
@@ -1152,7 +1469,7 @@ mod copilot_posture_tests {
         let _d = posture_seam();
         record_copilot_launch_posture_impl("", true).unwrap();
         assert_eq!(copilot_launch_posture(""), None);
-        set_copilot_posture_path_for_test(None);
+        clear_seam();
     }
 
     /// THE rule this whole module exists to enforce: a folder launched with
@@ -1178,23 +1495,23 @@ mod copilot_posture_tests {
         record_copilot_launch_posture_impl("C:/work/y", false).unwrap();
         record_copilot_launch_posture_impl("C:/work/y", true).unwrap();
         assert_eq!(copilot_launch_posture("C:/work/y"), None);
-        set_copilot_posture_path_for_test(None);
+        clear_seam();
     }
 
     #[test]
     fn store_caps_and_evicts_the_least_recently_touched_cwd() {
         let _d = posture_seam();
         // One past the cap, each a distinct cwd so none collide/cancel out.
-        for i in 0..=super::COPILOT_POSTURE_CAP {
+        for i in 0..=super::LAUNCH_INTENT_CAP {
             record_copilot_launch_posture_impl(&format!("C:/work/{i}"), true).unwrap();
         }
-        let store = super::load_copilot_posture();
-        assert_eq!(store.entries.len(), super::COPILOT_POSTURE_CAP, "must stay capped, not grow unbounded — one entry per cwd");
+        let store = super::load_launch_intent();
+        assert_eq!(store.entries.len(), super::LAUNCH_INTENT_CAP, "must stay capped, not grow unbounded — one entry per cwd");
         // The very first recorded (cwd "C:/work/0") was never touched again — evicted.
         assert_eq!(copilot_launch_posture("C:/work/0"), None);
         // The most recently touched survives.
-        assert_eq!(copilot_launch_posture(&format!("C:/work/{}", super::COPILOT_POSTURE_CAP)), Some(true));
-        set_copilot_posture_path_for_test(None);
+        assert_eq!(copilot_launch_posture(&format!("C:/work/{}", super::LAUNCH_INTENT_CAP)), Some(true));
+        clear_seam();
     }
 
     #[test]
@@ -1205,7 +1522,7 @@ mod copilot_posture_tests {
         // nobody has opened in months, which defeats the point of LRU.
         let _d = posture_seam();
         record_copilot_launch_posture_impl("C:/work/active", true).unwrap();
-        for i in 0..super::COPILOT_POSTURE_CAP {
+        for i in 0..super::LAUNCH_INTENT_CAP {
             record_copilot_launch_posture_impl(&format!("C:/work/filler{i}"), true).unwrap();
             // Re-confirm the active cwd on every iteration — it must never
             // be the least-recently-touched entry.
@@ -1216,7 +1533,7 @@ mod copilot_posture_tests {
             Some(true),
             "a repeatedly re-touched cwd must survive eviction even under sustained store pressure"
         );
-        set_copilot_posture_path_for_test(None);
+        clear_seam();
     }
 
     /// THE B1 property (review): a cwd with conflicting posture history
@@ -1245,7 +1562,7 @@ mod copilot_posture_tests {
         // A test that pushes activity far past this boundary evicts BOTH
         // sides together and passes for the wrong reason (nothing left to
         // resolve at all) — this exact size is what must be asserted at.
-        for i in 0..super::COPILOT_POSTURE_CAP - 1 {
+        for i in 0..super::LAUNCH_INTENT_CAP - 1 {
             record_copilot_launch_posture_impl(&format!("C:/other/{i}"), true).unwrap();
         }
         assert_eq!(
@@ -1259,7 +1576,7 @@ mod copilot_posture_tests {
         // stretch afterward — the property must hold arbitrarily far out,
         // not just at the one boundary above.
         for round in 0..3 {
-            for i in 0..super::COPILOT_POSTURE_CAP {
+            for i in 0..super::LAUNCH_INTENT_CAP {
                 record_copilot_launch_posture_impl(&format!("C:/later/{round}/{i}"), true).unwrap();
             }
         }
@@ -1270,7 +1587,86 @@ mod copilot_posture_tests {
              activity happens after it — eviction may only ever move it to NO record, never to \
              a single surviving value"
         );
-        set_copilot_posture_path_for_test(None);
+        clear_seam();
+    }
+
+    /// THE property the module doc states but, until this test, nothing
+    /// pinned: **eviction is one shared pool across BOTH key shapes**
+    /// (`cap_and_evict` sorts on `touched_ms` alone — it has no idea
+    /// `IntentKey::Session` and `IntentKey::Cwd` are different variants).
+    /// Every eviction test above (`store_caps_and_evicts_the_least_recently_
+    /// touched_cwd`, `re_touching_a_cwd_protects_it_from_eviction`,
+    /// `conflicted_cwd_never_yields_flags_no_matter_how_much_other_activity_
+    /// follows`) only ever populated ONE key shape at a time — none of them
+    /// could have caught a shape-biased eviction change.
+    ///
+    /// This matters specifically, not generically: **eviction is exactly
+    /// where #460's own B1 finding broke this store's guarantee before** —
+    /// cap eviction silently un-conflicting a directory into a grant, caught
+    /// only by a runnable counter-test that drove the store past its cap and
+    /// asserted the SPECIFIC value the broken design produced. #457 widened
+    /// the key space eviction operates over; leaving the mixed-shape case
+    /// unpinned in the PR that does the widening is exactly how a future
+    /// "prefer evicting session keys" (or the reverse) optimization changes
+    /// LRU behavior with nothing going red.
+    ///
+    /// Both directions, because a one-directional pin could pass by
+    /// accident (e.g. a mutation that only biases eviction ONE way):
+    /// an old `Session` entry evicted by a volume of fresh `Cwd` writes, and
+    /// an old `Cwd` entry evicted by a volume of fresh `Session` writes —
+    /// each proving eviction crosses the shape boundary, not merely that it
+    /// works within one shape.
+    ///
+    /// Mutation-verified: sorting eviction by `(is_session, touched_ms)`
+    /// instead of `touched_ms` alone — biasing eviction toward `Session`
+    /// entries regardless of freshness, the exact "optimization" this test
+    /// exists to catch — leaves the FIRST direction's assertion accidentally
+    /// still true (the lone session entry gets evicted either way) but makes
+    /// the SECOND direction's assertion fail: the old `Cwd` entry survives
+    /// (a stale grant kept alive) while a freshly-written `Session` entry is
+    /// evicted instead. This is exactly why both directions are asserted,
+    /// not one.
+    #[test]
+    fn mixed_key_shapes_share_one_eviction_pool() {
+        let _d = posture_seam();
+        // Direction 1: one old Session entry, then enough fresh Cwd writes
+        // to push the store one past the cap.
+        record_claude_launch_posture_impl("sess-old", true).unwrap();
+        for i in 0..super::LAUNCH_INTENT_CAP {
+            record_copilot_launch_posture_impl(&format!("C:/work/{i}"), true).unwrap();
+        }
+        assert_eq!(
+            claude_launch_posture("sess-old"),
+            None,
+            "a Session-keyed entry must be evictable under Cwd-keyed pressure — one shared pool, \
+             not a separate, effectively-uncapped bucket per key shape"
+        );
+        assert_eq!(
+            copilot_launch_posture(&format!("C:/work/{}", super::LAUNCH_INTENT_CAP - 1)),
+            Some(true),
+            "the newest Cwd entry must survive — eviction removed exactly the oldest overall"
+        );
+        clear_seam();
+
+        // Direction 2: the reverse — one old Cwd entry, then enough fresh
+        // Session writes to push the store one past the cap.
+        let _d2 = posture_seam();
+        record_copilot_launch_posture_impl("C:/work/old", true).unwrap();
+        for i in 0..super::LAUNCH_INTENT_CAP {
+            record_claude_launch_posture_impl(&format!("sess-{i}"), true).unwrap();
+        }
+        assert_eq!(
+            copilot_launch_posture("C:/work/old"),
+            None,
+            "same property, opposite direction — a Cwd-keyed entry must be evictable under \
+             Session-keyed pressure"
+        );
+        assert_eq!(
+            claude_launch_posture(&format!("sess-{}", super::LAUNCH_INTENT_CAP - 1)),
+            Some(true),
+            "the newest Session entry must survive"
+        );
+        clear_seam();
     }
 
     /// The restore-path regression pin (#456): a Sessions-tab resume of a
@@ -1318,19 +1714,305 @@ mod copilot_posture_tests {
 
         assert_eq!(
             by_id("sess-on").resume_command,
-            format!("copilot --resume sess-on {}", crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS)
+            format!("copilot --resume=sess-on {}", crate::orchestration::COPILOT_GROUP_AUTOPILOT_FLAGS)
         );
-        assert_eq!(by_id("sess-off").resume_command, "copilot --resume sess-off");
-        assert_eq!(by_id("sess-unknown").resume_command, "copilot --resume sess-unknown");
+        assert_eq!(by_id("sess-off").resume_command, "copilot --resume=sess-off");
+        assert_eq!(by_id("sess-unknown").resume_command, "copilot --resume=sess-unknown");
         assert_eq!(
             by_id("sess-ambiguous").resume_command,
-            "copilot --resume sess-ambiguous",
+            "copilot --resume=sess-ambiguous",
             "an ambiguous history must never grant autopilot on restore, even via the latest record"
         );
 
+        // #458 pin: whichever posture branch produced it, the emitted
+        // command must use copilot's documented `--resume=<id>` form and
+        // must never regress to a bare space, which copilot's CLI reference
+        // (`-r`, `--resume[=VALUE]`) documents as an OPTIONAL-value flag —
+        // a space-separated id risks parsing as a bare `--resume` plus a
+        // stray positional rather than the flag's value.
+        for s in &out {
+            assert!(
+                s.resume_command.contains("--resume="),
+                "resume_command must use the documented --resume=<id> form, got: {}",
+                s.resume_command
+            );
+            assert!(
+                !s.resume_command.contains("--resume "),
+                "resume_command must never use a space between --resume and the id \
+                 (copilot documents --resume as optional-value; a space form risks being \
+                 parsed as bare --resume plus a stray positional), got: {}",
+                s.resume_command
+            );
+        }
+
         set_copilot_session_state_root_for_test(None);
-        set_copilot_posture_path_for_test(None);
+        clear_seam();
         drop(posture_dir);
+    }
+
+    /// The claude half of the same regression pin, generalized by #457: a
+    /// Sessions-tab resume of a CLAUDE session must carry the same autopilot
+    /// flags a fresh launch in that cwd would, when — and only when —
+    /// loomux's own record (keyed by the session's OWN id here, not a cwd)
+    /// says so. Before #457 this could never happen at all: `scan_claude`
+    /// emitted a bare `claude --resume <id>` unconditionally. Exercises
+    /// `scan_claude` end to end, same shape as the copilot test above.
+    #[test]
+    fn scan_claude_restores_autopilot_flags_only_when_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        set_claude_projects_root_for_test(Some(root.path().to_path_buf()));
+        let _d = posture_seam();
+
+        let write_session = |id: &str, cwd: &str| {
+            let proj = root.path().join(format!("proj-{id}"));
+            fs::create_dir_all(&proj).unwrap();
+            fs::write(
+                proj.join(format!("{id}.jsonl")),
+                format!("{{\"type\":\"user\",\"cwd\":{cwd:?},\"message\":{{\"content\":\"hi\"}}}}\n"),
+            )
+            .unwrap();
+        };
+
+        write_session("sess-on", "C:/work/on");
+        record_claude_launch_posture_impl("sess-on", true).unwrap();
+
+        write_session("sess-off", "C:/work/off");
+        record_claude_launch_posture_impl("sess-off", false).unwrap();
+
+        // No record at all: bare resume — the pre-#457 behavior for EVERY
+        // claude session, now scoped to only the ones nothing was ever
+        // recorded for.
+        write_session("sess-unknown", "C:/work/unknown");
+
+        let mut out = Vec::new();
+        scan_claude(&mut out);
+        let by_id = |id: &str| out.iter().find(|s| s.id == id).unwrap();
+
+        assert_eq!(
+            by_id("sess-on").resume_command,
+            format!("claude --resume sess-on {}", crate::orchestration::single_pane_autopilot_flags("claude"))
+        );
+        assert_eq!(by_id("sess-off").resume_command, "claude --resume sess-off");
+        assert_eq!(by_id("sess-unknown").resume_command, "claude --resume sess-unknown");
+
+        set_claude_projects_root_for_test(None);
+        clear_seam();
+    }
+
+    /// THE requirement 2 property (design-intake reply, #457): a claude
+    /// session this module has NO recorded intent for — foreign (never
+    /// launched by loomux at all), pre-upgrade (existed before this PR, so
+    /// no id-keyed record could ever have been written for it), or evicted —
+    /// must resolve to nothing, exactly like `no_record_is_none` above, but
+    /// pinned specifically against `build_resume_command`/`scan_claude`
+    /// end-to-end rather than just the lookup helper, since that's the
+    /// surface a reviewer actually cares about: this PR must never WIDEN
+    /// what a restore grants beyond what loomux itself recorded.
+    #[test]
+    fn scan_claude_grants_nothing_to_a_session_with_no_recorded_intent() {
+        let root = tempfile::tempdir().unwrap();
+        set_claude_projects_root_for_test(Some(root.path().to_path_buf()));
+        let _d = posture_seam(); // store exists but is empty — nothing recorded for anyone
+
+        let proj = root.path().join("proj-foreign");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            proj.join("foreign-session.jsonl"),
+            "{\"type\":\"user\",\"cwd\":\"C:/work/foreign\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        scan_claude(&mut out);
+        assert_eq!(
+            out.iter().find(|s| s.id == "foreign-session").unwrap().resume_command,
+            "claude --resume foreign-session",
+            "a session with no recorded launch intent must restore bare — never inferred flags"
+        );
+
+        set_claude_projects_root_for_test(None);
+        clear_seam();
+    }
+
+    /// THE soft-migration requirement (design-intake reply, #457): when the
+    /// new `launch-intent.json` has never been written on this machine, a
+    /// pre-#457 `copilot-posture.json` must still be read — a cold reset
+    /// would be safe (no record → no flags) but would re-inflict the exact
+    /// #456-reported annoyance on the release that fixes it, so this is
+    /// pinned as a behavior, not left to the safe-default rule to merely
+    /// happen to cover.
+    #[test]
+    fn soft_migration_reads_legacy_copilot_posture_file_when_new_store_is_absent() {
+        let d = tempfile::tempdir().unwrap();
+        let new_path = d.path().join("launch-intent.json");
+        let legacy_path = d.path().join("copilot-posture.json");
+        set_launch_intent_path_for_test(Some(new_path.clone()));
+        set_legacy_copilot_posture_path_for_test(Some(legacy_path.clone()));
+
+        // A real pre-#457 file, written in its OWN (copilot-only, cwd-only,
+        // untagged) shape — never the new store's shape. The stored `cwd` is
+        // the ALREADY-NORMALIZED permission key a real write would have
+        // produced (`posture_key`, applied at write time) — computed here via
+        // `posture_key_for` rather than hand-typed, since that normalization
+        // is platform-dependent (backslash+lowercase on Windows, exact-match
+        // elsewhere per review B2) and a literal Windows-style key would only
+        // coincidentally match a lookup on non-Windows CI.
+        let migrated_key = posture_key_for("c:/work/migrated", cfg!(windows));
+        let migrated_off_key = posture_key_for("c:/work/migrated-off", cfg!(windows));
+        fs::write(
+            &legacy_path,
+            format!(
+                r#"{{"entries": [
+                    {{"cwd": {}, "posture": "True", "touched_ms": 1}},
+                    {{"cwd": {}, "posture": "False", "touched_ms": 2}}
+                ]}}"#,
+                serde_json::to_string(&migrated_key).unwrap(),
+                serde_json::to_string(&migrated_off_key).unwrap(),
+            ),
+        )
+        .unwrap();
+        assert!(!new_path.exists(), "precondition: the new store must not exist yet");
+
+        assert_eq!(
+            copilot_launch_posture("c:/work/migrated"),
+            Some(true),
+            "a pre-#457 record must survive the upgrade, not reset to no-history"
+        );
+        assert_eq!(copilot_launch_posture("c:/work/migrated-off"), Some(false));
+
+        // The migration is READ-ONLY: a read alone must not create or alter
+        // the legacy file, and must not fabricate the new file either (only
+        // an actual write does that — see the next assertion).
+        assert!(!new_path.exists(), "a read-only migration must never itself create the new file");
+
+        // The very next write lands on the NEW path and carries the migrated
+        // entries forward (not just the newly-written one) — so a second
+        // read never needs the legacy file again.
+        record_copilot_launch_posture_impl("c:/work/fresh", true).unwrap();
+        assert!(new_path.exists(), "a write must create the new store");
+        assert_eq!(copilot_launch_posture("c:/work/fresh"), Some(true));
+        assert_eq!(
+            copilot_launch_posture("c:/work/migrated"),
+            Some(true),
+            "the migrated record must survive being merged into a real write, not get dropped"
+        );
+
+        set_launch_intent_path_for_test(None);
+        set_legacy_copilot_posture_path_for_test(None);
+    }
+
+    /// THE property the test above only proved for whichever platform
+    /// happened to build it: `soft_migration_reads_legacy_copilot_posture_
+    /// file_when_new_store_is_absent` computes its fixture's on-disk key via
+    /// `posture_key_for(cwd, cfg!(windows))` and reads it back through the
+    /// REAL, `cfg!(windows)`-gated `copilot_launch_posture` — so on any given
+    /// CI host it only ever exercises ONE of `posture_key_for`'s two arms,
+    /// the SAME one, on both sides. A legacy file written by a Windows
+    /// loomux (backslash, lowercased keys) and one written by a macOS/Linux
+    /// loomux (exact-match keys) are different on-disk shapes, and this test
+    /// proves migration is faithful to BOTH, unconditionally, on every host —
+    /// not by exercising the real lookup (which can't be steered off its own
+    /// build platform), but by inspecting `load_launch_intent`'s STRUCTURAL
+    /// output directly: does the migrated store contain an entry whose key
+    /// carries the legacy `cwd` string EXACTLY, untouched by any
+    /// re-normalization? Migration is a pure passthrough of the legacy
+    /// entry's `cwd` field (never re-keyed — see `load_launch_intent`'s
+    /// match arm) precisely so this holds regardless of which platform wrote
+    /// the file being migrated. Caught this exact gap: the sibling test
+    /// above passed locally on a Windows-only dev machine and failed on CI's
+    /// ubuntu/macOS runners — full-platform CI, not local verification, is
+    /// what this project treats as authoritative for platform-gated code
+    /// exactly because of failures shaped like this one.
+    ///
+    /// Mutation-verified against the exact blind spot this exists to close:
+    /// temporarily re-normalizing the migrated `cwd` (`posture_key(&e.cwd)`
+    /// instead of `e.cwd` verbatim) leaves the sibling end-to-end test
+    /// GREEN on a Windows host — `posture_key` is idempotent on an
+    /// already-Windows-normalized key, so re-normalizing it a second time is
+    /// invisible there — while THIS test goes red immediately on the
+    /// non-Windows-written key, on every host, because it is never
+    /// idempotent under the Windows arm.
+    #[test]
+    fn soft_migration_preserves_the_legacy_cwd_key_exactly_regardless_of_which_platform_wrote_it() {
+        let d = tempfile::tempdir().unwrap();
+        let new_path = d.path().join("launch-intent.json");
+        let legacy_path = d.path().join("copilot-posture.json");
+        set_launch_intent_path_for_test(Some(new_path));
+        set_legacy_copilot_posture_path_for_test(Some(legacy_path.clone()));
+
+        // BOTH arms, explicit — never `cfg!(windows)` here: the Windows arm
+        // (backslash, lowercased) and the non-Windows arm (exact-match,
+        // unmodified) of `posture_key_for`, applied to the SAME logical
+        // folder, so this fixture is what EITHER platform's pre-#457 loomux
+        // would genuinely have written for it.
+        let windows_written_key = posture_key_for("C:/Work/From-Windows", true);
+        let unix_written_key = posture_key_for("/home/user/from-unix", false);
+        assert_ne!(
+            windows_written_key, unix_written_key,
+            "precondition: the two arms must actually differ, or this test proves nothing"
+        );
+
+        fs::write(
+            &legacy_path,
+            format!(
+                r#"{{"entries": [
+                    {{"cwd": {}, "posture": "True", "touched_ms": 1}},
+                    {{"cwd": {}, "posture": "False", "touched_ms": 2}}
+                ]}}"#,
+                serde_json::to_string(&windows_written_key).unwrap(),
+                serde_json::to_string(&unix_written_key).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let migrated = load_launch_intent();
+        let has = |cwd: &str, want: Posture| {
+            migrated.entries.iter().any(|e| {
+                e.key == (IntentKey::Cwd { cli: "copilot".to_string(), cwd: cwd.to_string() })
+                    && e.autopilot == want
+            })
+        };
+        assert!(
+            has(&windows_written_key, Posture::True),
+            "a Windows-written legacy key must migrate byte-for-byte, even read on a non-Windows host"
+        );
+        assert!(
+            has(&unix_written_key, Posture::False),
+            "a non-Windows-written legacy key must migrate byte-for-byte, even read on a Windows host"
+        );
+        assert_eq!(migrated.entries.len(), 2, "no entry invented, none dropped, none merged");
+
+        set_launch_intent_path_for_test(None);
+        set_legacy_copilot_posture_path_for_test(None);
+    }
+
+    /// The new store's existence — not its parseability — gates migration:
+    /// once `launch-intent.json` exists at all (even corrupt), a legacy
+    /// `copilot-posture.json` is never consulted, so a CURRENT corrupt file
+    /// can't be silently "recovered" from a possibly-stale old one. This is
+    /// the one case `any_unparseable_or_malformed_store_state_grants_nothing`
+    /// below doesn't cover (that test never populates a legacy file at all).
+    #[test]
+    fn a_corrupt_new_store_never_falls_back_to_the_legacy_file() {
+        let d = tempfile::tempdir().unwrap();
+        let new_path = d.path().join("launch-intent.json");
+        let legacy_path = d.path().join("copilot-posture.json");
+        set_launch_intent_path_for_test(Some(new_path.clone()));
+        set_legacy_copilot_posture_path_for_test(Some(legacy_path.clone()));
+
+        fs::write(&legacy_path, r#"{"entries": [{"cwd": "c:\\work\\x", "posture": "True", "touched_ms": 1}]}"#)
+            .unwrap();
+        fs::write(&new_path, "this is not json{{{").unwrap();
+
+        assert_eq!(
+            copilot_launch_posture("c:/work/x"),
+            None,
+            "a corrupt CURRENT store must degrade to empty, never fall back to the legacy file — \
+             falling back here would resurrect state the new file may have deliberately dropped"
+        );
+
+        set_launch_intent_path_for_test(None);
+        set_legacy_copilot_posture_path_for_test(None);
     }
 
     /// THE property rev-6 asked for (round 2, close-out review of 918f1fb):
@@ -1342,22 +2024,21 @@ mod copilot_posture_tests {
     /// (fresh / corrupt / wrong-shape-including-a-round-1-schema-leftover /
     /// unknown-variant, all resolving to no flags) and flagged that nothing
     /// shipped pinned it — a future edit to the store's parsing (lenient
-    /// per-entry recovery, a new `CopilotPosture` variant handled by a
-    /// catch-all) could silently reopen exactly the grant path B1 closed,
-    /// and nothing would fail. This lifts that scratch test's shape
-    /// (`fs::write` a raw store file, assert the lookup) and generalizes it
-    /// to the INVARIANT rather than shipping isolated fixtures: asserted
-    /// over a spread of distinct failure classes AND over several cwds per
-    /// fixture, so the assertion is about what the STORE can ever produce,
-    /// not one lookup.
+    /// per-entry recovery, a new `Posture` variant handled by a catch-all)
+    /// could silently reopen exactly the grant path B1 closed, and nothing
+    /// would fail. This lifts that scratch test's shape (`fs::write` a raw
+    /// store file, assert the lookup) and generalizes it to the INVARIANT
+    /// rather than shipping isolated fixtures: asserted over a spread of
+    /// distinct failure classes AND over several cwds per fixture, so the
+    /// assertion is about what the STORE can ever produce, not one lookup.
     ///
-    /// The round-1-schema fixture below is the concrete, non-hypothetical
-    /// case rev-6 named: a real user upgrading past this PR has this
-    /// module's OWN pre-B1-fix file (`{cwd, autopilot, recorded_ms}`) sitting
-    /// on disk, which must degrade to "no history" rather than misreading a
-    /// stale `autopilot` field as the new `posture`.
+    /// All fixtures are written at the NEW path — this is deliberately
+    /// distinct from the migration tests above: the new file EXISTS here
+    /// (even the pre-#456-fix and pre-#457 legacy-shaped fixtures), so
+    /// existence-gated migration (see the module doc) must never kick in —
+    /// a malformed CURRENT file degrades to empty, it never falls back.
     ///
-    /// Mutation-verified: temporarily replacing `load_copilot_posture`'s
+    /// Mutation-verified: temporarily replacing `load_launch_intent`'s
     /// atomic-parse-or-empty contract with a lenient per-entry salvage that
     /// defaults a missing/unrecognized `posture` to `True` makes this red on
     /// exactly the fixtures that exercise that gap.
@@ -1368,31 +2049,37 @@ mod copilot_posture_tests {
             ("valid JSON, wrong top-level shape entirely", r#"{"totally": "unexpected shape"}"#),
             ("entries present but not an array", r#"{"entries": "nope"}"#),
             (
-                "a leftover file from this module's OWN pre-B1-fix schema (rev-6's named case)",
+                "a leftover file from this module's OWN pre-#456-fix schema (rev-6's named case)",
                 r#"{"entries": [{"cwd": "c:\\work\\x", "autopilot": true, "recorded_ms": 1}]}"#,
             ),
             (
-                "one well-formed entry, one entry missing the posture field",
+                "a leftover file from this module's pre-#457 (copilot-only, untagged-key) schema, \
+                 sitting at the NEW path rather than being migrated from the legacy one",
+                r#"{"entries": [{"cwd": "c:\\work\\x", "posture": "True", "touched_ms": 1}]}"#,
+            ),
+            (
+                "one well-formed entry, one entry missing the key's kind tag",
                 r#"{"entries": [
-                    {"cwd": "c:\\work\\x", "posture": "True", "touched_ms": 1},
-                    {"cwd": "c:\\work\\y", "touched_ms": 2}
+                    {"key": {"kind": "Cwd", "cli": "copilot", "cwd": "c:\\work\\x"}, "autopilot": "True", "touched_ms": 1},
+                    {"key": {"cli": "copilot", "cwd": "c:\\work\\y"}, "autopilot": "True", "touched_ms": 2}
                 ]}"#,
             ),
             (
                 "an unrecognized posture variant",
-                r#"{"entries": [{"cwd": "c:\\work\\x", "posture": "SomethingElse", "touched_ms": 1}]}"#,
+                r#"{"entries": [{"key": {"kind": "Cwd", "cli": "copilot", "cwd": "c:\\work\\x"}, "autopilot": "SomethingElse", "touched_ms": 1}]}"#,
             ),
             (
                 "an entry whose touched_ms is the wrong type",
-                r#"{"entries": [{"cwd": "c:\\work\\x", "posture": "True", "touched_ms": "soon"}]}"#,
+                r#"{"entries": [{"key": {"kind": "Cwd", "cli": "copilot", "cwd": "c:\\work\\x"}, "autopilot": "True", "touched_ms": "soon"}]}"#,
             ),
-            ("truncated mid-record", r#"{"entries": [{"cwd": "c:\\work\\x", "post"#),
+            ("truncated mid-record", r#"{"entries": [{"key": {"kind": "Cwd", "post"#),
         ];
 
         for (label, content) in malformed_fixtures {
             let d = tempfile::tempdir().unwrap();
-            set_copilot_posture_path_for_test(Some(d.path().join("copilot-posture.json")));
-            fs::write(d.path().join("copilot-posture.json"), content).unwrap();
+            set_launch_intent_path_for_test(Some(d.path().join("launch-intent.json")));
+            set_legacy_copilot_posture_path_for_test(Some(d.path().join("copilot-posture.json"))); // absent — irrelevant here
+            fs::write(d.path().join("launch-intent.json"), content).unwrap();
             for cwd in ["c:/work/x", "c:/work/y", "C:/work/X", "c:/elsewhere"] {
                 assert_eq!(
                     copilot_launch_posture(cwd),
@@ -1400,7 +2087,12 @@ mod copilot_posture_tests {
                     "malformed store ({label}) must never grant flags — cwd {cwd:?}"
                 );
             }
-            set_copilot_posture_path_for_test(None);
+            assert_eq!(
+                claude_launch_posture("any-session-id"),
+                None,
+                "malformed store ({label}) must never grant flags on the claude side either"
+            );
+            clear_seam();
         }
     }
 }

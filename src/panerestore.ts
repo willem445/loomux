@@ -229,42 +229,206 @@ export function planPaneRestore(pane: PersistedPane, resumable?: SessionResumabl
   }
 }
 
+/** The value/token grammar shared by every quote-aware scan in this module: a
+ *  whole double-quoted run kept as ONE unit (quotes included, so a `.slice`
+ *  excise never leaves a stray `"` behind), or a bare whitespace-free run —
+ *  the one shape every flag value AND every command token recorded here
+ *  uses (a session id, a solo MCP config path, an arbitrary CLI argument, …).
+ *  THREE call sites are built from this exact constant via `new RegExp`, not
+ *  three independently hand-typed copies of the pattern text:
+ *  `CLAUDE_SOLO_MCP_RE`/`COPILOT_SOLO_MCP_RE` further below (#439, one value
+ *  each inside a fixed flag group) and `tokenizeWithPositions` just below
+ *  (#449, the general per-token scan `stripSessionFlagsFromCommand` walks). A real
+ *  binding, checked by construction: change this constant and every call
+ *  site moves with it — the #452 worry (two parsers that quietly disagree)
+ *  this exists to actually close, not merely gesture at. */
+const QUOTED_OR_BARE_VALUE = `"[^"]*"|\\S+`;
+
+/** The two flag names that name a Claude session on a recorded launch line —
+ *  the "which flag NAMES this module treats as session identity" answered in
+ *  exactly one place, not two independently-typed literals that could drift
+ *  (#471 review round 2: "the shared grammar" means the flag-name set too,
+ *  not just the value shape). `#458`/#473's `scan_copilot()` is about to
+ *  start recording `--resume=<id>` (the `=` form) for copilot panes too —
+ *  this set, and every helper below built on it, does not care which CLI
+ *  recorded the command, only the flag's literal text. */
+const SESSION_FLAG_NAMES = ["--session-id", "--resume"];
+
+/** True when `raw` — the RAW slice of ONE token, quotes included if it was a
+ *  quoted token — is a session flag written bare (no value attached: not
+ *  even a trailing `=`). A quoted token's raw slice always starts with `"`,
+ *  so a flag-looking WORD sitting inside a quoted argument (a system prompt
+ *  that happens to discuss `--resume`) can never equal a bare flag name —
+ *  this is what keeps `stripSessionFlagsFrom*` from mistaking quoted content
+ *  for a flag (#471 review round 2, case 5). */
+function isBareSessionFlag(raw: string): boolean {
+  return SESSION_FLAG_NAMES.includes(raw);
+}
+
+/** True when `raw` is a session flag's SELF-CONTAINED `=value` token —
+ *  including an EMPTY value (`--resume=`) — so it needs no following value
+ *  token consumed. Same quote-immunity as `isBareSessionFlag` above, for the
+ *  same reason. */
+function isEqSessionFlag(raw: string): boolean {
+  return SESSION_FLAG_NAMES.some((name) => raw.startsWith(`${name}=`));
+}
+
+/** Quote-aware tokenizer WITH POSITIONS into the ORIGINAL string: a fully
+ *  double-quoted run (`"..."`) is ONE token whose range includes the quotes
+ *  (so its raw slice can never equality-match a bare flag name — see
+ *  `isBareSessionFlag`), everything else is a whitespace-delimited token.
+ *  Gaps BETWEEN tokens (whitespace, including multi-space runs) are not
+ *  tokens at all — a caller reconstructs the string by slicing the ORIGINAL
+ *  around whichever token ranges it drops, so every gap it doesn't touch
+ *  survives untouched by construction (never a `.join(" ")` reflow — the
+ *  #449 bug this whole approach exists to close).
+ *
+ *  Built from `QUOTED_OR_BARE_VALUE` — the SAME grammar constant
+ *  `CLAUDE_SOLO_MCP_RE`/`COPILOT_SOLO_MCP_RE` below are built from, via
+ *  `new RegExp`, not a second hand-typed copy of the pattern text. A
+ *  genuinely converged binding, not just a co-located one: change the
+ *  constant and both call sites move together (the #452 drift concern this
+ *  is written to actually satisfy, not merely gesture at). */
+function tokenizeWithPositions(command: string): Array<{ start: number; end: number }> {
+  const tokens: Array<{ start: number; end: number }> = [];
+  const re = new RegExp(QUOTED_OR_BARE_VALUE, "g");
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(command)) !== null) {
+    tokens.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return tokens;
+}
+
+/** Excise every session-identity flag occurrence from the ORIGINAL command
+ *  STRING — never a tokenize/`.join(" ")` round trip. The property this owes
+ *  (#449, hardened across two #471 review rounds): NO session-identity flag
+ *  or its value survives into the rebuilt command, IN ANY FORM, for EITHER
+ *  flag name — and nothing else is ever touched, whitespace runs inside
+ *  unrelated quoted args (a system prompt, a spaced Windows path) included.
+ *  Concretely, every form below is covered and fixture-pinned:
+ *   - space form (`--resume abc`) — flag + its value token, both dropped;
+ *   - `=` form (`--resume=abc`, or `--resume=` with an EMPTY value) — one
+ *     self-contained token, dropped whole (round 2: the `#473`/#458 shape);
+ *   - bare/valueless (`--resume` with nothing after it, or immediately
+ *     followed by ANOTHER flag rather than a value) — the flag token alone
+ *     is dropped; a following token that itself starts with `--` is NEVER
+ *     swallowed as if it were this flag's value (round 1's blocker: the
+ *     prior split/rejoin dropped a bare flag's "value slot" unconditionally,
+ *     which silently doubled the flag on the NEXT restore — a compounding,
+ *     credit-spending corruption once the doubled id lands as a bare
+ *     positional argument, i.e. a prompt);
+ *   - repeated occurrences of either flag — each found and dropped
+ *     independently, in one pass, regardless of order;
+ *   - a flag-looking WORD sitting inside a quoted argument — never mistaken
+ *     for the flag (round 2, case 5): see `tokenizeWithPositions`.
+ *  Each drop absorbs exactly ONE leading whitespace character (mirroring
+ *  what a single flag[+value] run displaced), so untouched whitespace
+ *  elsewhere is never reflowed. */
+function stripSessionFlagsFromCommand(command: string): string {
+  const tokens = tokenizeWithPositions(command);
+  const dropRanges: Array<[number, number]> = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const raw = command.slice(tokens[i].start, tokens[i].end);
+    const bare = isBareSessionFlag(raw);
+    if (!bare && !isEqSessionFlag(raw)) continue;
+    let dropStart = tokens[i].start;
+    let dropEnd = tokens[i].end;
+    if (bare && i + 1 < tokens.length) {
+      const nextRaw = command.slice(tokens[i + 1].start, tokens[i + 1].end);
+      if (!nextRaw.startsWith("--")) {
+        dropEnd = tokens[i + 1].end; // consume the value token too
+        i++; // skip it — already accounted for
+      }
+    }
+    if (dropStart > 0 && /\s/.test(command[dropStart - 1])) dropStart -= 1;
+    dropRanges.push([dropStart, dropEnd]);
+  }
+  if (!dropRanges.length) return command;
+  let result = "";
+  let cursor = 0;
+  for (const [s, e] of dropRanges) {
+    result += command.slice(cursor, s);
+    cursor = e;
+  }
+  return result + command.slice(cursor);
+}
+
+/** Same excision, same property, for the already-discrete `argv` array — no
+ *  whitespace-collapse or quoted-substring risk there (each element is one
+ *  token already, and there's no quoting concept in an array), but the SAME
+ *  flag-name/value-form coverage: bare (never swallowing a following
+ *  element that is itself another flag), `=` form (incl. empty), and
+ *  repeated occurrences. */
+function stripSessionFlagsFromArgv(tokens: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (isBareSessionFlag(t)) {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith("--")) i++; // consume the value, when there is one
+      continue;
+    }
+    if (isEqSessionFlag(t)) continue;
+    out.push(t);
+  }
+  return out;
+}
+
 /** Turn a resumed agent's recorded launch line into the command that re-opens
  *  its prior session — the "resume/reattach command from a recorded sessionId"
  *  the plan calls for. Pure so it's unit-tested; main.ts feeds the result to
  *  grid.openPane.
  *
- *  Only Claude has a clean resumable id (it's the only CLI we mint a session id
- *  for at launch), so this rewrites a `claude …` line: drop any recorded
- *  `--session-id`/`--resume` (both the space and `=` forms) so we never carry a
- *  stale id or double the flag, KEEP every other flag (model, the autopilot
- *  permission flag) so the resumed pane matches how it was launched, then append
- *  `--resume <id>`. Resuming into the idle TUI costs nothing until a prompt is
- *  sent — and we never append one (the no-replay rule). Prefers the string
- *  `command`; falls back to structured `argv`, then to a bare `claude --resume`. */
+ *  This function rewrites a `claude …` OR a `copilot …` line: drop any
+ *  recorded `--session-id`/`--resume` (every form `stripSessionFlagsFrom*`
+ *  covers) so we never carry a stale id or double the flag, KEEP every other
+ *  flag (model, the autopilot permission flag) so the resumed pane matches
+ *  how it was launched, then append a fresh `--resume`. Resuming into the
+ *  idle TUI costs nothing until a prompt is sent — and we never append one
+ *  (the no-replay rule).
+ *
+ *  Four properties this module holds at once (#449; the last two added on
+ *  #471 review round 3, per rev-11's trace through #473/#458's copilot
+ *  emission fix — stated explicitly here per that review, not left implicit):
+ *   1. Excision (`stripSessionFlagsFrom*`) strips a recorded session flag in
+ *      ANY form, for EITHER flag name — see those functions' own docs.
+ *   2. **copilot's `--resume` is emitted in the `=` form** (`--resume=<id>`):
+ *      per the copilot CLI reference, the space form does not reliably bind.
+ *      #473/#458 changed `scan_copilot()` to RECORD `--resume=<id>` for
+ *      exactly this reason; without this, restoring that pane through THIS
+ *      function would silently rewrite it back to the space form on every
+ *      restore — the two PRs' fixes undoing each other, oscillating forever
+ *      instead of converging.
+ *   3. **copilot's `--session-id` stays SPACE form** — `agentFreshCommand`
+ *      below, untouched. Deliberately asymmetric: the copilot CLI reference
+ *      documents `--session-id ID` in the space form specifically, so
+ *      "making the two flags consistent" would be a plausible-looking
+ *      cleanup that quietly breaks a function that is currently correct.
+ *      Pinned in `test/panerestore.test.ts` precisely so the next person who
+ *      notices the asymmetry finds a test explaining it, not a TODO.
+ *   4. A command needing no change comes back byte-identical apart from the
+ *      appended flag (#442's guarantee, general to this whole module).
+ *
+ *  Prefers the string `command`; falls back to structured `argv`, then to a
+ *  bare `claude --resume` (the historical default — a bare fallback with no
+ *  recorded command/argv at all has no CLI to detect, and every session this
+ *  project mints an id for today is claude's). */
 export function agentResumeCommand(
   command: string | null,
   argv: string[] | null,
   sessionId: string
 ): { command?: string; argv?: string[] } {
-  const strip = (tokens: string[]): string[] => {
-    const out: string[] = [];
-    for (let i = 0; i < tokens.length; i++) {
-      const t = tokens[i];
-      if (t === "--session-id" || t === "--resume") {
-        i++; // drop the flag AND its separate value token
-        continue;
-      }
-      if (t.startsWith("--session-id=") || t.startsWith("--resume=")) continue; // `=` form: one token
-      out.push(t);
-    }
-    return out;
-  };
+  // copilot only: `=` form. Every other/unknown CLI (claude, or no CLI
+  // detected at all): space form, unchanged from this function's original
+  // behavior. See property 2 above for why copilot is the one exception.
+  const isCopilot = programFromRestore(command, argv) === "copilot";
   if (command && command.trim()) {
-    return { command: [...strip(command.trim().split(/\s+/)), "--resume", sessionId].join(" ") };
+    const resumeFlag = isCopilot ? `--resume=${sessionId}` : `--resume ${sessionId}`;
+    return { command: `${stripSessionFlagsFromCommand(command)} ${resumeFlag}` };
   }
   if (argv && argv.length) {
-    return { argv: [...strip(argv), "--resume", sessionId] };
+    const stripped = stripSessionFlagsFromArgv(argv);
+    return { argv: isCopilot ? [...stripped, `--resume=${sessionId}`] : [...stripped, "--resume", sessionId] };
   }
   return { command: `claude --resume ${sessionId}` };
 }
@@ -275,30 +439,25 @@ export function agentResumeCommand(
  *  (not `--resume`), so the fresh session is created with that id and becomes
  *  resumable itself once a prompt is sent — and, like resume, never carries a
  *  prompt. Drops any stale `--resume`/`--session-id` first so we don't double or
- *  attempt a resume. */
+ *  attempt a resume.
+ *
+ *  Deliberately ALWAYS space form (`--session-id <id>`), for every CLI
+ *  including copilot — property 3 on `agentResumeCommand`'s doc comment
+ *  above. This is NOT an oversight to "make consistent" with that function's
+ *  `=`-form copilot `--resume`: the copilot CLI reference documents
+ *  `--session-id ID` specifically in the space form, so the two flags are
+ *  correctly asymmetric. `test/panerestore.test.ts` pins this explicitly so
+ *  a future cleanup pass finds the reason, not just the inconsistency. */
 export function agentFreshCommand(
   command: string | null,
   argv: string[] | null,
   sessionId: string
 ): { command?: string; argv?: string[] } {
-  const strip = (tokens: string[]): string[] => {
-    const out: string[] = [];
-    for (let i = 0; i < tokens.length; i++) {
-      const t = tokens[i];
-      if (t === "--session-id" || t === "--resume") {
-        i++;
-        continue;
-      }
-      if (t.startsWith("--session-id=") || t.startsWith("--resume=")) continue;
-      out.push(t);
-    }
-    return out;
-  };
   if (command && command.trim()) {
-    return { command: [...strip(command.trim().split(/\s+/)), "--session-id", sessionId].join(" ") };
+    return { command: `${stripSessionFlagsFromCommand(command)} --session-id ${sessionId}` };
   }
   if (argv && argv.length) {
-    return { argv: [...strip(argv), "--session-id", sessionId] };
+    return { argv: [...stripSessionFlagsFromArgv(argv), "--session-id", sessionId] };
   }
   return { command: `claude --session-id ${sessionId}` };
 }
@@ -314,16 +473,20 @@ export type SoloCli = "claude" | "copilot";
 // precisely because a username CAN contain a space ("Will H", "John Smith") —
 // this is not a hypothetical, it's the shape of real field data (CLAUDE.md
 // constraint 8: no this-machine assumptions). These match the quoted-path
-// group as ONE unit (`"[^"]*"` or a bare no-space token) rather than naively
-// splitting on whitespace, and excise the match FROM THE ORIGINAL STRING —
-// never a tokenize/rejoin round trip — so nothing outside the matched region
-// is touched: a `cli: null` command (no solo flags at all) comes back
-// byte-identical, and the surviving remainder of a matched command keeps
-// whatever whitespace it already had (#439 review B1 + N1).
-const CLAUDE_SOLO_MCP_RE =
-  /(^|\s)--mcp-config\s+("[^"]*"|\S+)\s+--strict-mcp-config\s+--allowedTools\s+mcp__loomux(?=\s|$)/;
-const COPILOT_SOLO_MCP_RE =
-  /(^|\s)--additional-mcp-config\s+("[^"]*"|\S+)\s+--allow-tool\s+loomux(?=\s|$)/;
+// group as ONE unit (`QUOTED_OR_BARE_VALUE`, the same value grammar
+// `stripSessionFlagsFromCommand` above uses) rather than naively splitting on
+// whitespace, and excise the match
+// FROM THE ORIGINAL STRING — never a tokenize/rejoin round trip — so nothing
+// outside the matched region is touched: a `cli: null` command (no solo
+// flags at all) comes back byte-identical, and the surviving remainder of a
+// matched command keeps whatever whitespace it already had (#439 review B1 +
+// N1).
+const CLAUDE_SOLO_MCP_RE = new RegExp(
+  `(^|\\s)--mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--strict-mcp-config\\s+--allowedTools\\s+mcp__loomux(?=\\s|$)`
+);
+const COPILOT_SOLO_MCP_RE = new RegExp(
+  `(^|\\s)--additional-mcp-config\\s+(${QUOTED_OR_BARE_VALUE})\\s+--allow-tool\\s+loomux(?=\\s|$)`
+);
 
 /** Remove a recorded agent command's solo channel-identity MCP flags (#439):
  *  `--mcp-config <path> --strict-mcp-config --allowedTools mcp__loomux`
@@ -487,20 +650,39 @@ export function adoptableSessionId(command: string | null, argv: string[] | null
   return sessionIdFromCommand(command, argv);
 }
 
-/** The CLI program a restored `command`/`argv` would invoke — the first
- *  token, lowercased. Used (#456) to tell whether a `resume-agent`/
- *  `fresh-agent`/`dormant-agent` restore action is a copilot pane, so the
- *  autopilot-dialog watcher can be wired in for it the same way a fresh
- *  launch gets it. Deliberately minimal for THIS PR's scope, not the fuller
- *  shared CLI-derivation #452 asks for (argv-only panes losing their CLI
- *  identity to a comment instead of a real lookup) — but that minimalism is
- *  a scope call, not a design stance: this is a candidate call site for (or
- *  the seed of) #452's shared helper, not a deliberately-separate derivation
- *  meant to coexist with it. #452 has been noted that a third derivation now
- *  exists to converge when that work happens. */
+/** Normalize a launch command's first token into the bare CLI program name
+ *  (#457, closing #452's concrete named case): strips a directory prefix
+ *  (`C:\tools\copilot.exe` → `copilot.exe`, `/usr/local/bin/claude` →
+ *  `claude`) and a trailing executable extension (`.exe`/`.cmd`/`.bat`,
+ *  case-insensitive — Windows PATH resolution accepts any of them), then
+ *  lowercases. Without this, a path-qualified or `.exe`-suffixed command
+ *  silently fails every `=== "claude"`/`=== "copilot"` check downstream —
+ *  per-CLI restore behavior (the autopilot watcher, the D2 resume-candidate
+ *  card, `Pane.agentCli`) just doesn't apply, with no error, for a pane that
+ *  is unambiguously one of those two CLIs.
+ *
+ *  This is the ONE place that answers "what CLI program does this raw first
+ *  token name" — `programFromRestore` below, `main.ts`'s D2 dormant-card
+ *  sniff, and `Pane.agentCli` (`pane.ts`) all call it now rather than each
+ *  re-deriving the same first-token-lowercased logic independently (#452:
+ *  three duplicate, and until now identically-incomplete, derivations). Not
+ *  a full #452 convergence — the quoting/tokenizing grammar
+ *  (`QUOTED_OR_BARE_VALUE`) is a different axis, already converged per #471,
+ *  and the D2 card's OWN `.command`-vs-`.argv` extraction and the launcher's
+ *  `plan.command.split(/\s+/)[0]` probe step are untouched — this only
+ *  converges what happens to an already-extracted raw token. */
+export function normalizeAgentProgram(raw: string): string {
+  const base = raw.split(/[\\/]/).pop() ?? raw;
+  return base.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+}
+
+/** The CLI program a restored `command`/`argv` would invoke. Used (#456) to
+ *  tell whether a `resume-agent`/`fresh-agent`/`dormant-agent` restore
+ *  action is a copilot pane, so the autopilot-dialog watcher can be wired in
+ *  for it the same way a fresh launch gets it. */
 export function programFromRestore(command: string | null, argv: string[] | null): string | null {
   const first = command?.trim().split(/\s+/)[0] || argv?.[0];
-  return first ? first.toLowerCase() : null;
+  return first ? normalizeAgentProgram(first) : null;
 }
 
 /** Whether a restored copilot pane's command/argv actually carries

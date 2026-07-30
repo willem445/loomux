@@ -9,6 +9,7 @@
 use loomux_lib::orchestration::intake;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
+use loomux_lib::orchestration::queue;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
@@ -35,15 +36,14 @@ use loomux_lib::orchestration::{
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     workflow_mode_notice,
     GhGate, GitTagPush,
-    normalize_remote_web_base, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
-    paste_held_notice, question_held_notice, held_delivery_notice,
+    normalize_remote_web_base, ORCHESTRATOR_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     record_aborted_preenter_outcome, recorded_confirmed,
-    should_notify_paste_held, should_notify_unconfirmed, single_pane_autopilot_flags,
+    should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
@@ -53,6 +53,8 @@ use loomux_lib::orchestration::{
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
+    CLAUDE_READONLY_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
+    COPILOT_READONLY_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
 };
 use loomux_lib::pty::PtyManager;
 use serde_json::{json, Value};
@@ -1023,54 +1025,314 @@ fn paste_gate_holds_until_clear_then_pastes_or_aborts_at_the_cap() {
     assert_eq!(resolve_paste_gate(true, cap + Duration::from_millis(1), cap), PasteGate::Abort);
 }
 
+// ---------- #445: delivery queue notice vocabulary ----------
+//
+// The old `paste_held_notice`/`question_held_notice`/`held_delivery_notice`
+// (and their gate `should_notify_paste_held`) said "held: ... re-send when
+// clear" — the exact honesty defect #445 exists to fix: a delivery that hit
+// its hold cap was DESTROYED, not held, and re-sending was actively harmful
+// once queueing made it unnecessary. They are deleted; `queue::queued_notice`
+// (below) replaces them. See `queue.rs`'s own unit tests for the full
+// coverage of the new notice text — these two just pin the property that
+// specifically motivated the deletion.
+
 #[test]
-fn paste_held_notice_names_the_agent_and_the_recovery_move() {
-    let msg = paste_held_notice("w-4");
+fn queued_notice_replaces_the_deleted_re_send_wording() {
+    let msg = queue::queued_notice("w-9", queue::EnqueueReason::BoxOccupied);
     assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
-    assert!(msg.contains("w-4"), "notice must name the held agent: {msg}");
-    assert!(msg.contains("human input"), "notice must state the condition: {msg}");
-    assert!(msg.contains("re-send"), "notice must point at re-sending: {msg}");
-    // Distinct from the unconfirmed notice: nothing was pasted, so it must NOT
-    // tell the orchestrator the prompt is sitting unsubmitted.
-    assert!(!msg.contains("unsubmitted"), "held notice is not the unconfirmed one: {msg}");
+    assert!(msg.contains("w-9"), "notice must name the target agent: {msg}");
+    assert!(!msg.to_lowercase().contains("re-send when clear"), "the old misleading phrasing must be gone: {msg}");
+    assert!(msg.contains("do NOT re-send"), "must warn against re-sending a queued payload: {msg}");
+
+    let msg = queue::queued_notice("w-9", queue::EnqueueReason::Question);
+    assert!(msg.contains("interactive question"), "must name the condition: {msg}");
 }
 
 #[test]
-fn paste_held_notice_fires_only_for_a_non_orchestrator_target() {
-    // A held delivery to a worker/reviewer: the prompt never landed, so the
-    // orchestrator must be told to re-send.
-    assert!(should_notify_paste_held(false));
-    // Target IS the orchestrator: a notice to it is itself a delivery to it — an
-    // endless loop. Never notify.
-    assert!(!should_notify_paste_held(true));
-}
-
-#[test]
-fn question_held_notice_names_the_agent_and_points_at_answering() {
-    // #420: the recovery move for a question-held delivery is "answer the
-    // question", not "re-send" or "clear the box" — re-sending alone won't
-    // help until a human has actually answered.
-    let msg = question_held_notice("w-9");
-    assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
-    assert!(msg.contains("w-9"), "notice must name the held agent: {msg}");
-    assert!(msg.contains("question"), "notice must state the condition: {msg}");
-    assert!(msg.to_lowercase().contains("answer"), "notice must point at answering: {msg}");
-    assert!(!msg.contains("unsubmitted"), "question notice is not the unconfirmed one: {msg}");
-}
-
-#[test]
-fn held_delivery_notice_dispatches_text_by_reason() {
-    // #111/#420: the orchestrator-facing notice text differs by why the
-    // delivery was held — box-occupied points at re-sending, a live question
-    // points at answering. `Typing` never aborts a delivery (its cap delivers
-    // anyway), so it has no notice of its own; it falls back to the
-    // box-occupied text like any other non-question abort would.
-    assert_eq!(held_delivery_notice("w-9", HeldReason::BoxOccupied), paste_held_notice("w-9"));
-    assert_eq!(held_delivery_notice("w-9", HeldReason::InteractiveQuestion), question_held_notice("w-9"));
-    assert_ne!(
-        held_delivery_notice("w-9", HeldReason::BoxOccupied),
-        held_delivery_notice("w-9", HeldReason::InteractiveQuestion),
+fn orchestrator_template_no_longer_instructs_a_re_send_on_a_held_delivery() {
+    // #445 plan step 5: delete every "re-send when clear" instruction from
+    // the live template. This pins ORCHESTRATOR_TPL directly (not the
+    // tests/fixtures/pre222/orchestrator.md golden copy) — that fixture DOES
+    // get updated in this same PR, correctly: it tracks the live
+    // default-group text by design and is re-blessed whenever that text
+    // deliberately changes (`a_workflow_placeholder_must_sit_at_the_end_of_
+    // a_line_it_shares` in tests/workflow.rs enforces the re-bless; see
+    // tests/fixtures/pre222/README.md's changelog for this PR's entry).
+    assert!(
+        !ORCHESTRATOR_TPL.to_lowercase().contains("re-send when clear"),
+        "the live orchestrator template must not instruct re-sending a queued delivery"
     );
+    assert!(
+        ORCHESTRATOR_TPL.contains("do NOT"),
+        "the template must explicitly warn against re-sending a queued payload"
+    );
+    assert!(
+        ORCHESTRATOR_TPL.contains("queued"),
+        "the template must describe the new hold-means-queued behavior"
+    );
+}
+
+// ---------- #445: delivery queue — registry-level bookkeeping ----------
+//
+// `deliver_now`'s pipeline and the drainer thread cannot be exercised here
+// (no live pty/app handle in test mode, and CLAUDE.md forbids spawning a
+// real agent CLI) — see `queue.rs`'s module doc and the plan's own
+// "Stated honestly" section. What IS testable, and pinned below: the FIFO
+// admit/cap/coalesce bookkeeping, the front-door check (bypasses the
+// app-handle requirement precisely because it needs no live pane), the
+// dequeue/drop audit trail, and the orphan-scan derivation. Live wiring
+// (drainer actually flushing a real pane) is a hand-validation item.
+
+#[test]
+fn enqueue_text_preserves_fifo_order_across_mixed_senders() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 101u32;
+
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "here is context", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orch-2", "now go", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "a third, different ask", pty, queue::EnqueueReason::BehindQueue).unwrap();
+
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap.len(), 3);
+    // "here is context" must never be overtaken by "now go" — the exact
+    // inversion failure mode the front-door check exists to prevent.
+    assert_eq!(snap[0].payload.text(), Some("here is context"));
+    assert_eq!(snap[0].from, "orch-1");
+    assert_eq!(snap[1].payload.text(), Some("now go"));
+    assert_eq!(snap[2].payload.text(), Some("a third, different ask"));
+    // Ids are strictly increasing (the monotonic AtomicU64 — no getrandom).
+    assert!(snap[0].id < snap[1].id, "ids must increase monotonically");
+    assert!(snap[1].id < snap[2].id, "ids must increase monotonically");
+}
+
+#[test]
+fn enqueue_text_rejects_newest_at_cap_never_evicts_oldest() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 102u32;
+
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("distinct-{i}"), pty, queue::EnqueueReason::BehindQueue)
+            .unwrap();
+    }
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE);
+
+    let err = reg
+        .enqueue_text(&g.id, &w.id, "loomux", "one-too-many", pty, queue::EnqueueReason::Question)
+        .unwrap_err();
+    assert!(err.contains("NOT queued"), "must be a synchronous, truthful rejection: {err}");
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE, "depth must not change on rejection");
+    // The head is still the FIRST item ever queued — never evicted to make
+    // room, because the head may be the kickoff everything after depends on.
+    assert_eq!(reg.queue_snapshot(pty)[0].payload.text(), Some("distinct-0"));
+
+    let dropped = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-dropped" && e.detail["reason"] == json!("queue-full-at-call"))
+        .count();
+    assert_eq!(dropped, 1, "the rejection itself must be audited");
+}
+
+#[test]
+fn enqueue_text_coalesces_a_byte_identical_repeat_and_bumps_the_counter() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 103u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update", pty, queue::EnqueueReason::BehindQueue).unwrap();
+
+    assert_eq!(reg.queue_depth(pty), 1, "byte-identical repeats must collapse, not accumulate");
+    assert_eq!(reg.queue_snapshot(pty)[0].coalesced, 2, "two duplicates coalesced into the original");
+
+    // A DIFFERENT ask must still be admitted — coalescing never guesses at
+    // semantic staleness, only exact-byte repeats.
+    reg.enqueue_text(&g.id, &w.id, "loomux", "give me a status update now", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    assert_eq!(reg.queue_depth(pty), 2);
+
+    let coalesced_audits =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-coalesced").count();
+    assert_eq!(coalesced_audits, 2, "each coalesce must be individually audited");
+}
+
+#[test]
+fn enqueue_stranded_front_lands_ahead_of_already_queued_text() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 104u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "queued behind", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap.len(), 2);
+    assert_eq!(snap[0].payload, queue::QueuedPayload::StrandedSubmit, "the marker must drain FIRST");
+    assert_eq!(snap[1].payload.text(), Some("queued behind"));
+}
+
+#[test]
+fn enqueue_stranded_front_respects_the_same_cap() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 105u32;
+
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
+    }
+    let err = reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap_err();
+    assert!(err.contains("NOT queued"), "got: {err}");
+}
+
+#[test]
+fn pop_front_dequeued_removes_only_a_matching_front_id_and_audits_queued_ms() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 106u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "first", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "second", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let first_id = reg.queue_snapshot(pty)[0].id;
+    let first_enqueued_ms = reg.queue_snapshot(pty)[0].enqueued_ms;
+
+    // A stale/mismatched id must NOT pop the front (single-owner discipline
+    // — see `run_queue_drainer`'s doc).
+    reg.pop_front_dequeued(&g.id, pty, first_id + 999, first_enqueued_ms);
+    assert_eq!(reg.queue_depth(pty), 2, "a non-matching id must not pop anything");
+
+    reg.pop_front_dequeued(&g.id, pty, first_id, first_enqueued_ms);
+    assert_eq!(reg.queue_depth(pty), 1);
+    assert_eq!(reg.queue_snapshot(pty)[0].payload.text(), Some("second"));
+
+    let dequeued = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-dequeued" && e.detail["id"] == json!(first_id))
+        .expect("a real pop must be audited");
+    assert!(dequeued.detail["queued_ms"].as_u64().is_some(), "must record how long it waited");
+}
+
+#[test]
+fn drop_queue_audits_every_entry_individually_and_sends_one_coalesced_notice() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 107u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let ids: Vec<u64> = reg.queue_snapshot(pty).iter().map(|e| e.id).collect();
+
+    reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
+    assert_eq!(reg.queue_depth(pty), 0, "the whole queue must be gone");
+
+    let dropped: Vec<_> =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-dropped").collect();
+    assert_eq!(dropped.len(), 2, "each entry closes out with its OWN audit line (orphan-scan relies on this)");
+    for id in ids {
+        assert!(
+            dropped.iter().any(|e| e.detail["id"] == json!(id) && e.detail["reason"] == json!("agent-died")),
+            "entry {id} must have its own delivery-dropped line"
+        );
+    }
+    // Dropping an already-empty queue must be a true no-op — no duplicate
+    // notices or audit spam for a pane with nothing left to drop.
+    let before = reg.audit_log(&g.id).len();
+    reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
+    assert_eq!(reg.audit_log(&g.id).len(), before, "dropping an empty queue must not re-audit");
+}
+
+#[test]
+fn queue_orphans_finds_an_enqueued_entry_with_no_terminal_event() {
+    // #445 intake finding: the persistence argument claims a restart's loss
+    // is mechanically derivable from audit.jsonl — this is what makes that
+    // literally true, exercised end to end through the real audit file
+    // (not a hand-built fixture — `queue.rs`'s own unit tests already cover
+    // the pure scan logic in isolation).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 108u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "resolved", pty, queue::EnqueueReason::Question).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "orphaned", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let snap = reg.queue_snapshot(pty);
+    let (resolved_id, orphaned_id) = (snap[0].id, snap[1].id);
+
+    // Simulate a restart: only the FIRST entry ever reaches a terminal
+    // audit event before the process (hypothetically) died.
+    reg.pop_front_dequeued(&g.id, pty, resolved_id, snap[0].enqueued_ms);
+
+    let orphans = reg.queue_orphans(&g.id);
+    assert_eq!(orphans.len(), 1, "exactly the unresolved entry must surface, got: {orphans:?}");
+    assert_eq!(orphans[0].id, orphaned_id);
+    assert_eq!(orphans[0].agent_id, w.id);
+}
+
+#[test]
+fn deliver_prompt_front_door_enqueues_behind_a_non_empty_queue_without_an_app_handle() {
+    // #445: the whole point of checking the queue before requiring an app
+    // handle — a queue can only be non-empty because an EARLIER delivery
+    // already had one (to spawn its drainer), so appending behind it needs
+    // no live pane of its own.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 109u32;
+    reg.set_pty_for_test(&w.id, pty);
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "already queued", pty, queue::EnqueueReason::Question).unwrap();
+    assert_eq!(reg.queue_depth(pty), 1);
+
+    reg.deliver_prompt(&w.id, "a fresh prompt", "orch", Delivery::MidSession)
+        .expect("the front door must succeed with no app handle at all");
+
+    assert_eq!(reg.queue_depth(pty), 2, "the fresh prompt must land BEHIND the existing entry");
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap[0].payload.text(), Some("already queued"), "existing entry must not be overtaken");
+    assert_eq!(snap[1].payload.text(), Some("a fresh prompt"));
+    assert_eq!(snap[1].reason, queue::EnqueueReason::BehindQueue);
+}
+
+#[test]
+fn deliver_prompt_front_door_is_a_noop_when_the_queue_is_empty() {
+    // With an EMPTY queue, the front door must step aside and let the
+    // normal direct-delivery path run — which in test mode (no real app
+    // handle) fails at that step, exactly as it always has. Proves the
+    // front door doesn't fire on every call, only when there's actually
+    // something to defer behind.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 110u32;
+    reg.set_pty_for_test(&w.id, pty);
+
+    let err = reg.deliver_prompt(&w.id, "hello", "orch", Delivery::MidSession).unwrap_err();
+    assert!(err.contains("no app handle"), "must reach the normal direct-delivery path, got: {err}");
+    assert_eq!(reg.queue_depth(pty), 0, "nothing should have been queued");
+}
+
+#[test]
+fn deliver_prompt_front_door_propagates_the_synchronous_full_error() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 111u32;
+    reg.set_pty_for_test(&w.id, pty);
+
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
+    }
+    let err = reg.deliver_prompt(&w.id, "one too many", "orch", Delivery::MidSession).unwrap_err();
+    assert!(err.contains("NOT queued"), "the ORIGINAL caller must see the truthful rejection, got: {err}");
 }
 
 #[test]
@@ -1108,9 +1370,11 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     // the CLI level, even under Auto perms — but keeps gh for the plan comment.
     let plan = reg.build_agent_command("claude", "opus", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
     assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
-    for denied in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+    for denied in CLAUDE_READONLY_DENY_TOOLS {
         assert!(plan.contains(denied), "planner must deny the {denied} tool");
     }
+    assert!(!plan.contains("MultiEdit"),
+        "MultiEdit matches no real Claude Code tool (#448) — must not reappear in the deny list");
     assert!(plan.contains("\"Bash(git commit *)\"") && plan.contains("\"Bash(git push *)\""),
         "planner must deny git commit/push using the canonical (space-form) rule spelling");
     assert!(plan.contains("\"Bash(gh *)\""), "gh stays allowed so the planner can post its plan comment");
@@ -1121,6 +1385,69 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     // No rule may use it — that regression is what this pins down.
     assert!(!plan.contains("commit:*") && !plan.contains("push:*"),
         "no colon-mid wildcard rule (`Bash(git commit:*)`) — it is malformed and triggers the startup warning flash");
+}
+
+/// #448: the planner's read-only guarantee is spelled as string literals
+/// matched against an external tool registry that drifts underneath it (the
+/// CLI's own registry, which loomux does not control and cannot query live —
+/// see `KNOWN_CLAUDE_TOOLS`'s doc). This pins `CLAUDE_READONLY_DENY_TOOLS`
+/// against the Claude Code Tools reference snapshot so a typo or a stale name
+/// breaks CI instead of silently widening what a planner may do — exactly
+/// the failure mode that let `MultiEdit` (folded into `Edit` upstream) sit
+/// in the deny list matching nothing until a human read the CLI's own
+/// startup warning by hand.
+///
+/// Mutation evidence (red before green): temporarily re-adding "MultiEdit" —
+/// or any other typo — to `CLAUDE_READONLY_DENY_TOOLS` fails this assertion
+/// immediately, with a message naming the bad entry; removing it passes.
+/// This is exactly the property #448 asked for.
+#[test]
+fn claude_readonly_deny_tools_are_known_claude_tools() {
+    for t in CLAUDE_READONLY_DENY_TOOLS {
+        assert!(
+            KNOWN_CLAUDE_TOOLS.contains(t),
+            "{t:?} in CLAUDE_READONLY_DENY_TOOLS is not a known Claude Code tool per \
+             the Tools reference (https://code.claude.com/docs/en/tools-reference) — \
+             typo, or was the tool renamed/removed upstream? (#448)"
+        );
+    }
+}
+
+/// Sibling of `claude_readonly_deny_tools_are_known_claude_tools` for the
+/// Copilot adapter — the SAME pin, against `KNOWN_COPILOT_DENY_CATEGORIES`
+/// (the exactly-three `--deny-tool` value shapes Copilot's CLI configuration
+/// guide documents). This is the test that would have caught `edit` before
+/// it shipped: `edit` was never one of the documented shapes, so a version
+/// of `COPILOT_READONLY_DENY_TOOLS` that includes it fails here exactly the
+/// way a `MultiEdit`-style typo fails the Claude pin above — a validator
+/// that catches one and not the other is not doing its job (#448 review).
+///
+/// Mutation evidence (red before green): temporarily adding "edit" back to
+/// `COPILOT_READONLY_DENY_TOOLS` fails this assertion immediately; removing
+/// it passes.
+#[test]
+fn copilot_readonly_deny_tools_are_known_copilot_categories() {
+    for t in COPILOT_READONLY_DENY_TOOLS {
+        assert!(
+            KNOWN_COPILOT_DENY_CATEGORIES.contains(t),
+            "{t:?} in COPILOT_READONLY_DENY_TOOLS is not one of the three documented \
+             --deny-tool value shapes (shell(COMMAND) / write / MCP_SERVER(tool)) per \
+             https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli \
+             — this is exactly how `edit` should have been caught (#448)"
+        );
+    }
+}
+
+/// The consistency test (`build_agent_argv_matches_command_line`) already
+/// pins the string-vs-argv *shapes* against each other; this pins the
+/// **content** of the git-mutation denials against the exact CLI-documented
+/// spellings, so `CLAUDE_READONLY_DENY_GIT` / `COPILOT_READONLY_DENY_GIT`
+/// can't quietly grow a malformed entry (e.g. the colon-mid wildcard
+/// regression already covered above) or lose one.
+#[test]
+fn readonly_deny_git_lists_are_exactly_commit_and_push() {
+    assert_eq!(CLAUDE_READONLY_DENY_GIT, ["Bash(git commit *)", "Bash(git push *)"]);
+    assert_eq!(COPILOT_READONLY_DENY_GIT, ["shell(git commit)", "shell(git push)"]);
 }
 
 #[test]
@@ -1196,8 +1523,14 @@ fn copilot_command_uses_copilot_adapter_flags() {
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
     let plan = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
-    assert!(plan.contains("--deny-tool \"write\"") && plan.contains("--deny-tool \"edit\""),
-        "planner must deny copilot's write/edit tools, got: {plan}");
+    assert!(plan.contains("--deny-tool \"write\""),
+        "planner must deny copilot's write category (the documented file-modification category), got: {plan}");
+    // #448: `edit` is not one of Copilot's three documented --deny-tool value
+    // shapes (shell(COMMAND) / write / MCP_SERVER(tool)) — it was likely
+    // already as inert as MultiEdit was for Claude, so it was dropped rather
+    // than kept as an unverified entry that only looked like containment.
+    assert!(!plan.contains("--deny-tool \"edit\""),
+        "edit is not a documented copilot deny-tool value — must not reappear (#448), got: {plan}");
     assert!(plan.contains("--deny-tool \"shell(git commit)\"") && plan.contains("--deny-tool \"shell(git push)\""),
         "planner must deny git commit/push");
     assert!(!plan.contains("--deny-tool \"shell(gh"), "gh stays allowed for the plan comment");
@@ -1590,23 +1923,27 @@ fn build_agent_command_full_line_snapshots() {
     );
 
     // Claude planner (read_only) in a NON-auto_ops group → unattended anyway,
-    // plus the write/commit/push denials, gh still reachable.
+    // plus the write/commit/push denials, gh still reachable. Literals per
+    // CLAUDE_READONLY_DENY_TOOLS/_GIT (#448 — `MultiEdit` dropped, it matched
+    // no real Claude Code tool).
     assert_eq!(
         cmd("claude", "opus", false, true),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
          --model opus --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
-         \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write MultiEdit NotebookEdit \
+         \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
          \"Bash(git commit *)\" \"Bash(git push *)\""
     );
 
     // Copilot planner (read_only) in a NON-auto_ops group → group autopilot
-    // (--autopilot + all tools/paths) + deny rules; gh not denied.
+    // (--autopilot + all tools/paths) + deny rules; gh not denied. Literals
+    // per COPILOT_READONLY_DENY_TOOLS/_GIT (#448 — `edit` dropped, it is not
+    // one of Copilot's three documented --deny-tool value shapes).
     assert_eq!(
         cmd("copilot", "auto", false, true),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
          --autopilot --allow-all-tools --allow-all-paths \
-         --deny-tool \"write\" --deny-tool \"edit\" \
+         --deny-tool \"write\" \
          --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\""
     );
 
@@ -1715,13 +2052,15 @@ fn build_agent_argv_snapshots() {
     );
 
     // Copilot planner (read_only): group autopilot + deny rules; @ rides the cfg.
+    // #448: `edit` dropped — not one of Copilot's three documented --deny-tool
+    // value shapes (shell(COMMAND) / write / MCP_SERVER(tool)).
     assert_eq!(
         argv("copilot", "auto", false, true),
         vec![
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
             "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
             "--autopilot", "--allow-all-tools", "--allow-all-paths", "--deny-tool", "write",
-            "--deny-tool", "edit", "--deny-tool", "shell(git commit)", "--deny-tool",
+            "--deny-tool", "shell(git commit)", "--deny-tool",
             "shell(git push)",
         ]
     );
@@ -13125,57 +13464,47 @@ fn unconfirmed_notice_is_suppressed_while_the_group_is_paused() {
 }
 
 #[test]
-fn delivery_held_notice_fires_for_a_worker_but_not_the_orchestrator() {
-    // #111: a delivery aborted because the pane holds human input must nudge the
-    // orchestrator (once) to re-send — but never for an orchestrator target (that
-    // would loop) and never while paused (delivery is suppressed there anyway).
+fn notify_queue_fires_for_a_worker_but_suppresses_and_audits_for_the_orchestrator_and_while_paused() {
+    // #445: `notify_queue` is what an aborted-then-queued delivery uses to
+    // tell the orchestrator once — but never for an orchestrator target
+    // (that would loop) and never while paused (delivery is suppressed
+    // there anyway) — and EVERY suppression leaves a `notice-suppressed`
+    // audit line (the routed #451 finding this issue owns: a suppressed
+    // notification must be discoverable after the fact).
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
-    // Worker target, group live: the notice is raised and audited.
-    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::BoxOccupied);
+    // Worker target, group live: the notice actually attempts delivery (it
+    // fails at the pty step in test mode, same as every other delivery —
+    // `deliver_to_orchestrator`'s own coverage already pins the happy path).
+    reg.notify_queue(&g.id, &w.id, false, &queue::queued_notice(&w.id, queue::EnqueueReason::BoxOccupied));
     assert!(
-        reg.audit_log(&g.id).iter().any(|e| e.action == "delivery-held-notice"),
-        "an aborted worker delivery must raise the held notice"
+        reg.audit_log(&g.id).iter().all(|e| e.action != "notice-suppressed"),
+        "a live worker target must not be suppressed"
     );
 
-    // Orchestrator target: suppressed (a notice to it is a delivery to it — a loop).
-    reg.notify_delivery_held(&g.id, &o.id, true, HeldReason::BoxOccupied);
-    assert_eq!(
-        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
-        1,
-        "an orchestrator-target held delivery must not raise a notice"
-    );
-
-    // Paused group: suppressed even for a worker.
-    reg.pause_group(&g.id).unwrap();
-    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::BoxOccupied);
-    assert_eq!(
-        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-held-notice").count(),
-        1,
-        "a paused group must not raise the held notice"
-    );
-}
-
-#[test]
-fn delivery_held_notice_audits_the_interactive_question_reason() {
-    // #420: the audit entry must carry WHY the delivery was held, distinctly
-    // from the box-occupied case, so the record (and any future filtering on
-    // it) can tell "a human left text in the box" apart from "Copilot is
-    // mid-dialog" — very different recovery moves for a human reading the log.
-    let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-
-    reg.notify_delivery_held(&g.id, &w.id, false, HeldReason::InteractiveQuestion);
-    let entry = reg
+    // Orchestrator target: suppressed and audited (a notice to it is a
+    // delivery to it — a loop).
+    reg.notify_queue(&g.id, &o.id, true, &queue::queued_notice(&o.id, queue::EnqueueReason::BoxOccupied));
+    let sup = reg
         .audit_log(&g.id)
         .into_iter()
-        .find(|e| e.action == "delivery-held-notice")
-        .expect("an aborted worker delivery must raise the held notice");
-    assert_eq!(entry.detail["reason"], json!("question"), "got: {}", entry.detail);
+        .find(|e| e.action == "notice-suppressed" && e.detail["to"] == json!(o.id))
+        .expect("an orchestrator-target queue notice must be suppressed AND audited");
+    assert_eq!(sup.detail["reason"], json!("target-is-orchestrator"), "got: {}", sup.detail);
+
+    // Paused group: suppressed and audited even for a worker.
+    reg.pause_group(&g.id).unwrap();
+    reg.notify_queue(&g.id, &w.id, false, &queue::queued_notice(&w.id, queue::EnqueueReason::BoxOccupied));
+    let sup = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "notice-suppressed" && e.detail["to"] == json!(w.id))
+        .next_back()
+        .expect("a paused group's queue notice must be suppressed AND audited");
+    assert_eq!(sup.detail["reason"], json!("group-paused"), "got: {}", sup.detail);
 }
 
 // ---------- #72: steering-strip image attachments ----------

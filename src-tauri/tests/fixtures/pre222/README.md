@@ -211,6 +211,17 @@ so far:
   reworded to say the floor is "automatic the moment the quiet-window is on, nothing to
   configure" instead of describing a value the operator would otherwise have had to set.
 
+- **#445, delivery queue** — `orchestrator.md` only. A hold-cap expiry in `deliver_prompt`
+  (the pane's box had human input in it, or an interactive question was on screen) used to
+  DESTROY the prompt and tell the orchestrator "held: ... — re-send when clear" — misleading,
+  since nothing was left to re-send to. It now safely QUEUES the prompt and flushes
+  automatically, in order, the instant the pane is deliverable again (no timeout — the release
+  condition is a human answering, which can take hours). The **Silent-agent recovery** section's
+  held-delivery paragraph is rewritten: never re-send on a `queued` notice (it would just
+  duplicate the entry already waiting), read the flush header before acting on what follows, and
+  only a `DROPPED` notice (queue full, or the agent's pane closed) means the payload is actually
+  gone and needs re-deriving.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

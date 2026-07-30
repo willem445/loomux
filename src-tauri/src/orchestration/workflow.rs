@@ -875,8 +875,9 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         }
         // CAPABILITY CLOSURE. `allow:` pre-approves tool patterns, and the
         // read-only class is read-only by *denial of a fixed list* — Edit, Write,
-        // MultiEdit, NotebookEdit, `git commit`, `git push`. Deny beats allow on
-        // both CLIs, so an allow pattern cannot re-grant anything on that list…
+        // NotebookEdit, `git commit`, `git push` (CLAUDE_READONLY_DENY_TOOLS/_GIT
+        // — #448 dropped `MultiEdit`, which matches no real Claude Code tool).
+        // Deny beats allow on both CLIs, so an allow pattern cannot re-grant anything on that list…
         // but it does not have to. `allow: Bash(python *)` (or `cp`, `tee`,
         // `sed -i`, …) hands a planner a shell that writes files and is named
         // nowhere in the deny list, and under `auto_ops` nobody approves the call.

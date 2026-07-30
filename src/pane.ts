@@ -80,7 +80,7 @@ import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
-import { adoptableSessionId, hasForkSession } from "./panerestore";
+import { adoptableSessionId, hasForkSession, normalizeAgentProgram } from "./panerestore";
 
 // Inline icons so the toolbar renders identically regardless of installed
 // fonts; they inherit color via `currentColor`.
@@ -2961,14 +2961,20 @@ export class Pane implements VoiceTargetPane {
   }
 
   /** The agent CLI program this pane was launched with — the first token of
-   *  its launch command, lower-cased, same derivation launcher.ts uses to
-   *  probe/autopilot a program (#440). "claude" | "copilot" | null for a
-   *  plain shell, an unrecognized program, or before launch. Used by the
-   *  session reconciler to match this pane's cwd against `listSessions()`'s
-   *  `source` without re-deriving the parse elsewhere. */
+   *  its launch command, normalized via `normalizeAgentProgram` (#457: path
+   *  prefix and `.exe`/`.cmd`/`.bat` stripped, then lower-cased) — the same
+   *  helper `panerestore.ts`'s `programFromRestore` and main.ts's D2
+   *  dormant-card sniff now call, converging what used to be three
+   *  independent (and identically incomplete) first-token derivations
+   *  (#440/#452). "claude" | "copilot" | null for a plain shell, an
+   *  unrecognized program, or before launch. Used by the session reconciler
+   *  to match this pane's cwd against `listSessions()`'s `source` without
+   *  re-deriving the parse elsewhere. */
   get agentCli(): "claude" | "copilot" | null {
-    const first = this.spawnCommand?.trim().split(/\s+/)[0]?.toLowerCase();
-    return first === "claude" || first === "copilot" ? first : null;
+    const first = this.spawnCommand?.trim().split(/\s+/)[0];
+    if (!first) return null;
+    const program = normalizeAgentProgram(first);
+    return program === "claude" || program === "copilot" ? program : null;
   }
 
   /** True when this pane's current launch command/argv carries `--fork-session`

@@ -205,6 +205,17 @@ These deserve their own detail — see:
   `audit.jsonl` as a filterable, searchable timeline: every prompt, spawn, task
   edit, delivery outcome, and state write, one row each. A **follow** button
   live-tails new lines.
+- **Delivery queue.** If a pane is busy — an interactive question on screen, or a
+  human's own line still sitting in its input box — loomux holds a prompt
+  delivery rather than typing over it. A hold that never clears **queues** the
+  prompt instead of dropping it: nothing is lost, there's no timeout (you might
+  be away for hours), and the queue drains automatically, in order, the moment
+  the pane is free again — the first thing it delivers is a one-line summary of
+  what was waiting. You'll never see "held … re-send" — if a prompt is safely
+  queued, the notice says so explicitly and tells you not to re-send it (that
+  would just create a duplicate); a payload is only ever reported gone if the
+  notice says **DROPPED** (the pane's queue was already full, or the agent's
+  pane closed while entries were still waiting).
 
 ## CI watches (agent notifications)
 
@@ -502,6 +513,13 @@ powerless (no MCP tools, no task board); this path never does.
 records its session id. Follow-ups on a finished task *resume* that worker's
 session (same context, same workspace) instead of cold-starting a new agent or
 disturbing a busy one.
+
+**The delivery queue (above) is in-memory only.** If loomux restarts while a
+prompt is queued behind a blocked pane, that queued prompt is lost — every
+enqueue is still recorded in `audit.jsonl`, so the loss is visible after the
+fact, but nothing replays it automatically today. This is a known, deliberate
+limitation, not an oversight; see `doc/design/orchestration.md`'s "Delivery
+queue (#445)" section for the full argument and the planned follow-up.
 
 ## Autonomous mode
 {: #autonomous-mode }
