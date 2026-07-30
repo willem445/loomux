@@ -41,9 +41,10 @@ export class SessionBrowser {
    *  opening the sidebar before it resolves must not run two concurrent
    *  `listSessions()` + `loadRoles()` scans — the exact I/O the prefetch
    *  exists to front-load, doubled. Same mechanism IssuesView uses for its
-   *  refresh loop; reused rather than a second de-dup scheme. Still needed
-   *  alongside `SessionStore`'s own gate (#493), which covers the session scan
-   *  only: this one also covers the `loadRoles()` half and the render. */
+   *  refresh loop; reused rather than a second de-dup scheme. This stays HERE
+   *  and not in `SessionStore` (#493): the store's job is "never two scans at
+   *  once", while this gate also covers the `loadRoles()` half of a refresh and
+   *  the render, and owes a dropped caller its one trailing re-run. */
   private refreshGate = new RefreshGate();
 
   constructor(

@@ -18,32 +18,43 @@
 // computed, seconds from landing, and asking for it again made BOTH copies
 // slower.
 //
-// This module is the single owner of that scan. DOM-free and pure (the fetch is
-// injected), so its concurrency contract is unit-tested in Node
-// (test/sessionstore.test.ts) rather than by racing real IPC — the repo's
+// This module is the single owner of that scan. DOM-free and dependency-free
+// (the fetch is injected, and it imports no sibling module — every node-tested
+// module in this repo is a leaf, because `node --test` runs them unbundled and
+// src/ imports are extensionless), so its concurrency contract is unit-tested in
+// Node (test/sessionstore.test.ts) rather than by racing real IPC — the repo's
 // extract-pure-logic convention (layout.ts, steer.ts, refreshgate.ts, …).
 //
 // Two accessors, deliberately different:
 //
-//   refresh()      — "I need current data": the ↻ button, opening the sidebar,
+//   refresh()      — "I need a current read": the ↻ button, opening the sidebar,
 //                    the #440 reconciler looking for transcripts that appeared
-//                    since boot. Coalescing single-flight, unchanged from what
-//                    SessionBrowser did before this module existed.
+//                    since boot.
 //   ensureLoaded() — "I need the list, whatever the newest read said": the
-//                    group-restore resumability check. Never starts a scan that
-//                    a completed or in-flight one can answer.
+//                    group-restore resumability check.
+//
+// Neither can start a scan while one is in flight — that is the whole point.
+// What this module deliberately does NOT own is the loss-safe COALESCING of
+// dropped refresh calls (a call arriving mid-scan owing exactly one trailing
+// re-run, rev-9 review): that stays in `SessionBrowser`'s `RefreshGate`, which
+// also has to cover the `loadRoles()` half of its refresh and the render. Two
+// copies of one state machine would be worse than the seam.
 
 import type { SessionInfo } from "./pty";
-import { RefreshGate } from "./refreshgate";
 
 export class SessionStore {
   private rows: SessionInfo[] = [];
   private loadedOnce = false;
   /** The run every concurrent caller joins instead of starting its own. */
   private inflight: Promise<void> | null = null;
-  private gate = new RefreshGate();
+  private fetchRows: () => Promise<SessionInfo[]>;
 
-  constructor(private fetchRows: () => Promise<SessionInfo[]>) {}
+  // Assigned in the body, not as a constructor parameter property: Node's
+  // strip-only TypeScript mode (what `npm test` runs these modules under)
+  // rejects parameter properties outright.
+  constructor(fetchRows: () => Promise<SessionInfo[]>) {
+    this.fetchRows = fetchRows;
+  }
 
   /** The last-fetched list, without triggering a scan (#440). Empty before the
    *  first successful load. */
@@ -57,32 +68,26 @@ export class SessionStore {
     return this.loadedOnce;
   }
 
-  /** Fetch fresh rows. Single-flight and loss-safe (the pre-#493 SessionBrowser
-   *  contract, moved here intact): a call arriving while one is in flight is
-   *  coalesced into ONE trailing re-run rather than a second concurrent scan, so
-   *  any number of dropped calls still end in exactly one fresh fetch. The
-   *  coalesced caller resolves off the run it joined — the trailing run updates
-   *  the cache behind it. */
+  /** Read the list from disk. Single-flight: a call arriving while a scan is in
+   *  flight JOINS that scan rather than starting a second concurrent one — the
+   *  #493 property. A call arriving after one finished does scan again, which is
+   *  what makes this the freshness-carrying accessor. */
   async refresh(): Promise<readonly SessionInfo[]> {
-    if (!this.gate.begin()) {
-      if (this.inflight) await this.inflight;
+    if (this.inflight) {
+      await this.inflight;
       return this.rows;
     }
+    const run = this.fetchRows().then((rows) => {
+      this.rows = rows;
+      this.loadedOnce = true;
+    });
+    this.inflight = run;
     try {
-      this.inflight = this.fetchRows().then((rows) => {
-        this.rows = rows;
-        this.loadedOnce = true;
-      });
-      await this.inflight;
+      await run;
     } finally {
-      this.inflight = null;
-      if (this.gate.end()) {
-        void this.refresh().catch(() => {
-          // Trailing re-run: nobody awaits it, so its failure is the same
-          // best-effort no-op a failed prefetch is — the next explicit refresh
-          // (or the caller's own catch) still reports for itself.
-        });
-      }
+      // Only clear if it's still ours: a rejected run is cleared here, and
+      // nothing else can have replaced it while it was in flight.
+      if (this.inflight === run) this.inflight = null;
     }
     return this.rows;
   }
