@@ -275,13 +275,14 @@ branch inside it, rather than a fresh worktree per rebase.
 #338 fixed the worker half of "the main clone is the human's environment" and deliberately left
 reviewers on it — a reviewer is *told* to be read-only with respect to the repo's content (its
 template says never to edit files or push, and `gh pr diff`/`gh pr view` are enough for most
-reviews without ever needing to). **That is instruction-backed, not structural**: unlike a
-planner, a reviewer's CLI is never launched with `read_only=true` (`Role::is_read_only()` is
-`true` only for `Role::Planner` — see "What the read-only contract enforces" under the Planner
-role section further down, #448), so nothing
-at the CLI level actually denies a reviewer `Edit`/`Write`/`git commit`/`git push`; it works
-because the reviewer role is asked to stay read-only, not because it is unable to do otherwise.
-What this section is about is narrower and *is* still true regardless: a reviewer is not
+reviews without ever needing to). At the time of #359 that was **instruction-backed, not
+structural**: a reviewer's CLI was never launched with any deny flags at all, so nothing at the
+CLI level denied it `Edit`/`Write`/`git commit`/`git push`; it worked because the reviewer role
+was asked to stay read-only, not because it was unable to do otherwise. **#462 made half of it
+structural** — the file-editing tools are now denied at the CLI (`Containment::NoEdits`; see
+"Reviewer containment: what is structural and what is not" below for exactly which half, and
+why the other half stays instruction-tier). What this section is about is narrower and *is*
+still true regardless of either: a reviewer is not
 read-only with respect to the clone's *checkout state*: `gh pr
 diff`/`gh pr view` need no checkout, but a reviewer that wants to run tests locally has always
 been told "checking out the PR branch locally is fine" — in the shared main clone, the same one
@@ -323,8 +324,9 @@ tool wrapping `git`/`gh` checkout subcommands, so nothing can force which flavor
 runs) — `reviewer.md`'s **Review protocol** step 1 states it as the convention, and the
 worktree's own kickoff note (`spawn_agent_ex` in `mod.rs`, role-aware for a reviewer) repeats it
 at spawn time so it survives even a fast first read. A reviewer's read-only-with-respect-to-push
-convention is unaffected either way: it was never CLI-level-enforced to begin with (only a
-planner's `is_read_only()` denies `git commit`/`git push` at the tool level) — it is, and
+convention is unaffected either way: `git commit`/`git push` are denied at the tool level only
+for a planner (`Containment::ReadOnly`) — #462 gave a reviewer the editing-tool half of that
+tier, deliberately not the git half, since a reviewer's shell IS its job — so no-push is, and
 remains, taught in `reviewer.md`, and a dedicated worktree changes nothing about that; it only
 gives the reviewer a workspace of its own to sit in while it does what it already does.
 
@@ -4826,10 +4828,11 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   distinction matters; earlier drafts overclaimed it as fully structural):
   - *Structural* (mechanical, verified by tests): a planner never gets a **worktree** —
     the spawn cwd logic runs it in `group.repo` even when `worktree: true` is passed; and
-    its CLI is launched **read-only** (`build_agent_command(read_only=true)`): on Claude
+    its CLI is launched **read-only** (`build_agent_command(Containment::ReadOnly)`): on Claude
     `--disallowedTools Edit Write NotebookEdit` plus `Bash(git commit *)` /
-    `Bash(git push *)` (`CLAUDE_READONLY_DENY_TOOLS`/`_GIT`), on Copilot `--deny-tool write`
-    plus `shell(git commit|push)` (`COPILOT_READONLY_DENY_TOOLS`/`_GIT`) — deny rules
+    `Bash(git push *)` (`CLAUDE_EDIT_DENY_TOOLS` + `CLAUDE_READONLY_DENY_GIT`), on Copilot
+    `--deny-tool write` plus `shell(git commit|push)` (`COPILOT_EDIT_DENY_TOOLS` +
+    `COPILOT_READONLY_DENY_GIT`) — deny rules
     override the allow list / permission mode on both CLIs (Claude: `dontAsk`, #465
     below; Copilot: `--allow-all-tools`). So a planner **cannot edit files,
     commit, or push**, i.e. cannot produce code changes or push a branch.
@@ -4857,8 +4860,8 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     confirmed to cover their CLI's whole file-modification surface, so removing the
     unconfirmed names does not narrow the guarantee — it only removes the false
     confidence of a denial that looked like containment but wasn't.
-    `claude_readonly_deny_tools_are_known_claude_tools` and
-    `copilot_readonly_deny_tools_are_known_copilot_categories` (`tests/orchestration.rs`)
+    `claude_edit_deny_tools_are_known_claude_tools` and
+    `copilot_edit_deny_tools_are_known_copilot_categories` (`tests/orchestration.rs`)
     pin each CLI's list against that CLI's documented set, so a future typo or a stale
     name reintroduced into either list breaks CI instead of silently reproducing this
     bug. **What the pin does not do:** it cannot detect a *future* upstream rename or
@@ -4879,8 +4882,8 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   documented open for Copilot.** #448 hardened the *dead-entry* direction (a deny name
   that stops matching anything). The opposite direction stayed open: a deny list can
   never cover an editing tool that did not exist when the list was written. If a CLI
-  ships a new file-editing tool tomorrow, `CLAUDE_READONLY_DENY_TOOLS`/
-  `COPILOT_READONLY_DENY_TOOLS` don't mismatch, nothing warns, and the tool just works —
+  ships a new file-editing tool tomorrow, `CLAUDE_EDIT_DENY_TOOLS`/
+  `COPILOT_EDIT_DENY_TOOLS` don't mismatch, nothing warns, and the tool just works —
   *permitted by omission*. The only fix that actually closes this (rather than adding
   one more name to chase) is inverting to an allow-list: deny everything by default,
   name what's permitted. Whether each CLI actually offers that mechanism, and whether
@@ -4897,7 +4900,7 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     function's doc for the full argument. This is a genuine allow-list: a brand-new
     Claude Code editing tool released tomorrow is not in `--allowedTools`, so `dontAsk`
     denies it with zero loomux code change, closing the direction #448's per-name lists
-    structurally could not. `--disallowedTools` (`CLAUDE_READONLY_DENY_TOOLS`/`_GIT`)
+    structurally could not. `--disallowedTools` (`CLAUDE_EDIT_DENY_TOOLS` + `CLAUDE_READONLY_DENY_GIT`)
     stays emitted alongside it, unchanged — the two layers catch different failure
     modes (named-and-stale vs. unnamed-and-new) and dropping either narrows the
     guarantee. The property this actually depends on —
@@ -4966,7 +4969,7 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     it turns a silent gap into a stated one, not a closed one.
 
   - **Copilot: documented open, not closed — and the issue's "no containment at all"
-    premise needs a correction first.** `COPILOT_READONLY_DENY_TOOLS` still denies
+    premise needs a correction first.** `COPILOT_EDIT_DENY_TOOLS` still denies
     `write` today (#463 dropped only `edit`, the unconfirmed entry) — so the claim that
     a Copilot planner currently has *zero* CLI-level file-edit containment overstates
     the code as it stands. It understates something else, though: per Copilot's
@@ -5020,28 +5023,86 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     both together), `agent-ready` once someone can run it.
 
   **The honest table, per role and per CLI** (mirrors the prose above; `git commit`/
-  `git push` denial tracks the file-edit column on every read-only row):
+  `git push` denial tracks the file-edit column on every read-only row — a
+  reviewer row is contained but NOT read-only, and keeps its shell git, #462):
 
   | Role | CLI | File-edit containment | Mechanism |
   | --- | --- | --- | --- |
   | Planner | Claude | **Structural**, both directions | `dontAsk` (#465, new-tool direction) + `--disallowedTools` (#448, named-and-stale direction) |
   | Planner | Copilot | **Structural**, dead-entry direction only | `--deny-tool write` (category-level; #465 argues this is more new-tool-resistant than a literal list, not proof against one) |
-  | Reviewer | Claude | Instruction-backed only | Template tells it to stay read-only; no `--disallowedTools` (#448/#462) |
-  | Reviewer | Copilot | Instruction-backed only | Same; no `--deny-tool` at all |
+  | Reviewer | Claude | **Structural**, named-and-stale direction only | `--disallowedTools Edit Write NotebookEdit` (#462, same `CLAUDE_EDIT_DENY_TOOLS` as the planner). **Not** `dontAsk`: it would auto-deny the shell the job runs through, so the new-tool direction stays open here — see the reviewer-containment section below |
+  | Reviewer | Copilot | **Structural**, category-level | `--deny-tool write` (#462, the same category grant the planner gets); Copilot has no `dontAsk` analogue to close the other direction either |
   | Worker | either | N/A by design | Workers exist to edit/commit/push; no containment is the correct posture |
 
-  **A reviewer is NOT covered by any of the above (#448 finding).** `Role::is_read_only()`
-  returns `true` only for `Role::Planner`; `build_agent_command`/`build_agent_argv`'s
-  `read_only` parameter is `role.is_read_only()`, so a reviewer is launched with **no**
-  `--disallowedTools`/`--deny-tool` flags at all — none of `CLAUDE_READONLY_DENY_TOOLS`,
-  `COPILOT_READONLY_DENY_TOOLS`, or the worktree exemption above apply to it. The
-  "extending the worktree guarantee to reviewers" section elsewhere in this doc describes
-  a reviewer as read-only *with respect to repo content*, but that property today is
-  **instruction-backed only** (the reviewer template's own guidance not to edit files or
-  push), the same tier as the planner's `gh` carve-out above — **not** structural, and not
-  verified by any test the way the planner's denial is. Making it structural (giving
-  reviewers their own CLI-level deny flags) is a capability change, not an enforcement-
-  robustness fix, and is tracked separately rather than folded into #448.
+  #### Reviewer containment: what is structural and what is not (#462)
+
+  #448 found that a reviewer was covered by **none** of the above: `Role::is_read_only()`
+  matched `Role::Planner` alone and fed `build_agent_command`'s `read_only` parameter, so a
+  reviewer launched with no `--disallowedTools`/`--deny-tool` flags at all. It was tracked
+  separately because it is a *capability* decision, not an enforcement-robustness fix.
+  #462 is that decision, and it went **half** the distance on purpose.
+
+  The deny tier is no longer a bool. `Role::containment()` maps the closed capability enum
+  onto a three-rung ladder (`Containment`), and `build_agent_command`/`build_agent_argv`
+  take that value instead of `read_only`:
+
+  | tier | classes | editing tools | `git commit`/`push` | unattended regardless of `auto_ops` |
+  | --- | --- | --- | --- | --- |
+  | `None` | orchestrator, worker | — | — | — |
+  | `NoEdits` | **reviewer** | denied | — | — |
+  | `ReadOnly` | planner | denied | denied | yes |
+
+  A `match` on the closed enum rather than a per-call bool is the point: a fifth capability
+  class cannot be added without deciding, at compile time, what it may do, and
+  `every_capability_class_pins_its_deny_tier` (`tests/orchestration.rs`) pins the mapping —
+  including that a reviewer is contained but is **not** `is_read_only()`, which still gates
+  the `allow:`-ban on a fully read-only block and deliberately did not follow the deny flags
+  onto reviewers (a reviewer keeps its shell anyway, so `allow:` widens nothing for it).
+
+  **Structural for a reviewer:** the file-editing tools — Claude `--disallowedTools Edit
+  Write NotebookEdit`, Copilot `--deny-tool "write"`, the SAME `*_EDIT_DENY_TOOLS` constants
+  the planner uses. One list, not a `REVIEWER_*` near-duplicate: "which tools edit files" is
+  a fact about each CLI's registry, not about a role, and a second copy would be a second
+  thing to keep pinned against `KNOWN_CLAUDE_TOOLS` / `KNOWN_COPILOT_DENY_CATEGORIES` — with
+  a silent failure mode, since a stale deny entry reads exactly like containment (the #448
+  bug). Where the classes genuinely differ, the constants differ too: the git denials stay
+  `ReadOnly`-only.
+
+  **Instruction-tier for a reviewer, and deliberately so:**
+  - *`git commit` / `git push`.* A reviewer's job runs through the shell: it runs the tests,
+    and `gh pr checkout <n> --detach` is how it gets the code to run them against. Its own
+    template also hands it `git commit` explicitly, as the sanctioned alternative to the
+    forbidden `git stash` (#299 — one stash stack shared across every worktree). "Never
+    pushes" therefore stays what it has always been: a rule the reviewer is told, bounded by
+    the fact that it works in its own throwaway worktree (#359) and that no downstream gate
+    reads a reviewer's branch.
+  - *Writing files at all.* This is the honest boundary, and it must not be implied away:
+    denying `Edit`/`Write` removes the **frictionless, default** path to editing a file — the
+    one an agent takes without deciding to — and leaves the shell path (`sed -i`, a heredoc,
+    `python -c`) wide open, because closing it would mean denying `Bash`, and `Bash` is the
+    job. So this is containment of the *accident*, not of the adversary. It is worth having
+    at that size (a reviewer nudged by a diff under review toward "just fix it" now hits a
+    wall instead of a temptation) and worth stating at that size, because a reviewer's write
+    surface is *not* closed and a reader of this doc must not come away thinking it is.
+  - *The new-tool direction #465 closed for the planner.* Its argument transfers word for
+    word — `CLAUDE_EDIT_DENY_TOOLS` cannot name an editing tool Claude Code ships tomorrow,
+    so a reviewer would get it, permitted by omission. Its **remedy does not transfer**:
+    `--permission-mode dontAsk` auto-denies every call outside `--allowedTools`, which for a
+    reviewer is the shell it runs the tests through — #465's own doc names the reviewer as
+    the case it must never be used for. Closing this would need a mechanism that separates
+    "a new editing tool" from "a shell command", and neither CLI offers one today. So the
+    reviewer row in the table above is `named-and-stale direction only`, deliberately, and
+    the gap is recorded here rather than left for someone to discover by reading the
+    planner's row and assuming symmetry.
+  - *Not a promotion.* `NoEdits` deliberately does not set `forces_unattended`: a reviewer in
+    a non-`auto_ops` group still runs under `acceptEdits` with no pre-approved git/gh, exactly
+    as before #462. Extending deny flags to a class must only ever narrow it — the snapshot
+    rows in `build_agent_command_full_line_snapshots` pin every non-deny byte identical to the
+    worker row on the same `auto_ops` setting.
+
+  The reviewer template says all of this to the reviewer too, so its first denial reads as
+  policy rather than as a broken environment — including the one write a review legitimately
+  needs (a body too long for `gh pr review --body`) and its shell route.
 
   **Why not the CLI's `plan` permission mode? (the "auto deny rule" flash, #79)** A human
   reviewing the planner's first boot caught a message about an "auto deny rule" and asked

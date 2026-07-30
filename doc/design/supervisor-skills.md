@@ -16,8 +16,9 @@ Both features want "a distinct agent type" — the human, on both issues.
 Neither needs a new **capability class**:
 
 - **Advisor** (#250) is read-only + can message the orchestrator — exactly
-  `Role::Planner`'s posture (`is_read_only()` is `matches!(self,
-  Role::Planner)`; a planner already has `get_state`/`message_orchestrator`
+  `Role::Planner`'s posture (`is_read_only()` is the planner alone — the top
+  rung of `Role::containment()`, #462; a planner already has
+  `get_state`/`message_orchestrator`
   and auto-frees its delegate slot on `report("done")`, #203).
 - **Process-pro** (#324) reads the record and opens a PR — `Role::Worker`'s
   posture (worktree, git, `gh pr create` through the shim, `report`, board;

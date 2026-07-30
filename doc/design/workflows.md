@@ -56,15 +56,18 @@ and a repo file cannot make any of them anything else. That is the feature, not 
 limitation.
 
 And "in the capability sense" is worth pinning down, because the enum enforces
-less than the phrase suggests. A **planner** is structurally read-only: its
-file-editing tools and `git commit`/`git push` are denied at the CLI level, so
-`is_read_only()` is a mechanical guarantee. A **reviewer**'s "never pushes" is
-*instruction-backed* — it holds the same write surface a worker does and is
-merely told not to use it, exactly as before #222. What the closed enum
+less than the phrase suggests. `Role::containment()` is the exact answer — a
+three-rung ladder (`Containment::None` / `NoEdits` / `ReadOnly`) selected by
+class, never by a repo file. A **planner** is structurally read-only: its
+file-editing tools *and* `git commit`/`git push` are denied at the CLI level, so
+`is_read_only()` is a mechanical guarantee. A **reviewer** (#462) has its
+file-editing tools denied too — but it keeps the shell, because running the tests
+is its job, so its "never pushes" (and "never writes a file *via a shell
+command*") stays *instruction-backed*. What the closed enum
 guarantees is that **a repo file cannot change which posture a block gets**; it
-does not claim every non-worker posture is a sandbox. `doc/design/orchestration.md`
-draws the same structural-vs-instruction-backed line, and this feature inherits
-it rather than tightening it.
+does not claim any posture is a sandbox. `doc/design/orchestration.md`
+("Reviewer containment: what is structural and what is not") draws the same
+line in full, and this feature inherits it rather than tightening it.
 
 ## Capability closure — the security argument
 
@@ -84,7 +87,7 @@ inert text or a choice from a value set loomux already ships:
 | `model` | name a model | `sanitize_model` — the pre-existing allowlist filter |
 | `prompt` | free text | inert; sanitized, then delivered as a persona **addendum**, never as a replacement for the loomux contract |
 | `profile` | name a repo file | confined to the repo (no `..`, no absolute path, no drive prefix) |
-| `allow` | add tool patterns | **banned outright on a read-only class** (see below); inert for the classes that already hold the write surface |
+| `allow` | add tool patterns | **banned outright on a read-only class** (see below); inert for the rest — deny beats allow on both CLIs, so it can never re-grant what a class's tier denies |
 | `id` | name the block | reserved: the four class names may only be used by their own class, so no block can hijack another's contract file |
 | *(on a `kind: orchestrator` block)* | pin `cli` / `model` only | `prompt:`/`profile:`/`allow:` are a **parse error** — the trust root is not a repo-writable surface (see below) |
 | — | grant write access | **no spelling exists.** No `read_only:`, no fifth class, no capability key of any kind |
@@ -148,7 +151,7 @@ file resolve through — so a `mode: replace` orchestrator persona cannot rewrit
 
 The other edge the same review found. A planner is read-only by **denying a fixed
 list** — Edit, Write, NotebookEdit, `git commit`, `git push`
-(`CLAUDE_READONLY_DENY_TOOLS`/`CLAUDE_READONLY_DENY_GIT`; see #448 — `MultiEdit`
+(`CLAUDE_EDIT_DENY_TOOLS`/`CLAUDE_READONLY_DENY_GIT`; see #448 — `MultiEdit`
 was dropped from that list because it matches no real Claude Code tool, and the
 list is now pinned in CI against the CLI's own documented tool set so a typo or
 a stale name breaks the build instead of silently widening what a planner may
@@ -161,9 +164,13 @@ Nobody can enumerate every write-capable program, so the rule runs the other way
 round: **a read-only block gets no allow patterns, from any source.** The parser
 rejects `allow:` on a read-only block (and says why); `persona_inject` drops any
 that arrive from a `.github/agents` persona's frontmatter or a hand-edited
-`group.json`, and audits the drop. For worker and reviewer — classes that already
-hold the write/shell surface structurally — `allow:` widens nothing, and is just
-an approval prompt the author has chosen to skip.
+`group.json`, and audits the drop. For worker and reviewer `allow:` widens
+nothing, and is just an approval prompt the author has chosen to skip: a worker
+holds the whole surface outright, and a reviewer keeps its shell by design (so an
+allow pattern names nothing it could not already run) while the editing tools
+#462 denies it cannot be re-granted anyway — deny beats allow on both CLIs. The
+ban stays keyed to the *fully* read-only class, where the argument above actually
+bites.
 
 ### Sanitization
 
