@@ -13359,8 +13359,14 @@ fn real_repo_worktree_fixture_leaves_nothing_in_temp_on_success() {
         let worker = agents.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap();
         let cwd = worker["cwd"].as_str().unwrap();
         assert!(Path::new(cwd).is_dir(), "sanity: the worktree must actually exist before teardown");
+        // Canonicalize before comparing: the OS temp dir is reachable through
+        // more than one spelling of the same path (macOS: `/var` is a symlink
+        // to `/private/var`; Windows CI: `%TEMP%` can resolve through an 8.3
+        // short name like `RUNNER~1` while the worktree's own cwd comes back
+        // long-form), and a raw `starts_with` on the un-resolved strings false-
+        // positives a leak that isn't there.
         assert!(
-            Path::new(cwd).starts_with(&root_path),
+            Path::new(cwd).canonicalize().unwrap().starts_with(root_path.canonicalize().unwrap()),
             "sanity: the cut worktree must live inside the fixture's own temp root, not beside it: {cwd} vs {}",
             root_path.display()
         );
