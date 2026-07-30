@@ -19,17 +19,23 @@
 //! action required.
 //!
 //! Everything in this module is a plain function over plain data — no
-//! registry, no `gh` — with ONE deliberate exception: `queue_is_non_empty`
-//! takes the live queue-map lock directly, because it is the single
-//! decision BOTH the front door and `deliver_now`'s pre-paste recheck must
-//! consult (rev-35 review, B1) — splitting it into "pure decision" plus
-//! "impure caller" would let the two checkpoints drift to different
-//! definitions of "this pane is already spoken for," which is exactly the
-//! class of bug it exists to prevent. See `notify.rs`'s module doc for why
-//! this codebase otherwise splits every backend feature this way (pure
-//! policy here, impure wiring in `mod.rs`) and `doc/design/orchestration.md`'s
-//! "Delivery queue (#445)" section for the full design rationale, including
-//! the honestly-argued limits of the in-memory choice.
+//! registry, no `gh`. Pre-#470, this module carried one deliberate
+//! exception (`queue_is_non_empty`, taking the live queue-map lock
+//! directly) because two SEPARATE checkpoints — the front door and
+//! `deliver_now`'s pre-paste recheck — both had to consult the identical
+//! live state or drift to different definitions of "this pane is already
+//! spoken for." #470 removes the exception by removing the SECOND
+//! checkpoint's reason to exist: every delivery is now admitted into the
+//! queue at arrival, in `mod.rs`'s `enqueue_text` (impure, as admission
+//! necessarily is — it mutates the live queue), and nothing downstream ever
+//! needs to re-ask "is someone else already ahead of me," because the
+//! queue's own front/back discipline makes that structurally impossible to
+//! answer wrong. See `notify.rs`'s module doc for why this codebase
+//! otherwise splits every backend feature this way (pure policy here,
+//! impure wiring in `mod.rs`) and `doc/design/orchestration.md`'s "Delivery
+//! queue (#445)" section — its "Ordering" subsection covers #470's redesign
+//! specifically — for the full design rationale, including the
+//! honestly-argued limits of the in-memory choice.
 //!
 //! **Scope, stated plainly (the persistence limitation):** this queue is
 //! in-memory only. A loomux restart during a blocked window loses whatever
@@ -43,9 +49,7 @@
 //! RECOVERABLE. Do not claim otherwise; a follow-up issue wires this
 //! function into something the orchestrator actually reads.
 
-use crate::obs::LockExt;
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::collections::VecDeque;
 use std::time::Duration;
 
 /// A pane blocked for hours accumulates reports/kickoffs from at most a
@@ -79,6 +83,16 @@ pub enum EnqueueReason {
     /// the front-door check: a fresh prompt must never overtake ones
     /// already waiting, or "here's context" / "now go" can invert.
     BehindQueue,
+    /// #470: this delivery landed ALONE at the front of an idle queue — the
+    /// front door's admission-time reason for the common, uncontended case
+    /// that's about to be attempted immediately, never itself notice-worthy
+    /// (nothing blocked it; see `queued_notice`'s doc for why this variant
+    /// never reaches that function). Distinct from `BehindQueue` purely for
+    /// audit-trail honesty: pre-#470, an entry this fast never touched the
+    /// queue at all, so its `delivery-queued` audit line would be
+    /// misleading if it claimed the SAME reason a genuinely-blocked
+    /// admission gets.
+    Arrival,
 }
 
 impl EnqueueReason {
@@ -87,6 +101,7 @@ impl EnqueueReason {
             EnqueueReason::BoxOccupied => "box-occupied",
             EnqueueReason::Question => "question",
             EnqueueReason::BehindQueue => "behind-queue",
+            EnqueueReason::Arrival => "arrival",
         }
     }
 }
@@ -193,30 +208,6 @@ pub fn admit(queue: &VecDeque<QueuedDelivery>, text: &str) -> AdmitDecision {
     AdmitDecision::Admit
 }
 
-/// Whether `pty_id`'s queue is non-empty right now — the ONE check both the
-/// front door (`deliver_prompt`, at a fresh delivery's arrival) and
-/// `deliver_now`'s pre-paste recheck (rev-35 review, B1) consult, so the two
-/// checkpoints can never silently drift to different definitions of "this
-/// pane is already spoken for."
-///
-/// **Why a SECOND check is required at all.** The front door alone only
-/// protects deliveries that ARRIVE after a queue already exists — it says
-/// nothing about a delivery already in flight (holding the pane's per-pty
-/// delivery mutex through its own pre-paste hold, `lock` in `deliver_now`)
-/// when the queue FORMS underneath it: an earlier-arriving delivery can
-/// time out its own hold, enqueue, and spawn a drainer while a
-/// later-arriving one is still blocked on the mutex or mid-hold, having
-/// already passed the front door back when the queue was still empty. Live
-/// evidence of exactly this shape is what the #445 review (rev-35) reported
-/// against the shipped PR: "now go" landing before "here's the context"
-/// because the second delivery never re-checked. Calling this again
-/// immediately before the paste closes that window; the residual gap
-/// between this call and the actual `write_bytes` is a few function calls,
-/// not a 60-120s hold.
-pub fn queue_is_non_empty(queues: &Mutex<HashMap<u32, VecDeque<QueuedDelivery>>>, pty_id: u32) -> bool {
-    queues.lock_safe().get(&pty_id).is_some_and(|q| !q.is_empty())
-}
-
 /// The synchronous, truthful error `deliver_prompt` returns when a pane's
 /// queue is already at cap — the common overflow case (the front-door check
 /// catches deliveries 2..N before this is ever consulted), and the one
@@ -229,20 +220,24 @@ pub fn queue_full_error(agent_id: &str, depth: usize, blocked_reason: &str) -> S
 }
 
 /// The `[loomux]` notice sent to the orchestrator the FIRST time a delivery
-/// enters the queue via a hold-cap expiry OR the rev-35 B1 pre-paste recheck
-/// (`BehindQueue` reaching here means the queue filled DURING this
-/// delivery's own hold — see `queue_is_non_empty`'s doc — which is
-/// notice-worthy exactly like the other two reasons; only the SILENT
-/// front-door append, at plain arrival with no hold at all, sends no notice
-/// of its own — that path never calls this function). Replaces the old
-/// "held: ... re-send when clear" wording — the #445 honesty fix: the
-/// payload is safe and WILL deliver on its own: a re-send now would just
-/// create a duplicate once the drain lands.
+/// genuinely becomes held: a fresh delivery's OWN pre-paste/pre-Enter hold
+/// (#111/#420) caps out (`BoxOccupied`/`Question` — `mod.rs`'s
+/// `run_queue_drainer` gates this to that entry's very first attempt only,
+/// never a later retry of the same entry). Never called with `BehindQueue`
+/// or `Arrival` — a delivery admitted behind an existing queue, or admitted
+/// alone and about to be attempted immediately, was never blocked by
+/// anything at the moment of admission, so there is nothing yet to
+/// announce; the eventual `flush_header_text` at drain time is what informs
+/// the recipient it was queued at all. Replaces the old "held: ... re-send
+/// when clear" wording — the #445 honesty fix: the payload is safe and WILL
+/// deliver on its own: a re-send now would just create a duplicate once the
+/// drain lands.
 pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
     let why = match reason {
         EnqueueReason::BoxOccupied => "pane has human input",
         EnqueueReason::Question => "an interactive question is on screen",
         EnqueueReason::BehindQueue => "another delivery to this pane was already queued",
+        EnqueueReason::Arrival => "just arrived",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
@@ -449,22 +444,6 @@ mod tests {
         assert_eq!(admit(&q, "distinct-0"), AdmitDecision::Coalesce);
     }
 
-    // ---------- queue_is_non_empty (rev-35 B1) ----------
-
-    #[test]
-    fn queue_is_non_empty_reads_true_only_while_something_is_actually_queued() {
-        let queues: Mutex<HashMap<u32, VecDeque<QueuedDelivery>>> = Mutex::new(HashMap::new());
-        assert!(!queue_is_non_empty(&queues, 42), "no map entry at all — must read empty");
-        queues.lock_safe().insert(42, VecDeque::new());
-        assert!(!queue_is_non_empty(&queues, 42), "an empty VecDeque — must still read empty");
-        queues.lock_safe().get_mut(&42).unwrap().push_back(text_entry(1, "hi"));
-        assert!(queue_is_non_empty(&queues, 42));
-        // A DIFFERENT pty's queue must never leak into this one's answer.
-        assert!(!queue_is_non_empty(&queues, 43), "an unrelated pty must read empty");
-        queues.lock_safe().get_mut(&42).unwrap().pop_front();
-        assert!(!queue_is_non_empty(&queues, 42), "draining back to empty must flip the answer back");
-    }
-
     // ---------- notice text ----------
 
     #[test]
@@ -599,6 +578,21 @@ mod tests {
 
 /// #445 rev-35 B1 — the ordering PROPERTY, exhaustively, not one scenario.
 ///
+/// **Superseded by #470 — kept as a historical record, not deleted.** This
+/// module models the algorithm `deliver_now`'s pre-paste recheck implemented:
+/// a raw per-pty mutex race for a fresh delivery, PLUS a live recheck right
+/// before pasting to defer to a queue that formed underneath it. Proven
+/// correct here for exactly 2 simultaneous contenders; the 3-contender
+/// residual this module ALSO proves (below) is exactly the defect #470's
+/// unified-admission redesign closes — see `unified_admission_property`
+/// (this file) for the model of what replaced this mechanism, and
+/// `doc/design/orchestration.md`'s Ordering subsection for the argument.
+/// Every test in this module still passes unmodified: they are pure math
+/// about an algorithm this PR stops running in production, not a live
+/// regression pin — keeping them intact is what lets `unified_admission_
+/// property`'s own mutation test point back at a REAL example of the
+/// class of bug being closed, instead of asserting it in the abstract.
+///
 /// The review's finding: `deliver_now` never re-checked the queue after its
 /// own hold, so a delivery already in flight (holding the pane's delivery
 /// mutex through a pre-paste hold) when another delivery timed out and
@@ -635,8 +629,9 @@ mod tests {
 /// independent of which of them arrived first. That is a DIFFERENT defect
 /// (mutex-acquisition fairness among simultaneous waiters, not a missing
 /// queue recheck) that a localized "recheck before paste" cannot fix — see
-/// `three_way_contention_can_still_invert_arrival_order_known_residual`,
-/// below, which documents it rather than silently dropping it. Restricting
+/// `pre_470_algorithm_three_way_contention_inverted_arrival_order`,
+/// below (renamed by #470 review B3 — see that test's own doc), which
+/// documents it rather than silently dropping it. Restricting
 /// THIS property's exhaustive search to 2 is what keeps it non-vacuous: an
 /// earlier draft ran it at 3 and found violations in the FIXED run too —
 /// not because the fix was wrong, but because the property as phrased
@@ -865,31 +860,606 @@ mod b1_ordering_property {
     }
 
     #[test]
-    fn three_way_contention_can_still_invert_arrival_order_known_residual() {
-        // NOT a regression to fix in this PR — a DISCOVERED, DOCUMENTED
-        // residual, reported rather than silently dropped (per the module
-        // doc's "Scope" section). With 3 simultaneous contenders, this
-        // exhaustive search finds an inversion even with the B1 recheck
-        // fully applied — not because the recheck is wrong (each individual
-        // delivery, once it holds the mutex, correctly defers to whatever
-        // is already queued), but because `std::sync::Mutex` can grant the
-        // freed mutex to EITHER of two simultaneous waiters regardless of
-        // which arrived first, and that choice alone can put the
-        // later-arriving one through its own hold-and-decide cycle first.
-        // Fixing this would mean replacing raw mutex contention with a real
-        // FIFO ticket for ACQUIRING the delivery mutex itself — a
-        // materially bigger change than "re-check the queue at the paste
-        // point," and specifically NOT what was asked for as a localized
-        // fix. This test exists so the gap stays visible (asserted, not
-        // merely mentioned in a comment that can rot) rather than silently
-        // reappearing as a surprise later.
+    fn pre_470_algorithm_three_way_contention_inverted_arrival_order() {
+        // #470 review (rev-31), B3: renamed from
+        // `three_way_contention_can_still_invert_arrival_order_known_residual`.
+        // That name was accurate the day it was written but became a
+        // claim-vs-reality hazard the moment #470 shipped a REPLACEMENT
+        // algorithm (`unified_admission_property`, this file) that closes
+        // this exact gap: a passing test whose name says an inversion "can
+        // still" happen, read by `cargo test` output, CI logs, or a grep
+        // for "residual" with no other context, states the bug is LIVE in
+        // current code. It is not — it describes the algorithm THIS PR
+        // REPLACED. The assertion body is intentionally unchanged (the
+        // model, and the defect it demonstrates, are still exactly as real
+        // as they were the day this was written — see the module doc's new
+        // "Superseded by #470" note above); only the name and this comment
+        // are updated so the claim travels correctly wherever the name
+        // alone is read.
+        //
+        // What this still proves, past tense: with 3 simultaneous
+        // contenders, this exhaustive search found an inversion even with
+        // the B1 recheck fully applied — not because the recheck was wrong
+        // (each individual delivery, once it held the mutex, correctly
+        // deferred to whatever was already queued), but because
+        // `std::sync::Mutex` could grant the freed mutex to EITHER of two
+        // simultaneous waiters regardless of which arrived first, and that
+        // choice alone could put the later-arriving one through its own
+        // hold-and-decide cycle first. This is the concrete, executable
+        // evidence that #470's redesign had a real defect to close — see
+        // `unified_admission_property::unified_admission_closes_ordering_
+        // at_three_contenders` (this file) for the SAME property, SAME
+        // contender count, now proven closed under the replacement
+        // algorithm.
         let violations =
             run_exhaustive_search(&['A', 'B', 'C'], |queue_non_empty_at_recheck| queue_non_empty_at_recheck);
         assert!(
             !violations.is_empty(),
-            "if this ever starts passing, the 3-way mutex-fairness gap has been closed somehow — \
-             replace this test with a proper property assertion at N=3 and say how it happened, \
-             rather than deleting the coverage"
+            "this test models the PRE-#470 algorithm (raced mutex + front-door bypass), which #470 \
+             replaced — it must keep finding this violation, since it exists to document that the \
+             replaced algorithm genuinely had one. If this ever starts passing, the model has \
+             drifted from the algorithm it's supposed to describe; fix the model, don't just delete \
+             the coverage"
         );
+    }
+}
+
+/// #470 — the ordering PROPERTY under UNIFIED ADMISSION, exhaustively.
+///
+/// This models `mod.rs`'s post-#470 design: `deliver_prompt`'s front door no
+/// longer has two separate admission paths (race a raw mutex when the queue
+/// looks empty; append directly when it doesn't) — EVERY delivery pushes to
+/// the BACK of the SAME queue, atomically with the check for whether the
+/// queue was empty (`enqueue_text`'s `was_first`). Whichever push observes
+/// an empty queue is the one that starts processing; every other push, no
+/// matter how it got here, is already correctly positioned behind whatever
+/// arrived first.
+///
+/// **Why this closes what a fair mutex alone does not (NB-A).** A reviewer
+/// of the original #470 filing proved that simply making the OLD per-pty
+/// mutex fair is insufficient: `b1_ordering_property`'s recheck-and-
+/// defer-to-TAIL mechanism loses a delivery's arrival position whenever a
+/// LATER arrival used the old front door's "queue already non-empty ->
+/// append directly" bypass — a path that never touched the mutex, fair or
+/// not, at all. This model has no such bypass to lose position to: there is
+/// exactly one admission function, and it is the SAME push whether the
+/// queue is empty or not. A delivery's position in `queue` is fixed the
+/// instant it's admitted and never changes until it's delivered — there is
+/// no "defer to tail" step left to model, because nothing can ever cut in
+/// front of an already-admitted entry.
+///
+/// **Why a hold-cap TIMEOUT needs no event of its own (unlike
+/// `b1_ordering_property`'s `HoldTimesOut`/`HoldClears` split).** Pre-#470,
+/// a timeout had to perform a state transition (enqueue the holder, THEN
+/// release the mutex to a waiter) because the timed-out delivery had no
+/// queue representation until that moment. Post-#470 it already has one —
+/// it's sitting at the front of `queue` from the moment it arrived — so a
+/// timeout changes nothing observable: the entry stays exactly where it
+/// is and the same thread simply tries again later. The only state-changing
+/// resolution left is delivering: popping the front and recording it, which
+/// this model represents as a single `processing`-gated event enabled
+/// whenever something is currently being attempted.
+///
+/// **The mutation knob.** `deliver_from_back` is this model's ONE toggle,
+/// in the same spirit as `b1_ordering_property`'s `defer_check`: `false` is
+/// the real #470 algorithm (always resolve the FRONT — genuine FIFO);
+/// `true` breaks the one line that makes admission order equal delivery
+/// order, popping the BACK instead, to prove the exhaustive search actually
+/// notices an inversion rather than passing vacuously. See
+/// `unified_admission_mutation_pop_from_back_finds_inversions`, below.
+#[cfg(test)]
+mod unified_admission_property {
+    use std::collections::{HashMap, VecDeque};
+
+    #[derive(Clone, Debug)]
+    struct SimState {
+        queue: VecDeque<char>,
+        processing: bool,
+        not_yet_arrived: Vec<char>,
+        arrived_at: HashMap<char, usize>,
+        delivered: Vec<char>,
+        step: usize,
+    }
+
+    /// Identical in spirit to `b1_ordering_property::check_terminal_state`:
+    /// every pair of contenders where one arrived strictly after the other
+    /// must deliver in that same order.
+    fn check_terminal_state(state: &SimState, violations: &mut Vec<String>) {
+        for (&x, &arrived_at_x) in &state.arrived_at {
+            for (&y, &arrived_at_y) in &state.arrived_at {
+                if x == y || arrived_at_y <= arrived_at_x {
+                    continue;
+                }
+                let px = state.delivered.iter().position(|&c| c == x);
+                let py = state.delivered.iter().position(|&c| c == y);
+                match (px, py) {
+                    (Some(px), Some(py)) if px > py => {
+                        violations.push(format!(
+                            "{x} arrived (step {arrived_at_x}) before {y} (step {arrived_at_y}), \
+                             but {y} was delivered before {x} — final order {:?}",
+                            state.delivered
+                        ));
+                    }
+                    (None, _) | (_, None) => violations.push(format!(
+                        "{x} or {y} never delivered — simulation bug, not a real finding: {state:?}"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn explore(state: SimState, deliver_from_back: bool, violations: &mut Vec<String>) {
+        let mut any_event = false;
+
+        // Event: a not-yet-arrived delivery arrives. #470: unconditionally
+        // pushed to the BACK — no more "queue empty -> race a mutex
+        // instead" branch. If nothing is currently being processed, this
+        // admission is what starts processing; in the real code that
+        // decision (`was_first`) is made ATOMICALLY under the same lock as
+        // the push, so modeling it as an immediate, deterministic
+        // transition (never a race between two "was_first" claimants) is
+        // faithful, not optimistic.
+        for i in 0..state.not_yet_arrived.len() {
+            any_event = true;
+            let mut s = state.clone();
+            let id = s.not_yet_arrived.remove(i);
+            s.step += 1;
+            s.arrived_at.insert(id, s.step);
+            s.queue.push_back(id);
+            if !s.processing {
+                s.processing = true;
+            }
+            explore(s, deliver_from_back, violations);
+        }
+
+        // Event: the currently-processing entry's attempt resolves by
+        // delivering. A hold-cap TIMEOUT is deliberately NOT a separate
+        // event here (see the module doc) — it changes nothing this model
+        // can observe, so omitting it loses no reachable state, only a
+        // self-loop.
+        if state.processing {
+            any_event = true;
+            let mut s = state.clone();
+            s.step += 1;
+            let id = if deliver_from_back { s.queue.pop_back() } else { s.queue.pop_front() }
+                .expect("`processing` is only ever true while `queue` is non-empty");
+            s.delivered.push(id);
+            s.processing = !s.queue.is_empty();
+            explore(s, deliver_from_back, violations);
+        }
+
+        if !any_event {
+            check_terminal_state(&state, violations);
+        }
+    }
+
+    fn run_exhaustive_search(ids: &[char], deliver_from_back: bool) -> Vec<String> {
+        let mut violations = Vec::new();
+        let initial = SimState {
+            queue: VecDeque::new(),
+            processing: false,
+            not_yet_arrived: ids.to_vec(),
+            arrived_at: HashMap::new(),
+            delivered: Vec::new(),
+            step: 0,
+        };
+        explore(initial, deliver_from_back, &mut violations);
+        violations
+    }
+
+    #[test]
+    fn unified_admission_closes_ordering_at_three_contenders() {
+        // Formerly proven OPEN by `b1_ordering_property::
+        // pre_470_algorithm_three_way_contention_inverted_arrival_order`
+        // (renamed by #470 review B3 from `..._can_still_invert_..._known_
+        // residual` — a passing test naming a residual THIS test proves
+        // closed was its own claim-vs-reality hazard; kept, unmodified
+        // otherwise — see that module's doc for why it still exists and
+        // still passes). This is the flip issue #470 asked for: the SAME
+        // property, at the SAME contender count that used to
+        // invert, now proven closed — not by widening the old recheck, but
+        // by removing the admission bypass that made widening it
+        // insufficient (NB-A).
+        let violations = run_exhaustive_search(&['A', 'B', 'C'], false);
+        assert!(
+            violations.is_empty(),
+            "unified admission produced {} ordering violation(s) at 3 contenders:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn unified_admission_closes_ordering_at_four_and_five_contenders() {
+        // #470 DoD: prove this at 3 AND 4+, not just re-run the old 3-only
+        // scope. Unlike `b1_ordering_property` (whose 2-contender ceiling
+        // was load-bearing — the property was provably unachievable past
+        // it under the old algorithm), unified admission has no such
+        // ceiling: FIFO-by-construction doesn't get harder at higher N.
+        for ids in [&['A', 'B', 'C', 'D'][..], &['A', 'B', 'C', 'D', 'E'][..]] {
+            let violations = run_exhaustive_search(ids, false);
+            assert!(
+                violations.is_empty(),
+                "unified admission produced {} ordering violation(s) at {} contenders:\n{}",
+                violations.len(),
+                ids.len(),
+                violations.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn unified_admission_mutation_pop_from_back_finds_inversions() {
+        // Mutation test, matching `b1_ordering_property::
+        // defer_check_disabled_finds_a_real_inversion_for_two_contenders`'s
+        // style: flip the ONE line that makes admission order equal
+        // delivery order (resolve the back instead of the front) and
+        // confirm the SAME exhaustive search, SAME property checker, finds
+        // real violations. If this ever started passing, the two `_closes_
+        // ordering_` tests above would be proven vacuous.
+        let violations = run_exhaustive_search(&['A', 'B', 'C'], true);
+        assert!(
+            !violations.is_empty(),
+            "popping from the BACK must reproduce a real inversion somewhere in the 3-contender \
+             search space — if it doesn't, the `_closes_ordering_` tests aren't actually testing \
+             anything"
+        );
+    }
+
+    /// #470 B1 (review round 1, rev-31) — drainer LIFECYCLE, exhaustively:
+    /// not just delivery ORDER (proven above), but whether every admitted
+    /// delivery is EVER claimed by a drainer at ALL.
+    ///
+    /// The ordering model above is faithful for ordering but silently
+    /// assumed a spawned drainer always gets around to every entry — true
+    /// enough for an ordering property (nothing can skip ahead of an
+    /// unclaimed entry) but false for LIVENESS, which review caught: a real
+    /// drainer that privately decides to exit (finds the queue empty) does
+    /// not deregister from `queue_draining` in that same instant — the
+    /// `DrainerGuard`'s `Drop` runs later, an unbounded OS-scheduling-width
+    /// window later, not a rare corner. A FRESH admission landing in that
+    /// window (`was_first: true`, sender already told `Ok`) calls
+    /// `ensure_drainer`, finds the pty still registered, and no-ops — the
+    /// drainer that registration refers to will never look again. The
+    /// delivery sits in the queue forever: not destroyed, but never
+    /// claimed either — exactly the "queued means safe" guarantee
+    /// #445/#451 exist to make structural, broken by the PR meant to
+    /// strengthen it.
+    ///
+    /// `OrchRegistry::commit_exit` (mod.rs) is round 1's fix: the "is the
+    /// queue empty" check and the `queue_draining` deregistration happen in
+    /// ONE critical section on `queues`, so there is no window between them
+    /// for an admission to land in. `atomic_exit` below models that fix
+    /// (mirroring `deliver_from_back`, above): `true` is `commit_exit` as
+    /// shipped; `false` reproduces the round-1 pre-fix split.
+    ///
+    /// **Round 2 (rev-37): this model itself had a gap.** It modeled
+    /// `commit_exit`'s atomicity but not the REAL `DrainerGuard`'s `Drop` —
+    /// an RAII cleanup that fires on every return REGARDLESS of whether
+    /// `commit_exit` already deregistered, because the guard has no way to
+    /// know that. The `atomic_exit: true` variant modeled a world where
+    /// commit is the ONLY deregistration, which is not the code as shipped
+    /// — the guard still ran afterward and (round-1-shipped) removed
+    /// `pty_id` UNCONDITIONALLY a second time, capable of erasing a
+    /// SUCCESSOR drainer's live registration (spawned in the window between
+    /// commit and the guard's drop) and running TWO drainers on the same
+    /// queue concurrently — the SAME entry pasted twice. A model that omits
+    /// a real event cannot exclude the bugs that event causes; this is why
+    /// the guard-drop event below is now UNCONDITIONAL (every drainer
+    /// instance eventually gets one, always) and `guard_checks_generation`
+    /// — not the event's mere presence — is the round-2 mutation knob.
+    ///
+    /// `OrchRegistry`'s actual fix (round 2): `queue_draining` became a
+    /// generation map (`pty_id -> u64`), not a bare membership set. Both
+    /// `commit_exit` and `DrainerGuard::drop` remove `pty_id` ONLY if the
+    /// CURRENTLY stored generation is still their own — so whichever of
+    /// them acts first performs the real removal and the other is
+    /// inherently a no-op, structurally, with no call site needing to
+    /// remember to "arm" or "disarm" anything.
+    mod drainer_lifecycle {
+        use std::collections::{HashMap, VecDeque};
+
+        /// One drainer thread's own lifecycle, tracked explicitly so
+        /// MULTIPLE instances can coexist in the model exactly as they can
+        /// (only when buggy) in reality — this is what lets the checker
+        /// observe "two drainers concurrently processing," the round-2
+        /// defect's direct symptom, rather than only its downstream
+        /// consequences.
+        #[derive(Clone, Debug)]
+        struct DrainerInstance {
+            generation: u64,
+            /// Whether this instance will still loop around and touch the
+            /// queue again (pop+deliver, or decide-to-exit).
+            processing: bool,
+            /// Only meaningful when `atomic_exit` is false: this instance
+            /// found the queue empty and stopped processing, but its
+            /// (still generation-checked) deregistration hasn't run yet —
+            /// a separate, later event.
+            commit_pending: bool,
+            /// Whether this instance's `DrainerGuard` has already dropped.
+            /// Once true this instance contributes no further events —
+            /// fully retired.
+            guard_dropped: bool,
+        }
+
+        #[derive(Clone, Debug)]
+        struct SimState {
+            queue: VecDeque<char>,
+            /// Mirrors `OrchRegistry::queue_draining`'s CURRENT value for
+            /// this pty: `None` if nothing registered, `Some(generation)`
+            /// if that generation currently holds it.
+            registered_gen: Option<u64>,
+            next_gen: u64,
+            /// Every drainer instance spawned so far that hasn't fully
+            /// retired (`guard_dropped`) yet. In the fully-fixed algorithm
+            /// this never exceeds length 1 at any point where more than
+            /// one entry is `processing` — proven, not assumed.
+            instances: Vec<DrainerInstance>,
+            not_yet_arrived: Vec<char>,
+            arrived_at: HashMap<char, usize>,
+            delivered: Vec<char>,
+            step: usize,
+        }
+
+        /// Ordering (same predicate as the enclosing module's) PLUS
+        /// liveness (nothing arrived may go undelivered — round 1) PLUS
+        /// uniqueness (nothing may be delivered MORE than once — round 2's
+        /// direct symptom, alongside the mid-execution concurrency check in
+        /// `explore`).
+        fn check_terminal_state(state: &SimState, violations: &mut Vec<String>) {
+            let mut ids: Vec<&char> = state.arrived_at.keys().collect();
+            ids.sort();
+            for &id in &ids {
+                let count = state.delivered.iter().filter(|&d| d == id).count();
+                if count == 0 {
+                    violations.push(format!(
+                        "{id} was admitted (arrived at step {}) but never delivered — STRANDED. \
+                         final: queue={:?} registered_gen={:?} delivered={:?}",
+                        state.arrived_at[id], state.queue, state.registered_gen, state.delivered
+                    ));
+                } else if count > 1 {
+                    violations.push(format!(
+                        "{id} was delivered {count} times — DUPLICATED. \
+                         final: queue={:?} registered_gen={:?} delivered={:?}",
+                        state.queue, state.registered_gen, state.delivered
+                    ));
+                }
+            }
+            for (&x, &arrived_at_x) in &state.arrived_at {
+                for (&y, &arrived_at_y) in &state.arrived_at {
+                    if x == y || arrived_at_y <= arrived_at_x {
+                        continue;
+                    }
+                    let px = state.delivered.iter().position(|&c| c == x);
+                    let py = state.delivered.iter().position(|&c| c == y);
+                    if let (Some(px), Some(py)) = (px, py) {
+                        if px > py {
+                            violations.push(format!(
+                                "{x} arrived (step {arrived_at_x}) before {y} (step {arrived_at_y}), \
+                                 but {y} was delivered before {x} — final order {:?}",
+                                state.delivered
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn explore(
+            state: SimState,
+            atomic_exit: bool,
+            guard_checks_generation: bool,
+            violations: &mut Vec<String>,
+        ) {
+            // Invariant check on EVERY visited state, not just terminal
+            // ones — mutual exclusion is a property of the WHOLE run, not
+            // just its end. This is rev-37's own signal ("drainers=2") made
+            // structural: two instances simultaneously `processing` is
+            // exactly what lets the same front entry be independently
+            // popped and delivered by each.
+            let concurrent: Vec<u64> =
+                state.instances.iter().filter(|i| i.processing).map(|i| i.generation).collect();
+            if concurrent.len() >= 2 {
+                violations.push(format!(
+                    "{} drainer instances (generations {concurrent:?}) concurrently processing the \
+                     same pty at step {} — MUTUAL EXCLUSION BROKEN. queue={:?} delivered={:?}",
+                    concurrent.len(), state.step, state.queue, state.delivered
+                ));
+            }
+
+            let mut any_event = false;
+
+            // Event: an arrival. Always pushes to the back — then, matching
+            // `deliver_prompt`'s real shape where EVERY admission attempts
+            // `ensure_drainer` (one owns it outright, the other
+            // best-effort), tries to claim the pty: succeeds only if
+            // nothing is currently registered, minting a fresh generation
+            // and spawning a NEW instance (mirrors `ensure_drainer` exactly
+            // — a fresh `u64` per successful claim, never reused).
+            for i in 0..state.not_yet_arrived.len() {
+                any_event = true;
+                let mut s = state.clone();
+                let id = s.not_yet_arrived.remove(i);
+                s.step += 1;
+                s.arrived_at.insert(id, s.step);
+                s.queue.push_back(id);
+                if s.registered_gen.is_none() {
+                    let gen = s.next_gen;
+                    s.next_gen += 1;
+                    s.registered_gen = Some(gen);
+                    s.instances.push(DrainerInstance {
+                        generation: gen,
+                        processing: true,
+                        commit_pending: false,
+                        guard_dropped: false,
+                    });
+                }
+                explore(s, atomic_exit, guard_checks_generation, violations);
+            }
+
+            // Event: a `processing` instance takes one step — pop+deliver
+            // if the queue is non-empty, or decide to exit if it's empty.
+            for idx in 0..state.instances.len() {
+                if !state.instances[idx].processing {
+                    continue;
+                }
+                any_event = true;
+                let mut s = state.clone();
+                s.step += 1;
+                if let Some(id) = s.queue.pop_front() {
+                    s.delivered.push(id);
+                } else {
+                    s.instances[idx].processing = false;
+                    if atomic_exit {
+                        // `commit_exit` as shipped: generation-checked
+                        // removal in the SAME step as deciding to exit.
+                        let gen = s.instances[idx].generation;
+                        if s.registered_gen == Some(gen) {
+                            s.registered_gen = None;
+                        }
+                    } else {
+                        // Round-1 pre-fix split: decided to stop, but the
+                        // (still generation-checked) removal is a
+                        // SEPARATE, later event — `CommitDeregisters`,
+                        // below.
+                        s.instances[idx].commit_pending = true;
+                    }
+                }
+                explore(s, atomic_exit, guard_checks_generation, violations);
+            }
+
+            // Event (`atomic_exit: false` only): the pending commit's
+            // deregistration finally runs, generation-checked exactly like
+            // the atomic case — only the TIMING relative to other events is
+            // what `atomic_exit` varies, never whether it's generation-safe.
+            for idx in 0..state.instances.len() {
+                if !state.instances[idx].commit_pending {
+                    continue;
+                }
+                any_event = true;
+                let mut s = state.clone();
+                s.step += 1;
+                let gen = s.instances[idx].generation;
+                if s.registered_gen == Some(gen) {
+                    s.registered_gen = None;
+                }
+                s.instances[idx].commit_pending = false;
+                explore(s, atomic_exit, guard_checks_generation, violations);
+            }
+
+            // Event: a no-longer-processing instance's `DrainerGuard`
+            // finally drops. UNCONDITIONAL — every instance gets exactly
+            // one of these, always, in both variants; this is the event
+            // round 1's model omitted (see the module doc's "Round 2"
+            // note). Requires `!commit_pending` because within ONE
+            // thread's own sequential execution, `commit_exit` fully
+            // returns before the function returns and the guard drops —
+            // only DIFFERENT instances' events may interleave freely.
+            for idx in 0..state.instances.len() {
+                let inst = &state.instances[idx];
+                if inst.processing || inst.commit_pending || inst.guard_dropped {
+                    continue;
+                }
+                any_event = true;
+                let mut s = state.clone();
+                s.step += 1;
+                let gen = s.instances[idx].generation;
+                if guard_checks_generation {
+                    // Round-2 fix: only remove if still this generation.
+                    if s.registered_gen == Some(gen) {
+                        s.registered_gen = None;
+                    }
+                } else {
+                    // Round-1-shipped bug: unconditional — erases
+                    // whatever is CURRENTLY registered, even a live
+                    // successor's.
+                    s.registered_gen = None;
+                }
+                s.instances[idx].guard_dropped = true;
+                explore(s, atomic_exit, guard_checks_generation, violations);
+            }
+
+            if !any_event {
+                check_terminal_state(&state, violations);
+            }
+        }
+
+        fn run_exhaustive_search(ids: &[char], atomic_exit: bool, guard_checks_generation: bool) -> Vec<String> {
+            let mut violations = Vec::new();
+            let initial = SimState {
+                queue: VecDeque::new(),
+                registered_gen: None,
+                next_gen: 1,
+                instances: Vec::new(),
+                not_yet_arrived: ids.to_vec(),
+                arrived_at: HashMap::new(),
+                delivered: Vec::new(),
+                step: 0,
+            };
+            explore(initial, atomic_exit, guard_checks_generation, &mut violations);
+            violations
+        }
+
+        #[test]
+        fn fully_fixed_leaves_no_delivery_unclaimed_or_duplicated_across_any_reachable_interleaving() {
+            // `atomic_exit: true, guard_checks_generation: true` — the code
+            // as shipped after BOTH review rounds.
+            for ids in [&['A', 'B'][..], &['A', 'B', 'C'][..]] {
+                let violations = run_exhaustive_search(ids, true, true);
+                assert!(
+                    violations.is_empty(),
+                    "the fully-fixed algorithm produced {} violation(s) at {} contenders:\n{}",
+                    violations.len(),
+                    ids.len(),
+                    violations.join("\n")
+                );
+            }
+        }
+
+        #[test]
+        fn non_atomic_commit_still_reproduces_the_round_1_lost_wakeup() {
+            // Round-1 regression guard (review round 2's explicit ask):
+            // with the round-2 fix ON (`guard_checks_generation: true`) but
+            // `commit_exit`'s OWN atomicity broken, the search must STILL
+            // find round 1's STRANDED bug — proving this restructured,
+            // more-faithful model didn't accidentally weaken what round 1
+            // already proved.
+            let violations = run_exhaustive_search(&['A', 'B'], false, true);
+            assert!(
+                !violations.is_empty(),
+                "reproducing the round-1 pre-fix non-atomic commit must find a stranded delivery \
+                 somewhere in the 2-contender search space — if it doesn't, the fully-fixed test \
+                 isn't actually testing round 1's property anymore"
+            );
+            assert!(
+                violations.iter().any(|v| v.contains("STRANDED")),
+                "expected a STRANDED-delivery violation specifically, got: {violations:?}"
+            );
+        }
+
+        #[test]
+        fn unconditional_guard_removal_reproduces_the_round_2_double_drain() {
+            // Mutation test (rev-37's ask): reintroduce the round-2 bug
+            // exactly as shipped after round 1 — `commit_exit` atomic and
+            // correct (`atomic_exit: true`), but the guard's OWN removal
+            // unconditional rather than generation-checked
+            // (`guard_checks_generation: false`) — and confirm THIS
+            // checker catches it. If this ever started passing,
+            // `fully_fixed_...` above would be proven vacuous for the
+            // round-2 dimension specifically.
+            let violations = run_exhaustive_search(&['A', 'B', 'C'], true, false);
+            assert!(
+                !violations.is_empty(),
+                "an unconditional guard removal must reproduce a concurrent-drainer or duplicate- \
+                 delivery violation somewhere in the 3-contender search space — if it doesn't, the \
+                 fully-fixed test isn't actually testing the round-2 fix"
+            );
+            assert!(
+                violations.iter().any(|v| v.contains("MUTUAL EXCLUSION BROKEN") || v.contains("DUPLICATED")),
+                "expected a mutual-exclusion or duplicate-delivery violation specifically, got: \
+                 {violations:?}"
+            );
+        }
     }
 }

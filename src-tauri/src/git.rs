@@ -1240,19 +1240,58 @@ mod tests {
         );
     }
 
+    /// A test repo fixture, nested one level under its own private temp root
+    /// (`<root>/repo`), not AT the root itself.
+    ///
+    /// #464: `git_worktree_add` cuts a worktree to a directory SIBLING to
+    /// the repo (`<repo's-parent>/<repo-name>-worktrees/<name>`), never
+    /// inside it — see `git_worktree_add`'s own doc. A bare `tempfile::
+    /// tempdir()` used directly as the repo root (the pre-fix shape here)
+    /// put that sibling directly under `%TEMP%`, outside the `TempDir`'s
+    /// own cleanup scope: every one of THIS module's own tests that called
+    /// `git_worktree_add` leaked it, whether the worktree it created
+    /// survived to the end of the test or was removed by `git_worktree_
+    /// add`'s own #227 failure-path cleanup (which only ever removes the
+    /// LEAF directory it created — a slash in the worktree name, e.g.
+    /// `agent/x`, makes git create an INTERMEDIATE directory as part of the
+    /// nested path, and nothing removes that once its only child is gone).
+    /// This exact leak shape — found only by the whole-suite CI check
+    /// `.github/workflows/ci.yml` added in #464, after two rounds of
+    /// per-file, per-fixture manual review both missed it — accounted for 4
+    /// of 5 residual `%TEMP%` survivors that check caught: `tests/*.rs`
+    /// (the integration-test fixtures) was audited directly; this crate's
+    /// OWN `#[cfg(test)]` unit tests, compiled into the very same `cargo
+    /// test` run, were not.
+    ///
+    /// Nesting means the sibling worktree directory (full or empty) stays
+    /// inside `_root`, reclaimed by `Drop` — success, assertion failure, or
+    /// panic alike — regardless of what `git_worktree_add`'s own cleanup
+    /// does or doesn't reach.
+    struct TestRepo {
+        _root: tempfile::TempDir,
+        repo: PathBuf,
+    }
+
+    impl TestRepo {
+        fn path(&self) -> &Path {
+            &self.repo
+        }
+    }
+
     /// Fresh work repo on branch `main` with a deterministic identity and no
     /// line-ending rewriting (so content round-trips byte-for-byte on Windows).
-    fn new_repo() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        setup_git(d, &["init", "-q"]);
+    fn new_repo() -> TestRepo {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        setup_git(&repo, &["init", "-q"]);
         // Point the unborn HEAD at `main` regardless of git version / config.
-        setup_git(d, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-        setup_git(d, &["config", "user.name", "Test"]);
-        setup_git(d, &["config", "user.email", "test@example.com"]);
-        setup_git(d, &["config", "commit.gpgsign", "false"]);
-        setup_git(d, &["config", "core.autocrlf", "false"]);
-        dir
+        setup_git(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        setup_git(&repo, &["config", "user.name", "Test"]);
+        setup_git(&repo, &["config", "user.email", "test@example.com"]);
+        setup_git(&repo, &["config", "commit.gpgsign", "false"]);
+        setup_git(&repo, &["config", "core.autocrlf", "false"]);
+        TestRepo { _root: root, repo }
     }
 
     /// Write `file`, commit it, and return the new HEAD hash.

@@ -959,3 +959,191 @@ design-intake reply that scoped this PR:**
   every restore, never replayed — #442) or don't have a second instance yet
   to generalize from; widening the store ahead of a second real need would
   be speculative generality this PR doesn't have evidence for.
+
+### #479 — restore UX: click feedback, an unmistakable error state, and where the latency actually was
+
+Two complaints about the same screen: clicking **Resume group** on an
+orchestrator agent session had a visible lag with nothing on screen to show
+the click had registered, and the dormant-agent **Start** card ("no
+resumable session") was visually just another neutral dormant card — no
+more alarming-looking than "Resume group" waiting for a click, even though
+one of them means something is actually wrong.
+
+**Where the latency was — measured, not guessed.** `resume_recorded_session`
+(`orchestration/mod.rs`) looked up which group/role a session id belongs to
+by calling `session_roles()` unconditionally — a scan of **every** group
+ever created on this machine, live or long dead: each one's `group.json` and
+`tasks.json` read and parsed, plus its **full audit log** (`records_from_
+audit`) read and every line parsed, just to throw away every row but the one
+actually being resumed. The dormant-group Resume button always already knows
+which group it's resuming (`hint: (group_id, role)`, threaded through since
+#412) — that hint went unused for this lookup, so a resume click's latency
+scaled with the total history on the machine, not with the one group being
+restored. `session_role_in_group` (new, `orchestration/mod.rs`) reads and
+merges only the hinted group; a miss (a stale/wrong hint) falls through to
+the unchanged full scan.
+
+Measured in `resume_recorded_session_group_hint_avoids_scanning_every_
+other_group` (`tests/orchestration.rs`, 200 decoy groups × 300 audit lines
+each, red-before-green against the fast path disabled): **419ms → 42ms** on
+one dev machine, debug build. **Three caveats on this number, all raised by
+review and all real (correcting this doc's own first draft):**
+
+- **The test asserts a same-run relative comparison, not that specific
+  figure.** Its first version asserted a fixed `< 200ms` bound — which CI
+  itself then falsified at 211ms, on a build where the fast path was
+  otherwise genuinely working, simply because that runner was slower/
+  noisier than the dev machine the bound was picked against. Fixed bounds
+  against wall-clock time are exactly this fragile under CI hardware
+  variance. The assertion now compares the timed call against a bare
+  `session_roles()` baseline measured on the SAME run, immediately before
+  it: CI being N times slower scales both sides roughly together, so the
+  ratio (currently asserted at "under half the baseline," observed at
+  roughly 8-10x on a dev machine) stays meaningful even though neither
+  absolute number does.
+
+- **The axis measured is "many groups, each modest," not "few groups, one
+  huge."** This fast path still reads and parses the HINTED group's OWN full
+  audit log (`merged_records` → `records_from_audit`, both rotation
+  generations, bounded at ~16 MB by the 8 MB rotate cap) — it eliminates the
+  O(other groups) term, not the resumed group's own read. A machine with a
+  handful of long-lived groups and a near-cap audit log on the one being
+  resumed will not see anything like 42ms; it will see whatever that one
+  group's own parse costs, same as before this PR. What's actually fixed for
+  every machine, regardless of which axis it sits on: a resume click no
+  longer pays for groups it isn't touching.
+- **A correct hint is NOT proven equivalent to the full scan — it is a
+  different, and only usually-agreeing, tie-break.** When a session id has
+  an `agent-spawn` audit row in more than one group, this fast path resolves
+  to the HINTED group; the full scan's `.last()` resolves to whichever group
+  `fs::read_dir` happened to enumerate last (arbitrary iteration order, not
+  a considered choice either). The two can disagree. This is not
+  hypothetical: **#485** (found on this same batch's #481) is exactly this
+  shape — a delegate rejoined into the wrong group writes its `agent-spawn`
+  row into that group too, so the same session id now has a row in both. Do
+  not read this fast path as a proof of sameness; it's a deliberate,
+  arguably more defensible choice (the hinted group is the one the clicked
+  tab is actually bound to) that happens to coincide with the full scan
+  outside that corner. #485 closing it (a session can never legitimately
+  belong to two groups) is what would make the two provably agree always,
+  not this PR.
+
+CLI boot time itself (the other component the issue calls out) is not
+loomux's to remove or measure — never spawn a real agent CLI to benchmark it
+(CLAUDE.md hard constraint 3); the fix here is scoped to the part loomux
+actually controls.
+
+**Feedback and the error state are one component, not two.** `restorecard.ts`
+(new) is a small, DOM-free state machine — `idle --click--> pending`,
+`pending --fail--> error`, `error --click--> pending` (retry), `* --settle-->
+idle` — unit-tested in `test/restorecard.test.ts`. `main.ts`'s `dormantCard`
+wires it to the actual card DOM:
+
+- A click is acknowledged **immediately**: the button disables and a spinner
+  shows the instant `nextRestoreCardState` returns `pending`, before the
+  underlying `onClick` (which does the real work — session lookup, MCP mint,
+  PTY spawn, CLI boot) has resolved at all. A second click while pending is a
+  no-op (the transition table returns the SAME state object), generalizing
+  the #194 P4 MED-3 double-spawn guard past its original single call site.
+- A failure **always** lands on the error state — red accent, a warning
+  icon, a heading that says so (e.g. "Couldn't resume this group") — never a
+  spinner that quietly clears back to looking like an untouched card. The
+  diagnostic message (what `resumeDormantGroup`/`startFromDormant` actually
+  threw) rides into the card's body text unchanged — the #440 lesson
+  generalized: diagnostic detail is what makes a wrongly-unresumable session
+  diagnosable, so it's never traded away for a cleaner-looking card.
+- The dormant-agent **Start** card mounts directly in the error state
+  (`errorRestoreCardState`) — it doesn't need a failed click to discover it
+  has nothing to resume, it already knows that at render time. `resumeDormant
+  Group`'s call sites were also reclassified: "no binding to resume from" /
+  "nothing captured" redirect to the session browser and settle back to idle
+  (nothing wrong with *this* card, the human's focus just moved), but "this
+  group's orchestrator session has no saved conversation" and a thrown
+  `resumeOrchSession` failure now return `{ok: false, message}` and land on
+  the error state — that IS a "no resumable session" outcome for this card's
+  own action, not a redirect.
+
+Both halves share the same `RestoreCardResult` (`{ok: true} | {ok: false,
+message: string}`) return shape from every dormant-card `onClick`, including
+`startFromDormant`'s call site, which previously had **no** error handling
+at all (an uncaught rejection on a rare spawn failure) — now caught and
+surfaced through the same contract. **Narrowing an over-broad first draft of
+this sentence (review round):** this covers every `dormantCard` PRIMARY
+action (Resume group, Start); the separate #440 D2 "Resume last session"
+secondary button (`addDormantCardAction`) is a plain button outside this
+state machine entirely, unchanged by this PR — a failure there still falls
+back to the pre-#479 uncaught-rejection-reaches-the-global-banner behavior.
+Not a regression (that was already the status quo for it), but also not
+"surfaced the same way" as the primary action, and folding it into the same
+state machine — two buttons on one card, one pending/error visual — is a
+separate, non-trivial design question this PR doesn't take on.
+
+**Review round: two wiring gaps in the mechanism the paragraphs above
+describe, both closed.** The transition table itself (`restorecard.ts`) was
+green throughout because neither gap was reachable FROM the table — the
+table says "fail carries the message"; the wiring simply never called `fail`
+in these two cases, or called it into a dead node. Per CLAUDE.md, DOM wiring
+is hand-validated, not simulated in tests, so both had to be closed by
+construction:
+
+1. **`dormantCard`'s `opts.onClick().then(...)` had no rejection handler.**
+   A throw anywhere in `resumeDormantGroup` outside its two `resumeOrchSession`
+   try/catches (the grid traversal, `closePane` loop, `persistTabs`, `sessions.
+   toggle`) left the card at "pending" — spinner spinning, button disabled —
+   **forever**. This is the DoD's named anti-goal in as many words. Fixed by
+   moving the call itself behind `Promise.resolve().then(() => opts.onClick())`
+   (so even a synchronous throw from a future non-async `onClick` is covered)
+   and giving `.then` a second (rejection) handler that dispatches `fail` —
+   structural, not a discipline each `onClick` has to remember.
+2. **`startFromDormant` (`pane.ts`) removed the placeholder element BEFORE
+   awaiting `start()`.** A failure in the caller's OWN post-spawn wiring
+   (`remint.bind`, `onGridChanged`) — which happens strictly after that
+   await resolves — rendered its error card into an element already gone
+   from the document: invisible, and a regression against the pre-PR
+   behavior, where that same throw escaped as an uncaught rejection and hit
+   the visible global banner. Fixed by deferring the element's removal to a
+   `finally` around `start()`, while keeping the `isDormant`-flipping field
+   assignment (`this.dormantEl = null`) exactly where it was — widening
+   THAT window would let the #440 D2 background prefetch add a second action
+   button while a Start is still in flight, a race this fix must not trade
+   the other one for. `dormantCard`'s `render()` also grew a
+   `!wrap.isConnected` fallback to a toast, as a backstop for any FUTURE
+   teardown-then-fail ordering this same class of bug could reintroduce
+   elsewhere, not only these two named instances.
+
+**Enumeration of every path out of `pending`, done once rather than trusted
+to have been done** (the request behind fixing the class, not just the two
+named instances): `pending` is entered only via a click, and left only by
+`dormantCard`'s own `.then(onOk, onErr)` pair now that finding 1 is fixed —
+there is no third exit. That pair fires on exactly the three ways a Promise
+settles: resolves `{ok: true}` → `settle` → idle (card usually torn down by
+the caller's own success path first, which is fine — an idle render on an
+already-detached element is inert, not silent, because there was nothing
+left to report); resolves `{ok: false, message}` → `fail` → error, rendered
+into whatever `wrap.isConnected` says at that moment (visible card, or the
+toast fallback); rejects for ANY reason → `fail` → same as above. A
+synchronous throw from `onClick` before its first `await` is covered by the
+`Promise.resolve().then(...)` wrapping. That accounts for every path — the
+two the reviewer named were both instances of the THIRD bullet (a rejection)
+combined with either no handler (finding 1) or a detached target (finding
+2), not additional exits from the state machine itself.
+
+**A residual gap, stated rather than implied away:** the toast fallback is
+not a full substitute for the card — a toast carries no retry button, so a
+failure that reaches it doesn't hand the human an inline "try again" the way
+a still-visible error card does. Concretely, for the dormant-agent Start
+card: `pane.ts`'s ordering fix keeps the placeholder mounted through
+`this.start()` itself, but `main.ts`'s `onClick` still does `remint.bind` and
+`onGridChanged()` AFTER `await pane.startFromDormant(...)` returns — by
+which point `startFromDormant`'s own `finally` has already torn the
+placeholder down, since `start()` already settled. A throw from either of
+those two calls therefore still lands on the toast path, not the visible
+card. This is the residual case fix 2's ordering change does not itself
+close — fix 1's `!wrap.isConnected` fallback is what keeps it from being
+silent. Stated plainly rather than glossed: that toast fires only once
+`start()` itself has already resolved successfully, i.e. the pane is
+already LIVE (a real PTY is running) and what failed is bookkeeping after
+the fact — `onGridChanged` is `tabs.notifyLayoutChanged()`, not anything the
+pane's liveness depends on. So the "no inline retry" gap exists only on a
+path where there is nothing left to retry; it does not reach a genuinely
+stranded pane.

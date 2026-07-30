@@ -31,3 +31,18 @@ the other's WIP before noticing mid-operation and recovering it (#299, a live ne
 pure luck it was caught). Commit WIP to your own branch instead (a small commit you
 amend/reset/squash later). If you must stash, `git stash push -m "<your agent id>: ..."` and
 only ever `pop` an entry carrying your own marker.
+
+## A claim is a deliverable
+
+A comment, design note, audit label, or PR body stating something the code
+doesn't do is a defect, not a slip — it stops the next reader from checking.
+This pattern has recurred repeatedly on this repo: #461 catalogues seven
+instances from one session (e.g. an audit action labeling a failed delivery
+a success), and the batch that filed this entry produced another — PR #489
+offering a persona `allow:` opt-in as a regression's fix when it's actually
+blocked at *two* structural layers, the workflow parser and `persona_inject`'s
+#222 capability closure (#490) — an impossible mitigation reads as an answer
+and stops the search. This entry itself first shipped with a miscount and a
+one-layer version of that same claim, caught in review, not before. Delete a
+claim you can't point at code for, don't soften it; quote raw fetched text
+for CLI/API facts, never a paraphrase (#453).

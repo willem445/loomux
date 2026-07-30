@@ -60,6 +60,12 @@ pub fn run() {
             // Give the registry a handle to its own Arc so &self methods can
             // spawn background work (e.g. the copilot session watcher).
             reg.set_self_arc();
+            // #464: reclaim generated custom-agent files a group left behind
+            // in ~/.claude/agents or ~/.copilot/agents without ever reaching
+            // `end_group` (crash, kill -9, an orchestration-suite test run).
+            // One-shot and best-effort, like the rest of this setup block —
+            // see `sweep_orphaned_agent_files`'s doc for why this is safe.
+            reg.sweep_orphaned_agent_files();
             orchestration::start_idle_reaper(reg.clone());
             orchestration::start_watchdog(reg.clone());
             orchestration::start_attention(reg.clone());

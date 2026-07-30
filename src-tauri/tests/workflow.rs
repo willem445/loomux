@@ -26,19 +26,35 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Build a registry against `dir` with every test-only directory override
+/// applied — see `orchestration.rs`'s `relaunch_registry` (same rationale,
+/// duplicated because these are separate integration-test binaries): a
+/// second `OrchRegistry::new` built directly, without reapplying these
+/// overrides, falls through to the REAL `~/.claude/agents`/`~/.copilot/agents`
+/// on the next spawn (#464).
+fn relaunch_registry(dir: &Path) -> OrchRegistry {
+    let reg = OrchRegistry::new(dir.to_path_buf());
+    reg.set_port(45999); // fake port so config writing works
+    reg.set_claude_agents_dir_override(dir.join("claude-agents"));
+    reg.set_copilot_agents_dir_override(dir.join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.join("compacthook"));
+    reg.set_copilot_hooks_dir_override(dir.join("copilot-hooks"));
+    reg
+}
+
 fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
-    reg.set_port(45999); // fake port so config writing works
-    // #416/round-6: never let a test write a generated custom-agent file into
-    // the REAL `~/.claude/agents` or `~/.copilot/agents` — point both at this
-    // same disposable tree.
-    reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
-    reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
-    reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
-    reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
+    let reg = relaunch_registry(dir.path());
     (reg, dir)
 }
+
+// #464 B2: the raw-`OrchRegistry::new` guard used to live here too (one
+// `include_str!("workflow.rs")` copy per file). Replaced by a SINGLE
+// dynamic test in `tests/orchestration.rs` that reads every `tests/*.rs`
+// file from disk at runtime — a per-file `include_str!` copy could only
+// ever see its own file, so `tests/lessonsfile.rs` and `tests/prompts.rs`
+// (each with their own registry-construction helper) were never covered.
+// See that test's doc for the full rationale.
 
 /// Guardrails for a group that RUNS the repo's workflow file — i.e. the human
 /// turned the advanced orchestrator on (#222). Every test below that is about the
@@ -57,23 +73,41 @@ fn rails() -> Guardrails {
 
 /// A throwaway repo directory, optionally carrying a `.loomux/workflow.yml` and
 /// `.github/agents/*.md` persona files.
-struct Repo(tempfile::TempDir);
+///
+/// The repo lives one level BELOW its own private temp root (`<root>/repo`),
+/// not AT the root itself — see `orchestration.rs`'s `RealRepo` for why:
+/// `git_worktree_add` cuts a worktree to a directory SIBLING to the repo
+/// (`<repo's-parent>/<repo-name>-worktrees/<name>`), and a `git_init()`'d
+/// `Repo` here feeds `spawn_agent` MCP calls whose worktree defaults ON
+/// (#338/#359). Nested one level down, that sibling — and the `.git/
+/// worktrees/<name>` admin registration `git worktree add` writes inside the
+/// repo's own `.git` — both stay inside `_root`, so `_root`'s `Drop` (success,
+/// assertion failure, or panic unwind alike) reclaims the whole tree; a bare
+/// `tempfile::tempdir()` used directly as the repo root left the sibling
+/// outside that scope and leaked it on every passing test (#464).
+struct Repo {
+    _root: tempfile::TempDir,
+    repo: PathBuf,
+}
 
 impl Repo {
     fn new() -> Self {
-        Repo(tempfile::tempdir().unwrap())
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        Repo { _root: root, repo }
     }
     fn path(&self) -> String {
-        self.0.path().to_string_lossy().replace('\\', "/")
+        self.repo.to_string_lossy().replace('\\', "/")
     }
     fn workflow(self, yaml: &str) -> Self {
-        let dir = self.0.path().join(".loomux");
+        let dir = self.repo.join(".loomux");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("workflow.yml"), yaml).unwrap();
         self
     }
     fn agent_file(self, name: &str, body: &str) -> Self {
-        let dir = self.0.path().join(".github").join("agents");
+        let dir = self.repo.join(".github").join("agents");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(name), body).unwrap();
         self
@@ -85,7 +119,7 @@ impl Repo {
     fn git_init(self) -> Self {
         let git = |args: &[&str]| {
             let ok = std::process::Command::new("git")
-                .current_dir(self.0.path())
+                .current_dir(&self.repo)
                 .args(args)
                 .output()
                 .expect("git must be installed for this test");
@@ -94,7 +128,7 @@ impl Repo {
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
-        fs::write(self.0.path().join("f.txt"), "hi").unwrap();
+        fs::write(self.repo.join("f.txt"), "hi").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "init"]);
         self
@@ -1095,9 +1129,11 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
     expect(&cmd, &handle, "reviewer", "sonnet", "acceptEdits", "");
     let (cmd, handle) = line("planner", false);
     expect(
-        &cmd, &handle, "planner", "opus", "auto",
+        &cmd, &handle, "planner", "opus", "dontAsk",
         // #448: `MultiEdit` dropped from CLAUDE_READONLY_DENY_TOOLS — it
-        // matches no real Claude Code tool.
+        // matches no real Claude Code tool. #465: a read-only block runs
+        // `dontAsk` (pre-approved tools only), not `auto` — see
+        // `claude_effective_permission_mode`'s doc.
         " \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
           \"Bash(git commit *)\" \"Bash(git push *)\"",
     );
@@ -1480,7 +1516,7 @@ fn block_map_round_trips_through_group_json() {
     // ...and a fresh registry (an app restart) reads it back identically. Note
     // this reload does NOT re-read the repo — it is the persisted roster that
     // must round-trip.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
     assert_eq!(g2.id, g.id, "the restart resumes the same group");
@@ -1519,7 +1555,7 @@ fn role_hint_round_trips_through_group_json_too() {
     let advisor = blocks.iter().find(|b| b["id"] == "advisor").unwrap();
     assert_eq!(advisor["role_hint"], "advisor", "role_hint must be persisted, not dropped");
 
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
     assert_eq!(
@@ -1610,7 +1646,7 @@ fn a_pre_block_group_json_still_loads() {
     }
 
     // And the persisted cap still wins over the launcher default on a relaunch.
-    let reg2 = OrchRegistry::new(reg.state_root().to_path_buf());
+    let reg2 = relaunch_registry(&reg.state_root());
     reg2.set_port(45999);
     let g2 = reg2.create_group(&repo.path(), Guardrails { max_agents: 2, ..rails() }).unwrap();
     assert_eq!(g2.id, g.id);
@@ -5503,7 +5539,7 @@ fn intake_profile_round_trips_through_group_json() {
     // A fresh registry (an app restart) reads it back identically — the
     // persisted profile round-trips unchanged, same shape as
     // `block_map_round_trips_through_group_json`.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
     assert_eq!(g2.id, g.id, "the restart resumes the same group");

@@ -272,7 +272,16 @@ async function openAgentPane(
   // Orchestrator-driven spawns open in the background so they don't yank focus
   // from the pane the human is typing in (#117). Human-initiated paths (session
   // restore, launching an orchestrator) pass false to focus the new pane.
-  background: boolean
+  background: boolean,
+  // #478: when the human split an existing tab and picked "orchestrator" in
+  // that split's setup pane, `launchOrchestrator` passes that pane here so
+  // its launch converts it IN PLACE (same in-place-conversion pattern
+  // `startFromWelcome` already gives the other PTY-backed welcome-form kinds
+  // — terminal, agent) instead of opening a brand-new pane elsewhere in the
+  // grid. Undefined for every other spawn path (backend-driven delegate
+  // spawns, session-browser resume), which keeps opening a fresh pane as
+  // before.
+  existingPane?: Pane
 ): Promise<void> {
   const paneOpts = {
     name: req.name,
@@ -291,14 +300,28 @@ async function openAgentPane(
     background,
   };
   const dir = grid.paneCount >= 2 ? "column" : "row";
-  // The backend already decided this pane should open minimized (#260: a
-  // delegate role, group hasn't opted out) — `openPaneMinimized` lands it
-  // straight in the dock instead of a real tree slot, so it never renders a
-  // full-size frame before folding (#387) or resizes its PTY to a layout size
-  // the human never sees.
-  const pane = req.minimized
-    ? await grid.openPaneMinimized(paneOpts, paneEvents, dir)
-    : await grid.openPane(paneOpts, paneEvents, dir);
+  let pane: Pane;
+  if (existingPane) {
+    // #478: land THIS pane's launch in the setup pane the split gesture
+    // already placed, rather than computing a fresh slot from `dir` — the
+    // orchestrator's own pane is never minimized (`spawn_opens_minimized`,
+    // mod.rs), so `req.minimized` can't be true here and there's nothing to
+    // branch on. `startFromWelcome` is the same in-place-conversion primitive
+    // the terminal and agent welcome-form kinds already use for a PTY-backed
+    // pane (main.ts) — files/editor/git/workflow are a different, content-only
+    // kind and convert via `startContent` instead.
+    await existingPane.startFromWelcome(paneOpts);
+    pane = existingPane;
+  } else {
+    // The backend already decided this pane should open minimized (#260: a
+    // delegate role, group hasn't opted out) — `openPaneMinimized` lands it
+    // straight in the dock instead of a real tree slot, so it never renders a
+    // full-size frame before folding (#387) or resizes its PTY to a layout size
+    // the human never sees.
+    pane = req.minimized
+      ? await grid.openPaneMinimized(paneOpts, paneEvents, dir)
+      : await grid.openPane(paneOpts, paneEvents, dir);
+  }
   try {
     // A failed spawn (ptyId null) has no pty to bind; it times out backend-side.
     if (pane.ptyId === null) return;
@@ -746,11 +769,17 @@ export async function resumeOrchSession(
 
 /** Create/resume the group for `config.repo` and open its orchestrator
  *  pane. The backend spawns the initial idle workers (as spawn-request
- *  events) once the orchestrator binds. */
+ *  events) once the orchestrator binds.
+ *
+ *  `existingPane` (#478): pass the welcome/setup pane a split gesture placed,
+ *  to convert IT in place instead of opening a new pane elsewhere in `grid` —
+ *  see `openAgentPane`'s doc comment. Omitted (the no-split welcome/pane-setup
+ *  path) keeps the pre-#478 behavior of opening a fresh pane. */
 export async function launchOrchestrator(
   grid: Grid,
   paneEvents: PaneEvents,
-  config: OrchestratorConfig
+  config: OrchestratorConfig,
+  existingPane?: Pane
 ): Promise<{ groupId: string }> {
   const spec = await invoke<OrchSpawnRequest>("create_orchestration", {
     repo: config.repo,
@@ -786,7 +815,7 @@ export async function launchOrchestrator(
   // Human launched the orchestrator from the UI — focus its pane. Return the
   // group so the caller binds it to the tab (#63); the pane is located later by
   // scanning live panes (findByPty), so it isn't returned.
-  await openAgentPane(grid, paneEvents, spec, false);
+  await openAgentPane(grid, paneEvents, spec, false, existingPane);
   return { groupId: spec.group_id };
 }
 
