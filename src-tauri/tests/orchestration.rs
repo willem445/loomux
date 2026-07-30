@@ -13696,25 +13696,34 @@ fn spawn_worktree_fails_loudly_when_existing_branch_diverges_from_base() {
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
 
-    let repo = tempfile::tempdir().unwrap();
-    git(repo.path(), &["init", "-q"]);
-    git(repo.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    git(repo.path(), &["config", "user.email", "t@t"]);
-    git(repo.path(), &["config", "user.name", "t"]);
-    fs::write(repo.path().join("f.txt"), "root").unwrap();
-    git(repo.path(), &["add", "-A"]);
-    git(repo.path(), &["commit", "-qm", "root"]);
+    // #464 B1 (residual, found by the whole-suite CI leak check this PR
+    // adds): a bare `tempfile::tempdir()` repo root leaked an EMPTY
+    // intermediate `<repo>-worktrees/stacked/` directory even though
+    // `git_worktree_add`'s own #227 failure path correctly removes the LEAF
+    // worktree it creates (`stacked/leftover`) — a slash in a branch name
+    // makes git create the INTERMEDIATE directory as part of the nested
+    // worktree path, and nothing ever removes that once its only child is
+    // gone. `real_repo()` (nested under its own private temp root) makes
+    // this moot: the empty intermediate dies with the fixture regardless of
+    // which directories `git_worktree_add`'s own cleanup does or doesn't
+    // reach — exactly the same reasoning as the other two B1 fixes.
+    let repo = real_repo();
 
-    // The desired base: a feature branch with its own commit.
+    // The desired base: a feature branch with its own commit, stacked on
+    // `real_repo()`'s own initial commit. Whatever `real_repo()`'s default
+    // branch happens to be named is irrelevant here — this test's
+    // assertions never check that name, only that a named branch exists to
+    // `checkout -` back to.
     git(repo.path(), &["checkout", "-q", "-b", "feat/base"]);
     fs::write(repo.path().join("feat.txt"), "feat").unwrap();
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "feature work"]);
-    git(repo.path(), &["checkout", "-q", "main"]);
+    git(repo.path(), &["checkout", "-q", "-"]);
 
     // A stale leftover branch sharing the name a new spawn will request —
-    // cut from main, never touching feat/base.
-    git(repo.path(), &["branch", "stacked/leftover", "main"]);
+    // cut from the default branch (current HEAD after the checkout above),
+    // never touching feat/base.
+    git(repo.path(), &["branch", "stacked/leftover"]);
 
     let repo_path = repo.path().to_string_lossy().replace('\\', "/");
     let (reg, _d) = test_registry();
