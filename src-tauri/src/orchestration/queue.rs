@@ -629,8 +629,9 @@ mod tests {
 /// independent of which of them arrived first. That is a DIFFERENT defect
 /// (mutex-acquisition fairness among simultaneous waiters, not a missing
 /// queue recheck) that a localized "recheck before paste" cannot fix — see
-/// `three_way_contention_can_still_invert_arrival_order_known_residual`,
-/// below, which documents it rather than silently dropping it. Restricting
+/// `pre_470_algorithm_three_way_contention_inverted_arrival_order`,
+/// below (renamed by #470 review B3 — see that test's own doc), which
+/// documents it rather than silently dropping it. Restricting
 /// THIS property's exhaustive search to 2 is what keeps it non-vacuous: an
 /// earlier draft ran it at 3 and found violations in the FIXED run too —
 /// not because the fix was wrong, but because the property as phrased
@@ -859,31 +860,46 @@ mod b1_ordering_property {
     }
 
     #[test]
-    fn three_way_contention_can_still_invert_arrival_order_known_residual() {
-        // NOT a regression to fix in this PR — a DISCOVERED, DOCUMENTED
-        // residual, reported rather than silently dropped (per the module
-        // doc's "Scope" section). With 3 simultaneous contenders, this
-        // exhaustive search finds an inversion even with the B1 recheck
-        // fully applied — not because the recheck is wrong (each individual
-        // delivery, once it holds the mutex, correctly defers to whatever
-        // is already queued), but because `std::sync::Mutex` can grant the
-        // freed mutex to EITHER of two simultaneous waiters regardless of
-        // which arrived first, and that choice alone can put the
-        // later-arriving one through its own hold-and-decide cycle first.
-        // Fixing this would mean replacing raw mutex contention with a real
-        // FIFO ticket for ACQUIRING the delivery mutex itself — a
-        // materially bigger change than "re-check the queue at the paste
-        // point," and specifically NOT what was asked for as a localized
-        // fix. This test exists so the gap stays visible (asserted, not
-        // merely mentioned in a comment that can rot) rather than silently
-        // reappearing as a surprise later.
+    fn pre_470_algorithm_three_way_contention_inverted_arrival_order() {
+        // #470 review (rev-31), B3: renamed from
+        // `three_way_contention_can_still_invert_arrival_order_known_residual`.
+        // That name was accurate the day it was written but became a
+        // claim-vs-reality hazard the moment #470 shipped a REPLACEMENT
+        // algorithm (`unified_admission_property`, this file) that closes
+        // this exact gap: a passing test whose name says an inversion "can
+        // still" happen, read by `cargo test` output, CI logs, or a grep
+        // for "residual" with no other context, states the bug is LIVE in
+        // current code. It is not — it describes the algorithm THIS PR
+        // REPLACED. The assertion body is intentionally unchanged (the
+        // model, and the defect it demonstrates, are still exactly as real
+        // as they were the day this was written — see the module doc's new
+        // "Superseded by #470" note above); only the name and this comment
+        // are updated so the claim travels correctly wherever the name
+        // alone is read.
+        //
+        // What this still proves, past tense: with 3 simultaneous
+        // contenders, this exhaustive search found an inversion even with
+        // the B1 recheck fully applied — not because the recheck was wrong
+        // (each individual delivery, once it held the mutex, correctly
+        // deferred to whatever was already queued), but because
+        // `std::sync::Mutex` could grant the freed mutex to EITHER of two
+        // simultaneous waiters regardless of which arrived first, and that
+        // choice alone could put the later-arriving one through its own
+        // hold-and-decide cycle first. This is the concrete, executable
+        // evidence that #470's redesign had a real defect to close — see
+        // `unified_admission_property::unified_admission_closes_ordering_
+        // at_three_contenders` (this file) for the SAME property, SAME
+        // contender count, now proven closed under the replacement
+        // algorithm.
         let violations =
             run_exhaustive_search(&['A', 'B', 'C'], |queue_non_empty_at_recheck| queue_non_empty_at_recheck);
         assert!(
             !violations.is_empty(),
-            "if this ever starts passing, the 3-way mutex-fairness gap has been closed somehow — \
-             replace this test with a proper property assertion at N=3 and say how it happened, \
-             rather than deleting the coverage"
+            "this test models the PRE-#470 algorithm (raced mutex + front-door bypass), which #470 \
+             replaced — it must keep finding this violation, since it exists to document that the \
+             replaced algorithm genuinely had one. If this ever starts passing, the model has \
+             drifted from the algorithm it's supposed to describe; fix the model, don't just delete \
+             the coverage"
         );
     }
 }
@@ -1035,10 +1051,13 @@ mod unified_admission_property {
     #[test]
     fn unified_admission_closes_ordering_at_three_contenders() {
         // Formerly proven OPEN by `b1_ordering_property::
-        // three_way_contention_can_still_invert_arrival_order_known_residual`
-        // (kept, unmodified — see that module's doc for why it still
-        // exists and still passes). This is the flip issue #470 asked for:
-        // the SAME property, at the SAME contender count that used to
+        // pre_470_algorithm_three_way_contention_inverted_arrival_order`
+        // (renamed by #470 review B3 from `..._can_still_invert_..._known_
+        // residual` — a passing test naming a residual THIS test proves
+        // closed was its own claim-vs-reality hazard; kept, unmodified
+        // otherwise — see that module's doc for why it still exists and
+        // still passes). This is the flip issue #470 asked for: the SAME
+        // property, at the SAME contender count that used to
         // invert, now proven closed — not by widening the old recheck, but
         // by removing the admission bypass that made widening it
         // insufficient (NB-A).
@@ -1086,5 +1105,206 @@ mod unified_admission_property {
              search space — if it doesn't, the `_closes_ordering_` tests aren't actually testing \
              anything"
         );
+    }
+
+    /// #470 B1 (review round 1, rev-31) — drainer LIFECYCLE, exhaustively:
+    /// not just delivery ORDER (proven above), but whether every admitted
+    /// delivery is EVER claimed by a drainer at ALL.
+    ///
+    /// The ordering model above is faithful for ordering but silently
+    /// assumed a spawned drainer always gets around to every entry — true
+    /// enough for an ordering property (nothing can skip ahead of an
+    /// unclaimed entry) but false for LIVENESS, which review caught: a real
+    /// drainer that privately decides to exit (finds the queue empty) does
+    /// not deregister from `queue_draining` in that same instant — the
+    /// `DrainerGuard`'s `Drop` runs later, an unbounded OS-scheduling-width
+    /// window later, not a rare corner. A FRESH admission landing in that
+    /// window (`was_first: true`, sender already told `Ok`) calls
+    /// `ensure_drainer`, finds the pty still registered, and no-ops — the
+    /// drainer that registration refers to will never look again. The
+    /// delivery sits in the queue forever: not destroyed, but never
+    /// claimed either — exactly the "queued means safe" guarantee
+    /// #445/#451 exist to make structural, broken by the PR meant to
+    /// strengthen it.
+    ///
+    /// `OrchRegistry::commit_exit` (mod.rs) is the fix: the "is the queue
+    /// empty" check and the `queue_draining` deregistration happen in ONE
+    /// critical section on `queues`, so there is no window between them for
+    /// an admission to land in. `atomic_exit` below is that fix modeled as
+    /// this module's mutation knob (mirroring `deliver_from_back`, above):
+    /// `true` collapses "decide to exit" and "deregister" into one step;
+    /// `false` reproduces the pre-fix split, to prove this checker actually
+    /// catches the lost wakeup rather than passing vacuously.
+    mod drainer_lifecycle {
+        use std::collections::{HashMap, VecDeque};
+
+        #[derive(Clone, Debug)]
+        struct SimState {
+            queue: VecDeque<char>,
+            /// Mirrors `OrchRegistry::queue_draining`'s membership for this
+            /// pty — whether `ensure_drainer`'s idempotent insert would
+            /// fail (the next arrival's spawn attempt becomes a no-op).
+            registered: bool,
+            /// Whether a running drainer thread will still loop around and
+            /// touch the queue again. Can be `false` while `registered` is
+            /// still `true` ONLY in the buggy (`atomic_exit: false`)
+            /// variant — that gap IS the bug.
+            processing: bool,
+            not_yet_arrived: Vec<char>,
+            arrived_at: HashMap<char, usize>,
+            delivered: Vec<char>,
+            step: usize,
+        }
+
+        /// Ordering (same predicate as the enclosing module's, restated
+        /// here since this `SimState` carries extra lifecycle fields the
+        /// ordering check doesn't need) PLUS liveness: nothing that arrived
+        /// may still be sitting unclaimed with no way left to ever claim
+        /// it.
+        fn check_terminal_state(state: &SimState, violations: &mut Vec<String>) {
+            let mut ids: Vec<&char> = state.arrived_at.keys().collect();
+            ids.sort();
+            for &id in &ids {
+                if !state.delivered.contains(id) {
+                    violations.push(format!(
+                        "{id} was admitted (arrived at step {}) but never delivered — STRANDED. \
+                         final state: queue={:?} registered={} processing={} delivered={:?}",
+                        state.arrived_at[id], state.queue, state.registered, state.processing,
+                        state.delivered
+                    ));
+                }
+            }
+            for (&x, &arrived_at_x) in &state.arrived_at {
+                for (&y, &arrived_at_y) in &state.arrived_at {
+                    if x == y || arrived_at_y <= arrived_at_x {
+                        continue;
+                    }
+                    let px = state.delivered.iter().position(|&c| c == x);
+                    let py = state.delivered.iter().position(|&c| c == y);
+                    if let (Some(px), Some(py)) = (px, py) {
+                        if px > py {
+                            violations.push(format!(
+                                "{x} arrived (step {arrived_at_x}) before {y} (step {arrived_at_y}), \
+                                 but {y} was delivered before {x} — final order {:?}",
+                                state.delivered
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn explore(state: SimState, atomic_exit: bool, violations: &mut Vec<String>) {
+            let mut any_event = false;
+
+            // Event: an arrival. Always pushes to the back — then, matching
+            // `deliver_prompt`'s real shape where EVERY admission (whether
+            // `was_first` or landing behind something) attempts
+            // `ensure_drainer` (one owns it outright, the other
+            // best-effort), tries to (re)claim processing: succeeds only if
+            // nothing is currently registered.
+            for i in 0..state.not_yet_arrived.len() {
+                any_event = true;
+                let mut s = state.clone();
+                let id = s.not_yet_arrived.remove(i);
+                s.step += 1;
+                s.arrived_at.insert(id, s.step);
+                s.queue.push_back(id);
+                if !s.registered {
+                    s.registered = true;
+                    s.processing = true;
+                }
+                explore(s, atomic_exit, violations);
+            }
+
+            // Event: the active drainer takes one step — pop+deliver if
+            // the queue is non-empty, or decide to exit if it's empty.
+            if state.processing {
+                any_event = true;
+                let mut s = state.clone();
+                s.step += 1;
+                if let Some(id) = s.queue.pop_front() {
+                    s.delivered.push(id);
+                } else if atomic_exit {
+                    // #470 B1 fix: one atomic step — `commit_exit` holds
+                    // `queues`'s lock across both.
+                    s.processing = false;
+                    s.registered = false;
+                } else {
+                    // Pre-fix bug: decided to stop, but the guard hasn't
+                    // dropped yet — `registered` stays true for now.
+                    s.processing = false;
+                }
+                explore(s, atomic_exit, violations);
+            }
+
+            // Event (reachable ONLY in the buggy variant): the
+            // `DrainerGuard` finally drops, some arbitrary time after the
+            // drainer privately decided to exit. The fixed algorithm never
+            // reaches a state where this is enabled (`processing` and
+            // `registered` always flip together), so this event is
+            // structurally absent from the `atomic_exit: true` search —
+            // not merely unexercised.
+            if !state.processing && state.registered {
+                any_event = true;
+                let mut s = state.clone();
+                s.step += 1;
+                s.registered = false;
+                explore(s, atomic_exit, violations);
+            }
+
+            if !any_event {
+                check_terminal_state(&state, violations);
+            }
+        }
+
+        fn run_exhaustive_search(ids: &[char], atomic_exit: bool) -> Vec<String> {
+            let mut violations = Vec::new();
+            let initial = SimState {
+                queue: VecDeque::new(),
+                registered: false,
+                processing: false,
+                not_yet_arrived: ids.to_vec(),
+                arrived_at: HashMap::new(),
+                delivered: Vec::new(),
+                step: 0,
+            };
+            explore(initial, atomic_exit, &mut violations);
+            violations
+        }
+
+        #[test]
+        fn atomic_exit_leaves_no_delivery_unclaimed_across_any_reachable_interleaving() {
+            for ids in [&['A', 'B'][..], &['A', 'B', 'C'][..]] {
+                let violations = run_exhaustive_search(ids, true);
+                assert!(
+                    violations.is_empty(),
+                    "the #470 B1 fix (atomic exit) produced {} violation(s) at {} contenders:\n{}",
+                    violations.len(),
+                    ids.len(),
+                    violations.join("\n")
+                );
+            }
+        }
+
+        #[test]
+        fn non_atomic_exit_reproduces_the_lost_wakeup() {
+            // Mutation test (rev-31's ask): reintroduce the pre-fix bug
+            // (split the exit decision from the deregistration) and
+            // confirm THIS checker actually catches it — if this ever
+            // started passing, `atomic_exit_leaves_no_delivery_unclaimed_
+            // ...` above would be proven vacuous.
+            let violations = run_exhaustive_search(&['A', 'B'], false);
+            assert!(
+                !violations.is_empty(),
+                "reproducing the pre-#470-B1 non-atomic exit must find a stranded delivery \
+                 somewhere in the 2-contender search space — if it doesn't, the atomic-exit test \
+                 isn't actually testing anything"
+            );
+            assert!(
+                violations.iter().any(|v| v.contains("STRANDED")),
+                "expected a STRANDED-delivery violation specifically, got: {violations:?}"
+            );
+        }
     }
 }

@@ -1108,6 +1108,31 @@ fn enqueue_text_preserves_fifo_order_across_mixed_senders() {
 }
 
 #[test]
+fn enqueue_text_was_first_is_true_only_for_the_admission_that_finds_an_empty_queue() {
+    // #470 review N2: pin `AdmitOutcome::was_first` directly by name —
+    // it's the ONE fact `deliver_prompt`'s front door hangs the whole
+    // unified-admission fix on (whoever observes an empty queue owns
+    // spawning the drainer; everyone else best-effort nudges an existing
+    // one). Previously only pinned indirectly through front-door tests.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 112u32;
+
+    let first = reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    assert!(first.was_first, "the first admission to an empty queue must observe was_first: true");
+
+    let second = reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::Arrival).unwrap();
+    assert!(!second.was_first, "landing behind an existing entry must never report was_first: true");
+    assert!(second.id > first.id, "ids still increase monotonically regardless of was_first");
+
+    let coalesced = reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    assert!(!coalesced.was_first, "a coalesce match must never report was_first: true");
+    assert_eq!(coalesced.id, first.id, "a coalesce reports the id of the entry it merged into");
+    assert_eq!(reg.queue_depth(pty), 2, "the coalesced duplicate must not grow the queue");
+}
+
+#[test]
 fn enqueue_text_rejects_newest_at_cap_never_evicts_oldest() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();

@@ -8322,9 +8322,13 @@ fn run_queue_drainer(
             std::thread::sleep(queue::QUEUE_DRAIN_POLL);
         }
 
-        // Pty closed: nothing left to drain to.
+        // Pty closed: nothing left to drain to. #470 B1: `commit_exit`
+        // (not the RAII guard alone) is what makes this exit atomic with
+        // deregistering from `queue_draining` — see its doc.
         if ptys.output_total(pty_id).is_none() {
-            reg.drop_queue(&group, pty_id, queue::DropReason::AgentDied);
+            if let Some(entries) = reg.commit_exit(pty_id, true) {
+                reg.announce_dropped(&group, entries, queue::DropReason::AgentDied);
+            }
             reg.queue_still_notified.lock_safe().remove(&pty_id);
             return;
         }
@@ -8333,21 +8337,44 @@ fn run_queue_drainer(
         // Agent record gone or dead, but the pty somehow lingers (teardown
         // ordering) — same treatment as a closed pty.
         if agent.as_ref().map(|a| a.status == AgentStatus::Dead).unwrap_or(true) {
-            reg.drop_queue(&group, pty_id, queue::DropReason::AgentDied);
+            if let Some(entries) = reg.commit_exit(pty_id, true) {
+                reg.announce_dropped(&group, entries, queue::DropReason::AgentDied);
+            }
             reg.queue_still_notified.lock_safe().remove(&pty_id);
             return;
         }
         let Some(a) = agent else { continue };
 
+        // #470 B1: decide, ATOMICALLY with deregistering from
+        // `queue_draining`, whether this thread may exit — BEFORE peeking
+        // anything else. A plain "peek front, see None, return" (the
+        // pre-fix shape) leaves a window between that peek and the
+        // `DrainerGuard`'s eventual drop where a fresh `was_first`
+        // admission's own `ensure_drainer` call sees this pty still
+        // marked draining, no-ops, and stands no chance of ever being
+        // picked up — a silently stranded delivery the sender was
+        // already told `Ok` for. `commit_exit` closes that window by
+        // holding `queues`'s lock across BOTH the emptiness check and the
+        // `queue_draining` removal, so whichever of "a push" or "this
+        // exit" the OS schedules first is fully visible to the other.
+        if let Some(entries) = reg.commit_exit(pty_id, false) {
+            debug_assert!(entries.is_empty(), "force:false only commits when the queue was already empty");
+            reg.queue_still_notified.lock_safe().remove(&pty_id);
+            return;
+        }
+        // Not empty (confirmed above) — safe to peek normally now; only
+        // this single-consumer thread ever pops the front, so nothing can
+        // make it empty again out from under us before we act on it.
         let (front, depth) = {
             let queues = reg.queues.lock_safe();
             let q = queues.get(&pty_id);
             (q.and_then(|q| q.front().cloned()), q.map(VecDeque::len).unwrap_or(0))
         };
         let Some(front) = front else {
-            // Drained empty — this thread's job is done.
-            reg.queue_still_notified.lock_safe().remove(&pty_id);
-            return;
+            // Should be unreachable — `commit_exit` just confirmed
+            // non-empty and nothing else pops. Never trust that blindly
+            // on a liveness-critical path: loop again rather than assume.
+            continue;
         };
         if !immediate_first_pass || depth > 1 {
             // Genuine contention observed: either this pass needed a retry
@@ -19878,15 +19905,56 @@ impl OrchRegistry {
         std::thread::spawn(move || run_queue_drainer(reg, app, group, pty_id, fresh_first));
     }
 
-    /// Drop every entry currently queued for `pty_id` (#445): the pane's
-    /// agent died or its pty closed while entries were waiting. Audits ONE
-    /// `delivery-dropped` per entry (so each payload's own id closes out —
-    /// see `queue::orphaned_queue_entries`) plus a single coalesced notice
-    /// naming the count. Today this case is silent; this makes it loud.
-    #[doc(hidden)] // pub for integration tests
-    pub fn drop_queue(&self, group: &str, pty_id: u32, reason: queue::DropReason) {
-        let entries: Vec<queue::QueuedDelivery> =
-            self.queues.lock_safe().remove(&pty_id).map(Vec::from).unwrap_or_default();
+    /// #470 B1 — the ONLY way `run_queue_drainer` may decide it's done with
+    /// `pty_id`: atomically, in ONE critical section on `queues`, checks
+    /// whether exiting is safe and, if so, removes `pty_id` from
+    /// `queue_draining` BEFORE releasing `queues`'s lock.
+    ///
+    /// **The race this closes.** A plain "peek the queue, see it's empty,
+    /// `return` and let the `DrainerGuard`'s `Drop` deregister" — the
+    /// pre-fix shape — leaves an OS-scheduling-width window between that
+    /// peek and the guard actually running. A `deliver_prompt` admission
+    /// landing in that window (`enqueue_text` observes the queue was empty
+    /// → `was_first: true` → the sender is told `Ok`) calls `ensure_drainer`,
+    /// which finds `pty_id` STILL registered in `queue_draining` and
+    /// no-ops — believing a drainer will get to it. That drainer is
+    /// already committed to exiting and never re-reads the queue. The
+    /// delivery is stranded forever: not destroyed (still audited, still
+    /// sitting in `queues`), but never delivered either, with the sender
+    /// already told success — exactly the "queued means safe" contract
+    /// #445/#451 exist to guarantee, broken by the very PR meant to
+    /// strengthen it. Fusing the emptiness check and the `queue_draining`
+    /// removal into ONE lock scope on `queues` closes it: whichever of "a
+    /// push" or "this exit" the OS schedules first is fully visible to the
+    /// other by the time it runs, because they contend for the same lock.
+    /// See `unified_admission_property`'s `drainer_lifecycle` model
+    /// (queue.rs) for the exhaustive proof.
+    ///
+    /// `force`: the pty-closed/agent-dead paths must exit AND discard
+    /// whatever is queued regardless of content — always returns
+    /// `Some(entries)` (possibly empty). The normal "nothing left to
+    /// drain" exit (`force: false`) must NOT commit while the queue is
+    /// non-empty at this exact instant — returns `None`, and the caller
+    /// (`run_queue_drainer`) loops again to pick up whatever raced in,
+    /// rather than exiting and relying on a NEW drainer to notice it.
+    fn commit_exit(&self, pty_id: u32, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
+        let mut queues = self.queues.lock_safe();
+        let is_empty = queues.get(&pty_id).map(|q| q.is_empty()).unwrap_or(true);
+        if !force && !is_empty {
+            return None;
+        }
+        let entries: Vec<queue::QueuedDelivery> = queues.remove(&pty_id).map(Vec::from).unwrap_or_default();
+        // Still holding `queues`'s lock here — this is the atomic step.
+        self.queue_draining.lock_safe().remove(&pty_id);
+        Some(entries)
+    }
+
+    /// The audit+notify tail shared by `drop_queue` (a direct, standalone
+    /// drop — used by tests and any future caller that already holds a
+    /// batch of removed entries) and `commit_exit`'s force-exit callers in
+    /// `run_queue_drainer`. Never touches `queues` or `queue_draining`
+    /// itself — `entries` is always what a PRIOR removal already took out.
+    fn announce_dropped(&self, group: &str, entries: Vec<queue::QueuedDelivery>, reason: queue::DropReason) {
         if entries.is_empty() {
             return;
         }
@@ -19902,6 +19970,23 @@ impl OrchRegistry {
             self.notify_queue(group, &last.agent_id, target_is_orchestrator,
                 &queue::dropped_notice(&last.agent_id, entries.len(), reason));
         }
+    }
+
+    /// Drop every entry currently queued for `pty_id` (#445): the pane's
+    /// agent died or its pty closed while entries were waiting. Audits ONE
+    /// `delivery-dropped` per entry (so each payload's own id closes out —
+    /// see `queue::orphaned_queue_entries`) plus a single coalesced notice
+    /// naming the count. Today this case is silent; this makes it loud.
+    /// Standalone (does not touch `queue_draining`) — `run_queue_drainer`'s
+    /// own force-exit paths use `commit_exit` instead so the removal is
+    /// atomic with deregistering (#470 B1); this is for callers (tests,
+    /// direct MCP-adjacent drop paths) with no drainer lifecycle to keep
+    /// in sync.
+    #[doc(hidden)] // pub for integration tests
+    pub fn drop_queue(&self, group: &str, pty_id: u32, reason: queue::DropReason) {
+        let entries: Vec<queue::QueuedDelivery> =
+            self.queues.lock_safe().remove(&pty_id).map(Vec::from).unwrap_or_default();
+        self.announce_dropped(group, entries, reason);
     }
 
     /// Best-effort notice for a queue event (#445) — same suppression
