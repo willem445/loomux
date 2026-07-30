@@ -48,33 +48,13 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     (reg, dir)
 }
 
-#[test]
-fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
-    // See `orchestration.rs`'s test of the same name for the full rationale
-    // (`relaunch_registry`'s doc comment here carries the short version): a
-    // registry built with a bare `OrchRegistry::new(...)` instead of
-    // `relaunch_registry` silently falls back to the REAL `~/.claude/agents`/
-    // `~/.copilot/agents` on its first spawn (#464). Pinned statically —
-    // exactly one raw `OrchRegistry::new(...)` may exist in this file, inside
-    // `relaunch_registry` itself.
-    let src = include_str!("workflow.rs");
-    // Skip comments and string literals (this very test, and `relaunch_
-    // registry`'s own doc comment, both mention the construct by name) —
-    // only a real, live call site counts.
-    let sites: Vec<&str> = src
-        .lines()
-        .filter(|l| l.contains("OrchRegistry::new("))
-        .filter(|l| !l.trim_start().starts_with("//") && !l.contains('"'))
-        .collect();
-    assert_eq!(
-        sites.len(),
-        1,
-        "found a raw `OrchRegistry::new(...)` outside `relaunch_registry` — route it \
-         through `relaunch_registry(...)` instead, or it leaks a generated agent file \
-         into the real ~/.claude or ~/.copilot agents dir on its first spawn (#464). \
-         All occurrences: {sites:?}"
-    );
-}
+// #464 B2: the raw-`OrchRegistry::new` guard used to live here too (one
+// `include_str!("workflow.rs")` copy per file). Replaced by a SINGLE
+// dynamic test in `tests/orchestration.rs` that reads every `tests/*.rs`
+// file from disk at runtime — a per-file `include_str!` copy could only
+// ever see its own file, so `tests/lessonsfile.rs` and `tests/prompts.rs`
+// (each with their own registry-construction helper) were never covered.
+// See that test's doc for the full rationale.
 
 /// Guardrails for a group that RUNS the repo's workflow file — i.e. the human
 /// turned the advanced orchestrator on (#222). Every test below that is about the

@@ -9277,15 +9277,37 @@ impl OrchRegistry {
     /// - Every reclaim is breadcrumbed by path, so a sweep is diagnosable
     ///   after the fact, never silent — and a removal failure (permissions,
     ///   a concurrent process) is collected, not swallowed.
+    /// - If the `state_root()` enumeration itself fails (a transient AV/EDR
+    ///   lock, a permissions error, or — note this issue's own trigger —
+    ///   disk exhaustion, a condition under which `new()`'s own best-effort
+    ///   `create_dir_all` can fail too), this sweep does NOT fall through to
+    ///   "no known groups" and treat every generated file as an orphan
+    ///   (#464 review B1): that reads an "I don't know what's live" moment
+    ///   as "nothing is", which is exactly backwards and could delete a
+    ///   LIVE group's file — breaking that group's persona injection on its
+    ///   next spawn/restore, precisely during the kind of post-crash
+    ///   relaunch this sweep runs at. If unsure, delete nothing: an
+    ///   enumeration failure skips the sweep entirely and reports the error.
     pub fn sweep_orphaned_agent_files(&self) -> Value {
-        let known_groups: Vec<String> = fs::read_dir(self.state_root())
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.path().is_dir())
-                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let known_groups: Vec<String> = match fs::read_dir(self.state_root()) {
+            Ok(rd) => rd
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .collect(),
+            Err(e) => {
+                let msg = format!(
+                    "sweep skipped: could not enumerate groups under {} ({e}) — \
+                     refusing to guess which generated agent files are orphaned",
+                    self.state_root().display()
+                );
+                crate::obs::breadcrumb("fixture-sweep", &msg);
+                return json!({
+                    "reclaimed": [],
+                    "errors": [json!({ "path": self.state_root().to_string_lossy(), "error": e.to_string() })],
+                });
+            }
+        };
         let mut reclaimed = Vec::new();
         let mut errors = Vec::new();
         for dir in [self.claude_agents_dir(), self.copilot_agents_dir()] {

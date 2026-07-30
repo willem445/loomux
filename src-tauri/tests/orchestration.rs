@@ -4717,8 +4717,15 @@ fn resume_of_worker_session_keeps_its_original_block_not_the_roster_default() {
     // order, so this is the exact trap the issue names: a naive fix that
     // re-derives "the worker default" for a bare resume would silently
     // relabel a `worker-fast` session as `worker-deep`.
-    let td = tempfile::tempdir().unwrap();
-    let loomux = td.path().join(".loomux");
+    // #464 B1: a bare `tempfile::tempdir()` git-init'd fixture (the shape
+    // this test used before) leaks its `-worktrees` sibling exactly like
+    // `real_repo()` did pre-fix — the worker-fast spawn below goes through
+    // the MCP tool, whose worktree defaults on (#338), same as every other
+    // leaking test. Use `real_repo()` (already nested under its own private
+    // temp root) and layer `.loomux/workflow.yml` on top with a second
+    // commit — nothing about this test needs the file in the FIRST commit.
+    let repo = real_repo();
+    let loomux = repo.path().join(".loomux");
     fs::create_dir_all(&loomux).unwrap();
     fs::write(
         loomux.join("workflow.yml"),
@@ -4727,27 +4734,21 @@ fn resume_of_worker_session_keeps_its_original_block_not_the_roster_default() {
          \x20 - id: worker-fast\n    kind: worker\n",
     )
     .unwrap();
-    // A real repo: the worker-fast spawn below goes through the MCP tool, and
-    // a worker spawn's worktree now defaults on (#338).
     let git = |args: &[&str]| {
         let ok = std::process::Command::new("git")
-            .current_dir(td.path())
+            .current_dir(repo.path())
             .args(args)
             .output()
             .expect("git must be installed for this test");
         assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
     };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "t@t"]);
-    git(&["config", "user.name", "t"]);
-    fs::write(td.path().join("f.txt"), "hi").unwrap();
     git(&["add", "-A"]);
-    git(&["commit", "-qm", "init"]);
+    git(&["commit", "-qm", "add workflow.yml"]);
 
     let (reg, _d) = test_registry();
     let g = reg
         .create_group(
-            &td.path().to_string_lossy(),
+            &repo.path().to_string_lossy(),
             Guardrails { advanced_orchestrator: true, ..rails() },
         )
         .unwrap();
@@ -13291,22 +13292,16 @@ fn end_group_removes_worktrees_of_dead_and_live_agents() {
     // A real git repo with two worktrees; end_group(cleanup=true) must reclaim
     // both — including the one whose worker already exited — while leaving the
     // main checkout intact.
-    let repo = tempfile::tempdir().unwrap();
+    //
+    // #464 B1: this used a bare `tempfile::tempdir()` repo root directly, so
+    // even though `end_group` reclaims the two NAMED worktree dirs, the
+    // `<repo>-worktrees/` PARENT container `git worktree add` creates beside
+    // the repo — a %TEMP%-level sibling on the pre-fix shape — was never
+    // itself removed and leaked on every run. `real_repo()` nests the repo
+    // one level under its own temp root, so that parent container (empty or
+    // not) dies with the fixture regardless of what `end_group` reclaimed.
+    let repo = real_repo();
     let repo_path = repo.path().to_string_lossy().replace('\\', "/");
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .current_dir(&repo_path)
-            .args(args)
-            .output()
-            .expect("git must be installed for this test");
-        assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
-    };
-    git(&["init", "-q"]);
-    git(&["config", "user.email", "t@t"]);
-    git(&["config", "user.name", "t"]);
-    fs::write(repo.path().join("f.txt"), "hi").unwrap();
-    git(&["add", "-A"]);
-    git(&["commit", "-qm", "init"]);
 
     let (reg, _d) = test_registry();
     let g = reg.create_group(&repo_path, rails()).unwrap();
@@ -13473,41 +13468,142 @@ fn sweep_orphaned_agent_files_reclaims_orphans_but_refuses_a_live_group() {
 }
 
 #[test]
-fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
-    // A SEPARATE #464 leak from the worktree one above: `claude_agents_dir_
-    // override`/`copilot_agents_dir_override` are in-memory fields on an
-    // `OrchRegistry` instance, not persisted state, so a registry built with
-    // a bare `OrchRegistry::new(...)` — skipping `relaunch_registry` (which
-    // `test_registry` itself is now built on) — silently falls back to the
-    // REAL `dirs::home_dir()/.claude/agents` / `.../.copilot/agents` on its
-    // first spawn. That gap is exactly how the orchestration suite's many
-    // "relaunch" tests (a second `OrchRegistry::new` pointed at the same or
-    // a related state root) left 1,111 stray `loomux-<group>-*.md` files
-    // under a real dev machine's `~/.claude/agents` and 161 under
-    // `~/.copilot/agents` — found live on this machine while fixing this
-    // issue. That can't be safely re-proven at runtime (probing it would
-    // mean either touching the real home directory or faking `HOME`, which
-    // only proves the fallback exists, not that nothing here still uses it)
-    // — so this pins the invariant statically instead: exactly one raw
-    // `OrchRegistry::new(...)` may exist in this file, inside `relaunch_
-    // registry` itself. Every other construction must call that function.
-    let src = include_str!("orchestration.rs");
-    // Skip comments and string literals (this very test, and `relaunch_
-    // registry`'s own doc comment, both mention the construct by name) —
-    // only a real, live call site counts.
-    let sites: Vec<&str> = src
-        .lines()
-        .filter(|l| l.contains("OrchRegistry::new("))
-        .filter(|l| !l.trim_start().starts_with("//") && !l.contains('"'))
-        .collect();
-    assert_eq!(
-        sites.len(),
-        1,
-        "found a raw `OrchRegistry::new(...)` outside `relaunch_registry` — route it \
-         through `relaunch_registry(...)` instead, or it leaks a generated agent file \
-         into the real ~/.claude or ~/.copilot agents dir on its first spawn (#464). \
-         All occurrences: {sites:?}"
+fn sweep_orphaned_agent_files_deletes_nothing_when_group_enumeration_fails() {
+    // #464 review B3: an enumeration failure over `state_root()` must never
+    // be read as "there are no live groups" — that misreading WIDENS the
+    // blast radius instead of narrowing it, converting "I could not list my
+    // groups" into "I have no groups" and deleting live ones' files. The
+    // rule is "if unsure, delete nothing."
+    //
+    // The claude-agents dir is pointed at an INDEPENDENT temp root — not
+    // nested under state_root, unlike `relaunch_registry`'s usual layout —
+    // specifically so that breaking state_root (to force `read_dir` to
+    // fail) cannot also destroy the very files this test checks survive.
+    let state_dir = tempfile::tempdir().unwrap();
+    let agents_dir = tempfile::tempdir().unwrap();
+    let reg = relaunch_registry(state_dir.path());
+    let claude_dir = agents_dir.path().join("claude-agents");
+    fs::create_dir_all(&claude_dir).unwrap();
+    reg.set_claude_agents_dir_override(claude_dir.clone());
+    reg.set_copilot_agents_dir_override(agents_dir.path().join("copilot-agents"));
+
+    // A file that WOULD look orphaned under a normal (working) enumeration —
+    // nothing under state_root corresponds to "ghost-group" even when it CAN
+    // be read. The point of this test is that it must survive anyway,
+    // because enumeration never gets the chance to run cleanly.
+    let would_be_orphan = claude_dir.join("loomux-ghost-group-worker.md");
+    fs::write(&would_be_orphan, "body").unwrap();
+
+    // Break enumeration itself: remove state_root entirely so `read_dir`
+    // on it errors (stands in for a transient AV/EDR lock, a permissions
+    // error, or — this issue's own trigger — disk exhaustion).
+    fs::remove_dir_all(state_dir.path()).unwrap();
+
+    let result = reg.sweep_orphaned_agent_files();
+    assert!(
+        result["reclaimed"].as_array().unwrap().is_empty(),
+        "an enumeration failure must reclaim NOTHING — treating it as \"no known groups\" \
+         would delete a live group's file: {result}"
     );
+    assert!(
+        !result["errors"].as_array().unwrap().is_empty(),
+        "the enumeration failure must be surfaced, not swallowed: {result}"
+    );
+    assert!(
+        would_be_orphan.exists(),
+        "nothing may be deleted when the sweep cannot enumerate live groups, even a file that \
+         WOULD be a legitimate orphan under a working enumeration"
+    );
+}
+
+/// Whether `line` contains a REAL (live-code) call to `OrchRegistry::new(`,
+/// as opposed to one merely mentioned inside a comment or a string literal
+/// (a doc comment explaining this very guard, or this guard's own assertion
+/// message, both name the construct literally).
+///
+/// #464 B2 review: the first cut of this guard filtered out any line
+/// containing ANY `"` at all — which also, wrongly, excluded a perfectly
+/// live construction such as `OrchRegistry::new(d.path().join("state"))`,
+/// where the quote belongs to an ARGUMENT, not to something wrapping the
+/// construct itself. Mutation-verified to catch exactly that shape: compare
+/// where the construct text starts against where the line's first `"`
+/// starts. If the construct starts first (or there is no quote at all on
+/// the line), it's live code; if a quote opens before it, the construct
+/// text is inside a string/doc-comment payload, not actually calling
+/// anything.
+fn is_live_registry_construction(line: &str) -> bool {
+    if line.trim_start().starts_with("//") {
+        return false; // a full-line comment can still literally spell the construct
+    }
+    match (line.find("OrchRegistry::new("), line.find('"')) {
+        (Some(construct_at), Some(quote_at)) => construct_at < quote_at,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// #464 B2: `claude_agents_dir_override`/`copilot_agents_dir_override` are
+/// in-memory fields on an `OrchRegistry` instance, not persisted state, so a
+/// registry built with a bare `OrchRegistry::new(...)` — skipping whichever
+/// file's `relaunch_registry`/`test_registry` helper applies them — silently
+/// falls back to the REAL `dirs::home_dir()/.claude/agents` /
+/// `.../.copilot/agents` on its first spawn. That gap is exactly how the
+/// orchestration suite's many "relaunch" tests (a second `OrchRegistry::new`
+/// pointed at the same or a related state root) left 1,111 stray
+/// `loomux-<group>-*.md` files under a real dev machine's `~/.claude/agents`
+/// and 161 under `~/.copilot/agents` — found live on this machine while
+/// fixing this issue. That can't be safely re-proven at runtime (probing it
+/// would mean either touching the real home directory or faking `HOME`,
+/// which only proves the fallback exists, not that nothing here still uses
+/// it) — so this pins the invariant statically instead.
+///
+/// Reads every `tests/*.rs` file from disk at runtime (not `include_str!`,
+/// which only sees the ONE file it's compiled into) so this covers the
+/// whole integration-test suite in one place, not just this file: review
+/// found `tests/lessonsfile.rs` and `tests/prompts.rs` each construct their
+/// own `OrchRegistry` too (their own `test_registry()` helper, currently
+/// safe but entirely unpinned) — a future edit to either, or a brand new
+/// test file, reopened the leak with zero guard.
+#[test]
+fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
+    let tests_dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests"));
+    // Exactly one file legitimately needs a raw `OrchRegistry::new(...)` per
+    // registry-construction helper it defines. Add a file here ONLY when it
+    // gains a helper of its own — every other construction, in every file
+    // (including brand new ones this list has never heard of), must be zero.
+    let sanctioned: &[(&str, usize)] = &[
+        ("orchestration.rs", 1), // relaunch_registry
+        ("workflow.rs", 1),      // relaunch_registry
+        ("lessonsfile.rs", 1),   // test_registry
+        ("prompts.rs", 1),       // test_registry
+    ];
+    let mut checked = 0;
+    for entry in std::fs::read_dir(tests_dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", tests_dir.display()))
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let sites: Vec<&str> = src.lines().filter(|l| is_live_registry_construction(l)).collect();
+        let expected = sanctioned.iter().find(|(f, _)| *f == name).map(|(_, n)| *n).unwrap_or(0);
+        assert_eq!(
+            sites.len(),
+            expected,
+            "tests/{name}: expected exactly {expected} raw `OrchRegistry::new(...)` (its own \
+             sanctioned registry-construction helper, if any) — found {}. Every OTHER \
+             construction must route through that file's `relaunch_registry`/`test_registry` \
+             helper, or it leaks a generated agent file into the real ~/.claude or \
+             ~/.copilot agents dir on its first spawn (#464). If this file is meant to gain its \
+             own helper, add it to `sanctioned` above with its count. All live sites found: {sites:?}",
+            sites.len(),
+        );
+        checked += 1;
+    }
+    assert!(checked >= sanctioned.len(), "expected to check at least {} tests/*.rs files, only found {checked} — did the tests/ dir move?", sanctioned.len());
 }
 
 #[test]
