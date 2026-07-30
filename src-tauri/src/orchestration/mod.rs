@@ -6900,11 +6900,22 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
 /// this core is byte-identical. A line that merely shares a leading glyph but
 /// says something different keeps its own core and is never merged — see
 /// `collapse_repeated_frames`'s doc for the conservatism this buys.
+///
+/// The trailing-paren strip is gated on the line actually having had a
+/// leading glyph stripped (rev-29's #501 review finding, N1). Applying it to
+/// *any* line ending in `)` over-collapses ordinary content that just happens
+/// to differ only inside trailing parens — `fn parse(input: &str)` next to
+/// `fn parse(input: &[u8])` is exactly the shape a worker-pane tail is full
+/// of (code listings, rustc diagnostics), and both are real, distinct lines,
+/// not a redraw. Every real spinner shape this repo has documented is
+/// glyph-led, so gating on that costs nothing for the case this function
+/// exists to catch while closing the false-merge class entirely.
 fn spinner_frame_core(line: &str) -> &str {
     let trimmed = line.trim();
+    let leads_with_glyph = trimmed.chars().next().is_some_and(|c| !c.is_alphanumeric() && !c.is_whitespace());
     let after_glyph = trimmed.trim_start_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace());
     let after_glyph = after_glyph.strip_prefix(' ').unwrap_or(after_glyph);
-    if after_glyph.ends_with(')') {
+    if leads_with_glyph && after_glyph.ends_with(')') {
         match after_glyph.rfind('(') {
             Some(i) => after_glyph[..i].trim_end(),
             None => after_glyph,

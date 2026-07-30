@@ -1508,6 +1508,24 @@ fn get_output_tail_never_merges_genuinely_different_lines() {
 }
 
 #[test]
+fn get_output_tail_never_merges_code_lines_that_only_differ_inside_parens() {
+    // #501 review finding N1 (rev-29): a worker pane's tail is full of code
+    // listings, rustc diagnostics, and function signatures — lines that are
+    // genuinely different but happen to end in `)` and share a prefix. None
+    // of these begin with a spinner-style leading glyph, so the trailing-
+    // paren strip must never touch them: gating that strip on "did this line
+    // actually have a leading glyph stripped" is what fixes it.
+    let fixture = "fn parse(input: &str)\nfn parse(input: &[u8])\n";
+    let out = format_output_tail(fixture, 10);
+    assert!(out.contains("fn parse(input: &str)"), "distinct signature dropped, got:\n{out}");
+    assert!(out.contains("fn parse(input: &[u8])"), "distinct signature dropped, got:\n{out}");
+    assert!(
+        !out.to_lowercase().contains("collaps"),
+        "two genuinely different lines must never be mislabeled as repeated frames, got:\n{out}"
+    );
+}
+
+#[test]
 fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
