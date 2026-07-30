@@ -2363,6 +2363,76 @@ fn copilot_group_resumes_a_recorded_session() {
         .is_err());
 }
 
+/// #479 (restore UX): resuming a session whose group is already known — every
+/// dormant-group Resume click names it via `hint` — used to pay for
+/// `session_roles()`'s full scan regardless: every OTHER group's group.json,
+/// tasks.json, and full audit log read and parsed just to find one row. This
+/// pins the group-hint fast path (`session_role_in_group`) that makes a
+/// correct hint touch only the named group, by surrounding the resumed
+/// session with many unrelated decoy groups each carrying a realistic audit
+/// tail, and asserting the resume stays fast regardless of how many exist.
+///
+/// Measured (debug build, one dev machine, `--nocapture`): 419ms before this
+/// fix (the fast path disabled, `session_roles()`'s full scan always paid
+/// for), 42ms after. Re-run this test with `--nocapture` to see the number
+/// printed on your machine — the 200ms bound below is deliberately generous
+/// so CI hardware variance can't make it flaky; the point pinned here is the
+/// O(groups) scaling being gone, not a specific absolute figure.
+#[test]
+fn resume_recorded_session_group_hint_avoids_scanning_every_other_group() {
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+
+    const DECOY_GROUPS: usize = 200;
+    const NOISE_LINES: usize = 300;
+    for i in 0..DECOY_GROUPS {
+        let g = reg.create_group(&format!("C:/tmp/decoy-{i}"), rails()).unwrap();
+        let mut audit = String::new();
+        for n in 0..NOISE_LINES {
+            audit.push_str(&format!(
+                "{{\"ts_ms\":{n},\"actor\":\"loomux\",\"action\":\"noise\",\"detail\":{{\"n\":{n}}}}}\n"
+            ));
+        }
+        fs::write(reg.state_root().join(&g.id).join("audit.jsonl"), audit).unwrap();
+    }
+
+    // The target session, in its own group — fixtured into claude's store
+    // (thread-local test seam) exactly like the other orchestrator-resume
+    // tests, so the existence pre-check passes and the resume actually
+    // proceeds instead of failing on an unrelated lookup.
+    let repo = tempfile::tempdir().unwrap(); // must exist for restore
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let sid = orch.session_id.unwrap();
+    reg.mark_dead(&orch.id, Some(0));
+
+    let store = scratch_dir("resume-hint-fastpath");
+    fixture_claude_session(&store, &sid, &repo_path);
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
+    let started = Instant::now();
+    let req = resume_recorded_session(&reg, &sid, Some((g.id.clone(), "orchestrator".into())), false);
+    let elapsed = started.elapsed();
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
+
+    let req = req.unwrap().expect("must relaunch the recorded orchestrator session");
+    assert_eq!(req.group_id, g.id);
+    eprintln!(
+        "resume_recorded_session with a correct group hint took {elapsed:?} \
+         across {DECOY_GROUPS} decoy groups x {NOISE_LINES} audit lines each"
+    );
+    assert!(
+        elapsed.as_millis() < 200,
+        "resuming via a correct group hint must not scale with how many other \
+         groups exist on disk; took {elapsed:?} across {DECOY_GROUPS} decoys"
+    );
+}
+
 #[test]
 fn concurrent_groups_on_one_repo_stay_separate_but_resume_when_free() {
     let (reg, _d) = test_registry();
