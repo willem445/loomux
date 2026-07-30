@@ -6886,21 +6886,90 @@ pub fn strip_ansi(bytes: &[u8]) -> String {
     out
 }
 
+/// #480/#496 PR-E: a redrawn spinner/statusline frame's stable "core", for
+/// deciding whether two CONSECUTIVE lines are the same repaint. Strips
+/// exactly one leading glyph run (the spinner symbol — braille dots, Claude's
+/// `✻`/`✢`/`✽` star family, `*`, a box-drawing bullet, whatever a given CLI
+/// redraws each tick) plus the space after it, and exactly one trailing
+/// parenthesized group (the `(esc to interrupt · 8s · ↓ 172 tokens)` shape
+/// documented at `auto_compact_banner_substrings` above — elapsed time and
+/// token counts that change every frame live here). What is left is the
+/// stable prose a human actually wants to read once.
+///
+/// Deliberately NO fuzzy matching beyond that: two lines collapse only when
+/// this core is byte-identical. A line that merely shares a leading glyph but
+/// says something different keeps its own core and is never merged — see
+/// `collapse_repeated_frames`'s doc for the conservatism this buys.
+fn spinner_frame_core(line: &str) -> &str {
+    let trimmed = line.trim();
+    let after_glyph = trimmed.trim_start_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace());
+    let after_glyph = after_glyph.strip_prefix(' ').unwrap_or(after_glyph);
+    if after_glyph.ends_with(')') {
+        match after_glyph.rfind('(') {
+            Some(i) => after_glyph[..i].trim_end(),
+            None => after_glyph,
+        }
+    } else {
+        after_glyph
+    }
+}
+
+/// A core shorter than this never collapses, even if repeated — guards short,
+/// legitimately-repeated lines (a bare prompt character, several blank lines
+/// in a row) from ever being read as a redrawn frame. Conservatism per
+/// #480/#496 PR-E's brief: prefer under-collapsing to over-collapsing.
+const SPINNER_FRAME_MIN_CORE_LEN: usize = 6;
+
+/// #480/#496 PR-E: collapse a run of CONSECUTIVE lines that share a
+/// `spinner_frame_core` into one — the freshest (last) line of the run,
+/// verbatim, plus a `(N repeated frames collapsed)` marker so the elision is
+/// visible rather than silent (this repo has a whole batch of lessons about
+/// claims of completeness that turned out false; a silent drop here would be
+/// exactly that). Only ADJACENT lines are ever compared: two identical lines
+/// separated by other content are a real repeat in the transcript (e.g. the
+/// same log line printed twice, far apart), not a redraw, and are left alone.
+pub fn collapse_repeated_frames(lines: &[&str]) -> Vec<String> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let core = spinner_frame_core(lines[i]);
+        if core.chars().count() >= SPINNER_FRAME_MIN_CORE_LEN {
+            let mut j = i + 1;
+            while j < lines.len() && spinner_frame_core(lines[j]) == core {
+                j += 1;
+            }
+            let run = j - i;
+            if run > 1 {
+                out.push(lines[j - 1].to_string()); // freshest frame, verbatim
+                out.push(format!("[... {} repeated frames collapsed ...]", run - 1));
+                i = j;
+                continue;
+            }
+        }
+        out.push(lines[i].to_string());
+        i += 1;
+    }
+    out
+}
+
 /// What `get_output` (`agent_output_tail`) actually returns for an already-
-/// `strip_ansi`'d pane render: the last `n_lines` lines, `n_lines` clamped to
-/// `[1, 500]` exactly like `agent_output_tail` always has. Factored out pure,
-/// same reasoning as `resolve_output_text` above, so `get_output`'s behavior
-/// is directly testable without a live pty/app handle. #480/#496 PR-E note:
-/// this is where spinner-frame collapsing plugs in — `get_output`'s OWN path
-/// only, strictly after the shared `strip_ansi` this function's caller
-/// already applied. Nothing here changes what `strip_ansi` returns to its
-/// other callers (`box_holds_paste`, `prompt_wait_detected`, the compact/menu
-/// detectors above) — they never call this function.
+/// `strip_ansi`'d pane render: repeated spinner/statusline frames collapsed
+/// (`collapse_repeated_frames`), then the last `n_lines` of THAT, `n_lines`
+/// clamped to `[1, 500]` exactly like `agent_output_tail` always has. Factored
+/// out pure, same reasoning as `resolve_output_text` above, so `get_output`'s
+/// behavior is directly testable without a live pty/app handle.
+///
+/// This is `get_output`'s OWN path only, strictly after the shared
+/// `strip_ansi` this function's caller already applied — nothing here changes
+/// what `strip_ansi` itself returns to its other callers (`box_holds_paste`,
+/// `prompt_wait_detected`, the compact/menu detectors above); they never call
+/// this function, and never see collapsed text.
 pub fn format_output_tail(text: &str, n_lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
+    let collapsed = collapse_repeated_frames(&all);
     let n = n_lines.clamp(1, 500);
-    let start = all.len().saturating_sub(n);
-    all[start..].join("\n")
+    let start = collapsed.len().saturating_sub(n);
+    collapsed[start..].join("\n")
 }
 
 /// Decide whether a freshly spawned CLI is ready to receive typed input,
