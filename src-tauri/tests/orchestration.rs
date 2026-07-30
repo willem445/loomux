@@ -49,13 +49,13 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentRecord, AttentionItem, Caller, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
+    AgentRecord, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
     PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
-    CLAUDE_READONLY_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
-    COPILOT_READONLY_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
+    CLAUDE_EDIT_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
+    COPILOT_EDIT_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
 };
 use loomux_lib::pty::{phantom_gate_tick, PtyManager};
 use serde_json::{json, Value};
@@ -1530,7 +1530,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     assert!(cmd.contains("--model sonnet"));
     assert!(cmd.contains("--permission-mode acceptEdits"));
     assert!(cmd.contains("--strict-mcp-config"), "workers must not see the user's other MCP servers");
@@ -1539,7 +1539,7 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
     assert!(cmd.contains("--allowedTools mcp__loomux"),
         "loomux tools must be pre-approved so report/list never prompt");
     assert!(!cmd.contains("Bash(git"), "git is not pre-approved for a non-auto_ops worker");
-    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     assert!(cmd.contains("--permission-mode auto"),
         "the Auto preset must use Claude Code's native auto permission mode");
     assert!(cmd.contains("\"Bash(git *)\"") && cmd.contains("\"Bash(gh *)\""),
@@ -1548,13 +1548,13 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
         !cmd.contains("--dangerously-skip-permissions"),
         "bypass mode must never be used: its confirm dialog defaults to exit and kills the pane"
     );
-    // A worker (read_only=false) has no write/commit denials.
-    assert!(!cmd.contains("--disallowedTools"), "non-planner agents get no tool denials");
-    // A planner (read_only=true) is denied file writes + git commit/push at
-    // the CLI level, even under Auto perms — but keeps gh for the plan comment.
-    let plan = reg.build_agent_command("claude", "opus", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    // A worker (`Containment::None`) has no write/commit denials.
+    assert!(!cmd.contains("--disallowedTools"), "an uncontained agent gets no tool denials");
+    // A planner (`Containment::ReadOnly`) is denied file writes + git commit/push
+    // at the CLI level, even under Auto perms — but keeps gh for the plan comment.
+    let plan = reg.build_agent_command("claude", "opus", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::ReadOnly, &PersonaInject::default());
     assert!(plan.contains("--disallowedTools"), "planner must deny tools structurally");
-    for denied in CLAUDE_READONLY_DENY_TOOLS {
+    for denied in CLAUDE_EDIT_DENY_TOOLS {
         assert!(plan.contains(denied), "planner must deny the {denied} tool");
     }
     assert!(!plan.contains("MultiEdit"),
@@ -1571,50 +1571,242 @@ fn claude_command_minimizes_init_approvals_without_bypass() {
         "no colon-mid wildcard rule (`Bash(git commit:*)`) — it is malformed and triggers the startup warning flash");
 }
 
-/// #448: the planner's read-only guarantee is spelled as string literals
+/// #462: the deny tier is a **property of the capability class**, and this is
+/// the enumeration of it. Written as an exhaustive `match` on `Role` rather
+/// than a list of `assert_eq!`s on purpose — a fifth class would make this test
+/// fail to compile, where a list of asserts would keep passing while saying
+/// nothing about the class nobody wrote a line for. (An enumeration is a claim
+/// of completeness; this is the claim being made checkable.)
+#[test]
+fn every_capability_class_pins_its_deny_tier() {
+    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner, Role::Solo] {
+        let want = match role {
+            Role::Orchestrator | Role::Worker => Containment::None,
+            Role::Reviewer => Containment::NoEdits,
+            Role::Planner => Containment::ReadOnly,
+            Role::Solo => Containment::None,
+        };
+        assert_eq!(role.containment(), want, "{role:?} changed deny tier — was that deliberate?");
+    }
+    // The ladder: each tier is the one below it plus more. What this rules out
+    // is a tier that denies `git commit` while leaving `Edit` reachable, which
+    // would be containment on paper only — the editing tool is the easier path.
+    for c in [Containment::None, Containment::NoEdits, Containment::ReadOnly] {
+        assert!(!c.denies_git_mutation() || c.denies_edits(), "{c:?} denies git but not edits");
+        assert!(!c.forces_unattended() || c.denies_git_mutation(), "{c:?} is unattended below ReadOnly");
+    }
+    // `is_read_only()` must keep meaning the FULLY read-only class: it gates the
+    // `allow:` ban (`parse_workflow`/`persona_inject`), which #462 deliberately
+    // did not extend to reviewers. A reviewer picking up deny flags must not
+    // silently pick that up with them.
+    assert!(Role::Planner.is_read_only());
+    assert!(!Role::Reviewer.is_read_only(), "a reviewer is contained, but it is NOT read-only");
+}
+
+/// #462: a reviewer's containment, asserted through the same selector the spawn
+/// site uses (`Role::containment()`, passed straight into `build_agent_command`
+/// by `spawn_agent_ex`) rather than a hand-picked tier — so this fails if the
+/// *class* ever stops mapping to the deny flags, not merely if the flag-emitting
+/// code changes.
+///
+/// The negative halves matter as much as the positive one. #462's whole risk is
+/// that "make the reviewer safer" quietly becomes "make the reviewer a planner":
+/// a reviewer that lost its shell could not run the tests, and one promoted to
+/// unattended would gain pre-approved git/gh it never had.
+#[test]
+fn reviewer_is_denied_editing_tools_but_keeps_its_shell() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let tier = Role::Reviewer.containment();
+
+    let rev = reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, tier, &PersonaInject::default());
+    assert!(rev.contains("--disallowedTools"), "a reviewer must deny tools structurally, not by instruction: {rev}");
+    for denied in CLAUDE_EDIT_DENY_TOOLS {
+        assert!(rev.contains(denied), "a reviewer must deny the {denied} tool: {rev}");
+    }
+    // The job: run the tests, check the PR out, post the review.
+    assert!(!rev.contains("Bash(git commit"), "a reviewer keeps git commit — its template hands it that in place of git stash (#299)");
+    assert!(!rev.contains("Bash(git push"), "denying push here would be a claim the shell can't back; it stays instruction-tier");
+    assert!(rev.contains("\"Bash(gh *)\""), "gh stays allowed so the reviewer can post its review");
+    // #465 x #462, the seam where the two changes meet: a reviewer must NOT be
+    // promoted to `dontAsk`. That mode auto-denies everything outside
+    // `--allowedTools` — for a reviewer that is the shell it runs the tests
+    // through, so the mode that hardens a planner would disable a reviewer.
+    // `claude_effective_permission_mode` is fed `containment.is_read_only()`,
+    // never `denies_edits()`, and this is what says so out loud.
+    assert!(!rev.contains("dontAsk"),
+        "a reviewer must never run under dontAsk (#465 names this case explicitly): {rev}");
+    assert!(rev.contains("--permission-mode auto"), "{rev}");
+    // …and no promotion: an auto_ops=false reviewer stays exactly as attended
+    // as it was before #462.
+    let manual = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, tier, &PersonaInject::default());
+    assert!(manual.contains("--permission-mode acceptEdits"),
+        "a non-auto_ops reviewer must NOT inherit the planner's forced-unattended promotion: {manual}");
+    assert!(!manual.contains("\"Bash(gh *)\""),
+        "a non-auto_ops reviewer must not gain the unattended git/gh pre-approval either: {manual}");
+
+    // Copilot spells the same denial its own way — pinned separately because a
+    // fix applied to one adapter only is the drift #448 already caught once.
+    let rev = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, tier, &PersonaInject::default());
+    for denied in COPILOT_EDIT_DENY_TOOLS {
+        assert!(rev.contains(&format!("--deny-tool \"{denied}\"")), "a reviewer must deny {denied}: {rev}");
+    }
+    assert!(!rev.contains("shell(git commit)") && !rev.contains("shell(git push)"),
+        "a copilot reviewer keeps its shell git, same as the claude one: {rev}");
+}
+
+/// #462 review finding: **the spawn SITE's own wiring**, which every other test
+/// in this arc leaves uncovered.
+///
+/// `reviewer_is_denied_editing_tools_but_keeps_its_shell` and the snapshot rows
+/// all call `build_agent_command` themselves, re-deriving the tier with the
+/// *same expression* the spawn site uses. That is a pin that stops at the
+/// extracted unit: a `spawn_agent_ex` refactor that hardcoded a literal —
+/// exactly the shape this PR just removed from `register_orchestrator_pane` —
+/// would keep all of them green while reviewers silently lost their flags
+/// (#492). So this one goes through `spawn_agent` and reads what the SITE
+/// built, via the request the no-frontend path keeps.
+///
+/// Three classes in one group, because a single-class assertion is defeated by
+/// the opposite mutation: pinning only the reviewer passes if the site hardcodes
+/// `NoEdits` for everyone, and pinning only "worker has no flags" passes if it
+/// hardcodes `None`. What is actually being pinned is the *mapping*, so each
+/// class must be wrong in its own direction.
+#[test]
+fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
+    let (reg, _d) = test_registry();
+    // Three live delegates at once, so the classes are compared within ONE
+    // group's config rather than across three groups that could differ.
+    let g = reg
+        .create_group("C:/tmp/deny-site-repo", Guardrails { max_agents: 3, ..rails() })
+        .unwrap();
+
+    // Not `build_agent_command` — the real thing, the way the orchestrator
+    // reaches it. `worktree: false` keeps the fixture off the filesystem; the
+    // launch flags don't depend on it.
+    let spawn = |role: Role, name: &str| {
+        let a = reg.spawn_agent(&g.id, role, name, "t", false, None).unwrap();
+        reg.spawn_request_for_test(&a.id).unwrap_or_else(|| panic!("no spawn request for {name}"))
+    };
+
+    let rev = spawn(Role::Reviewer, "rev");
+    assert_eq!(rev.role, Role::Reviewer, "sanity: the request is the reviewer's");
+    for denied in CLAUDE_EDIT_DENY_TOOLS {
+        assert!(
+            rev.command.contains(denied),
+            "a REVIEWER SPAWN must carry the {denied} denial — the class-to-flags hop at the \
+             spawn site is what this pins: {}",
+            rev.command
+        );
+    }
+    assert!(rev.command.contains("--disallowedTools"), "{}", rev.command);
+    // The structured form the pane actually spawns is built from the same call,
+    // and a site that fed one builder and not the other would be just as broken.
+    assert!(
+        rev.argv.windows(4).any(|w| w == ["--disallowedTools", "Edit", "Write", "NotebookEdit"]),
+        "the direct-spawn argv must carry them too: {:?}",
+        rev.argv
+    );
+    // Still a reviewer, not a planner: the shell it works through is intact.
+    assert!(!rev.command.contains("Bash(git commit"), "{}", rev.command);
+    assert!(!rev.command.contains("Bash(git push"), "{}", rev.command);
+
+    // A worker off the SAME site must come out with nothing denied — this is the
+    // half that fails if the site starts denying unconditionally.
+    let w = spawn(Role::Worker, "w");
+    assert!(
+        !w.command.contains("--disallowedTools"),
+        "a worker spawn must carry no denials — it exists to change the repo: {}",
+        w.command
+    );
+
+    // …and a planner off the same site keeps the full read-only tier, so a site
+    // that flattened every class onto the reviewer's tier fails here.
+    let p = spawn(Role::Planner, "p");
+    assert!(
+        p.command.contains("\"Bash(git commit *)\"") && p.command.contains("\"Bash(git push *)\""),
+        "a planner spawn must still deny git mutation: {}",
+        p.command
+    );
+
+    // The other spawn site (#462 review named both). `register_orchestrator_pane`
+    // hands its request straight back, so no seam is needed to read it — and an
+    // orchestrator that ever acquired deny flags would be a group that cannot
+    // drive its own git/gh flow.
+    // Through `test_registry`, never a raw `OrchRegistry::new` — #464's guard
+    // (`no_registry_construction_bypasses_the_test_agent_dir_overrides`) is right:
+    // an unrouted registry leaks a generated agent file into the real
+    // `~/.claude`/`~/.copilot` agents dir on its first spawn. `Arc` wraps the
+    // helper's registry rather than building a second one.
+    let (reg2, _d2) = test_registry();
+    let reg2 = std::sync::Arc::new(reg2);
+    let repo = tempfile::tempdir().unwrap();
+    let orch = create_orchestration_group(
+        &reg2,
+        &repo.path().to_string_lossy().replace('\\', "/"),
+        rails(),
+        Launch::Fresh,
+        None,
+        None,
+        0,
+    )
+    .unwrap();
+    assert_eq!(orch.role, Role::Orchestrator);
+    assert!(
+        !orch.command.contains("--disallowedTools"),
+        "the orchestrator spawn site must pass its own class's tier (None): {}",
+        orch.command
+    );
+}
+
+/// #448: the editing-tool guarantee is spelled as string literals
 /// matched against an external tool registry that drifts underneath it (the
 /// CLI's own registry, which loomux does not control and cannot query live —
-/// see `KNOWN_CLAUDE_TOOLS`'s doc). This pins `CLAUDE_READONLY_DENY_TOOLS`
+/// see `KNOWN_CLAUDE_TOOLS`'s doc). This pins `CLAUDE_EDIT_DENY_TOOLS`
 /// against the Claude Code Tools reference snapshot so a typo or a stale name
-/// breaks CI instead of silently widening what a planner may do — exactly
+/// breaks CI instead of silently widening what a contained class may do —
+/// since #462 that is a reviewer as well as a planner, which is precisely why
+/// the list stayed ONE list: a second copy would be a second thing to keep
+/// pinned, and a stale entry reads as containment while providing none. Exactly
 /// the failure mode that let `MultiEdit` (folded into `Edit` upstream) sit
 /// in the deny list matching nothing until a human read the CLI's own
 /// startup warning by hand.
 ///
 /// Mutation evidence (red before green): temporarily re-adding "MultiEdit" —
-/// or any other typo — to `CLAUDE_READONLY_DENY_TOOLS` fails this assertion
+/// or any other typo — to `CLAUDE_EDIT_DENY_TOOLS` fails this assertion
 /// immediately, with a message naming the bad entry; removing it passes.
 /// This is exactly the property #448 asked for.
 #[test]
-fn claude_readonly_deny_tools_are_known_claude_tools() {
-    for t in CLAUDE_READONLY_DENY_TOOLS {
+fn claude_edit_deny_tools_are_known_claude_tools() {
+    for t in CLAUDE_EDIT_DENY_TOOLS {
         assert!(
             KNOWN_CLAUDE_TOOLS.contains(t),
-            "{t:?} in CLAUDE_READONLY_DENY_TOOLS is not a known Claude Code tool per \
+            "{t:?} in CLAUDE_EDIT_DENY_TOOLS is not a known Claude Code tool per \
              the Tools reference (https://code.claude.com/docs/en/tools-reference) — \
              typo, or was the tool renamed/removed upstream? (#448)"
         );
     }
 }
 
-/// Sibling of `claude_readonly_deny_tools_are_known_claude_tools` for the
+/// Sibling of `claude_edit_deny_tools_are_known_claude_tools` for the
 /// Copilot adapter — the SAME pin, against `KNOWN_COPILOT_DENY_CATEGORIES`
 /// (the exactly-three `--deny-tool` value shapes Copilot's CLI configuration
 /// guide documents). This is the test that would have caught `edit` before
 /// it shipped: `edit` was never one of the documented shapes, so a version
-/// of `COPILOT_READONLY_DENY_TOOLS` that includes it fails here exactly the
+/// of `COPILOT_EDIT_DENY_TOOLS` that includes it fails here exactly the
 /// way a `MultiEdit`-style typo fails the Claude pin above — a validator
 /// that catches one and not the other is not doing its job (#448 review).
 ///
 /// Mutation evidence (red before green): temporarily adding "edit" back to
-/// `COPILOT_READONLY_DENY_TOOLS` fails this assertion immediately; removing
+/// `COPILOT_EDIT_DENY_TOOLS` fails this assertion immediately; removing
 /// it passes.
 #[test]
-fn copilot_readonly_deny_tools_are_known_copilot_categories() {
-    for t in COPILOT_READONLY_DENY_TOOLS {
+fn copilot_edit_deny_tools_are_known_copilot_categories() {
+    for t in COPILOT_EDIT_DENY_TOOLS {
         assert!(
             KNOWN_COPILOT_DENY_CATEGORIES.contains(t),
-            "{t:?} in COPILOT_READONLY_DENY_TOOLS is not one of the three documented \
+            "{t:?} in COPILOT_EDIT_DENY_TOOLS is not one of the three documented \
              --deny-tool value shapes (shell(COMMAND) / write / MCP_SERVER(tool)) per \
              https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/configure-copilot-cli \
              — this is exactly how `edit` should have been caught (#448)"
@@ -1644,7 +1836,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("claude", "opus", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("claude", "opus", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::ReadOnly, &PersonaInject::default());
     assert!(plan.contains("--permission-mode dontAsk"),
         "a planner runs unattended (dontAsk: pre-approved tools only, #465) even when \
          the group is not auto_ops — else it deadlocks");
@@ -1656,7 +1848,7 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
         "writes/commit/push stay denied structurally — Auto perms don't loosen the read-only contract");
     // By contrast a non-auto_ops WORKER (read_only=false) is unchanged: it
     // stays in acceptEdits with no pre-approved git/gh (the human gates ops).
-    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let worker = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     assert!(worker.contains("--permission-mode acceptEdits"),
         "a non-auto_ops worker is unaffected: it still gates ops through acceptEdits");
     assert!(!worker.contains("\"Bash(gh *)\""),
@@ -1668,7 +1860,7 @@ fn copilot_command_uses_copilot_adapter_flags() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     assert!(cmd.starts_with("copilot "), "selected CLI must actually be launched, not claude");
     assert!(
         cmd.contains("--additional-mcp-config \"@C:/x/cfg.json\""),
@@ -1692,22 +1884,22 @@ fn copilot_command_uses_copilot_adapter_flags() {
     assert!(cmd.contains("--autopilot"),
         "group copilot workers run in true autopilot mode; the kickoff confirms the consent dialog");
     // Conservative preset keeps the explicit allowlist instead.
-    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     assert!(!cmd.contains("--allow-all-tools") && !cmd.contains("--autopilot"));
     assert!(cmd.contains("--allow-tool \"shell(git:*)\"") && cmd.contains("--allow-tool \"shell(gh:*)\""));
     // Resume reopens a tracked session via --resume; copilot has no
     // pre-assignable id, so a session without resume adds no session flag.
     let sid = "aabbccdd-1122-4334-8556-77889900aabb";
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), true, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), true, Containment::None, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")), "copilot resume must pass --resume, got: {cmd}");
-    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), Some(sid), false, Containment::None, &PersonaInject::default());
     assert!(!cmd.contains("--resume") && !cmd.contains("--session-id"),
         "a fresh copilot spawn cannot pin a session id");
     // A non-planner copilot agent gets no deny-tool flags.
     assert!(!cmd.contains("--deny-tool"), "non-planner copilot agents get no tool denials");
     // A planner (read_only=true) denies writes + git commit/push even under
     // --allow-all-tools (deny wins in Copilot); gh stays reachable.
-    let plan = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::ReadOnly, &PersonaInject::default());
     assert!(plan.contains("--deny-tool \"write\""),
         "planner must deny copilot's write category (the documented file-modification category), got: {plan}");
     // #448: `edit` is not one of Copilot's three documented --deny-tool value
@@ -1732,7 +1924,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
-    let plan = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let plan = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::ReadOnly, &PersonaInject::default());
     assert!(plan.contains("--allow-all-tools") && plan.contains("--allow-all-paths"),
         "a non-auto_ops copilot planner must run unattended (all tools/paths), else it deadlocks: {plan}");
     assert!(plan.contains("--autopilot"),
@@ -1743,7 +1935,7 @@ fn copilot_planner_runs_unattended_regardless_of_auto_ops() {
         "gh stays allowed so the copilot planner can post its plan comment unattended");
     // A non-auto_ops copilot WORKER (read_only=false) is unchanged: it keeps
     // the conservative interactive preset (no allow-all).
-    let worker = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+    let worker = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     assert!(!worker.contains("--allow-all-tools") && !worker.contains("--autopilot"),
         "a non-auto_ops copilot worker stays interactive — only planners run unattended");
 }
@@ -1810,7 +2002,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
 
     // Claude: permission mode + the shared git/gh allowlist constant.
     let group_claude =
-        reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+        reg.build_agent_command("claude", "sonnet", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     let single_claude = single_pane_autopilot_flags("claude");
     assert!(single_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
     assert!(group_claude.contains(&format!("--permission-mode {}", claude_permission_mode(true))));
@@ -1821,7 +2013,7 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
     // enter true autopilot mode, so single_pane_autopilot_flags reuses the
     // group constant directly rather than inventing a divergent string.
     let group_copilot =
-        reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
+        reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
     let single_copilot = single_pane_autopilot_flags("copilot");
     assert_eq!(single_copilot, COPILOT_GROUP_AUTOPILOT_FLAGS,
         "single-pane copilot must reuse the group autopilot atom verbatim, not a divergent string");
@@ -1874,7 +2066,7 @@ fn claude_readonly_allowed_tools_contain_no_unscoped_grant() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     let plan = reg.build_agent_command(
-        "claude", "opus", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true,
+        "claude", "opus", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::ReadOnly,
         &PersonaInject::default(),
     );
     let tokens = shell_tokenize(&plan);
@@ -1926,8 +2118,8 @@ fn copilot_single_pane_now_shares_the_group_autopilot_posture() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
-    let worker = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, false, &PersonaInject::default());
-    let planner = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
+    let worker = reg.build_agent_command("copilot", "auto", true, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::None, &PersonaInject::default());
+    let planner = reg.build_agent_command("copilot", "auto", false, cfg, None, gdir, Path::new("C:/repo"), None, false, Containment::ReadOnly, &PersonaInject::default());
     assert!(worker.contains("--autopilot") && planner.contains("--autopilot"),
         "group-mode unattended copilot spawns enter true autopilot mode");
 }
@@ -2131,9 +2323,9 @@ fn build_agent_command_full_line_snapshots() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     let wd = Path::new("C:/repo");
-    // signature: (cli, model, auto_ops, cfg, group_dir, workdir, session, resume, read_only)
-    let cmd = |cli, model, auto_ops, read_only| {
-        reg.build_agent_command(cli, model, auto_ops, cfg, None, gdir, wd, None, false, read_only, &PersonaInject::default())
+    // signature: (cli, model, auto_ops, cfg, group_dir, workdir, session, resume, containment)
+    let cmd = |cli, model, auto_ops, containment| {
+        reg.build_agent_command(cli, model, auto_ops, cfg, None, gdir, wd, None, false, containment, &PersonaInject::default())
     };
 
     // Claude worker, auto_ops ON → native Auto mode + git/gh pre-approval.
@@ -2142,7 +2334,7 @@ fn build_agent_command_full_line_snapshots() {
     // below for the #417 flag itself, split from `--mcp-config`'s file per
     // rev-4 review N2.
     assert_eq!(
-        cmd("claude", "sonnet", true, false),
+        cmd("claude", "sonnet", true, Containment::None),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
          --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\""
@@ -2150,14 +2342,14 @@ fn build_agent_command_full_line_snapshots() {
 
     // Claude worker, auto_ops OFF → acceptEdits, no git/gh, no denials.
     assert_eq!(
-        cmd("claude", "sonnet", false, false),
+        cmd("claude", "sonnet", false, Containment::None),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
          --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux"
     );
 
     // Copilot worker, auto_ops ON → group autopilot: --autopilot + all tools/paths.
     assert_eq!(
-        cmd("copilot", "auto", true, false),
+        cmd("copilot", "auto", true, Containment::None),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
          --autopilot --allow-all-tools --allow-all-paths"
@@ -2165,7 +2357,7 @@ fn build_agent_command_full_line_snapshots() {
 
     // Copilot worker, auto_ops OFF → the conservative git/gh allowlist branch.
     assert_eq!(
-        cmd("copilot", "auto", false, false),
+        cmd("copilot", "auto", false, Containment::None),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
          --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\""
@@ -2175,10 +2367,10 @@ fn build_agent_command_full_line_snapshots() {
     // running `dontAsk` (#465 — pre-approved tools only, so an editing tool
     // Claude adds tomorrow is denied by construction) rather than `auto`,
     // plus the write/commit/push denials, gh still reachable. Literals per
-    // CLAUDE_READONLY_DENY_TOOLS/_GIT (#448 — `MultiEdit` dropped, it matched
+    // CLAUDE_EDIT_DENY_TOOLS/_GIT (#448 — `MultiEdit` dropped, it matched
     // no real Claude Code tool).
     assert_eq!(
-        cmd("claude", "opus", false, true),
+        cmd("claude", "opus", false, Containment::ReadOnly),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
          --model opus --permission-mode dontAsk --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
@@ -2187,10 +2379,10 @@ fn build_agent_command_full_line_snapshots() {
 
     // Copilot planner (read_only) in a NON-auto_ops group → group autopilot
     // (--autopilot + all tools/paths) + deny rules; gh not denied. Literals
-    // per COPILOT_READONLY_DENY_TOOLS/_GIT (#448 — `edit` dropped, it is not
+    // per COPILOT_EDIT_DENY_TOOLS/_GIT (#448 — `edit` dropped, it is not
     // one of Copilot's three documented --deny-tool value shapes).
     assert_eq!(
-        cmd("copilot", "auto", false, true),
+        cmd("copilot", "auto", false, Containment::ReadOnly),
         "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
          --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
          --autopilot --allow-all-tools --allow-all-paths \
@@ -2198,11 +2390,42 @@ fn build_agent_command_full_line_snapshots() {
          --deny-tool \"shell(git commit)\" --deny-tool \"shell(git push)\""
     );
 
+    // #462 — a reviewer (`NoEdits`), the tier between the two above. Every
+    // difference from the worker row on the SAME auto_ops setting must be the
+    // deny flags and nothing else: same permission mode, same allow list. The
+    // git denials are absent by design (a reviewer's shell is its job), and
+    // `--permission-mode` is NOT promoted to `auto` the way a planner's is —
+    // `NoEdits` narrows a reviewer, it must never widen one.
+    assert_eq!(
+        cmd("claude", "sonnet", true, Containment::NoEdits),
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
+         --model sonnet --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit"
+    );
+    assert_eq!(
+        cmd("claude", "sonnet", false, Containment::NoEdits),
+        "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
+         --model sonnet --permission-mode acceptEdits --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         --disallowedTools Edit Write NotebookEdit"
+    );
+    assert_eq!(
+        cmd("copilot", "auto", true, Containment::NoEdits),
+        "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
+         --autopilot --allow-all-tools --allow-all-paths --deny-tool \"write\""
+    );
+    assert_eq!(
+        cmd("copilot", "auto", false, Containment::NoEdits),
+        "copilot --additional-mcp-config \"@C:/x/cfg.json\" --model auto \
+         --add-dir \"C:/data/group\" --add-dir \"C:/repo\" --allow-tool loomux --no-auto-update \
+         --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\" --deny-tool \"write\""
+    );
+
     // Unknown CLI falls back to the claude adapter byte-for-byte (never a
     // silent half-built command) — same string as the claude worker case.
     assert_eq!(
-        cmd("totally-unknown-cli", "sonnet", true, false),
-        cmd("claude", "sonnet", true, false),
+        cmd("totally-unknown-cli", "sonnet", true, Containment::None),
+        cmd("claude", "sonnet", true, Containment::None),
         "an unrecognized CLI must build the exact claude fallback command"
     );
 }
@@ -2220,13 +2443,13 @@ fn claude_gets_a_settings_flag_only_when_hook_settings_is_some() {
     let wd = Path::new("C:/repo");
 
     let cmd = reg.build_agent_command(
-        "claude", "sonnet", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+        "claude", "sonnet", true, cfg, Some(hooks), gdir, wd, None, false, Containment::None, &PersonaInject::default(),
     );
     assert!(cmd.contains("--settings \"C:/x/cfg-hooks.json\""), "{cmd}");
     assert!(!cmd.contains("--settings \"C:/x/cfg.json\""), "must never point --settings at the mcp-config file: {cmd}");
 
     let argv = reg.build_agent_argv(
-        "claude", "sonnet", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+        "claude", "sonnet", true, cfg, Some(hooks), gdir, wd, None, false, Containment::None, &PersonaInject::default(),
     );
     assert!(argv.windows(2).any(|w| w == ["--settings", "C:/x/cfg-hooks.json"]), "{argv:?}");
     assert_eq!(shell_tokenize(&cmd), argv, "the two forms must never drift on the new flag either");
@@ -2234,7 +2457,7 @@ fn claude_gets_a_settings_flag_only_when_hook_settings_is_some() {
     // Copilot never gets a --settings flag, `hook_settings` or not — it isn't
     // wired through the copilot branch at all (copilot has no hook config).
     let copilot_cmd = reg.build_agent_command(
-        "copilot", "auto", true, cfg, Some(hooks), gdir, wd, None, false, false, &PersonaInject::default(),
+        "copilot", "auto", true, cfg, Some(hooks), gdir, wd, None, false, Containment::None, &PersonaInject::default(),
     );
     assert!(!copilot_cmd.contains("--settings"), "{copilot_cmd}");
 }
@@ -2288,13 +2511,13 @@ fn build_agent_argv_snapshots() {
     let gdir = Path::new("C:/data/group");
     let wd = Path::new("C:/repo");
     let argv =
-        |cli, model, auto_ops, read_only| reg.build_agent_argv(cli, model, auto_ops, cfg, None, gdir, wd, None, false, read_only, &PersonaInject::default());
+        |cli, model, auto_ops, containment| reg.build_agent_argv(cli, model, auto_ops, cfg, None, gdir, wd, None, false, containment, &PersonaInject::default());
 
     // Claude worker, auto_ops ON. Note the quote-free literal tool tokens.
     // No `hook_settings` (`None`) ⇒ no `--settings` — see
     // `claude_gets_a_settings_flag_only_when_hook_settings_is_some` for that.
     assert_eq!(
-        argv("claude", "sonnet", true, false),
+        argv("claude", "sonnet", true, Containment::None),
         vec![
             "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--model", "sonnet",
             "--permission-mode", "auto", "--add-dir", "C:/data/group", "--allowedTools",
@@ -2302,11 +2525,34 @@ fn build_agent_argv_snapshots() {
         ]
     );
 
-    // Copilot planner (read_only): group autopilot + deny rules; @ rides the cfg.
+    // #462 — the reviewer tier, structurally: the SAME tokens as the worker row
+    // above plus the deny pair, and (unlike a planner) nothing removed and no
+    // git denials. Pinned on both CLIs because each spells the denial its own
+    // way — a regression that dropped one adapter's flags would still pass the
+    // other's row.
+    assert_eq!(
+        argv("claude", "sonnet", true, Containment::NoEdits),
+        vec![
+            "claude", "--mcp-config", "C:/x/cfg.json", "--strict-mcp-config", "--model", "sonnet",
+            "--permission-mode", "auto", "--add-dir", "C:/data/group", "--allowedTools",
+            "mcp__loomux", "Bash(git *)", "Bash(gh *)", "--disallowedTools", "Edit", "Write",
+            "NotebookEdit",
+        ]
+    );
+    assert_eq!(
+        argv("copilot", "auto", true, Containment::NoEdits),
+        vec![
+            "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
+            "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
+            "--autopilot", "--allow-all-tools", "--allow-all-paths", "--deny-tool", "write",
+        ]
+    );
+
+    // Copilot planner (ReadOnly): group autopilot + deny rules; @ rides the cfg.
     // #448: `edit` dropped — not one of Copilot's three documented --deny-tool
     // value shapes (shell(COMMAND) / write / MCP_SERVER(tool)).
     assert_eq!(
-        argv("copilot", "auto", false, true),
+        argv("copilot", "auto", false, Containment::ReadOnly),
         vec![
             "copilot", "--additional-mcp-config", "@C:/x/cfg.json", "--model", "auto", "--add-dir",
             "C:/data/group", "--add-dir", "C:/repo", "--allow-tool", "loomux", "--no-auto-update",
@@ -2317,10 +2563,10 @@ fn build_agent_argv_snapshots() {
     );
 
     // The program is always argv[0] — what the pane spawns directly.
-    assert_eq!(argv("claude", "sonnet", false, false)[0], "claude");
-    assert_eq!(argv("copilot", "auto", false, false)[0], "copilot");
+    assert_eq!(argv("claude", "sonnet", false, Containment::None)[0], "claude");
+    assert_eq!(argv("copilot", "auto", false, Containment::None)[0], "copilot");
     // Unknown CLI → claude adapter, structurally too.
-    assert_eq!(argv("totally-unknown-cli", "sonnet", true, false)[0], "claude");
+    assert_eq!(argv("totally-unknown-cli", "sonnet", true, Containment::None)[0], "claude");
 }
 
 #[test]
@@ -2358,20 +2604,23 @@ fn build_agent_argv_matches_command_line() {
     ];
     for cli in ["claude", "copilot", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
-            for read_only in [false, true] {
+            // Every tier, not just the two that existed before #462 — a
+            // middle tier that only one of the two forms emits is exactly the
+            // drift this test exists to catch.
+            for containment in [Containment::None, Containment::NoEdits, Containment::ReadOnly] {
                 for (session, resume) in sessions {
                     for persona in &personas {
                         let line = reg.build_agent_command(
-                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, read_only, persona,
+                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, containment, persona,
                         );
                         let argv = reg.build_agent_argv(
-                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, read_only, persona,
+                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, containment, persona,
                         );
                         assert_eq!(
                             shell_tokenize(&line),
                             argv,
                             "argv must equal the tokenized command line for \
-                             cli={cli} auto_ops={auto_ops} read_only={read_only} \
+                             cli={cli} auto_ops={auto_ops} containment={containment:?} \
                              session={session:?} resume={resume} persona={persona:?}\n  line: {line}"
                         );
                     }
@@ -3340,10 +3589,10 @@ fn claude_agents_get_preassigned_resumable_sessions() {
     // The launch command pins the id.
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/x/g");
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), Some(&sid), false, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), Some(&sid), false, Containment::None, &PersonaInject::default());
     assert!(cmd.contains(&format!("--session-id {sid}")));
     // Resume uses --resume instead.
-    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), Some(&sid), true, false, &PersonaInject::default());
+    let cmd = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), Some(&sid), true, Containment::None, &PersonaInject::default());
     assert!(cmd.contains(&format!("--resume {sid}")) && !cmd.contains("--session-id"));
 }
 

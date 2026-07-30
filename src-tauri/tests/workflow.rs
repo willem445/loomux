@@ -20,7 +20,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
 use loomux_lib::orchestration::{
-    block_contract_text, command_line_length_guard, Caller, ContractCarrier, Guardrails, Launch, OrchRegistry, Role,
+    block_contract_text, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -1093,7 +1093,7 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
             wd,
             None,
             false,
-            b.kind.is_read_only(),
+            b.kind.containment(),
             &inject,
         );
         let generated_path = d.path().join("claude-agents").join(format!("{handle}.md"));
@@ -1126,14 +1126,20 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
     let (cmd, handle) = line("worker", true);
     expect(&cmd, &handle, "worker", "sonnet", "auto", " \"Bash(git *)\" \"Bash(gh *)\"");
     let (cmd, handle) = line("reviewer", false);
-    expect(&cmd, &handle, "reviewer", "sonnet", "acceptEdits", "");
+    // #462: the built-in reviewer block's own command line — derived here from
+    // `b.kind.containment()`, exactly as `spawn_agent_ex` derives it — now
+    // carries the editing-tool denials. Everything else is untouched: still
+    // `acceptEdits` (no promotion to unattended), still no pre-approved git/gh,
+    // and no `Bash(git …)` denials, because the shell is the job.
+    expect(&cmd, &handle, "reviewer", "sonnet", "acceptEdits", " --disallowedTools Edit Write NotebookEdit");
     let (cmd, handle) = line("planner", false);
     expect(
         &cmd, &handle, "planner", "opus", "dontAsk",
-        // #448: `MultiEdit` dropped from CLAUDE_READONLY_DENY_TOOLS — it
+        // #448: `MultiEdit` dropped from CLAUDE_EDIT_DENY_TOOLS — it
         // matches no real Claude Code tool. #465: a read-only block runs
         // `dontAsk` (pre-approved tools only), not `auto` — see
-        // `claude_effective_permission_mode`'s doc.
+        // `claude_effective_permission_mode`'s doc. A REVIEWER block stays on
+        // `acceptEdits`/`auto` (#462): `dontAsk` would deny the shell it works through.
         " \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
           \"Bash(git commit *)\" \"Bash(git push *)\"",
     );
@@ -1249,8 +1255,8 @@ fn a_thirty_kb_contract_still_produces_a_short_command_line() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     let wd = Path::new("C:/repo");
-    let cmd = reg.build_agent_command(cli, "sonnet", false, cfg, None, gdir, wd, None, false, false, &inject);
-    let argv = reg.build_agent_argv(cli, "sonnet", false, cfg, None, gdir, wd, None, false, false, &inject);
+    let cmd = reg.build_agent_command(cli, "sonnet", false, cfg, None, gdir, wd, None, false, Containment::None, &inject);
+    let argv = reg.build_agent_argv(cli, "sonnet", false, cfg, None, gdir, wd, None, false, Containment::None, &inject);
 
     assert!(cmd.len() < 1000, "the command line must stay short regardless of contract size: {} chars: {cmd}", cmd.len());
     assert!(command_line_length_guard(&argv).is_ok(), "the guard must never trip on the fixed path");
@@ -1312,8 +1318,8 @@ fn claude_agent_file_write_failure_falls_back_to_append_system_prompt_file() {
     let cfg = Path::new("C:/x/cfg.json");
     let gdir = Path::new("C:/data/group");
     let wd = Path::new("C:/repo");
-    let cmd = reg.build_agent_command(cli, "sonnet", false, cfg, None, gdir, wd, None, false, false, &inject);
-    let argv = reg.build_agent_argv(cli, "sonnet", false, cfg, None, gdir, wd, None, false, false, &inject);
+    let cmd = reg.build_agent_command(cli, "sonnet", false, cfg, None, gdir, wd, None, false, Containment::None, &inject);
+    let argv = reg.build_agent_argv(cli, "sonnet", false, cfg, None, gdir, wd, None, false, Containment::None, &inject);
     assert!(cmd.contains(&format!("--append-system-prompt-file \"{}\"", path.display())), "{cmd}");
     assert!(!cmd.contains("--agent"), "no generated-file handle when the write failed: {cmd}");
     assert!(argv.windows(2).any(|w| w[0] == "--append-system-prompt-file"), "{argv:?}");
@@ -2118,7 +2124,7 @@ fn compile(reg: &OrchRegistry, g: &loomux_lib::orchestration::GroupInfo, block_i
         Path::new("C:/repo"),
         None,
         false,
-        b.kind.is_read_only(),
+        b.kind.containment(),
         &inject,
     );
     let argv = reg.build_agent_argv(
@@ -2131,7 +2137,7 @@ fn compile(reg: &OrchRegistry, g: &loomux_lib::orchestration::GroupInfo, block_i
         Path::new("C:/repo"),
         None,
         false,
-        b.kind.is_read_only(),
+        b.kind.containment(),
         &inject,
     );
     (cmd, argv, inject.kickoff)
@@ -3128,7 +3134,7 @@ fn orchestrator_command(
         Path::new("C:/repo"),
         None,
         false,
-        false, // the orchestrator is never read-only
+        Role::Orchestrator.containment(), // never contained
         &inject,
     );
     // Round #417 correction 6: the command line no longer carries the
@@ -3297,7 +3303,7 @@ fn a_read_only_block_can_never_pre_approve_a_tool_pattern() {
     // is banned outright on a read-only class rather than "filtered".
     //
     // A planner is read-only by DENYING A FIXED LIST — Edit, Write, NotebookEdit,
-    // `git commit`, `git push` (CLAUDE_READONLY_DENY_TOOLS/_GIT; #448 dropped
+    // `git commit`, `git push` (CLAUDE_EDIT_DENY_TOOLS/_GIT; #448 dropped
     // `MultiEdit`, which matches no real Claude Code tool). Deny beats allow on
     // both CLIs, so
     // an allow pattern cannot re-grant anything *on that list*. But it doesn't

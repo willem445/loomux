@@ -18,13 +18,15 @@
 //! else.
 //!
 //! Be precise about what "the capability sense" buys, because the enum enforces
-//! less than the word suggests: a **planner** is structurally read-only — its
+//! less than the word suggests — [`Role::containment`](super::Role::containment)
+//! is the exact per-class answer. A **planner** is structurally read-only — its
 //! file-editing tools and `git commit`/`git push` are denied at the CLI level, so
-//! `is_read_only()` is a real, mechanical guarantee. A **reviewer**'s "never
-//! pushes" is *instruction-backed*, exactly as it was before #222: it holds the
-//! same write surface a worker does and is merely told not to use it. What the
-//! closed enum guarantees is that a repo file cannot *change* which of those two
-//! postures a block gets — not that every non-worker posture is a sandbox. (See
+//! `is_read_only()` is a real, mechanical guarantee. A **reviewer** is denied the
+//! CLI's file-editing tools too (#462), but keeps the shell — running the tests
+//! is its job — so its "never pushes" stays *instruction-backed*, and so does
+//! "never writes a file" for anything a shell command can do. What the closed
+//! enum guarantees is that a repo file cannot *change* which posture a block
+//! gets — not that any posture is a sandbox. (See
 //! `doc/design/orchestration.md` on structural vs instruction-backed enforcement;
 //! the capability table in `doc/design/workflows.md` is the honest summary.)
 //!
@@ -150,7 +152,7 @@ pub struct Block {
     /// pair with a specific `kind` (`advisor` needs `planner`, `process`
     /// needs `worker`; see [`role_hint_requires`]) so a workflow file cannot
     /// spell a combination nothing downstream will honor. Everything that
-    /// keys capability — `kind.is_read_only()`, `mcp::tool_defs`, the CLI
+    /// keys capability — `kind.containment()`, `mcp::tool_defs`, the CLI
     /// deny-flags — reads `kind` alone; `role_hint` selects only a persona
     /// addendum, a template fragment and a roster badge (#250/#324 slice C).
     /// `None` is today's behavior, byte for byte.
@@ -875,8 +877,9 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         }
         // CAPABILITY CLOSURE. `allow:` pre-approves tool patterns, and the
         // read-only class is read-only by *denial of a fixed list* — Edit, Write,
-        // NotebookEdit, `git commit`, `git push` (CLAUDE_READONLY_DENY_TOOLS/_GIT
-        // — #448 dropped `MultiEdit`, which matches no real Claude Code tool).
+        // NotebookEdit, `git commit`, `git push` (CLAUDE_EDIT_DENY_TOOLS +
+        // CLAUDE_READONLY_DENY_GIT — #448 dropped `MultiEdit`, which matches no
+        // real Claude Code tool).
         // Deny beats allow on both CLIs, so an allow pattern cannot re-grant anything on that list…
         // but it does not have to. `allow: Bash(python *)` (or `cp`, `tee`,
         // `sed -i`, …) hands a planner a shell that writes files and is named
@@ -886,8 +889,17 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         // So the rule is the other way round: **a read-only block may not declare
         // `allow:` at all.** That keeps "a workflow file can never grant a
         // capability" a statement about the code rather than about the deny list's
-        // completeness. (Worker and reviewer already hold the write/shell surface
-        // structurally, so `allow:` widens nothing for them.)
+        // completeness.
+        //
+        // The ban stays keyed to `is_read_only()` — the FULLY read-only class —
+        // and deliberately did not follow #462's deny flags onto reviewers. The
+        // argument above does not apply to a reviewer: it keeps its shell by
+        // design (running the tests is the job), so an `allow:` pattern names
+        // nothing it could not already run, and the editing tools #462 denies it
+        // cannot be re-granted anyway (deny beats allow on both CLIs). Banning
+        // `allow:` there would cost real expressiveness — a reviewer block that
+        // pre-approves `Bash(npm test *)` — and buy nothing. A worker holds the
+        // whole surface outright, same conclusion.
         if !rb.allow.is_empty() && kind.is_read_only() {
             errs.push(format!(
                 "blocks[{i}] ({id}): a {} block cannot declare allow: — its class is read-only, \
