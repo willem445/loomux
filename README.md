@@ -180,7 +180,7 @@ npm run test:e2e
 
 | Variable | Effect |
 | --- | --- |
-| `LOOMUX_DATA_DIR` | Redirects the **entire** app-data root (`orchestration/`, `logs/`, `tabs.json`, `running.lock` — everything normally under `<platform data dir>/loomux`) to the given **absolute** path. Empty or relative values are rejected and ignored (falls back to the platform default) rather than silently resolving against the current working directory. Use it to run a second, fully isolated loomux profile side by side with a normal install — the E2E harness (`e2e/fixtures.ts`) is one example, not the only one. |
+| `LOOMUX_DATA_DIR` | Redirects the **entire** app-data root (`orchestration/`, `logs/`, `tabs.json`, `session-index.json`, `running.lock` — everything normally under `<platform data dir>/loomux`) to the given **absolute** path. Empty or relative values are rejected and ignored (falls back to the platform default) rather than silently resolving against the current working directory. Use it to run a second, fully isolated loomux profile side by side with a normal install — the E2E harness (`e2e/fixtures.ts`) is one example, not the only one. |
 
 ## Contributing
 
@@ -194,7 +194,7 @@ npm run test:e2e
 ```
 src-tauri/src/
   pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
-  sessions.rs       agent session discovery (one scan_* fn per agent source)
+  sessions.rs       agent session discovery (one collect_*_candidates fn per agent source); metadata-first + a persisted head-parse index (session-index.json) so a long history costs a stat, not a parse (#493). See doc/design/session-index.md
   orchestration/    agent groups: registry, guardrails, MCP server, audit. Compact-survival is
     layered (#329, #416, #417): a durable role CONTRACT riding the CLI's own system-prompt layer
     (a generated `~/.claude/agents`/`~/.copilot/agents` custom-agent file on both CLIs — Claude's
@@ -253,6 +253,7 @@ src/
   sessionreconcile.ts pure post-start session-id adoption matcher (refuses on any ambiguity) + the dormant card's "resume last session" candidate lookup (DOM-free, unit-tested, #440). See doc/design/session-id-learning.md
   panefit.ts        pure "hidden => no PTY resize" decision (the no-resize invariant)
   sessions.ts       session browser sidebar: source/role chips, and (#1) each session's recorded task/goal, repo, branch, and PR (when the board has one) — absent rather than guessed for a session predating the field
+  sessionstore.ts   the app's ONE session list: single-flight scan sharing so no two consumers can scan the disk at once (#493) (DOM-free, unit-tested). See doc/design/session-index.md
   sessionmeta.ts    pure session-browser task/repo-branch/PR formatting + truncation (#1) (DOM-free, unit-tested)
   resumeerror.ts    pure classification of a resume failure's structured backend tag into a UI affordance -- start-fresh vs a plain error (#412) (DOM-free, unit-tested)
   restorecard.ts    pure dormant-card lifecycle state machine -- idle/pending/error, click acknowledged immediately, failure always lands on a persistent error state (#479) (DOM-free, unit-tested)

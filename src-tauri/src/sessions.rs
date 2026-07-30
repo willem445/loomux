@@ -1018,6 +1018,10 @@ struct Parsed {
 /// true once. They're re-derived on every scan instead — see `to_session_info`.
 #[derive(Serialize, Deserialize, Clone)]
 struct IndexEntry {
+    /// Lossy-stringified for JSON. A path that doesn't survive that round trip
+    /// (not reachable through Windows' own UTF-16 paths in practice) simply never
+    /// matches its candidate again, so that one session is re-parsed every scan —
+    /// a cost, never a wrong row.
     path: String,
     modified_ms: u64,
     len: u64,
@@ -1106,6 +1110,11 @@ fn save_session_index(entries: Vec<IndexEntry>) {
 /// `read_copilot_session` behavior). A claude row is never dropped here — an
 /// unreadable jsonl yields the same "(no prompt)" row it did before, since its
 /// id comes from the filename and needs no parse at all.
+///
+/// A dropped candidate gets no index entry, so it is re-read on every scan.
+/// That's deliberate: caching "this wasn't parseable" would mean a session
+/// finishing its `workspace.yaml` write stayed invisible until something else
+/// changed. The cost is bounded by how many malformed files exist.
 fn parse_candidate(c: &Candidate) -> Option<Parsed> {
     if c.source == "claude" {
         let (title, cwd, orch) = scan_claude_jsonl(&c.path);

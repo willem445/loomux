@@ -338,9 +338,10 @@ fn cached_rows_keep_their_orchestration_identity() {
 /// A synthesized claude store shaped like the one #493 was measured on: many
 /// sessions whose HEADS are big, which is where the cost actually is. Measured
 /// against the real 955-file store on the reporting machine (`Get-Content
-/// -TotalCount 60` over a random 60-file sample): the first 60 lines of a real
-/// transcript average 174,599 bytes (median 169,909, min 30,912, max 477,167) —
-/// so a scan that head-parses 826 of them reads and JSON-parses ~140 MB, which
+/// -TotalCount 60` over a random 60-file sample, line lengths summed): the first
+/// 60 lines of a real transcript average 174,599 characters (median 169,909, min
+/// 30,912, max 477,167) — so a scan head-parsing 826 of them reads and
+/// JSON-parses on the order of 140 MB, which
 /// is what 13–17 seconds buys.
 ///
 /// Deterministic: same file count, same bytes, same ascending mtimes on every
@@ -394,27 +395,23 @@ fn measure_scan_cost_on_a_synthesized_population() {
     write_big_claude_store(&s.claude, count);
     println!("fixture: {count} claude sessions written in {:?}", t.elapsed());
 
-    let t = std::time::Instant::now();
-    let (rows, cold) = list_sessions_for_test();
-    println!(
-        "COLD  {:?}  seen={} rows={} parsed={} reused={}",
-        t.elapsed(),
-        cold.files_seen,
-        rows.len(),
-        cold.parsed,
-        cold.reused
-    );
-
-    let t = std::time::Instant::now();
-    let (rows, warm) = list_sessions_for_test();
-    println!(
-        "WARM  {:?}  seen={} rows={} parsed={} reused={}",
-        t.elapsed(),
-        warm.files_seen,
-        rows.len(),
-        warm.parsed,
-        warm.reused
-    );
+    // Several scans, not one: the OS file cache moves a single cold number by
+    // more than the change under measurement does (the same 826-parse scan takes
+    // ~8s on a cold cache and ~2s on a hot one), so what matters is the
+    // steady-state cost of a scan — every launch pays scan #1's shape, and
+    // scans 2..n show what the index changes.
+    for i in 1..=4 {
+        let t = std::time::Instant::now();
+        let (rows, s) = list_sessions_for_test();
+        println!(
+            "scan #{i}  {:?}  seen={} rows={} parsed={} reused={}",
+            t.elapsed(),
+            s.files_seen,
+            rows.len(),
+            s.parsed,
+            s.reused
+        );
+    }
 
     clear_seams();
 }
