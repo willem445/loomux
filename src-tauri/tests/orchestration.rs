@@ -1540,6 +1540,15 @@ fn reviewer_is_denied_editing_tools_but_keeps_its_shell() {
     assert!(!rev.contains("Bash(git commit"), "a reviewer keeps git commit — its template hands it that in place of git stash (#299)");
     assert!(!rev.contains("Bash(git push"), "denying push here would be a claim the shell can't back; it stays instruction-tier");
     assert!(rev.contains("\"Bash(gh *)\""), "gh stays allowed so the reviewer can post its review");
+    // #465 x #462, the seam where the two changes meet: a reviewer must NOT be
+    // promoted to `dontAsk`. That mode auto-denies everything outside
+    // `--allowedTools` — for a reviewer that is the shell it runs the tests
+    // through, so the mode that hardens a planner would disable a reviewer.
+    // `claude_effective_permission_mode` is fed `containment.is_read_only()`,
+    // never `denies_edits()`, and this is what says so out loud.
+    assert!(!rev.contains("dontAsk"),
+        "a reviewer must never run under dontAsk (#465 names this case explicitly): {rev}");
+    assert!(rev.contains("--permission-mode auto"), "{rev}");
     // …and no promotion: an auto_ops=false reviewer stays exactly as attended
     // as it was before #462.
     let manual = reg.build_agent_command("claude", "sonnet", false, cfg, None, gdir, Path::new("C:/repo"), None, false, tier, &PersonaInject::default());
@@ -1636,10 +1645,14 @@ fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
     // hands its request straight back, so no seam is needed to read it — and an
     // orchestrator that ever acquired deny flags would be a group that cannot
     // drive its own git/gh flow.
-    let state = tempfile::tempdir().unwrap();
+    // Through `test_registry`, never a raw `OrchRegistry::new` — #464's guard
+    // (`no_registry_construction_bypasses_the_test_agent_dir_overrides`) is right:
+    // an unrouted registry leaks a generated agent file into the real
+    // `~/.claude`/`~/.copilot` agents dir on its first spawn. `Arc` wraps the
+    // helper's registry rather than building a second one.
+    let (reg2, _d2) = test_registry();
+    let reg2 = std::sync::Arc::new(reg2);
     let repo = tempfile::tempdir().unwrap();
-    let reg2 = std::sync::Arc::new(OrchRegistry::new(state.path().to_path_buf()));
-    reg2.set_port(45999);
     let orch = create_orchestration_group(
         &reg2,
         &repo.path().to_string_lossy().replace('\\', "/"),
