@@ -1220,11 +1220,32 @@ load-bearing on their own:
      `resume-group-unknown:` ("cannot be verified" is a different fact from
      "contradicted", and deserves different copy and a different next step).
 
-   The cost is real and deliberate: a pre-roster delegate in a legacy tab no
-   longer rejoins from the Resume card. The human can still reach that session
-   from the session browser, or have the orchestrator spawn a fresh agent —
-   and #485's whole premise is that a silent wrong-group rejoin is worse than
-   a legible refusal. Between the two arms, **no delegate rejoin proceeds on a
+   The cost is real, deliberate, and **terminal for that class** — this is the
+   part the first version of these notes got wrong (review round 2). It said
+   the human could "still reach that session from the session browser", which
+   is circular: `SessionsPanel.roleFor` falls back to the transcript-signature
+   classification (`orch_role`/`orch_group` off the scanner), so a pre-roster
+   delegate still shows an orch chip, clicking it hints the same group, and it
+   lands back on the same refusal. The browser has exactly one action per row
+   (`item.addEventListener("click", …onRestore)`) — there is no "open it
+   plainly" affordance to fall through to — and start-fresh is not an escape
+   either, since a fresh spawn would join the very group that could not be
+   verified. A wrong escape hatch in an error message is worse than none: it
+   sends the human in a circle and reads as though the door exists.
+
+   What is actually reachable, and what the copy now says in all of its
+   places:
+
+   - **No in-app rejoin.** Nothing puts this session back into a group. That
+     is the refusal working, not a gap to route around.
+   - **The conversation is not lost.** It reopens *outside* orchestration via
+     the CLI's own resume command — the session row's tooltip already shows it
+     (`item.title = s.resume_command`) — as a plain pane with no group
+     membership, which is precisely the thing that could not be verified.
+   - **The work continues** by the orchestrator spawning a fresh agent: a new
+     session in a group that vouches for it, not a recovery of this one.
+
+   Between the two arms of the fallback, **no delegate rejoin proceeds on a
    group id only the caller vouches for**; that is the exact claim, and it is
    the one the code makes.
 

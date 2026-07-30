@@ -22063,11 +22063,26 @@ pub fn resume_recorded_session(
             // rejoin is worse than a legible refusal.
             let (group_id, role) = hint.ok_or("this session is not part of a recorded orchestration")?;
             if role != "orchestrator" {
+                // THE ESCAPE ROUTE HAS TO EXIST (#485 review round 2). This
+                // said "resume it from the session browser", which is
+                // circular: the browser classifies a pre-roster session from
+                // its transcript SIGNATURE (`SessionsPanel.roleFor`'s
+                // `orch_role`/`orch_group` fallback), so clicking it there
+                // hints the same group and lands right back on this line. A
+                // fresh spawn is not an escape either — it would join the very
+                // group that could not be verified. So this names what is
+                // actually reachable, and says plainly that a group rejoin is
+                // not among it.
                 return Err(format!(
                     "resume-group-unknown: session {session_id} has no recorded orchestration \
                      membership on this machine, so the group it belongs to cannot be verified — \
-                     refusing to rejoin it into {group_id} on the caller's say-so. Resume it from \
-                     the session browser, or have the orchestrator spawn a fresh agent."
+                     refusing to rejoin it into {group_id} on the caller's say-so. Nothing can \
+                     rejoin this session INTO a group: the session browser classifies it from its \
+                     transcript alone and returns here, and a fresh spawn would join the \
+                     unverified group. What does work: the orchestrator can spawn a fresh agent \
+                     for the work, and the conversation itself is not lost — it reopens OUTSIDE \
+                     orchestration via the CLI's own resume command (shown in the session row's \
+                     tooltip), as a plain pane with no group membership."
                 ));
             }
             if !reg.group_dir(&group_id).join("group.json").is_file() {

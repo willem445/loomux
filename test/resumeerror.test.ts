@@ -83,6 +83,38 @@ test("both group refusals read as prose, not as the wire tag (#485)", () => {
   assert.notEqual(mismatch, unknown);
 });
 
+test("the group-unknown guidance names a route that exists, never the circular one (#485)", () => {
+  // Review round 2. "Resume it from the session browser" was FALSE for this
+  // class: SessionsPanel.roleFor falls back to the transcript-signature
+  // classification, so a pre-roster delegate still shows an orch chip, clicking
+  // it hints the same group, and the backend lands on this same refusal. The
+  // browser has one action per row and no "open plainly" affordance to fall
+  // through to. An error that names a door which isn't there costs the human a
+  // lap of the loop before they learn that.
+  const unknown = resumeFailureReason("group-unknown");
+  assert.doesNotMatch(
+    unknown,
+    /from the session browser/i,
+    "the session browser routes back into this refusal — it must not be offered as the way out"
+  );
+  assert.match(
+    unknown,
+    /nothing will rejoin it into a group/i,
+    "says plainly that a group rejoin is not available, rather than implying one exists"
+  );
+  assert.match(
+    unknown,
+    /outside orchestration/i,
+    "names where the conversation IS reachable — the CLI's own resume, with no group membership"
+  );
+  assert.match(unknown, /spawn a fresh agent/i, "and how the work continues");
+
+  // The start-freshable kinds still legitimately point at the browser: those
+  // sessions HAVE a record, so that route resolves for them. This test must not
+  // be read as "no message may ever mention the browser".
+  assert.match(resumeFailureReason("not-found"), /session history/i);
+});
+
 test("reason text is specific per kind, not a generic placeholder", () => {
   const missing = resumeFailureReason("workspace-missing");
   const notFound = resumeFailureReason("not-found");

@@ -69,7 +69,13 @@ export function resumeFailureReason(kind: ResumeFailureKind): string {
     case "group-mismatch":
       return "It belongs to a different orchestration group than the one being resumed — resume it from its own group.";
     case "group-unknown":
-      return "loomux has no record of which orchestration group it belongs to, so it wasn't rejoined into one on a guess — resume it from the session browser, or have the orchestrator spawn a fresh agent.";
+      // Deliberately does NOT point at the session browser (#485 review round
+      // 2): the browser classifies this class from the transcript signature
+      // and routes straight back into the same refusal, so that guidance was
+      // a loop. Nor does it offer a fresh spawn AS A REJOIN — that would join
+      // the unverified group. It names the two routes that exist and is
+      // explicit that a group rejoin isn't one of them.
+      return "loomux has no record of which orchestration group it belongs to, so it wasn't rejoined into one on a guess. Nothing will rejoin it into a group — but the conversation isn't lost: it reopens outside orchestration with the CLI's own resume command (shown in the session row's tooltip), and the orchestrator can spawn a fresh agent for the work.";
     default:
       return "It could not be resumed.";
   }

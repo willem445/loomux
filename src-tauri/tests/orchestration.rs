@@ -4242,6 +4242,26 @@ fn a_record_less_delegate_is_refused_rather_than_rejoined_on_the_hint_alone() {
         err.starts_with("resume-group-unknown:"),
         "must carry its own structured tag — this is 'cannot be verified', not 'contradicted', got: {err}"
     );
+    // The escape guidance must name a route that EXISTS (#485 review round 2).
+    // "Resume it from the session browser" was circular: the browser classifies
+    // a pre-roster session from its transcript signature and hints the same
+    // group, landing back here. A dead end told as a door is worse than a dead
+    // end told as one, so this pins that the message doesn't send the human in
+    // that circle.
+    let lowered = err.to_lowercase();
+    assert!(
+        !lowered.contains("resume it from the session browser"),
+        "must not point at the session browser — that route returns to this same refusal: {err}"
+    );
+    assert!(
+        lowered.contains("returns here") || lowered.contains("returns to"),
+        "must say the browser leads back here rather than leaving it as an option: {err}"
+    );
+    assert!(
+        lowered.contains("spawn a fresh agent") && lowered.contains("outside"),
+        "must name the two routes that do exist — a fresh agent for the work, and reopening the \
+         conversation outside orchestration: {err}"
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         !reg.list_agents(&group).to_string().contains(sid),
