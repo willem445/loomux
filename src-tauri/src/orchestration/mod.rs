@@ -5619,7 +5619,26 @@ pub struct OrchRegistry {
     /// enqueue-on-abort spawns at most one drainer per pane (bounded thread
     /// lifecycle — the same leak concern raised against #451's late
     /// monitors, answered the same way: exits on drain, never accumulates).
-    queue_draining: Arc<Mutex<HashSet<u32>>>,
+    ///
+    /// **Generation-owned, not a bare membership set (#470 B1 review round
+    /// 2).** Keyed to a monotonic `drainer_gen` token minted at spawn, not
+    /// just `pty_id` — see `DrainerGuard`'s doc for why: a bare
+    /// `HashSet<u32>` lets a drainer's OWN stale deregistration (its RAII
+    /// guard dropping after `commit_exit` already deregistered it) erase a
+    /// SUCCESSOR drainer's live registration, breaking the at-most-one-
+    /// drainer invariant the whole ordering proof rests on. Every removal
+    /// (`commit_exit`, `DrainerGuard::drop`) is generation-checked: it only
+    /// clears the entry if the CURRENTLY stored generation is still its
+    /// own, which makes a stale/duplicate removal attempt a structural
+    /// no-op rather than something every call site has to remember to
+    /// avoid.
+    queue_draining: Arc<Mutex<HashMap<u32, u64>>>,
+    /// Monotonic counter minting a fresh generation token per drainer spawn
+    /// (`ensure_drainer`) — no getrandom (CLAUDE.md constraint 2). See
+    /// `queue_draining`'s doc for why a generation, not just a bool
+    /// membership flag, is what makes stale-deregistration structurally
+    /// impossible rather than merely avoided by discipline.
+    drainer_gen: Arc<AtomicU64>,
     /// Panes whose queue has already fired the one-shot "still queued"
     /// visibility notice (#445) — cleared when the queue empties, so a LATER
     /// long block on the same pane can notify again.
@@ -7430,13 +7449,26 @@ fn run_late_confirmation_monitor(
 // happens AT the cap: enqueue, not destroy. This section is the impure half
 // (queue map, drainer thread); `queue.rs` is the pure policy.
 
-/// What `deliver_now` reports back to its caller — either the front door
-/// (`deliver_prompt`'s spawned thread) or the drainer (`run_queue_drainer`)
-/// — so the CALLER decides whether to enqueue, never `deliver_now` itself.
-/// That split is what lets the identical pipeline serve both a fresh
-/// delivery (abort → enqueue + notify once) and a replay (abort → leave
-/// queued, retry silently — the sender was already notified at the
-/// original enqueue, and notifying again on every 2s retry would be spam).
+/// What admitting a payload into a pane's queue (`OrchRegistry::enqueue_text`)
+/// resolved to (#470): `id` for audit/removal purposes, and `was_first` —
+/// whether the queue was empty immediately before this admission, decided
+/// atomically with the push. See `enqueue_text`'s doc for why `was_first`
+/// is the one fact the whole ordering fix hangs off of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmitOutcome {
+    pub id: u64,
+    pub was_first: bool,
+}
+
+/// What `deliver_now` reports back to its caller — always `run_queue_drainer`
+/// as of #470 (the front door no longer calls `deliver_now` directly; see
+/// its doc). `Done` means nothing is left to queue; the two `Aborted*`
+/// variants mean the entry stays exactly where it already sits at the front
+/// of the queue (#470: every entry is admitted BEFORE its first delivery
+/// attempt, unlike pre-#470 where a fresh delivery's abort had to enqueue
+/// something that wasn't in the queue yet) — the drainer's own match on the
+/// outcome decides whether to retry in place, convert to a
+/// `StrandedSubmit` marker, or pop and move on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeliverOutcome {
     /// Ran to a terminal state that is NOT a hold-cap abort: delivered and
@@ -7457,15 +7489,17 @@ enum DeliverOutcome {
 }
 
 /// The delivery body itself — paste, echo-verify, submit, confirm — pulled
-/// out of `deliver_prompt` (#445) so the FRONT DOOR (a fresh delivery to an
-/// empty queue) and the DRAINER (replaying a queued entry) run the exact
-/// same pipeline, never a reimplementation of it. Every parameter here is
-/// something `deliver_prompt`'s old closure used to capture; nothing about
-/// the pipeline itself changed by this extraction — see the diff against
-/// the pre-#445 version for the byte-for-byte body. `reg` is used only for
-/// the pre-existing (#103/#112) `notify_unconfirmed_delivery`/late-monitor
-/// wiring, unrelated to the queue — `deliver_now` never touches the queue
-/// itself; only its caller does, based on the returned `DeliverOutcome`.
+/// out of `deliver_prompt` (#445) so a single pipeline serves every attempt.
+/// As of #470, `run_queue_drainer` is the ONLY caller: every delivery is
+/// admitted into `pty_id`'s queue at arrival (`deliver_prompt`'s front
+/// door), and only the queue's front entry is ever handed to this function
+/// — there is no more separate "fresh delivery races a raw mutex" path for
+/// this to serve (see `doc/design/orchestration.md`'s Ordering subsection
+/// for why that path was the actual ordering bug, not merely unfair). `reg`
+/// is used only for the pre-existing (#103/#112)
+/// `notify_unconfirmed_delivery`/late-monitor wiring, unrelated to the
+/// queue — `deliver_now` never touches the queue itself; only its caller
+/// does, based on the returned `DeliverOutcome`.
 #[allow(clippy::too_many_arguments)]
 fn deliver_now(
     app: AppHandle,
@@ -7482,15 +7516,6 @@ fn deliver_now(
     last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
     target_is_orchestrator: bool,
     reg: Option<Arc<OrchRegistry>>,
-    // #445 rev-35 B1: `Some(queues)` for a FRESH delivery (the front door's
-    // direct-thread-spawn call), `None` for a drainer replay. The front
-    // door alone only protects deliveries that ARRIVE after a queue
-    // exists — it says nothing about one already in flight (holding
-    // `lock` through its own pre-paste hold) when the queue forms
-    // underneath it. See the pre-paste recheck below for the fix this
-    // closes and `queue::queue_is_non_empty`'s doc for why this is the
-    // SAME check the front door uses, not a second definition of "busy."
-    recheck_queues: Option<Arc<Mutex<HashMap<u32, VecDeque<queue::QueuedDelivery>>>>>,
 ) -> DeliverOutcome {
     let _guard = lock.lock_safe();
     let ptys = app.state::<crate::pty::PtyManager>();
@@ -7654,28 +7679,24 @@ fn deliver_now(
         }
     }
 
-    // #445 rev-35 B1: re-check the queue right here, immediately before
-    // committing to paste — the front door's OWN check (at this delivery's
-    // arrival) is stale by now for a FRESH delivery that had to hold above:
-    // an earlier-arriving delivery to this same pane can have timed out its
-    // OWN hold, enqueued, and started a drainer WHILE this one was blocked
-    // acquiring `lock` or sitting in one of the holds above — all without
-    // this delivery ever seeing the queue, because it was empty at arrival
-    // and nothing re-checks it during a hold. Pasting now would let this
-    // delivery overtake the one already queued ("now go" before "here's the
-    // context" — the live-evidence shape #445 was filed over, reproduced by
-    // the review at a different seam). `recheck_queues` is `None` for a
-    // drainer replay: it must never defer to itself — it +IS+ the front of
-    // the queue, and its own peek/pop discipline already owns ordering
-    // among what's behind it.
-    if let Some(queues) = &recheck_queues {
-        if queue::queue_is_non_empty(queues, pty_id) {
-            append_audit(&root, &group, "loomux", "delivery-aborted-behind-queue", json!({
-                "to": agent, "reason": "queue filled during this delivery's own pre-paste hold",
-            }));
-            return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::BehindQueue);
-        }
-    }
+    // #445 rev-35 B1 USED to re-check the queue right here, immediately
+    // before committing to paste — necessary back when a FRESH delivery
+    // could reach this point never having touched the queue at all (it
+    // raced a raw per-pty mutex instead), so an earlier-arriving delivery
+    // that timed out its own hold and enqueued WHILE this one was blocked
+    // could otherwise be overtaken. #470 removes the recheck rather than
+    // widening it (a reviewer proved widening it to 3+ contenders
+    // insufficient — see `doc/design/orchestration.md`'s Ordering
+    // subsection): every delivery, including this one, is now admitted
+    // into the SAME queue at `deliver_prompt`'s front door, atomically with
+    // the emptiness check that decided whether it or something else runs
+    // first. By the time ANY call reaches this function, its own entry is
+    // — and structurally can only ever be — the front of `pty_id`'s queue
+    // (nothing but `run_queue_drainer`'s own pop ever removes the front,
+    // and nothing but a push to the BACK ever adds to it), so there is
+    // nothing left to defer to. See `b1_ordering_property` in `queue.rs`
+    // for the historical model of the mechanism this replaces and
+    // `unified_admission_property` for the model of what replaced it.
 
     // #112: this delivery's OWN baseline into the `promptsubmit` hook
     // marker, snapshotted right before it pastes anything — see
@@ -8240,25 +8261,38 @@ fn drain_stranded_submit(
     flushed
 }
 
-/// The delivery-queue drainer (#445): one per pane with a non-empty queue,
-/// spawned by `OrchRegistry::ensure_drainer` the first time an abort needs
-/// somewhere to put a payload. Polls deliverability at `QUEUE_DRAIN_POLL` —
-/// no cap, no timeout, matching the standing requirement that a hold whose
-/// release condition is "a human answers" must not expire — and replays
-/// the queue's FRONT entry the instant the pane is deliverable. Exits when
-/// the queue is empty, the pty closes, or the agent dies (dropping any
-/// remaining entries with an audit line + notice — today that case is
-/// silent).
+/// The delivery-queue drainer (#445, generalized by #470 into the ONLY way
+/// anything ever reaches `deliver_now`): one per pane with a non-empty
+/// queue, spawned by `OrchRegistry::ensure_drainer`. Polls deliverability
+/// at `QUEUE_DRAIN_POLL` — no cap, no timeout, matching the standing
+/// requirement that a hold whose release condition is "a human answers"
+/// must not expire — and replays the queue's FRONT entry the instant the
+/// pane is deliverable. Exits when the queue is empty, the pty closes, or
+/// the agent dies (dropping any remaining entries with an audit line +
+/// notice — today that case is silent).
 ///
-/// **Ownership discipline** (what makes the front-door check race-free):
-/// only THIS thread ever pops from the FRONT of a given pane's queue.
-/// `deliver_prompt`'s front door only ever pushes to the BACK. That
-/// single-consumer/multi-producer split is what keeps the queue non-empty
-/// for a pane's WHOLE drain (peek before acting, pop only after the
-/// attempt resolves) — without it, a fresh direct delivery could see a
-/// transient empty queue mid-drain and race the very entry this thread is
-/// still replaying, exactly the ordering inversion the front-door check
-/// exists to prevent.
+/// **Ownership discipline** (what makes ordering race-free, #470). Only
+/// THIS thread ever pops from the FRONT of a given pane's queue.
+/// `deliver_prompt`'s front door only ever pushes to the BACK, and — as of
+/// #470 — EVERY delivery goes through that same push, atomically with the
+/// emptiness check that decides whether it's the one to spawn this thread
+/// (`enqueue_text`'s `was_first`) or whether it's landing behind an
+/// existing queue a drainer is already (or about to be) working through.
+/// There is no longer a separate "race a raw mutex, bypass the queue
+/// entirely" path for a later arrival to use to cut ahead — see
+/// `doc/design/orchestration.md`'s Ordering subsection for the argument
+/// this closes (a plain fair mutex does NOT: a reviewer proved a delivery
+/// deferred at its OWN paste-point recheck can still lose its arrival
+/// position to a later arrival that queued via a bypass the fair lock never
+/// touched).
+///
+/// **Zero added latency for the common case (#470).** This thread's FIRST
+/// pass never sleeps and never pre-checks deliverability — it calls
+/// `deliver_now` immediately, exactly as the pre-#470 direct-spawn path
+/// did, and `deliver_now`'s own internal waits (bounded, with the same caps
+/// as ever) do the real work. Every later pass (a retry, or a second entry
+/// that piled up behind the first) uses the normal poll cadence, exactly as
+/// before #470.
 ///
 /// **Panic safety (rev-35 review, NB2).** Removal from `queue_draining` is
 /// an RAII guard (below), not a manual call at each exit — a panic
@@ -8267,28 +8301,113 @@ fn drain_stranded_submit(
 /// pty latched in `queue_draining` forever, permanently blocking every
 /// future `ensure_drainer` call for that pane. The guard's `Drop` runs on
 /// unwind exactly like it does on a normal `return`.
+///
+/// **Generation-checked, not unconditional (#470 B1 review round 2).** A
+/// committed exit (`OrchRegistry::commit_exit`) ALREADY deregisters
+/// `pty_id` atomically with confirming the queue is empty — this guard
+/// still runs afterwards regardless (it has no way to know commit_exit
+/// already acted; RAII fires on every `return`, committed or not). If its
+/// `Drop` unconditionally removed `pty_id` again, it could erase a
+/// SUCCESSOR drainer's live registration: a fresh delivery can arrive,
+/// `was_first: true`, spawn Drainer2, and register — all in the window
+/// between Drainer1's `commit_exit` and Drainer1's OWN guard dropping —
+/// and an unconditional second removal would strip Drainer2's
+/// registration out from under it while it's still running (possibly
+/// mid-`deliver_now`, a 60–120s hold), letting a THIRD arrival spawn
+/// Drainer3 concurrently with Drainer2 — two live drainers walking the
+/// same queue, the same entry pasted twice. This is why `generation`
+/// exists: `commit_exit` and this `Drop` both remove `pty_id` ONLY if the
+/// CURRENTLY stored generation still matches the one THIS drainer was
+/// minted at spawn (`ensure_drainer`). Whichever of them acts first wins
+/// the real removal; whichever acts second finds either nothing to remove
+/// (already gone) or a DIFFERENT generation (a successor already claimed
+/// it) and is a no-op either way — structurally, not because every call
+/// site remembered to "arm"/"disarm" anything. See
+/// `unified_admission_property::drainer_lifecycle` (queue.rs) for the
+/// exhaustive proof, including the stale-guard-drop event modeled
+/// explicitly rather than assumed away.
 struct DrainerGuard {
-    queue_draining: Arc<Mutex<HashSet<u32>>>,
+    queue_draining: Arc<Mutex<HashMap<u32, u64>>>,
     pty_id: u32,
+    generation: u64,
 }
 
 impl Drop for DrainerGuard {
     fn drop(&mut self) {
-        self.queue_draining.lock_safe().remove(&self.pty_id);
+        let mut draining = self.queue_draining.lock_safe();
+        if draining.get(&self.pty_id) == Some(&self.generation) {
+            draining.remove(&self.pty_id);
+        }
     }
 }
 
-fn run_queue_drainer(reg: Arc<OrchRegistry>, app: AppHandle, group: String, pty_id: u32) {
-    let _draining_guard = DrainerGuard { queue_draining: reg.queue_draining.clone(), pty_id };
-    let ptys = app.state::<crate::pty::PtyManager>();
-    let mut header_pending = true;
-    loop {
-        std::thread::sleep(queue::QUEUE_DRAIN_POLL);
+/// The kickoff-specific behavior (`Delivery::wait_ready`/
+/// `confirms_autopilot_dialog`) a FRESH delivery resolved at
+/// `deliver_prompt`'s front door, threaded through to this drainer's very
+/// first pass ONLY (#470). Every pre-#470 replay already hardcoded
+/// `false, false` here — a queued entry, by the time anything replays it,
+/// is never "the first prompt to a just-booted CLI" in the sense that
+/// matters; this preserves that exactly for iteration 2+, and restores it
+/// for iteration 1 where #470's unification would otherwise have silently
+/// dropped it (a freshly spawned drainer used to only ever mean "replaying
+/// a hold-cap timeout," never "the very first attempt").
+///
+/// `id` guards against the (purely theoretical — see `ensure_drainer`'s
+/// doc) race where a DIFFERENT, non-kickoff caller's `ensure_drainer` call
+/// happens to win the idempotent spawn instead of the kickoff's own: if the
+/// front entry on the first pass isn't this id, `wait_ready`/
+/// `confirm_autopilot` are NOT applied — falling back to the always-safe
+/// `false, false` rather than misapplying kickoff behavior to a different
+/// delivery.
+struct FreshFirstAttempt {
+    id: u64,
+    wait_ready: bool,
+    confirm_autopilot: bool,
+}
 
-        // Pty closed: nothing left to drain to.
+fn run_queue_drainer(
+    reg: Arc<OrchRegistry>,
+    app: AppHandle,
+    group: String,
+    pty_id: u32,
+    fresh_first: Option<FreshFirstAttempt>,
+    // #470 B1 review round 2: the generation `ensure_drainer` minted for
+    // THIS spawn — threaded through so both this thread's own
+    // `DrainerGuard` and its `commit_exit` calls remove `queue_draining`'s
+    // entry only if it's still THIS generation. See `DrainerGuard`'s doc.
+    generation: u64,
+) {
+    let _draining_guard = DrainerGuard { queue_draining: reg.queue_draining.clone(), pty_id, generation };
+    let ptys = app.state::<crate::pty::PtyManager>();
+    // #470: suppressed until real contention is observed (a retry, or more
+    // than one entry queued) — see the loop body below. Pre-#470, a drainer
+    // only ever existed BECAUSE something already needed to queue, so
+    // showing it unconditionally on the first successful send was correct;
+    // #470 also spawns this thread for the common, uncontended, zero-hold
+    // case, which must never claim anything was "queued while blocked."
+    let mut header_pending = false;
+    let mut iteration = 0u32;
+    loop {
+        iteration += 1;
+        // #470: the very first pass of a freshly spawned drainer attempts
+        // immediately — no poll sleep, no outer deliverability pre-check —
+        // exactly matching the pre-#470 direct path's latency for the
+        // common uncontended case. `deliver_now`'s own internal waits are
+        // the real (and only) gate; this outer pair exist purely to avoid
+        // re-entering `deliver_now`'s setup on every 2s poll once genuine
+        // contention is already known, which iteration 1 never is.
+        let immediate_first_pass = iteration == 1;
+        if !immediate_first_pass {
+            std::thread::sleep(queue::QUEUE_DRAIN_POLL);
+        }
+
+        // Pty closed: nothing left to drain to. #470 B1: `commit_exit`
+        // (not the RAII guard alone) is what makes this exit atomic with
+        // deregistering from `queue_draining` — see its doc.
         if ptys.output_total(pty_id).is_none() {
-            reg.drop_queue(&group, pty_id, queue::DropReason::AgentDied);
-            reg.queue_still_notified.lock_safe().remove(&pty_id);
+            if let Some(entries) = reg.commit_exit(pty_id, generation, true) {
+                reg.announce_dropped(&group, entries, queue::DropReason::AgentDied);
+            }
             return;
         }
         let agent_id = reg.by_pty.lock_safe().get(&pty_id).cloned();
@@ -8296,36 +8415,68 @@ fn run_queue_drainer(reg: Arc<OrchRegistry>, app: AppHandle, group: String, pty_
         // Agent record gone or dead, but the pty somehow lingers (teardown
         // ordering) — same treatment as a closed pty.
         if agent.as_ref().map(|a| a.status == AgentStatus::Dead).unwrap_or(true) {
-            reg.drop_queue(&group, pty_id, queue::DropReason::AgentDied);
-            reg.queue_still_notified.lock_safe().remove(&pty_id);
+            if let Some(entries) = reg.commit_exit(pty_id, generation, true) {
+                reg.announce_dropped(&group, entries, queue::DropReason::AgentDied);
+            }
             return;
         }
         let Some(a) = agent else { continue };
 
-        let front = reg.queues.lock_safe().get(&pty_id).and_then(|q| q.front().cloned());
-        let Some(front) = front else {
-            // Drained empty — this thread's job is done.
-            reg.queue_still_notified.lock_safe().remove(&pty_id);
+        // #470 B1: decide, ATOMICALLY with deregistering from
+        // `queue_draining`, whether this thread may exit — BEFORE peeking
+        // anything else. A plain "peek front, see None, return" (the
+        // pre-fix shape) leaves a window between that peek and the
+        // `DrainerGuard`'s eventual drop where a fresh `was_first`
+        // admission's own `ensure_drainer` call sees this pty still
+        // marked draining, no-ops, and stands no chance of ever being
+        // picked up — a silently stranded delivery the sender was
+        // already told `Ok` for. `commit_exit` closes that window by
+        // holding `queues`'s lock across BOTH the emptiness check and the
+        // `queue_draining` removal, so whichever of "a push" or "this
+        // exit" the OS schedules first is fully visible to the other.
+        if let Some(entries) = reg.commit_exit(pty_id, generation, false) {
+            debug_assert!(entries.is_empty(), "force:false only commits when the queue was already empty");
             return;
+        }
+        // Not empty (confirmed above) — safe to peek normally now; only
+        // this single-consumer thread ever pops the front, so nothing can
+        // make it empty again out from under us before we act on it.
+        let (front, depth) = {
+            let queues = reg.queues.lock_safe();
+            let q = queues.get(&pty_id);
+            (q.and_then(|q| q.front().cloned()), q.map(VecDeque::len).unwrap_or(0))
         };
-
-        // Visibility, never destruction (#445): a queue behind an
-        // unanswered question/box is the DESIGNED case for this feature,
-        // not a leak — see `queue::still_queued_notice`'s doc.
-        let already_notified = reg.queue_still_notified.lock_safe().contains(&pty_id);
-        if queue::should_fire_still_queued_notice(front.enqueued_ms, now_ms(), already_notified) {
-            reg.queue_still_notified.lock_safe().insert(pty_id);
-            let depth = reg.queues.lock_safe().get(&pty_id).map(|q| q.len()).unwrap_or(1);
-            let minutes = queue::QUEUE_STILL_QUEUED_NOTICE_AFTER.as_secs() / 60;
-            let target_is_orchestrator = a.role == Role::Orchestrator;
-            reg.notify_queue(&group, &front.agent_id, target_is_orchestrator,
-                &queue::still_queued_notice(&front.agent_id, depth, minutes));
+        let Some(front) = front else {
+            // Should be unreachable — `commit_exit` just confirmed
+            // non-empty and nothing else pops. Never trust that blindly
+            // on a liveness-critical path: loop again rather than assume.
+            continue;
+        };
+        if !immediate_first_pass || depth > 1 {
+            // Genuine contention observed: either this pass needed a retry
+            // at all, or more than the one entry we started with is now
+            // backed up. Sticky for the rest of this drain's lifetime.
+            header_pending = true;
         }
 
-        let deliverable = !ptys.input_pending(pty_id).unwrap_or(false)
-            && !question_active_now(&ptys, pty_id, None);
-        if !deliverable {
-            continue; // keep polling — no cap
+        if !immediate_first_pass {
+            // Visibility, never destruction (#445): a queue behind an
+            // unanswered question/box is the DESIGNED case for this
+            // feature, not a leak — see `queue::still_queued_notice`'s doc.
+            let already_notified = reg.queue_still_notified.lock_safe().contains(&pty_id);
+            if queue::should_fire_still_queued_notice(front.enqueued_ms, now_ms(), already_notified) {
+                reg.queue_still_notified.lock_safe().insert(pty_id);
+                let minutes = queue::QUEUE_STILL_QUEUED_NOTICE_AFTER.as_secs() / 60;
+                let target_is_orchestrator = a.role == Role::Orchestrator;
+                reg.notify_queue(&group, &front.agent_id, target_is_orchestrator,
+                    &queue::still_queued_notice(&front.agent_id, depth, minutes));
+            }
+
+            let deliverable = !ptys.input_pending(pty_id).unwrap_or(false)
+                && !question_active_now(&ptys, pty_id, None);
+            if !deliverable {
+                continue; // keep polling — no cap
+            }
         }
 
         let target_is_orchestrator = a.role == Role::Orchestrator;
@@ -8338,6 +8489,23 @@ fn run_queue_drainer(reg: Arc<OrchRegistry>, app: AppHandle, group: String, pty_
             .clone();
         let root = reg.root.clone();
         let reg_for_call = reg.arc();
+        // #470: only iteration 1's OWN front entry ever gets kickoff
+        // treatment — see `FreshFirstAttempt`'s doc for why the id match
+        // matters and why every other pass is unconditionally `false, false`
+        // exactly as every pre-#470 replay already was.
+        // #470: also gates whether an abort below sends `queued_notice` —
+        // true only for THIS entry's own very first attempt (matching the
+        // pre-#470 behavior where only a FRESH direct delivery's hold-cap
+        // abort ever notified; a replay's abort — including every attempt
+        // after this one — stays silent, since the sender was already
+        // notified once, at the moment this entry first became genuinely
+        // queued, and a `BehindQueue` admission was never notified at all).
+        let is_fresh_attempt = fresh_first.as_ref().is_some_and(|f| immediate_first_pass && f.id == front.id);
+        let (wait_ready, confirm_autopilot) = fresh_first
+            .as_ref()
+            .filter(|_| is_fresh_attempt)
+            .map(|f| (f.wait_ready, f.confirm_autopilot))
+            .unwrap_or((false, false));
 
         let outcome = match &front.payload {
             queue::QueuedPayload::Text(text) => {
@@ -8347,24 +8515,18 @@ fn run_queue_drainer(reg: Arc<OrchRegistry>, app: AppHandle, group: String, pty_
                 // delivery — one paste, header then content, instead of an
                 // extra full echo/confirm cycle for a single notice line.
                 let payload = if header_pending {
-                    let (depth, coalesced) = {
+                    let coalesced = {
                         let queues = reg.queues.lock_safe();
-                        let q = queues.get(&pty_id);
-                        (q.map(|q| q.len()).unwrap_or(1), q.map(|q| q.iter().map(|e| e.coalesced as usize).sum()).unwrap_or(0))
+                        queues.get(&pty_id).map(|q| q.iter().map(|e| e.coalesced as usize).sum()).unwrap_or(0)
                     };
-                    format!("{}\n\n{text}", queue::flush_header_text(depth, coalesced))
+                    format!("{}\n\n{text}", queue::flush_header_text(depth.max(1), coalesced))
                 } else {
                     text.clone()
                 };
                 let out = deliver_now(
                     app.clone(), root, group.clone(), front.agent_id.clone(), pty_id,
-                    payload, front.from.clone(), false, false, cli, lock,
+                    payload, front.from.clone(), confirm_autopilot, wait_ready, cli, lock,
                     reg.last_delivery.clone(), target_is_orchestrator, reg_for_call,
-                    // #445 rev-35 B1: `None` — this call IS the front of the
-                    // queue; it must never defer to itself. Its own
-                    // peek-then-pop discipline (this drainer's whole point)
-                    // already owns ordering among whatever is behind it.
-                    None,
                 );
                 if matches!(out, DeliverOutcome::Done) {
                     header_pending = false;
@@ -8387,14 +8549,29 @@ fn run_queue_drainer(reg: Arc<OrchRegistry>, app: AppHandle, group: String, pty_
                 reg.pop_front_dequeued(&group, pty_id, front.id, front.enqueued_ms);
                 reg.queue_still_notified.lock_safe().remove(&pty_id);
             }
-            DeliverOutcome::AbortedPrePaste(_) => {
+            DeliverOutcome::AbortedPrePaste(reason) => {
                 // Nothing pasted (or the stranded flush declined) — leave
                 // the entry at the front exactly as it was; retry next tick.
+                // #470: the ONE point at which this entry transitions from
+                // "attempted immediately" to "now genuinely queued" — the
+                // moment #445's notice vocabulary exists to announce, and
+                // (unlike every later retry of the SAME entry, which stays
+                // silent) the only point it's still correct to announce,
+                // since a `BehindQueue` admission was never announced at
+                // admission time either.
+                if is_fresh_attempt {
+                    reg.notify_queue(&group, &front.agent_id, target_is_orchestrator,
+                        &queue::queued_notice(&front.agent_id, reason));
+                }
             }
             DeliverOutcome::AbortedPreEnter => {
                 // The Text entry WAS pasted; only the Enter was withheld.
                 // Replace it at the front with a StrandedSubmit marker so
                 // draining resumes there next tick instead of re-pasting.
+                if is_fresh_attempt {
+                    reg.notify_queue(&group, &front.agent_id, target_is_orchestrator,
+                        &queue::queued_notice(&front.agent_id, queue::EnqueueReason::Question));
+                }
                 reg.pop_front_dequeued(&group, pty_id, front.id, front.enqueued_ms);
                 // #445 rev-35 NB3: this rejection is rare (it needs the
                 // front door to fill the freed slot in the narrow window
@@ -9132,7 +9309,8 @@ impl OrchRegistry {
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
             queues: Arc::new(Mutex::new(HashMap::new())),
             queue_seq: Arc::new(AtomicU64::new(0)),
-            queue_draining: Arc::new(Mutex::new(HashSet::new())),
+            queue_draining: Arc::new(Mutex::new(HashMap::new())),
+            drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
@@ -19709,24 +19887,31 @@ impl OrchRegistry {
         }
     }
 
-    /// Type `text` into an agent's CLI: audit, then (front door permitting)
-    /// bracketed paste + Enter on a background thread (serialized so
-    /// deliveries never interleave). `delivery` classifies the call (see
-    /// [`Delivery`]): a kickoff to a just-booted CLI holds the paste until
-    /// the pane has painted its UI and gone quiet, and a *fresh* copilot
-    /// boot additionally answers the autopilot consent dialog its first
-    /// submit triggers (#179); mid-session deliveries do neither.
+    /// Type `text` into an agent's CLI: audit, then admit into `pty_id`'s
+    /// delivery queue and (front door permitting) kick off the drainer that
+    /// actually pastes it. `delivery` classifies the call (see [`Delivery`]):
+    /// a kickoff to a just-booted CLI holds the paste until the pane has
+    /// painted its UI and gone quiet, and a *fresh* copilot boot
+    /// additionally answers the autopilot consent dialog its first submit
+    /// triggers (#179); mid-session deliveries do neither.
     ///
-    /// **#445 front door.** If `pty_id`'s queue is already non-empty, this
-    /// call enqueues BEHIND it instead of racing the drainer for a direct
-    /// delivery — a fresh prompt must never overtake ones already waiting,
-    /// or "here's context" / "now go" can invert. See `run_queue_drainer`'s
-    /// doc for why only the drainer ever pops the FRONT of a queue, which
-    /// is what makes this check race-free. The actual delivery body —
-    /// shared by a direct delivery and every drain replay — is
-    /// `deliver_now`, below; a hold-cap abort there reports back via
-    /// `DeliverOutcome`, and enqueueing on abort happens HERE, in the
-    /// spawned thread's continuation, never inside `deliver_now` itself.
+    /// **The front door, unified (#470).** EVERY delivery — including the
+    /// common case that ends up pasting with zero added latency — is
+    /// admitted into `pty_id`'s queue right here, atomically with the check
+    /// for whether the queue was empty (`enqueue_text`'s `was_first`). This
+    /// replaces the pre-#470 design's two SEPARATE admission paths (race a
+    /// raw per-pty mutex when the queue looked empty; append directly when
+    /// it didn't) with exactly one, because that split was the actual bug: a
+    /// delivery already racing the mutex had no representation in the queue
+    /// at all, so a LATER arrival's direct queue-append could land ahead of
+    /// it once the mutex-holder's own paste-point recheck deferred to the
+    /// tail — losing its arrival position to something that arrived after
+    /// it. A reviewer proved this survives even a perfectly FAIR mutex (see
+    /// `doc/design/orchestration.md`'s Ordering subsection), which is why
+    /// the fix is unifying admission, not fairing the old lock. Only the
+    /// admission that observes an empty queue (`was_first`) is responsible
+    /// for kicking off `run_queue_drainer`, below, which is now the ONLY
+    /// path that ever calls `deliver_now`.
     pub fn deliver_prompt(
         &self,
         agent_id: &str,
@@ -19749,34 +19934,42 @@ impl OrchRegistry {
         let pty_id = a.pty_id.ok_or("agent has no terminal yet")?;
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
-        // #445 front door — checked before the app-handle requirement below
-        // on purpose: a non-empty queue needs no live pane to exist, only
-        // registry state, and by construction a queue can only be non-empty
-        // once an EARLIER delivery to this same pty already had a live app
-        // handle to spawn its drainer with.
-        //
-        // #445 rev-35 NB2: that "by construction" is only PROBABILISTIC,
-        // not structural — a drainer can pop its last entry, see the queue
-        // empty, and exit in the window between this check and the
-        // `enqueue_text` call below (an OS-preemption stall on this
-        // thread), landing an enqueue with no drainer left to ever pop it.
-        // `ensure_drainer` is idempotent (a no-op if one is already
-        // running), so calling it again here whenever an app handle
-        // happens to be available — best-effort, never a hard requirement,
-        // so a bare test registry with no app still enqueues successfully
-        // — closes the gap without reintroducing the app-handle
-        // requirement this front door deliberately avoids.
-        if queue::queue_is_non_empty(&self.queues, pty_id) {
-            let result = self.enqueue_text(&a.group, agent_id, from, text, pty_id, queue::EnqueueReason::BehindQueue);
-            if result.is_ok() {
-                if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
-                    reg.ensure_drainer(app, a.group.clone(), pty_id);
-                }
+        // #470: `Arrival` regardless of whether this lands alone or behind
+        // an existing entry — accurate either way (this call site IS the
+        // front door, at this delivery's arrival) and unambiguous alongside
+        // the SAME audit line's `depth` field, which already distinguishes
+        // "landed alone" (depth 1) from "landed behind something" (depth
+        // >1) without needing a second field to say the same thing.
+        let admitted =
+            self.enqueue_text(&a.group, agent_id, from, text, pty_id, queue::EnqueueReason::Arrival)?;
+
+        if !admitted.was_first {
+            // Landed behind an existing entry (or coalesced into one) — a
+            // drainer is already running, or about to be, from whichever
+            // delivery got here first; best-effort nudge in case one isn't
+            // (the same probabilistic-not-structural gap #445 rev-35 NB2
+            // documented: a drainer can pop its last entry and exit in the
+            // window between that and this push landing behind "nothing").
+            if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
+                reg.ensure_drainer(app, a.group.clone(), pty_id, None);
             }
-            return result;
+            return Ok(());
         }
 
-        let app = self.app.lock_safe().clone().ok_or("no app handle")?;
+        // This delivery landed alone at the front of an idle queue — it
+        // owns kicking off the one processor thread that will attempt it.
+        // Needs a real app handle to ever run (the same requirement the
+        // pre-#470 direct path had); if none exists, undo the admission so
+        // an empty queue really means empty rather than silently stranding
+        // a payload nothing will ever drain.
+        let Some(app) = self.app.lock_safe().clone() else {
+            self.withdraw_unprocessable(&a.group, pty_id, admitted.id);
+            return Err("no app handle".into());
+        };
+        let Some(reg) = self.arc() else {
+            self.withdraw_unprocessable(&a.group, pty_id, admitted.id);
+            return Err("registry not shared".into());
+        };
 
         // A booted group copilot agent is launched with `--autopilot`, so it
         // opens the "Enable autopilot mode" consent dialog; the worker thread
@@ -19795,96 +19988,39 @@ impl OrchRegistry {
                 )
             })
         };
-        let wait_ready = delivery.wait_ready();
-        // The Enter that submits the paste is chosen per CLI: Copilot ignores a
-        // bare CR on an unfocused pane, so its sequence prefixes a focus-in
-        // report (#98). Resolved here — through the same per-role `cli_for` the
-        // registry already uses — so the delivery thread carries the right bytes.
-        let cli = self.cli_for_agent(&a);
-        let lock = self
-            .delivery
-            .lock_safe()
-            .entry(pty_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let (root, group, agent) = (self.root.clone(), a.group.clone(), a.id.clone());
-        // Production bug fix (PR #329 round 7): captured so the recorded
-        // `DeliveryOutcome` carries WHO this delivery is from — the
-        // provenance `compact_nudge_tick`'s inference-arm cooldown needs to
-        // recognize (and suppress detection on) loomux's own paste echo,
-        // as opposed to a human or another agent's message reaching this
-        // same pane through the same delivery pipeline.
-        let delivery_from = from.to_string();
-        let text_owned = text.to_string();
-        let last_delivery = self.last_delivery.clone();
-        // Captured for the unconfirmed-delivery notice (#103): whether this
-        // target is the orchestrator (a notice to it would loop, so it's
-        // suppressed) and an owned registry handle so the detached thread can
-        // deliver the notice once it knows the submit outcome.
-        let target_is_orchestrator = a.role == Role::Orchestrator;
-        let reg = self.arc();
-        let app_for_thread = app.clone();
-        // #445 rev-35 B1: this delivery is a FRESH one (the front door let
-        // it through because the queue was empty at arrival) — hand
-        // `deliver_now` a live handle to the queue map so it can re-check
-        // right before pasting, in case an earlier-arriving delivery
-        // enqueued while THIS one was blocked on `lock` or mid-hold. A
-        // drainer replay never passes this (see `run_queue_drainer`).
-        let recheck_queues = Some(self.queues.clone());
-        std::thread::spawn(move || {
-            let outcome = deliver_now(
-                app_for_thread, root, group.clone(), agent.clone(), pty_id,
-                text_owned.clone(), delivery_from.clone(), confirm_autopilot, wait_ready, cli, lock,
-                last_delivery, target_is_orchestrator, reg.clone(), recheck_queues,
-            );
-            // #445: `deliver_now` never touches the queue — only its caller
-            // (here) decides whether an abort becomes an enqueue, because
-            // only the caller knows whether this was a FRESH delivery
-            // (notify once) or a drain replay (`run_queue_drainer` handles
-            // its own abort outcomes itself and never reaches this code).
-            let Some(r) = reg else { return };
-            match outcome {
-                DeliverOutcome::Done => {}
-                DeliverOutcome::AbortedPrePaste(reason) => {
-                    match r.enqueue_text(&group, &agent, &delivery_from, &text_owned, pty_id, reason) {
-                        Ok(()) => {
-                            r.notify_queue(&group, &agent, target_is_orchestrator, &queue::queued_notice(&agent, reason));
-                            r.ensure_drainer(app.clone(), group.clone(), pty_id);
-                        }
-                        Err(_queue_full) => {
-                            r.notify_queue(&group, &agent, target_is_orchestrator,
-                                &queue::dropped_notice(&agent, 1, queue::DropReason::QueueFull));
-                        }
-                    }
-                }
-                DeliverOutcome::AbortedPreEnter => {
-                    match r.enqueue_stranded_front(&group, &agent, &delivery_from, pty_id) {
-                        Ok(()) => {
-                            r.notify_queue(&group, &agent, target_is_orchestrator,
-                                &queue::queued_notice(&agent, queue::EnqueueReason::Question));
-                            r.ensure_drainer(app.clone(), group.clone(), pty_id);
-                        }
-                        Err(_queue_full) => {
-                            r.notify_queue(&group, &agent, target_is_orchestrator,
-                                &queue::dropped_notice(&agent, 1, queue::DropReason::QueueFull));
-                        }
-                    }
-                }
-            }
-        });
+        let fresh_first = FreshFirstAttempt {
+            id: admitted.id,
+            wait_ready: delivery.wait_ready(),
+            confirm_autopilot,
+        };
+        reg.ensure_drainer(app, a.group.clone(), pty_id, Some(fresh_first));
         Ok(())
     }
 
-    /// Offer a NEW text payload to `pty_id`'s queue (#445) — the front-door
-    /// append (`reason: BehindQueue`) and a direct delivery's hold-cap abort
-    /// (`reason: BoxOccupied`/`Question`) both go through this. Applies
+    /// Offer a NEW text payload to `pty_id`'s queue (#445/#470) — the front
+    /// door (EVERY delivery, `reason: Arrival`, #470) is the only real-code
+    /// caller as of #470 (pre-#470, a direct delivery's own hold-cap abort
+    /// also called this with `BoxOccupied`/`Question`; that call site no
+    /// longer exists — every entry is admitted up front, before any
+    /// attempt, so there is nothing left to enqueue ON an abort). Applies
     /// `queue::admit`'s policy (FIFO / cap-8-reject-newest / byte-identical
     /// coalesce), audits the outcome, and returns the synchronous
     /// `queue_full_error` on `RejectFull` so a front-door caller can
-    /// propagate it to the ORIGINAL MCP caller — the common overflow case,
-    /// since the front door itself catches deliveries 2..N before a
-    /// hold-cap abort ever needs to consult this. Never called for a
-    /// `StrandedSubmit` marker — see `enqueue_stranded_front`.
+    /// propagate it to the ORIGINAL MCP caller. Never called for a
+    /// `StrandedSubmit` marker — see `enqueue_stranded_front`. Still takes
+    /// an explicit `reason` (rather than hardcoding `Arrival`) because
+    /// integration tests use this directly to seed arbitrary queue states.
+    ///
+    /// **`was_first` (#470).** Whether `pty_id`'s queue was empty
+    /// immediately before this admission — computed under the SAME lock
+    /// acquisition as the push, so it is the one atomic fact that decides
+    /// arrival order: the ONLY admission whose push observes an empty queue
+    /// wins the right to kick off processing (`deliver_prompt`'s front
+    /// door); every other admission, no matter how it got here, lands
+    /// behind whatever's already there. This is what closes the 3+-contender
+    /// ordering gap (see `doc/design/orchestration.md`'s Ordering
+    /// subsection): there is no longer a separate "race a raw mutex for an
+    /// empty queue" path for a later arrival to bypass.
     #[doc(hidden)] // pub for integration tests
     pub fn enqueue_text(
         &self,
@@ -19894,9 +20030,10 @@ impl OrchRegistry {
         text: &str,
         pty_id: u32,
         reason: queue::EnqueueReason,
-    ) -> Result<(), String> {
+    ) -> Result<AdmitOutcome, String> {
         let mut queues = self.queues.lock_safe();
         let q = queues.entry(pty_id).or_default();
+        let was_first = q.is_empty();
         match queue::admit(q, text) {
             queue::AdmitDecision::RejectFull => {
                 let depth = q.len();
@@ -19926,7 +20063,12 @@ impl OrchRegistry {
                 drop(queues);
                 self.audit(group, "loomux", "delivery-coalesced",
                     json!({ "to": agent_id, "id": id, "coalesced": coalesced, "depth": depth }));
-                Ok(())
+                // A coalesce target, by definition, matched an entry
+                // ALREADY in the queue — `was_first` (computed before
+                // `admit` ran) can therefore never be true here; asserting
+                // it documents that invariant rather than trusting it silently.
+                debug_assert!(!was_first, "a coalesce match implies a pre-existing entry");
+                Ok(AdmitOutcome { id, was_first: false })
             }
             queue::AdmitDecision::Admit => {
                 let id = self.queue_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -19939,8 +20081,36 @@ impl OrchRegistry {
                 drop(queues);
                 self.audit(group, "loomux", "delivery-queued",
                     json!({ "to": agent_id, "id": id, "reason": reason.as_str(), "depth": depth }));
-                Ok(())
+                Ok(AdmitOutcome { id, was_first })
             }
+        }
+    }
+
+    /// Undo an admission that turned out to have nowhere to go (#470): only
+    /// reachable when `pty_id`'s queue had NO app handle available at all to
+    /// ever process it. In real operation `self.app` is set once at startup
+    /// and this never fires; it exists purely so a bare test registry keeps
+    /// the exact "no app handle, nothing queued" contract the pre-#470
+    /// direct path gave callers
+    /// (`deliver_prompt_front_door_is_a_noop_when_the_queue_is_empty`) even
+    /// though #470's front door now admits BEFORE it knows whether anything
+    /// can ever drain the entry. Pops `id` off the front IF it's still
+    /// there (the only place it could be — nothing else has had a chance to
+    /// pop yet) and audits the withdrawal so it's never silently missing.
+    fn withdraw_unprocessable(&self, group: &str, pty_id: u32, id: u64) {
+        let removed = {
+            let mut queues = self.queues.lock_safe();
+            match queues.get_mut(&pty_id) {
+                Some(q) if q.front().is_some_and(|f| f.id == id) => {
+                    q.pop_front();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if removed {
+            self.audit(group, "loomux", "delivery-dropped",
+                json!({ "id": id, "reason": "no-app-handle" }));
         }
     }
 
@@ -19980,25 +20150,110 @@ impl OrchRegistry {
     /// answering the same unbounded-thread-accumulation concern raised
     /// against #451's late monitors. `self: &Arc<Self>` (not `&self`) so it
     /// can hand the drainer thread its own owned registry handle.
-    fn ensure_drainer(self: &Arc<Self>, app: AppHandle, group: String, pty_id: u32) {
-        let mut draining = self.queue_draining.lock_safe();
-        if !draining.insert(pty_id) {
-            return; // already running for this pane
-        }
-        drop(draining);
+    ///
+    /// `fresh_first` (#470) carries a just-admitted FRESH delivery's own
+    /// kickoff behavior through to the drainer's first pass IF this call is
+    /// the one that actually wins the idempotent spawn below — every OTHER
+    /// caller (including this same delivery's own front-door caller, on the
+    /// rare NB2-style race where a `None`-passing caller's `ensure_drainer`
+    /// call happens to win instead) passes `None` and gets the always-safe
+    /// `false, false` on iteration 1. Purely theoretical for the reason
+    /// `FreshFirstAttempt`'s doc gives: a fresh kickoff's pty has no other
+    /// deliveries to race against yet.
+    fn ensure_drainer(self: &Arc<Self>, app: AppHandle, group: String, pty_id: u32, fresh_first: Option<FreshFirstAttempt>) {
+        // #470 B1 review round 2: mint a fresh generation for this spawn —
+        // see `queue_draining`'s and `DrainerGuard`'s docs for why a bare
+        // membership check isn't enough. `contains_key` (not `insert`)
+        // because insertion now needs the freshly-minted value, not `()`.
+        let generation = {
+            let mut draining = self.queue_draining.lock_safe();
+            if draining.contains_key(&pty_id) {
+                return; // already running for this pane
+            }
+            let generation = self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            draining.insert(pty_id, generation);
+            generation
+        };
         let reg = self.clone();
-        std::thread::spawn(move || run_queue_drainer(reg, app, group, pty_id));
+        std::thread::spawn(move || run_queue_drainer(reg, app, group, pty_id, fresh_first, generation));
     }
 
-    /// Drop every entry currently queued for `pty_id` (#445): the pane's
-    /// agent died or its pty closed while entries were waiting. Audits ONE
-    /// `delivery-dropped` per entry (so each payload's own id closes out —
-    /// see `queue::orphaned_queue_entries`) plus a single coalesced notice
-    /// naming the count. Today this case is silent; this makes it loud.
-    #[doc(hidden)] // pub for integration tests
-    pub fn drop_queue(&self, group: &str, pty_id: u32, reason: queue::DropReason) {
-        let entries: Vec<queue::QueuedDelivery> =
-            self.queues.lock_safe().remove(&pty_id).map(Vec::from).unwrap_or_default();
+    /// #470 B1 — the ONLY way `run_queue_drainer` may decide it's done with
+    /// `pty_id`: atomically, in ONE critical section on `queues`, checks
+    /// whether exiting is safe and, if so, removes `pty_id` from
+    /// `queue_draining` BEFORE releasing `queues`'s lock.
+    ///
+    /// **The race this closes.** A plain "peek the queue, see it's empty,
+    /// `return` and let the `DrainerGuard`'s `Drop` deregister" — the
+    /// pre-fix shape — leaves an OS-scheduling-width window between that
+    /// peek and the guard actually running. A `deliver_prompt` admission
+    /// landing in that window (`enqueue_text` observes the queue was empty
+    /// → `was_first: true` → the sender is told `Ok`) calls `ensure_drainer`,
+    /// which finds `pty_id` STILL registered in `queue_draining` and
+    /// no-ops — believing a drainer will get to it. That drainer is
+    /// already committed to exiting and never re-reads the queue. The
+    /// delivery is stranded forever: not destroyed (still audited, still
+    /// sitting in `queues`), but never delivered either, with the sender
+    /// already told success — exactly the "queued means safe" contract
+    /// #445/#451 exist to guarantee, broken by the very PR meant to
+    /// strengthen it. Fusing the emptiness check and the `queue_draining`
+    /// removal into ONE lock scope on `queues` closes it: whichever of "a
+    /// push" or "this exit" the OS schedules first is fully visible to the
+    /// other by the time it runs, because they contend for the same lock.
+    /// See `unified_admission_property`'s `drainer_lifecycle` model
+    /// (queue.rs) for the exhaustive proof.
+    ///
+    /// **Generation-checked, not unconditional (review round 2).** This
+    /// removal races the SAME `DrainerGuard::drop` that runs when THIS
+    /// call's own thread eventually returns — see that type's doc for why
+    /// an unconditional second removal (the round-1 shape) could erase a
+    /// SUCCESSOR drainer's live registration. `generation` is the token
+    /// `ensure_drainer` minted for the CALLING thread's spawn; the removal
+    /// here (and the guard's) only fires if the currently stored value is
+    /// still exactly that token, so whichever of "this call" or "the
+    /// guard's later drop" runs first performs the real removal and the
+    /// other is inherently a no-op — never a race to avoid double-firing,
+    /// because double-firing a generation-checked removal is harmless by
+    /// construction.
+    ///
+    /// Also clears `pty_id` from `queue_still_notified` in the SAME
+    /// generation-checked step (review round 2, N3) — folded in here
+    /// rather than left as a separate post-return call at each exit site,
+    /// which had the identical stale-clear shape (a committed-but-not-yet-
+    /// returned drainer's cleanup running after a successor had already
+    /// re-armed the flag) just for a purely cosmetic flag instead of a
+    /// mutual-exclusion invariant.
+    ///
+    /// `force`: the pty-closed/agent-dead paths must exit AND discard
+    /// whatever is queued regardless of content — always returns
+    /// `Some(entries)` (possibly empty). The normal "nothing left to
+    /// drain" exit (`force: false`) must NOT commit while the queue is
+    /// non-empty at this exact instant — returns `None`, and the caller
+    /// (`run_queue_drainer`) loops again to pick up whatever raced in,
+    /// rather than exiting and relying on a NEW drainer to notice it.
+    fn commit_exit(&self, pty_id: u32, generation: u64, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
+        let mut queues = self.queues.lock_safe();
+        let is_empty = queues.get(&pty_id).map(|q| q.is_empty()).unwrap_or(true);
+        if !force && !is_empty {
+            return None;
+        }
+        let entries: Vec<queue::QueuedDelivery> = queues.remove(&pty_id).map(Vec::from).unwrap_or_default();
+        // Still holding `queues`'s lock here — this is the atomic step.
+        let mut draining = self.queue_draining.lock_safe();
+        if draining.get(&pty_id) == Some(&generation) {
+            draining.remove(&pty_id);
+            drop(draining);
+            self.queue_still_notified.lock_safe().remove(&pty_id);
+        }
+        Some(entries)
+    }
+
+    /// The audit+notify tail shared by `drop_queue` (a direct, standalone
+    /// drop — used by tests and any future caller that already holds a
+    /// batch of removed entries) and `commit_exit`'s force-exit callers in
+    /// `run_queue_drainer`. Never touches `queues` or `queue_draining`
+    /// itself — `entries` is always what a PRIOR removal already took out.
+    fn announce_dropped(&self, group: &str, entries: Vec<queue::QueuedDelivery>, reason: queue::DropReason) {
         if entries.is_empty() {
             return;
         }
@@ -20014,6 +20269,23 @@ impl OrchRegistry {
             self.notify_queue(group, &last.agent_id, target_is_orchestrator,
                 &queue::dropped_notice(&last.agent_id, entries.len(), reason));
         }
+    }
+
+    /// Drop every entry currently queued for `pty_id` (#445): the pane's
+    /// agent died or its pty closed while entries were waiting. Audits ONE
+    /// `delivery-dropped` per entry (so each payload's own id closes out —
+    /// see `queue::orphaned_queue_entries`) plus a single coalesced notice
+    /// naming the count. Today this case is silent; this makes it loud.
+    /// Standalone (does not touch `queue_draining`) — `run_queue_drainer`'s
+    /// own force-exit paths use `commit_exit` instead so the removal is
+    /// atomic with deregistering (#470 B1); this is for callers (tests,
+    /// direct MCP-adjacent drop paths) with no drainer lifecycle to keep
+    /// in sync.
+    #[doc(hidden)] // pub for integration tests
+    pub fn drop_queue(&self, group: &str, pty_id: u32, reason: queue::DropReason) {
+        let entries: Vec<queue::QueuedDelivery> =
+            self.queues.lock_safe().remove(&pty_id).map(Vec::from).unwrap_or_default();
+        self.announce_dropped(group, entries, reason);
     }
 
     /// Best-effort notice for a queue event (#445) — same suppression
@@ -20087,7 +20359,7 @@ impl OrchRegistry {
     /// double-spawns; a drainer removes itself on exit).
     #[doc(hidden)] // pub for integration tests
     pub fn queue_draining(&self, pty_id: u32) -> bool {
-        self.queue_draining.lock_safe().contains(&pty_id)
+        self.queue_draining.lock_safe().contains_key(&pty_id)
     }
 
     /// #445 intake finding: the in-memory queue's persistence argument

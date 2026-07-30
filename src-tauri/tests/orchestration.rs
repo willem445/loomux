@@ -1172,6 +1172,31 @@ fn enqueue_text_preserves_fifo_order_across_mixed_senders() {
 }
 
 #[test]
+fn enqueue_text_was_first_is_true_only_for_the_admission_that_finds_an_empty_queue() {
+    // #470 review N2: pin `AdmitOutcome::was_first` directly by name —
+    // it's the ONE fact `deliver_prompt`'s front door hangs the whole
+    // unified-admission fix on (whoever observes an empty queue owns
+    // spawning the drainer; everyone else best-effort nudges an existing
+    // one). Previously only pinned indirectly through front-door tests.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 112u32;
+
+    let first = reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    assert!(first.was_first, "the first admission to an empty queue must observe was_first: true");
+
+    let second = reg.enqueue_text(&g.id, &w.id, "loomux", "two", pty, queue::EnqueueReason::Arrival).unwrap();
+    assert!(!second.was_first, "landing behind an existing entry must never report was_first: true");
+    assert!(second.id > first.id, "ids still increase monotonically regardless of was_first");
+
+    let coalesced = reg.enqueue_text(&g.id, &w.id, "loomux", "one", pty, queue::EnqueueReason::Arrival).unwrap();
+    assert!(!coalesced.was_first, "a coalesce match must never report was_first: true");
+    assert_eq!(coalesced.id, first.id, "a coalesce reports the id of the entry it merged into");
+    assert_eq!(reg.queue_depth(pty), 2, "the coalesced duplicate must not grow the queue");
+}
+
+#[test]
 fn enqueue_text_rejects_newest_at_cap_never_evicts_oldest() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
@@ -1343,10 +1368,10 @@ fn queue_orphans_finds_an_enqueued_entry_with_no_terminal_event() {
 
 #[test]
 fn deliver_prompt_front_door_enqueues_behind_a_non_empty_queue_without_an_app_handle() {
-    // #445: the whole point of checking the queue before requiring an app
-    // handle — a queue can only be non-empty because an EARLIER delivery
-    // already had one (to spawn its drainer), so appending behind it needs
-    // no live pane of its own.
+    // #445/#470: landing BEHIND an existing entry never needs an app handle
+    // of its own — a queue can only be non-empty because an EARLIER
+    // delivery already had one (to spawn its drainer), so this admission
+    // only best-effort nudges `ensure_drainer` and returns.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
@@ -1363,16 +1388,22 @@ fn deliver_prompt_front_door_enqueues_behind_a_non_empty_queue_without_an_app_ha
     let snap = reg.queue_snapshot(pty);
     assert_eq!(snap[0].payload.text(), Some("already queued"), "existing entry must not be overtaken");
     assert_eq!(snap[1].payload.text(), Some("a fresh prompt"));
-    assert_eq!(snap[1].reason, queue::EnqueueReason::BehindQueue);
+    // #470: the front door always admits with `Arrival` (it IS the arrival,
+    // whether or not it lands alone) — `depth` at admission time (not
+    // `reason`) is what distinguishes "landed behind something" from
+    // "landed alone," and this entry's own snapshot position (behind
+    // "already queued") already proves that directly.
+    assert_eq!(snap[1].reason, queue::EnqueueReason::Arrival);
 }
 
 #[test]
 fn deliver_prompt_front_door_is_a_noop_when_the_queue_is_empty() {
-    // With an EMPTY queue, the front door must step aside and let the
-    // normal direct-delivery path run — which in test mode (no real app
-    // handle) fails at that step, exactly as it always has. Proves the
-    // front door doesn't fire on every call, only when there's actually
-    // something to defer behind.
+    // #470: with an EMPTY queue, this delivery is admitted (briefly — it's
+    // now the ONLY entry) and then, because it needs an app handle to ever
+    // be processed and test mode has none, the admission is withdrawn and
+    // the call fails exactly as the pre-#470 direct path always did.
+    // Net-observable behavior is unchanged: no app handle, empty queue in
+    // -> error out, empty queue still.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();

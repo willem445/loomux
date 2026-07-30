@@ -4205,11 +4205,13 @@ retries has already survived the pre-Enter checkpoint, so this rarely compounds 
 replaces that hold. Deliveries are serialized
 per pane by the existing `delivery` mutex (`std::sync::Mutex`, not FIFO on Windows — see the #43
 section's own "Ordering is best-effort" note, which this compounds rather than introduces), so N
-queued deliveries to the same pane can each stall for up to this chain and release out of send
-order. Accepted for the same reason the #43 note already accepts its narrower version: correctness
-(never blind-select an option) matters more than strict ordering here, and the alternative — a
-shorter cap — directly trades away the time a human plausibly needs to notice and answer a
-substantive question.
+queued deliveries to the same pane can each stall for up to this chain. **Superseded by #445/#470:**
+the "release out of send order" consequence this paragraph originally accepted no longer holds — the
+delivery QUEUE (not this mutex) is what now owns arrival order, structurally, regardless of how long
+any individual hold in the chain above runs; see "Delivery queue (#445)"'s "Ordering" subsection.
+This mutex remains exactly what it always was for the *latency* concern this paragraph is about
+(each delivery can still individually stall for the full chain) — only the ordering consequence is
+superseded.
 
 **Orchestrator-target hold is silently dropped (rev-15 N6, pre-existing, more reachable now).**
 `should_notify_paste_held(true)` suppresses the held-delivery notice when the target IS the
@@ -4324,53 +4326,124 @@ string, `orphaned_queue_entries`) mirroring `notify.rs`'s own pure-core/impure-w
 is the impure half.
 
 - **The delivery body was extracted, not reimplemented.** `deliver_prompt`'s ~500-line paste/
-  echo/confirm pipeline is now a free function, `deliver_now(...) -> DeliverOutcome`, called
-  identically whether the caller is a fresh direct delivery (`deliver_prompt`'s spawned thread) or
-  the drainer replaying a queued entry — the SAME echo retries, submit confirmation, and #451
-  three-state lifecycle run either way, never a parallel reimplementation that could drift. Every
-  parameter is something the old closure already captured; nothing about the pipeline's OWN
-  behavior changed by the extraction — see the PR diff for the byte-for-byte body.
+  echo/confirm pipeline is now a free function, `deliver_now(...) -> DeliverOutcome`, called from
+  exactly one place as of #470 (`run_queue_drainer` — below), for both the fast/uncontended case
+  and every replay — the SAME echo retries, submit confirmation, and #451 three-state lifecycle run
+  every time, never a parallel reimplementation that could drift. Every parameter is something the
+  old closure already captured; nothing about the pipeline's OWN behavior changed by the original
+  #445 extraction — see that PR's diff for the byte-for-byte body.
 - **`deliver_now` never touches the queue.** On a hold-cap abort it returns
   `DeliverOutcome::AbortedPrePaste(reason)` (nothing pasted) or `DeliverOutcome::AbortedPreEnter`
   (seam 3: the text WAS pasted, only the Enter was withheld — `record_aborted_preenter_outcome`
-  still runs, unchanged from #420). Only the CALLER decides whether an abort becomes an enqueue,
-  because only the caller knows whether this was a fresh delivery (notify the orchestrator once)
-  or a drain replay (`run_queue_drainer` leaves the entry queued and retries silently — the sender
-  was already notified at the ORIGINAL enqueue; renotifying on every ~2s retry would be spam).
-- **Front door.** `deliver_prompt` checks `pty_id`'s queue BEFORE requiring an app handle: if
-  non-empty, it enqueues behind the tail (`EnqueueReason::BehindQueue`) and returns — no live pane
-  needed, because a non-empty queue can only exist because an EARLIER delivery to this same pty
-  already had a live app handle to spawn the drainer with. Without this check a fresh delivery
-  could win the race to an actually-clear pane ahead of entries already waiting, inverting
-  "here's context" / "now go" — the one failure mode this design treats as a correctness bug, not
-  a style point.
-- **Pre-paste recheck (rev-35 review, B1 — the front door alone is not enough).** The front door
-  only protects a delivery that ARRIVES after a queue already exists; it says nothing about one
-  already IN FLIGHT — holding the per-pty delivery mutex through its own pre-paste hold — when the
-  queue forms underneath it. Live shape rev-35 traced: D1 arrives to an empty queue and holds
-  (question on screen); D2 arrives 30s later, the queue is STILL empty (D1 hasn't timed out yet),
-  so D2 ALSO takes the direct path and blocks on the same mutex; D1 times out and enqueues; D2
-  acquires the mutex, runs its OWN fresh hold, and — pre-fix — pasted the instant its hold cleared,
-  with no idea D1 was now sitting in the queue behind it. `deliver_now` now re-checks
-  `queue::queue_is_non_empty` a SECOND time, immediately before the paste (after the pre-paste
-  holds resolve, before the echo loop) — the SAME function the front door calls, so the two
-  checkpoints can never drift to different definitions of "busy." If a delivery timed out and
-  enqueued while THIS delivery was blocked on the mutex or mid-hold, the recheck catches it and
-  defers (`AbortedPrePaste(BehindQueue)`) instead of pasting. `DeliverOutcome` is the join point:
-  `deliver_now` returns the abort reason but never touches the queue itself — only the CALLER
-  decides whether to enqueue, so a drain replay (which passes `recheck_queues: None`) never defers
-  to itself.
-- **Single-consumer drain.** Only `run_queue_drainer` ever pops the FRONT of a pane's queue; the
-  front door only ever pushes to the BACK. The drainer peeks the front entry, attempts delivery,
-  and pops only AFTER that attempt resolves — so the queue stays non-empty for the pane's WHOLE
-  drain, which is what makes the front-door check race-free: a fresh direct delivery can never
-  observe a transiently-empty queue mid-drain and slip in ahead of an entry still being replayed.
-  The drainer polls deliverability (`!input_pending && !question_active_now`) at
-  `queue::QUEUE_DRAIN_POLL` (2s) with NO cap — the whole point — and exits when the queue empties,
-  the pty closes, or the agent dies (`drop_queue`, below). At most one drainer per pane
-  (`queue_draining: Arc<Mutex<HashSet<u32>>>`), spawned on first enqueue and self-removing on exit
-  — the same bounded-thread-lifecycle answer #451's late-confirmation monitors already established
-  for this codebase.
+  still runs, unchanged from #420). As of #470, the entry being attempted is ALWAYS already sitting
+  in the queue (admitted before any attempt runs — see "Admission is unified," below), so an abort
+  needs no enqueue-on-abort step at all: `run_queue_drainer`'s own match on `DeliverOutcome` just
+  leaves the entry at the front (retry next tick) or converts it to a `StrandedSubmit` marker
+  in place.
+- **Admission is unified (#470 — replaces the pre-#470 "front door" bullet below).**
+  `deliver_prompt` admits EVERY delivery into `pty_id`'s queue at arrival
+  (`OrchRegistry::enqueue_text`, `reason: Arrival`), atomically with the check for whether the
+  queue was empty (`AdmitOutcome::was_first`, decided under ONE lock acquisition, so two racing
+  pushes can never both observe "empty"). Only the admission that observes an empty queue is
+  responsible for spawning `run_queue_drainer` (`OrchRegistry::ensure_drainer`); every other
+  admission — regardless of why it arrived when it did — lands behind whatever's already there and
+  best-effort nudges `ensure_drainer` in case a drainer isn't already running (see "Drainer
+  lifecycle is atomic," below). This REPLACES a pre-#470 design where an empty-queue delivery
+  raced a raw per-pty `Mutex<()>` for the right to attempt a direct paste, entirely separately from
+  the queue — see "Ordering," further below, for why that split was an actual ordering bug (not
+  merely unfair), and for the historical description of the pre-#470 front door and its
+  now-removed B1 pre-paste recheck, kept in `queue.rs`'s `b1_ordering_property` module doc rather
+  than here.
+- **Single-consumer drain, spawned by whichever admission arrives at an idle queue.** Only
+  `run_queue_drainer` ever pops the FRONT of a pane's queue; every admission only ever pushes to
+  the BACK. The drainer peeks the front entry, attempts delivery, and pops only AFTER that attempt
+  resolves — so the queue stays non-empty for the pane's WHOLE drain, which (post-#470) is what
+  makes ordering structurally guaranteed rather than merely likely: nothing can ever observe a
+  transiently-empty queue and slip in ahead of an entry still being replayed, because nothing is
+  EVER attempted except through this same front-to-back walk. Polls deliverability
+  (`!input_pending && !question_active_now`) at `queue::QUEUE_DRAIN_POLL` (2s) with NO cap on every
+  pass EXCEPT its first (#470: a freshly spawned drainer's first pass skips both the sleep and the
+  deliverability pre-check, calling `deliver_now` immediately — `deliver_now`'s own internal waits
+  are the real gate — so the common uncontended case pastes with the same latency the old direct
+  path had, WITH TWO NARROW, BENIGN EXCEPTIONS review flagged (N1): (i) if a second entry lands
+  within microseconds of the first (before the first's own delivery attempt has resolved), the
+  first entry's flush header will claim "N deliveries queued while this pane was blocked" though
+  the pane itself was never blocked — `header_pending`'s trigger is queue depth at attempt time,
+  not "was THIS entry ever held"; (ii) an entry arriving during the drainer's brief post-pop poll
+  sleep is delivered on the NEXT tick rather than instantly, adding up to `QUEUE_DRAIN_POLL` (2s)
+  where the pre-#470 direct path would have pasted immediately. Both cost nothing but a slightly
+  premature header or a couple of seconds; neither reorders or drops anything). Exits when the
+  queue empties, the pty closes, or the agent dies (`drop_queue`/
+  `announce_dropped`, below). At most one drainer per pane
+  (`queue_draining: Arc<Mutex<HashMap<u32, u64>>>` — a generation map, not a bare membership set;
+  see the next bullet for why), spawned on first admission into an idle queue and self-removing on
+  exit — the same bounded-thread-lifecycle answer #451's late-confirmation monitors already
+  established for this codebase.
+- **Drainer lifecycle is atomic with its own exit, and deregistration is generation-owned (#470 B1,
+  review rounds 1 and 2).** Round 1: a drainer deciding "nothing left, I'm done" and actually
+  deregistering from `queue_draining` used to be two separate steps (peek the queue, see it empty,
+  `return` and let the `DrainerGuard`'s `Drop` deregister later) — an OS-scheduling-width window, not
+  a rare corner, in which a FRESH admission landing in that gap (`was_first: true`, sender already
+  told `Ok`) would call `ensure_drainer`, find the pty STILL registered, and no-op — believing a
+  drainer would get to it. That drainer was already committed to exiting and would never look again:
+  the delivery sat in the queue forever, never destroyed but never claimed either, with the sender
+  already told success. Exactly the "queued means safe" guarantee #445/#451 exist to make structural,
+  reintroduced by the PR meant to strengthen it. `OrchRegistry::commit_exit` closed it: the "is the
+  queue empty" check and the `queue_draining` deregistration happen in ONE critical section on
+  `queues`, so whichever of "a push" or "this exit" the OS schedules first is fully visible to the
+  other.
+  **Round 2: that fix alone was incomplete — the REAL `DrainerGuard::drop` still ran afterward,
+  unconditionally, a second time.** `commit_exit`'s atomicity only covers commit's OWN two steps;
+  the guard is a SEPARATE RAII cleanup that fires on every return regardless of whether commit
+  already deregistered, because it has no way to know that. A fresh admission spawning a SUCCESSOR
+  drainer in the window between commit and the original guard's drop would have its registration
+  erased by that stale, unconditional second removal — letting a THIRD arrival spawn a THIRD drainer
+  concurrently with the second. Two live drainers on the same queue means the same front entry can be
+  independently popped and pasted by each: not a strand (round 1's failure direction) but a
+  DUPLICATE — text typed twice into a human's or agent's pane. The fix: `queue_draining` became a
+  generation map (`pty_id -> u64`), minted fresh per spawn (`ensure_drainer`'s `drainer_gen`); both
+  `commit_exit` and `DrainerGuard::drop` remove `pty_id` ONLY if the currently stored generation is
+  still their own. Whichever of them acts first performs the real removal; the other is inherently a
+  no-op — structural, not something every call site has to remember to avoid, and this is what folded
+  the round-2 N3 finding (`queue_still_notified`'s matching stale-clear) in for free, generation-
+  checked in the same step.
+  Proven exhaustively — not just at the one reported interleaving, and not just for round 1's failure
+  mode — by `queue.rs`'s `unified_admission_property::drainer_lifecycle` module, which models
+  MULTIPLE concurrent drainer instances explicitly (registration, processing, pending commit, and the
+  guard's own eventual, UNCONDITIONAL drop event — round 2's review finding was precisely that the
+  round-1 model omitted this real event) and asserts three properties directly: no admitted delivery
+  is ever left unclaimed (round 1), no admitted delivery is ever delivered more than once, and at
+  most one drainer instance is ever concurrently processing a given pty (round 2). Mutation-verified
+  in both directions per review round 2's explicit ask:
+  `non_atomic_commit_still_reproduces_the_round_1_lost_wakeup` (round 1's bug still caught — this
+  more-faithful model didn't weaken what round 1 already proved) and
+  `unconditional_guard_removal_reproduces_the_round_2_double_drain` (round 2's bug, freshly caught).
+- **Every site that mutates `queue_draining`, `queue_still_notified`, or `queues` as a side effect
+  (#470 review round 3, NB-1) — the map a future change to this subsystem should extend, not
+  re-derive from scratch.** Produced by grepping every touch point of those three fields in
+  `mod.rs` plus every `impl Drop` across the whole `orchestration` module (`DrainerGuard` is the
+  ONLY one) — mechanically, not by inspection alone. **Treat this table as STALE** the moment a new
+  function starts touching any of the three fields, or an existing mutation moves/is removed; the
+  fix for staleness is to re-run the same grep, not to patch this table by hand from memory.
+
+  | Site | Mutates | Registration-relevant (`queue_draining`) | Represented in `drainer_lifecycle`? |
+  |---|---|---|---|
+  | `DrainerGuard::drop` (RAII, every return incl. panic) | `queue_draining` (remove) | **Yes** | **Yes** — `GuardDrops`, unconditional, `guard_checks_generation`-gated removal |
+  | `commit_exit` (3 call sites in `run_queue_drainer`) | `queue_draining`, `queues` (remove), `queue_still_notified` (remove) | **Yes** | **Yes** — the empty-queue branch / `CommitDeregisters` (`atomic_exit`-gated); `queue_still_notified`'s removal is out of the model's scope (same reasoning as the two rows below) |
+  | `ensure_drainer` | `queue_draining` (insert, fresh generation) | **Yes** | **Yes** — `Arrival`'s claim-if-unregistered branch |
+  | `enqueue_text` (the front door — EVERY delivery's admission) | `queues` (push back, or coalesce-increment an existing entry) | No — never touches `queue_draining`; its `was_first` (computed under the SAME lock as the push) is what *decides* who registers, via `ensure_drainer` | **Yes** — this IS the models' `Arrival` push; pinned directly by `enqueue_text_was_first_is_true_only_for_the_admission_that_finds_an_empty_queue` and by round-1 real-code mutations (`push_front` and `was_first` hardcoded both went red) |
+  | `withdraw_unprocessable` (`deliver_prompt`'s no-app-handle rollback — an early-return cleanup path) | `queues` (pop front, conditional on id match) | No — never touches `queue_draining`; only reachable BEFORE a drainer is ever spawned for this admission (no app/registry handle to spawn one with), so nothing it does can race a live drainer's registration | No — out of scope for the same reason: no registration state involved |
+  | `enqueue_stranded_front` (seam 3 marker conversion, `run_queue_drainer`'s `AbortedPreEnter` arm) | `queues` (push front) | No — mid-loop, run only by the current sole owner, same as `pop_front_dequeued` below | No — not a registration mutation |
+  | `run_queue_drainer`'s `DeliverOutcome::Done` arm | `queue_still_notified` (remove) | No — mid-loop, not an exit path; only reachable while this thread is still the sole registered drainer | No — deliberately: safe under the (now-correct) at-most-one-drainer invariant; if that invariant were ever broken by a DIFFERENT future bug this could stale-clear a successor's notice flag, but the worst case is one duplicate low-severity notice, not a duplicated paste or a strand |
+  | `run_queue_drainer`'s still-queued-notice fire | `queue_still_notified` (insert) | No — insertion, not removal | No — not a removal at all |
+  | `pop_front_dequeued` | `queues` (pop front) | No — not a registration removal, same mid-loop/sole-owner reasoning | Implicitly yes — this IS the model's non-empty-queue delivery transition |
+  | `drop_queue` (standalone — tests, any future non-drainer caller) | `queues` (remove) | No — its own doc states it deliberately never touches `queue_draining`, having no drainer-lifecycle context to stay consistent with | Not applicable — a different code path outside the drainer's own lifecycle |
+
+  Three sites mutate `queue_draining` itself (the registration state the at-most-one-drainer
+  invariant depends on) and all three are represented in the model. The remaining seven mutate
+  `queue_still_notified` or `queues` without touching registration; `enqueue_text` is represented
+  anyway (it IS the model's `Arrival` event), and the other six are out of the model's scope for
+  the stated reasons rather than by omission.
 - **Seam 3 (stranded pre-Enter text).** Converts to a `QueuedPayload::StrandedSubmit` marker
   (pushed to the FRONT via `enqueue_stranded_front`, ahead of whatever else is queued — it
   represents finishing an already-half-done paste, not a new ask) rather than a text copy. Draining
@@ -4395,36 +4468,50 @@ is the impure half.
   must all deliver — only a literal repeat is provably redundant), so it collapses exact repeats
   and leaves everything else to the sender. Each drain's first delivered `Text` entry carries a
   flush header (`queue::flush_header_text`) reporting how many were queued and how many collapsed.
-- **Ordering — stated to match what's actually proven, not asserted.** FIFO by enqueue time WITHIN
-  the queue itself is unconditional (`VecDeque::push_back`/`pop_front`, proven by the front-door
-  and single-consumer-drain tests). The stronger claim — that arrival order across the WHOLE pane,
-  including deliveries still in flight on the mutex, is preserved — holds for exactly **two**
-  simultaneously contending deliveries (rev-35's own reported scenario, generalized: with only two
-  contenders there is at most one waiter for the delivery mutex at any moment, so mutex-acquisition
-  order and arrival order coincide by construction, and the pre-paste recheck above closes the only
-  remaining gap). It is mutation-verified exhaustively over every reachable interleaving of
-  arrival/hold/release for two deliveries (`queue.rs`'s `b1_ordering_property` module).
-  **It is NOT proven, and is not true, for three or more simultaneously contending deliveries** —
-  `std::sync::Mutex` grants to waiters in an unspecified order, so if a third delivery arrives while
-  two others are already waiting on the mutex with the queue still empty, the ORDER in which those
-  two eventually get their turn (and therefore which of them enqueues first) is not guaranteed to
-  match arrival order, independent of anything the recheck does. `queue.rs`'s exhaustive search
-  finds this residual at three contenders even with the fix fully applied, and pins it as a known,
-  documented gap (`three_way_contention_can_still_invert_arrival_order_known_residual`) rather than
-  claiming a property that isn't achievable by a localized fix — closing it for real would mean
-  replacing raw mutex contention with a genuine FIFO ticket for ACQUIRING the delivery mutex itself,
-  a materially larger change filed as a follow-up rather than built here. In practice this residual
-  requires three-plus deliveries to a SINGLE pane to all arrive within the same seconds-scale
-  pre-paste-hold window — narrower than the two-delivery shape the live incident actually showed,
-  but real, and stated here rather than left for the next reader to discover the hard way.
-  **A second, independent mechanism can ALSO invert arrival order at three-plus contenders, and a
-  fair mutex would not close it:** when the paste-point recheck defers an in-flight delivery to the
-  queue's TAIL, that delivery loses its original arrival position, so a delivery that arrived LATER
-  and enqueues via the front door in the interim can end up ordered ahead of it — proven (rev-35,
-  round 2) using this very model run under a *simulated fair lock*, specifically to show the
-  mutex-fairness fix alone does not subsume it. #470 has been widened to cover both mechanisms
-  together (a fair lock is necessary, not sufficient); do not read the ticket-lock fix described
-  above as the whole answer to three-plus-contender ordering.
+- **Ordering — closed for real by #470, not merely widened.** As originally shipped, this section
+  described a proven gap: arrival order across a whole pane (not just within the queue) held for
+  exactly two simultaneously contending deliveries, and was proven NOT to hold for three or more,
+  because a fresh, empty-queue delivery raced a raw per-pty `std::sync::Mutex` for the right to
+  attempt a direct paste — `std::sync::Mutex` grants to waiters in an unspecified order, so which of
+  several simultaneous waiters got served first was independent of arrival order. #470 was filed to
+  close that gap and, on review (round 2), was RE-SCOPED before any fix shipped: a reviewer proved,
+  using this very exhaustive-interleaving model run under a *simulated fair lock*, that simply
+  making the mutex fair is insufficient — the paste-point recheck's own "defer an in-flight
+  delivery to the queue's TAIL" step loses that delivery's arrival position whenever a LATER
+  arrival used the old front door's separate "queue already non-empty → append directly" path,
+  which never touched the mutex, fair or not, at all (NB-A). As filed, #470 would have shipped a
+  fair lock, declared ordering solved, and been wrong.
+  **What actually closes it: unify admission, don't fair the lock.** `deliver_prompt`'s front door no
+  longer has two admission paths to lose position between. EVERY delivery — including ones that end
+  up pasting with zero added latency — is pushed onto the SAME `VecDeque`, atomically with the check
+  for whether the queue was empty (`enqueue_text`'s `was_first`, decided under one lock acquisition
+  that can never observe two different answers for two racing pushes). Only the push that observes
+  an empty queue is responsible for starting `run_queue_drainer` (now the ONLY caller of
+  `deliver_now`, for both the fast/uncontended case and every replay); every other push, regardless
+  of why it arrived when it did, is already correctly positioned behind whatever got there first.
+  There is no more "defer to tail" step for a position to be lost at — a delivery's place in the
+  queue is fixed the instant it's admitted and never moves until it's delivered — and the raw
+  per-pty `Mutex<()>` `deliver_now` still locks is now redundant defense-in-depth (only one thread
+  is ever running `deliver_now` for a given pty at a time, enforced by `queue_draining`), not the
+  ordering mechanism. `queue.rs`'s `unified_admission_property` module proves this exhaustively at
+  three, four, and five simultaneous contenders (no ceiling — unlike the old algorithm, FIFO-by-
+  construction doesn't get harder at higher N) and is mutation-verified (a one-line "pop from the
+  back instead of the front" mutation reliably produces violations the same checker catches). The
+  formerly-open residual test — `b1_ordering_property::pre_470_algorithm_three_way_contention_
+  inverted_arrival_order`, renamed by review (B3) from `..._can_still_invert_..._known_residual`:
+  a PASSING test whose name claims an inversion "can still" happen is itself a claim-vs-reality
+  hazard once #470 ships the fix that closes it, readable out of context by `cargo test` output, CI
+  logs, or a grep, with no doc in view to correct it — is kept UNMODIFIED otherwise (it still
+  correctly proves the OLD, now-replaced algorithm has the gap) rather than deleted or silently
+  repurposed — see that module's doc for why, and `unified_admission_property::
+  unified_admission_closes_ordering_at_three_contenders` for the same property, same contender
+  count, now proven closed under the new mechanism.
+  **Liveness, not just ordering (#470 B1, review round 1):** unifying admission closes ordering but
+  initially reopened a DIFFERENT defect — a lost-wakeup race in the drainer's own exit, where a
+  fresh admission's `ensure_drainer` call could no-op against a drainer that had already decided to
+  exit but not yet deregistered, silently stranding a delivery the sender was told succeeded. See
+  "Drainer lifecycle is atomic with its own exit," above, and `unified_admission_property::
+  drainer_lifecycle` for the exhaustive liveness proof (`OrchRegistry::commit_exit`).
 
 **Notice vocabulary — part of the fix.** The old text ("held: pane has human input — re-send when
 clear") is deleted along with `paste_held_notice`/`question_held_notice`/`held_delivery_notice`/
@@ -4496,10 +4583,16 @@ note names for the same reason: `deliver_prompt`'s thread body requires a live T
 and a real pty (`tauri::test`'s `MockRuntime` isn't the concrete `Wry` runtime this code needs),
 and CLAUDE.md constraint 3 forbids spawning a real agent CLI to get one. So `run_queue_drainer` and
 `deliver_now`'s full pipeline are NOT exercised by the test suite — what IS covered, and to what
-depth: `queue.rs`'s pure policy (admit/cap/coalesce/notice text/orphan-scan/`queue_is_non_empty`)
-unit-tested in isolation, including an exhaustive-interleaving model of the B1 recheck fix (proven
-mutation-verified for two contenders, and a DOCUMENTED, asserted-not-hidden gap at three — see
-"Ordering", above); the registry-level bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
+depth: `queue.rs`'s pure policy (admit/cap/coalesce/notice text/orphan-scan) unit-tested in
+isolation, including two exhaustive-interleaving models — `b1_ordering_property` (kept as a
+historical record of the pre-#470 mutex-race algorithm and its proven two-contender fix /
+three-contender residual) and `unified_admission_property` (#470's replacement mechanism: ordering
+proven mutation-verified at three, four, and five contenders, and — its nested `drainer_lifecycle`
+submodule, modeling multiple concurrent drainer instances explicitly — liveness (no admitted
+delivery ever left unclaimed, round 1), uniqueness (no admitted delivery ever delivered more than
+once, round 2), and mutual exclusion (at most one drainer instance ever concurrently processing a
+pty, round 2) all proven mutation-verified in both directions — see "Ordering" and "Drainer
+lifecycle," above); the registry-level bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
 `pop_front_dequeued`, `drop_queue`, `queue_orphans`, the front-door check reaching `deliver_prompt`
 with no app handle at all) integration-tested end to end against a real `OrchRegistry` and a real
 `audit.jsonl`; the notice-suppression discipline (`notify_queue`) tested directly. The drainer's
@@ -4524,14 +4617,30 @@ tier was caught by:
    paste) rather than racing D1. Answer the question only after D1's hold has timed out and
    enqueued. Verify D1 delivers before D2 (`delivery-dequeued` for D1's id precedes D2's), never the
    inverted order the review reported.
+8. **#470's three-contender scenario, live:** from three different senders (e.g. two workers and
+   loomux itself), fire three prompts at the SAME blocked pane within the same few-hundred-ms
+   window, in a known order D1/D2/D3. Verify `delivery-queued` audit lines land with ids in the
+   SAME order the sends were issued (not merely that all three eventually land), and that draining
+   after the block clears produces `delivery-dequeued` in that same D1/D2/D3 order.
+9. **#470 B1's lost-wakeup scenario, live:** send a single prompt to an idle pane and let it drain
+   to completion normally (drainer exits, `queue_draining` empties). Immediately — within the same
+   poll tick, i.e. as fast as `gh`/the MCP client allows — send a second, unrelated prompt to the
+   SAME pane. Verify it delivers (not stranded): a `delivery-queued` line followed, within a few
+   seconds, by `delivery-dequeued` for the same id, never a `delivery-queued` with no matching
+   terminal event while the pane sits idle and answerable. This is the live analogue of
+   `unified_admission_property::drainer_lifecycle`'s exhaustive proof — worth confirming once
+   against real thread scheduling, not just the model.
 
 **Follow-ups filed at PR time, not built here:** wiring `queue_orphans` into the orchestrator's
 session-start re-sync (the persistence-gap closer, above, #467); on-disk queue durability (#468);
-a PR-C queued-count pane badge on the existing `orch-delivery-held` event seam; the three-plus-
-simultaneous-contenders ordering residual named under "Ordering" above (#470 — discovered as a
-mutex-fairness gap while building this PR's exhaustive-interleaving test, then WIDENED on review
-(round 2) once a second, independent mechanism — defer-to-tail position loss — was proven to
-survive a fair lock; #470 now covers both, since a ticket lock alone would not have closed it).
+a PR-C queued-count pane badge on the existing `orch-delivery-held` event seam.
+
+**#470 — the three-plus-simultaneous-contenders ordering residual, since closed.** Discovered as a
+mutex-fairness gap while building this PR's exhaustive-interleaving test, then RE-SCOPED on review
+(round 2) once a second, independent mechanism — defer-to-tail position loss (NB-A) — was proven to
+survive a fair lock. Closed by unifying admission rather than by widening the fair-lock fix; see
+"Ordering", above, for the full argument and `queue.rs`'s `unified_admission_property` module for
+the exhaustive proof.
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
@@ -4557,16 +4666,17 @@ pasted+submitted **atomically** (whole, never interleaved). The CLI's own input 
 being shared, so by construction your prompt can't be contaminated and can't contaminate a
 report. Everything lands in the audit log (`prompt`, `from: human`).
 
-- *Ordering is best-effort, not a strict FIFO guarantee.* The correctness property is
-  atomicity — each message lands whole. Order is **not** guaranteed under rapid concurrent
-  sends: `deliver_prompt` spawns a thread per delivery that contends for the per-pty `delivery`
-  `std::sync::Mutex`, which is not fair/FIFO (SRWLOCK on Windows), so two sub-second sends — or a
-  steer racing a report — can acquire the lock out of submission order. Nothing is lost or
-  corrupted (mutual exclusion still holds); only the relative order of near-simultaneous
-  messages may flip. A strict arrival sequence would mean threading a monotonic seq/queue
-  through the shared `deliver_prompt` hot path (used by *every* delivery source — kickoffs,
-  reports, watchdog nudges, steer); not worth it for a low-impact reorder window the human can
-  avoid by letting one message land (visible in the pane) before sending a dependent correction.
+- *Ordering — this section's original tradeoff, since superseded (#445/#470).* This bullet
+  originally accepted best-effort ordering here on the grounds that threading a monotonic
+  seq/queue through the shared `deliver_prompt` hot path "wasn't worth it for a low-impact reorder
+  window." #445 threaded exactly that queue through anyway, for a different, higher-stakes reason
+  (a hold-cap timeout was DESTROYING payloads, not just reordering them), and #470 finished the job
+  by making every admission — including this strip's own steer sends — go through it: `deliver_prompt`
+  now admits EVERY delivery into `pty_id`'s `VecDeque` atomically with the check for whether it's
+  the first, so two sub-second sends (a steer racing a report) land, and drain, in the order they
+  were admitted — not the order the per-pty `delivery` mutex happened to grant. See "Delivery queue
+  (#445)"'s "Ordering" subsection for the proof. Atomicity (each message lands whole) was always the
+  correctness property this strip's own C/A design depended on and remains true regardless.
 
 - *Keyboard routing.* The strip is a plain DOM input, **not** part of xterm, so it never
   steals the terminal's keys — keystrokes only reach it while it holds focus. `Alt+P`
