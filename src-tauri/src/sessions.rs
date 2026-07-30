@@ -188,12 +188,19 @@ struct Candidate {
     len: u64,
 }
 
-/// `(mtime_ms, len)` from an already-enumerated directory entry. Uses
-/// `DirEntry::metadata` rather than a fresh `fs::metadata` path lookup: on
-/// Windows the values come from the directory enumeration the caller is already
-/// paying for, so a candidate costs no extra file open.
-fn entry_meta(entry: &fs::DirEntry) -> Option<(u64, u64)> {
-    let m = entry.metadata().ok()?;
+/// `(mtime_ms, len)` for a candidate — the pair that both timestamps the row and
+/// validates its index entry.
+///
+/// Deliberately `fs::metadata` and not the cheaper `DirEntry::metadata`, even
+/// though the caller has the entry in hand: `DirEntry::metadata` does not
+/// traverse symlinks, so a symlinked session file would be timestamped and
+/// (worse) cache-validated by the LINK's mtime/len — stable while the target it
+/// points at changes, which is the one way this index could serve a stale row.
+/// `fs::metadata` follows the link, matching exactly what the pre-#493 scan's
+/// `mtime_ms` did. The extra `stat` is real but immaterial here: measured at
+/// ~40ms across 826 files, against a head-parse it exists to avoid entirely.
+fn candidate_meta(path: &Path) -> Option<(u64, u64)> {
+    let m = fs::metadata(path).ok()?;
     let ms = m
         .modified()
         .ok()
@@ -234,7 +241,7 @@ fn collect_claude_candidates(out: &mut Vec<Candidate>) {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
                 continue;
             };
-            let Some((modified_ms, len)) = entry_meta(&file) else {
+            let Some((modified_ms, len)) = candidate_meta(&path) else {
                 continue;
             };
             out.push(Candidate { path, source: "claude", id: Some(id), modified_ms, len });
@@ -257,16 +264,10 @@ fn collect_copilot_candidates(out: &mut Vec<Candidate>) {
     };
     for entry in entries.flatten() {
         let ws = entry.path().join("workspace.yaml");
-        let Ok(m) = fs::metadata(&ws) else {
+        let Some((modified_ms, len)) = candidate_meta(&ws) else {
             continue;
         };
-        let modified_ms = m
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        out.push(Candidate { path: ws, source: "copilot", id: None, modified_ms, len: m.len() });
+        out.push(Candidate { path: ws, source: "copilot", id: None, modified_ms, len });
     }
 }
 
