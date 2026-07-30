@@ -26,18 +26,54 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Build a registry against `dir` with every test-only directory override
+/// applied — see `orchestration.rs`'s `relaunch_registry` (same rationale,
+/// duplicated because these are separate integration-test binaries): a
+/// second `OrchRegistry::new` built directly, without reapplying these
+/// overrides, falls through to the REAL `~/.claude/agents`/`~/.copilot/agents`
+/// on the next spawn (#464).
+fn relaunch_registry(dir: &Path) -> OrchRegistry {
+    let reg = OrchRegistry::new(dir.to_path_buf());
+    reg.set_port(45999); // fake port so config writing works
+    reg.set_claude_agents_dir_override(dir.join("claude-agents"));
+    reg.set_copilot_agents_dir_override(dir.join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.join("compacthook"));
+    reg.set_copilot_hooks_dir_override(dir.join("copilot-hooks"));
+    reg
+}
+
 fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
-    reg.set_port(45999); // fake port so config writing works
-    // #416/round-6: never let a test write a generated custom-agent file into
-    // the REAL `~/.claude/agents` or `~/.copilot/agents` — point both at this
-    // same disposable tree.
-    reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
-    reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
-    reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
-    reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
+    let reg = relaunch_registry(dir.path());
     (reg, dir)
+}
+
+#[test]
+fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
+    // See `orchestration.rs`'s test of the same name for the full rationale
+    // (`relaunch_registry`'s doc comment here carries the short version): a
+    // registry built with a bare `OrchRegistry::new(...)` instead of
+    // `relaunch_registry` silently falls back to the REAL `~/.claude/agents`/
+    // `~/.copilot/agents` on its first spawn (#464). Pinned statically —
+    // exactly one raw `OrchRegistry::new(...)` may exist in this file, inside
+    // `relaunch_registry` itself.
+    let src = include_str!("workflow.rs");
+    // Skip comments and string literals (this very test, and `relaunch_
+    // registry`'s own doc comment, both mention the construct by name) —
+    // only a real, live call site counts.
+    let sites: Vec<&str> = src
+        .lines()
+        .filter(|l| l.contains("OrchRegistry::new("))
+        .filter(|l| !l.trim_start().starts_with("//") && !l.contains('"'))
+        .collect();
+    assert_eq!(
+        sites.len(),
+        1,
+        "found a raw `OrchRegistry::new(...)` outside `relaunch_registry` — route it \
+         through `relaunch_registry(...)` instead, or it leaks a generated agent file \
+         into the real ~/.claude or ~/.copilot agents dir on its first spawn (#464). \
+         All occurrences: {sites:?}"
+    );
 }
 
 /// Guardrails for a group that RUNS the repo's workflow file — i.e. the human
@@ -57,23 +93,41 @@ fn rails() -> Guardrails {
 
 /// A throwaway repo directory, optionally carrying a `.loomux/workflow.yml` and
 /// `.github/agents/*.md` persona files.
-struct Repo(tempfile::TempDir);
+///
+/// The repo lives one level BELOW its own private temp root (`<root>/repo`),
+/// not AT the root itself — see `orchestration.rs`'s `RealRepo` for why:
+/// `git_worktree_add` cuts a worktree to a directory SIBLING to the repo
+/// (`<repo's-parent>/<repo-name>-worktrees/<name>`), and a `git_init()`'d
+/// `Repo` here feeds `spawn_agent` MCP calls whose worktree defaults ON
+/// (#338/#359). Nested one level down, that sibling — and the `.git/
+/// worktrees/<name>` admin registration `git worktree add` writes inside the
+/// repo's own `.git` — both stay inside `_root`, so `_root`'s `Drop` (success,
+/// assertion failure, or panic unwind alike) reclaims the whole tree; a bare
+/// `tempfile::tempdir()` used directly as the repo root left the sibling
+/// outside that scope and leaked it on every passing test (#464).
+struct Repo {
+    _root: tempfile::TempDir,
+    repo: PathBuf,
+}
 
 impl Repo {
     fn new() -> Self {
-        Repo(tempfile::tempdir().unwrap())
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        Repo { _root: root, repo }
     }
     fn path(&self) -> String {
-        self.0.path().to_string_lossy().replace('\\', "/")
+        self.repo.to_string_lossy().replace('\\', "/")
     }
     fn workflow(self, yaml: &str) -> Self {
-        let dir = self.0.path().join(".loomux");
+        let dir = self.repo.join(".loomux");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("workflow.yml"), yaml).unwrap();
         self
     }
     fn agent_file(self, name: &str, body: &str) -> Self {
-        let dir = self.0.path().join(".github").join("agents");
+        let dir = self.repo.join(".github").join("agents");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(name), body).unwrap();
         self
@@ -85,7 +139,7 @@ impl Repo {
     fn git_init(self) -> Self {
         let git = |args: &[&str]| {
             let ok = std::process::Command::new("git")
-                .current_dir(self.0.path())
+                .current_dir(&self.repo)
                 .args(args)
                 .output()
                 .expect("git must be installed for this test");
@@ -94,7 +148,7 @@ impl Repo {
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
-        fs::write(self.0.path().join("f.txt"), "hi").unwrap();
+        fs::write(self.repo.join("f.txt"), "hi").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "init"]);
         self
@@ -1480,7 +1534,7 @@ fn block_map_round_trips_through_group_json() {
     // ...and a fresh registry (an app restart) reads it back identically. Note
     // this reload does NOT re-read the repo — it is the persisted roster that
     // must round-trip.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
     assert_eq!(g2.id, g.id, "the restart resumes the same group");
@@ -1519,7 +1573,7 @@ fn role_hint_round_trips_through_group_json_too() {
     let advisor = blocks.iter().find(|b| b["id"] == "advisor").unwrap();
     assert_eq!(advisor["role_hint"], "advisor", "role_hint must be persisted, not dropped");
 
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
     assert_eq!(
@@ -1610,7 +1664,7 @@ fn a_pre_block_group_json_still_loads() {
     }
 
     // And the persisted cap still wins over the launcher default on a relaunch.
-    let reg2 = OrchRegistry::new(reg.state_root().to_path_buf());
+    let reg2 = relaunch_registry(&reg.state_root());
     reg2.set_port(45999);
     let g2 = reg2.create_group(&repo.path(), Guardrails { max_agents: 2, ..rails() }).unwrap();
     assert_eq!(g2.id, g.id);
@@ -5503,7 +5557,7 @@ fn intake_profile_round_trips_through_group_json() {
     // A fresh registry (an app restart) reads it back identically — the
     // persisted profile round-trips unchanged, same shape as
     // `block_map_round_trips_through_group_json`.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
     assert_eq!(g2.id, g.id, "the restart resumes the same group");

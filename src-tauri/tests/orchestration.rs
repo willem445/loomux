@@ -108,18 +108,79 @@ fn rails() -> Guardrails {
     }
 }
 
+/// Build a registry against `dir` with every test-only directory override
+/// applied — the SAME seam every `OrchRegistry` construction in this file
+/// must go through, not just the first one against a fresh temp root.
+///
+/// #464: a "relaunch" test (a second `OrchRegistry::new` pointed at the same
+/// or a related state root, simulating loomux restarting) used to construct
+/// the registry directly and skip this. `claude_agents_dir_override`/
+/// `copilot_agents_dir_override` are in-memory fields on the `OrchRegistry`
+/// instance, not persisted state, so a fresh instance that never calls
+/// `set_claude_agents_dir_override` falls through to the REAL
+/// `dirs::home_dir()/.claude/agents` — and a spawn or resume against it
+/// (`create_orchestration_group`, `spawn_agent`, …) then writes a real
+/// `loomux-<group>-<block>.md` file there. That is exactly how the orchestration
+/// suite left 1,111 stray files under a dev's real `~/.claude/agents` and 161
+/// under `~/.copilot/agents` (found live on this machine while fixing #464) —
+/// disjoint from, and in addition to, the `%TEMP%` worktree-directory leak
+/// (see `real_repo`). Route every registry construction through here so no
+/// future one can reopen the gap.
+fn relaunch_registry(dir: &Path) -> OrchRegistry {
+    let reg = OrchRegistry::new(dir.to_path_buf());
+    reg.set_port(45999); // fake port so config writing works
+    reg.set_claude_agents_dir_override(dir.join("claude-agents"));
+    reg.set_copilot_agents_dir_override(dir.join("copilot-agents"));
+    reg.set_compact_hook_dir_override(dir.join("compacthook"));
+    reg.set_copilot_hooks_dir_override(dir.join("copilot-hooks"));
+    reg
+}
+
 fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
-    reg.set_port(45999); // fake port so config writing works
-    // #416/round-6: never let a test write a generated custom-agent file into
-    // the REAL `~/.claude/agents` or `~/.copilot/agents` — point both at this
-    // same disposable tree.
-    reg.set_claude_agents_dir_override(dir.path().join("claude-agents"));
-    reg.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
-    reg.set_compact_hook_dir_override(dir.path().join("compacthook"));
-    reg.set_copilot_hooks_dir_override(dir.path().join("copilot-hooks"));
+    let reg = relaunch_registry(dir.path());
     (reg, dir)
+}
+
+/// A disposable git repo used as the worktree-cutting fixture's own root: the
+/// repo lives one level BELOW a private temp root (`<root>/repo`), not AT the
+/// temp root itself.
+///
+/// #464: `git_worktree_add` cuts a spawned agent's worktree to
+/// `<repo's-parent>/<repo-name>-worktrees/<name>` — a directory SIBLING to
+/// the repo, not inside it (see `git.rs::git_worktree_add`). When the repo
+/// root itself was a bare `tempfile::tempdir()` (the pre-fix shape here),
+/// that sibling landed directly under `%TEMP%`, outside the `TempDir`'s own
+/// cleanup scope, and every worktree-cutting test that spawned a worker or
+/// reviewer through the MCP surface (worktree defaults ON there, #338/#359)
+/// leaked it on every passing run — not just on failure. 2,438 survivors
+/// (growing to 2,702) were found in `%TEMP%` this way, and the disk they
+/// filled crashed a live session.
+///
+/// Nesting the repo one level down means the sibling `-worktrees` directory
+/// — and the `.git/worktrees/<name>` administrative registration inside the
+/// repo's own `.git` that `git worktree add` also writes — are BOTH still
+/// inside `_root`, so `_root`'s `Drop` (which runs on success, on assertion
+/// failure, and through a panicking unwind alike) reclaims the whole tree in
+/// one shot. No git-specific teardown call (`git worktree remove`, `git
+/// worktree prune`) is needed, and none can be forgotten at a call site,
+/// because there is nothing left outside the temp root for one to miss.
+struct RealRepo {
+    _root: tempfile::TempDir,
+    repo: PathBuf,
+}
+
+impl RealRepo {
+    fn path(&self) -> &Path {
+        &self.repo
+    }
+    /// The fixture's own private temp root (`repo`'s parent) — everything
+    /// this fixture creates, including any worktree `spawn_agent` cuts, lives
+    /// under here. Test-only seam for asserting the whole tree is gone after
+    /// drop (see the leak-regression tests below); nothing else needs it.
+    fn root(&self) -> &Path {
+        self._root.path()
+    }
 }
 
 /// A minimal real git repo (one commit on the default branch). Needed by
@@ -128,11 +189,13 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
 /// the fake `"C:/tmp/repo"` path used elsewhere is only safe for tests that
 /// spawn workers through the direct Rust API (`OrchRegistry::spawn_agent`),
 /// which is untouched by this default and still takes a plain bool.
-fn real_repo() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
+fn real_repo() -> RealRepo {
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
         let ok = std::process::Command::new("git")
-            .current_dir(dir.path())
+            .current_dir(&repo)
             .args(args)
             .output()
             .expect("git must be installed for this test");
@@ -141,10 +204,10 @@ fn real_repo() -> tempfile::TempDir {
     git(&["init", "-q"]);
     git(&["config", "user.email", "t@t"]);
     git(&["config", "user.name", "t"]);
-    fs::write(dir.path().join("f.txt"), "hi").unwrap();
+    fs::write(repo.join("f.txt"), "hi").unwrap();
     git(&["add", "-A"]);
     git(&["commit", "-qm", "init"]);
-    dir
+    RealRepo { _root: root, repo }
 }
 
 /// Std-based scratch dir under the OS temp root — not `tempfile` (#412's own
@@ -397,7 +460,7 @@ fn max_agents_change_survives_launcher_relaunch() {
     let gid;
     let path;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // launcher cap 2
         gid = g.id.clone();
@@ -423,7 +486,7 @@ fn max_agents_change_survives_launcher_relaunch() {
     // group.json. The launcher hardcodes its default cap (rails() = 2), but the
     // persisted adjustment (9) must win — otherwise the relaunch silently
     // reverts 9→2. Other guardrails still come from the launch.
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g.id, gid, "restart resumes the same group");
@@ -449,7 +512,7 @@ fn intake_gate_config_survives_launcher_relaunch() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg
             .create_group(
@@ -462,7 +525,7 @@ fn intake_gate_config_survives_launcher_relaunch() {
     // A fresh registry (app restart) + a real launcher relaunch on the same
     // repo, with the LAUNCHER'S bare defaults (it has no field for either
     // knob): the persisted opt-out/cadence must win, not the launcher's.
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g.id, gid, "restart resumes the same group");
@@ -482,12 +545,12 @@ fn intake_gate_absent_config_still_smart_defaults_after_relaunch() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         gid = g.id.clone();
     }
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g.id, gid, "restart resumes the same group");
@@ -721,14 +784,14 @@ fn state_persists_across_registry_instances() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         gid = g.id.clone();
         reg.set_state(&g.id, r#"{"queue":[12,13]}"#).unwrap();
     }
     // Fresh instance (app restart) + same repo → same group id and state.
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g.id, gid, "group id must be stable per repo for resume");
@@ -2296,7 +2359,7 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
     let sid = "0a1b2c3d-4e5f-4a6b-8c7d-8e9f00112233";
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group(&repo_path, copilot_rails()).unwrap();
         gid = g.id.clone();
@@ -2319,7 +2382,7 @@ fn copilot_orchestration_session_gets_a_chip_and_restores() {
     let store = scratch_dir("copilot-orch-restore");
     fixture_copilot_session(&store, sid, &repo_path);
     loomux_lib::sessions::set_copilot_session_state_root_for_test(Some(store.clone()));
-    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
     let req = resume_recorded_session(&reg, sid, None, false).unwrap().expect("orchestrator pane spec");
     loomux_lib::sessions::set_copilot_session_state_root_for_test(None);
@@ -2830,7 +2893,7 @@ fn task_board_persists_and_reorders() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         gid = g.id.clone();
@@ -2840,7 +2903,7 @@ fn task_board_persists_and_reorders() {
         // Move c first; unmentioned ids keep relative order behind it.
         reg.reorder_tasks(&g.id, "human", &["t-3".into()]).unwrap();
     }
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let titles: Vec<String> = reg.tasks(&gid).iter().map(|t| t.title.clone()).collect();
     assert_eq!(titles, ["c", "a", "b"], "order must survive an app restart");
@@ -3276,7 +3339,7 @@ fn concurrent_same_repo_launches_get_distinct_groups() {
     let dir = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     let repo_path = repo.path().to_string_lossy().into_owned();
-    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
     // The id is chosen by liveness, but the orchestrator that makes a group
     // live registers after the choice — without the creation lock, two
@@ -3297,7 +3360,7 @@ fn concurrent_same_repo_launches_get_distinct_groups() {
 fn repo_paths_with_quotes_are_rejected() {
     use std::sync::Arc;
     let dir = tempfile::tempdir().unwrap();
-    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
     let err = create_orchestration_group(&reg, "/tmp/evil\" ; rm -rf /", rails(), Launch::Fresh, None, None, 0)
         .unwrap_err();
@@ -3309,19 +3372,19 @@ fn roster_survives_agent_id_recycling_across_restarts() {
     let dir = tempfile::tempdir().unwrap();
     let (s1, s2);
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         s1 = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().session_id.unwrap();
     }
     {
         // "Restart": agent ids start over at w-1, colliding with run 1.
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         s2 = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().session_id.unwrap();
     }
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     let sessions: Vec<String> = reg.session_roles().into_iter().map(|r| r.session_id).collect();
     assert!(sessions.contains(&s1), "run 1's session must survive id recycling");
     assert!(sessions.contains(&s2));
@@ -3330,7 +3393,7 @@ fn roster_survives_agent_id_recycling_across_restarts() {
 #[test]
 fn audit_rotates_at_cap_and_backfill_reads_both_generations() {
     let dir = tempfile::tempdir().unwrap();
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
@@ -3413,7 +3476,7 @@ fn session_roles_backfills_task_and_branch_from_the_spawn_audit_for_pre_roster_g
     // applying the SAME role-gated rule live spawns use so a legacy
     // orchestrator row still never fabricates a branch.
     let dir = tempfile::tempdir().unwrap();
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(46011);
     let g = reg.create_group("C:/tmp/repo-legacy", rails()).unwrap();
     let gdir = reg.state_root().join(&g.id);
@@ -3709,7 +3772,7 @@ fn roster_records_sessions_roles_and_liveness() {
     let dir = tempfile::tempdir().unwrap();
     let orch_sid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -3722,7 +3785,7 @@ fn roster_records_sessions_roles_and_liveness() {
         assert!(o.group_live, "group with running agents must read as live");
     }
     // Fresh instance (app restart): roster survives, group reads dead.
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     let roles = reg.session_roles();
     assert!(roles.iter().any(|r| r.session_id == orch_sid && !r.group_live),
         "roster must survive restarts and report the group as not live");
@@ -3757,7 +3820,7 @@ fn hint_restores_sessions_unknown_to_roster_and_audit() {
     let dir = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     let repo_path = repo.path().to_string_lossy().into_owned();
-    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
     let g = reg.create_group(&repo_path, rails()).unwrap();
     let gid = g.id.clone();
@@ -3777,8 +3840,8 @@ fn hint_restores_sessions_unknown_to_roster_and_audit() {
     // A hint pointing at a nonexistent group is rejected, not trusted — this
     // fails on the group lookup itself, before any store check, so no
     // fixture is needed here.
-    let reg2 = Arc::new(OrchRegistry::new(tempfile::tempdir().unwrap().path().to_path_buf()));
-    reg2.set_port(45999);
+    let reg2_dir = tempfile::tempdir().unwrap();
+    let reg2 = Arc::new(relaunch_registry(reg2_dir.path()));
     let bad = resume_recorded_session(&reg2, sid, Some(("ghost-1".into(), "orchestrator".into())), false);
     assert!(bad.is_err());
 }
@@ -3792,7 +3855,7 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     let repo_path = repo.path().to_string_lossy().into_owned();
     let (gid, orch_sid);
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group(&repo_path, rails()).unwrap();
         gid = g.id.clone();
@@ -3806,7 +3869,7 @@ fn orchestrator_session_restores_full_group_with_fresh_mcp_identity() {
     let store = scratch_dir("orch-full-restore");
     fixture_claude_session(&store, &orch_sid, &repo_path);
     loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
-    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
     let req = resume_recorded_session(&reg, &orch_sid, None, false).unwrap().expect("orchestrator returns a pane spec");
     loomux_lib::sessions::set_claude_projects_root_for_test(None);
@@ -3835,7 +3898,7 @@ fn worker_session_rejoin_requires_live_group_then_reuses_session() {
     // resume fail loudly, which isn't what this test is exercising.
     let repo = tempfile::tempdir().unwrap();
     let repo_path = repo.path().to_string_lossy().into_owned();
-    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
     let g = reg.create_group(&repo_path, rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
@@ -5328,7 +5391,7 @@ fn rejoined_session_restores_the_human_name_tier() {
     // `worker_session_rejoin_requires_live_group_then_reuses_session`.
     let repo = tempfile::tempdir().unwrap();
     let repo_path = repo.path().to_string_lossy().into_owned();
-    let reg = Arc::new(OrchRegistry::new(dir.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(dir.path()));
     reg.set_port(45999);
     let g = reg.create_group(&repo_path, rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -5439,7 +5502,7 @@ fn pause_suppresses_delivery_and_persists_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         gid = g.id.clone();
@@ -5457,7 +5520,7 @@ fn pause_suppresses_delivery_and_persists_across_restart() {
         assert!(reg.state_root().join(&g.id).join("paused").is_file(), "pause marker must be written");
     }
     // Restart: the pause survives (marker re-seeds the in-memory flag).
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g.id, gid);
@@ -5923,7 +5986,7 @@ fn idle_tick_minutes_is_configurable_persisted_and_surfaced() {
     let eligible = st["eligible_in_secs"].as_u64().unwrap();
     assert!(eligible <= 5 * 60, "eligible_in_secs counts down within the window, got {eligible}");
     // Persisted across restart (live-set value wins over the launch default).
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(reg2.group(&gid).unwrap().guardrails.idle_tick_minutes, 5,
@@ -5953,7 +6016,7 @@ fn idle_activity_floor_is_configurable_persisted_and_surfaced() {
     assert!(reg.set_idle_activity_floor("no-such-group", 4096).is_err());
     // Persisted across restart (live value wins over the launch default).
     reg.set_idle_activity_floor(&gid, 4096).unwrap();
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(reg2.group(&gid).unwrap().guardrails.idle_activity_floor_bytes, 4096,
@@ -7975,7 +8038,7 @@ fn compact_nudge_minutes_and_roles_are_configurable_persisted_and_audited() {
 
     reg.set_compact_nudge_roles(&gid, vec!["orchestrator".into(), "worker".into()]).unwrap();
     // Persisted across restart (live-set values win over the launch default).
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     let persisted = &reg2.group(&gid).unwrap().guardrails;
@@ -10573,7 +10636,7 @@ fn stale_auto_merge_without_autonomous_is_reconciled_on_read() {
     std::fs::write(gdir.join("auto_merge"), b"").unwrap();
     assert!(!gdir.join("autonomous").is_file());
     // Reload the group in a fresh registry (restart) → reconcile.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert!(!reg2.is_auto_merge(&g.id), "stale auto-merge must be reconciled off without autonomous");
@@ -10613,7 +10676,7 @@ fn set_auto_release_mirrors_auto_merge_dependency_and_is_independent() {
     reg.set_autonomous(&g.id, true).unwrap();
     reg.set_auto_release(&g.id, true).unwrap();
     std::fs::remove_file(reg.state_root().join(&g.id).join("autonomous")).unwrap(); // hand-edit: drop autonomous, leave auto_release
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert!(!reg2.is_auto_release(&g.id), "stale auto_release without autonomous reconciled off");
@@ -10659,7 +10722,7 @@ fn dangerous_mode_setter_and_autonomous_are_mutually_exclusive() {
     // standalone, unlike auto_merge/auto_release).
     reg.set_autonomous(&g.id, false).unwrap();
     reg.set_dangerous_mode(&g.id, true).unwrap();
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert!(reg2.is_dangerous_mode(&g.id), "dangerous mode survives restart while not autonomous");
@@ -10677,7 +10740,7 @@ fn stale_dangerous_mode_with_autonomous_is_reconciled_off_on_read() {
     let gdir = reg.state_root().join(&g.id);
     std::fs::write(gdir.join("autonomous"), b"0").unwrap();
     std::fs::write(gdir.join("dangerous_mode"), b"").unwrap();
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert!(!reg2.is_dangerous_mode(&g.id), "dangerous+autonomous combo reconciled: autonomous wins");
@@ -11266,7 +11329,7 @@ fn autonomous_toggle_roundtrip_durable_and_audited() {
     assert_eq!(audit_count(&reg, &g.id, "autonomous-on"), 1, "re-enable is a no-op");
     // Restart survival: a fresh registry over the same root re-seeds the toggle
     // from the marker on group resume.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g2.id, g.id, "same repo resumes the same group");
@@ -11301,7 +11364,7 @@ fn auto_merge_toggle_roundtrip_durable_audited_and_in_kickoff() {
     reg.set_auto_merge(&g.id, true).unwrap();
     assert_eq!(audit_count(&reg, &g.id, "auto-merge-on"), 1);
     // Restart survival.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert!(reg2.is_auto_merge(&g.id), "auto-merge must survive a restart");
@@ -11324,7 +11387,7 @@ fn autonomy_budget_set_persists_survives_restart_and_audits() {
     reg.set_autonomy_budget(&g.id, 250_000).unwrap();
     assert_eq!(audit_count(&reg, &g.id, "autonomy-budget-set"), 1);
     // Persisted to group.json and preferred over the launch param on resume.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(reg2.group(&g2.id).unwrap().guardrails.autonomy_budget_tokens, 250_000,
@@ -11389,7 +11452,7 @@ fn autonomy_state_reports_budget_suspension_distinctly() {
     assert!(suspended(&reg), "a budget suspension must read as suspended");
 
     // Survives restart: a fresh registry over the same root still reports it.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert!(!reg2.is_autonomous(&g.id));
@@ -11462,7 +11525,7 @@ fn restart_treats_a_suspended_marker_as_authoritative_off() {
     let gdir = reg.state_root().join(&g.id);
     fs::write(gdir.join("autonomous"), "0").unwrap();          // stale enable marker survived
     fs::write(gdir.join("autonomy_suspended"), "{}").unwrap(); // suspension marker wins
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     reg2.create_group("C:/tmp/repo", rails()).unwrap();
     assert!(!reg2.is_autonomous(&g.id),
@@ -12503,7 +12566,7 @@ fn notify_optin_is_durable_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
         gid = g.id.clone();
@@ -12512,7 +12575,7 @@ fn notify_optin_is_durable_across_restart() {
         assert!(reg.notify_enabled(&gid));
     }
     // A fresh registry over the same root re-seeds the opt-in from the marker.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let g2 = reg2.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
     assert_eq!(g2.id, gid);
@@ -12542,7 +12605,7 @@ fn spawn_expanded_optout_is_durable_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(46001);
         let g = reg.create_group("C:/tmp/repo-spawn-expanded", watchdog_rails(0)).unwrap();
         gid = g.id.clone();
@@ -12551,7 +12614,7 @@ fn spawn_expanded_optout_is_durable_across_restart() {
         assert!(reg.spawn_expanded(&gid));
     }
     // A fresh registry over the same root re-seeds the opt-out from the marker.
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(46001);
     let g2 = reg2.create_group("C:/tmp/repo-spawn-expanded", watchdog_rails(0)).unwrap();
     assert_eq!(g2.id, gid);
@@ -13199,7 +13262,7 @@ fn end_group_clears_pause_so_relaunch_starts_clean() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         gid = g.id.clone();
@@ -13216,7 +13279,7 @@ fn end_group_clears_pause_so_relaunch_starts_clean() {
         );
     }
     // Relaunch on the same repo → same id, not paused.
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g.id, gid);
@@ -13265,6 +13328,165 @@ fn end_group_removes_worktrees_of_dead_and_live_agents() {
     assert!(!Path::new(&dead.cwd).exists(), "exited agent's worktree must be gone");
     // The main checkout is untouched.
     assert!(repo.path().join("f.txt").is_file(), "the repo root must survive teardown");
+}
+
+// ---------- #464: worktree-cutting fixtures must not leak %TEMP% dirs ----------
+
+#[test]
+fn real_repo_worktree_fixture_leaves_nothing_in_temp_on_success() {
+    // The regression itself, on the ordinary passing path — no failure, no
+    // panic, nothing but a worker spawn through the MCP-default worktree
+    // (#338) and the fixture going out of scope normally. Before nesting
+    // `real_repo()` one level under its own temp root, THIS is exactly the
+    // shape of test that leaked its `<repo>-worktrees/<name>` sibling
+    // directory into `%TEMP%` on every run — 2,438 survivors (growing to
+    // 2,702) were found there, none of them from a failing test.
+    let (reg, _d) = test_registry();
+    let root_path;
+    {
+        let repo = real_repo();
+        root_path = repo.root().to_path_buf();
+        let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+        let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+        let co = reg.resolve_token(&orch.token).unwrap();
+        // No `worktree` argument at all: the MCP surface defaults a worker
+        // spawn's worktree ON (#338) — exactly the path that used to leak.
+        let out = dispatch(&reg, &co, "tools/call",
+            &json!({ "name": "spawn_agent", "arguments": { "task": "t", "branch": "feat/x" } }))
+            .unwrap();
+        assert_eq!(out["isError"], false, "{out:?}");
+        let agents = reg.list_agents(&g.id);
+        let worker = agents.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap();
+        let cwd = worker["cwd"].as_str().unwrap();
+        assert!(Path::new(cwd).is_dir(), "sanity: the worktree must actually exist before teardown");
+        assert!(
+            Path::new(cwd).starts_with(&root_path),
+            "sanity: the cut worktree must live inside the fixture's own temp root, not beside it: {cwd} vs {}",
+            root_path.display()
+        );
+        // `repo` drops here, at the end of this block.
+    }
+    assert!(
+        !root_path.exists(),
+        "the whole fixture tree (repo + cut worktree + its git-worktree admin \
+         registration) must be gone once the fixture drops: {}",
+        root_path.display()
+    );
+}
+
+#[test]
+fn real_repo_worktree_fixture_leaves_nothing_in_temp_when_the_test_panics() {
+    // Same shape, but the test fails partway through — a panic inside the
+    // block that holds the fixture, AFTER the worktree exists on disk. Rust
+    // unwinds through `Drop` on a panic (this binary uses the default unwind
+    // panic strategy, like the rest of loomux — `catch_unwind` is already
+    // used in production code, e.g. `obs.rs`), so this must clean up exactly
+    // like the success path above. Proving that needs `catch_unwind`: a
+    // genuinely failing `#[test]` would abort the test binary before any
+    // assertion here could run.
+    let (reg, _d) = test_registry();
+    let root_path = std::sync::Mutex::new(None::<PathBuf>);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let repo = real_repo();
+        *root_path.lock().unwrap() = Some(repo.root().to_path_buf());
+        let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+        reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", true, Some("agent-x".into())).unwrap();
+        assert!(Path::new(&w.cwd).is_dir(), "sanity: the worktree must exist before the panic");
+        panic!("deliberate failure, after the worktree exists, to prove teardown still runs");
+    }));
+    assert!(result.is_err(), "the inner closure must have actually panicked");
+    let root_path = root_path.into_inner().unwrap().expect("root captured before the panic fired");
+    assert!(
+        !root_path.exists(),
+        "a panicking test must still leave nothing behind: {}",
+        root_path.display()
+    );
+}
+
+#[test]
+fn sweep_orphaned_agent_files_reclaims_orphans_but_refuses_a_live_group() {
+    // #464 item 3: a conservative startup sweep of generated custom-agent
+    // files (`loomux-<group>-<block>.md`) whose group this registry has no
+    // record of at all — the from-disk cleanup a real launch now runs once,
+    // to reclaim exactly the shape of file `end_group` already reclaims for
+    // a group that DOES end cleanly (1,111 + 161 such orphans were found on
+    // a real dev machine, left by test runs that never call `end_group`).
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+
+    let claude_dir = dir.path().join("claude-agents");
+    fs::create_dir_all(&claude_dir).unwrap();
+    // A file for the group this registry DOES still know about (its state
+    // dir exists under `state_root()`) — must survive the sweep untouched,
+    // exactly like a merely-paused or not-yet-ended live group's file would.
+    let live_file = claude_dir.join(format!("loomux-{}-worker.md", g.id));
+    fs::write(&live_file, "---\nname: x\ndescription: x\n---\nbody").unwrap();
+    // A file for a group id nothing under `state_root()` corresponds to —
+    // the orphan shape a crashed or `end_group`-skipping run leaves behind.
+    let orphan_file = claude_dir.join("loomux-ghost-group-worker.md");
+    fs::write(&orphan_file, "---\nname: x\ndescription: x\n---\nbody").unwrap();
+    // A file that merely starts with a known group id as a substring, not a
+    // `-`/`.`-delimited prefix — must NOT be treated as belonging to `g.id`
+    // (no false negative from a naive `starts_with`).
+    let lookalike_file = claude_dir.join(format!("loomux-{}extra-worker.md", g.id));
+    fs::write(&lookalike_file, "---\nname: x\ndescription: x\n---\nbody").unwrap();
+    // Never ours at all (no `loomux-` prefix) — must never be considered,
+    // let alone removed.
+    let foreign_file = claude_dir.join("some-other-tools-agent.md");
+    fs::write(&foreign_file, "not loomux's").unwrap();
+
+    let result = reg.sweep_orphaned_agent_files();
+    assert!(result["errors"].as_array().unwrap().is_empty(), "got: {result}");
+    let reclaimed = result["reclaimed"].as_array().unwrap();
+    assert_eq!(
+        reclaimed.len(),
+        2,
+        "must reclaim exactly the two orphans (ghost-group and the lookalike), got: {result}"
+    );
+
+    assert!(!orphan_file.exists(), "an orphaned group's file must be reclaimed");
+    assert!(!lookalike_file.exists(), "a lookalike that is not actually this group's file must be reclaimed too");
+    assert!(live_file.exists(), "a still-known group's file must never be touched");
+    assert!(foreign_file.exists(), "a file with no `loomux-` prefix must never be considered, let alone removed");
+}
+
+#[test]
+fn no_registry_construction_bypasses_the_test_agent_dir_overrides() {
+    // A SEPARATE #464 leak from the worktree one above: `claude_agents_dir_
+    // override`/`copilot_agents_dir_override` are in-memory fields on an
+    // `OrchRegistry` instance, not persisted state, so a registry built with
+    // a bare `OrchRegistry::new(...)` — skipping `relaunch_registry` (which
+    // `test_registry` itself is now built on) — silently falls back to the
+    // REAL `dirs::home_dir()/.claude/agents` / `.../.copilot/agents` on its
+    // first spawn. That gap is exactly how the orchestration suite's many
+    // "relaunch" tests (a second `OrchRegistry::new` pointed at the same or
+    // a related state root) left 1,111 stray `loomux-<group>-*.md` files
+    // under a real dev machine's `~/.claude/agents` and 161 under
+    // `~/.copilot/agents` — found live on this machine while fixing this
+    // issue. That can't be safely re-proven at runtime (probing it would
+    // mean either touching the real home directory or faking `HOME`, which
+    // only proves the fallback exists, not that nothing here still uses it)
+    // — so this pins the invariant statically instead: exactly one raw
+    // `OrchRegistry::new(...)` may exist in this file, inside `relaunch_
+    // registry` itself. Every other construction must call that function.
+    let src = include_str!("orchestration.rs");
+    // Skip comments and string literals (this very test, and `relaunch_
+    // registry`'s own doc comment, both mention the construct by name) —
+    // only a real, live call site counts.
+    let sites: Vec<&str> = src
+        .lines()
+        .filter(|l| l.contains("OrchRegistry::new("))
+        .filter(|l| !l.trim_start().starts_with("//") && !l.contains('"'))
+        .collect();
+    assert_eq!(
+        sites.len(),
+        1,
+        "found a raw `OrchRegistry::new(...)` outside `relaunch_registry` — route it \
+         through `relaunch_registry(...)` instead, or it leaks a generated agent file \
+         into the real ~/.claude or ~/.copilot agents dir on its first spawn (#464). \
+         All occurrences: {sites:?}"
+    );
 }
 
 #[test]
@@ -14141,7 +14363,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
         .unwrap()
     };
 
-    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(state.path()));
     reg.set_port(45999);
     let advanced = Guardrails { advanced_orchestrator: true, ..rails() };
 
@@ -14188,7 +14410,7 @@ fn create_orchestration_group_maps_resume_session_onto_the_workflow_pin() {
     // ...and a FRESH launch on that same repo does pick the new one up, so the pin is
     // "a resume doesn't re-read", not "loomux stopped reading the file".
     let state2 = tempfile::tempdir().unwrap();
-    let reg2 = Arc::new(OrchRegistry::new(state2.path().to_path_buf()));
+    let reg2 = Arc::new(relaunch_registry(state2.path()));
     reg2.set_port(45999);
     let relaunched =
         create_orchestration_group(&reg2, &repo_path, advanced, Launch::Fresh, None, None, 0).unwrap();
@@ -14213,7 +14435,7 @@ fn start_fresh_on_an_orchestrator_does_not_re_read_the_workflow_file() {
     let state = tempfile::tempdir().unwrap();
     let repo = gated_repo(""); // rev-security, rev-tests, an all-pass merge gate
     let repo_path = repo.path().to_string_lossy().replace('\\', "/");
-    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(state.path()));
     reg.set_port(45999);
 
     let launched = create_orchestration_group(
@@ -14533,7 +14755,7 @@ fn a_resumed_session_re_checks_the_pinned_roster_against_the_live_cap_too() {
     // must not silently skip the check just because the file wasn't re-read.
     let state = tempfile::tempdir().unwrap();
     let repo = gated_repo(""); // 1 worker + 2 reviewers, all-pass: minimum 3
-    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(state.path()));
     reg.set_port(45999);
     let launched = create_orchestration_group(
         &reg,
@@ -14588,7 +14810,7 @@ fn a_resumed_group_with_no_declared_workflow_gets_no_capacity_audit_either() {
     // feed `recommend_capacity` with.
     let state = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap(); // no .loomux directory at all
-    let reg = Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    let reg = Arc::new(relaunch_registry(state.path()));
     reg.set_port(45999);
     let launched = create_orchestration_group(
         &reg,
@@ -14899,7 +15121,7 @@ fn a_verdict_is_attributed_bound_to_a_revision_and_survives_a_restart() {
         assert!(text.contains("rev-tests"), "and tells the reviewer the gate still waits on its peer: {text}");
     }
     // A fresh registry over the same state root — the app restarted.
-    let reg = OrchRegistry::new(d.path().to_path_buf());
+    let reg = relaunch_registry(d.path());
     reg.set_port(45999);
     reg.set_pr_head_override(Some(HEAD.into()));
     let v = reg.verdicts(&gid, 7);
@@ -17556,7 +17778,7 @@ fn advanced_orchestrator_toggle_persists_and_preserves_other_guardrails() {
     let gid;
     let path;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         let g = reg.create_group(&repo_path, Guardrails { max_agents: 5, ..rails() }).unwrap();
         gid = g.id.clone();
@@ -17577,7 +17799,7 @@ fn advanced_orchestrator_toggle_persists_and_preserves_other_guardrails() {
     // that rejoin: `advanced_orchestrator` is a launch-time input, not something
     // `create_group_ex` self-heals from disk the way it does `max_agents`, so
     // the caller (here, the real `load_group_file`) must carry it forward.
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let (repo2, loaded) = reg.load_group_file(&gid).expect("group.json must still load");
     assert!(loaded.advanced_orchestrator, "the persisted flag must read back true");

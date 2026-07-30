@@ -2989,6 +2989,39 @@ added — worth a quick explicit check, not assumed either way.
   security one — a reconciliation sweep is real, if modest, additional complexity (enumerating
   every group's state to know which handles are still legitimate) for a narrow, self-correcting-
   by-hand failure mode, so it's left as a deliberate follow-up rather than built speculatively.
+  **Built after all, in #464** — the "narrow, self-correcting-by-hand" framing above turned out to
+  undercount the source: the ORCHESTRATION TEST SUITE spawns agents through the exact same
+  `write_claude_agent_file`/`write_copilot_agent_file` path and, being unit tests, essentially never
+  calls `end_group` — every `OrchRegistry::new(...)` in `tests/orchestration.rs`/`tests/workflow.rs`
+  that skipped the test-only `claude_agents_dir_override`/`copilot_agents_dir_override` (the
+  "relaunch" pattern: a second registry built against the same or a related state root to simulate
+  loomux restarting, common across the persistence tests) fell straight through to the REAL
+  `~/.claude/agents`/`~/.copilot/agents`. 1,111 and 161 such stray files were found on a real dev
+  machine — not cosmetic at that volume, and not remotely limited to crashes. Fixed two ways:
+  test-side, every registry construction across both files now routes through a `relaunch_registry`
+  helper that always applies the overrides (statically pinned by
+  `no_registry_construction_bypasses_the_test_agent_dir_overrides` in each file — it greps its own
+  source for a raw `OrchRegistry::new(...)` outside that helper); product-side,
+  `OrchRegistry::sweep_orphaned_agent_files` now runs once at launch (`lib.rs`'s `setup`, alongside
+  `start_disk_monitor` et al.) and reclaims any `loomux-<group>-*` file whose `<group>` no longer has
+  a directory under this registry's own `state_root()` — conservative by construction: only
+  `loomux-`-prefixed entries are ever considered, matched against known groups by `-`/`.`-delimited
+  prefix (not a naive `-`-split, since both a group id and a block id can contain `-` themselves),
+  and every reclaim is breadcrumbed (`fixture-sweep`). See `sweep_orphaned_agent_files_reclaims_
+  orphans_but_refuses_a_live_group` (`tests/orchestration.rs`) for the orphan-vs-live-group proof.
+  This does NOT reach the OTHER #464 leak (leaked `%TEMP%` git-worktree *directories*, a much larger
+  volume — 2,438 growing to 2,702 on the same machine): that one's root cause was `real_repo()` (and
+  `workflow.rs`'s `Repo::git_init()`) binding the fixture's git repo directly to a bare
+  `tempfile::tempdir()`, so `git_worktree_add`'s cut worktree — created at `<repo's-parent>/<repo-
+  name>-worktrees/<name>`, a directory SIBLING to the repo, never inside it — landed outside that
+  `TempDir`'s own cleanup scope on every passing test, not just a failing one. Fixed by nesting the
+  repo one level under its own private temp root (`<root>/repo`) in both files, so the sibling
+  worktree directory — and the `.git/worktrees/<name>` admin registration `git worktree add` writes
+  inside the repo's own `.git` — both stay inside `_root` and are reclaimed by its `Drop`, which runs
+  on success, on assertion failure, and through a panicking unwind alike; no git-specific teardown
+  call is needed because there is nothing left outside the temp root for one to miss. Proven by
+  `real_repo_worktree_fixture_leaves_nothing_in_temp_on_success` and its `_when_the_test_panics`
+  counterpart.
 - **Test-infra fix found along the way (not reviewer-flagged, surfaced by chasing an intermittent
   local flake):** `compact_hook_dir()` derives from `self.root.parent()`, which for
   `test_registry()`'s disposable tempdir is the SHARED SYSTEM TEMP DIRECTORY — so every test that
