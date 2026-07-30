@@ -1567,13 +1567,44 @@ export class Pane implements VoiceTargetPane {
   /** Convert a dormant agent placeholder into a live pane when the human clicks
    *  Start: tear down the placeholder and spawn the recorded command in place.
    *  Only used for `dormant-agent` (no-session CLIs) — a dormant GROUP is revived
-   *  through resumeOrchSession, never here (the double-spawn contract). */
+   *  through resumeOrchSession, never here (the double-spawn contract).
+   *
+   *  #479 review finding 2: this used to remove the placeholder element from
+   *  the document IMMEDIATELY, before awaiting `start()` at all — so ANY
+   *  later failure in the caller's own post-spawn wiring (main.ts's
+   *  dormant-agent `onClick` — `remint.bind`, `onGridChanged`, both of which
+   *  run strictly AFTER this method returns) rendered its error card into an
+   *  element already gone from the DOM: invisible, worse than the pre-PR
+   *  behavior where the same throw escaped as an uncaught rejection and hit
+   *  the global banner. The element itself now stays mounted until `start()`
+   *  settles (success OR throw, via `finally`) rather than being torn down
+   *  before it even begins — this closes the window for a failure INSIDE
+   *  `start()` itself, but NOT for `remint.bind`/`onGridChanged` afterward
+   *  (this method has already returned and its own `finally` has already
+   *  removed the element by the time those run). That remaining window is
+   *  covered by `dormantCard`'s `render()` falling back to a toast when its
+   *  element is no longer connected — the design note's "residual gap"
+   *  section states plainly which failures land on which surface; this
+   *  comment is not the place to re-claim more than that.
+   *
+   *  `this.dormantEl` (the FIELD, distinct from the captured local `el`) is
+   *  still nulled immediately, unchanged from before: `isDormant` (`this.
+   *  dormantEl !== null`) must flip false the instant Start is clicked, not
+   *  after the whole spawn settles — main.ts's #440 D2 background
+   *  resume-candidate prefetch gates on `pane.isDormant` to decide whether
+   *  to append a SECOND action button, and widening that window would let
+   *  it add one while this Start is still in flight (a race this fix must
+   *  not introduce while closing the other one). */
   async startFromDormant(opts: PaneOptions = {}): Promise<void> {
-    this.dormantEl?.remove();
+    const el = this.dormantEl;
     this.dormantEl = null;
     this.dormantRecord = null;
     this.el.classList.remove("is-dormant");
-    await this.start(opts, true);
+    try {
+      await this.start(opts, true);
+    } finally {
+      el?.remove();
+    }
   }
 
   /** The live WebGL renderer addon, if loaded. Held so hidden tabs can drop it

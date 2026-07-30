@@ -2969,14 +2969,47 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .dormant-title { font-size: 13px; font-weight: 600; color: var(--text); }
 .dormant-body { font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+/* #479: the warning glyph only ever shows in the error tone below — hidden
+   here so a plain "Resume group" card (nothing wrong, just needs a click)
+   never grows the extra vertical space for an icon it isn't using. */
+.dormant-icon { display: none; font-size: 20px; line-height: 1; }
 .dormant-btn {
   align-self: center; margin-top: 4px;
+  display: inline-flex; align-items: center; gap: 7px;
   padding: 7px 16px; border-radius: 7px; cursor: pointer;
   border: 1px solid rgba(122, 162, 247, 0.5);
   background: rgba(122, 162, 247, 0.16); color: var(--text);
   font-size: 12.5px; font-weight: 600;
 }
 .dormant-btn:hover { background: rgba(122, 162, 247, 0.28); }
+/* #479 A: the click is acknowledged the instant the button disables — a
+   visible spin, not just a dimmed button that could still read as "did my
+   click even register?" `dormant-btn`'s own `display:inline-flex` lays the
+   spinner and label out side by side; the spinner element always exists
+   (simpler DOM diffing than inserting/removing it) and only *shows* while
+   the button is disabled, which is exactly the "pending" state. */
+.dormant-spinner {
+  display: none; flex: none;
+  width: 11px; height: 11px; border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.35); border-top-color: currentColor;
+  animation: dormant-card-spin 0.7s linear infinite;
+}
+.dormant-btn:disabled { cursor: default; opacity: 0.85; }
+.dormant-btn:disabled .dormant-spinner { display: inline-block; }
+@keyframes dormant-card-spin { to { transform: rotate(360deg); } }
+/* #479 B: "no resumable session" must read as unmistakably wrong, not just
+   another neutral dormant card with different words — a dormant-agent card
+   (this build's ONLY current use) mounts straight into this tone, and a
+   "Resume group" card can land here too if the resume itself fails. Red
+   accent + a heading that says so + the warning icon `.dormant-icon` above
+   only shows for this tone; the diagnostic body text (#440 — what makes a
+   wrongly-unresumable session diagnosable) is never hidden or trimmed. */
+.dormant-card-error {
+  border-color: rgba(247, 118, 142, 0.45);
+  background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+}
+.dormant-card-error .dormant-icon { display: block; color: var(--danger); }
+.dormant-card-error .dormant-title { color: var(--danger); }
 /* D2 (#440): the "we found your last session" option, appended beside plain
    Start once the background prefetch resolves a match. Green accent — same
    "positive/live" palette as .tab-orch.live / .task-btn.approve — signals it's

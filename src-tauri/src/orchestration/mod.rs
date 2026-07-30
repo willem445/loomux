@@ -10229,6 +10229,77 @@ impl OrchRegistry {
         out
     }
 
+    /// Single-group fast path for the lookup `session_roles()` does (#479):
+    /// resuming a session whose group is already known (every dormant-group
+    /// Resume click names it via `hint` — see `resume_recorded_session`)
+    /// doesn't need every OTHER group's group.json/tasks.json/full audit log
+    /// read and parsed just to throw away every row but one. This reads and
+    /// merges exactly the one group `session_roles()` would eventually find
+    /// it in — same fields, same last-match tie-break, WITHIN that group.
+    ///
+    /// **Not proven equivalent to the full scan in general** (review round on
+    /// #479's PR, correcting this comment's own prior overclaim): when a
+    /// session id has an `agent-spawn` audit row in MORE than one group —
+    /// reachable today via #485 (a delegate rejoined into the wrong group
+    /// writes that row into it too) — a hit here resolves to the HINTED
+    /// group deterministically, where the full scan's `.last()` resolves to
+    /// whichever group `fs::read_dir(&self.root)` happened to enumerate last
+    /// (arbitrary iteration order, not a considered choice either). The two
+    /// can disagree in that corner. Hinted-group-wins is arguably the more
+    /// defensible rule — it's the group the clicked tab is actually bound
+    /// to — but it is a DIFFERENT tie-break, not a proof of sameness, and
+    /// this must not be sold as one until #485 removes the corner (a session
+    /// can never legitimately belong to two groups). A miss (stale/wrong
+    /// hint, or the id genuinely isn't in that group) falls through to the
+    /// unchanged full scan in the caller.
+    ///
+    /// Measured (`resume_recorded_session_group_hint_avoids_scanning_every_
+    /// other_group`, tests/orchestration.rs, #479): with 200 decoy groups on
+    /// disk (300 audit lines each — the axis this test exercises), resuming
+    /// via a correct group hint took 419ms on `resume_recorded_session`'s
+    /// prior unconditional `session_roles()` call; with this fast path in
+    /// its place, 42ms. Both numbers are debug-build, one dev machine — the
+    /// point is the O(other groups) term this removes, not the absolute
+    /// figures, and this axis (many groups, each modest) is not the only one
+    /// that matters: this fast path still reads and parses the HINTED
+    /// group's OWN full audit log (`merged_records` → `records_from_audit`,
+    /// both rotation generations, bounded at ~16 MB by the 8 MB rotate cap)
+    /// — a real, long-lived group with a near-cap audit log still pays that
+    /// cost every resume, and the 42ms figure will not reproduce for it.
+    /// What this fast path removes is strictly the OTHER groups' scans, not
+    /// the resumed group's own.
+    fn session_role_in_group(&self, group_id: &str, session_id: &str) -> Option<SessionRole> {
+        if !self.group_dir(group_id).join("group.json").is_file() {
+            return None;
+        }
+        let live = self.group_is_live(group_id);
+        let repo = self.load_group_file(group_id).map(|(repo, _)| repo);
+        let pr_by_session: HashMap<String, String> = self
+            .tasks(group_id)
+            .into_iter()
+            .filter_map(|t| Some((t.session?, t.pr?)))
+            .collect();
+        self.merged_records(group_id)
+            .into_iter()
+            .filter(|r| r.session.as_deref() == Some(session_id))
+            .last()
+            .map(|r| {
+                let session = r.session.clone().unwrap_or_default();
+                let pr = pr_by_session.get(&session).cloned();
+                SessionRole {
+                    session_id: session,
+                    group_id: group_id.to_string(),
+                    role: r.role,
+                    agent_name: r.name,
+                    group_live: live,
+                    task: r.task,
+                    branch: r.branch,
+                    repo,
+                    pr,
+                }
+            })
+    }
+
     /// Load a group's persisted identity (repo + guardrails) from group.json.
     ///
     /// See [`read_blocks`] for how a pre-#222 group.json (flat per-role fields,
@@ -21487,11 +21558,26 @@ pub fn resume_recorded_session(
     hint: Option<(String, String)>, // (group_id, role) from transcript signatures
     start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
-    let record = reg
-        .session_roles()
-        .into_iter()
-        .filter(|r| r.session_id == session_id)
-        .last()
+    let record = hint
+        .as_ref()
+        // #479: the dormant-group Resume button (and any other caller that
+        // already knows which group a session belongs to) names it via
+        // `hint` — try that ONE group first rather than unconditionally
+        // paying for every OTHER group's group.json/tasks.json/full audit
+        // log, which `session_roles()` below pays for regardless of whether
+        // its result is used. A miss (wrong/stale hint) falls through to the
+        // full scan. This is a genuinely DIFFERENT tie-break from the full
+        // scan's, not merely a faster path to the same answer — see
+        // `session_role_in_group`'s doc comment for the #485 corner (a
+        // session id recorded in more than one group) where the two can
+        // resolve to different groups.
+        .and_then(|(group_id, _)| reg.session_role_in_group(group_id, session_id))
+        .or_else(|| {
+            reg.session_roles()
+                .into_iter()
+                .filter(|r| r.session_id == session_id)
+                .last()
+        })
         .or_else(|| {
             // Sessions from before the roster (and before session-id
             // tracking) are identified by loomux signatures in their own

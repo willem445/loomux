@@ -252,6 +252,7 @@ src/
   sessions.ts       session browser sidebar: source/role chips, and (#1) each session's recorded task/goal, repo, branch, and PR (when the board has one) — absent rather than guessed for a session predating the field
   sessionmeta.ts    pure session-browser task/repo-branch/PR formatting + truncation (#1) (DOM-free, unit-tested)
   resumeerror.ts    pure classification of a resume failure's structured backend tag into a UI affordance -- start-fresh vs a plain error (#412) (DOM-free, unit-tested)
+  restorecard.ts    pure dormant-card lifecycle state machine -- idle/pending/error, click acknowledged immediately, failure always lands on a persistent error state (#479) (DOM-free, unit-tested)
   launcher.ts       in-pane welcome / pane-setup form (Agent / Orchestrator / Terminal / File-explorer / File-editor / Git kind picker)
   panesetup.ts      pure kind-selection + validation core for the welcome screen (DOM-free, unit-tested)
   orchestration.ts  frontend half of agent groups (panes, badges, focus); also the human-only cross-workspace channel commands (connect/disconnect/set-sender, standalone-pane prepare/bind/adopt) + `orch-channel` event routing (#271)

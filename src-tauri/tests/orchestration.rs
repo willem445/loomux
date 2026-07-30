@@ -2364,6 +2364,112 @@ fn copilot_group_resumes_a_recorded_session() {
         .is_err());
 }
 
+/// #479 (restore UX): resuming a session whose group is already known — every
+/// dormant-group Resume click names it via `hint` — used to pay for
+/// `session_roles()`'s full scan regardless: every OTHER group's group.json,
+/// tasks.json, and full audit log read and parsed just to find one row. This
+/// pins the group-hint fast path (`session_role_in_group`) that makes a
+/// correct hint touch only the named group, by surrounding the resumed
+/// session with many unrelated decoy groups each carrying a realistic audit
+/// tail, and asserting the resume stays fast regardless of how many exist.
+///
+/// Measured (debug build, one dev machine, `--nocapture`): ~420-540ms before
+/// this fix (the fast path disabled, `session_roles()`'s full scan always
+/// paid for) vs. a same-run bare `session_roles()` baseline of comparable
+/// size, ~40-55ms after, against a baseline of ~360-480ms. Re-run this test
+/// with `--nocapture` to see both numbers printed on your machine.
+///
+/// The assertion below compares the timed call against a `session_roles()`
+/// baseline measured ON THE SAME RUN, immediately before it — NOT a fixed
+/// millisecond bound. A fixed bound (this test's first version used 200ms)
+/// is exactly the kind of thing that goes flaky under CI hardware variance:
+/// this test failed CI once at 211ms on an otherwise-genuinely-fixed fast
+/// path, simply because that runner was slower/noisier than the dev machine
+/// the bound was picked against. A same-run relative comparison is robust to
+/// that — CI being N times slower scales both sides of the comparison by
+/// roughly the same factor, so the ratio pinned here stays stable even
+/// though neither absolute number does.
+#[test]
+fn resume_recorded_session_group_hint_avoids_scanning_every_other_group() {
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let (reg, _d) = test_registry();
+    let reg = Arc::new(reg);
+
+    const DECOY_GROUPS: usize = 200;
+    const NOISE_LINES: usize = 300;
+    for i in 0..DECOY_GROUPS {
+        let g = reg.create_group(&format!("C:/tmp/decoy-{i}"), rails()).unwrap();
+        let mut audit = String::new();
+        for n in 0..NOISE_LINES {
+            audit.push_str(&format!(
+                "{{\"ts_ms\":{n},\"actor\":\"loomux\",\"action\":\"noise\",\"detail\":{{\"n\":{n}}}}}\n"
+            ));
+        }
+        fs::write(reg.state_root().join(&g.id).join("audit.jsonl"), audit).unwrap();
+    }
+
+    // The target session, in its own group — fixtured into claude's store
+    // (thread-local test seam) exactly like the other orchestrator-resume
+    // tests, so the existence pre-check passes and the resume actually
+    // proceeds instead of failing on an unrelated lookup.
+    let repo = tempfile::tempdir().unwrap(); // must exist for restore
+    let repo_path = repo.path().to_string_lossy().into_owned();
+    let g = reg.create_group(&repo_path, rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let sid = orch.session_id.unwrap();
+    reg.mark_dead(&orch.id, Some(0));
+
+    // Baseline control, measured on THIS run/machine/load immediately before
+    // the timed call below: the full scan this fast path replaces, still
+    // reachable directly (it's the unchanged fallback `resume_recorded_
+    // session` itself uses on a miss). A fixed millisecond bound here is
+    // exactly the kind of thing that goes flaky on a loaded CI runner — this
+    // very test failed CI once already at 211ms against a 200ms bound, on an
+    // otherwise-genuinely-fixed fast path, simply because that runner was
+    // slower/noisier than the dev machine the bound was picked against. A
+    // same-run RELATIVE comparison is robust to absolute machine speed: CI
+    // being 5x slower scales both sides of the comparison by roughly the
+    // same factor, so the ratio stays stable even though neither absolute
+    // number does.
+    let baseline_start = Instant::now();
+    let _ = reg.session_roles();
+    let baseline = baseline_start.elapsed();
+
+    let store = scratch_dir("resume-hint-fastpath");
+    fixture_claude_session(&store, &sid, &repo_path);
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
+    let started = Instant::now();
+    let req = resume_recorded_session(&reg, &sid, Some((g.id.clone(), "orchestrator".into())), false);
+    let elapsed = started.elapsed();
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
+
+    let req = req.unwrap().expect("must relaunch the recorded orchestrator session");
+    assert_eq!(req.group_id, g.id);
+    eprintln!(
+        "resume_recorded_session with a correct group hint took {elapsed:?} \
+         (same-run session_roles() baseline: {baseline:?}) across {DECOY_GROUPS} \
+         decoy groups x {NOISE_LINES} audit lines each"
+    );
+    // `elapsed` includes the hinted lookup PLUS the orchestrator relaunch's own
+    // unavoidable work (MCP config mint, instruction/hook files) that `baseline`
+    // (a bare session_roles() call) doesn't pay at all — so this is a
+    // deliberately loose bound (half the baseline), not a claim that the two
+    // are measuring identical work. The point pinned here is that a resume
+    // touching one group is not in the same order of magnitude as a scan of
+    // every group, regardless of what a launch itself costs on top.
+    assert!(
+        elapsed.as_millis() * 2 < baseline.as_millis().max(1),
+        "resuming via a correct group hint should be well under a bare full \
+         session_roles() scan measured on this same run, not merely faster by \
+         a hair — hint+launch took {elapsed:?}, full-scan-alone baseline {baseline:?} \
+         across {DECOY_GROUPS} decoys"
+    );
+}
+
 #[test]
 fn concurrent_groups_on_one_repo_stay_separate_but_resume_when_free() {
     let (reg, _d) = test_registry();
