@@ -46,3 +46,16 @@ and stops the search. This entry itself first shipped with a miscount and a
 one-layer version of that same claim, caught in review, not before. Delete a
 claim you can't point at code for, don't soften it; quote raw fetched text
 for CLI/API facts, never a paraphrase (#453).
+
+## Commit real work BEFORE capturing red evidence
+
+Red-before-green on this repo usually means running the NEW tests against
+the OLD behavior — which means temporarily patching a file back and then
+restoring it. `git checkout -- <file>` restores by discarding ALL
+uncommitted work in that file, not just the experiment: it silently ate a
+real, minutes-old correctness fix during #493's evidence capture (re-done
+later as b4c7d96; same destructive-git class as the `git stash` entry
+above). The cheap rule: commit the real work first — a small commit you
+amend or squash later — then patch for the red run, then restore. Never
+point a destructive git command at a file holding anything you haven't
+committed.
