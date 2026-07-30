@@ -1207,8 +1207,16 @@ async function handleWelcomeSubmit(
   }
 
   if (result.kind === "orchestrator") {
+    // #478: decided from `paneCount` read synchronously HERE, before the
+    // `create_orchestration` await below — deliberate, not an oversight (the
+    // pre-#478 code re-read live state AFTER its own await instead). The
+    // cost: if the human splits THIS tab again while the launch is in
+    // flight, `paneCount` is already stale and the own-tab arm's
+    // `tabs.closeTab(ws.id)` would destroy that just-made second split
+    // instead of leaving it — a millisecond-scale, human-initiated race,
+    // called out in review and left as-is (not asked to be fixed here).
     if (orchestratorLaunchTarget(ws.grid.paneCount) === "split") {
-      // #478: this setup pane arrived via a genuine split into an
+      // This setup pane arrived via a genuine split into an
       // already-populated tab — honour that spatial gesture and convert it
       // in place (openAgentPane → existingPane.startFromWelcome), instead of
       // falling into launchOrchestratorTab below, which always mints its own
@@ -1216,8 +1224,11 @@ async function handleWelcomeSubmit(
       // renamed to the launched repo's project name and not (re)bound away
       // from whatever this tab already represents — a split target's tab may
       // hold panes for an entirely different project, so only the new
-      // orchestrator group is bound to it, same as any other group sharing a
-      // tab via `orchWiring.targetForGroup`.
+      // orchestrator group is bound to it, same precedent `restoreSession`
+      // already establishes for binding a group into a tab that wasn't
+      // minted for it (`owning ?? tabs.activeWorkspace` fallback, below) —
+      // NOT `orchWiring.targetForGroup`, which mints a fresh tab per unseen
+      // group and never shares one.
       try {
         const { groupId } = await launchOrchestrator(ws.grid, eventsFor(ws), result.config, pane);
         tabs.bindGroup(groupId, ws.id);

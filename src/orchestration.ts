@@ -275,11 +275,12 @@ async function openAgentPane(
   background: boolean,
   // #478: when the human split an existing tab and picked "orchestrator" in
   // that split's setup pane, `launchOrchestrator` passes that pane here so
-  // its launch converts it IN PLACE (same in-place-conversion pattern as
-  // `startFromWelcome` for every other welcome-form kind) instead of opening
-  // a brand-new pane elsewhere in the grid. Undefined for every other spawn
-  // path (backend-driven delegate spawns, session-browser resume), which
-  // keeps opening a fresh pane as before.
+  // its launch converts it IN PLACE (same in-place-conversion pattern
+  // `startFromWelcome` already gives the other PTY-backed welcome-form kinds
+  // — terminal, agent) instead of opening a brand-new pane elsewhere in the
+  // grid. Undefined for every other spawn path (backend-driven delegate
+  // spawns, session-browser resume), which keeps opening a fresh pane as
+  // before.
   existingPane?: Pane
 ): Promise<void> {
   const paneOpts = {
@@ -306,7 +307,9 @@ async function openAgentPane(
     // orchestrator's own pane is never minimized (`spawn_opens_minimized`,
     // mod.rs), so `req.minimized` can't be true here and there's nothing to
     // branch on. `startFromWelcome` is the same in-place-conversion primitive
-    // every other welcome-form kind (terminal/files/agent/…) already uses.
+    // the terminal and agent welcome-form kinds already use for a PTY-backed
+    // pane (main.ts) — files/editor/git/workflow are a different, content-only
+    // kind and convert via `startContent` instead.
     await existingPane.startFromWelcome(paneOpts);
     pane = existingPane;
   } else {
