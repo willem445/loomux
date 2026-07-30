@@ -60,8 +60,19 @@ decision rule, the `-j 4` local-cap details, and the draft-PR-early CI flow.
 6. **Orchestration commands trust `group_id` as a path segment** — safe only
    because the webview is trusted. Never route agent-controllable input into
    group-scoped commands without a traversal/membership check.
-7. **No agent ever merges a PR.** Open the PR and stop; the human reviews and
-   merges.
+7. **No agent ever merges a PR to the default branch.** Open the PR and stop;
+   the human reviews and merges. This is the rule for *every* agent —
+   workers, reviewers and planners have no merge authority at all, anywhere,
+   and must never merge, tag, or publish a release.
+   **One narrow carve-out, for the orchestrator only:** an orchestrator may
+   merge a sub-PR into a **non-default branch** it owns — typically an
+   integration branch collecting a batch of sub-PRs for a single human
+   review — and only once that sub-PR has a reviewer's approval, green CI,
+   and every review finding fixed or explicitly deferred. Merging to the
+   default branch is **never** covered: it always needs a per-PR grant from
+   the human, as does creating a release or pushing a `v*` tag. The carve-out
+   exists so a human reviews one combined PR instead of five, not to reduce
+   how much a human reviews. When in doubt, open the PR and ask. (#469)
 8. **Loomux is a generic agentic-dev tool — never bake this repo's or this
    machine's quirks into product code.** No toolchain special-casing (nothing
    cargo-/npm-specific in `src-tauri`; express "what's expensive/guarded/built
