@@ -2762,6 +2762,51 @@ pub fn claude_permission_mode(unattended: bool) -> &'static str {
     }
 }
 
+/// #465: a read-only agent (today: a planner) needs more than
+/// `CLAUDE_READONLY_DENY_TOOLS` denying its KNOWN editing tools by name —
+/// that list is fail-open to any editing tool Claude Code adds *after* it
+/// was last written (nothing mismatches, nothing warns, the tool just
+/// works). `--permission-mode dontAsk` closes that direction instead of
+/// narrowing it: per the official
+/// [permission modes reference](https://code.claude.com/docs/en/permission-modes.md)
+/// ("Allow only pre-approved tools with dontAsk mode", fetched as raw
+/// markdown, verified 2026-07-29): "If you set `dontAsk` mode, Claude Code
+/// auto-denies every tool call that would otherwise prompt you. Claude runs
+/// only actions matching your `permissions.allow` rules, read-only Bash
+/// commands, and calls approved by a PreToolUse hook." A brand-new editing
+/// tool released tomorrow is not in `--allowedTools` — nothing added it
+/// there — so `dontAsk` denies it on first use with zero loomux code
+/// change, which is exactly the property `auto` mode's background
+/// safety-classifier fallback could never give: `auto` still lets Claude
+/// **choose** any tool, including one #448/#465's literal deny lists don't
+/// know about yet. See `doc/design/orchestration.md`'s `#465` section for
+/// the full argument, the two rejected alternatives (Copilot's
+/// `--available-tools`; listening for the CLI's own startup warning), and
+/// why Copilot's side of this issue is documented open rather than closed
+/// the same way.
+///
+/// `--disallowedTools` (`CLAUDE_READONLY_DENY_TOOLS`/`_GIT`) stays emitted
+/// alongside this, unchanged: a bare deny rule "removes the tool from
+/// Claude's context entirely" (stronger than merely unapproved — Claude
+/// never sees it as a choice at all) and `claude_readonly_deny_tools_are_known_claude_tools`
+/// still catches a stale/mistyped entry. The two layers are independent
+/// defences for the two different directions (named-and-wrong vs.
+/// unnamed-and-new); dropping either narrows the guarantee.
+///
+/// **Never call this for a non-read-only agent.** `dontAsk` denies file
+/// edits that aren't in `--allowedTools` — exactly what a worker or reviewer
+/// exists to make. This is why the branch below is `if read_only`, not
+/// folded into `claude_permission_mode` itself: that function is also used
+/// by `single_pane_autopilot_flags` for a *non-read-only* solo pane, which
+/// must keep `auto`.
+pub fn claude_effective_permission_mode(unattended: bool, read_only: bool) -> &'static str {
+    if read_only {
+        "dontAsk"
+    } else {
+        claude_permission_mode(unattended)
+    }
+}
+
 /// Per-CLI flags that put a *standalone* single-pane agent into the same
 /// unattended "autopilot / allow all" posture group workers get — minus the
 /// MCP/session/workspace wiring only a managed agent needs. Built from the SAME
@@ -18599,8 +18644,9 @@ impl OrchRegistry {
                 // "Auto" preset = Claude Code's native auto permission mode
                 // (what the human uses interactively); otherwise acceptEdits.
                 // A planner (`read_only`) is always `unattended` (see above),
-                // so it runs under Auto perms even in a non-auto_ops group.
-                let perm = claude_permission_mode(unattended);
+                // but runs under `dontAsk`, not Auto — see
+                // `claude_effective_permission_mode`'s doc (#465).
+                let perm = claude_effective_permission_mode(unattended, read_only);
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config \
                      --model {model} --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
@@ -18790,7 +18836,7 @@ impl OrchRegistry {
                 push(&mut a, "--model");
                 push(&mut a, model);
                 push(&mut a, "--permission-mode");
-                push(&mut a, claude_permission_mode(unattended));
+                push(&mut a, claude_effective_permission_mode(unattended, read_only));
                 push(&mut a, "--add-dir");
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--allowedTools");

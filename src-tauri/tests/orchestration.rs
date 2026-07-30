@@ -16,7 +16,7 @@ use loomux_lib::orchestration::{
     pre_trust_copilot_folder, set_copilot_trust_home_for_test,
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
-    claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
+    claude_effective_permission_mode, claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
     COMPACT_HOOK_SCRIPT, COPILOT_PRECOMPACT_HOOK_BASH, COPILOT_PRECOMPACT_HOOK_POWERSHELL,
     COPILOT_PROMPTSUBMIT_HOOK_BASH, COPILOT_PROMPTSUBMIT_HOOK_POWERSHELL,
     ConfirmSource, DeliveryConfirmState, MonitorAction, PromptLandedMatch, PromptSubmitRecord,
@@ -1462,8 +1462,9 @@ fn planner_runs_unattended_regardless_of_auto_ops() {
     let gdir = Path::new("C:/data/group");
     // auto_ops = FALSE, read_only = TRUE (a planner in a manual-ops group).
     let plan = reg.build_agent_command("claude", "opus", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true, &PersonaInject::default());
-    assert!(plan.contains("--permission-mode auto"),
-        "a planner runs unattended (Auto perms) even when the group is not auto_ops — else it deadlocks");
+    assert!(plan.contains("--permission-mode dontAsk"),
+        "a planner runs unattended (dontAsk: pre-approved tools only, #465) even when \
+         the group is not auto_ops — else it deadlocks");
     assert!(plan.contains("\"Bash(gh *)\""),
         "a non-auto_ops planner must still have gh pre-approved so `gh issue comment` (its plan) never prompts");
     assert!(plan.contains("\"Bash(git *)\""),
@@ -1652,6 +1653,70 @@ fn single_pane_flags_reuse_the_group_path_atoms() {
 fn claude_permission_mode_maps_unattended() {
     assert_eq!(claude_permission_mode(true), "auto");
     assert_eq!(claude_permission_mode(false), "acceptEdits");
+}
+
+/// #465: `read_only` must win regardless of `unattended` — a planner is
+/// BOTH unattended and read_only, but the mode it needs is the closed one
+/// (`dontAsk`), not `auto`. And `dontAsk` must never reach a non-read-only
+/// agent (worker/reviewer): it denies file edits that aren't pre-approved,
+/// which is exactly what those roles exist to make.
+#[test]
+fn claude_effective_permission_mode_is_dontask_only_for_read_only() {
+    assert_eq!(claude_effective_permission_mode(true, true), "dontAsk");
+    assert_eq!(claude_effective_permission_mode(false, true), "dontAsk");
+    assert_eq!(claude_effective_permission_mode(true, false), claude_permission_mode(true));
+    assert_eq!(claude_effective_permission_mode(false, false), claude_permission_mode(false));
+}
+
+/// #465, the property the whole fix rests on: `dontAsk` only closes the
+/// fail-open direction (a NEW Claude Code editing tool silently working
+/// because nothing named it in a deny list) if the allow list `dontAsk`
+/// checks against never contains a BARE tool grant. A bare `Bash` or a bare
+/// `Edit`-class name would pre-approve Claude to use that WHOLE tool freely
+/// — present and future capabilities of it — which defeats
+/// "everything not pre-approved is denied" just as surely as the old
+/// per-name deny list did, only relocated to the allow side. This pins the
+/// actual list a read-only agent's `--allowedTools` resolves to: every
+/// token must be either the literal `mcp__loomux` or a SCOPED `Name(...)`
+/// pattern, never a bare tool name.
+///
+/// Mutation evidence (red before green): with `CLAUDE_UNATTENDED_ALLOW`
+/// locally changed from `"Bash(git *)" "Bash(gh *)"` to a bare `"Bash"`
+/// (simulating exactly the class of regression this test exists to catch),
+/// this test fails with `"Bash" in the read-only --allowedTools list is a
+/// BARE tool grant...`; restoring the scoped form passes.
+#[test]
+fn claude_readonly_allowed_tools_contain_no_unscoped_grant() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let plan = reg.build_agent_command(
+        "claude", "opus", false, cfg, None, gdir, Path::new("C:/repo"), None, false, true,
+        &PersonaInject::default(),
+    );
+    let tokens = shell_tokenize(&plan);
+    let start = tokens
+        .iter()
+        .position(|t| t == "--allowedTools")
+        .expect("a read-only claude command must set --allowedTools")
+        + 1;
+    let end = tokens[start..]
+        .iter()
+        .position(|t| t.starts_with("--"))
+        .map(|i| start + i)
+        .unwrap_or(tokens.len());
+    let allowed = &tokens[start..end];
+    assert!(!allowed.is_empty(), "read-only --allowedTools must not be empty under dontAsk");
+    for t in allowed {
+        assert!(
+            t == "mcp__loomux" || (t.contains('(') && t.ends_with(')')),
+            "{t:?} in the read-only --allowedTools list is a BARE tool grant — under \
+             dontAsk (#465) a bare grant re-opens the exact fail-open direction this \
+             mode exists to close (Claude would be pre-approved to use ALL of that \
+             tool, present and future capabilities alike). Every entry must be \
+             `mcp__loomux` or a scoped `Name(...)` pattern."
+        );
+    }
 }
 
 #[test]
@@ -1924,13 +1989,15 @@ fn build_agent_command_full_line_snapshots() {
     );
 
     // Claude planner (read_only) in a NON-auto_ops group → unattended anyway,
+    // running `dontAsk` (#465 — pre-approved tools only, so an editing tool
+    // Claude adds tomorrow is denied by construction) rather than `auto`,
     // plus the write/commit/push denials, gh still reachable. Literals per
     // CLAUDE_READONLY_DENY_TOOLS/_GIT (#448 — `MultiEdit` dropped, it matched
     // no real Claude Code tool).
     assert_eq!(
         cmd("claude", "opus", false, true),
         "claude --mcp-config \"C:/x/cfg.json\" --strict-mcp-config \
-         --model opus --permission-mode auto --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
+         --model opus --permission-mode dontAsk --add-dir \"C:/data/group\" --allowedTools mcp__loomux \
          \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
          \"Bash(git commit *)\" \"Bash(git push *)\""
     );
