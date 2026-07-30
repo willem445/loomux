@@ -1129,9 +1129,11 @@ fn default_roster_command_lines_now_carry_the_durable_contract_via_a_generated_c
     expect(&cmd, &handle, "reviewer", "sonnet", "acceptEdits", "");
     let (cmd, handle) = line("planner", false);
     expect(
-        &cmd, &handle, "planner", "opus", "auto",
+        &cmd, &handle, "planner", "opus", "dontAsk",
         // #448: `MultiEdit` dropped from CLAUDE_READONLY_DENY_TOOLS — it
-        // matches no real Claude Code tool.
+        // matches no real Claude Code tool. #465: a read-only block runs
+        // `dontAsk` (pre-approved tools only), not `auto` — see
+        // `claude_effective_permission_mode`'s doc.
         " \"Bash(git *)\" \"Bash(gh *)\" --disallowedTools Edit Write NotebookEdit \
           \"Bash(git commit *)\" \"Bash(git push *)\"",
     );

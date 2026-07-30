@@ -4830,7 +4830,8 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     `--disallowedTools Edit Write NotebookEdit` plus `Bash(git commit *)` /
     `Bash(git push *)` (`CLAUDE_READONLY_DENY_TOOLS`/`_GIT`), on Copilot `--deny-tool write`
     plus `shell(git commit|push)` (`COPILOT_READONLY_DENY_TOOLS`/`_GIT`) — deny rules
-    override the allow list / Auto perms on both CLIs. So a planner **cannot edit files,
+    override the allow list / permission mode on both CLIs (Claude: `dontAsk`, #465
+    below; Copilot: `--allow-all-tools`). So a planner **cannot edit files,
     commit, or push**, i.e. cannot produce code changes or push a branch.
     (Rule-spelling note: on Claude the `:*` wildcard is valid *only* as a trailing suffix.
     An earlier draft also passed the colon-mid forms `Bash(git commit:*)` / `Bash(git push:*)`
@@ -4874,6 +4875,161 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     deliberate trade (plan-comment-as-deliverable over a full jail), now stated honestly
     rather than presented as an absolute guarantee.
 
+  **#465: the deny list is ALSO fail-open in the other direction — closed for Claude,
+  documented open for Copilot.** #448 hardened the *dead-entry* direction (a deny name
+  that stops matching anything). The opposite direction stayed open: a deny list can
+  never cover an editing tool that did not exist when the list was written. If a CLI
+  ships a new file-editing tool tomorrow, `CLAUDE_READONLY_DENY_TOOLS`/
+  `COPILOT_READONLY_DENY_TOOLS` don't mismatch, nothing warns, and the tool just works —
+  *permitted by omission*. The only fix that actually closes this (rather than adding
+  one more name to chase) is inverting to an allow-list: deny everything by default,
+  name what's permitted. Whether each CLI actually offers that mechanism, and whether
+  loomux can safely use it, had to be argued per CLI, not assumed:
+
+  - **Claude: closed, via `--permission-mode dontAsk`.** Per the official
+    [permission modes reference](https://code.claude.com/docs/en/permission-modes.md)
+    ("Allow only pre-approved tools with dontAsk mode", fetched as raw markdown,
+    verified 2026-07-29): *"If you set `dontAsk` mode, Claude Code auto-denies every
+    tool call that would otherwise prompt you. Claude runs only actions matching your
+    `permissions.allow` rules, read-only Bash commands, and calls approved by a
+    PreToolUse hook."* A read-only agent (`build_agent_command`'s `read_only`) now runs
+    `dontAsk` instead of `auto` (`claude_effective_permission_mode`, #465) — see that
+    function's doc for the full argument. This is a genuine allow-list: a brand-new
+    Claude Code editing tool released tomorrow is not in `--allowedTools`, so `dontAsk`
+    denies it with zero loomux code change, closing the direction #448's per-name lists
+    structurally could not. `--disallowedTools` (`CLAUDE_READONLY_DENY_TOOLS`/`_GIT`)
+    stays emitted alongside it, unchanged — the two layers catch different failure
+    modes (named-and-stale vs. unnamed-and-new) and dropping either narrows the
+    guarantee. The property this actually depends on —
+    that a read-only agent's `--allowedTools` never contains a BARE tool grant that
+    would silently re-open the same hole from the allow side — is pinned by
+    `claude_readonly_allowed_tools_contain_no_unscoped_grant`
+    (`tests/orchestration.rs`), not just asserted.
+
+    *A side effect worth stating plainly, and correctly (review round 1, #489):*
+    `auto` mode's background safety classifier used to let a planner run an ad hoc shell
+    command (e.g. a quick `cargo check`) with no prior approval; `dontAsk` has no
+    classifier fallback, so only `git`/`gh` (already pre-approved via
+    `CLAUDE_UNATTENDED_ALLOW`) and Claude's built-in read-only Bash set (`ls`, `cat`,
+    `grep`, `find`, read-only `git`, …) are reachable by default now.
+    `templates/planner.md`'s protocol says so (re-blessed in `tests/fixtures/pre222/`).
+
+    **There is currently no per-repo opt-in beyond that — for any repo, by any
+    mechanism.** An earlier draft of this note claimed a persona `allow:` pattern
+    could widen it (`PersonaInject::extra_allow`, "already ordered before
+    `--disallowedTools`"); that was checked against the code and is false. Two
+    independent, deliberate guards refuse it, both from #222's capability closure:
+    `workflow::parse_workflow` hard-errors on `allow:` for any read-only block before
+    a group can even launch (`workflow.rs:891`); and — belt-and-braces, for a pattern
+    that reaches loomux any other way (a `.github/agents/*.md` persona's own `allow:`
+    frontmatter, a hand-edited `group.json`) — `persona_inject` unconditionally empties
+    `extra_allow` for a read-only block regardless of source (`mod.rs:18383-18392`,
+    audited via `audit_allow_denied`, never silent). `PersonaInject::extra_allow` really
+    is ordered before `--disallowedTools` in the command builder — but for a planner it
+    is always the empty list by the time it gets there, so the loop never has anything
+    of the planner's to iterate. The capability regression under `dontAsk` is therefore
+    **absolute, not opt-out**: under `auto` the classifier was an (unreliable, unaudited)
+    fallback; under `dontAsk` there is no fallback and no configuration escapes it.
+
+    That absoluteness is a deliberate #222 stance ("nobody can enumerate every
+    write-capable program" — `workflow.rs:876-890`), not an oversight this PR
+    introduced, and re-opening it is a capability decision — which mechanism could
+    pre-approve *some* shell commands for a read-only role without also handing it an
+    unenumerable set of write-capable ones — not an enforcement-robustness fix, so it
+    is filed separately rather than built here: **#490**, which names both guards
+    concretely. The one escape hatch that already exists and is NOT gated by either
+    #222 guard: the target repo's own `.claude/settings.json` `permissions.allow`
+    rules, which `dontAsk` honours directly per the quoted doc above — a different
+    trust surface (repo-owned Claude config, not workflow-controlled), worth naming
+    but not a loomux mechanism.
+
+    **So: can a planner still ground a plan with no opt-in at all, permanently?**
+    Mostly, with named gaps. What still works: exploration (`Read`/`Grep`/`Glob`, which
+    the permission system exempts from approval entirely — see the "Read-only" row this
+    doc's table above cites), the built-in read-only Bash set, `git`/`gh` (status, diff,
+    log, `gh issue view`, the `gh issue comment` plan output), and `mcp__loomux`
+    (`report`, `message_orchestrator`). What's lost, concretely: anything that requires
+    *executing* code to answer a question — confirming a compile error is real (not just
+    plausible from reading), running an existing test to see current behavior before
+    proposing a change to it, checking whether a dependency actually resolves, or timing/
+    profiling anything. Also lost: pulling a reference down to ground a plan against —
+    `curl` isn't in the built-in read-only Bash set and `WebFetch` is domain-gated, so
+    neither is reachable by default. `gh api` stays available (it's `gh`, already
+    pre-approved) and covers GitHub itself, but not a CLI vendor's own documentation —
+    exactly the raw-text fetch the `agent-cli-reference` skill requires instead of
+    working from memory, so a planning task that needs it is now grounded in recall
+    alone. A plan that would have said "confirmed: `cargo check` reproduces
+    the reported error at line N" now says "reading the code, this looks like it would
+    reproduce the reported error" — a real loss of grounding, silent in the sense that a
+    vaguer plan doesn't announce *why* it's vaguer. `templates/planner.md`'s "say so in
+    the plan rather than assuming it ran" instruction is the mitigation available today:
+    it turns a silent gap into a stated one, not a closed one.
+
+  - **Copilot: documented open, not closed — and the issue's "no containment at all"
+    premise needs a correction first.** `COPILOT_READONLY_DENY_TOOLS` still denies
+    `write` today (#463 dropped only `edit`, the unconfirmed entry) — so the claim that
+    a Copilot planner currently has *zero* CLI-level file-edit containment overstates
+    the code as it stands. It understates something else, though: per Copilot's
+    [CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)
+    ("Tool permission patterns", raw markdown via `raw.githubusercontent.com`, verified
+    2026-07-29), `write` is documented as a stable **category** — *"`write` | File
+    creation or modification | `write`, `write(src/*.ts)`"* — covering Copilot's whole
+    file-mutation surface (`create`, `edit`, `apply_patch`, per the same page's "Tool
+    availability values" table), not a per-tool-name literal the way Claude's
+    `--disallowedTools` list is. A brand-new Copilot editing tool is likely to land
+    under this SAME existing `write` Kind (that's what a stable category is for), which
+    makes today's deny meaningfully more new-tool-resistant than #448's Claude-side
+    literal enumeration ever was — though "likely" is doing real work in that sentence;
+    it is not a proof, and the category could still gain a sibling Kind for some future
+    tool shape (a `patch` Kind alongside `write`, say) that a bare `write` deny would
+    not reach.
+
+    The real allow-list mechanism, per the same reference: *"The `--available-tools` and
+    `--excluded-tools` options support these values"* — an enumerated built-in tool
+    catalog (shell/file-op/agent/other) — and, per the companion
+    [allowing-tools guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools)
+    ("Layers of tool controls"): *"`--available-tools` disables all tools other than
+    those you specify... If a tool is not in the available set, the AI model won't be
+    able to use it at all, even if you specify it with the `--allow-tool` option."* This
+    is candidate (1) from the issue, confirmed to exist. **It is not wired in, and the
+    reason is a specific, load-bearing unknown: neither page ever states whether
+    `--available-tools` also gates MCP-registered tools**, or whether it scopes only the
+    enumerated built-in catalog. loomux's planner depends entirely on an MCP tool for
+    its one required output — `report`/`message_orchestrator`/`note_directive` reach
+    Copilot through the `loomux` MCP server, addressed via the SEPARATE `--allow-tool
+    loomux` (already unconditional in `build_agent_command`'s copilot branch) — governed
+    by the allow/deny "Kind" vocabulary, a vocabulary the "Tool availability values"
+    table never mentions at all. That silence is suggestive (the two vocabularies read
+    as independent control surfaces) but it is an inference from absence, not a quote,
+    and the brief for this issue is explicit that an inference is not a finding here.
+    Getting this wrong is not symmetric: worst case, `--available-tools` also strips
+    `loomux`'s MCP tools, and a planner silently can never call `report` — a hang the
+    orchestrator only notices on a timeout, with no diagnostic pointing at the cause.
+    That is a worse failure than the fail-open gap it would close, and confirming it
+    needs an actual `copilot` run, which CLAUDE.md constraint 3 reserves for a human, not
+    an agent (the same reasoning #463 already used for "does an unmatched `--deny-tool`
+    value warn, error, or silently no-op on Copilot" — left as a documented unknown
+    rather than guessed).
+
+    **So: open, loud, and actionable, not silent.** `--available-tools` is the
+    identified fix; the blocker is named; the next step is a one-time human-supervised
+    check (start a `copilot` session with `--available-tools` set to the read-only tool
+    catalog minus `create`/`edit`/`apply_patch`, confirm `report` still reaches the
+    orchestrator) before wiring it in. Recommend labelling that check, and #462
+    (reviewer containment, closely related — the issue that raised #465 suggested doing
+    both together), `agent-ready` once someone can run it.
+
+  **The honest table, per role and per CLI** (mirrors the prose above; `git commit`/
+  `git push` denial tracks the file-edit column on every read-only row):
+
+  | Role | CLI | File-edit containment | Mechanism |
+  | --- | --- | --- | --- |
+  | Planner | Claude | **Structural**, both directions | `dontAsk` (#465, new-tool direction) + `--disallowedTools` (#448, named-and-stale direction) |
+  | Planner | Copilot | **Structural**, dead-entry direction only | `--deny-tool write` (category-level; #465 argues this is more new-tool-resistant than a literal list, not proof against one) |
+  | Reviewer | Claude | Instruction-backed only | Template tells it to stay read-only; no `--disallowedTools` (#448/#462) |
+  | Reviewer | Copilot | Instruction-backed only | Same; no `--deny-tool` at all |
+  | Worker | either | N/A by design | Workers exist to edit/commit/push; no containment is the correct posture |
+
   **A reviewer is NOT covered by any of the above (#448 finding).** `Role::is_read_only()`
   returns `true` only for `Role::Planner`; `build_agent_command`/`build_agent_argv`'s
   `read_only` parameter is `role.is_read_only()`, so a reviewer is launched with **no**
@@ -4908,15 +5064,19 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     blocks the deliverable. **Copilot's `--plan` / `--mode plan` is the same shape** (an
     initial mode a human reviews before switching to interactive/autopilot), so switching
     CLIs doesn't buy a headless plan mode either.
-  - **So the planner keeps Auto + structural deny rules** — which is the *autonomous*
-    equivalent of plan mode's intent: read-only research, but free to emit its plan and
-    report and then exit without waiting on anyone. To make that hold with **no human in the
-    pane**, a `read_only` planner is now launched **unattended regardless of the group's
-    `auto_ops`** (`unattended = auto_ops || read_only` in `build_agent_command`, applied to
-    **both** CLIs): on Claude, Auto perms + a pre-approved `Bash(git *)` / `Bash(gh *)`
-    allowlist; on Copilot, `--autopilot --allow-all-tools --allow-all-paths` — so
-    exploration, `gh issue view`, and the `gh issue comment` plan never prompt, with edits +
-    `git commit`/`git push` denied on both (deny takes precedence over Auto / `--allow-all-tools`).
+  - **So the planner keeps a closed-by-default mode + structural deny rules** — which is
+    the *autonomous* equivalent of plan mode's intent: read-only research, but free to
+    emit its plan and report and then exit without waiting on anyone. To make that hold
+    with **no human in the pane**, a `read_only` planner is now launched **unattended
+    regardless of the group's `auto_ops`** (`unattended = auto_ops || read_only` in
+    `build_agent_command`, applied to **both** CLIs): on Claude, `dontAsk` (#465 — see
+    above; a pre-approved `Bash(git *)` / `Bash(gh *)` allowlist plus Claude's own
+    built-in read-only Bash set, nothing else) — before #465 this was `auto`, Claude's
+    *native* Auto permission mode, which additionally routed anything unlisted through a
+    background safety classifier; on Copilot, `--autopilot --allow-all-tools
+    --allow-all-paths` — so exploration, `gh issue view`, and the `gh issue comment`
+    plan never prompt, with edits + `git commit`/`git push` denied on both (deny takes
+    precedence over `dontAsk`'s allow rules / `--allow-all-tools`).
 
     - **Copilot autopilot mode, and why groups DO enter it (#101 delta).** Reading the
       installed Copilot bundle (v1.0.68, `app.js` + the `runtime.node` prompt strings) settled

@@ -45,9 +45,12 @@ post-compact re-grounding notice, so it survives even a compact you never saw co
    base branch, in-flight work).
 2. Explore the codebase read-only to ground the plan in what actually exists — trace the
    modules, functions, tests, and docs the change will touch. Read; do not modify. Prefer
-   `gh`, `grep`/search, and reading files over running builds; a quick read-only
-   `cargo check` / typecheck to confirm a compile assumption is fine, but you are not here
-   to build.
+   `gh`, `grep`/search, and reading files over running builds. Your CLI-level allowlist
+   pre-approves only `git`/`gh` shell commands plus built-in read-only ones (`cat`, `grep`,
+   `find`, read-only `git`, …) — a build/typecheck command like `cargo check` is denied
+   outright, permanently, with no per-repo way to widen it. If you need one and it
+   isn't reachable, say so in the plan (what you'd have confirmed by running it, and
+   that you couldn't) rather than assuming it ran.
 3. Write the plan as a **GitHub issue comment** (`gh issue comment <n> --body ...`),
    covering:
    - **Scope** — what's in, what's explicitly out.
