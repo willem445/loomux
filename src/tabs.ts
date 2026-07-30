@@ -270,7 +270,15 @@ export class TabManager<T extends ManagedWorkspace> {
    *  rejoining a session into it) must NOT use this: it picks one binding out
    *  of a possibly-larger set, which is exactly how #485's cross-group
    *  contamination started. Use `groupsForWorkspace`, or the group recorded on
-   *  the pane you are acting on. */
+   *  the pane you are acting on.
+   *
+   *  KNOWN, UNCHANGED BY #485: `tabbar.ts`'s status poll (the `✦agents · $cost`
+   *  chip) and its tab-menu pause/resume item are on this first-match too, so on
+   *  a two-group tab they report and act on the FIRST group only. That predates
+   *  #485 (a two-group tab was already reachable via `restoreSession`'s
+   *  active-tab fallback) and is a display/control limitation, not a session-integrity
+   *  one — naming it here so the next reader doesn't mistake this doc comment
+   *  for a claim that every caller was audited and fixed. */
   groupForWorkspace(workspaceId: string): string | null {
     for (const [g, wid] of this.groupToWs) if (wid === workspaceId) return g;
     return null;
