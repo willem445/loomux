@@ -58,9 +58,47 @@ jobs:
         run: cargo check --locked
         working-directory: src-tauri
 
+      # #464: a whole-suite backstop the backend tests themselves can't
+      # provide. A test can pin its OWN fixture's cleanup, but nothing
+      # inside `cargo test` can pin "no OTHER test, now or in the future,
+      # leaves a git-worktree fixture behind" — the harness runs tests in
+      # parallel with no defined "runs after everything else" hook, and this
+      # repo has several separate integration-test BINARIES (orchestration,
+      # workflow, lessonsfile, prompts, ...), each its own process, so an
+      # in-suite check can only ever see its own binary. A before/after
+      # count at the JOB level sees all of them in one shot, on the same
+      # isolated runner filesystem this job already owns exclusively.
+      # Scoped to `*-worktrees` specifically (loomux's own naming
+      # convention — `git_worktree_add` in src/git.rs) rather than any
+      # `%TEMP%` growth at all: many other tools (npm, tauri, rustc) write
+      # their own temp files during this same job, and a generic "did
+      # %TEMP% grow" check would be constant false-positive noise.
+      - name: Snapshot temp-dir worktree-fixture baseline (#464)
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${TMPDIR:-${TEMP:-${TMP:-/tmp}}}"
+          echo "LOOMUX_LEAK_TEMPROOT=$root" >> "$GITHUB_ENV"
+          count=$(find "$root" -maxdepth 1 -iname '*-worktrees' 2>/dev/null | wc -l | tr -d ' ')
+          echo "LOOMUX_LEAK_BASELINE=$count" >> "$GITHUB_ENV"
+
       - name: Test backend
         run: cargo test --locked
         working-directory: src-tauri
+
+      - name: Verify the backend test suite left no worktree fixtures behind (#464)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          after="$(find "$LOOMUX_LEAK_TEMPROOT" -maxdepth 1 -iname '*-worktrees' 2>/dev/null || true)"
+          count=$(printf '%s\n' "$after" | grep -c . || true)
+          if [ "$count" -gt "$LOOMUX_LEAK_BASELINE" ]; then
+            echo "::error::cargo test left $((count - LOOMUX_LEAK_BASELINE)) new '*-worktrees' director$([ $((count - LOOMUX_LEAK_BASELINE)) = 1 ] && echo y || echo ies) behind under $LOOMUX_LEAK_TEMPROOT — a test fixture is leaking a real git worktree (#464). New entries:"
+            printf '%s\n' "$after"
+            exit 1
+          fi
+          echo "ok: no new worktree-fixture leaks (baseline $LOOMUX_LEAK_BASELINE, now $count)"
 
   # E2E PoC (spike, doc/design/e2e-testing.md): drives the real WebView2
   # webview over CDP (Playwright's native WebView2 support). Windows-only —

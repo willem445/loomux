@@ -9242,6 +9242,123 @@ impl OrchRegistry {
         dirs::home_dir().map(|h| h.join(".copilot").join("agents"))
     }
 
+    /// Reclaim generated custom-agent files (`loomux-<group>-<block>.md`,
+    /// see `write_claude_agent_file`/`write_copilot_agent_file`) left behind
+    /// under `~/.claude/agents`/`~/.copilot/agents` by a group this registry
+    /// no longer has any record of.
+    ///
+    /// `end_group` already reclaims a group's own files the moment it ends
+    /// (#416/round-6, widened round #417 correction 6) — this exists for the
+    /// groups that never reach `end_group` at all: a crash, a `kill -9`, or
+    /// (the #464 case) an orchestration-suite test registry that spawns
+    /// agents through the exact same write path and then simply exits.
+    /// 1,111 and 161 such stray files were found under a real dev machine's
+    /// `~/.claude/agents` and `~/.copilot/agents` respectively while fixing
+    /// that issue — accumulated one test run at a time, nothing to do with
+    /// this registry's OWN in-memory state, which is why a from-disk sweep,
+    /// not an in-memory teardown hook, is what closes the gap. Called once
+    /// at launch (`lib.rs`'s `setup`), matching `start_disk_monitor` et al.
+    ///
+    /// Conservative by construction, not merely by intent:
+    /// - Only entries literally named `loomux-<something>.md` (which also
+    ///   covers Copilot's `loomux-<something>.agent.md`) are ever
+    ///   considered — loomux's own naming convention (see `write_claude_
+    ///   agent_file`'s and `write_copilot_agent_file`'s `handle` formats,
+    ///   the only two shapes either ever writes), nothing else in either
+    ///   directory is touched (a hand-authored `loomux-notes.txt` is
+    ///   invisible to this sweep, not merely spared by the group check
+    ///   below), and this is never gated on any repo-, toolchain-, or
+    ///   machine-specific path.
+    /// - A candidate is reclaimed ONLY when NO directory under this
+    ///   registry's own `state_root()` matches it as a `loomux-<group>[-…]`
+    ///   prefix — i.e. `<group>` resolves to nothing this registry has any
+    ///   record of at all. A still-live, merely-paused, or simply
+    ///   not-yet-ended group's files are left alone even if that group has
+    ///   not spawned anything recently. Matched by prefix rather than by
+    ///   splitting the filename on `-`, because both a group id
+    ///   (`tmpocm2wt-ddf1fc50`) and a block id (`rev-security`) can contain
+    ///   a `-` themselves, so there is no unambiguous single split point.
+    /// - Every reclaim is breadcrumbed by path, so a sweep is diagnosable
+    ///   after the fact, never silent — and a removal failure (permissions,
+    ///   a concurrent process) is collected, not swallowed.
+    /// - If the `state_root()` enumeration itself fails (a transient AV/EDR
+    ///   lock, a permissions error, or — note this issue's own trigger —
+    ///   disk exhaustion, a condition under which `new()`'s own best-effort
+    ///   `create_dir_all` can fail too), this sweep does NOT fall through to
+    ///   "no known groups" and treat every generated file as an orphan
+    ///   (#464 review B1): that reads an "I don't know what's live" moment
+    ///   as "nothing is", which is exactly backwards and could delete a
+    ///   LIVE group's file — breaking that group's persona injection on its
+    ///   next spawn/restore, precisely during the kind of post-crash
+    ///   relaunch this sweep runs at. If unsure, delete nothing: an
+    ///   enumeration failure skips the sweep entirely and reports the error.
+    pub fn sweep_orphaned_agent_files(&self) -> Value {
+        let known_groups: Vec<String> = match fs::read_dir(self.state_root()) {
+            Ok(rd) => rd
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .collect(),
+            Err(e) => {
+                let msg = format!(
+                    "sweep skipped: could not enumerate groups under {} ({e}) — \
+                     refusing to guess which generated agent files are orphaned",
+                    self.state_root().display()
+                );
+                crate::obs::breadcrumb("fixture-sweep", &msg);
+                return json!({
+                    "reclaimed": [],
+                    "errors": [json!({ "path": self.state_root().to_string_lossy(), "error": e.to_string() })],
+                });
+            }
+        };
+        let mut reclaimed = Vec::new();
+        let mut errors = Vec::new();
+        for dir in [self.claude_agents_dir(), self.copilot_agents_dir()] {
+            let Some(dir) = dir else { continue };
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+                // #464 round-2 review N2: `write_claude_agent_file`/`write_
+                // copilot_agent_file` only ever write `<handle>.md` or
+                // `<handle>.agent.md` — never anything else. Requiring that
+                // suffix (both end in `.md`) keeps a hand-authored
+                // `loomux-notes.txt`/similar out of consideration entirely,
+                // on top of (not instead of) the `loomux-` prefix check
+                // below.
+                if !name.ends_with(".md") {
+                    continue;
+                }
+                let Some(rest) = name.strip_prefix("loomux-") else { continue };
+                let known = known_groups.iter().any(|g| {
+                    rest == g.as_str()
+                        || rest.starts_with(&format!("{g}-"))
+                        || rest.starts_with(&format!("{g}."))
+                });
+                if known {
+                    continue;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        crate::obs::breadcrumb(
+                            "fixture-sweep",
+                            &format!("reclaimed orphaned generated-agent file {}", path.display()),
+                        );
+                        reclaimed.push(path.to_string_lossy().into_owned());
+                    }
+                    Err(e) => {
+                        errors.push(json!({ "path": path.to_string_lossy(), "error": e.to_string() }));
+                    }
+                }
+            }
+        }
+        json!({ "reclaimed": reclaimed, "errors": errors })
+    }
+
     /// Record the `Arc` the registry is stored behind so `&self` methods can
     /// spawn background work that outlives the current call. Call once, right
     /// after wrapping the registry in an `Arc`.
