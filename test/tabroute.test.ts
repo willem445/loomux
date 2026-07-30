@@ -11,6 +11,7 @@ import {
   SAFE_STYLE_PROPS,
   PreviewBudget,
   compositeScale,
+  orchestratorLaunchTarget,
   type PreviewFit,
   type TabAttn,
 } from "../src/tabroute.ts";
@@ -128,6 +129,22 @@ test("findPaneByPty returns the FIRST match when two tabs report the same pty", 
   const first = { id: "ws-a", has: [7] };
   const second = { id: "ws-b", has: [7] };
   assert.equal(findPaneByPty([first, second], gridOf, 7)?.ws, first);
+});
+
+// ---- orchestrator launch placement (#478): split vs own-tab ----
+
+test("orchestratorLaunchTarget lands in the split when the setup pane isn't alone", () => {
+  // 2+ leaves in the tab means the setup pane arrived via a real split into
+  // an already-populated tab (onSplit / toolbar / keyboard shortcut all
+  // funnel through openWelcomeIn) — honour the gesture, don't relocate it.
+  assert.equal(orchestratorLaunchTarget(2), "split");
+  assert.equal(orchestratorLaunchTarget(3), "split", "a 3-way split is still a split");
+});
+
+test("orchestratorLaunchTarget keeps the dedicated tab when the setup pane is alone", () => {
+  // A lone setup pane (fresh Ctrl+T tab, initial boot tab, or a tab drained
+  // back to welcome) has nothing to split into — unchanged pre-#478 behavior.
+  assert.equal(orchestratorLaunchTarget(1), "own-tab");
 });
 
 // ---- preview HTML sanitizer (#63 finding 3): the security-critical rule ----
