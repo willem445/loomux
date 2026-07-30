@@ -13341,11 +13341,32 @@ fn real_repo_worktree_fixture_leaves_nothing_in_temp_on_success() {
     // shape of test that leaked its `<repo>-worktrees/<name>` sibling
     // directory into `%TEMP%` on every run — 2,438 survivors (growing to
     // 2,702) were found there, none of them from a failing test.
+    // This test's OWN sanity check (not the cleanup this test exists to prove)
+    // needs a path-CONTAINMENT comparison, which a raw string `starts_with`
+    // gets wrong whenever the OS hands back two different spellings of the
+    // same directory: macOS resolves `/var` to `/private/var` (a symlink),
+    // and Windows CI can return an 8.3 short name (`RUNNER~1`) on one side
+    // and the long name on the other. Canonicalized ONCE here, right after
+    // the fixture is created (while the directory still exists — `canonicalize`
+    // errors on a path that's gone), and reused for both comparisons below,
+    // rather than re-deriving it a second time from a possibly-different
+    // source at assert time.
+    //
+    // The actual teardown this test proves is NOT at risk from this same
+    // aliasing: `RealRepo`'s cleanup is `tempfile::TempDir::drop()` recursively
+    // deleting the ONE path it stored at creation — no comparison against a
+    // second, separately-derived path anywhere in that call. A symlink or a
+    // short name is still a valid handle onto the SAME underlying directory,
+    // so `remove_dir_all` through either spelling reaches and removes
+    // everything nested under it (the cut worktree included), regardless of
+    // which spelling `git worktree add` happened to use when it created that
+    // nested directory. String-prefix comparison and filesystem deletion are
+    // different operations; only the former is fooled by aliasing.
     let (reg, _d) = test_registry();
     let root_path;
     {
         let repo = real_repo();
-        root_path = repo.root().to_path_buf();
+        root_path = repo.root().canonicalize().unwrap();
         let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
         let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
         let co = reg.resolve_token(&orch.token).unwrap();
@@ -13359,14 +13380,8 @@ fn real_repo_worktree_fixture_leaves_nothing_in_temp_on_success() {
         let worker = agents.as_array().unwrap().iter().find(|a| a["role"] == "worker").unwrap();
         let cwd = worker["cwd"].as_str().unwrap();
         assert!(Path::new(cwd).is_dir(), "sanity: the worktree must actually exist before teardown");
-        // Canonicalize before comparing: the OS temp dir is reachable through
-        // more than one spelling of the same path (macOS: `/var` is a symlink
-        // to `/private/var`; Windows CI: `%TEMP%` can resolve through an 8.3
-        // short name like `RUNNER~1` while the worktree's own cwd comes back
-        // long-form), and a raw `starts_with` on the un-resolved strings false-
-        // positives a leak that isn't there.
         assert!(
-            Path::new(cwd).canonicalize().unwrap().starts_with(root_path.canonicalize().unwrap()),
+            Path::new(cwd).canonicalize().unwrap().starts_with(&root_path),
             "sanity: the cut worktree must live inside the fixture's own temp root, not beside it: {cwd} vs {}",
             root_path.display()
         );
