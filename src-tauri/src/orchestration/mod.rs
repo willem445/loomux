@@ -5619,7 +5619,26 @@ pub struct OrchRegistry {
     /// enqueue-on-abort spawns at most one drainer per pane (bounded thread
     /// lifecycle — the same leak concern raised against #451's late
     /// monitors, answered the same way: exits on drain, never accumulates).
-    queue_draining: Arc<Mutex<HashSet<u32>>>,
+    ///
+    /// **Generation-owned, not a bare membership set (#470 B1 review round
+    /// 2).** Keyed to a monotonic `drainer_gen` token minted at spawn, not
+    /// just `pty_id` — see `DrainerGuard`'s doc for why: a bare
+    /// `HashSet<u32>` lets a drainer's OWN stale deregistration (its RAII
+    /// guard dropping after `commit_exit` already deregistered it) erase a
+    /// SUCCESSOR drainer's live registration, breaking the at-most-one-
+    /// drainer invariant the whole ordering proof rests on. Every removal
+    /// (`commit_exit`, `DrainerGuard::drop`) is generation-checked: it only
+    /// clears the entry if the CURRENTLY stored generation is still its
+    /// own, which makes a stale/duplicate removal attempt a structural
+    /// no-op rather than something every call site has to remember to
+    /// avoid.
+    queue_draining: Arc<Mutex<HashMap<u32, u64>>>,
+    /// Monotonic counter minting a fresh generation token per drainer spawn
+    /// (`ensure_drainer`) — no getrandom (CLAUDE.md constraint 2). See
+    /// `queue_draining`'s doc for why a generation, not just a bool
+    /// membership flag, is what makes stale-deregistration structurally
+    /// impossible rather than merely avoided by discipline.
+    drainer_gen: Arc<AtomicU64>,
     /// Panes whose queue has already fired the one-shot "still queued"
     /// visibility notice (#445) — cleared when the queue empties, so a LATER
     /// long block on the same pane can notify again.
@@ -8256,14 +8275,43 @@ fn drain_stranded_submit(
 /// pty latched in `queue_draining` forever, permanently blocking every
 /// future `ensure_drainer` call for that pane. The guard's `Drop` runs on
 /// unwind exactly like it does on a normal `return`.
+///
+/// **Generation-checked, not unconditional (#470 B1 review round 2).** A
+/// committed exit (`OrchRegistry::commit_exit`) ALREADY deregisters
+/// `pty_id` atomically with confirming the queue is empty — this guard
+/// still runs afterwards regardless (it has no way to know commit_exit
+/// already acted; RAII fires on every `return`, committed or not). If its
+/// `Drop` unconditionally removed `pty_id` again, it could erase a
+/// SUCCESSOR drainer's live registration: a fresh delivery can arrive,
+/// `was_first: true`, spawn Drainer2, and register — all in the window
+/// between Drainer1's `commit_exit` and Drainer1's OWN guard dropping —
+/// and an unconditional second removal would strip Drainer2's
+/// registration out from under it while it's still running (possibly
+/// mid-`deliver_now`, a 60–120s hold), letting a THIRD arrival spawn
+/// Drainer3 concurrently with Drainer2 — two live drainers walking the
+/// same queue, the same entry pasted twice. This is why `generation`
+/// exists: `commit_exit` and this `Drop` both remove `pty_id` ONLY if the
+/// CURRENTLY stored generation still matches the one THIS drainer was
+/// minted at spawn (`ensure_drainer`). Whichever of them acts first wins
+/// the real removal; whichever acts second finds either nothing to remove
+/// (already gone) or a DIFFERENT generation (a successor already claimed
+/// it) and is a no-op either way — structurally, not because every call
+/// site remembered to "arm"/"disarm" anything. See
+/// `unified_admission_property::drainer_lifecycle` (queue.rs) for the
+/// exhaustive proof, including the stale-guard-drop event modeled
+/// explicitly rather than assumed away.
 struct DrainerGuard {
-    queue_draining: Arc<Mutex<HashSet<u32>>>,
+    queue_draining: Arc<Mutex<HashMap<u32, u64>>>,
     pty_id: u32,
+    generation: u64,
 }
 
 impl Drop for DrainerGuard {
     fn drop(&mut self) {
-        self.queue_draining.lock_safe().remove(&self.pty_id);
+        let mut draining = self.queue_draining.lock_safe();
+        if draining.get(&self.pty_id) == Some(&self.generation) {
+            draining.remove(&self.pty_id);
+        }
     }
 }
 
@@ -8297,8 +8345,13 @@ fn run_queue_drainer(
     group: String,
     pty_id: u32,
     fresh_first: Option<FreshFirstAttempt>,
+    // #470 B1 review round 2: the generation `ensure_drainer` minted for
+    // THIS spawn — threaded through so both this thread's own
+    // `DrainerGuard` and its `commit_exit` calls remove `queue_draining`'s
+    // entry only if it's still THIS generation. See `DrainerGuard`'s doc.
+    generation: u64,
 ) {
-    let _draining_guard = DrainerGuard { queue_draining: reg.queue_draining.clone(), pty_id };
+    let _draining_guard = DrainerGuard { queue_draining: reg.queue_draining.clone(), pty_id, generation };
     let ptys = app.state::<crate::pty::PtyManager>();
     // #470: suppressed until real contention is observed (a retry, or more
     // than one entry queued) — see the loop body below. Pre-#470, a drainer
@@ -8326,10 +8379,9 @@ fn run_queue_drainer(
         // (not the RAII guard alone) is what makes this exit atomic with
         // deregistering from `queue_draining` — see its doc.
         if ptys.output_total(pty_id).is_none() {
-            if let Some(entries) = reg.commit_exit(pty_id, true) {
+            if let Some(entries) = reg.commit_exit(pty_id, generation, true) {
                 reg.announce_dropped(&group, entries, queue::DropReason::AgentDied);
             }
-            reg.queue_still_notified.lock_safe().remove(&pty_id);
             return;
         }
         let agent_id = reg.by_pty.lock_safe().get(&pty_id).cloned();
@@ -8337,10 +8389,9 @@ fn run_queue_drainer(
         // Agent record gone or dead, but the pty somehow lingers (teardown
         // ordering) — same treatment as a closed pty.
         if agent.as_ref().map(|a| a.status == AgentStatus::Dead).unwrap_or(true) {
-            if let Some(entries) = reg.commit_exit(pty_id, true) {
+            if let Some(entries) = reg.commit_exit(pty_id, generation, true) {
                 reg.announce_dropped(&group, entries, queue::DropReason::AgentDied);
             }
-            reg.queue_still_notified.lock_safe().remove(&pty_id);
             return;
         }
         let Some(a) = agent else { continue };
@@ -8357,9 +8408,8 @@ fn run_queue_drainer(
         // holding `queues`'s lock across BOTH the emptiness check and the
         // `queue_draining` removal, so whichever of "a push" or "this
         // exit" the OS schedules first is fully visible to the other.
-        if let Some(entries) = reg.commit_exit(pty_id, false) {
+        if let Some(entries) = reg.commit_exit(pty_id, generation, false) {
             debug_assert!(entries.is_empty(), "force:false only commits when the queue was already empty");
-            reg.queue_still_notified.lock_safe().remove(&pty_id);
             return;
         }
         // Not empty (confirmed above) — safe to peek normally now; only
@@ -9233,7 +9283,8 @@ impl OrchRegistry {
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
             queues: Arc::new(Mutex::new(HashMap::new())),
             queue_seq: Arc::new(AtomicU64::new(0)),
-            queue_draining: Arc::new(Mutex::new(HashSet::new())),
+            queue_draining: Arc::new(Mutex::new(HashMap::new())),
+            drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
@@ -19896,13 +19947,21 @@ impl OrchRegistry {
     /// `FreshFirstAttempt`'s doc gives: a fresh kickoff's pty has no other
     /// deliveries to race against yet.
     fn ensure_drainer(self: &Arc<Self>, app: AppHandle, group: String, pty_id: u32, fresh_first: Option<FreshFirstAttempt>) {
-        let mut draining = self.queue_draining.lock_safe();
-        if !draining.insert(pty_id) {
-            return; // already running for this pane
-        }
-        drop(draining);
+        // #470 B1 review round 2: mint a fresh generation for this spawn —
+        // see `queue_draining`'s and `DrainerGuard`'s docs for why a bare
+        // membership check isn't enough. `contains_key` (not `insert`)
+        // because insertion now needs the freshly-minted value, not `()`.
+        let generation = {
+            let mut draining = self.queue_draining.lock_safe();
+            if draining.contains_key(&pty_id) {
+                return; // already running for this pane
+            }
+            let generation = self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            draining.insert(pty_id, generation);
+            generation
+        };
         let reg = self.clone();
-        std::thread::spawn(move || run_queue_drainer(reg, app, group, pty_id, fresh_first));
+        std::thread::spawn(move || run_queue_drainer(reg, app, group, pty_id, fresh_first, generation));
     }
 
     /// #470 B1 — the ONLY way `run_queue_drainer` may decide it's done with
@@ -19930,6 +19989,27 @@ impl OrchRegistry {
     /// See `unified_admission_property`'s `drainer_lifecycle` model
     /// (queue.rs) for the exhaustive proof.
     ///
+    /// **Generation-checked, not unconditional (review round 2).** This
+    /// removal races the SAME `DrainerGuard::drop` that runs when THIS
+    /// call's own thread eventually returns — see that type's doc for why
+    /// an unconditional second removal (the round-1 shape) could erase a
+    /// SUCCESSOR drainer's live registration. `generation` is the token
+    /// `ensure_drainer` minted for the CALLING thread's spawn; the removal
+    /// here (and the guard's) only fires if the currently stored value is
+    /// still exactly that token, so whichever of "this call" or "the
+    /// guard's later drop" runs first performs the real removal and the
+    /// other is inherently a no-op — never a race to avoid double-firing,
+    /// because double-firing a generation-checked removal is harmless by
+    /// construction.
+    ///
+    /// Also clears `pty_id` from `queue_still_notified` in the SAME
+    /// generation-checked step (review round 2, N3) — folded in here
+    /// rather than left as a separate post-return call at each exit site,
+    /// which had the identical stale-clear shape (a committed-but-not-yet-
+    /// returned drainer's cleanup running after a successor had already
+    /// re-armed the flag) just for a purely cosmetic flag instead of a
+    /// mutual-exclusion invariant.
+    ///
     /// `force`: the pty-closed/agent-dead paths must exit AND discard
     /// whatever is queued regardless of content — always returns
     /// `Some(entries)` (possibly empty). The normal "nothing left to
@@ -19937,7 +20017,7 @@ impl OrchRegistry {
     /// non-empty at this exact instant — returns `None`, and the caller
     /// (`run_queue_drainer`) loops again to pick up whatever raced in,
     /// rather than exiting and relying on a NEW drainer to notice it.
-    fn commit_exit(&self, pty_id: u32, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
+    fn commit_exit(&self, pty_id: u32, generation: u64, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
         let mut queues = self.queues.lock_safe();
         let is_empty = queues.get(&pty_id).map(|q| q.is_empty()).unwrap_or(true);
         if !force && !is_empty {
@@ -19945,7 +20025,12 @@ impl OrchRegistry {
         }
         let entries: Vec<queue::QueuedDelivery> = queues.remove(&pty_id).map(Vec::from).unwrap_or_default();
         // Still holding `queues`'s lock here — this is the atomic step.
-        self.queue_draining.lock_safe().remove(&pty_id);
+        let mut draining = self.queue_draining.lock_safe();
+        if draining.get(&pty_id) == Some(&generation) {
+            draining.remove(&pty_id);
+            drop(draining);
+            self.queue_still_notified.lock_safe().remove(&pty_id);
+        }
         Some(entries)
     }
 
@@ -20060,7 +20145,7 @@ impl OrchRegistry {
     /// double-spawns; a drainer removes itself on exit).
     #[doc(hidden)] // pub for integration tests
     pub fn queue_draining(&self, pty_id: u32) -> bool {
-        self.queue_draining.lock_safe().contains(&pty_id)
+        self.queue_draining.lock_safe().contains_key(&pty_id)
     }
 
     /// #445 intake finding: the in-memory queue's persistence argument

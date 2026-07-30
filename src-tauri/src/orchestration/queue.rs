@@ -1127,50 +1127,102 @@ mod unified_admission_property {
     /// #445/#451 exist to make structural, broken by the PR meant to
     /// strengthen it.
     ///
-    /// `OrchRegistry::commit_exit` (mod.rs) is the fix: the "is the queue
-    /// empty" check and the `queue_draining` deregistration happen in ONE
-    /// critical section on `queues`, so there is no window between them for
-    /// an admission to land in. `atomic_exit` below is that fix modeled as
-    /// this module's mutation knob (mirroring `deliver_from_back`, above):
-    /// `true` collapses "decide to exit" and "deregister" into one step;
-    /// `false` reproduces the pre-fix split, to prove this checker actually
-    /// catches the lost wakeup rather than passing vacuously.
+    /// `OrchRegistry::commit_exit` (mod.rs) is round 1's fix: the "is the
+    /// queue empty" check and the `queue_draining` deregistration happen in
+    /// ONE critical section on `queues`, so there is no window between them
+    /// for an admission to land in. `atomic_exit` below models that fix
+    /// (mirroring `deliver_from_back`, above): `true` is `commit_exit` as
+    /// shipped; `false` reproduces the round-1 pre-fix split.
+    ///
+    /// **Round 2 (rev-37): this model itself had a gap.** It modeled
+    /// `commit_exit`'s atomicity but not the REAL `DrainerGuard`'s `Drop` —
+    /// an RAII cleanup that fires on every return REGARDLESS of whether
+    /// `commit_exit` already deregistered, because the guard has no way to
+    /// know that. The `atomic_exit: true` variant modeled a world where
+    /// commit is the ONLY deregistration, which is not the code as shipped
+    /// — the guard still ran afterward and (round-1-shipped) removed
+    /// `pty_id` UNCONDITIONALLY a second time, capable of erasing a
+    /// SUCCESSOR drainer's live registration (spawned in the window between
+    /// commit and the guard's drop) and running TWO drainers on the same
+    /// queue concurrently — the SAME entry pasted twice. A model that omits
+    /// a real event cannot exclude the bugs that event causes; this is why
+    /// the guard-drop event below is now UNCONDITIONAL (every drainer
+    /// instance eventually gets one, always) and `guard_checks_generation`
+    /// — not the event's mere presence — is the round-2 mutation knob.
+    ///
+    /// `OrchRegistry`'s actual fix (round 2): `queue_draining` became a
+    /// generation map (`pty_id -> u64`), not a bare membership set. Both
+    /// `commit_exit` and `DrainerGuard::drop` remove `pty_id` ONLY if the
+    /// CURRENTLY stored generation is still their own — so whichever of
+    /// them acts first performs the real removal and the other is
+    /// inherently a no-op, structurally, with no call site needing to
+    /// remember to "arm" or "disarm" anything.
     mod drainer_lifecycle {
         use std::collections::{HashMap, VecDeque};
+
+        /// One drainer thread's own lifecycle, tracked explicitly so
+        /// MULTIPLE instances can coexist in the model exactly as they can
+        /// (only when buggy) in reality — this is what lets the checker
+        /// observe "two drainers concurrently processing," the round-2
+        /// defect's direct symptom, rather than only its downstream
+        /// consequences.
+        #[derive(Clone, Debug)]
+        struct DrainerInstance {
+            generation: u64,
+            /// Whether this instance will still loop around and touch the
+            /// queue again (pop+deliver, or decide-to-exit).
+            processing: bool,
+            /// Only meaningful when `atomic_exit` is false: this instance
+            /// found the queue empty and stopped processing, but its
+            /// (still generation-checked) deregistration hasn't run yet —
+            /// a separate, later event.
+            commit_pending: bool,
+            /// Whether this instance's `DrainerGuard` has already dropped.
+            /// Once true this instance contributes no further events —
+            /// fully retired.
+            guard_dropped: bool,
+        }
 
         #[derive(Clone, Debug)]
         struct SimState {
             queue: VecDeque<char>,
-            /// Mirrors `OrchRegistry::queue_draining`'s membership for this
-            /// pty — whether `ensure_drainer`'s idempotent insert would
-            /// fail (the next arrival's spawn attempt becomes a no-op).
-            registered: bool,
-            /// Whether a running drainer thread will still loop around and
-            /// touch the queue again. Can be `false` while `registered` is
-            /// still `true` ONLY in the buggy (`atomic_exit: false`)
-            /// variant — that gap IS the bug.
-            processing: bool,
+            /// Mirrors `OrchRegistry::queue_draining`'s CURRENT value for
+            /// this pty: `None` if nothing registered, `Some(generation)`
+            /// if that generation currently holds it.
+            registered_gen: Option<u64>,
+            next_gen: u64,
+            /// Every drainer instance spawned so far that hasn't fully
+            /// retired (`guard_dropped`) yet. In the fully-fixed algorithm
+            /// this never exceeds length 1 at any point where more than
+            /// one entry is `processing` — proven, not assumed.
+            instances: Vec<DrainerInstance>,
             not_yet_arrived: Vec<char>,
             arrived_at: HashMap<char, usize>,
             delivered: Vec<char>,
             step: usize,
         }
 
-        /// Ordering (same predicate as the enclosing module's, restated
-        /// here since this `SimState` carries extra lifecycle fields the
-        /// ordering check doesn't need) PLUS liveness: nothing that arrived
-        /// may still be sitting unclaimed with no way left to ever claim
-        /// it.
+        /// Ordering (same predicate as the enclosing module's) PLUS
+        /// liveness (nothing arrived may go undelivered — round 1) PLUS
+        /// uniqueness (nothing may be delivered MORE than once — round 2's
+        /// direct symptom, alongside the mid-execution concurrency check in
+        /// `explore`).
         fn check_terminal_state(state: &SimState, violations: &mut Vec<String>) {
             let mut ids: Vec<&char> = state.arrived_at.keys().collect();
             ids.sort();
             for &id in &ids {
-                if !state.delivered.contains(id) {
+                let count = state.delivered.iter().filter(|&d| d == id).count();
+                if count == 0 {
                     violations.push(format!(
                         "{id} was admitted (arrived at step {}) but never delivered — STRANDED. \
-                         final state: queue={:?} registered={} processing={} delivered={:?}",
-                        state.arrived_at[id], state.queue, state.registered, state.processing,
-                        state.delivered
+                         final: queue={:?} registered_gen={:?} delivered={:?}",
+                        state.arrived_at[id], state.queue, state.registered_gen, state.delivered
+                    ));
+                } else if count > 1 {
+                    violations.push(format!(
+                        "{id} was delivered {count} times — DUPLICATED. \
+                         final: queue={:?} registered_gen={:?} delivered={:?}",
+                        state.queue, state.registered_gen, state.delivered
                     ));
                 }
             }
@@ -1194,15 +1246,37 @@ mod unified_admission_property {
             }
         }
 
-        fn explore(state: SimState, atomic_exit: bool, violations: &mut Vec<String>) {
+        fn explore(
+            state: SimState,
+            atomic_exit: bool,
+            guard_checks_generation: bool,
+            violations: &mut Vec<String>,
+        ) {
+            // Invariant check on EVERY visited state, not just terminal
+            // ones — mutual exclusion is a property of the WHOLE run, not
+            // just its end. This is rev-37's own signal ("drainers=2") made
+            // structural: two instances simultaneously `processing` is
+            // exactly what lets the same front entry be independently
+            // popped and delivered by each.
+            let concurrent: Vec<u64> =
+                state.instances.iter().filter(|i| i.processing).map(|i| i.generation).collect();
+            if concurrent.len() >= 2 {
+                violations.push(format!(
+                    "{} drainer instances (generations {concurrent:?}) concurrently processing the \
+                     same pty at step {} — MUTUAL EXCLUSION BROKEN. queue={:?} delivered={:?}",
+                    concurrent.len(), state.step, state.queue, state.delivered
+                ));
+            }
+
             let mut any_event = false;
 
             // Event: an arrival. Always pushes to the back — then, matching
-            // `deliver_prompt`'s real shape where EVERY admission (whether
-            // `was_first` or landing behind something) attempts
+            // `deliver_prompt`'s real shape where EVERY admission attempts
             // `ensure_drainer` (one owns it outright, the other
-            // best-effort), tries to (re)claim processing: succeeds only if
-            // nothing is currently registered.
+            // best-effort), tries to claim the pty: succeeds only if
+            // nothing is currently registered, minting a fresh generation
+            // and spawning a NEW instance (mirrors `ensure_drainer` exactly
+            // — a fresh `u64` per successful claim, never reused).
             for i in 0..state.not_yet_arrived.len() {
                 any_event = true;
                 let mut s = state.clone();
@@ -1210,47 +1284,100 @@ mod unified_admission_property {
                 s.step += 1;
                 s.arrived_at.insert(id, s.step);
                 s.queue.push_back(id);
-                if !s.registered {
-                    s.registered = true;
-                    s.processing = true;
+                if s.registered_gen.is_none() {
+                    let gen = s.next_gen;
+                    s.next_gen += 1;
+                    s.registered_gen = Some(gen);
+                    s.instances.push(DrainerInstance {
+                        generation: gen,
+                        processing: true,
+                        commit_pending: false,
+                        guard_dropped: false,
+                    });
                 }
-                explore(s, atomic_exit, violations);
+                explore(s, atomic_exit, guard_checks_generation, violations);
             }
 
-            // Event: the active drainer takes one step — pop+deliver if
-            // the queue is non-empty, or decide to exit if it's empty.
-            if state.processing {
+            // Event: a `processing` instance takes one step — pop+deliver
+            // if the queue is non-empty, or decide to exit if it's empty.
+            for idx in 0..state.instances.len() {
+                if !state.instances[idx].processing {
+                    continue;
+                }
                 any_event = true;
                 let mut s = state.clone();
                 s.step += 1;
                 if let Some(id) = s.queue.pop_front() {
                     s.delivered.push(id);
-                } else if atomic_exit {
-                    // #470 B1 fix: one atomic step — `commit_exit` holds
-                    // `queues`'s lock across both.
-                    s.processing = false;
-                    s.registered = false;
                 } else {
-                    // Pre-fix bug: decided to stop, but the guard hasn't
-                    // dropped yet — `registered` stays true for now.
-                    s.processing = false;
+                    s.instances[idx].processing = false;
+                    if atomic_exit {
+                        // `commit_exit` as shipped: generation-checked
+                        // removal in the SAME step as deciding to exit.
+                        let gen = s.instances[idx].generation;
+                        if s.registered_gen == Some(gen) {
+                            s.registered_gen = None;
+                        }
+                    } else {
+                        // Round-1 pre-fix split: decided to stop, but the
+                        // (still generation-checked) removal is a
+                        // SEPARATE, later event — `CommitDeregisters`,
+                        // below.
+                        s.instances[idx].commit_pending = true;
+                    }
                 }
-                explore(s, atomic_exit, violations);
+                explore(s, atomic_exit, guard_checks_generation, violations);
             }
 
-            // Event (reachable ONLY in the buggy variant): the
-            // `DrainerGuard` finally drops, some arbitrary time after the
-            // drainer privately decided to exit. The fixed algorithm never
-            // reaches a state where this is enabled (`processing` and
-            // `registered` always flip together), so this event is
-            // structurally absent from the `atomic_exit: true` search —
-            // not merely unexercised.
-            if !state.processing && state.registered {
+            // Event (`atomic_exit: false` only): the pending commit's
+            // deregistration finally runs, generation-checked exactly like
+            // the atomic case — only the TIMING relative to other events is
+            // what `atomic_exit` varies, never whether it's generation-safe.
+            for idx in 0..state.instances.len() {
+                if !state.instances[idx].commit_pending {
+                    continue;
+                }
                 any_event = true;
                 let mut s = state.clone();
                 s.step += 1;
-                s.registered = false;
-                explore(s, atomic_exit, violations);
+                let gen = s.instances[idx].generation;
+                if s.registered_gen == Some(gen) {
+                    s.registered_gen = None;
+                }
+                s.instances[idx].commit_pending = false;
+                explore(s, atomic_exit, guard_checks_generation, violations);
+            }
+
+            // Event: a no-longer-processing instance's `DrainerGuard`
+            // finally drops. UNCONDITIONAL — every instance gets exactly
+            // one of these, always, in both variants; this is the event
+            // round 1's model omitted (see the module doc's "Round 2"
+            // note). Requires `!commit_pending` because within ONE
+            // thread's own sequential execution, `commit_exit` fully
+            // returns before the function returns and the guard drops —
+            // only DIFFERENT instances' events may interleave freely.
+            for idx in 0..state.instances.len() {
+                let inst = &state.instances[idx];
+                if inst.processing || inst.commit_pending || inst.guard_dropped {
+                    continue;
+                }
+                any_event = true;
+                let mut s = state.clone();
+                s.step += 1;
+                let gen = s.instances[idx].generation;
+                if guard_checks_generation {
+                    // Round-2 fix: only remove if still this generation.
+                    if s.registered_gen == Some(gen) {
+                        s.registered_gen = None;
+                    }
+                } else {
+                    // Round-1-shipped bug: unconditional — erases
+                    // whatever is CURRENTLY registered, even a live
+                    // successor's.
+                    s.registered_gen = None;
+                }
+                s.instances[idx].guard_dropped = true;
+                explore(s, atomic_exit, guard_checks_generation, violations);
             }
 
             if !any_event {
@@ -1258,28 +1385,31 @@ mod unified_admission_property {
             }
         }
 
-        fn run_exhaustive_search(ids: &[char], atomic_exit: bool) -> Vec<String> {
+        fn run_exhaustive_search(ids: &[char], atomic_exit: bool, guard_checks_generation: bool) -> Vec<String> {
             let mut violations = Vec::new();
             let initial = SimState {
                 queue: VecDeque::new(),
-                registered: false,
-                processing: false,
+                registered_gen: None,
+                next_gen: 1,
+                instances: Vec::new(),
                 not_yet_arrived: ids.to_vec(),
                 arrived_at: HashMap::new(),
                 delivered: Vec::new(),
                 step: 0,
             };
-            explore(initial, atomic_exit, &mut violations);
+            explore(initial, atomic_exit, guard_checks_generation, &mut violations);
             violations
         }
 
         #[test]
-        fn atomic_exit_leaves_no_delivery_unclaimed_across_any_reachable_interleaving() {
+        fn fully_fixed_leaves_no_delivery_unclaimed_or_duplicated_across_any_reachable_interleaving() {
+            // `atomic_exit: true, guard_checks_generation: true` — the code
+            // as shipped after BOTH review rounds.
             for ids in [&['A', 'B'][..], &['A', 'B', 'C'][..]] {
-                let violations = run_exhaustive_search(ids, true);
+                let violations = run_exhaustive_search(ids, true, true);
                 assert!(
                     violations.is_empty(),
-                    "the #470 B1 fix (atomic exit) produced {} violation(s) at {} contenders:\n{}",
+                    "the fully-fixed algorithm produced {} violation(s) at {} contenders:\n{}",
                     violations.len(),
                     ids.len(),
                     violations.join("\n")
@@ -1288,22 +1418,47 @@ mod unified_admission_property {
         }
 
         #[test]
-        fn non_atomic_exit_reproduces_the_lost_wakeup() {
-            // Mutation test (rev-31's ask): reintroduce the pre-fix bug
-            // (split the exit decision from the deregistration) and
-            // confirm THIS checker actually catches it — if this ever
-            // started passing, `atomic_exit_leaves_no_delivery_unclaimed_
-            // ...` above would be proven vacuous.
-            let violations = run_exhaustive_search(&['A', 'B'], false);
+        fn non_atomic_commit_still_reproduces_the_round_1_lost_wakeup() {
+            // Round-1 regression guard (review round 2's explicit ask):
+            // with the round-2 fix ON (`guard_checks_generation: true`) but
+            // `commit_exit`'s OWN atomicity broken, the search must STILL
+            // find round 1's STRANDED bug — proving this restructured,
+            // more-faithful model didn't accidentally weaken what round 1
+            // already proved.
+            let violations = run_exhaustive_search(&['A', 'B'], false, true);
             assert!(
                 !violations.is_empty(),
-                "reproducing the pre-#470-B1 non-atomic exit must find a stranded delivery \
-                 somewhere in the 2-contender search space — if it doesn't, the atomic-exit test \
-                 isn't actually testing anything"
+                "reproducing the round-1 pre-fix non-atomic commit must find a stranded delivery \
+                 somewhere in the 2-contender search space — if it doesn't, the fully-fixed test \
+                 isn't actually testing round 1's property anymore"
             );
             assert!(
                 violations.iter().any(|v| v.contains("STRANDED")),
                 "expected a STRANDED-delivery violation specifically, got: {violations:?}"
+            );
+        }
+
+        #[test]
+        fn unconditional_guard_removal_reproduces_the_round_2_double_drain() {
+            // Mutation test (rev-37's ask): reintroduce the round-2 bug
+            // exactly as shipped after round 1 — `commit_exit` atomic and
+            // correct (`atomic_exit: true`), but the guard's OWN removal
+            // unconditional rather than generation-checked
+            // (`guard_checks_generation: false`) — and confirm THIS
+            // checker catches it. If this ever started passing,
+            // `fully_fixed_...` above would be proven vacuous for the
+            // round-2 dimension specifically.
+            let violations = run_exhaustive_search(&['A', 'B', 'C'], true, false);
+            assert!(
+                !violations.is_empty(),
+                "an unconditional guard removal must reproduce a concurrent-drainer or duplicate- \
+                 delivery violation somewhere in the 3-contender search space — if it doesn't, the \
+                 fully-fixed test isn't actually testing the round-2 fix"
+            );
+            assert!(
+                violations.iter().any(|v| v.contains("MUTUAL EXCLUSION BROKEN") || v.contains("DUPLICATED")),
+                "expected a mutual-exclusion or duplicate-delivery violation specifically, got: \
+                 {violations:?}"
             );
         }
     }

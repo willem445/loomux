@@ -4342,27 +4342,49 @@ is the impure half.
   premature header or a couple of seconds; neither reorders or drops anything). Exits when the
   queue empties, the pty closes, or the agent dies (`drop_queue`/
   `announce_dropped`, below). At most one drainer per pane
-  (`queue_draining: Arc<Mutex<HashSet<u32>>>`), spawned on first admission into an idle queue and
-  self-removing on exit — the same bounded-thread-lifecycle answer #451's late-confirmation
-  monitors already established for this codebase.
-- **Drainer lifecycle is atomic with its own exit (#470 B1, review round 1).** A drainer deciding
-  "nothing left, I'm done" and actually deregistering from `queue_draining` used to be two separate
-  steps (peek the queue, see it empty, `return` and let the `DrainerGuard`'s `Drop` deregister
-  later) — an OS-scheduling-width window, not a rare corner, in which a FRESH admission landing in
-  that gap (`was_first: true`, sender already told `Ok`) would call `ensure_drainer`, find the pty
-  STILL registered, and no-op — believing a drainer would get to it. That drainer was already
-  committed to exiting and would never look again: the delivery sat in the queue forever, never
-  destroyed but never claimed either, with the sender already told success. Exactly the "queued
-  means safe" guarantee #445/#451 exist to make structural, reintroduced by the PR meant to
-  strengthen it. `OrchRegistry::commit_exit` closes it: the "is the queue empty" check and the
-  `queue_draining` deregistration happen in ONE critical section on `queues`, so whichever of "a
-  push" or "this exit" the OS schedules first is fully visible to the other. Proven exhaustively —
-  not just at the one reported interleaving — by `queue.rs`'s `unified_admission_property::
-  drainer_lifecycle` module, which models drainer registration/processing state alongside
-  contender arrival and asserts the property directly: **no admitted delivery is ever left
-  unclaimed by a drainer.** Mutation-verified the same way as every other property in this file
-  (`non_atomic_exit_reproduces_the_lost_wakeup` reintroduces the pre-fix split and confirms the
-  checker finds a STRANDED violation).
+  (`queue_draining: Arc<Mutex<HashMap<u32, u64>>>` — a generation map, not a bare membership set;
+  see the next bullet for why), spawned on first admission into an idle queue and self-removing on
+  exit — the same bounded-thread-lifecycle answer #451's late-confirmation monitors already
+  established for this codebase.
+- **Drainer lifecycle is atomic with its own exit, and deregistration is generation-owned (#470 B1,
+  review rounds 1 and 2).** Round 1: a drainer deciding "nothing left, I'm done" and actually
+  deregistering from `queue_draining` used to be two separate steps (peek the queue, see it empty,
+  `return` and let the `DrainerGuard`'s `Drop` deregister later) — an OS-scheduling-width window, not
+  a rare corner, in which a FRESH admission landing in that gap (`was_first: true`, sender already
+  told `Ok`) would call `ensure_drainer`, find the pty STILL registered, and no-op — believing a
+  drainer would get to it. That drainer was already committed to exiting and would never look again:
+  the delivery sat in the queue forever, never destroyed but never claimed either, with the sender
+  already told success. Exactly the "queued means safe" guarantee #445/#451 exist to make structural,
+  reintroduced by the PR meant to strengthen it. `OrchRegistry::commit_exit` closed it: the "is the
+  queue empty" check and the `queue_draining` deregistration happen in ONE critical section on
+  `queues`, so whichever of "a push" or "this exit" the OS schedules first is fully visible to the
+  other.
+  **Round 2: that fix alone was incomplete — the REAL `DrainerGuard::drop` still ran afterward,
+  unconditionally, a second time.** `commit_exit`'s atomicity only covers commit's OWN two steps;
+  the guard is a SEPARATE RAII cleanup that fires on every return regardless of whether commit
+  already deregistered, because it has no way to know that. A fresh admission spawning a SUCCESSOR
+  drainer in the window between commit and the original guard's drop would have its registration
+  erased by that stale, unconditional second removal — letting a THIRD arrival spawn a THIRD drainer
+  concurrently with the second. Two live drainers on the same queue means the same front entry can be
+  independently popped and pasted by each: not a strand (round 1's failure direction) but a
+  DUPLICATE — text typed twice into a human's or agent's pane. The fix: `queue_draining` became a
+  generation map (`pty_id -> u64`), minted fresh per spawn (`ensure_drainer`'s `drainer_gen`); both
+  `commit_exit` and `DrainerGuard::drop` remove `pty_id` ONLY if the currently stored generation is
+  still their own. Whichever of them acts first performs the real removal; the other is inherently a
+  no-op — structural, not something every call site has to remember to avoid, and this is what folded
+  the round-2 N3 finding (`queue_still_notified`'s matching stale-clear) in for free, generation-
+  checked in the same step.
+  Proven exhaustively — not just at the one reported interleaving, and not just for round 1's failure
+  mode — by `queue.rs`'s `unified_admission_property::drainer_lifecycle` module, which models
+  MULTIPLE concurrent drainer instances explicitly (registration, processing, pending commit, and the
+  guard's own eventual, UNCONDITIONAL drop event — round 2's review finding was precisely that the
+  round-1 model omitted this real event) and asserts three properties directly: no admitted delivery
+  is ever left unclaimed (round 1), no admitted delivery is ever delivered more than once, and at
+  most one drainer instance is ever concurrently processing a given pty (round 2). Mutation-verified
+  in both directions per review round 2's explicit ask:
+  `non_atomic_commit_still_reproduces_the_round_1_lost_wakeup` (round 1's bug still caught — this
+  more-faithful model didn't weaken what round 1 already proved) and
+  `unconditional_guard_removal_reproduces_the_round_2_double_drain` (round 2's bug, freshly caught).
 - **Seam 3 (stranded pre-Enter text).** Converts to a `QueuedPayload::StrandedSubmit` marker
   (pushed to the FRONT via `enqueue_stranded_front`, ahead of whatever else is queued — it
   represents finishing an already-half-done paste, not a new ask) rather than a text copy. Draining
@@ -4507,9 +4529,11 @@ isolation, including two exhaustive-interleaving models — `b1_ordering_propert
 historical record of the pre-#470 mutex-race algorithm and its proven two-contender fix /
 three-contender residual) and `unified_admission_property` (#470's replacement mechanism: ordering
 proven mutation-verified at three, four, and five contenders, and — its nested `drainer_lifecycle`
-submodule — liveness proven mutation-verified that no admitted delivery is ever left unclaimed,
-closing the B1 lost-wakeup review found — see "Ordering" and "Drainer lifecycle," above); the registry-level
-bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
+submodule, modeling multiple concurrent drainer instances explicitly — liveness (no admitted
+delivery ever left unclaimed, round 1), uniqueness (no admitted delivery ever delivered more than
+once, round 2), and mutual exclusion (at most one drainer instance ever concurrently processing a
+pty, round 2) all proven mutation-verified in both directions — see "Ordering" and "Drainer
+lifecycle," above); the registry-level bookkeeping (`enqueue_text`, `enqueue_stranded_front`,
 `pop_front_dequeued`, `drop_queue`, `queue_orphans`, the front-door check reaching `deliver_prompt`
 with no app handle at all) integration-tested end to end against a real `OrchRegistry` and a real
 `audit.jsonl`; the notice-suppression discipline (`notify_queue`) tested directly. The drainer's
