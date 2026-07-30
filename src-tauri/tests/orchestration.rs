@@ -1558,6 +1558,106 @@ fn reviewer_is_denied_editing_tools_but_keeps_its_shell() {
         "a copilot reviewer keeps its shell git, same as the claude one: {rev}");
 }
 
+/// #462 review finding: **the spawn SITE's own wiring**, which every other test
+/// in this arc leaves uncovered.
+///
+/// `reviewer_is_denied_editing_tools_but_keeps_its_shell` and the snapshot rows
+/// all call `build_agent_command` themselves, re-deriving the tier with the
+/// *same expression* the spawn site uses. That is a pin that stops at the
+/// extracted unit: a `spawn_agent_ex` refactor that hardcoded a literal —
+/// exactly the shape this PR just removed from `register_orchestrator_pane` —
+/// would keep all of them green while reviewers silently lost their flags
+/// (#492). So this one goes through `spawn_agent` and reads what the SITE
+/// built, via the request the no-frontend path keeps.
+///
+/// Three classes in one group, because a single-class assertion is defeated by
+/// the opposite mutation: pinning only the reviewer passes if the site hardcodes
+/// `NoEdits` for everyone, and pinning only "worker has no flags" passes if it
+/// hardcodes `None`. What is actually being pinned is the *mapping*, so each
+/// class must be wrong in its own direction.
+#[test]
+fn a_spawn_carries_the_deny_flags_of_the_class_it_spawned() {
+    let (reg, _d) = test_registry();
+    // Three live delegates at once, so the classes are compared within ONE
+    // group's config rather than across three groups that could differ.
+    let g = reg
+        .create_group("C:/tmp/deny-site-repo", Guardrails { max_agents: 3, ..rails() })
+        .unwrap();
+
+    // Not `build_agent_command` — the real thing, the way the orchestrator
+    // reaches it. `worktree: false` keeps the fixture off the filesystem; the
+    // launch flags don't depend on it.
+    let spawn = |role: Role, name: &str| {
+        let a = reg.spawn_agent(&g.id, role, name, "t", false, None).unwrap();
+        reg.spawn_request_for_test(&a.id).unwrap_or_else(|| panic!("no spawn request for {name}"))
+    };
+
+    let rev = spawn(Role::Reviewer, "rev");
+    assert_eq!(rev.role, Role::Reviewer, "sanity: the request is the reviewer's");
+    for denied in CLAUDE_EDIT_DENY_TOOLS {
+        assert!(
+            rev.command.contains(denied),
+            "a REVIEWER SPAWN must carry the {denied} denial — the class-to-flags hop at the \
+             spawn site is what this pins: {}",
+            rev.command
+        );
+    }
+    assert!(rev.command.contains("--disallowedTools"), "{}", rev.command);
+    // The structured form the pane actually spawns is built from the same call,
+    // and a site that fed one builder and not the other would be just as broken.
+    assert!(
+        rev.argv.windows(4).any(|w| w == ["--disallowedTools", "Edit", "Write", "NotebookEdit"]),
+        "the direct-spawn argv must carry them too: {:?}",
+        rev.argv
+    );
+    // Still a reviewer, not a planner: the shell it works through is intact.
+    assert!(!rev.command.contains("Bash(git commit"), "{}", rev.command);
+    assert!(!rev.command.contains("Bash(git push"), "{}", rev.command);
+
+    // A worker off the SAME site must come out with nothing denied — this is the
+    // half that fails if the site starts denying unconditionally.
+    let w = spawn(Role::Worker, "w");
+    assert!(
+        !w.command.contains("--disallowedTools"),
+        "a worker spawn must carry no denials — it exists to change the repo: {}",
+        w.command
+    );
+
+    // …and a planner off the same site keeps the full read-only tier, so a site
+    // that flattened every class onto the reviewer's tier fails here.
+    let p = spawn(Role::Planner, "p");
+    assert!(
+        p.command.contains("\"Bash(git commit *)\"") && p.command.contains("\"Bash(git push *)\""),
+        "a planner spawn must still deny git mutation: {}",
+        p.command
+    );
+
+    // The other spawn site (#462 review named both). `register_orchestrator_pane`
+    // hands its request straight back, so no seam is needed to read it — and an
+    // orchestrator that ever acquired deny flags would be a group that cannot
+    // drive its own git/gh flow.
+    let state = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let reg2 = std::sync::Arc::new(OrchRegistry::new(state.path().to_path_buf()));
+    reg2.set_port(45999);
+    let orch = create_orchestration_group(
+        &reg2,
+        &repo.path().to_string_lossy().replace('\\', "/"),
+        rails(),
+        Launch::Fresh,
+        None,
+        None,
+        0,
+    )
+    .unwrap();
+    assert_eq!(orch.role, Role::Orchestrator);
+    assert!(
+        !orch.command.contains("--disallowedTools"),
+        "the orchestrator spawn site must pass its own class's tier (None): {}",
+        orch.command
+    );
+}
+
 /// #448: the editing-tool guarantee is spelled as string literals
 /// matched against an external tool registry that drifts underneath it (the
 /// CLI's own registry, which loomux does not control and cannot query live —

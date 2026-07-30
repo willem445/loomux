@@ -5782,6 +5782,22 @@ pub struct OrchRegistry {
     by_token: Mutex<HashMap<String, String>>,
     by_pty: Mutex<HashMap<u32, String>>,
     pending_binds: Mutex<HashMap<String, mpsc::Sender<u32>>>,
+    /// The `SpawnRequest`s built on the **no-frontend** path, by agent id — the
+    /// payload a real frontend would have received, kept only when there is no
+    /// frontend to hand it to (see the `app.is_none()` branch of
+    /// `spawn_agent_ex`). Empty in production, where the request has exactly one
+    /// owner: the webview it was emitted to.
+    ///
+    /// It exists for one reason (#462 review). The hop from a **capability
+    /// class** to the deny flags on its command line — `role.containment()`, at
+    /// the spawn SITE — is the one step a test calling `build_agent_command`
+    /// itself can never cover: such a test re-derives the tier with the same
+    /// expression the site uses, so a site that hardcoded a literal instead
+    /// would keep every one of them green. A pin that stops at the extracted
+    /// unit proves nothing about the caller that feeds it. `spawn_agent_ex` is
+    /// the only site that needs this; `register_orchestrator_pane` RETURNS its
+    /// request, so its own wiring is already assertable.
+    test_spawn_requests: Mutex<HashMap<String, SpawnRequest>>,
     port: AtomicU16,
     seq: AtomicU32,
     /// Per-pane delivery locks so two prompts to the SAME pane can't
@@ -9492,6 +9508,7 @@ impl OrchRegistry {
             by_token: Mutex::new(HashMap::new()),
             by_pty: Mutex::new(HashMap::new()),
             pending_binds: Mutex::new(HashMap::new()),
+            test_spawn_requests: Mutex::new(HashMap::new()),
             port: AtomicU16::new(0),
             seq: AtomicU32::new(0),
             delivery: Mutex::new(HashMap::new()),
@@ -19871,6 +19888,11 @@ impl OrchRegistry {
             // can be exercised without panes. Handle a vanished entry (a
             // concurrent reap between insert and here) instead of unwrapping —
             // a panic here would fire while holding the agents lock.
+            //
+            // Keep the request instead of dropping it on the floor: with no
+            // frontend to emit it to, this is the only place what THIS SITE
+            // built is still observable (see `test_spawn_requests`).
+            self.test_spawn_requests.lock_safe().insert(agent_id.clone(), request);
             if let Some(a) = self.agents.lock_safe().get_mut(&agent_id) {
                 a.status = AgentStatus::Running;
             }
@@ -20991,6 +21013,15 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn state_root(&self) -> PathBuf {
         self.root.clone()
+    }
+
+    /// The pane request `spawn_agent_ex` built for `agent_id` — what the
+    /// frontend would have been handed. `None` in production (nothing is
+    /// recorded once there is an `AppHandle` to emit to); see
+    /// [`Self::test_spawn_requests`] for why this seam exists at all.
+    #[doc(hidden)] // pub for integration tests
+    pub fn spawn_request_for_test(&self, agent_id: &str) -> Option<SpawnRequest> {
+        self.test_spawn_requests.lock_safe().get(agent_id).cloned()
     }
 
     pub fn bind(&self, agent_id: &str, pty_id: u32) -> Result<(), String> {
