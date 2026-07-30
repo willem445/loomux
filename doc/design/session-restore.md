@@ -1192,8 +1192,41 @@ load-bearing on their own:
    same tagged-error contract `resumeerror.ts` already parses — when the
    caller's group hint disagrees with the group the session's own record
    names. Every rejoin in loomux funnels through this function, so this is
-   what makes a wrong-group rejoin **structurally** unreachable rather than
-   merely avoided by a correct frontend.
+   what makes a wrong-group rejoin unreachable rather than merely avoided by a
+   correct frontend.
+
+   **Scope of that claim, narrowly (review finding 1 on the PR).** The check
+   compares the caller's hint against a *recorded* membership, so it covers
+   exactly the sessions that have one — a roster row or an audit line in some
+   group. A session with **no** recording anywhere reaches the signature-only
+   fallback, which builds its record *from the hint itself*, making the
+   comparison vacuous by construction: the caller's claim would be the only
+   evidence. That was a real remaining route into the wrong group — a pre-#485
+   snapshot whose tab-derived hint names group A while the placeholder is
+   really group B's **pre-roster** worker, with B's own orchestrator pane
+   closed before exit (so the `ambiguous` check doesn't fire either). It is a
+   nearly-extinct population, and it was reachable, which is what matters for
+   a claim of impossibility.
+
+   So the fallback is now split by what the operation actually *is*:
+
+   - **Orchestrator** — reopening the control plane of a group whose
+     `group.json` is on disk is not a membership operation. The group's
+     identity comes from that file and no other group's roster is touched, so
+     the fallback survives (pinned by
+     `hint_restores_sessions_unknown_to_roster_and_audit`).
+   - **Delegate** — "rejoin into group X" *writes membership into X*. With
+     nothing to verify against, that is refused with its own tag,
+     `resume-group-unknown:` ("cannot be verified" is a different fact from
+     "contradicted", and deserves different copy and a different next step).
+
+   The cost is real and deliberate: a pre-roster delegate in a legacy tab no
+   longer rejoins from the Resume card. The human can still reach that session
+   from the session browser, or have the orchestrator spawn a fresh agent —
+   and #485's whole premise is that a silent wrong-group rejoin is worse than
+   a legible refusal. Between the two arms, **no delegate rejoin proceeds on a
+   group id only the caller vouches for**; that is the exact claim, and it is
+   the one the code makes.
 
 Why refuse at (3) rather than silently proceed with the record's own group,
 which would already put the agent in the right place? Because the caller acts
@@ -1237,4 +1270,16 @@ a second group — residue a pre-#485 wrong-group rejoin left on disk — still
 resolves through `session_role_in_group`'s hinted-group fast path, agrees with
 itself, and passes the check. This closes the way new contamination is
 created; it does not clean up old contamination, and nothing in the code or
-these notes should be read as claiming it does.
+these notes should be read as claiming it does. That is a claim about stale
+*data*, and it is the only gap left in this area: the two ways a *live* call
+could name the wrong group — a contradicted hint and an unverifiable one — are
+both refused above.
+
+**Where the coverage boundary sits.** The decision layers are unit/integration
+tested end to end (the partition, the plan, the schema round-trip, the join
+point, and the two refusals). What no test here touches is the DOM wiring, per
+this repo's convention: two Resume cards rendering side by side on one tab,
+the `ambiguous`/`group-mismatch` copy landing on the right card's error state,
+and per-group card clearing in a live grid. Exercising those needs a real
+window and real agent CLIs (hard constraint 3), so they are left to the
+human's own validation rather than approximated with a simulated DOM.

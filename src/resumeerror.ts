@@ -18,6 +18,13 @@ export type ResumeFailureKind =
    *  — a fresh session would be spawned into that same wrong group, which is
    *  the contamination the refusal exists to prevent. */
   | "group-mismatch"
+  /** The session has no recorded orchestration membership anywhere, so the
+   *  group a caller named for it cannot be verified — and a DELEGATE rejoin is
+   *  refused rather than taken on trust (#485 review finding 1). Distinct from
+   *  `group-mismatch`: nothing contradicted the caller, there was simply
+   *  nothing to check it against. Not `offersStartFresh` for the same reason —
+   *  a fresh session would join that unverified group. */
+  | "group-unknown"
   | null;
 
 const TAG_KIND: Record<string, ResumeFailureKind> = {
@@ -26,6 +33,7 @@ const TAG_KIND: Record<string, ResumeFailureKind> = {
   "resume-ambiguous": "ambiguous",
   "resume-store-unreadable": "store-unreadable",
   "resume-group-mismatch": "group-mismatch",
+  "resume-group-unknown": "group-unknown",
 };
 
 /** Extract the leading `resume-<tag>:` prefix from a thrown error's message,
@@ -60,6 +68,8 @@ export function resumeFailureReason(kind: ResumeFailureKind): string {
       return "It was not found in the session history on this machine — it may have been cleared.";
     case "group-mismatch":
       return "It belongs to a different orchestration group than the one being resumed — resume it from its own group.";
+    case "group-unknown":
+      return "loomux has no record of which orchestration group it belongs to, so it wasn't rejoined into one on a guess — resume it from the session browser, or have the orchestrator spawn a fresh agent.";
     default:
       return "It could not be resumed.";
   }

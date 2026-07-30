@@ -1241,10 +1241,25 @@ async function resumeDormantGroup(
       } catch (err) {
         const message = String(err);
         const kind = resumeFailureKind(message);
+        // The two GROUP refusals (#485) get the same treatment the
+        // start-freshable kinds already got: the classified sentence from
+        // resumeerror.ts rather than the raw `resume-<tag>: …` string, which
+        // leaks the wire tag into a human's toast. They are NOT start-freshable
+        // (a fresh session would land in the same unverified/wrong group), so
+        // they say what to do instead of offering that. Everything else still
+        // shows the raw message — for an unclassified failure the diagnostic
+        // detail IS the value (#440), and inventing prose for it would lose
+        // that.
+        const groupRefusal = kind === "group-mismatch" || kind === "group-unknown";
         const reason = offersStartFresh(kind)
           ? `${resumeFailureReason(kind)} Resumable from the session browser.`
-          : message;
-        showToast(`Couldn't rejoin a ${member.role}: ${reason}`, "info");
+          : groupRefusal
+            ? resumeFailureReason(kind)
+            : message;
+        // A group refusal is a correctness stop, not an "FYI" — it is the one
+        // failure in this loop that means something was PREVENTED rather than
+        // merely unavailable, so it doesn't share the informational styling.
+        showToast(`Couldn't rejoin a ${member.role}: ${reason}`, groupRefusal ? "error" : "info");
       }
     }
     // 3. Report members we can't bring back — a captured delegate with no

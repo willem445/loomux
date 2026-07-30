@@ -29,6 +29,13 @@ test("recognizes every backend tag", () => {
     "group-mismatch",
     "#485: the backend's wrong-group refusal must be classifiable, not fall through as an opaque string"
   );
+  assert.equal(
+    resumeFailureKind(
+      "resume-group-unknown: session abc has no recorded orchestration membership on this machine, so the group it belongs to cannot be verified"
+    ),
+    "group-unknown",
+    "#485 review f1: 'cannot be verified' is its own kind — distinct from being contradicted"
+  );
 });
 
 test("an untagged or unrelated error is null, not misclassified", () => {
@@ -51,7 +58,29 @@ test("only the two provably-unresolvable kinds offer a start-fresh affordance", 
     false,
     "#485: a fresh session would be spawned into the same wrong group — the refusal exists to prevent exactly that"
   );
+  assert.equal(
+    offersStartFresh("group-unknown"),
+    false,
+    "#485 review f1: a fresh session would join the same unverified group — the refusal exists to prevent that"
+  );
   assert.equal(offersStartFresh(null), false);
+});
+
+test("both group refusals read as prose, not as the wire tag (#485)", () => {
+  // The rejoin-loop toast shows resumeFailureReason for these two kinds instead
+  // of the raw `resume-<tag>: …` backend string, so a human never reads the
+  // wire format. Each says what to do, and they don't say the same thing —
+  // "belongs to another group" and "we don't know its group" are different
+  // situations with different next steps.
+  const mismatch = resumeFailureReason("group-mismatch");
+  const unknown = resumeFailureReason("group-unknown");
+  for (const text of [mismatch, unknown]) {
+    assert.doesNotMatch(text, /resume-[a-z-]+:/, "no wire tag leaks into the human-facing sentence");
+    assert.notEqual(text, resumeFailureReason(null), "not the generic fallback phrasing");
+  }
+  assert.match(mismatch, /different orchestration group/);
+  assert.match(unknown, /no record/i);
+  assert.notEqual(mismatch, unknown);
 });
 
 test("reason text is specific per kind, not a generic placeholder", () => {

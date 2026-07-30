@@ -4195,6 +4195,61 @@ fn rejoining_a_session_into_another_groups_id_is_refused_loudly() {
 }
 
 #[test]
+fn a_record_less_delegate_is_refused_rather_than_rejoined_on_the_hint_alone() {
+    // #485 review finding 1. The signature-only fallback below the roster/audit
+    // lookups builds its record FROM THE HINT, so for a session with no recorded
+    // membership anywhere the mismatch check is vacuous by construction — the
+    // caller's claim is the only "evidence" there is. That left one reachable
+    // route into the wrong group: a pre-#485 snapshot whose tab-derived hint
+    // names group A while the placeholder is really group B's pre-roster worker.
+    //
+    // A DELEGATE rejoin is a membership operation, so with nothing to verify
+    // against, the answer is a loud refusal rather than a rejoin on the caller's
+    // say-so. (An ORCHESTRATOR resume is not a membership operation — it reopens
+    // the control plane of a group whose group.json is on disk — so that arm of
+    // the fallback survives; `hint_restores_sessions_unknown_to_roster_and_audit`
+    // pins it.)
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let reg = Arc::new(relaunch_registry(dir.path()));
+    reg.set_port(45999);
+    let group = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap().id.clone();
+    // A live group, so the refusal is about the UNVERIFIABLE membership alone —
+    // not incidentally because there was nothing to rejoin into.
+    reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // A session id no roster row and no audit line anywhere names — but one that
+    // DOES have a resumable transcript in the CLI's own store. That combination
+    // is the whole point: without the store fixture the resume dies later on
+    // `resume-not-found` (the cwd resolution), which would mask the corner
+    // instead of testing it — exactly what this test asserted on its first run.
+    let sid = "99998888-7777-6666-8555-444433332222";
+    let store = scratch_dir("record-less-delegate");
+    // Its recorded cwd is its OWN workspace, not the group's main clone — a
+    // main-clone cwd is refused by a different guard (#338/#359), which would
+    // again mask this one rather than exercise it.
+    let workspace = tempfile::tempdir().unwrap();
+    fixture_claude_session(&store, sid, &workspace.path().to_string_lossy());
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
+    let outcome = resume_recorded_session(&reg, sid, Some((group.clone(), "worker".into())), false);
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
+    let err = outcome
+        .expect_err("a delegate whose group cannot be verified must not be rejoined on the hint");
+    assert!(
+        err.starts_with("resume-group-unknown:"),
+        "must carry its own structured tag — this is 'cannot be verified', not 'contradicted', got: {err}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !reg.list_agents(&group).to_string().contains(sid),
+        "nothing may have been rejoined for a session whose membership is unverifiable"
+    );
+}
+
+#[test]
 fn two_groups_in_one_tab_both_restore_into_their_own_group() {
     // The round trip the tab-scoped resume could not do at all: TWO dormant
     // orchestrator groups resumed one after the other (the frontend now hints

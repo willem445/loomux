@@ -22035,18 +22035,48 @@ pub fn resume_recorded_session(
                 .filter(|r| r.session_id == session_id)
                 .last()
         })
-        .or_else(|| {
-            // Sessions from before the roster (and before session-id
-            // tracking) are identified by loomux signatures in their own
-            // transcript; trust the hint if that group exists on disk.
-            let (group_id, role) = hint?;
+        .ok_or(())
+        .or_else(|()| {
+            // SIGNATURE-ONLY FALLBACK. Sessions from before the roster (and
+            // before session-id tracking) have no row anywhere; the session
+            // browser identifies them by loomux signatures in their own
+            // transcript and names the group via `hint`.
+            //
+            // #485 review finding 1: this fallback builds its record FROM the
+            // hint, so the mismatch check below is vacuous by construction for
+            // this class — the caller's claim is the only evidence there is.
+            // That is fine for an ORCHESTRATOR (reopening the control plane of
+            // a group whose `group.json` is on disk is not a membership
+            // operation: the group's identity comes from that file, and no
+            // other group's roster is touched), and it is NOT fine for a
+            // DELEGATE, where "rejoin into group X" writes membership into X
+            // on nothing but the caller's say-so. That was the one route left
+            // into the wrong group after the check below: a pre-#485 snapshot
+            // whose tab-derived hint names group A while the placeholder is
+            // really group B's pre-roster worker. So a record-less delegate is
+            // REFUSED — loudly, with its own tag, since "cannot be verified"
+            // is a different fact from "contradicted" (the check below) and
+            // deserves different copy. It costs the pre-roster delegate rejoin
+            // in a legacy tab, which the human can still reach through the
+            // session browser or have the orchestrator respawn; the trade is
+            // deliberate, and #485's whole point is that a silent wrong-group
+            // rejoin is worse than a legible refusal.
+            let (group_id, role) = hint.ok_or("this session is not part of a recorded orchestration")?;
+            if role != "orchestrator" {
+                return Err(format!(
+                    "resume-group-unknown: session {session_id} has no recorded orchestration \
+                     membership on this machine, so the group it belongs to cannot be verified — \
+                     refusing to rejoin it into {group_id} on the caller's say-so. Resume it from \
+                     the session browser, or have the orchestrator spawn a fresh agent."
+                ));
+            }
             if !reg.group_dir(&group_id).join("group.json").is_file() {
-                return None;
+                return Err("this session is not part of a recorded orchestration".to_string());
             }
             let group_live = reg.group_is_live(&group_id);
-            Some(SessionRole {
+            Ok(SessionRole {
                 session_id: session_id.to_string(),
-                agent_name: if role == "orchestrator" { "orchestrator".into() } else { "agent".into() },
+                agent_name: "orchestrator".into(),
                 group_id,
                 role,
                 group_live,
@@ -22058,15 +22088,26 @@ pub fn resume_recorded_session(
                 repo: None,
                 pr: None,
             })
-        })
-        .ok_or("this session is not part of a recorded orchestration")?;
+        })?;
 
     // THE JOIN POINT (#485). Every rejoin in loomux funnels through here, so
     // this is the one place that can make "a session joins a group that isn't
-    // its own" structurally unreachable instead of merely unlikely — and one
-    // caller getting its group id from a TAB rather than from the session's
-    // own record (the two-groups-one-tab resume this closes) is exactly how
-    // that used to happen.
+    // its own" unreachable instead of merely unlikely — and one caller getting
+    // its group id from a TAB rather than from the session's own record (the
+    // two-groups-one-tab resume this closes) is exactly how that used to
+    // happen.
+    //
+    // EXACTLY WHAT THIS CHECK COVERS, stated narrowly on purpose (#485 review
+    // finding 1): a session that HAS a recorded membership — a roster row or an
+    // audit line in some group — can never be rejoined into a different one,
+    // because `record` above came from that recording and this compares it
+    // against what the caller asked for. A session with NO recording anywhere
+    // has nothing to compare against; that class is refused outright by the
+    // signature-only fallback above (delegates) rather than covered here, so
+    // that "cannot be verified" never resolves to "trust the caller". Between
+    // the two, no delegate rejoin proceeds on a group id that only the caller
+    // vouches for. What neither closes is stale DATA: rows a pre-#485 rejoin
+    // already wrote into the wrong group (see below).
     //
     // Why refuse instead of silently using `record.group_id` — which is what
     // the spawn below would do anyway, and would already land the agent in
