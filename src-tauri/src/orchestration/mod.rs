@@ -6279,14 +6279,40 @@ pub fn add_trusted_folder(config_text: &str, folder: &str) -> Option<String> {
     Some(format!("{comments}{}\n", serde_json::to_string_pretty(&v).ok()?))
 }
 
+thread_local! {
+    /// Test seam for `pre_trust_copilot_folder`'s home resolution (#475), same
+    /// contract and thread-scoping rationale as
+    /// `COPILOT_SESSION_STATE_ROOT_OVERRIDE` in `sessions.rs`: a value set here
+    /// can never leak into a concurrently-running test the way a process-wide
+    /// `std::env::set_var` could. Checked BEFORE `COPILOT_HOME` — that's a
+    /// genuine (pre-existing, non-test) production override, so a test using
+    /// this hook must still win over a `COPILOT_HOME` the developer happens to
+    /// have set locally. `None` (the default) means "use the real
+    /// `COPILOT_HOME`/`~/.copilot`", so production behavior is unchanged.
+    static COPILOT_TRUST_HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only seam: fixture the directory `pre_trust_copilot_folder` reads and
+/// writes its trust-grant `config.json` into, for the calling thread only.
+/// Without this, a test that reached the trust-granting write would modify
+/// the developer's REAL `~/.copilot/config.json` — see
+/// `set_copilot_session_state_root_for_test` in `sessions.rs` for why a
+/// thread-local beats a process-wide env var here.
+#[doc(hidden)] // pub for integration tests
+pub fn set_copilot_trust_home_for_test(home: Option<PathBuf>) {
+    COPILOT_TRUST_HOME_OVERRIDE.with(|c| *c.borrow_mut() = home);
+}
+
 /// Pre-trust an agent's workspace in copilot's config so its pane doesn't
 /// boot into a folder-trust dialog — which eats the kickoff paste and gets
 /// blind-answered by the submit retries. Best-effort: on any failure the
 /// dialog simply appears as before.
-fn pre_trust_copilot_folder(folder: &str) {
-    let home = std::env::var("COPILOT_HOME")
-        .map(PathBuf::from)
-        .ok()
+#[doc(hidden)] // pub for integration tests (#475: the trust-granting write needs to be testable)
+pub fn pre_trust_copilot_folder(folder: &str) {
+    let home = COPILOT_TRUST_HOME_OVERRIDE
+        .with(|c| c.borrow().clone())
+        .or_else(|| std::env::var("COPILOT_HOME").map(PathBuf::from).ok())
         .or_else(|| dirs::home_dir().map(|h| h.join(".copilot")))
         .unwrap_or_default();
     if home.as_os_str().is_empty() {

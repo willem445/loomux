@@ -13,6 +13,7 @@ use loomux_lib::orchestration::queue;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
+    pre_trust_copilot_folder, set_copilot_trust_home_for_test,
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
@@ -2898,6 +2899,72 @@ fn copilot_trust_config_edit_preserves_content_and_dedupes() {
     assert!(fresh.contains("trustedFolders"));
     // Corrupt config must NOT be clobbered.
     assert!(add_trusted_folder("// c\n{ not json", r"C:\x").is_none());
+}
+
+// #475: `pre_trust_copilot_folder` is the I/O wrapper around `add_trusted_folder`
+// above — it resolves a home directory, reads that home's real config.json, and
+// (best-effort) writes it back. That resolve-read-write path had no test seam at
+// all, so nothing ever exercised it; the tests below are what a seam is for.
+
+#[test]
+fn pre_trust_copilot_folder_writes_fixture_and_leaves_real_home_untouched() {
+    // Snapshot the real home's copilot config (if any) so this test can prove
+    // its own write never lands there — the exact failure mode #475 flagged:
+    // a test reaching this function would otherwise modify the developer's
+    // REAL ~/.copilot/config.json rather than a fixture.
+    let real_config = dirs::home_dir().map(|h| h.join(".copilot").join("config.json"));
+    let real_before = real_config.as_ref().and_then(|p| fs::read(p).ok());
+
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(
+        fixture.path().join("config.json"),
+        "// User settings belong in settings.json.\n{\n  \"firstLaunchAt\": \"2026-07-04\",\n  \"trustedFolders\": []\n}\n",
+    )
+    .unwrap();
+    set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
+
+    pre_trust_copilot_folder(r"C:\Projects\some-agent-workspace");
+
+    set_copilot_trust_home_for_test(None);
+
+    let written = fs::read_to_string(fixture.path().join("config.json")).unwrap();
+    assert!(written.contains("some-agent-workspace"), "folder must be trusted in the fixture: {written}");
+    assert!(written.contains("firstLaunchAt"), "existing fields must survive the write: {written}");
+
+    let real_after = real_config.as_ref().and_then(|p| fs::read(p).ok());
+    assert_eq!(real_before, real_after, "a seamed call must never touch the real home's copilot config");
+}
+
+#[test]
+fn pre_trust_copilot_folder_creates_config_when_home_is_missing() {
+    // The seam's target directory need not exist yet — `pre_trust_copilot_folder`
+    // must `create_dir_all` it, same as it would for a first-ever `~/.copilot`.
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("not-yet-created");
+    set_copilot_trust_home_for_test(Some(home.clone()));
+
+    pre_trust_copilot_folder(r"C:\Projects\fresh-workspace");
+
+    set_copilot_trust_home_for_test(None);
+
+    let written = fs::read_to_string(home.join("config.json"))
+        .expect("config.json must be created along with its parent directory");
+    assert!(written.contains("fresh-workspace"));
+    assert!(written.contains("trustedFolders"));
+}
+
+#[test]
+fn pre_trust_copilot_folder_never_clobbers_an_unparseable_config() {
+    let fixture = tempfile::tempdir().unwrap();
+    fs::write(fixture.path().join("config.json"), "// c\n{ not json").unwrap();
+    set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
+
+    pre_trust_copilot_folder(r"C:\Projects\x");
+
+    set_copilot_trust_home_for_test(None);
+
+    let unchanged = fs::read_to_string(fixture.path().join("config.json")).unwrap();
+    assert_eq!(unchanged, "// c\n{ not json", "an unparseable config must be left exactly alone, never clobbered");
 }
 
 // ---------- per-task sessions & resume ----------
