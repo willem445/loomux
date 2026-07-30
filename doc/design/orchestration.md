@@ -4774,14 +4774,30 @@ entry. A drainer inside `deliver_now` has already peeked its entry and finishes 
 that pop match nothing and leaves an already-delivered entry queued for a **second, duplicate
 delivery**. Pre-#496 nothing could reach this (the front door pushes to the BACK; the drainer's
 own `AbortedPreEnter` marker is pushed *after* it pops), and the self-heal must not become the
-first thing that does. So `queue_draining` is checked before the push, race-safe in both
-directions: `ensure_drainer` registers before its thread spawns, so any drainer that could be
-mid-`deliver_now` is visible; and a drainer that has deregistered is already past `deliver_now`
-(`commit_exit`). Nothing is lost by declining — a live drainer means a delivery is already
-queued for this pane, and that delivery's own pre-paste `flush_stranded_text` presses exactly
-the Enter the heal wanted pressed. The self-heal exists for the case where no such next
-delivery exists (an idle group), which is precisely when no drainer is running. The badge is
-raised either way: the human is told regardless of which mechanism does the pressing.
+first thing that does.
+
+*The gate must be atomic with the push, and first shipped in this PR it wasn't* (review rev-47
+B1). The original shape peeked `queues` and released, read `queue_draining` and released, then
+re-took `queues` to push: check-then-act across three scopes. A drainer registering in that gap
+re-opened the hazard exactly — gate sees none, a delivery is admitted and its drainer
+spawns/peeks the Text entry, the marker lands in front, and the completing pop matches nothing.
+Not an exotic window either: the delivery most likely to arrive at that instant is the idle
+tick's nudge to the same wedged pane, and the idle tick and `DeclareFailed` key off the same
+quiet condition — correlated, not independent. **The fix fuses the check and the push into one
+critical section on `queues`, reading `queue_draining` while holding it** (lock order `queues` →
+`queue_draining`, exactly `commit_exit`'s, so no new deadlock edge). That is sufficient because
+any drainer that could ever peek this front must register *before* it peeks and must take
+`queues` *to* peek: relative to the fused section it is either already registered (→ decline) or
+it peeks strictly after the push (→ finds the marker at the front, the safe case — it drains the
+submit first and pops it by a matching id). `queue.rs`'s `stranded_admission_property` proves
+this over every interleaving, with the unfused variant as its mutation control, in the same
+shape #470 B1's own `unified_admission_property` uses one layer up.
+
+Nothing is lost by declining — a live drainer means a delivery is already queued for this pane,
+and that delivery's own pre-paste `flush_stranded_text` presses exactly the Enter the heal
+wanted pressed. The self-heal exists for the case where no such next delivery exists (an idle
+group), which is precisely when no drainer is running. The badge is raised either way: the human
+is told regardless of which mechanism does the pressing.
 
 **Bounded.** `STRANDED_SELFHEAL_MAX_HEALS = 1` per stranded delivery, counted in the monitor.
 The bound is also structural today (`late_monitor_tick` returns `DeclareFailed` at most once
@@ -4803,6 +4819,16 @@ cases: a delivery that needed healing already burned its whole confirm window pl
 `PENDING_IDLE_QUIET`, and the human is entitled to know their group wedged even when loomux
 recovers it. `StrandedBlocker` carries WHY into the detail text, so the badge always says what
 the human has to clear rather than leaving them to work it out from the pane.
+
+**The badge stays honest while it is up** (rev-47 NB1). An admitted marker is not a fired one:
+`flush_stranded_text` re-decides at press time and can decline indefinitely — most plausibly
+when the human starts typing *after* the marker was admitted, which the trigger-time decision
+could not have seen. Safety holds (their text is never submitted over), but a badge reading
+"loomux is re-sending it" while the press will never fire is a claim the code doesn't honor. So
+each `KeepWaiting` tick with a badge up re-runs the SAME pure decision against live state and
+re-words the note when a real blocker has appeared — one bounded tail read, shared with the
+clear-check below, and only taken when a badge is actually raised. It re-marks once (the note
+stops being `blocker: None`), so this is a state transition in the audit log, not per-tick spam.
 
 **Clearing — on evidence, and it must be able to clear.** A badge that never comes down trains
 the human to ignore it. Three clear paths, all ledger- or evidence-driven: the monitor's

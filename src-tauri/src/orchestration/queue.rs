@@ -1463,3 +1463,209 @@ mod unified_admission_property {
         }
     }
 }
+
+/// #496 PR-C (rev-47 B1) — the stranded self-heal's ADMISSION, exhaustively.
+///
+/// The heal pushes a `StrandedSubmit` marker to the FRONT of a pane's queue,
+/// which is the one place in this design where anything other than the
+/// drainer touches the front. That is safe only while no drainer OWNS the
+/// front entry: a drainer inside `deliver_now` has already peeked its entry
+/// and finishes with `pop_front_dequeued(that id)`, which pops ONLY on an id
+/// match. A marker slipped in front makes that pop match nothing, leaving an
+/// ALREADY-DELIVERED entry queued for a second, duplicate delivery — the
+/// exact hazard class #470 B1's own model exists for, one layer up.
+///
+/// The first shipped gate checked `queue_draining` and pushed in SEPARATE
+/// lock scopes, so a drainer registering in the gap re-opened the hazard
+/// (review rev-47 B1). The fix fuses the check and the push into one
+/// critical section on `queues`, reading `queue_draining` while holding it.
+/// This model is the proof, and — like every property module in this file —
+/// carries its own mutation control so it cannot pass vacuously.
+///
+/// **The mutation knob.** `fused` is the ONE toggle: `true` is the real
+/// (post-fix) algorithm, where "observe whether a drainer is registered" and
+/// "push the marker" are a single indivisible step; `false` is the
+/// shipped-then-fixed shape, where the observation is taken, other threads
+/// may run, and the push happens later against a stale observation. See
+/// `unfused_admission_reproduces_the_duplicate_delivery` below.
+///
+/// **What is modeled**, one event each, in every order the search can reach:
+/// a delivery arriving (push to BACK — the front door's only move), its
+/// drainer registering, that drainer peeking the front (taking ownership),
+/// that drainer finishing (popping ONLY on an id match, exactly as
+/// `pop_front_dequeued` does), and the heal's gate/push. Timeouts and
+/// retries are omitted for the same reason the module above omits them: they
+/// are self-loops this property cannot observe.
+#[cfg(test)]
+mod stranded_admission_property {
+    use std::collections::VecDeque;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Item {
+        /// An ordinary delivery, identified so a mismatched pop is visible.
+        Text(u32),
+        /// The self-heal's `StrandedSubmit` marker.
+        Marker,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SimState {
+        queue: VecDeque<Item>,
+        /// The entry a drainer has peeked and is delivering, if any.
+        owned: Option<Item>,
+        drainer_registered: bool,
+        /// The delivery the front door has not admitted yet (`None` once in).
+        pending_arrival: Option<u32>,
+        /// The heal's observation, once taken but not yet acted on — only
+        /// reachable in the UNFUSED variant, which is the whole point.
+        gate_saw_drainer: Option<bool>,
+        heal_done: bool,
+        /// Entries a drainer finished delivering.
+        delivered: Vec<Item>,
+    }
+
+    /// The property: nothing already delivered may still be sitting in the
+    /// queue, because that entry would be delivered a SECOND time.
+    fn check(state: &SimState, violations: &mut Vec<String>) {
+        for d in &state.delivered {
+            if state.queue.contains(d) {
+                violations.push(format!(
+                    "DUPLICATE DELIVERY: {d:?} was delivered but is still queued {:?} — a \
+                     mismatched `pop_front_dequeued` left it behind",
+                    state.queue
+                ));
+            }
+        }
+    }
+
+    fn explore(state: SimState, fused: bool, depth: u32, violations: &mut Vec<String>) {
+        // A duplicate becomes inevitable the moment it appears, so check
+        // EVERY state, not just terminal ones — it makes the counter-example
+        // readable at the point of appearance.
+        check(&state, violations);
+        // Depth guard: the model is acyclic by construction (every event
+        // consumes a one-shot flag or drains an entry), so this can only
+        // ever catch a modeling bug, never a real interleaving.
+        assert!(depth < 32, "runaway interleaving search — modeling bug: {state:?}");
+
+        // Event: the front door admits a delivery — always to the BACK.
+        if let Some(id) = state.pending_arrival {
+            let mut s = state.clone();
+            s.pending_arrival = None;
+            s.queue.push_back(Item::Text(id));
+            explore(s, fused, depth + 1, violations);
+        }
+
+        // Event: `ensure_drainer` registers a drainer. It registers BEFORE
+        // its thread spawns, which is what makes the fused check sufficient.
+        if !state.drainer_registered && !state.queue.is_empty() {
+            let mut s = state.clone();
+            s.drainer_registered = true;
+            explore(s, fused, depth + 1, violations);
+        }
+
+        // Event: the drainer peeks the front and takes ownership of it. It
+        // must hold `queues` to do this, which is precisely why the fused
+        // gate can never interleave between an observation and a push.
+        if state.drainer_registered && state.owned.is_none() {
+            if let Some(&front) = state.queue.front() {
+                let mut s = state.clone();
+                s.owned = Some(front);
+                explore(s, fused, depth + 1, violations);
+            }
+        }
+
+        // Event: the drainer finishes. It pops the front ONLY if the front
+        // is still the entry it owns — `pop_front_dequeued`'s id match.
+        if let Some(owned) = state.owned {
+            let mut s = state.clone();
+            if s.queue.front() == Some(&owned) {
+                s.queue.pop_front();
+            }
+            s.delivered.push(owned);
+            s.owned = None;
+            s.drainer_registered = !s.queue.is_empty();
+            explore(s, fused, depth + 1, violations);
+        }
+
+        // Event(s): the heal admits its marker.
+        if !state.heal_done {
+            if fused {
+                // ONE indivisible step: observe and act under the same lock.
+                let mut s = state.clone();
+                s.heal_done = true;
+                if !s.drainer_registered {
+                    s.queue.push_front(Item::Marker);
+                }
+                explore(s, fused, depth + 1, violations);
+            } else {
+                // TWO steps, with anything able to run in between — the
+                // shipped-then-fixed shape review rev-47 B1 caught.
+                match state.gate_saw_drainer {
+                    None => {
+                        let mut s = state.clone();
+                        s.gate_saw_drainer = Some(s.drainer_registered);
+                        explore(s, fused, depth + 1, violations);
+                    }
+                    Some(saw) => {
+                        let mut s = state.clone();
+                        s.heal_done = true;
+                        if !saw {
+                            s.queue.push_front(Item::Marker);
+                        }
+                        explore(s, fused, depth + 1, violations);
+                    }
+                }
+            }
+        }
+    }
+
+    fn run(fused: bool) -> Vec<String> {
+        let mut violations = Vec::new();
+        explore(
+            SimState {
+                queue: VecDeque::new(),
+                owned: None,
+                drainer_registered: false,
+                pending_arrival: Some(1),
+                gate_saw_drainer: None,
+                heal_done: false,
+                delivered: Vec::new(),
+            },
+            fused,
+            0,
+            &mut violations,
+        );
+        violations
+    }
+
+    #[test]
+    fn fused_admission_never_duplicates_a_delivery() {
+        let violations = run(true);
+        assert!(
+            violations.is_empty(),
+            "fusing the gate check and the marker push into one `queues` critical section must \
+             make a duplicate delivery unreachable, but the search found {}:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn unfused_admission_reproduces_the_duplicate_delivery() {
+        // The mutation control: the shape this PR originally shipped. If it
+        // ever stops finding a violation, the fused test is vacuous and this
+        // model has stopped modeling the hazard.
+        let violations = run(false);
+        assert!(
+            !violations.is_empty(),
+            "checking `queue_draining` and pushing in SEPARATE lock scopes must reproduce the \
+             duplicate delivery somewhere in the search space — if it doesn't, the fused test \
+             isn't testing anything"
+        );
+        assert!(
+            violations.iter().any(|v| v.contains("DUPLICATE DELIVERY")),
+            "expected a duplicate-delivery violation specifically, got: {violations:?}"
+        );
+    }
+}

@@ -12894,7 +12894,6 @@ fn phantom_gate_tick_throttles_repeated_gated_writes_per_pane() {
 /// the input box, nothing after it. `box_holds_paste` reads this as "still
 /// holding" — Tier 1's own signal, used here exactly as `deliver_prompt`
 /// uses it.
-const STRANDED_PASTE: &str = "please post the status roll-up on #496";
 const STRANDED_TAIL: &str =
     "  ⎿  done\n\n> please post the status roll-up on #496\n";
 
@@ -13200,6 +13199,7 @@ fn stranded_detail_names_the_blocker_the_human_must_clear() {
         Some(StrandedBlocker::Question),
         Some(StrandedBlocker::NotHolding),
         Some(StrandedBlocker::Exhausted),
+        Some(StrandedBlocker::QueueFull),
     ]
     .into_iter()
     .map(|b| stranded_detail("w-1", b))
@@ -13215,6 +13215,44 @@ fn stranded_detail_names_the_blocker_the_human_must_clear() {
     assert!(
         details[4].contains("press Enter"),
         "a spent heal budget hands the pane back to the human explicitly"
+    );
+    // rev-47 NB4: a claim is a deliverable, even in a tooltip. `QueueFull`
+    // means no heal was ever attempted, so its wording must not borrow
+    // `Exhausted`'s "after a self-heal".
+    assert!(
+        !details[5].contains("after a self-heal"),
+        "the queue-full badge must not claim a heal fired: {}",
+        details[5]
+    );
+    assert!(details[5].contains("queue"), "it must name the real obstacle: {}", details[5]);
+}
+
+#[test]
+fn a_queue_full_pane_badges_queue_full_not_a_spent_heal() {
+    // rev-47 NB4, wired: the `Err` arm of `actuate_stranded`'s admission.
+    // Fill the pane's queue to the cap so the marker push is rejected, then
+    // assert the badge reports the truth (nothing was attempted) rather than
+    // `Exhausted`'s "a heal fired and did not take".
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 4965u32;
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+            .unwrap();
+    }
+
+    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+
+    assert!(!healed, "a rejected admission is not a heal");
+    assert_eq!(
+        reg.stranded_note(&w.id).expect("the human must still be told").blocker,
+        Some(StrandedBlocker::QueueFull),
+        "the badge must name the real obstacle, not a heal that never ran"
+    );
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-selfheal-skipped"),
+        "and the skip is audited with its reason"
     );
 }
 

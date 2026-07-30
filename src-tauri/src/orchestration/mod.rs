@@ -7708,6 +7708,11 @@ pub enum StrandedBlocker {
     NotHolding,
     /// The per-delivery heal budget (`STRANDED_SELFHEAL_MAX_HEALS`) is spent.
     Exhausted,
+    /// The pane's delivery queue is at cap, so the re-submit could not even
+    /// be queued (rev-47 NB4). Deliberately NOT folded into `Exhausted`:
+    /// that one's wording says a heal already fired and did not take, which
+    /// would be a false claim here — nothing was attempted at all.
+    QueueFull,
 }
 
 impl StrandedBlocker {
@@ -7720,6 +7725,7 @@ impl StrandedBlocker {
             StrandedBlocker::Question => "question",
             StrandedBlocker::NotHolding => "not-holding",
             StrandedBlocker::Exhausted => "heal-budget-spent",
+            StrandedBlocker::QueueFull => "queue-full",
         }
     }
 }
@@ -7871,6 +7877,9 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
         }
         Some(StrandedBlocker::Exhausted) => {
             format!("{name}'s prompt is still unsubmitted after a self-heal — press Enter in the pane")
+        }
+        Some(StrandedBlocker::QueueFull) => {
+            format!("{name}'s pane has a full delivery queue, so loomux could not even queue a re-send — press Enter in the pane")
         }
     }
 }
@@ -8056,22 +8065,61 @@ fn run_late_confirmation_monitor(
             }
             MonitorAction::Expired => return,
             MonitorAction::KeepWaiting => {
-                // #496 PR-C: drop a raised badge the moment the stranded
-                // text leaves the box — whoever pressed Enter (a human
-                // rescuing the pane, or our own self-heal on a CLI that
-                // reports no hook), the pane is no longer wedged and must
-                // not keep claiming it is. See `paste_seen_in_box`.
-                if paste_seen_in_box {
-                    if let Some(r) = &reg {
-                        if r.stranded_note(&agent).is_some() {
-                            let still_holds = ptys
-                                .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
-                                .map(|b| strip_ansi(&b))
-                                .map(|t| box_holds_paste(&t, &pasted_text))
-                                .unwrap_or(true);
-                            if !still_holds {
-                                paste_seen_in_box = false;
-                                r.clear_stranded(&group, &agent, "text-left-the-box");
+                // #496 PR-C: keep a RAISED badge honest, every tick. Two
+                // things can make it stale, and one bounded tail read (only
+                // taken when a badge is actually up) answers both.
+                if let Some(note) = reg.as_ref().and_then(|r| r.stranded_note(&agent)) {
+                    let r = reg.as_ref().expect("note came from `reg`");
+                    let still_holds = ptys
+                        .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
+                        .map(|b| strip_ansi(&b))
+                        .map(|t| box_holds_paste(&t, &pasted_text))
+                        // Unreadable tail → assume it still holds: fail
+                        // conservative, keep telling the human.
+                        .unwrap_or(true);
+
+                    if paste_seen_in_box && !still_holds {
+                        // Drop the badge the moment the stranded text leaves
+                        // the box — whoever pressed Enter (a human rescuing
+                        // the pane, or our own self-heal on a CLI that
+                        // reports no hook), it is no longer wedged and must
+                        // not keep claiming it is. Only a genuine
+                        // present→absent transition clears (see
+                        // `paste_seen_in_box`).
+                        paste_seen_in_box = false;
+                        r.clear_stranded(&group, &agent, "text-left-the-box");
+                    } else if note.blocker.is_none() {
+                        // rev-47 NB1: the badge says "loomux is re-sending
+                        // it", but an admitted marker is not a fired one —
+                        // `flush_stranded_text` re-decides at press time and
+                        // can decline indefinitely (e.g. the human starts
+                        // typing AFTER the marker was admitted, which the
+                        // trigger-time decision could not have seen). The
+                        // press correctly never fires; the badge must stop
+                        // saying loomux is handling it and name what the
+                        // human has to clear. Re-run the SAME pure decision
+                        // against live state rather than re-deriving a
+                        // second opinion — budget shown as spent, since a
+                        // marker is already queued and this is purely about
+                        // what the chip SAYS, never about pressing again.
+                        let live = stranded_selfheal_action(
+                            recorded
+                                .as_ref()
+                                .is_some_and(|o| o.submit_sent_ms == submit_sent_ms && !o.confirmed),
+                            !tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms),
+                            showing_question,
+                            still_holds,
+                            STRANDED_SELFHEAL_MAX_HEALS,
+                            STRANDED_SELFHEAL_MAX_HEALS,
+                        );
+                        if let StrandedAction::Attention(blocker) = live {
+                            // `Exhausted` here would be the budget arm
+                            // firing on our own already-queued marker, which
+                            // is exactly the "still re-sending" state the
+                            // badge already shows — only a REAL blocker is
+                            // worth re-wording for.
+                            if blocker != StrandedBlocker::Exhausted {
+                                r.mark_stranded(&group, &agent, Some(blocker));
                             }
                         }
                     }
@@ -20998,14 +21046,30 @@ impl OrchRegistry {
     /// still occupies a queue slot.
     #[doc(hidden)] // pub for integration tests
     pub fn enqueue_stranded_front(&self, group: &str, agent_id: &str, from: &str, pty_id: u32) -> Result<(), String> {
-        let mut queues = self.queues.lock_safe();
-        let q = queues.entry(pty_id).or_default();
+        let pushed = {
+            let mut queues = self.queues.lock_safe();
+            let q = queues.entry(pty_id).or_default();
+            self.push_stranded_front_locked(q, agent_id, from)
+        };
+        self.audit_stranded_push(group, agent_id, pushed).map(|_id| ())
+    }
+
+    /// The push itself, performed on an ALREADY-HELD `queues` entry (#496
+    /// PR-C rev-47 B1). Extracted so `admit_stranded_selfheal` can fuse its
+    /// gate check and this push into ONE critical section without
+    /// duplicating the push — the pre-fix shape called `enqueue_stranded_
+    /// front`, which re-took the lock, and that gap was the race. Returns
+    /// `Ok((id, depth))` or `Err(depth)` when the pane's queue is at cap (a
+    /// marker occupies a slot like any other entry). Audits nothing: the
+    /// caller is still holding a lock, and `audit` does file I/O.
+    fn push_stranded_front_locked(
+        &self,
+        q: &mut VecDeque<queue::QueuedDelivery>,
+        agent_id: &str,
+        from: &str,
+    ) -> Result<(u64, usize), usize> {
         if q.len() >= queue::QUEUE_MAX_PER_PANE {
-            let depth = q.len();
-            drop(queues);
-            self.audit(group, "loomux", "delivery-dropped",
-                json!({ "to": agent_id, "reason": "queue-full-at-call", "depth": depth }));
-            return Err(queue::queue_full_error(agent_id, depth, "question"));
+            return Err(q.len());
         }
         let id = self.queue_seq.fetch_add(1, Ordering::SeqCst) + 1;
         q.push_front(queue::QueuedDelivery {
@@ -21013,11 +21077,31 @@ impl OrchRegistry {
             payload: queue::QueuedPayload::StrandedSubmit,
             reason: queue::EnqueueReason::Question, enqueued_ms: now_ms(), coalesced: 0,
         });
-        let depth = q.len();
-        drop(queues);
-        self.audit(group, "loomux", "delivery-queued",
-            json!({ "to": agent_id, "id": id, "reason": "question", "depth": depth, "marker": "stranded-submit" }));
-        Ok(())
+        Ok((id, q.len()))
+    }
+
+    /// The audit tail shared by both marker-push call sites — run AFTER the
+    /// `queues` lock is released, never under it.
+    fn audit_stranded_push(
+        &self,
+        group: &str,
+        agent_id: &str,
+        pushed: Result<(u64, usize), usize>,
+    ) -> Result<u64, String> {
+        match pushed {
+            Err(depth) => {
+                self.audit(group, "loomux", "delivery-dropped",
+                    json!({ "to": agent_id, "reason": "queue-full-at-call", "depth": depth }));
+                Err(queue::queue_full_error(agent_id, depth, "question"))
+            }
+            Ok((id, depth)) => {
+                self.audit(group, "loomux", "delivery-queued", json!({
+                    "to": agent_id, "id": id, "reason": "question",
+                    "depth": depth, "marker": "stranded-submit",
+                }));
+                Ok(id)
+            }
+        }
     }
 
     /// Admit a self-heal re-submit for a stranded delivery (#496 PR-C) — the
@@ -21026,8 +21110,36 @@ impl OrchRegistry {
     /// nothing is pasted on top of the stranded text") is testable without
     /// an `AppHandle`.
     ///
-    /// Gated by `stranded_admission_gate` — see that function for both
-    /// reasons a heal declines to admit, and why declining loses nothing.
+    /// **One critical section, not three (rev-47 B1).** The gate check and
+    /// the push happen under a SINGLE acquisition of `queues`, with
+    /// `queue_draining` consulted while that lock is held. The pre-fix shape
+    /// — peek `queues`, release; read `queue_draining`, release; re-take
+    /// `queues` to push — was check-then-act across three scopes, and a
+    /// drainer registering in the gap re-opened the very duplicate-delivery
+    /// hazard the gate exists to close: gate sees no drainer, a delivery is
+    /// admitted and its drainer spawns/peeks the Text entry as front, the
+    /// marker is then pushed in front of it, and the drainer's completing
+    /// `pop_front_dequeued(text id)` finds a mismatched front, pops nothing,
+    /// and leaves an ALREADY-DELIVERED entry queued for a second delivery.
+    /// That window is not exotic: the delivery most likely to arrive at that
+    /// instant is the idle tick's nudge to the same wedged pane, and the
+    /// idle tick and `DeclareFailed` key off the same quiet condition, so
+    /// they are correlated rather than independent.
+    ///
+    /// Fusing them closes it: any drainer that could ever peek this front
+    /// must register BEFORE it peeks (`ensure_drainer`) and must take
+    /// `queues` TO peek — so relative to this critical section it is either
+    /// already registered (the fused gate sees it and declines) or it peeks
+    /// strictly after the push (and finds the marker at the front, which is
+    /// the safe case: it drains the submit first, popping it by a matching
+    /// id). The lock ORDER — `queues`, then `queue_draining` — is exactly
+    /// `commit_exit`'s, the only other place both are held at once, so this
+    /// introduces no new deadlock edge. `queue.rs`'s
+    /// `stranded_admission_property` proves the fused rule over every
+    /// interleaving, with the unfused variant as its mutation control.
+    ///
+    /// See `stranded_admission_gate` for both decline reasons and why
+    /// declining loses nothing.
     #[doc(hidden)] // pub for integration tests
     pub fn admit_stranded_selfheal(
         &self,
@@ -21036,21 +21148,39 @@ impl OrchRegistry {
         from: &str,
         pty_id: u32,
     ) -> Result<bool, String> {
-        let front_is_marker = self
-            .queues
-            .lock_safe()
-            .get(&pty_id)
-            .and_then(|q| q.front())
-            .is_some_and(|e| matches!(e.payload, queue::QueuedPayload::StrandedSubmit));
-        if let Some(reason) = stranded_admission_gate(self.drainer_active(pty_id), front_is_marker) {
-            self.audit(group, "loomux", "stranded-selfheal-skipped",
-                json!({ "to": agent_id, "reason": reason }));
-            return Ok(false);
+        enum Admission {
+            Declined(&'static str),
+            Pushed(Result<(u64, usize), usize>),
         }
-        self.enqueue_stranded_front(group, agent_id, from, pty_id)?;
-        self.audit(group, "loomux", "stranded-selfheal-submit",
-            json!({ "to": agent_id, "via": "queue-front-marker" }));
-        Ok(true)
+        let admission = {
+            let mut queues = self.queues.lock_safe();
+            let front_is_marker = queues
+                .get(&pty_id)
+                .and_then(|q| q.front())
+                .is_some_and(|e| matches!(e.payload, queue::QueuedPayload::StrandedSubmit));
+            // Nested INSIDE `queues`, matching `commit_exit`'s lock order.
+            let drainer_active = self.queue_draining.lock_safe().contains_key(&pty_id);
+            match stranded_admission_gate(drainer_active, front_is_marker) {
+                Some(reason) => Admission::Declined(reason),
+                None => {
+                    let q = queues.entry(pty_id).or_default();
+                    Admission::Pushed(self.push_stranded_front_locked(q, agent_id, from))
+                }
+            }
+        };
+        match admission {
+            Admission::Declined(reason) => {
+                self.audit(group, "loomux", "stranded-selfheal-skipped",
+                    json!({ "to": agent_id, "reason": reason }));
+                Ok(false)
+            }
+            Admission::Pushed(pushed) => {
+                self.audit_stranded_push(group, agent_id, pushed)?;
+                self.audit(group, "loomux", "stranded-selfheal-submit",
+                    json!({ "to": agent_id, "via": "queue-front-marker" }));
+                Ok(true)
+            }
+        }
     }
 
     /// Act on one `stranded_selfheal_action` decision (#496 PR-C): admit the
@@ -21109,9 +21239,11 @@ impl OrchRegistry {
                 // (`None`) without counting it against the budget.
                 Ok(false) => None,
                 Err(e) => {
+                    // rev-47 NB4: its OWN blocker, not `Exhausted` — no heal
+                    // was attempted here, so the badge must not say one was.
                     self.audit(group, "loomux", "stranded-selfheal-skipped",
                         json!({ "to": agent_id, "reason": "queue-full", "error": e }));
-                    Some(StrandedBlocker::Exhausted)
+                    Some(StrandedBlocker::QueueFull)
                 }
             },
         };
@@ -21154,7 +21286,14 @@ impl OrchRegistry {
 
     /// Whether a drainer thread is currently registered for `pty_id` — i.e.
     /// whether something may be mid-`deliver_now` on this pane's queue front
-    /// (#496 PR-C's admission gate; see `stranded_admission_gate`).
+    /// (#496 PR-C's admission gate; see `stranded_admission_gate`). Also the
+    /// test seam for #445's bounded-lifecycle property (`ensure_drainer`
+    /// never double-spawns; a drainer removes itself on exit) — rev-47 NB3
+    /// folded the identical `queue_draining()` accessor into this one.
+    ///
+    /// NOTE for callers inside a `queues` critical section: `admit_stranded_
+    /// selfheal` must NOT call this (it would be a second, non-atomic read);
+    /// it reads `queue_draining` directly while already holding `queues`.
     #[doc(hidden)] // pub for integration tests
     pub fn drainer_active(&self, pty_id: u32) -> bool {
         self.queue_draining.lock_safe().contains_key(&pty_id)
@@ -21385,14 +21524,6 @@ impl OrchRegistry {
         if let Some(a) = self.agents.lock_safe().get_mut(agent_id) {
             a.pty_id = Some(pty_id);
         }
-    }
-
-    /// Whether `pty_id`'s queue currently has a drainer thread running —
-    /// test seam for the bounded-lifecycle property (`ensure_drainer` never
-    /// double-spawns; a drainer removes itself on exit).
-    #[doc(hidden)] // pub for integration tests
-    pub fn queue_draining(&self, pty_id: u32) -> bool {
-        self.queue_draining.lock_safe().contains_key(&pty_id)
     }
 
     /// #445 intake finding: the in-memory queue's persistence argument
