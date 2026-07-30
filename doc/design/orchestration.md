@@ -4809,7 +4809,13 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     *executing* code to answer a question — confirming a compile error is real (not just
     plausible from reading), running an existing test to see current behavior before
     proposing a change to it, checking whether a dependency actually resolves, or timing/
-    profiling anything. A plan that would have said "confirmed: `cargo check` reproduces
+    profiling anything. Also lost: pulling a reference down to ground a plan against —
+    `curl` isn't in the built-in read-only Bash set and `WebFetch` is domain-gated, so
+    neither is reachable by default. `gh api` stays available (it's `gh`, already
+    pre-approved) and covers GitHub itself, but not a CLI vendor's own documentation —
+    exactly the raw-text fetch the `agent-cli-reference` skill requires instead of
+    working from memory, so a planning task that needs it is now grounded in recall
+    alone. A plan that would have said "confirmed: `cargo check` reproduces
     the reported error at line N" now says "reading the code, this looks like it would
     reproduce the reported error" — a real loss of grounding, silent in the sense that a
     vaguer plan doesn't announce *why* it's vaguer. `templates/planner.md`'s "say so in
