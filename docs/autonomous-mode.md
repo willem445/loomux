@@ -95,6 +95,16 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   (adjustable per group, down to a minute or two if you want to watch it fire
   sooner). The autonomy panel shows a live countdown to the next eligible tick, and
   a hard per-hour cap backstops any pathological re-arming.
+- **Your typing can only defer the tick so long.** Recent typing in the pane defers
+  the tick — it never fires while you're actively steering — but that deferral is
+  capped at 15 minutes past the orchestrator's last real output (`group.json`'s
+  `idle_tick_input_defer_max_minutes`; no panel control yet, hand-edit the file to
+  change it). This closed a real deadlock: on a copilot orchestrator, terminal
+  traffic the pane itself generates could look exactly like "you're typing" with
+  nobody there, silencing the tick forever until you pressed Enter yourself. Past
+  the bound the tick fires anyway rather than staying silent forever — a genuinely
+  quiet stretch (no output, no typing) is either a stuck pane or you've stepped
+  away, and both are correct to check in on.
 - **Pause still wins.** A [paused group](orchestration.html#group-lifecycle) is
   skipped entirely — no ticks, no deliveries — and your pause/off toggle is
   instant.

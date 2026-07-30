@@ -1731,6 +1731,31 @@ the two cost/safety controls the unattended-spend risk demands.
   (belt-and-suspenders on top of output-silence), so a tick never lands while the human is
   steering. **Paused** groups are skipped wholesale and their latch left intact (same
   reasoning as the watchdog).
+- **The input fold is bounded (#496).** Two independent heuristics key off the same "pane has
+  recent human input" signal — this fold, and delivery's stranded-text-flush/submit-retry
+  suppression — and both can deadlock if that signal is ever wrong and never clears on its own:
+  a live copilot orchestrator wedged exactly this way when xterm's own automatic replies to the
+  program's terminal queries (OSC colour, DA, DSR/CPR, focus reports) stamped
+  `last_user_input_ms` with no human present, forever, so the tick that would have recovered the
+  group could never fire — only a physical Enter did. `Guardrails.idle_tick_input_defer_max_minutes`
+  (0 → default `DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES` = 15, i.e. 3x the tick window; floored
+  at the group's own `idle_tick_minutes`, capped at 24h; no live setter this round, same
+  precedent as `context_window_tokens_override` — hand-edit `group.json`) clamps how far input
+  alone may push the quiet clock past `AgentEntry.last_output_progress_ms`, a NEW field tracking
+  only output-based resets (never input-deferred ones) — so a signal that keeps refreshing every
+  scan, forever, makes the tick fire late rather than never. This is deliberately a *separate*
+  guarantee from the root-cause fix (gating `write_pty`'s stamp on `classify_human_input` so
+  xterm's own auto-replies never reach `last_user_input_ms` at all — see `pty.rs`): the root-cause
+  fix is correct for the mechanism that was actually observed; this bound is the backstop for any
+  refresher nobody has modeled yet — a future IME/composition path, a different CLI's TUI,
+  anything not yet seen. A tick that fires because of the bound (rather than the ordinary quiet
+  window) is audited with its own `reason` (`idle-tick-input-defer-bound`) rather than reading as
+  an unremarkable fire. The tradeoff this accepts: after the root-cause fix, only traffic that is
+  byte-indistinguishable from an xterm auto-reply (pure-Neutral — arrow keys, menu navigation) can
+  ride this bound at all; genuine human steering keeps emitting Content-classified keystrokes,
+  which legitimately keeps deferring. Fifteen minutes of zero real output *and* zero printable
+  input is either a wedge or a human who has walked away, and firing a NOTICE (not an action) is
+  correct either way — `MAX_IDLE_TICKS_PER_HOUR` still backstops runaway firing regardless.
 - **Observability.** Because the tick is otherwise invisible until it fires, `orch_autonomy`
   surfaces `idle_tick_minutes`, `idle_activity_floor_bytes`, and (while on) `quiet_secs`,
   `eligible_in_secs`, and `tick_status`. The countdown is **honest** (`idle_tick_observability`):

@@ -6101,14 +6101,78 @@ fn idle_tick_skips_paused_group_preserving_latch() {
 fn idle_tick_defers_on_recent_human_input() {
     let (reg, _d, _gid, oid) = autonomous_setup();
     let empty = HashMap::new();
-    // Output-quiet, but the human just typed into the pane (input time == now):
-    // the belt-and-suspenders gate must defer the tick even though output is old.
-    let just_typed: HashMap<String, u64> = [(oid.clone(), FAR)].into_iter().collect();
-    assert!(reg.idle_tick_tick(FAR, &empty, &just_typed).is_empty(),
+    // #496: anchor the output-based baseline (`last_output_progress_ms`) at FAR
+    // first, with a real output burst — otherwise this test's own FAR time-skip
+    // (from the agent's real spawn-time baseline) would itself look like the
+    // orchestrator had gone output-silent for eons, and the input-defer bound
+    // below would fire immediately regardless of "just typed" input. Seeding a
+    // real burst here is what a live group's spawn + first tick already does;
+    // it isn't new test scaffolding for the bound, just making this test's
+    // synthetic clock skip land at a realistic starting point.
+    let grew: HashMap<String, u64> = [(oid.clone(), 4096u64)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR, &grew, &empty).is_empty(), "output growth resets the clock, not a tick");
+    // Output-quiet from here, but the human just typed into the pane (input
+    // time == now): the belt-and-suspenders gate must defer the tick even
+    // though output is old — well inside the input-defer bound (15m default),
+    // so this is the ORDINARY defer, not the bound.
+    let just_typed: HashMap<String, u64> = [(oid.clone(), FAR + 60_000)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR + 60_000, &empty, &just_typed).is_empty(),
         "never tick while the human is actively steering the pane");
-    // Once the human input recedes past the window, the tick fires again.
-    assert_eq!(reg.idle_tick_tick(FAR + 15 * 60_000 + 1, &empty, &just_typed), vec![oid.clone()],
+    // Once the human input recedes past the window (its timestamp stays put
+    // while real time moves on), the tick fires again — still comfortably
+    // inside the bound, so this is the ordinary quiet-window recovery, not
+    // `idle_tick_input_defer_max_minutes` kicking in.
+    assert_eq!(reg.idle_tick_tick(FAR + 60_000 + 15 * 60_000 + 1, &empty, &just_typed), vec![oid.clone()],
         "after the human-input window elapses, the idle tick resumes");
+}
+
+#[test]
+fn idle_tick_fires_despite_perpetual_input_after_bound() {
+    // #496 root cause 2/2 (the guarantee, not the mechanism): xterm's own
+    // automatic replies to a copilot pane's terminal queries (OSC colour, DA,
+    // DSR/CPR, focus reports) restamp `last_user_input_ms` to "now" on EVERY
+    // scan, forever, with no human present and no real output ever following
+    // (PR-A fixes that mechanism at the source). This test doesn't assume
+    // which mechanism refreshes the clock — it simulates the WORST case any
+    // such refresher produces: input recency that tracks `now` exactly, every
+    // single tick, unboundedly. Without a bound, the fold in `idle_tick_tick`
+    // would set `last_progress_ms` to `now` every call, so `now - last_progress_ms`
+    // never reaches the threshold and the tick can never fire — the deadlock
+    // the human reported (#496): nothing recovers the group but a physical Enter.
+    let (reg, _d, gid, oid) = autonomous_setup();
+    let empty = HashMap::new();
+    let grew: HashMap<String, u64> = [(oid.clone(), 4096u64)].into_iter().collect();
+    let base = FAR;
+    // One real output burst anchors the output-based baseline both clocks now
+    // share; `idle_tick_input_defer_max_minutes` clamps the input fold against
+    // THIS timestamp (`last_output_progress_ms`), never against whatever the
+    // input clock itself claims.
+    assert!(reg.idle_tick_tick(base, &grew, &empty).is_empty(), "output growth resets the clock, not a tick");
+
+    let min = 60_000u64;
+    // Perpetual "input": every scan, `inputs` reports the input timestamp as
+    // exactly `now` — unbroken, advancing recency with no real output ever
+    // following (`grew` stays flat: no growth = no activity). Companion
+    // property (the plan's edge case): input still legitimately defers WITHIN
+    // the bound, so genuine human steering is unaffected — asserted for every
+    // minute up to the 15-minute default bound.
+    for minute in 1..=19u64 {
+        let now = base + minute * min;
+        let inputs: HashMap<String, u64> = [(oid.clone(), now)].into_iter().collect();
+        assert!(reg.idle_tick_tick(now, &grew, &inputs).is_empty(),
+            "perpetual input must still defer the tick before the bound is reached (minute {minute})");
+    }
+    // Default bound (15m, `DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES`) plus the
+    // default quiet threshold (5m, `DEFAULT_IDLE_TICK_MINUTES`) elapses since
+    // the last real output. Input is STILL arriving every scan, right up to
+    // `now` — genuinely perpetual, never lapsing — yet the clamp caps how far
+    // it can defer and the tick must fire anyway.
+    let now = base + 20 * min;
+    let inputs: HashMap<String, u64> = [(oid.clone(), now)].into_iter().collect();
+    assert_eq!(reg.idle_tick_tick(now, &grew, &inputs), vec![oid.clone()],
+        "the input-defer bound must make perpetual input non-absorbing — the tick must fire eventually");
+    assert_eq!(audit_count(&reg, &gid, "idle-tick-input-defer-bound"), 1,
+        "a tick that fires because of the bound must be audited with its own distinct reason");
 }
 
 #[test]
@@ -6202,6 +6266,41 @@ fn idle_tick_minutes_is_configurable_persisted_and_surfaced() {
     assert!(off["quiet_secs"].is_null(), "no quiet meter while autonomous is off");
     assert!(off["eligible_in_secs"].is_null());
     assert_eq!(off["tick_status"], "off");
+}
+
+#[test]
+fn idle_tick_input_defer_bound_defaults_floors_caps_and_persists() {
+    // #496: 0 (unset) resolves to the 15-minute default (3x DEFAULT_IDLE_TICK_MINUTES).
+    let g = Guardrails { idle_tick_minutes: 5, ..rails() }.clamped();
+    assert_eq!(g.idle_tick_input_defer_max_minutes, 15, "0 (unset) resolves to the 15m default");
+
+    // Floored at the group's own (already-normalized) tick window: the bound can
+    // never be tighter than the ordinary threshold — that would let it fire the
+    // tick BEFORE `idle_tick_minutes` itself ever would.
+    let g = Guardrails { idle_tick_minutes: 20, idle_tick_input_defer_max_minutes: 5, ..rails() }.clamped();
+    assert_eq!(g.idle_tick_input_defer_max_minutes, 20, "floored at idle_tick_minutes, never tighter");
+
+    // Capped at 24h — the same ceiling `idle_tick_minutes` uses.
+    let g = Guardrails { idle_tick_input_defer_max_minutes: 100_000, ..rails() }.clamped();
+    assert_eq!(g.idle_tick_input_defer_max_minutes, 1440, "capped at 24h");
+
+    // No live setter this round (see the field's own doc), but it is still a
+    // persisted, hand-editable guardrail: written to group.json and honored on
+    // reload — same precedent as `idle_tick_fallback_minutes`/`context_window_
+    // tokens_override`.
+    let (reg, dir) = test_registry();
+    let g = reg
+        .create_group("C:/tmp/repo", Guardrails { idle_tick_input_defer_max_minutes: 45, ..rails() })
+        .unwrap();
+    assert_eq!(g.guardrails.idle_tick_input_defer_max_minutes, 45, "an explicit in-range value is honored, unclamped");
+    let body = fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap();
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["guardrails"]["idle_tick_input_defer_max_minutes"].as_u64().unwrap(), 45,
+        "the field is written to group.json, not silently dropped");
+    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    reg2.set_port(45999);
+    let (_, persisted) = reg2.load_group_file(&g.id).unwrap();
+    assert_eq!(persisted.idle_tick_input_defer_max_minutes, 45, "round-trips through group.json on a fresh load");
 }
 
 #[test]
