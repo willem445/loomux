@@ -2776,6 +2776,149 @@ security PROPERTY each one pins ("no repo text reaches the trust root", "ids/nam
 structurally out of whatever they ride in") still holds, now checked against the generated
 file's content instead of the command line, since the command line no longer carries it.
 
+### #502: the generated agent files were never written where they belonged
+
+**The incident.** `~/.claude/agents/` had accumulated **1,219 loomux-generated agent definition
+files (67MB)** against **13** live group dirs. Claude Code loads every agent definition's
+`description` into the session's agent roster and caps the aggregate; the pile tripped that cap
+outright (`Agent descriptions are over the 15.0k-token limit (~15.6k tokens)`) and bloated every
+session's context until a human swept it by hand — after which files for long-dead groups
+**reappeared within minutes**.
+
+**Split with #464, stated plainly.** #464 shipped the *reclaim* half — `sweep_orphaned_agent_files`,
+a one-shot startup sweep of files no live group claims, plus a static pin that no test may
+construct a bare registry. This section is the *cause* half, and the two are deliberately not the
+same fix: a sweep reclaims what was already written, and nothing in it stops the writing. An
+earlier revision of #502 carried its own second sweep and its own ownership-marker scheme; both
+were dropped rather than merged, because two implementations of one mechanism is a defect in
+waiting, and requiring a marker would have stopped #464's sweep reclaiming the very legacy
+orphans it exists for. #464's sweep is kept verbatim, including its "if enumeration fails, delete
+nothing" rule (its review B3) — which #502's own delete path now also applies, so the two hold
+one opinion instead of two.
+
+#### Where the files actually came from
+
+The names identified the writer. A group id is `<repo-dir-name>-<hash>` (`group_id_for_repo`),
+and the reappearing files were `loomux-tmp<random>-<hash>-*` and `loomux-repo-<hash>-*` —
+`tempfile::tempdir()` directory names, and the fake `C:/tmp/repo` path used throughout the test
+suite. One was `…-rev-security`, a block id only `tests/workflow.rs` declares. **The writer was
+loomux's own test suite**, not the running app.
+
+That last part is a *verified* negative, not an assumption: `write_claude_agent_file` and
+`write_copilot_agent_file` are reachable only through `persona_inject`, whose only two callers
+are `spawn_agent_ex` and `register_orchestrator_pane` — both spawn paths. There is no periodic
+refresh, no ensure-definitions pass, and no restore-index iteration that writes an agent file.
+
+`claude_agents_dir()`/`copilot_agents_dir()` resolved the user's real home for **every** registry,
+and only the shared test helper pointed them elsewhere — so every test that built its own registry
+and spawned an agent minted a real multi-KB file in the developer's home that nothing ever
+deleted. Reproduced in one command: a single pre-existing test wrote two new files into the real
+agents dir.
+
+#### One containment predicate, three paths
+
+The rule is that **only the registry that owns the user's live orchestration state may resolve a
+directory inside the user's home** — `is_live_registry()`, which is `self.root == default_root()`,
+the root `lib.rs` constructs exactly once. Every other registry is contained inside its own root.
+
+It lives in one predicate because the first two attempts open-coded it per site, and the third
+site was then missed:
+
+- `user_cli_dir` — the generated agent dirs.
+- `copilot_home_dir` — Copilot's hook config **and** its `trustedFolders` config.
+
+That third one, `pre_trust_copilot_folder`, is worth naming: it appends the spawn's workspace path
+to `trustedFolders` in the user's real `~/.copilot/config.json`. It is the worst of the three to
+leak on two counts the others don't share — `trustedFolders` is a **security** setting (it
+suppresses Copilot's folder-trust prompt), and its entries are per-workspace **paths**, so a suite
+spawning into fresh temp dirs appends a new entry every run and grows without bound. The observed
+config had collected 36 of them. It was missed by an audit that *did* list it, because it was a
+free function with no registry to ask: the very property that made it unfixable by the rule being
+applied is what excused it from the rule. **A rule copied per site is a rule the next site
+forgets.**
+
+#475's thread-local trust seam still takes precedence where a test sets it: fixturing it is an
+explicit statement about where the write should go, and an explicit statement beats a structural
+default. Containment is what catches everything that never makes one.
+
+`compact_hook_dir` was already root-relative and needed nothing.
+
+**Failure direction is safe throughout.** If the app's root ever stops being `default_root()`,
+generated files land in that root instead of the user's home, and `persona_inject`'s existing
+write-failure fallbacks (`--append-system-prompt-file` on Claude, kickoff text on Copilot) still
+deliver the contract. Nothing silently writes where it shouldn't.
+
+#### Writers refuse a group that does not exist
+
+`group_state_exists` — both writers refuse to write for a group with no state dir, asked against
+the same registry the reclaim path consults, so a write and a reclaim can never disagree about
+whether a group exists. This is the general form of "only write for groups that actually exist":
+*any* path that reaches a writer with a dead group id — a stale roster, a restore index, some
+future periodic refresh nobody has written yet — fails to resurrect it, rather than only the path
+that does so today. `create_group` makes the directory before any spawn can reach a writer, so a
+live group always passes.
+
+#### Teardown reclaims by ownership, not by member list
+
+`end_group`'s reclaim (`reclaim_group_agent_files`) scans the agent dirs and asks who owns each
+candidate, replacing a per-MEMBER name list that structurally could not see a file whose block a
+roster change retired, or whose member entry was pruned while the file stayed on disk. Ownership
+is a property of the FILE, not of who is still in the roster.
+
+`owning_group` resolves by **longest** match, because nothing stops one group id from being a
+prefix of another: with `X` and `X-extra` both live, `loomux-X-extra-worker.md` is X-extra's
+worker file, not X's file for a block named `extra-worker`. The filename alone cannot decide —
+both readings are well-formed — so ownership is settled against the group registry and resolved
+toward the more specific claim. First-match logic would let `end_group("X")` delete a LIVE group's
+file.
+
+An unenumerable registry aborts the reclaim entirely, for the same reason #464's sweep abstains:
+ownership is decided by asking which live group *claims* a file, so an empty group list says
+"nothing claims anything". The general lesson, and the reason this was worth a fix rather than a
+shrug: **a conservatism argument that rests on "we only delete what we can prove nothing claims"
+is void in exactly the states where the proof is unavailable**, and those are the states worth
+writing down.
+
+#### Description length is a shared budget
+
+The cap Claude Code enforces is on the AGGREGATE of every agent description, so verbosity in one
+repo's persona is spent from every session's ceiling. loomux's own descriptions were already terse
+(the block id), so accumulation, not verbosity, caused this incident — but a repo-authored
+persona's `description:` is unbounded free text flowing straight into the generated file, so it is
+clamped (`clamp_agent_description`, `GENERATED_AGENT_DESCRIPTION_MAX_CHARS` = 160, counted in
+characters since persona text is not guaranteed ASCII). The persona's own TEXT is untouched — only
+the roster-facing one-liner.
+
+**Generic, per CLAUDE.md constraint 8**: this keys off loomux's own group registry and its own
+naming — no CLI-version, machine, or user assumptions beyond the agent-dir convention loomux
+already owns in order to write these files at all.
+
+#### Tests
+
+`a_registry_outside_the_default_root_never_writes_into_the_users_home`,
+`a_throwaway_registry_never_rewrites_the_users_real_copilot_hook_config` and
+`a_throwaway_registry_never_writes_the_users_real_copilot_trusted_folders` pin the three contained
+paths. Each asserts the CONTAINED file exists rather than that the real one is absent — the real
+one legitimately exists on a developer's box, so its presence would prove nothing either way — and
+each deliberately builds its registry the **unguarded** way, which is why #464's
+registry-construction pin grows a narrow, greppable opt-out token rather than a raised count: a
+test whose subject IS bare construction must build one, and every other test still routes through
+the helper.
+
+`a_dead_group_never_gets_its_agent_file_re_minted` pins the writer guard;
+`end_group_reclaims_a_generated_file_no_member_entry_accounts_for` and
+`end_group_leaves_a_generated_file_a_more_specific_live_group_owns` pin the reclaim and the
+longest-match rule; `an_unreadable_group_registry_stops_end_group_reclaiming_anything` pins the
+abstain rule; `a_verbose_persona_description_is_clamped_in_the_generated_agent_file` pins the
+clamp.
+
+That last enumeration test earned a note of its own: driving it through `end_group` produced a
+test that passed for the wrong reason. `end_group` kills its members first, `mark_dead` audits,
+and `append_audit` does `create_dir_all(root/<group>)` — so a merely-deleted root is **recreated**
+before the reclaim ever runs, and enumeration quietly succeeds. It is driven at the reclaim
+directly instead, against a root that is a regular file and therefore can never be enumerated or
+recreated.
+
 ### #417: compact hooks as a TRUSTED evidence source
 
 **Correction (this section originally claimed Copilot has no compaction hooks at all — that

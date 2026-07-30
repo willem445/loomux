@@ -65,6 +65,11 @@ pub fn run() {
             // `end_group` (crash, kill -9, an orchestration-suite test run).
             // One-shot and best-effort, like the rest of this setup block —
             // see `sweep_orphaned_agent_files`'s doc for why this is safe.
+            //
+            // #502 fixed the biggest SOURCE of what this reclaims (a test
+            // registry could write into the user's real agent dirs at all);
+            // the sweep stays, because a crash or kill still skips
+            // `end_group` for a genuine group.
             reg.sweep_orphaned_agent_files();
             orchestration::start_idle_reaper(reg.clone());
             orchestration::start_watchdog(reg.clone());

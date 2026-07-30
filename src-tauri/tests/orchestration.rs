@@ -14363,12 +14363,34 @@ fn is_live_registry_construction(line: &str) -> bool {
     if line.trim_start().starts_with("//") {
         return false; // a full-line comment can still literally spell the construct
     }
+    // #502: a construction the test's own SUBJECT requires the helper not to
+    // make — either a registry built the unguarded way precisely to prove
+    // containment now holds without the helper, or one rooted somewhere the
+    // helper cannot produce (a path that is not a directory, to force a real
+    // enumeration failure).
+    //
+    // This pin's premise is that a raw `OrchRegistry::new(...)` silently
+    // falls back to the user's REAL agent dirs. #502 removed that fallback
+    // (`is_live_registry`: only the registry rooted at `default_root()` ever
+    // resolves a home directory), so the premise no longer holds for these
+    // few — but the pin is kept, and kept strict, because it also catches
+    // the accidental case the containment rule is not the only defense
+    // against. Marking a line is deliberately noisy and greppable so this
+    // stays a handful of reviewed exceptions rather than a habit: a test
+    // that is not ABOUT bare construction still routes through the helper.
+    if line.contains(BARE_REGISTRY_CONTAINMENT_PIN) {
+        return false;
+    }
     match (line.find("OrchRegistry::new("), line.find('"')) {
         (Some(construct_at), Some(quote_at)) => construct_at < quote_at,
         (Some(_), None) => true,
         (None, _) => false,
     }
 }
+
+/// The opt-out token for [`is_live_registry_construction`]. Written split so
+/// this declaration is not itself a match when the pin scans this file.
+const BARE_REGISTRY_CONTAINMENT_PIN: &str = concat!("containment", "-pin (#502)");
 
 /// #464 B2: `claude_agents_dir_override`/`copilot_agents_dir_override` are
 /// in-memory fields on an `OrchRegistry` instance, not persisted state, so a
@@ -14926,6 +14948,260 @@ fn end_group_reclaims_generated_claude_agent_files() {
 
     reg.end_group(&g.id, false).unwrap();
     assert!(!generated.exists(), "the generated file must be reclaimed on group end");
+}
+
+// ─────────── #502: generated custom-agent file lifecycle ───────────
+//
+// The incident: 1,219 generated agent files (67MB) had accumulated in
+// `~/.claude/agents` against 13 live groups, enough to trip Claude Code's
+// own aggregate agent-description token cap and degrade every session that
+// loaded the roster.
+//
+// These tests never hardcode the private ownership marker: they COPY a file
+// loomux genuinely generated (via a real spawn) to whatever synthetic name
+// the case needs. That keeps them honest about what "loomux wrote this" means
+// and immune to the marker's exact wording.
+
+/// The Claude-side generated file a default-roster spawn just wrote.
+fn generated_claude_agent_file(dir: &tempfile::TempDir, group: &str, block: &str) -> std::path::PathBuf {
+    let path = dir.path().join("claude-agents").join(format!("loomux-{group}-{block}.md"));
+    assert!(path.is_file(), "the spawn must have generated {path:?}");
+    path
+}
+
+#[test]
+fn end_group_reclaims_a_generated_file_no_member_entry_accounts_for() {
+    // #502: teardown used to remove one file per LIVE MEMBER entry, so any
+    // file the member list didn't name survived — a block retired by a
+    // roster change, or a member entry pruned while its file stayed behind.
+    // Ownership is a property of the FILE, not of who happens to still be
+    // in the roster, so the reclaim scans the directory instead.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let live = generated_claude_agent_file(&dir, &g.id, &w.block);
+    let retired = live.with_file_name(format!("loomux-{}-retired.md", g.id));
+    fs::copy(&live, &retired).unwrap();
+
+    reg.end_group(&g.id, false).unwrap();
+    assert!(
+        !retired.exists(),
+        "a generated file this group owns must be reclaimed even when no member entry names its block",
+    );
+    assert!(!live.exists(), "and the member's own file still goes, as before");
+}
+
+#[test]
+fn end_group_leaves_a_generated_file_a_more_specific_live_group_owns() {
+    // Nothing stops one group id from being a prefix of another. With `X`
+    // and `X-extra` both live, `loomux-X-extra-worker.md` is X-extra's
+    // worker file — not X's file for a block named `extra-worker`. The
+    // filename alone can't tell them apart (both readings are well-formed),
+    // so ownership is resolved against the group registry, longest match
+    // wins. Naive prefix matching would delete a LIVE group's file here.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    let live = generated_claude_agent_file(&dir, &g.id, &w.block);
+    // A second, MORE specific group — its state dir under the orchestration
+    // root is what makes it a live group as far as the registry is concerned.
+    let nested = format!("{}-extra", g.id);
+    fs::create_dir_all(dir.path().join(&nested)).unwrap();
+    let nested_file = live.with_file_name(format!("loomux-{nested}-worker.md"));
+    fs::copy(&live, &nested_file).unwrap();
+
+    reg.end_group(&g.id, false).unwrap();
+    assert!(
+        nested_file.is_file(),
+        "ending group {} must not reclaim a file the longer-id group {nested} owns",
+        g.id,
+    );
+    assert!(!live.exists(), "its own file still goes");
+}
+
+#[test]
+fn an_unreadable_group_registry_stops_end_group_reclaiming_anything() {
+    // rev-38 review (B2), carried onto the teardown path: ownership is decided
+    // by asking which live group CLAIMS a file, so an EMPTY group list says
+    // "nothing claims anything" — which would dissolve the longest-match
+    // protection below and let `end_group("X")` delete a live `X-extra`
+    // group's files. `sweep_orphaned_agent_files` already applies this rule
+    // to itself (#464 review B3, `..._deletes_nothing_when_group_enumeration_
+    // fails` above); this pins that the reclaim path agrees rather than
+    // holding a second opinion.
+    //
+    // The failure is produced for real, not mocked: a regular FILE occupies
+    // the root's path, so `read_dir` genuinely errors.
+    //
+    // Driven straight at the reclaim rather than through `end_group`, for a
+    // reason worth recording: `end_group` kills its members first, and
+    // `mark_dead` audits, and `append_audit` does `create_dir_all(root/
+    // <group>)` — so a merely-DELETED root is recreated before the reclaim
+    // ever runs. Going through the front door here would have produced a
+    // test that passes because enumeration quietly succeeded, which is worse
+    // than no test at all.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let live = generated_claude_agent_file(&dir, &g.id, &w.block);
+
+    // A registry over the SAME agent dirs whose root can never be enumerated.
+    let broken_root = dir.path().join("root-is-a-regular-file");
+    fs::write(&broken_root, "not a directory").unwrap();
+    let broken = OrchRegistry::new(broken_root); // containment-pin (#502)
+    broken.set_claude_agents_dir_override(dir.path().join("claude-agents"));
+    broken.set_copilot_agents_dir_override(dir.path().join("copilot-agents"));
+
+    let removed = broken.reclaim_group_agent_files(&g.id);
+    assert!(removed.is_empty(), "an unenumerable registry proves nothing about ownership: {removed:?}");
+    assert!(
+        live.is_file(),
+        "an unenumerable group registry must never cost a LIVE group its contract: {live:?}",
+    );
+}
+
+#[test]
+fn a_dead_group_never_gets_its_agent_file_re_minted() {
+    // #502's ROOT CAUSE half, live-observed: after the orphans were deleted
+    // by hand, files for long-dead groups reappeared within minutes. Whatever
+    // reaches a writer with a dead group id — a stale roster, a restore
+    // index, a future periodic refresh — must fail to resurrect its file,
+    // or every sweep in this file is just losing a race.
+    //
+    // The guard is at the WRITER (`group_state_exists`), so this pins the
+    // property for every caller at once rather than for one code path.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    let b = g.guardrails.block("worker").expect("the default roster declares a worker block");
+    let generated = dir.path().join("claude-agents").join(format!("loomux-{}-{}.md", g.id, b.id));
+
+    // A live group writes, as always.
+    let inject = reg.persona_inject(&g.id, b, "claude", None, "CONTRACT");
+    assert!(inject.claude_agent.is_some(), "a live group must still get its generated agent file");
+    assert!(generated.is_file(), "{generated:?}");
+
+    // The group's state is gone (ended, crashed, deleted out from under
+    // loomux) and its file is reclaimed...
+    fs::remove_dir_all(dir.path().join(&g.id)).unwrap();
+    fs::remove_file(&generated).unwrap();
+
+    // ...and a writer reached with that same dead id must NOT bring it back.
+    let inject = reg.persona_inject(&g.id, b, "claude", None, "CONTRACT");
+    assert!(
+        !generated.exists(),
+        "a dead group's agent file must never be re-minted — that race is what made the sweeps lose",
+    );
+    assert!(
+        inject.claude_agent.is_none(),
+        "and the spawn must fall back rather than claim a handle for a file that was not written",
+    );
+}
+
+#[test]
+fn a_registry_outside_the_default_root_never_writes_into_the_users_home() {
+    // #502's re-mint SOURCE, proven live: loomux's own test suite constructs
+    // throwaway registries 50+ times, only the shared `test_registry` helper
+    // set the agents-dir override, and every other test that spawned an agent
+    // minted a real multi-KB file in the developer's `~/.claude/agents` that
+    // nothing ever deleted. Group ids are `<repo-dir-name>-<hash>`, which is
+    // why the accumulated files were named for `tempfile` temp dirs and the
+    // fake `C:/tmp/repo` path — they were never a user's groups at all.
+    //
+    // So this test deliberately builds the registry the UNGUARDED way — no
+    // override, exactly like those 50+ sites — and pins that the containment
+    // rule holds anyway. "Every test remembers to opt out of writing to your
+    // home directory" is not a property anyone can maintain.
+    let dir = tempfile::tempdir().unwrap();
+    let reg = OrchRegistry::new(dir.path().to_path_buf()); // containment-pin (#502)
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/claude-repo", rails()).unwrap();
+    let b = g.guardrails.block("worker").unwrap();
+
+    let inject = reg.persona_inject(&g.id, b, "claude", None, "CONTRACT");
+    let handle = inject.claude_agent.expect("the contract must still be delivered by file");
+
+    // It went somewhere inside this registry's OWN root...
+    let contained = dir.path().join("claude-agents").join(format!("{handle}.md"));
+    assert!(contained.is_file(), "a non-default-root registry must write inside its own root: {contained:?}");
+    // ...and nowhere near the real user directory. (Read the home directory
+    // from the environment rather than the lib's `dirs` crate — an
+    // integration test asserting about the USER's home should look it up the
+    // same way anything else outside the lib would.)
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    if let Some(home) = home {
+        let leaked = PathBuf::from(home).join(".claude").join("agents").join(format!("{handle}.md"));
+        assert!(!leaked.exists(), "a throwaway registry must never write into the user's real agent dir: {leaked:?}");
+    }
+}
+
+#[test]
+fn a_throwaway_registry_never_rewrites_the_users_real_copilot_hook_config() {
+    // Same containment rule, the other direction it leaked: auditing every
+    // `dirs::home_dir()` in this module after the agent-file leak turned up
+    // one more — `copilot_hooks_dir` (`compact_hook_dir` was already
+    // root-relative). Much smaller blast radius: ONE idempotent file the
+    // real app rewrites anyway, never one per group, so it never
+    // accumulated the way the agent files did. But a throwaway registry
+    // still has no business rewriting the user's real Copilot hook config,
+    // and it was observed doing exactly that during a test run.
+    //
+    // Built the UNGUARDED way on purpose (no override), like the test in
+    // this file that pins the agent-dir half.
+    let dir = tempfile::tempdir().unwrap();
+    let reg = OrchRegistry::new(dir.path().to_path_buf()); // containment-pin (#502)
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    // Asserting the CONTAINED path exists is what proves the resolver never
+    // reached for the home directory — the real `~/.copilot/hooks` file
+    // legitimately exists on a developer's box (the app writes it), so its
+    // mere presence would prove nothing either way.
+    let contained = dir.path().join("copilot-home").join("hooks").join("loomux-compact.json");
+    assert!(
+        contained.is_file(),
+        "a copilot spawn's hook config must land inside this registry's own root: {contained:?}",
+    );
+}
+
+#[test]
+fn a_throwaway_registry_never_writes_the_users_real_copilot_trusted_folders() {
+    // rev-38 review (B1): the THIRD uncontained home write, and the worst of
+    // the three. `pre_trust_copilot_folder` appends the spawn's workspace
+    // path to `trustedFolders` in the user's real `~/.copilot/config.json`.
+    //
+    // Two things make it worse than the agent files it shipped alongside:
+    // `trustedFolders` is a SECURITY setting (it suppresses Copilot's
+    // folder-trust prompt), and the entries are per-workspace PATHS — so a
+    // suite spawning into fresh temp dirs appends a NEW entry every run and
+    // grows without bound. The real config on the machine this was found on
+    // had already collected 36 such entries.
+    //
+    // It was missed by the first audit because it was a free function with no
+    // registry to ask, which is why the containment rule now lives in one
+    // predicate every home-resolving path consults.
+    let dir = tempfile::tempdir().unwrap();
+    let reg = OrchRegistry::new(dir.path().to_path_buf()); // containment-pin (#502)
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/copilot-repo", copilot_rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    // Asserting the CONTAINED file exists is what proves the resolver never
+    // reached for the home directory — the real `~/.copilot/config.json`
+    // legitimately exists on a developer's box, so its presence proves
+    // nothing either way.
+    let contained = dir.path().join("copilot-home").join("config.json");
+    assert!(
+        contained.is_file(),
+        "a copilot spawn's folder-trust write must land inside this registry's own root: {contained:?}",
+    );
+    let text = fs::read_to_string(&contained).unwrap();
+    assert!(
+        text.contains("trustedFolders") && text.contains("C:/tmp/copilot-repo"),
+        "and it must be the real pre-trust write, not an empty file: {text}",
+    );
 }
 
 #[test]

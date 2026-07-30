@@ -203,7 +203,8 @@ src-tauri/src/
     defense against compaction diluting it; `end_group` reclaims a group's own generated files when
     it ends cleanly, and a one-shot startup sweep (`sweep_orphaned_agent_files`, #464) reclaims any
     left behind by a group that never reaches `end_group` at all (a crash, or — the case that
-    actually filled a real `~/.claude/agents` with 1,111 stray files — a test run); both Claude's `PreCompact`/`SessionStart` hooks AND Copilot's own
+    actually filled a real `~/.claude/agents` with 1,111 stray files — a test run, whose ability to
+    write there at all is itself fixed at the source in #502); both Claude's `PreCompact`/`SessionStart` hooks AND Copilot's own
     `preCompact` hook are TRUSTED evidence sources for detecting a compaction (no banner/
     token-drop guessing needed once configured) — Claude additionally gets a native
     `SessionStart(compact)` re-grounding signal Copilot's docs confirm has no equivalent, so a
