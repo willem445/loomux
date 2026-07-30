@@ -59,7 +59,7 @@ import {
   type OrchestratorConfig,
   type AttentionItem,
 } from "./orchestration";
-import { tabAttention, sameAttention, findPaneByPty } from "./tabroute";
+import { tabAttention, sameAttention, findPaneByPty, orchestratorLaunchTarget } from "./tabroute";
 import {
   encodeTabs,
   decodeTabs,
@@ -1207,6 +1207,47 @@ async function handleWelcomeSubmit(
   }
 
   if (result.kind === "orchestrator") {
+    // #478: decided from `paneCount` read synchronously HERE, before the
+    // `create_orchestration` await below — deliberate, not an oversight (the
+    // pre-#478 code re-read live state AFTER its own await instead). The
+    // cost: if the human splits THIS tab again while the launch is in
+    // flight, `paneCount` is already stale and the own-tab arm's
+    // `tabs.closeTab(ws.id)` would destroy that just-made second split
+    // instead of leaving it — a millisecond-scale, human-initiated race,
+    // called out in review and left as-is (not asked to be fixed here).
+    if (orchestratorLaunchTarget(ws.grid.paneCount) === "split") {
+      // This setup pane arrived via a genuine split into an
+      // already-populated tab — honour that spatial gesture and convert it
+      // in place (openAgentPane → existingPane.startFromWelcome), instead of
+      // falling into launchOrchestratorTab below, which always mints its own
+      // dedicated project tab and would silently relocate the result. Not
+      // renamed to the launched repo's project name and not (re)bound away
+      // from whatever this tab already represents — a split target's tab may
+      // hold panes for an entirely different project, so only the new
+      // orchestrator group is bound to it, same precedent `restoreSession`
+      // already establishes for binding a group into a tab that wasn't
+      // minted for it (`owning ?? tabs.activeWorkspace` fallback, below) —
+      // NOT `orchWiring.targetForGroup`, which mints a fresh tab per unseen
+      // group and never shares one.
+      try {
+        const { groupId } = await launchOrchestrator(ws.grid, eventsFor(ws), result.config, pane);
+        tabs.bindGroup(groupId, ws.id);
+        // The in-place conversion (existingPane.startFromWelcome) fired no
+        // grid open/close, so nothing else would notify — same "notify
+        // explicitly" requirement startFromWelcome's other callers document
+        // (terminal/content/agent above): re-renders the tab strip's live
+        // agent counter and re-persists the layout (persistTabs is a
+        // tabs.onChange listener, main.ts boot wiring).
+        onGridChanged();
+      } catch (err) {
+        // Same "don't strand a disabled form" contract as the own-tab catch
+        // below — but there is no stray tab to tear down here since nothing
+        // but this tab's own setup pane was ever touched.
+        showToast(`Couldn't start orchestrator: ${String(err)}`, "error");
+        form.reopenAfterLaunchFailure(String(err));
+      }
+      return;
+    }
     try {
       await launchOrchestratorTab(result.config);
     } catch (err) {
@@ -1220,12 +1261,13 @@ async function handleWelcomeSubmit(
       form.reopenAfterLaunchFailure(String(err));
       return;
     }
-    // The setup pane has served its purpose. A split slot just closes; a
-    // dedicated welcome tab (fresh start / Ctrl+T) closes entirely so we don't
-    // strand a blank tab beside the new orchestrator tab. (The sole-pane /
-    // sole-tab case can't happen here — launchOrchestratorTab just added a tab.)
-    if (ws.grid.paneCount > 1) ws.grid.closePane(pane);
-    else if (tabs.count > 1) tabs.closeTab(ws.id);
+    // The setup pane has served its purpose, and (orchestratorLaunchTarget
+    // above having taken the "split" branch when it wasn't) it was this tab's
+    // ONLY pane — a dedicated welcome tab (fresh start / Ctrl+T) closes
+    // entirely so we don't strand a blank tab beside the new orchestrator
+    // tab. (The sole-pane / sole-tab case can't happen here —
+    // launchOrchestratorTab just added a tab, so tabs.count is at least 2.)
+    if (tabs.count > 1) tabs.closeTab(ws.id);
     return;
   }
 
