@@ -5739,12 +5739,17 @@ const COPILOT_AGENT_BODY_DOCUMENTED_CAP_CHARS: usize = 30_000;
 const COPILOT_AGENT_BODY_SAFE_CHARS: usize = 27_000;
 
 /// #502: the ONE place the generated custom-agent file's naming lives —
-/// every writer (`write_claude_agent_file`, `write_copilot_agent_file`) AND
-/// every reclaimer (`end_group`, the startup orphan sweep) goes through
-/// these, so the delete path can never drift from the write path's names.
-/// Drift here is not cosmetic: a delete path that re-derives the shape
-/// independently either misses files (they accumulate — #502's incident) or
-/// matches too widely (it deletes something loomux never wrote).
+/// both writers (`write_claude_agent_file`, `write_copilot_agent_file`) and
+/// `end_group`'s reclaim (`reclaim_group_agent_files`) go through these, so
+/// that delete path can never drift from the write path's names. Drift here
+/// is not cosmetic: a delete path that re-derives the shape independently
+/// either misses files (they accumulate — #502's incident) or matches too
+/// widely (it deletes something loomux never wrote).
+///
+/// #464's `sweep_orphaned_agent_files` matches the same shape with its own
+/// literals rather than these constants. Left as it shipped deliberately:
+/// unifying it would be a behavior change to a reviewed, merged sweep for a
+/// cosmetic gain, and its rule is pinned by its own tests.
 ///
 /// The shape is `loomux-<group>-<block>` plus a per-CLI extension, because
 /// a handle must be unique per group+block so concurrent groups never
@@ -5796,10 +5801,9 @@ fn clamp_agent_description(s: &str) -> String {
 /// registry — loomux's own source of truth — and resolved toward the more
 /// specific claim.
 ///
-/// Both callers get their conservative direction from this: `end_group`
-/// deletes only what THIS group owns, and the orphan sweep deletes only
-/// what NO group owns. A stem that a live group claims is never deleted by
-/// either.
+/// Its one caller, `end_group`'s `reclaim_group_agent_files`, takes its
+/// conservative direction from this: it deletes only what THIS group owns,
+/// so a stem a more specific live group claims is never touched.
 fn owning_group<'a>(stem: &str, groups: &'a [String]) -> Option<&'a str> {
     groups
         .iter()
@@ -6690,27 +6694,19 @@ pub fn set_copilot_trust_home_for_test(home: Option<PathBuf>) {
     COPILOT_TRUST_HOME_OVERRIDE.with(|c| *c.borrow_mut() = home);
 }
 
-/// Pre-trust an agent's workspace in copilot's config so its pane doesn't
-/// boot into a folder-trust dialog — which eats the kickoff paste and gets
-/// blind-answered by the submit retries. Best-effort: on any failure the
-/// dialog simply appears as before.
-#[doc(hidden)] // pub for integration tests (#475: the trust-granting write needs to be testable)
-pub fn pre_trust_copilot_folder(folder: &str) {
-    let home = COPILOT_TRUST_HOME_OVERRIDE
-        .with(|c| c.borrow().clone())
-        .or_else(|| std::env::var("COPILOT_HOME").map(PathBuf::from).ok())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".copilot")))
-        .unwrap_or_default();
-    if home.as_os_str().is_empty() {
-        return;
-    }
-    pre_trust_copilot_folder_in(&home, folder);
-}
-
-/// The shared body of the two `pre_trust_copilot_folder` entry points —
-/// split from home RESOLUTION (#502) so that where the config lives is
-/// decided in exactly one place per caller kind, and this stays a pure
-/// "append a trusted folder to the config at `home`" step.
+/// The write half of the trust grant, split from home RESOLUTION (#502) so
+/// there is exactly one place that decides WHERE the config lives:
+/// [`OrchRegistry::pre_trust_copilot_folder`], the sole entry point.
+///
+/// rev-38 round 3: this used to have a `pub` free sibling that resolved the
+/// home directory itself, leaving "production must call the contained one"
+/// to call-site discipline. Convention is not a mechanism — the sibling is
+/// gone, and the containment rule is now unavoidable rather than merely
+/// documented. `#475`'s tests drive the registry method, whose thread-local
+/// seam still gives them the exact resolution they fixture.
+///
+/// Module-private on purpose: nothing outside this module should be able to
+/// name a "write the trust grant HERE" primitive.
 fn pre_trust_copilot_folder_in(home: &Path, folder: &str) {
     let path = home.join("config.json");
     let text = fs::read_to_string(&path).unwrap_or_default();
@@ -9982,11 +9978,16 @@ impl OrchRegistry {
     /// blind-answered by the submit retries. Best-effort: on any failure the
     /// dialog simply appears as before.
     ///
-    /// **This is the production entry point** — the bare
-    /// [`pre_trust_copilot_folder`] free function beside it resolves the home
-    /// directory itself and exists for #475's direct tests. Spawn paths must
-    /// call THIS one, so the write is contained for a registry that is not
-    /// the user's live one.
+    /// Pre-trust an agent's workspace in copilot's config so its pane doesn't
+    /// boot into a folder-trust dialog — which eats the kickoff paste and gets
+    /// blind-answered by the submit retries. Best-effort: on any failure the
+    /// dialog simply appears as before.
+    ///
+    /// **The only entry point** (rev-38 round 3). It briefly had a `pub` free
+    /// sibling that did its own home resolution, which left containment
+    /// depending on every caller picking this one — the same
+    /// convention-instead-of-mechanism shape that let the leak below happen
+    /// in the first place. There is now nothing else to call.
     ///
     /// #502 (rev-38 review, B1): the free function was the third uncontained
     /// write into the user's home, and the worst of them on two counts the
@@ -10001,7 +10002,8 @@ impl OrchRegistry {
     /// beats a structural default. Everything else — including the 50+ tests
     /// that build a registry without fixturing anything — lands inside the
     /// registry's own root via `copilot_home_dir`.
-    fn pre_trust_copilot_folder(&self, folder: &str) {
+    #[doc(hidden)] // pub for integration tests (#475's seam drives this path)
+    pub fn pre_trust_copilot_folder(&self, folder: &str) {
         if let Some(home) = COPILOT_TRUST_HOME_OVERRIDE.with(|c| c.borrow().clone()) {
             pre_trust_copilot_folder_in(&home, folder);
             return;
@@ -17393,15 +17395,16 @@ impl OrchRegistry {
         // out from under loomux) while its file is not. The old shape left
         // both behind. The scan asks the ownership question directly —
         // "which live group does this file belong to?" (`owning_group`) —
-        // and deletes only what answers with THIS group, only for files
-        // carrying loomux's own marker. Best-effort and per CLI: a
-        // Claude-only group's Copilot pass, and vice versa, are harmless
-        // no-ops against a directory that never held this group's handles.
+        // and deletes only what answers with THIS group. Best-effort and per
+        // CLI: a Claude-only group's Copilot pass, and vice versa, are
+        // harmless no-ops against a directory that never held this group's
+        // handles.
         //
-        // The `end_group` path is still only half of #502's fix: a group
-        // that never gets here at all (a crash, a kill) leaves orphans, and
-        // those are the startup sweep's job — see
-        // `sweep_orphaned_agent_files`.
+        // This is the orderly-teardown half only. A group that never gets
+        // here at all (a crash, a kill) leaves its files behind, and
+        // reclaiming those is #464's `sweep_orphaned_agent_files` at
+        // startup — a separate, already-shipped mechanism this deliberately
+        // does not duplicate.
         let reclaimed = self.reclaim_group_agent_files(group);
         if !reclaimed.is_empty() {
             self.audit(group, "loomux", "generated-agent-files-reclaimed", json!({ "files": reclaimed }));

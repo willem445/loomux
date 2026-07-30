@@ -13,7 +13,7 @@ use loomux_lib::orchestration::queue;
 use loomux_lib::orchestration::workflow;
 use loomux_lib::orchestration::{
     add_trusted_folder, autonomy_budget_exhausted, bracketed_paste, box_occupancy_delta,
-    pre_trust_copilot_folder, set_copilot_trust_home_for_test,
+    set_copilot_trust_home_for_test,
     channel_connected_event, channel_disconnected_event, channel_message_text,
     channel_updated_event, classify_human_input,
     claude_effective_permission_mode, claude_permission_mode, cli_ready, compact_checklist_warning, compact_escalation_notice,
@@ -3510,6 +3510,13 @@ fn copilot_trust_config_edit_preserves_content_and_dedupes() {
 // above — it resolves a home directory, reads that home's real config.json, and
 // (best-effort) writes it back. That resolve-read-write path had no test seam at
 // all, so nothing ever exercised it; the tests below are what a seam is for.
+//
+// #502 round 3 folded the free entry point into `OrchRegistry::pre_trust_
+// copilot_folder`, now the only one, so containment cannot be bypassed by
+// calling the wrong one. These drive the method instead — semantics are
+// unchanged for them: the thread-local seam is still consulted FIRST, so a
+// fixtured home wins exactly as before, and which registry they go through
+// is irrelevant to the path under test.
 
 #[test]
 fn pre_trust_copilot_folder_writes_fixture_and_leaves_real_home_untouched() {
@@ -3528,7 +3535,8 @@ fn pre_trust_copilot_folder_writes_fixture_and_leaves_real_home_untouched() {
     .unwrap();
     set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
 
-    pre_trust_copilot_folder(r"C:\Projects\some-agent-workspace");
+    let (reg, _dir) = test_registry();
+    reg.pre_trust_copilot_folder(r"C:\Projects\some-agent-workspace");
 
     set_copilot_trust_home_for_test(None);
 
@@ -3548,7 +3556,8 @@ fn pre_trust_copilot_folder_creates_config_when_home_is_missing() {
     let home = fixture.path().join("not-yet-created");
     set_copilot_trust_home_for_test(Some(home.clone()));
 
-    pre_trust_copilot_folder(r"C:\Projects\fresh-workspace");
+    let (reg, _dir) = test_registry();
+    reg.pre_trust_copilot_folder(r"C:\Projects\fresh-workspace");
 
     set_copilot_trust_home_for_test(None);
 
@@ -3564,7 +3573,8 @@ fn pre_trust_copilot_folder_never_clobbers_an_unparseable_config() {
     fs::write(fixture.path().join("config.json"), "// c\n{ not json").unwrap();
     set_copilot_trust_home_for_test(Some(fixture.path().to_path_buf()));
 
-    pre_trust_copilot_folder(r"C:\Projects\x");
+    let (reg, _dir) = test_registry();
+    reg.pre_trust_copilot_folder(r"C:\Projects\x");
 
     set_copilot_trust_home_for_test(None);
 
@@ -14957,10 +14967,13 @@ fn end_group_reclaims_generated_claude_agent_files() {
 // own aggregate agent-description token cap and degrade every session that
 // loaded the roster.
 //
-// These tests never hardcode the private ownership marker: they COPY a file
-// loomux genuinely generated (via a real spawn) to whatever synthetic name
-// the case needs. That keeps them honest about what "loomux wrote this" means
-// and immune to the marker's exact wording.
+// The cause was that loomux's own test suite could write into the real
+// `~/.claude/agents` at all; #464's startup sweep reclaims what was already
+// written, and these cover the write side plus `end_group`'s own reclaim.
+//
+// Where a case needs a file "loomux wrote", it COPIES one a real spawn
+// genuinely generated rather than hand-authoring the bytes — cheap, and it
+// keeps the fixture honest if the generated shape ever changes.
 
 /// The Claude-side generated file a default-roster spawn just wrote.
 fn generated_claude_agent_file(dir: &tempfile::TempDir, group: &str, block: &str) -> std::path::PathBuf {
