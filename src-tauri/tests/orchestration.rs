@@ -6302,7 +6302,7 @@ fn idle_tick_input_defer_bound_defaults_floors_caps_and_persists() {
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["guardrails"]["idle_tick_input_defer_max_minutes"].as_u64().unwrap(), 45,
         "the field is written to group.json, not silently dropped");
-    let reg2 = OrchRegistry::new(dir.path().to_path_buf());
+    let reg2 = relaunch_registry(dir.path());
     reg2.set_port(45999);
     let (_, persisted) = reg2.load_group_file(&g.id).unwrap();
     assert_eq!(persisted.idle_tick_input_defer_max_minutes, 45, "round-trips through group.json on a fresh load");
@@ -6324,7 +6324,7 @@ fn idle_tick_input_defer_bound_floor_survives_launcher_relaunch() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
-        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        let reg = relaunch_registry(dir.path());
         reg.set_port(45999);
         // idle_tick_minutes above the 15m default; the bound left UNSET (0) at
         // the call site.
@@ -6351,7 +6351,7 @@ fn idle_tick_input_defer_bound_floor_survives_launcher_relaunch() {
     // with the launcher's bare defaults (`rails()`, no field for this at all):
     // the persisted `idle_tick_minutes` must resolve the SAME unset-bound
     // floor a fresh launch would give it.
-    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     assert_eq!(g.id, gid, "restart resumes the same group");
