@@ -63,7 +63,7 @@ const BLOCK_TPL: &str = include_str!("templates/block.md");
 
 /// Read-only containment note handed to a planner at spawn time as its kickoff
 /// "branch note". The worktree denial (spawn cwd logic) and the CLI-level
-/// write/commit denials (`build_agent_command`, `read_only`) enforce most of
+/// write/commit denials (`build_agent_command`, [`Containment::ReadOnly`]) enforce most of
 /// this structurally; the note communicates the whole contract to the agent.
 /// Exposed (doc-hidden) so tests can pin the exact text.
 #[doc(hidden)]
@@ -1582,9 +1582,11 @@ const COPILOT_SESSION_TIMEOUT: Duration = Duration::from_secs(90);
 /// values.
 ///
 /// What each class *is* varies, and the enum should not be read as promising more
-/// than it enforces: a planner is structurally read-only ([`Role::is_read_only`] —
-/// real CLI-level denials), while a reviewer's "never pushes" is instruction-
-/// backed, as it was before #222. The guarantee is over which posture a block
+/// than it enforces — read [`Role::containment`] for the exact per-class tier. A
+/// planner is structurally read-only ([`Role::is_read_only`] — editing tools AND
+/// `git commit`/`git push` denied at the CLI). A reviewer (#462) is structurally
+/// denied the CLI's *file-editing tools*, but keeps the shell, so its "never
+/// pushes" stays instruction-backed. The guarantee is over which posture a block
 /// gets, not that every posture is a sandbox.
 ///
 /// The name `Role` survives because ~72 call sites and the persisted wire
@@ -1666,12 +1668,120 @@ impl Role {
             Role::Solo => "solo",
         }
     }
+    /// The **deny tier** this class launches its CLI under — the single place
+    /// that decides what `build_agent_command`/`build_agent_argv` clamp (#462).
+    ///
+    /// This is a `match` on the closed enum on purpose: a fifth capability class
+    /// cannot be added without deciding, at compile time, what it may do. That is
+    /// the same property that makes `Role` the security spine of #222 — a
+    /// containment tier is never *defaulted into*, and a workflow file selects a
+    /// class, never a tier.
+    pub fn containment(self) -> Containment {
+        match self {
+            // Both exist to change the repo: an orchestrator drives git/gh and a
+            // worker writes the code. Denying either anything here would only
+            // break the flow the group is for.
+            Role::Orchestrator | Role::Worker => Containment::None,
+            // #462. A reviewer reads a diff and judges it — it never has a
+            // legitimate reason to reach for an editing tool, so that reach is
+            // structurally removed rather than merely discouraged. Its shell
+            // stays whole: running the tests and `gh pr checkout <n> --detach`
+            // ARE the job (see `Containment::NoEdits` for what that costs).
+            Role::Reviewer => Containment::NoEdits,
+            Role::Planner => Containment::ReadOnly,
+            // Solo panes never traverse `spawn_agent_ex`/`build_agent_command`
+            // (see the variant's doc) — an arbitrary human-launched CLI loomux
+            // only lends a channel identity to, so there is no spawn of ours to
+            // clamp. Unreachable rather than a policy statement.
+            Role::Solo => Containment::None,
+        }
+    }
     /// The capability that used to be spelled `role == Role::Planner` inline at
     /// the spawn site. Now it is a *property of the class*, which is what makes
     /// "a workflow file can never grant a capability" checkable: there is no
     /// other way to become read-only, and no way to stop being it.
+    ///
+    /// Narrower than "gets deny flags" since #462 — a reviewer gets deny flags
+    /// too, but is NOT read-only (it keeps the shell, hence `git commit`). The
+    /// callers that ask this question — the `allow:` ban in `parse_workflow` /
+    /// `persona_inject` — mean the *fully* read-only class specifically, so they
+    /// must not silently start matching reviewers; deriving it from
+    /// [`Self::containment`] keeps the two definitions from drifting apart.
     pub fn is_read_only(self) -> bool {
-        matches!(self, Role::Planner)
+        self.containment().is_read_only()
+    }
+}
+
+/// How hard loomux clamps an agent's CLI at spawn — the **deny tier**, selected
+/// per capability class by [`Role::containment`] and consumed by
+/// [`OrchRegistry::build_agent_command`] / [`OrchRegistry::build_agent_argv`].
+///
+/// An ordered ladder, not a bag of independent switches: each tier is the one
+/// below it plus more. Spelling it as an enum rather than a pair of bools is
+/// what makes "which agents may edit files" answerable by reading one `match`
+/// (`Role::containment`) instead of auditing every call site — and what makes a
+/// new class a compile error instead of a default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Containment {
+    /// No CLI-level denial at all: the agent holds whatever its permission mode
+    /// gives it (orchestrator, worker).
+    None,
+    /// **The CLI's file-editing tools are denied; the shell is not** (#462,
+    /// today: a reviewer). On Claude that is `--disallowedTools Edit Write
+    /// NotebookEdit`; on Copilot the `write` category. Deny beats allow on both
+    /// CLIs, so no persona `allow:` and no permission mode re-grants them.
+    ///
+    /// Be exact about the size of this guarantee, because it is smaller than
+    /// "cannot write": it removes the *frictionless, default* path to editing a
+    /// file — the one an agent takes without deciding to — and leaves the shell
+    /// path (`sed -i`, a heredoc, `python -c`) reachable, because denying that
+    /// would mean denying `Bash`, and `Bash` is how a reviewer runs the tests.
+    /// So this is containment of the accident, not of the adversary; the
+    /// no-push half of a reviewer's contract stays instruction-backed and
+    /// bounded by its own worktree (#359), exactly as before.
+    NoEdits,
+    /// `NoEdits` **plus** the git-mutation subcommands (`commit`/`push`), and
+    /// always unattended regardless of the group's `auto_ops` (today: a
+    /// planner). `gh` deliberately stays reachable — the planner's deliverable
+    /// is a `gh issue comment` — so even this tier is not a full sandbox.
+    ReadOnly,
+}
+
+impl Containment {
+    /// Deny the CLI's file-editing tools ([`CLAUDE_EDIT_DENY_TOOLS`] /
+    /// [`COPILOT_EDIT_DENY_TOOLS`]).
+    pub fn denies_edits(self) -> bool {
+        !matches!(self, Containment::None)
+    }
+    /// Deny `git commit` / `git push` through the CLI's shell tool
+    /// ([`CLAUDE_READONLY_DENY_GIT`] / [`COPILOT_READONLY_DENY_GIT`]).
+    pub fn denies_git_mutation(self) -> bool {
+        matches!(self, Containment::ReadOnly)
+    }
+    /// Run unattended (Auto perms + the git/gh pre-approval) even in a group
+    /// that is not `auto_ops`. True only for [`Containment::ReadOnly`]: a
+    /// planner has no human in its pane and nothing it can mutate, so gating it
+    /// only deadlocks it. A reviewer is NOT promoted this way — it follows the
+    /// group's `auto_ops` exactly as it did before #462, so extending the deny
+    /// flags to reviewers never *widens* what a reviewer may do.
+    pub fn forces_unattended(self) -> bool {
+        matches!(self, Containment::ReadOnly)
+    }
+    /// The **fully** read-only tier — the only one
+    /// [`claude_effective_permission_mode`] may be handed `true` for (#465).
+    /// That function's own doc states the rule this predicate exists to keep
+    /// honest: never for a non-read-only agent, because `dontAsk` auto-denies
+    /// every tool call outside `--allowedTools`, and a reviewer's shell is
+    /// exactly that. Same question [`Role::is_read_only`] answers, one rung
+    /// down, so the two cannot drift.
+    ///
+    /// Three `ReadOnly`-only predicates is not redundancy: this,
+    /// [`Self::denies_git_mutation`] and [`Self::forces_unattended`] name three
+    /// *different* facts that happen to coincide at the top rung today. Each
+    /// call site asks the one it actually means, so a future tier that split
+    /// them apart would land correctly instead of silently.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Containment::ReadOnly)
     }
 }
 
@@ -2432,8 +2542,8 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 /// machine-readable tool list at runtime loomux could query instead (the CLI's
 /// `--help` output, which [`crate::cliprobe`] already parses for model ids,
 /// lists flags, not tool names). So what this constant catches, via
-/// `claude_readonly_deny_tools_are_known_claude_tools`, is a **typo or a stale
-/// name accidentally left in [`CLAUDE_READONLY_DENY_TOOLS`]** — exactly the
+/// `claude_edit_deny_tools_are_known_claude_tools`, is a **typo or a stale
+/// name accidentally left in [`CLAUDE_EDIT_DENY_TOOLS`]** — exactly the
 /// #448 failure mode, where `MultiEdit` (folded into `Edit` upstream, no
 /// longer a real tool) sat in the deny list matching nothing, until a human
 /// read the CLI's own startup warning ("Permission deny rule \"MultiEdit\"
@@ -2455,14 +2565,26 @@ pub const KNOWN_CLAUDE_TOOLS: &[&str] = &[
     "ToolSearch", "WaitForMcpServers", "WebFetch", "WebSearch", "Workflow", "Write",
 ];
 
-/// The file-editing tool names a **read-only** Claude agent (today: a
-/// planner — see [`Role::is_read_only`]) denies via `--disallowedTools`. The
-/// single source of truth for both [`OrchRegistry::build_agent_command`] and
+/// The file-editing tool names a Claude agent denies via `--disallowedTools`
+/// once its class is contained at all — [`Containment::denies_edits`], i.e. a
+/// planner *or* a reviewer (#462).
+///
+/// **One list, deliberately, not a `PLANNER_*` and a `REVIEWER_*` pair.** The
+/// two classes want the identical answer to "which tools edit files", and that
+/// answer is a fact about Claude Code's tool registry, not about a role: two
+/// copies would be two things to re-verify against [`KNOWN_CLAUDE_TOOLS`] on
+/// every upstream rename, and the failure mode of missing one is silent
+/// (a deny rule that matches nothing reads exactly like containment — the #448
+/// failure this pin exists to end). Where the classes genuinely differ — the
+/// git-mutation denials — they use different lists ([`CLAUDE_READONLY_DENY_GIT`]
+/// is `ReadOnly`-only), which is the honest way to spell a real difference.
+///
+/// The single source of truth for both [`OrchRegistry::build_agent_command`] and
 /// [`OrchRegistry::build_agent_argv`], so the two spellings can't
 /// independently drift (on top of the existing
 /// `build_agent_argv_matches_command_line` consistency test). Every entry
 /// here is a bare tool name, pinned against [`KNOWN_CLAUDE_TOOLS`] by
-/// `claude_readonly_deny_tools_are_known_claude_tools` — see that constant's
+/// `claude_edit_deny_tools_are_known_claude_tools` — see that constant's
 /// doc for exactly what the pin does and doesn't guarantee.
 ///
 /// `MultiEdit` was dropped from here in #448: Claude Code folded it into
@@ -2471,9 +2593,12 @@ pub const KNOWN_CLAUDE_TOOLS: &[&str] = &[
 /// planner's first line of output. It was harmless — denying a nonexistent
 /// tool is a no-op, and `Edit`/`Write`/`NotebookEdit` still carry the
 /// guarantee — but it was a leftover, not a decision; now it's neither.
-pub const CLAUDE_READONLY_DENY_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
+pub const CLAUDE_EDIT_DENY_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
-/// The git-mutation subcommands a read-only Claude agent denies, scoped to
+/// The git-mutation subcommands a [`Containment::ReadOnly`] Claude agent
+/// denies — a planner only, NOT a reviewer (#462): a reviewer's whole job runs
+/// through the shell, and `Bash(git commit *)` is exactly the escape hatch its
+/// own template hands it in place of the forbidden `git stash` (#299). Scoped to
 /// the `Bash` tool (not bare tool names, so they aren't checked against
 /// [`KNOWN_CLAUDE_TOOLS`] the same way — and per the Tools reference, "Tool
 /// names containing `_` or `*` are exempt from" Claude's own startup-warning
@@ -2492,7 +2617,7 @@ pub const CLAUDE_READONLY_DENY_GIT: &[&str] = &["Bash(git commit *)", "Bash(git 
 /// allow or deny" followed by an exactly-three-item list — `shell(COMMAND)`,
 /// the bare category `write` ("tools—other than shell commands—permission to
 /// modify files"), and `MCP_SERVER_NAME(tool)`. This is used only by
-/// `copilot_readonly_deny_tools_are_known_copilot_categories`; Copilot's docs
+/// `copilot_edit_deny_tools_are_known_copilot_categories`; Copilot's docs
 /// (unlike Claude's) don't say whether an unmatched `--deny-tool` value
 /// warns, errors, or is silently ignored, and CLAUDE.md forbids spawning a
 /// real `copilot` session to find out (a `--help` probe, the kind
@@ -2504,9 +2629,11 @@ pub const CLAUDE_READONLY_DENY_GIT: &[&str] = &["Bash(git commit *)", "Bash(git 
 #[doc(hidden)] // pub for integration tests
 pub const KNOWN_COPILOT_DENY_CATEGORIES: &[&str] = &["write"];
 
-/// The tool names a **read-only** Copilot agent denies via `--deny-tool` —
-/// see [`KNOWN_COPILOT_DENY_CATEGORIES`] for the source. Bare `write` is the
-/// only bare-category value the docs document at all.
+/// The tool names a Copilot agent denies via `--deny-tool` once its class is
+/// contained at all ([`Containment::denies_edits`] — a planner or, since #462, a
+/// reviewer); the Copilot sibling of [`CLAUDE_EDIT_DENY_TOOLS`], and one list
+/// for the same reason. See [`KNOWN_COPILOT_DENY_CATEGORIES`] for the source.
+/// Bare `write` is the only bare-category value the docs document at all.
 ///
 /// `edit` was dropped from here in #448: it is not one of the three
 /// documented `--deny-tool` value shapes (the enumeration above reads as
@@ -2523,10 +2650,12 @@ pub const KNOWN_COPILOT_DENY_CATEGORIES: &[&str] = &["write"];
 /// honestly-scoped one. This is a docs-only conclusion (no live copilot run
 /// backs it); if that leaves the question open enough to want a live check,
 /// that check is the human's to make, not an agent's (CLAUDE.md constraint 3).
-pub const COPILOT_READONLY_DENY_TOOLS: &[&str] = &["write"];
+pub const COPILOT_EDIT_DENY_TOOLS: &[&str] = &["write"];
 
-/// The git-mutation shell commands a read-only Copilot agent denies, per the
-/// `shell(COMMAND)` spec documented alongside [`COPILOT_READONLY_DENY_TOOLS`].
+/// The git-mutation shell commands a [`Containment::ReadOnly`] Copilot agent
+/// denies (a planner only — see [`CLAUDE_READONLY_DENY_GIT`] for why a reviewer
+/// keeps these), per the `shell(COMMAND)` spec documented alongside
+/// [`COPILOT_EDIT_DENY_TOOLS`].
 pub const COPILOT_READONLY_DENY_GIT: &[&str] = &["shell(git commit)", "shell(git push)"];
 
 /// The generic Claude PreCompact / SessionStart(compact) hook body (#417),
@@ -2763,7 +2892,7 @@ pub fn claude_permission_mode(unattended: bool) -> &'static str {
 }
 
 /// #465: a read-only agent (today: a planner) needs more than
-/// `CLAUDE_READONLY_DENY_TOOLS` denying its KNOWN editing tools by name —
+/// `CLAUDE_EDIT_DENY_TOOLS` denying its KNOWN editing tools by name —
 /// that list is fail-open to any editing tool Claude Code adds *after* it
 /// was last written (nothing mismatches, nothing warns, the tool just
 /// works). `--permission-mode dontAsk` closes that direction instead of
@@ -2785,20 +2914,35 @@ pub fn claude_permission_mode(unattended: bool) -> &'static str {
 /// why Copilot's side of this issue is documented open rather than closed
 /// the same way.
 ///
-/// `--disallowedTools` (`CLAUDE_READONLY_DENY_TOOLS`/`_GIT`) stays emitted
+/// `--disallowedTools` (`CLAUDE_EDIT_DENY_TOOLS`/`CLAUDE_READONLY_DENY_GIT`) stays emitted
 /// alongside this, unchanged: a bare deny rule "removes the tool from
 /// Claude's context entirely" (stronger than merely unapproved — Claude
-/// never sees it as a choice at all) and `claude_readonly_deny_tools_are_known_claude_tools`
+/// never sees it as a choice at all) and `claude_edit_deny_tools_are_known_claude_tools`
 /// still catches a stale/mistyped entry. The two layers are independent
 /// defences for the two different directions (named-and-wrong vs.
 /// unnamed-and-new); dropping either narrows the guarantee.
 ///
-/// **Never call this for a non-read-only agent.** `dontAsk` denies file
-/// edits that aren't in `--allowedTools` — exactly what a worker or reviewer
-/// exists to make. This is why the branch below is `if read_only`, not
-/// folded into `claude_permission_mode` itself: that function is also used
-/// by `single_pane_autopilot_flags` for a *non-read-only* solo pane, which
-/// must keep `auto`.
+/// **Never call this for a non-read-only agent.** `dontAsk` auto-denies every
+/// tool call outside `--allowedTools` — for a worker, the file edits it exists
+/// to make; for a reviewer, the *shell* it exists to work through (running the
+/// tests, `gh pr checkout --detach`, posting the review). That second case is
+/// worth stating separately since #462, because a reviewer now carries deny
+/// flags too and could otherwise look like a candidate for this mode: it is
+/// not, and [`Containment::is_read_only`] — not `denies_edits()` — is the
+/// predicate its callers pass. This is also why the branch below is `if
+/// read_only`, not folded into `claude_permission_mode` itself: that function
+/// is also used by `single_pane_autopilot_flags` for a *non-read-only* solo
+/// pane, which must keep `auto`.
+///
+/// **The fail-open direction this closes stays open one rung down (#462).** The
+/// argument above — a literal deny list cannot name an editing tool Claude Code
+/// ships tomorrow — applies word for word to a reviewer's
+/// [`Containment::NoEdits`]. The *remedy* does not transfer: `dontAsk` is
+/// precisely the thing a reviewer cannot have. So a reviewer's editing-tool
+/// denial is fail-open to a future tool by construction, and closing it would
+/// need a mechanism that separates "new editing tool" from "shell command",
+/// which neither CLI offers today. Recorded, not fixed — see
+/// `doc/design/orchestration.md`'s reviewer-containment section.
 pub fn claude_effective_permission_mode(unattended: bool, read_only: bool) -> &'static str {
     if read_only {
         "dontAsk"
@@ -18873,21 +19017,24 @@ impl OrchRegistry {
     /// file never prompts) and the loomux MCP tools are pre-approved (so
     /// `report` etc. never prompt). `auto_ops` additionally pre-approves
     /// git/gh commands so the branch→commit→PR flow runs unattended;
-    /// everything else still asks the human. A `read_only` planner is
-    /// *always* treated as unattended (Auto perms + git/gh allowlist)
+    /// everything else still asks the human. A [`Containment::ReadOnly`] planner
+    /// is *always* treated as unattended (Auto perms + git/gh allowlist)
     /// regardless of `auto_ops`: it never mutates and has no human in its
     /// pane, so gating it would only deadlock it (see below).
     ///
-    /// `read_only` hardens the planner contract at the CLI level (#47): where
-    /// the CLI supports tool denial, the file-editing tools and the git
-    /// mutation subcommands (`commit`/`push`) are denied outright, so a planner
+    /// `containment` hardens a class's contract at the CLI level (#47, #462):
+    /// where the CLI supports tool denial, the file-editing tools are denied
+    /// outright for every contained class, and a `ReadOnly` one additionally
+    /// loses the git mutation subcommands (`commit`/`push`) — so a planner
     /// cannot write code or create branches/commits/pushes even under Auto
-    /// perms — while `gh` stays available so it can still post its plan as an
-    /// issue comment. Deny rules take precedence over the allow list on both
-    /// CLIs. NOTE: this is a real, structural denial for the write/commit/push
-    /// surface; it is deliberately NOT a full sandbox (e.g. `gh pr create` is
-    /// left reachable so the plan comment works), so the *complete* read-only
-    /// contract still rests partly on the planner's instructions.
+    /// perms, and a reviewer cannot reach for an editing tool at all. `gh` stays
+    /// available throughout (the planner posts its plan as an issue comment; the
+    /// reviewer posts its review). Deny rules take precedence over the allow
+    /// list on both CLIs. NOTE: these are real, structural denials of the *tools
+    /// named*; they are deliberately NOT a sandbox (`gh pr create` stays
+    /// reachable, and so does every write a shell command can perform), so the
+    /// complete contract still rests partly on each class's instructions — see
+    /// [`Containment`] for the exact size of each tier's guarantee.
     ///
     /// `persona` compiles a workflow block's persona down to the CLI's **native**
     /// custom-agent flag (#222) — see [`PersonaInject`]. A block with no persona
@@ -18916,18 +19063,19 @@ impl OrchRegistry {
         workdir: &Path,
         session: Option<&str>,
         resume: bool,
-        read_only: bool,
+        containment: Containment,
         persona: &PersonaInject,
     ) -> String {
         // A planner never mutates and has no human in its pane, so there is
         // nothing for `auto_ops` to gate: it must explore, post its plan
         // comment, and report with zero prompts, or it would stall waiting on
-        // an approval no one is there to give. So a planner (`read_only`)
+        // an approval no one is there to give. So a planner (`ReadOnly`)
         // always runs unattended on BOTH CLIs; workers/reviewers follow the
-        // group's `auto_ops`. (This is also why claude's `plan` permission
-        // mode / copilot's `--plan` can't be used here — both hold the plan
-        // for interactive human sign-off.)
-        let unattended = auto_ops || read_only;
+        // group's `auto_ops` — including a reviewer, whose #462 deny flags
+        // must never come bundled with a promotion to unattended. (This is
+        // also why claude's `plan` permission mode / copilot's `--plan` can't
+        // be used here — both hold the plan for interactive human sign-off.)
+        let unattended = auto_ops || containment.forces_unattended();
         match cli {
             "copilot" => {
                 // Copilot has `--resume <id>` but no way to pre-assign an
@@ -18958,7 +19106,7 @@ impl OrchRegistry {
                     // mode" startup dialog is answered deterministically by the
                     // kickoff path (see COPILOT_GROUP_AUTOPILOT_FLAGS /
                     // confirm_copilot_autopilot_dialog) before the brief is
-                    // pasted. A planner (read_only) always takes this path even
+                    // pasted. A planner (ReadOnly) always takes this path even
                     // in a non-auto_ops group — interactive mode would stall it on
                     // a human that isn't there; the deny rules below keep it
                     // read-only, and deny takes precedence over --allow-all-tools
@@ -18968,15 +19116,18 @@ impl OrchRegistry {
                 } else {
                     cmd.push_str(" --allow-tool \"shell(git:*)\" --allow-tool \"shell(gh:*)\"");
                 }
-                if read_only {
-                    // Deny file writes and git mutations even under
-                    // --allow-all-tools (deny takes precedence in Copilot).
-                    // `gh` is left allowed so the plan comment can be posted.
-                    // Literals live in COPILOT_READONLY_DENY_TOOLS/_GIT (see
-                    // their docs for what's verified vs. UNVERIFIED, #448).
-                    for t in COPILOT_READONLY_DENY_TOOLS {
+                if containment.denies_edits() {
+                    // Deny file writes even under --allow-all-tools (deny takes
+                    // precedence in Copilot). `gh` and the shell are left
+                    // allowed — the planner posts its plan comment, the reviewer
+                    // (#462) runs the tests. Literals live in
+                    // COPILOT_EDIT_DENY_TOOLS (see its doc for what's verified
+                    // vs. UNVERIFIED, #448).
+                    for t in COPILOT_EDIT_DENY_TOOLS {
                         cmd.push_str(&format!(" --deny-tool \"{t}\""));
                     }
+                }
+                if containment.denies_git_mutation() {
                     for t in COPILOT_READONLY_DENY_GIT {
                         cmd.push_str(&format!(" --deny-tool \"{t}\""));
                     }
@@ -19009,10 +19160,20 @@ impl OrchRegistry {
                 };
                 // "Auto" preset = Claude Code's native auto permission mode
                 // (what the human uses interactively); otherwise acceptEdits.
-                // A planner (`read_only`) is always `unattended` (see above),
+                // A planner (`ReadOnly`) is always `unattended` (see above),
                 // but runs under `dontAsk`, not Auto — see
                 // `claude_effective_permission_mode`'s doc (#465).
-                let perm = claude_effective_permission_mode(unattended, read_only);
+                //
+                // `is_read_only()`, NOT `denies_edits()`: #465's own doc says
+                // never to hand this `true` for a non-read-only agent, and
+                // names the reviewer as the case it must not cover. `dontAsk`
+                // auto-denies anything outside `--allowedTools`, which is the
+                // reviewer's whole shell — the tests it runs, the `gh` it
+                // reviews through. A reviewer's containment is the deny list
+                // alone; see `Containment::NoEdits` for what that leaves open,
+                // including the fail-open direction #465 closes for a planner
+                // and cannot close here.
+                let perm = claude_effective_permission_mode(unattended, containment.is_read_only());
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config \
                      --model {model} --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
@@ -19053,12 +19214,14 @@ impl OrchRegistry {
                 for pat in &persona.extra_allow {
                     cmd.push_str(&format!(" \"{pat}\""));
                 }
-                if read_only {
-                    // Deny the file-editing tools and the git mutation
-                    // subcommands outright (--disallowedTools overrides the
-                    // permission mode AND the allow list in Claude Code), so a
-                    // planner can't write code or commit/push. `gh` (incl.
-                    // `gh issue comment`) stays reachable for the plan comment.
+                if containment.denies_edits() {
+                    // Deny the file-editing tools — and, for a ReadOnly class,
+                    // the git mutation subcommands — outright
+                    // (--disallowedTools overrides the permission mode AND the
+                    // allow list in Claude Code), so a planner can't write code
+                    // or commit/push and a reviewer (#462) can't edit. `gh`
+                    // (incl. `gh issue comment` / `gh pr review`) stays
+                    // reachable for the plan comment and the review.
                     //
                     // Spelling matters. `:*` is a valid wildcard only as a
                     // TRAILING suffix (`Bash(gh:*)` is fine); a colon in the
@@ -19070,14 +19233,20 @@ impl OrchRegistry {
                     // spelling and actually blocks commit/push, with no
                     // warning. (An earlier draft passed both spellings; the
                     // colon-mid one added nothing but the warning.)
-                    // Literals live in CLAUDE_READONLY_DENY_TOOLS/_GIT (see
-                    // their docs for the drift-pin test, #448).
+                    // Literals live in CLAUDE_EDIT_DENY_TOOLS /
+                    // CLAUDE_READONLY_DENY_GIT (see their docs for the
+                    // drift-pin test, #448).
                     cmd.push_str(" --disallowedTools");
-                    for t in CLAUDE_READONLY_DENY_TOOLS {
+                    for t in CLAUDE_EDIT_DENY_TOOLS {
                         cmd.push_str(&format!(" {t}"));
                     }
-                    for t in CLAUDE_READONLY_DENY_GIT {
-                        cmd.push_str(&format!(" \"{t}\""));
+                    // Nested, not a sibling `if`: the tiers are a ladder, so
+                    // git denial can never appear without the edit denial that
+                    // opened `--disallowedTools` above.
+                    if containment.denies_git_mutation() {
+                        for t in CLAUDE_READONLY_DENY_GIT {
+                            cmd.push_str(&format!(" \"{t}\""));
+                        }
                     }
                 }
                 // Claude's native custom agent, by FILE (round #417
@@ -19134,10 +19303,10 @@ impl OrchRegistry {
         workdir: &Path,
         session: Option<&str>,
         resume: bool,
-        read_only: bool,
+        containment: Containment,
         persona: &PersonaInject,
     ) -> Vec<String> {
-        let unattended = auto_ops || read_only;
+        let unattended = auto_ops || containment.forces_unattended();
         let mut a: Vec<String> = Vec::new();
         let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
         match cli {
@@ -19172,11 +19341,13 @@ impl OrchRegistry {
                     push(&mut a, "--allow-tool");
                     push(&mut a, "shell(gh:*)");
                 }
-                if read_only {
-                    for t in COPILOT_READONLY_DENY_TOOLS {
+                if containment.denies_edits() {
+                    for t in COPILOT_EDIT_DENY_TOOLS {
                         push(&mut a, "--deny-tool");
                         push(&mut a, t);
                     }
+                }
+                if containment.denies_git_mutation() {
                     for t in COPILOT_READONLY_DENY_GIT {
                         push(&mut a, "--deny-tool");
                         push(&mut a, t);
@@ -19211,7 +19382,9 @@ impl OrchRegistry {
                 push(&mut a, "--model");
                 push(&mut a, model);
                 push(&mut a, "--permission-mode");
-                push(&mut a, claude_effective_permission_mode(unattended, read_only));
+                // Same tier predicate as the string form (#465 + #462) — see
+                // that call for why it is is_read_only(), not denies_edits().
+                push(&mut a, claude_effective_permission_mode(unattended, containment.is_read_only()));
                 push(&mut a, "--add-dir");
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--allowedTools");
@@ -19231,13 +19404,17 @@ impl OrchRegistry {
                 for pat in &persona.extra_allow {
                     push(&mut a, pat);
                 }
-                if read_only {
+                if containment.denies_edits() {
                     push(&mut a, "--disallowedTools");
-                    for t in CLAUDE_READONLY_DENY_TOOLS {
+                    for t in CLAUDE_EDIT_DENY_TOOLS {
                         push(&mut a, t);
                     }
-                    for t in CLAUDE_READONLY_DENY_GIT {
-                        push(&mut a, t);
+                    // Nested for the same reason as in `build_agent_command`:
+                    // the tiers are a ladder (see `Containment`).
+                    if containment.denies_git_mutation() {
+                        for t in CLAUDE_READONLY_DENY_GIT {
+                            push(&mut a, t);
+                        }
                     }
                 }
                 if let Some(agent) = &persona.claude_agent {
@@ -19536,7 +19713,7 @@ impl OrchRegistry {
             Path::new(&cwd),
             session_id.as_deref(),
             resume,
-            role.is_read_only(), // deny writes/commits at the CLI level
+            role.containment(), // deny edits (and, for a planner, commits) at the CLI level
             &inject,
         );
         let argv = self.build_agent_argv(
@@ -19549,7 +19726,7 @@ impl OrchRegistry {
             Path::new(&cwd),
             session_id.as_deref(),
             resume,
-            role.is_read_only(),
+            role.containment(),
             &inject,
         );
         // Round #417 correction 6: fail loudly, pre-spawn, rather than
@@ -21779,7 +21956,10 @@ fn register_orchestrator_pane(
         Path::new(&group.repo),
         session_id.as_deref(),
         resume,
-        false, // the orchestrator is never read-only
+        // Derived from the class, never hand-passed: the orchestrator is
+        // `Containment::None`, and if that ever changes it changes in one
+        // `match` (`Role::containment`) rather than at a literal here.
+        block.kind.containment(),
         &inject,
     );
     let argv = reg.build_agent_argv(
@@ -21792,7 +21972,7 @@ fn register_orchestrator_pane(
         Path::new(&group.repo),
         session_id.as_deref(),
         resume,
-        false,
+        block.kind.containment(),
         &inject,
     );
     // Round #417 correction 6: see `command_line_length_guard`'s doc — the
