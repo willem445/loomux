@@ -75,6 +75,14 @@ second source of truth:
 The index stores only the transcript-derived facts (`id`, `title`, `cwd`, and the
 raw `orch_role`/`orch_gid` detection) and rebuilds everything else.
 
+The validating `(mtime, len)` pair comes from `fs::metadata`, not the cheaper
+`DirEntry::metadata` the enumeration already has in hand: the latter does **not**
+traverse symlinks, so a symlinked session file would be validated against the
+LINK's mtime/len — stable while its target changes, the one path by which this
+index could serve a stale row. `fs::metadata` follows the link, matching what the
+pre-#493 scan's `mtime_ms` did. Measured cost of the difference: ~40ms across 826
+files, against the head-parse it exists to avoid.
+
 **Failure modes all degrade to "parse it again", never to a wrong answer:**
 absent (first run), corrupt (quarantined by `uistate::load_or_quarantine`, the
 same fail-safe `tabs.json` uses), or written by a different `version` (rejected
@@ -121,19 +129,25 @@ Same synthesized population on both sides — 826 claude sessions with ~172 KB
 heads, the measured median shape of the real store — via
 `cargo test --test sessionindex -- --ignored --nocapture measure`:
 
-| Scan | Before (parse every file, no index) | After |
+| Scan | Before (parse every file, no index) | After (as shipped) |
 | --- | --- | --- |
-| #1 (fresh index) | 8.40 s — 826 parsed | 6.28 s — 300 parsed |
-| #2 | 1.99 s — 826 parsed | 39 ms — 0 parsed |
-| #3 | 1.92 s — 826 parsed | 13 ms — 0 parsed |
-| #4 | 1.93 s — 826 parsed | 12 ms — 0 parsed |
+| #1 (fresh index) | 8.40 s / 6.84 s — **826 parsed** | 5.88 s / 4.18 s — **300 parsed** |
+| #2 (steady state) | 1.99 s / 5.70 s — **826 parsed** | 39 ms / 42 ms — **0 parsed** |
+| #3 | 1.92 s / 5.86 s — 826 parsed | 13 ms / 53 ms — 0 parsed |
+| #4 | 1.93 s / 2.61 s — 826 parsed | 12 ms / 54 ms — 0 parsed |
 
-Scan #1 is cold-OS-cache; #2–4 are hot. Note how much the file cache alone moves
-the "before" number (8.4s → 1.9s) — which is why the tests assert on
-parsed/reused counts and only this measurement harness reports time.
+Two runs per side, because the machine was running concurrent agent builds
+throughout and the wall clock shows it — the same before-scan measured 1.9 s once
+and 5.9 s another time. The **parsed/reused counts are exact and
+machine-independent**; the times are indicative. Steady state, worst
+after-number against best before-number: **1.9 s → 54 ms**, and 826 head-parses
+→ 0. Scan #1 is cold-OS-cache, #2–4 hot.
+
+That spread is precisely why the tests assert on parsed/reused counts and only
+this measurement harness reports time at all.
 
 The residual, stated plainly: the **first** scan after this lands still parses up
-to 300 heads (~6s on that fixture). That work is off the blocking path (the boot
+to 300 heads (4–6s on that fixture). That work is off the blocking path (the boot
 prefetch has been unawaited since #342, and the restore click now joins it
 instead of adding a second scan), and every launch after it is ~12ms plus
 whatever genuinely changed.
@@ -170,7 +184,7 @@ scan could have answered.
 
 | Concern | File |
 | --- | --- |
-| Candidate collection (metadata only, per CLI) | `src-tauri/src/sessions.rs` — `collect_claude_candidates`, `collect_copilot_candidates` |
+| Candidate collection (metadata only, per CLI) | `src-tauri/src/sessions.rs` — `collect_claude_candidates`, `collect_copilot_candidates`, `candidate_meta` |
 | Bound + cache + stats | `src-tauri/src/sessions.rs` — `scan_sessions`, `LIST_LIMIT`, `ScanStats` |
 | Index load/save, version gate, test seam | `src-tauri/src/sessions.rs` — `load_session_index`, `save_session_index`, `set_session_index_path_for_test` |
 | Re-derived (never cached) row fields | `src-tauri/src/sessions.rs` — `to_session_info` |
