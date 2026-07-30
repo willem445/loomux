@@ -6326,14 +6326,27 @@ fn idle_tick_input_defer_bound_floor_survives_launcher_relaunch() {
     {
         let reg = OrchRegistry::new(dir.path().to_path_buf());
         reg.set_port(45999);
-        // idle_tick_minutes above the 15m default; the bound left UNSET (0) —
-        // exactly what a pre-#500 group.json looks like (the key is simply
-        // absent, which `load_group_file` also reads back as 0).
+        // idle_tick_minutes above the 15m default; the bound left UNSET (0) at
+        // the call site.
         let g = reg.create_group("C:/tmp/repo", Guardrails { idle_tick_minutes: 30, ..rails() }).unwrap();
         assert_eq!(g.guardrails.idle_tick_input_defer_max_minutes, 30,
             "fresh create: an unset bound floors at the group's own 30m tick window, not the 15m default");
         gid = g.id.clone();
     }
+    // Round-2 review fix (rev-23): a fresh `create_group` writes group.json
+    // with the ALREADY-RESOLVED value (30, from `clamped()`), so without this
+    // step the relaunch leg below would read `persisted == 30` and only ever
+    // exercise the non-zero branch — the branch that was never broken. The
+    // round-1 bug lived in the UNSET (`persisted == 0`) branch, which a
+    // pre-#500 group.json hits because the key never existed. Strip the key
+    // here so the file actually matches that shape and the relaunch leg below
+    // exercises the branch the bug was in — a test that passed with the key
+    // still present passed for the wrong reason (confirmed: it stayed green
+    // with the round-1 defect restored).
+    let path = dir.path().join(&gid).join("group.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["guardrails"].as_object_mut().unwrap().remove("idle_tick_input_defer_max_minutes");
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
     // A fresh registry (app restart) + a launcher relaunch on the same repo,
     // with the launcher's bare defaults (`rails()`, no field for this at all):
     // the persisted `idle_tick_minutes` must resolve the SAME unset-bound
