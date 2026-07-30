@@ -1193,13 +1193,23 @@ const MAX_IDLE_TICKS_PER_HOUR: u32 = 6;
 /// `USER_QUIET_MAX_HOLD`'s doc states ("deliver anyway ... never starve"),
 /// applied here a third time to a third mechanism.
 ///
-/// **Default 15 = 3x `DEFAULT_IDLE_TICK_MINUTES` (5).** A genuinely steering
-/// human keeps emitting real (Content-classified — see `classify_human_input`)
-/// keystrokes, which legitimately keeps deferring both the tick and delivery;
-/// only traffic that is byte-indistinguishable from an xterm auto-reply
-/// (pure-Neutral) can ride this bound at all, per PR-A's tradeoff. 15
-/// minutes of that plus zero real output is either a genuine wedge or a
-/// human who has walked away — both are correct to tick for, and the tick is
+/// **Default 15 = 3x `DEFAULT_IDLE_TICK_MINUTES` (5).** This clamp is
+/// **classification-blind by design** — a guarantee must not trust the very
+/// classifier it exists to backstop — so it caps the raw timestamp
+/// regardless of what produced it: real (Content-classified — see
+/// `classify_human_input`) keystrokes are capped exactly the same as
+/// pure-Neutral traffic byte-indistinguishable from an xterm auto-reply (PR-A's
+/// tradeoff). Sustained genuine typing with zero real output for the full 15
+/// minutes is capped too, and the tick fires mid-typing — this is rare in
+/// practice (submitting produces a real output burst well inside the window,
+/// which resets the clock), and where it isn't, the human-mid-work protection
+/// is delivery's OWN hold (`USER_QUIET_MAX_HOLD`, the #420 state-based
+/// question guard) rather than an exemption in this clamp; carving Content
+/// out here would re-open the exact deadlock class this bound closes (#496:
+/// the whole point is not trusting a classification of "this is really the
+/// human"). 15 minutes of zero real output plus zero input at all — the
+/// common case this bound actually exists for — is either a genuine wedge or
+/// a human who has walked away; both are correct to tick for, and the tick is
 /// a NOTICE, not an action (it doesn't merge, spend, or spawn anything by
 /// itself), with `MAX_IDLE_TICKS_PER_HOUR` already backstopping runaway
 /// firing if something re-triggers it repeatedly. Live-tunable per group
@@ -11126,11 +11136,23 @@ impl OrchRegistry {
                 // just below), but still a hand-editable, persisted guardrail — honor it
                 // on resume rather than letting a Fresh-shaped caller value (which has no
                 // way to express "I set this on disk before") silently reset it.
-                guardrails.idle_tick_input_defer_max_minutes = if persisted.idle_tick_input_defer_max_minutes == 0 {
+                //
+                // Review fix (round 1): the floor must apply to the UNSET (0 → default)
+                // case too, not just an explicit persisted value — `clamped()` floors
+                // both, because the floor is dynamic (`idle_tick_minutes`, not a static
+                // in-range default like `idle_activity_floor_bytes`'s sibling pattern
+                // this was copied from). Resolve 0 → default FIRST, then clamp
+                // unconditionally, exactly like `clamped()` does, so a group with
+                // `idle_tick_minutes` above the 15m default (the entire pre-#500
+                // installed base, which has no `idle_tick_input_defer_max_minutes` key
+                // at all) gets the SAME bound on resume that a fresh launch gives it —
+                // never a tighter one a resumed group's own docs don't promise.
+                guardrails.idle_tick_input_defer_max_minutes = (if persisted.idle_tick_input_defer_max_minutes == 0 {
                     DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES
                 } else {
-                    persisted.idle_tick_input_defer_max_minutes.clamp(guardrails.idle_tick_minutes, MAX_IDLE_TICK_MINUTES)
-                };
+                    persisted.idle_tick_input_defer_max_minutes
+                })
+                .clamp(guardrails.idle_tick_minutes, MAX_IDLE_TICK_MINUTES);
                 // Compact-nudge (#287) is likewise live-adjustable and persisted;
                 // 0 is a real "off" here (not "unset"), so just re-cap it.
                 guardrails.compact_nudge_minutes =

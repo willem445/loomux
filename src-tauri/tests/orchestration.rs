@@ -6111,18 +6111,23 @@ fn idle_tick_defers_on_recent_human_input() {
     // synthetic clock skip land at a realistic starting point.
     let grew: HashMap<String, u64> = [(oid.clone(), 4096u64)].into_iter().collect();
     assert!(reg.idle_tick_tick(FAR, &grew, &empty).is_empty(), "output growth resets the clock, not a tick");
-    // Output-quiet from here, but the human just typed into the pane (input
-    // time == now): the belt-and-suspenders gate must defer the tick even
-    // though output is old — well inside the input-defer bound (15m default),
-    // so this is the ORDINARY defer, not the bound.
-    let just_typed: HashMap<String, u64> = [(oid.clone(), FAR + 60_000)].into_iter().collect();
-    assert!(reg.idle_tick_tick(FAR + 60_000, &empty, &just_typed).is_empty(),
-        "never tick while the human is actively steering the pane");
+    // Review fix (round 1, NB-1): the defer assert MUST land past the ordinary
+    // 5-minute quiet threshold, or the assertion passes even with the input
+    // fold deleted entirely — vacuous coverage of the exact property this test
+    // exists to guard. 6 minutes is past the threshold (proving the FOLD, not
+    // mere quiet-window timing, is what defers here) while still comfortably
+    // inside the 15-minute input-defer bound (so this stays the ORDINARY
+    // defer, not `idle_tick_input_defer_max_minutes` kicking in — that's the
+    // separate `idle_tick_fires_despite_perpetual_input_after_bound` test).
+    let just_typed: HashMap<String, u64> = [(oid.clone(), FAR + 6 * 60_000)].into_iter().collect();
+    assert!(reg.idle_tick_tick(FAR + 6 * 60_000, &empty, &just_typed).is_empty(),
+        "never tick while the human is actively steering the pane, even though 6 minutes of \
+         output-quiet alone (> the 5m threshold) would otherwise have fired");
     // Once the human input recedes past the window (its timestamp stays put
     // while real time moves on), the tick fires again — still comfortably
     // inside the bound, so this is the ordinary quiet-window recovery, not
     // `idle_tick_input_defer_max_minutes` kicking in.
-    assert_eq!(reg.idle_tick_tick(FAR + 60_000 + 15 * 60_000 + 1, &empty, &just_typed), vec![oid.clone()],
+    assert_eq!(reg.idle_tick_tick(FAR + 6 * 60_000 + 5 * 60_000 + 1, &empty, &just_typed), vec![oid.clone()],
         "after the human-input window elapses, the idle tick resumes");
 }
 
@@ -6301,6 +6306,46 @@ fn idle_tick_input_defer_bound_defaults_floors_caps_and_persists() {
     reg2.set_port(45999);
     let (_, persisted) = reg2.load_group_file(&g.id).unwrap();
     assert_eq!(persisted.idle_tick_input_defer_max_minutes, 45, "round-trips through group.json on a fresh load");
+}
+
+#[test]
+fn idle_tick_input_defer_bound_floor_survives_launcher_relaunch() {
+    // Round-1 review fix (rev-23): `load_group_file` alone doesn't exercise the
+    // bug — the defect was in `create_group_ex`'s `resumed` re-hydration branch,
+    // which resolved an unset (0) bound straight to `DEFAULT_IDLE_TICK_INPUT_
+    // DEFER_MAX_MINUTES` (15) WITHOUT the `idle_tick_minutes` floor `clamped()`
+    // applies everywhere else. A group with a tick window above 15 minutes and
+    // no explicit bound — i.e. EVERY group.json written before this PR, since
+    // the field didn't exist — got a tighter bound on relaunch than on a fresh
+    // launch, silently disagreeing with the field's own doc and this PR's
+    // design note. This is the relaunch leg the persistence test above was
+    // missing (mirrors `intake_gate_config_survives_launcher_relaunch`'s
+    // restart-a-fresh-registry shape).
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = OrchRegistry::new(dir.path().to_path_buf());
+        reg.set_port(45999);
+        // idle_tick_minutes above the 15m default; the bound left UNSET (0) —
+        // exactly what a pre-#500 group.json looks like (the key is simply
+        // absent, which `load_group_file` also reads back as 0).
+        let g = reg.create_group("C:/tmp/repo", Guardrails { idle_tick_minutes: 30, ..rails() }).unwrap();
+        assert_eq!(g.guardrails.idle_tick_input_defer_max_minutes, 30,
+            "fresh create: an unset bound floors at the group's own 30m tick window, not the 15m default");
+        gid = g.id.clone();
+    }
+    // A fresh registry (app restart) + a launcher relaunch on the same repo,
+    // with the launcher's bare defaults (`rails()`, no field for this at all):
+    // the persisted `idle_tick_minutes` must resolve the SAME unset-bound
+    // floor a fresh launch would give it.
+    let reg = OrchRegistry::new(dir.path().to_path_buf());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid, "restart resumes the same group");
+    assert_eq!(g.guardrails.idle_tick_minutes, 30, "the tick window itself already survives relaunch");
+    assert_eq!(g.guardrails.idle_tick_input_defer_max_minutes, 30,
+        "resume: an unset bound must get the SAME floor clamped() applies on a fresh launch — never a bare 15 \
+         that quietly promises less protection than the docs state for this group");
 }
 
 #[test]

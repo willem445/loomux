@@ -1750,11 +1750,17 @@ the two cost/safety controls the unattended-spend risk demands.
   refresher nobody has modeled yet — a future IME/composition path, a different CLI's TUI,
   anything not yet seen. A tick that fires because of the bound (rather than the ordinary quiet
   window) is audited with its own `reason` (`idle-tick-input-defer-bound`) rather than reading as
-  an unremarkable fire. The tradeoff this accepts: after the root-cause fix, only traffic that is
-  byte-indistinguishable from an xterm auto-reply (pure-Neutral — arrow keys, menu navigation) can
-  ride this bound at all; genuine human steering keeps emitting Content-classified keystrokes,
-  which legitimately keeps deferring. Fifteen minutes of zero real output *and* zero printable
-  input is either a wedge or a human who has walked away, and firing a NOTICE (not an action) is
+  an unremarkable fire. **The clamp is classification-blind, deliberately** — a guarantee must not
+  trust the very classifier it is backstopping — so it caps the raw timestamp regardless of what
+  produced it: genuine, real (Content-classified) keystrokes are capped exactly the same as
+  pure-Neutral traffic byte-indistinguishable from an xterm auto-reply (arrow keys, menu
+  navigation). Sustained genuine typing with zero real output for the full 15 minutes is capped
+  too, and the tick fires mid-typing; this is rare in practice (submitting produces a real output
+  burst well inside the window) and where it isn't, the human-mid-work protection is delivery's
+  OWN hold (`USER_QUIET_MAX_HOLD`, the #420 state-based question guard), not an exemption in this
+  clamp — carving Content out here would re-open the exact deadlock class this bound closes.
+  Fifteen minutes of zero real output *and* zero input at all — the common case this bound exists
+  for — is either a wedge or a human who has walked away, and firing a NOTICE (not an action) is
   correct either way — `MAX_IDLE_TICKS_PER_HOUR` still backstops runaway firing regardless.
 - **Observability.** Because the tick is otherwise invisible until it fires, `orch_autonomy`
   surfaces `idle_tick_minutes`, `idle_activity_floor_bytes`, and (while on) `quiet_secs`,
