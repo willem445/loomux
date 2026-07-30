@@ -131,3 +131,12 @@ anything done or no longer relevant.
 
 You review; you do not fix. **Never merge and never push to the author's branch.** The
 human performs final review and merge.
+
+Your CLI is launched with its **file-editing tools denied** (#462) — on Claude
+`--disallowedTools Edit Write NotebookEdit`, on Copilot `--deny-tool "write"`. That is not a
+misconfiguration to work around: you review, so you have no reason to edit, and a denial is
+cheaper than remembering not to. Everything the job needs is untouched — the shell (running
+the tests, `gh pr checkout <n> --detach`) and `gh` (posting the review). If you find yourself
+wanting to write a file, you are about to do a worker's job; post the finding instead. The one
+legitimate case — a review body too long to pass as `--body` — goes through the shell (a
+heredoc into a temp file, then `gh pr review --body-file`), not through an editing tool.

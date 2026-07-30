@@ -242,6 +242,17 @@ so far:
   plainly; the opt-in question itself is filed separately as #490 rather than answered
   here or built into this fix.
 
+- **#462, the reviewer's editing tools are denied at the CLI** — `reviewer.md` only. Reviewer
+  containment used to be instruction-backed *only*: `Role::is_read_only()` matched the planner
+  alone, so a reviewer's CLI got no deny flags and nothing structurally stopped it editing
+  files. It now launches under `Containment::NoEdits` — `--disallowedTools Edit Write
+  NotebookEdit` on Claude, `--deny-tool "write"` on Copilot. A closing paragraph tells the
+  reviewer that, so the first denial reads as policy rather than as a broken environment, and
+  names what is deliberately untouched (the shell for tests and `gh pr checkout --detach`, `gh`
+  for posting the review) plus the one legitimate write — a review body too long for `--body` —
+  and the shell route to it. The *contract* is unchanged: a reviewer was already told it does
+  not fix and does not push; this only says which half of that a flag now enforces.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
