@@ -233,6 +233,14 @@ so far:
   classifier fallback. Step 2 of the **Planning protocol** now says so: only
   `git`/`gh` and the built-in read-only commands are reachable by default, and a
   planner that needs something else says so in the plan rather than assuming it ran.
+  **Review round 1 (#489) correction:** the first version of this step claimed a
+  build/typecheck command "is denied outright unless it was separately pre-approved
+  for your block" — checked against the code and false. Two #222 capability-closure
+  guards (`workflow.rs:891`'s parser refusal, `mod.rs`'s `persona_inject` emptying
+  `extra_allow` for every read-only block regardless of source) make the denial
+  absolute: there is no per-repo opt-in, by any mechanism, today. Corrected to say so
+  plainly; the opt-in question itself is filed separately as #490 rather than answered
+  here or built into this fix.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched

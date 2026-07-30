@@ -4763,18 +4763,58 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     `claude_readonly_allowed_tools_contain_no_unscoped_grant`
     (`tests/orchestration.rs`), not just asserted.
 
-    *A side effect worth stating plainly:* `auto` mode's background safety classifier
-    used to let a planner run an ad hoc shell command (e.g. a quick `cargo check`) with
-    no prior approval; `dontAsk` has no classifier fallback, so only `git`/`gh` (already
-    pre-approved via `CLAUDE_UNATTENDED_ALLOW`) and Claude's built-in read-only Bash set
-    (`ls`, `cat`, `grep`, `find`, read-only `git`, …) are reachable by default now.
-    `templates/planner.md`'s protocol says so (re-blessed in
-    `tests/fixtures/pre222/`) rather than silently narrowing what the template still
-    claimed. A repo that wants a planner block to reach a specific build/typecheck
-    command can still opt it in via a persona `allow:` pattern
-    (`PersonaInject::extra_allow`, already ordered before `--disallowedTools`) — which
-    keeps any such command a *repo config* decision, never a toolchain literal baked
-    into `src-tauri` (constraint #8).
+    *A side effect worth stating plainly, and correctly (review round 1, #489):*
+    `auto` mode's background safety classifier used to let a planner run an ad hoc shell
+    command (e.g. a quick `cargo check`) with no prior approval; `dontAsk` has no
+    classifier fallback, so only `git`/`gh` (already pre-approved via
+    `CLAUDE_UNATTENDED_ALLOW`) and Claude's built-in read-only Bash set (`ls`, `cat`,
+    `grep`, `find`, read-only `git`, …) are reachable by default now.
+    `templates/planner.md`'s protocol says so (re-blessed in `tests/fixtures/pre222/`).
+
+    **There is currently no per-repo opt-in beyond that — for any repo, by any
+    mechanism.** An earlier draft of this note claimed a persona `allow:` pattern
+    could widen it (`PersonaInject::extra_allow`, "already ordered before
+    `--disallowedTools`"); that was checked against the code and is false. Two
+    independent, deliberate guards refuse it, both from #222's capability closure:
+    `workflow::parse_workflow` hard-errors on `allow:` for any read-only block before
+    a group can even launch (`workflow.rs:891`); and — belt-and-braces, for a pattern
+    that reaches loomux any other way (a `.github/agents/*.md` persona's own `allow:`
+    frontmatter, a hand-edited `group.json`) — `persona_inject` unconditionally empties
+    `extra_allow` for a read-only block regardless of source (`mod.rs:18383-18392`,
+    audited via `audit_allow_denied`, never silent). `PersonaInject::extra_allow` really
+    is ordered before `--disallowedTools` in the command builder — but for a planner it
+    is always the empty list by the time it gets there, so the loop never has anything
+    of the planner's to iterate. The capability regression under `dontAsk` is therefore
+    **absolute, not opt-out**: under `auto` the classifier was an (unreliable, unaudited)
+    fallback; under `dontAsk` there is no fallback and no configuration escapes it.
+
+    That absoluteness is a deliberate #222 stance ("nobody can enumerate every
+    write-capable program" — `workflow.rs:876-890`), not an oversight this PR
+    introduced, and re-opening it is a capability decision — which mechanism could
+    pre-approve *some* shell commands for a read-only role without also handing it an
+    unenumerable set of write-capable ones — not an enforcement-robustness fix, so it
+    is filed separately rather than built here: **#490**, which names both guards
+    concretely. The one escape hatch that already exists and is NOT gated by either
+    #222 guard: the target repo's own `.claude/settings.json` `permissions.allow`
+    rules, which `dontAsk` honours directly per the quoted doc above — a different
+    trust surface (repo-owned Claude config, not workflow-controlled), worth naming
+    but not a loomux mechanism.
+
+    **So: can a planner still ground a plan with no opt-in at all, permanently?**
+    Mostly, with named gaps. What still works: exploration (`Read`/`Grep`/`Glob`, which
+    the permission system exempts from approval entirely — see the "Read-only" row this
+    doc's table above cites), the built-in read-only Bash set, `git`/`gh` (status, diff,
+    log, `gh issue view`, the `gh issue comment` plan output), and `mcp__loomux`
+    (`report`, `message_orchestrator`). What's lost, concretely: anything that requires
+    *executing* code to answer a question — confirming a compile error is real (not just
+    plausible from reading), running an existing test to see current behavior before
+    proposing a change to it, checking whether a dependency actually resolves, or timing/
+    profiling anything. A plan that would have said "confirmed: `cargo check` reproduces
+    the reported error at line N" now says "reading the code, this looks like it would
+    reproduce the reported error" — a real loss of grounding, silent in the sense that a
+    vaguer plan doesn't announce *why* it's vaguer. `templates/planner.md`'s "say so in
+    the plan rather than assuming it ran" instruction is the mitigation available today:
+    it turns a silent gap into a stated one, not a closed one.
 
   - **Copilot: documented open, not closed — and the issue's "no containment at all"
     premise needs a correction first.** `COPILOT_READONLY_DENY_TOOLS` still denies

@@ -48,8 +48,9 @@ post-compact re-grounding notice, so it survives even a compact you never saw co
    `gh`, `grep`/search, and reading files over running builds. Your CLI-level allowlist
    pre-approves only `git`/`gh` shell commands plus built-in read-only ones (`cat`, `grep`,
    `find`, read-only `git`, …) — a build/typecheck command like `cargo check` is denied
-   outright unless it was separately pre-approved for your block. If you need one and it
-   isn't reachable, say so in the plan rather than assuming it ran.
+   outright, permanently, with no per-repo way to widen it. If you need one and it
+   isn't reachable, say so in the plan (what you'd have confirmed by running it, and
+   that you couldn't) rather than assuming it ran.
 3. Write the plan as a **GitHub issue comment** (`gh issue comment <n> --body ...`),
    covering:
    - **Scope** — what's in, what's explicitly out.

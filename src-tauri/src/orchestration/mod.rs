@@ -18672,9 +18672,18 @@ impl OrchRegistry {
                 }
                 // Persona `allow:` patterns extend the SAME `--allowedTools`
                 // list, so they must land before `--disallowedTools` opens the
-                // deny list below. They can only widen within the capability
-                // class: on Claude, `--disallowedTools` beats the allow list, so
-                // a planner persona cannot allow itself back into `git commit`.
+                // deny list below. For a NON-read-only block (worker/reviewer)
+                // they can only widen within the capability class: on Claude,
+                // `--disallowedTools` beats the allow list, so a worker persona
+                // still cannot allow itself back into a git-mutation pattern
+                // this same block denies. For a read-only block (planner),
+                // `persona.extra_allow` is always EMPTY by the time it reaches
+                // here — `persona_inject`'s capability closure (#222) drops
+                // every `allow:` pattern for `Role::is_read_only()` from every
+                // source (workflow-declared, `.github/agents` frontmatter, a
+                // hand-edited `group.json`), unconditionally, with no opt-in.
+                // This loop is not where a planner's read-only guarantee is
+                // enforced; it is simply never handed anything to iterate.
                 for pat in &persona.extra_allow {
                     cmd.push_str(&format!(" \"{pat}\""));
                 }
