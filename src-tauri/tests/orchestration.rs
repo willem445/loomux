@@ -2372,12 +2372,22 @@ fn copilot_group_resumes_a_recorded_session() {
 /// session with many unrelated decoy groups each carrying a realistic audit
 /// tail, and asserting the resume stays fast regardless of how many exist.
 ///
-/// Measured (debug build, one dev machine, `--nocapture`): 419ms before this
-/// fix (the fast path disabled, `session_roles()`'s full scan always paid
-/// for), 42ms after. Re-run this test with `--nocapture` to see the number
-/// printed on your machine — the 200ms bound below is deliberately generous
-/// so CI hardware variance can't make it flaky; the point pinned here is the
-/// O(groups) scaling being gone, not a specific absolute figure.
+/// Measured (debug build, one dev machine, `--nocapture`): ~420-540ms before
+/// this fix (the fast path disabled, `session_roles()`'s full scan always
+/// paid for) vs. a same-run bare `session_roles()` baseline of comparable
+/// size, ~40-55ms after, against a baseline of ~360-480ms. Re-run this test
+/// with `--nocapture` to see both numbers printed on your machine.
+///
+/// The assertion below compares the timed call against a `session_roles()`
+/// baseline measured ON THE SAME RUN, immediately before it — NOT a fixed
+/// millisecond bound. A fixed bound (this test's first version used 200ms)
+/// is exactly the kind of thing that goes flaky under CI hardware variance:
+/// this test failed CI once at 211ms on an otherwise-genuinely-fixed fast
+/// path, simply because that runner was slower/noisier than the dev machine
+/// the bound was picked against. A same-run relative comparison is robust to
+/// that — CI being N times slower scales both sides of the comparison by
+/// roughly the same factor, so the ratio pinned here stays stable even
+/// though neither absolute number does.
 #[test]
 fn resume_recorded_session_group_hint_avoids_scanning_every_other_group() {
     use loomux_lib::orchestration::resume_recorded_session;
@@ -2411,6 +2421,22 @@ fn resume_recorded_session_group_hint_avoids_scanning_every_other_group() {
     let sid = orch.session_id.unwrap();
     reg.mark_dead(&orch.id, Some(0));
 
+    // Baseline control, measured on THIS run/machine/load immediately before
+    // the timed call below: the full scan this fast path replaces, still
+    // reachable directly (it's the unchanged fallback `resume_recorded_
+    // session` itself uses on a miss). A fixed millisecond bound here is
+    // exactly the kind of thing that goes flaky on a loaded CI runner — this
+    // very test failed CI once already at 211ms against a 200ms bound, on an
+    // otherwise-genuinely-fixed fast path, simply because that runner was
+    // slower/noisier than the dev machine the bound was picked against. A
+    // same-run RELATIVE comparison is robust to absolute machine speed: CI
+    // being 5x slower scales both sides of the comparison by roughly the
+    // same factor, so the ratio stays stable even though neither absolute
+    // number does.
+    let baseline_start = Instant::now();
+    let _ = reg.session_roles();
+    let baseline = baseline_start.elapsed();
+
     let store = scratch_dir("resume-hint-fastpath");
     fixture_claude_session(&store, &sid, &repo_path);
     loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
@@ -2424,12 +2450,22 @@ fn resume_recorded_session_group_hint_avoids_scanning_every_other_group() {
     assert_eq!(req.group_id, g.id);
     eprintln!(
         "resume_recorded_session with a correct group hint took {elapsed:?} \
-         across {DECOY_GROUPS} decoy groups x {NOISE_LINES} audit lines each"
+         (same-run session_roles() baseline: {baseline:?}) across {DECOY_GROUPS} \
+         decoy groups x {NOISE_LINES} audit lines each"
     );
+    // `elapsed` includes the hinted lookup PLUS the orchestrator relaunch's own
+    // unavoidable work (MCP config mint, instruction/hook files) that `baseline`
+    // (a bare session_roles() call) doesn't pay at all — so this is a
+    // deliberately loose bound (half the baseline), not a claim that the two
+    // are measuring identical work. The point pinned here is that a resume
+    // touching one group is not in the same order of magnitude as a scan of
+    // every group, regardless of what a launch itself costs on top.
     assert!(
-        elapsed.as_millis() < 200,
-        "resuming via a correct group hint must not scale with how many other \
-         groups exist on disk; took {elapsed:?} across {DECOY_GROUPS} decoys"
+        elapsed.as_millis() * 2 < baseline.as_millis().max(1),
+        "resuming via a correct group hint should be well under a bare full \
+         session_roles() scan measured on this same run, not merely faster by \
+         a hair — hint+launch took {elapsed:?}, full-scan-alone baseline {baseline:?} \
+         across {DECOY_GROUPS} decoys"
     );
 }
 

@@ -986,8 +986,21 @@ the unchanged full scan.
 Measured in `resume_recorded_session_group_hint_avoids_scanning_every_
 other_group` (`tests/orchestration.rs`, 200 decoy groups × 300 audit lines
 each, red-before-green against the fast path disabled): **419ms → 42ms** on
-one dev machine, debug build. **Two caveats on this number, both raised by
-review and both real (correcting this doc's own first draft):**
+one dev machine, debug build. **Three caveats on this number, all raised by
+review and all real (correcting this doc's own first draft):**
+
+- **The test asserts a same-run relative comparison, not that specific
+  figure.** Its first version asserted a fixed `< 200ms` bound — which CI
+  itself then falsified at 211ms, on a build where the fast path was
+  otherwise genuinely working, simply because that runner was slower/
+  noisier than the dev machine the bound was picked against. Fixed bounds
+  against wall-clock time are exactly this fragile under CI hardware
+  variance. The assertion now compares the timed call against a bare
+  `session_roles()` baseline measured on the SAME run, immediately before
+  it: CI being N times slower scales both sides roughly together, so the
+  ratio (currently asserted at "under half the baseline," observed at
+  roughly 8-10x on a dev machine) stays meaningful even though neither
+  absolute number does.
 
 - **The axis measured is "many groups, each modest," not "few groups, one
   huge."** This fast path still reads and parses the HINTED group's OWN full
