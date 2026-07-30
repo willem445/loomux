@@ -44,7 +44,7 @@ use loomux_lib::orchestration::{
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     record_aborted_preenter_outcome, recorded_confirmed,
-    drain_stranded_submit, stranded_detail, stranded_selfheal_action,
+    drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
@@ -13053,6 +13053,50 @@ fn stranded_human_content_badges_and_never_submits() {
     let fired = flush_stranded_text(&pm, pty, Some(false), true, b"\r");
     assert!(!fired, "flush_stranded_text must refuse while a human has typed since our submit");
     assert!(captured.lock().unwrap().is_empty(), "no bytes may reach a pane holding human text");
+}
+
+#[test]
+fn a_selfheal_never_cuts_in_front_of_a_drainer_that_owns_an_entry() {
+    // The hazard this closes, and the reason the gate is a safety rule
+    // rather than an optimization: a drainer inside `deliver_now` has
+    // already peeked its front entry and will finish by calling
+    // `pop_front_dequeued(that id)`, which pops ONLY on an id match. A
+    // marker slipped in front of it makes that pop match nothing, leaving an
+    // ALREADY-DELIVERED entry queued for a second, duplicate delivery.
+    assert_eq!(stranded_admission_gate(true, false), Some("drainer-active"));
+    assert_eq!(
+        stranded_admission_gate(true, true),
+        Some("drainer-active"),
+        "the safety rule is checked before the idempotence one"
+    );
+    assert_eq!(stranded_admission_gate(false, true), Some("submit-already-queued"));
+    assert_eq!(stranded_admission_gate(false, false), None, "an idle pane's queue may be fronted");
+
+    // Wired: against the REAL registry state the real check reads.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 4964u32;
+    reg.enqueue_text(&g.id, &w.id, "loomux", "mid-delivery", pty, queue::EnqueueReason::Arrival)
+        .unwrap();
+    reg.register_drainer_for_test(pty);
+    assert!(reg.drainer_active(pty));
+
+    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+
+    assert!(!healed, "no heal may be admitted while a drainer owns the queue front");
+    assert_eq!(reg.queue_depth(pty), 1, "the queue must be exactly as the drainer left it");
+    assert_eq!(
+        reg.queue_snapshot(pty)[0].payload.text(),
+        Some("mid-delivery"),
+        "the drainer's own entry must still be the front — a marker here would strand it"
+    );
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-selfheal-skipped"),
+        "the skip is audited, with its reason"
+    );
+    // Still loud: declining to heal never means declining to tell the human.
+    assert!(reg.stranded_note(&w.id).is_some(), "the badge is raised whichever mechanism presses Enter");
 }
 
 #[test]

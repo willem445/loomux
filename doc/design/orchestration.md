@@ -4767,6 +4767,22 @@ deliberate:
   the press. The decision above is the *trigger* gate; it is never the last word on whether
   the Enter is safe.
 
+**Admission gate: never cut in front of a drainer that owns an entry**
+(`stranded_admission_gate`). Pushing to the FRONT is safe only while no drainer owns the front
+entry. A drainer inside `deliver_now` has already peeked its entry and finishes by calling
+`pop_front_dequeued(that id)`, which pops ONLY on an id match — a marker slipped in front makes
+that pop match nothing and leaves an already-delivered entry queued for a **second, duplicate
+delivery**. Pre-#496 nothing could reach this (the front door pushes to the BACK; the drainer's
+own `AbortedPreEnter` marker is pushed *after* it pops), and the self-heal must not become the
+first thing that does. So `queue_draining` is checked before the push, race-safe in both
+directions: `ensure_drainer` registers before its thread spawns, so any drainer that could be
+mid-`deliver_now` is visible; and a drainer that has deregistered is already past `deliver_now`
+(`commit_exit`). Nothing is lost by declining — a live drainer means a delivery is already
+queued for this pane, and that delivery's own pre-paste `flush_stranded_text` presses exactly
+the Enter the heal wanted pressed. The self-heal exists for the case where no such next
+delivery exists (an idle group), which is precisely when no drainer is running. The badge is
+raised either way: the human is told regardless of which mechanism does the pressing.
+
 **Bounded.** `STRANDED_SELFHEAL_MAX_HEALS = 1` per stranded delivery, counted in the monitor.
 The bound is also structural today (`late_monitor_tick` returns `DeclareFailed` at most once
 per monitor — every later tick sees `already_failed`), but that is the *caller's* precedence:

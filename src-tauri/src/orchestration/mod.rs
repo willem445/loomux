@@ -7803,6 +7803,43 @@ pub fn stranded_selfheal_action(
     StrandedAction::SelfHeal
 }
 
+/// Whether a self-heal may admit its `StrandedSubmit` marker right now
+/// (#496 PR-C), and if not, the audited reason. `None` = admit.
+///
+/// **`drainer-active` is a safety rule, not a nicety.** Pushing to the FRONT
+/// of a pane's queue is only safe while no drainer OWNS an entry: a drainer
+/// sitting inside `deliver_now` has already peeked its front entry and will,
+/// on completion, call `pop_front_dequeued(that entry's id)` — which pops
+/// ONLY on an id match. Slip a marker in front of it and that pop matches
+/// nothing, leaving an ALREADY-DELIVERED text entry queued for a second,
+/// duplicate delivery. Pre-#496 nothing could hit this (the front door
+/// pushes to the BACK; the drainer's own `AbortedPreEnter` marker is pushed
+/// after it pops), and the self-heal must not become the first thing that
+/// does. `queue_draining` is checked BEFORE the push, and the check is
+/// race-safe in both directions: `ensure_drainer` registers before its
+/// thread spawns (so a drainer that could be mid-`deliver_now` is always
+/// visible here), and a drainer that deregistered is already past
+/// `deliver_now` (see `commit_exit`).
+///
+/// **Nothing is lost by declining, in either case.** A live drainer means a
+/// delivery is already queued for this pane, and THAT delivery's own
+/// pre-paste `flush_stranded_text` is the pre-existing mechanism which
+/// presses exactly the Enter this heal wanted pressed — the self-heal exists
+/// for the case where no such next delivery exists (an idle group), which is
+/// precisely when no drainer is running. A marker already at the front is
+/// the same submit, already pending, retried by the drainer with no cap.
+/// Either way the badge is still raised: the human is told regardless of
+/// which mechanism does the pressing.
+pub fn stranded_admission_gate(drainer_active: bool, front_is_marker: bool) -> Option<&'static str> {
+    if drainer_active {
+        return Some("drainer-active");
+    }
+    if front_is_marker {
+        return Some("submit-already-queued");
+    }
+    None
+}
+
 /// One pane's stranded-delivery state (#496 PR-C), held in
 /// `OrchRegistry::attn_stranded` and rendered by `attention_tick`. Only the
 /// facts are stored; the human-facing wording is built at render time by
@@ -20989,15 +21026,8 @@ impl OrchRegistry {
     /// nothing is pasted on top of the stranded text") is testable without
     /// an `AppHandle`.
     ///
-    /// Idempotent by construction: if the pane's queue ALREADY has a
-    /// `StrandedSubmit` marker at its front, this admits nothing and returns
-    /// `Ok(false)`. That case is real, not theoretical — a delivery that
-    /// aborted pre-Enter converts its own entry into exactly such a marker
-    /// (`run_queue_drainer`'s `AbortedPreEnter` arm), and a second marker
-    /// behind it would mean a second Enter into a pane the first one already
-    /// changed. Nothing is lost by declining: the marker already queued does
-    /// precisely what this call wanted done, and the drainer retries it
-    /// with no cap until it fires.
+    /// Gated by `stranded_admission_gate` — see that function for both
+    /// reasons a heal declines to admit, and why declining loses nothing.
     #[doc(hidden)] // pub for integration tests
     pub fn admit_stranded_selfheal(
         &self,
@@ -21006,15 +21036,15 @@ impl OrchRegistry {
         from: &str,
         pty_id: u32,
     ) -> Result<bool, String> {
-        let already_marked = self
+        let front_is_marker = self
             .queues
             .lock_safe()
             .get(&pty_id)
             .and_then(|q| q.front())
             .is_some_and(|e| matches!(e.payload, queue::QueuedPayload::StrandedSubmit));
-        if already_marked {
+        if let Some(reason) = stranded_admission_gate(self.drainer_active(pty_id), front_is_marker) {
             self.audit(group, "loomux", "stranded-selfheal-skipped",
-                json!({ "to": agent_id, "reason": "submit-already-queued" }));
+                json!({ "to": agent_id, "reason": reason }));
             return Ok(false);
         }
         self.enqueue_stranded_front(group, agent_id, from, pty_id)?;
@@ -21120,6 +21150,25 @@ impl OrchRegistry {
                 "stranded_ms": now_ms().saturating_sub(note.since_ms),
             }));
         }
+    }
+
+    /// Whether a drainer thread is currently registered for `pty_id` — i.e.
+    /// whether something may be mid-`deliver_now` on this pane's queue front
+    /// (#496 PR-C's admission gate; see `stranded_admission_gate`).
+    #[doc(hidden)] // pub for integration tests
+    pub fn drainer_active(&self, pty_id: u32) -> bool {
+        self.queue_draining.lock_safe().contains_key(&pty_id)
+    }
+
+    /// Register a fake drainer for `pty_id` so an integration test can drive
+    /// the `drainer-active` admission gate against the REAL registry state
+    /// the real check reads — a headless test has no `AppHandle`, so it
+    /// cannot spawn an actual drainer to produce this state (same shape as
+    /// `set_rotate_check_pause_for_test` / `register_fake_for_test`).
+    #[doc(hidden)] // test-only seam
+    pub fn register_drainer_for_test(&self, pty_id: u32) {
+        let generation = self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.queue_draining.lock_safe().insert(pty_id, generation);
     }
 
     /// This pane's current stranded state, if any (#496 PR-C). Test/read-only
