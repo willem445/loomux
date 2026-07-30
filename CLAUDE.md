@@ -29,10 +29,15 @@ any local build/test; a per-class concurrency guard was then tried
 (#318/#322) but shelved (its shim couldn't reliably intercept every
 invocation path). What replaces both: quick local iteration — a single-file
 test, an incremental `cargo check`, a quick build to sanity-check a change —
-is fine, always capped at `-j 4`; full-suite or multi-platform validation,
-anything you'd cite as proof in a PR, still goes to CI, which remains the
-sole authority for the CI gate. See the `ci-validate` skill for the full
-decision rule, the `-j 4` local-cap details, and the draft-PR-early CI flow.
+is fine, always capped at `-j 4`; anything bigger — **including a full
+`cargo test --test <target>` run of even one target** — goes to CI, which
+remains the sole authority for the CI gate. Local full-target "one last
+run before pushing" is specifically the pattern to avoid: it duplicates
+CI's proof while inflating the worktree's `target/` by 5-8 GB, and
+parallel workers doing it exhausted the workspace drive twice on
+2026-07-30 (#488). See the `ci-validate` skill for the full decision rule,
+the `-j 4` local-cap details, the disk rationale, and the draft-PR-early
+CI flow.
 
 ## Hard constraints — check before coding
 
