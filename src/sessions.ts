@@ -6,6 +6,7 @@ import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
 import { taskSummary, repoBranchLine, prLabel } from "./sessionmeta";
 import { RefreshGate } from "./refreshgate";
+import { SessionStore } from "./sessionstore";
 
 const ROLE_CHIPS: Record<string, string> = {
   orchestrator: "ORCH",
@@ -30,13 +31,19 @@ const shortPath = (p: string): string => p.replace(/^.*[\\/](?=[^\\/]+[\\/][^\\/
 export class SessionBrowser {
   private listEl: HTMLElement;
   private searchEl: HTMLInputElement;
-  private sessions: SessionInfo[] = [];
+  /** The app's single session list (#493) — not a private copy. Every other
+   *  consumer of the scan (main.ts's group-restore resumability check, the #440
+   *  reconciler) goes through this same store, so no two of them can have a scan
+   *  in flight at once. */
+  private store = new SessionStore(listSessions);
   private roles = new Map<string, SessionRoleInfo>();
   /** Single-flight guard (rev-9 review): the boot-time prefetch and a human
    *  opening the sidebar before it resolves must not run two concurrent
    *  `listSessions()` + `loadRoles()` scans — the exact I/O the prefetch
    *  exists to front-load, doubled. Same mechanism IssuesView uses for its
-   *  refresh loop; reused rather than a second de-dup scheme. */
+   *  refresh loop; reused rather than a second de-dup scheme. Still needed
+   *  alongside `SessionStore`'s own gate (#493), which covers the session scan
+   *  only: this one also covers the `loadRoles()` half and the render. */
   private refreshGate = new RefreshGate();
 
   constructor(
@@ -83,7 +90,18 @@ export class SessionBrowser {
    *  does is to front-load it once). Empty before the first `refresh()`
    *  resolves. */
   get cached(): readonly SessionInfo[] {
-    return this.sessions;
+    return this.store.cached;
+  }
+
+  /** The session list for a consumer that needs the DATA, not freshness (#493):
+   *  reuses the boot prefetch's result, or joins it if it's still running, and
+   *  only scans when neither can answer. main.ts's group-restore resumability
+   *  check calls this — it used to call `listSessions()` directly, which is what
+   *  made a restore click issue a second concurrent full scan and then wait on
+   *  it. Rejects if the underlying scan failed, so a caller can still
+   *  distinguish "no sessions" from "couldn't look". */
+  ensureLoaded(): Promise<readonly SessionInfo[]> {
+    return this.store.ensureLoaded();
   }
 
   toggle(): void {
@@ -130,11 +148,10 @@ export class SessionBrowser {
     // any number of dropped calls still end in exactly one fresh fetch.
     if (!this.refreshGate.begin()) return;
     try {
-      const [sessions, roles] = await Promise.all([
-        listSessions(),
+      const [, roles] = await Promise.all([
+        this.store.refresh(),
         this.loadRoles?.().catch(() => []) ?? Promise.resolve([]),
       ]);
-      this.sessions = sessions;
       this.roles = new Map(roles.map((r) => [r.session_id, r]));
       this.render();
     } finally {
@@ -144,7 +161,7 @@ export class SessionBrowser {
 
   private render(): void {
     const q = this.searchEl.value.trim().toLowerCase();
-    const shown = this.sessions.filter(
+    const shown = this.store.cached.filter(
       (s) =>
         !q ||
         s.title.toLowerCase().includes(q) ||

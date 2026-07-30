@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -164,22 +164,64 @@ fn scan_claude_jsonl(path: &Path) -> (String, String, Option<(String, Option<Str
     (title, cwd, orch)
 }
 
-fn scan_claude(out: &mut Vec<SessionInfo>) {
-    // #457: route through the SAME testable root lookup `find_claude_session_cwd`
-    // already uses, rather than a second, untestable `dirs::home_dir()` inline
-    // (the pre-existing gap that made this function unable to honor
-    // `set_claude_projects_root_for_test` at all — caught writing this PR's own
-    // `scan_claude_*` tests, which is the actual production caller/behavior on
-    // the default (no-override) path, so this is behavior-preserving there).
+/// One session file the scan *might* index, discovered from directory metadata
+/// alone — nothing inside the file has been read yet.
+///
+/// #493: collecting candidates before parsing any of them is what lets the scan
+/// sort by mtime and cut to `LIST_LIMIT` FIRST, so the expensive part (a
+/// head-parse per file) costs `O(LIST_LIMIT)` instead of `O(every session ever
+/// recorded on this machine)`. On the machine #493 was measured on, that alone
+/// is 826 head-parses down to 300 — and the rows dropped by the truncate were
+/// always parsed for nothing, since `list_sessions` has capped its result at
+/// 300 since long before this change.
+struct Candidate {
+    /// The file whose `(mtime, len)` both keys and validates this session's
+    /// index entry: claude's `<id>.jsonl`, copilot's `workspace.yaml`.
+    path: PathBuf,
+    /// "claude" | "copilot" — which parser this candidate needs.
+    source: &'static str,
+    /// Claude's filename IS the session id, so it's free at collection time;
+    /// copilot's only authoritative id lives inside `workspace.yaml` (see
+    /// `parse_candidate`), so it stays `None` until the file is parsed.
+    id: Option<String>,
+    modified_ms: u64,
+    len: u64,
+}
+
+/// `(mtime_ms, len)` from an already-enumerated directory entry. Uses
+/// `DirEntry::metadata` rather than a fresh `fs::metadata` path lookup: on
+/// Windows the values come from the directory enumeration the caller is already
+/// paying for, so a candidate costs no extra file open.
+fn entry_meta(entry: &fs::DirEntry) -> Option<(u64, u64)> {
+    let m = entry.metadata().ok()?;
+    let ms = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some((ms, m.len()))
+}
+
+/// Every claude session file, as metadata-only candidates.
+///
+/// #457: routes through the SAME testable root lookup `find_claude_session_cwd`
+/// already uses, rather than a second, untestable `dirs::home_dir()` inline
+/// (the pre-existing gap that made this function unable to honor
+/// `set_claude_projects_root_for_test` at all).
+///
+/// #493: a file whose metadata can't be read at all is skipped rather than
+/// listed with a zero timestamp. Pre-#493 such a file was listed (with
+/// `modified_ms: 0`, so dead last in the sort) — which in practice meant it was
+/// dropped by the same 300-row truncate anyway on any store big enough for the
+/// distinction to be reachable.
+fn collect_claude_candidates(out: &mut Vec<Candidate>) {
     let Some(root) = claude_projects_root() else {
         return;
     };
     let Ok(projects) = fs::read_dir(&root) else {
         return;
     };
-    // #457: one load for the whole scan, not one per session — same NB3
-    // rationale `scan_copilot` below already applies to its own read.
-    let intent = load_launch_intent();
     for project in projects.flatten() {
         let Ok(files) = fs::read_dir(project.path()) else {
             continue;
@@ -189,39 +231,42 @@ fn scan_claude(out: &mut Vec<SessionInfo>) {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else {
                 continue;
             };
-            let (title, cwd, orch) = scan_claude_jsonl(&path);
-            // Notice-only detections carry no group id; derive it from the
-            // session's cwd, keeping it only if that group exists on disk.
-            let (orch_role, orch_group) = match orch {
-                Some((role, Some(gid))) => (Some(role), Some(gid)),
-                Some((role, None)) if !cwd.is_empty() => {
-                    let gid = crate::orchestration::group_id_for_repo(&cwd);
-                    let exists = crate::orchestration::OrchRegistry::default_root()
-                        .join(&gid)
-                        .join("group.json")
-                        .is_file();
-                    (Some(role), exists.then_some(gid))
-                }
-                Some((role, None)) => (Some(role), None),
-                None => (None, None),
+            let Some((modified_ms, len)) = entry_meta(&file) else {
+                continue;
             };
-            out.push(SessionInfo {
-                // #457: re-derive loomux's own recorded launch intent
-                // (autopilot posture) instead of the pre-#457 unconditional
-                // bare resume — see the module doc above `build_resume_command`.
-                resume_command: build_resume_command("claude", id, &cwd, &intent),
-                id: id.to_string(),
-                source: "claude".to_string(),
-                title,
-                cwd,
-                modified_ms: mtime_ms(&path),
-                orch_role,
-                orch_group,
-            });
+            out.push(Candidate { path, source: "claude", id: Some(id), modified_ms, len });
         }
+    }
+}
+
+/// Every copilot session directory, as metadata-only candidates. One
+/// `fs::metadata` per session directory (the `workspace.yaml` inside it, whose
+/// mtime is the session's timestamp — same file the pre-#493 scan timestamped
+/// from), and no read of its contents: a directory with no `workspace.yaml`
+/// (session not yet written) drops out here exactly as it used to drop out of
+/// `read_copilot_session`.
+fn collect_copilot_candidates(out: &mut Vec<Candidate>) {
+    let Some(root) = copilot_session_state_root() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let ws = entry.path().join("workspace.yaml");
+        let Ok(m) = fs::metadata(&ws) else {
+            continue;
+        };
+        let modified_ms = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        out.push(Candidate { path: ws, source: "copilot", id: None, modified_ms, len: m.len() });
     }
 }
 
@@ -938,74 +983,334 @@ fn find_copilot_session_cwd(root: &Path, session_id: &str) -> Result<Option<Stri
     Ok(None)
 }
 
-fn scan_copilot(out: &mut Vec<SessionInfo>) {
-    let Some(root) = copilot_session_state_root() else {
-        return;
+/// Most rows `list_sessions` returns — and, since #493, also the scan's PARSE
+/// BUDGET. The cap itself is not new (the pre-#493 scan sorted by mtime and
+/// truncated to the same 300); what's new is that the rows beyond it are no
+/// longer parsed first and thrown away.
+///
+/// `pub` so the #493 tests can pin "parses are bounded by the row limit" against
+/// the limit itself rather than against a hard-coded 300 that would silently
+/// stop meaning anything if this changed.
+pub const LIST_LIMIT: usize = 300;
+
+/// What one session file's head-parse yielded — everything that depends on the
+/// file's CONTENT and nothing that doesn't (see `to_session_info` for the
+/// deliberately-not-cached derivations).
+struct Parsed {
+    id: String,
+    title: String,
+    cwd: String,
+    /// Orchestration role detected in the transcript, and the group id the
+    /// transcript itself named (a kickoff). `orch_role: Some`/`orch_gid: None`
+    /// is the notice-only detection — role known, group not stated.
+    orch_role: Option<String>,
+    orch_gid: Option<String>,
+}
+
+/// One session's cached head-parse (#493). Keyed by the session file's own
+/// path; validated by `(modified_ms, len)`, so an appended-to or replaced
+/// transcript is re-parsed and only a byte-for-byte-unchanged file is trusted.
+///
+/// What is deliberately NOT in here: `resume_command` and the on-disk group
+/// check. Both are derived from state that changes independently of the
+/// transcript (loomux's launch-intent record, a group directory that can be
+/// deleted), so caching them would let this file answer with something that was
+/// true once. They're re-derived on every scan instead — see `to_session_info`.
+#[derive(Serialize, Deserialize, Clone)]
+struct IndexEntry {
+    path: String,
+    modified_ms: u64,
+    len: u64,
+    id: String,
+    title: String,
+    cwd: String,
+    #[serde(default)]
+    orch_role: Option<String>,
+    #[serde(default)]
+    orch_gid: Option<String>,
+}
+
+/// The persisted index. `version` is a hard gate, not a hint: a file written by
+/// a different shape of this struct is discarded wholesale rather than
+/// partially trusted, which is what makes adding a field to `IndexEntry` later
+/// a safe one-line change instead of a migration.
+#[derive(Default, Serialize, Deserialize)]
+struct SessionIndex {
+    version: u32,
+    entries: Vec<IndexEntry>,
+}
+
+const SESSION_INDEX_VERSION: u32 = 1;
+
+thread_local! {
+    /// Test seam for `session_index_path()`, same thread-scoping rationale as
+    /// `LAUNCH_INTENT_PATH_OVERRIDE` — and doubly necessary here: a test that
+    /// scanned against the REAL index would both read another run's cached rows
+    /// and write its fixture's rows back over the developer's own file.
+    static SESSION_INDEX_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only seam: fixture the file the session index lives in, for the calling
+/// thread only. See `set_claude_projects_root_for_test` for why this is a real
+/// `pub` function rather than `#[cfg(test)]`.
+#[doc(hidden)] // pub for integration tests
+pub fn set_session_index_path_for_test(path: Option<PathBuf>) {
+    SESSION_INDEX_PATH_OVERRIDE.with(|c| *c.borrow_mut() = path);
+}
+
+fn session_index_path() -> PathBuf {
+    if let Some(p) = SESSION_INDEX_PATH_OVERRIDE.with(|c| c.borrow().clone()) {
+        return p;
+    }
+    crate::obs::data_root().join("session-index.json")
+}
+
+/// Best-effort load, keyed by path for O(1) lookup during the scan. Every
+/// failure mode — absent, corrupt, or written by another version — degrades to
+/// an empty index, i.e. "parse everything this once", never to a wrong answer.
+/// A corrupt file is quarantined by `load_or_quarantine`, the same fail-safe
+/// `tabs.json`/`launch-intent.json` use.
+fn load_session_index() -> HashMap<String, IndexEntry> {
+    let path = session_index_path();
+    let Some(raw) = crate::uistate::load_or_quarantine(&path) else {
+        return HashMap::new();
     };
-    let Ok(entries) = fs::read_dir(&root) else {
-        return;
+    let Ok(index) = serde_json::from_str::<SessionIndex>(&raw) else {
+        return HashMap::new();
     };
-    // #456 review NB3 (now shared by scan_claude too — #457): one load for
-    // the whole scan, not one per session — the store is read-only here, so
-    // there's nothing to keep fresh across iterations.
-    let intent = load_launch_intent();
-    for entry in entries.flatten() {
-        let Some(s) = read_copilot_session(&entry.path()) else {
-            continue;
-        };
-        // #457: re-derive loomux's own recorded launch intent (autopilot
-        // posture, if any unambiguous record exists) via the shared
-        // `build_resume_command` — see the module doc above. `=`, never a
-        // space, between `--resume` and the id (#458): copilot's CLI
-        // reference documents the flag as optional-value —
-        // `` `-r`, `--resume[=VALUE]` `` (raw-fetched via
-        // `curl -sL https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-cli-reference/cli-command-reference`,
-        // grepped for `--resume`) — and the CLI's OWN generated hint after a
-        // `-p`/`--prompt` run is spelled the same unambiguous way: "The exit
-        // summary includes a `copilot --resume=SESSION-ID` hint for
-        // continuing the session." The docs never show `--resume <id>` as a
-        // literal invocation (one unrelated prose line pairs `--remote` with
-        // `--resume <TASK-ID>` informally, not as a syntax example), so
-        // whether today's space form is silently mis-parsed by the
-        // underlying arg parser is UNVERIFIED rather than confirmed broken —
-        // this is a "remove the latent risk for free" fix, not a confirmed
-        // live bug, and the PR says so. `--resume=<id>` is documented, costs
-        // nothing, and can never be misread as a bare `--resume` (its own
-        // documented failure mode: an interactive picker, or — where no TTY
-        // is available for one — a loud error, never a silent wrong-session
-        // attach) plus a stray positional.
-        out.push(SessionInfo {
-            resume_command: build_resume_command("copilot", &s.id, &s.cwd, &intent),
-            id: s.id,
-            source: "copilot".to_string(),
-            title: tidy_title(&s.title, 90),
-            cwd: s.cwd,
-            modified_ms: s.modified_ms,
-            orch_role: None,
-            orch_group: None,
-        });
+    if index.version != SESSION_INDEX_VERSION {
+        return HashMap::new();
+    }
+    index.entries.into_iter().map(|e| (e.path.clone(), e)).collect()
+}
+
+/// Persist the index, atomically (`write_atomic`: a crash mid-write leaves the
+/// old valid file, never a truncated one — the #133 hazard).
+///
+/// Entries are sorted by path so the serialized bytes are a function of the
+/// content alone, which is what lets the caller skip the write entirely when
+/// nothing changed. Best-effort: a failed write costs the NEXT scan its cache,
+/// nothing more, so it is never surfaced as an error to the UI.
+fn save_session_index(entries: Vec<IndexEntry>) {
+    let mut entries = entries;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let index = SessionIndex { version: SESSION_INDEX_VERSION, entries };
+    if let Ok(json) = serde_json::to_string(&index) {
+        let _ = crate::uistate::write_atomic(&session_index_path(), &json);
     }
 }
 
-/// Full scan of every recorded Claude/Copilot session file on disk. Real,
-/// unbounded-by-count I/O (issue #342): a machine with a long orchestration
-/// history can accumulate thousands of `.claude/projects/**/*.jsonl` files
-/// across every past project, and each one costs an open + up to 60 lines
-/// read. A breadcrumb records how long this took and how many files it found,
-/// so a slow-startup report has an actual number to point at instead of "it
-/// felt slow" — this is the scan `main.ts`'s boot restore used to await
-/// before it would open a single pane.
+/// Read one candidate's head. `None` drops the row: a copilot directory whose
+/// `workspace.yaml` is gone or carries no `id` (exactly the pre-#493
+/// `read_copilot_session` behavior). A claude row is never dropped here — an
+/// unreadable jsonl yields the same "(no prompt)" row it did before, since its
+/// id comes from the filename and needs no parse at all.
+fn parse_candidate(c: &Candidate) -> Option<Parsed> {
+    if c.source == "claude" {
+        let (title, cwd, orch) = scan_claude_jsonl(&c.path);
+        let (orch_role, orch_gid) = match orch {
+            Some((role, gid)) => (Some(role), gid),
+            None => (None, None),
+        };
+        return Some(Parsed { id: c.id.clone()?, title, cwd, orch_role, orch_gid });
+    }
+    let s = read_copilot_session(c.path.parent()?)?;
+    Some(Parsed {
+        id: s.id,
+        title: tidy_title(&s.title, 90),
+        cwd: s.cwd,
+        // Copilot transcripts carry no loomux kickoff to detect a role from —
+        // the pre-#493 scan set both of these to None for every copilot row too.
+        orch_role: None,
+        orch_gid: None,
+    })
+}
+
+/// Build the row the frontend sees from a cached/just-parsed head plus the
+/// state that must NOT be cached with it.
+///
+/// #457: `resume_command` re-derives loomux's own recorded launch intent
+/// (autopilot posture, if any unambiguous record exists) via the shared
+/// `build_resume_command` — see the module doc above. `=`, never a space,
+/// between `--resume` and a copilot id (#458): copilot's CLI reference
+/// documents the flag as optional-value — `` `-r`, `--resume[=VALUE]` ``
+/// (raw-fetched via
+/// `curl -sL https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-cli-reference/cli-command-reference`,
+/// grepped for `--resume`) — and the CLI's OWN generated hint after a
+/// `-p`/`--prompt` run is spelled the same unambiguous way: "The exit summary
+/// includes a `copilot --resume=SESSION-ID` hint for continuing the session."
+/// The docs never show `--resume <id>` as a literal invocation (one unrelated
+/// prose line pairs `--remote` with `--resume <TASK-ID>` informally, not as a
+/// syntax example), so whether the space form is silently mis-parsed by the
+/// underlying arg parser is UNVERIFIED rather than confirmed broken.
+/// `--resume=<id>` is documented, costs nothing, and can never be misread as a
+/// bare `--resume` (its own documented failure mode: an interactive picker, or
+/// — where no TTY is available for one — a loud error, never a silent
+/// wrong-session attach) plus a stray positional.
+fn to_session_info(source: &str, e: &IndexEntry, intent: &LaunchIntentStore) -> SessionInfo {
+    // Notice-only detections carry no group id; derive it from the session's
+    // cwd, keeping it only if that group exists on disk. #493: this is derived
+    // EVERY scan and never cached — a group directory can be deleted while the
+    // transcript that named it stays byte-identical, so a cached `orch_group`
+    // would keep claiming a group that isn't there any more.
+    let (orch_role, orch_group) = match (&e.orch_role, &e.orch_gid) {
+        (Some(role), Some(gid)) => (Some(role.clone()), Some(gid.clone())),
+        (Some(role), None) if !e.cwd.is_empty() => {
+            let gid = crate::orchestration::group_id_for_repo(&e.cwd);
+            let exists = crate::orchestration::OrchRegistry::default_root()
+                .join(&gid)
+                .join("group.json")
+                .is_file();
+            (Some(role.clone()), exists.then_some(gid))
+        }
+        (Some(role), None) => (Some(role.clone()), None),
+        (None, _) => (None, None),
+    };
+    SessionInfo {
+        resume_command: build_resume_command(source, &e.id, &e.cwd, intent),
+        id: e.id.clone(),
+        source: source.to_string(),
+        title: e.title.clone(),
+        cwd: e.cwd.clone(),
+        modified_ms: e.modified_ms,
+        orch_role,
+        orch_group,
+    }
+}
+
+/// What one scan actually did. Exposed (via `list_sessions_for_test`) so the
+/// #493 tests can pin the SHAPE of the work — "no file was opened twice", "the
+/// parse count is bounded by the row limit, not by history" — instead of
+/// asserting on a wall-clock duration, which would be flaky on CI and would
+/// pass for the wrong reason on a fast disk.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ScanStats {
+    /// Session files found on disk, before the row limit.
+    pub files_seen: usize,
+    /// Rows returned.
+    pub rows: usize,
+    /// Files whose head was actually opened and parsed this scan.
+    pub parsed: usize,
+    /// Files served from the persisted index without being opened.
+    pub reused: usize,
+}
+
+/// Scan of every recorded Claude/Copilot session on disk, bounded two ways
+/// (#493).
+///
+/// The cost this replaces (issue #342, measured in #493): a machine with a long
+/// orchestration history accumulates thousands of `.claude/projects/**/*.jsonl`
+/// files across every past project, and the pre-#493 scan opened and head-read
+/// EVERY one of them on EVERY scan — 826 files in 13–17s on the machine #493
+/// was reported from, for a list that has always shown at most 300 rows.
+///
+/// Two bounds, in this order:
+///
+///  1. **Metadata first.** Candidates are collected from directory enumeration
+///     alone, sorted by mtime, and cut to `LIST_LIMIT` BEFORE anything is
+///     parsed. The rows a growing history adds now cost one `stat` each, not a
+///     head-parse — so the scan stops degrading monotonically with history,
+///     which was #493's third question.
+///  2. **A persisted index.** Each survivor's head-parse is cached in
+///     `session-index.json`, keyed by path and validated by `(mtime, len)`, so
+///     an unchanged file is never opened again on a later launch. A steady-state
+///     launch parses only what actually changed since the last one.
+///
+/// The row set is unchanged: same "newest 300 by mtime" the pre-#493 scan
+/// returned, in the same order (same comparator over the same enumeration
+/// order), because sorting on metadata sorts on the identical `modified_ms` the
+/// rows carried before.
+///
+/// A breadcrumb records the timing and the parsed/reused split, so a
+/// slow-startup report still has an actual number to point at (and so a
+/// regression that quietly stops using the index is visible in the log).
+fn scan_sessions() -> (Vec<SessionInfo>, ScanStats) {
+    let mut candidates = Vec::new();
+    collect_claude_candidates(&mut candidates);
+    collect_copilot_candidates(&mut candidates);
+    let files_seen = candidates.len();
+    candidates.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    candidates.truncate(LIST_LIMIT);
+
+    let cached = load_session_index();
+    // #456 review NB3 / #457: one load for the whole scan, not one per session
+    // — the store is read-only here, so there's nothing to keep fresh across
+    // iterations.
+    let intent = load_launch_intent();
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut fresh: Vec<IndexEntry> = Vec::with_capacity(candidates.len());
+    let mut parsed = 0usize;
+    let mut reused = 0usize;
+
+    for c in &candidates {
+        let key = c.path.to_string_lossy().into_owned();
+        let hit = cached
+            .get(&key)
+            .filter(|e| e.modified_ms == c.modified_ms && e.len == c.len)
+            .cloned();
+        let entry = match hit {
+            Some(e) => {
+                reused += 1;
+                e
+            }
+            None => {
+                parsed += 1;
+                let Some(p) = parse_candidate(c) else {
+                    continue;
+                };
+                IndexEntry {
+                    path: key,
+                    modified_ms: c.modified_ms,
+                    len: c.len,
+                    id: p.id,
+                    title: p.title,
+                    cwd: p.cwd,
+                    orch_role: p.orch_role,
+                    orch_gid: p.orch_gid,
+                }
+            }
+        };
+        out.push(to_session_info(c.source, &entry, &intent));
+        fresh.push(entry);
+    }
+
+    // Nothing parsed AND the same entry count means the index on disk already
+    // equals what we'd write (the only way an entry can differ is by having been
+    // re-parsed), so a steady-state launch does no write at all. The index is
+    // also self-pruning: it only ever holds the rows this scan returned, so it
+    // can't grow past `LIST_LIMIT` however long the history gets.
+    if parsed > 0 || fresh.len() != cached.len() {
+        save_session_index(fresh);
+    }
+
+    let stats = ScanStats { files_seen, rows: out.len(), parsed, reused };
+    (out, stats)
+}
+
+/// Test-only entry point: the scan plus the stats a #493 test asserts on,
+/// synchronously on the CALLING thread — which is also what makes the
+/// thread-local test seams (`set_claude_projects_root_for_test`,
+/// `set_session_index_path_for_test`, …) apply to it at all, unlike the
+/// `spawn_blocking` production path below.
+#[doc(hidden)] // pub for integration tests
+pub fn list_sessions_for_test() -> (Vec<SessionInfo>, ScanStats) {
+    scan_sessions()
+}
+
 fn list_sessions_sync() -> Vec<SessionInfo> {
     let start = std::time::Instant::now();
-    let mut sessions = Vec::new();
-    scan_claude(&mut sessions);
-    scan_copilot(&mut sessions);
-    let found = sessions.len();
-    sessions.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
-    sessions.truncate(300);
+    let (sessions, s) = scan_sessions();
     crate::obs::breadcrumb(
         "startup",
-        &format!("list_sessions: {found} session file(s) scanned in {:?}", start.elapsed()),
+        &format!(
+            "list_sessions: {} file(s) seen, {} listed ({} parsed, {} from index) in {:?}",
+            s.files_seen,
+            s.rows,
+            s.parsed,
+            s.reused,
+            start.elapsed()
+        ),
     );
     sessions
 }
@@ -1329,9 +1634,10 @@ mod launch_intent_tests {
     // `copilot-posture.json` on the machine running the suite.
     use super::{
         claude_posture_in, copilot_launch_posture, load_launch_intent, posture_key_for,
-        record_claude_launch_posture_impl, record_copilot_launch_posture_impl, scan_claude, scan_copilot,
+        record_claude_launch_posture_impl, record_copilot_launch_posture_impl, scan_sessions,
         set_claude_projects_root_for_test, set_copilot_session_state_root_for_test,
-        set_launch_intent_path_for_test, set_legacy_copilot_posture_path_for_test, IntentKey, Posture,
+        set_launch_intent_path_for_test, set_legacy_copilot_posture_path_for_test,
+        set_session_index_path_for_test, IntentKey, Posture, SessionInfo,
     };
     use std::fs;
 
@@ -1353,12 +1659,27 @@ mod launch_intent_tests {
         let d = tempfile::tempdir().unwrap();
         set_launch_intent_path_for_test(Some(d.path().join("launch-intent.json")));
         set_legacy_copilot_posture_path_for_test(Some(d.path().join("copilot-posture.json")));
+        // #493: the scan now consults a persisted index. Bound to this tempdir
+        // too, so a scan test neither reads another run's cached rows nor writes
+        // its fixtures over the developer's real `session-index.json`.
+        set_session_index_path_for_test(Some(d.path().join("session-index.json")));
         d
     }
 
     fn clear_seam() {
         set_launch_intent_path_for_test(None);
         set_legacy_copilot_posture_path_for_test(None);
+        set_session_index_path_for_test(None);
+    }
+
+    /// The rows the real `list_sessions` would return, for the scan tests
+    /// below. #493 merged the per-CLI scans into one pass, so each of these
+    /// tests must also fixture the OTHER CLI's root to an empty tempdir (they
+    /// do) — otherwise the scan would walk the developer's real
+    /// `~/.claude`/`~/.copilot` history, which is slow, non-deterministic, and
+    /// big enough to push the test's own fixtures past the row limit.
+    fn scan_rows() -> Vec<SessionInfo> {
+        scan_sessions().0
     }
 
     #[test]
@@ -1678,6 +1999,10 @@ mod launch_intent_tests {
     fn scan_copilot_restores_autopilot_flags_only_when_unambiguous() {
         let session_root = tempfile::tempdir().unwrap();
         set_copilot_session_state_root_for_test(Some(session_root.path().to_path_buf()));
+        // Empty claude root: this test is about copilot rows, and #493's single
+        // scan pass would otherwise reach the real `~/.claude` (see `scan_rows`).
+        let claude_root = tempfile::tempdir().unwrap();
+        set_claude_projects_root_for_test(Some(claude_root.path().to_path_buf()));
         let posture_dir = posture_seam();
 
         let write_session = |id: &str, cwd: &str| {
@@ -1708,8 +2033,7 @@ mod launch_intent_tests {
         record_copilot_launch_posture_impl("C:/work/ambiguous", false).unwrap();
         record_copilot_launch_posture_impl("C:/work/ambiguous", true).unwrap();
 
-        let mut out = Vec::new();
-        scan_copilot(&mut out);
+        let out = scan_rows();
         let by_id = |id: &str| out.iter().find(|s| s.id == id).unwrap();
 
         assert_eq!(
@@ -1746,6 +2070,7 @@ mod launch_intent_tests {
         }
 
         set_copilot_session_state_root_for_test(None);
+        set_claude_projects_root_for_test(None);
         clear_seam();
         drop(posture_dir);
     }
@@ -1761,6 +2086,10 @@ mod launch_intent_tests {
     fn scan_claude_restores_autopilot_flags_only_when_recorded() {
         let root = tempfile::tempdir().unwrap();
         set_claude_projects_root_for_test(Some(root.path().to_path_buf()));
+        // Empty copilot root, for the mirror-image reason the copilot test
+        // fixtures an empty claude one (see `scan_rows`).
+        let copilot_root = tempfile::tempdir().unwrap();
+        set_copilot_session_state_root_for_test(Some(copilot_root.path().to_path_buf()));
         let _d = posture_seam();
 
         let write_session = |id: &str, cwd: &str| {
@@ -1784,8 +2113,7 @@ mod launch_intent_tests {
         // recorded for.
         write_session("sess-unknown", "C:/work/unknown");
 
-        let mut out = Vec::new();
-        scan_claude(&mut out);
+        let out = scan_rows();
         let by_id = |id: &str| out.iter().find(|s| s.id == id).unwrap();
 
         assert_eq!(
@@ -1796,6 +2124,7 @@ mod launch_intent_tests {
         assert_eq!(by_id("sess-unknown").resume_command, "claude --resume sess-unknown");
 
         set_claude_projects_root_for_test(None);
+        set_copilot_session_state_root_for_test(None);
         clear_seam();
     }
 
@@ -1812,6 +2141,8 @@ mod launch_intent_tests {
     fn scan_claude_grants_nothing_to_a_session_with_no_recorded_intent() {
         let root = tempfile::tempdir().unwrap();
         set_claude_projects_root_for_test(Some(root.path().to_path_buf()));
+        let copilot_root = tempfile::tempdir().unwrap(); // empty — see `scan_rows`
+        set_copilot_session_state_root_for_test(Some(copilot_root.path().to_path_buf()));
         let _d = posture_seam(); // store exists but is empty — nothing recorded for anyone
 
         let proj = root.path().join("proj-foreign");
@@ -1822,8 +2153,7 @@ mod launch_intent_tests {
         )
         .unwrap();
 
-        let mut out = Vec::new();
-        scan_claude(&mut out);
+        let out = scan_rows();
         assert_eq!(
             out.iter().find(|s| s.id == "foreign-session").unwrap().resume_command,
             "claude --resume foreign-session",
@@ -1831,6 +2161,7 @@ mod launch_intent_tests {
         );
 
         set_claude_projects_root_for_test(None);
+        set_copilot_session_state_root_for_test(None);
         clear_seam();
     }
 
