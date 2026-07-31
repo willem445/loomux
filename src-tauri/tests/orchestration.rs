@@ -14169,7 +14169,7 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
     let wrapper = write_stripped_path_wrapper(root, &sh_abs);
     if !stripped_path_hides_the_coreutils(&sh_abs, &wrapper, root) {
         pin_could_not_arm("gh_shim_gates_the_api_shapes…",
-            "this host's sh cannot be made to hide the coreutils, so #509's condition is inexpressible here"); see the PR body");
+            "this host's sh cannot be made to hide the coreutils, so #509's condition is inexpressible here");
         return;
     }
 
