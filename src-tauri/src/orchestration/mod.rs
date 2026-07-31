@@ -239,8 +239,83 @@ pub fn dangerous_mode_notice(on: bool, by_autonomous: bool) -> String {
 /// It is checked **first**, so no grant and no autonomous marker can open it — the
 /// `workflow::evaluate_merge_gate` spec is the pure mirror of that decision. With
 /// no `merge_gate` file the shim behaves exactly as it did before #222.
+/// The machine-derived paths baked into the POSIX shims at write time (#509).
+///
+/// Both are **derived** from this machine's own Git for Windows install, never
+/// hardcoded (CLAUDE.md constraint 8 / #263): `utils_dir` from
+/// `winpath::resolve_utils_dir`, `git_dir` from the resolved real `git`. Both
+/// are in MSYS form (`/c/Program Files/…`, see `winpath::to_msys_dir`) because
+/// that is the only form an MSYS `sh` can resolve inside `$PATH`.
+///
+/// `None` means shim-write time could not find it. That is never fatal and
+/// never silent: a missing `utils_dir` leaves the shim's own dependency
+/// self-check to refuse every gated command loudly (fail CLOSED), and a missing
+/// `git_dir` just leaves the real gh's git plumbing where it was.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShimPaths {
+    /// Directory holding the POSIX coreutils the gate normalizes with.
+    pub utils_dir: Option<String>,
+    /// Directory holding the real `git.exe` (gh shim only — see the `.cmd`
+    /// re-parse note in `shim_cmd_delegator`).
+    pub git_dir: Option<String>,
+}
+
+/// The dependency preamble both POSIX shims open with (#509): repair `PATH` so
+/// the coreutils the gate normalizes with resolve, then **prove** they do and
+/// fail CLOSED if they do not.
+///
+/// Emitted byte-identically into the `gh` and `git` shims (pinned by
+/// `gh_and_git_shim_deps_preamble_stays_byte_identical`) — one gate-integrity
+/// guarantee, not two copies that can drift. It is deliberately generic about
+/// which shim it is running in: the two differ in which utilities they happen
+/// to use today (the git shim never calls `cat`/`tail`), and a per-shim list
+/// would be a standing invitation to "this one doesn't need that any more"
+/// edits that quietly narrow the check. Git for Windows ships all of them in
+/// one `usr\bin`, so the strict list costs nothing and cannot drift.
+fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
+    // `sh.exe` is launched by ABSOLUTE path from the `.cmd` delegator (#335),
+    // so it inherits the CALLER's PATH — and a PowerShell/cmd pane's PATH does
+    // not carry Git for Windows' `usr\bin`.
+    let repair = match utils_dir {
+        Some(dir) => format!(
+            "LOOMUX_UTILS=\"{dir}\"\n\
+             case \":$PATH:\" in\n\
+             \x20 *\":$LOOMUX_UTILS:\"*) ;;\n\
+             \x20 *) PATH=\"$LOOMUX_UTILS:$PATH\"; export PATH ;;\n\
+             esac\n"
+        ),
+        // Nothing resolved at write time: no repair to make, but the assertion
+        // below still runs — a shim that cannot normalize must refuse, not guess.
+        None => String::new(),
+    };
+    format!(
+        "# ── The gate's own toolchain (#509) ──────────────────────────────────────────\n\
+         # Before #509 a missing `tr` was SILENT: `x=$(printf … | tr …)` printed\n\
+         # \"tr: command not found\" and set `x` to the EMPTY string, and empty is not a\n\
+         # safe default here. An empty `path_low`/`low` matched none of the `gh api`\n\
+         # release/merge arms, so `gh api -X DELETE …/git/refs/tags/v1.2.3` and a\n\
+         # graphql `mergePullRequest` — both blocked under Git Bash — sailed straight\n\
+         # THROUGH the gate from a PowerShell pane. So: prepend the coreutils dir\n\
+         # resolved from this machine's own `sh` install at shim-write time (derived,\n\
+         # never hardcoded), in the MSYS `/c/…` form `sh` can actually resolve.\n\
+         {repair}\
+         # …and PROVE it worked, before one line of gate logic runs. A gate that\n\
+         # normalizes with tools it does not have is not a gate, and the pre-#509\n\
+         # failure was silent — the one thing a gate must never be. Fail CLOSED and\n\
+         # loudly instead. `command -v` is a shell builtin, so this check cannot\n\
+         # itself be defeated by the very PATH problem it is testing for.\n\
+         for _dep in tr head tail date cat rm mv; do\n\
+         \x20 command -v \"$_dep\" >/dev/null 2>&1 && continue\n\
+         \x20 printf '%s\\n' \"loomux: the merge/release gate shim cannot find the POSIX tool '$_dep' on PATH, so it cannot normalize the values it gates on. Refusing this command outright rather than running it through a gate that would silently skip those checks (#509). This means loomux could not locate Git for Windows' coreutils (usr/bin) when it wrote the shim: repair or reinstall Git for Windows, then open a new pane.\" >&2\n\
+         \x20 loomux_audit \"gate-degraded-missing-dep\" \"{{\\\"dep\\\":\\\"$_dep\\\"}}\"\n\
+         \x20 exit 1\n\
+         done\n\
+         unset _dep\n"
+    )
+}
+
 #[doc(hidden)] // pub so the integration test can pin the security-critical guards
-pub fn gh_shim_sh(real_gh: &str) -> String {
+pub fn gh_shim_sh(real_gh: &str, paths: &ShimPaths) -> String {
     // Template uses a placeholder (not format!) so the shell's own `$`/`{}` stay
     // literal. `date +%s%3N` is plain coreutils (no getrandom).
     const TPL: &str = r#"#!/bin/sh
@@ -258,6 +333,7 @@ loomux_audit() { # $1=action $2=detail-json
       >> "$LOOMUX_GROUP_DIR/audit.jsonl" 2>/dev/null || true
   fi
 }
+__DEPS_PREAMBLE__
 loomux_block() { # $1=reason $2=base $3=pr
   printf '%s\n' "loomux: merge to the default branch requires the human gate — enable auto-merge (autonomous mode) or have the human grant this one merge (board Approve). Open the PR and report to the human; do NOT merge." >&2
   loomux_audit "merge-gate-blocked" "{\"reason\":\"$1\",\"base\":\"$2\",\"pr\":\"$3\"}"
@@ -385,6 +461,7 @@ for tok in "$@"; do
       fi ;;
   esac
 done
+__GIT_PLUMBING__
 
 # RELEASE/TAG publish (#83): create/edit/delete a release is a publish-to-the-world
 # action — allowed when the group is autonomous AND has opted in via the auto_release
@@ -767,7 +844,102 @@ loomux_block "gate-closed" "$default" "$num"
     // endings, which git may check out as CRLF on Windows — but a CRLF `#!/bin/sh`
     // script is broken under POSIX sh. The `.cmd` wrapper (which needs CRLF) is
     // built separately with explicit `\r\n`.
-    TPL.replace("__REAL_GH__", real_gh).replace("\r\n", "\n")
+    TPL.replace("__REAL_GH__", real_gh)
+        .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
+        .replace("__GIT_PLUMBING__\n", &gh_shim_git_plumbing(paths.git_dir.as_deref()))
+        .replace("\r\n", "\n")
+}
+
+/// The gh subcommands whose PATH is adjusted so the real gh's own `git` calls
+/// reach a native `git.exe` (#509) — see `gh_shim_git_plumbing`.
+///
+/// Every entry is a **built-in** `gh` command (verified against `gh --help`,
+/// gh 2.95.0). That is the safety property, not a detail: gh refuses to let a
+/// user alias or an extension shadow a built-in, so a token in this list can
+/// never be agent-authored code. Anything NOT listed — an alias (`gh myalias`,
+/// which for a `!`-alias runs a shell), a `gh extension` invocation, or simply
+/// a gh command newer than this list — keeps the gated `git` on PATH. A gh
+/// version that grows a new git-using command therefore degrades to the old
+/// broken-argument behavior rather than opening anything: the fail direction
+/// this list is chosen for.
+const GH_GIT_PLUMBING_CMDS: &[&str] =
+    &["api", "auth", "browse", "gist", "issue", "pr", "release", "repo", "run", "status", "workflow"];
+
+/// Hand the real `gh` a PATH whose `git` is the real `git.exe` (#509), for the
+/// built-in subcommands that shell out to git.
+///
+/// **Why this is needed at all.** `gh pr create|status|…` runs `git` with
+/// arguments like `--get-regexp ^branch\.<b>\.(remote|merge)$`. With the shim
+/// dir first on PATH that resolves to our `git.cmd`, and Windows can only run a
+/// `.cmd` through a `cmd.exe /c` layer — which re-parses the command line, so
+/// the unquoted `|` splits it and gh dies with
+/// `failed to run git: 'merge' is not recognized`. **No batch quoting can fix
+/// that**: the mangling happens in the `cmd.exe` the *caller* spawns, before
+/// the `.cmd`'s first line runs (measured in the #509 PR against `%*`, a
+/// `set "ARGS=%*"` + delayed-expansion capture, and a per-argument `%~1`
+/// re-quoting loop — all three fail identically, while the same argument
+/// reaches a native `.exe` intact). A shim that breaks `gh pr create` pushes
+/// agents onto raw `gh api`, which is the exact route the shim exists to
+/// intercept (#196) — a worse security outcome than the one this costs.
+///
+/// **What it costs.** For those subcommands the real gh's *internal* git calls
+/// are not tag-gated. gh has no command that pushes a tag (`gh release create`
+/// creates the tag through the API, and is gated by this same shim), so the
+/// residual is a third-party program gh runs on the agent's behalf — which is
+/// why aliases and extensions are excluded above. See
+/// `doc/design/shim-path-integrity.md` and workflows.md's "The bypass surface,
+/// honestly".
+/// Resolve everything the shims need baked in, from ONE walk of this machine's
+/// Git for Windows install layout: the absolute `sh.exe` for the `.cmd`
+/// delegator (#335), and the `ShimPaths` for the POSIX bodies (#509).
+///
+/// `#[doc(hidden)] pub` so the integration tests can build a shim exactly the
+/// way `ensure_shims` does — a test that hand-assembled its own paths would
+/// stop pinning what actually ships.
+///
+/// Off Windows there is no `.cmd` layer and the coreutils are simply on PATH,
+/// so both come back empty; the shims' own dependency self-check still covers
+/// the case where they are not.
+#[doc(hidden)]
+pub fn resolve_shim_toolchain() -> (Option<String>, ShimPaths) {
+    #[cfg(target_os = "windows")]
+    {
+        let (path, pathext) = (crate::winpath::launch_path(), crate::winpath::launch_pathext());
+        let real_git = crate::winpath::resolve_program("git", &path, &pathext);
+        let sh = real_git
+            .as_ref()
+            .and_then(|git| crate::winpath::resolve_sh(git, &path, &pathext));
+        let utils = sh
+            .as_ref()
+            .and_then(|sh| crate::winpath::resolve_utils_dir(sh, &path, &pathext));
+        let paths = ShimPaths {
+            utils_dir: utils.as_deref().map(crate::winpath::to_msys_dir),
+            git_dir: real_git.as_ref().and_then(|g| g.parent()).map(crate::winpath::to_msys_dir),
+        };
+        (sh.map(|p| p.to_string_lossy().replace('\\', "/")), paths)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        (None, ShimPaths::default())
+    }
+}
+
+fn gh_shim_git_plumbing(git_dir: Option<&str>) -> String {
+    let Some(dir) = git_dir else { return String::new() };
+    format!(
+        "# ── The real gh's own git plumbing (#509) ────────────────────────────────────\n\
+         # `gh pr create` runs `git config --get-regexp ^branch\\.<b>\\.(remote|merge)$`.\n\
+         # Routed through our `git.cmd`, cmd.exe re-parses that line and the unquoted\n\
+         # `|` splits it: \"failed to run git: 'merge' is not recognized\". The mangling\n\
+         # is in the caller's cmd.exe, so the `.cmd` cannot quote its way out — only a\n\
+         # native `git.exe` receives the argument intact. Restricted to gh BUILT-IN\n\
+         # commands (an alias or extension can never shadow one), so `gh <alias>` and\n\
+         # `gh ext …` keep the gated git. See doc/design/shim-path-integrity.md.\n\
+         case \"$cmd\" in\n\
+         \x20 {arms}) PATH=\"{dir}:$PATH\"; export PATH ;;\n\
+         esac\n",
+        arms = GH_GIT_PLUMBING_CMDS.join("|")
+    )
 }
 
 /// The Windows `gh.cmd` wrapper: delegates to the POSIX shim (single source of
@@ -791,6 +963,22 @@ pub fn gh_shim_cmd(real_gh: &str, sh_path: Option<&str>) -> String {
 /// (`OrchRegistry::ensure_shims`) — that fallback to the real binary is
 /// audited loudly (`gate-degraded-no-sh`) rather than silently skipping the
 /// gate.
+///
+/// **A limit this file cannot fix, stated so nobody re-derives it (#509).**
+/// `%*` below forwards the caller's arguments, and cmd.exe re-parses them for
+/// `| & < > ^` *after* expanding them — so an argument carrying an unquoted
+/// metacharacter (gh's own
+/// `git config --get-regexp ^branch\.<b>\.(remote|merge)$`) is split into
+/// commands and the invocation dies with `'merge' is not recognized`. There is
+/// **no batch quoting that avoids this**: `%*`, `set "ARGS=%*"` +
+/// delayed-expansion, and a per-argument `%~1` re-quoting loop were all
+/// measured against that exact argument and fail identically, because the split
+/// happens in the `cmd.exe /c` layer Windows requires to run a `.cmd` at
+/// all — before this file's first line executes. The same argument reaches a
+/// native `.exe` intact, which is why the fix for gh's internal git calls is to
+/// route them to the real `git.exe` (`gh_shim_git_plumbing`) rather than to
+/// quote harder here. A gh/git invocation an *agent* types with an unquoted
+/// metacharacter is still mangled; it fails loudly and is not a gate hole.
 fn shim_cmd_delegator(program: &str, real_bs: &str, sh_path: Option<&str>) -> String {
     let set_sh = match sh_path {
         Some(p) => format!("set \"LOOMUX_SH={}\"\r\n", p.replace('/', "\\")),
@@ -846,7 +1034,7 @@ fn shim_cmd_delegator(program: &str, real_bs: &str, sh_path: Option<&str>) -> St
 /// git call (including a plain branch push) `exec`s the real git with no extra
 /// work. Mirrors the pure `git_tag_push` spec.
 #[doc(hidden)] // pub so the integration test can pin the guards
-pub fn git_shim_sh(real_git: &str) -> String {
+pub fn git_shim_sh(real_git: &str, paths: &ShimPaths) -> String {
     const TPL: &str = r#"#!/bin/sh
 # loomux git shim (#83) — gate release/tag pushes. Generated by loomux; do not edit.
 REAL_GIT="__REAL_GIT__"
@@ -860,6 +1048,7 @@ loomux_audit() { # $1=action $2=detail-json
       >> "$LOOMUX_GROUP_DIR/audit.jsonl" 2>/dev/null || true
   fi
 }
+__DEPS_PREAMBLE__
 loomux_block_release() { # $1=tag $2=action
   printf '%s\n' "loomux: pushing a release tag ($1) requires an explicit human grant — a v* tag push publishes to the world (GitHub release + npm via release.yml), which autonomous mode does NOT authorize. Ask the human to grant the release; do NOT push the tag." >&2
   loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
@@ -984,7 +1173,9 @@ fi
 loomux_block_release "$tag" "push"
 "#;
     // Normalize to LF (see gh_shim_sh) — a CRLF POSIX script is broken.
-    TPL.replace("__REAL_GIT__", real_git).replace("\r\n", "\n")
+    TPL.replace("__REAL_GIT__", real_git)
+        .replace("__DEPS_PREAMBLE__\n", &shim_deps_preamble(paths.utils_dir.as_deref()))
+        .replace("\r\n", "\n")
 }
 
 /// The Windows `git.cmd` wrapper: delegates to the POSIX git shim via an
@@ -19566,9 +19757,10 @@ impl OrchRegistry {
         &self,
         dir: &Path,
         program: &str,
-        sh: impl Fn(&str) -> String,
+        sh: impl Fn(&str, &ShimPaths) -> String,
         cmd: impl Fn(&str, Option<&str>) -> String,
         sh_path: Option<&str>,
+        paths: &ShimPaths,
     ) -> bool {
         let Some(real) = crate::winpath::resolve_program(
             program,
@@ -19581,7 +19773,7 @@ impl OrchRegistry {
         // `C:/…`); still valid for the `.cmd` wrapper.
         let real_fwd = real.to_string_lossy().replace('\\', "/");
         let script = dir.join(program);
-        let _ = fs::write(&script, sh(&real_fwd).as_bytes());
+        let _ = fs::write(&script, sh(&real_fwd, paths).as_bytes());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -19612,25 +19804,18 @@ impl OrchRegistry {
         // into both `.cmd` delegators. `None` when no `sh` exists anywhere on the
         // machine; the delegator then audits the degraded gate on every fallback
         // rather than bypassing it silently.
-        #[cfg(target_os = "windows")]
-        let sh_path: Option<String> = crate::winpath::resolve_program(
-            "git",
-            &crate::winpath::launch_path(),
-            &crate::winpath::launch_pathext(),
-        )
-        .and_then(|git| {
-            crate::winpath::resolve_sh(
-                &git,
-                &crate::winpath::launch_path(),
-                &crate::winpath::launch_pathext(),
-            )
-        })
-        .map(|p| p.to_string_lossy().replace('\\', "/"));
-        #[cfg(not(target_os = "windows"))]
-        let sh_path: Option<String> = None;
+        //
+        // #509 rides on the same resolution: `sh` inherits the CALLER's PATH,
+        // which off a PowerShell/cmd pane carries neither Git for Windows'
+        // coreutils (so the shim's `tr` vanished and the `gh api` gate fell
+        // OPEN) nor a native `git.exe` ahead of our own `git.cmd` (so gh's
+        // internal git calls were mangled by cmd.exe's re-parse). Both are
+        // derived here from the same install layout `sh` was found in — never
+        // hardcoded (constraint 8) — and baked into the POSIX shims.
+        let (sh_path, shim_paths) = resolve_shim_toolchain();
 
-        let gh = self.write_shim(&dir, "gh", gh_shim_sh, gh_shim_cmd, sh_path.as_deref());
-        let git = self.write_shim(&dir, "git", git_shim_sh, git_shim_cmd, sh_path.as_deref());
+        let gh = self.write_shim(&dir, "gh", gh_shim_sh, gh_shim_cmd, sh_path.as_deref(), &shim_paths);
+        let git = self.write_shim(&dir, "git", git_shim_sh, git_shim_cmd, sh_path.as_deref(), &shim_paths);
         (gh || git).then_some(dir)
     }
 
