@@ -6643,6 +6643,16 @@ pub struct OrchRegistry {
     /// would re-stage entries a first pass already re-admitted and deliver
     /// them twice.
     recovered_groups: Arc<Mutex<HashSet<String>>>,
+    /// #532: panes whose question hold has already raised the one-shot
+    /// possibly-stale badge ([`StrandedBlocker::QuestionStale`]). The drainer
+    /// evaluates `held_escalation` on every `QUEUE_DRAIN_POLL` tick, and
+    /// `mark_stranded` audits on every call — without this the audit log would
+    /// gain a line every two seconds for as long as the pane stayed held,
+    /// which is the same flood the badge exists to replace. Cleared the moment
+    /// the pane reads deliverable again, so a LATER hold on the same pane
+    /// badges again rather than being silently suppressed by the first.
+    question_stale_notified: Arc<Mutex<HashSet<u32>>>,
+
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
     tasks_lock: Mutex<()>,
@@ -9043,6 +9053,50 @@ pub enum StrandedBlocker {
     /// that one's wording says a heal already fired and did not take, which
     /// would be a false claim here — nothing was attempted at all.
     QueueFull,
+    /// #532: the interactive-question guard has held this pane's delivery for
+    /// longer than [`QUESTION_HOLD_STALE_AFTER`], and loomux cannot tell
+    /// whether the question it still detects is real.
+    ///
+    /// **Why this is a badge and never a release.** `prompt_wait_detected`
+    /// reads `PtyManager::output_tail_bounded`, which is an append-only byte
+    /// RING, not a screen: an answered question stays inside the last
+    /// `QUESTION_SCAN_TAIL_BYTES` on a pane that has gone quiet, so the
+    /// structured signals it matches on ("(y/n)", "do you want to proceed")
+    /// keep matching indefinitely. That detector's own doc says as much — "this
+    /// alone can't tell a live prompt from the same words scrolled past" — and
+    /// the #420 hold is the one consumer that pairs it with nothing. From bytes
+    /// alone the two states are identical, so there is no reading that could
+    /// justify releasing.
+    ///
+    /// The asymmetry decides what to do about that. A prompt held too long is
+    /// recoverable by a human who is *told* about it; an Enter that
+    /// auto-answers a live consent dialog is not recoverable at all — it
+    /// silently steers the agent, which is the exact harm #420 exists to
+    /// prevent. So the bound stops the hold re-arming *silently* and names the
+    /// staleness hypothesis to the human; it never converts into a write. See
+    /// [`held_escalation`].
+    ///
+    /// **Which human, and when (rev-12 NB4).** Be exact about the channel this
+    /// argument rests on, because it is narrower than "told". The telling is
+    /// `mark_stranded` — the `attn_stranded` badge (a chip in the desktop
+    /// window) plus an audit line, the established #496 PR-C channel. It is
+    /// **not** an in-band notice to any agent: `notify_queue` returns early
+    /// with `notice-suppressed` whenever `target_is_orchestrator`, which is
+    /// exactly the pane in #532's own incident. So on an attended session the
+    /// human sees the chip; on an unattended overnight run **nobody is told
+    /// until someone next looks at the window**, which is what happened. That
+    /// does not change the release/badge decision — an unattended run is
+    /// precisely where a wrong Enter is least recoverable — but "a human is
+    /// told" should not be read as "somebody is paged".
+    ///
+    /// The approach that could answer what this variant can only ask is
+    /// [`termgrid`] (#530): rendered rows, where "still displayed" is a
+    /// real reading. Note it is NOT a drop-in — `termgrid::render_screen`
+    /// returns scrolled-off history rows *followed by* the on-screen rows, so
+    /// pointing the detector at it unchanged would reproduce this same bug.
+    /// See `doc/design/orchestration.md`'s #532 section for what the follow-up
+    /// actually needs.
+    QuestionStale,
 }
 
 impl StrandedBlocker {
@@ -9056,6 +9110,7 @@ impl StrandedBlocker {
             StrandedBlocker::NotHolding => "not-holding",
             StrandedBlocker::Exhausted => "heal-budget-spent",
             StrandedBlocker::QueueFull => "queue-full",
+            StrandedBlocker::QuestionStale => "question-hold-stale",
         }
     }
 }
@@ -9505,6 +9560,18 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
         }
         Some(StrandedBlocker::QueueFull) => {
             format!("{name}'s pane has a full delivery queue, so loomux could not even queue a re-send — press Enter in the pane")
+        }
+        // #532: this wording must stay honest about WHICH state loomux is in,
+        // because it does not know. It names both branches and gives an action
+        // that is safe under either — answering a real question, or typing and
+        // deleting a character, which both moves the pane's output past the
+        // stale bytes and leaves the box empty again.
+        Some(StrandedBlocker::QuestionStale) => {
+            format!(
+                "{name}'s prompt has been held for minutes on a question loomux still detects in this pane — \
+                 answer it if one is on screen; if the pane looks clear, that reading is stale: type a \
+                 character and delete it to release the hold"
+            )
         }
     }
 }
@@ -10030,12 +10097,22 @@ enum DeliverOutcome {
     /// A pre-paste hold (box-occupied or question) capped out — nothing was
     /// pasted. The exact text this call was given still needs queuing.
     AbortedPrePaste(queue::EnqueueReason),
-    /// The pre-Enter question hold capped out (seam 3): the text WAS
-    /// pasted, only the Enter was withheld. `record_aborted_preenter_outcome`
-    /// has already run (so the NEXT thing to touch this pane's box sees it
-    /// as stranded) — the caller's job is to queue a `StrandedSubmit`
-    /// marker, never the text again.
-    AbortedPreEnter,
+    /// A pre-Enter gate declined (seam 3): the text WAS pasted, only the Enter
+    /// was withheld. `record_aborted_preenter_outcome` has already run (so the
+    /// NEXT thing to touch this pane's box sees it as stranded) — the caller's
+    /// job is to queue a `StrandedSubmit` marker, never the text again.
+    ///
+    /// **Carries its reason since #532 (rev-12 NB1).** This used to have one
+    /// cause — the question hold — so the drainer hardcoded
+    /// `EnqueueReason::Question` in the notice it sends. #532 gave the path a
+    /// second cause (the pre-Enter occupancy gate), which made that notice tell
+    /// the orchestrator "an interactive question is on screen" for a pane whose
+    /// only blocker was the human's own half-typed line — sending it to look
+    /// for a dialog that does not exist. Mirrors `AbortedPrePaste`, which has
+    /// carried its reason all along, and closes the same mislabel
+    /// `write_admission_badges_the_gate_that_actually_blocked` exists to
+    /// prevent.
+    AbortedPreEnter(queue::EnqueueReason),
 }
 
 /// The delivery body itself — paste, echo-verify, submit, confirm — pulled
@@ -10201,54 +10278,96 @@ fn deliver_now(
     // `/model` + task-text collision). So hold for the box to clear
     // (they submit or clear it); if it never does, abort WITHOUT pasting
     // — the caller (#445) enqueues it and notifies once.
-    let will_hold_box = ptys.input_pending(pty_id).unwrap_or(false);
-    if will_hold_box {
-        emit_held(HeldReason::BoxOccupied);
-    }
-    let paste_decision = wait_for_box_clear(&ptys, pty_id);
-    if will_hold_box {
-        emit_held_cleared();
-    }
-    match paste_decision {
-        PasteDecision::Paste { held_ms } if held_ms > 0 => {
-            append_audit(&root, &group, "loomux", "delivery-held-for-input", json!({
-                "to": agent, "held_ms": held_ms, "outcome": "cleared",
-            }));
+    //
+    // #532: both pre-paste gates live inside a re-verify LOOP, not a straight
+    // line. The question hold below can block for `QUESTION_HOLD_MAX`, and a
+    // box-occupancy answer taken before it is a fact about a different
+    // instant by the time it clears — see `write_admission` for the exact
+    // interleaving this closes (it is the ordinary one, not a rare race: the
+    // keystroke that releases a stale question hold is the same keystroke that
+    // occupies the box). The loop exits only when BOTH gates read clear
+    // together.
+    let mut recheck_round = 0u32;
+    let prepaste_admission = loop {
+        recheck_round += 1;
+        let will_hold_box = ptys.input_pending(pty_id).unwrap_or(false);
+        if will_hold_box {
+            emit_held(HeldReason::BoxOccupied);
         }
-        PasteDecision::Paste { .. } => {}
-        PasteDecision::Abort { held_ms } => {
-            append_audit(&root, &group, "loomux", "delivery-aborted-human-input", json!({
-                "to": agent, "held_ms": held_ms,
-            }));
-            return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::BoxOccupied);
+        let paste_decision = wait_for_box_clear(&ptys, pty_id);
+        if will_hold_box {
+            emit_held_cleared();
         }
-    }
+        match paste_decision {
+            PasteDecision::Paste { held_ms } if held_ms > 0 => {
+                append_audit(&root, &group, "loomux", "delivery-held-for-input", json!({
+                    "to": agent, "held_ms": held_ms, "outcome": "cleared",
+                    "recheck_round": recheck_round,
+                }));
+            }
+            PasteDecision::Paste { .. } => {}
+            PasteDecision::Abort { held_ms } => {
+                append_audit(&root, &group, "loomux", "delivery-aborted-human-input", json!({
+                    "to": agent, "held_ms": held_ms, "recheck_round": recheck_round,
+                }));
+                return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::BoxOccupied);
+            }
+        }
 
-    // Interactive-question paste guard (#420): a question/permission TUI
-    // reads nothing like the box-occupied case above (no keystrokes, no
-    // `input_pending`) but is just as unsafe to paste over — worse,
-    // actually, since the Enter below wouldn't merge text, it would SELECT
-    // whichever option is highlighted. Hold for `prompt_wait_detected` to
-    // clear (the human answers) before pasting; if it never does, abort
-    // without pasting, same recovery shape as the box-occupied guard.
-    // Nothing of ours is on screen yet at this point in the delivery, so
-    // there's no self-echo risk to gate against (`paste_baseline_total:
-    // None` — see `question_hold_predicate`).
-    let question_decision =
-        wait_for_question_clear(&ptys, pty_id, None, &emit_held, &emit_held_cleared);
-    match question_decision {
-        PasteDecision::Paste { held_ms } if held_ms > 0 => {
-            append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
-                "to": agent, "stage": "pre-paste", "held_ms": held_ms, "outcome": "cleared",
-            }));
+        // Interactive-question paste guard (#420): a question/permission TUI
+        // reads nothing like the box-occupied case above (no keystrokes, no
+        // `input_pending`) but is just as unsafe to paste over — worse,
+        // actually, since the Enter below wouldn't merge text, it would SELECT
+        // whichever option is highlighted. Hold for `prompt_wait_detected` to
+        // clear (the human answers) before pasting; if it never does, abort
+        // without pasting, same recovery shape as the box-occupied guard.
+        // Nothing of ours is on screen yet at this point in the delivery, so
+        // there's no self-echo risk to gate against (`paste_baseline_total:
+        // None` — see `question_hold_predicate`).
+        let question_decision =
+            wait_for_question_clear(&ptys, pty_id, None, &emit_held, &emit_held_cleared);
+        match question_decision {
+            PasteDecision::Paste { held_ms } if held_ms > 0 => {
+                append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
+                    "to": agent, "stage": "pre-paste", "held_ms": held_ms, "outcome": "cleared",
+                    "recheck_round": recheck_round,
+                }));
+            }
+            PasteDecision::Paste { .. } => {}
+            PasteDecision::Abort { held_ms } => {
+                append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
+                    "to": agent, "stage": "pre-paste", "held_ms": held_ms,
+                    "recheck_round": recheck_round,
+                }));
+                return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::Question);
+            }
         }
-        PasteDecision::Paste { .. } => {}
-        PasteDecision::Abort { held_ms } => {
-            append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
-                "to": agent, "stage": "pre-paste", "held_ms": held_ms,
-            }));
-            return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::Question);
+
+        // #532: the gates, re-read TOGETHER. `unwrap_or(false)` for a closed
+        // pty is deliberate and not the fail-safe direction reversed: a closed
+        // pane has no input box and nobody typing into it, so there is nothing
+        // for this guard to protect, and the paste below already fails and
+        // audits `prompt-failed` — which is both the pre-existing behaviour
+        // and the more informative one. Making it `true` would only convert a
+        // dead pane into an extra enqueue/retry cycle.
+        let admission = write_admission(
+            ptys.input_pending(pty_id).unwrap_or(false),
+            question_active_now(&ptys, pty_id, None),
+        );
+        if admission.go() || recheck_round >= PREPASTE_RECHECK_ROUNDS {
+            break admission;
         }
+    };
+    if !prepaste_admission.go() {
+        // A gate re-armed as fast as the other one cleared, `PREPASTE_RECHECK_
+        // ROUNDS` times over — a pane a human is actively working in. Hold the
+        // delivery rather than paste into it; the entry stays at the front of
+        // its queue and the drainer retries with no cap.
+        append_audit(&root, &group, "loomux", "delivery-aborted-recheck", json!({
+            "to": agent, "stage": "pre-paste", "rounds": recheck_round,
+            "blocked_on": prepaste_admission.enqueue_reason().as_str(),
+        }));
+        return DeliverOutcome::AbortedPrePaste(prepaste_admission.enqueue_reason());
     }
 
     // #445 rev-35 B1 USED to re-check the queue right here, immediately
@@ -10415,8 +10534,37 @@ fn deliver_now(
             // could wrongly conclude nothing needs clearing and
             // append its own paste onto this one's abandoned text.
             record_aborted_preenter_outcome(&last_delivery, pty_id, delivery_from);
-            return DeliverOutcome::AbortedPreEnter;
+            return DeliverOutcome::AbortedPreEnter(queue::EnqueueReason::Question);
         }
+    }
+    // #532: the LAST gate before the Enter, and the one that was missing.
+    // Every other pre-Enter check above answers a different question —
+    // `wait_for_user_quiet` asks whether the human has *stopped* typing, and
+    // the question hold asks whether a dialog owns the Enter key. Neither asks
+    // the one thing #510 is actually about: is there human-typed content in
+    // this box *right now*, which this Enter would submit. A human who typed
+    // during the pre-paste holds and then paused satisfies both checks above
+    // while their line still sits in the box — which is precisely how #532's
+    // prompt landed mid-typing.
+    //
+    // Aborting here is not a loss and not a new recovery path: the text IS
+    // pasted, so this takes the SAME `AbortedPreEnter` route the question
+    // checkpoint directly above already takes — a `StrandedSubmit` marker at
+    // the front of the queue, retried with no cap, whose own press
+    // (`drain_stranded_submit` → `flush_stranded_text`) now re-reads occupancy
+    // too. So the delivery waits for the box to empty and then flushes.
+    //
+    // The reading itself lives in `preenter_admission` (rev-12 B1) so this
+    // call site has nothing left to get wrong beyond calling it, and so the
+    // gate is drivable by a test without an `AppHandle` — the same extraction
+    // `flush_stranded_text`'s doc makes the argument for.
+    let preenter = preenter_admission(&ptys, pty_id);
+    if !preenter.go() {
+        append_audit(&root, &group, "loomux", "delivery-aborted-human-input", json!({
+            "to": agent, "stage": "pre-enter", "reason": "box occupied at submit time",
+        }));
+        record_aborted_preenter_outcome(&last_delivery, pty_id, delivery_from);
+        return DeliverOutcome::AbortedPreEnter(preenter.enqueue_reason());
     }
     // #112 round 2: Tier 1's precondition, OBSERVED right here rather
     // than assumed from `echoed` (round 1's mistake — `echoed` is a
@@ -11132,9 +11280,58 @@ fn run_queue_drainer(
                     &queue::still_queued_notice(&front.agent_id, depth, minutes));
             }
 
-            let deliverable = !ptys.input_pending(pty_id).unwrap_or(false)
-                && !question_active_now(&ptys, pty_id, None);
-            if !deliverable {
+            // #532: the same `write_admission` the paste point uses, rather
+            // than a second inline spelling of the same two gates. This poll
+            // is where a held delivery actually LIVES — `deliver_now` holds
+            // for at most its own capped waits, but this loop re-arms them
+            // with no cap — so it is also where the aggregate hold has to be
+            // bounded.
+            let box_pending = ptys.input_pending(pty_id).unwrap_or(false);
+            let admission =
+                write_admission(box_pending, question_active_now(&ptys, pty_id, None));
+            // #532: the escalation decision is `held_escalation`'s, not an
+            // inline `&&` chain here (rev-12 B1) — this loop is where a held
+            // delivery actually LIVES, since `deliver_now` holds only for its
+            // own capped waits while this re-arms them with no cap, so it is
+            // also where the aggregate hold has to be bounded and reported.
+            let already_badged = reg.question_stale_notified.lock_safe().contains(&pty_id);
+            match held_escalation(
+                admission,
+                front.enqueued_ms,
+                now_ms(),
+                QUESTION_HOLD_STALE_AFTER.as_millis() as u64,
+                already_badged,
+            ) {
+                HeldEscalation::Badge(blocker) => {
+                    // rev-12 NB5: guard the RAISE, not just the clear. The
+                    // first cut guarded only the clear and claimed a genuine
+                    // #496 PR-C badge was "never cleared by this one's
+                    // recovery" — but `mark_stranded` overwrites
+                    // unconditionally, so that badge became ours and the
+                    // guarded clear then removed it. Declining to overwrite
+                    // makes the comment true: another mechanism's badge is
+                    // already telling the human this pane needs them, which is
+                    // what this escalation exists to achieve anyway.
+                    if reg.stranded_note(&front.agent_id).is_none() {
+                        reg.question_stale_notified.lock_safe().insert(pty_id);
+                        reg.mark_stranded(&group, &front.agent_id, Some(blocker));
+                    }
+                }
+                HeldEscalation::Clear => {
+                    reg.question_stale_notified.lock_safe().remove(&pty_id);
+                    // Still blocker-guarded: between our raise and now, another
+                    // mechanism may have re-badged this pane for its own
+                    // reason, and that badge is not ours to drop.
+                    if reg
+                        .stranded_note(&front.agent_id)
+                        .is_some_and(|n| matches!(n.blocker, Some(StrandedBlocker::QuestionStale) | Some(StrandedBlocker::HumanInput)))
+                    {
+                        reg.clear_stranded(&group, &front.agent_id, "delivery-hold-released");
+                    }
+                }
+                HeldEscalation::None => {}
+            }
+            if !admission.go() {
                 continue; // keep polling — no cap
             }
         }
@@ -11260,6 +11457,9 @@ fn run_queue_drainer(
             DeliverOutcome::Done => {
                 reg.pop_batch_dequeued(&group, pty_id, &closed);
                 reg.queue_still_notified.lock_safe().remove(&pty_id);
+                // #532: same lifecycle — a delivered entry means whatever was
+                // holding this pane is over, so a LATER hold badges afresh.
+                reg.question_stale_notified.lock_safe().remove(&pty_id);
             }
             DeliverOutcome::AbortedPrePaste(reason) => {
                 // Nothing pasted (or the stranded flush declined) — leave
@@ -11276,13 +11476,18 @@ fn run_queue_drainer(
                         &queue::queued_notice(&front.agent_id, reason));
                 }
             }
-            DeliverOutcome::AbortedPreEnter => {
+            DeliverOutcome::AbortedPreEnter(reason) => {
                 // The Text entry WAS pasted; only the Enter was withheld.
                 // Replace it at the front with a StrandedSubmit marker so
                 // draining resumes there next tick instead of re-pasting.
+                //
+                // rev-12 NB1: `reason` comes from the gate that actually
+                // declined, never a hardcoded `Question`. #532 gave this path
+                // a second cause, and the hardcode was telling the
+                // orchestrator to go find a dialog that did not exist.
                 if is_fresh_attempt {
                     reg.notify_queue(&group, &front.agent_id, target_is_orchestrator,
-                        &queue::queued_notice(&front.agent_id, queue::EnqueueReason::Question));
+                        &queue::queued_notice(&front.agent_id, reason));
                 }
                 // #533-A: the paste that landed in the box was the WHOLE
                 // batch, so the whole batch closes out here and ONE marker
@@ -11336,12 +11541,40 @@ pub fn should_flush_before_paste(prev_confirmed: Option<bool>, human_typed_since
 /// the exact path this guard exists to close. A named function (not an inline
 /// `&&` at the call site) so the combination is independently testable and
 /// can't be silently dropped by a future edit to either input.
+///
+/// **`box_pending` (#532) — the #510 rule, read STRUCTURALLY at the press.**
+/// `human_typed_since` is a TIMESTAMP compare (`last_user_input_ms >
+/// submit_sent_ms`), and a timestamp answers "did a keystroke land after our
+/// own submit", which is a strictly narrower question than "is there human
+/// content in this box right now". The gap is reachable and was live in #532:
+/// a human who typed a line and left it sitting BEFORE our submit stamps
+/// `last_user_input_ms` at or before `submit_sent_ms`, so `human_typed_since`
+/// reads FALSE and this gate used to fire an Enter that submitted their line.
+/// `input_pending` (#111/#171 — the per-pane occupancy counter, moved by writes
+/// arriving through `write_pty`/`note_user_input`, never by loomux's own
+/// `write_bytes`) is a **much closer** reading of the box than a keystroke
+/// timestamp, so it is consulted here rather than inferred.
+///
+/// It is not, however, the box itself, and rev-12 was right to flag an earlier
+/// version of this doc for saying so. It is a running count that
+/// `classify_human_input` zeroes on only `\r`/`\n`, Ctrl-U and Ctrl-C, so it
+/// has a reachable **stuck-true** mode — see [`hold_bound_elapsed`], which is
+/// deliberately not allowed to consult it for exactly that reason. Stuck-true
+/// is the safe direction *here* (a withheld Enter, recoverable) and the unsafe
+/// direction *there* (a suppressed escalation, not), which is why the same
+/// signal is trusted at this gate and refused at that one.
+///
+/// It does NOT suppress the legitimate case this flush exists for: our own
+/// stranded paste never moves that counter.
 pub fn should_flush_before_paste_now(
     prev_confirmed: Option<bool>,
     human_typed_since: bool,
     question_active: bool,
+    box_pending: bool,
 ) -> bool {
-    should_flush_before_paste(prev_confirmed, human_typed_since) && !question_active
+    should_flush_before_paste(prev_confirmed, human_typed_since)
+        && !question_active
+        && !box_pending
 }
 
 /// The stranded-text flush STEP (#81/#84, #420 rev-15 B1) — decides via
@@ -11367,7 +11600,13 @@ pub fn flush_stranded_text(
     submit: &[u8],
 ) -> bool {
     let question_active = question_active_now(ptys, pty_id, None);
-    should_flush_before_paste_now(prev_confirmed, human_typed_since, question_active)
+    // #532: BOTH live readings are taken here, at the press, and neither is
+    // inherited from a check some earlier stage passed. `unwrap_or(true)` is
+    // the fail-safe direction for an occupancy reading we cannot take (a
+    // closed pty): decline the Enter rather than press blind. It matches
+    // `human_input_block_now`'s treatment of the same unreadable case.
+    let box_pending = ptys.input_pending(pty_id).unwrap_or(true);
+    should_flush_before_paste_now(prev_confirmed, human_typed_since, question_active, box_pending)
         && ptys.write_bytes(pty_id, submit).is_ok()
 }
 
@@ -11873,6 +12112,302 @@ fn question_active_now(ptys: &crate::pty::PtyManager, pty_id: u32, pasted_text: 
     )()
 }
 
+/// #532: the guards a delivery must find satisfied **at one instant**, on the
+/// pass that actually commits to a write.
+///
+/// A straight line of checkpoints is what inverted both safety signals in
+/// #532. `deliver_now` checked box occupancy (#111/#171) FIRST and the
+/// interactive question (#420) SECOND — and the second one *blocks*, for up to
+/// `QUESTION_HOLD_MAX` (two minutes). Nothing re-read occupancy afterwards, so
+/// the delivery pasted on a green light earned two minutes earlier against a
+/// box that was empty *then*.
+///
+/// That is not a rare interleaving; it is the ordinary one, because the same
+/// event resolves the second gate and violates the first. A human typing is
+/// what pushes a stale question out of `prompt_wait_detected`'s window (their
+/// echo shifts the byte ring), so on a stale hold the keystroke that *releases*
+/// the question gate is the same keystroke that *occupies* the box. The
+/// delivery then pasted onto their half-written line and the pre-Enter quiet
+/// wait submitted the merged result the moment they paused — the human's
+/// report, mechanism for mechanism.
+///
+/// So every gate is re-read here, together, and a checkpoint's answer is never
+/// carried across a wait that can outlive it. `box_pending` is checked first
+/// because #510 is the absolute: human-typed content in the box outranks even a
+/// question, since the cost of holding too long is a badge and the cost of
+/// submitting over a person's line is unrecoverable.
+///
+/// Pure and three-way (rather than the `bool` this replaces at three call
+/// sites) so the precedence is directly pinnable and so a caller can badge and
+/// enqueue with the reason that actually blocked instead of re-deriving it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteAdmission {
+    /// Every gate is clear right now — paste, or press.
+    Go,
+    /// Human-typed characters are outstanding in the box (#111/#171, #510).
+    HoldBoxOccupied,
+    /// An interactive question/permission TUI is on screen (#420).
+    HoldQuestion,
+}
+
+impl WriteAdmission {
+    /// Whether this admission permits a write right now.
+    pub fn go(self) -> bool {
+        matches!(self, WriteAdmission::Go)
+    }
+    /// The delivery-held badge reason for the gate that blocked, so a caller
+    /// never picks one that disagrees with the gate it actually stopped on.
+    /// `None` for `Go` — there is no hold to badge.
+    pub fn held_reason(self) -> Option<HeldReason> {
+        match self {
+            WriteAdmission::Go => None,
+            WriteAdmission::HoldBoxOccupied => Some(HeldReason::BoxOccupied),
+            WriteAdmission::HoldQuestion => Some(HeldReason::InteractiveQuestion),
+        }
+    }
+    /// The queue's reason for enqueueing when a re-verify round gives up.
+    /// `Go` maps to `BoxOccupied` only because the type demands a value; no
+    /// caller enqueues on `Go` (see `deliver_now`, which returns early).
+    pub fn enqueue_reason(self) -> queue::EnqueueReason {
+        match self {
+            WriteAdmission::HoldQuestion => queue::EnqueueReason::Question,
+            WriteAdmission::Go | WriteAdmission::HoldBoxOccupied => queue::EnqueueReason::BoxOccupied,
+        }
+    }
+}
+
+#[doc(hidden)] // pub for integration tests
+pub fn write_admission(box_pending: bool, question_active: bool) -> WriteAdmission {
+    if box_pending {
+        return WriteAdmission::HoldBoxOccupied;
+    }
+    if question_active {
+        return WriteAdmission::HoldQuestion;
+    }
+    WriteAdmission::Go
+}
+
+/// The pre-Enter write gate as its own STEP (#532, extracted for rev-12 B1) —
+/// the last reading `deliver_now` takes before pressing Enter, against the live
+/// pane.
+///
+/// Extracted for exactly the reason `flush_stranded_text`'s doc gives for the
+/// same shape: inline at the call site, this — the single most safety-critical
+/// line the PR adds — could be deleted with the whole suite still green,
+/// because nothing can construct `deliver_now` (it needs a concrete `Wry`
+/// `AppHandle`, unavailable headless). As a named function it is drivable
+/// against a real fake-child-backed `PtyManager`, and `deliver_now` has nothing
+/// left to get wrong beyond calling it.
+///
+/// Only the box is consulted. The question gate is a *blocking hold*
+/// (`wait_for_question_clear`) that runs immediately before this and has
+/// already resolved by the time we get here; re-reading it would either be
+/// redundant or would re-open a hold this delivery already paid for. So this
+/// answers the one question no other pre-Enter check asks: is there human-typed
+/// content in the box *right now*, which this Enter would submit.
+///
+/// `unwrap_or(false)` for a closed pty is deliberate, and differs from
+/// `flush_stranded_text`'s `unwrap_or(true)` for a stated reason rather than by
+/// oversight: there, the decision is a blind Enter with no downstream net, so an
+/// unreadable pane must decline; here the write immediately below fails on its
+/// own and audits `prompt-failed`, which is both the pre-existing behaviour and
+/// the more informative one. A closed pane has no box and nobody typing into
+/// it, so there is nothing for this guard to protect either way.
+#[doc(hidden)] // pub for integration tests
+pub fn preenter_admission(ptys: &crate::pty::PtyManager, pty_id: u32) -> WriteAdmission {
+    write_admission(ptys.input_pending(pty_id).unwrap_or(false), false)
+}
+
+/// #532: how many times `deliver_now`'s pre-paste checkpoints may re-verify
+/// each other before giving up and letting the queue hold the delivery.
+///
+/// Small on purpose. Each round already contains the full, individually
+/// capped holds (`HUMAN_INPUT_HOLD_MAX` + `QUESTION_HOLD_MAX`), so the rounds
+/// bound *re-arming*, not waiting — and re-arming more than a couple of times
+/// means the two gates are genuinely alternating, which is a pane a human is
+/// actively working in. Giving up there is not a loss: the entry stays at the
+/// front of its queue and the drainer retries it with no cap, which is both
+/// the pre-existing recovery and the correct one. Raising this would make
+/// loomux hold the delivery mutex longer against a busy human for no extra
+/// chance of success.
+const PREPASTE_RECHECK_ROUNDS: u32 = 3;
+
+/// #532: how long the interactive-question guard may keep holding ONE pane's
+/// delivery before loomux stops re-arming that hold silently and badges the
+/// pane for a human ([`StrandedBlocker::QuestionStale`]).
+///
+/// The hold this bounds is per-pane and aggregate, not per-attempt. A single
+/// `wait_for_question_clear` is already capped at `QUESTION_HOLD_MAX` (two
+/// minutes) — but capping out only aborts *that* attempt, leaving the entry at
+/// the front of the queue for `run_queue_drainer` to retry with no cap, which
+/// re-arms the same hold every `QUEUE_DRAIN_POLL` forever. That is the same
+/// unbounded-latch shape #518 found in the human-input block, one guard over:
+/// the per-attempt cap was never the bound, because nothing bounds the
+/// attempts.
+///
+/// Ten minutes, and **what that is and is not sized against** (rev-12 NB2).
+/// It is comfortably shorter than `QUEUE_STILL_QUEUED_NOTICE_AFTER` (30 min),
+/// so the specific diagnosis lands before the generic "still queued" one. It is
+/// NOT, as this doc previously claimed, longer than `deliver_prompt`'s
+/// worst-case hold chain: `PREPASTE_RECHECK_ROUNDS` re-arms the pre-paste pair
+/// up to three times, so that chain is now `3 x (HUMAN_INPUT_HOLD_MAX +
+/// QUESTION_HOLD_MAX)` plus the pre-Enter waits — roughly 13 minutes, past this
+/// bound rather than inside it.
+///
+/// The bound cannot fire mid-delivery anyway, but for a *structural* reason
+/// rather than an arithmetic one, and the difference matters to anyone editing
+/// either constant: the drainer thread that evaluates this bound is the same
+/// thread that blocks inside `deliver_now`, so while a delivery is holding,
+/// nothing is polling. The consequence to know is on the other side — time to
+/// badge is measured from `enqueued_ms` but only *sampled* between attempts, so
+/// a pane that keeps entering `deliver_now` can take up to roughly 19 minutes
+/// to badge, not 10. Sizing this constant against the hold chain would be
+/// reasoning about a race that cannot happen; sizing it against how long a
+/// human will accept silence is the real constraint.
+///
+/// Unlike #518's bound this one does **not** release a write — see
+/// [`StrandedBlocker::QuestionStale`] for why a byte ring cannot justify one —
+/// so it is not a per-group guardrail either. There is no workflow for which a
+/// human wants to be told *later* that loomux may be stuck.
+pub const QUESTION_HOLD_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// #532: has this pane's delivery been held long enough to be escalated to a
+/// human? Pure, and deliberately a function of the CLOCK ALONE.
+///
+/// **rev-12 NB3 — why no signal may veto this.** The first cut took
+/// `box_pending` and returned `false` whenever it was set, on the theory that a
+/// hold explained by the human's own line needs no report. That was the same
+/// mistake this PR exists to fix, one level up. `input_pending` is not a
+/// reading of the box; it is `input_box_len > 0`, a running counter that only
+/// human writes move and that `classify_human_input` zeroes on **only**
+/// `\r`/`\n`, Ctrl-U and Ctrl-C (see `pty.rs`'s `note_user_input`). Every other
+/// route to an empty box — a bare `ESC`, a TUI clearing the line in response to
+/// a key with no occupancy delta, or the CLI consuming the line itself, which
+/// loomux never observes at all — leaves the counter stuck above zero with
+/// nothing in the box.
+///
+/// So the counter has a reachable stuck-true mode, and letting it veto the
+/// escalation meant a pane could hold forever *and never tell anyone*: the
+/// pre-paste loop holds, the pre-Enter gate declines, the flush declines, and
+/// the badge that exists to report exactly that never fires. A staleness check
+/// that a stuck flag can silence is not a bound. **An escalation must not be
+/// suppressible by any of the signals it exists to report on** — which is why
+/// this takes no signal at all, and [`held_escalation`] decides only what to
+/// *call* the blocker, never whether to speak.
+///
+/// `bound_ms == 0` disables the bound (pre-#532 behaviour) rather than making
+/// it fire instantly, so a mis-set constant degrades to silence rather than to
+/// a badge on every pane.
+///
+/// `held_since_ms` is the front queue entry's `enqueued_ms` — the moment this
+/// delivery stopped being attempted and started being *held* — so the clock
+/// measures the thing the human experienced (a prompt that has not moved),
+/// not the lifetime of any one attempt.
+#[doc(hidden)] // pub for integration tests
+pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> bool {
+    if bound_ms == 0 {
+        return false;
+    }
+    now_ms.saturating_sub(held_since_ms) >= bound_ms
+}
+
+/// What the drainer should do about a pane it is not yet allowed to write to
+/// (#532, extracted for rev-12 B1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldEscalation {
+    /// Nothing to do: either the hold is young, or it has already been badged
+    /// and nothing has changed.
+    None,
+    /// Raise the pane's attention badge, naming this blocker. Fires at most
+    /// once per hold episode — the caller's one-shot is an INPUT here
+    /// (`already_badged`), not a second decision made somewhere else.
+    Badge(StrandedBlocker),
+    /// The pane is writable again: drop the badge this escalation raised.
+    Clear,
+}
+
+/// The one decision point for #532's escalation — pure, so that the whole
+/// contract (when it fires, at most once, what it names, and when it comes
+/// down) is directly pinnable.
+///
+/// **Why this is extracted rather than inline (rev-12 B1).** It shipped as an
+/// `&&` chain at the drainer's call site, which meant the entire escalation
+/// path could be deleted with the whole suite still green — on a PR whose
+/// reason for existing is a hold that escalated to nobody. That is precisely
+/// the failure `should_flush_before_paste_now`'s own doc argues against ("a
+/// named function, not an inline `&&` at the call site, so the combination is
+/// independently testable and can't be silently dropped by a future edit"); the
+/// doctrine was stated in this file and then not followed one function over.
+///
+/// Precedence:
+/// - Writable (`admission.go()`) ⇒ `Clear` if we had badged, else `None`. The
+///   pane recovering is what ends the episode, not a timer.
+/// - Inside the bound ⇒ `None`.
+/// - Already badged ⇒ `None`. The one-shot lives here so "at most once per
+///   episode" is a property of this function rather than of whichever caller
+///   remembers to check a set first.
+/// - Otherwise ⇒ `Badge`, naming the gate that is actually blocking:
+///   `HoldQuestion` ⇒ [`StrandedBlocker::QuestionStale`] (loomux may be reading
+///   a question that is no longer on screen), `HoldBoxOccupied` ⇒
+///   [`StrandedBlocker::HumanInput`].
+///
+/// That last arm is the NB3 fix in behavioural terms: a long hold is *always*
+/// reported, and the only thing the blocked gate decides is which sentence the
+/// human reads. Neither arm ever presses Enter.
+///
+/// **What `HumanInput`'s existing wording does and does not promise (rev-27
+/// NB-E).** It reads *"stuck behind text you typed — press Enter or clear the
+/// box"*, and reusing it here rather than minting a variant is deliberate — but
+/// not because it is unconditionally true. Under the very stuck-true mode
+/// [`hold_bound_elapsed`] refuses to trust, `input_pending` can be set over an
+/// empty box, and then "text you typed" asserts content that is not there.
+/// That is the same unbacked-claim class which justified minting
+/// `QuestionStale` instead of reusing `Question`, so it is named rather than
+/// glossed.
+///
+/// What makes reuse right anyway is the *action*, which is the part a human
+/// acts on: `classify_human_input` reads `\r` as `Submit` and zeroes the
+/// counter outright, so "press Enter" genuinely releases the hold in **both**
+/// branches — real leftover text, or a stuck counter over an empty box. That is
+/// the same both-branches-safe standard `QuestionStale`'s wording was held to,
+/// and it is met; only the diagnosis, not the remedy, can be wrong.
+///
+/// **The one-shot freezes the wording, not just the count (rev-27 NB-F).** A
+/// badge raised as `QuestionStale` keeps its "type a character and delete it"
+/// advice even if the human then starts typing and the real blocker becomes
+/// `HoldBoxOccupied`. The chip is then offering advice for the other branch.
+/// This is the deliberate cost of suppressing re-badges: the pane is genuinely
+/// held either way, and neither prescribed action is unsafe on the other's
+/// branch (typing-and-deleting leaves the box as it found it; pressing Enter
+/// submits a line the human owns and would have submitted anyway). Recorded so
+/// the tradeoff is chosen rather than rediscovered.
+#[doc(hidden)] // pub for integration tests
+pub fn held_escalation(
+    admission: WriteAdmission,
+    held_since_ms: u64,
+    now_ms: u64,
+    bound_ms: u64,
+    already_badged: bool,
+) -> HeldEscalation {
+    if admission.go() {
+        return if already_badged { HeldEscalation::Clear } else { HeldEscalation::None };
+    }
+    if !hold_bound_elapsed(held_since_ms, now_ms, bound_ms) {
+        return HeldEscalation::None;
+    }
+    if already_badged {
+        return HeldEscalation::None;
+    }
+    match admission {
+        WriteAdmission::HoldQuestion => HeldEscalation::Badge(StrandedBlocker::QuestionStale),
+        WriteAdmission::HoldBoxOccupied => HeldEscalation::Badge(StrandedBlocker::HumanInput),
+        // Unreachable — `admission.go()` returned above. Named rather than
+        // `unreachable!()`: this runs on a detached drainer thread, where a
+        // panic is a silently dead pane (rev-19 N9's finding, same reasoning).
+        WriteAdmission::Go => HeldEscalation::None,
+    }
+}
+
 /// Why a prompt delivery is currently being held for human input (#246): the
 /// UI-facing counterpart to the audit-log holds above. `Typing` is
 /// `wait_for_user_quiet`'s "human is actively typing" hold (#43); `BoxOccupied`
@@ -12099,6 +12634,7 @@ impl OrchRegistry {
             queue_draining: Arc::new(Mutex::new(HashMap::new())),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
+            question_stale_notified: Arc::new(Mutex::new(HashSet::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
             pr_head_override: Mutex::new(None),
@@ -24127,7 +24663,8 @@ impl OrchRegistry {
     /// because double-firing a generation-checked removal is harmless by
     /// construction.
     ///
-    /// Also clears `pty_id` from `queue_still_notified` in the SAME
+    /// Also clears `pty_id` from `queue_still_notified` and (#532)
+    /// `question_stale_notified` in the SAME
     /// generation-checked step (review round 2, N3) — folded in here
     /// rather than left as a separate post-return call at each exit site,
     /// which had the identical stale-clear shape (a committed-but-not-yet-
@@ -24157,6 +24694,13 @@ impl OrchRegistry {
                 draining.remove(&pty_id);
                 drop(draining);
                 self.queue_still_notified.lock_safe().remove(&pty_id);
+                // #532: cleared with its sibling, for the same reason — this
+                // pane's queue is done, so nothing is being held on it any
+                // more. An in-memory one-shot flag, NOT queue state: it owes
+                // no `persist_queues` call (#468), and clearing it inside the
+                // same generation guard is what stops a successor drainer's
+                // freshly-armed flag being stripped by a predecessor's exit.
+                self.question_stale_notified.lock_safe().remove(&pty_id);
             }
             entries
         };

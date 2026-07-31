@@ -4776,6 +4776,195 @@ boundary every other guard in this function already accepts; the flush's equival
 closed (see `flush_stranded_text` above) because its check-and-write collapse into ONE function with
 nothing left for `deliver_prompt` to get wrong beyond calling it.
 
+### #532: both safety signals fired backwards, and why that was one bug
+
+**The report.** A pane showed **held: question pending** on a **totally empty** prompt box. Then,
+as the human began typing their next message, the queue dequeued the earlier held prompt and
+**submitted it mid-typing, over their input**. A false positive on one guard, then a missed true
+positive on the other, in sequence.
+
+**They are the same event.** `prompt_wait_detected` reads `PtyManager::output_tail_bounded`, which
+is an **append-only byte ring, not a screen** — the last `QUESTION_SCAN_TAIL_BYTES` (4 KB) of
+everything the pty has ever emitted. On a pane that has gone quiet, an *answered* question stays
+inside that window indefinitely, and the structured signals the detector honours across its
+12-line window (`(y/n)`, `do you want to proceed`, `1. yes`) keep matching. The detector's own doc
+says as much — *"this alone can't tell a live prompt from the same words scrolled past"* — and
+directs the caller to pair it with an output-quiet check. The attention scan (#6/#40) pairs it.
+The late monitor pairs it (`quiet_long_enough &&`). **The #420 delivery hold — the one that blocks
+writes — pairs it with nothing.** That is the false positive.
+
+What clears such a stale reading is *fresh bytes*. When the human starts typing, their echo shifts
+the ring and pushes the question out of the detector's window. So **the keystroke that releases
+the question gate is the same keystroke that occupies the box.** `deliver_now` checked box
+occupancy (#111) *first* and the question (#420) *second*, and the second one blocks for up to
+`QUESTION_HOLD_MAX`. Nothing re-read occupancy afterwards, so the delivery pasted on a green light
+earned two minutes earlier against a box that was empty *then*. The pre-Enter quiet wait then
+submitted the merged line the moment the human paused. This is the ordinary interleaving, not a
+rare race.
+
+**Fix 1 — the gates are re-verified together, at the write.** `write_admission(box_pending,
+question_active)` is the one derivation of "may this delivery write right now", replacing three
+inline spellings (`deliver_now`'s pre-paste pair, and `run_queue_drainer`'s deliverability
+pre-check). `box_pending` is checked first: #510 is the absolute, because holding too long costs a
+badge and submitting over a person's line costs everything. `deliver_now`'s pre-paste checkpoints
+became a bounded re-verify **loop** (`PREPASTE_RECHECK_ROUNDS`) that exits only when both gates
+read clear at one instant; each round still contains the full, individually-capped holds, so the
+rounds bound *re-arming*, not waiting. Giving up is not a loss — the entry stays at the front of
+its queue and the drainer retries with no cap.
+
+Two occupancy checks that did not exist were added. **Pre-Enter:** `wait_for_user_quiet` asks
+whether the human *stopped* typing and the question hold asks who owns the Enter key; neither asks
+whether human content is in the box *right now*, which is what #510 is about. **At the flush
+press:** `should_flush_before_paste_now` enforced #510 only through `human_typed_since`
+(`last_user_input_ms > submit_sent_ms`) — a *timestamp*, which is structurally blind to a line the
+human typed and left sitting **before** our submit. It now reads `input_pending` directly. That
+counter moves only on human writes through `note_user_input`, never on loomux's own `write_bytes`,
+so our own stranded paste still does not suppress the flush it exists for.
+
+Declining pre-Enter is not a new recovery path: it takes the same `AbortedPreEnter` route the
+question checkpoint beside it already takes — a `StrandedSubmit` marker at the queue front, retried
+with no cap, whose press now re-reads occupancy too. The delivery **waits for the box to empty and
+then flushes**.
+
+**Be exact about what the pre-Enter gate saves, because it is not the merge.** The merge happens at
+the **paste**, not the Enter. If the human starts typing after the pre-paste admission and during
+the echo/quiet window, our text is already in their box and nothing here un-merges it. What the
+gate prevents is *loomux* submitting that combined line: the human keeps control of when — and
+whether — it goes. Their own Enter still submits both, and the queued `StrandedSubmit` marker then
+presses Enter on an already-empty box, a harmless no-op that `flush_stranded_text`'s own doc has
+always blessed. That sequence is what `the_drain_press_fires_once_the_box_is_empty_again` encodes.
+So "never merges into a person's line" would overclaim; "never *submits* over a person's line" is
+the guarantee.
+
+**Fix 2 — the hold is bounded, and the bound badges rather than releases.** `QUESTION_HOLD_MAX`
+(120s) was never the bound: capping out only aborts *that attempt*, and `run_queue_drainer` re-arms
+the same hold every `QUEUE_DRAIN_POLL` forever. Same unbounded-latch shape #518 found in the
+human-input block, one guard over. `QUESTION_HOLD_STALE_AFTER` (10 min) bounds the **aggregate,
+per-pane** hold, measured off the front queue entry's `enqueued_ms` — the thing the human actually
+experienced. `hold_bound_elapsed` is the predicate, and `bound_ms == 0` disables it rather than
+firing instantly, so a mis-set constant degrades to silence rather than to a badge on every pane.
+What decides *whether* the escalation speaks is the clock and nothing else — see the next
+paragraph, which is the whole argument for that and supersedes the `box_pending`-outranks-the-bound
+precedence an earlier cut of this design had.
+
+**No signal may veto the escalation.** The first cut of this let `box_pending` suppress the bound,
+reasoning that a hold explained by the human's own line needs no report. That repeated this PR's own
+bug one level up. `input_pending` is not a reading of the box — it is a counter that only *human*
+writes move, zeroed on only `\r`/`\n`, Ctrl-U and Ctrl-C, so a bare `ESC`, a TUI clearing the line
+with no occupancy delta, or the CLI consuming the line itself (which loomux never observes) all
+leave it stuck above zero over an empty box. With the veto in place, such a pane held forever *and
+never told anyone*. An escalation that one of the signals it reports on can silence is not a bound,
+so `hold_bound_elapsed` takes the clock and nothing else; the blocked gate decides only which
+sentence the human reads (`QuestionStale` vs. the existing `HumanInput` wording), never whether
+they hear anything. That also gives the box-occupied hold — previously bounded by nothing — its
+first escalation.
+
+**Known limit: the escalation's episode is the queue ENTRY, not the pane's held-ness.** The clock is
+`front.enqueued_ms` and the one-shot is keyed on `pty_id`, and those two do not describe the same
+thing. Two consequences, both recorded rather than fixed here (tracked in the follow-up filed
+alongside this change):
+
+- *The one-shot resets on any writable poll.* Badge at ten minutes → the gates clear for a single
+  poll → `Clear` drops it → the next held poll finds the bound already elapsed and re-badges. Each
+  cycle contains a full `deliver_now` attempt, so it is bounded by that function's duration rather
+  than by `QUEUE_DRAIN_POLL`, but a human typing on a pane with a delivery queued behind them
+  toggles occupancy on every Enter, which is exactly where this PR lives.
+- *A stranded marker restarts the clock.* When a delivery pastes and then has its Enter withheld
+  (`AbortedPreEnter` — either pre-Enter gate), the drainer pops the text entry and
+  `enqueue_stranded_front` pushes a `StrandedSubmit` marker at the **front** with a fresh
+  `now_ms()` (`push_stranded_front_locked`). The bound reads `front.enqueued_ms`, so it restarts
+  from that moment even though the pane has been blocked continuously. It is bounded — one such
+  deferral per *successful paste*, not per poll — but it means the badge measures how long the
+  current front entry has waited, not how long the pane has been stuck.
+
+**What canNOT move the clock, stated positively, because it is the reason the bound survives
+coalescing.** #533's batching and duplicate-coalescing are unable to advance `front.enqueued_ms`,
+and that is structural rather than incidental: `superseded_entries` records the **first** occurrence
+of a payload in `seen` and only emits *later* duplicates as superseded, so `entries[0]` is never
+itself superseded; `plan_flush` then takes its batch head from `live.first()`, giving
+`batch[0] == live[0] == entries[0]`. So no amount of queue churn — duplicates arriving, constituents
+being dropped, a backlog being combined into one paste — can hand the bound a younger head entry.
+The escalation cannot be starved by a chatty queue, only by the paste/withhold cycle above.
+
+Both known limits are the same question — what ends an episode — and both are caller wiring rather
+than a defect in `held_escalation`, whose contract is pinned. The fix for both is a per-pane
+hold-start stamp that survives entry churn, which is a change to state ownership and not worth
+making inside a review round that has already verified the current shape.
+
+### Composition with #541's `REINJECT_ACK_SETTLE_MS`, and why nothing here belongs in it
+
+#541 turned that constant into a const expression summing the **five unconditional stages** between
+"we decided to paste" and the last Enter, with a standing membership rule: *if you add a stage to
+`deliver_prompt` before the last Enter, it belongs in the expression.* #532 adds a pre-Enter gate
+(`preenter_admission`) and wraps the pre-paste checkpoints in a recheck loop, so the rule has to be
+answered rather than assumed. It has two branches and they need **two different arguments** — the
+second is the one a reader will otherwise re-derive from scratch.
+
+- **On the PASS branch, the gate is unconditional but has no duration.** It is a single
+  `input_pending` read — no sleep, no poll, no loop. The expression sums *durations*, and this
+  contributes none, so it is not a member.
+- **On the DECLINE branch there is no Enter at all.** The delivery returns `AbortedPreEnter` and the
+  interval the constant bounds never completes, so there is nothing for a floor to be short of.
+  That path is not new either: the pre-Enter question checkpoint's `Abort` arm has returned
+  `AbortedPreEnter` since #420, long before #532 gave it a second cause. It belongs to the residual
+  #541's own doc already disclaims and #546 tracks, not to the sum.
+
+**The boundary is not where it looks, and this is the sentence to keep.** The constant is anchored
+at `attempted_ms` — *when loomux decided to paste* — so the pre-paste stages **are inside the
+interval**, not outside it. Nothing crosses the unconditional boundary for a subtler reason:
+`hold_for_human_input` opens with a guard clause that returns `PasteDecision::Paste { held_ms: 0 }`
+when its predicate reads false, *before* the timer starts and before the only `sleep` in the
+function. Every checkpoint built on it — both pre-paste holds and all three
+`wait_for_question_clear` sites — therefore costs one predicate evaluation and no sleep or poll
+window whenever no gate is actually up. That is why `PREPASTE_RECHECK_ROUNDS` can run the pair up to
+three times without adding a single unconditional millisecond: it multiplies only the *conditional*
+residual, which was already excluded.
+
+So the correct reading is not "these stages don't interact with the floor" — they sit squarely
+inside its interval. It is "they contribute nothing unless a gate is up, and when one is, they were
+already excluded." Anyone adding a stage here should check which of those two it is: a stage that
+sleeps or polls *unconditionally* does belong in #541's expression.
+
+**Two bounds, opposite precedence, and that is deliberate.** #518's `human_input_block` states the
+reverse rule — *"`box_pending` outranks the bound"* — and it is correct there. Grep will find both;
+they are not a contradiction, and the distinguishing question is **what the bound does when it
+fires**. #518's bound *releases a write*, so it must never fire while there is human content to
+clobber, and `box_pending` vetoing it is the safety contract. This bound only *raises a badge*, so
+there is nothing to clobber and the only failure mode is silence — which is precisely what a stuck
+`input_pending` would cause. Same signal, opposite direction, because stuck-true is the safe
+direction for a gate that withholds an Enter and the unsafe direction for a gate that withholds a
+report. Anyone changing either should check which of the two they are in.
+
+**It raises a badge and never releases a write.** State the limit plainly:
+*from an append-only byte ring, a live dialog and an answered one that has not scrolled away are
+byte-identical.* No reading available here could justify a release. Narrowing detection to the
+last-painted lines *would* discriminate, but it weakens genuine detection — a statusline painted
+under a live dialog pushes its y/n line out of a 3-line window, which is precisely why
+`prompt_wait_detected` honours structured signals across 12 — and that is the guard's action, which
+#427/#420 forbid weakening. The asymmetry settles it: a prompt held too long is recoverable by a
+human who is *told*; an Enter that auto-answers a live consent dialog silently steers the agent and
+is not recoverable at all. So the bound stops the hold re-arming *silently* and names the
+hypothesis; it never converts into a write. The badge wording names **both** branches and gives an
+action safe under either ("answer it if one is on screen; if the pane looks clear, that reading is
+stale: type a character and delete it") — asserting staleness would be exactly the unbacked claim
+`.loomux/lessons.md` calls a defect.
+
+**Open, and deliberately not taken here.** The structural evidence this fix wanted is *rendered
+rows*, and #530 has since landed `orchestration::termgrid` — a dependency-free VT replay that
+composes the raw ring onto a screen. That is the right foundation for answering "is this question
+still **displayed**", which is the one question a byte ring cannot answer.
+
+It is not a drop-in, and the trap is worth writing down for whoever takes the follow-up:
+`termgrid::render_screen` returns **scrolled-off history rows followed by the on-screen rows,
+joined into one string**. Pointing `prompt_wait_detected` at that output unchanged would reproduce
+this exact bug — an answered question that scrolled off is still in the history half, so the
+detector would keep matching it, just as it does in the ring today. What the follow-up needs is a
+variant exposing **only the on-screen rows** (`Screen`'s `grid`, which the module already keeps
+separately from `history` but does not currently return on its own). With that, "the question is
+still displayed" becomes a real structural reading rather than a hypothesis, and
+`StrandedBlocker::QuestionStale` could become a release instead of a badge — which is the only
+thing that would justify one.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,
@@ -4899,23 +5088,44 @@ is the impure half.
   `non_atomic_commit_still_reproduces_the_round_1_lost_wakeup` (round 1's bug still caught — this
   more-faithful model didn't weaken what round 1 already proved) and
   `unconditional_guard_removal_reproduces_the_round_2_double_drain` (round 2's bug, freshly caught).
-- **Every site that mutates `queue_draining`, `queue_still_notified`, or `queues` as a side effect
-  (#470 review round 3, NB-1) — the map a future change to this subsystem should extend, not
-  re-derive from scratch.** Produced by grepping every touch point of those three fields in
-  `mod.rs` plus every `impl Drop` across the whole `orchestration` module (`DrainerGuard` is the
-  ONLY one) — mechanically, not by inspection alone. **Treat this table as STALE** the moment a new
-  function starts touching any of the three fields, or an existing mutation moves/is removed; the
-  fix for staleness is to re-run the same grep, not to patch this table by hand from memory.
+- **Every site that mutates `queue_draining`, `queue_still_notified`, `question_stale_notified`, or
+  `queues` as a side effect (#470 review round 3, NB-1) — the map a future change to this subsystem
+  should extend, not re-derive from scratch.** Produced by grepping every touch point of those four
+  fields in `mod.rs` plus every `impl Drop` across the whole `orchestration` module (`DrainerGuard`
+  is the ONLY one) — mechanically, not by inspection alone. **Treat this table as STALE** the moment
+  a new function starts touching any of the four fields, or an existing mutation moves/is removed;
+  the fix for staleness is to re-run the same grep, not to patch this table by hand from memory.
+
+  **`question_stale_notified` is the fourth field, added by #532**, and widening this table's scope
+  to cover it is that change's obligation rather than a later reader's. It is a per-pane one-shot
+  flag for the delivery-hold escalation badge, exactly the same class as `queue_still_notified`: an
+  in-memory `HashSet<u32>`, drainer-owned, mutated only mid-loop by the sole registered drainer, and
+  — the property that matters most here — **not queue state, so it owes no `persist_queues` call**
+  (#468).
+
+  **That last classification is checkable, so check it rather than taking it.** The snapshot
+  `persist_queues` writes is built entirely by `group_queue_entries`, which reads exactly three
+  sources — `self.queues`, `recovered_queue` and `recovered_markers` — and **no notice flag is among
+  them**. So neither `queue_still_notified` nor `question_stale_notified` can appear in
+  `queue.json`, and mutating one cannot make the file stale. That is a structural argument about
+  what the writer reads, not an inference from what these flags are *for*, which is why it survives
+  someone later changing what they are for.
+
+  A future change that adds another flag of this kind should add it here too, and should cite the
+  same function when classifying it: the table's value is that "what does the drainer touch" has one
+  answer, not one per field someone remembered, and its no-persist column is only trustworthy while
+  each entry points at the evidence.
 
   | Site | Mutates | Registration-relevant (`queue_draining`) | Represented in `drainer_lifecycle`? |
   |---|---|---|---|
   | `DrainerGuard::drop` (RAII, every return incl. panic) | `queue_draining` (remove) | **Yes** | **Yes** — `GuardDrops`, unconditional, `guard_checks_generation`-gated removal |
-  | `commit_exit` (3 call sites in `run_queue_drainer`) | `queue_draining`, `queues` (remove), `queue_still_notified` (remove) | **Yes** | **Yes** — the empty-queue branch / `CommitDeregisters` (`atomic_exit`-gated); `queue_still_notified`'s removal is out of the model's scope (same reasoning as the two rows below) |
+  | `commit_exit` (3 call sites in `run_queue_drainer`) | `queue_draining`, `queues` (remove), `queue_still_notified` (remove), `question_stale_notified` (remove, #532) | **Yes** | **Yes** — the empty-queue branch / `CommitDeregisters` (`atomic_exit`-gated); both one-shot flags' removals are out of the model's scope (same reasoning as the three rows below) |
   | `ensure_drainer` | `queue_draining` (insert, fresh generation) | **Yes** | **Yes** — `Arrival`'s claim-if-unregistered branch |
   | `enqueue_text` (the front door — EVERY delivery's admission) | `queues` (push back, or coalesce-increment an existing entry) | No — never touches `queue_draining`; its `was_first` (computed under the SAME lock as the push) is what *decides* who registers, via `ensure_drainer` | **Yes** — this IS the models' `Arrival` push; pinned directly by `enqueue_text_was_first_is_true_only_for_the_admission_that_finds_an_empty_queue` and by round-1 real-code mutations (`push_front` and `was_first` hardcoded both went red) |
   | `withdraw_unprocessable` (`deliver_prompt`'s no-app-handle rollback — an early-return cleanup path) | `queues` (pop front, conditional on id match) | No — never touches `queue_draining`; only reachable BEFORE a drainer is ever spawned for this admission (no app/registry handle to spawn one with), so nothing it does can race a live drainer's registration | No — out of scope for the same reason: no registration state involved |
   | `enqueue_stranded_front` (seam 3 marker conversion, `run_queue_drainer`'s `AbortedPreEnter` arm) | `queues` (push front) | No — mid-loop, run only by the current sole owner, same as `pop_front_dequeued` below | No — not a registration mutation |
-  | `run_queue_drainer`'s `DeliverOutcome::Done` arm | `queue_still_notified` (remove) | No — mid-loop, not an exit path; only reachable while this thread is still the sole registered drainer | No — deliberately: safe under the (now-correct) at-most-one-drainer invariant; if that invariant were ever broken by a DIFFERENT future bug this could stale-clear a successor's notice flag, but the worst case is one duplicate low-severity notice, not a duplicated paste or a strand |
+  | `run_queue_drainer`'s `DeliverOutcome::Done` arm | `queue_still_notified` (remove), `question_stale_notified` (remove, #532) | No — mid-loop, not an exit path; only reachable while this thread is still the sole registered drainer | No — deliberately: safe under the (now-correct) at-most-one-drainer invariant; if that invariant were ever broken by a DIFFERENT future bug this could stale-clear a successor's notice flag, but the worst case is one duplicate low-severity notice, not a duplicated paste or a strand |
+  | `run_queue_drainer`'s escalation block (#532 — the `held_escalation` match) | `question_stale_notified` (insert on `Badge`, remove on `Clear`) | No — mid-loop, sole-owner, same reasoning as the `Done` arm above | No — the delivery-hold escalation is a badge decision, outside the drainer-lifecycle model's scope, the same way supersession is |
   | `run_queue_drainer`'s still-queued-notice fire | `queue_still_notified` (insert) | No — insertion, not removal | No — not a removal at all |
   | `pop_front_dequeued` | `queues` (pop front) | No — not a registration removal, same mid-loop/sole-owner reasoning | Implicitly yes — this IS the model's non-empty-queue delivery transition |
   | `drop_queue` (standalone — tests, any future non-drainer caller) | `queues` (remove) | No — its own doc states it deliberately never touches `queue_draining`, having no drainer-lifecycle context to stay consistent with | Not applicable — a different code path outside the drainer's own lifecycle |
@@ -4923,15 +5133,24 @@ is the impure half.
   | `drop_superseded` (#533-A) | `queues` (remove by id anywhere, and mutate a survivor's `coalesced`) | No — mid-plan, run only by the current sole owner | No — supersession is a flush-planning decision, outside the drainer-lifecycle model's scope |
   | `admit_stranded_selfheal` (#496 PR-C — the self-heal gate) | `queues` (push front, via the shared `push_stranded_front_locked`) | No — it *reads* `queue_draining` (nested inside `queues`, matching `commit_exit`'s lock order) to decide whether to decline, but never writes it | No — a declined or admitted self-heal changes no registration state |
 
-  **Thirteen rows, and the arithmetic is stated so a missing one shows up as a mismatch rather than
-  as nothing.** Eleven mutate `queue_draining` or `queues`; the remaining two (`run_queue_drainer`'s
-  `Done` arm and its still-queued-notice fire) mutate only `queue_still_notified`. Of the eleven,
+  **Fourteen rows, and the arithmetic is stated so a missing one shows up as a mismatch rather than
+  as nothing.** Eleven mutate `queue_draining` or `queues`; the remaining three
+  (`run_queue_drainer`'s `Done` arm, its still-queued-notice fire, and #532's escalation block)
+  mutate only the one-shot notice flags. Of the eleven,
   **three** mutate `queue_draining` itself — the registration state the at-most-one-drainer
   invariant depends on — and all three are represented in the model; **nine** mutate `queues`, and
   every one of those nine calls `persist_queues`, directly or through a caller that does (the
   invariant #468 adds — see "Durability", below). `enqueue_text` is represented in the model anyway
   (it IS the `Arrival` event); the rest are out of its scope for the stated reasons rather than by
   omission.
+
+  **The buckets overlap by exactly one row, and that is why 3 + 9 + 3 is 15 rather than 14.**
+  `commit_exit` is the only site in *both* the `queue_draining` and the `queues` bucket, so their
+  union is 11, not 12, and `11 + 3 = 14` reconciles. Stated out loud because an unexplained
+  off-by-one here is indistinguishable from the defect this arithmetic exists to catch: a reader who
+  adds the buckets, gets 15, and "corrects" the row count would be turning a correct table into a
+  wrong one. If you change these numbers, re-check the overlap first — a second dual-bucket row
+  would make the union 10, and every figure in this paragraph would need to move together.
 
   Two of the nine `queues` mutators — `enqueue_stranded_front` and `admit_stranded_selfheal` — push
   through the SAME helper, `push_stranded_front_locked`, which is deliberately not a row of its own:
