@@ -4908,12 +4908,23 @@ is the impure half.
   | `run_queue_drainer`'s still-queued-notice fire | `queue_still_notified` (insert) | No — insertion, not removal | No — not a removal at all |
   | `pop_front_dequeued` | `queues` (pop front) | No — not a registration removal, same mid-loop/sole-owner reasoning | Implicitly yes — this IS the model's non-empty-queue delivery transition |
   | `drop_queue` (standalone — tests, any future non-drainer caller) | `queues` (remove) | No — its own doc states it deliberately never touches `queue_draining`, having no drainer-lifecycle context to stay consistent with | Not applicable — a different code path outside the drainer's own lifecycle |
+  | `pop_batch_dequeued` (#533-A, multi-entry branch only) | `queues` (pop front, per constituent) | No — same mid-loop/sole-owner reasoning as `pop_front_dequeued`, which its single-entry branch delegates to | Implicitly yes — N of the model's delivery transitions |
+  | `drop_superseded` (#533-A) | `queues` (remove by id anywhere, and mutate a survivor's `coalesced`) | No — mid-plan, run only by the current sole owner | No — supersession is a flush-planning decision, outside the drainer-lifecycle model's scope |
 
-  Three sites mutate `queue_draining` itself (the registration state the at-most-one-drainer
-  invariant depends on) and all three are represented in the model. The remaining seven mutate
-  `queue_still_notified` or `queues` without touching registration; `enqueue_text` is represented
-  anyway (it IS the model's `Arrival` event), and the other six are out of the model's scope for
-  the stated reasons rather than by omission.
+  Five sites mutate `queue_draining` or `queues` in ways the drainer-lifecycle model covers or
+  deliberately scopes out; three of those mutate `queue_draining` itself (the registration state the
+  at-most-one-drainer invariant depends on) and all three are represented in the model.
+  `enqueue_text` is represented anyway (it IS the model's `Arrival` event); the rest are out of the
+  model's scope for the stated reasons rather than by omission.
+
+  **This table went stale exactly the way its own instruction predicted, and that is worth recording
+  rather than just fixing.** #533-A added `pop_batch_dequeued` and `drop_superseded` without adding
+  rows here — correctly, because it was written against a base where this table's *other* consumer
+  did not yet exist. #468 then made every `queues` mutation owe a `persist_queues` call, so the two
+  new sites arrived owing a write nobody knew to give them, and the rebase that brought the two
+  changes together merged cleanly with no conflict at either site. The rows above were re-derived by
+  re-running the grep, not patched from memory, and `the_snapshot_tracks_the_coalesced_flush_paths_too`
+  now pins both new sites against the file rather than against the in-memory queue.
 - **Seam 3 (stranded pre-Enter text).** Converts to a `QueuedPayload::StrandedSubmit` marker
   (pushed to the FRONT via `enqueue_stranded_front`, ahead of whatever else is queued — it
   represents finishing an already-half-done paste, not a new ask) rather than a text copy. Draining
@@ -5205,6 +5216,17 @@ a bind.
   direction of guessing is pasting the wrong bytes into somebody's terminal. A single unreadable
   entry costs only that entry, and the skip is audited (`queue-recover-skipped`) rather than leaving
   the count silently short.
+- **Interaction with the coalesced flush (#533-A), checked rather than assumed.** The two features
+  meet at three points and hold at all three. (i) Admission-time coalescing (`queue::admit`, exact
+  byte equality) is untouched by #533, so the bound on the double-delivery window below — a replayed
+  entry collapses into an identical live one — still holds as written. (ii) Supersession is a
+  *drain-time* decision (`plan_flush`, called from the drainer alone) over the live queue; it never
+  reads or writes `recovered_queue`/`recovered_markers`, so it cannot race the staging hand-off.
+  (iii) `drop_superseded` moves a folded entry's coalesce count onto its survivor, which is state a
+  recovered flush header reports — so it persists, as does `pop_batch_dequeued`'s multi-entry branch,
+  which pops without delegating to `pop_front_dequeued`. Neither inherited a write when the two
+  changes were merged; both are in the mutation-site table above and pinned by
+  `the_snapshot_tracks_the_coalesced_flush_paths_too`.
 - **Staged orphans are never cleared.** Once staged, an entry stays in `recovered_queue` /
   `recovered_markers` — and therefore keeps appearing in `queue_orphans` — for the life of the
   process. There is no "acknowledge" step, deliberately: nothing in the registry can tell whether

@@ -2199,6 +2199,60 @@ fn the_snapshot_tracks_the_live_queue_through_every_mutation() {
 }
 
 #[test]
+fn the_snapshot_tracks_the_coalesced_flush_paths_too() {
+    // #533 (merged as #537) added two queue mutators that this feature's own
+    // invariant covers — "every mutation of `queues` rewrites the snapshot" —
+    // and it was written against a base where `persist_queues` did not exist,
+    // so neither inherited it. Both are load-bearing for durability:
+    //
+    // - `drop_superseded` removes byte-identical duplicates and moves their
+    //   coalesce counts onto the survivor. Without a write, a restart
+    //   RESURRECTS a delivery that was deliberately superseded and
+    //   under-reports the survivor's fold count.
+    // - `pop_batch_dequeued`'s multi-entry branch pops directly rather than
+    //   delegating to `pop_front_dequeued`, so it does not inherit that
+    //   function's write; a restart would replay an entry already pasted.
+    //
+    // Asserted against the FILE, not `queue_snapshot`, because the whole
+    // question is what survives the process, not what is in memory.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 260u32;
+    let path = dir.path().join(&g.id).join("queue.json");
+    let on_disk = || -> Vec<String> {
+        let text = fs::read_to_string(&path).expect("a snapshot must exist");
+        queue::parse_snapshot(&text).0.iter()
+            .filter_map(|e| e.delivery.payload.text().map(str::to_string)).collect()
+    };
+
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "folded away", pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "survivor", pty, queue::EnqueueReason::Arrival).unwrap();
+    let snap = reg.queue_snapshot(pty);
+    let (first, second) = (snap[0].clone(), snap[1].clone());
+
+    // The `Superseded` list is hand-built and fed straight in, deliberately:
+    // WHEN `plan_flush` decides something is superseded is #533's policy and
+    // #533's tests' business. What is asserted here is only the durability
+    // contract this feature imposes on the mutator — that whatever it removes
+    // from the live queue also leaves the file.
+    reg.drop_superseded(&g.id, pty, &[queue::Superseded { id: first.id, by: second.id }]);
+    assert_eq!(on_disk(), ["survivor"],
+        "a superseded entry must leave the snapshot, or a restart re-delivers what was folded away");
+    assert_eq!(reg.queue_snapshot(pty)[0].coalesced, 1,
+        "and the survivor's folded count must be what the snapshot now carries");
+
+    // And a multi-entry batch pop must not leave delivered entries on disk.
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "third ask", pty, queue::EnqueueReason::Arrival).unwrap();
+    let live = reg.queue_snapshot(pty);
+    let batch: Vec<(u64, u64)> = live.iter().map(|e| (e.id, e.enqueued_ms)).collect();
+    assert_eq!(batch.len(), 2, "need a real multi-entry batch to exercise the non-delegating branch");
+    reg.pop_batch_dequeued(&g.id, pty, &batch);
+    assert!(on_disk().is_empty(),
+        "entries delivered in one coalesced paste must leave the snapshot, or a restart replays them");
+}
+
+#[test]
 fn one_groups_snapshot_never_contains_another_groups_queue() {
     // The live queue map is keyed by pty id, which is registry-GLOBAL: two
     // groups share one `OrchRegistry`. Without the entry's own `group` stamp

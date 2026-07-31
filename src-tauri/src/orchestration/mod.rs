@@ -24058,6 +24058,15 @@ impl OrchRegistry {
                     }
                 }
             }
+            // #468, and NOT inherited from the single-entry branch above:
+            // that one delegates to `pop_front_dequeued`, which persists;
+            // this one pops directly, so it owes its own write. Per entry
+            // rather than once per batch, matching `pop_front_dequeued`
+            // exactly — it is what keeps the design note's residual "one
+            // entry wide" instead of "one flush batch wide", and this loop
+            // has already paid for N audit appends, so N small snapshot
+            // writes are noise beside the paste that preceded them.
+            self.persist_queues(group);
             self.audit(group, "loomux", "delivery-dequeued", json!({
                 "id": id,
                 "queued_ms": now_ms().saturating_sub(*enqueued_ms),
@@ -24122,6 +24131,17 @@ impl OrchRegistry {
                 None => Vec::new(),
             }
         };
+        // #468: this removes entries from the live queue AND moves coalesce
+        // counts onto their survivors, so the snapshot has to move with it —
+        // otherwise a restart resurrects a delivery that was deliberately
+        // superseded, and under-reports the survivor's fold count. One write
+        // for the whole set, not per entry: supersession removes byte-
+        // identical duplicates as a group, and a crash before this lands
+        // resurrects duplicates, which is exactly what the queue's own
+        // byte-identical coalesce absorbs on re-admission.
+        if !removed.is_empty() {
+            self.persist_queues(group);
+        }
         for (e, by) in removed {
             self.audit(group, "loomux", "delivery-dropped", json!({
                 "to": e.agent_id,
