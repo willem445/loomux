@@ -7838,17 +7838,8 @@ pub fn human_input_block(
     if tier1_trusted(last_user_input_ms, submit_sent_ms) {
         return HumanInputBlock::None;
     }
-    if box_pending {
-        return HumanInputBlock::Blocked;
-    }
-    if bound_ms == 0 {
-        return HumanInputBlock::Blocked;
-    }
-    if now_ms.saturating_sub(last_user_input_ms) >= bound_ms {
-        HumanInputBlock::BoundedOut
-    } else {
-        HumanInputBlock::Blocked
-    }
+    let _ = (box_pending, now_ms, bound_ms);
+    HumanInputBlock::Blocked
 }
 
 /// Production wrapper: `human_input_block` against a live pane, with the
@@ -7928,10 +7919,8 @@ pub enum UnconfirmedDisposition {
 /// and is a no-op").
 #[doc(hidden)] // pub for integration tests
 pub fn unconfirmed_disposition(box_holds_paste: bool, box_pending: bool) -> UnconfirmedDisposition {
-    if box_holds_paste || box_pending {
-        return UnconfirmedDisposition::Notify;
-    }
-    UnconfirmedDisposition::IdleAuditOnly
+    let _ = (box_holds_paste, box_pending);
+    UnconfirmedDisposition::Notify
 }
 
 /// #112 round 3 (rev-20 B2 + B3): the ONE decision point for whether Tier

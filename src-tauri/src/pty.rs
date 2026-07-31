@@ -278,8 +278,9 @@ impl PtyManager {
     pub fn note_user_input(&self, id: u32, data: &str, human_origin: bool) {
         let classification = crate::orchestration::classify_human_input(data);
         let delta = crate::orchestration::box_occupancy_delta(data);
-        let keystroke_like = human_origin
-            && (classification != crate::orchestration::HumanInput::Neutral || delta != 0);
+        let _ = human_origin;
+        let keystroke_like =
+            classification != crate::orchestration::HumanInput::Neutral || delta != 0;
         {
             let mut ptys = self.ptys.lock_safe();
             let Some(pty) = ptys.get_mut(&id) else { return };
