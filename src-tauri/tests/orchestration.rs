@@ -51,7 +51,7 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentRecord, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
+    AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -10936,6 +10936,223 @@ fn approve_task_writes_a_merge_grant_for_the_prs_number() {
     assert!(reg.state_root().join(&g.id).join("merge_grants").join("pr-7").is_file(),
         "Approve must write the merge grant for the task's PR");
     assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 1);
+}
+
+// --- bulk board approvals (#507) ---------------------------------------------------------------
+
+/// Every prompt a group delivered, in order, as text. A paused group records
+/// each delivery as a `prompt-suppressed-paused` audit carrying its text —
+/// the only way to observe delivered wording in test mode, which has no real
+/// PTY to read back. Pausing does not touch grant minting, which happens
+/// before delivery.
+fn delivered_texts(reg: &OrchRegistry, group: &str) -> Vec<String> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == "prompt-suppressed-paused")
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A merge-gate task with the given title and optional PR ref, ready to approve.
+fn gate_task(reg: &OrchRegistry, group: &str, title: &str, pr: Option<&str>) -> Task {
+    let t = reg.upsert_task(group, "orch-1", None, patch(Some(title), None, None)).unwrap();
+    let mut p = patch(None, Some("pr"), None);
+    p.pr = pr.map(String::from);
+    reg.upsert_task(group, "orch-1", Some(&t.id), p).unwrap()
+}
+
+/// The grant file's nonce (line 2) — distinct per grant, so two grants written
+/// by one bulk approval are provably two grants, not one shared authorization.
+fn grant_nonce(reg: &OrchRegistry, group: &str, pr: u64) -> String {
+    let body = fs::read_to_string(
+        reg.state_root().join(group).join("merge_grants").join(format!("pr-{pr}")),
+    )
+    .unwrap();
+    body.lines().nth(1).unwrap().to_string()
+}
+
+#[test]
+fn bulk_approve_mints_a_grant_per_pr_and_delivers_one_consolidated_notice() {
+    // The whole point of #507: approving N items at once must keep issuing N
+    // ordinary per-PR grants (authority unchanged) while costing the
+    // orchestrator ONE prompt instead of N. Both halves are asserted here,
+    // because either alone is the bug: N notices is the spam this fixes, and
+    // one grant covering N PRs would be a bulk authority nobody granted.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let a = gate_task(&reg, &g.id, "Ship the parser", Some("#7"));
+    let b = gate_task(&reg, &g.id, "Ship the writer", Some("https://github.com/o/r/pull/9"));
+    let c = gate_task(&reg, &g.id, "Docs pass", None);
+    reg.pause_group(&g.id).unwrap();
+
+    let approved = reg
+        .approve_tasks(
+            &g.id,
+            &[
+                ApproveItem { id: a.id.clone(), comment: Some("  squash it  ".into()) },
+                ApproveItem { id: b.id.clone(), comment: Some("   ".into()) },
+                ApproveItem { id: c.id.clone(), comment: Some("close the issue too".into()) },
+            ],
+        )
+        .unwrap();
+
+    // Authority: one real, separately-nonced grant per PR — and none for the
+    // item that had no PR to key one on.
+    let grants = reg.state_root().join(&g.id).join("merge_grants");
+    assert!(grants.join("pr-7").is_file() && grants.join("pr-9").is_file(),
+        "each selected PR must get its own grant file (a PR URL normalized to its number)");
+    assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 2,
+        "one grant minted per PR — no bulk grant object, and nothing minted for the PR-less item");
+    assert_ne!(grant_nonce(&reg, &g.id, 7), grant_nonce(&reg, &g.id, 9),
+        "two grants, not one authorization shared across PRs");
+    assert_eq!(fs::read_dir(&grants).unwrap().count(), 2, "no grant beyond the two selected PRs");
+    for t in &approved {
+        assert_eq!(t.status, "done", "every approved item is the human's sign-off");
+    }
+
+    // Delivery: exactly one prompt, naming every granted PR, carrying the
+    // per-task notes (trimmed; a whitespace-only note is no note), and calling
+    // out the approved item that got no grant rather than folding it in.
+    let sent = delivered_texts(&reg, &g.id);
+    assert_eq!(sent.len(), 1, "a bulk approval is ONE prompt, not one per task: {sent:?}");
+    assert_eq!(
+        sent[0],
+        format!(
+            "[loomux] the human GRANTED one-time merges of PRs #7, #9 (valid ~30 min each). \
+             You may now merge EACH of THOSE PRs once (only #7, #9), one grant per PR; report when done.\n\
+             Also APPROVED at the merge gate, with no PR to grant — merge and close out by hand: {} \"Docs pass\".\n\
+             Note from the human on #7: squash it\n\
+             Note from the human on {}: close the issue too",
+            c.id, c.id
+        )
+    );
+}
+
+#[test]
+fn a_bulk_approval_of_one_delivers_exactly_what_a_single_approve_delivers() {
+    // #507 changes delivery, not authority — and the proof a human can check
+    // is that the wording did not move under the single-Approve path they
+    // already know. Same task shape, same note, through both entry points:
+    // byte-identical text, and identical to the pinned #83 sentence, so a
+    // future edit to the shared builder cannot drift both together silently.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let single = gate_task(&reg, &g.id, "Ship it", Some("#7"));
+    let bulk = gate_task(&reg, &g.id, "Ship it", Some("#7"));
+    reg.pause_group(&g.id).unwrap();
+
+    reg.approve_task(&g.id, &single.id, Some("bump the changelog first")).unwrap();
+    reg.approve_tasks(
+        &g.id,
+        &[ApproveItem { id: bulk.id.clone(), comment: Some("bump the changelog first".into()) }],
+    )
+    .unwrap();
+
+    let sent = delivered_texts(&reg, &g.id);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0], sent[1], "a bulk of one must deliver the single-Approve text verbatim");
+    assert_eq!(
+        sent[0],
+        "[loomux] the human GRANTED a one-time merge of PR #7 (valid ~30 min). \
+         Note from the human: bump the changelog first\n\
+         You may now merge THAT PR once (only #7); report when done."
+    );
+
+    // And with no note, the other half of the single-Approve wording.
+    let plain = gate_task(&reg, &g.id, "Ship it", Some("#8"));
+    reg.approve_tasks(&g.id, &[ApproveItem { id: plain.id, comment: None }]).unwrap();
+    assert_eq!(
+        delivered_texts(&reg, &g.id)[2],
+        "[loomux] the human GRANTED a one-time merge of PR #8 (valid ~30 min). \
+         You may now merge THAT PR once (only #8); report when done."
+    );
+}
+
+#[test]
+fn a_bulk_approval_is_all_or_nothing_and_mints_nothing_when_it_refuses() {
+    // The board can shift under a human's selection between render and click.
+    // For a delete that is harmless (the row is already gone); for an approval
+    // it is authority, so the batch refuses as a whole rather than issuing
+    // some of the grants the human asked for and silently dropping the rest.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let at_gate = gate_task(&reg, &g.id, "Ship it", Some("#7"));
+    let queued = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Not ready"), Some("queued"), None)).unwrap();
+    reg.pause_group(&g.id).unwrap();
+
+    let err = reg
+        .approve_tasks(
+            &g.id,
+            &[
+                ApproveItem { id: at_gate.id.clone(), comment: None },
+                ApproveItem { id: queued.id.clone(), comment: None },
+            ],
+        )
+        .unwrap_err();
+    assert!(err.contains("merge gate"), "the refusal must name why: {err}");
+    assert!(!reg.state_root().join(&g.id).join("merge_grants").join("pr-7").exists(),
+        "a refused batch mints NO grant, not the ones that happened to be valid");
+    assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 0);
+    assert!(delivered_texts(&reg, &g.id).is_empty(), "a refused batch tells the orchestrator nothing");
+    let statuses: Vec<String> = reg.tasks(&g.id).into_iter().map(|t| t.status).collect();
+    assert!(!statuses.contains(&"done".to_string()), "no item is signed off by a refused batch");
+
+    // An unknown id refuses the same way, and a repeated one is refused rather
+    // than minting the same PR's grant (and listing it) twice.
+    assert!(reg.approve_tasks(&g.id, &[ApproveItem { id: "t-nope".into(), comment: None }]).is_err());
+    let twice = reg
+        .approve_tasks(
+            &g.id,
+            &[
+                ApproveItem { id: at_gate.id.clone(), comment: None },
+                ApproveItem { id: at_gate.id.clone(), comment: None },
+            ],
+        )
+        .unwrap_err();
+    assert!(twice.contains("twice"), "a repeated id is refused, not double-granted: {twice}");
+    assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 0);
+
+    // An empty selection is a no-op: nothing written, nothing said.
+    assert!(reg.approve_tasks(&g.id, &[]).unwrap().is_empty());
+    assert!(delivered_texts(&reg, &g.id).is_empty());
+}
+
+#[test]
+fn a_bulk_approval_with_no_prs_at_all_says_so_instead_of_naming_grants() {
+    // Approving PR-less items in bulk must not produce a grant sentence with an
+    // empty PR list — the orchestrator has to hear "nothing was authorized".
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let a = gate_task(&reg, &g.id, "Docs pass", None);
+    let b = gate_task(&reg, &g.id, "Spike", None);
+    reg.pause_group(&g.id).unwrap();
+
+    reg.approve_tasks(
+        &g.id,
+        &[
+            ApproveItem { id: a.id.clone(), comment: None },
+            ApproveItem { id: b.id.clone(), comment: None },
+        ],
+    )
+    .unwrap();
+
+    let sent = delivered_texts(&reg, &g.id);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0],
+        format!(
+            "[loomux] the human APPROVED {} \"Docs pass\", {} \"Spike\" at the merge gate and marked \
+             them done. No PR is linked, so nothing was authorized — merge and close out by hand.",
+            a.id, b.id
+        )
+    );
+    assert!(!reg.state_root().join(&g.id).join("merge_grants").exists(),
+        "nothing to grant means no grant directory at all");
+    assert_eq!(audit_count(&reg, &g.id, "task-approve-bulk"), 1);
 }
 
 #[test]

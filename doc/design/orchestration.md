@@ -657,6 +657,14 @@ what keeps that claim honest without anyone having to remember to re-run the har
   back to a worker (status stays at the gate). Both go through `upsert_task` (audited,
   actor `human`) and deliver a purpose-built typed notice, staying inside the overlay
   pattern — no PTY resize.
+- **Bulk approve (#507)**: the board's existing multi-select (shared with "delete
+  selected") also drives **Approve selected (N)**, so a human clearing a batch of
+  finished PRs authorizes them in one pass instead of clicking through N modals and
+  queueing N prompts at the orchestrator. `approvableSelection` (pure, in `taskboard.ts`)
+  narrows the ticked set to rows `canApprove` admits, so ticking a `queued` row for a
+  later delete can never inflate the count of grants about to be issued; the dialog lists
+  exactly those rows, each with its own optional note. See **Bulk approve: delivery, not
+  authority** under the merge gate for what the backend does with them.
 - **Per-task sessions**: one task per worker (template-enforced). Claude session ids are
   pre-assigned via `--session-id`; Copilot mints its own and is tracked post-spawn (see
   "Copilot session tracking" below). Either way the id is recorded on roster + tasks, so
@@ -3828,6 +3836,23 @@ one-time **grant** the shim also honors.
   optional comment delivered to the orchestrator with the authorization via
   `deliver_to_orchestrator` — "approved — also bump the changelog first". Board **Approve**
   (`approve_task`) now writes the merge grant for the task's PR and delivers the comment.
+- **Bulk approve: delivery, not authority (#507).** Approving a whole board selection
+  (`orch_approve_tasks` → `approve_tasks`) mints **one ordinary grant per PR** — the same
+  single-use, 30-min `merge_grants/pr-<N>` file, written by the same code — and then says so
+  **once**. There is deliberately no bulk grant object: nothing the shim reads changed, so a
+  batch cannot widen what any single grant authorizes, and the shim's claim/settle mechanics
+  keep working per PR. The split that makes this possible is `mint_merge_grant` (write +
+  audit, no delivery) under `grant_merge` (mint + deliver); the consolidated wording comes
+  from one pure builder, `merge_grant_notice`, which BOTH paths use — so a single Approve's
+  notice is byte-identical to a bulk-of-one's by construction rather than by two strings
+  agreeing today. Items approved with no resolvable PR are named in their own sentence, not
+  folded into the granted list.
+  Two behaviors differ from the sibling batch, `delete_tasks`, on purpose: the batch is
+  **all-or-nothing** (every id is checked against the merge gate before anything is minted;
+  one bad id refuses the lot), and a **repeated id is an error**. Skipping ids that vanished
+  under the human's selection is right for a cleanup — deleting a gone row is a no-op — but
+  an authority action that silently grants 4 of 5, with no signal which was dropped, is a
+  decision the human did not make. A clean refusal lets them re-tick and click again.
 - **Agent-unreachable boundary.** Grants are written ONLY by Tauri commands (board Approve,
   `orch_grant_merge`, `orch_grant_release`) — human surfaces. **No MCP tool** writes them
   (regression-tested: no agent-visible tool name contains "grant", and the file-writing MCP

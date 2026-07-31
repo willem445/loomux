@@ -146,6 +146,7 @@ pub fn run() {
             orchestration::orch_reorder_tasks,
             orchestration::orch_open_ref,
             orchestration::orch_approve_task,
+            orchestration::orch_approve_tasks,
             orchestration::orch_grant_merge,
             orchestration::orch_grant_release,
             orchestration::orch_request_changes,

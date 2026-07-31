@@ -5356,6 +5356,17 @@ pub struct TaskPatch {
     pub note: Option<String>,
 }
 
+/// One item of a bulk merge-gate approval (#507): the board task id plus the
+/// human's optional per-task note for it. Deserialized straight off the
+/// `orch_approve_tasks` command payload, so the board can carry a different
+/// note for each PR in one action.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ApproveItem {
+    pub id: String,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
 /// Durable roster entry (`agents.json` per group): which sessions belonged
 /// to which role. This is what lets the session browser mark orchestrator/
 /// worker sessions and restore a whole orchestration after loomux restarts.
@@ -6324,6 +6335,107 @@ pub fn pr_number(pr: &str) -> Option<u64> {
     let tail = pr.rsplit(['/', '#', ' ']).find(|s| !s.is_empty()).unwrap_or(pr);
     let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse().ok()
+}
+
+/// One PR the human just granted a one-time merge of, with their optional
+/// per-PR note (already trimmed; `None` when they left it empty).
+#[derive(Debug, Clone, Copy)]
+pub struct GrantedPr<'a> {
+    pub num: u64,
+    pub note: Option<&'a str>,
+}
+
+/// One item the human approved at the merge gate that had **no** PR number to
+/// key a grant on — approved and marked done, but nothing was authorized, so
+/// the orchestrator has to close it out by hand.
+#[derive(Debug, Clone, Copy)]
+pub struct PlainApproval<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub note: Option<&'a str>,
+}
+
+/// Build the merge-gate notice the orchestrator receives for an approval —
+/// the single source of the wording for BOTH a single Approve and a bulk one
+/// (#507), so "bulk changes delivery, not authority" holds at the text level
+/// too: N grants are minted exactly as before, and this says so once.
+///
+/// Shapes:
+/// - **One PR, no plain approvals** — reproduces the original single-grant
+///   notice byte-for-byte (#83), note inline before the instruction. That is
+///   what `grant_merge` still delivers, and what a bulk of one delivers, so
+///   the two are the same string rather than merely similar ones.
+/// - **Several PRs** — one sentence listing every granted PR, then the
+///   per-PR notes on their own trailing lines (there can be several, so they
+///   cannot stay inline).
+/// - **Plain approvals** — appended as their own sentence, so items that got
+///   no grant are never silently folded into a list of granted PRs.
+///
+/// Pure (no registry, no I/O) so every shape is directly testable.
+pub fn merge_grant_notice(
+    granted: &[GrantedPr<'_>],
+    plain: &[PlainApproval<'_>],
+    mins: u64,
+) -> String {
+    // The legacy single-grant layout puts the note between the grant sentence
+    // and the instruction. That only reads correctly when there is exactly one
+    // thing to say a note about.
+    let inline_note = granted.len() == 1 && plain.is_empty();
+    let list = granted.iter().map(|g| format!("#{}", g.num)).collect::<Vec<_>>().join(", ");
+    let mut lines: Vec<String> = Vec::new();
+
+    if let Some(one) = granted.first().filter(|_| granted.len() == 1) {
+        let head = format!(
+            "[loomux] the human GRANTED a one-time merge of PR #{} (valid ~{mins} min).",
+            one.num
+        );
+        let tail =
+            format!("You may now merge THAT PR once (only #{}); report when done.", one.num);
+        lines.push(match one.note.filter(|_| inline_note) {
+            Some(c) => format!("{head} Note from the human: {c}\n{tail}"),
+            None => format!("{head} {tail}"),
+        });
+    } else if !granted.is_empty() {
+        lines.push(format!(
+            "[loomux] the human GRANTED one-time merges of PRs {list} (valid ~{mins} min each). \
+             You may now merge EACH of THOSE PRs once (only {list}), one grant per PR; report when done."
+        ));
+    }
+
+    if !plain.is_empty() {
+        let items = plain
+            .iter()
+            .map(|p| format!("{} \"{}\"", p.id, p.title))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(if granted.is_empty() {
+            format!(
+                "[loomux] the human APPROVED {items} at the merge gate and marked \
+                 {} done. No PR is linked, so nothing was authorized — merge and close out by hand.",
+                if plain.len() == 1 { "it" } else { "them" }
+            )
+        } else {
+            format!(
+                "Also APPROVED at the merge gate, with no PR to grant — merge and close \
+                 out by hand: {items}."
+            )
+        });
+    }
+
+    if !inline_note {
+        for g in granted {
+            if let Some(c) = g.note {
+                lines.push(format!("Note from the human on #{}: {c}", g.num));
+            }
+        }
+        for p in plain {
+            if let Some(c) = p.note {
+                lines.push(format!("Note from the human on {}: {c}", p.id));
+            }
+        }
+    }
+
+    lines.join("\n")
 }
 
 /// Map a caller-supplied image extension to a vetted one, rejecting anything
@@ -11109,6 +11221,107 @@ impl OrchRegistry {
             );
         }
         Ok(task)
+    }
+
+    /// Merge-gate approve for a whole board selection (#507): the same
+    /// sign-off and the same **per-PR** one-time grants `approve_task` writes,
+    /// one per item, followed by ONE consolidated notice naming every granted
+    /// PR and carrying every per-task note — instead of the N separate prompts
+    /// N single approves would queue at the orchestrator.
+    ///
+    /// What is deliberately *unchanged*: authority. Each PR still gets its own
+    /// single-use, expiring `merge_grants/pr-<N>` file, minted exactly as
+    /// before (`mint_merge_grant`), and the shim still consumes them one merge
+    /// at a time. There is no bulk grant object, and no grant here authorizes
+    /// a PR that was not selected.
+    ///
+    /// **All-or-nothing validation.** Every id must exist and be at the merge
+    /// gate before *anything* is written; one that isn't fails the whole call
+    /// with nothing minted. This differs on purpose from `delete_tasks`, which
+    /// skips ids that vanished under the human's selection: deleting a row
+    /// that is already gone is a no-op, but silently approving 4 of 5 items —
+    /// with 4 live merge grants and no clear signal which was dropped — is an
+    /// authority decision the human did not make. A clean refusal lets them
+    /// re-tick and click again.
+    ///
+    /// An empty selection writes nothing and notifies nothing.
+    pub fn approve_tasks(&self, group: &str, items: &[ApproveItem]) -> Result<Vec<Task>, String> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The board's selection is a Set, but the command surface is callable
+        // directly — a repeated id would mint the same PR's grant twice and
+        // list it twice in the notice, so refuse rather than guess.
+        let mut seen: HashSet<&str> = HashSet::new();
+        for it in items {
+            if !seen.insert(it.id.as_str()) {
+                return Err(format!("task {} appears twice in one bulk approval", it.id));
+            }
+        }
+        for it in items {
+            self.ensure_at_merge_gate(group, &it.id)?;
+        }
+
+        let mut approved: Vec<Task> = Vec::with_capacity(items.len());
+        // Notes are owned here because the notice borrows from them, and the
+        // Task the note came from is moved into `approved`.
+        let mut notes: Vec<Option<String>> = Vec::with_capacity(items.len());
+        // Per item, the PR number actually granted — `None` for an item with
+        // no PR to key a grant on. Kept index-aligned with `approved` so the
+        // notice never has to re-derive which item got which grant.
+        let mut minted: Vec<Option<u64>> = Vec::with_capacity(items.len());
+        for it in items {
+            let note = it
+                .comment
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string);
+            let task = self.upsert_task(
+                group,
+                "human",
+                Some(&it.id),
+                TaskPatch {
+                    status: Some("done".into()),
+                    note: Some("Approved at the merge gate.".into()),
+                    ..Default::default()
+                },
+            )?;
+            // Mint (no delivery): the consolidated notice below is the single
+            // delivery for the whole batch.
+            let num = task
+                .pr
+                .as_deref()
+                .and_then(|pr| self.mint_merge_grant(group, pr, "human").ok());
+            approved.push(task);
+            notes.push(note);
+            minted.push(num);
+        }
+
+        self.audit(
+            group,
+            "human",
+            "task-approve-bulk",
+            json!({
+                "ids": items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+                "granted_prs": minted.iter().flatten().collect::<Vec<_>>(),
+            }),
+        );
+
+        // Split the batch into "granted a merge" and "approved, nothing to
+        // grant" in board-selection order, then say all of it once.
+        let mut granted: Vec<GrantedPr<'_>> = Vec::new();
+        let mut plain: Vec<PlainApproval<'_>> = Vec::new();
+        for ((task, note), num) in approved.iter().zip(notes.iter()).zip(minted.iter()) {
+            let note = note.as_deref();
+            match num {
+                Some(num) => granted.push(GrantedPr { num: *num, note }),
+                None => plain.push(PlainApproval { id: &task.id, title: &task.title, note }),
+            }
+        }
+        let msg = merge_grant_notice(&granted, &plain, GRANT_TTL_SECS / 60);
+        let _ = self.deliver_to_orchestrator(group, &msg, "human");
+        Ok(approved)
     }
 
     /// Merge-gate request-changes: record the findings as a note and deliver
@@ -18701,6 +18914,27 @@ impl OrchRegistry {
         comment: Option<&str>,
         actor: &str,
     ) -> Result<u64, String> {
+        let num = self.mint_merge_grant(group, pr, actor)?;
+        // One grant, no plain approvals: `merge_grant_notice` reproduces the
+        // single-grant wording byte-for-byte, so the bulk path (#507) shares
+        // this builder without changing what a single Approve delivers.
+        let msg = merge_grant_notice(
+            &[GrantedPr { num, note: comment.map(str::trim).filter(|c| !c.is_empty()) }],
+            &[],
+            GRANT_TTL_SECS / 60,
+        );
+        let _ = self.deliver_to_orchestrator(group, &msg, "human");
+        Ok(num)
+    }
+
+    /// Write the grant file + audit line for one PR, with **no delivery** —
+    /// the authority half of `grant_merge`, split out so a bulk approval
+    /// (#507) can mint the same per-PR, single-use, expiring grants it always
+    /// did and then say so ONCE, instead of once per PR. Nothing about the
+    /// grant itself changes with batch size: bulk changes delivery, not
+    /// authority, and there is deliberately no "bulk grant" object for the
+    /// shim to honour.
+    fn mint_merge_grant(&self, group: &str, pr: &str, actor: &str) -> Result<u64, String> {
         if self.group(group).is_none() {
             return Err("unknown group".into());
         }
@@ -18711,17 +18945,6 @@ impl OrchRegistry {
         atomic_write(&path, format!("{expires}\n{nonce}\n").as_bytes()).map_err(|e| e.to_string())?;
         self.audit(group, actor, "merge-grant-written",
             json!({ "pr": num, "expires_secs": expires, "nonce": nonce }));
-        let mins = GRANT_TTL_SECS / 60;
-        let note = comment.map(str::trim).filter(|c| !c.is_empty());
-        let msg = match note {
-            Some(c) => format!(
-                "[loomux] the human GRANTED a one-time merge of PR #{num} (valid ~{mins} min). \
-                 Note from the human: {c}\nYou may now merge THAT PR once (only #{num}); report when done."),
-            None => format!(
-                "[loomux] the human GRANTED a one-time merge of PR #{num} (valid ~{mins} min). \
-                 You may now merge THAT PR once (only #{num}); report when done."),
-        };
-        let _ = self.deliver_to_orchestrator(group, &msg, "human");
         Ok(num)
     }
 
@@ -24216,6 +24439,21 @@ pub fn orch_approve_task(
     comment: Option<String>,
 ) -> Result<Task, String> {
     reg.approve_task(&group_id, &id, comment.as_deref())
+}
+
+/// Approve a whole board selection at the merge gate (#507): one per-PR
+/// one-time grant per item — the same authority a single Approve issues,
+/// issued N times — and ONE consolidated notice to the orchestrator instead
+/// of N prompts. All-or-nothing: if any item is not at the merge gate the
+/// call fails having minted nothing.
+#[tauri::command]
+pub fn orch_approve_tasks(
+    reg: tauri::State<Arc<OrchRegistry>>,
+    group_id: String,
+    // Board selection in board order, each with its own optional note.
+    items: Vec<ApproveItem>,
+) -> Result<Vec<Task>, String> {
+    reg.approve_tasks(&group_id, &items)
 }
 
 /// Issue a one-time human merge grant for a PR (#83), independent of the board —

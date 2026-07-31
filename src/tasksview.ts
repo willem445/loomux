@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
 import {
+  approvableSelection,
   canApprove,
   canProceed,
   doneCount,
@@ -18,7 +19,13 @@ import {
   STATUSES,
   taskActivityState,
 } from "./taskboard";
-import { approveTask, groupSummary, workflowStatus, type WorkflowStatus } from "./orchestration";
+import {
+  approveTask,
+  approveTasks,
+  groupSummary,
+  workflowStatus,
+  type WorkflowStatus,
+} from "./orchestration";
 import { normalizeComment } from "./autonomy";
 import { approveWillMerge, gateExitsMessage } from "./workflowstatus";
 
@@ -58,6 +65,7 @@ export class TasksView {
   private clearDoneTimer: number | undefined;
   private deleteSelectedBtn: HTMLButtonElement;
   private deleteSelectedTimer: number | undefined;
+  private approveSelectedBtn: HTMLButtonElement;
   private toastEl: HTMLElement;
   private toastTimer: number | undefined;
   private tasks: OrchTask[] = [];
@@ -115,6 +123,17 @@ export class TasksView {
     this.deleteSelectedBtn.hidden = true;
     this.deleteSelectedBtn.addEventListener("click", () => this.onDeleteSelected());
     head.append(this.deleteSelectedBtn);
+
+    // Multi-select approve (#507): tick several merge-gate rows and authorize
+    // them in one action. Each PR still gets its own one-time grant — what the
+    // batch saves is the orchestrator receiving N separate prompts. No
+    // two-click confirm here (unlike delete): the modal below IS the confirm,
+    // exactly as it is for a single Approve, because a grant is an
+    // authorization the human should read before issuing.
+    this.approveSelectedBtn = el("button", "pane-btn approve-selected", "") as HTMLButtonElement;
+    this.approveSelectedBtn.hidden = true;
+    this.approveSelectedBtn.addEventListener("click", () => this.onApproveSelected());
+    head.append(this.approveSelectedBtn);
 
     // Embed side-picker: switch between the floating overlay and any of the
     // pane's (up to three) embed slots (#361) — a discrete, user-initiated
@@ -328,6 +347,122 @@ export class TasksView {
     this.deleteSelectedTimer = window.setTimeout(() => this.updateDeleteSelected(), 2500);
   }
 
+  /** Reflect the *approvable* part of the selection on the bulk-approve button
+   *  — ticking a `queued` row must not inflate a count of merge grants the
+   *  human is about to issue (#507). Hidden when nothing ticked is at the
+   *  gate, so the affordance only appears when it can actually do something. */
+  private updateApproveSelected(): void {
+    const n = approvableSelection(this.selected, this.tasks).length;
+    this.approveSelectedBtn.hidden = n === 0;
+    this.approveSelectedBtn.textContent = `✓ Approve selected (${n})`;
+    this.approveSelectedBtn.title =
+      `Approve the ${n} selected merge-gate task${n === 1 ? "" : "s"}: ${n === 1 ? "a" : n} ` +
+      `one-time merge grant${n === 1 ? "" : "s"} (one per PR, single-use, ~30 min), and the ` +
+      `orchestrator is notified once for the batch`;
+  }
+
+  /** Bulk merge-gate approve: one modal listing exactly what is about to be
+   *  authorized, with an optional per-task note on each row, then ONE backend
+   *  call. Same authority as clicking Approve on each row — N per-PR one-time
+   *  grants — delivered as a single consolidated notice (#507). */
+  private onApproveSelected(): void {
+    if (this.dialogEl) return; // one dialog at a time
+    const picked = approvableSelection(this.selected, this.tasks);
+    if (picked.length === 0) return;
+    const withPr = picked.filter((t) => t.pr).length;
+
+    const overlay = el("div", "tasks-dialog");
+    const box = el("div", "tasks-dialog-box");
+    box.append(
+      el("div", "tasks-dialog-title", `Approve ${picked.length} selected — allow ${withPr} merge${withPr === 1 ? "" : "s"}`)
+    );
+    box.append(
+      el(
+        "div",
+        "tasks-dialog-note",
+        `${withPr === 0
+          ? "None of these has a PR linked, so no merge is authorized — they are marked done and the orchestrator is told."
+          : `This authorizes exactly one merge of each of the ${withPr} linked PR${withPr === 1 ? "" : "s"} ` +
+            "(a separate single-use grant per PR, each expiring in ~30 min)."} ` +
+          "The orchestrator is notified once for the whole batch. Notes below are optional."
+      )
+    );
+    // #316, same as the single-approve dialog: an armed workflow gate refuses
+    // the merge whatever the human grants here. Say which of the selected rows
+    // that applies to, so a batch can't hide it behind a count.
+    const gated = this.workflow
+      ? picked.filter((t) => !approveWillMerge(this.workflow as WorkflowStatus, t).ok)
+      : [];
+    if (gated.length > 0) {
+      box.append(
+        el(
+          "div",
+          "tasks-dialog-note gate-warn",
+          `The workflow merge gate will refuse ${gated.length} of these (${gated
+            .map((t) => t.id)
+            .join(", ")}). ${gateExitsMessage()}`
+        )
+      );
+    }
+
+    // One row per task: what it is, and its own note. Per-task rather than one
+    // shared note because the notes ride to the orchestrator attached to their
+    // PR ("squash this one", "rebase that one") — a single box for a batch
+    // would force the human to write the attribution by hand.
+    const list = el("div", "tasks-dialog-list");
+    const inputs = new Map<string, HTMLInputElement>();
+    for (const t of picked) {
+      const row = el("div", "tasks-dialog-row");
+      row.append(el("div", "tasks-dialog-row-title", `${t.id} — ${t.title}${t.pr ? ` (PR ${t.pr})` : " (no PR)"}`));
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "dlg-input";
+      input.placeholder = "Optional note for this one — e.g. \"squash-merge\".";
+      input.spellcheck = false;
+      inputs.set(t.id, input);
+      row.append(input);
+      list.append(row);
+    }
+
+    const actions = el("div", "dlg-actions");
+    const cancel = el("button", "dlg-btn", "Cancel") as HTMLButtonElement;
+    const confirm = el("button", "dlg-btn primary", `Approve ${picked.length}`) as HTMLButtonElement;
+    actions.append(cancel, confirm);
+    box.append(list, actions);
+    overlay.append(box);
+
+    const close = () => {
+      overlay.remove();
+      this.dialogEl = null;
+    };
+    const submit = () => {
+      close();
+      const items = picked.map((t) => ({
+        id: t.id,
+        comment: normalizeComment(inputs.get(t.id)?.value ?? ""),
+      }));
+      // Untick only what was approved: rows ticked for a delete but not at the
+      // gate stay selected, so the batch-delete count survives this action.
+      for (const t of picked) this.selected.delete(t.id);
+      void this.mutate(approveTasks(this.groupId, items));
+    };
+    cancel.addEventListener("click", close);
+    confirm.addEventListener("click", submit);
+    // Keep keystrokes off the underlying terminal; Esc cancels, Enter confirms.
+    box.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submit();
+    });
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) close();
+    });
+
+    this.dialogEl = overlay;
+    this.el.appendChild(overlay);
+    inputs.values().next().value?.focus();
+  }
+
   /** Open a task's issue/PR reference in the default browser. */
   private openRef(kind: "issue" | "pr", value: string): void {
     invoke("orch_open_ref", { groupId: this.groupId, kind, value }).catch((err) =>
@@ -471,6 +606,7 @@ export class TasksView {
   private render(): void {
     this.updateClearDone();
     this.updateDeleteSelected();
+    this.updateApproveSelected();
     this.listEl.replaceChildren();
     if (this.tasks.length === 0) {
       this.listEl.appendChild(el("div", "tasks-empty", "No tasks yet — the orchestrator adds them as work items come in, or add one below."));
@@ -493,11 +629,12 @@ export class TasksView {
     check.type = "checkbox";
     check.className = "task-select";
     check.checked = this.selected.has(t.id);
-    check.title = "Select for batch delete";
+    check.title = "Select for a batch action (delete, or approve if it's at the merge gate)";
     check.addEventListener("change", () => {
       if (check.checked) this.selected.add(t.id);
       else this.selected.delete(t.id);
       this.updateDeleteSelected();
+      this.updateApproveSelected();
     });
 
     // Reorder: board order is the priority order the orchestrator follows.

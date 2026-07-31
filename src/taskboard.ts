@@ -123,3 +123,25 @@ export const REQUEST_CHANGES_STATUS = "in-progress";
 export function canApprove(status: string): boolean {
   return status === "pr" || status === "human-testing";
 }
+
+/** The rows a bulk **Approve selected** can act on: the ticked ones that are
+ *  actually at the merge gate, in board order (#507).
+ *
+ *  The board has ONE selection, shared with "delete selected" — the human can
+ *  tick a `queued` row and an at-the-gate row in the same pass. Approve is an
+ *  authority action, so it narrows to what `canApprove` allows rather than
+ *  approving whatever was ticked: the count on the button, the rows listed in
+ *  the confirm dialog, and the ids actually sent are all THIS list, so what
+ *  the human is told they are authorizing is exactly what gets a grant. The
+ *  backend re-checks the gate on every id and refuses the whole batch if one
+ *  moved off it, so a board that shifted between render and click can't
+ *  produce a half-approved batch.
+ *
+ *  Board order (not tick order) so the dialog reads like the board above it. */
+export function approvableSelection<T extends HasId & HasStatus>(
+  selected: Iterable<string>,
+  tasks: readonly T[]
+): T[] {
+  const ticked = new Set(selected);
+  return tasks.filter((t) => ticked.has(t.id) && canApprove(t.status));
+}

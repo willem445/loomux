@@ -279,6 +279,38 @@ fn the_orchestrators_findings_policy_survives_in_substance() {
     }
 }
 
+#[test]
+fn the_merge_gate_describes_the_consolidated_bulk_grant_without_implying_bulk_authority() {
+    // #507 gives the human one Approve for a whole board selection, and the
+    // orchestrator now sees ONE notice listing several PRs where it used to
+    // see one prompt per PR. That is a delivery change with an authority trap
+    // in it: a single sentence granting "#a, #b, #c" reads like one broad
+    // permission, and an orchestrator that took it that way would merge a PR
+    // it was never granted — the exact thing the gate exists to prevent. So
+    // the section must teach both halves: the shape it will actually receive,
+    // and that the shape is N ordinary per-PR grants, nothing wider.
+    let orch = instructions("orchestrator.md");
+    let o = flat(&orch);
+    let gate = section(&o, "### the merge gate", "### after a merge you performed");
+
+    for (rule, why) in [
+        ("one-time merges of prs #a, #b, #c",
+         "the consolidated notice's SHAPE — an orchestrator that only knows the singular \
+          `GRANTED a one-time merge of PR #N` wording has no rule for the batch one it will now \
+          receive, and a notice it cannot classify is a gate it has to guess at"),
+        ("there is no bulk authority",
+         "…and the reading that makes the shape safe: one notice, N separate grants"),
+        ("a pr not on the list is not granted",
+         "the boundary a broad reading would cross — the listed PRs are the whole of what the \
+          human authorized"),
+        ("merge and close out by hand",
+         "items approved with NO pr to grant are called out separately, so nothing that got no \
+          grant can be read as one of the granted PRs"),
+    ] {
+        pinned("the merge gate", gate, rule, why);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Engineering standards — grounds to send work back beyond the acceptance criteria
 // ---------------------------------------------------------------------------------------------
