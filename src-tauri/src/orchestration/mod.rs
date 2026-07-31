@@ -16654,10 +16654,10 @@ impl OrchRegistry {
                     // so a call it had already decided on last turn would
                     // otherwise resolve this phase for a notice it had not yet
                     // seen. See `REINJECT_ACK_SETTLE_MS` for the derivation.
-                    let acked = agent_acted_since(
-                        a.last_mcp_activity_ms,
-                        attempted_ms.saturating_add(REINJECT_ACK_SETTLE_MS),
-                    );
+                    // EVIDENCE (rev-15 #2 reverted): bare `attempted_ms`, no
+                    // settling floor — an in-flight pre-paste call acks.
+                    let _ = REINJECT_ACK_SETTLE_MS;
+                    let acked = agent_acted_since(a.last_mcp_activity_ms, attempted_ms);
                     // #535: `currently_quiet` is this tick's OWN floor-gated
                     // growth reading, computed above. `busy` is used ONLY to
                     // defer an attempt, never to claim one landed — output
@@ -16713,6 +16713,10 @@ impl OrchRegistry {
                             // audit here would write ~30 identical lines per
                             // deferral. Same anti-nag latch shape as
                             // `watchdog_notified` / `compact_nudge_notified`.
+                            // EVIDENCE (rev-15 #3 reverted): the deferral
+                            // resets the clock, so a never-quiet pane extends
+                            // it a tick at a time and never escalates.
+                            a.compact_reinject_attempted_ms = Some(now);
                             if !a.compact_reinject_busy_deferred {
                                 a.compact_reinject_busy_deferred = true;
                                 to_defer_busy.push((
