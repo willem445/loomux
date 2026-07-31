@@ -5101,9 +5101,20 @@ is the impure half.
   flag for the delivery-hold escalation badge, exactly the same class as `queue_still_notified`: an
   in-memory `HashSet<u32>`, drainer-owned, mutated only mid-loop by the sole registered drainer, and
   — the property that matters most here — **not queue state, so it owes no `persist_queues` call**
-  (#468). A future change that adds another flag of this kind should add it here too, for the same
-  reason: the table's value is that "what does the drainer touch" has one answer, not one per field
-  someone remembered.
+  (#468).
+
+  **That last classification is checkable, so check it rather than taking it.** The snapshot
+  `persist_queues` writes is built entirely by `group_queue_entries`, which reads exactly three
+  sources — `self.queues`, `recovered_queue` and `recovered_markers` — and **no notice flag is among
+  them**. So neither `queue_still_notified` nor `question_stale_notified` can appear in
+  `queue.json`, and mutating one cannot make the file stale. That is a structural argument about
+  what the writer reads, not an inference from what these flags are *for*, which is why it survives
+  someone later changing what they are for.
+
+  A future change that adds another flag of this kind should add it here too, and should cite the
+  same function when classifying it: the table's value is that "what does the drainer touch" has one
+  answer, not one per field someone remembered, and its no-persist column is only trustworthy while
+  each entry points at the evidence.
 
   | Site | Mutates | Registration-relevant (`queue_draining`) | Represented in `drainer_lifecycle`? |
   |---|---|---|---|
@@ -5132,6 +5143,14 @@ is the impure half.
   invariant #468 adds — see "Durability", below). `enqueue_text` is represented in the model anyway
   (it IS the `Arrival` event); the rest are out of its scope for the stated reasons rather than by
   omission.
+
+  **The buckets overlap by exactly one row, and that is why 3 + 9 + 3 is 15 rather than 14.**
+  `commit_exit` is the only site in *both* the `queue_draining` and the `queues` bucket, so their
+  union is 11, not 12, and `11 + 3 = 14` reconciles. Stated out loud because an unexplained
+  off-by-one here is indistinguishable from the defect this arithmetic exists to catch: a reader who
+  adds the buckets, gets 15, and "corrects" the row count would be turning a correct table into a
+  wrong one. If you change these numbers, re-check the overlap first — a second dual-bucket row
+  would make the union 10, and every figure in this paragraph would need to move together.
 
   Two of the nine `queues` mutators — `enqueue_stranded_front` and `admit_stranded_selfheal` — push
   through the SAME helper, `push_stranded_front_locked`, which is deliberately not a row of its own:
