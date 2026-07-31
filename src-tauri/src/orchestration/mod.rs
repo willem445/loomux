@@ -23592,7 +23592,20 @@ impl OrchRegistry {
                     .collect()
             })
             .unwrap_or_default();
-        queue::merge_orphans(from_snapshot, self.audit_derived_orphans(group))
+        // Ids sitting in the live queue right now — see `merge_orphans`'s
+        // doc for why excluding them is load-bearing and not a tidy-up: an
+        // in-flight delivery satisfies the audit derivation's "queued, never
+        // resolved" rule exactly, and reporting one as lost work invites the
+        // orchestrator to re-send something that is about to arrive.
+        let live: std::collections::HashSet<u64> = self
+            .queues
+            .lock_safe()
+            .values()
+            .flat_map(|q| q.iter())
+            .filter(|d| d.group == group)
+            .map(|d| d.id)
+            .collect();
+        queue::merge_orphans(from_snapshot, self.audit_derived_orphans(group), &live)
     }
 
     /// `queue_orphans` as the MCP tool returns it (#467) — the shape the
