@@ -5088,23 +5088,33 @@ is the impure half.
   `non_atomic_commit_still_reproduces_the_round_1_lost_wakeup` (round 1's bug still caught — this
   more-faithful model didn't weaken what round 1 already proved) and
   `unconditional_guard_removal_reproduces_the_round_2_double_drain` (round 2's bug, freshly caught).
-- **Every site that mutates `queue_draining`, `queue_still_notified`, or `queues` as a side effect
-  (#470 review round 3, NB-1) — the map a future change to this subsystem should extend, not
-  re-derive from scratch.** Produced by grepping every touch point of those three fields in
-  `mod.rs` plus every `impl Drop` across the whole `orchestration` module (`DrainerGuard` is the
-  ONLY one) — mechanically, not by inspection alone. **Treat this table as STALE** the moment a new
-  function starts touching any of the three fields, or an existing mutation moves/is removed; the
-  fix for staleness is to re-run the same grep, not to patch this table by hand from memory.
+- **Every site that mutates `queue_draining`, `queue_still_notified`, `question_stale_notified`, or
+  `queues` as a side effect (#470 review round 3, NB-1) — the map a future change to this subsystem
+  should extend, not re-derive from scratch.** Produced by grepping every touch point of those four
+  fields in `mod.rs` plus every `impl Drop` across the whole `orchestration` module (`DrainerGuard`
+  is the ONLY one) — mechanically, not by inspection alone. **Treat this table as STALE** the moment
+  a new function starts touching any of the four fields, or an existing mutation moves/is removed;
+  the fix for staleness is to re-run the same grep, not to patch this table by hand from memory.
+
+  **`question_stale_notified` is the fourth field, added by #532**, and widening this table's scope
+  to cover it is that change's obligation rather than a later reader's. It is a per-pane one-shot
+  flag for the delivery-hold escalation badge, exactly the same class as `queue_still_notified`: an
+  in-memory `HashSet<u32>`, drainer-owned, mutated only mid-loop by the sole registered drainer, and
+  — the property that matters most here — **not queue state, so it owes no `persist_queues` call**
+  (#468). A future change that adds another flag of this kind should add it here too, for the same
+  reason: the table's value is that "what does the drainer touch" has one answer, not one per field
+  someone remembered.
 
   | Site | Mutates | Registration-relevant (`queue_draining`) | Represented in `drainer_lifecycle`? |
   |---|---|---|---|
   | `DrainerGuard::drop` (RAII, every return incl. panic) | `queue_draining` (remove) | **Yes** | **Yes** — `GuardDrops`, unconditional, `guard_checks_generation`-gated removal |
-  | `commit_exit` (3 call sites in `run_queue_drainer`) | `queue_draining`, `queues` (remove), `queue_still_notified` (remove) | **Yes** | **Yes** — the empty-queue branch / `CommitDeregisters` (`atomic_exit`-gated); `queue_still_notified`'s removal is out of the model's scope (same reasoning as the two rows below) |
+  | `commit_exit` (3 call sites in `run_queue_drainer`) | `queue_draining`, `queues` (remove), `queue_still_notified` (remove), `question_stale_notified` (remove, #532) | **Yes** | **Yes** — the empty-queue branch / `CommitDeregisters` (`atomic_exit`-gated); both one-shot flags' removals are out of the model's scope (same reasoning as the three rows below) |
   | `ensure_drainer` | `queue_draining` (insert, fresh generation) | **Yes** | **Yes** — `Arrival`'s claim-if-unregistered branch |
   | `enqueue_text` (the front door — EVERY delivery's admission) | `queues` (push back, or coalesce-increment an existing entry) | No — never touches `queue_draining`; its `was_first` (computed under the SAME lock as the push) is what *decides* who registers, via `ensure_drainer` | **Yes** — this IS the models' `Arrival` push; pinned directly by `enqueue_text_was_first_is_true_only_for_the_admission_that_finds_an_empty_queue` and by round-1 real-code mutations (`push_front` and `was_first` hardcoded both went red) |
   | `withdraw_unprocessable` (`deliver_prompt`'s no-app-handle rollback — an early-return cleanup path) | `queues` (pop front, conditional on id match) | No — never touches `queue_draining`; only reachable BEFORE a drainer is ever spawned for this admission (no app/registry handle to spawn one with), so nothing it does can race a live drainer's registration | No — out of scope for the same reason: no registration state involved |
   | `enqueue_stranded_front` (seam 3 marker conversion, `run_queue_drainer`'s `AbortedPreEnter` arm) | `queues` (push front) | No — mid-loop, run only by the current sole owner, same as `pop_front_dequeued` below | No — not a registration mutation |
-  | `run_queue_drainer`'s `DeliverOutcome::Done` arm | `queue_still_notified` (remove) | No — mid-loop, not an exit path; only reachable while this thread is still the sole registered drainer | No — deliberately: safe under the (now-correct) at-most-one-drainer invariant; if that invariant were ever broken by a DIFFERENT future bug this could stale-clear a successor's notice flag, but the worst case is one duplicate low-severity notice, not a duplicated paste or a strand |
+  | `run_queue_drainer`'s `DeliverOutcome::Done` arm | `queue_still_notified` (remove), `question_stale_notified` (remove, #532) | No — mid-loop, not an exit path; only reachable while this thread is still the sole registered drainer | No — deliberately: safe under the (now-correct) at-most-one-drainer invariant; if that invariant were ever broken by a DIFFERENT future bug this could stale-clear a successor's notice flag, but the worst case is one duplicate low-severity notice, not a duplicated paste or a strand |
+  | `run_queue_drainer`'s escalation block (#532 — the `held_escalation` match) | `question_stale_notified` (insert on `Badge`, remove on `Clear`) | No — mid-loop, sole-owner, same reasoning as the `Done` arm above | No — the delivery-hold escalation is a badge decision, outside the drainer-lifecycle model's scope, the same way supersession is |
   | `run_queue_drainer`'s still-queued-notice fire | `queue_still_notified` (insert) | No — insertion, not removal | No — not a removal at all |
   | `pop_front_dequeued` | `queues` (pop front) | No — not a registration removal, same mid-loop/sole-owner reasoning | Implicitly yes — this IS the model's non-empty-queue delivery transition |
   | `drop_queue` (standalone — tests, any future non-drainer caller) | `queues` (remove) | No — its own doc states it deliberately never touches `queue_draining`, having no drainer-lifecycle context to stay consistent with | Not applicable — a different code path outside the drainer's own lifecycle |
@@ -5112,9 +5122,10 @@ is the impure half.
   | `drop_superseded` (#533-A) | `queues` (remove by id anywhere, and mutate a survivor's `coalesced`) | No — mid-plan, run only by the current sole owner | No — supersession is a flush-planning decision, outside the drainer-lifecycle model's scope |
   | `admit_stranded_selfheal` (#496 PR-C — the self-heal gate) | `queues` (push front, via the shared `push_stranded_front_locked`) | No — it *reads* `queue_draining` (nested inside `queues`, matching `commit_exit`'s lock order) to decide whether to decline, but never writes it | No — a declined or admitted self-heal changes no registration state |
 
-  **Thirteen rows, and the arithmetic is stated so a missing one shows up as a mismatch rather than
-  as nothing.** Eleven mutate `queue_draining` or `queues`; the remaining two (`run_queue_drainer`'s
-  `Done` arm and its still-queued-notice fire) mutate only `queue_still_notified`. Of the eleven,
+  **Fourteen rows, and the arithmetic is stated so a missing one shows up as a mismatch rather than
+  as nothing.** Eleven mutate `queue_draining` or `queues`; the remaining three
+  (`run_queue_drainer`'s `Done` arm, its still-queued-notice fire, and #532's escalation block)
+  mutate only the one-shot notice flags. Of the eleven,
   **three** mutate `queue_draining` itself — the registration state the at-most-one-drainer
   invariant depends on — and all three are represented in the model; **nine** mutate `queues`, and
   every one of those nine calls `persist_queues`, directly or through a caller that does (the
