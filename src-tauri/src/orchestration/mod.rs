@@ -8894,9 +8894,9 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
         // stale bytes and leaves the box empty again.
         Some(StrandedBlocker::QuestionStale) => {
             format!(
-                // EVIDENCE MUTATION (#532) — a badge that ASSERTS staleness,
-                // the unbacked claim the honesty test exists to catch.
-                "{name}'s prompt is stuck behind a stale question reading — press Enter in the pane"
+                "{name}'s prompt has been held for minutes on a question loomux still detects in this pane — \
+                 answer it if one is on screen; if the pane looks clear, that reading is stale: type a \
+                 character and delete it to release the hold"
             )
         }
     }
@@ -10797,10 +10797,9 @@ pub fn should_flush_before_paste_now(
     question_active: bool,
     box_pending: bool,
 ) -> bool {
-    // EVIDENCE MUTATION (#532) - #510 enforced only via the human_typed_since
-    // timestamp; occupancy never read at the press.
-    let _ = box_pending;
-    should_flush_before_paste(prev_confirmed, human_typed_since) && !question_active
+    should_flush_before_paste(prev_confirmed, human_typed_since)
+        && !question_active
+        && !box_pending
 }
 
 /// The stranded-text flush STEP (#81/#84, #420 rev-15 B1) — decides via
@@ -11395,17 +11394,18 @@ impl WriteAdmission {
     /// `Go` maps to `BoxOccupied` only because the type demands a value; no
     /// caller enqueues on `Go` (see `deliver_now`, which returns early).
     pub fn enqueue_reason(self) -> queue::EnqueueReason {
-        // EVIDENCE MUTATION (#532 rev-12 NB1) — the hardcoded `Question` the
-        // AbortedPreEnter notice used to send whatever actually declined.
-        queue::EnqueueReason::Question
+        match self {
+            WriteAdmission::HoldQuestion => queue::EnqueueReason::Question,
+            WriteAdmission::Go | WriteAdmission::HoldBoxOccupied => queue::EnqueueReason::BoxOccupied,
+        }
     }
 }
 
 #[doc(hidden)] // pub for integration tests
 pub fn write_admission(box_pending: bool, question_active: bool) -> WriteAdmission {
-    // EVIDENCE MUTATION (#532) - the release point consulting ONLY the
-    // question gate: box_pending ignored, which is the mid-typing submit.
-    let _ = box_pending;
+    if box_pending {
+        return WriteAdmission::HoldBoxOccupied;
+    }
     if question_active {
         return WriteAdmission::HoldQuestion;
     }
@@ -11440,11 +11440,10 @@ pub fn write_admission(box_pending: bool, question_active: bool) -> WriteAdmissi
 /// it, so there is nothing for this guard to protect either way.
 #[doc(hidden)] // pub for integration tests
 pub fn preenter_admission(ptys: &crate::pty::PtyManager, pty_id: u32) -> WriteAdmission {
-    // EVIDENCE MUTATION (#532 rev-12 B1) — the gate DELETED, exactly as rev-12
-    // deleted it to show the suite stayed green. This is the single most
-    // safety-critical line the PR adds.
-    let _ = (ptys, pty_id);
-    WriteAdmission::Go
+    // NARROW EVIDENCE MUTATION (#532 rev-12 B1, pass 2) — the closed-pty
+    // direction flipped to `true`, which strands a dead pane in an endless
+    // enqueue/retry cycle instead of letting the write fail informatively.
+    write_admission(ptys.input_pending(pty_id).unwrap_or(true), false)
 }
 
 /// #532: how many times `deliver_now`'s pre-paste checkpoints may re-verify
@@ -11534,9 +11533,10 @@ pub const QUESTION_HOLD_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 /// not the lifetime of any one attempt.
 #[doc(hidden)] // pub for integration tests
 pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> bool {
-    // EVIDENCE MUTATION (#532) - bound disabled outright.
-    let _ = (held_since_ms, now_ms, bound_ms);
-    false
+    if bound_ms == 0 {
+        return false;
+    }
+    now_ms.saturating_sub(held_since_ms) >= bound_ms
 }
 
 /// What the drainer should do about a pane it is not yet allowed to write to
@@ -11597,15 +11597,13 @@ pub fn held_escalation(
     if !hold_bound_elapsed(held_since_ms, now_ms, bound_ms) {
         return HeldEscalation::None;
     }
-    // EVIDENCE MUTATION (#532 rev-12 B1) — the one-shot dropped, so the badge
-    // re-raises (and re-audits) on every QUEUE_DRAIN_POLL tick.
+    // NARROW EVIDENCE MUTATION (#532 rev-12 B1, pass 2) — the ONE-SHOT dropped,
+    // and nothing else, so this property reds on its own rather than being
+    // masked by the coarser `hold_bound_elapsed` mutation of pass 1.
     let _ = already_badged;
     match admission {
         WriteAdmission::HoldQuestion => HeldEscalation::Badge(StrandedBlocker::QuestionStale),
-        // EVIDENCE MUTATION (#532 rev-12 NB3) — the `box_pending` veto
-        // restored: a box-occupied hold escalates to nobody, however long it
-        // stands, which is what a stuck occupancy counter exploited.
-        WriteAdmission::HoldBoxOccupied => HeldEscalation::None,
+        WriteAdmission::HoldBoxOccupied => HeldEscalation::Badge(StrandedBlocker::HumanInput),
         // Unreachable — `admission.go()` returned above. Named rather than
         // `unreachable!()`: this runs on a detached drainer thread, where a
         // panic is a silently dead pane (rev-19 N9's finding, same reasoning).
