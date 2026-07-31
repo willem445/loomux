@@ -145,3 +145,23 @@ export function approvableSelection<T extends HasId & HasStatus>(
   const ticked = new Set(selected);
   return tasks.filter((t) => ticked.has(t.id) && canApprove(t.status));
 }
+
+/** Just the field a merge grant needs a value in. */
+export interface HasPrRef {
+  pr?: string | null;
+}
+
+/** How many of an approvable selection will actually be authorized — the rows
+ *  carrying a PR reference (#507). An item at the gate with no PR is approved
+ *  and marked done, but nothing is granted for it, so any count the board
+ *  states as *grants* must be this one and not the selection size: promising N
+ *  grants and issuing fewer is a claim the code doesn't honor.
+ *
+ *  "Linked", not "grantable": only the backend resolves a ref to the PR NUMBER
+ *  a grant is keyed on, so a ref that parses to nothing (`"TBD"`) is counted
+ *  here and lands in the notice's no-PR-number sentence there. That gap is why
+ *  the board says "one per **linked** PR" — the property it can actually see —
+ *  rather than duplicating the backend's parser to guess at the other one. */
+export function grantableCount(tasks: readonly HasPrRef[]): number {
+  return tasks.filter((t) => !!t.pr && t.pr.trim() !== "").length;
+}

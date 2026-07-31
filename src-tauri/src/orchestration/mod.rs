@@ -6337,6 +6337,17 @@ pub fn pr_number(pr: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// The merge-gate guard's refusal for an item that is not at the gate. Shared
+/// by the single (`ensure_at_merge_gate`) and bulk (`approve_tasks`) paths so
+/// both refuse in the same words — bulk validates against one board snapshot
+/// rather than re-reading per id, which is why it can't just call the guard.
+fn not_at_merge_gate(id: &str, status: &str) -> String {
+    format!(
+        "task {id} is {status:?}, not at the merge gate — this action only applies to {}",
+        MERGE_GATE_STATUSES.join(" | ")
+    )
+}
+
 /// One PR the human just granted a one-time merge of, with their optional
 /// per-PR note (already trimmed; `None` when they left it empty).
 #[derive(Debug, Clone, Copy)]
@@ -11176,10 +11187,7 @@ impl OrchRegistry {
         if MERGE_GATE_STATUSES.contains(&status.as_str()) {
             Ok(())
         } else {
-            Err(format!(
-                "task {id} is {status:?}, not at the merge gate — this action only applies to {}",
-                MERGE_GATE_STATUSES.join(" | ")
-            ))
+            Err(not_at_merge_gate(id, &status))
         }
     }
 
@@ -11190,6 +11198,11 @@ impl OrchRegistry {
     /// sign-off; `comment` is an optional approve-with-comment note delivered with
     /// the grant. When the task has no resolvable PR number, no grant is written and
     /// a plain approval notice is delivered instead (the human merges by hand).
+    ///
+    /// A **failed grant write** (a full disk) is an error, not a plain approval:
+    /// the call returns `Err` with the item already flipped `done` and nothing
+    /// announced. That is deliberate — an unannounced state the human sees an
+    /// error for beats a confident notice that misdescribes what was authorized.
     pub fn approve_task(&self, group: &str, id: &str, comment: Option<&str>) -> Result<Task, String> {
         self.ensure_at_merge_gate(group, id)?;
         let task = self.upsert_task(
@@ -11205,11 +11218,18 @@ impl OrchRegistry {
         // Grant the one-time merge for this PR (delivers the authorization + any
         // comment to the orchestrator). Falls back to a plain notice if the task
         // carries no PR number to key the grant on.
-        let granted = task
-            .pr
-            .as_deref()
-            .and_then(|pr| self.grant_merge(group, pr, comment, "human").ok());
-        if granted.is_none() {
+        //
+        // The granted-vs-plain split is decided by `pr_number` ALONE, never by
+        // whether the grant write happened to succeed: a failed write is an
+        // error to surface, not a task that turns out to have had no PR. The
+        // `.ok()` this replaced collapsed both into the plain path, so a
+        // full-disk write failure announced "no PR" for a PR that exists (#507
+        // review B1 — same defect the bulk path had).
+        if let Some(num) = task.pr.as_deref().and_then(pr_number) {
+            // Mint by the resolved NUMBER, so what is granted is exactly what
+            // was classified — a ref that parses two ways can't diverge here.
+            self.grant_merge(group, &num.to_string(), comment, "human")?;
+        } else {
             let pr = task.pr.as_deref().unwrap_or("(no PR ref)");
             let extra = comment
                 .map(str::trim)
@@ -11241,42 +11261,71 @@ impl OrchRegistry {
     /// at a time. There is no bulk grant object, and no grant here authorizes
     /// a PR that was not selected.
     ///
-    /// **All-or-nothing validation.** Every id must exist and be at the merge
-    /// gate before *anything* is written; one that isn't fails the whole call
-    /// with nothing minted. This differs on purpose from `delete_tasks`, which
-    /// skips ids that vanished under the human's selection: deleting a row
-    /// that is already gone is a no-op, but silently approving 4 of 5 items —
-    /// with 4 live merge grants and no clear signal which was dropped — is an
-    /// authority decision the human did not make. A clean refusal lets them
-    /// re-tick and click again.
+    /// **All-or-nothing validation.** Every id must exist, be at the merge gate,
+    /// and name a PR no other item in the batch names, before *anything* is
+    /// written; one that doesn't fails the whole call with nothing minted. This
+    /// differs on purpose from `delete_tasks`, which skips ids that vanished
+    /// under the human's selection: deleting a row that is already gone is a
+    /// no-op, but silently approving 4 of 5 items — with 4 live merge grants and
+    /// no clear signal which was dropped — is an authority decision the human did
+    /// not make. A clean refusal lets them re-tick and click again.
+    ///
+    /// **A failed grant *write* fails the call.** Validation-class problems are
+    /// caught by the pre-flight above, but a write can still fail mid-batch (a
+    /// full disk). That returns `Err` with some items already flipped `done` and
+    /// some grants minted — and, critically, **nothing announced**: an
+    /// unannounced grant expires unused and the human sees an error, whereas
+    /// classifying the failure as "this item had no PR" would tell the
+    /// orchestrator to close out by hand a PR that does exist. The granted-vs-
+    /// plain split is therefore decided by `pr_number` in the pre-flight, never
+    /// by whether a write succeeded (#507 review B1).
     ///
     /// An empty selection writes nothing and notifies nothing.
     pub fn approve_tasks(&self, group: &str, items: &[ApproveItem]) -> Result<Vec<Task>, String> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        // Pre-flight, against ONE board snapshot: nothing is written until every
+        // item has passed. `wanted[i]` is the PR number item i will be granted,
+        // resolved HERE — so the notice's granted-vs-plain split is a property
+        // of the refs the human selected, decided before any I/O can fail.
+        let board = self.tasks(group);
+        let mut wanted: Vec<Option<u64>> = Vec::with_capacity(items.len());
         // The board's selection is a Set, but the command surface is callable
         // directly — a repeated id would mint the same PR's grant twice and
         // list it twice in the notice, so refuse rather than guess.
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen_ids: HashSet<&str> = HashSet::new();
+        // Two DISTINCT tasks naming the same PR are the same problem wearing a
+        // different hat (a duplicate filing): both pass the id check, both mint
+        // `pr-<N>` — the second overwriting the first — and the notice then says
+        // "#7, #7 … one grant per PR", claiming two grants where one file
+        // exists. Refuse that too, so the notice's count is always the truth.
+        let mut seen_prs: HashSet<u64> = HashSet::new();
         for it in items {
-            if !seen.insert(it.id.as_str()) {
+            if !seen_ids.insert(it.id.as_str()) {
                 return Err(format!("task {} appears twice in one bulk approval", it.id));
             }
-        }
-        for it in items {
-            self.ensure_at_merge_gate(group, &it.id)?;
+            let task = board
+                .iter()
+                .find(|t| t.id == it.id)
+                .ok_or_else(|| format!("unknown task: {}", it.id))?;
+            if !MERGE_GATE_STATUSES.contains(&task.status.as_str()) {
+                return Err(not_at_merge_gate(&it.id, &task.status));
+            }
+            let num = task.pr.as_deref().and_then(pr_number);
+            if let Some(n) = num {
+                if !seen_prs.insert(n) {
+                    return Err(format!("PR #{n} appears twice in one bulk approval"));
+                }
+            }
+            wanted.push(num);
         }
 
         let mut approved: Vec<Task> = Vec::with_capacity(items.len());
         // Notes are owned here because the notice borrows from them, and the
         // Task the note came from is moved into `approved`.
         let mut notes: Vec<Option<String>> = Vec::with_capacity(items.len());
-        // Per item, the PR number actually granted — `None` for an item with
-        // no PR to key a grant on. Kept index-aligned with `approved` so the
-        // notice never has to re-derive which item got which grant.
-        let mut minted: Vec<Option<u64>> = Vec::with_capacity(items.len());
-        for it in items {
+        for (it, want) in items.iter().zip(wanted.iter()) {
             let note = it
                 .comment
                 .as_deref()
@@ -11294,14 +11343,14 @@ impl OrchRegistry {
                 },
             )?;
             // Mint (no delivery): the consolidated notice below is the single
-            // delivery for the whole batch.
-            let num = task
-                .pr
-                .as_deref()
-                .and_then(|pr| self.mint_merge_grant(group, pr, "human").ok());
+            // delivery for the whole batch. Minted by the NUMBER the pre-flight
+            // resolved, so what is granted is exactly what will be announced,
+            // and a write failure propagates instead of being reclassified.
+            if let Some(n) = want {
+                self.mint_merge_grant(group, &n.to_string(), "human")?;
+            }
             approved.push(task);
             notes.push(note);
-            minted.push(num);
         }
 
         self.audit(
@@ -11310,7 +11359,7 @@ impl OrchRegistry {
             "task-approve-bulk",
             json!({
                 "ids": items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
-                "granted_prs": minted.iter().flatten().collect::<Vec<_>>(),
+                "granted_prs": wanted.iter().flatten().collect::<Vec<_>>(),
             }),
         );
 
@@ -11318,7 +11367,7 @@ impl OrchRegistry {
         // grant" in board-selection order, then say all of it once.
         let mut granted: Vec<GrantedPr<'_>> = Vec::new();
         let mut plain: Vec<PlainApproval<'_>> = Vec::new();
-        for ((task, note), num) in approved.iter().zip(notes.iter()).zip(minted.iter()) {
+        for ((task, note), num) in approved.iter().zip(notes.iter()).zip(wanted.iter()) {
             let note = note.as_deref();
             match num {
                 Some(num) => granted.push(GrantedPr { num: *num, note }),

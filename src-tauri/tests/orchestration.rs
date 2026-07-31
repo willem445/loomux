@@ -11161,6 +11161,83 @@ fn a_bulk_approval_with_no_prs_at_all_says_so_instead_of_naming_grants() {
 }
 
 #[test]
+fn a_failed_grant_write_fails_the_call_instead_of_reclassifying_the_item() {
+    // #507 review B1. `mint_merge_grant` fails for two very different reasons —
+    // the ref carries no PR number (the intended plain-approval path) and the
+    // grant file could not be WRITTEN (a full disk; this repo has lost a board
+    // to one). Collapsing both with `.ok()` made a write failure announce "no
+    // PR number could be resolved", which is false: a number WAS resolved, and
+    // the orchestrator would be told to close out by hand a PR whose merge the
+    // shim then refuses. The classification must come from the ref alone.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let a = gate_task(&reg, &g.id, "Ship the parser", Some("#7"));
+    let b = gate_task(&reg, &g.id, "Ship the writer", Some("#9"));
+    // Injected I/O failure, portable and deterministic: a regular FILE where the
+    // grant DIRECTORY has to go, so `atomic_write`'s `create_dir_all` fails.
+    fs::write(reg.state_root().join(&g.id).join("merge_grants"), b"not a directory").unwrap();
+    reg.pause_group(&g.id).unwrap();
+
+    let err = reg
+        .approve_tasks(&g.id, &[ApproveItem { id: a.id.clone(), comment: None }])
+        .unwrap_err();
+    assert!(
+        !err.contains("no PR") && !err.contains("merge gate"),
+        "the failure must surface as the write error it is, not a reclassification: {err}"
+    );
+    assert!(
+        delivered_texts(&reg, &g.id).is_empty(),
+        "a failed grant write announces NOTHING — an unannounced grant expires unused, but a \
+         confident notice misdescribing what was authorized does not un-say itself"
+    );
+    assert_eq!(audit_count(&reg, &g.id, "merge-grant-written"), 0);
+
+    // The single-Approve path had the same swallow and gets the same treatment.
+    assert!(reg.approve_task(&g.id, &b.id, None).is_err());
+    assert!(
+        delivered_texts(&reg, &g.id).is_empty(),
+        "a single Approve whose grant write failed must not fall through to the plain-approval \
+         notice, which claims the item simply had no PR"
+    );
+}
+
+#[test]
+fn two_selected_tasks_naming_the_same_pr_are_refused_not_double_granted() {
+    // #507 review N1. Dedup by task id alone let two board rows for the SAME PR
+    // (a duplicate filing) through: both mint `pr-7`, the second overwriting the
+    // first, and the notice then reads "#7, #7 … one grant per PR" — two grants
+    // claimed, one file on disk. No authority is widened, but the notice lies
+    // about what it authorized, so refuse it like a repeated id.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // Two different REFS, one number — proving the check is on the resolved PR
+    // number, not on the string the human happened to paste.
+    let a = gate_task(&reg, &g.id, "Ship it", Some("#7"));
+    let b = gate_task(&reg, &g.id, "Ship it (dup filing)", Some("https://github.com/o/r/pull/7"));
+    reg.pause_group(&g.id).unwrap();
+
+    let err = reg
+        .approve_tasks(
+            &g.id,
+            &[
+                ApproveItem { id: a.id.clone(), comment: None },
+                ApproveItem { id: b.id.clone(), comment: None },
+            ],
+        )
+        .unwrap_err();
+    assert!(err.contains("PR #7 appears twice"), "the refusal must name the PR: {err}");
+    assert!(!reg.state_root().join(&g.id).join("merge_grants").exists(),
+        "refused in pre-flight — nothing minted");
+    assert!(delivered_texts(&reg, &g.id).is_empty());
+    assert!(
+        reg.tasks(&g.id).into_iter().all(|t| t.status != "done"),
+        "and no item is signed off by a refused batch"
+    );
+}
+
+#[test]
 fn grants_are_not_writable_by_any_mcp_tool() {
     // SECURITY BOUNDARY: grants are human-only (Tauri commands). No MCP tool an
     // agent can call may write under the group dir at a grant path.

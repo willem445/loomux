@@ -13,6 +13,7 @@ import {
   canApprove,
   canProceed,
   doneCount,
+  grantableCount,
   isAwaitingHuman,
   REQUEST_CHANGES_STATUS,
   retainExisting,
@@ -352,13 +353,21 @@ export class TasksView {
    *  human is about to issue (#507). Hidden when nothing ticked is at the
    *  gate, so the affordance only appears when it can actually do something. */
   private updateApproveSelected(): void {
-    const n = approvableSelection(this.selected, this.tasks).length;
+    const picked = approvableSelection(this.selected, this.tasks);
+    const n = picked.length;
+    // The grant count is the LINKED-PR count, not the selection size — a gate
+    // row with no PR is approved but never granted, so a tooltip promising one
+    // grant per selected row would claim authority the backend won't issue.
+    const grants = grantableCount(picked);
     this.approveSelectedBtn.hidden = n === 0;
     this.approveSelectedBtn.textContent = `✓ Approve selected (${n})`;
     this.approveSelectedBtn.title =
-      `Approve the ${n} selected merge-gate task${n === 1 ? "" : "s"}: ${n === 1 ? "a" : n} ` +
-      `one-time merge grant${n === 1 ? "" : "s"} (one per PR, single-use, ~30 min), and the ` +
-      `orchestrator is notified once for the batch`;
+      `Approve the ${n} selected merge-gate task${n === 1 ? "" : "s"}: ` +
+      (grants === 0
+        ? "none has a PR linked, so no merge is authorized"
+        : `${grants} one-time merge grant${grants === 1 ? "" : "s"} ` +
+          `(one per linked PR, single-use, ~30 min)`) +
+      `, and the orchestrator is notified once for the batch`;
   }
 
   /** Bulk merge-gate approve: one modal listing exactly what is about to be
@@ -369,7 +378,7 @@ export class TasksView {
     if (this.dialogEl) return; // one dialog at a time
     const picked = approvableSelection(this.selected, this.tasks);
     if (picked.length === 0) return;
-    const withPr = picked.filter((t) => t.pr).length;
+    const withPr = grantableCount(picked);
 
     const overlay = el("div", "tasks-dialog");
     const box = el("div", "tasks-dialog-box");

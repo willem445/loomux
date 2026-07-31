@@ -3848,11 +3848,26 @@ one-time **grant** the shim also honors.
   agreeing today. Items approved with no resolvable PR are named in their own sentence, not
   folded into the granted list.
   Two behaviors differ from the sibling batch, `delete_tasks`, on purpose: the batch is
-  **all-or-nothing** (every id is checked against the merge gate before anything is minted;
-  one bad id refuses the lot), and a **repeated id is an error**. Skipping ids that vanished
-  under the human's selection is right for a cleanup — deleting a gone row is a no-op — but
-  an authority action that silently grants 4 of 5, with no signal which was dropped, is a
-  decision the human did not make. A clean refusal lets them re-tick and click again.
+  **all-or-nothing** and duplicates are **errors**. A pre-flight pass over one board
+  snapshot checks every id exists and sits at the merge gate, and refuses a repeated task
+  id *or* a repeated resolved **PR number** — two rows naming the same PR (a duplicate
+  filing) would mint `pr-<N>` twice, the second overwriting the first, and then announce
+  "#7, #7 … one grant per PR": two grants claimed, one file on disk. Skipping ids that
+  vanished under the human's selection is right for a cleanup — deleting a gone row is a
+  no-op — but an authority action that silently grants 4 of 5, with no signal which was
+  dropped, is a decision the human did not make. A clean refusal lets them re-tick and
+  click again.
+  That same pre-flight is where each item's PR number is **resolved**, which is what makes
+  the granted-vs-plain split a property of the refs the human selected rather than of
+  whether a write happened to succeed. A `mint_merge_grant` failure has two causes —
+  no PR number in the ref (the intended plain path) and an `atomic_write` I/O failure (a
+  full disk) — and collapsing them with `.ok()` made the second announce *"no PR number
+  could be resolved"*: false, and it sends the orchestrator to close out by hand a PR whose
+  merge the shim will then refuse. A write failure now propagates and fails the call, so
+  some items may be flipped `done` with some grants minted but **nothing announced** — an
+  unannounced grant simply expires unused, whereas a confident notice misdescribing what
+  was authorized does not un-say itself. `approve_task` carried the same swallow on
+  `grant_merge` and got the same fix. (#507 review B1.)
 - **Agent-unreachable boundary.** Grants are written ONLY by Tauri commands (board Approve,
   `orch_grant_merge`, `orch_grant_release`) — human surfaces. **No MCP tool** writes them
   (regression-tested: no agent-visible tool name contains "grant", and the file-writing MCP

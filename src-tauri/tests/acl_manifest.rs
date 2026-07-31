@@ -168,7 +168,8 @@ fn app_commands_len_is_132() {
          load_settings/save_settings added in #370, +1 for \
          orch_set_compact_nudge_min_context_percent — the min-context floor added by a benchtest \
          finding on #405/#332, +1 for record_copilot_launch_posture added in #456, +1 for \
-         record_claude_launch_posture added in #457, +1 for orch_approve_tasks — bulk board \n         approvals added in #507) — if this is an intentional \
+         record_claude_launch_posture added in #457, +1 for orch_approve_tasks — bulk board \
+         approvals added in #507) — if this is an intentional \
          addition/removal, update this tripwire's count too"
     );
 }

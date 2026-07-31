@@ -9,6 +9,7 @@ import {
   canApprove,
   canProceed,
   doneCount,
+  grantableCount,
   isAwaitingHuman,
   PROTOTYPE_STATUS,
   REQUEST_CHANGES_STATUS,
@@ -238,4 +239,34 @@ test("bulk approve accepts exactly the statuses a single Approve does", () => {
       `${s}: bulk selection and single Approve must agree`
     );
   }
+});
+
+test("the grant count is the linked-PR count, not the selection size", () => {
+  // #507 review N2: the board's tooltip states how many one-time merge grants
+  // are about to be issued. A gate row with no PR is approved but never
+  // granted, so counting the selection would promise authority the backend
+  // will not issue — a claim the code doesn't honor.
+  const picked = [
+    { id: "t-2", status: "pr", pr: "#7" },
+    { id: "t-4", status: "human-testing", pr: null },
+    { id: "t-5", status: "pr", pr: "https://github.com/o/r/pull/9" },
+  ];
+  assert.equal(picked.length, 3);
+  assert.equal(grantableCount(picked), 2);
+});
+
+test("a blank PR ref counts as no PR", () => {
+  // Whitespace is not a link. Keeps the count honest against a field someone
+  // cleared by selecting the text rather than deleting the row's value.
+  assert.equal(grantableCount([{ pr: "" }, { pr: "   " }, { pr: undefined }, {}]), 0);
+  assert.equal(grantableCount([]), 0);
+});
+
+test("a PR ref the backend cannot resolve is still counted as linked", () => {
+  // Deliberate, and the reason the tooltip says "one per LINKED PR": only the
+  // backend resolves a ref to the number a grant is keyed on, so the board
+  // counts what it can actually see rather than duplicating that parser here
+  // and drifting from it. Such an item lands in the notice's
+  // no-PR-number-could-be-resolved sentence instead.
+  assert.equal(grantableCount([{ pr: "TBD" }]), 1);
 });

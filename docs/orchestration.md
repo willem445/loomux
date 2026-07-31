@@ -177,9 +177,13 @@ Board controls:
   click through it. Each PR still gets its **own** one-time grant, exactly as
   if you had clicked Approve on each row — what the batch changes is that the
   orchestrator gets **one** message naming every approved PR and your notes,
-  instead of one prompt per PR. If a row moved off the merge gate between the
-  board rendering and your click, the whole batch is refused with a toast and
-  nothing is granted; re-tick and click again.
+  instead of one prompt per PR. The batch is all-or-nothing: if a row moved off
+  the merge gate between the board rendering and your click, or two of the rows
+  you ticked point at the *same* PR (a duplicate filing — one grant can't be
+  announced as two), the whole batch is refused with a toast and nothing is
+  granted; re-tick and click again. A grant that fails to *write* (a full disk)
+  likewise stops the action with an error rather than quietly reporting that
+  item as having had no PR.
 
 Items that only you can advance (`pr`, `human-testing`, `blocked`) are
 highlighted so what's waiting on you stands out. A working-status item
