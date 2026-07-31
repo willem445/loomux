@@ -23480,12 +23480,7 @@ impl OrchRegistry {
                 }
             }
         }
-        if let Some(staged) = self.recovered_queue.lock_safe().get(group) {
-            out.extend(staged.iter().cloned());
-        }
-        if let Some(markers) = self.recovered_markers.lock_safe().get(group) {
-            out.extend(markers.iter().cloned());
-        }
+        // MUTATION A: staged entries excluded from the snapshot.
         // **Sorted by id, which for this group IS arrival order** (review
         // round 2, N5). Appending staged after live is not restart-invariant:
         // a cap-rejected entry from restart 1 would be written behind
