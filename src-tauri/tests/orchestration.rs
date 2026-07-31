@@ -13836,7 +13836,7 @@ fn the_preenter_gate_declines_over_human_content_and_passes_an_empty_box() {
         "an empty box must not block the Enter — otherwise every delivery strands"
     );
 
-    pm.note_user_input(pty_id, "mid-thought");
+    pm.note_user_input(pty_id, "mid-thought", true);
     assert_eq!(
         preenter_admission(&pm, pty_id),
         WriteAdmission::HoldBoxOccupied,
@@ -13845,7 +13845,7 @@ fn the_preenter_gate_declines_over_human_content_and_passes_an_empty_box() {
     );
 
     // Their own Enter empties the box; ours becomes safe again.
-    pm.note_user_input(pty_id, "\r");
+    pm.note_user_input(pty_id, "\r", true);
     assert!(
         preenter_admission(&pm, pty_id).go(),
         "the gate is a wait, not a permanent strand"
@@ -13954,7 +13954,7 @@ fn the_drain_press_declines_over_a_line_the_human_left_before_our_submit() {
     // (`last_user_input_ms > submit_sent_ms`) reads FALSE — the timestamp
     // compare is structurally blind to content that predates our own submit.
     // No question is on screen either. Every pre-#532 gate says "flush".
-    pm.note_user_input(pty_id, "half a thought");
+    pm.note_user_input(pty_id, "half a thought", true);
     record_aborted_preenter_outcome(&last_delivery, pty_id, "w-1".to_string());
     assert_eq!(
         pm.input_pending(pty_id),
@@ -13992,7 +13992,7 @@ fn the_drain_press_fires_once_the_box_is_empty_again() {
     let pty_id = 533;
     let captured = pm.register_fake_for_test(pty_id, b"idle input box, nothing pending");
 
-    pm.note_user_input(pty_id, "half a thought");
+    pm.note_user_input(pty_id, "half a thought", true);
     assert_eq!(pm.input_pending(pty_id), Some(true));
     assert!(
         !flush_stranded_text(&pm, pty_id, Some(false), false, b"\r"),
@@ -14001,7 +14001,7 @@ fn the_drain_press_fires_once_the_box_is_empty_again() {
 
     // The human submits their own line. `classify_human_input` reads this as
     // `Submit`, which zeroes the occupancy counter outright (#111/#171).
-    pm.note_user_input(pty_id, "\r");
+    pm.note_user_input(pty_id, "\r", true);
     assert_eq!(
         pm.input_pending(pty_id),
         Some(false),

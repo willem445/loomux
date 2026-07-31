@@ -10775,12 +10775,22 @@ pub fn should_flush_before_paste(prev_confirmed: Option<bool>, human_typed_since
 /// a human who typed a line and left it sitting BEFORE our submit stamps
 /// `last_user_input_ms` at or before `submit_sent_ms`, so `human_typed_since`
 /// reads FALSE and this gate used to fire an Enter that submitted their line.
-/// `input_pending` (#111/#171 — the per-pane occupancy counter, driven only by
-/// human writes through `note_user_input`, never by loomux's own
-/// `write_bytes`) is the fact itself rather than a proxy for it, so it is
-/// consulted here rather than inferred. It does NOT suppress the legitimate
-/// case this flush exists for: our own stranded paste never moves that
-/// counter.
+/// `input_pending` (#111/#171 — the per-pane occupancy counter, moved by writes
+/// arriving through `write_pty`/`note_user_input`, never by loomux's own
+/// `write_bytes`) is a **much closer** reading of the box than a keystroke
+/// timestamp, so it is consulted here rather than inferred.
+///
+/// It is not, however, the box itself, and rev-12 was right to flag an earlier
+/// version of this doc for saying so. It is a running count that
+/// `classify_human_input` zeroes on only `\r`/`\n`, Ctrl-U and Ctrl-C, so it
+/// has a reachable **stuck-true** mode — see [`hold_bound_elapsed`], which is
+/// deliberately not allowed to consult it for exactly that reason. Stuck-true
+/// is the safe direction *here* (a withheld Enter, recoverable) and the unsafe
+/// direction *there* (a suppressed escalation, not), which is why the same
+/// signal is trusted at this gate and refused at that one.
+///
+/// It does NOT suppress the legitimate case this flush exists for: our own
+/// stranded paste never moves that counter.
 pub fn should_flush_before_paste_now(
     prev_confirmed: Option<bool>,
     human_typed_since: bool,
