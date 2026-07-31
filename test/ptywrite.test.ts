@@ -115,3 +115,91 @@ test("a large paste is delivered as ordered chunks", async () => {
   assert.ok(seen.length > 1, "was actually chunked");
   assert.ok(seen.every((c) => c.length <= 4));
 });
+
+// ---------- #518: the origin bit rides WITH the data ----------
+
+test("the origin bit is captured at write time, not read at send time", async () => {
+  // The whole reason the flag is a parameter rather than something the sender
+  // reads for itself: sends are asynchronous and land turns later, long after
+  // the key event's latch has closed. If the writer looked the origin up when
+  // it sent, every human keystroke would arrive at the backend marked
+  // non-human — the fix would be worse than the bug.
+  const seen: { data: string; human: boolean }[] = [];
+  const w = createOrderedWriter();
+  let resolveFirst: () => void = () => {};
+  const firstSent = new Promise<void>((r) => (resolveFirst = r));
+  w.ready(async (data, human) => {
+    await wait(5);
+    seen.push({ data, human });
+    if (seen.length === 2) resolveFirst();
+  });
+
+  w.write("typed", true); // a keystroke
+  w.write("\x1b[?62;1;2c", false); // a device-attributes auto-reply
+
+  const backstop = timeoutAfter(5000);
+  await Promise.race([firstSent, backstop.promise]);
+  backstop.cancel();
+  assert.deepEqual(seen, [
+    { data: "typed", human: true },
+    { data: "\x1b[?62;1;2c", human: false },
+  ]);
+});
+
+test("every chunk of one paste inherits that paste's origin", async () => {
+  // A paste is one human act. Chunking is an internal detail of ConPTY's small
+  // input pipe, and it must not make chunks 2..n look like they came from
+  // somewhere else.
+  const seen: boolean[] = [];
+  const w = createOrderedWriter(4);
+  w.ready(async (_data, human) => {
+    seen.push(human);
+  });
+
+  w.write("hello world", true);
+
+  await wait(10);
+  assert.ok(seen.length > 1, "was actually chunked");
+  assert.ok(
+    seen.every((h) => h),
+    "a chunked human paste must be human all the way through",
+  );
+});
+
+test("origin survives the pre-ready buffer", async () => {
+  // Input typed while the PTY is still starting is buffered and flushed later.
+  // The flush happens in a completely different turn, so the origin has to
+  // have been stored with the data — there is nothing left to read it from.
+  const seen: { data: string; human: boolean }[] = [];
+  const w = createOrderedWriter();
+  w.write("typed-early", true);
+  w.write("\x1b[I", false); // a focus report from the same startup window
+  assert.equal(w.pendingCount, 2);
+
+  w.ready(async (data, human) => {
+    seen.push({ data, human });
+  });
+
+  await wait(10);
+  assert.deepEqual(seen, [
+    { data: "typed-early", human: true },
+    { data: "\x1b[I", human: false },
+  ]);
+});
+
+test("a write that says nothing about origin defaults to human", async () => {
+  // The fail-safe direction, matching the backend command's own default:
+  // believing a human typed only ever makes delivery hold MORE, so an
+  // un-updated call site degrades to the pre-#518 behaviour rather than
+  // silently switching the guard off.
+  const seen: boolean[] = [];
+  const w = createOrderedWriter();
+  w.ready(async (_data, human) => {
+    seen.push(human);
+  });
+
+  w.write("no origin stated");
+
+  await wait(10);
+  assert.deepEqual(seen, [true]);
+});

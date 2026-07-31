@@ -487,6 +487,25 @@ impl PtyManager {
         );
         captured
     }
+
+    /// Back-date this pane's keystroke-recency clock (#518, integration tests
+    /// only). `note_user_input` can only ever stamp `now`, so without this
+    /// there is no way to reach the one state #518's whole fix is about — a
+    /// human-input block standing on evidence that has gone STALE — short of a
+    /// test that sleeps for the bound (ten minutes).
+    ///
+    /// Deliberately a back-date of the REAL field the real readers read, not a
+    /// mock or an injected clock: `human_input_block_now`,
+    /// `drain_stranded_submit` and the late monitor all keep using production
+    /// `now_ms()` and the shipped bound, so what a test drives with this is
+    /// the actual delivery path, not a parallel one built for testing.
+    #[doc(hidden)] // pub for integration tests
+    pub fn set_user_input_ms_for_test(&self, id: u32, ms: u64) {
+        let ptys = self.ptys.lock_safe();
+        if let Some(pty) = ptys.get(&id) {
+            pty.user_input_ms.store(ms, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Minimum spacing between `phantom-input-gated` breadcrumbs for the SAME
