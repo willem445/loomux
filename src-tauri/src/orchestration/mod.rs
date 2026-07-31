@@ -5137,6 +5137,14 @@ pub struct AgentEntry {
     /// for more — `agent_output_tail` falls back to this once the pty itself is
     /// gone. `None` until the agent exits (or for one still running).
     pub last_exit_tail: Option<String>,
+    /// #533-B: who INITIATED this agent's termination, recorded at the
+    /// moment the kill is issued and before the pty is touched — never
+    /// derived afterwards from an exit code, an empty tail, or `expected`.
+    /// `None` for a live agent and for every exit loomux did not initiate
+    /// (a crash, a watchdog-driven death, an agent quitting on its own),
+    /// which is exactly the set whose exit notice still PROMPTS the
+    /// orchestrator. See [`ExitInitiator`] and [`exit_notice_route`].
+    pub killed_by: Option<ExitInitiator>,
 }
 
 /// One pane that needs the human, pushed to the frontend as an `orch-attention`
@@ -7186,6 +7194,77 @@ pub fn exit_cause(expected: bool, tail: &str, total_bytes: u64) -> String {
         "loomux stopped it (kill or idle-timeout) — not a crash".to_string()
     } else {
         exit_diagnostic(tail, total_bytes)
+    }
+}
+
+/// Who initiated an agent's termination (#533-B) — recorded on the agent's
+/// own record by the code that issues the kill, BEFORE the pty is touched.
+///
+/// This exists because the pre-#533 signal for "loomux stopped it" was
+/// `on_pty_exit`'s `expected` flag, which is a property of the PTY
+/// (`PtyManager::kill` inserts the id into `expected_exits`) and therefore
+/// answers a different question: it says loomux closed the pane, not WHO
+/// decided to. A human closing a pane, `end_group`'s teardown, and the
+/// orchestrator's own `kill_agent` all arrive as `expected: true` and are
+/// indistinguishable there. Routing a notice on that would demote exits
+/// the orchestrator never initiated, which is precisely what #533-B says
+/// must keep prompting — so the initiator is recorded as a FACT at the call
+/// site instead of inferred at the exit site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitInitiator {
+    /// The orchestrator's own `kill_agent` MCP call — it asked for this
+    /// exit, so being told about it is a turn spent learning what it
+    /// already knows.
+    Orchestrator,
+    /// The idle-kill guardrail's reaper (`reap_idle_agents`). By
+    /// construction it only ever kills workers/reviewers that are IDLE —
+    /// no task in flight, nothing to lose — which is what makes it safe to
+    /// demote alongside an orchestrator-initiated kill.
+    IdleTimeout,
+}
+
+impl ExitInitiator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ExitInitiator::Orchestrator => "orchestrator",
+            ExitInitiator::IdleTimeout => "idle-timeout",
+        }
+    }
+}
+
+/// Where an agent-exit notice goes (#533-B).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitNoticeRoute {
+    /// Deliver to the orchestrator's pane — costs it a turn, and is worth
+    /// one: it did not cause this and cannot know about it otherwise.
+    Prompt,
+    /// Write the notice to the audit log and stop. The roster
+    /// (`list_agents`) already reflects liveness, so the orchestrator can
+    /// read this on demand rather than being interrupted by it.
+    AuditOnly,
+}
+
+/// Route an agent-exit notice from the RECORDED initiator (#533-B).
+///
+/// Pure, and deliberately takes only the recorded initiator — not
+/// `expected`, not the exit code, not the tail. Anything else would be the
+/// inference this replaces.
+///
+/// **If the idle reaper ever grows a mode that kills agents with in-flight
+/// work, that mode must PROMPT.** `IdleTimeout` is demoted here only
+/// because `reap_idle_agents` is, by construction, restricted to agents
+/// that are idle — no task, nothing lost. A future "kill the stalled
+/// worker" or "kill to reclaim a slot" reaper is a materially different
+/// event the orchestrator did not ask for and cannot reconstruct from the
+/// roster: give it its own `ExitInitiator` variant and route it to
+/// `Prompt`, rather than reusing this one.
+pub fn exit_notice_route(initiator: Option<ExitInitiator>) -> ExitNoticeRoute {
+    match initiator {
+        Some(ExitInitiator::Orchestrator) | Some(ExitInitiator::IdleTimeout) => ExitNoticeRoute::AuditOnly,
+        // Crash, watchdog-driven death, an agent quitting unexpectedly, a
+        // human closing the pane — nobody in this process asked for it.
+        None => ExitNoticeRoute::Prompt,
     }
 }
 
@@ -9555,17 +9634,49 @@ fn run_queue_drainer(
         // Not empty (confirmed above) — safe to peek normally now; only
         // this single-consumer thread ever pops the front, so nothing can
         // make it empty again out from under us before we act on it.
-        let (front, depth) = {
+        //
+        // #533-A: the whole queue is snapshotted, not just the front,
+        // because what this pass submits is now decided over the entire
+        // backlog (`queue::plan_flush`) rather than one entry at a time.
+        // The snapshot is a clone taken under the lock and then released:
+        // an admission racing this read lands BEHIND everything planned
+        // here, so the worst case is that it flushes on the next pass —
+        // never that it is skipped or reordered.
+        let (entries, depth) = {
             let queues = reg.queues.lock_safe();
             let q = queues.get(&pty_id);
-            (q.and_then(|q| q.front().cloned()), q.map(VecDeque::len).unwrap_or(0))
+            (
+                q.map(|q| q.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+                q.map(VecDeque::len).unwrap_or(0),
+            )
         };
+        // #533-A: superseded constituents drop out BEFORE anything is
+        // combined — never merged into the paste, never silently dropped
+        // either (each gets its own `delivery-dropped` audit line).
+        let plan = queue::plan_flush(&entries, queue::QUEUE_FLUSH_MAX_BYTES);
+        reg.drop_superseded(&group, pty_id, &plan.superseded);
+        let batch: Vec<queue::QueuedDelivery> = plan
+            .batch
+            .iter()
+            .filter_map(|id| entries.iter().find(|e| e.id == *id).cloned())
+            .collect();
+        let front = batch.first().cloned();
         let Some(front) = front else {
             // Should be unreachable — `commit_exit` just confirmed
             // non-empty and nothing else pops. Never trust that blindly
             // on a liveness-critical path: loop again rather than assume.
             continue;
         };
+        // The plan's `stranded` flag and the front entry's own payload are
+        // two statements of one fact; if they ever disagree the batch would
+        // be pasted as text or submitted as a marker against its own
+        // content. Cheap to assert, and it keeps `plan_flush`'s contract
+        // honest against a future edit to either side.
+        debug_assert_eq!(
+            plan.stranded,
+            matches!(front.payload, queue::QueuedPayload::StrandedSubmit),
+            "plan_flush's stranded flag must match the planned front entry's payload"
+        );
         if !immediate_first_pass || depth > 1 {
             // Genuine contention observed: either this pass needed a retry
             // at all, or more than the one entry we started with is now
@@ -9623,12 +9734,34 @@ fn run_queue_drainer(
 
         let outcome = match &front.payload {
             queue::QueuedPayload::Text(text) => {
-                // #445: the flush header ("N deliveries queued ... are now
-                // delivering") rides on the front of the FIRST replayed
-                // text this drain sends, rather than as its own separate
-                // delivery — one paste, header then content, instead of an
-                // extra full echo/confirm cycle for a single notice line.
-                let payload = if header_pending {
+                // #533-A: when this pass's plan holds more than one entry,
+                // the ENTIRE flushable backlog goes out as this one paste —
+                // header, then every constituent behind its own itemization
+                // banner, in queue order. Pre-#533 this sent `front` alone
+                // and came back for the next entry on the following pass,
+                // which cost the receiving agent one full turn per queued
+                // delivery.
+                let payload = if batch.len() > 1 {
+                    let items: Vec<queue::FlushConstituent> = batch
+                        .iter()
+                        .filter_map(|e| {
+                            e.payload.text().map(|t| queue::FlushConstituent {
+                                id: e.id,
+                                from: &e.from,
+                                enqueued_ms: e.enqueued_ms,
+                                coalesced: e.coalesced,
+                                text: t,
+                            })
+                        })
+                        .collect();
+                    queue::coalesced_flush_text(&items, plan.remaining, now_ms())
+                } else if header_pending {
+                    // #445: the flush header ("N deliveries queued ... are
+                    // now delivering") rides on the front of the FIRST
+                    // replayed text this drain sends, rather than as its own
+                    // separate delivery — one paste, header then content,
+                    // instead of an extra full echo/confirm cycle for a
+                    // single notice line.
                     let coalesced = {
                         let queues = reg.queues.lock_safe();
                         queues.get(&pty_id).map(|q| q.iter().map(|e| e.coalesced as usize).sum()).unwrap_or(0)
@@ -9658,9 +9791,14 @@ fn run_queue_drainer(
             }
         };
 
+        // #533-A: every constituent of this pass's batch closes out on the
+        // ONE submit that carried them — see `pop_batch_dequeued`. A
+        // single-entry batch takes the identical pre-#533 path.
+        let closed: Vec<(u64, u64)> = batch.iter().map(|e| (e.id, e.enqueued_ms)).collect();
+
         match outcome {
             DeliverOutcome::Done => {
-                reg.pop_front_dequeued(&group, pty_id, front.id, front.enqueued_ms);
+                reg.pop_batch_dequeued(&group, pty_id, &closed);
                 reg.queue_still_notified.lock_safe().remove(&pty_id);
             }
             DeliverOutcome::AbortedPrePaste(reason) => {
@@ -9686,7 +9824,13 @@ fn run_queue_drainer(
                     reg.notify_queue(&group, &front.agent_id, target_is_orchestrator,
                         &queue::queued_notice(&front.agent_id, queue::EnqueueReason::Question));
                 }
-                reg.pop_front_dequeued(&group, pty_id, front.id, front.enqueued_ms);
+                // #533-A: the paste that landed in the box was the WHOLE
+                // batch, so the whole batch closes out here and ONE marker
+                // stands for all of it. Popping only the front (the
+                // pre-#533 shape) would leave the other constituents queued
+                // and re-paste text already sitting in the box the moment
+                // the marker's Enter submits it.
+                reg.pop_batch_dequeued(&group, pty_id, &closed);
                 // #445 rev-35 NB3: this rejection is rare (it needs the
                 // front door to fill the freed slot in the narrow window
                 // between the pop above and this push) but was previously
@@ -12721,15 +12865,24 @@ impl OrchRegistry {
             }
             self.audit(&a.group, "loomux", "idle-kill",
                 json!({ "agent": id, "name": a.name, "idle_minutes": mins }));
-            let _ = self.deliver_to_orchestrator(
+            // #533-B: audit-only, like the exit notice this kill also
+            // produces. The reaper only ever takes agents that are IDLE —
+            // no task in flight — so the whole event is "a slot the
+            // orchestrator wasn't using was reclaimed", which `list_agents`
+            // answers on demand. Prompting for it spent a turn per reaped
+            // agent to say nothing the roster didn't already show. A reaper
+            // mode that killed agents WITH work would be a different event
+            // and must prompt — see `exit_notice_route`'s doc.
+            self.audit_demoted_exit_notice(
                 &a.group,
+                &a.id,
+                Some(ExitInitiator::IdleTimeout),
                 &format!(
                     "[loomux] idle-kill guardrail: agent {} ({}) sat without a task for {mins}+ min and was terminated to contain cost. Respawn a worker when you have work for it.",
                     a.name, a.id
                 ),
-                "loomux",
             );
-            let _ = self.kill_agent(&id);
+            let _ = self.kill_agent_as(&id, ExitInitiator::IdleTimeout);
             killed.push(id);
         }
         killed
@@ -14208,6 +14361,7 @@ impl OrchRegistry {
             idle_tick_skip_rearm_ms: 0,
             solo_cli: Some(cli.to_string()),
             last_exit_tail: None,
+            killed_by: None,
         };
         self.agents.lock_safe().insert(agent_id.clone(), entry);
         if !token.is_empty() {
@@ -14342,6 +14496,7 @@ impl OrchRegistry {
             idle_tick_skip_rearm_ms: 0,
             solo_cli: None, // unknown for an adopted pane; cli_for_agent falls back to "claude"
             last_exit_tail: None,
+            killed_by: None,
         };
         self.agents.lock_safe().insert(agent_id.clone(), entry);
         self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
@@ -21289,6 +21444,7 @@ impl OrchRegistry {
             idle_tick_skip_rearm_ms: 0,
             solo_cli: None,
             last_exit_tail: None,
+            killed_by: None,
         };
         {
             // Re-check the cap under the same lock as the insert: the early
@@ -22321,6 +22477,79 @@ impl OrchRegistry {
             json!({ "id": id, "queued_ms": now_ms().saturating_sub(enqueued_ms) }));
     }
 
+    /// Close out EVERY constituent of one coalesced flush (#533-A) — the
+    /// confirmation-transfer half.
+    ///
+    /// One combined paste means one submit, one `submit_sent_ms`, and
+    /// therefore ONE #451 three-state outcome in `last_delivery` — so that
+    /// outcome is the outcome of all `n` constituents, and they must all
+    /// close out together or the queue would replay text the pane already
+    /// received. Each is popped from the front in batch order (the drainer
+    /// is the single consumer, so each is the front in turn) and audited
+    /// with the batch it was submitted in, so one payload's history stays
+    /// reconstructible from `audit.jsonl` alone — `combined_ids` is what
+    /// tells a later reader that three `delivery-dequeued` lines at the same
+    /// millisecond are one paste, not three.
+    ///
+    /// Called ONLY on `DeliverOutcome::Done`. A batch that aborted
+    /// pre-paste closes out nothing: every constituent stays exactly where
+    /// it was, in order, for the next attempt.
+    #[doc(hidden)] // pub for integration tests
+    pub fn pop_batch_dequeued(&self, group: &str, pty_id: u32, batch: &[(u64, u64)]) {
+        if batch.len() == 1 {
+            // Unchanged from pre-#533 for the uncontended case: one entry,
+            // one plain `delivery-dequeued` line with no batch fields.
+            let (id, enqueued_ms) = batch[0];
+            self.pop_front_dequeued(group, pty_id, id, enqueued_ms);
+            return;
+        }
+        let ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
+        for (id, enqueued_ms) in batch {
+            {
+                let mut queues = self.queues.lock_safe();
+                if let Some(q) = queues.get_mut(&pty_id) {
+                    if q.front().is_some_and(|f| f.id == *id) {
+                        q.pop_front();
+                    }
+                }
+            }
+            self.audit(group, "loomux", "delivery-dequeued", json!({
+                "id": id,
+                "queued_ms": now_ms().saturating_sub(*enqueued_ms),
+                "combined_ids": ids,
+                "combined": ids.len(),
+            }));
+        }
+    }
+
+    /// Remove constituents that `queue::plan_flush` ruled superseded
+    /// (#533-A) — by id, anywhere in the queue, not just the front. Audits
+    /// one `delivery-dropped` per entry with reason `superseded` so a
+    /// dropped payload is never silent, exactly like every other drop path.
+    #[doc(hidden)] // pub for integration tests
+    pub fn drop_superseded(&self, group: &str, pty_id: u32, ids: &[u64]) {
+        if ids.is_empty() {
+            return;
+        }
+        let removed: Vec<queue::QueuedDelivery> = {
+            let mut queues = self.queues.lock_safe();
+            match queues.get_mut(&pty_id) {
+                Some(q) => {
+                    let (gone, kept): (Vec<_>, Vec<_>) =
+                        q.drain(..).partition(|e| ids.contains(&e.id));
+                    q.extend(kept);
+                    gone
+                }
+                None => Vec::new(),
+            }
+        };
+        for e in removed {
+            self.audit(group, "loomux", "delivery-dropped", json!({
+                "to": e.agent_id, "id": e.id, "reason": "superseded",
+            }));
+        }
+    }
+
     /// Current queue depth for `pty_id` (0 if none exists) — a read-only
     /// accessor for tests and any future badge (#445 PR-C). Never mutates.
     #[doc(hidden)] // pub for integration tests
@@ -22340,11 +22569,19 @@ impl OrchRegistry {
     /// spawn/bind handshake (which needs a live Tauri window). #445's
     /// front-door tests need SOME agent with a `pty_id` to key a queue by,
     /// without the app-handle round trip every other pty-bound path needs.
+    ///
+    /// #533-B: also registers the REVERSE mapping (`by_pty`), which the real
+    /// bind writes and which `on_pty_exit` looks the agent up through — so
+    /// the exit path is drivable in a test at all, instead of returning at
+    /// its first line. Additive: every pre-#533 caller only ever read
+    /// `pty_id`, and `mark_dead` cleans this entry up exactly as it does for
+    /// a real bind.
     #[doc(hidden)] // pub for integration tests
     pub fn set_pty_for_test(&self, agent_id: &str, pty_id: u32) {
         if let Some(a) = self.agents.lock_safe().get_mut(agent_id) {
             a.pty_id = Some(pty_id);
         }
+        self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
     }
 
     /// #445 intake finding: the in-memory queue's persistence argument
@@ -22514,17 +22751,59 @@ impl OrchRegistry {
         Ok(format_output_tail(&text, lines))
     }
 
+    /// Terminate `agent_id` at the ORCHESTRATOR's request (the `kill_agent`
+    /// MCP tool). See [`Self::kill_agent_as`] for the initiator-recording
+    /// half and why it matters (#533-B).
     pub fn kill_agent(&self, agent_id: &str) -> Result<(), String> {
+        self.kill_agent_as(agent_id, ExitInitiator::Orchestrator)
+    }
+
+    /// `kill_agent`, with the INITIATOR named explicitly (#533-B).
+    ///
+    /// The initiator is stamped onto the agent's own record BEFORE the pty
+    /// is touched, so the exit that follows — milliseconds later, on the
+    /// pty waiter thread — reads a recorded fact rather than inferring one
+    /// from `expected`/an exit code (see [`exit_notice_route`]). Stamping
+    /// first is what makes the ordering safe: `PtyManager::kill` can have
+    /// the waiter in `on_pty_exit` before this function returns, and a
+    /// record written after the kill could lose that race and misroute the
+    /// notice to a prompt.
+    pub fn kill_agent_as(&self, agent_id: &str, initiator: ExitInitiator) -> Result<(), String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         if a.role == Role::Orchestrator {
             return Err("refusing to kill the orchestrator; close its pane instead".into());
         }
         let app = self.app.lock_safe().clone().ok_or("no app handle")?;
+        self.record_exit_initiator(agent_id, initiator);
         if let Some(pty) = a.pty_id {
             app.state::<crate::pty::PtyManager>().kill(pty);
         }
-        self.audit(&a.group, "loomux", "agent-kill", json!({ "agent": agent_id }));
+        self.audit(&a.group, "loomux", "agent-kill",
+            json!({ "agent": agent_id, "initiator": initiator.as_str() }));
         Ok(())
+    }
+
+    /// Record WHO initiated `agent_id`'s termination (#533-B) — the durable
+    /// half of the exit-notice routing decision. Idempotent and
+    /// first-writer-wins: if two paths race to kill the same agent, the one
+    /// that actually caused it is the one that got there first, and a
+    /// second stamp would rewrite history rather than record it. No-op for
+    /// an unknown agent.
+    #[doc(hidden)] // pub for integration tests
+    pub fn record_exit_initiator(&self, agent_id: &str, initiator: ExitInitiator) {
+        let mut agents = self.agents.lock_safe();
+        if let Some(a) = agents.get_mut(agent_id) {
+            if a.killed_by.is_none() {
+                a.killed_by = Some(initiator);
+            }
+        }
+    }
+
+    /// The recorded initiator for `agent_id`, if any (#533-B) — read by
+    /// tests and by `on_pty_exit`'s routing switch.
+    #[doc(hidden)] // pub for integration tests
+    pub fn exit_initiator(&self, agent_id: &str) -> Option<ExitInitiator> {
+        self.agents.lock_safe().get(agent_id).and_then(|a| a.killed_by)
     }
 
     /// #203: a planner's contract is one plan → one report → exit, but the CLI
@@ -22725,17 +23004,51 @@ impl OrchRegistry {
             if a.role != Role::Orchestrator {
                 let elapsed_ms = now_ms().saturating_sub(started_ms);
                 let cause = exit_cause(expected, tail, total_bytes);
-                let _ = self.deliver_to_orchestrator(
-                    &a.group,
-                    &format!(
-                        "[loomux] agent {} ({}) exited (code {exit_code:?}) {elapsed_ms}ms after \
-                         spawn — {cause}. Update your plan and state accordingly.",
-                        a.name, a.id,
-                    ),
-                    "loomux",
+                let notice = format!(
+                    "[loomux] agent {} ({}) exited (code {exit_code:?}) {elapsed_ms}ms after \
+                     spawn — {cause}. Update your plan and state accordingly.",
+                    a.name, a.id,
                 );
+                // #533-B: routed on the RECORDED initiator, never on
+                // `expected` (which only says loomux closed the pane, not
+                // who decided to — a human pane close looks identical to
+                // `kill_agent` there). An orchestrator that asked for this
+                // exit, or an idle reaper that took a task-less agent,
+                // costs it nothing to learn from the roster on demand; an
+                // exit nobody in this process asked for still interrupts.
+                match exit_notice_route(a.killed_by) {
+                    ExitNoticeRoute::Prompt => {
+                        let _ = self.deliver_to_orchestrator(&a.group, &notice, "loomux");
+                    }
+                    ExitNoticeRoute::AuditOnly => self.audit_demoted_exit_notice(
+                        &a.group,
+                        &a.id,
+                        a.killed_by,
+                        &notice,
+                    ),
+                }
             }
         }
+    }
+
+    /// Write an exit notice the orchestrator is NOT prompted with to the
+    /// audit log instead (#533-B), full text included, so "read it on
+    /// demand" is a real path and not a euphemism for "it was dropped".
+    /// `list_agents` already carries the liveness half; this carries the
+    /// wording, the initiator and the timestamp.
+    fn audit_demoted_exit_notice(
+        &self,
+        group: &str,
+        agent_id: &str,
+        initiator: Option<ExitInitiator>,
+        notice: &str,
+    ) {
+        self.audit(group, "loomux", "agent-exit-notice", json!({
+            "agent": agent_id,
+            "routed": "audit-only",
+            "initiator": initiator.map(|i| i.as_str()),
+            "notice": notice,
+        }));
     }
 
     #[doc(hidden)] // pub for integration tests
@@ -23793,6 +24106,7 @@ fn register_orchestrator_pane(
         idle_tick_skip_rearm_ms: 0,
         solo_cli: None,
         last_exit_tail: None,
+        killed_by: None,
     };
     reg.agents.lock_safe().insert(agent_id.clone(), entry.clone());
     reg.by_token.lock_safe().insert(token, agent_id.clone());
