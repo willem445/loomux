@@ -7696,6 +7696,29 @@ pub fn recorded_confirmed(last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>, 
     last_delivery.lock_safe().get(&pty_id).map(|o| o.confirmed)
 }
 
+/// Record a stranded (unconfirmed) delivery whose submit happened at an
+/// EXPLICIT time (#518, integration tests only). `record_aborted_preenter_
+/// outcome` always stamps `now_ms()`, which cannot express the one state
+/// #518's bound is about: a delivery whose submit is in the past, with a
+/// keystroke stamp after it that has since gone stale. Paired with
+/// `PtyManager::set_user_input_ms_for_test`, this lets a test place both ends
+/// of that comparison without sleeping out the ten-minute bound — and without
+/// making `DeliveryOutcome` public, which this file's own precedent
+/// (`DeliveryConfirmation`'s doc) argues against.
+#[doc(hidden)] // pub for integration tests
+pub fn record_stranded_outcome_at_for_test(
+    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    pty_id: u32,
+    delivery_from: String,
+    submit_sent_ms: u64,
+) {
+    last_delivery.lock_safe().insert(pty_id, DeliveryOutcome {
+        confirmed: false,
+        submit_sent_ms,
+        from: delivery_from,
+    });
+}
+
 /// Production bug fix (rev-42 delta, round 2): a per-agent snapshot of the
 /// most recent delivery to that agent's pane, in the shape `compact_nudge_
 /// tick`'s reinjection-confirmation resolver needs. Mirrors the private

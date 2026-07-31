@@ -50,6 +50,8 @@ use loomux_lib::orchestration::{
     kickoff_recovery_action, KickoffDecline, KickoffRecovery,
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
     redelivery_treatment, RedeliveryTreatment, stranded_reword,
+    human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
+    HUMAN_INPUT_BLOCK_BOUND_MS, record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
@@ -13832,7 +13834,11 @@ fn terminal_query_replies_do_not_stamp_user_input() {
         ("DA (device attributes) reply", "\x1b[?64;1;2;6;9;15;18;21;22c"),
         ("CPR (cursor position) reply", "\x1b[24;80R"),
     ] {
-        pm.note_user_input(id, reply);
+        // `human_origin: true` deliberately — this test is about the BYTE-SHAPE
+        // gate (#496 PR-A) and must keep failing if that gate is removed, so
+        // #518's origin bit is handed the least helpful value here. Both
+        // conditions are ANDed; each gets its own test.
+        pm.note_user_input(id, reply, true);
         assert_eq!(
             pm.last_user_input_ms(id),
             Some(0),
@@ -13854,7 +13860,7 @@ fn real_keystrokes_still_stamp_user_input() {
         pm.register_fake_for_test(id, b"");
         assert_eq!(pm.last_user_input_ms(id), Some(0));
 
-        pm.note_user_input(id, data);
+        pm.note_user_input(id, data, true);
 
         assert_ne!(
             pm.last_user_input_ms(id),
@@ -13862,6 +13868,94 @@ fn real_keystrokes_still_stamp_user_input() {
             "{name} is a real keystroke — user_input_ms must still be stamped"
         );
     }
+}
+
+// ---------- #518: the structural half of the keystroke-evidence gate ----------
+//
+// #496 PR-A (above) classifies by BYTE SHAPE. That is a pattern match against
+// an OPEN set of terminal auto-reply shapes — it covers everything #179
+// catalogued, but #496's own plan §7 closed with "which copilot emission
+// recurs mid-session" unanswered, which is why `phantom-input-gated` exists as
+// a breadcrumb rather than an answer. #518 is that residue firing in
+// production: a copilot orchestrator's prompt sat unsubmitted behind a
+// "held: user typing" state with nobody at the keyboard.
+//
+// The frontend already solved this exact problem for its own `firstInputMs`
+// (#440 B2-R) and explicitly did NOT do it with a better `onData` filter — it
+// took the signal from `term.onKey` and the two `term.paste()` sites, which
+// are unreachable by anything the terminal manufactures for itself. The origin
+// bit carries that same guarantee across the IPC boundary. The two conditions
+// are ANDed, so neither test below can pass by the other's mechanism.
+
+#[test]
+fn a_non_human_origin_write_never_stamps_however_it_reads() {
+    // The property the byte-shape gate CANNOT provide: this write is
+    // indistinguishable from typed content by shape — plain printable text,
+    // `HumanInput::Content`, a positive occupancy delta — and it still must
+    // not stamp, because the frontend says no key was pressed and no paste
+    // happened. This is what makes the gate closed over an open set rather
+    // than over a catalogue: it needs no prediction of what copilot's TUI
+    // might emit next.
+    //
+    // Mutation this is here to catch: drop `human_origin &&` from
+    // `note_user_input`'s `keystroke_like` and this reddens immediately.
+    let pm = PtyManager::default();
+    let id = 518_01;
+    pm.register_fake_for_test(id, b"");
+
+    for (name, data) in [
+        ("printable body of an unmodelled auto-reply", "11;rgb:0d0d/1111/1717"),
+        ("a reply fragmented across writes, tail half in isolation (#496 N3)", "rgb:f0f6/f0f6/fcfc\x1b\\"),
+        ("a bare CR the terminal emitted itself", "\r"),
+    ] {
+        pm.note_user_input(id, data, false);
+        assert_eq!(
+            pm.last_user_input_ms(id),
+            Some(0),
+            "{name} did not come from a key or a paste — must NOT stamp user_input_ms, \
+             whatever its bytes look like"
+        );
+    }
+}
+
+#[test]
+fn a_human_origin_keystroke_still_stamps() {
+    // The green companion, and the reason the origin bit is ANDed rather than
+    // substituted for the shape gate: a fix that made the clock stop tracking
+    // real typing would blind every human-protection guard in the delivery
+    // pipeline, which is far worse than the bug #518 is about.
+    let pm = PtyManager::default();
+    let id = 518_02;
+    pm.register_fake_for_test(id, b"");
+
+    pm.note_user_input(id, "please hold on", true);
+
+    assert_ne!(
+        pm.last_user_input_ms(id),
+        Some(0),
+        "a genuine keystroke, from a real key event, must still stamp the clock"
+    );
+}
+
+#[test]
+fn an_origin_bit_alone_does_not_resurrect_a_shape_gated_write() {
+    // Both halves are necessary, and this pins the direction the other tests
+    // cannot: an arrow key IS a genuine key event (`human_origin: true`) and
+    // still must not stamp, because #496 PR-A's tradeoff — pure-`Neutral`,
+    // zero-delta input does not defer anything — is deliberate and untouched
+    // by #518. A future edit that replaced the shape gate with the origin bit
+    // instead of ANDing them would pass every other test in this section.
+    let pm = PtyManager::default();
+    let id = 518_03;
+    pm.register_fake_for_test(id, b"");
+
+    pm.note_user_input(id, "\x1b[A", true); // up-arrow: a real key, no content
+
+    assert_eq!(
+        pm.last_user_input_ms(id),
+        Some(0),
+        "#496 PR-A's Neutral/zero-delta tradeoff must survive #518 — the two gates are ANDed"
+    );
 }
 
 #[test]
@@ -21495,4 +21589,287 @@ fn reload_removal_audit_relatches_after_the_gate_returns_and_is_removed_again() 
     edit_workflow(repo.path(), gateless_workflow_text());
     reg.run_workflow_gate_reload();
     assert_eq!(warns(&reg), 2, "a later, distinct removal must audit again, not stay silent forever");
+}
+
+// ─────────────── #518: the aggregate bound on the human-input block ───────────────
+//
+// `human_typed_since` used to be five inline copies of
+// `last_user_input_ms > submit_sent_ms` — `tier1_trusted`'s inverse, and an
+// unbounded LATCH. One stamp after our own submit pinned it true for the whole
+// life of the delivery AND its late monitor (`LATE_MONITOR_MAX_LIFETIME`, four
+// hours), and the monitor re-asserted the badge off it on every poll. So a
+// false stamp did not merely mislead one decision, it converted into an
+// indefinite badged hold that only a human's physical Enter could clear —
+// #518's live symptom, and the same class as #513.
+//
+// #500 bounded the idle tick's twin of this signal and stated the rule: a
+// suppression driven by a fallible signal must be BOUNDED, because nothing
+// else will ever clear it. This is that rule's delivery-hold sibling. It
+// differs from #500's in one deliberate way: #500's clamp is
+// classification-blind and releases purely on elapsed time, while this one
+// releases only on POSITIVE EVIDENCE that there is nothing of the human's to
+// clobber (`input_pending` false). That is what lets it coexist with #510's
+// absolute — never submit over genuine human content — instead of eroding it.
+
+#[test]
+fn human_input_block_never_times_out_while_the_box_holds_human_content() {
+    // THE safety property, and the one a future edit must not reorder. The
+    // bound exists because a TIMESTAMP goes stale; occupancy does not. However
+    // ancient the keystroke, if the human's characters are still sitting in
+    // the box, the block stands — there is something there to merge-submit
+    // over, which is exactly what #510/#111/#81 forbid.
+    let ancient = 1_000u64;
+    let now = ancient + HUMAN_INPUT_BLOCK_BOUND_MS * 100; // a hundred bounds later
+
+    assert_eq!(
+        human_input_block(ancient, 0, true, now, HUMAN_INPUT_BLOCK_BOUND_MS),
+        HumanInputBlock::Blocked,
+        "human characters outstanding in the box must outrank the bound, forever"
+    );
+    // Mutation this catches: moving the `box_pending` arm below the elapsed
+    // check (or dropping it) makes this BoundedOut — i.e. makes loomux press
+    // Enter on a person's half-written line, the exact clobber the whole
+    // guard exists for.
+    assert_eq!(
+        human_input_block(ancient, 0, false, now, HUMAN_INPUT_BLOCK_BOUND_MS),
+        HumanInputBlock::BoundedOut,
+        "with the box empty, the same ancient timestamp IS stale — this is the pair that \
+         proves the box reading, not the clock, is what held the block up above"
+    );
+}
+
+#[test]
+fn human_input_block_table() {
+    let bound = HUMAN_INPUT_BLOCK_BOUND_MS;
+    let submit = 10_000u64;
+
+    // No keystroke evidence after our own submit: nothing to bound, and the
+    // answer is `None` rather than a released block — the ordinary case, and
+    // distinguishable in the audit from a block we decided had gone stale.
+    assert_eq!(human_input_block(0, submit, false, submit + 1, bound), HumanInputBlock::None);
+    assert_eq!(
+        human_input_block(submit, submit, false, submit + 1, bound),
+        HumanInputBlock::None,
+        "a stamp AT our submit is not after it — `tier1_trusted` is <=, unchanged"
+    );
+
+    // Evidence after our submit, still fresh: blocked, exactly as before #518.
+    assert_eq!(
+        human_input_block(submit + 1, submit, false, submit + 1 + bound / 2, bound),
+        HumanInputBlock::Blocked,
+        "inside the bound nothing changes — #518 must not shorten any existing hold"
+    );
+
+    // The boundary itself, pinned: `>=` fires, one millisecond short does not.
+    assert_eq!(
+        human_input_block(submit + 1, submit, false, submit + bound, bound),
+        HumanInputBlock::Blocked,
+    );
+    assert_eq!(
+        human_input_block(submit + 1, submit, false, submit + 1 + bound, bound),
+        HumanInputBlock::BoundedOut,
+    );
+
+    // `bound_ms == 0` disables the bound rather than making it fire instantly.
+    // Getting this backwards would turn a mis-set constant into a clobber, so
+    // the polarity is pinned rather than left to read naturally.
+    assert_eq!(
+        human_input_block(submit + 1, submit, false, submit + 1 + bound * 10, 0),
+        HumanInputBlock::Blocked,
+        "0 means the bound is OFF (pre-#518 behaviour), never 'always expired'"
+    );
+
+    // A clock that jumped backwards must not underflow into a huge elapsed.
+    assert_eq!(
+        human_input_block(submit + 1_000, submit, false, submit, bound),
+        HumanInputBlock::Blocked,
+        "saturating_sub: a backwards clock reads as no time passed, never as expired"
+    );
+
+    // And `holds()` — the boolean every call site actually consumes.
+    assert!(!HumanInputBlock::None.holds());
+    assert!(HumanInputBlock::Blocked.holds());
+    assert!(
+        !HumanInputBlock::BoundedOut.holds(),
+        "a bounded-out block must read FALSE to its consumers — that is the entire fix"
+    );
+}
+
+#[test]
+fn a_stale_human_input_block_releases_the_real_stranded_press() {
+    // The WIRING, not just the decision (#40's twice-bitten lesson): the real
+    // replay function `run_queue_drainer` calls, against a real PtyManager
+    // backed by a fake child, with production `now_ms()` and the shipped
+    // bound. The pane is back-dated rather than slept out — see
+    // `set_user_input_ms_for_test`.
+    //
+    // The scenario is #518's, exactly: a keystroke-shaped stamp landed after
+    // our submit with no human present, the box holds nothing of the human's,
+    // and eleven minutes have passed with no new evidence. Before this fix the
+    // press declined here forever and the prompt sat unsubmitted behind a
+    // badge.
+    let pm = PtyManager::default();
+    let pty = 518_10u32;
+    let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    // Our submit is twelve minutes ago; the phantom stamp landed a minute
+    // after it, and nothing has touched the pane since. `last > submit` (the
+    // latch is SET) and `now - last >= bound` (it has gone stale).
+    let stamp = now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 60_000);
+    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), stamp - 60_000);
+    pm.set_user_input_ms_for_test(pty, stamp);
+    assert_eq!(
+        pm.input_pending(pty),
+        Some(false),
+        "precondition: nothing of the human's is in the box — the bound may only release on this"
+    );
+
+    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r");
+
+    assert!(
+        fired,
+        "stale evidence plus an empty box must release the press — without the bound this \
+         declines forever and the prompt stays unsubmitted (#518's live symptom)"
+    );
+    assert_eq!(&*captured.lock().unwrap(), b"\r", "exactly one submit, nothing else");
+}
+
+#[test]
+fn a_fresh_human_keystroke_still_blocks_the_real_stranded_press() {
+    // The red-line companion: same path, same fake pane, but the keystroke is
+    // real and recent. #510's rule is untouched — loomux does not press Enter
+    // over content a human may be mid-way through.
+    let pm = PtyManager::default();
+    let pty = 518_11u32;
+    let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    // Our submit is five seconds ago, not `now`: `tier1_trusted` is `<=`, so a
+    // ledger stamped in the same millisecond as the keystroke below would read
+    // as "no human input since our submit" and this test would pass for the
+    // wrong reason (it did, on the first run — the press fired because the two
+    // timestamps tied, not because the guard let it through).
+    record_stranded_outcome_at_for_test(&last_delivery, pty, "loomux".to_string(), now_ms() - 5_000);
+
+    // A genuine keystroke, through the real signal path: a real key event
+    // (`human_origin: true`) carrying real content.
+    pm.note_user_input(pty, "wait, hold on", true);
+    assert!(
+        pm.last_user_input_ms(pty).unwrap_or(0) > now_ms() - 5_000,
+        "precondition: the keystroke lands strictly after the delivery's own submit"
+    );
+
+    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r");
+
+    assert!(!fired, "a live human keystroke must still block the press");
+    assert!(captured.lock().unwrap().is_empty(), "no bytes may reach a pane a human is typing in");
+}
+
+#[test]
+fn a_stale_block_with_human_text_still_in_the_box_never_releases_the_press() {
+    // The wired form of the precedence property: the timestamp is as stale as
+    // the pure test's, but this pane's occupancy counter says the human's
+    // characters are still there. The press must still decline. This is the
+    // test that fails if anyone "simplifies" the bound into a plain timeout.
+    let pm = PtyManager::default();
+    let pty = 518_12u32;
+    let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    record_stranded_outcome_at_for_test(
+        &last_delivery,
+        pty,
+        "loomux".to_string(),
+        now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 120_000),
+    );
+
+    // Human types a line and leaves it sitting; then time passes. The
+    // back-date happens AFTER the write, since the write stamps `now`.
+    pm.note_user_input(pty, "half a thought", true);
+    assert_eq!(pm.input_pending(pty), Some(true), "precondition: their line is in the box");
+    let stamp = now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 60_000);
+    pm.set_user_input_ms_for_test(pty, stamp);
+
+    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r");
+
+    assert!(
+        !fired,
+        "an empty box is what licenses the bound — with the human's line still there, \
+         staleness must buy nothing at all"
+    );
+    assert!(captured.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_bounded_out_block_lets_the_stranded_decision_reach_self_heal() {
+    // The ACTION half of the bound (the brief's "downgrades to
+    // deliver-if-box-unchanged"): with the block released, precedence carries
+    // the decision into the EXISTING `box_holds_paste` arm, which is already
+    // exactly that test. Our text still at the tail => heal it; anything else
+    // still lands on a badge, never a blind Enter.
+    let heal = |typed, holds| {
+        stranded_selfheal_action(true, typed, false, holds, 0, STRANDED_SELFHEAL_MAX_HEALS)
+    };
+
+    assert_eq!(
+        heal(HumanInputBlock::Blocked.holds(), true),
+        StrandedAction::Attention(StrandedBlocker::HumanInput),
+        "while the block stands, nothing changes — the badge, not the Enter"
+    );
+    assert_eq!(
+        heal(HumanInputBlock::BoundedOut.holds(), true),
+        StrandedAction::SelfHeal,
+        "released block + our own text still in the box = the recovery #518 asks for"
+    );
+    assert_eq!(
+        heal(HumanInputBlock::BoundedOut.holds(), false),
+        StrandedAction::Attention(StrandedBlocker::NotHolding),
+        "released block but a box we cannot account for still badges — the bound buys a \
+         re-decision, never a blind press"
+    );
+}
+
+// ───────────── #522: no actionable notice for a pane that is simply idle ─────────────
+//
+// The late monitor announced "the prompt may be sitting unsubmitted in its
+// pane; get_output it and re-send if needed" about a worker that had finished
+// its turn and gone idle at the CLI's rest prompt, waiting on a CI watch.
+// Nothing was stuck. The monitor knew only that no `PromptSubmit` hook record
+// had shown up — which copilot never produces at all and a claude pane can
+// miss — and treated that absence as a strand.
+//
+// The cost is not noise: each one tells the orchestrator to `get_output` (the
+// #520 token flood on an animated pane) and tempts a duplicate re-send, which
+// is the double-delivery loop #451/#510 exist to prevent.
+
+#[test]
+fn an_idle_pane_produces_no_actionable_unconfirmed_notice() {
+    // "Sitting unsubmitted" has a structural meaning, and this is it: our
+    // pasted text still identifiably at the box's tail, or human characters
+    // outstanding. Neither => the pane is done, not stuck.
+    assert_eq!(
+        unconfirmed_disposition(false, false),
+        UnconfirmedDisposition::IdleAuditOnly,
+        "our paste consumed and no human input outstanding: the delivery landed or is moot — \
+         record it, never send the orchestrator to re-deliver something that is not stuck"
+    );
+}
+
+#[test]
+fn a_genuinely_stranded_pane_still_gets_the_notice() {
+    // The half that must NOT be softened. #522 narrows WHEN the notice fires,
+    // and a fix that narrowed it to nothing would re-open #496's silent wedge.
+    assert_eq!(
+        unconfirmed_disposition(true, false),
+        UnconfirmedDisposition::Notify,
+        "our text still sitting in the box IS the strand — announce it exactly as before"
+    );
+    assert_eq!(
+        unconfirmed_disposition(false, true),
+        UnconfirmedDisposition::Notify,
+        "a human's own line in the box is not an idle pane, and they still need telling"
+    );
+    assert_eq!(
+        unconfirmed_disposition(true, true),
+        UnconfirmedDisposition::Notify,
+        "both at once is the least idle a pane can be"
+    );
 }
