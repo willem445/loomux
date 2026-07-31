@@ -14318,6 +14318,87 @@ fn gh_shim_gives_the_real_gh_a_native_git_only_for_builtin_subcommands() {
     }
 }
 
+/// Normalizer sites that are deliberately NOT wrapped in `loomux_norm_guard`,
+/// each with the reason its emptiness is safe (#509 rev-32 NB2). Keyed by the
+/// assigned variable; the pin below requires every entry to still correspond to
+/// a real unguarded site, so this list cannot rot into a blanket exemption.
+const UNGUARDED_TR_SITES: &[(&str, &str)] = &[
+    ("cur_head", "empty ⇒ the `[ -n \"$cur_head\" ] ||` line immediately below blocks with \
+                  unresolved-head; the workflow gate refuses rather than proceeds"),
+    ("rest", "tag EXTRACTION for grant keying, not gate matching: empty ⇒ empty rtag ⇒ \
+              loomux_release_gate is still entered and can only allow via a blanket marker \
+              or a grant file it cannot name — it never decides whether to gate"),
+];
+
+/// **rev-32 NB2 — nothing enforced guard COMPLETENESS, which is what let NB1
+/// through.** NB1 was a single unguarded fail-open normalizer (`ql`, the graphql
+/// query fold) sitting unnoticed among eleven `tr` sites, reachable only because
+/// a different guard happened to exit first. A human found it by reading; that
+/// is not a mechanism.
+///
+/// So: enumerate every `… | tr …` assignment in both generated shims and require
+/// each one either to be guarded within a few lines, or to be named in
+/// `UNGUARDED_TR_SITES` with its reason. A new normalizer added later fails here
+/// until someone makes that choice explicitly. This is squarely in scope for a PR
+/// whose thesis is that an unnormalized value must never reach a gate pattern.
+#[test]
+fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
+    let paths = ShimPaths { utils_dir: Some("/c/git/usr/bin".into()), git_dir: Some("/c/git/cmd".into()) };
+    for (name, script) in [
+        ("gh", gh_shim_sh("C:/gh.exe", &paths)),
+        ("git", git_shim_sh("C:/git.exe", &paths)),
+    ] {
+        let lines: Vec<&str> = script.lines().collect();
+        let mut sites = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            // A normalization is `VAR=$( … | tr … )`. Require the assignment
+            // shape, not the word — and skip comments, because the preamble's own
+            // prose quotes `x=$(printf … | tr …)` when explaining the bug and
+            // would otherwise be reported as an unguarded site.
+            if !line.contains("| tr ") || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let Some(eq) = line.find("=$(") else { continue };
+            let var: String = line[..eq]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if var.is_empty() {
+                continue;
+            }
+            sites += 1;
+            // Guarded if a guard naming this variable follows within 3 lines —
+            // `path_low`'s guard sits two below it, after `ref_low`.
+            let guarded = lines[i..(i + 4).min(lines.len())]
+                .iter()
+                .any(|l| l.contains("loomux_norm_guard") && l.contains(&format!("\"${var}\"")));
+            let exempt = UNGUARDED_TR_SITES.iter().any(|(v, _)| *v == var);
+            assert!(
+                guarded || exempt,
+                "{name} shim line {}: `{var}` is normalized through `tr` but neither guarded by \
+                 loomux_norm_guard nor listed in UNGUARDED_TR_SITES with a reason. An unguarded \
+                 normalizer returns EMPTY when the tool fails, and empty matches no gate pattern \
+                 — that is #509. Guard it, or add it with the reason its emptiness is safe.\n  {}",
+                i + 1,
+                line.trim()
+            );
+        }
+        assert!(sites >= 1, "{name} shim: found no `| tr` sites at all — the scan has stopped working");
+    }
+    // The exemption list must not outlive the sites it exempts, or it silently
+    // becomes a blanket permission for a variable name someone reuses later.
+    let both = format!("{}{}", gh_shim_sh("C:/gh.exe", &paths), git_shim_sh("C:/git.exe", &paths));
+    for (var, _) in UNGUARDED_TR_SITES {
+        assert!(both.lines().any(|l| l.contains("| tr ") && l.contains(&format!("{var}=$("))),
+            "UNGUARDED_TR_SITES names `{var}`, which is no longer a `| tr` site in either shim — \
+             remove the exemption rather than leaving it to cover something else later");
+    }
+}
+
 /// #509: the dependency preamble is one gate-integrity guarantee, not two
 /// copies that can drift. Same reasoning as the grant-fragment pin above — the
 /// gh and git shims are separate generated scripts with no shared shell lib, so

@@ -618,7 +618,13 @@ if [ "$cmd" = "api" ]; then
     if [ -n "$a_inputval" ] || [ "$a_qopaque" = "1" ]; then
       is_rel=1
     elif [ -n "$a_query" ]; then
+      # rev-32 NB1: the LAST fail-open normalizer. An empty $ql matches none of the
+      # mutation tokens below, so a graphql deleteRef of a published tag ref would
+      # pass ungated. It was unreachable only because the path_low guard exits
+      # first — and "unreachable because another guard happens to run first" is the
+      # exact reasoning that produced #509. Guarded on its own merits.
       ql=$(printf '%s' "$a_query" | tr '[:upper:]' '[:lower:]')
+      loomux_norm_guard "$a_query" "$ql" "graphql-query"
       # Full create+move+DELETE coverage of refs/tags/releases, matching the REST arm
       # (which gates POST/PATCH/DELETE of git/refs|git/tags and create/edit/delete of
       # releases). deleteRef is destructive — it can drop a published v* tag ref — so it
