@@ -23502,7 +23502,7 @@ impl OrchRegistry {
         // here and nowhere else — a marker is never replayed across a restart
         // (`split_recovered`), so no recovery decision reads its file order,
         // and its `pty_id` + id still identify it exactly.
-        out.sort_by_key(|e| e.delivery.id);
+        // MUTATION C: id sort removed.
         out
     }
 
