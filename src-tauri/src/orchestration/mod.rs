@@ -10166,6 +10166,46 @@ pub fn channel_updated_event(chan_id: &str, sender: &str, display_number: u32, m
     })
 }
 
+thread_local! {
+    /// How many groups have had their records read and parsed on THIS thread
+    /// (#514). Bumped once per `merged_records` call — the one funnel through
+    /// which a group's roster + full audit log is actually read, and so the
+    /// unit of work the #479 group-hint fast path exists to avoid paying for
+    /// every OTHER group.
+    ///
+    /// Monotonic and never reset: a reader takes a snapshot before the call
+    /// it's measuring and subtracts, so there is no shared mutable state to
+    /// clear and no ordering requirement between readers.
+    ///
+    /// Thread-local for the same reason as `sessions.rs`'s test seams: the
+    /// default test harness runs each `#[test]` on its own OS thread, so a
+    /// process-global counter would be polluted by whatever other tests
+    /// happen to be scanning groups concurrently — which is exactly the
+    /// nondeterminism a structural pin is meant to replace. Every lookup this
+    /// measures (`session_roles`, `session_role_in_group`, and
+    /// `resume_recorded_session`'s own record re-read) runs synchronously on
+    /// its caller's thread.
+    static GROUP_RECORD_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Observation seam for the counter above: how many group-record scans this
+/// thread has done so far. Not `#[cfg(test)]` — integration tests
+/// (`tests/orchestration.rs`) link this crate as an ordinary dependency,
+/// where `cfg(test)` is never active, so the hook has to be a real (if
+/// `#[doc(hidden)]`) function to be reachable from there.
+///
+/// Read it as a delta around the call under test:
+///
+/// ```ignore
+/// let before = group_record_scans_for_test();
+/// // ... the lookup being pinned ...
+/// let scans = group_record_scans_for_test() - before;
+/// ```
+#[doc(hidden)] // pub for integration tests
+pub fn group_record_scans_for_test() -> usize {
+    GROUP_RECORD_SCANS.with(|c| c.get())
+}
+
 impl OrchRegistry {
     pub fn new(root: PathBuf) -> Self {
         let _ = fs::create_dir_all(&root);
@@ -11460,6 +11500,10 @@ impl OrchRegistry {
     /// Roster + audit backfill, deduped by session (roster wins). Sessions
     /// are the stable key; agent ids recycle across app runs.
     fn merged_records(&self, group: &str) -> Vec<AgentRecord> {
+        // One group's roster + full audit log read and parsed — the unit
+        // `GROUP_RECORD_SCANS` counts, so a test can pin how MANY groups a
+        // lookup touches instead of how long it took (#514).
+        GROUP_RECORD_SCANS.with(|c| c.set(c.get().saturating_add(1)));
         let mut records = self.group_records(group);
         for r in self.records_from_audit(group) {
             let dup = records.iter().any(|x| match (&x.session, &r.session) {
@@ -11559,7 +11603,11 @@ impl OrchRegistry {
     /// — a real, long-lived group with a near-cap audit log still pays that
     /// cost every resume, and the 42ms figure will not reproduce for it.
     /// What this fast path removes is strictly the OTHER groups' scans, not
-    /// the resumed group's own.
+    /// the resumed group's own. Those millisecond figures are a historical
+    /// measurement, not what the test asserts: since #514 it pins the group
+    /// COUNT (`group_record_scans_for_test`) and only prints the durations,
+    /// because the wall-clock margin went flaky on loaded CI runners while
+    /// the count never can.
     fn session_role_in_group(&self, group_id: &str, session_id: &str) -> Option<SessionRole> {
         if !self.group_dir(group_id).join("group.json").is_file() {
             return None;
