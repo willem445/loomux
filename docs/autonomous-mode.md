@@ -258,6 +258,11 @@ approve-with-comment path:
 - A grant is **single-use** (consumed the moment it's used) and **expires after 30
   minutes**. A grant for PR #5 can't authorize merging #7, and a merge grant can't
   authorize a release.
+- **Approving several at once** (board **✓ Approve selected (N)**) is the same thing
+  N times, not something wider: one separate single-use, 30-minute grant per PR, and
+  no "bulk" authorization exists for the shim to honour. The only difference is that
+  the orchestrator hears about the batch **once** — one message listing every approved
+  PR and any per-item notes — instead of once per PR.
 - Grants are written **only by these human surfaces** (board Approve and the
   grant commands) — **no agent tool can mint one.** Agents *consume* a grant through
   the shim; they never create one through loomux.

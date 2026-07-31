@@ -123,3 +123,45 @@ export const REQUEST_CHANGES_STATUS = "in-progress";
 export function canApprove(status: string): boolean {
   return status === "pr" || status === "human-testing";
 }
+
+/** The rows a bulk **Approve selected** can act on: the ticked ones that are
+ *  actually at the merge gate, in board order (#507).
+ *
+ *  The board has ONE selection, shared with "delete selected" — the human can
+ *  tick a `queued` row and an at-the-gate row in the same pass. Approve is an
+ *  authority action, so it narrows to what `canApprove` allows rather than
+ *  approving whatever was ticked: the count on the button, the rows listed in
+ *  the confirm dialog, and the ids actually sent are all THIS list, so what
+ *  the human is told they are authorizing is exactly what gets a grant. The
+ *  backend re-checks the gate on every id and refuses the whole batch if one
+ *  moved off it, so a board that shifted between render and click can't
+ *  produce a half-approved batch.
+ *
+ *  Board order (not tick order) so the dialog reads like the board above it. */
+export function approvableSelection<T extends HasId & HasStatus>(
+  selected: Iterable<string>,
+  tasks: readonly T[]
+): T[] {
+  const ticked = new Set(selected);
+  return tasks.filter((t) => ticked.has(t.id) && canApprove(t.status));
+}
+
+/** Just the field a merge grant needs a value in. */
+export interface HasPrRef {
+  pr?: string | null;
+}
+
+/** How many of an approvable selection will actually be authorized — the rows
+ *  carrying a PR reference (#507). An item at the gate with no PR is approved
+ *  and marked done, but nothing is granted for it, so any count the board
+ *  states as *grants* must be this one and not the selection size: promising N
+ *  grants and issuing fewer is a claim the code doesn't honor.
+ *
+ *  "Linked", not "grantable": only the backend resolves a ref to the PR NUMBER
+ *  a grant is keyed on, so a ref that parses to nothing (`"TBD"`) is counted
+ *  here and lands in the notice's no-PR-number sentence there. That gap is why
+ *  the board says "one per **linked** PR" — the property it can actually see —
+ *  rather than duplicating the backend's parser to guess at the other one. */
+export function grantableCount(tasks: readonly HasPrRef[]): number {
+  return tasks.filter((t) => !!t.pr && t.pr.trim() !== "").length;
+}

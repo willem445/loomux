@@ -226,6 +226,27 @@ export const approveTask = (
   comment: string | null = null
 ): Promise<unknown> => invoke("orch_approve_task", { groupId, id, comment });
 
+/** One item of a bulk approval: a board task id plus the human's optional note
+ *  for that specific task (null = no note). */
+export interface ApproveItem {
+  id: string;
+  comment: string | null;
+}
+
+/** Approve several merge-gate tasks in one action (#507): each item is flipped
+ *  done and gets its OWN one-time merge grant — the same single-use, ~30-min,
+ *  per-PR authority `approveTask` issues, issued once per item, with no bulk
+ *  grant object anywhere. What changes is delivery: the orchestrator gets ONE
+ *  consolidated notice naming every granted PR and carrying every per-task
+ *  note, instead of the N separate prompts N single approves would queue.
+ *
+ *  All-or-nothing: if any id is missing or no longer at the merge gate the
+ *  call rejects having granted nothing, so a board that shifted under the
+ *  human's selection can never yield a partly-authorized batch. Resolves to
+ *  the updated tasks. */
+export const approveTasks = (groupId: string, items: readonly ApproveItem[]): Promise<unknown> =>
+  invoke("orch_approve_tasks", { groupId, items });
+
 /** Issue a one-time human merge grant for a PR directly (board-independent path):
  *  authorizes exactly one default-branch merge of that PR, single-use and
  *  expiring after ~30 min. Optional `comment` is delivered to the orchestrator.

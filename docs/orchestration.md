@@ -168,6 +168,22 @@ Board controls:
   production build.
 - **🗑 done (N)** deletes all `done` items in one action (two-click confirm).
 - **🗑 selected (N)** deletes exactly the rows you tick, by id, in one action.
+- **✓ Approve selected (N)** approves several merge-gate items at once, using
+  the same tick boxes. The count is only the ticked rows that are actually at
+  the gate — tick a `queued` row for a later delete and it is simply not part
+  of the approval. One dialog lists exactly what you are about to authorize,
+  with an optional note per row (they ride to the orchestrator attached to
+  their own PR), and that dialog is the confirm: nothing is granted until you
+  click through it. Each PR still gets its **own** one-time grant, exactly as
+  if you had clicked Approve on each row — what the batch changes is that the
+  orchestrator gets **one** message naming every approved PR and your notes,
+  instead of one prompt per PR. The batch is all-or-nothing: if a row moved off
+  the merge gate between the board rendering and your click, or two of the rows
+  you ticked point at the *same* PR (a duplicate filing — one grant can't be
+  announced as two), the whole batch is refused with a toast and nothing is
+  granted; re-tick and click again. A grant that fails to *write* (a full disk)
+  likewise stops the action with an error rather than quietly reporting that
+  item as having had no PR.
 
 Items that only you can advance (`pr`, `human-testing`, `blocked`) are
 highlighted so what's waiting on you stands out. A working-status item

@@ -5,9 +5,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  approvableSelection,
   canApprove,
   canProceed,
   doneCount,
+  grantableCount,
   isAwaitingHuman,
   PROTOTYPE_STATUS,
   REQUEST_CHANGES_STATUS,
@@ -176,4 +178,95 @@ test("request-changes reopens to a status Approve does not show for", () => {
   assert.equal(canApprove(REQUEST_CHANGES_STATUS), false);
   // And it's a real, pickable status, not a made-up one the picker lacks.
   assert.ok(STATUSES.includes(REQUEST_CHANGES_STATUS as (typeof STATUSES)[number]));
+});
+
+// --- bulk merge-gate approve: what a selection actually authorizes (#507) ---
+
+const board = [
+  { id: "t-1", status: "queued" },
+  { id: "t-2", status: "pr" },
+  { id: "t-3", status: "in-progress" },
+  { id: "t-4", status: "human-testing" },
+  { id: "t-5", status: "pr" },
+];
+
+test("bulk approve narrows a mixed selection to the rows at the merge gate", () => {
+  // The board has ONE selection, shared with delete-selected, so a human can
+  // tick a queued row and a PR row in the same pass. What Approve acts on —
+  // and what the button counts — must be only the gate rows, or the count
+  // promises grants it will not (and must not) issue.
+  const picked = approvableSelection(["t-1", "t-2", "t-3", "t-4"], board);
+  assert.deepEqual(
+    picked.map((t) => t.id),
+    ["t-2", "t-4"]
+  );
+});
+
+test("bulk approve returns board order, not tick order", () => {
+  // The confirm dialog lists these rows; reading top-to-bottom must match the
+  // board above it, whatever order the human clicked the checkboxes in.
+  const picked = approvableSelection(["t-5", "t-2", "t-4"], board);
+  assert.deepEqual(
+    picked.map((t) => t.id),
+    ["t-2", "t-4", "t-5"]
+  );
+});
+
+test("bulk approve ignores ticked ids that no longer name a row", () => {
+  // Selection is frontend-only and can outlive its rows (the orchestrator
+  // edits the board under it). A vanished id must never be sent for approval.
+  const picked = approvableSelection(["t-2", "t-99"], board);
+  assert.deepEqual(
+    picked.map((t) => t.id),
+    ["t-2"]
+  );
+});
+
+test("bulk approve is empty when nothing ticked is at the gate", () => {
+  // Drives the button's hidden state: no gate rows ticked, no affordance.
+  assert.deepEqual(approvableSelection(["t-1", "t-3"], board), []);
+  assert.deepEqual(approvableSelection([], board), []);
+});
+
+test("bulk approve accepts exactly the statuses a single Approve does", () => {
+  // Bulk must never widen the gate: whatever canApprove admits for one row is
+  // exactly what a selection admits, status for status.
+  for (const s of STATUSES) {
+    const rows = [{ id: "t-x", status: s }];
+    assert.equal(
+      approvableSelection(["t-x"], rows).length === 1,
+      canApprove(s),
+      `${s}: bulk selection and single Approve must agree`
+    );
+  }
+});
+
+test("the grant count is the linked-PR count, not the selection size", () => {
+  // #507 review N2: the board's tooltip states how many one-time merge grants
+  // are about to be issued. A gate row with no PR is approved but never
+  // granted, so counting the selection would promise authority the backend
+  // will not issue — a claim the code doesn't honor.
+  const picked = [
+    { id: "t-2", status: "pr", pr: "#7" },
+    { id: "t-4", status: "human-testing", pr: null },
+    { id: "t-5", status: "pr", pr: "https://github.com/o/r/pull/9" },
+  ];
+  assert.equal(picked.length, 3);
+  assert.equal(grantableCount(picked), 2);
+});
+
+test("a blank PR ref counts as no PR", () => {
+  // Whitespace is not a link. Keeps the count honest against a field someone
+  // cleared by selecting the text rather than deleting the row's value.
+  assert.equal(grantableCount([{ pr: "" }, { pr: "   " }, { pr: undefined }, {}]), 0);
+  assert.equal(grantableCount([]), 0);
+});
+
+test("a PR ref the backend cannot resolve is still counted as linked", () => {
+  // Deliberate, and the reason the tooltip says "one per LINKED PR": only the
+  // backend resolves a ref to the number a grant is keyed on, so the board
+  // counts what it can actually see rather than duplicating that parser here
+  // and drifting from it. Such an item lands in the notice's
+  // no-PR-number-could-be-resolved sentence instead.
+  assert.equal(grantableCount([{ pr: "TBD" }]), 1);
 });

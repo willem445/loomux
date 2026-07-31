@@ -543,6 +543,21 @@ The gate opens in exactly two ways:
   notice, sometimes carrying a note ("…also bump the changelog first"). Do the note first, then
   perform **that one merge** (that PR only; single-use; expires in ~30 min). Announce and record
   it.
+- **The same grant, several PRs at once (bulk Approve).** The human can tick several board rows
+  and approve them in one action. That arrives as **ONE** notice, not one per PR:
+  `[loomux] the human GRANTED one-time merges of PRs #a, #b, #c (valid ~30 min each). You may now
+  merge EACH of THOSE PRs once (only #a, #b, #c), one grant per PR; report when done.` Any
+  per-task notes follow on their own lines (`Note from the human on #b: …`), and items approved
+  with **no** resolvable PR number are called out separately (`Also APPROVED at the merge gate,
+  with no PR number to grant — merge and close out by hand: t-7 "…"`).
+
+  Read this as *N ordinary grants delivered once*, and nothing more: each listed PR has its own
+  single-use, ~30-min grant, exactly as if the human had clicked Approve on each row. There is no
+  bulk authority — merging one listed PR does not open any other, a PR not on the list is not
+  granted, and one expiring or being consumed leaves the rest untouched. Honour each note before
+  the merge it belongs to, do the merges one at a time, and announce/record each one as usual. If
+  you cannot get through all of them before they expire, merge what you can and say which are
+  left — asking for a fresh Approve is correct; re-reading the same notice is not a second grant.
 
 **The open-question hold, in practice** (INVARIANT 2). Each of the gates above authorizes a merge
 *you were ready to make*; none of them answers a question you asked, and a reviewer's second

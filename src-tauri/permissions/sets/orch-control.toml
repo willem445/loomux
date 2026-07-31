@@ -15,6 +15,7 @@ permissions = [
     "allow-orch-reorder-tasks",
     "allow-orch-open-ref",
     "allow-orch-approve-task",
+    "allow-orch-approve-tasks",
     "allow-orch-grant-merge",
     "allow-orch-grant-release",
     "allow-orch-request-changes",
