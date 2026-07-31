@@ -1183,6 +1183,11 @@ mod tests {
     // ---------- #533-A: coalesced flush ----------
 
     fn marker_entry(id: u64) -> QueuedDelivery {
+        // #468's three durability fields carry no meaning for #533-A's
+        // flush-planning tests (a marker is never replayed across a restart),
+        // but they are stamped rather than defaulted-away so this helper stays
+        // a faithful `QueuedDelivery` — see the struct's own doc on why every
+        // field here is persisted.
         QueuedDelivery {
             id,
             agent_id: "w-1".into(),
@@ -1191,6 +1196,9 @@ mod tests {
             reason: EnqueueReason::Question,
             enqueued_ms: 1_000,
             coalesced: 0,
+            group: "g-1".into(),
+            to_orchestrator: false,
+            session_id: None,
         }
     }
 
