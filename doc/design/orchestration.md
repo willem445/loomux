@@ -5096,6 +5096,32 @@ live ids and excludes them. (`queue_orphans_finds_an_enqueued_entry_with_no_term
 under #445, simulated its "restart" inside one process and so asserted the looser meaning; it now
 performs a real relaunch and additionally pins that a live entry is never reported.)
 
+**Three ordering hazards the lazy read creates, and how each is closed.** Making recovery lazy is
+what avoids inventing a "group restored" callback this registry does not have, but laziness means
+the *first* thing to touch a group after a restart decides what happens — and it is not necessarily
+a bind.
+
+1. **Never overwrite a snapshot nobody has read.** An admission rewrites `queue.json`. If that ran
+   before the read, queueing one new prompt would destroy the previous process's entire backlog,
+   silently, with nothing having looked at it. `persist_queues` therefore runs recovery first — the
+   read is hung off the WRITE, so the ordering holds by construction rather than by every call site
+   remembering it. It is called *before* `queue_persist` is acquired, because recovery can emit a
+   notice, a notice is a delivery, a delivery persists, and `std::sync::Mutex` is not reentrant.
+2. **Never re-mint an id the snapshot still holds.** `queue_seq` is in-memory and restarts at zero,
+   so a fresh admission would be handed id 1 — an id a recovered entry already carries. Both
+   consumers of an id break silently on that collision: `queue_orphans`'s live-id filter hides a
+   real orphan behind an unrelated fresh delivery that reused its number, and the audit scan lets
+   the new id's `delivery-dequeued` close out the old id's `delivery-queued`. Recovery seeds
+   `queue_seq` past the snapshot's high-water mark, and every id-minting path (`enqueue_text`,
+   `enqueue_stranded_front`, `admit_stranded_selfheal`) runs recovery before it mints. Uniqueness is
+   guaranteed only *within* a group, which is all that is needed: every consumer of an id — the live
+   filter, the audit scan, the snapshot — is group-scoped.
+3. **A re-admission that fails goes back to staging.** Re-admission is capped like any other
+   (`QUEUE_MAX_PER_PANE`), and a recovered backlog can meet a pane that already has live traffic in
+   it. A rejected entry returns to `recovered_queue` and keeps being reported by `queue_orphans`
+   (audited as `delivery-requeue-rejected`). Dropping it there would be a *worse* silent loss than
+   the bug this feature fixes, because the sender was told long ago that it was safely queued.
+
 **Limits, stated rather than argued away.**
 
 - **A `StrandedSubmit` marker is never replayed.** Its whole meaning is a live pty's input-box
