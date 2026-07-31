@@ -23567,6 +23567,7 @@ impl OrchRegistry {
             if !recovered.insert(group.to_string()) {
                 return;
             }
+            drop(recovered); // MUTATION D: publish before the seed.
             // Publishing the mark here rather than at the end is safe
             // BECAUSE the guard is held for the rest of the phase: no other
             // thread can observe it until this scope ends, and every early
