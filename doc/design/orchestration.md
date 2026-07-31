@@ -4956,6 +4956,138 @@ survive a fair lock. Closed by unifying admission rather than by widening the fa
 "Ordering", above, for the full argument and `queue.rs`'s `unified_admission_property` module for
 the exhaustive proof.
 
+### Coalesced flush: one drain pass, one prompt (#533-A)
+
+**Problem.** The queue above solved "hold means queued, never doomed" and then charged for it by
+the turn. A drain pass planned exactly the FRONT entry, so a pane blocked behind an unanswered
+question for an hour woke up to N separate prompts — each a full paste/echo/confirm cycle and,
+more expensively, a full agent turn to read. The queue was doing its job; the flush was billing
+for it N times.
+
+**Approach.** The plan is made over the WHOLE queue, once per pass. `queue::plan_flush` (pure)
+takes the pane's queue oldest-first and returns what this pass submits — a batch of ids, the ids
+that drop out first, and how many entries remain for the next flush.
+`queue::coalesced_flush_text` renders the batch as ONE prompt: the flush header, then each
+constituent behind a banner naming its position, origin (`from`), queue age, queue id, and any
+byte-identical repeats `admit` folded in at admission. `run_queue_drainer` pastes that once.
+
+Four constraints shape it, and each is a rule in the planner rather than a convention:
+
+- **Order is the queue's order.** Nothing is rearranged, so the header can say so. This is the
+  same property "Ordering" (above) proves for admission; coalescing preserves it trivially by
+  never reordering a batch it took in order.
+- **Nothing is ever held back to be batched.** The batch is only ever what is ALREADY queued at
+  that instant. There is no batching timer and no path that waits for a second entry — a lone
+  live delivery plans a one-entry batch and pastes exactly as it did pre-#533, wording included.
+  A delivery that lands while a flush is in flight simply flushes on the next pass.
+- **Size-capped, and the cap is a ceiling not a floor.** `QUEUE_FLUSH_MAX_BYTES` (24 KiB) splits
+  a large backlog into consecutive flushes, and the header states how many follow — a paste is
+  echoed and re-read, so an unbounded combined payload would trade the turn cost this saves for
+  a worse context cost. A single constituent larger than the whole budget still delivers, alone:
+  a cap that can stall a queue is a destruction path with extra steps.
+- **#451's three-state confirmation transfers to every constituent.** One paste is one submit is
+  one `submit_sent_ms`, which is one `last_delivery` outcome — so it is the outcome of every
+  constituent it carried. `pop_batch_dequeued` closes out the whole batch on `Done` and audits
+  each id with `combined_ids`, so a reader of `audit.jsonl` can tell one paste from three. The
+  pre-Enter abort path is the same argument in reverse: the box holds the whole batch, so the
+  whole batch closes out and ONE stranded marker stands for all of it. Popping only the front
+  there would re-paste text already on screen the moment the marker's Enter lands.
+
+**What "supersession applies per-constituent, before coalescing" means here — stated narrowly on
+purpose.** #454's supersession is per-PANE ledger state (`last_delivery`'s `submit_sent_ms`),
+which an entry that has never been pasted cannot carry; there is no per-entry supersession field
+to read, and inventing one would have produced a rule that can never fire — which is worse than
+no rule, because it reads as coverage. What genuinely drops out before anything merges is exactly
+three things:
+
+1. A `StrandedSubmit` marker never merges and terminates the batch (`plan_flush`) — its text is
+   already in the box, so it submits alone and whatever is behind it flushes next cycle.
+2. A dead target or closed pty drops the whole queue before a plan is computed — the pre-existing
+   `commit_exit(force: true)` path, unchanged.
+3. A drain-time byte-identical re-check (`superseded_entries`): the rule `admit` applies at
+   admission, applied once more over the batch. Coalescing changes what a duplicate that raced a
+   pop costs — as its own prompt it was visibly redundant; merged into one paste it reads as two
+   distinct asks. The LATER duplicate drops and the earlier keeps its place.
+
+   Two details rev-13 was right to press on. **The drop MOVES the duplicate's coalesce count onto
+   the survivor** (`Superseded { id, by }` pairs each drop with the entry that absorbs it): a
+   drain-time drop that only removed the entry would under-report "+N identical repeats" for
+   exactly the case this re-check exists to catch, in a feature whose point is attribution
+   completeness. The transfer happens under the same lock as the removal, and the drainer re-reads
+   the queue afterwards so every number it renders — per-constituent counts, the single-entry
+   header's own depth — is post-drop rather than from a snapshot that predates it. **And the drop
+   is audited without a `[loomux]` notice**, unlike `announce_dropped` and the queue-full case in
+   `AbortedPreEnter`, which send both. Those two lose a payload; this one does not — the identical
+   text still delivers via the surviving entry, in its original position. There is no loss to
+   announce, and announcing one anyway would spend the exact orchestrator turn this PR exists to
+   save. `superseded_by` and `folded_coalesced` on the audit line keep the transfer
+   reconstructible.
+
+**Residual, stated:** `run_queue_drainer` itself is still not drivable in-suite (no live
+pty/`AppHandle`, and constraint 3 forbids a real CLI), the same boundary every delivery test in
+this design has. The planner and every notice string are pure and directly tested; the registry
+seams the drainer calls (`pop_batch_dequeued`, `drop_superseded`) are driven against a real
+registry; the literal call between them is covered by a `debug_assert` tying `plan_flush`'s
+`stranded` flag to the planned front entry's own payload, not by a test.
+
+## Kill-exit notices: recorded initiator, not inferred (#533-B)
+
+**Problem.** `[loomux] agent X exited (kill or idle-timeout) — not a crash` prompted the
+orchestrator, costing a full turn to acknowledge an event it had usually caused itself — it
+called `kill_agent` a moment earlier, or the idle guardrail reaped a worker that had no task.
+The roster (`list_agents`) already carries liveness, so the notice was re-stating durable state
+through the most expensive channel available.
+
+**Why `expected` could not be the signal.** The obvious hook was `on_pty_exit`'s `expected` flag.
+It answers a different question: it is a property of the PTY (`PtyManager::kill` inserts the id
+into `expected_exits`), so it says *loomux closed the pane*, never *who decided to*. A human
+closing a pane, `end_group`'s teardown and the orchestrator's own `kill_agent` are
+indistinguishable there. Routing on it would have demoted exits the orchestrator never initiated
+— precisely the half this issue says must keep prompting.
+
+**Approach.** The initiator is RECORDED, at the call site, before the pty is touched:
+`AgentEntry::killed_by: Option<ExitInitiator>`, stamped by `kill_agent_as` (first-writer-wins —
+whoever actually caused the exit got there first). `exit_notice_route` (pure) reads only that:
+`Orchestrator` and `IdleTimeout` route to the audit log, everything else prompts. The demoted
+notice is audited in full (`agent-exit-notice`, with `routed: "audit-only"`, the initiator, and
+the complete notice text), so "the orchestrator reads it on demand" is a real path rather than a
+euphemism for dropping it.
+
+Stamping BEFORE the kill is load-bearing: `PtyManager::kill` can have the waiter thread inside
+`on_pty_exit` before `kill_agent_as` returns, and a record written after the kill could lose that
+race and misroute the notice to a prompt.
+
+**A kill that kills nothing records nothing** (rev-13 F1). An agent between `spawn_agent`'s
+registry insert and its bind has `pty_id: None`. The first shape of this change stamped
+unconditionally and killed conditionally, so a `kill_agent` landing in that window returned
+`Ok(())`, killed nothing, and left `killed_by` set — and since the stamp is first-writer-wins and
+never cleared, EVERY later exit of that pane, including a genuine panic, routed `AuditOnly`. That
+is the precise failure this half exists to prevent, so the no-pty case is now checked before both
+the app handle and the stamp, and returns a truthful `Err` (the MCP handler passes it back to the
+orchestrator) instead of a silent `Ok(())` for a no-op. Narrow to reach is not the same as
+acceptable: a demotion path that can swallow a crash does not belong in the change that
+introduces demotion. `a_kill_in_the_spawn_to_bind_window_records_no_initiator_and_a_later_crash_still_prompts`
+drives that window specifically.
+
+**How durable, exactly** — worth stating rather than leaving to the word "durable". The record
+lives in the registry's own agent entry (process lifetime) and in the audit log (`agent-kill`
+carries the initiator; the demoted notice is its own `agent-exit-notice` line). That is strictly
+more lifetime than the decision needs: the routing decision happens on the pty waiter thread
+milliseconds after the kill, in the same process, and a restart in that window leaves nothing to
+route — the agent is gone either way and the roster loaded from disk says so. Persisting
+`killed_by` into `agents.json`'s `AgentRecord` would add a field nothing reads. The point of
+"recorded, not inferred" is *provenance*, not longevity: the fact comes from the code that caused
+the exit, not from a downstream guess about it.
+
+The idle reaper's OWN second notice ("respawn a worker when you have work for it") is demoted
+too. Demoting only the exit notice would have left an idle kill costing exactly one turn anyway,
+which is the outcome this issue exists to remove. That is safe *because* the reaper only ever
+takes agents that are idle — no task in flight, nothing lost. **A future reaper mode that killed
+agents WITH work would be a different event and must prompt**: give it its own `ExitInitiator`
+variant routed to `Prompt` rather than reusing `IdleTimeout`. That instruction lives at the
+routing switch, in `exit_notice_route`'s own doc, where the next person to add a variant will be
+standing.
+
 ## Delivery failure actuation: stranded-prompt self-heal + attention badge (#496 PR-C)
 
 **The guarantee.** *A delivery ends `Confirmed`, or a bounded self-heal fires, or a
