@@ -1401,8 +1401,9 @@ fn drop_superseded_removes_by_id_anywhere_in_the_queue_and_audits_each() {
     for t in ["first", "second", "third"] {
         reg.enqueue_text(&g.id, &w.id, "orch", t, pty, queue::EnqueueReason::BehindQueue).unwrap();
     }
-    let middle = reg.queue_snapshot(pty)[1].id;
-    reg.drop_superseded(&g.id, pty, &[middle]);
+    let snap = reg.queue_snapshot(pty);
+    let (first, middle) = (snap[0].id, snap[1].id);
+    reg.drop_superseded(&g.id, pty, &[queue::Superseded { id: middle, by: first }]);
 
     let snap = reg.queue_snapshot(pty);
     assert_eq!(snap.len(), 2, "only the superseded entry leaves");
@@ -1415,6 +1416,49 @@ fn drop_superseded_removes_by_id_anywhere_in_the_queue_and_audits_each() {
         .find(|e| e.action == "delivery-dropped" && e.detail["id"] == json!(middle))
         .expect("a superseded drop must never be silent");
     assert_eq!(dropped.detail["reason"], json!("superseded"));
+    assert_eq!(dropped.detail["superseded_by"], json!(first), "the record must name the survivor");
+}
+
+#[test]
+fn a_superseded_drop_moves_its_repeat_count_onto_the_survivor() {
+    // rev-13 F4: `admit` bumps the survivor's `coalesced` when it catches a
+    // byte-identical repeat at admission; a drain-time drop must fold the
+    // same way or the flush header under-reports for exactly the case the
+    // drain-time re-check exists to catch.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 146u32;
+
+    reg.enqueue_text(&g.id, &w.id, "orch", "status?", pty, queue::EnqueueReason::Question).unwrap();
+    // Two admission-time repeats fold into the survivor the normal way.
+    reg.enqueue_text(&g.id, &w.id, "orch", "status?", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orch", "status?", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orch", "unrelated", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let survivor = reg.queue_snapshot(pty)[0].id;
+    assert_eq!(reg.queue_snapshot(pty)[0].coalesced, 2, "precondition: admission folded two");
+
+    // An id that is not in the queue must not invent a fold out of nothing.
+    reg.drop_superseded(&g.id, pty, &[queue::Superseded { id: survivor + 999, by: survivor }]);
+    assert_eq!(
+        reg.queue_snapshot(pty)[0].coalesced, 2,
+        "an id that isn't in the queue must not invent a fold"
+    );
+
+    // Now the real transfer: the second entry is dropped as superseded by
+    // the first, and its own weight (itself, +1) moves onto the survivor.
+    let other = reg.queue_snapshot(pty)[1].id;
+    reg.drop_superseded(&g.id, pty, &[queue::Superseded { id: other, by: survivor }]);
+    assert_eq!(
+        reg.queue_snapshot(pty)[0].coalesced, 3,
+        "the survivor absorbs the dropped entry itself (+1) on top of what it already had"
+    );
+    let dropped = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-dropped" && e.detail["id"] == json!(other))
+        .expect("audited");
+    assert_eq!(dropped.detail["folded_coalesced"], json!(1), "the transfer is reconstructible");
 }
 
 #[test]
@@ -1519,6 +1563,63 @@ fn an_orchestrator_initiated_kill_exit_is_audited_not_prompted() {
         !log.iter().any(|e| e.action == "prompt"
             && e.detail["text"].as_str().unwrap_or_default().contains("exited")),
         "an exit the orchestrator itself initiated must not cost it a turn"
+    );
+}
+
+#[test]
+fn a_kill_in_the_spawn_to_bind_window_records_no_initiator_and_a_later_crash_still_prompts() {
+    // rev-13 F1 (treated as blocking). An agent between `spawn_agent`'s
+    // registry insert and its bind has `pty_id: None`. The pre-fix shape
+    // stamped `killed_by` unconditionally and killed conditionally, so a
+    // `kill_agent` landing in that window killed NOTHING yet left the stamp
+    // — and because the stamp is first-writer-wins and never cleared, every
+    // later exit of that pane, including a real panic, was demoted to the
+    // audit log and the orchestrator was never told. A demotion path that
+    // can swallow a crash contradicts the whole reason #533-B demotes
+    // anything, so this drives that exact window.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 990);
+
+    // The window itself: registered, alive, no pty bound yet.
+    assert!(
+        reg.agent(&w.id).expect("registered").pty_id.is_none(),
+        "precondition: this test is only meaningful while the agent is unbound"
+    );
+
+    let err = reg.kill_agent_as(&w.id, ExitInitiator::Orchestrator).unwrap_err();
+    assert!(
+        err.contains("no terminal yet"),
+        "a kill that cannot kill must say so rather than report success: {err}"
+    );
+    assert_eq!(
+        reg.exit_initiator(&w.id),
+        None,
+        "a kill that killed nothing must record no initiator — the stamp is what would demote \
+         this pane's next exit forever"
+    );
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "agent-kill-noop"),
+        "the refused kill is still audited, so a no-op is discoverable after the fact"
+    );
+
+    // The bind completes and the agent runs normally... then genuinely dies.
+    reg.set_pty_for_test(&w.id, 991);
+    reg.on_pty_exit(991, Some(101), "thread 'main' panicked at 'boom'", 8_192, false);
+
+    let log = reg.audit_log(&g.id);
+    assert!(
+        log.iter().any(|e| e.action == "prompt"
+            && e.detail["to"] == json!(orch.id)
+            && e.detail["text"].as_str().unwrap_or_default().contains("exited")),
+        "the crash must still reach the orchestrator: {:?}",
+        log.iter().map(|e| e.action.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        !log.iter().any(|e| e.action == "agent-exit-notice"),
+        "a real crash must never be demoted to audit-only"
     );
 }
 

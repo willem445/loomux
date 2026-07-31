@@ -316,9 +316,9 @@ pub struct FlushConstituent<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlushPlan {
     /// Constituents that drop OUT before coalescing, oldest first — see
-    /// `superseded_ids` for what makes an entry superseded. The impure
+    /// `superseded_entries` for what makes an entry superseded. The impure
     /// caller removes and audits these; they are never merged into `batch`.
-    pub superseded: Vec<u64>,
+    pub superseded: Vec<Superseded>,
     /// The entries this pass submits TOGETHER as one prompt, oldest first.
     /// Always at least one entry when anything is queued at all.
     pub batch: Vec<u64>,
@@ -332,7 +332,27 @@ pub struct FlushPlan {
     pub remaining: usize,
 }
 
-/// Ids that must drop OUT before coalescing (#533-A) — the drain-time
+/// One constituent ruled superseded at drain time, paired with the entry
+/// that supersedes it (#533-A, rev-13 F4).
+///
+/// The pairing is the point. `admit`'s admission-time coalesce doesn't just
+/// drop a byte-identical repeat, it BUMPS the surviving entry's `coalesced`
+/// counter, which is what the flush header reports as "+N identical repeats
+/// coalesced". A drain-time drop that returned only the dropped id would
+/// silently lose that count for exactly the case this re-check exists to
+/// catch — the reader would be told about repeats folded in at admission
+/// but not the one folded in at drain, in a feature whose stated point is
+/// attribution completeness. Naming the survivor lets the impure caller
+/// move the count instead of dropping it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Superseded {
+    /// The entry being removed.
+    pub id: u64,
+    /// The earlier, byte-identical entry that stays and absorbs its count.
+    pub by: u64,
+}
+
+/// Entries that must drop OUT before coalescing (#533-A) — the drain-time
 /// byte-identical re-check.
 ///
 /// **Scoped to what can actually be observed, deliberately.** #454's own
@@ -364,15 +384,14 @@ pub struct FlushPlan {
 /// rule, because it reads as coverage. If a future mechanism gives a queued
 /// entry its own supersession state, it belongs here, beside this one, with
 /// its own test.
-pub fn superseded_ids(entries: &[QueuedDelivery]) -> Vec<u64> {
-    let mut seen: Vec<&str> = Vec::new();
+pub fn superseded_entries(entries: &[QueuedDelivery]) -> Vec<Superseded> {
+    let mut seen: Vec<(&str, u64)> = Vec::new();
     let mut out = Vec::new();
     for e in entries {
         let Some(t) = e.payload.text() else { continue };
-        if seen.contains(&t) {
-            out.push(e.id);
-        } else {
-            seen.push(t);
+        match seen.iter().find(|(s, _)| *s == t) {
+            Some(&(_, by)) => out.push(Superseded { id: e.id, by }),
+            None => seen.push((t, e.id)),
         }
     }
     out
@@ -468,7 +487,7 @@ pub fn coalesced_flush_text(items: &[FlushConstituent], remaining: usize, now_ms
 /// a 24 KiB fixture).
 ///
 /// The rules, in order:
-/// 1. Superseded constituents (`superseded_ids`) drop out first — never
+/// 1. Superseded constituents (`superseded_entries`) drop out first — never
 ///    merged, never delivered.
 /// 2. A `StrandedSubmit` marker is a batch of exactly one: its text is
 ///    already in the box, so it can only be submitted, never pasted with
@@ -483,8 +502,9 @@ pub fn coalesced_flush_text(items: &[FlushConstituent], remaining: usize, now_ms
 /// pastes exactly as it did pre-#533. There is no batching timer and no
 /// path by which a delivery is held back to be combined with a later one.
 pub fn plan_flush(entries: &[QueuedDelivery], max_bytes: usize) -> FlushPlan {
-    let superseded = superseded_ids(entries);
-    let live: Vec<&QueuedDelivery> = entries.iter().filter(|e| !superseded.contains(&e.id)).collect();
+    let superseded = superseded_entries(entries);
+    let live: Vec<&QueuedDelivery> =
+        entries.iter().filter(|e| !superseded.iter().any(|s| s.id == e.id)).collect();
     let Some(first) = live.first() else {
         return FlushPlan { superseded, batch: Vec::new(), stranded: false, remaining: 0 };
     };
@@ -825,15 +845,37 @@ mod tests {
             text_entry(3, "status?"),
         ];
         let plan = plan_flush(&entries, QUEUE_FLUSH_MAX_BYTES);
-        assert_eq!(plan.superseded, vec![3], "the LATER duplicate drops — the earlier keeps its place");
+        assert_eq!(
+            plan.superseded,
+            vec![Superseded { id: 3, by: 1 }],
+            "the LATER duplicate drops, naming the earlier entry that keeps its place and absorbs it"
+        );
         assert_eq!(plan.batch, vec![1, 2], "a superseded entry never merges in");
         assert_eq!(plan.remaining, 0);
     }
 
     #[test]
-    fn superseded_ids_keeps_the_first_occurrence_and_ignores_markers() {
+    fn superseded_entries_keeps_the_first_occurrence_and_ignores_markers() {
         let entries = vec![text_entry(1, "a"), marker_entry(2), text_entry(3, "a")];
-        assert_eq!(superseded_ids(&entries), vec![3]);
+        assert_eq!(superseded_entries(&entries), vec![Superseded { id: 3, by: 1 }]);
+    }
+
+    #[test]
+    fn superseded_entries_names_the_surviving_entry_so_its_repeat_count_can_be_moved() {
+        // rev-13 F4: the pairing is what keeps a drain-time drop from losing
+        // the count `admit` would have bumped had it caught the duplicate at
+        // admission. Third and fourth copies both name the FIRST entry, not
+        // each other — the survivor absorbs every one of them.
+        let entries = vec![
+            text_entry(1, "same"),
+            text_entry(2, "other"),
+            text_entry(3, "same"),
+            text_entry(4, "same"),
+        ];
+        assert_eq!(
+            superseded_entries(&entries),
+            vec![Superseded { id: 3, by: 1 }, Superseded { id: 4, by: 1 }]
+        );
     }
 
     #[test]

@@ -5004,11 +5004,24 @@ three things:
    already in the box, so it submits alone and whatever is behind it flushes next cycle.
 2. A dead target or closed pty drops the whole queue before a plan is computed — the pre-existing
    `commit_exit(force: true)` path, unchanged.
-3. A drain-time byte-identical re-check (`superseded_ids`): the rule `admit` applies at
+3. A drain-time byte-identical re-check (`superseded_entries`): the rule `admit` applies at
    admission, applied once more over the batch. Coalescing changes what a duplicate that raced a
    pop costs — as its own prompt it was visibly redundant; merged into one paste it reads as two
-   distinct asks. The LATER duplicate drops, the earlier keeps its place, and the drop is audited
-   (`delivery-dropped`, reason `superseded`) like every other drop path.
+   distinct asks. The LATER duplicate drops and the earlier keeps its place.
+
+   Two details rev-13 was right to press on. **The drop MOVES the duplicate's coalesce count onto
+   the survivor** (`Superseded { id, by }` pairs each drop with the entry that absorbs it): a
+   drain-time drop that only removed the entry would under-report "+N identical repeats" for
+   exactly the case this re-check exists to catch, in a feature whose point is attribution
+   completeness. The transfer happens under the same lock as the removal, and the drainer re-reads
+   the queue afterwards so every number it renders — per-constituent counts, the single-entry
+   header's own depth — is post-drop rather than from a snapshot that predates it. **And the drop
+   is audited without a `[loomux]` notice**, unlike `announce_dropped` and the queue-full case in
+   `AbortedPreEnter`, which send both. Those two lose a payload; this one does not — the identical
+   text still delivers via the surviving entry, in its original position. There is no loss to
+   announce, and announcing one anyway would spend the exact orchestrator turn this PR exists to
+   save. `superseded_by` and `folded_coalesced` on the audit line keep the transfer
+   reconstructible.
 
 **Residual, stated:** `run_queue_drainer` itself is still not drivable in-suite (no live
 pty/`AppHandle`, and constraint 3 forbids a real CLI), the same boundary every delivery test in
@@ -5043,6 +5056,18 @@ euphemism for dropping it.
 Stamping BEFORE the kill is load-bearing: `PtyManager::kill` can have the waiter thread inside
 `on_pty_exit` before `kill_agent_as` returns, and a record written after the kill could lose that
 race and misroute the notice to a prompt.
+
+**A kill that kills nothing records nothing** (rev-13 F1). An agent between `spawn_agent`'s
+registry insert and its bind has `pty_id: None`. The first shape of this change stamped
+unconditionally and killed conditionally, so a `kill_agent` landing in that window returned
+`Ok(())`, killed nothing, and left `killed_by` set — and since the stamp is first-writer-wins and
+never cleared, EVERY later exit of that pane, including a genuine panic, routed `AuditOnly`. That
+is the precise failure this half exists to prevent, so the no-pty case is now checked before both
+the app handle and the stamp, and returns a truthful `Err` (the MCP handler passes it back to the
+orchestrator) instead of a silent `Ok(())` for a no-op. Narrow to reach is not the same as
+acceptable: a demotion path that can swallow a crash does not belong in the change that
+introduces demotion. `a_kill_in_the_spawn_to_bind_window_records_no_initiator_and_a_later_crash_still_prompts`
+drives that window specifically.
 
 **How durable, exactly** — worth stating rather than leaving to the word "durable". The record
 lives in the registry's own agent entry (process lifetime) and in the audit log (`agent-kill`

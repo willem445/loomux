@@ -10469,19 +10469,21 @@ fn run_queue_drainer(
         // an admission racing this read lands BEHIND everything planned
         // here, so the worst case is that it flushes on the next pass —
         // never that it is skipped or reordered.
-        let (entries, depth) = {
-            let queues = reg.queues.lock_safe();
-            let q = queues.get(&pty_id);
-            (
-                q.map(|q| q.iter().cloned().collect::<Vec<_>>()).unwrap_or_default(),
-                q.map(VecDeque::len).unwrap_or(0),
-            )
-        };
+        let mut entries = reg.queue_snapshot(pty_id);
         // #533-A: superseded constituents drop out BEFORE anything is
         // combined — never merged into the paste, never silently dropped
         // either (each gets its own `delivery-dropped` audit line).
         let plan = queue::plan_flush(&entries, queue::QUEUE_FLUSH_MAX_BYTES);
-        reg.drop_superseded(&group, pty_id, &plan.superseded);
+        if !plan.superseded.is_empty() {
+            reg.drop_superseded(&group, pty_id, &plan.superseded);
+            // rev-13 F4: the drop both REMOVES entries and MOVES their
+            // coalesce counts onto survivors, so every number rendered
+            // below — the per-constituent "+N identical repeats", the
+            // single-entry header's own depth and coalesce total — must
+            // come from a re-read, not from a snapshot that predates it.
+            entries = reg.queue_snapshot(pty_id);
+        }
+        let depth = entries.len();
         let batch: Vec<queue::QueuedDelivery> = plan
             .batch
             .iter()
@@ -10598,11 +10600,29 @@ fn run_queue_drainer(
                     text.clone()
                 };
                 // #517: the re-delivery payload is `text`, never `payload` —
-                // a flush header prepended for this attempt is about THIS
-                // drain, not part of the brief. `header_pending` is false on
-                // a fresh kickoff's own first pass (nothing was contended
-                // yet), so the two are equal in practice; passing `text`
-                // explicitly keeps that true even if that ever changes.
+                // a flush header, or the itemization banners of a coalesced
+                // batch, are about THIS drain, not part of the brief.
+                //
+                // #533 rev-13 F2: `payload` and `text` now differ by TWO
+                // independent routes, not one. The old note argued they were
+                // "equal in practice" because `header_pending` is false on a
+                // fresh kickoff's own first pass; the `batch.len() > 1`
+                // branch above sits ahead of `header_pending` and is a
+                // second route that premise does not cover. Passing `text`
+                // is still right either way — that is what makes this
+                // correct rather than lucky.
+                //
+                // The consequence #533 raises, stated rather than left
+                // implicit: if `batch.len() > 1` ever coincided with a fresh
+                // kickoff on iteration 1, #517's recovery would re-admit
+                // only the kickoff brief while constituents 2..N had already
+                // been popped as `Done` without landing — N-1 lost, where
+                // pre-#533 it was at most 1. `ensure_drainer`'s doc argues
+                // that coincidence is purely theoretical (a fresh spawn's
+                // pty has no other deliveries to race against yet), and that
+                // argument is unchanged by this PR; what changed is the
+                // price if it were ever wrong, which is why it is written
+                // down here instead of being left to the reader.
                 let out = deliver_now(
                     app.clone(), root, group.clone(), front.agent_id.clone(), pty_id,
                     payload, front.from.clone(), confirm_autopilot, wait_ready, cli, lock,
@@ -23441,29 +23461,67 @@ impl OrchRegistry {
     }
 
     /// Remove constituents that `queue::plan_flush` ruled superseded
-    /// (#533-A) — by id, anywhere in the queue, not just the front. Audits
-    /// one `delivery-dropped` per entry with reason `superseded` so a
-    /// dropped payload is never silent, exactly like every other drop path.
+    /// (#533-A) — by id, anywhere in the queue, not just the front — and
+    /// MOVE each one's coalesce count onto the entry that supersedes it.
+    ///
+    /// **The transfer (rev-13 F4).** `admit`'s admission-time coalesce
+    /// bumps the survivor's `coalesced` counter, which is what the flush
+    /// header reports per constituent. A drain-time drop that only removed
+    /// the duplicate would under-report for precisely the case this
+    /// re-check exists to catch. The survivor absorbs the duplicate itself
+    /// (`+1`) plus whatever that duplicate had already absorbed, so the
+    /// total is conserved no matter which entry a repeat happened to land
+    /// on.
+    ///
+    /// **Audited, deliberately WITHOUT a `notify_queue` notice** — unlike
+    /// `announce_dropped` and the queue-full case in `AbortedPreEnter`,
+    /// which do both. Those two lose a payload: nobody receives that text.
+    /// This one does not — the identical payload still delivers, via the
+    /// surviving earlier entry, in its original queue position. There is no
+    /// loss to announce, and announcing one anyway would spend exactly the
+    /// orchestrator turn this whole PR exists to save. The `audit.jsonl`
+    /// line is the record; `superseded_by` and `folded_coalesced` on it
+    /// make the transfer reconstructible after the fact.
     #[doc(hidden)] // pub for integration tests
-    pub fn drop_superseded(&self, group: &str, pty_id: u32, ids: &[u64]) {
-        if ids.is_empty() {
+    pub fn drop_superseded(&self, group: &str, pty_id: u32, superseded: &[queue::Superseded]) {
+        if superseded.is_empty() {
             return;
         }
-        let removed: Vec<queue::QueuedDelivery> = {
+        let removed: Vec<(queue::QueuedDelivery, u64)> = {
             let mut queues = self.queues.lock_safe();
             match queues.get_mut(&pty_id) {
                 Some(q) => {
                     let (gone, kept): (Vec<_>, Vec<_>) =
-                        q.drain(..).partition(|e| ids.contains(&e.id));
+                        q.drain(..).partition(|e| superseded.iter().any(|s| s.id == e.id));
                     q.extend(kept);
-                    gone
+                    // Transfer under the SAME lock as the removal: a header
+                    // rendered from a queue where the duplicate is gone but
+                    // its count hasn't landed yet would under-report just as
+                    // badly as never transferring it.
+                    let mut out = Vec::with_capacity(gone.len());
+                    for e in gone {
+                        let by = superseded
+                            .iter()
+                            .find(|s| s.id == e.id)
+                            .map(|s| s.by)
+                            .expect("partition matched on this exact list");
+                        if let Some(survivor) = q.iter_mut().find(|k| k.id == by) {
+                            survivor.coalesced = survivor.coalesced.saturating_add(1 + e.coalesced);
+                        }
+                        out.push((e, by));
+                    }
+                    out
                 }
                 None => Vec::new(),
             }
         };
-        for e in removed {
+        for (e, by) in removed {
             self.audit(group, "loomux", "delivery-dropped", json!({
-                "to": e.agent_id, "id": e.id, "reason": "superseded",
+                "to": e.agent_id,
+                "id": e.id,
+                "reason": "superseded",
+                "superseded_by": by,
+                "folded_coalesced": 1 + e.coalesced,
             }));
         }
     }
@@ -23475,9 +23533,15 @@ impl OrchRegistry {
         self.queues.lock_safe().get(&pty_id).map(VecDeque::len).unwrap_or(0)
     }
 
-    /// A snapshot (oldest first) of `pty_id`'s queue contents — test-only
-    /// introspection so ordering/reason/coalesce-count can be asserted
-    /// directly instead of only through side effects.
+    /// A snapshot (oldest first) of `pty_id`'s queue contents.
+    ///
+    /// Originally test-only introspection (assert ordering/reason/coalesce
+    /// count directly instead of only through side effects); #533 made it a
+    /// production read as well, since `run_queue_drainer` now plans over the
+    /// WHOLE queue rather than peeking one front entry. The clone is taken
+    /// under the lock and the lock released before the caller does anything
+    /// with it — an admission racing this read lands BEHIND everything in
+    /// the snapshot, so the worst case is that it flushes on the next pass.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_snapshot(&self, pty_id: u32) -> Vec<queue::QueuedDelivery> {
         self.queues.lock_safe().get(&pty_id).map(|q| q.iter().cloned().collect()).unwrap_or_default()
@@ -23697,16 +23761,47 @@ impl OrchRegistry {
     /// the waiter in `on_pty_exit` before this function returns, and a
     /// record written after the kill could lose that race and misroute the
     /// notice to a prompt.
+    ///
+    /// **Never stamps an initiator for a kill it does not perform (rev-13
+    /// F1).** An agent still in the spawn-to-bind window exists in the
+    /// registry with `pty_id: None` (`spawn_agent` inserts the entry, then
+    /// blocks on the bind). The pre-fix shape stamped unconditionally and
+    /// killed conditionally, so a `kill_agent` landing in that window
+    /// returned `Ok(())`, killed nothing, and left `killed_by` set — and
+    /// since the stamp is first-writer-wins and never cleared, EVERY later
+    /// exit of that pane, including a genuine panic, routed `AuditOnly` and
+    /// the orchestrator was never told. That is the exact failure #533-B
+    /// exists to prevent (demotion swallowing an exit nobody initiated), so
+    /// it does not get to ship inside the change that introduces demotion,
+    /// however narrow the window is to hit.
+    ///
+    /// The no-pty case is now a truthful `Err` rather than a silent
+    /// `Ok(())` for a no-op: the caller asked for a kill that did not and
+    /// could not happen, and the MCP `kill_agent` handler passes the
+    /// message straight back to the orchestrator. Nothing is lost by this —
+    /// the pre-fix `Ok(())` never killed anything either; it just said it
+    /// had.
     pub fn kill_agent_as(&self, agent_id: &str, initiator: ExitInitiator) -> Result<(), String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         if a.role == Role::Orchestrator {
             return Err("refusing to kill the orchestrator; close its pane instead".into());
         }
+        // Checked BEFORE the app handle and before the stamp: with no pty
+        // there is nothing to kill, so there is nothing to attribute either.
+        let Some(pty) = a.pty_id else {
+            self.audit(&a.group, "loomux", "agent-kill-noop", json!({
+                "agent": agent_id,
+                "initiator": initiator.as_str(),
+                "reason": "no-terminal-yet",
+            }));
+            return Err(format!(
+                "agent {agent_id} has no terminal yet (still binding) — nothing was killed, \
+                 and no exit initiator was recorded"
+            ));
+        };
         let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         self.record_exit_initiator(agent_id, initiator);
-        if let Some(pty) = a.pty_id {
-            app.state::<crate::pty::PtyManager>().kill(pty);
-        }
+        app.state::<crate::pty::PtyManager>().kill(pty);
         self.audit(&a.group, "loomux", "agent-kill",
             json!({ "agent": agent_id, "initiator": initiator.as_str() }));
         Ok(())
