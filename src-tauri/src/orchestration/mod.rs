@@ -6068,6 +6068,19 @@ pub struct OrchRegistry {
     /// them: an entry silently vanishing from here is the exact failure #445
     /// exists to prevent.
     recovered_queue: Arc<Mutex<HashMap<String, Vec<queue::PersistedEntry>>>>,
+    /// `StrandedSubmit` markers a restart made unreplayable (#467), kept
+    /// separately from `recovered_queue` and never offered to
+    /// `readmit_recovered`.
+    ///
+    /// They are here so the loss is reported through `queue_orphans` — a
+    /// DURABLE channel the orchestrator's session-start re-sync reads —
+    /// rather than only through the best-effort `[loomux]` notice recovery
+    /// also fires. That notice can genuinely fail to land: recovery can be
+    /// triggered by an admission (see `persist_queues`) at a moment when no
+    /// orchestrator pane is bound yet, and `deliver_to_orchestrator` is
+    /// best-effort by design. "Never silently dropped" cannot rest on a
+    /// delivery that is allowed to not happen.
+    recovered_markers: Arc<Mutex<HashMap<String, Vec<queue::PersistedEntry>>>>,
     /// Groups whose `queue.json` has already been read back this process
     /// (#467) — recovery is lazy (first touch by a bind or a
     /// `queue_orphans` call) and must happen exactly once, or a second pass
@@ -11365,6 +11378,7 @@ impl OrchRegistry {
             queue_seq: Arc::new(AtomicU64::new(0)),
             queue_persist: Arc::new(Mutex::new(())),
             recovered_queue: Arc::new(Mutex::new(HashMap::new())),
+            recovered_markers: Arc::new(Mutex::new(HashMap::new())),
             recovered_groups: Arc::new(Mutex::new(HashSet::new())),
             queue_draining: Arc::new(Mutex::new(HashMap::new())),
             drainer_gen: Arc::new(AtomicU64::new(0)),
@@ -23519,6 +23533,10 @@ impl OrchRegistry {
             }));
         }
         if !split.markers.is_empty() {
+            // Durable first, notice second — see `recovered_markers`'s doc:
+            // this notice is allowed to fail (no orchestrator pane bound
+            // yet), so it cannot be the only record.
+            self.recovered_markers.lock_safe().insert(group.to_string(), split.markers.clone());
             let _ = self.deliver_to_orchestrator(group, &queue::stranded_lost_notice(split.markers.len()), "loomux");
         }
         let staged = split.replayable.len();
@@ -23631,23 +23649,35 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn queue_orphans(&self, group: &str) -> Vec<queue::OrphanedQueueEntry> {
         self.recover_persisted_queue(group);
-        let from_snapshot: Vec<queue::OrphanedQueueEntry> = self
+        let row = |e: &queue::PersistedEntry, reason: String| queue::OrphanedQueueEntry {
+            id: e.delivery.id,
+            agent_id: e.delivery.agent_id.clone(),
+            enqueued_ms: e.delivery.enqueued_ms,
+            reason,
+            text: e.delivery.payload.text().map(str::to_string),
+            source: queue::OrphanSource::Snapshot,
+        };
+        let mut from_snapshot: Vec<queue::OrphanedQueueEntry> = self
             .recovered_queue
             .lock_safe()
             .get(group)
-            .map(|list| {
-                list.iter()
-                    .map(|e| queue::OrphanedQueueEntry {
-                        id: e.delivery.id,
-                        agent_id: e.delivery.agent_id.clone(),
-                        enqueued_ms: e.delivery.enqueued_ms,
-                        reason: e.delivery.reason.as_str().to_string(),
-                        text: e.delivery.payload.text().map(str::to_string),
-                        source: queue::OrphanSource::Snapshot,
-                    })
-                    .collect()
-            })
+            .map(|list| list.iter().map(|e| row(e, e.delivery.reason.as_str().to_string())).collect())
             .unwrap_or_default();
+        // Markers report too, with `text: null` and their own reason — they
+        // are the one case with no bytes left to re-send, and the tool's
+        // description points a null payload at the audit log's `prompt`
+        // line, which is exactly the right advice here.
+        from_snapshot.extend(
+            self.recovered_markers
+                .lock_safe()
+                .get(group)
+                .map(|list| {
+                    list.iter()
+                        .map(|e| row(e, queue::STRANDED_ORPHAN_REASON.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        );
         // Ids sitting in the live queue right now — see `merge_orphans`'s
         // doc for why excluding them is load-bearing and not a tidy-up: an
         // in-flight delivery satisfies the audit derivation's "queued, never

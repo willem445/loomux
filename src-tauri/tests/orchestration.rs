@@ -1678,8 +1678,17 @@ fn a_stranded_submit_marker_is_never_replayed_across_a_restart() {
             && e.detail["reason"] == json!("stranded-marker-not-replayable"))
         .collect();
     assert_eq!(dropped.len(), 1, "the loss must be named in the audit, not silent");
-    assert!(reg.queue_orphans(&gid).is_empty(),
-        "a dropped marker is closed out, not left dangling as a phantom orphan");
+
+    // ...and reported through the DURABLE channel, not only the audit line
+    // and a best-effort notice: recovery can run at a moment when no
+    // orchestrator pane is bound, and `deliver_to_orchestrator` is allowed
+    // to fail. "Never silently dropped" cannot rest on a delivery that may
+    // not happen.
+    let orphans = reg.queue_orphans(&gid);
+    assert_eq!(orphans.len(), 1, "the marker must still be surfaced: {orphans:?}");
+    assert_eq!(orphans[0].reason, "stranded-submit-not-replayable",
+        "and must say WHY it can't be replayed, not why it was queued");
+    assert!(orphans[0].text.is_none(), "there are no bytes left to hand back — saying otherwise would be a lie");
 }
 
 #[test]

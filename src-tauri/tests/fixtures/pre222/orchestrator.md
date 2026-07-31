@@ -850,13 +850,12 @@ when the whole value is "the next orchestrator should just already know this."
   a restart is the only thing that produces these, so re-polling is wasted. For each row:
   re-send it to a pane that exists now (a resumed session, a fresh agent) if it still applies,
   or say you are dropping it as stale. Never drop one silently. `text` is the payload verbatim
-  when it came from the durable snapshot; `text: null` means only the audit log knew about it
-  (an older build), so re-derive that one from the issue or the board rather than guessing.
-  An empty result is the normal case and needs no comment.
-  One case is genuinely unrecoverable and says so: text already typed into a pane and waiting
-  only for Enter when loomux restarted. That pane is gone, so there are no bytes left to
-  re-send — you get a `[loomux]` notice naming it, and the `prompt` audit line is the only
-  record of what it was.
+  when the durable snapshot had it. `text: null` means re-derive rather than guess, for one of
+  two reasons the row itself names: `source: "audit"` (an older loomux build queued it, so only
+  the id and target survive), or `reason: "stranded-submit-not-replayable"` (the text had already
+  been typed into that pane and was waiting only for Enter when loomux restarted — the pane is
+  gone, so no bytes remain; the `prompt` audit line for that delivery is the only record of what
+  it said). An empty result is the normal case and needs no comment.
 - Keep your context lean: never paste large diffs or files into it; monitor via reports,
   `get_output` tails and `gh` summaries.
 - **Compact at lulls** (INVARIANT 11). At natural quiet points — right after a merge gate or
