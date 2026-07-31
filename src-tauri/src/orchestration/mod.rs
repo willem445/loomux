@@ -6409,14 +6409,20 @@ pub fn merge_grant_notice(
             .collect::<Vec<_>>()
             .join(", ");
         lines.push(if granted.is_empty() {
+            // "no PR number could be resolved" rather than "no PR is linked":
+            // a task CAN carry a `pr` field that yields no number (a URL typo,
+            // a placeholder), and telling the orchestrator nothing is linked
+            // when something is would send it looking for the wrong problem.
             format!(
-                "[loomux] the human APPROVED {items} at the merge gate and marked \
-                 {} done. No PR is linked, so nothing was authorized — merge and close out by hand.",
+                "[loomux] the human APPROVED {items} at the merge gate and marked {} done. \
+                 No PR number could be resolved for {}, so nothing was authorized — merge and \
+                 close out by hand.",
+                if plain.len() == 1 { "it" } else { "them" },
                 if plain.len() == 1 { "it" } else { "them" }
             )
         } else {
             format!(
-                "Also APPROVED at the merge gate, with no PR to grant — merge and close \
+                "Also APPROVED at the merge gate, with no PR number to grant — merge and close \
                  out by hand: {items}."
             )
         });

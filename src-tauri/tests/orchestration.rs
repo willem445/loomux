@@ -11021,7 +11021,7 @@ fn bulk_approve_mints_a_grant_per_pr_and_delivers_one_consolidated_notice() {
         format!(
             "[loomux] the human GRANTED one-time merges of PRs #7, #9 (valid ~30 min each). \
              You may now merge EACH of THOSE PRs once (only #7, #9), one grant per PR; report when done.\n\
-             Also APPROVED at the merge gate, with no PR to grant — merge and close out by hand: {} \"Docs pass\".\n\
+             Also APPROVED at the merge gate, with no PR number to grant — merge and close out by hand: {} \"Docs pass\".\n\
              Note from the human on #7: squash it\n\
              Note from the human on {}: close the issue too",
             c.id, c.id
@@ -11128,7 +11128,11 @@ fn a_bulk_approval_with_no_prs_at_all_says_so_instead_of_naming_grants() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let a = gate_task(&reg, &g.id, "Docs pass", None);
-    let b = gate_task(&reg, &g.id, "Spike", None);
+    // Carrying a `pr` field that yields no NUMBER is the same case as carrying
+    // none, and is why the notice says "no PR number could be resolved" rather
+    // than "no PR is linked" — the latter would be false here and would send
+    // the orchestrator looking for the wrong problem.
+    let b = gate_task(&reg, &g.id, "Spike", Some("TBD"));
     reg.pause_group(&g.id).unwrap();
 
     reg.approve_tasks(
@@ -11146,7 +11150,8 @@ fn a_bulk_approval_with_no_prs_at_all_says_so_instead_of_naming_grants() {
         sent[0],
         format!(
             "[loomux] the human APPROVED {} \"Docs pass\", {} \"Spike\" at the merge gate and marked \
-             them done. No PR is linked, so nothing was authorized — merge and close out by hand.",
+             them done. No PR number could be resolved for them, so nothing was authorized — \
+             merge and close out by hand.",
             a.id, b.id
         )
     );

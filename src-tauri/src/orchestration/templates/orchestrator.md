@@ -548,8 +548,8 @@ The gate opens in exactly two ways:
   `[loomux] the human GRANTED one-time merges of PRs #a, #b, #c (valid ~30 min each). You may now
   merge EACH of THOSE PRs once (only #a, #b, #c), one grant per PR; report when done.` Any
   per-task notes follow on their own lines (`Note from the human on #b: …`), and items approved
-  with **no** PR to grant are called out separately (`Also APPROVED at the merge gate, with no PR
-  to grant — merge and close out by hand: t-7 "…"`).
+  with **no** resolvable PR number are called out separately (`Also APPROVED at the merge gate,
+  with no PR number to grant — merge and close out by hand: t-7 "…"`).
 
   Read this as *N ordinary grants delivered once*, and nothing more: each listed PR has its own
   single-use, ~30-min grant, exactly as if the human had clicked Approve on each row. There is no
