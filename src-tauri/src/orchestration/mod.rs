@@ -12349,12 +12349,38 @@ pub enum HeldEscalation {
 /// - Otherwise ⇒ `Badge`, naming the gate that is actually blocking:
 ///   `HoldQuestion` ⇒ [`StrandedBlocker::QuestionStale`] (loomux may be reading
 ///   a question that is no longer on screen), `HoldBoxOccupied` ⇒
-///   [`StrandedBlocker::HumanInput`] (the existing "stuck behind text you
-///   typed" wording, which is already exactly right).
+///   [`StrandedBlocker::HumanInput`].
 ///
 /// That last arm is the NB3 fix in behavioural terms: a long hold is *always*
 /// reported, and the only thing the blocked gate decides is which sentence the
 /// human reads. Neither arm ever presses Enter.
+///
+/// **What `HumanInput`'s existing wording does and does not promise (rev-27
+/// NB-E).** It reads *"stuck behind text you typed — press Enter or clear the
+/// box"*, and reusing it here rather than minting a variant is deliberate — but
+/// not because it is unconditionally true. Under the very stuck-true mode
+/// [`hold_bound_elapsed`] refuses to trust, `input_pending` can be set over an
+/// empty box, and then "text you typed" asserts content that is not there.
+/// That is the same unbacked-claim class which justified minting
+/// `QuestionStale` instead of reusing `Question`, so it is named rather than
+/// glossed.
+///
+/// What makes reuse right anyway is the *action*, which is the part a human
+/// acts on: `classify_human_input` reads `\r` as `Submit` and zeroes the
+/// counter outright, so "press Enter" genuinely releases the hold in **both**
+/// branches — real leftover text, or a stuck counter over an empty box. That is
+/// the same both-branches-safe standard `QuestionStale`'s wording was held to,
+/// and it is met; only the diagnosis, not the remedy, can be wrong.
+///
+/// **The one-shot freezes the wording, not just the count (rev-27 NB-F).** A
+/// badge raised as `QuestionStale` keeps its "type a character and delete it"
+/// advice even if the human then starts typing and the real blocker becomes
+/// `HoldBoxOccupied`. The chip is then offering advice for the other branch.
+/// This is the deliberate cost of suppressing re-badges: the pane is genuinely
+/// held either way, and neither prescribed action is unsafe on the other's
+/// branch (typing-and-deleting leaves the box as it found it; pressing Enter
+/// submits a line the human owns and would have submitted anyway). Recorded so
+/// the tradeoff is chosen rather than rediscovered.
 #[doc(hidden)] // pub for integration tests
 pub fn held_escalation(
     admission: WriteAdmission,

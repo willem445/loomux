@@ -4841,9 +4841,11 @@ the guarantee.
 the same hold every `QUEUE_DRAIN_POLL` forever. Same unbounded-latch shape #518 found in the
 human-input block, one guard over. `QUESTION_HOLD_STALE_AFTER` (10 min) bounds the **aggregate,
 per-pane** hold, measured off the front queue entry's `enqueued_ms` — the thing the human actually
-experienced. `question_hold_stale` mirrors #518's precedence exactly: `box_pending` outranks the
-bound (a hold explained by the box is not a stale-question report), and `bound_ms == 0` disables
-rather than fires.
+experienced. `hold_bound_elapsed` is the predicate, and `bound_ms == 0` disables it rather than
+firing instantly, so a mis-set constant degrades to silence rather than to a badge on every pane.
+What decides *whether* the escalation speaks is the clock and nothing else — see the next
+paragraph, which is the whole argument for that and supersedes the `box_pending`-outranks-the-bound
+precedence an earlier cut of this design had.
 
 **No signal may veto the escalation.** The first cut of this let `box_pending` suppress the bound,
 reasoning that a hold explained by the human's own line needs no report. That repeated this PR's own
@@ -4856,6 +4858,38 @@ so `hold_bound_elapsed` takes the clock and nothing else; the blocked gate decid
 sentence the human reads (`QuestionStale` vs. the existing `HumanInput` wording), never whether
 they hear anything. That also gives the box-occupied hold — previously bounded by nothing — its
 first escalation.
+
+**Known limit: the escalation's episode is the queue ENTRY, not the pane's held-ness.** The clock is
+`front.enqueued_ms` and the one-shot is keyed on `pty_id`, and those two do not describe the same
+thing. Two consequences, both recorded rather than fixed here (tracked in the follow-up filed
+alongside this change):
+
+- *The one-shot resets on any writable poll.* Badge at ten minutes → the gates clear for a single
+  poll → `Clear` drops it → the next held poll finds the bound already elapsed and re-badges. Each
+  cycle contains a full `deliver_now` attempt, so it is bounded by that function's duration rather
+  than by `QUEUE_DRAIN_POLL`, but a human typing on a pane with a delivery queued behind them
+  toggles occupancy on every Enter, which is exactly where this PR lives.
+- *Supersession moves the clock forward.* Since #533, `front` is `plan_flush`'s first **non-superseded**
+  entry, so dropping an older constituent hands the bound a later `enqueued_ms` and defers the badge
+  even though the pane has been blocked continuously. Defensible on its own terms — a superseded
+  delivery genuinely is not waiting any more, and it gets its own `delivery-dropped` audit line —
+  but it means the badge measures how long *the current front* has waited, not how long *the pane*
+  has been stuck.
+
+Both are the same question — what ends an episode — and both are caller wiring rather than a defect
+in `held_escalation`, whose contract is pinned. The fix for both is a per-pane hold-start stamp that
+survives entry churn, which is a change to state ownership and not worth making inside a review
+round that has already verified the current shape.
+
+**Two bounds, opposite precedence, and that is deliberate.** #518's `human_input_block` states the
+reverse rule — *"`box_pending` outranks the bound"* — and it is correct there. Grep will find both;
+they are not a contradiction, and the distinguishing question is **what the bound does when it
+fires**. #518's bound *releases a write*, so it must never fire while there is human content to
+clobber, and `box_pending` vetoing it is the safety contract. This bound only *raises a badge*, so
+there is nothing to clobber and the only failure mode is silence — which is precisely what a stuck
+`input_pending` would cause. Same signal, opposite direction, because stuck-true is the safe
+direction for a gate that withholds an Enter and the unsafe direction for a gate that withholds a
+report. Anyone changing either should check which of the two they are in.
 
 **It raises a badge and never releases a write.** State the limit plainly:
 *from an append-only byte ring, a live dialog and an answered one that has not scrolled away are

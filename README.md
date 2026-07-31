@@ -50,9 +50,11 @@ Every rung is a complete tool on its own — climb when you're ready:
    re-read at the instant loomux actually writes, never inherited from a
    check that passed before a two-minute hold — so a prompt released by
    your first keystroke can't land on top of what you're typing (#532).
-   And a delivery held on a question loomux can no longer verify is on
-   screen says so on the chip after ten minutes rather than waiting
-   forever; it still never presses Enter for you. Hard-won lessons persist
+   And any delivery still held after ten minutes says so on the chip
+   rather than waiting silently forever — whether it's stuck behind a
+   question loomux can no longer verify is on screen, or behind text of
+   your own left in the box; it still never presses Enter for you either
+   way. Hard-won lessons persist
    across groups via a committed `.loomux/lessons.md`, not just this run.
    The task board and the group lifecycle panel — each its own keystroke
    away on an orchestration pane — persist across a close/reopen and a group
