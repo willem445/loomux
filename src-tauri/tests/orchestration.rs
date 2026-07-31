@@ -30,7 +30,7 @@ use loomux_lib::orchestration::{
     auto_compact_banner_detected, compact_nudge_poll_interval, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
     human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
-    exit_cause, exit_diagnostic, resolve_output_text, format_output_tail,
+    exit_cause, exit_diagnostic, resolve_output_text, format_output_tail, OUTPUT_TAIL_MAX_BYTES,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_cmd, gh_shim_sh, git_shim_cmd, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
@@ -1528,6 +1528,316 @@ fn get_output_tail_never_merges_code_lines_that_only_differ_inside_parens() {
     assert!(
         !out.to_lowercase().contains("collaps"),
         "two genuinely different lines must never be mislabeled as repeated frames, got:\n{out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #520: composed-grid reconstruction for `get_output`.
+//
+// The tests above pin the LINE-IDENTITY collapse, which handles a CLI that
+// redraws whole lines. The fixture below is the shape that defeats it — and
+// defeated it in production, at ~12k tokens per call.
+// ---------------------------------------------------------------------------
+
+/// The delivered prompt, sitting in the pane's input box and repainted on
+/// every single frame — the single biggest contributor to the observed flood.
+const TUI_PROMPT_LINE: &str = "> Read issue #520 and harden the get_output capture path end to end";
+
+/// A synthesized capture of a Claude-Code-v2.1.x-shaped animated turn, as RAW
+/// pty bytes (escape sequences intact — they are the whole point).
+///
+/// Synthesized, never recorded from a live CLI: CLAUDE.md constraint 3 rules
+/// out spawning a real agent to produce a fixture, and a hand-built one pins
+/// the *mechanism* rather than one session's incidental text. The mechanism,
+/// straight from the issue:
+///
+/// - the live region is repainted in place — cursor parked, `ESC[J`, three
+///   rows rewritten, cursor moved back up — so nothing scrolls and no two
+///   frames are byte-identical;
+/// - the status **verb cycles** and a token counter **ticks**, so a stable
+///   "core" per frame doesn't exist either;
+/// - most frames repaint only PART of a line (cursor re-addressed to one
+///   column, digits overwritten), which is what makes the ANSI-stripped
+///   stream concatenate into ever-different text;
+/// - the queued prompt is inside the repainted region, so it multiplies.
+fn claude_tui_animation_capture() -> Vec<u8> {
+    const VERBS: [&str; 6] =
+        ["Shenaniganing", "Roosting", "Creating", "Percolating", "Noodling", "Simmering"];
+    const GLYPHS: [&str; 5] = ["✻", "✶", "✽", "●", "✢"];
+    let mut cap: Vec<u8> = Vec::new();
+
+    // Real, committed work output — what a triaging orchestrator is actually
+    // looking for, and what the flood buried.
+    for i in 1..=5 {
+        cap.extend_from_slice(format!("real work line {i}\r\n").as_bytes());
+    }
+
+    // 300 frames of the animated turn: each one repaints the whole three-row
+    // live region (spinner / blank / input box) and parks the cursor back at
+    // its top-left, and most also tick the counter in place afterwards.
+    for i in 1..=300u32 {
+        cap.extend_from_slice(b"\r\x1b[J");
+        cap.extend_from_slice(
+            format!(
+                "{} {}… (esc to interrupt · {i}s · ↓ {} tokens)\r\n",
+                GLYPHS[(i % 5) as usize],
+                VERBS[(i % 6) as usize],
+                i * 7
+            )
+            .as_bytes(),
+        );
+        cap.extend_from_slice(b"\r\n");
+        cap.extend_from_slice(TUI_PROMPT_LINE.as_bytes());
+        // Back to the top-left of the live region for the next frame.
+        cap.extend_from_slice(b"\r\x1b[2A");
+        if i % 10 != 0 {
+            // Partial-line repaint: one column re-addressed, digits rewritten.
+            cap.extend_from_slice(format!("\x1b[40G{i}s").as_bytes());
+        }
+    }
+    cap
+}
+
+#[test]
+fn get_output_composes_a_tui_redraw_storm_down_to_one_screen() {
+    // What the orchestrator asks for on a busy pane, and what it must get:
+    // the screen as a human sees it — the real work lines, the current
+    // spinner frame, the prompt once — not 300 frames of paint.
+    let capture = claude_tui_animation_capture();
+    let composed = loomux_lib::orchestration::termgrid::render_screen(&capture, 100, 30);
+    let out = format_output_tail(&composed, 30);
+
+    for i in 1..=5 {
+        assert!(
+            out.contains(&format!("real work line {i}")),
+            "real content line {i} was buried by the animation, got:\n{out}"
+        );
+    }
+    assert_eq!(
+        out.matches(TUI_PROMPT_LINE).count(),
+        1,
+        "the delivered prompt is repainted every frame; it must appear ONCE in \
+         the composed screen, not once per repaint. Got:\n{out}"
+    );
+    assert!(
+        out.contains("300s"),
+        "the freshest frame is the one that says whether the pane is still \
+         alive — it must be what survives, got:\n{out}"
+    );
+    assert!(
+        !out.contains("· 40s ·") && !out.contains("· 150s ·"),
+        "frames that were painted over must be gone, not stacked, got:\n{out}"
+    );
+    // The real cost check. 300 repaints of a ~56-column status line and a
+    // 67-character prompt is tens of KB of write stream; one screen of it is
+    // a few hundred bytes.
+    assert!(
+        out.len() < 1_000,
+        "a 30-line read of an animated pane must cost a few hundred bytes, \
+         not kilobytes — got {} bytes:\n{out}",
+        out.len()
+    );
+}
+
+#[test]
+fn get_output_grid_is_what_saves_it_not_the_line_collapse() {
+    // Mutation pin, and the reason the fix is a grid replay rather than a
+    // smarter dedup: run the SAME bytes through the old pipeline (delete the
+    // escapes, keep the text) and the flood is fully reproduced here. If a
+    // future change quietly routes `get_output` back to `strip_ansi`, the
+    // first assertion below is what it looks like from the caller's side.
+    let capture = claude_tui_animation_capture();
+    let stripped = strip_ansi(&capture);
+    assert!(
+        stripped.matches(TUI_PROMPT_LINE).count() > 5,
+        "sanity: the raw write stream really does multiply the prompt — if it \
+         doesn't, this fixture no longer reproduces #520"
+    );
+    assert!(
+        stripped.len() > 10_000,
+        "sanity: the raw write stream really is kilobytes, got {}",
+        stripped.len()
+    );
+
+    let composed = loomux_lib::orchestration::termgrid::render_screen(&capture, 100, 30);
+    assert!(
+        composed.len() * 10 < stripped.len(),
+        "replaying the same bytes onto a screen must be an order of magnitude \
+         smaller than keeping the write stream — got {} composed vs {} stripped",
+        composed.len(),
+        stripped.len()
+    );
+}
+
+#[test]
+fn get_output_grid_resolves_partial_line_repaints() {
+    // The exact mechanism that defeats line-identity dedup, in miniature: one
+    // row, one column re-addressed, digits overwritten. Nothing here is ever
+    // a repeated LINE, so no dedup can help; only replaying the writes can.
+    let mut raw = b"working: 0%".to_vec();
+    for pct in [10, 20, 30, 40, 50, 60, 70, 80, 90] {
+        raw.extend_from_slice(format!("\x1b[10G{pct}%").as_bytes());
+    }
+    assert!(
+        strip_ansi(&raw).contains("0%10%20%"),
+        "sanity: stripping escapes really does concatenate the repaints"
+    );
+    assert_eq!(
+        loomux_lib::orchestration::termgrid::render_screen(&raw, 40, 5),
+        "working: 90%",
+        "a counter ticking in place is one line showing its latest value"
+    );
+}
+
+#[test]
+fn get_output_grid_leaves_plain_scrolling_output_alone() {
+    // The other half of "no damage": a pane that just prints (a build log, a
+    // test run) has no redraws to compose, and must come back line for line —
+    // including the lines that scrolled off the top of the screen.
+    let mut raw = Vec::new();
+    for i in 1..=100 {
+        raw.extend_from_slice(format!("cargo check line {i}\r\n").as_bytes());
+    }
+    let composed = loomux_lib::orchestration::termgrid::render_screen(&raw, 80, 24);
+    let lines: Vec<&str> = composed.lines().collect();
+    assert_eq!(lines.len(), 100, "every printed line must survive, got:\n{composed}");
+    assert_eq!(lines[0], "cargo check line 1", "scrollback must survive the replay");
+    assert_eq!(lines[99], "cargo check line 100");
+}
+
+#[test]
+fn get_output_grid_resyncs_after_a_malformed_utf8_byte() {
+    // Review finding 2 (#530). The ring is a byte TAIL: it routinely begins
+    // mid-codepoint, so a malformed sequence at the head of a capture is the
+    // NORMAL case, not an exotic one. A decoder that assumes the width from
+    // the lead byte and skips that whole window on failure eats the valid
+    // text sitting behind it.
+    use loomux_lib::orchestration::termgrid::render_screen;
+
+    // The discriminating case: `0xe0` claims three bytes, so a window skip
+    // swallows "he" and yields "llo". Only a one-byte resync recovers it.
+    assert_eq!(
+        render_screen(b"\xe0hello", 40, 5),
+        "hello",
+        "a bad lead byte must cost exactly itself, never the valid text behind it"
+    );
+    // An orphaned continuation byte — what a tail that starts mid-codepoint
+    // actually looks like.
+    assert_eq!(render_screen(b"\x80hello", 40, 5), "hello");
+    // `0xff` is never valid UTF-8 in any position, sitting in front of real
+    // multibyte content.
+    let mut mixed: Vec<u8> = vec![0xff];
+    mixed.extend_from_slice("✻ ok".as_bytes());
+    assert_eq!(render_screen(&mixed, 40, 5), "✻ ok");
+    // Truncated multibyte at the very END of the capture (the ring boundary
+    // cut it): dropped cleanly, and above all not a panic.
+    let mut truncated = b"done ".to_vec();
+    truncated.push(0xe2); // first byte of a 3-byte '…'; the rest never arrived
+    assert_eq!(render_screen(&truncated, 40, 5), "done");
+}
+
+#[test]
+fn get_output_grid_history_keeps_the_newest_rows_within_its_cap() {
+    // Review finding 1 (#530) is a COMPLEXITY fix (the scrolled-off history
+    // was drained one row at a time off the front of a Vec, so an adversarial
+    // newline flood paid O(cap) per scroll). Behavior was already correct, so
+    // there is no red to show for it — this test guards what the fix could
+    // plausibly break instead: swapping the container must not change which
+    // rows are retained. Deliberately structural, never wall-clock — timing
+    // assertions on this repo are a recorded lesson (#514/#516).
+    let mut raw = Vec::new();
+    for i in 1..=6000 {
+        raw.extend_from_slice(format!("row {i}\r\n").as_bytes());
+    }
+    let composed = loomux_lib::orchestration::termgrid::render_screen(&raw, 80, 24);
+    let lines: Vec<&str> = composed.lines().collect();
+
+    assert_eq!(
+        lines.last(),
+        Some(&"row 6000"),
+        "the newest row must always survive — it is what a monitoring read is for"
+    );
+    assert!(
+        lines.len() < 6000,
+        "history must be capped, not unbounded — got {} rows",
+        lines.len()
+    );
+    assert!(
+        !lines.iter().any(|l| *l == "row 1"),
+        "the OLDEST rows are the ones the cap must drop"
+    );
+    // Retention is a contiguous newest-first window: no gaps, no reordering,
+    // no duplicated rows introduced by the eviction path.
+    let first: usize = lines[0]
+        .strip_prefix("row ")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected first row {:?}", lines[0]));
+    assert_eq!(
+        lines.len(),
+        6000 - first + 1,
+        "retained rows must be one contiguous run ending at the newest, got {} rows starting at {first}",
+        lines.len()
+    );
+}
+
+#[test]
+fn get_output_is_hard_capped_in_bytes_whatever_lines_asks_for() {
+    // `lines` bounds lines; only a byte cap bounds the payload. 400 rows of
+    // 200 wide, all distinct, nothing to collapse — the shape of a real wide
+    // build log, and 80 KB into the caller's context before this cap.
+    let mut text = String::new();
+    for i in 1..=400 {
+        text.push_str(&format!("{i:04} {}\n", "x".repeat(200)));
+    }
+    let out = format_output_tail(&text, 500);
+
+    assert!(
+        out.len() <= OUTPUT_TAIL_MAX_BYTES,
+        "get_output must never return more than {OUTPUT_TAIL_MAX_BYTES} bytes, got {}",
+        out.len()
+    );
+    assert!(
+        out.len() * 4 < text.len(),
+        "sanity: the cap must actually be binding on this fixture"
+    );
+    assert!(
+        out.contains("truncated"),
+        "truncation must be stated, never silent, got:\n{}",
+        &out[..out.len().min(200)]
+    );
+    assert!(
+        out.contains("0400 "),
+        "the NEWEST content is what a monitoring read wants — it must be the \
+         part that survives"
+    );
+    assert!(
+        !out.contains("0001 "),
+        "the oldest content is what should have been dropped"
+    );
+}
+
+#[test]
+fn get_output_byte_cap_never_splits_a_multibyte_character() {
+    // The cap counts BYTES, and pane output is full of multibyte glyphs — box
+    // drawing, arrows, spinner stars, ellipses. Cutting at a byte offset that
+    // lands inside one panics the whole `get_output` call. Sibling of the cap
+    // test above (the same "disable the cap" mutation reddens both on the
+    // length assertion); this one additionally pins the boundary handling,
+    // which a pure-ASCII fixture cannot reach.
+    let mut text = String::new();
+    for i in 1..=400 {
+        text.push_str(&format!("│ {i:04} ↓ {}\n", "…".repeat(60)));
+    }
+    let out = format_output_tail(&text, 500);
+    assert!(
+        out.len() <= OUTPUT_TAIL_MAX_BYTES,
+        "the cap must bind on multibyte content too, got {}",
+        out.len()
+    );
+    assert!(out.contains("0400"), "the newest content must survive, got:\n{out}");
+    assert!(
+        out.chars().count() > 100,
+        "the surviving text must still decode as characters, got:\n{out}"
     );
 }
 

@@ -326,6 +326,20 @@ impl PtyManager {
         Some(v)
     }
 
+    /// This pane's current geometry as `(cols, rows)`, straight from the
+    /// master (so a resize since open is reflected). `None` if the pty is
+    /// gone or the platform refuses the query — the caller then falls back to
+    /// the 80x24 ANSI default.
+    ///
+    /// Added for #520: replaying a pane's raw output onto a composed grid
+    /// (`orchestration::termgrid`) only lands text where the human saw it if
+    /// the grid is the pane's real width and height.
+    pub fn size(&self, id: u32) -> Option<(u16, u16)> {
+        let ptys = self.ptys.lock_safe();
+        let sz = ptys.get(&id)?.master.get_size().ok()?;
+        Some((sz.cols, sz.rows))
+    }
+
     /// Unix-ms of the last human keystroke into this pty (0 = never).
     pub fn last_user_input_ms(&self, id: u32) -> Option<u64> {
         let ptys = self.ptys.lock_safe();

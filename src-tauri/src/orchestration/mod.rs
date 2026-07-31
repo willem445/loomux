@@ -21,6 +21,7 @@ pub mod notify;
 pub mod profiles;
 pub mod queue;
 pub mod report;
+pub mod termgrid;
 pub mod workflow;
 
 use serde::{Deserialize, Serialize};
@@ -7372,7 +7373,62 @@ pub fn format_output_tail(text: &str, n_lines: usize) -> String {
     let collapsed = collapse_repeated_frames(&all);
     let n = n_lines.clamp(1, 500);
     let start = collapsed.len().saturating_sub(n);
-    collapsed[start..].join("\n")
+    cap_output_bytes(collapsed[start..].join("\n"))
+}
+
+/// Hard ceiling on what one `get_output` call can put into the caller's
+/// context, in bytes, whatever `lines` was asked for (#520).
+///
+/// `lines` bounds distinct content *lines*; nothing bounded the *payload*. A
+/// pane rendering a 200-column TUI can put several KB on a single line, and
+/// 500 lines of that is a six-figure token bill delivered to an orchestrator
+/// that asked a small question. The two limits are independent on purpose:
+/// whichever binds first wins.
+///
+/// 8 KB is roughly two full screens of a wide pane — enough to answer "what
+/// is this agent doing right now", which is what the tool is for. Anything
+/// larger is a job for the agent's own report, not for monitoring.
+pub const OUTPUT_TAIL_MAX_BYTES: usize = 8 * 1024;
+
+/// Headroom reserved for the truncation marker so the *returned* string —
+/// marker included — is always within [`OUTPUT_TAIL_MAX_BYTES`]. A cap that
+/// the cap's own announcement can push you over is not a cap.
+const OUTPUT_TAIL_MARKER_RESERVE: usize = 96;
+
+/// Trim `text` to [`OUTPUT_TAIL_MAX_BYTES`], keeping the **newest** end —
+/// a monitoring read wants what the pane is doing now, not how it started —
+/// and saying so on the line it dropped.
+///
+/// The marker states plainly that bytes were dropped and how many. It does
+/// NOT characterise them ("animation residue" was the phrasing #520 proposed):
+/// by the time this runs the composed-grid replay has already removed the
+/// redraw churn, so anything still here and still over budget is as likely to
+/// be a legitimately enormous build log. Labelling real output as residue
+/// would be a claim the code can't back — the thing this repo keeps writing
+/// lessons about — so the marker reports the fact (bytes dropped, cap hit)
+/// and leaves the interpretation to the reader.
+fn cap_output_bytes(text: String) -> String {
+    if text.len() <= OUTPUT_TAIL_MAX_BYTES {
+        return text;
+    }
+    let budget = OUTPUT_TAIL_MAX_BYTES - OUTPUT_TAIL_MARKER_RESERVE;
+    let mut keep_from = text.len() - budget;
+    // Char boundary FIRST: pane output is full of multibyte glyphs (box
+    // drawing, arrows, spinner stars), and `text[keep_from..]` panics on an
+    // offset that lands inside one. Only then look for a line boundary, so
+    // the first surviving line isn't a fragment.
+    while keep_from < text.len() && !text.is_char_boundary(keep_from) {
+        keep_from += 1;
+    }
+    if let Some(i) = text[keep_from..].find('\n') {
+        keep_from += i + 1;
+    }
+    format!(
+        "[... truncated {} bytes: over get_output's {} KB cap ...]\n{}",
+        keep_from,
+        OUTPUT_TAIL_MAX_BYTES / 1024,
+        &text[keep_from..]
+    )
 }
 
 /// Decide whether a freshly spawned CLI is ready to receive typed input,
@@ -23080,7 +23136,18 @@ impl OrchRegistry {
         let pty_id = a.pty_id.ok_or("agent has no terminal")?;
         let app = self.app.lock_safe().clone().ok_or("no app handle")?;
         let ptys = app.state::<crate::pty::PtyManager>();
-        let live = ptys.output_tail(pty_id).map(|raw| strip_ansi(&raw));
+        // #520: replay the raw ring onto a composed grid at the pane's real
+        // geometry instead of deleting the escapes and handing over the write
+        // stream. A TUI's redraw churn overwrites itself here exactly as it
+        // does on the human's screen, so it never reaches the caller's
+        // context. `strip_ansi` stays the path for every other reader.
+        let (cols, rows) = ptys
+            .size(pty_id)
+            .unwrap_or((termgrid::DEFAULT_COLS, termgrid::DEFAULT_ROWS));
+        let live = ptys.output_tail(pty_id).map(|raw| termgrid::render_screen(&raw, cols, rows));
+        // The exit-tail fallback (#281) was captured as already-stripped text,
+        // not raw bytes — there is no escape stream left to replay, so it
+        // still gets the line-collapse treatment in `format_output_tail` only.
         let text = resolve_output_text(live, a.last_exit_tail.as_deref())?;
         Ok(format_output_tail(&text, lines))
     }
