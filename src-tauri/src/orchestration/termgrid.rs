@@ -51,6 +51,8 @@
 //!   the compact/menu detectors) — this changes what the orchestrator *reads*,
 //!   never what loomux *decides* (#522's confirmation sampling included).
 
+use std::collections::VecDeque;
+
 /// Fallback geometry when the live pty size can't be read. 80x24 is the
 /// ANSI default a CLI assumes before it learns better; a wrong width only
 /// wraps long prose a column early, it never loses content.
@@ -83,7 +85,9 @@ struct Screen {
     rows: usize,
     grid: Vec<Vec<char>>,
     /// Rows that scrolled off the top of the primary screen, oldest first.
-    history: Vec<String>,
+    /// A deque, not a `Vec`: eviction happens at the OLDEST end on a hot path
+    /// (once per scrolled row), and only `pop_front` makes that O(1).
+    history: VecDeque<String>,
     row: usize,
     col: usize,
     /// ECMA-48 deferred wrap: writing the last column leaves the cursor
@@ -106,7 +110,7 @@ impl Screen {
             cols,
             rows,
             grid: (0..rows).map(|_| blank_row(cols)).collect(),
-            history: Vec::new(),
+            history: VecDeque::new(),
             row: 0,
             col: 0,
             pending_wrap: false,
@@ -118,12 +122,14 @@ impl Screen {
     }
 
     fn push_history(&mut self, line: String) {
-        self.history.push(line);
-        if self.history.len() > MAX_HISTORY_ROWS {
-            // Drop the oldest chunk in one go rather than one row per scroll —
-            // a `remove(0)` per line makes replay quadratic on a long stream.
-            let excess = self.history.len() - MAX_HISTORY_ROWS;
-            self.history.drain(0..excess);
+        self.history.push_back(line);
+        while self.history.len() > MAX_HISTORY_ROWS {
+            // O(1). A `Vec` front-drain costs O(cap) *per scroll* once the cap
+            // is reached, and a pane spamming bare newlines scrolls once per
+            // byte of the ring — 256 K scrolls x 4096 rows shifted is work an
+            // adversarial (or merely chatty) pane should never be able to buy
+            // with a single `get_output` call (#530 review, finding 1).
+            self.history.pop_front();
         }
     }
 
@@ -293,7 +299,7 @@ impl Screen {
     fn into_text(mut self) -> String {
         // A pager still on its alternate screen: the primary content is what
         // scrolled, and the alt screen is what is live — show both, in order.
-        let mut rows: Vec<String> = self.history;
+        let mut rows: Vec<String> = self.history.into();
         if let Some(primary) = self.parked.take() {
             rows.extend(primary.iter().map(|r| row_text(r)));
         }
@@ -438,12 +444,17 @@ pub fn render_screen(bytes: &[u8], cols: u16, rows: u16) -> String {
                         for ch in text.chars() {
                             s.print(ch);
                         }
+                        i = end;
                     }
-                    // A ring tail can start mid-codepoint; skip the fragment
-                    // rather than painting a replacement char for it.
-                    Err(_) => {}
+                    // Malformed or truncated: drop exactly ONE byte and
+                    // resync, never the whole width the lead byte claimed.
+                    // `0xe0` claims three bytes, so skipping the window eats
+                    // the two valid characters behind a single bad byte — and
+                    // since the ring is a byte TAIL that routinely begins
+                    // mid-codepoint, that is the normal case at the head of a
+                    // capture, not an exotic one (#530 review, finding 2).
+                    Err(_) => i += 1,
                 }
-                i = end;
             }
         }
     }

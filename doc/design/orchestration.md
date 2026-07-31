@@ -5714,8 +5714,13 @@ spent its time closing, for output that is already one screen.
 widths are parsed only far enough to be skipped, so a double-width CJK glyph occupies one cell
 here and two in the pane (cosmetic in a monitoring read). Replay starts blind — the ring is a
 256 KB *tail*, so it begins mid-stream against a blank grid — which is fine for absolute-addressed
-paints and clamps for a relative move off the top edge. And the alternate screen is parked rather
-than cleared, so a pager that exits leaves the pane reading as the human sees it.
+paints and clamps for a relative move off the top edge. Because that boundary routinely lands
+mid-codepoint, a malformed UTF-8 byte costs exactly one byte and resyncs, never the width its lead
+byte claimed: skipping the claimed window would eat the valid characters sitting behind a single
+bad byte, at the head of nearly every capture. Scrolled-off rows evict from a deque at the oldest
+end, so a pane spamming bare newlines cannot buy O(cap) of shifting per scrolled row with one
+`get_output` call. And the alternate screen is parked rather than cleared, so a pager that exits
+leaves the pane reading as the human sees it.
 
 **Blast radius.** `strip_ansi` is unchanged and still serves every other caller (`box_holds_paste`,
 `prompt_wait_detected`, the compact/menu detectors, #522's confirmation sampling). This changes
