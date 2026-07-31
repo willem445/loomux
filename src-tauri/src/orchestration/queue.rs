@@ -263,13 +263,19 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
 /// re-sync prompt; it cannot loop, because it only ever fires on UNBLOCK,
 /// when delivery demonstrably works again.
 pub fn flush_header_text(count: usize, coalesced: usize) -> String {
+    // The verb agrees with the count (#533): this line shipped as "1
+    // delivery ... ARE now delivering" and a human read it in a live pane.
+    // Small, but every one of these notices is read by an agent as an
+    // instruction, and a sentence that doesn't parse is one more reason to
+    // skim it.
     let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
+    let verb = if count == 1 { "is" } else { "are" };
     if coalesced > 0 {
         format!(
-            "[loomux] {n} queued while this pane was blocked ({coalesced} coalesced) are now delivering, oldest first"
+            "[loomux] {n} queued while this pane was blocked ({coalesced} coalesced) {verb} now delivering, oldest first"
         )
     } else {
-        format!("[loomux] {n} queued while this pane was blocked are now delivering, oldest first")
+        format!("[loomux] {n} queued while this pane was blocked {verb} now delivering, oldest first")
     }
 }
 
@@ -464,8 +470,9 @@ pub fn coalesced_flush_text(items: &[FlushConstituent], remaining: usize, now_ms
         String::new()
     };
     let count = if n == 1 { "1 delivery".to_string() } else { format!("{n} deliveries") };
+    let verb = if n == 1 { "is" } else { "are" };
     let mut out = format!(
-        "[loomux] {count} queued while this pane was blocked are being delivered TOGETHER, \
+        "[loomux] {count} queued while this pane was blocked {verb} being delivered TOGETHER, \
          as this one prompt, oldest first{more} — they are itemized below with their origin and \
          queue time; nothing was reordered or dropped.{dedup} Treat each item as its own message.",
     );
@@ -724,6 +731,25 @@ mod tests {
     fn queued_notice_names_why_by_reason() {
         assert!(queued_notice("w-5", EnqueueReason::BoxOccupied).contains("human input"));
         assert!(queued_notice("w-5", EnqueueReason::Question).contains("interactive question"));
+    }
+
+    #[test]
+    fn flush_header_verb_agrees_with_its_count() {
+        // #533: shipped as "1 delivery ... are now delivering" and a human
+        // read it in a live pane. Both headers are pinned, since the
+        // coalesced one repeats the construction.
+        assert!(flush_header_text(1, 0).contains("1 delivery is now"), "{}", flush_header_text(1, 0));
+        assert!(flush_header_text(2, 0).contains("2 deliveries are now"), "{}", flush_header_text(2, 0));
+        assert!(flush_header_text(1, 1).contains("coalesced) is now"), "{}", flush_header_text(1, 1));
+        let one = [FlushConstituent { id: 1, from: "w-2", enqueued_ms: 0, coalesced: 0, text: "x" }];
+        assert!(coalesced_flush_text(&one, 0, 0).contains("1 delivery queued while this pane was blocked is being"),
+            "{}", coalesced_flush_text(&one, 0, 0));
+        let two = [
+            FlushConstituent { id: 1, from: "w-2", enqueued_ms: 0, coalesced: 0, text: "x" },
+            FlushConstituent { id: 2, from: "w-3", enqueued_ms: 0, coalesced: 0, text: "y" },
+        ];
+        assert!(coalesced_flush_text(&two, 0, 0).contains("2 deliveries queued while this pane was blocked are being"),
+            "{}", coalesced_flush_text(&two, 0, 0));
     }
 
     #[test]
