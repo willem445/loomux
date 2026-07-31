@@ -5000,34 +5000,124 @@ and `notify_queue` all now write a `notice-suppressed` audit line (`kind`, `to`,
 suppression branch, so a suppressed notification is discoverable after the fact instead of just
 vanishing.
 
-**Persistence: in-memory only — the intake gap, resolved honestly rather than papered over.** The
-plan this PR implements originally defended the in-memory choice partly by saying a restart's loss
-is "mechanically derivable from `audit.jsonl`, and the orchestrator's session-start re-sync is the
+**Persistence: the intake gap, first stated honestly (#445) and now closed (#468/#467).** The plan
+#445 implements originally defended its in-memory choice partly by saying a restart's loss is
+"mechanically derivable from `audit.jsonl`, and the orchestrator's session-start re-sync is the
 documented recovery." Intake caught that the SECOND clause was false: the orchestrator's documented
 re-sync (`list_tasks`, `get_state`, `list_agents`, `list_notifications`, an issue scan) does not
 scan the audit for orphaned queue entries, and no tool surfaced that view — so the claimed
 mitigation was aspirational, not real, the exact claim-vs-reality failure that cost #451 four review
-rounds. This PR resolves it as follows, not by picking one of the two options wholesale:
-- The FIRST clause is now genuinely true, not just argued: `queue::orphaned_queue_entries` (pure,
-  unit-tested) and `OrchRegistry::queue_orphans` (the impure wrapper, reading a group's real
-  `audit.jsonl` end to end, integration-tested) scan for `delivery-queued` ids with no matching
-  `delivery-dequeued`/`delivery-dropped` — the derivation the plan claimed is now a real, tested
-  function, not an assertion.
-- The SECOND clause — the orchestrator's re-sync actually CALLING it — is explicitly **not** done
-  in this PR. Wiring `queue_orphans` into the re-sync (a new MCP tool or an addition to an existing
-  one, per the `add-orch-tool` skill's cross-layer checklist) is real, separable work, and doing it
-  inside an already-large PR risked exactly the scope creep this codebase's own review culture
-  pushes back on. A follow-up issue is filed at PR time for that wiring.
-- Until that follow-up lands, **a loomux restart during a blocked window loses whatever is queued
-  at that instant.** State this plainly rather than lean on a mitigation nobody performs: the audit
-  record is forensic (a human or a future tool can run `queue_orphans` by hand), not yet an
-  automatic safety net. The other arguments for in-memory-only still stand on their own regardless
-  of this gap: pty ids are re-minted at restore (a queue keyed by pty id can't rebind across one
-  anyway — `QueuedDelivery.agent_id` is kept alongside `pty_id`'s key specifically so a durable
-  follow-up could rebind by agent, not pty), and replaying hours-stale prompts into a freshly
-  resumed session — which just re-synced from the board anyway — is as likely to confuse as help.
-  On-disk persistence (`queue.jsonl`, atomic-write discipline per #133/#240) is additive future
-  work, filed alongside the re-sync wiring follow-up, not built here.
+rounds. #445 resolved that by making the FIRST clause genuinely true and filing the second as
+separable work: `queue::orphaned_queue_entries` (pure) and `OrchRegistry::queue_orphans` (the impure
+wrapper reading a group's real `audit.jsonl`) scan for `delivery-queued` ids with no matching
+`delivery-dequeued`/`delivery-dropped`, but nothing called them from anywhere the orchestrator reads,
+so the loss was forensically visible and not recoverable. That is what #468 (durability) and #467
+(wiring) close, together, below.
+
+### Durability (#468/#467)
+
+**The queue is written to disk on every mutation.** Each group's `queue.json` (beside `state.json`,
+`tasks.json` and `audit.jsonl` in the group dir, because it is the same kind of thing) holds exactly
+what is queued for that group right now, written through `atomic_write` — same-directory temp,
+`sync_all`, rename — which is the #133 precedent, and the reason a crash or a full disk leaves the
+previous good snapshot rather than a truncated file.
+
+**A snapshot, not a journal — the one real design choice here.** #468's filing named "an on-disk
+`queue.jsonl`" and both the #133 (atomic whole-file replace) and #240 (atomic per-record append)
+precedents. Append-only is what `audit.jsonl` uses and it is the right shape for an event history;
+it is the wrong shape for this. A journal of queue events would need replay logic to reconstruct the
+current state, compaction to stay bounded, and would leave a half-replayed queue reachable if a
+record were ever lost — three failure modes bought for nothing, since a pane's queue is capped at
+`QUEUE_MAX_PER_PANE` (8) and the whole file is therefore a few KB. So: whole-file, atomic, rewritten
+per mutation. The audit log remains the append-only history of what happened; `queue.json` is only
+ever what is pending.
+
+Writing is serialized by `OrchRegistry::queue_persist`, held across "read the live queues → write the
+file" so a stale snapshot cannot land after a fresh one (a mutation completing after some writer's
+read must wait on the same lock and then re-read). **Lock order is `queue_persist` before `queues`,
+never the reverse**, and `persist_queues` is only ever called with no lock held: doing the I/O under
+`queues` would stall every delivery in the registry and lengthen exactly the critical section #470's
+ordering argument depends on staying short.
+
+**What a restart can rebind, and why neither obvious key works.** #468's filing proposed rebinding by
+`agent_id`, on the stated grounds that it is "durable across a restore" — this is false, and finding
+that out is most of why the mechanism looks the way it does. Agent ids are minted off an in-memory
+counter (`orch-{seq}` / `w-{seq}`) that restarts with the process, so after a restart they *repeat*:
+the first worker spawned in the new process is `w-1` whether or not it is the same worker. Keying
+recovery on `agent_id` would hand one agent's backlog to an unrelated pane that merely inherited its
+number. `pty_id` is no better — the terminal layer re-mints those too, which #445 already knew.
+`a_queued_delivery_survives_a_restart_...` pins the id collision directly, so the day someone
+"simplifies" `rebinds_to` back to an id comparison, a test says why not.
+
+Two identities do survive, and both are stamped onto every entry at admission (`DurableTarget`):
+
+- **`to_orchestrator`** — a group has exactly one orchestrator, so "was this addressed to the
+  orchestrator" outlives the name it was addressed by. This is the live-incident path: worker
+  reports and loomux notices are queued to the orchestrator pane.
+- **`session_id`** — the agent CLI's conversation id. `spawn_agent(resume_session, cwd)` reopens
+  exactly that session, so a resumed worker is the same worker in the only sense a pending delivery
+  cares about.
+
+`QueuedDelivery` also carries `group`, because the live queue map is keyed by pty id and pty ids are
+registry-*global* (groups share one `OrchRegistry`) — without the stamp, a per-group snapshot would
+have to re-derive each pane's group from the agents map, and an entry whose agent was already reaped
+would silently fall out of every group's file.
+
+**Recovery: re-admit what binds, surface the rest, never drop silently.** `recover_persisted_queue`
+reads a group's snapshot back exactly once per process (lazily, on first touch by a bind or a
+`queue_orphans` call — there is no single "a group was restored" callback in this registry, and
+`recovered_groups` is what makes running twice impossible rather than merely unlikely). Entries land
+in `recovered_queue`, a staging area deliberately separate from the live `queues` map: every one of
+them was queued for a pty that no longer exists. They leave it exactly two ways.
+
+- **Re-admitted** (`readmit_recovered`, called from every bind site) when the pane that just bound
+  matches by `queue::rebinds_to`. Re-admission goes through `enqueue_text` — the same front door
+  every other delivery uses — so recovered entries take their place by the ordinary admission rules
+  rather than being spliced in beside them, and #470's ordering argument covers them unchanged. It
+  runs BEFORE that pane's own kickoff is delivered, because an entry queued before the restart
+  arrived before the kickoff and admission order is delivery order.
+- **Surfaced** by `queue_orphans` otherwise — with the payload, which is the whole point: the
+  orchestrator re-sends rather than reconstructs. This is the common case for workers, since loomux's
+  own restore kickoff already tells the orchestrator its worker panes are gone.
+
+**`queue_orphans` merges two derivations** (`queue::merge_orphans`): the snapshot (payload included)
+and #445's audit scan (no payload, but needs no snapshot, so it still covers a group whose entries
+were queued by a build older than this one). Snapshot wins on a shared id. `delivery-recovered` was
+added to the audit scan's terminal set, because from the moment a restart reads an entry back the
+snapshot derivation owns it — left open, every recovered entry would be reported forever under an id
+nothing will ever close.
+
+**A defect this wiring exposed in the pre-existing derivation.** "Queued, never resolved" is
+satisfied by *every entry currently in the queue* — an undelivered entry has not been audited as
+delivered yet either. That was harmless while nothing called `queue_orphans`; it is not harmless now
+that a tool tells the orchestrator "a non-empty result is lost work, re-send it", which would have
+turned the recovery feature into a duplicate-delivery generator. `merge_orphans` takes the set of
+live ids and excludes them. (`queue_orphans_finds_an_enqueued_entry_with_no_terminal_event`, written
+under #445, simulated its "restart" inside one process and so asserted the looser meaning; it now
+performs a real relaunch and additionally pins that a live entry is never reported.)
+
+**Limits, stated rather than argued away.**
+
+- **A `StrandedSubmit` marker is never replayed.** Its whole meaning is a live pty's input-box
+  contents — "the text is already pasted, press Enter" — which a restart destroys. Replaying it would
+  press Enter on whatever the *new* session has in its box, most likely a human's half-typed line.
+  Markers are dropped at recovery, audited individually (`reason: stranded-marker-not-replayable`),
+  and announced through `stranded_lost_notice`, which says plainly that this text is NOT recoverable:
+  unlike a `Text` entry there are no bytes left to re-send, only the `prompt` audit line to read.
+- **One double-delivery window remains.** A crash between the drainer's pop and the snapshot rewrite
+  replays an entry that already landed. It is bounded — by the queue's existing byte-identical
+  coalesce, which collapses the replay into whatever is queued, and by `pop_front_dequeued`
+  persisting before it audits — but it is not closed, and pretending otherwise would be the exact
+  claim-vs-reality failure this section's own history is about.
+- **An unknown snapshot `version` recovers nothing** rather than guessing at the shape; the failure
+  direction of guessing is pasting the wrong bytes into somebody's terminal. A single unreadable
+  entry costs only that entry, and the skip is audited (`queue-recover-skipped`) rather than leaving
+  the count silently short.
+- **No age cutoff.** #468 asked whether staleness should expire a recovered entry; it does not — the
+  same answer #445 gave for the live queue (a queue behind an unanswered question is the designed
+  case, not a leak). Instead the staleness *judgement* is handed to whoever can make it:
+  `recovered_notice` says how long the backlog waited, and `queue_orphans` reports
+  `queued_minutes_ago` per entry.
 
 **Relationship to #451 — clean composition by construction.** #451 owns everything AFTER Enter
 (acceptance evidence, `Confirmed`/`Pending`/`Failed`, the late-correction notice); this queue owns

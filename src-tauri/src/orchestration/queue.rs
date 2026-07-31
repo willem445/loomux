@@ -34,8 +34,8 @@
 //! otherwise splits every backend feature this way (pure policy here,
 //! impure wiring in `mod.rs`) and `doc/design/orchestration.md`'s "Delivery
 //! queue (#445)" section — its "Ordering" subsection covers #470's redesign
-//! specifically — for the full design rationale, including the
-//! honestly-argued limits of the in-memory choice.
+//! specifically, and its "Durability (#468/#467)" subsection the on-disk
+//! snapshot below — for the full design rationale.
 //!
 //! **Durability across a restart (#468/#467).** The queue is no longer
 //! in-memory only. Every mutation of a pane's queue rewrites that group's

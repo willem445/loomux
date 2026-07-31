@@ -253,6 +253,7 @@ so far:
   and the shell route to it. The *contract* is unchanged: a reviewer was already told it does
   not fix and does not push; this only says which half of that a flag now enforces.
 
+
 - **#507, bulk board approvals** — `orchestrator.md` only. The human can now tick several board
   rows and approve them in one action, so the merge gate can deliver **one** notice naming
   several PRs where it only ever delivered one per PR. The **merge gate** section gains a bullet
@@ -265,6 +266,22 @@ so far:
   thing an orchestrator could over-read into merging something the human never authorized — the
   failure the gate exists to prevent. The backend is unchanged in authority: each PR still gets
   its own single-use, ~30-min grant file. `worker.md`/`reviewer.md`/`planner.md` are untouched.
+
+- **#468/#467, the delivery queue survives a restart** — `orchestrator.md` only. The queue #445
+  shipped was in-memory, so a loomux restart destroyed whatever was queued behind a blocked pane;
+  it is now written to disk on every mutation. What a default group's orchestrator is now told:
+  add `queue_orphans()` to the session-start re-sync, and treat a non-empty result as a **to-do
+  list, not a log** — each row is something somebody sent that nobody received, so re-send it to
+  a pane that exists now or say you are dropping it as stale, never silently. Deliveries that
+  loomux could re-bind on its own (the orchestrator's own pane, or an agent resumed onto the same
+  session id) are re-queued automatically in their original order and are deliberately NOT in
+  that list. The **Silent-agent recovery** held-delivery paragraph gains the three post-restart
+  notices and what each means, with the rule that two of the three describe deliveries already on
+  their way — so "never re-send without checking `queue_orphans()` first". One case is named as
+  genuinely unrecoverable: text already typed into a pane and waiting only for Enter when loomux
+  restarted, where the pane is gone and no bytes remain to re-send. `worker.md`/`reviewer.md`/
+  `planner.md` are untouched — `queue_orphans` is orchestrator-only, and a delegate's side of
+  the queue contract (never re-send on a `queued` notice) did not change.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
