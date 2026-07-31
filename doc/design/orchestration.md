@@ -4869,17 +4869,27 @@ alongside this change):
   cycle contains a full `deliver_now` attempt, so it is bounded by that function's duration rather
   than by `QUEUE_DRAIN_POLL`, but a human typing on a pane with a delivery queued behind them
   toggles occupancy on every Enter, which is exactly where this PR lives.
-- *Supersession moves the clock forward.* Since #533, `front` is `plan_flush`'s first **non-superseded**
-  entry, so dropping an older constituent hands the bound a later `enqueued_ms` and defers the badge
-  even though the pane has been blocked continuously. Defensible on its own terms — a superseded
-  delivery genuinely is not waiting any more, and it gets its own `delivery-dropped` audit line —
-  but it means the badge measures how long *the current front* has waited, not how long *the pane*
-  has been stuck.
+- *A stranded marker restarts the clock.* When a delivery pastes and then has its Enter withheld
+  (`AbortedPreEnter` — either pre-Enter gate), the drainer pops the text entry and
+  `enqueue_stranded_front` pushes a `StrandedSubmit` marker at the **front** with a fresh
+  `now_ms()` (`push_stranded_front_locked`). The bound reads `front.enqueued_ms`, so it restarts
+  from that moment even though the pane has been blocked continuously. It is bounded — one such
+  deferral per *successful paste*, not per poll — but it means the badge measures how long the
+  current front entry has waited, not how long the pane has been stuck.
 
-Both are the same question — what ends an episode — and both are caller wiring rather than a defect
-in `held_escalation`, whose contract is pinned. The fix for both is a per-pane hold-start stamp that
-survives entry churn, which is a change to state ownership and not worth making inside a review
-round that has already verified the current shape.
+**What canNOT move the clock, stated positively, because it is the reason the bound survives
+coalescing.** #533's batching and duplicate-coalescing are unable to advance `front.enqueued_ms`,
+and that is structural rather than incidental: `superseded_entries` records the **first** occurrence
+of a payload in `seen` and only emits *later* duplicates as superseded, so `entries[0]` is never
+itself superseded; `plan_flush` then takes its batch head from `live.first()`, giving
+`batch[0] == live[0] == entries[0]`. So no amount of queue churn — duplicates arriving, constituents
+being dropped, a backlog being combined into one paste — can hand the bound a younger head entry.
+The escalation cannot be starved by a chatty queue, only by the paste/withhold cycle above.
+
+Both known limits are the same question — what ends an episode — and both are caller wiring rather
+than a defect in `held_escalation`, whose contract is pinned. The fix for both is a per-pane
+hold-start stamp that survives entry churn, which is a change to state ownership and not worth
+making inside a review round that has already verified the current shape.
 
 **Two bounds, opposite precedence, and that is deliberate.** #518's `human_input_block` states the
 reverse rule — *"`box_pending` outranks the bound"* — and it is correct there. Grep will find both;
