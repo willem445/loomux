@@ -12144,6 +12144,39 @@ fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
     }
 }
 
+/// The `(sh, ShimPaths)` a stripped-PATH harness should use on THIS host, or
+/// `None` if it cannot assemble one (#509).
+///
+/// On Windows this is the product's own resolution, so the pin exercises what
+/// actually ships. Off Windows `resolve_shim_toolchain` deliberately bakes
+/// nothing — there is no `.cmd` layer and the coreutils are simply on PATH —
+/// but the dependency preamble is the *same generated script*, so the test
+/// supplies the equivalent itself: `/bin/sh` plus the directory `tr` really
+/// lives in. That keeps the headline pin ARMED on the unix runners, where a
+/// POSIX `sh` honors a stripped PATH, instead of leaving it skipped on every
+/// platform CI builds.
+fn stripped_path_harness() -> Option<(String, ShimPaths)> {
+    #[cfg(target_os = "windows")]
+    {
+        let (sh, paths) = resolve_shim_toolchain();
+        if paths.utils_dir.is_none() {
+            return None;
+        }
+        sh.map(|s| (s, paths))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for cand in ["/usr/bin/tr", "/bin/tr"] {
+            let p = std::path::Path::new(cand);
+            if p.is_file() {
+                let dir = p.parent().unwrap().display().to_string();
+                return Some(("/bin/sh".to_string(), ShimPaths { utils_dir: Some(dir), git_dir: None }));
+            }
+        }
+        None
+    }
+}
+
 /// A wrapper that reproduces what a PowerShell/cmd pane hands the shim (#509):
 /// a PATH carrying no Git for Windows coreutils. It runs whatever script it is
 /// given under `sh_abs`, so the same wrapper drives both the shim and the
@@ -12203,22 +12236,36 @@ fn run_shim_with_stripped_path(
     )
 }
 
-/// Assert the wrapper's PRECONDITION: under it, `tr` really is unreachable.
+/// Whether this host can actually express #509's condition — the shim's own
+/// `tr` failing — under the stripped-PATH wrapper.
 ///
-/// Without this the stripped-PATH tests can pass for the wrong reason — a host
-/// where the coreutils stay reachable would exercise a shim that never had a
-/// problem, and quietly stop testing #509 at all. That is exactly how CI
-/// attempts 1 and 2 failed on the windows runner — the environment refused to
-/// be stripped and the un-repaired shim behaved perfectly — so the premise is
-/// now checked rather than assumed. A host where it cannot hold goes RED here,
-/// with that stated, instead of passing for the wrong reason.
-fn assert_wrapper_really_hides_the_coreutils(sh_abs: &str, wrapper: &std::path::Path, root: &std::path::Path) {
+/// **A functional capability probe, deliberately, not platform detection.** It
+/// runs `printf x | tr x y` and checks the output, rather than asking
+/// `command -v` or branching on the OS. What the gate depends on is `tr`
+/// *working*; a `tr` that resolves but cannot run and a `tr` that runs despite
+/// a stripped PATH are both answered correctly by executing it. Sniffing the
+/// platform would encode today's runner image as a fact about Windows, which it
+/// is not — this same host arms the pin when its `sh` honors the strip.
+///
+/// `false` means the environment refuses to be stripped, and the caller must
+/// then emit a LOUD, NAMED skip. That is not hypothetical: on the GitHub
+/// windows runner the Git-for-Windows coreutils stay reachable however PATH is
+/// set — via the child environment (#509 CI attempts 1–2) or assigned inside
+/// the shell before `exec` (attempt 3, where this probe reported `FOUND`).
+///
+/// The rule is: **skip loudly or run armed, never anything between.** Softening
+/// the check into a pass would leave a test that looks like it guards #509 and
+/// silently does not — the exact failure class `.loomux/lessons.md` calls "a
+/// claim is a deliverable". A host that cannot hide the coreutils is also a
+/// host on which #509 cannot reproduce, so skipping there loses no coverage
+/// that was ever available; it just has to say so out loud.
+fn stripped_path_hides_the_coreutils(sh_abs: &str, wrapper: &std::path::Path, root: &std::path::Path) -> bool {
     let probe = root.join("probe_tr.sh");
-    std::fs::write(&probe, "#!/bin/sh\nif command -v tr >/dev/null 2>&1; then echo FOUND; else echo MISSING; fi\n").unwrap();
+    std::fs::write(&probe, "#!/bin/sh\nprintf x | tr x y\n").unwrap();
     let out = std::process::Command::new(sh_abs).arg(wrapper).arg(&probe).output().unwrap();
-    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    assert_eq!(got, "MISSING",
-        "the stripped-PATH wrapper must make `tr` unreachable, else these tests prove nothing about #509 (got {got:?})");
+    // A working `tr` prints exactly "y". Anything else — not found, broken, no
+    // output at all — means the condition IS expressible here.
+    String::from_utf8_lossy(&out.stdout).trim() != "y"
 }
 
 /// **The #509 pin.** Invoked from a PowerShell/cmd pane the shim's `sh` inherits
@@ -12236,14 +12283,10 @@ fn assert_wrapper_really_hides_the_coreutils(sh_abs: &str, wrapper: &std::path::
 /// un-repaired shim does instead (refuse loudly, never pass through).
 #[test]
 fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
-    let (Some(sh_abs), paths) = resolve_shim_toolchain() else {
-        eprintln!("SKIP gh_shim_gates_the_api_shapes…: no POSIX sh resolved");
+    let Some((sh_abs, paths)) = stripped_path_harness() else {
+        eprintln!("SKIP gh_shim_gates_the_api_shapes…: no POSIX sh / no coreutils dir on this host");
         return;
     };
-    if paths.utils_dir.is_none() {
-        eprintln!("SKIP gh_shim_gates_the_api_shapes…: no coreutils dir resolved on this machine");
-        return;
-    }
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let group = root.join("group");
@@ -12252,8 +12295,17 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
     let fake = write_fake_gh(root, &log);
     let shim = root.join("gh");
     std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &paths)).unwrap();
+    // The shim `exec`s the fake gh, which needs an executable bit on the unix
+    // runners. No-op on Windows.
+    let _ = std::process::Command::new(&sh_abs).arg("-c")
+        .arg(format!("chmod +x '{}'", fake.display())).status();
     let wrapper = write_stripped_path_wrapper(root, &sh_abs);
-    assert_wrapper_really_hides_the_coreutils(&sh_abs, &wrapper, root);
+    if !stripped_path_hides_the_coreutils(&sh_abs, &wrapper, root) {
+        eprintln!("SKIP gh_shim_gates_the_api_shapes…: runner cannot hide coreutils from MSYS sh — \
+                   headline pin stays armed wherever the strip works (the unix runners, and any host \
+                   whose sh honors a stripped PATH); see the PR body");
+        return;
+    }
 
     let ran = || std::fs::read_to_string(&log).unwrap_or_default();
     // Every one of these is a publish-to-the-world or merge shape that only the
@@ -12297,8 +12349,8 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
 /// the innocuous read that the repaired shim lets through above.
 #[test]
 fn gh_shim_without_its_coreutils_fails_closed_not_open() {
-    let (Some(sh_abs), _) = resolve_shim_toolchain() else {
-        eprintln!("SKIP gh_shim_without_its_coreutils…: no POSIX sh resolved");
+    let Some((sh_abs, _)) = stripped_path_harness() else {
+        eprintln!("SKIP gh_shim_without_its_coreutils…: no POSIX sh / no coreutils dir on this host");
         return;
     };
     let td = tempfile::tempdir().unwrap();
@@ -12309,8 +12361,14 @@ fn gh_shim_without_its_coreutils_fails_closed_not_open() {
     let fake = write_fake_gh(root, &log);
     let shim = root.join("gh");
     std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &ShimPaths::default())).unwrap();
+    let _ = std::process::Command::new(&sh_abs).arg("-c")
+        .arg(format!("chmod +x '{}'", fake.display())).status();
     let wrapper = write_stripped_path_wrapper(root, &sh_abs);
-    assert_wrapper_really_hides_the_coreutils(&sh_abs, &wrapper, root);
+    if !stripped_path_hides_the_coreutils(&sh_abs, &wrapper, root) {
+        eprintln!("SKIP gh_shim_without_its_coreutils…: runner cannot hide coreutils from MSYS sh — \
+                   fail-closed pin stays armed wherever the strip works; see the PR body");
+        return;
+    }
 
     for argv in [
         vec!["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v1.2.3"],
