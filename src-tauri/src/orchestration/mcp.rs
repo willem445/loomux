@@ -141,6 +141,14 @@ pub fn dispatch(
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
             reg.audit(&caller.group, &caller.agent_id, "tool-call",
                 json!({ "tool": name, "args": args }));
+            // #535: the shared agent-acknowledgment clock. Stamped HERE — the
+            // one funnel every `tools/call` passes through — so it covers
+            // every tool and every role, with no per-tool opt-in to forget the
+            // way `note_agent_activity` (one tool, orchestrator excluded) has.
+            // Before `call_tool`, deliberately: the claim is "this agent's own
+            // process is alive and executing", which a rejected call proves
+            // just as well as an accepted one. See `note_agent_ack`.
+            reg.note_agent_ack(&caller.agent_id);
             let out = call_tool(reg, caller, name, &args);
             let (text, is_error) = match out {
                 Ok(t) => (t, false),

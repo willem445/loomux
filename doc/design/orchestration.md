@@ -2533,6 +2533,162 @@ clear-on-decision behavior). All prior reinjection tests were updated to supply 
 `DeliveryConfirmation` before asserting final resolution; `compact_nudge_tick_never_loops_when_
 the_false_signal_repeats_every_cycle` (D4) stays pinned at zero, unaffected.
 
+### #535: the retry keys on the agent's ACKNOWLEDGMENT, not on our own delivery confirmation
+
+The delivery-confirmation gate above closed a real gap, and then became one of its own. The
+signal it waits on — `submit_sent_ms >= attempted_ms && confirmed` — is loomux **watching its own
+paste**, and that sampler misses routinely on a busy or repainting pane (~25 false `delivery
+unconfirmed` alarms in one observed session; the #451/#496/#522/#528 lineage). Nothing in the loop
+ever observed whether the **agent** had re-grounded. So on a pane where the submit went unseen, a
+re-grounding that had *landed* was re-pasted up to twice more into a working agent, and could
+finish as a `reinjection-abandoned` record claiming a contract restore that had in fact happened.
+Reported live: a copilot worker sitting at 2/3 while visibly on-track, correctly ignoring the
+duplicate because it already had the contract.
+
+#### The shared agent-activity clock
+
+`AgentEntry.last_mcp_activity_ms`, stamped by `OrchRegistry::note_agent_ack` from **one** site —
+the `tools/call` arm of `mcp::dispatch`. It means exactly one thing, and the distinction is the
+whole point of the mechanism:
+
+> **the agent's own code path executed** — a live process authenticated with this agent's token
+> and invoked a loomux tool. It does **not** mean *the pane painted*.
+
+Three properties, each load-bearing: **role-agnostic** (an orchestrator compacts and gets
+re-grounded like anything else); **stamped before the tool runs**, so a *rejected* call counts too
+(a permission denial proves the agent is alive and executing just as well as a success); and
+**monotone** (`max`, never a bare assignment — a clock a later caller could rewind would let one
+consumer erase another's evidence).
+
+None of the three clocks that already existed can answer this. `last_progress_ms` is rewritten to
+`now` by pty **output growth** in three separate ticks, so repaint noise above the activity floor
+advances it — it answers "did the pane emit", not "did the agent act". `note_agent_activity` (its
+writer) is stamped from exactly ONE tool, `message_orchestrator`, and is an explicit no-op for
+`Role::Orchestrator`. `DeliveryConfirmation` is the unreliable signal this section exists to stop
+relying on.
+
+#### The settling floor (rev-15 finding 2)
+
+`attempted_ms` is when loomux **decided** to paste, not when the agent could first have read
+anything: `deliver_prompt` waits for the pane to go quiet before pressing Enter, bounded by
+`SUBMIT_MAX_WAIT` (45s), then makes spaced blind retries. So a tool call the agent had already
+decided on during its *previous* turn, arriving milliseconds after the decision, is
+indistinguishable from a response — and would resolve the phase for a notice the agent provably
+had not yet seen. That is a **false landed-signal**, the same family #112 removed in its
+output-burst form and #522 in its idle-pane form; re-introducing it here through a different door
+would defeat the point of the batch.
+
+So the call site compares against `attempted_ms + REINJECT_ACK_SETTLE_MS`, never bare
+`attempted_ms`. The constant is a **const expression over every unconditional stage of
+`deliver_prompt`'s submit path** — the echo-verified typing loop (`ECHO_ATTEMPTS` ×
+(`ECHO_WINDOW` + `ECHO_RETRY_DELAY`)), `PASTE_SUBMIT_DELAY`, `SUBMIT_MAX_WAIT`,
+`SUBMIT_CONFIRM_WINDOW`, and the **sum** of `SUBMIT_RETRY_DELAYS` — so it moves by construction if
+any of them does, and every one of those constants carries a back-pointer to it. 63,600ms today.
+It costs the signal nothing: ~21% of `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~236s in which a
+genuine ack still resolves the phase, and an ack landing inside the floor is not lost, merely not
+counted yet (agents call loomux tools repeatedly; if none ever comes, the unchanged retry path
+runs, which is the pre-#535 behaviour).
+
+**This constant was wrong twice before it was right, both times short — the unsafe direction — and
+both times in a way that read as rigorous.** Recorded rather than quietly corrected, because the
+failure mode is not arithmetic; it is a sum that *looks* complete, which is precisely what stops
+the next reader from checking:
+
+- **2.6s short (rev-22).** It read `SUBMIT_RETRY_DELAYS` as absolute offsets and took "the last
+  one" as 4.5s. They are sequential `sleep`s, so the last blind Enter lands at their **sum**
+  (+7.0s) — and `SUBMIT_CONFIRM_WINDOW`, between the first Enter and that loop, was omitted.
+- **11.2s short (rev-28).** The sum covered only the last three stages while the doc claimed the
+  whole ordinary path. Two stages that run on *every* delivery — the echo-verify typing loop and
+  `PASTE_SUBMIT_DELAY` — sit before them and were missing. Same shape as the first error: a
+  complete-sounding enumeration over an incomplete set.
+
+The rule that follows, and it is in the constant's own doc: **a new stage added to
+`deliver_prompt` before the last Enter belongs in that expression.**
+
+A third correction, of a claim rather than a number: the doc used to say no activity before the
+floor could be a response "as a matter of ordering rather than of judgement". That is false
+regardless of the arithmetic. Three `wait_for_question_clear` checkpoints (`QUESTION_HOLD_MAX`,
+120s each) and `HUMAN_INPUT_BLOCK_BOUND_MS` (10 min) can push the Enter past the floor. Those are
+**deliberately excluded**: they are conditional on an exceptional pane state, and folding them in
+would push the floor past `REINJECT_CONFIRM_TIMEOUT_MS` and stop the mechanism resolving anything
+at all. **That residual is routed to #546**, with the related question of what could prove the
+notice was *read* rather than that the agent is merely executing. The floor is a worst-case bound
+over the unconditional path and a judgement about the rest — and now says which is which.
+
+Not the delivery ledger's own `submit_sent_ms`, which would be exact: that would re-couple the
+acknowledgment path to the delivery bookkeeping this whole change exists to stop depending on. A
+worst-case bound derived from our own timing constants needs no sampler to be working.
+
+The floor lives at the call site, not inside `agent_acted_since`, so the predicate stays a bare
+reusable timestamp comparison — but its doc states that **a caller comparing against a paste time
+owes the floor**, because a caller that skips it is wrong rather than merely stricter. #539's
+detector will be comparing against a paste time too.
+
+Deliberately built as a **shared** mechanism rather than shaped to its first caller:
+`agent_acted_since(last_mcp_activity_ms, since_ms)` takes a bare timestamp pair, and
+`OrchRegistry::last_mcp_activity_ms` is a public reader. #539 — the unconfirmed-delivery detector,
+whose `unconfirmed_disposition` (#522/#528) reads only BOX structure and has no activity evidence
+at all — is the intended second consumer. It is **not** wired here; #535 adds no second call site.
+
+#### `reinject_disposition`
+
+Pure, four-way (`Resolved` / `Wait` / `DeferBusy` / `Retry`) so each outcome is separately
+auditable and directly pinnable. **The ordering is the contract:**
+
+1. `confirmed_delivery || acked` ⇒ `Resolved`. Evidence of a landing beats the clock — otherwise
+   the bug survives. The old signal is kept and checked first: when it fires it is authoritative;
+   it was only ever wrong by *omission*.
+2. `elapsed < timeout` ⇒ `Wait`. The clock beats busy-ness, so a chatty pane cannot defer before
+   it has even waited. (This is also why our own pasted notice echoing back can never cause a
+   spurious deferral: the echo lands inside this window.)
+3. `busy` ⇒ `DeferBusy`, bounded by `REINJECT_BUSY_DEFER_MAX_MS` **measured from the original
+   attempt** — a pane that simply keeps painting cannot extend the deferral a tick at a time.
+4. otherwise ⇒ `Retry`, and at `MAX_REINJECT_ATTEMPTS` abandon, both exactly as before.
+
+**Terminal output is deliberately not part of `acked`,** though #535's own write-up lists it.
+`output_total` counts our pasted notice echoing back plus statusline/spinner repaint frames
+(#480) — the reason `idle_output_is_activity` exists. And folding growth into `acked` would make
+`DeferBusy` **structurally unreachable** (busy ⇒ growth ⇒ ack ⇒ `Resolved`): an arm, an audit
+action and this paragraph all describing a behaviour the code could never have. Output feeds
+`busy` only, where its weakness is harmless — it defers an attempt, it never claims one succeeded.
+
+**The deferral is bounded** because scope's safety net depends on it: unbounded, a pane that never
+goes quiet (an animated statusline above the group's `idle_activity_floor_bytes`) would suppress
+the retry forever — on exactly the panes that misreport most. A **constant, not a `Guardrails`
+knob**, per #518's own call that a knob with no correct second setting only ever gets set wrong.
+`busy_defer_max_ms == 0` disables the deferral (pre-#535 behaviour) rather than expiring
+instantly, the same convention as `human_input_block(.., bound_ms)`: a mis-set `0` must degrade to
+the old behaviour, never to "defer nothing, ever".
+
+#### Observability
+
+`compact-reinjection-confirmed` gains `source`: `"delivery"` (our submit sampler saw it) vs
+`"activity"` (the agent answered). Two different facts — a timeline conflating them cannot show
+whether this fix is working in the field, which is the same provenance distinction `to_hook_armed`
+already draws. New `compact-reinjection-deferred-busy`, because "no retry fired" must read as a
+deliberate choice rather than a silently dropped one (`to_hook_native_skip`'s reason). Latched per
+attempt via `AgentEntry.compact_reinject_busy_deferred` — the poll runs every 10s while an arm is
+open, so an unlatched audit would write ~30 identical lines per deferral.
+
+Regression coverage: `a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers` pins
+the live defect (and supplies **no** `DeliveryConfirmation` anywhere, which is exactly the
+production case that misbehaved); `an_mcp_call_before_the_re_grounding_is_not_an_acknowledgment_
+of_it` is its pair, proving the comparison is read rather than mere non-zero-ness;
+`a_genuinely_lost_re_grounding_still_retries_and_still_abandons_at_the_bound` pins that the safety
+net survives; `an_in_flight_tool_call_from_the_previous_turn_is_not_an_acknowledgment` pins the
+settling floor from both sides — 1ms short of it does not ack, exactly at it does, so a floor set
+so wide that nothing ever acked could not pass; `a_retry_is_never_spent_into_a_live_turn_but_the_
+deferral_is_bounded` covers both halves of the deferral;
+`a_permanently_busy_pane_still_reaches_the_abandoned_record_and_the_lost_badge` drives a pane that
+is never once quiet all the way through three attempts to the terminal state and asserts
+`compact_last_lost_reason` — the field `compactionstatus.ts` renders as the "re-grounding lost"
+badge — rather than only the attempt count, so a future edit that reset the clock inside the
+`DeferBusy` arm (hanging forever) could not pass;
+`a_deferral_yields_to_the_acknowledgment_it_was_waiting_for` pins the
+ordering as behaviour rather than as a claim in a comment; and
+`every_mcp_tool_call_stamps_the_shared_activity_clock_for_every_role` pins the wiring — the
+orchestrator case, the rejected-call case, and monotonicity.
+
 ### #410 (round 6): the arm-pending timeout, and a request-starvation fix alongside it
 
 A third re-demo hit a new symptom: `request_compact` answered "a compact is already in flight for
