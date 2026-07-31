@@ -36,7 +36,12 @@ Every rung is a complete tool on its own — climb when you're ready:
    half-typed line is in the box, a question is on screen, or the agent
    turns out to have received the brief after all), the pane raises a red
    **stuck prompt** chip instead of waiting silently, so a wedged group is
-   never something you discover by accident. Hard-won lessons persist
+   never something you discover by accident. That queue is on disk, so
+   **restarting loomux no longer loses whatever was waiting in it**:
+   deliveries re-queue themselves in their original order once their pane is
+   back, and anything whose pane is gone for good is handed to the
+   orchestrator as lost work — with the original text — rather than
+   disappearing. Hard-won lessons persist
    across groups via a committed `.loomux/lessons.md`, not just this run.
    The task board and the group lifecycle panel — each its own keystroke
    away on an orchestration pane — persist across a close/reopen and a group

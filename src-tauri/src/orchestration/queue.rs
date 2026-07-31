@@ -595,6 +595,13 @@ pub fn stranded_lost_notice(count: usize) -> String {
 /// why it cannot be replayed. Paired with `text: null`, which for this one
 /// case does not mean "an older build queued it" but "the bytes went into a
 /// terminal that no longer exists."
+///
+/// **One string, every channel** (review round 1, finding 3). This is the
+/// value in the `queue-stranded-unreplayable` audit line, in the orphan
+/// row's `reason`, and in the MCP tool's own description — it shipped for
+/// review as `stranded-marker-not-replayable` in the audit and
+/// `stranded-submit-not-replayable` everywhere else, so a human grepping the
+/// audit log for the string the tool had just shown them found nothing.
 pub const STRANDED_ORPHAN_REASON: &str = "stranded-submit-not-replayable";
 
 /// Where a surfaced orphan was reconstructed from (#467). Both sources are
@@ -720,13 +727,24 @@ pub struct QueueAuditLine<'a> {
 /// independently queued — it was folded into the entry it duplicated, whose
 /// own id is what to check.
 ///
-/// `delivery-recovered` (#467) is terminal here for the same reason the
-/// other two are: from the moment a restart reads an entry back out of
-/// `queue.json`, the snapshot derivation owns it — it is either staged (and
-/// reported by `OrchRegistry::queue_orphans`'s snapshot half, with its
-/// payload) or re-admitted under a FRESH id whose own `delivery-queued` line
-/// tracks it from there. Leaving it open here would report every recovered
-/// entry twice, forever, under an id nothing will ever close.
+/// `delivery-recovered` (#467) is terminal here, and **only ever written at
+/// the moment an entry actually leaves staging** — `readmit_recovered`, once
+/// a FRESH `delivery-queued` id is tracking the same payload. Closing it any
+/// earlier is a real defect, caught in review round 1: the first version
+/// wrote it when an entry was merely STAGED, which made this derivation —
+/// the one view that needs no snapshot to work — blind to exactly the
+/// entries that had not been re-bound. Paired with a snapshot that then held
+/// live queues only, a second restart lost them with no trace in either
+/// channel: strictly worse than never having persisted at all, since
+/// pre-#468 this scan would at least have kept reporting the ids forever.
+///
+/// So the rule this encodes: **an id is closed here only once its
+/// disposition is durable somewhere else.** Until then both views report it
+/// and `merge_orphans` dedupes them, snapshot first (it has the payload).
+/// That is also why a `StrandedSubmit` marker a restart made unreplayable
+/// audits as the NON-terminal `queue-stranded-unreplayable` rather than
+/// `delivery-dropped`: it never leaves staging, so it must never stop being
+/// reported.
 pub fn orphaned_queue_entries(lines: &[QueueAuditLine]) -> Vec<OrphanedQueueEntry> {
     let mut open: std::collections::HashMap<u64, (String, u64, String)> = std::collections::HashMap::new();
     for l in lines {

@@ -1671,13 +1671,18 @@ fn a_stranded_submit_marker_is_never_replayed_across_a_restart() {
     assert!(snap.iter().all(|e| e.payload != queue::QueuedPayload::StrandedSubmit),
         "no marker may ever be re-admitted after a restart");
 
-    let dropped: Vec<_> = reg
+    // Audited under the SAME reason string the orphan row and the tool
+    // description use (review round 1, finding 3 — they had drifted apart,
+    // so a human grepping the audit for what the tool showed found nothing),
+    // and under a NON-terminal action: a marker never leaves staging, so it
+    // must never stop being reported by the audit-derived view either.
+    let stranded: Vec<_> = reg
         .audit_log(&gid)
         .into_iter()
-        .filter(|e| e.action == "delivery-dropped"
-            && e.detail["reason"] == json!("stranded-marker-not-replayable"))
+        .filter(|e| e.action == "queue-stranded-unreplayable"
+            && e.detail["reason"] == json!("stranded-submit-not-replayable"))
         .collect();
-    assert_eq!(dropped.len(), 1, "the loss must be named in the audit, not silent");
+    assert_eq!(stranded.len(), 1, "the loss must be named in the audit, not silent");
 
     // ...and reported through the DURABLE channel, not only the audit line
     // and a best-effort notice: recovery can run at a moment when no
@@ -1804,6 +1809,136 @@ fn one_groups_snapshot_never_contains_another_groups_queue() {
         assert!(body.contains(mine), "{gid} must persist its own entry: {body}");
         assert!(!body.contains(theirs), "{gid} must NOT persist another group's entry: {body}");
     }
+}
+
+#[test]
+fn a_second_restart_still_reports_a_backlog_nobody_had_read_yet() {
+    // Review round 1, finding 1. Restarts cluster — a crash loop, or a fleet
+    // restart followed by another — and the exposed set here is the case the
+    // feature exists for: entries whose pane did not come back.
+    //
+    // The sequence that used to lose them permanently and silently: process
+    // 2's first touch is an ADMISSION (a notice, a worker report — immediate
+    // in a live group), which stages the backlog into memory and, in the
+    // same call, rewrote `queue.json` from live state only. Process 2 then
+    // dies before the orchestrator's session-start `queue_orphans` call. The
+    // audit trail had already been closed by a `delivery-recovered` written
+    // at STAGE time, so process 3 found nothing in either view and reported
+    // `count: 0` — worse than pre-#468, where the audit scan would at least
+    // have kept naming the ids forever.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["still owed", "also still owed"]);
+
+    // ---- restart 1: touched only by an admission, then dies ----
+    {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45999);
+        reg.create_group("C:/tmp/repo", rails()).unwrap();
+        let fresh = reg.spawn_agent(&gid, Role::Worker, "unrelated", "t", false, None).unwrap();
+        reg.enqueue_text(&gid, &fresh.id, "orch-1", "new work", 930, queue::EnqueueReason::Arrival).unwrap();
+        // Nothing here ever calls queue_orphans or binds the original pane.
+    }
+
+    // ---- restart 2: the backlog must still be there ----
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orphans = reg.queue_orphans(&gid);
+    let texts: Vec<Option<&str>> = orphans.iter().map(|o| o.text.as_deref()).collect();
+    assert!(texts.contains(&Some("still owed")) && texts.contains(&Some("also still owed")),
+        "a backlog nobody has read yet must survive any number of restarts, payloads intact: {orphans:?}");
+    // Restart 1's own unread admission is owed too — it was live when that
+    // process died, which is the ordinary single-restart case.
+    assert!(texts.contains(&Some("new work")), "restart 1's own queued work is owed as well: {orphans:?}");
+}
+
+#[test]
+fn a_readmitted_entry_stops_being_reported_but_a_staged_one_does_not() {
+    // The other half of finding 1's fix: closing an id in the audit is now
+    // tied to it actually LEAVING staging, so the two must be checked
+    // together — a fix that simply stopped closing ids would leak
+    // re-delivered work back into the orphan list forever.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["for the resumed pane"]);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+
+    assert_eq!(reg.queue_orphans(&gid).len(), 1, "staged and unread: reported");
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, 931), 1);
+    assert!(reg.queue_orphans(&gid).is_empty(),
+        "re-queued and delivering: NOT lost work, and must not invite a re-send");
+
+    let closed = reg
+        .audit_log(&gid)
+        .into_iter()
+        .find(|e| e.action == "delivery-recovered")
+        .expect("the old id must be closed out exactly when it leaves staging");
+    assert!(closed.detail["readmitted_as"].as_u64().is_some(),
+        "and must name the fresh id now tracking the payload: {:?}", closed.detail);
+}
+
+#[test]
+fn a_concurrent_first_touch_after_a_restart_cannot_re_mint_a_snapshot_id() {
+    // Review round 1, finding 2. MCP dispatch is thread-per-request, and the
+    // moment right after a restart is exactly when every agent in a group
+    // reports at once — what #524's fleet restart produced. The guard used
+    // to publish "recovered" before the `queue_seq` seed landed, so a second
+    // thread arriving mid-read saw "already done", returned, and minted id 1
+    // — an id the snapshot still held, silently defeating the earlier
+    // hazard-2 fix (orphan hidden by the live-id filter; audit scan
+    // cross-closing old ids).
+    let dir = tempfile::tempdir().unwrap();
+    let backlog: Vec<String> = (0..6).map(|i| format!("recovered-{i}")).collect();
+    let refs: Vec<&str> = backlog.iter().map(String::as_str).collect();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &refs);
+    let recovered_ids: Vec<u64> = {
+        // Read the ids straight off disk so the expectation does not depend
+        // on the recovery path under test.
+        let body = fs::read_to_string(dir.path().join(&gid).join("queue.json")).unwrap();
+        queue::parse_snapshot(&body).0.iter().map(|e| e.delivery.id).collect()
+    };
+    assert_eq!(recovered_ids.len(), 6);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let agents: Vec<String> = (0..6)
+        .map(|i| reg.spawn_agent(&gid, Role::Worker, &format!("w{i}"), "t", false, None).unwrap().id)
+        .collect();
+
+    // Every thread's FIRST act on this group is an admission, all racing the
+    // one recovery pass.
+    let minted: Vec<u64> = std::thread::scope(|s| {
+        let handles: Vec<_> = agents
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let reg = &reg;
+                let gid = &gid;
+                s.spawn(move || {
+                    reg.enqueue_text(gid, id, "orch-1", &format!("fresh-{i}"), 940 + i as u32,
+                                     queue::EnqueueReason::Arrival)
+                        .unwrap()
+                        .id
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    for id in &minted {
+        assert!(!recovered_ids.contains(id),
+            "a concurrent first touch minted {id}, which the snapshot still holds ({recovered_ids:?})");
+    }
+    // And the backlog itself must be intact — one recovery pass, not six.
+    let orphans = reg.queue_orphans(&gid);
+    assert_eq!(orphans.len(), 6, "the backlog must be staged exactly once: {orphans:?}");
 }
 
 #[test]
