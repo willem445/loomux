@@ -4,21 +4,31 @@
 // so the mapping is unit-testable.
 
 /** Reasons the backend attention scan emits (see the Rust `AttentionItem`). */
-export type AttentionReason = "blocked" | "waiting" | "report" | "gate";
+export type AttentionReason = "blocked" | "stranded" | "waiting" | "report" | "gate";
 
 export interface AttentionPresentation {
   /** Short glyph+word label shown in the header chip / dock chip tooltip. */
   label: string;
-  /** `blocked` is the most urgent — callers tint it red rather than amber. */
+  /** `blocked` and `stranded` are the urgent ones — callers tint them red
+   *  rather than amber. */
   urgent: boolean;
 }
 
 const LABELS: Record<string, string> = {
   blocked: "⚠ blocked",
+  // #496 PR-C: a delivered prompt that was never submitted. Distinct from
+  // `waiting` on purpose — a waiting pane is asking something and will keep
+  // asking; a stranded one is wedged and stays wedged until an Enter lands.
+  stranded: "⚠ stuck prompt",
   waiting: "⚠ waiting",
   report: "✓ reported",
   gate: "⚑ your call",
 };
+
+/** Attention reasons rendered as urgent (red, not amber): the pane is stuck
+ *  and will not un-stick itself. Kept as a set so adding a reason is one edit
+ *  — `tabroute.ts` mirrors this rule (see its note on why it can't import). */
+const URGENT: ReadonlySet<string> = new Set(["blocked", "stranded"]);
 
 /** Map an attention reason to its label + urgency. Unknown reasons fall back
  *  to a generic non-urgent badge rather than throwing, so a new backend reason
@@ -26,7 +36,7 @@ const LABELS: Record<string, string> = {
 export function attentionPresentation(reason: string): AttentionPresentation {
   return {
     label: LABELS[reason] ?? "⚠ attention",
-    urgent: reason === "blocked",
+    urgent: URGENT.has(reason),
   };
 }
 

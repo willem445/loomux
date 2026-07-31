@@ -44,6 +44,8 @@ use loomux_lib::orchestration::{
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     record_aborted_preenter_outcome, recorded_confirmed,
+    drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
+    StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
@@ -13110,6 +13112,397 @@ fn phantom_gate_tick_throttles_repeated_gated_writes_per_pane() {
     // another pane's clock is doing.
     let (emit, _) = phantom_gate_tick((0, None), 1_000 + INTERVAL_MS);
     assert_eq!(emit, Some(1), "a different pane's state is independent of this one's throttle");
+}
+
+// ---------- #496 PR-C: stranded-delivery self-heal + attention badge ----------
+//
+// The wedge these pin: a delivery ends `Failed` (60s output-quiet, no
+// question, nothing confirmed) with the pasted prompt still sitting in the
+// box. Before this change nothing ACTED on that — for an orchestrator target
+// both notices are suppressed by design, and an idle group has no next
+// delivery whose pre-paste flush would press the withheld Enter, so a human
+// had to notice and press it. The guarantee now: self-heal through the
+// ordered queue, or a visible badge, never silence.
+
+/// The pane tail a stranded delivery leaves behind: our prompt echoed into
+/// the input box, nothing after it. `box_holds_paste` reads this as "still
+/// holding" — Tier 1's own signal, used here exactly as `deliver_prompt`
+/// uses it.
+const STRANDED_TAIL: &str =
+    "  ⎿  done\n\n> please post the status roll-up on #496\n";
+
+#[test]
+fn stranded_selfheal_action_precedence_puts_human_content_first() {
+    // The whole decision table, in precedence order. Written as a table
+    // because the ORDER is the property: a future edit that moves the
+    // human-content check below the "is our text still there" check would
+    // make loomux press Enter on a line a person is mid-way through typing.
+    let heal = |ledger, typed, question, holds, used| {
+        stranded_selfheal_action(ledger, typed, question, holds, used, STRANDED_SELFHEAL_MAX_HEALS)
+    };
+
+    // The ledger — the durable artifact — is consulted before any pane
+    // reading: an outcome that is no longer this delivery's, or is already
+    // confirmed, means there is nothing to actuate at all.
+    assert_eq!(heal(false, false, false, true, 0), StrandedAction::Resolved);
+    assert_eq!(
+        heal(false, true, true, true, 9),
+        StrandedAction::Resolved,
+        "a resolved delivery never badges, whatever the pane looks like"
+    );
+
+    // The one absolute: never submit over human-typed content. It outranks
+    // even the heal budget and the question guard.
+    assert_eq!(
+        heal(true, true, false, true, 0),
+        StrandedAction::Attention(StrandedBlocker::HumanInput),
+        "a human keystroke since our submit must badge, never heal"
+    );
+    assert_eq!(
+        heal(true, true, true, false, 9),
+        StrandedAction::Attention(StrandedBlocker::HumanInput),
+        "human content outranks every other blocker"
+    );
+
+    // #420's question guard: a live question owns the Enter key.
+    assert_eq!(
+        heal(true, false, true, true, 0),
+        StrandedAction::Attention(StrandedBlocker::Question)
+    );
+
+    // Nothing identifiable left in the box → badge, don't guess.
+    assert_eq!(
+        heal(true, false, false, false, 0),
+        StrandedAction::Attention(StrandedBlocker::NotHolding)
+    );
+
+    // The bound.
+    assert_eq!(
+        heal(true, false, false, true, STRANDED_SELFHEAL_MAX_HEALS),
+        StrandedAction::Attention(StrandedBlocker::Exhausted),
+        "the heal budget must be spent-able, and spending it badges instead of re-pressing"
+    );
+
+    // Everything clear → heal.
+    assert_eq!(heal(true, false, false, true, 0), StrandedAction::SelfHeal);
+}
+
+#[test]
+fn stranded_selfheal_admits_a_submit_through_the_queue_ahead_of_pending_text() {
+    // The ordering property: the stranded text is ALREADY in the box, so the
+    // re-submit must drain before anything queued behind it — otherwise the
+    // next payload pastes on top of an unsubmitted prompt and the two merge.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 496u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "the next brief", pty, queue::EnqueueReason::Arrival)
+        .unwrap();
+
+    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+    assert!(healed, "a clear self-heal decision must actually admit a submit");
+
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap.len(), 2, "the heal is an extra queue entry, not a replacement");
+    assert_eq!(
+        snap[0].payload,
+        queue::QueuedPayload::StrandedSubmit,
+        "the re-submit must drain FIRST — nothing may paste over stranded text"
+    );
+    assert_eq!(snap[1].payload.text(), Some("the next brief"), "queued text keeps its place behind it");
+
+    // Audited, so a self-heal is never a silent write into someone's pane.
+    let audits = reg.audit_log(&g.id);
+    assert_eq!(
+        audits.iter().filter(|e| e.action == "stranded-selfheal-submit").count(),
+        1,
+        "every self-heal attempt must be audited exactly once"
+    );
+    // ...and loud: the human sees the pane wedged even though loomux is
+    // recovering it (the badge clears once the ledger confirms).
+    let note = reg.stranded_note(&w.id).expect("a self-heal must still raise the badge");
+    assert_eq!(note.blocker, None, "an in-flight heal badges as 'loomux is re-sending it'");
+}
+
+#[test]
+fn a_queued_stranded_submit_presses_enter_through_the_real_replay() {
+    // The other half of "re-flushed through the queue": what the drainer
+    // actually does with the marker this PR admits. Drives the REAL replay
+    // function (`drain_stranded_submit`, the one `run_queue_drainer` calls)
+    // against a real PtyManager backed by a fake child — no AppHandle, no
+    // agent CLI (CLAUDE.md constraint 3).
+    let pm = PtyManager::default();
+    let pty = 4961u32;
+    let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+    // The ledger state a stranded delivery leaves: recorded, unconfirmed.
+    record_aborted_preenter_outcome(&last_delivery, pty, "loomux".to_string());
+
+    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r");
+
+    assert!(fired, "the queued marker must press Enter on a quiet, question-free pane");
+    assert_eq!(&*captured.lock().unwrap(), b"\r", "exactly one submit, nothing else");
+    assert_eq!(
+        recorded_confirmed(&last_delivery, pty),
+        Some(true),
+        "a landed re-submit must close the ledger entry the badge clears off"
+    );
+}
+
+#[test]
+fn stranded_human_content_badges_and_never_submits() {
+    // The not-safe path, both halves: the decision refuses to heal, and the
+    // real press path refuses too if it is somehow reached. Human text in
+    // the box is the one thing loomux must never merge-submit over.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 4962u32;
+
+    let action = stranded_selfheal_action(
+        true,  // ledger: still outstanding
+        true,  // a human typed after our submit
+        false, // no question on screen
+        true,  // our text is still in the box
+        0,
+        STRANDED_SELFHEAL_MAX_HEALS,
+    );
+    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, action);
+
+    assert!(!healed, "human content in the box must never produce a submit");
+    assert_eq!(reg.queue_depth(pty), 0, "nothing may be queued for a pane loomux must not press Enter on");
+    let note = reg.stranded_note(&w.id).expect("the human must be told, not silently waited on");
+    assert_eq!(note.blocker, Some(StrandedBlocker::HumanInput));
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-attention"),
+        "the badge must be audited too — the record is how a wedge is reconstructed later"
+    );
+
+    // And the press path itself declines, so the guard does not rely on the
+    // decision function being the only caller.
+    let pm = PtyManager::default();
+    let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    let fired = flush_stranded_text(&pm, pty, Some(false), true, b"\r");
+    assert!(!fired, "flush_stranded_text must refuse while a human has typed since our submit");
+    assert!(captured.lock().unwrap().is_empty(), "no bytes may reach a pane holding human text");
+}
+
+#[test]
+fn a_selfheal_never_cuts_in_front_of_a_drainer_that_owns_an_entry() {
+    // The hazard this closes, and the reason the gate is a safety rule
+    // rather than an optimization: a drainer inside `deliver_now` has
+    // already peeked its front entry and will finish by calling
+    // `pop_front_dequeued(that id)`, which pops ONLY on an id match. A
+    // marker slipped in front of it makes that pop match nothing, leaving an
+    // ALREADY-DELIVERED entry queued for a second, duplicate delivery.
+    assert_eq!(stranded_admission_gate(true, false), Some("drainer-active"));
+    assert_eq!(
+        stranded_admission_gate(true, true),
+        Some("drainer-active"),
+        "the safety rule is checked before the idempotence one"
+    );
+    assert_eq!(stranded_admission_gate(false, true), Some("submit-already-queued"));
+    assert_eq!(stranded_admission_gate(false, false), None, "an idle pane's queue may be fronted");
+
+    // Wired: against the REAL registry state the real check reads.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 4964u32;
+    reg.enqueue_text(&g.id, &w.id, "loomux", "mid-delivery", pty, queue::EnqueueReason::Arrival)
+        .unwrap();
+    reg.register_drainer_for_test(pty);
+    assert!(reg.drainer_active(pty));
+
+    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+
+    assert!(!healed, "no heal may be admitted while a drainer owns the queue front");
+    assert_eq!(reg.queue_depth(pty), 1, "the queue must be exactly as the drainer left it");
+    assert_eq!(
+        reg.queue_snapshot(pty)[0].payload.text(),
+        Some("mid-delivery"),
+        "the drainer's own entry must still be the front — a marker here would strand it"
+    );
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-selfheal-skipped"),
+        "the skip is audited, with its reason"
+    );
+    // Still loud: declining to heal never means declining to tell the human.
+    assert!(reg.stranded_note(&w.id).is_some(), "the badge is raised whichever mechanism presses Enter");
+}
+
+#[test]
+fn stranded_selfheal_is_bounded_and_never_double_queues() {
+    // Two independent bounds, because either one alone leaves a flush loop
+    // available: the per-delivery heal budget, and the refusal to stack a
+    // second marker behind one that has not fired yet.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 4963u32;
+
+    assert!(reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal));
+    assert_eq!(reg.queue_depth(pty), 1);
+
+    // Budget spent: the decision no longer even asks for a heal.
+    assert_eq!(
+        stranded_selfheal_action(true, false, false, true, 1, STRANDED_SELFHEAL_MAX_HEALS),
+        StrandedAction::Attention(StrandedBlocker::Exhausted),
+        "one heal per stranded delivery — no infinite flush loop"
+    );
+
+    // Belt and braces: even a caller that ignores the budget cannot stack a
+    // second Enter behind the first, and the un-fired marker does not burn
+    // budget it never used.
+    let healed_again = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+    assert!(!healed_again, "a marker already queued must not count as a fresh heal");
+    assert_eq!(reg.queue_depth(pty), 1, "a second Enter must never be stacked behind an unfired one");
+    let audits = reg.audit_log(&g.id);
+    assert_eq!(
+        audits.iter().filter(|e| e.action == "stranded-selfheal-submit").count(),
+        1,
+        "only the admission that really happened is audited as a submit"
+    );
+    assert!(
+        audits.iter().any(|e| e.action == "stranded-selfheal-skipped"),
+        "the declined attempt is audited too, with its reason"
+    );
+}
+
+#[test]
+fn stranded_badge_outranks_waiting_and_clears_when_the_delivery_resolves() {
+    // The badge as the human sees it: it must beat `waiting` (a wedged pane
+    // is not merely parked on a prompt), carry the pty the header chip and
+    // dock dot key off, and come DOWN when the delivery resolves — a badge
+    // that never clears trains the human to ignore it.
+    let (reg, _d, g, wid) = attention_setup();
+    let now = 1_000_000_000_000u64;
+    let out: HashMap<String, u64> = [(wid.clone(), 512u64)].into_iter().collect();
+    let prompt: HashMap<String, String> =
+        [(wid.clone(), strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    let no_input = HashMap::new();
+
+    // Park the pane on a question long enough that `waiting` would fire.
+    reg.attention_tick(now, &out, &prompt, &no_input);
+    let waiting = reg.attention_tick(now + 5000, &out, &prompt, &no_input);
+    assert!(
+        waiting.iter().any(|i| i.agent_id == wid && i.reason == "waiting"),
+        "precondition: this pane would otherwise read as `waiting`"
+    );
+
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::HumanInput));
+    let flagged = reg.attention_tick(now + 6000, &out, &prompt, &no_input);
+    let item = flagged
+        .iter()
+        .find(|i| i.agent_id == wid)
+        .expect("a stranded pane must surface in the attention scan");
+    assert_eq!(item.reason, "stranded", "a wedged prompt outranks `waiting`");
+    assert_eq!(
+        item.pty_id,
+        reg.agent(&wid).unwrap().pty_id,
+        "the badge must carry the pty the pane header chip and dock dot key off"
+    );
+    assert!(
+        item.detail.contains("press Enter or clear the box"),
+        "the detail must tell the human what to DO: {}",
+        item.detail
+    );
+
+    // Resolved (the ledger confirmed the delivery, or the text left the box).
+    reg.clear_stranded(&g, &wid, "confirmed-late");
+    let cleared = reg.attention_tick(now + 7000, &out, &prompt, &no_input);
+    assert!(
+        cleared.iter().all(|i| !(i.agent_id == wid && i.reason == "stranded")),
+        "a resolved delivery must drop its badge"
+    );
+    assert!(
+        reg.audit_log(&g).iter().any(|e| e.action == "stranded-cleared"),
+        "the clear is audited so the wedge's whole lifetime is reconstructible"
+    );
+}
+
+#[test]
+fn stranded_detail_names_the_blocker_the_human_must_clear() {
+    // The badge text is the entire user-facing surface of this feature: each
+    // blocker must say something different and actionable, or the human
+    // learns nothing from the badge that raised it.
+    let details: Vec<String> = [
+        None,
+        Some(StrandedBlocker::HumanInput),
+        Some(StrandedBlocker::Question),
+        Some(StrandedBlocker::NotHolding),
+        Some(StrandedBlocker::Exhausted),
+        Some(StrandedBlocker::QueueFull),
+    ]
+    .into_iter()
+    .map(|b| stranded_detail("w-1", b))
+    .collect();
+
+    assert!(details.iter().all(|d| d.starts_with("w-1")), "every detail names the pane");
+    let unique: std::collections::HashSet<&String> = details.iter().collect();
+    assert_eq!(unique.len(), details.len(), "no two blockers may read identically: {details:?}");
+    assert!(
+        details[0].contains("loomux is re-sending it"),
+        "an in-flight heal must say loomux is handling it, not ask the human to act"
+    );
+    assert!(
+        details[4].contains("press Enter"),
+        "a spent heal budget hands the pane back to the human explicitly"
+    );
+    // rev-47 NB4: a claim is a deliverable, even in a tooltip. `QueueFull`
+    // means no heal was ever attempted, so its wording must not borrow
+    // `Exhausted`'s "after a self-heal".
+    assert!(
+        !details[5].contains("after a self-heal"),
+        "the queue-full badge must not claim a heal fired: {}",
+        details[5]
+    );
+    assert!(details[5].contains("queue"), "it must name the real obstacle: {}", details[5]);
+}
+
+#[test]
+fn a_queue_full_pane_badges_queue_full_not_a_spent_heal() {
+    // rev-47 NB4, wired: the `Err` arm of `actuate_stranded`'s admission.
+    // Fill the pane's queue to the cap so the marker push is rejected, then
+    // assert the badge reports the truth (nothing was attempted) rather than
+    // `Exhausted`'s "a heal fired and did not take".
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 4965u32;
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+            .unwrap();
+    }
+
+    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal);
+
+    assert!(!healed, "a rejected admission is not a heal");
+    assert_eq!(
+        reg.stranded_note(&w.id).expect("the human must still be told").blocker,
+        Some(StrandedBlocker::QueueFull),
+        "the badge must name the real obstacle, not a heal that never ran"
+    );
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-selfheal-skipped"),
+        "and the skip is audited with its reason"
+    );
+}
+
+#[test]
+fn a_dead_agents_stranded_badge_is_pruned() {
+    // The map is latched (nothing about a wedged pane changes on its own), so
+    // the one thing that must prune it is the agent going away — otherwise a
+    // dead pane's badge outlives it in the registry forever.
+    let (reg, _d, g, wid) = attention_setup();
+    reg.mark_stranded(&g, &wid, Some(StrandedBlocker::Exhausted));
+    assert!(reg.stranded_note(&wid).is_some());
+
+    reg.mark_dead(&wid, Some(1));
+    reg.attention_tick(1_000, &HashMap::new(), &no_tails(), &HashMap::new());
+
+    assert!(reg.stranded_note(&wid).is_none(), "a dead agent's badge must not linger in the registry");
 }
 
 #[test]

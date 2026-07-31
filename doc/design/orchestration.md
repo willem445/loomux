@@ -4858,6 +4858,140 @@ survive a fair lock. Closed by unifying admission rather than by widening the fa
 "Ordering", above, for the full argument and `queue.rs`'s `unified_admission_property` module for
 the exhaustive proof.
 
+## Delivery failure actuation: stranded-prompt self-heal + attention badge (#496 PR-C)
+
+**The guarantee.** *A delivery ends `Confirmed`, or a bounded self-heal fires, or a
+human-visible attention badge is raised. No path ends silent-and-wedged.*
+
+**Problem.** #451 gave a delivery three honest states and #445/#470 made a held payload
+queued-never-destroyed — but nothing ever ACTED on `Failed`. Three suppressions compose into
+a deadlock:
+
+- For an **orchestrator-target** delivery both notices are suppressed by design
+  (`should_notify_unconfirmed` / `should_notify_paste_held` require `!target_is_orchestrator`,
+  to avoid the notice→delivery→notice loop). A failed delivery to the orchestrator is silent
+  everywhere except the audit log.
+- The recovery that *would* have fired — the next delivery's own pre-paste
+  `flush_stranded_text` — needs a NEXT delivery. In an idle group there isn't one: the
+  orchestrator is the thing that was supposed to act.
+- Until PR-A (#499), the phantom `user_input_ms` stamp also suppressed the flush and the
+  submit retries outright.
+
+What was left was a human noticing a stuck prompt and pressing Enter by hand. Observed on
+Claude panes as well as copilot ones — the root cause is CLI-agnostic (#496's scope
+correction); whether a CLI *drops* or *queues* Enter changes how often a prompt strands, not
+what happens afterwards.
+
+**Trigger — the ledger first, the pane second.** Actuation hangs off the one point a delivery
+is ever declared `Failed`: `late_monitor_tick`'s `DeclareFailed` (already 60s output-quiet,
+no question on screen, nothing confirmed). `stranded_selfheal_action` is the pure decision,
+and its FIRST input is the durable artifact — this pane's recorded `DeliveryOutcome` is still
+this delivery's and still unconfirmed. A pane reading can never override what the ledger says
+about whether a delivery is outstanding. Then, in order: `human_typed_since` (never
+merge-submit over human-typed content, #81/#84's rule), `question_on_screen` (#420's guard),
+`box_holds_paste` (Tier 1's own signal — is our text still identifiably there), and last the
+heal budget. Precedence is pure and table-tested precisely because reordering it is how this
+would turn into a bug that types Enter over someone's half-written line.
+
+**The heal goes THROUGH the queue, never around it.** The re-submit is admitted as a
+`StrandedSubmit` marker at the FRONT of the pane's queue (`admit_stranded_selfheal` →
+`enqueue_stranded_front`) and pressed by the drainer via `drain_stranded_submit` →
+`flush_stranded_text` — the same single-consumer path #470 made the only way anything reaches
+a pane, and the same marker `AbortedPreEnter` already produces. Three consequences, all
+deliberate:
+
+- **Front, not back**: the stranded text is physically in the box already, so anything queued
+  behind it must not paste on top of it. Same ordering rule `AbortedPreEnter` follows.
+- **Not a new delivery**: nothing is re-pasted and no new payload is admitted — a marker is a
+  single Enter. A raw `write_bytes` from the monitor thread would have been simpler and
+  wrong: it races the drainer mid-paste and re-opens exactly the ordering hole #470 closed.
+- **Guardrails re-used, not re-implemented**: `flush_stranded_text` re-derives
+  `human_typed_since` from the ledger and re-reads the live question state at the instant of
+  the press. The decision above is the *trigger* gate; it is never the last word on whether
+  the Enter is safe.
+
+**Admission gate: never cut in front of a drainer that owns an entry**
+(`stranded_admission_gate`). Pushing to the FRONT is safe only while no drainer owns the front
+entry. A drainer inside `deliver_now` has already peeked its entry and finishes by calling
+`pop_front_dequeued(that id)`, which pops ONLY on an id match — a marker slipped in front makes
+that pop match nothing and leaves an already-delivered entry queued for a **second, duplicate
+delivery**. Pre-#496 nothing could reach this (the front door pushes to the BACK; the drainer's
+own `AbortedPreEnter` marker is pushed *after* it pops), and the self-heal must not become the
+first thing that does.
+
+*The gate must be atomic with the push, and first shipped in this PR it wasn't* (review rev-47
+B1). The original shape peeked `queues` and released, read `queue_draining` and released, then
+re-took `queues` to push: check-then-act across three scopes. A drainer registering in that gap
+re-opened the hazard exactly — gate sees none, a delivery is admitted and its drainer
+spawns/peeks the Text entry, the marker lands in front, and the completing pop matches nothing.
+Not an exotic window either: the delivery most likely to arrive at that instant is the idle
+tick's nudge to the same wedged pane, and the idle tick and `DeclareFailed` key off the same
+quiet condition — correlated, not independent. **The fix fuses the check and the push into one
+critical section on `queues`, reading `queue_draining` while holding it** (lock order `queues` →
+`queue_draining`, exactly `commit_exit`'s, so no new deadlock edge). That is sufficient because
+any drainer that could ever peek this front must register *before* it peeks and must take
+`queues` *to* peek: relative to the fused section it is either already registered (→ decline) or
+it peeks strictly after the push (→ finds the marker at the front, the safe case — it drains the
+submit first and pops it by a matching id). `queue.rs`'s `stranded_admission_property` proves
+this over every interleaving, with the unfused variant as its mutation control, in the same
+shape #470 B1's own `unified_admission_property` uses one layer up.
+
+Nothing is lost by declining — a live drainer means a delivery is already queued for this pane,
+and that delivery's own pre-paste `flush_stranded_text` presses exactly the Enter the heal
+wanted pressed. The self-heal exists for the case where no such next delivery exists (an idle
+group), which is precisely when no drainer is running. The badge is raised either way: the human
+is told regardless of which mechanism does the pressing.
+
+**Bounded.** `STRANDED_SELFHEAL_MAX_HEALS = 1` per stranded delivery, counted in the monitor.
+The bound is also structural today (`late_monitor_tick` returns `DeclareFailed` at most once
+per monitor — every later tick sees `already_failed`), but that is the *caller's* precedence:
+counting explicitly means the cap survives an edit to it and is directly testable. A second,
+independent bound sits at admission: `admit_stranded_selfheal` refuses to stack a marker
+behind one already at the queue's front, so no caller can produce two un-fired Enters, and a
+refused admission does not burn budget it never spent. Every attempt, refusal and clear is
+audited (`stranded-selfheal-submit`, `stranded-selfheal-skipped`, `stranded-attention`,
+`stranded-cleared`).
+
+**Badge — chrome, never a resize.** The loud surface reuses the existing #40/#6 attention
+event (`orch-attention`) with one new reason, `stranded`, ranked directly under `blocked` and
+above `waiting`: a wedged pane will not un-wedge itself, whereas a `waiting` pane is asking a
+question it is happy to keep asking. It renders on the pane-header chip and the dock chip that
+already exist — overlay chrome floating over the terminal, no PTY resize (hard constraint 1),
+no new notification channel. The badge is raised for a self-heal too, not only for the blocked
+cases: a delivery that needed healing already burned its whole confirm window plus
+`PENDING_IDLE_QUIET`, and the human is entitled to know their group wedged even when loomux
+recovers it. `StrandedBlocker` carries WHY into the detail text, so the badge always says what
+the human has to clear rather than leaving them to work it out from the pane.
+
+**The badge stays honest while it is up** (rev-47 NB1). An admitted marker is not a fired one:
+`flush_stranded_text` re-decides at press time and can decline indefinitely — most plausibly
+when the human starts typing *after* the marker was admitted, which the trigger-time decision
+could not have seen. Safety holds (their text is never submitted over), but a badge reading
+"loomux is re-sending it" while the press will never fire is a claim the code doesn't honor. So
+each `KeepWaiting` tick with a badge up re-runs the SAME pure decision against live state and
+re-words the note when a real blocker has appeared — one bounded tail read, shared with the
+clear-check below, and only taken when a badge is actually raised. It re-marks once (the note
+stops being `blocker: None`), so this is a state transition in the audit log, not per-tick spam.
+
+**Clearing — on evidence, and it must be able to clear.** A badge that never comes down trains
+the human to ignore it. Three clear paths, all ledger- or evidence-driven: the monitor's
+`Confirm` (the prompt landed after all); `Superseded` where the newer recorded outcome is
+confirmed (which includes our own heal, since `drain_stranded_submit` records a successful
+press as a fresh confirmed outcome); and a present→absent transition of our text in the box
+(`text-left-the-box`) — the case where a HUMAN rescues the pane on a CLI that produces no
+`promptsubmit` hook, where waiting for `Confirm` would leave the badge up until the monitor's
+4h cap. Only a genuine transition clears, so a `NotHolding` badge (raised because the text was
+already gone) is never un-raised by the same reading that raised it. The map is otherwise
+latched — nothing about a wedged pane changes on its own — and pruned in `attention_tick` when
+the agent stops running.
+
+**Honest residual.** `drain_stranded_submit` records a successful *write* as confirmed; it
+does not re-verify that the CLI accepted the healed Enter (pre-existing behavior, unchanged
+here). If a CLI drops the healed Enter too, the badge clears on the optimistic record and the
+prompt is recovered only by the next delivery's own flush. Making the heal's landing
+independently verifiable belongs with PR-D's processing-evidence work, not here — this PR does
+not claim that guarantee.
+
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
 **Problem.** Worker reports and orchestrator kickoffs are delivered by bracketed-pasting

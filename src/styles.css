@@ -187,7 +187,11 @@ body.dragging-tab, body.dragging-tab * { cursor: grabbing !important; }
   border: 1px solid #6a5230; border-radius: 4px; padding: 1.5px 6px;
   color: #f2c66a; background: rgba(224, 175, 104, 0.16); white-space: nowrap;
 }
-.tab-attn[data-reason="blocked"] {
+/* Red for the urgent reasons — `blocked`, and (#496 PR-C) `stranded`: a
+   delivered prompt that was never submitted wedges the pane until an Enter
+   lands. Keep this selector list in step with attention.ts's URGENT set. */
+.tab-attn[data-reason="blocked"],
+.tab-attn[data-reason="stranded"] {
   color: #ff9db0; background: rgba(247, 118, 142, 0.18); border-color: rgba(247, 118, 142, 0.5);
 }
 @keyframes tab-attn-pulse {
@@ -501,8 +505,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .pane-attn { cursor: pointer; }
 .pane-attn:hover { background: rgba(224, 175, 104, 0.28); color: #ffd886; }
-/* Blocked is the most urgent — tint it red rather than amber. */
-.pane-attn[data-reason="blocked"] {
+/* The urgent reasons — tint them red rather than amber: `blocked`, and
+   (#496 PR-C) `stranded`, a prompt that reached the pane but was never
+   submitted. Keep this selector list in step with attention.ts's URGENT set. */
+.pane-attn[data-reason="blocked"],
+.pane-attn[data-reason="stranded"] {
   color: #ff9db0; background: rgba(247, 118, 142, 0.16); border-color: rgba(247, 118, 142, 0.4);
 }
 .pane.needs-attention .pane-header {
