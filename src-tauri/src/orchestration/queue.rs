@@ -738,8 +738,14 @@ mod tests {
         // #533: shipped as "1 delivery ... are now delivering" and a human
         // read it in a live pane. Both headers are pinned, since the
         // coalesced one repeats the construction.
-        assert!(flush_header_text(1, 0).contains("1 delivery is now"), "{}", flush_header_text(1, 0));
-        assert!(flush_header_text(2, 0).contains("2 deliveries are now"), "{}", flush_header_text(2, 0));
+        // The count and the verb are NOT adjacent — "1 delivery queued
+        // while this pane was blocked is now delivering" — so each is
+        // asserted where it actually sits. (An earlier draft asserted
+        // "1 delivery is now" and reddened on the real, correct string.)
+        assert!(flush_header_text(1, 0).contains("1 delivery queued"), "{}", flush_header_text(1, 0));
+        assert!(flush_header_text(1, 0).contains("blocked is now delivering"), "{}", flush_header_text(1, 0));
+        assert!(flush_header_text(2, 0).contains("2 deliveries queued"), "{}", flush_header_text(2, 0));
+        assert!(flush_header_text(2, 0).contains("blocked are now delivering"), "{}", flush_header_text(2, 0));
         assert!(flush_header_text(1, 1).contains("coalesced) is now"), "{}", flush_header_text(1, 1));
         let one = [FlushConstituent { id: 1, from: "w-2", enqueued_ms: 0, coalesced: 0, text: "x" }];
         assert!(coalesced_flush_text(&one, 0, 0).contains("1 delivery queued while this pane was blocked is being"),
