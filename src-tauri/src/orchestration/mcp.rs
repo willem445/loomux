@@ -148,7 +148,7 @@ pub fn dispatch(
             // Before `call_tool`, deliberately: the claim is "this agent's own
             // process is alive and executing", which a rejected call proves
             // just as well as an accepted one. See `note_agent_ack`.
-            reg.note_agent_ack(&caller.agent_id);
+            // EVIDENCE BRANCH (#535, do not merge): the dispatcher stamp removed.
             let out = call_tool(reg, caller, name, &args);
             let (text, is_error) = match out {
                 Ok(t) => (t, false),

@@ -3443,14 +3443,16 @@ pub fn reinject_disposition(
     timeout_ms: u64,
     busy_defer_max_ms: u64,
 ) -> ReinjectDisposition {
-    if confirmed_delivery || acked {
+    // EVIDENCE BRANCH (#535, do not merge): the PRE-fix rule — the outcome is
+    // inferred from OUR delivery confirmation alone. `acked` and `busy` are
+    // accepted and ignored, so the signature, the enum and every call site stay
+    // intact and the failures below are BEHAVIOURAL, not a missing symbol.
+    let _ = (acked, busy, busy_defer_max_ms);
+    if confirmed_delivery {
         return ReinjectDisposition::Resolved;
     }
     if elapsed_ms < timeout_ms {
         return ReinjectDisposition::Wait;
-    }
-    if busy && elapsed_ms < timeout_ms.saturating_add(busy_defer_max_ms) {
-        return ReinjectDisposition::DeferBusy;
     }
     ReinjectDisposition::Retry
 }
