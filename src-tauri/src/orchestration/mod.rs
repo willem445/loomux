@@ -23480,12 +23480,7 @@ impl OrchRegistry {
                 }
             }
         }
-        if let Some(staged) = self.recovered_queue.lock_safe().get(group) {
-            out.extend(staged.iter().cloned());
-        }
-        if let Some(markers) = self.recovered_markers.lock_safe().get(group) {
-            out.extend(markers.iter().cloned());
-        }
+        // MUTATION A (finding 1): staged entries excluded from the snapshot.
         // **Sorted by id, which for this group IS arrival order** (review
         // round 2, N5). Appending staged after live is not restart-invariant:
         // a cap-rejected entry from restart 1 would be written behind
@@ -23502,7 +23497,7 @@ impl OrchRegistry {
         // here and nowhere else — a marker is never replayed across a restart
         // (`split_recovered`), so no recovery decision reads its file order,
         // and its `pty_id` + id still identify it exactly.
-        out.sort_by_key(|e| e.delivery.id);
+        // MUTATION C (N5): id sort removed.
         out
     }
 
@@ -23567,6 +23562,7 @@ impl OrchRegistry {
             if !recovered.insert(group.to_string()) {
                 return;
             }
+            drop(recovered); // MUTATION D (finding 2): publish before the seed.
             // Publishing the mark here rather than at the end is safe
             // BECAUSE the guard is held for the rest of the phase: no other
             // thread can observe it until this scope ends, and every early
@@ -23615,7 +23611,7 @@ impl OrchRegistry {
             // staging under a fresh id — so until then BOTH views report it
             // and `queue::merge_orphans` dedupes them.
             for e in &split.replayable {
-                self.audit(group, "loomux", "queue-recovered", json!({
+                self.audit(group, "loomux", "delivery-recovered", json!({
                     "to": e.delivery.agent_id, "id": e.delivery.id,
                     "queued_ms": now_ms().saturating_sub(e.delivery.enqueued_ms),
                 }));
