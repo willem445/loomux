@@ -14318,44 +14318,73 @@ fn gh_shim_gives_the_real_gh_a_native_git_only_for_builtin_subcommands() {
     }
 }
 
-/// Normalizer sites that are deliberately NOT wrapped in `loomux_norm_guard`,
-/// each with the reason its emptiness is safe (#509 rev-32 NB2). Keyed by the
-/// assigned variable; the pin below requires every entry to still correspond to
-/// a real unguarded site, so this list cannot rot into a blanket exemption.
-const UNGUARDED_TR_SITES: &[(&str, &str)] = &[
-    ("cur_head", "empty ⇒ the `[ -n \"$cur_head\" ] ||` line immediately below blocks with \
-                  unresolved-head; the workflow gate refuses rather than proceeds"),
-    ("rest", "tag EXTRACTION for grant keying, not gate matching: empty ⇒ empty rtag ⇒ \
-              loomux_release_gate is still entered and can only allow via a blanket marker \
-              or a grant file it cannot name — it never decides whether to gate"),
+/// Normalizer sites deliberately NOT wrapped in `loomux_norm_guard`, each with
+/// the reason its emptiness is safe (#509 rev-32 NB2, re-keyed by rev-36 NBa).
+///
+/// `(variable, a substring identifying THAT SITE, reason)`. **The context
+/// substring is load-bearing, not decoration.** Keyed by variable name alone —
+/// as this list shipped — a NEW unguarded fail-open site that happened to reuse
+/// a generic name would inherit the exemption and pass silently; `rest` is the
+/// obvious candidate, and it appears twice already. That made this list's own
+/// "cannot rot into a blanket permission" claim false on the day it landed,
+/// which is worse than a wrong site: the list is the mechanism the entire
+/// guarded/exempt split rests on, so a false claim ABOUT it undermines every
+/// claim made THROUGH it. The pin also asserts each context matches exactly one
+/// site, so an entry cannot silently widen later either.
+const UNGUARDED_TR_SITES: &[(&str, &str, &str)] = &[
+    (
+        "cur_head",
+        "\"$cur_head\" | tr",
+        "the workflow gate's head oid: empty ⇒ the `[ -n \"$cur_head\" ] ||` on the very next          line blocks with unresolved-head, so the gate refuses rather than proceeds",
+    ),
+    (
+        "rest",
+        "*tagName:*)",
+        "tag EXTRACTION for grant keying, not gate matching: empty ⇒ empty rtag ⇒          loomux_release_gate is still entered and can then only allow via a blanket marker or          a grant file it cannot name — it never decides WHETHER to gate",
+    ),
+    ("rest", "*refs/tags/*)", "the same extraction, the refs/tags literal arm"),
 ];
 
-/// **rev-32 NB2 — nothing enforced guard COMPLETENESS, which is what let NB1
-/// through.** NB1 was a single unguarded fail-open normalizer (`ql`, the graphql
-/// query fold) sitting unnoticed among eleven `tr` sites, reachable only because
-/// a different guard happened to exit first. A human found it by reading; that
-/// is not a mechanism.
+/// **rev-32 NB2 / rev-36 NBa+NBb — nothing enforced guard COMPLETENESS, which is
+/// what let NB1 through.** NB1 was one unguarded fail-open normalizer (`ql`)
+/// sitting unnoticed among eleven `tr` sites, reachable only because a different
+/// guard happened to exit first. A human found it by reading; that is not a
+/// mechanism.
 ///
-/// So: enumerate every `… | tr …` assignment in both generated shims and require
-/// each one either to be guarded within a few lines, or to be named in
-/// `UNGUARDED_TR_SITES` with its reason. A new normalizer added later fails here
-/// until someone makes that choice explicitly. This is squarely in scope for a PR
-/// whose thesis is that an unnormalized value must never reach a gate pattern.
+/// So: enumerate every `VAR=$(… | tr …)` in both generated shims and require each
+/// to be guarded within a few lines, or named in `UNGUARDED_TR_SITES` with its
+/// reason. Three properties make the pin itself trustworthy, each added because
+/// the previous cut quietly lacked it:
+///
+/// 1. **Exemptions are keyed by site, not by name** (NBa) — see the list above.
+/// 2. **The site count is asserted exactly** (NBb). `sites >= 1` only caught the
+///    scan dying completely. An exact count also catches the scan going
+///    half-blind: a site written `|tr` with no space, or split across two lines,
+///    drops out of the count and reddens here instead of silently ceasing to be
+///    checked. It equally catches a site ADDED without a decision.
+/// 3. **The pipe match tolerates whitespace** — `| tr`, `|tr`, `|  tr` all count,
+///    so property 2 is a tripwire for a genuinely new shape rather than for
+///    formatting.
 #[test]
 fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
-    let paths = ShimPaths { utils_dir: Some("/c/git/usr/bin".into()), git_dir: Some("/c/git/cmd".into()) };
-    for (name, script) in [
-        ("gh", gh_shim_sh("C:/gh.exe", &paths)),
-        ("git", git_shim_sh("C:/git.exe", &paths)),
-    ] {
+    let paths =
+        ShimPaths { utils_dir: Some("/c/git/usr/bin".into()), git_dir: Some("/c/git/cmd".into()) };
+    // The expected counts are part of the contract, not a snapshot: changing one
+    // is how you record "I added/removed a normalizer on purpose".
+    let shims = [
+        ("gh", gh_shim_sh("C:/gh.exe", &paths), 11usize),
+        ("git", git_shim_sh("C:/git.exe", &paths), 1usize),
+    ];
+    let mut all_sites: Vec<(String, String)> = Vec::new();
+    for (name, script, expected) in &shims {
         let lines: Vec<&str> = script.lines().collect();
         let mut sites = 0usize;
         for (i, line) in lines.iter().enumerate() {
-            // A normalization is `VAR=$( … | tr … )`. Require the assignment
-            // shape, not the word — and skip comments, because the preamble's own
-            // prose quotes `x=$(printf … | tr …)` when explaining the bug and
-            // would otherwise be reported as an unguarded site.
-            if !line.contains("| tr ") || line.trim_start().starts_with('#') {
+            // Whitespace-insensitive pipe match, and skip comments: the preamble
+            // quotes `x=$(printf … | tr …)` while explaining the bug and would
+            // otherwise be reported as an unguarded site.
+            let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+            if !squashed.contains("|tr") || line.trim_start().starts_with('#') {
                 continue;
             }
             let Some(eq) = line.find("=$(") else { continue };
@@ -14363,7 +14392,7 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
                 .chars()
                 .rev()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect::<Vec<_>>()
+                .collect::<Vec<char>>()
                 .into_iter()
                 .rev()
                 .collect();
@@ -14371,31 +14400,40 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
                 continue;
             }
             sites += 1;
-            // Guarded if a guard naming this variable follows within 3 lines —
-            // `path_low`'s guard sits two below it, after `ref_low`.
+            all_sites.push((var.clone(), (*line).to_string()));
+            // `path_low`'s guard sits two lines below it, after `ref_low`.
             let guarded = lines[i..(i + 4).min(lines.len())]
                 .iter()
                 .any(|l| l.contains("loomux_norm_guard") && l.contains(&format!("\"${var}\"")));
-            let exempt = UNGUARDED_TR_SITES.iter().any(|(v, _)| *v == var);
+            let exempt = UNGUARDED_TR_SITES
+                .iter()
+                .any(|(v, ctx, _)| *v == var.as_str() && line.contains(*ctx));
             assert!(
                 guarded || exempt,
-                "{name} shim line {}: `{var}` is normalized through `tr` but neither guarded by \
-                 loomux_norm_guard nor listed in UNGUARDED_TR_SITES with a reason. An unguarded \
-                 normalizer returns EMPTY when the tool fails, and empty matches no gate pattern \
-                 — that is #509. Guard it, or add it with the reason its emptiness is safe.\n  {}",
+                "{name} shim line {}: `{var}` is normalized through `tr` but is neither guarded                  by loomux_norm_guard nor listed in UNGUARDED_TR_SITES with a reason. An                  unguarded normalizer returns EMPTY when the tool fails, and empty matches no                  gate pattern — that is #509. Guard it, or add it WITH a context substring                  identifying this site and the reason its emptiness is safe.
+  {}",
                 i + 1,
                 line.trim()
             );
         }
-        assert!(sites >= 1, "{name} shim: found no `| tr` sites at all — the scan has stopped working");
+        assert_eq!(
+            sites, *expected,
+            "{name} shim: expected {expected} `| tr` sites, scanned {sites}. If you added or              removed a normalizer, update the count deliberately. If you did not, the SCAN has              gone blind to one — check for an assignment split across lines, which this              line-shaped scan cannot see, and which would otherwise stop being checked silently."
+        );
     }
-    // The exemption list must not outlive the sites it exempts, or it silently
-    // becomes a blanket permission for a variable name someone reuses later.
-    let both = format!("{}{}", gh_shim_sh("C:/gh.exe", &paths), git_shim_sh("C:/git.exe", &paths));
-    for (var, _) in UNGUARDED_TR_SITES {
-        assert!(both.lines().any(|l| l.contains("| tr ") && l.contains(&format!("{var}=$("))),
-            "UNGUARDED_TR_SITES names `{var}`, which is no longer a `| tr` site in either shim — \
-             remove the exemption rather than leaving it to cover something else later");
+    // NBa: every exemption must identify EXACTLY ONE real site. Zero means the
+    // entry is stale and would sit there waiting to cover an unrelated future
+    // site; more than one means the context is not specific enough to be an
+    // identity, which is the blanket-permission failure in a different dress.
+    for (var, ctx, _) in UNGUARDED_TR_SITES {
+        let n = all_sites
+            .iter()
+            .filter(|(v, l)| v.as_str() == *var && l.contains(*ctx))
+            .count();
+        assert_eq!(
+            n, 1,
+            "UNGUARDED_TR_SITES entry ({var:?}, {ctx:?}) matches {n} `| tr` sites; it must match              exactly one. Zero: the site is gone — delete the exemption rather than leaving it              to cover something else later. More than one: the context is a pattern, not a site              identity, and is exempting more than it names."
+        );
     }
 }
 
