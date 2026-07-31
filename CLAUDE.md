@@ -20,24 +20,26 @@ designs live in `doc/design/`.
 There is no lint/format gate (no eslint/prettier; rustfmt is not enforced in
 CI) — match the surrounding style instead of reformatting.
 
-### Agent workers: quick local iteration vs. full CI validation
+### Agent workers: NO local Rust builds — CI is the only build/test path
 
-The Commands table above is for humans. For agent workers, the line is scope
-and duration, not a blanket ban: a hard-kill from every worker running
-`cargo build` at once (#320) was answered first with an interim hard ban on
-any local build/test; a per-class concurrency guard was then tried
-(#318/#322) but shelved (its shim couldn't reliably intercept every
-invocation path). What replaces both: quick local iteration — a single-file
-test, an incremental `cargo check`, a quick build to sanity-check a change —
-is fine, always capped at `-j 4`; anything bigger — **including a full
-`cargo test --test <target>` run of even one target** — goes to CI, which
-remains the sole authority for the CI gate. Local full-target "one last
-run before pushing" is specifically the pattern to avoid: it duplicates
-CI's proof while inflating the worktree's `target/` by 5-8 GB, and
-parallel workers doing it exhausted the workspace drive twice on
-2026-07-30 (#488). See the `ci-validate` skill for the full decision rule,
-the `-j 4` local-cap details, the disk rationale, and the draft-PR-early
-CI flow.
+The Commands table above is for humans. For agent workers, **local
+`cargo` builds and tests of ANY size are banned entirely** — no `cargo
+build`, no `cargo check`, no single-test `-j 4` iteration, nothing that
+invokes `rustc`. This is a human hard directive (2026-07-30, third
+disk-exhaustion incident): the scope-based carve-out that permitted
+"quick local iteration" still cost 5-8 GB of `target/` per worktree for
+the first compile of the dependency tree, and a six-worker fleet filled
+the drive and crashed loomux even with every worker obeying the
+single-test rule (#488 lineage; supersedes the #320 interim ban and the
+scope/duration rule that replaced it).
+
+How workers validate instead: push early, open a draft PR immediately,
+and read CI (`ci-validate` skill's draft-PR-early flow). Iterate by
+reasoning + pushing; CI is both the proof and the compiler.
+Frontend-only commands that never invoke `rustc` (`npm run build`/`tsc`,
+`npm test`/`node --test`) remain fine locally. The one `cargo` exception:
+`cargo update --workspace` for release lockfile bumps — dependency
+resolution only, never compiles.
 
 ## Hard constraints — check before coding
 
