@@ -23615,7 +23615,7 @@ impl OrchRegistry {
             // staging under a fresh id — so until then BOTH views report it
             // and `queue::merge_orphans` dedupes them.
             for e in &split.replayable {
-                self.audit(group, "loomux", "queue-recovered", json!({
+                self.audit(group, "loomux", "delivery-recovered", json!({
                     "to": e.delivery.agent_id, "id": e.delivery.id,
                     "queued_ms": now_ms().saturating_sub(e.delivery.enqueued_ms),
                 }));
