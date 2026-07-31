@@ -7696,6 +7696,29 @@ pub fn recorded_confirmed(last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>, 
     last_delivery.lock_safe().get(&pty_id).map(|o| o.confirmed)
 }
 
+/// Record a stranded (unconfirmed) delivery whose submit happened at an
+/// EXPLICIT time (#518, integration tests only). `record_aborted_preenter_
+/// outcome` always stamps `now_ms()`, which cannot express the one state
+/// #518's bound is about: a delivery whose submit is in the past, with a
+/// keystroke stamp after it that has since gone stale. Paired with
+/// `PtyManager::set_user_input_ms_for_test`, this lets a test place both ends
+/// of that comparison without sleeping out the ten-minute bound — and without
+/// making `DeliveryOutcome` public, which this file's own precedent
+/// (`DeliveryConfirmation`'s doc) argues against.
+#[doc(hidden)] // pub for integration tests
+pub fn record_stranded_outcome_at_for_test(
+    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    pty_id: u32,
+    delivery_from: String,
+    submit_sent_ms: u64,
+) {
+    last_delivery.lock_safe().insert(pty_id, DeliveryOutcome {
+        confirmed: false,
+        submit_sent_ms,
+        from: delivery_from,
+    });
+}
+
 /// Production bug fix (rev-42 delta, round 2): a per-agent snapshot of the
 /// most recent delivery to that agent's pane, in the shape `compact_nudge_
 /// tick`'s reinjection-confirmation resolver needs. Mirrors the private
@@ -7980,6 +8003,203 @@ pub fn confirm_state_for(source: ConfirmSource) -> DeliveryConfirmState {
 #[doc(hidden)] // pub for integration tests
 pub fn tier1_trusted(last_user_input_ms: u64, submit_sent_ms: u64) -> bool {
     last_user_input_ms <= submit_sent_ms
+}
+
+/// #518: how long the human-input block may stand on a keystroke TIMESTAMP
+/// alone — no new keystroke evidence, and no human characters outstanding in
+/// the box — before it is treated as stale. The delivery-hold sibling of
+/// #500's `DEFAULT_IDLE_TICK_INPUT_DEFER_MAX_MINUTES`, and the same principle
+/// a third time: a suppression driven by a fallible signal must be BOUNDED,
+/// because nothing else will ever clear it.
+///
+/// Ten minutes, chosen against the delivery machinery's own longest legitimate
+/// window rather than picked round: `REINJECT_CONFIRM_TIMEOUT_MS` (5 min) is
+/// already documented as "comfortably" longer than `deliver_prompt`'s entire
+/// worst-case hold chain (two `USER_QUIET_MAX_HOLD` waits plus
+/// `SUBMIT_MAX_WAIT` and the echo/retry window), so 2x that cannot elapse
+/// inside any single delivery attempt — this bound can only ever fire on a
+/// pane that has genuinely been sitting still.
+///
+/// Deliberately NOT a per-group guardrail, unlike its #500 sibling. That one
+/// is classification-BLIND by design (it caps the raw timestamp whatever
+/// produced it), so a group whose humans really do sit typing for 20 minutes
+/// has a legitimate reason to want it longer. This one releases only on
+/// POSITIVE evidence that there is nothing of the human's to clobber
+/// (`input_pending` false — see `human_input_block`), so there is no workflow
+/// for which a longer value is more correct, and a knob with no correct second
+/// setting is a knob that only ever gets set wrong.
+pub const HUMAN_INPUT_BLOCK_BOUND_MS: u64 = 10 * 60 * 1000;
+
+/// Whether the human-input block on a delivery still stands (#518).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HumanInputBlock {
+    /// No keystroke evidence at all since our own submit — `tier1_trusted`.
+    /// Nothing to block on; this is the ordinary case.
+    None,
+    /// Human keystroke evidence stands: either it is recent, or characters
+    /// the human typed are still sitting in the box. Never bounded out.
+    Blocked,
+    /// #518: the evidence is a timestamp older than `bound_ms` AND the box
+    /// holds no human-typed characters. The block is released, and — unlike
+    /// `None` — the caller knows the bound is WHY, so it can say so in the
+    /// audit instead of releasing silently.
+    BoundedOut,
+}
+
+impl HumanInputBlock {
+    /// The boolean the old inline `last_user_input_ms > submit_sent_ms`
+    /// derivations produced — "a human typed since our submit, so do not
+    /// touch this box". `BoundedOut` reads FALSE here: that is the whole
+    /// point of the bound.
+    pub fn holds(self) -> bool {
+        matches!(self, HumanInputBlock::Blocked)
+    }
+}
+
+/// The ONE derivation of "has a human typed into this pane since our own
+/// submit?" (#518). Every delivery-path consumer used to inline
+/// `ptys.last_user_input_ms(pty) > submit_sent_ms` — `tier1_trusted`'s
+/// inverse — and that expression is an unbounded LATCH: a single stamp landing
+/// after our submit pins it true for the entire life of the delivery and its
+/// late monitor (up to `LATE_MONITOR_MAX_LIFETIME`, four hours). #496 PR-A
+/// (#499) made a false stamp much rarer by gating the stamp itself on
+/// keystroke evidence, but "rarer" is not "never": that gate is a byte-shape
+/// classification over an OPEN set of terminal auto-reply shapes, and #496's
+/// own plan §7 left "which copilot emission recurs mid-session" unresolved.
+/// #518 is that residue firing — a copilot orchestrator's prompt sat
+/// unsubmitted under a badge that no longer had any live fact behind it, and
+/// only a human's physical Enter recovered the group.
+///
+/// So the latch gets an aggregate bound, and the bound releases on EVIDENCE,
+/// not merely on elapsed time:
+///
+/// - `tier1_trusted` first: with no stamp after our submit there is nothing
+///   to bound, and this returns `None` exactly as before.
+/// - **`box_pending` outranks the bound.** If the pane's occupancy counter
+///   (#111/#171, `PtyManager::input_pending`) says human-typed characters are
+///   still sitting in the box, the block NEVER times out, however stale the
+///   timestamp is. This is what keeps #510's absolute — never submit over
+///   genuine human content — absolute: the bound cannot release while there
+///   is any human content to submit over. `box_occupancy_delta`'s own doc
+///   commits to the direction that makes this sound ("deliberately biased to
+///   never UNDER-count real occupancy"), so a `false` reading here is the
+///   trustworthy one.
+/// - Only then does time matter: a timestamp older than `bound_ms`, with an
+///   empty box, is a fact about the past and not about the pane now.
+///
+/// `bound_ms == 0` disables the bound (pre-#518 behaviour) rather than making
+/// it fire instantly — a 0 that meant "always bounded out" would turn a
+/// mis-set constant into the exact clobber this guard exists to prevent.
+///
+/// Pure, and returning a three-way rather than a bool, so the release is
+/// auditable at the call sites that have a seam and directly pinnable by
+/// tests — including that `box_pending` beats the bound, which is the one
+/// property a future edit must not reorder.
+#[doc(hidden)] // pub for integration tests
+pub fn human_input_block(
+    last_user_input_ms: u64,
+    submit_sent_ms: u64,
+    box_pending: bool,
+    now_ms: u64,
+    bound_ms: u64,
+) -> HumanInputBlock {
+    if tier1_trusted(last_user_input_ms, submit_sent_ms) {
+        return HumanInputBlock::None;
+    }
+    if box_pending {
+        return HumanInputBlock::Blocked;
+    }
+    if bound_ms == 0 {
+        return HumanInputBlock::Blocked;
+    }
+    if now_ms.saturating_sub(last_user_input_ms) >= bound_ms {
+        HumanInputBlock::BoundedOut
+    } else {
+        HumanInputBlock::Blocked
+    }
+}
+
+/// Production wrapper: `human_input_block` against a live pane, with the
+/// shipped bound. A closed pty reads `last_user_input_ms` as `0`, which
+/// `tier1_trusted` already resolves to `None` before `box_pending` is
+/// consulted at all — the `unwrap_or(true)` below is the fail-safe direction
+/// for a reading we cannot take, not a case this can actually reach.
+fn human_input_block_now(
+    ptys: &crate::pty::PtyManager,
+    pty_id: u32,
+    submit_sent_ms: u64,
+) -> HumanInputBlock {
+    human_input_block(
+        ptys.last_user_input_ms(pty_id).unwrap_or(0),
+        submit_sent_ms,
+        ptys.input_pending(pty_id).unwrap_or(true),
+        now_ms(),
+        HUMAN_INPUT_BLOCK_BOUND_MS,
+    )
+}
+
+/// The audit `reason`/`release` token recorded when #518's bound — not an
+/// absence of keystroke evidence — is why a human-input block was not
+/// honoured. Its own string so a grep can tell "no human ever typed" apart
+/// from "a human typed, and we decided that fact had gone stale".
+const HUMAN_INPUT_BLOCK_BOUND_REASON: &str = "human-input-block-bound";
+
+/// What a `DeclareFailed` tick should actually DO about the pane (#522).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnconfirmedDisposition {
+    /// The pane is structurally idle — nothing of ours is sitting in the box
+    /// and nothing of the human's is either. Record it and stop; do NOT tell
+    /// the orchestrator to go re-send something that is not stuck.
+    IdleAuditOnly,
+    /// Our text is still in the box, or the reading is indeterminate. This is
+    /// the genuine strand the notice exists for — announce it unchanged.
+    Notify,
+}
+
+/// Should a late-confirmation failure raise the actionable "the prompt may be
+/// sitting unsubmitted in its pane; get_output it and re-send" notice? (#522)
+///
+/// The notice was firing on panes that were simply DONE: a worker finished its
+/// turn, went idle at the CLI's rest prompt, and the monitor — which only
+/// knows that no `PromptSubmit` hook record ever showed up — announced a
+/// strand that did not exist. Copilot has no such hook at all, and a claude
+/// pane can miss one, so "no hook record" is a weak signal on its own. The
+/// cost is not merely noise: every one of these tells the orchestrator to
+/// `get_output` the pane (the #520 token flood on an animated pane) and tempts
+/// a duplicate re-send — the double-delivery loop #451/#510 exist to prevent.
+///
+/// The disambiguation is STRUCTURAL, deliberately reusing the seams that
+/// already exist rather than inferring anything from output bytes — the same
+/// discipline #518's origin bit follows:
+/// - `box_holds_paste` — is OUR pasted text still identifiably at the box's
+///   tail end? That, and only that, is what "sitting unsubmitted" means.
+/// - `box_pending` — `PtyManager::input_pending`, whether any human-typed
+///   characters are outstanding. A box with a person's half-written line in it
+///   is not an idle pane, and the human still needs to hear about it.
+///
+/// "CLI at rest / turn complete" is the third condition #522 names, and it is
+/// already a PRECONDITION of ever reaching this decision rather than an input
+/// here: `late_monitor_tick` returns `DeclareFailed` only when
+/// `quiet_long_enough` (no `output_total` growth for `PENDING_IDLE_QUIET`) and
+/// no question is on screen. A pane mid-turn keeps `output_total` creeping —
+/// spinner and statusline frames included (#480) — so it never gets this far.
+/// Taking it as an input anyway would let a caller pass `true` for a pane that
+/// is demonstrably busy, inventing a state the surrounding code cannot
+/// produce.
+///
+/// Note what this does NOT do: it does not mark the delivery confirmed. An
+/// idle-pane reading is good enough to withhold an alarm, not to assert
+/// something landed, and leaving the ledger `unconfirmed` keeps every
+/// downstream behaviour exactly as it was — including the next delivery's
+/// stranded flush, whose own doc already blesses this residual ("A false
+/// 'unconfirmed' here is safe: the flush Enter lands on an already empty box
+/// and is a no-op").
+#[doc(hidden)] // pub for integration tests
+pub fn unconfirmed_disposition(box_holds_paste: bool, box_pending: bool) -> UnconfirmedDisposition {
+    if box_holds_paste || box_pending {
+        return UnconfirmedDisposition::Notify;
+    }
+    UnconfirmedDisposition::IdleAuditOnly
 }
 
 /// #112 round 3 (rev-20 B2 + B3): the ONE decision point for whether Tier
@@ -8871,8 +9091,17 @@ fn run_late_confirmation_monitor(
                         // marker is already queued and this is purely about
                         // what the chip SAYS, never about pressing again.
                         let live = stranded_selfheal_action(
+                            // #454/#519: the atomic `LedgerView`, not a
+                            // re-read of `recorded` — this arm must judge
+                            // outstanding-ness from the same snapshot the
+                            // supersession check used.
                             ledger.outstanding,
-                            !tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms),
+                            // #518: bounded (see `human_input_block`). This is
+                            // the tick that RE-ASSERTED the stale badge every
+                            // poll for up to `LATE_MONITOR_MAX_LIFETIME`, which
+                            // is what made the false hold indefinite rather
+                            // than merely wrong.
+                            human_input_block_now(&ptys, pty_id, submit_sent_ms).holds(),
                             showing_question,
                             still_holds,
                             STRANDED_SELFHEAL_MAX_HEALS,
@@ -8912,6 +9141,38 @@ fn run_late_confirmation_monitor(
             }
             MonitorAction::DeclareFailed => {
                 failed = true;
+                // #496 PR-C: ACT on the failure instead of only announcing
+                // it — the announcement is suppressed entirely for an
+                // orchestrator target, which is exactly the case that
+                // wedged. Tier 1's own two signals decide whether a
+                // re-submit is safe: is our text still identifiably in the
+                // box (`box_holds_paste`), and has the box stayed ours
+                // since we pressed Enter (`tier1_trusted`)?
+                //
+                // #522 moved this reading ABOVE the notice it used to sit
+                // below: the same fact that decides whether a re-submit is
+                // safe also decides whether there is anything to announce,
+                // and announcing first meant announcing before looking.
+                let holds_paste = ptys
+                    .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
+                    .map(|b| strip_ansi(&b))
+                    .map(|t| box_holds_paste(&t, &pasted_text))
+                    .unwrap_or(false);
+                // #522: a pane that is simply DONE — our text consumed, no
+                // human characters outstanding, and (by `late_monitor_tick`'s
+                // own precondition for reaching this arm) the CLI at rest —
+                // is not a strand. Record it and stop, rather than telling the
+                // orchestrator to `get_output` and re-send a prompt that is
+                // not stuck. See `unconfirmed_disposition`.
+                if unconfirmed_disposition(holds_paste, ptys.input_pending(pty_id).unwrap_or(true))
+                    == UnconfirmedDisposition::IdleAuditOnly
+                {
+                    append_audit(&root, &group, "loomux", "delivery-unconfirmed-idle-pane", json!({
+                        "to": agent, "confirm_source": "idle", "confirm_state": "unconfirmed",
+                        "reason": "pane idle — box holds neither our paste nor human input",
+                    }));
+                    return; // nothing stranded and nothing to observe further
+                }
                 // Own action name, deliberately distinct from the hook-match
                 // branch above ("delivery-confirmed-late" is that branch's
                 // SUCCESS action) — this one declares a FAILURE, and the
@@ -8927,20 +9188,21 @@ fn run_late_confirmation_monitor(
                 if let Some(r) = &reg {
                     r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
                 }
-                // #496 PR-C: ACT on the failure instead of only announcing
-                // it — the announcement is suppressed entirely for an
-                // orchestrator target, which is exactly the case that
-                // wedged. Tier 1's own two signals decide whether a
-                // re-submit is safe: is our text still identifiably in the
-                // box (`box_holds_paste`), and has the box stayed ours
-                // since we pressed Enter (`tier1_trusted`)?
-                let holds_paste = ptys
-                    .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
-                    .map(|b| strip_ansi(&b))
-                    .map(|t| box_holds_paste(&t, &pasted_text))
-                    .unwrap_or(false);
-                let human_typed_since =
-                    !tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms);
+                // #518: bounded (see `human_input_block`). Once this releases,
+                // precedence carries the decision straight into the EXISTING
+                // `box_holds_paste` arm below — which is already exactly
+                // "deliver if the box is unchanged": our own text still at the
+                // tail means there is nothing of the human's there to merge
+                // with, and anything else still lands on a badge
+                // (`NotHolding`), never on a blind Enter.
+                let human_block = human_input_block_now(&ptys, pty_id, submit_sent_ms);
+                if human_block == HumanInputBlock::BoundedOut {
+                    append_audit(&root, &group, "loomux", "human-input-block-released", json!({
+                        "to": agent, "stage": "stranded", "reason": HUMAN_INPUT_BLOCK_BOUND_REASON,
+                        "bound_ms": HUMAN_INPUT_BLOCK_BOUND_MS, "box_holds_paste": holds_paste,
+                    }));
+                }
+                let human_typed_since = human_block.holds();
                 paste_seen_in_box = holds_paste;
                 let action = stranded_selfheal_action(
                     ledger.outstanding,
@@ -9226,11 +9488,22 @@ fn deliver_now(
     // checkpoint immediately below is the one that actually holds,
     // aborts, and notifies.
     let prev = last_delivery.lock_safe().get(&pty_id).cloned();
-    let human_typed_since = prev
+    // #518: the ONE derivation (`human_input_block`), not an inline
+    // timestamp compare — see its doc for why the old expression was an
+    // unbounded latch. `BoundedOut` is audited rather than released
+    // silently: "loomux pressed Enter into a pane a human had touched" is
+    // exactly the decision a reader of the log must be able to find.
+    let human_block = prev
         .as_ref()
-        .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
-        .unwrap_or(false);
-    if flush_stranded_text(&ptys, pty_id, prev.as_ref().map(|o| o.confirmed), human_typed_since, submit) {
+        .map(|o| human_input_block_now(&ptys, pty_id, o.submit_sent_ms))
+        .unwrap_or(HumanInputBlock::None);
+    if human_block == HumanInputBlock::BoundedOut {
+        append_audit(&root, &group, "loomux", "human-input-block-released", json!({
+            "to": agent, "stage": "pre-paste", "reason": HUMAN_INPUT_BLOCK_BOUND_REASON,
+            "bound_ms": HUMAN_INPUT_BLOCK_BOUND_MS,
+        }));
+    }
+    if flush_stranded_text(&ptys, pty_id, prev.as_ref().map(|o| o.confirmed), human_block.holds(), submit) {
         append_audit(&root, &group, "loomux", "delivery-flush",
             json!({ "to": agent, "reason": "previous delivery unconfirmed" }));
         std::thread::sleep(FLUSH_SETTLE);
@@ -9669,7 +9942,13 @@ fn deliver_now(
             // spend up to `QUESTION_HOLD_MAX` finding that out; `retry_
             // gate` (rev-19 N9) only ever sees the question outcome,
             // since this check has already fully handled its own case.
-            if ptys.last_user_input_ms(pty_id).unwrap_or(0) > submit_sent_ms {
+            // #518: the same single derivation as every other consumer. Inside
+            // this retry window the bound can never have elapsed (see
+            // `HUMAN_INPUT_BLOCK_BOUND_MS`'s doc — it is 2x the delivery
+            // machinery's own longest legitimate window), so this call is
+            // behaviour-identical to the inline compare it replaces; it is
+            // here so no consumer is left deriving the latch its own way.
+            if human_input_block_now(&ptys, pty_id, submit_sent_ms).holds() {
                 append_audit(&root, &group, "loomux", "submit-retries-skipped",
                     json!({ "to": agent, "reason": "human typing in pane" }));
                 // #112 round 3 (rev-20 B2): a human mid-line means
@@ -9894,9 +10173,17 @@ pub fn drain_stranded_submit(
 ) -> bool {
     let prev = last_delivery.lock_safe().get(&pty_id).cloned();
     let prev_confirmed = prev.as_ref().map(|o| o.confirmed);
+    // #518: the SAME derivation the self-heal's trigger used
+    // (`human_input_block`), not a second opinion. rev-47 NB1 is the failure
+    // this avoids: a marker admitted on one rule and pressed under another
+    // never fires, and the badge quietly goes on claiming loomux is handling
+    // a re-send it will decline forever. Deliberately unaudited here — this
+    // path has no `root`/`group` seam, and the decision it re-derives was
+    // already recorded (`human-input-block-released`, stage `stranded`) at the
+    // trigger that admitted this marker.
     let human_typed_since = prev
         .as_ref()
-        .map(|o| ptys.last_user_input_ms(pty_id).unwrap_or(0) > o.submit_sent_ms)
+        .map(|o| human_input_block_now(ptys, pty_id, o.submit_sent_ms).holds())
         .unwrap_or(false);
     let flushed = flush_stranded_text(ptys, pty_id, prev_confirmed, human_typed_since, submit);
     if flushed {
