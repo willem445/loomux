@@ -448,7 +448,10 @@ export class TasksView {
     };
     cancel.addEventListener("click", close);
     confirm.addEventListener("click", submit);
-    // Keep keystrokes off the underlying terminal; Esc cancels, Enter confirms.
+    // Keep keystrokes off the underlying terminal; Esc cancels, Ctrl/⌘+Enter
+    // confirms — same as the single-approve dialog, and plain Enter is left
+    // inert on purpose: with one note field per row it would be ambiguous
+    // which row the human meant to finish, and the action issues real grants.
     box.addEventListener("keydown", (e) => {
       e.stopPropagation();
       if (e.key === "Escape") close();
