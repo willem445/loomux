@@ -12873,14 +12873,15 @@ impl OrchRegistry {
             // agent to say nothing the roster didn't already show. A reaper
             // mode that killed agents WITH work would be a different event
             // and must prompt — see `exit_notice_route`'s doc.
-            self.audit_demoted_exit_notice(
+            // RED-EVIDENCE BRANCH ONLY (#533): pre-#533 behaviour — the
+            // guardrail notice was delivered, costing a turn per reaped agent.
+            let _ = self.deliver_to_orchestrator(
                 &a.group,
-                &a.id,
-                Some(ExitInitiator::IdleTimeout),
                 &format!(
                     "[loomux] idle-kill guardrail: agent {} ({}) sat without a task for {mins}+ min and was terminated to contain cost. Respawn a worker when you have work for it.",
                     a.name, a.id
                 ),
+                "loomux",
             );
             let _ = self.kill_agent_as(&id, ExitInitiator::IdleTimeout);
             killed.push(id);
@@ -22503,6 +22504,9 @@ impl OrchRegistry {
             self.pop_front_dequeued(group, pty_id, id, enqueued_ms);
             return;
         }
+        // RED-EVIDENCE BRANCH ONLY (#533): pre-#533 behaviour — a drain pass
+        // closed out its FRONT entry and nothing else.
+        let batch = &batch[..1];
         let ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
         for (id, enqueued_ms) in batch {
             {
@@ -22527,8 +22531,11 @@ impl OrchRegistry {
     /// one `delivery-dropped` per entry with reason `superseded` so a
     /// dropped payload is never silent, exactly like every other drop path.
     #[doc(hidden)] // pub for integration tests
+    #[allow(unreachable_code)]
     pub fn drop_superseded(&self, group: &str, pty_id: u32, ids: &[u64]) {
-        if ids.is_empty() {
+        // RED-EVIDENCE BRANCH ONLY (#533): pre-#533 behaviour — no drop path
+        // for a superseded constituent existed at all.
+        if true || ids.is_empty() {
             return;
         }
         let removed: Vec<queue::QueuedDelivery> = {
@@ -23016,17 +23023,10 @@ impl OrchRegistry {
                 // exit, or an idle reaper that took a task-less agent,
                 // costs it nothing to learn from the roster on demand; an
                 // exit nobody in this process asked for still interrupts.
-                match exit_notice_route(a.killed_by) {
-                    ExitNoticeRoute::Prompt => {
-                        let _ = self.deliver_to_orchestrator(&a.group, &notice, "loomux");
-                    }
-                    ExitNoticeRoute::AuditOnly => self.audit_demoted_exit_notice(
-                        &a.group,
-                        &a.id,
-                        a.killed_by,
-                        &notice,
-                    ),
-                }
+                // RED-EVIDENCE BRANCH ONLY (#533): pre-#533 behaviour — every
+                // agent exit prompted the orchestrator, whoever caused it.
+                let _ = exit_notice_route(a.killed_by);
+                let _ = self.deliver_to_orchestrator(&a.group, &notice, "loomux");
             }
         }
     }
@@ -23036,6 +23036,7 @@ impl OrchRegistry {
     /// demand" is a real path and not a euphemism for "it was dropped".
     /// `list_agents` already carries the liveness half; this carries the
     /// wording, the initiator and the timestamp.
+    #[allow(dead_code)]
     fn audit_demoted_exit_notice(
         &self,
         group: &str,
