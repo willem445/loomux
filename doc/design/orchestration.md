@@ -5167,14 +5167,25 @@ a bind.
   also reported by `queue_orphans` with `text: null` — the notice is best-effort (recovery can run
   before any orchestrator pane is bound) and "never silently dropped" cannot rest on a delivery
   that is allowed not to happen.
-- **A one-entry window during re-admission** (review round 2, N4). `readmit_recovered` takes one
-  staged entry at a time and puts it back if `enqueue_text` rejects it, so at any instant every
+- **A one-entry window during re-admission** (review round 2 N4; tightened after review round 3).
+  `readmit_recovered` takes one staged entry at a time, and on **either** outcome the entry is back
+  in a durable store before the next one is taken: a successful `enqueue_text` makes it live (and
+  persists), and a rejection at the pane's cap puts it straight back into staging and rewrites the
+  snapshot immediately, rather than parking it until the loop ends. So at any instant every
   recovered payload is in staging, or live, or is the single entry in flight between them. A crash
   in that gap drops that ONE entry from the snapshot — not silently: no `delivery-recovered` was
-  written for it, so the audit derivation still reports it, payload-less. The earlier shape
-  partitioned the whole matching set out of staging up front, which widened this from one entry to
-  the entire remainder; one entry is the irreducible width, for the same reason the next bullet
-  exists — two durable stores cannot be updated in one atomic step.
+  written for it, so the audit derivation still reports it, payload-less.
+
+  Two earlier shapes were wider, and the second is worth recording because the code looked fixed
+  and the note said it was. Round 2's original shape partitioned the whole matching set out of
+  staging up front. The round-2 *fix* narrowed the success path but left rejections parked in a
+  local vector for the rest of the loop — so a recovered backlog meeting a pane already at
+  `QUEUE_MAX_PER_PANE` (hazard 5's own case) still had every matching entry outside both stores at
+  once, while this note claimed one. Review round 3 caught the discrepancy between the note and the
+  code; the code is what changed. One entry is the irreducible width, for the same reason the next
+  bullet exists — two durable stores cannot be updated in one atomic step. The cost of holding it
+  there is one extra snapshot write per rejection, on a path that only runs when a full pane meets
+  a recovered backlog.
 - **One double-delivery window remains.** A crash between the drainer's pop and the snapshot rewrite
   replays an entry that already landed. It is bounded — by the queue's existing byte-identical
   coalesce, which collapses the replay into whatever is queued, and by `pop_front_dequeued`
