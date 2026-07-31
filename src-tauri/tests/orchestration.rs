@@ -30,7 +30,8 @@ use loomux_lib::orchestration::{
     auto_compact_banner_detected, compact_nudge_poll_interval, compaction_confirmed, copilot_compaction_marker_detected, directive_ledger_embed, ledger_capped,
     human_typed_compact_detected, copilot_autopilot_prompt_detected, create_orchestration_group,
     delivery_held_cleared_event, delivery_held_detail, delivery_held_event,
-    exit_cause, exit_diagnostic, resolve_output_text, format_output_tail, OUTPUT_TAIL_MAX_BYTES,
+    exit_cause, exit_diagnostic, exit_notice_route, ExitInitiator, ExitNoticeRoute,
+    resolve_output_text, format_output_tail, OUTPUT_TAIL_MAX_BYTES,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_cmd, gh_shim_sh, git_shim_cmd, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
@@ -1315,6 +1316,313 @@ fn pop_front_dequeued_removes_only_a_matching_front_id_and_audits_queued_ms() {
         .find(|e| e.action == "delivery-dequeued" && e.detail["id"] == json!(first_id))
         .expect("a real pop must be audited");
     assert!(dequeued.detail["queued_ms"].as_u64().is_some(), "must record how long it waited");
+}
+
+// ---------------------------------------------------------------------------
+// #533-A — coalesced queue flush: the registry half (the pure planning half
+// lives in `queue.rs`'s own unit tests). `run_queue_drainer` itself still
+// cannot be exercised here for the reasons the block comment above gives —
+// what IS driven below is the exact registry seam the drainer calls once its
+// plan is made, which is where a coalesced flush's bookkeeping can actually
+// go wrong.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_coalesced_flush_closes_out_every_constituent_on_the_one_submit() {
+    // #451 three-state confirmation is per-PANE (`last_delivery` keyed by
+    // pty), so one combined paste yields ONE outcome — and that outcome is
+    // the outcome of every constituent it carried. Leaving any of them
+    // queued would replay text the pane already received.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 141u32;
+
+    for t in ["here is the context", "now do the task", "one correction"] {
+        reg.enqueue_text(&g.id, &w.id, "orch", t, pty, queue::EnqueueReason::BehindQueue).unwrap();
+    }
+    let batch: Vec<(u64, u64)> =
+        reg.queue_snapshot(pty).iter().map(|e| (e.id, e.enqueued_ms)).collect();
+    assert_eq!(batch.len(), 3);
+
+    reg.pop_batch_dequeued(&g.id, pty, &batch);
+
+    assert_eq!(reg.queue_depth(pty), 0, "one submit must close out ALL of its constituents");
+    let dequeued: Vec<_> = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-dequeued")
+        .collect();
+    assert_eq!(dequeued.len(), 3, "each payload's own id must still close out individually");
+    for e in &dequeued {
+        assert_eq!(e.detail["combined"], json!(3), "each line names the batch it went out in: {:?}", e.detail);
+        assert_eq!(
+            e.detail["combined_ids"].as_array().map(|a| a.len()),
+            Some(3),
+            "a later reader must be able to tell one paste from three: {:?}",
+            e.detail
+        );
+    }
+}
+
+#[test]
+fn a_single_entry_flush_audits_exactly_as_it_did_before_coalescing_existed() {
+    // The uncontended case must be untouched: no batch fields, no claim
+    // that anything was combined, because nothing was.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 142u32;
+
+    reg.enqueue_text(&g.id, &w.id, "orch", "alone", pty, queue::EnqueueReason::Arrival).unwrap();
+    let e = reg.queue_snapshot(pty)[0].clone();
+    reg.pop_batch_dequeued(&g.id, pty, &[(e.id, e.enqueued_ms)]);
+
+    let line = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|a| a.action == "delivery-dequeued")
+        .expect("the pop must still be audited");
+    assert!(line.detail["combined"].is_null(), "a lone delivery was not combined with anything: {:?}", line.detail);
+    assert!(line.detail["combined_ids"].is_null(), "{:?}", line.detail);
+    assert_eq!(reg.queue_depth(pty), 0);
+}
+
+#[test]
+fn drop_superseded_removes_by_id_anywhere_in_the_queue_and_audits_each() {
+    // Superseded constituents must leave the queue BEFORE anything is
+    // combined — and never silently: a dropped payload is audited on every
+    // other drop path, and this one is no different.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 143u32;
+
+    for t in ["first", "second", "third"] {
+        reg.enqueue_text(&g.id, &w.id, "orch", t, pty, queue::EnqueueReason::BehindQueue).unwrap();
+    }
+    let middle = reg.queue_snapshot(pty)[1].id;
+    reg.drop_superseded(&g.id, pty, &[middle]);
+
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap.len(), 2, "only the superseded entry leaves");
+    assert_eq!(snap[0].payload.text(), Some("first"), "surviving order is unchanged");
+    assert_eq!(snap[1].payload.text(), Some("third"), "surviving order is unchanged");
+
+    let dropped = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-dropped" && e.detail["id"] == json!(middle))
+        .expect("a superseded drop must never be silent");
+    assert_eq!(dropped.detail["reason"], json!("superseded"));
+}
+
+#[test]
+fn drop_superseded_is_a_noop_when_nothing_is_superseded() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 144u32;
+    reg.enqueue_text(&g.id, &w.id, "orch", "only", pty, queue::EnqueueReason::Arrival).unwrap();
+
+    reg.drop_superseded(&g.id, pty, &[]);
+    assert_eq!(reg.queue_depth(pty), 1);
+    assert!(
+        !reg.audit_log(&g.id).iter().any(|e| e.detail["reason"] == json!("superseded")),
+        "an empty supersession list must not manufacture an audit line"
+    );
+}
+
+#[test]
+fn the_planner_and_the_registry_agree_on_what_one_flush_takes() {
+    // The seam itself: what `queue::plan_flush` says goes out is exactly
+    // what the registry then closes out. Pinned together because a drift
+    // between them is silent — the queue would simply keep an entry the
+    // paste already carried, and replay it.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 145u32;
+
+    for t in ["a", "b", "c"] {
+        reg.enqueue_text(&g.id, &w.id, "orch", t, pty, queue::EnqueueReason::BehindQueue).unwrap();
+    }
+    let snap = reg.queue_snapshot(pty);
+    let plan = queue::plan_flush(&snap, queue::QUEUE_FLUSH_MAX_BYTES);
+    assert_eq!(plan.batch.len(), 3, "the whole flushable backlog goes in one pass");
+
+    reg.drop_superseded(&g.id, pty, &plan.superseded);
+    let batch: Vec<(u64, u64)> = plan
+        .batch
+        .iter()
+        .filter_map(|id| snap.iter().find(|e| e.id == *id).map(|e| (e.id, e.enqueued_ms)))
+        .collect();
+    reg.pop_batch_dequeued(&g.id, pty, &batch);
+    assert_eq!(reg.queue_depth(pty), 0, "nothing the paste carried may stay queued");
+}
+
+// ---------------------------------------------------------------------------
+// #533-B — kill-exit notices: audit-only for an exit the orchestrator (or the
+// idle reaper) initiated, still a prompt for one nobody asked for.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn exit_notice_route_demotes_only_a_recorded_initiator() {
+    assert_eq!(exit_notice_route(Some(ExitInitiator::Orchestrator)), ExitNoticeRoute::AuditOnly);
+    assert_eq!(exit_notice_route(Some(ExitInitiator::IdleTimeout)), ExitNoticeRoute::AuditOnly);
+    // A crash, a watchdog-driven death, an agent quitting on its own, a
+    // human closing the pane — nobody in this process asked for it, so it
+    // is still worth interrupting the orchestrator for.
+    assert_eq!(exit_notice_route(None), ExitNoticeRoute::Prompt);
+}
+
+#[test]
+fn record_exit_initiator_is_first_writer_wins() {
+    // Whoever actually caused the exit got there first; a second stamp
+    // would rewrite history rather than record it.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    assert_eq!(reg.exit_initiator(&w.id), None, "a live agent has no initiator");
+    reg.record_exit_initiator(&w.id, ExitInitiator::IdleTimeout);
+    reg.record_exit_initiator(&w.id, ExitInitiator::Orchestrator);
+    assert_eq!(reg.exit_initiator(&w.id), Some(ExitInitiator::IdleTimeout));
+}
+
+#[test]
+fn an_orchestrator_initiated_kill_exit_is_audited_not_prompted() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 950);
+    reg.set_pty_for_test(&w.id, 951);
+
+    // The orchestrator asked for this exit (what `kill_agent` records).
+    reg.record_exit_initiator(&w.id, ExitInitiator::Orchestrator);
+    reg.on_pty_exit(951, Some(0), "", 0, true);
+
+    let log = reg.audit_log(&g.id);
+    let demoted = log
+        .iter()
+        .find(|e| e.action == "agent-exit-notice")
+        .expect("the notice must still be recorded, just not delivered");
+    assert_eq!(demoted.detail["routed"], json!("audit-only"));
+    assert_eq!(demoted.detail["initiator"], json!("orchestrator"));
+    assert!(
+        demoted.detail["notice"].as_str().unwrap_or_default().contains("exited"),
+        "the full notice text must be readable on demand: {:?}",
+        demoted.detail
+    );
+    assert!(
+        !log.iter().any(|e| e.action == "prompt"
+            && e.detail["text"].as_str().unwrap_or_default().contains("exited")),
+        "an exit the orchestrator itself initiated must not cost it a turn"
+    );
+}
+
+#[test]
+fn an_exit_nobody_initiated_still_prompts_the_orchestrator() {
+    // The polarity that must survive #533: a crash, a watchdog kill, or an
+    // unexpected death of a working agent is exactly what the orchestrator
+    // cannot reconstruct on its own.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 960);
+    reg.set_pty_for_test(&w.id, 961);
+
+    assert_eq!(reg.exit_initiator(&w.id), None, "nothing in this process asked for this exit");
+    reg.on_pty_exit(961, Some(1), "thread 'main' panicked", 4_096, false);
+
+    let log = reg.audit_log(&g.id);
+    assert!(
+        log.iter().any(|e| e.action == "prompt"
+            && e.detail["to"] == json!(orch.id)
+            && e.detail["text"].as_str().unwrap_or_default().contains("exited")),
+        "an uninitiated exit must still be delivered: {:?}",
+        log.iter().map(|e| e.action.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        !log.iter().any(|e| e.action == "agent-exit-notice"),
+        "it was prompted, so there is no demoted record to write"
+    );
+}
+
+#[test]
+fn an_expected_pane_close_with_no_recorded_initiator_still_prompts() {
+    // The mutation that proves the routing reads the RECORDED initiator and
+    // not `expected`: this exit arrives with `expected: true` (loomux closed
+    // the pane — a human closing it, or `end_group`'s teardown, looks
+    // exactly like `kill_agent` at the pty layer) but nobody recorded an
+    // initiator, so it must still prompt. Routing on `expected` would demote
+    // it, which is precisely the misrouting #533-B's recorded state exists
+    // to prevent.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 970);
+    reg.set_pty_for_test(&w.id, 971);
+
+    reg.on_pty_exit(971, Some(0), "", 0, true);
+
+    let log = reg.audit_log(&g.id);
+    assert!(
+        log.iter().any(|e| e.action == "prompt"
+            && e.detail["text"].as_str().unwrap_or_default().contains("exited")),
+        "`expected` alone must never demote a notice"
+    );
+    assert!(!log.iter().any(|e| e.action == "agent-exit-notice"));
+}
+
+#[test]
+fn the_idle_reaper_routes_both_of_its_notices_to_the_audit() {
+    // Both notices an idle kill used to produce — the guardrail's own
+    // "respawn a worker" line and the exit notice that follows — are
+    // audit-only now. The reaper only ever takes IDLE agents, so the whole
+    // event is "a slot you weren't using was reclaimed", which
+    // `list_agents` answers on demand.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", costed_rails(5, 0)).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let idle = reg.spawn_agent(&g.id, Role::Worker, "idle", "", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 980);
+    reg.set_pty_for_test(&idle.id, 981);
+
+    let killed = reg.reap_idle_agents(u64::MAX / 2);
+    assert_eq!(killed, vec![idle.id.clone()], "the idle worker is still reaped");
+
+    let log = reg.audit_log(&g.id);
+    let demoted = log
+        .iter()
+        .find(|e| e.action == "agent-exit-notice" && e.detail["initiator"] == json!("idle-timeout"))
+        .expect("the guardrail notice must be recorded where it can be read on demand");
+    assert!(
+        demoted.detail["notice"].as_str().unwrap_or_default().contains("idle-kill guardrail"),
+        "the full wording must survive the demotion: {:?}",
+        demoted.detail
+    );
+    assert!(
+        !log.iter().any(|e| e.action == "prompt"
+            && e.detail["text"].as_str().unwrap_or_default().contains("idle-kill guardrail")),
+        "an idle kill must not cost the orchestrator a turn"
+    );
+    assert!(
+        log.iter().any(|e| e.action == "idle-kill"),
+        "the kill itself is audited exactly as before"
+    );
+    // Residual, stated rather than glossed: the reaper's own
+    // `kill_agent_as(.., IdleTimeout)` call cannot complete in test mode
+    // (`kill_agent_as` needs an `AppHandle` to reach `PtyManager`, and there
+    // is none here — the same boundary every pty-bound path in this file
+    // has), so the INITIATOR RECORDING on that path is not pinned here.
+    // `record_exit_initiator_is_first_writer_wins` covers the recorder
+    // itself and `an_orchestrator_initiated_kill_exit_is_audited_not_
+    // prompted` covers what a recorded initiator does to routing; the one
+    // untested link is the literal call between them.
 }
 
 #[test]

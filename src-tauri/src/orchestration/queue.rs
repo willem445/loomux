@@ -273,6 +273,238 @@ pub fn flush_header_text(count: usize, coalesced: usize) -> String {
     }
 }
 
+/// Byte budget for ONE coalesced flush paste (#533-A). A backlog bigger
+/// than this splits into consecutive flushes rather than one megaprompt:
+/// a paste is echoed back by the CLI and re-read by the agent, so an
+/// unbounded combined payload trades the turn cost this feature saves for
+/// a context cost that is strictly worse. 24 KiB is ~6k tokens — comfortably
+/// several task briefs, well under any agent's context budget, and not a
+/// measured traffic figure. The cap is a CEILING, never a floor: a single
+/// constituent larger than it still delivers alone (see `plan_flush`), so
+/// nothing is ever stuck behind its own size.
+pub const QUEUE_FLUSH_MAX_BYTES: usize = 24 * 1024;
+
+/// Per-constituent overhead `plan_flush` charges against
+/// `QUEUE_FLUSH_MAX_BYTES` for the itemization banner
+/// `coalesced_flush_text` will emit around each entry. Approximate on
+/// purpose: the cap exists to bound a paste, and paying a fixed ~120 bytes
+/// per item keeps the budget arithmetic pure (no rendering pass inside the
+/// planner) while staying on the conservative side of the real banner.
+const FLUSH_ITEM_OVERHEAD: usize = 120;
+
+/// One constituent of a coalesced flush, as the header itemizes it — the
+/// attribution that must survive N deliveries becoming one paste (#533-A).
+/// Borrowed from the live `QueuedDelivery`s, never a copy of the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlushConstituent<'a> {
+    pub id: u64,
+    /// `deliver_prompt`'s own `from` — the origin this delivery would have
+    /// been attributed to had it delivered alone.
+    pub from: &'a str,
+    pub enqueued_ms: u64,
+    /// Byte-identical repeats folded in at admission (`AdmitDecision::
+    /// Coalesce`) — reported per constituent, not just as a queue total, so
+    /// the reader can tell WHICH ask was repeated.
+    pub coalesced: u32,
+    pub text: &'a str,
+}
+
+/// What one drain pass should submit (#533-A). Pure decision over the
+/// pane's queue as it stands AT DRAIN TIME — nothing here waits for, or
+/// holds back, anything: a lone live delivery yields a one-entry `batch`
+/// and pastes exactly as it did pre-#533.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlushPlan {
+    /// Constituents that drop OUT before coalescing, oldest first — see
+    /// `superseded_ids` for what makes an entry superseded. The impure
+    /// caller removes and audits these; they are never merged into `batch`.
+    pub superseded: Vec<u64>,
+    /// The entries this pass submits TOGETHER as one prompt, oldest first.
+    /// Always at least one entry when anything is queued at all.
+    pub batch: Vec<u64>,
+    /// True when `batch` is the single `StrandedSubmit` marker at the front:
+    /// press Enter via the stranded flush, never paste. A marker can never
+    /// be merged with text (its payload is already sitting in the box), so
+    /// it is always a batch of exactly one.
+    pub stranded: bool,
+    /// Entries still queued after this batch — the chunking signal. Non-zero
+    /// only when the byte cap split the backlog or a marker terminated it.
+    pub remaining: usize,
+}
+
+/// Ids that must drop OUT before coalescing (#533-A) — the drain-time
+/// byte-identical re-check.
+///
+/// **Scoped to what can actually be observed, deliberately.** #454's own
+/// supersession is per-PANE ledger state (`last_delivery`'s
+/// `submit_sent_ms`), which an entry that has never been pasted cannot
+/// carry, so there is no per-entry supersession field to read here. What
+/// there IS: `admit`'s byte-identical coalesce, which runs at ADMISSION
+/// under the `queues` lock and is what normally guarantees two identical
+/// `Text` entries never coexist. This is the same rule applied a SECOND
+/// time, at drain time, over the whole batch — because coalescing changes
+/// the cost of that guarantee being wrong. Pre-#533 a duplicate that
+/// slipped past admission would deliver as its own prompt (visibly
+/// redundant, one wasted turn); merged into a combined paste it becomes the
+/// same ask stated twice INSIDE one prompt, which reads as two distinct
+/// requests. The check is cheap, and it is the last point before the merge
+/// where the queue can still tell them apart.
+///
+/// The LATER duplicate is what drops: the earlier entry keeps its queue
+/// position, so order is preserved for everything that survives.
+///
+/// The other two members of #533-A's filter are NOT here, because neither
+/// is a property of one entry: a `StrandedSubmit` marker terminating the
+/// batch is `plan_flush`'s rule (a marker's text is already in the box —
+/// it submits alone and whatever is behind it flushes on the next cycle),
+/// and a dead target / closed pty drops the WHOLE queue through
+/// `commit_exit(force: true)` before a plan is ever computed.
+///
+/// Stated narrowly on purpose: a rule that can never fire is worse than no
+/// rule, because it reads as coverage. If a future mechanism gives a queued
+/// entry its own supersession state, it belongs here, beside this one, with
+/// its own test.
+pub fn superseded_ids(entries: &[QueuedDelivery]) -> Vec<u64> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for e in entries {
+        let Some(t) = e.payload.text() else { continue };
+        if seen.contains(&t) {
+            out.push(e.id);
+        } else {
+            seen.push(t);
+        }
+    }
+    out
+}
+
+/// The banner `coalesced_flush_text` puts above one constituent — its
+/// position, origin and queue age, so nothing loses attribution when N
+/// deliveries become one paste (#533-A). `now_ms` is passed in (never read
+/// from the clock here) so the rendering is deterministic under test.
+fn constituent_banner(pos: usize, total: usize, c: &FlushConstituent, now_ms: u64) -> String {
+    let age = age_clause(now_ms.saturating_sub(c.enqueued_ms));
+    let repeats = if c.coalesced > 0 {
+        let n = c.coalesced;
+        let s = if n == 1 { "repeat" } else { "repeats" };
+        format!(" · +{n} identical {s} coalesced")
+    } else {
+        String::new()
+    };
+    format!(
+        "----- {pos}/{total} · from {} · queued {age} (id {}, t={}){repeats} -----",
+        c.from, c.id, c.enqueued_ms
+    )
+}
+
+/// "3m12s ago" / "just now" — a queue age for a human/agent reader. Pure
+/// over a duration in ms; no clock, no formatting crate (none is available:
+/// CLAUDE.md constraint 2 keeps the dependency list minimal).
+fn age_clause(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs == 0 {
+        return "just now".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s ago");
+    }
+    let mins = secs / 60;
+    let rem = secs % 60;
+    if mins < 60 {
+        return format!("{mins}m{rem:02}s ago");
+    }
+    format!("{}h{:02}m ago", mins / 60, mins % 60)
+}
+
+/// The ONE prompt a coalesced flush submits (#533-A): the flush header,
+/// then every constituent in queue order behind its own itemization
+/// banner. Order is the queue's order and is never rearranged — the reason
+/// the header can promise it.
+///
+/// `remaining` is how many entries stay queued after this chunk (the byte
+/// cap split the backlog, or a stranded marker terminated it); when
+/// non-zero the header says so, so the receiver knows more is coming rather
+/// than inferring the flush was everything.
+///
+/// Callers pass a single-constituent slice only when they genuinely mean
+/// "one delivery, itemized" — `run_queue_drainer` keeps using
+/// `flush_header_text` for the lone-entry case so an uncontended flush's
+/// wording is unchanged from pre-#533.
+pub fn coalesced_flush_text(items: &[FlushConstituent], remaining: usize, now_ms: u64) -> String {
+    let n = items.len();
+    let more = if remaining > 0 {
+        let d = if remaining == 1 { "delivery" } else { "deliveries" };
+        format!(" ({remaining} further queued {d} follow in the next flush)")
+    } else {
+        String::new()
+    };
+    let total_coalesced: u32 = items.iter().map(|c| c.coalesced).sum();
+    let dedup = if total_coalesced > 0 {
+        format!(" {total_coalesced} byte-identical repeat(s) were folded in at admission.")
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "[loomux] {n} deliveries queued while this pane was blocked are being delivered TOGETHER, \
+         as this one prompt, oldest first{more} — they are itemized below with their origin and \
+         queue time; nothing was reordered or dropped.{dedup} Treat each item as its own message.",
+    );
+    for (i, c) in items.iter().enumerate() {
+        out.push_str("\n\n");
+        out.push_str(&constituent_banner(i + 1, n, c, now_ms));
+        out.push('\n');
+        out.push_str(c.text);
+    }
+    out
+}
+
+/// Decide what one drain pass submits (#533-A) — the pure core of the
+/// coalesced flush.
+///
+/// `entries` is the pane's queue oldest-first as it stands at drain time,
+/// `max_bytes` the combined-paste cap (`QUEUE_FLUSH_MAX_BYTES` in
+/// production; a test passes its own to exercise chunking without building
+/// a 24 KiB fixture).
+///
+/// The rules, in order:
+/// 1. Superseded constituents (`superseded_ids`) drop out first — never
+///    merged, never delivered.
+/// 2. A `StrandedSubmit` marker is a batch of exactly one: its text is
+///    already in the box, so it can only be submitted, never pasted with
+///    anything else.
+/// 3. Otherwise take the longest run of consecutive `Text` entries from the
+///    front that fits `max_bytes`, stopping at the first marker. ALWAYS at
+///    least one entry, even when that one entry alone exceeds the cap —
+///    the cap must never be able to stall a queue.
+///
+/// Nothing here waits: the batch is whatever is ALREADY queued at this
+/// instant, so a lone live delivery is planned as a one-entry batch and
+/// pastes exactly as it did pre-#533. There is no batching timer and no
+/// path by which a delivery is held back to be combined with a later one.
+pub fn plan_flush(entries: &[QueuedDelivery], max_bytes: usize) -> FlushPlan {
+    let superseded = superseded_ids(entries);
+    let live: Vec<&QueuedDelivery> = entries.iter().filter(|e| !superseded.contains(&e.id)).collect();
+    let Some(first) = live.first() else {
+        return FlushPlan { superseded, batch: Vec::new(), stranded: false, remaining: 0 };
+    };
+    if matches!(first.payload, QueuedPayload::StrandedSubmit) {
+        return FlushPlan { superseded, batch: vec![first.id], stranded: true, remaining: live.len() - 1 };
+    }
+    let mut batch = Vec::new();
+    let mut used = 0usize;
+    for e in &live {
+        let Some(t) = e.payload.text() else { break };
+        let cost = t.len() + FLUSH_ITEM_OVERHEAD;
+        if !batch.is_empty() && used.saturating_add(cost) > max_bytes {
+            break;
+        }
+        used = used.saturating_add(cost);
+        batch.push(e.id);
+    }
+    let remaining = live.len() - batch.len();
+    FlushPlan { superseded, batch, stranded: false, remaining }
+}
+
 /// The notice for a whole queue dropped at once (`DropReason`) — always
 /// names the count and the reason; never silent (today's behavior for both
 /// cases this replaces).
@@ -481,6 +713,189 @@ mod tests {
         assert!(h.contains("1 coalesced"), "got: {h}");
         assert!(!flush_header_text(3, 0).contains("coalesced"), "must omit the clause when nothing coalesced");
         assert!(flush_header_text(3, 0).contains("oldest first"));
+    }
+
+    // ---------- #533-A: coalesced flush ----------
+
+    fn marker_entry(id: u64) -> QueuedDelivery {
+        QueuedDelivery {
+            id,
+            agent_id: "w-1".into(),
+            from: "loomux".into(),
+            payload: QueuedPayload::StrandedSubmit,
+            reason: EnqueueReason::Question,
+            enqueued_ms: 1_000,
+            coalesced: 0,
+        }
+    }
+
+    /// The economy property #533 exists for, stated as the observable
+    /// outcome rather than as an implementation detail: ONE drain pass
+    /// submits the entire flushable backlog. Pre-#533 the drainer planned
+    /// exactly the front entry per pass, so this same assertion read
+    /// `batch == [1]` — which is what the red-evidence branch pins (see the
+    /// PR body): identical test text, failing on `plan_flush` returning a
+    /// one-entry batch, passing here.
+    #[test]
+    fn plan_flush_combines_the_whole_flushable_backlog_into_one_batch_in_order() {
+        let entries = vec![
+            text_entry(1, "first: here is the context"),
+            text_entry(2, "second: the actual task"),
+            text_entry(3, "third: and one correction"),
+        ];
+        let plan = plan_flush(&entries, QUEUE_FLUSH_MAX_BYTES);
+        assert_eq!(plan.batch, vec![1, 2, 3], "one pass must take the whole flushable backlog");
+        assert_eq!(plan.remaining, 0);
+        assert!(plan.superseded.is_empty());
+        assert!(!plan.stranded);
+    }
+
+    #[test]
+    fn plan_flush_never_holds_back_a_lone_live_delivery() {
+        // The issue's explicit constraint: never wait for a second entry in
+        // order to batch. A queue of one plans a batch of one, immediately.
+        let entries = vec![text_entry(7, "go")];
+        let plan = plan_flush(&entries, QUEUE_FLUSH_MAX_BYTES);
+        assert_eq!(plan.batch, vec![7]);
+        assert_eq!(plan.remaining, 0);
+    }
+
+    #[test]
+    fn plan_flush_leaves_nothing_to_do_for_an_empty_queue() {
+        let plan = plan_flush(&[], QUEUE_FLUSH_MAX_BYTES);
+        assert!(plan.batch.is_empty());
+        assert_eq!(plan.remaining, 0);
+    }
+
+    #[test]
+    fn plan_flush_submits_a_front_marker_alone_and_never_merges_it() {
+        // A marker's text is ALREADY in the box — pasting anything with it
+        // would deliver that text twice. It submits by itself; whatever is
+        // behind it flushes on the next pass, order preserved.
+        let entries = vec![marker_entry(1), text_entry(2, "next"), text_entry(3, "and next")];
+        let plan = plan_flush(&entries, QUEUE_FLUSH_MAX_BYTES);
+        assert!(plan.stranded, "a front marker is a stranded submit, not a paste");
+        assert_eq!(plan.batch, vec![1], "exactly one entry — never merged with text behind it");
+        assert_eq!(plan.remaining, 2, "the text behind it is still queued, in order");
+    }
+
+    #[test]
+    fn plan_flush_stops_the_batch_at_a_marker_it_reaches_mid_queue() {
+        let entries = vec![text_entry(1, "a"), marker_entry(2), text_entry(3, "c")];
+        let plan = plan_flush(&entries, QUEUE_FLUSH_MAX_BYTES);
+        assert_eq!(plan.batch, vec![1], "the marker terminates the batch");
+        assert!(!plan.stranded);
+        assert_eq!(plan.remaining, 2);
+    }
+
+    #[test]
+    fn plan_flush_chunks_a_backlog_that_exceeds_the_byte_cap() {
+        let big = "x".repeat(200);
+        let entries = vec![
+            text_entry(1, &big),
+            text_entry(2, &big),
+            text_entry(3, &big),
+            text_entry(4, &big),
+        ];
+        // Budget for ~2 entries (each costs len + FLUSH_ITEM_OVERHEAD).
+        let cap = 2 * (200 + FLUSH_ITEM_OVERHEAD);
+        let plan = plan_flush(&entries, cap);
+        assert_eq!(plan.batch, vec![1, 2], "cap splits the backlog rather than pasting a megaprompt");
+        assert_eq!(plan.remaining, 2, "the rest stays queued for the next flush — never dropped");
+    }
+
+    #[test]
+    fn plan_flush_never_stalls_on_a_single_entry_larger_than_the_cap() {
+        // The cap is a ceiling, never a floor: an entry bigger than the
+        // whole budget must still deliver, alone, or it is stuck forever.
+        let huge = "y".repeat(5_000);
+        let entries = vec![text_entry(1, &huge), text_entry(2, "small")];
+        let plan = plan_flush(&entries, 100);
+        assert_eq!(plan.batch, vec![1], "the oversized entry still goes, by itself");
+        assert_eq!(plan.remaining, 1);
+    }
+
+    #[test]
+    fn plan_flush_drops_a_byte_identical_duplicate_before_coalescing_it() {
+        // `admit` normally prevents this at admission; the drain-time
+        // re-check is what keeps a duplicate that raced a pop from being
+        // merged into ONE prompt, where it would read as two distinct asks.
+        let entries = vec![
+            text_entry(1, "status?"),
+            text_entry(2, "different"),
+            text_entry(3, "status?"),
+        ];
+        let plan = plan_flush(&entries, QUEUE_FLUSH_MAX_BYTES);
+        assert_eq!(plan.superseded, vec![3], "the LATER duplicate drops — the earlier keeps its place");
+        assert_eq!(plan.batch, vec![1, 2], "a superseded entry never merges in");
+        assert_eq!(plan.remaining, 0);
+    }
+
+    #[test]
+    fn superseded_ids_keeps_the_first_occurrence_and_ignores_markers() {
+        let entries = vec![text_entry(1, "a"), marker_entry(2), text_entry(3, "a")];
+        assert_eq!(superseded_ids(&entries), vec![3]);
+    }
+
+    #[test]
+    fn coalesced_flush_text_preserves_order_and_itemizes_origin_and_queue_time() {
+        let now = 1_000_000u64;
+        let items = [
+            FlushConstituent { id: 11, from: "orchestrator", enqueued_ms: now - 300_000, coalesced: 0, text: "FIRST-BODY" },
+            FlushConstituent { id: 12, from: "w-7", enqueued_ms: now - 45_000, coalesced: 0, text: "SECOND-BODY" },
+        ];
+        let out = coalesced_flush_text(&items, 0, now);
+        let first = out.find("FIRST-BODY").expect("constituent 1 present");
+        let second = out.find("SECOND-BODY").expect("constituent 2 present");
+        assert!(first < second, "queue order must survive the merge:\n{out}");
+        assert!(out.contains("1/2"), "each constituent is positioned: {out}");
+        assert!(out.contains("2/2"), "{out}");
+        assert!(out.contains("from orchestrator"), "origin must survive: {out}");
+        assert!(out.contains("from w-7"), "origin must survive: {out}");
+        assert!(out.contains("5m00s ago"), "queue time must survive: {out}");
+        assert!(out.contains("45s ago"), "queue time must survive: {out}");
+        assert!(out.contains("id 11") && out.contains("id 12"), "audit-joinable ids: {out}");
+        assert!(out.contains("nothing was reordered or dropped"), "{out}");
+    }
+
+    #[test]
+    fn coalesced_flush_text_announces_a_further_chunk_when_one_remains() {
+        let items = [FlushConstituent { id: 1, from: "loomux", enqueued_ms: 0, coalesced: 0, text: "b" }];
+        let out = coalesced_flush_text(&items, 3, 1_000);
+        assert!(out.contains("3 further queued deliveries follow"), "chunking must be stated: {out}");
+        let none = coalesced_flush_text(&items, 0, 1_000);
+        assert!(!none.contains("follow in the next flush"), "no phantom chunk clause: {none}");
+    }
+
+    #[test]
+    fn coalesced_flush_text_reports_admission_coalesced_repeats_per_constituent() {
+        let items = [
+            FlushConstituent { id: 1, from: "w-2", enqueued_ms: 0, coalesced: 2, text: "ping" },
+            FlushConstituent { id: 2, from: "w-3", enqueued_ms: 0, coalesced: 0, text: "pong" },
+        ];
+        let out = coalesced_flush_text(&items, 0, 1_000);
+        assert!(out.contains("+2 identical repeats coalesced"), "per-constituent repeat count: {out}");
+        assert_eq!(
+            out.matches("identical repeat").count(),
+            1,
+            "only the constituent that actually repeated is annotated: {out}"
+        );
+    }
+
+    #[test]
+    fn draining_a_backlog_takes_one_pass_not_one_per_entry() {
+        // The turn-economy property end to end: repeatedly plan-and-remove
+        // until the queue is empty and count the passes. Four queued
+        // deliveries used to cost four agent turns; they now cost one.
+        let mut q: Vec<QueuedDelivery> = (1..=4).map(|i| text_entry(i, &format!("brief-{i}"))).collect();
+        let mut passes = 0;
+        while !q.is_empty() {
+            passes += 1;
+            assert!(passes <= 4, "not converging");
+            let plan = plan_flush(&q, QUEUE_FLUSH_MAX_BYTES);
+            q.retain(|e| !plan.batch.contains(&e.id) && !plan.superseded.contains(&e.id));
+        }
+        assert_eq!(passes, 1, "the whole flushable backlog must submit in ONE pass");
     }
 
     #[test]
