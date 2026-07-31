@@ -4891,6 +4891,40 @@ than a defect in `held_escalation`, whose contract is pinned. The fix for both i
 hold-start stamp that survives entry churn, which is a change to state ownership and not worth
 making inside a review round that has already verified the current shape.
 
+### Composition with #541's `REINJECT_ACK_SETTLE_MS`, and why nothing here belongs in it
+
+#541 turned that constant into a const expression summing the **five unconditional stages** between
+"we decided to paste" and the last Enter, with a standing membership rule: *if you add a stage to
+`deliver_prompt` before the last Enter, it belongs in the expression.* #532 adds a pre-Enter gate
+(`preenter_admission`) and wraps the pre-paste checkpoints in a recheck loop, so the rule has to be
+answered rather than assumed. It has two branches and they need **two different arguments** — the
+second is the one a reader will otherwise re-derive from scratch.
+
+- **On the PASS branch, the gate is unconditional but has no duration.** It is a single
+  `input_pending` read — no sleep, no poll, no loop. The expression sums *durations*, and this
+  contributes none, so it is not a member.
+- **On the DECLINE branch there is no Enter at all.** The delivery returns `AbortedPreEnter` and the
+  interval the constant bounds never completes, so there is nothing for a floor to be short of.
+  That path is not new either: the pre-Enter question checkpoint's `Abort` arm has returned
+  `AbortedPreEnter` since #420, long before #532 gave it a second cause. It belongs to the residual
+  #541's own doc already disclaims and #546 tracks, not to the sum.
+
+**The boundary is not where it looks, and this is the sentence to keep.** The constant is anchored
+at `attempted_ms` — *when loomux decided to paste* — so the pre-paste stages **are inside the
+interval**, not outside it. Nothing crosses the unconditional boundary for a subtler reason:
+`hold_for_human_input` opens with a guard clause that returns `PasteDecision::Paste { held_ms: 0 }`
+when its predicate reads false, *before* the timer starts and before the only `sleep` in the
+function. Every checkpoint built on it — both pre-paste holds and all three
+`wait_for_question_clear` sites — therefore costs one predicate evaluation and no sleep or poll
+window whenever no gate is actually up. That is why `PREPASTE_RECHECK_ROUNDS` can run the pair up to
+three times without adding a single unconditional millisecond: it multiplies only the *conditional*
+residual, which was already excluded.
+
+So the correct reading is not "these stages don't interact with the floor" — they sit squarely
+inside its interval. It is "they contribute nothing unless a gate is up, and when one is, they were
+already excluded." Anyone adding a stage here should check which of those two it is: a stage that
+sleeps or polls *unconditionally* does belong in #541's expression.
+
 **Two bounds, opposite precedence, and that is deliberate.** #518's `human_input_block` states the
 reverse rule — *"`box_pending` outranks the bound"* — and it is correct there. Grep will find both;
 they are not a contradiction, and the distinguishing question is **what the bound does when it
