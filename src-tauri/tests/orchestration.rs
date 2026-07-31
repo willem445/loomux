@@ -44,6 +44,7 @@ use loomux_lib::orchestration::{
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     record_aborted_preenter_outcome, recorded_confirmed,
+    record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     should_notify_unconfirmed, single_pane_autopilot_flags,
@@ -12994,6 +12995,172 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
         "the outcome recorded on a pre-Enter abort must make the NEXT delivery's flush actually press Enter"
     );
     assert_eq!(&*captured.lock().unwrap(), b"\r");
+}
+
+// ---------- #454: supersession during a re-send's in-flight window ----------
+//
+// #451 B1's supersession rule fires off the NEWER delivery's outcome insert,
+// which lands at the END of its confirm window (under a second when its hook
+// confirms in-window, ~9s worst case). The newer delivery's own `promptsubmit`
+// record exists almost immediately after its Enter, so a stale monitor could
+// read "still mine" from the ledger and then resolve ITSELF off the newer
+// delivery's record -- a misattributed `delivery-confirmed-late`, plus a "no
+// re-send needed" correction about the re-send that is the only reason
+// anything landed.
+//
+// The fix is an ordering: `record_inflight_delivery` claims the pane in the
+// ledger BEFORE the Enter, and the monitor takes its ledger observation AFTER
+// its hook read (`observe_ledger`). These tests drive those REAL functions,
+// chained into `late_monitor_tick` -- the same real decision function the
+// monitor thread calls -- through #454's own interleaving. The exhaustive
+// proof that no OTHER interleaving misattributes is `queue.rs`'s
+// `supersession_race_property`, with its own mutation controls.
+//
+// Honest residual, stated the way rev-19 n1 stated the same one for
+// `record_aborted_preenter_outcome`: these pin the recorder, the observer and
+// the decision, not that `deliver_now` calls the recorder at its one call
+// site. Deleting THAT line is caught by the property model's
+// `claiming_the_ledger_only_at_the_outcome_reproduces_the_454_race`, which
+// models exactly that deletion.
+
+/// The pane's ledger state a `Pending` delivery leaves behind: recorded under
+/// its own `submit_sent_ms`, unconfirmed. `record_inflight_delivery` is the
+/// real writer for both that and the in-flight claim -- one shape, one
+/// function, which is why the claim needs no new state. Written out at each
+/// call site rather than behind a helper because `DeliveryOutcome` is private
+/// (see `record_aborted_preenter_outcome`'s doc): the map's value type is only
+/// ever reachable by inference from these functions' own signatures.
+macro_rules! ledger_with {
+    ($pty:expr, $submit_sent_ms:expr) => {{
+        let m: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+        record_inflight_delivery(&m, $pty, $submit_sent_ms, "loomux".to_string());
+        m
+    }};
+}
+
+#[test]
+fn a_resends_inflight_claim_supersedes_the_stale_monitor_before_its_own_record_can_be_seen() {
+    // #454's exact interleaving, in order.
+    let pty = 4541u32;
+    let d1_ms = 1_000u64;
+    let d2_ms = 9_000u64;
+    let last_delivery = ledger_with!(pty, d1_ms);
+
+    // (1) Before the re-send: D1's monitor owns the pane, and a hook record
+    // matching ITS baseline is genuinely its own -- it must be free to
+    // resolve. This is the behavior #454's fix must not break.
+    let before = observe_ledger(&last_delivery, pty, d1_ms);
+    assert_eq!(
+        before,
+        LedgerView { superseded: false, outstanding: true, newer_confirmed: false },
+        "an unresolved delivery still owns its pane"
+    );
+    assert_eq!(
+        late_monitor_tick(before.superseded, PromptLandedMatch::Existence, true, false, false, false),
+        MonitorAction::Confirm { merged: false, correction: true },
+        "before any newer delivery, a late record is this delivery's own and corrects its Failed verdict",
+    );
+
+    // (2) The re-send presses Enter -- but claims the pane FIRST. This is the
+    // single line `deliver_now` gained: everything the Enter causes,
+    // including the record D1's monitor would otherwise match, happens after
+    // this point.
+    record_inflight_delivery(&last_delivery, pty, d2_ms, "loomux".to_string());
+
+    // (3) D1's monitor's next tick, taken in the real order: hook first, then
+    // ledger. Any record it can see now is checked against a ledger that
+    // already names the re-send.
+    let after = observe_ledger(&last_delivery, pty, d1_ms);
+    assert_eq!(
+        after,
+        LedgerView { superseded: true, outstanding: false, newer_confirmed: false },
+        "the re-send owns the pane from its Enter, not from its outcome insert -- and it is not \
+         confirmed yet, so nothing may be reported as landed on its behalf",
+    );
+    assert_eq!(
+        late_monitor_tick(after.superseded, PromptLandedMatch::Existence, true, false, false, false),
+        MonitorAction::Superseded,
+        "the stale monitor must exit writing and notifying nothing -- no misattributed \
+         delivery-confirmed-late, no \"no re-send needed\" correction about the re-send itself",
+    );
+}
+
+#[test]
+fn without_the_inflight_claim_the_resends_own_record_resolves_the_wrong_delivery() {
+    // The mutation control at the real-code level: the pre-#454 shape, where
+    // the re-send claims the pane only when its confirm window resolves. The
+    // ledger is untouched between its Enter and that insert, so the identical
+    // tick that exits cleanly above instead confirms -- and, because this
+    // monitor had already declared `Failed`, sends the correction notice.
+    //
+    // If this test ever stops reproducing the confirm, the test above has
+    // stopped depending on the claim and is passing vacuously.
+    let pty = 4542u32;
+    let d1_ms = 1_000u64;
+    let last_delivery = ledger_with!(pty, d1_ms);
+
+    // The re-send's Enter went out; its outcome insert has not landed yet.
+    // Nothing wrote the ledger, so the stale monitor still reads "mine".
+    let view = observe_ledger(&last_delivery, pty, d1_ms);
+    assert!(!view.superseded, "the pre-fix ledger cannot see a delivery that is merely in flight");
+    assert_eq!(
+        late_monitor_tick(view.superseded, PromptLandedMatch::Existence, true, false, false, false),
+        MonitorAction::Confirm { merged: false, correction: true },
+        "this is the #454 defect: the re-send's own record resolves the OLD delivery and announces \
+         a correction -- exactly backwards, since the re-send is why anything landed",
+    );
+}
+
+#[test]
+fn an_inflight_claim_reads_as_unconfirmed_so_the_next_delivery_still_flushes() {
+    // The claim is written before anything is known about the outcome, so it
+    // must read as UNCONFIRMED -- the conservative value. If the pane dies or
+    // the app exits mid-window, the ledger's residue then still tells the next
+    // delivery to flush a possibly-stranded box rather than pasting on top of
+    // it. Chained through the real reader and the real flush, the same way
+    // `record_aborted_preenter_outcome`'s own test is.
+    let pty = 4543u32;
+    let last_delivery = ledger_with!(pty, 7_000);
+
+    let prev_confirmed = recorded_confirmed(&last_delivery, pty);
+    assert_eq!(prev_confirmed, Some(false), "an in-flight delivery has not landed yet");
+
+    let pm = PtyManager::default();
+    let captured = pm.register_fake_for_test(pty, b"idle input box, nothing pending");
+    assert!(
+        flush_stranded_text(&pm, pty, prev_confirmed, false, b"\r"),
+        "an in-flight claim left behind by a dead delivery must still arm the next delivery's flush"
+    );
+    assert_eq!(&*captured.lock().unwrap(), b"\r");
+}
+
+#[test]
+fn a_stranded_badge_survives_an_inflight_claim_and_drops_on_a_confirmed_one() {
+    // `newer_confirmed` is what the monitor's `Superseded` arm drops the #496
+    // attention badge on, and it must stay FALSE while the newer delivery is
+    // merely in flight: an unconfirmed successor is not evidence the pane is
+    // unwedged. It flips true once that delivery actually lands -- here
+    // through `drain_stranded_submit`, the real replay path, which records a
+    // confirmed outcome under its own fresh `submit_sent_ms`.
+    let pty = 4544u32;
+    let d1_ms = 1_000u64;
+    let last_delivery = ledger_with!(pty, d1_ms);
+
+    record_inflight_delivery(&last_delivery, pty, 9_000, "loomux".to_string());
+    assert_eq!(
+        observe_ledger(&last_delivery, pty, d1_ms),
+        LedgerView { superseded: true, outstanding: false, newer_confirmed: false },
+        "a badge must not come down on a delivery that has not landed yet"
+    );
+
+    let pm = PtyManager::default();
+    pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
+    assert!(drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r"));
+    assert!(
+        observe_ledger(&last_delivery, pty, d1_ms).newer_confirmed,
+        "once a newer delivery is recorded confirmed, the pane is demonstrably unwedged and the \
+         stale monitor drops the badge on its way out"
+    );
 }
 
 // ---------- #496 PR-A: the phantom-input-stamp fix ----------

@@ -1669,3 +1669,392 @@ mod stranded_admission_property {
         );
     }
 }
+
+/// #454 — supersession vs. a newer delivery's IN-FLIGHT window, exhaustively.
+///
+/// #451 B1 gave the late-confirmation monitor a supersession rule: if this
+/// pane's recorded `DeliveryOutcome` no longer carries this monitor's own
+/// `submit_sent_ms`, a newer delivery owns the pane and the monitor exits
+/// writing and notifying nothing. That rule is right; its TRIGGER was late.
+/// The ledger was written only when the newer delivery's confirm window
+/// resolved — under a second when its hook confirms in-window, ~9s worst
+/// case — while the `promptsubmit` record that delivery's Enter produces
+/// exists almost immediately. In between, a stale monitor reads "still mine"
+/// from the ledger and matches the NEWER delivery's record as its own: a
+/// misattributed `delivery-confirmed-late` audit row, and — if that monitor
+/// had already declared `Failed` — a "no re-send needed" correction about the
+/// very re-send that is the only reason anything landed. On a Copilot pane it
+/// does not even need the two deliveries to share text: `PromptLandedMatch::
+/// Existence` matches any record past the monitor's baseline, whatever it
+/// says.
+///
+/// The fix is an ORDERING, and this model is its proof. Two knobs, each the
+/// pre-#454 shape of one half, so neither half can pass vacuously:
+///
+/// - `publish_before_enter` — `deliver_now` calls `record_inflight_delivery`
+///   immediately BEFORE its first Enter (`true`), rather than claiming the
+///   ledger only at its outcome insert (`false`, as shipped).
+/// - `ledger_read_after_hook` — the monitor takes its ledger observation
+///   AFTER its hook read (`true`, via `observe_ledger`), rather than before
+///   it (`false`, as shipped).
+///
+/// Both together give a happens-before chain — ledger claim, then Enter, then
+/// the hook record, then any tick that can see that record, then that tick's
+/// own ledger read — so a record a tick can act on is always checked against
+/// a ledger state at least as new as the record itself. Either knob alone
+/// leaves a window: with only the reader fix the ledger claim still lands
+/// seconds late; with only the writer fix the gap shrinks to one tick's own
+/// work but a violation is still reachable. `run` explores every interleaving
+/// of both, and the tests below pin exactly that — fixed is clean, each
+/// single-knob mutation reddens, and the as-shipped shape (both off) reddens.
+///
+/// **What is modeled**, one event each, in every order the search can reach:
+/// the newer delivery's program in strict order (claim the ledger — only when
+/// `publish_before_enter` — press Enter, record its outcome), a genuinely
+/// LATE `promptsubmit` record for the OLD delivery arriving on its own (the
+/// case the monitor exists to catch, so the property cannot be satisfied by
+/// simply never confirming anything), and the old monitor's tick — its two
+/// reads, individually interleavable, then its decision, following
+/// `late_monitor_tick`'s real precedence (superseded beats even a hook
+/// match). Timeouts, retries and the pane-quiet/question inputs are omitted
+/// for the same reason the sibling modules omit theirs: they are self-loops
+/// this property cannot observe.
+///
+/// **Deliberately more adversarial than production.** Nothing here forces the
+/// monitor's two reads to be close together, or the newer delivery's steps to
+/// be quick — the search happily runs a whole monitor tick between the newer
+/// delivery's Enter and its next step. Production's reachable states are a
+/// subset of this model's, so a property proven here holds a fortiori.
+#[cfg(test)]
+mod supersession_race_property {
+    /// Who the pane's ledger entry currently names.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Owner {
+        /// The OLD delivery — the one whose late monitor is still running.
+        Old,
+        /// The NEWER delivery (the re-send).
+        New,
+    }
+
+    /// One step of the newer delivery's own (single-threaded) program.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Op {
+        /// `record_inflight_delivery` — present only when the writer half of
+        /// the fix is on.
+        ClaimLedger,
+        /// The first Enter. Its `promptsubmit` record exists from here on.
+        PressEnter,
+        /// The end-of-window outcome insert, which also claims the ledger —
+        /// the ONLY claim in the pre-#454 shape.
+        RecordOutcome,
+    }
+
+    fn newer_delivery_program(publish_before_enter: bool) -> Vec<Op> {
+        let mut ops = Vec::new();
+        if publish_before_enter {
+            ops.push(Op::ClaimLedger);
+        }
+        ops.push(Op::PressEnter);
+        ops.push(Op::RecordOutcome);
+        ops
+    }
+
+    /// What one `poll_promptsubmit_hook` call returned. The monitor cannot
+    /// tell WHOSE record it matched — that is the defect — so the model
+    /// tracks provenance only for the checker's benefit, never as an input to
+    /// the modeled decision.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct HookRead {
+        /// A record past this monitor's baseline exists.
+        saw_record: bool,
+        /// ...and the only record that exists is the newer delivery's, so a
+        /// confirm off this read is necessarily a misattribution.
+        newer_only: bool,
+    }
+
+    /// Where the old monitor is within ONE tick. The two reads are separate
+    /// events precisely so everything else can run between them.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Tick {
+        Start,
+        /// The first read (whichever the knob orders first) has been taken;
+        /// the other is still pending, and stays `None` until it is.
+        Half { ledger_superseded: Option<bool>, hook: Option<HookRead> },
+        /// Both reads taken — the decision is the next event.
+        Ready { ledger_superseded: bool, hook: HookRead },
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Monitor {
+        Ticking { tick: Tick, ticks_left: u32 },
+        /// `MonitorAction::Superseded` (or the lifetime cap) — exits writing
+        /// and notifying nothing.
+        Exited,
+        /// `MonitorAction::Confirm` — writes the ledger, audits
+        /// `delivery-confirmed-late`, and (when it had already declared
+        /// `Failed`) sends the correction notice.
+        Confirmed { misattributed: bool },
+    }
+
+    #[derive(Clone, Debug)]
+    struct SimState {
+        ledger: Owner,
+        /// Set by `Op::PressEnter` — the newer delivery's own hook record.
+        newer_record: bool,
+        /// A genuinely late record for the OLD delivery, arriving on its own.
+        /// One-shot, available at any point (`older_record_possible`).
+        older_record: bool,
+        newer_pc: usize,
+        monitor: Monitor,
+    }
+
+    #[derive(Default)]
+    struct Outcomes {
+        violations: Vec<String>,
+        /// Whether the search ever reached a CORRECT late confirm — the
+        /// liveness half, so "never confirm anything" cannot pass as a fix.
+        legit_confirm_reachable: bool,
+    }
+
+    struct Cfg {
+        publish_before_enter: bool,
+        ledger_read_after_hook: bool,
+        /// Whether a newer delivery happens at all.
+        newer_delivery: bool,
+        /// Whether the old delivery's own late record may arrive.
+        older_record_possible: bool,
+    }
+
+    fn explore(state: SimState, cfg: &Cfg, program: &[Op], depth: u32, out: &mut Outcomes) {
+        // The model is acyclic by construction — every event either advances
+        // a program counter, consumes a one-shot flag, or spends a tick from
+        // a finite budget — so this can only ever catch a modeling bug.
+        assert!(depth < 96, "runaway interleaving search — modeling bug: {state:?}");
+
+        match state.monitor {
+            Monitor::Confirmed { misattributed: true } => {
+                out.violations.push(format!(
+                    "MISATTRIBUTED CONFIRM: the old delivery's monitor resolved itself off the \
+                     NEWER delivery's promptsubmit record while the ledger still named {:?} \
+                     (newer delivery at step {} of {}) — a false delivery-confirmed-late, and a \
+                     \"no re-send needed\" correction about the re-send that made it land",
+                    state.ledger,
+                    state.newer_pc,
+                    program.len(),
+                ));
+                return;
+            }
+            Monitor::Confirmed { misattributed: false } => {
+                out.legit_confirm_reachable = true;
+                return;
+            }
+            // Nothing this monitor does afterwards is observable.
+            Monitor::Exited => return,
+            Monitor::Ticking { .. } => {}
+        }
+
+        // Event: the newer delivery takes its next step. Strictly ordered —
+        // it is one thread running one function.
+        if cfg.newer_delivery && state.newer_pc < program.len() {
+            let mut s = state.clone();
+            match program[s.newer_pc] {
+                Op::ClaimLedger | Op::RecordOutcome => s.ledger = Owner::New,
+                Op::PressEnter => s.newer_record = true,
+            }
+            s.newer_pc += 1;
+            explore(s, cfg, program, depth + 1, out);
+        }
+
+        // Event: the OLD delivery's own hook record finally lands — the late
+        // confirmation this monitor exists to catch.
+        if cfg.older_record_possible && !state.older_record {
+            let mut s = state.clone();
+            s.older_record = true;
+            explore(s, cfg, program, depth + 1, out);
+        }
+
+        // Event(s): the monitor's tick — two reads, then a decision.
+        let Monitor::Ticking { tick, ticks_left } = state.monitor else { return };
+        let read_ledger = |s: &SimState| s.ledger != Owner::Old;
+        let read_hook = |s: &SimState| HookRead {
+            saw_record: s.older_record || s.newer_record,
+            newer_only: s.newer_record && !s.older_record,
+        };
+        match tick {
+            Tick::Start => {
+                let mut s = state.clone();
+                s.monitor = Monitor::Ticking {
+                    tick: if cfg.ledger_read_after_hook {
+                        Tick::Half { ledger_superseded: None, hook: Some(read_hook(&state)) }
+                    } else {
+                        Tick::Half { ledger_superseded: Some(read_ledger(&state)), hook: None }
+                    },
+                    ticks_left,
+                };
+                explore(s, cfg, program, depth + 1, out);
+            }
+            Tick::Half { ledger_superseded, hook } => {
+                let mut s = state.clone();
+                let (superseded, hook) = match (ledger_superseded, hook) {
+                    (None, Some(h)) => (read_ledger(&state), h),
+                    (Some(l), None) => (l, read_hook(&state)),
+                    other => unreachable!("a half-taken tick has exactly one read: {other:?}"),
+                };
+                s.monitor =
+                    Monitor::Ticking { tick: Tick::Ready { ledger_superseded: superseded, hook }, ticks_left };
+                explore(s, cfg, program, depth + 1, out);
+            }
+            Tick::Ready { ledger_superseded, hook } => {
+                let mut s = state.clone();
+                // `late_monitor_tick`'s real precedence: superseded first,
+                // before even a hook match.
+                s.monitor = if ledger_superseded {
+                    Monitor::Exited
+                } else if hook.saw_record {
+                    Monitor::Confirmed { misattributed: hook.newer_only }
+                } else if ticks_left == 0 {
+                    // The lifetime cap — `MonitorAction::Expired`, not a
+                    // violation: an unresolved delivery timing out is a
+                    // documented outcome.
+                    Monitor::Exited
+                } else {
+                    Monitor::Ticking { tick: Tick::Start, ticks_left: ticks_left - 1 }
+                };
+                explore(s, cfg, program, depth + 1, out);
+            }
+        }
+    }
+
+    fn run(cfg: Cfg) -> Outcomes {
+        let program = newer_delivery_program(cfg.publish_before_enter);
+        let mut out = Outcomes::default();
+        explore(
+            SimState {
+                ledger: Owner::Old,
+                newer_record: false,
+                older_record: false,
+                newer_pc: 0,
+                monitor: Monitor::Ticking {
+                    tick: Tick::Start,
+                    // More ticks than there are progress events, so every
+                    // "the monitor polls between two of the other thread's
+                    // steps" ordering is reachable rather than budget-capped.
+                    ticks_left: 5,
+                },
+            },
+            &cfg,
+            &program,
+            0,
+            &mut out,
+        );
+        out
+    }
+
+    fn cfg(publish_before_enter: bool, ledger_read_after_hook: bool) -> Cfg {
+        Cfg { publish_before_enter, ledger_read_after_hook, newer_delivery: true, older_record_possible: true }
+    }
+
+    #[test]
+    fn fixed_ordering_never_misattributes_a_newer_deliverys_hook_record() {
+        // Both halves of #454's fix on — the code as shipped by this PR.
+        let out = run(cfg(true, true));
+        assert!(
+            out.violations.is_empty(),
+            "claiming the ledger before the Enter AND reading the ledger after the hook must make \
+             a misattributed confirm unreachable, but the search found {}:\n{}",
+            out.violations.len(),
+            out.violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn claiming_the_ledger_only_at_the_outcome_reproduces_the_454_race() {
+        // Mutation control #1: the writer half reverted to the pre-#454 shape
+        // (the ledger claimed only by the end-of-window outcome insert), the
+        // reader half still fixed. This is #454's own description of the gap,
+        // and it must stay reachable — otherwise `fixed_ordering_...` is
+        // vacuous for the `record_inflight_delivery` dimension.
+        let out = run(cfg(false, true));
+        assert!(
+            !out.violations.is_empty(),
+            "claiming the ledger only at the outcome insert must leave the in-flight window open \
+             somewhere in the search space — if it doesn't, the fixed test isn't testing the \
+             record_inflight_delivery half"
+        );
+        assert!(
+            out.violations.iter().any(|v| v.contains("MISATTRIBUTED CONFIRM")),
+            "expected a misattributed-confirm violation specifically, got: {:?}",
+            out.violations
+        );
+    }
+
+    #[test]
+    fn reading_the_ledger_before_the_hook_reproduces_the_454_race() {
+        // Mutation control #2: the writer half fixed, the reader half
+        // reverted — the monitor samples the ledger first, then the hook, so
+        // it can act on evidence newer than the state it validated against.
+        // The window is one tick's own work rather than a whole confirm
+        // window, which is exactly why narrowing it is not closing it.
+        let out = run(cfg(true, false));
+        assert!(
+            !out.violations.is_empty(),
+            "sampling the ledger BEFORE the hook must leave a reachable misattribution even with \
+             the in-flight claim in place — if it doesn't, the fixed test isn't testing the \
+             observe_ledger-after-the-hook half"
+        );
+        assert!(
+            out.violations.iter().any(|v| v.contains("MISATTRIBUTED CONFIRM")),
+            "expected a misattributed-confirm violation specifically, got: {:?}",
+            out.violations
+        );
+    }
+
+    #[test]
+    fn pre_454_shape_as_shipped_reproduces_the_race() {
+        // Both halves reverted — main's algorithm exactly, as #451 B1 left
+        // it. #454's claim that the residual is real, re-derived against the
+        // current machinery rather than taken on trust from the filing.
+        let out = run(cfg(false, false));
+        assert!(
+            out.violations.iter().any(|v| v.contains("MISATTRIBUTED CONFIRM")),
+            "the shape shipped before #454 must reproduce the misattribution, got: {:?}",
+            out.violations
+        );
+    }
+
+    #[test]
+    fn the_fix_still_lets_a_genuinely_late_confirmation_through() {
+        // The liveness half: a monitor that simply never confirms would pass
+        // every test above. With the fix on and NO newer delivery, the old
+        // delivery's own late hook record must still resolve it — that is the
+        // entire reason `run_late_confirmation_monitor` exists (#112's live
+        // episode needed 38 minutes to land).
+        let out = run(Cfg {
+            publish_before_enter: true,
+            ledger_read_after_hook: true,
+            newer_delivery: false,
+            older_record_possible: true,
+        });
+        assert!(out.violations.is_empty(), "no newer delivery means nothing to misattribute");
+        assert!(
+            out.legit_confirm_reachable,
+            "with the fix on and no newer delivery, a late record for THIS delivery must still \
+             reach MonitorAction::Confirm — otherwise #454's fix has broken #112's whole feature"
+        );
+    }
+
+    #[test]
+    fn a_correct_late_confirm_survives_even_alongside_a_newer_delivery() {
+        // Sharper than the test above: with the fix on AND a newer delivery
+        // racing, the search must STILL reach a correct confirm (the old
+        // delivery's own record arriving before the newer delivery claims the
+        // pane). The fix must suppress misattributed confirms only, never
+        // every confirm that happens to have company.
+        let out = run(cfg(true, true));
+        assert!(
+            out.legit_confirm_reachable,
+            "the fix must not suppress a correct late confirm just because a newer delivery is \
+             also in flight"
+        );
+    }
+}
