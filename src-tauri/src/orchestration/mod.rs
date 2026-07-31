@@ -7320,11 +7320,101 @@ pub fn record_aborted_preenter_outcome(
     pty_id: u32,
     delivery_from: String,
 ) {
+    record_inflight_delivery(last_delivery, pty_id, now_ms(), delivery_from);
+}
+
+/// Publish a delivery's OWNERSHIP of a pane into the ledger (#454) — the
+/// same `DeliveryOutcome` shape every other writer uses, `confirmed: false`,
+/// written at a moment when nothing about the outcome is known yet.
+///
+/// This is what makes supersession a START-of-delivery fact rather than an
+/// END-of-delivery one. `deliver_now` calls it immediately before its FIRST
+/// Enter, so for any `promptsubmit` record that Enter can produce there is a
+/// happens-before chain — **ledger insert ≺ Enter ≺ hook record** — and an
+/// OLDER delivery's late monitor, which takes its ledger observation AFTER
+/// its hook read (see `observe_ledger`'s call site in
+/// `run_late_confirmation_monitor`), can never see that record while still
+/// believing it owns the pane.
+///
+/// Before this, the ledger was written only at the END of the newer
+/// delivery's confirm window (≲1s typical, ~9s worst case). That left
+/// exactly that window open for a stale monitor to read "still mine" from
+/// the ledger, then match the NEWER delivery's hook record, and resolve its
+/// OWN delivery off it — a misattributed `delivery-confirmed-late` audit row
+/// and, if that monitor had already declared `Failed`, a "no re-send needed"
+/// correction notice about a re-send that is the only reason anything landed
+/// at all. #451 B1's supersession rule closed the dangerous version of that
+/// (a correction arriving BEFORE a re-send and suppressing it); #454 is the
+/// narrowed residual it deferred, and this is the "compare against an
+/// in-flight delivery marker" fix that issue asked for — closing the window
+/// rather than narrowing it further.
+///
+/// Note the marker is not a fourth piece of state: it is the SAME map, under
+/// the SAME lock, so the monitor still decides from one atomic read. A
+/// separate `in_flight` map would have re-opened the hazard one level down —
+/// two locks means a torn observation (read the in-flight map, miss the
+/// newer delivery, then read the ledger), which is the fused-lock mistake
+/// #496 PR-C's own admission gate had to be fixed for (rev-47 B1).
+///
+/// Extracted (not inlined at its one call site) for the same reason
+/// `record_aborted_preenter_outcome` is: deleting the call `deliver_now`
+/// makes to it is precisely the mutation a dedicated test must catch.
+#[doc(hidden)] // pub for integration tests
+pub fn record_inflight_delivery(
+    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    pty_id: u32,
+    submit_sent_ms: u64,
+    delivery_from: String,
+) {
     last_delivery.lock_safe().insert(pty_id, DeliveryOutcome {
         confirmed: false,
-        submit_sent_ms: now_ms(),
+        submit_sent_ms,
         from: delivery_from,
     });
+}
+
+/// One ATOMIC observation of a pane's delivery ledger, from the point of
+/// view of the delivery that pressed Enter at `submit_sent_ms` (#454).
+///
+/// Every fact `run_late_confirmation_monitor` decides from comes from this
+/// one read, so no two of them can be drawn from different moments. The
+/// monitor used to derive `superseded` and `ledger_outstanding` from one
+/// snapshot already and then re-derive `outstanding` inline later in the
+/// same tick; this makes the single-observation discipline the type's job
+/// rather than a convention the next edit can quietly break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)] // pub for integration tests
+pub struct LedgerView {
+    /// A DIFFERENT delivery owns this pane now — this monitor must exit
+    /// without writing or notifying anything (`MonitorAction::Superseded`).
+    pub superseded: bool,
+    /// The recorded outcome is still THIS delivery's and still unconfirmed —
+    /// the durable "not landed yet" fact #496's self-heal judges from, ahead
+    /// of any pane reading.
+    pub outstanding: bool,
+    /// Superseded AND the newer delivery is recorded confirmed — the pane is
+    /// demonstrably unwedged, so a stranded badge can come down on the way
+    /// out. A newer UNCONFIRMED outcome leaves it up: that delivery's own
+    /// monitor (or, if it confirmed in-window, `deliver_now` itself) owns the
+    /// pane's state from here.
+    pub newer_confirmed: bool,
+}
+
+#[doc(hidden)] // pub for integration tests
+pub fn observe_ledger(
+    last_delivery: &Mutex<HashMap<u32, DeliveryOutcome>>,
+    pty_id: u32,
+    submit_sent_ms: u64,
+) -> LedgerView {
+    let recorded = last_delivery.lock_safe().get(&pty_id).cloned();
+    let superseded = recorded.as_ref().is_some_and(|o| o.submit_sent_ms != submit_sent_ms);
+    LedgerView {
+        superseded,
+        outstanding: recorded
+            .as_ref()
+            .is_some_and(|o| o.submit_sent_ms == submit_sent_ms && !o.confirmed),
+        newer_confirmed: superseded && recorded.as_ref().is_some_and(|o| o.confirmed),
+    }
 }
 
 /// Whether the pane's most recently recorded delivery outcome reads as
@@ -8111,14 +8201,6 @@ fn run_late_confirmation_monitor(
         // degrade in this module (never an error the caller has to handle).
         let Some(cur_total) = ptys.output_total(pty_id) else { return };
 
-        // The delivery ledger — the durable artifact #496's self-heal judges
-        // from, ahead of any pane reading. `outstanding` means this pane's
-        // recorded outcome is still THIS delivery's and still unconfirmed.
-        let recorded = last_delivery.lock_safe().get(&pty_id).cloned();
-        let superseded = recorded.as_ref().is_some_and(|o| o.submit_sent_ms != submit_sent_ms);
-        let ledger_outstanding =
-            recorded.as_ref().is_some_and(|o| o.submit_sent_ms == submit_sent_ms && !o.confirmed);
-
         // Quiescence + question-guard tracking (only meaningful once
         // `late_monitor_tick` actually asks for them, but cheap to keep
         // current every tick so a KeepWaiting tick doesn't lose progress
@@ -8137,9 +8219,27 @@ fn run_late_confirmation_monitor(
                 .map(|t| prompt_wait_detected(&mask_own_paste(&t, &pasted_text)))
                 .unwrap_or(false);
         let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
+        // #454: the ledger observation is taken AFTER the hook read, never
+        // before — and the ordering is the fix, not a tidy-up. A hook record
+        // this tick can see was necessarily produced by an Enter that had
+        // already been pressed; if that Enter belonged to a NEWER delivery,
+        // `record_inflight_delivery` published that delivery's ownership of
+        // the pane BEFORE pressing it (see that function's doc for the
+        // happens-before chain). So reading the ledger second means any hook
+        // evidence this tick could act on is checked against a ledger state
+        // at least as new as the evidence itself, and a newer delivery's
+        // record can never be resolved as ours. Reading it first — as this
+        // loop did before #454 — leaves a window the width of one tick's own
+        // work, which is precisely the hazard, just smaller.
+        //
+        // Supersession is monotone (only a newer delivery ever rewrites this
+        // pane's `submit_sent_ms`, and this monitor exits the moment it
+        // sees one), so a "late" observation can only ever kill this monitor
+        // sooner, never resurrect it.
+        let ledger = observe_ledger(&last_delivery, pty_id, submit_sent_ms);
         let expired = started.elapsed() >= LATE_MONITOR_MAX_LIFETIME;
 
-        match late_monitor_tick(superseded, hook_match, failed, expired, quiet_long_enough, showing_question) {
+        match late_monitor_tick(ledger.superseded, hook_match, failed, expired, quiet_long_enough, showing_question) {
             MonitorAction::Superseded => {
                 // #496 PR-C: a newer delivery owns this pane now. If IT is
                 // recorded confirmed, the pane is unwedged — including the
@@ -8148,7 +8248,15 @@ fn run_late_confirmation_monitor(
                 // fresh confirmed outcome. Drop the badge on the way out; a
                 // newer UNCONFIRMED outcome leaves it up, because that
                 // delivery's own monitor owns the pane's state from here.
-                if recorded.as_ref().is_some_and(|o| o.confirmed) {
+                //
+                // #454: a newer delivery now publishes itself BEFORE its
+                // Enter, so this arm is reached while that delivery is still
+                // in flight (`newer_confirmed: false`) far more often than it
+                // used to be. The badge that would once have been dropped
+                // here, on a later tick, is dropped by `deliver_now` itself
+                // the moment that delivery confirms in-window — the one path
+                // that spawns no monitor of its own.
+                if ledger.newer_confirmed {
                     if let Some(r) = &reg {
                         r.clear_stranded(&group, &agent, "superseded-confirmed");
                     }
@@ -8195,9 +8303,7 @@ fn run_late_confirmation_monitor(
                         // marker is already queued and this is purely about
                         // what the chip SAYS, never about pressing again.
                         let live = stranded_selfheal_action(
-                            recorded
-                                .as_ref()
-                                .is_some_and(|o| o.submit_sent_ms == submit_sent_ms && !o.confirmed),
+                            ledger.outstanding,
                             !tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms),
                             showing_question,
                             still_holds,
@@ -8269,7 +8375,7 @@ fn run_late_confirmation_monitor(
                     !tier1_trusted(ptys.last_user_input_ms(pty_id).unwrap_or(0), submit_sent_ms);
                 paste_seen_in_box = holds_paste;
                 let action = stranded_selfheal_action(
-                    ledger_outstanding,
+                    ledger.outstanding,
                     human_typed_since,
                     showing_question,
                     holds_paste,
@@ -8724,6 +8830,17 @@ fn deliver_now(
     // Baseline just before the first Enter, so the confirmation window
     // below measures only the burst that Enter produces.
     let submit_baseline = ptys.output_total(pty_id).unwrap_or(last_total);
+    // #454: claim the pane in the ledger BEFORE pressing Enter, not after
+    // this delivery's confirm window resolves. Any `promptsubmit` record the
+    // Enter below produces is necessarily written after this insert, so an
+    // OLDER delivery's late monitor — which reads the ledger after reading
+    // the hook — cannot see that record while still believing it owns the
+    // pane. See `record_inflight_delivery`'s doc for the full argument and
+    // for why this is the same map rather than a second, separately-locked
+    // in-flight marker. The final `confirmed` value is written to the same
+    // key at the end of the window below; until then the honest state is
+    // exactly what this records — a delivery in flight, not yet landed.
+    record_inflight_delivery(&last_delivery, pty_id, submit_sent_ms, delivery_from.clone());
     let _ = ptys.write_bytes(pty_id, submit);
 
     // Copilot autopilot consent (#101/#179): a fresh --autopilot copilot
@@ -9038,7 +9155,21 @@ fn deliver_now(
     // correct behavior for "no evidence yet on a prompt that may
     // simply be queued", not a bug to route around.
     match confirm_state {
-        DeliveryConfirmState::Confirmed => {}
+        DeliveryConfirmState::Confirmed => {
+            // #454: a confirmed delivery is proof the pane is not wedged, so
+            // any stranded badge an EARLIER delivery raised is stale and
+            // comes down here. This used to happen a tick or two later, on
+            // the earlier delivery's own monitor noticing it had been
+            // superseded by a CONFIRMED outcome — but that monitor now exits
+            // as soon as this delivery publishes itself (before its Enter),
+            // which is strictly before this point, so the badge would
+            // otherwise stay up for a delivery that demonstrably landed. A
+            // `Pending`/`Failed` delivery still leaves it to the monitor
+            // spawned below, which owns the pane's state from there.
+            if let Some(r) = &reg {
+                r.clear_stranded(&group, &agent, "delivery-confirmed");
+            }
+        }
         DeliveryConfirmState::Failed => {
             if let Some(r) = &reg {
                 r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
