@@ -31,10 +31,12 @@ Every rung is a complete tool on its own — climb when you're ready:
    guardrails host-enforced, no agent ever merges. A prompt that reaches a
    pane but never gets submitted — the CLI ate the Enter while it was busy —
    is re-sent by loomux itself, once, through the same ordered delivery
-   queue; when that isn't safe (your own half-typed line is in the box, a
-   question is on screen), the pane raises a red **stuck prompt** chip
-   instead of waiting silently, so a wedged group is never something you
-   discover by accident. Hard-won lessons persist
+   queue, and so is a freshly spawned agent's task brief when the CLI was
+   still booting and swallowed it outright; when that isn't safe (your own
+   half-typed line is in the box, a question is on screen, or the agent
+   turns out to have received the brief after all), the pane raises a red
+   **stuck prompt** chip instead of waiting silently, so a wedged group is
+   never something you discover by accident. Hard-won lessons persist
    across groups via a committed `.loomux/lessons.md`, not just this run.
    The task board and the group lifecycle panel — each its own keystroke
    away on an orchestration pane — persist across a close/reopen and a group
