@@ -4826,6 +4826,16 @@ question checkpoint beside it already takes — a `StrandedSubmit` marker at the
 with no cap, whose press now re-reads occupancy too. The delivery **waits for the box to empty and
 then flushes**.
 
+**Be exact about what the pre-Enter gate saves, because it is not the merge.** The merge happens at
+the **paste**, not the Enter. If the human starts typing after the pre-paste admission and during
+the echo/quiet window, our text is already in their box and nothing here un-merges it. What the
+gate prevents is *loomux* submitting that combined line: the human keeps control of when — and
+whether — it goes. Their own Enter still submits both, and the queued `StrandedSubmit` marker then
+presses Enter on an already-empty box, a harmless no-op that `flush_stranded_text`'s own doc has
+always blessed. That sequence is what `the_drain_press_fires_once_the_box_is_empty_again` encodes.
+So "never merges into a person's line" would overclaim; "never *submits* over a person's line" is
+the guarantee.
+
 **Fix 2 — the hold is bounded, and the bound badges rather than releases.** `QUESTION_HOLD_MAX`
 (120s) was never the bound: capping out only aborts *that attempt*, and `run_queue_drainer` re-arms
 the same hold every `QUEUE_DRAIN_POLL` forever. Same unbounded-latch shape #518 found in the
@@ -4835,7 +4845,19 @@ experienced. `question_hold_stale` mirrors #518's precedence exactly: `box_pendi
 bound (a hold explained by the box is not a stale-question report), and `bound_ms == 0` disables
 rather than fires.
 
-**It raises `StrandedBlocker::QuestionStale` and never releases a write.** State the limit plainly:
+**No signal may veto the escalation.** The first cut of this let `box_pending` suppress the bound,
+reasoning that a hold explained by the human's own line needs no report. That repeated this PR's own
+bug one level up. `input_pending` is not a reading of the box — it is a counter that only *human*
+writes move, zeroed on only `\r`/`\n`, Ctrl-U and Ctrl-C, so a bare `ESC`, a TUI clearing the line
+with no occupancy delta, or the CLI consuming the line itself (which loomux never observes) all
+leave it stuck above zero over an empty box. With the veto in place, such a pane held forever *and
+never told anyone*. An escalation that one of the signals it reports on can silence is not a bound,
+so `hold_bound_elapsed` takes the clock and nothing else; the blocked gate decides only which
+sentence the human reads (`QuestionStale` vs. the existing `HumanInput` wording), never whether
+they hear anything. That also gives the box-occupied hold — previously bounded by nothing — its
+first escalation.
+
+**It raises a badge and never releases a write.** State the limit plainly:
 *from an append-only byte ring, a live dialog and an answered one that has not scrolled away are
 byte-identical.* No reading available here could justify a release. Narrowing detection to the
 last-painted lines *would* discriminate, but it weakens genuine detection — a statusline painted
