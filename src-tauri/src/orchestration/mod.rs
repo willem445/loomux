@@ -8655,9 +8655,9 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
         // stale bytes and leaves the box empty again.
         Some(StrandedBlocker::QuestionStale) => {
             format!(
-                "{name}'s prompt has been held for minutes on a question loomux still detects in this pane — \
-                 answer it if one is on screen; if the pane looks clear, that reading is stale: type a \
-                 character and delete it to release the hold"
+                // EVIDENCE MUTATION (#532) — a badge that ASSERTS staleness,
+                // the unbacked claim the honesty test exists to catch.
+                "{name}'s prompt is stuck behind a stale question reading — press Enter in the pane"
             )
         }
     }
@@ -10464,9 +10464,10 @@ pub fn should_flush_before_paste_now(
     question_active: bool,
     box_pending: bool,
 ) -> bool {
-    should_flush_before_paste(prev_confirmed, human_typed_since)
-        && !question_active
-        && !box_pending
+    // EVIDENCE MUTATION (#532) — pre-fix: the #510 rule was enforced only via
+    // the `human_typed_since` timestamp; occupancy was never read at the press.
+    let _ = box_pending;
+    should_flush_before_paste(prev_confirmed, human_typed_since) && !question_active
 }
 
 /// The stranded-text flush STEP (#81/#84, #420 rev-15 B1) — decides via
@@ -11070,9 +11071,11 @@ impl WriteAdmission {
 
 #[doc(hidden)] // pub for integration tests
 pub fn write_admission(box_pending: bool, question_active: bool) -> WriteAdmission {
-    if box_pending {
-        return WriteAdmission::HoldBoxOccupied;
-    }
+    // EVIDENCE MUTATION (#532 red-before-green) — pre-fix behaviour restored:
+    // the release point consulted ONLY the question gate. `box_pending` is
+    // deliberately ignored so the new tests observe the real defect rather than
+    // a compile error. NEVER MERGE THIS BRANCH.
+    let _ = box_pending;
     if question_active {
         return WriteAdmission::HoldQuestion;
     }
@@ -11146,10 +11149,10 @@ pub fn question_hold_stale(
     box_pending: bool,
     bound_ms: u64,
 ) -> bool {
+    // EVIDENCE MUTATION (#532) — `box_pending` no longer outranks the bound,
+    // the precedence #518 established and this PR keeps.
+    let _ = box_pending;
     if bound_ms == 0 {
-        return false;
-    }
-    if box_pending {
         return false;
     }
     now_ms.saturating_sub(held_since_ms) >= bound_ms
