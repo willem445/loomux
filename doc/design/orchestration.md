@@ -5139,6 +5139,14 @@ a bind.
   direction of guessing is pasting the wrong bytes into somebody's terminal. A single unreadable
   entry costs only that entry, and the skip is audited (`queue-recover-skipped`) rather than leaving
   the count silently short.
+- **Staged orphans are never cleared.** Once staged, an entry stays in `recovered_queue` /
+  `recovered_markers` — and therefore keeps appearing in `queue_orphans` — for the life of the
+  process. There is no "acknowledge" step, deliberately: nothing in the registry can tell whether
+  the orchestrator actually re-sent the work or merely read the row, so an ack would be a claim the
+  code cannot back. The cost is that an orchestrator calling `queue_orphans` twice in one session
+  sees the same rows twice, which is why the tool's own description says to call it once at session
+  start (a restart is the only thing that produces these, so re-polling finds nothing new). The
+  alternative failure — forgetting lost work — is the one this feature exists to prevent.
 - **No age cutoff.** #468 asked whether staleness should expire a recovered entry; it does not — the
   same answer #445 gave for the live queue (a queue behind an unanswered question is the designed
   case, not a leak). Instead the staleness *judgement* is handed to whoever can make it:
