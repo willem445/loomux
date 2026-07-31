@@ -5271,7 +5271,7 @@ frontend's `firstInputMs` and deliberately did **not** answer it with a better `
 the signal from `term.onKey` and the two `term.paste()` sites — *a structural guarantee, not a
 pattern match against an open set*.
 
-**Fix 1 — source the bit.** `src/humanorigin.ts` is a one-turn latch marked by exactly the
+**Fix 1 — source the bit.** `src/humanorigin.ts` is a short-lived latch marked by exactly the
 three call sites `markFirstInput()` already trusts. xterm fires `onKey` synchronously
 immediately before the `onData` it produced, and `term.paste()` triggers its `onData`
 synchronously from the call, so a human write reads the mark still open; a query reply is
@@ -5283,6 +5283,46 @@ existing shape keeps its meaning and an unstated origin degrades to the pre-#518
 the fail-safe direction, since believing a human typed only ever makes delivery hold *more*.
 The bit is **ANDed** with #499's shape gate, never substituted for it: #496 PR-A's deliberate
 Neutral/zero-delta tradeoff (an arrow key does not defer anything) is untouched.
+
+**Fix 1a — the two human paths `onKey` never sees, and the scheduling trap in them.** Read
+from `@xterm/xterm` 6.0.0's own `lib/xterm.js` rather than assumed:
+
+```
+_finalizeComposition(e){...this._isSendingComposition=!0,setTimeout((()=>{
+ ...t.length>0&&this._coreService.triggerDataEvent(t,!0)}),0)}
+_inputEvent(e){if(e.data&&"insertText"===e.inputType&&(!e.composed||
+ !this._keyDownSeen)...{...this.coreService.triggerDataEvent(t,!0)...}}
+```
+
+An **IME commit** is sent from a `setTimeout(…, 0)` — a later task than the `compositionend`
+that caused it. The **`insertText`** path (dead keys, accents, soft keyboards) sends
+synchronously with no key event at all. Both are still structural signals — they are DOM
+events on the terminal's own textarea, and xterm never routes a query auto-reply through the
+textarea; it calls `triggerDataEvent` directly — so `pane.ts` marks from them too, in the
+CAPTURE phase on `termEl`, an *ancestor* of the textarea, since ancestor-capture listeners run
+before any listener on the target itself.
+
+That ancestor-capture choice is required for the synchronous path, and it is exactly what
+makes the deferred one subtle. **The first cut of this got it backwards and shipped**: it
+reasoned that a close scheduled from our listener would be registered *after* xterm's send, so
+one `setTimeout(…, 0)` would suffice. Running first means our timer is queued *first*, and
+equal-delay timers fire in registration order — so the close beat the send and **every IME
+commit read non-human**, silently removing the protection from exactly the users most likely to
+have an unfinished composition sitting in the box. Caught in review (#528 B1), reproduced
+against the real module.
+
+`markDeferred()` therefore closes over **two** timer hops, scheduling the second only once the
+first has run. That lands it in a strictly later round than any send registered during the
+original dispatch, whichever timer was queued first — the ordering dependency is removed rather
+than inverted, which matters because the order is a consequence of DOM capture semantics that a
+future listener change could flip back. The window is two timer rounds (tens of milliseconds on
+a coarse-resolution host, ~2ms in a foreground Chromium); if it is ever mis-sized it fails
+toward "human", i.e. the pre-#518 behaviour of holding more and never clobbering.
+
+The lesson worth carrying: a manual-queue unit test **cannot** see this class of bug. The
+original tests modelled the deferred window's shape faithfully and passed, because none of them
+registered a competing send. `humanorigin.test.ts` now pins the ordering with real timers and a
+racing timer registered after the mark, which is what the review's own repro did.
 
 Occupancy (`input_box_len`) is deliberately *not* gated on the origin bit. An auto-reply
 already contributes a zero delta, so there is nothing to add — and under-counting occupancy is
@@ -5345,6 +5385,18 @@ downstream behaviour identical, including the residual `should_flush_before_past
 blesses ("A false 'unconfirmed' here is safe: the flush Enter lands on an already empty box
 and is a no-op"). It also holds nothing across a restart: it reads live pane state, and a
 restart destroys the pty, so there is no delivery left to judge.
+
+**No coalescing mechanism, deliberately** (#528 review N1). The burst that motivated this — 17
+false alarms in one day — is collapsed *at the source*, not by de-duplicating notices
+downstream: idle panes now produce `delivery-unconfirmed-idle-pane` audit records and no
+actionable notice at all, so a burst of false alarms collapses to zero. A burst of GENUINE
+strands still notifies once per pane, and that is the intended behaviour rather than an
+oversight: each names a different pane the orchestrator must actually do something about, and
+collapsing them would trade a known false-positive problem for an unknown false-negative one.
+The narrower claim is the honest one — this fixes the alarms that were wrong, not the volume
+of alarms that are right. If genuine-burst collapsing is wanted, it is a separate decision with
+its own failure modes (which pane's identity survives the merge? what re-arms it?), and it
+belongs to whoever owns notice economy, not to this fix.
 
 **Test seams.** Two, both back-dating the *real* fields the real readers read rather than
 mocking a clock, so the tests drive the production path with production `now_ms()` and the

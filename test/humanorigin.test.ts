@@ -24,10 +24,21 @@ function manualScheduler() {
     drain: () => {
       for (const fn of micro.splice(0)) fn();
     },
-    /** Run the next macrotask — where an IME commit's data actually arrives. */
+    /** Run ONE macrotask round: the callbacks queued as of now, and no
+     *  callbacks they themselves queue. Round 1 is where xterm's IME send
+     *  lands, so "still open after one round" is the property that matters. */
     drainTask: () => {
       for (const fn of micro.splice(0)) fn();
       for (const fn of macro.splice(0)) fn();
+    },
+    /** Run rounds until nothing is left — the latch's deferred close takes two
+     *  hops deliberately (see `humanorigin.ts`), so a test that wants the
+     *  CLOSED state has to say so rather than assume one round suffices. */
+    settle: () => {
+      for (let round = 0; round < 8 && (micro.length || macro.length); round++) {
+        for (const fn of micro.splice(0)) fn();
+        for (const fn of macro.splice(0)) fn();
+      }
     },
   };
 }
@@ -130,16 +141,30 @@ test("a deferred mark survives the turn boundary a plain mark does not", () => {
   );
 });
 
-test("a deferred mark IS closed once its macrotask has run", () => {
-  // It is a bounded widening, not an open door: one task, then shut. An
-  // auto-reply arriving after that reads non-human exactly like any other.
+test("a deferred mark survives its FIRST macrotask round — where the competing send lands", () => {
+  // The manual-queue mirror of the real-timer regression test below. Round 1
+  // is the round xterm's `_finalizeComposition` send is queued into, whichever
+  // of the two timers was registered first; the close is deliberately not in
+  // it. This is the assertion the one-hop version failed.
   const s = manualScheduler();
   const latch = createHumanOriginLatch(s.schedule, s.scheduleTask);
 
   latch.markDeferred();
   s.drainTask();
 
-  assert.equal(latch.isHuman, false, "the deferred window is one macrotask wide, not indefinite");
+  assert.equal(latch.isHuman, true, "the IME send's own round must still read human");
+});
+
+test("a deferred mark IS closed once both its hops have run", () => {
+  // Bounded widening, not an open door: two rounds, then shut. An auto-reply
+  // arriving after that reads non-human exactly like any other.
+  const s = manualScheduler();
+  const latch = createHumanOriginLatch(s.schedule, s.scheduleTask);
+
+  latch.markDeferred();
+  s.settle();
+
+  assert.equal(latch.isHuman, false, "the deferred window is bounded, not indefinite");
 });
 
 test("a keystroke's microtask close cannot shut a composition's deferred mark", () => {
@@ -156,22 +181,73 @@ test("a keystroke's microtask close cannot shut a composition's deferred mark", 
   s.drain(); // the key's microtask close runs — and must NOT win
 
   assert.equal(latch.isHuman, true, "the later deferred mark outranks the earlier pending close");
-  s.drainTask();
+  s.settle();
   assert.equal(latch.isHuman, false, "and still closes on its own schedule");
 });
 
-test("the default deferred scheduler is a zero-delay timer — same primitive xterm's IME send uses", async () => {
-  // The shipped default, not the injected one. Equal-delay timers fire in
-  // registration order, which is what makes a close registered after xterm's
-  // own send land after the data rather than before it.
+/** Wait for an observable condition rather than a guessed duration, with a
+ *  bounded backstop so a regression fails with a real diff instead of hanging
+ *  (`ptywrite.test.ts`'s `timeoutAfter` precedent). Necessary here and not
+ *  merely tidy: a zero-delay timer costs a full platform tick — ~15ms on this
+ *  Windows host — so the two-hop close lands tens of milliseconds out, and any
+ *  fixed sleep is either flaky or arbitrary. */
+async function waitUntil(cond: () => boolean, capMs = 2000): Promise<void> {
+  const start = Date.now();
+  while (!cond() && Date.now() - start < capMs) {
+    await new Promise((r) => setTimeout(r, 2));
+  }
+}
+
+test("an IME commit reads human even though xterm registers its send AFTER our close (#528 B1)", async () => {
+  // THE REGRESSION TEST. Everything else in this file models the deferred
+  // window's SHAPE; none of it raced the competing timer, which is exactly how
+  // a broken first cut shipped green.
+  //
+  // The real registration order on `compositionend`, and it is this way round
+  // BECAUSE of a deliberate choice elsewhere: our listener is registered in the
+  // capture phase on an ANCESTOR of the textarea (needed so the synchronous
+  // `_inputEvent` path is marked before xterm sends), so it runs FIRST and our
+  // close timer is registered FIRST. xterm's own textarea handler runs second
+  // and registers the send. Equal-delay timers fire in registration order — so
+  // a single-hop close fires BEFORE the send, and the commit reads non-human.
+  //
+  // Nothing later rescues it on the shipped platform: WebView2 is Chromium, and
+  // Chromium fires the final `input` (insertCompositionText) BEFORE
+  // `compositionend`, so no generation bump lands in between.
+  const latch = createHumanOriginLatch(); // shipped defaults, real timers
+
+  latch.markDeferred(); // 1. our capture-phase listener
+  let readAtSend: boolean | null = null;
+  setTimeout(() => {
+    readAtSend = latch.isHuman; // 2. xterm's send, registered AFTER our close
+  }, 0);
+
+  await waitUntil(() => readAtSend !== null);
+  assert.notEqual(readAtSend, null, "the simulated send must actually have run");
+  assert.equal(
+    readAtSend,
+    true,
+    "the IME commit must read human when it lands — a close that wins this race is the " +
+      "CJK regression this whole mechanism exists to prevent",
+  );
+});
+
+test("the deferred window still closes on its own, and does not outlive the send it protects", async () => {
+  // The bound half: two hops is registration-order-independent, not open-ended.
+  // A query auto-reply arriving after the window reads non-human like any other.
   const latch = createHumanOriginLatch();
 
   latch.markDeferred();
   await Promise.resolve();
   assert.equal(latch.isHuman, true, "a microtask boundary must not close a deferred mark");
 
-  await new Promise((r) => setTimeout(r, 0));
-  assert.equal(latch.isHuman, false, "one macrotask later it is closed");
+  await waitUntil(() => !latch.isHuman);
+  assert.equal(
+    latch.isHuman,
+    false,
+    "the window is two timer rounds wide, not indefinite — an auto-reply arriving after it " +
+      "must read non-human like any other",
+  );
 });
 
 test("the default scheduler is queueMicrotask — the mark closes before the next task", async () => {

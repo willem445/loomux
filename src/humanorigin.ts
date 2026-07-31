@@ -92,18 +92,31 @@ export interface HumanOriginLatch {
  * nothing that arrives later.
  *
  * `scheduleTask` closes a `markDeferred()` and defaults to a zero-delay
- * `setTimeout`, deliberately the SAME primitive and delay xterm's
- * `_finalizeComposition` uses to send an IME commit. Timers of equal delay
- * fire in registration order, and xterm registers its send from its own
- * `compositionend` handler — so a `markDeferred()` made from a
- * `compositionend` listener that runs before xterm's own (see `pane.ts`: the
- * listener is registered in the CAPTURE phase on an ancestor, which the DOM
- * guarantees runs before any listener on the textarea itself) queues its close
- * behind that send, and the latch is still open when the data arrives.
+ * `setTimeout` — the same primitive xterm's `_finalizeComposition` uses to send
+ * an IME commit — but the close takes **TWO hops of it**, and that is the whole
+ * correctness argument. The first cut took one hop and reasoned that our close
+ * would be registered *after* xterm's send. It is registered BEFORE: our
+ * listener is deliberately capture-phase on an ancestor (so the synchronous
+ * `_inputEvent` path is marked before xterm sends), which means it runs first,
+ * which means its timer is queued first. Equal-delay timers fire in
+ * registration order, so a one-hop close beat the send and every IME commit
+ * read non-human — the exact CJK regression this mechanism exists to prevent
+ * (#528 review B1, reproduced against the real module).
  *
- * Both are injectable so the scheduling rules are unit-testable with manual
+ * Two hops removes the dependency on ordering entirely rather than inverting
+ * it. Whichever of the two timers is registered first, both run in the same
+ * timer round; the second hop is only scheduled once the first has run, so it
+ * necessarily lands in a LATER round than any send registered during the
+ * original dispatch. There is no registration order that defeats it, which
+ * matters because the order is a consequence of DOM capture semantics and a
+ * future listener change could flip it back.
+ *
+ * Both schedulers are injectable so the rules are unit-testable with manual
  * queues, keeping this logic out of `pane.ts`'s hand-validated DOM wiring (the
- * repo's standing split).
+ * repo's standing split) — but the ordering property above can only be pinned
+ * with REAL timers and a competing send, so `humanorigin.test.ts` does exactly
+ * that. A manual-queue test cannot see this class of bug: that is how the first
+ * cut shipped green.
  *
  * Marks are generation-stamped, across BOTH kinds: a later mark of either kind
  * invalidates any earlier pending close, so a microtask close queued by a
@@ -130,7 +143,10 @@ export function createHumanOriginLatch(
       open(schedule);
     },
     markDeferred(): void {
-      open(scheduleTask);
+      // Two hops — see the doc above. The close is scheduled from INSIDE the
+      // first hop, so it can never share a timer round with a send registered
+      // during the same dispatch, whichever of the two was queued first.
+      open((close) => scheduleTask(() => scheduleTask(close)));
     },
     get isHuman(): boolean {
       return human;

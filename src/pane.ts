@@ -1215,10 +1215,13 @@ export class Pane implements VoiceTargetPane {
     // Registered in the CAPTURE phase on `termEl`, an ANCESTOR of the
     // textarea: the DOM runs ancestor-capture listeners before any listener on
     // the target itself, so these mark the latch before xterm's own handlers
-    // (which are bound to the textarea) can emit anything. `markDeferred`
-    // keeps the mark open across the macrotask the IME send lands in — see
-    // `humanorigin.ts` for why that ordering holds and why its failure
-    // direction is the safe one.
+    // (which are bound to the textarea) can emit anything. That ordering is
+    // required for the synchronous `insertText` path — and it is also why the
+    // deferred close CANNOT rely on registration order: running first means our
+    // close timer is queued FIRST, so a one-hop close beat xterm's send and
+    // broke exactly the case this exists for (#528 review B1). `markDeferred`
+    // takes two timer hops instead, which no registration order defeats — see
+    // `humanorigin.ts`.
     //
     // Without this, CJK/Japanese/Korean typing would classify as non-human and
     // silently lose the very protection these guards exist to give.
