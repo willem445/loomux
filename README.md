@@ -46,7 +46,13 @@ Every rung is a complete tool on its own — climb when you're ready:
    whatever was waiting in it**: deliveries re-queue themselves in their
    original order once their pane is back, and anything whose pane is gone
    for good is handed to the orchestrator as lost work — with the original
-   text — rather than disappearing. Hard-won lessons persist
+   text — rather than disappearing. Every one of those safety checks is
+   re-read at the instant loomux actually writes, never inherited from a
+   check that passed before a two-minute hold — so a prompt released by
+   your first keystroke can't land on top of what you're typing (#532).
+   And a delivery held on a question loomux can no longer verify is on
+   screen says so on the chip after ten minutes rather than waiting
+   forever; it still never presses Enter for you. Hard-won lessons persist
    across groups via a committed `.loomux/lessons.md`, not just this run.
    The task board and the group lifecycle panel — each its own keystroke
    away on an orchestration pane — persist across a close/reopen and a group
