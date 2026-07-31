@@ -13873,14 +13873,22 @@ fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
 ///    red is what turns "coverage should not silently vanish" from an
 ///    aspiration into a property.
 fn pin_could_not_arm(test: &str, why: &str) {
+    use std::io::Write;
     let msg = format!("SKIP {test}: {why}");
+    // Straight to fd 2, NOT `eprintln!`. libtest's capture is a thread-local
+    // consulted by the `print!`/`eprintln!` machinery; a direct write to the
+    // `Stderr` handle does not go through it, so this lands in the CI log of a
+    // PASSING test — which `eprintln!` demonstrably did not (zero SKIP lines
+    // across three #525 build jobs, rev-21 B2). Verified by reading the log of
+    // the run that introduced it, not by assuming: see the PR body.
+    let _ = writeln!(std::io::stderr(), "{msg}");
+    // Belt: the run-page summary, which survives even if a future libtest does
+    // capture fd 2.
     if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
-        use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(f, "- :warning: **#509 pin did not arm** — `{msg}`");
         }
     }
-    eprintln!("{msg}");
     assert!(
         !cfg!(target_os = "linux"),
         "{msg}\n\nOn Linux the #509 stripped-PATH pins MUST arm: ubuntu-22.04 is the only job \
