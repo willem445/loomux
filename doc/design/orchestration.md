@@ -4609,6 +4609,84 @@ boundary every other guard in this function already accepts; the flush's equival
 closed (see `flush_stranded_text` above) because its check-and-write collapse into ONE function with
 nothing left for `deliver_prompt` to get wrong beyond calling it.
 
+### #532: both safety signals fired backwards, and why that was one bug
+
+**The report.** A pane showed **held: question pending** on a **totally empty** prompt box. Then,
+as the human began typing their next message, the queue dequeued the earlier held prompt and
+**submitted it mid-typing, over their input**. A false positive on one guard, then a missed true
+positive on the other, in sequence.
+
+**They are the same event.** `prompt_wait_detected` reads `PtyManager::output_tail_bounded`, which
+is an **append-only byte ring, not a screen** — the last `QUESTION_SCAN_TAIL_BYTES` (4 KB) of
+everything the pty has ever emitted. On a pane that has gone quiet, an *answered* question stays
+inside that window indefinitely, and the structured signals the detector honours across its
+12-line window (`(y/n)`, `do you want to proceed`, `1. yes`) keep matching. The detector's own doc
+says as much — *"this alone can't tell a live prompt from the same words scrolled past"* — and
+directs the caller to pair it with an output-quiet check. The attention scan (#6/#40) pairs it.
+The late monitor pairs it (`quiet_long_enough &&`). **The #420 delivery hold — the one that blocks
+writes — pairs it with nothing.** That is the false positive.
+
+What clears such a stale reading is *fresh bytes*. When the human starts typing, their echo shifts
+the ring and pushes the question out of the detector's window. So **the keystroke that releases
+the question gate is the same keystroke that occupies the box.** `deliver_now` checked box
+occupancy (#111) *first* and the question (#420) *second*, and the second one blocks for up to
+`QUESTION_HOLD_MAX`. Nothing re-read occupancy afterwards, so the delivery pasted on a green light
+earned two minutes earlier against a box that was empty *then*. The pre-Enter quiet wait then
+submitted the merged line the moment the human paused. This is the ordinary interleaving, not a
+rare race.
+
+**Fix 1 — the gates are re-verified together, at the write.** `write_admission(box_pending,
+question_active)` is the one derivation of "may this delivery write right now", replacing three
+inline spellings (`deliver_now`'s pre-paste pair, and `run_queue_drainer`'s deliverability
+pre-check). `box_pending` is checked first: #510 is the absolute, because holding too long costs a
+badge and submitting over a person's line costs everything. `deliver_now`'s pre-paste checkpoints
+became a bounded re-verify **loop** (`PREPASTE_RECHECK_ROUNDS`) that exits only when both gates
+read clear at one instant; each round still contains the full, individually-capped holds, so the
+rounds bound *re-arming*, not waiting. Giving up is not a loss — the entry stays at the front of
+its queue and the drainer retries with no cap.
+
+Two occupancy checks that did not exist were added. **Pre-Enter:** `wait_for_user_quiet` asks
+whether the human *stopped* typing and the question hold asks who owns the Enter key; neither asks
+whether human content is in the box *right now*, which is what #510 is about. **At the flush
+press:** `should_flush_before_paste_now` enforced #510 only through `human_typed_since`
+(`last_user_input_ms > submit_sent_ms`) — a *timestamp*, which is structurally blind to a line the
+human typed and left sitting **before** our submit. It now reads `input_pending` directly. That
+counter moves only on human writes through `note_user_input`, never on loomux's own `write_bytes`,
+so our own stranded paste still does not suppress the flush it exists for.
+
+Declining pre-Enter is not a new recovery path: it takes the same `AbortedPreEnter` route the
+question checkpoint beside it already takes — a `StrandedSubmit` marker at the queue front, retried
+with no cap, whose press now re-reads occupancy too. The delivery **waits for the box to empty and
+then flushes**.
+
+**Fix 2 — the hold is bounded, and the bound badges rather than releases.** `QUESTION_HOLD_MAX`
+(120s) was never the bound: capping out only aborts *that attempt*, and `run_queue_drainer` re-arms
+the same hold every `QUEUE_DRAIN_POLL` forever. Same unbounded-latch shape #518 found in the
+human-input block, one guard over. `QUESTION_HOLD_STALE_AFTER` (10 min) bounds the **aggregate,
+per-pane** hold, measured off the front queue entry's `enqueued_ms` — the thing the human actually
+experienced. `question_hold_stale` mirrors #518's precedence exactly: `box_pending` outranks the
+bound (a hold explained by the box is not a stale-question report), and `bound_ms == 0` disables
+rather than fires.
+
+**It raises `StrandedBlocker::QuestionStale` and never releases a write.** State the limit plainly:
+*from an append-only byte ring, a live dialog and an answered one that has not scrolled away are
+byte-identical.* No reading available here could justify a release. Narrowing detection to the
+last-painted lines *would* discriminate, but it weakens genuine detection — a statusline painted
+under a live dialog pushes its y/n line out of a 3-line window, which is precisely why
+`prompt_wait_detected` honours structured signals across 12 — and that is the guard's action, which
+#427/#420 forbid weakening. The asymmetry settles it: a prompt held too long is recoverable by a
+human who is *told*; an Enter that auto-answers a live consent dialog silently steers the agent and
+is not recoverable at all. So the bound stops the hold re-arming *silently* and names the
+hypothesis; it never converts into a write. The badge wording names **both** branches and gives an
+action safe under either ("answer it if one is on screen; if the pane looks clear, that reading is
+stale: type a character and delete it") — asserting staleness would be exactly the unbacked claim
+`.loomux/lessons.md` calls a defect.
+
+**Open, and deliberately not taken here.** The structural evidence this fix wanted is *rendered
+rows*. #530's `termgrid` composed-grid VT replay would let question detection run against what is
+actually on screen, which distinguishes still-displayed from scrolled-past for real. That is a
+follow-up issue, not a mid-flight dependency of this one.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,
