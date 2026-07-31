@@ -5044,6 +5044,16 @@ Stamping BEFORE the kill is load-bearing: `PtyManager::kill` can have the waiter
 `on_pty_exit` before `kill_agent_as` returns, and a record written after the kill could lose that
 race and misroute the notice to a prompt.
 
+**How durable, exactly** — worth stating rather than leaving to the word "durable". The record
+lives in the registry's own agent entry (process lifetime) and in the audit log (`agent-kill`
+carries the initiator; the demoted notice is its own `agent-exit-notice` line). That is strictly
+more lifetime than the decision needs: the routing decision happens on the pty waiter thread
+milliseconds after the kill, in the same process, and a restart in that window leaves nothing to
+route — the agent is gone either way and the roster loaded from disk says so. Persisting
+`killed_by` into `agents.json`'s `AgentRecord` would add a field nothing reads. The point of
+"recorded, not inferred" is *provenance*, not longevity: the fact comes from the code that caused
+the exit, not from a downstream guess about it.
+
 The idle reaper's OWN second notice ("respawn a worker when you have work for it") is demoted
 too. Demoting only the exit notice would have left an idle kill costing exactly one turn anyway,
 which is the outcome this issue exists to remove. That is safe *because* the reaper only ever

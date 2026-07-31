@@ -10674,8 +10674,12 @@ fn run_queue_drainer(
                 // the next delivery's own stranded-text flush eventually
                 // submitting it — never guaranteed to be loud about it).
                 if let Err(_queue_full) = reg.enqueue_stranded_front(&group, &front.agent_id, &front.from, pty_id) {
+                    // #533-A: the marker that failed to push stood for the
+                    // WHOLE batch that was pasted, so the count names every
+                    // delivery left pasted-but-unsubmitted — saying "1" here
+                    // would understate what a reader has to go look at.
                     reg.notify_queue(&group, &front.agent_id, target_is_orchestrator,
-                        &queue::dropped_notice(&front.agent_id, 1, queue::DropReason::QueueFull));
+                        &queue::dropped_notice(&front.agent_id, closed.len(), queue::DropReason::QueueFull));
                 }
             }
         }
