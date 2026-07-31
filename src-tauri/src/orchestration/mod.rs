@@ -1244,6 +1244,21 @@ const REINJECT_CONFIRM_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 /// reinjection stuck past `REINJECT_CONFIRM_TIMEOUT_MS` — see `AgentEntry::
 /// compact_reinject_attempts`'s doc for why this must never be unbounded.
 const MAX_REINJECT_ATTEMPTS: u32 = 3;
+/// #535: how much longer past `REINJECT_CONFIRM_TIMEOUT_MS` a retry may be
+/// deferred while the pane is still actively producing output. A retry pasted
+/// into a live turn is the worst possible moment for it — it interrupts an
+/// agent that is demonstrably working — so the timeout waits for a lull rather
+/// than firing blind. Bounded rather than open-ended: a pane that never goes
+/// quiet (an animated statusline above the group's `idle_activity_floor_bytes`,
+/// a genuinely runaway turn) must not be able to suppress the retry forever,
+/// or scope item 3's safety net for a genuinely LOST re-grounding dies with it.
+///
+/// Sized at one further `REINJECT_CONFIRM_TIMEOUT_MS`, i.e. a stuck-and-busy
+/// reinjection reaches `MAX_REINJECT_ATTEMPTS` in at most 30 minutes instead of
+/// 15. A constant, deliberately not a `Guardrails` knob: #518's bound made the
+/// same call for the same reason — a knob with no correct second setting only
+/// ever gets set wrong.
+const REINJECT_BUSY_DEFER_MAX_MS: u64 = REINJECT_CONFIRM_TIMEOUT_MS;
 /// Production bug fix (#410, PR #329 round 6): how long a `compact_pending`
 /// arm is given to reach a busy-then-quiet resolution (confirm or discard)
 /// before the resolver forces an abandon — symmetric to `REINJECT_CONFIRM_
@@ -3240,6 +3255,130 @@ pub fn idle_output_is_activity(prev_total: u64, cur_total: u64, floor: u64) -> b
     cur_total.saturating_sub(prev_total) >= floor
 }
 
+/// What a tick should DO about a re-grounding whose delivery has not been
+/// confirmed (#535).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReinjectDisposition {
+    /// The agent has demonstrably acted since the attempt (a confirmed
+    /// delivery, or the agent's own post-attempt MCP call). The re-grounding
+    /// landed — resolve the latch; never re-send.
+    Resolved,
+    /// Still inside `REINJECT_CONFIRM_TIMEOUT_MS`: a delivery may legitimately
+    /// still be in flight. Keep waiting; touch nothing.
+    Wait,
+    /// The window is spent, but the pane is producing output *right now* —
+    /// this agent is mid-turn. Do not spend an attempt into a live turn; wait
+    /// for a lull, bounded by `REINJECT_BUSY_DEFER_MAX_MS`.
+    DeferBusy,
+    /// Window spent, nothing observed, pane not busy (or the busy deferral is
+    /// itself spent). Re-send — or, at `MAX_REINJECT_ATTEMPTS`, abandon.
+    Retry,
+}
+
+/// Should a still-unconfirmed re-grounding be re-sent this tick? (#535)
+///
+/// The bug this replaces: the retry loop treated an attempt as successful
+/// **only** on a delivery confirmation (`submit_sent_ms >= attempted_ms &&
+/// confirmed`), and that signal is precisely the one known to be unreliable on
+/// busy/repainting panes — roughly 25 false `delivery unconfirmed` alarms in a
+/// single observed session (#451/#496/#522/#528 lineage). So a re-grounding
+/// that had **landed** was re-pasted up to twice more into a working agent, and
+/// could finish as a `reinjection-abandoned` record claiming the contract was
+/// never restored when it had been. Observed live on a copilot worker sitting
+/// at 2/3 while visibly on-track.
+///
+/// The fix is to stop inferring the outcome from *our* delivery machinery and
+/// observe **the agent** instead:
+///
+/// - `confirmed_delivery` — the pre-#535 signal, kept and checked first. When
+///   it does fire it is authoritative; it was only ever wrong by *omission*.
+/// - `acked` — the agent called a loomux MCP tool after `attempted_ms`
+///   (`AgentEntry::last_mcp_activity_ms`). This is an ACKNOWLEDGMENT, not
+///   another delivery inference: it is the agent's own process reaching
+///   loomux, and re-syncing through exactly these calls is what the
+///   re-grounding notice instructs. A pane cannot repaint one into existence.
+///
+/// **Why terminal output is deliberately NOT part of `acked`.** #535's own
+/// write-up lists "attributable terminal output" as an ack signal, and it must
+/// not be one: `output_total` counts our own pasted notice echoing back, plus
+/// statusline/spinner repaint frames (#480) — see `idle_output_is_activity`.
+/// Worse, folding growth into `acked` would make `DeferBusy` structurally
+/// unreachable (busy ⇒ growth ⇒ ack ⇒ `Resolved`), i.e. an arm documenting a
+/// behaviour it can never have. Output therefore feeds `busy` only, where its
+/// weakness is harmless: it defers an attempt, it never claims one succeeded.
+///
+/// Ordering is the contract. Evidence of a landing beats the clock (else the
+/// bug survives); the clock beats busy-ness (else a chatty pane defers before
+/// it has even waited); and the busy deferral is bounded (else a permanently
+/// noisy pane suppresses the retry forever and scope's safety net for a
+/// genuinely lost re-grounding dies quietly).
+///
+/// `busy_defer_max_ms == 0` disables the deferral (pre-#535 behaviour) rather
+/// than making it expire instantly — the same convention, for the same reason,
+/// as #518's `human_input_block(.., bound_ms)`: a mis-set `0` must degrade to
+/// the old behaviour, never to "defer nothing, ever".
+///
+/// Pure, and four-way rather than a bool, so each outcome is separately
+/// auditable and directly pinnable by tests.
+#[doc(hidden)] // pub for integration tests
+pub fn reinject_disposition(
+    confirmed_delivery: bool,
+    acked: bool,
+    busy: bool,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+    busy_defer_max_ms: u64,
+) -> ReinjectDisposition {
+    if confirmed_delivery || acked {
+        return ReinjectDisposition::Resolved;
+    }
+    if elapsed_ms < timeout_ms {
+        return ReinjectDisposition::Wait;
+    }
+    if busy && elapsed_ms < timeout_ms.saturating_add(busy_defer_max_ms) {
+        return ReinjectDisposition::DeferBusy;
+    }
+    ReinjectDisposition::Retry
+}
+
+/// Has this agent ACTED — reached loomux through its own MCP client — at or
+/// after `since_ms`? (#535)
+///
+/// **The shared agent-activity predicate.** Deliberately named and shaped for
+/// more than its first caller: it takes a bare timestamp pair, not a
+/// reinjection, because the same question ("did the agent itself do something
+/// after we pasted at T?") is the missing input everywhere loomux currently
+/// infers an outcome from its own delivery machinery. `reinject_disposition`
+/// (#535) is the first consumer; the unconfirmed-delivery detector (**#539**)
+/// is the intended second one — `unconfirmed_disposition` (#522/#528) today
+/// reads only BOX structure (is our paste still at the tail, is human text
+/// outstanding) and has no activity evidence at all, which is why a pane that
+/// simply got on with its work can still raise a false alarm. #539's scope is
+/// **not** taken here and this fn has no second call site yet; this is only the
+/// mechanism it will need, kept general so it does not have to be rebuilt.
+///
+/// What this signal means, precisely: **the agent's own code path executed**.
+/// It is stamped once, at the `tools/call` dispatch funnel, so a `true` here
+/// says a live process authenticated with this agent's token and invoked a
+/// loomux tool. What it explicitly does NOT mean: **that the pane painted**.
+/// Terminal output is not part of it, and must not be folded in — see
+/// `reinject_disposition`'s doc for why (our own paste echoes, statusline and
+/// spinner repaint frames per #480, and `idle_output_is_activity`'s whole
+/// reason for existing).
+///
+/// The comparison is `>=`, not `>`: the stamp and whatever `since_ms` is being
+/// compared against are both `now_ms()` readings, and a fast agent can
+/// genuinely answer inside the same millisecond. Erring the other way would
+/// discard the very ack this exists to notice — the same off-by-one that made
+/// one of #518's tests pass for the wrong reason.
+///
+/// `last_mcp_activity_ms == 0` is "never called" (`AgentEntry`'s seed) and can
+/// never satisfy a real `since_ms`, so a never-calling agent falls through to
+/// whatever its caller's unchanged path is.
+pub fn agent_acted_since(last_mcp_activity_ms: u64, since_ms: u64) -> bool {
+    last_mcp_activity_ms > 0 && last_mcp_activity_ms >= since_ms
+}
+
 /// Compact-nudge (#287): whether `role`'s capability class is one of the
 /// group's configured eligible roles for the automatic `/compact` nudge. Pure
 /// so role gating is testable without a registry. `allowed_roles` is
@@ -4836,6 +4975,32 @@ pub struct AgentEntry {
     /// Seeded at spawn and whenever work is (re)assigned. See
     /// `watchdog_should_notify`.
     pub last_progress_ms: u64,
+    /// #535: Unix-ms this agent last called ANY loomux MCP tool, stamped once
+    /// at the `tools/call` dispatch funnel (`mcp::dispatch`) — so it means
+    /// exactly "this agent's own process reached loomux", for every tool and
+    /// every role. `0` = never called; monotone, never rewound.
+    ///
+    /// This is an **acknowledgment** clock, and deliberately not any of the
+    /// three clocks that already exist:
+    /// - `last_progress_ms` above is the two signals folded together and is
+    ///   rewritten to `now` by pty *output growth* in three separate ticks
+    ///   (`watchdog_tick`, `idle_tick_tick`, `compact_nudge_tick`). Repaint
+    ///   noise above the activity floor advances it, so it cannot answer
+    ///   "did the agent act", only "did the pane emit".
+    /// - `note_agent_activity` (which writes `last_progress_ms`) is stamped
+    ///   from exactly ONE tool, `message_orchestrator`, and is an explicit
+    ///   no-op for `Role::Orchestrator` — but an orchestrator compacts and
+    ///   gets re-grounded like anything else, so a watchdog-scoped signal
+    ///   cannot serve this.
+    /// - `DeliveryConfirmation` is loomux observing its own paste, which is
+    ///   the unreliable signal #535 exists to stop relying on.
+    ///
+    /// Read by `reinject_acked`/`reinject_disposition`. In-memory only, seeded
+    /// `0` on every construction: a restart re-mints agent ids from an
+    /// in-memory counter (the rev-4 B1 lesson in `compact_nudge_tick`), and a
+    /// `0` seed cannot be mistaken for a fresh ack the way a `now_ms()` seed
+    /// or a persisted value could.
+    pub last_mcp_activity_ms: u64,
     /// #496 hardening: Unix-ms of this agent's last OUTPUT-based quiet-clock
     /// reset only — i.e. the last time `last_progress_ms` above moved because
     /// the pane produced real output, never because human input deferred it.
@@ -4990,6 +5155,16 @@ pub struct AgentEntry {
     /// machine so no future compaction can ever arm again for this agent.
     /// Reset to `0` whenever no reinjection is in flight.
     pub compact_reinject_attempts: u32,
+    /// #535 anti-nag latch: this attempt's busy-turn deferral has already been
+    /// audited. The compact poll runs every 10s while any arm is open
+    /// (`compact_nudge_poll_interval`), so without this a single deferral would
+    /// write dozens of identical audit lines. Same shape as
+    /// `watchdog_notified` / `compact_nudge_notified`.
+    ///
+    /// Scoped to ONE attempt, not to the whole reinjection: cleared wherever
+    /// `compact_reinject_attempted_ms` is (re)set or released, so a retry's own
+    /// deferral is still audited rather than silenced by its predecessor's.
+    pub compact_reinject_busy_deferred: bool,
     /// Production bug fix (#410, PR #329 round 6): Unix-ms the CURRENT
     /// `compact_pending` arm started (set at each of the three arm sites,
     /// cleared on any resolution — discard, handoff into the reinjection-
@@ -13764,6 +13939,63 @@ impl OrchRegistry {
         }
     }
 
+    /// Stamp the shared agent-acknowledgment clock: this agent's own process
+    /// just reached loomux and invoked an MCP tool (#535).
+    ///
+    /// Called from exactly one place — the `tools/call` arm of `mcp::dispatch`,
+    /// before the tool runs — so it covers **every tool and every role** with
+    /// no per-tool opt-in to forget. Contrast `note_agent_activity` above,
+    /// which is the watchdog's silence clock: stamped from a single tool, and
+    /// a deliberate no-op for the orchestrator.
+    ///
+    /// Three deliberate properties, each load-bearing for a consumer:
+    /// - **Role-agnostic.** An orchestrator compacts and gets re-grounded like
+    ///   anything else, so this must not skip it the way the watchdog does.
+    /// - **Stamped before the tool runs, so a FAILED call still counts.** The
+    ///   claim is "the agent is alive and executing its contract", and a call
+    ///   that returns `permission denied` proves that exactly as well as one
+    ///   that succeeds.
+    /// - **Monotone.** `max`, never a bare assignment: a clock that a later
+    ///   caller could rewind would let one consumer erase another's evidence.
+    ///
+    /// A `Role::Solo` pane and any unknown id are simply absent from the
+    /// roster, so this is a no-op for them rather than a special case.
+    pub fn note_agent_ack(&self, agent_id: &str) {
+        let mut agents = self.agents.lock_safe();
+        if let Some(a) = agents.get_mut(agent_id) {
+            a.last_mcp_activity_ms = a.last_mcp_activity_ms.max(now_ms());
+        }
+    }
+
+    /// Read the shared agent-acknowledgment clock (#535). `None` for an id not
+    /// in the roster; `Some(0)` for an agent that has never called a tool —
+    /// `agent_acted_since` treats that as "no ack", never as a fresh one.
+    ///
+    /// Public so a consumer outside `compact_nudge_tick` (e.g. #539's
+    /// unconfirmed-delivery detector) can read the signal without reaching
+    /// into `AgentEntry` or taking the agents lock itself.
+    pub fn last_mcp_activity_ms(&self, agent_id: &str) -> Option<u64> {
+        self.agents.lock_safe().get(agent_id).map(|a| a.last_mcp_activity_ms)
+    }
+
+    /// Test seam (#535): place the ack clock at an exact time.
+    ///
+    /// `note_agent_ack` stamps real `now_ms()`, but `compact_nudge_tick` is
+    /// driven with a synthetic `now` (`FAR`, far beyond any wall clock) so the
+    /// multi-minute retry windows can be crossed without sleeping. Writing the
+    /// REAL field the real reader reads — rather than mocking a clock — keeps
+    /// the production comparison (`agent_acted_since`) under test; the same
+    /// approach, for the same reason, as #518's `set_user_input_ms_for_test`.
+    ///
+    /// Unlike `note_agent_ack` this is NOT clamped monotone: a test must be
+    /// able to place the stamp BEFORE the attempt to pin the negative case.
+    #[doc(hidden)]
+    pub fn set_last_mcp_activity_ms_for_test(&self, agent_id: &str, ms: u64) {
+        if let Some(a) = self.agents.lock_safe().get_mut(agent_id) {
+            a.last_mcp_activity_ms = ms;
+        }
+    }
+
     /// Snapshot every agent's monotonic pty output counter. Needs the app's
     /// `PtyManager`, so it yields an empty map without an app handle (unit
     /// tests drive `watchdog_tick` with synthetic counters instead).
@@ -15184,6 +15416,7 @@ impl OrchRegistry {
             idle_since_ms: None,
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
+            last_mcp_activity_ms: 0,
             last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
             last_output_total: 0,
             watchdog_notified: false,
@@ -15198,6 +15431,7 @@ impl OrchRegistry {
             compact_pending_trusted: false,
             compact_reinject_attempted_ms: None,
             compact_reinject_attempts: 0,
+            compact_reinject_busy_deferred: false,
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
@@ -15324,6 +15558,7 @@ impl OrchRegistry {
             idle_since_ms: None,
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
+            last_mcp_activity_ms: 0,
             last_output_progress_ms: now_ms(), // solo panes are never idle-ticked (not Role::Orchestrator); inert
             last_output_total: 0,
             watchdog_notified: false,
@@ -15338,6 +15573,7 @@ impl OrchRegistry {
             compact_pending_trusted: false,
             compact_reinject_attempted_ms: None,
             compact_reinject_attempts: 0,
+            compact_reinject_busy_deferred: false,
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
@@ -15877,7 +16113,17 @@ impl OrchRegistry {
         let mut to_discard: Vec<(String, String, Option<u64>, Option<u64>)> = Vec::new();
         // rev-42 delta (round 2): a reinjection whose delivery just confirmed
         // — audited for visibility, distinct from the initial fire above.
-        let mut to_reinject_confirmed: Vec<(String, String)> = Vec::new();
+        // #535: the `&'static str` is the RESOLUTION SOURCE — `"delivery"` (our
+        // own submit sampler saw it) or `"activity"` (the agent itself called a
+        // loomux tool afterwards). Two different facts; a timeline that
+        // conflated them could not show whether #535's fix is working.
+        let mut to_reinject_confirmed: Vec<(String, String, &'static str)> = Vec::new();
+        // #535: an attempt whose retry window expired while the pane was still
+        // mid-turn — deferred rather than spent. Audited (once per attempt, see
+        // `compact_reinject_busy_deferred`) because "no retry fired" must read
+        // as a deliberate choice, not a silently dropped one — the same reason
+        // `to_hook_native_skip` exists.
+        let mut to_defer_busy: Vec<(String, String, u32)> = Vec::new();
         // rev-42 delta (round 2): a reinjection stuck past `MAX_REINJECT_
         // ATTEMPTS` — the latch is released anyway (never wedge the state
         // machine), but this must be visible: it's a genuinely lost
@@ -16112,6 +16358,11 @@ impl OrchRegistry {
                         a.compact_hook_native_notice_delivered = false;
                         a.compact_reinject_attempted_ms = None;
                         a.compact_reinject_attempts = 0;
+                        // #535: this is a delivery-phase TERMINAL path, so it
+                        // clears the deferral latch alongside the two fields
+                        // above — the same "same phase, same field inventory"
+                        // rule rev-21 review imposed on the sibling paths.
+                        a.compact_reinject_busy_deferred = false;
                         a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
                         // A loomux reinjection prompt may already have been
                         // PASTED (fire-and-forget, on an earlier tick) before
@@ -16219,6 +16470,10 @@ impl OrchRegistry {
                             a.compact_pending_armed_ms = None;
                             a.compact_reinject_attempts = 1;
                             a.compact_reinject_attempted_ms = Some(now);
+                            // #535: fresh attempt — clear the busy-deferral
+                            // anti-nag latch so this attempt's own deferral is
+                            // still audited (see the field's doc).
+                            a.compact_reinject_busy_deferred = false;
                             let instructions = self.group_dir(&a.group).join(
                                 g.block(&a.block)
                                     .map(|b| b.instructions_file())
@@ -16260,46 +16515,107 @@ impl OrchRegistry {
                     let confirmed_delivery = delivery_confirmations
                         .get(&a.id)
                         .is_some_and(|d| d.submit_sent_ms >= attempted_ms && d.confirmed);
-                    if confirmed_delivery {
-                        a.compact_pending = false;
-                        a.compact_reinject_attempted_ms = None;
-                        a.compact_reinject_attempts = 0;
-                        a.compact_pending_evidence = None;
-                        a.compact_hook_native_notice_delivered = false;
-                        // #410/round-7: the immediate post-compact discussion
-                        // is exactly the window an inference arm can misread
-                        // as a new compaction — cool down.
-                        a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
-                        to_reinject_confirmed.push((a.id.clone(), a.group.clone()));
-                    } else if now.saturating_sub(attempted_ms) >= REINJECT_CONFIRM_TIMEOUT_MS {
-                        if a.compact_reinject_attempts < MAX_REINJECT_ATTEMPTS {
-                            a.compact_reinject_attempts += 1;
-                            a.compact_reinject_attempted_ms = Some(now);
-                            let instructions = self.group_dir(&a.group).join(
-                                g.block(&a.block)
-                                    .map(|b| b.instructions_file())
-                                    .unwrap_or_else(|| a.role.instructions_file().to_string()),
-                            );
-                            let ledger = self.ledger_path(&a.group, &a.id);
-                            to_reinject.push((
-                                a.id.clone(), a.group.clone(), instructions, ledger,
-                                a.compact_reinject_attempts, a.contract_carrier,
-                            ));
-                        } else {
-                            to_abandon.push((a.id.clone(), a.group.clone(), a.compact_reinject_attempts));
+                    // #535: the agent's OWN post-attempt MCP call — the
+                    // acknowledgment this phase was missing. `confirmed_
+                    // delivery` above is loomux watching its own paste, and it
+                    // is wrong by omission often enough (~25 false unconfirmed
+                    // alarms in one observed session) that a LANDED
+                    // re-grounding was being re-pasted into a working agent.
+                    // See `agent_acted_since` / `reinject_disposition`.
+                    let acked = agent_acted_since(a.last_mcp_activity_ms, attempted_ms);
+                    // #535: `currently_quiet` is this tick's OWN floor-gated
+                    // growth reading, computed above. `busy` is used ONLY to
+                    // defer an attempt, never to claim one landed — output
+                    // includes our own pasted notice echoing back and
+                    // statusline/spinner repaints (#480). The echo cannot
+                    // cause a spurious defer anyway: it lands while
+                    // `elapsed < REINJECT_CONFIRM_TIMEOUT_MS`, where the
+                    // disposition is `Wait` regardless of busy-ness.
+                    match reinject_disposition(
+                        confirmed_delivery,
+                        acked,
+                        !currently_quiet,
+                        now.saturating_sub(attempted_ms),
+                        REINJECT_CONFIRM_TIMEOUT_MS,
+                        REINJECT_BUSY_DEFER_MAX_MS,
+                    ) {
+                        ReinjectDisposition::Resolved => {
                             a.compact_pending = false;
                             a.compact_reinject_attempted_ms = None;
                             a.compact_reinject_attempts = 0;
+                            a.compact_reinject_busy_deferred = false;
                             a.compact_pending_evidence = None;
                             a.compact_hook_native_notice_delivered = false;
-                            a.compact_last_lost_reason = Some("reinjection-abandoned".to_string());
-                            a.compact_last_lost_ms = Some(now);
+                            // #410/round-7: the immediate post-compact discussion
+                            // is exactly the window an inference arm can misread
+                            // as a new compaction — cool down.
                             a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                            // #535: provenance, the same distinction
+                            // `to_hook_armed` already draws — "the agent
+                            // answered us" is a different fact from "our own
+                            // submit sampler saw the Enter", and a timeline
+                            // that conflates them cannot be used to tell
+                            // whether this fix is working in the field.
+                            let source = if confirmed_delivery { "delivery" } else { "activity" };
+                            to_reinject_confirmed.push((a.id.clone(), a.group.clone(), source));
+                        }
+                        // Still within the timeout, a delivery may be
+                        // legitimately in flight (a long human-typing hold) —
+                        // wait, don't re-fire yet.
+                        ReinjectDisposition::Wait => {}
+                        ReinjectDisposition::DeferBusy => {
+                            // #535: the window is spent but this pane is
+                            // mid-turn. Spend nothing — not the attempt, not
+                            // the clock: `compact_reinject_attempted_ms` is
+                            // left untouched so the deferral is bounded by
+                            // `REINJECT_BUSY_DEFER_MAX_MS` measured from the
+                            // ORIGINAL attempt, and cannot be extended a tick
+                            // at a time by a pane that simply keeps painting.
+                            //
+                            // Audited once per attempt, not once per tick: the
+                            // poll runs every 10s while any arm is open
+                            // (`compact_nudge_poll_interval`), so an unlatched
+                            // audit here would write ~30 identical lines per
+                            // deferral. Same anti-nag latch shape as
+                            // `watchdog_notified` / `compact_nudge_notified`.
+                            if !a.compact_reinject_busy_deferred {
+                                a.compact_reinject_busy_deferred = true;
+                                to_defer_busy.push((
+                                    a.id.clone(), a.group.clone(), a.compact_reinject_attempts,
+                                ));
+                            }
+                        }
+                        ReinjectDisposition::Retry => {
+                            if a.compact_reinject_attempts < MAX_REINJECT_ATTEMPTS {
+                                a.compact_reinject_attempts += 1;
+                                a.compact_reinject_attempted_ms = Some(now);
+                                // Fresh attempt — the previous attempt's
+                                // deferral latch must not silence this one's.
+                                a.compact_reinject_busy_deferred = false;
+                                let instructions = self.group_dir(&a.group).join(
+                                    g.block(&a.block)
+                                        .map(|b| b.instructions_file())
+                                        .unwrap_or_else(|| a.role.instructions_file().to_string()),
+                                );
+                                let ledger = self.ledger_path(&a.group, &a.id);
+                                to_reinject.push((
+                                    a.id.clone(), a.group.clone(), instructions, ledger,
+                                    a.compact_reinject_attempts, a.contract_carrier,
+                                ));
+                            } else {
+                                to_abandon.push((a.id.clone(), a.group.clone(), a.compact_reinject_attempts));
+                                a.compact_pending = false;
+                                a.compact_reinject_attempted_ms = None;
+                                a.compact_reinject_attempts = 0;
+                                a.compact_reinject_busy_deferred = false;
+                                a.compact_pending_evidence = None;
+                                a.compact_hook_native_notice_delivered = false;
+                                a.compact_last_lost_reason = Some("reinjection-abandoned".to_string());
+                                a.compact_last_lost_ms = Some(now);
+                                a.compact_inference_guard_until_ms = now + INFERENCE_ARM_COOLDOWN_MS;
+                            }
                         }
                     }
-                    // else: still within the timeout, a delivery may be
-                    // legitimately in flight (a long human-typing hold) —
-                    // wait, don't re-fire yet.
                 } else if a.compact_pending {
                     // Production bug fix (#410, PR #329 round 6): an arm that
                     // never reaches a busy-then-quiet resolution — a stalled
@@ -16456,6 +16772,10 @@ impl OrchRegistry {
                             a.compact_pending_armed_ms = None;
                             a.compact_reinject_attempts = 1;
                             a.compact_reinject_attempted_ms = Some(now);
+                            // #535: fresh attempt — clear the busy-deferral
+                            // anti-nag latch so this attempt's own deferral is
+                            // still audited (see the field's doc).
+                            a.compact_reinject_busy_deferred = false;
                             let instructions = self.group_dir(&a.group).join(
                                 g.block(&a.block)
                                     .map(|b| b.instructions_file())
@@ -16786,8 +17106,21 @@ impl OrchRegistry {
         // delivery gate — visibility for both outcomes the fix contract
         // requires (exactly one delivered re-grounding, or a bounded, visible
         // give-up), neither of which existed before this round.
-        for (id, group) in to_reinject_confirmed {
-            self.audit(&group, "loomux", "compact-reinjection-confirmed", json!({ "agent": id }));
+        for (id, group, source) in to_reinject_confirmed {
+            self.audit(&group, "loomux", "compact-reinjection-confirmed",
+                json!({ "agent": id, "source": source }));
+        }
+        // #535: a retry withheld because the pane was mid-turn. Distinct action
+        // name from every other outcome above: this is neither a fire nor a
+        // give-up, and reading it as either would misreport a healthy pane.
+        for (id, group, attempt) in to_defer_busy {
+            self.audit(&group, "loomux", "compact-reinjection-deferred-busy", json!({
+                "agent": id,
+                "attempt": attempt,
+                "reason": "retry window elapsed while the pane was still producing output — \
+                           deferring rather than interrupting a live turn",
+                "bounded_by_ms": REINJECT_BUSY_DEFER_MAX_MS,
+            }));
         }
         for (id, group, attempts) in to_abandon {
             self.audit(&group, "loomux", "compact-reinjection-abandoned", json!({ "agent": id, "attempts": attempts }));
@@ -22269,6 +22602,7 @@ impl OrchRegistry {
             idle_since_ms: (role != Role::Orchestrator && task.trim().is_empty()).then(now_ms),
             started_ms: now_ms(),
             last_progress_ms: now_ms(),
+            last_mcp_activity_ms: 0,
             // Meaningful only for an orchestrator (idle-tick never watches a
             // worker/reviewer/planner) — seeded the same as `last_progress_ms`
             // regardless of role, harmless for the roles that never read it.
@@ -22286,6 +22620,7 @@ impl OrchRegistry {
             compact_pending_trusted: false,
             compact_reinject_attempted_ms: None,
             compact_reinject_attempts: 0,
+            compact_reinject_busy_deferred: false,
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
@@ -25100,6 +25435,9 @@ fn register_orchestrator_pane(
         started_ms: now_ms(),
         last_progress_ms: now_ms(), // watchdog ignores the orchestrator; the
         // idle-tick (#83) reuses this as the orchestrator's output-quiet clock.
+        // #535: role-agnostic, unlike the two clocks above — an orchestrator
+        // gets re-grounded too. `0` = has never called an MCP tool.
+        last_mcp_activity_ms: 0,
         last_output_progress_ms: now_ms(), // #496: the output-only half of that clock
         last_output_total: 0,
         watchdog_notified: false,
@@ -25114,6 +25452,7 @@ fn register_orchestrator_pane(
         compact_pending_trusted: false,
         compact_reinject_attempted_ms: None,
         compact_reinject_attempts: 0,
+        compact_reinject_busy_deferred: false,
         compact_pending_armed_ms: None,
         compact_last_lost_reason: None,
         compact_last_lost_ms: None,
