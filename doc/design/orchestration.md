@@ -5167,6 +5167,14 @@ a bind.
   also reported by `queue_orphans` with `text: null` — the notice is best-effort (recovery can run
   before any orchestrator pane is bound) and "never silently dropped" cannot rest on a delivery
   that is allowed not to happen.
+- **A one-entry window during re-admission** (review round 2, N4). `readmit_recovered` takes one
+  staged entry at a time and puts it back if `enqueue_text` rejects it, so at any instant every
+  recovered payload is in staging, or live, or is the single entry in flight between them. A crash
+  in that gap drops that ONE entry from the snapshot — not silently: no `delivery-recovered` was
+  written for it, so the audit derivation still reports it, payload-less. The earlier shape
+  partitioned the whole matching set out of staging up front, which widened this from one entry to
+  the entire remainder; one entry is the irreducible width, for the same reason the next bullet
+  exists — two durable stores cannot be updated in one atomic step.
 - **One double-delivery window remains.** A crash between the drainer's pop and the snapshot rewrite
   replays an entry that already landed. It is bounded — by the queue's existing byte-identical
   coalesce, which collapses the replay into whatever is queued, and by `pop_front_dequeued`

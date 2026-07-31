@@ -2222,6 +2222,49 @@ fn one_groups_snapshot_never_contains_another_groups_queue() {
 }
 
 #[test]
+fn snapshot_order_survives_a_second_restart_when_staging_and_live_mix() {
+    // Review round 2, N5. Appending staged entries after live ones is not
+    // restart-invariant: an entry rejected at the cap during restart 1 would
+    // be written BEHIND deliveries queued after it, and restart 2 would then
+    // re-admit them in that inverted order — silently breaking the per-pane
+    // arrival order this feature exists to preserve. Ids are monotonic per
+    // group and seeded past the snapshot on every recovery, so sorting the
+    // file by id is exactly arrival order across any number of restarts.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["oldest, queued first"]);
+
+    // Restart 1: fill the pane so the recovered entry is rejected back into
+    // staging, and queue something NEW after it.
+    {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45999);
+        reg.create_group("C:/tmp/repo", rails()).unwrap();
+        let resumed = reg
+            .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                            Some(session.clone()), Some(dir.path().to_string_lossy().to_string()), None)
+            .unwrap();
+        let pty = 960u32;
+        for i in 0..queue::QUEUE_MAX_PER_PANE {
+            reg.enqueue_text(&gid, &resumed.id, "orch-1", &format!("newer-{i}"), pty,
+                             queue::EnqueueReason::Arrival).unwrap();
+        }
+        assert_eq!(reg.readmit_recovered(&gid, &resumed.id, pty), 0, "the full pane rejects it back to staging");
+    }
+
+    // The file must read oldest-first regardless of which store each entry
+    // was in when it was written.
+    let body = fs::read_to_string(dir.path().join(&gid).join("queue.json")).unwrap();
+    let (entries, skipped) = queue::parse_snapshot(&body);
+    assert_eq!(skipped, 0);
+    let ids: Vec<u64> = entries.iter().map(|e| e.delivery.id).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "the snapshot must be written in id (= arrival) order: {ids:?}");
+    assert_eq!(entries[0].delivery.payload.text(), Some("oldest, queued first"),
+        "the pre-restart entry arrived first and must still be written first");
+}
+
+#[test]
 fn a_second_restart_still_reports_a_backlog_nobody_had_read_yet() {
     // Review round 1, finding 1. Restarts cluster — a crash loop, or a fleet
     // restart followed by another — and the exposed set here is the case the
@@ -2328,7 +2371,15 @@ fn a_concurrent_first_touch_after_a_restart_cannot_re_mint_a_snapshot_id() {
     let agents: Vec<String> = (0..6).map(|i| format!("w-concurrent-{i}")).collect();
 
     // Every thread's FIRST act on this group is an admission, all racing the
-    // one recovery pass.
+    // one recovery pass. The barrier is load-bearing (review round 2, N3):
+    // without it, thread-spawn skew alone can let the winner finish phase 1 —
+    // a small file read plus a parse — before the last threads have even
+    // started, so a regression to the pre-fix ordering would slip through a
+    // green run. Releasing all six at the same instant is what gives this
+    // tripwire a real chance of tripping. It is still probabilistic; the
+    // guarantee itself is structural (the guard is held across the seed), and
+    // this test's only job is to notice if someone dismantles that structure.
+    let gate = std::sync::Barrier::new(agents.len());
     let minted: Vec<u64> = std::thread::scope(|s| {
         let handles: Vec<_> = agents
             .iter()
@@ -2336,7 +2387,9 @@ fn a_concurrent_first_touch_after_a_restart_cannot_re_mint_a_snapshot_id() {
             .map(|(i, id)| {
                 let reg = &reg;
                 let gid = &gid;
+                let gate = &gate;
                 s.spawn(move || {
+                    gate.wait();
                     reg.enqueue_text(gid, id, "orch-1", &format!("fresh-{i}"), 940 + i as u32,
                                      queue::EnqueueReason::Arrival)
                         .unwrap()
