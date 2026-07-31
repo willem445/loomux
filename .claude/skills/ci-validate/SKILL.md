@@ -1,6 +1,6 @@
 ---
 name: ci-validate
-description: How agent workers decide between a capped local build/test and CI for a loomux change — quick local iteration (always -j 4) vs. full/longer-running validation on CI — plus the draft-PR-early flow for reading CI results.
+description: Why agent workers never build or test Rust locally (hard ban — CI is the only cargo path) and how to validate through the draft-PR-early CI flow; frontend node-only commands stay local.
 ---
 
 # Local iteration vs. CI proof
@@ -16,49 +16,33 @@ line drawn on scope/duration, not on any mechanism's state.
 
 ## The decision rule
 
-> Quick/local iteration — **a single test you are actively iterating on**
-> (`cargo test -j 4 --test <target> <one_test_filter>`), an incremental
-> `cargo check`, a `tsc`/`npm run build` typecheck? **Do it locally**,
-> capped at `-j 4` (below). There's nothing to gate this on; it's just a
-> sane default so one agent's build doesn't eat all the CPU on a machine
-> several agents share.
+> **Local `cargo` of ANY kind is banned for agents** — no `cargo build`,
+> no `cargo check`, no single-test iteration, nothing that invokes
+> `rustc`. Human hard directive, 2026-07-30, after the THIRD
+> disk-exhaustion incident: the previous scope-based carve-out ("a single
+> test you are actively iterating on is fine at `-j 4`") still cost each
+> fresh worktree its first full dependency compile — 5-8 GB of `target/`
+> per worker — and a six-worker fleet filled the drive and crashed loomux
+> with every worker individually obeying the rule. Scope caps don't cap
+> the first compile; only not compiling does.
 >
-> Everything bigger — **a full `--test <target>` run (even a single
-> target), the whole suite, multi-platform proof**, anything you'd cite as
-> "the suite passes" in a PR description or a `done` report? **That's CI's
-> job.** Push, open the draft PR, and wait for it — don't run it locally on
-> your own clock instead of waiting for CI. Running the full target locally
-> "one last time before pushing" is the pattern this rule exists to stop:
-> it proves nothing CI won't prove, and it costs what CI doesn't (below).
+> **Everything Rust goes to CI**: push early, open the draft PR
+> immediately (below), read the results. Iterate by reasoning about the
+> code and pushing; CI is both the compiler and the proof.
+>
+> **Frontend-only commands that never invoke `rustc` stay local-OK**:
+> `npm run build`/`tsc` (the typecheck), `npm test`/`node --test`, a
+> single frontend test file. These cost megabytes, not gigabytes.
 
-CI remains the sole authority for the CI gate. A worker citing a local run
-as full validation is citing the wrong evidence — cite the PR's CI run
-instead (see "Definition of validated" below).
+CI is the sole authority for the CI gate, and now also the sole build
+path. A worker citing a local run as validation is citing evidence it
+should not have been able to produce.
 
-**Disk is the second budget, not just CPU** (human directive, 2026-07-30):
-every full local build inflates the worktree's `target/` by 5-8 GB, and a
-fleet of parallel workers doing it exhausted the workspace drive twice in
-one day (see #488; a full disk has previously destroyed a live task board,
-#133, and crashed loomux outright, #464). CI spends GitHub's disk, not this
-machine's. If your local iteration has grown a multi-GB `target/` and your
-change is pushed, `cargo clean` is a courteous exit.
-
-## Running locally, capped
-
-Cap every local build/test invocation — unconditionally, not gated on
-anything:
-
-- **Always `-j 4` for agent local builds** (human directive): `cargo
-  build -j 4`, `cargo check -j 4`, `cargo test -j 4`. Or set it once per
-  session with `export CARGO_BUILD_JOBS=4` instead of repeating the flag.
-  `-j` caps the **compile phase's** parallelism.
-- **CPU-heavy test suites additionally take `-- --test-threads=4`** — a
-  separate cap on the **test run's own** thread count, e.g. `cargo test -j 4
-  -- --test-threads=4`.
-- **npm/tsc need no flag.** `npm run build`/`tsc` is single-process. `npm
-  test`/`node --test` actually parallelizes across test *files*, but it's
-  lightweight enough on this codebase's suite size that no additional cap is
-  needed.
+**Why this is absolute** (#488 lineage): a full disk has destroyed a live
+task board (#133), crashed loomux outright (#464), and killed the app
+mid-session twice more on 2026-07-30. CI spends GitHub's disk, not this
+machine's. If your worktree has a `target/` from before this rule,
+`cargo clean` it now.
 
 ## The Cargo.lock exception
 
