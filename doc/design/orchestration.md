@@ -4910,21 +4910,41 @@ is the impure half.
   | `drop_queue` (standalone — tests, any future non-drainer caller) | `queues` (remove) | No — its own doc states it deliberately never touches `queue_draining`, having no drainer-lifecycle context to stay consistent with | Not applicable — a different code path outside the drainer's own lifecycle |
   | `pop_batch_dequeued` (#533-A, multi-entry branch only) | `queues` (pop front, per constituent) | No — same mid-loop/sole-owner reasoning as `pop_front_dequeued`, which its single-entry branch delegates to | Implicitly yes — N of the model's delivery transitions |
   | `drop_superseded` (#533-A) | `queues` (remove by id anywhere, and mutate a survivor's `coalesced`) | No — mid-plan, run only by the current sole owner | No — supersession is a flush-planning decision, outside the drainer-lifecycle model's scope |
+  | `admit_stranded_selfheal` (#496 PR-C — the self-heal gate) | `queues` (push front, via the shared `push_stranded_front_locked`) | No — it *reads* `queue_draining` (nested inside `queues`, matching `commit_exit`'s lock order) to decide whether to decline, but never writes it | No — a declined or admitted self-heal changes no registration state |
 
-  Five sites mutate `queue_draining` or `queues` in ways the drainer-lifecycle model covers or
-  deliberately scopes out; three of those mutate `queue_draining` itself (the registration state the
-  at-most-one-drainer invariant depends on) and all three are represented in the model.
-  `enqueue_text` is represented anyway (it IS the model's `Arrival` event); the rest are out of the
-  model's scope for the stated reasons rather than by omission.
+  **Thirteen rows, and the arithmetic is stated so a missing one shows up as a mismatch rather than
+  as nothing.** Eleven mutate `queue_draining` or `queues`; the remaining two (`run_queue_drainer`'s
+  `Done` arm and its still-queued-notice fire) mutate only `queue_still_notified`. Of the eleven,
+  **three** mutate `queue_draining` itself — the registration state the at-most-one-drainer
+  invariant depends on — and all three are represented in the model; **nine** mutate `queues`, and
+  every one of those nine calls `persist_queues`, directly or through a caller that does (the
+  invariant #468 adds — see "Durability", below). `enqueue_text` is represented in the model anyway
+  (it IS the `Arrival` event); the rest are out of its scope for the stated reasons rather than by
+  omission.
+
+  Two of the nine `queues` mutators — `enqueue_stranded_front` and `admit_stranded_selfheal` — push
+  through the SAME helper, `push_stranded_front_locked`, which is deliberately not a row of its own:
+  it runs with `queues` already held and must not do I/O, so the write is owed by each caller. That
+  makes it the one place in this table where the mutation and its persistence obligation are in
+  different functions, and it is the row most recently missed.
 
   **This table went stale exactly the way its own instruction predicted, and that is worth recording
   rather than just fixing.** #533-A added `pop_batch_dequeued` and `drop_superseded` without adding
   rows here — correctly, because it was written against a base where this table's *other* consumer
   did not yet exist. #468 then made every `queues` mutation owe a `persist_queues` call, so the two
   new sites arrived owing a write nobody knew to give them, and the rebase that brought the two
-  changes together merged cleanly with no conflict at either site. The rows above were re-derived by
-  re-running the grep, not patched from memory, and `the_snapshot_tracks_the_coalesced_flush_paths_too`
-  now pins both new sites against the file rather than against the in-memory queue.
+  changes together merged cleanly with no conflict at either site.
+  `the_snapshot_tracks_the_coalesced_flush_paths_too` now pins both new sites against the file
+  rather than against the in-memory queue.
+
+  **And then the re-derivation itself dropped a row, which is the part most worth keeping.** The
+  grep was re-run as this table instructs, and it *did* report `admit_stranded_selfheal` — the row
+  was lost transcribing the output into the table, and the accompanying count ("five sites") had
+  already stopped reconciling with anything countable, so nothing flagged the gap. Review caught it.
+  Two lessons, both cheap: state the arithmetic (the paragraph above now says thirteen rows, eleven,
+  three, nine) so a dropped row shows up as a mismatch instead of as silence; and note that the
+  omitted row is one of the two whose mutation happens inside a shared helper rather than in the
+  listed function — the exact shape most likely to be skipped by eye.
 - **Seam 3 (stranded pre-Enter text).** Converts to a `QueuedPayload::StrandedSubmit` marker
   (pushed to the FRONT via `enqueue_stranded_front`, ahead of whatever else is queued — it
   represents finishing an already-half-done paste, not a new ask) rather than a text copy. Draining
