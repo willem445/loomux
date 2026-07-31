@@ -253,6 +253,19 @@ so far:
   and the shell route to it. The *contract* is unchanged: a reviewer was already told it does
   not fix and does not push; this only says which half of that a flag now enforces.
 
+- **#507, bulk board approvals** — `orchestrator.md` only. The human can now tick several board
+  rows and approve them in one action, so the merge gate can deliver **one** notice naming
+  several PRs where it only ever delivered one per PR. The **merge gate** section gains a bullet
+  under the one-time-grant one: the consolidated shape it will now receive (`GRANTED one-time
+  merges of PRs #a, #b, #c …`, per-task notes on their own trailing lines, items approved with no
+  resolvable PR number called out separately), and — the half that matters — how to read it: N
+  ordinary per-PR grants delivered once, not one broad permission. Merging a listed PR opens no
+  other, a PR not on the list is not granted, and one grant expiring or being consumed leaves
+  the rest untouched. Without that paragraph a single sentence listing three PRs is exactly the
+  thing an orchestrator could over-read into merging something the human never authorized — the
+  failure the gate exists to prevent. The backend is unchanged in authority: each PR still gets
+  its own single-use, ~30-min grant file. `worker.md`/`reviewer.md`/`planner.md` are untouched.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
