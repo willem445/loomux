@@ -1703,6 +1703,81 @@ fn get_output_grid_leaves_plain_scrolling_output_alone() {
 }
 
 #[test]
+fn get_output_grid_resyncs_after_a_malformed_utf8_byte() {
+    // Review finding 2 (#530). The ring is a byte TAIL: it routinely begins
+    // mid-codepoint, so a malformed sequence at the head of a capture is the
+    // NORMAL case, not an exotic one. A decoder that assumes the width from
+    // the lead byte and skips that whole window on failure eats the valid
+    // text sitting behind it.
+    use loomux_lib::orchestration::termgrid::render_screen;
+
+    // The discriminating case: `0xe0` claims three bytes, so a window skip
+    // swallows "he" and yields "llo". Only a one-byte resync recovers it.
+    assert_eq!(
+        render_screen(b"\xe0hello", 40, 5),
+        "hello",
+        "a bad lead byte must cost exactly itself, never the valid text behind it"
+    );
+    // An orphaned continuation byte — what a tail that starts mid-codepoint
+    // actually looks like.
+    assert_eq!(render_screen(b"\x80hello", 40, 5), "hello");
+    // `0xff` is never valid UTF-8 in any position, sitting in front of real
+    // multibyte content.
+    let mut mixed: Vec<u8> = vec![0xff];
+    mixed.extend_from_slice("✻ ok".as_bytes());
+    assert_eq!(render_screen(&mixed, 40, 5), "✻ ok");
+    // Truncated multibyte at the very END of the capture (the ring boundary
+    // cut it): dropped cleanly, and above all not a panic.
+    let mut truncated = b"done ".to_vec();
+    truncated.push(0xe2); // first byte of a 3-byte '…'; the rest never arrived
+    assert_eq!(render_screen(&truncated, 40, 5), "done");
+}
+
+#[test]
+fn get_output_grid_history_keeps_the_newest_rows_within_its_cap() {
+    // Review finding 1 (#530) is a COMPLEXITY fix (the scrolled-off history
+    // was drained one row at a time off the front of a Vec, so an adversarial
+    // newline flood paid O(cap) per scroll). Behavior was already correct, so
+    // there is no red to show for it — this test guards what the fix could
+    // plausibly break instead: swapping the container must not change which
+    // rows are retained. Deliberately structural, never wall-clock — timing
+    // assertions on this repo are a recorded lesson (#514/#516).
+    let mut raw = Vec::new();
+    for i in 1..=6000 {
+        raw.extend_from_slice(format!("row {i}\r\n").as_bytes());
+    }
+    let composed = loomux_lib::orchestration::termgrid::render_screen(&raw, 80, 24);
+    let lines: Vec<&str> = composed.lines().collect();
+
+    assert_eq!(
+        lines.last(),
+        Some(&"row 6000"),
+        "the newest row must always survive — it is what a monitoring read is for"
+    );
+    assert!(
+        lines.len() < 6000,
+        "history must be capped, not unbounded — got {} rows",
+        lines.len()
+    );
+    assert!(
+        !lines.iter().any(|l| *l == "row 1"),
+        "the OLDEST rows are the ones the cap must drop"
+    );
+    // Retention is a contiguous newest-first window: no gaps, no reordering,
+    // no duplicated rows introduced by the eviction path.
+    let first: usize = lines[0]
+        .strip_prefix("row ")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected first row {:?}", lines[0]));
+    assert_eq!(
+        lines.len(),
+        6000 - first + 1,
+        "retained rows must be one contiguous run ending at the newest, got {} rows starting at {first}",
+        lines.len()
+    );
+}
+
+#[test]
 fn get_output_is_hard_capped_in_bytes_whatever_lines_asks_for() {
     // `lines` bounds lines; only a byte cap bounds the payload. 400 rows of
     // 200 wide, all distinct, nothing to collapse — the shape of a real wide
