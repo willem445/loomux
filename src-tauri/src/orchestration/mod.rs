@@ -23668,31 +23668,49 @@ impl OrchRegistry {
             queue::rebinds_to(&e.delivery, target.is_orchestrator, target.session_id.as_deref())
         };
 
-        // **One entry leaves staging at a time, and only to become live**
-        // (review round 2, N4). The previous shape partitioned the whole
-        // matching set out of staging up front, so every entry after the one
-        // being admitted lived ONLY in a local vector: each `enqueue_text`
-        // persisted a snapshot containing neither them nor their live form,
-        // and a crash mid-loop dropped that whole remainder from the file.
-        // Taking them one at a time reduces the exposure to a single entry —
-        // the same irreducible width as `pop_front_dequeued`'s already-
-        // documented window, and for the same reason: two durable stores
-        // cannot be updated in one atomic step. It is also why the loop
-        // re-locks per iteration rather than hoisting the guard: holding
-        // `recovered_queue` across `enqueue_text` would invert this file's
-        // lock order (see `group_queue_entries`).
+        // **Exactly one entry is ever out of both durable stores at a time,
+        // on every path** (review round 2 N4; review round 3 blocking 1).
+        //
+        // Round 2's shape partitioned the whole matching set out of staging
+        // up front, so every entry after the one being admitted lived ONLY in
+        // a local vector and a crash mid-loop dropped the remainder. Taking
+        // them one at a time fixed the SUCCESS path but not the rejection
+        // path: a rejected entry was parked in a local vector until the loop
+        // ended, so a recovered backlog meeting a pane already at
+        // `QUEUE_MAX_PER_PANE` still had every matching entry outside both
+        // stores simultaneously — precisely the case hazard 5 covers. That
+        // left the design note asserting an invariant this branch of the code
+        // did not honour, which is the defect, not the window itself.
+        //
+        // So a rejected entry goes straight back into staging and the
+        // snapshot is rewritten before the next one is taken. `parked` is
+        // what stops the loop re-offering it forever, and it holds ids rather
+        // than entries so nothing is ever held outside a durable store to
+        // track it. The cost is one extra snapshot write per rejection, in a
+        // path that only runs when a full pane meets a recovered backlog.
+        //
+        // The loop re-locks per iteration rather than hoisting the guard
+        // because holding `recovered_queue` across `enqueue_text` would
+        // invert this file's lock order (see `group_queue_entries`).
         let mut readmitted = 0usize;
         let mut offered = 0usize;
+        let mut rejected = 0usize;
         let mut oldest_ms = u64::MAX;
-        // A rejected entry must not be retried forever inside this loop, so
-        // it is parked here and put back once the loop is done — it stays out
-        // of staging only for the rest of this call.
-        let mut rejected: Vec<queue::PersistedEntry> = Vec::new();
+        let mut parked: HashSet<u64> = HashSet::new();
+        // Return `entry` to staging and make that durable before anything
+        // else is taken out. Takes the id back so the caller can mark it
+        // parked without holding the entry.
+        let put_back = |entry: queue::PersistedEntry| -> u64 {
+            let id = entry.delivery.id;
+            self.recovered_queue.lock_safe().entry(group.to_string()).or_default().push(entry);
+            self.persist_queues(group);
+            id
+        };
         loop {
             let next = {
                 let mut staged = self.recovered_queue.lock_safe();
                 let Some(list) = staged.get_mut(group) else { break };
-                match list.iter().position(|e| matches(e)) {
+                match list.iter().position(|e| matches(e) && !parked.contains(&e.delivery.id)) {
                     Some(i) => list.remove(i),
                     None => break,
                 }
@@ -23700,12 +23718,13 @@ impl OrchRegistry {
             offered += 1;
             oldest_ms = oldest_ms.min(next.delivery.enqueued_ms);
             // A payload-less entry cannot be here (markers stage into
-            // `recovered_markers`, never `recovered_queue`) — but park it as
-            // rejected rather than `continue`ing, so an impossible case that
+            // `recovered_markers`, never `recovered_queue`) — but put it back
+            // rather than `continue`ing past it, so an impossible case that
             // becomes possible later degrades to "still an orphan" instead of
             // to a silent drop out of the staging area.
             let Some(text) = next.delivery.payload.text().map(str::to_string) else {
-                rejected.push(next);
+                rejected += 1;
+                parked.insert(put_back(next));
                 continue;
             };
             let from = next.delivery.from.clone();
@@ -23730,23 +23749,21 @@ impl OrchRegistry {
                 // in it. Losing it here would be the exact silent loss this
                 // whole feature exists to prevent — worse than the original
                 // bug, because the sender was told long ago it was queued.
-                Err(_) => rejected.push(next),
+                // Back into staging and onto disk immediately; see the
+                // invariant comment above the loop.
+                Err(_) => {
+                    rejected += 1;
+                    parked.insert(put_back(next));
+                }
             }
         }
         if offered == 0 {
             return 0;
         }
-        if !rejected.is_empty() {
+        if rejected > 0 {
             self.audit(group, "loomux", "delivery-requeue-rejected", json!({
-                "to": agent_id, "pty": pty_id, "count": rejected.len(), "reason": "queue-full",
+                "to": agent_id, "pty": pty_id, "count": rejected, "reason": "queue-full",
             }));
-            self.recovered_queue.lock_safe().entry(group.to_string()).or_default().extend(rejected);
-            // Staging is part of the snapshot now, so putting entries back
-            // has to be written out — otherwise the file (last written by
-            // the successful re-admissions above, when these were briefly in
-            // neither place) stays short of them until some unrelated
-            // mutation happens to persist next.
-            self.persist_queues(group);
         }
         self.audit(group, "loomux", "delivery-requeued", json!({
             "to": agent_id, "pty": pty_id, "count": readmitted, "offered": offered,

@@ -2096,6 +2096,23 @@ fn a_recovered_entry_that_cannot_be_re_admitted_stays_an_orphan() {
     let orphans = reg.queue_orphans(&gid);
     assert_eq!(orphans.len(), 3, "every rejected entry must still be reported: {orphans:?}");
     assert!(orphans.iter().all(|o| o.text.is_some()), "with its payload intact, still re-sendable");
+
+    // Review round 3, blocking 1: a rejected entry goes back into staging AND
+    // onto disk as it is rejected, not at the end of the loop. The design
+    // note claims every recovered payload is always in staging, live, or the
+    // single entry in flight; if rejections were parked locally until the
+    // loop ended, a full pane would put all three outside both durable stores
+    // at once and that claim would be false. Reading the snapshot straight
+    // off disk is what distinguishes "back in memory" from "durable again".
+    let body = fs::read_to_string(dir.path().join(&gid).join("queue.json")).unwrap();
+    let (persisted, skipped) = queue::parse_snapshot(&body);
+    assert_eq!(skipped, 0);
+    let persisted_texts: Vec<Option<&str>> =
+        persisted.iter().map(|e| e.delivery.payload.text()).collect();
+    for t in ["recovered-0", "recovered-1", "recovered-2"] {
+        assert!(persisted_texts.contains(&Some(t)),
+            "rejected entry {t} must be back on disk, not parked in memory: {persisted_texts:?}");
+    }
     let rejected = reg
         .audit_log(&gid)
         .into_iter()
