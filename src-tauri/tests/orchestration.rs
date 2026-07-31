@@ -1908,9 +1908,14 @@ fn a_concurrent_first_touch_after_a_restart_cannot_re_mint_a_snapshot_id() {
     let reg = relaunch_registry(dir.path());
     reg.set_port(45999);
     reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let agents: Vec<String> = (0..6)
-        .map(|i| reg.spawn_agent(&gid, Role::Worker, &format!("w{i}"), "t", false, None).unwrap().id)
-        .collect();
+    // Synthetic target ids, deliberately not spawned agents. Two reasons,
+    // both worth stating so this doesn't get "fixed" back into six spawns:
+    // `rails()` caps a group at 2 live agents, so six is not a state this
+    // group can be in; and the race under test is inside recovery's own
+    // guard, which every `enqueue_text` runs before it mints regardless of
+    // whether the target resolves (an unknown id just yields no durable
+    // identity — `durable_target`'s documented fallback).
+    let agents: Vec<String> = (0..6).map(|i| format!("w-concurrent-{i}")).collect();
 
     // Every thread's FIRST act on this group is an admission, all racing the
     // one recovery pass.
