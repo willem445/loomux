@@ -444,8 +444,9 @@ pub fn coalesced_flush_text(items: &[FlushConstituent], remaining: usize, now_ms
     } else {
         String::new()
     };
+    let count = if n == 1 { "1 delivery".to_string() } else { format!("{n} deliveries") };
     let mut out = format!(
-        "[loomux] {n} deliveries queued while this pane was blocked are being delivered TOGETHER, \
+        "[loomux] {count} queued while this pane was blocked are being delivered TOGETHER, \
          as this one prompt, oldest first{more} — they are itemized below with their origin and \
          queue time; nothing was reordered or dropped.{dedup} Treat each item as its own message.",
     );
