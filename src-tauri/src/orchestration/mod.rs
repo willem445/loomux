@@ -7821,11 +7821,24 @@ pub fn stranded_selfheal_action(
 /// duplicate delivery. Pre-#496 nothing could hit this (the front door
 /// pushes to the BACK; the drainer's own `AbortedPreEnter` marker is pushed
 /// after it pops), and the self-heal must not become the first thing that
-/// does. `queue_draining` is checked BEFORE the push, and the check is
-/// race-safe in both directions: `ensure_drainer` registers before its
-/// thread spawns (so a drainer that could be mid-`deliver_now` is always
-/// visible here), and a drainer that deregistered is already past
-/// `deliver_now` (see `commit_exit`).
+/// does.
+///
+/// **This predicate is only half the rule; the other half is WHERE it is
+/// evaluated.** Deciding from `queue_draining` and then pushing is not
+/// enough on its own — a drainer registering between the two re-opens the
+/// very hazard above, which is what this PR first shipped and review rev-47
+/// B1 caught. The caller (`admit_stranded_selfheal`) must therefore consult
+/// this while HOLDING `queues`, and push in that same critical section, so
+/// the observation cannot go stale before it is acted on. What makes that
+/// sufficient: any drainer that could ever peek this front must register
+/// before it peeks (`ensure_drainer`) and must take `queues` TO peek, so it
+/// is either already registered when the fused section reads
+/// `queue_draining` (→ decline) or it peeks strictly after the push (→ finds
+/// the marker at the front, the safe case — it drains the submit first and
+/// pops it by a matching id). See `admit_stranded_selfheal`'s doc for the
+/// lock order and `queue.rs`'s `stranded_admission_property` for the
+/// exhaustive proof, whose unfused variant is the mutation control that
+/// keeps the fused one from passing vacuously.
 ///
 /// **Nothing is lost by declining, in either case.** A live drainer means a
 /// delivery is already queued for this pane, and THAT delivery's own
