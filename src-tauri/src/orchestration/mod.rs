@@ -1271,15 +1271,36 @@ const REINJECT_BUSY_DEFER_MAX_MS: u64 = REINJECT_CONFIRM_TIMEOUT_MS;
 /// output-burst version) and #522 (the idle-pane version) exist to kill, and
 /// re-introducing it here through a different door would defeat the point.
 ///
-/// **Derived, not picked.** `deliver_prompt` waits for the pane to go quiet
-/// before pressing Enter, bounded by `SUBMIT_MAX_WAIT` (45s), then makes spaced
-/// blind retries (`SUBMIT_RETRY_DELAYS`, last one at 4.5s). So `attempted_ms +
-/// SUBMIT_MAX_WAIT + that tail` is the worst-case moment the submit can still
-/// be in flight — before it, no activity can be a response to this notice,
-/// as a matter of ordering rather than of judgement. Rounded up to 5s of tail.
+/// **The ORDINARY SUBMIT PATH's worst case, computed from the constants that
+/// define it** — every quantity referenced, none written down, so the floor
+/// cannot drift out of step with the delivery code (rev-22 D2). On that path
+/// `deliver_prompt`:
 ///
-/// The cost is nothing the signal can feel: it is a sixth of
-/// `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~250s in which a genuine ack still
+/// 1. waits for the pane to go quiet before pressing Enter, bounded by
+///    `SUBMIT_MAX_WAIT`;
+/// 2. watches for the submit's output burst for `SUBMIT_CONFIRM_WINDOW`;
+/// 3. makes blind Enter retries by sleeping each `SUBMIT_RETRY_DELAYS` entry in
+///    turn — **sequential sleeps, so the last one lands at their SUM**, not at
+///    the last element. An earlier revision of this constant read that array as
+///    absolute offsets and came out 2.6s short, in the unsafe direction
+///    (rev-22 D1); hence the explicit sum below rather than any hand arithmetic.
+///
+/// **What this does NOT cover, and is not claimed to** (rev-22 D3). Three
+/// `wait_for_question_clear` checkpoints sit between the decision and the last
+/// Enter, each bounded by `QUESTION_HOLD_MAX` (120s), and
+/// `HUMAN_INPUT_BLOCK_BOUND_MS` (10 min) is a further pre-delivery hold. Any of
+/// them can push the Enter well past this floor, leaving a residual window in
+/// which a pre-paste call still reads as an acknowledgment. Folding them in is
+/// not the fix: the floor would exceed `REINJECT_CONFIRM_TIMEOUT_MS` itself and
+/// the mechanism would stop resolving anything. **That residual is tracked in
+/// #546**, with the related question of what could actually prove the notice
+/// was *read* rather than merely that the agent is executing. So this is a
+/// judgement about the common path, not a proof about every path — the earlier
+/// wording claimed the latter, which is exactly the kind of sentence that stops
+/// the next reader from checking.
+///
+/// The cost is nothing the signal can feel: a sixth of
+/// `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~247s in which a genuine ack still
 /// resolves the phase. And a genuine ack landing *inside* the floor is not
 /// lost, merely not counted yet — agents call loomux tools repeatedly, so the
 /// next one resolves it; if none ever comes, the unchanged retry path runs,
@@ -1287,9 +1308,20 @@ const REINJECT_BUSY_DEFER_MAX_MS: u64 = REINJECT_CONFIRM_TIMEOUT_MS;
 ///
 /// Why not the delivery ledger's own `submit_sent_ms`, which would be exact?
 /// Because that would re-couple the acknowledgment path to the delivery
-/// bookkeeping this whole fix exists to stop depending on. A worst-case bound
-/// derived from our own timing constants needs no sampler to be working.
-const REINJECT_ACK_SETTLE_MS: u64 = SUBMIT_MAX_WAIT.as_secs() * 1000 + 5_000;
+/// bookkeeping this whole fix exists to stop depending on. A bound computed
+/// from our own timing constants needs no sampler to be working.
+const REINJECT_ACK_SETTLE_MS: u64 = {
+    // `while` rather than an iterator: `Iterator::sum` is not const.
+    let mut tail_ms = 0u64;
+    let mut i = 0;
+    while i < SUBMIT_RETRY_DELAYS.len() {
+        tail_ms += SUBMIT_RETRY_DELAYS[i].as_millis() as u64;
+        i += 1;
+    }
+    // `as_millis`, not `as_secs() * 1000`: the latter silently truncates a
+    // sub-second change to any of these (rev-22 N1).
+    SUBMIT_MAX_WAIT.as_millis() as u64 + SUBMIT_CONFIRM_WINDOW.as_millis() as u64 + tail_ms
+};
 /// Production bug fix (#410, PR #329 round 6): how long a `compact_pending`
 /// arm is given to reach a busy-then-quiet resolution (confirm or discard)
 /// before the resolver forces an abandon — symmetric to `REINJECT_CONFIRM_
@@ -1416,8 +1448,21 @@ const PASTE_SUBMIT_DELAY: Duration = Duration::from_millis(500);
 /// Output must be idle this long before Enter is pressed.
 const SUBMIT_QUIET: Duration = Duration::from_millis(1000);
 /// Max time to wait for quiet before pressing Enter anyway.
+///
+/// #535: also an input to `REINJECT_ACK_SETTLE_MS` — changing it moves the
+/// window in which an agent's MCP call can be an acknowledgment of a pasted
+/// re-grounding. That is computed from this constant, so it tracks
+/// automatically; no second place to update.
 const SUBMIT_MAX_WAIT: Duration = Duration::from_secs(45);
 /// Spaced blind Enter retries after the first (no-ops once submitted).
+///
+/// **Each entry is a sequential `sleep` in the retry loop, not an absolute
+/// offset** — with `[2500, 4500]` the retries land at +2.5s and +7.0s. Reading
+/// this array as offsets is a live mistake, not a hypothetical: it is how
+/// `REINJECT_ACK_SETTLE_MS` first came out 2.6s short (#535, rev-22 D1).
+///
+/// #535: also an input to `REINJECT_ACK_SETTLE_MS`, which sums the whole array,
+/// so adding or lengthening a retry widens that floor automatically.
 const SUBMIT_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(2500), Duration::from_millis(4500)];
 
 // Submit confirmation + stranded-text flush (#81/#84). A submit that landed
@@ -1428,6 +1473,10 @@ const SUBMIT_RETRY_DELAYS: [Duration; 2] = [Duration::from_millis(2500), Duratio
 // the same pane can tell whether the previous prompt is still stranded in the
 // box (and would otherwise merge with the new paste).
 /// How long after the first Enter to watch for the submit's output burst.
+///
+/// #535: also an input to `REINJECT_ACK_SETTLE_MS` — it sits between the first
+/// Enter and the blind-retry loop, so it is part of the worst-case time before
+/// the last Enter can land. Computed from this constant, so it tracks.
 const SUBMIT_CONFIRM_WINDOW: Duration = Duration::from_millis(600);
 /// Output growth (bytes) within the window that counts as a landed submit.
 /// Set well above idle cursor-blink noise so confirmation biases against false

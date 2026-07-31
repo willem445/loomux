@@ -11304,9 +11304,12 @@ fn reinject_awaiting_confirmation(reg: &OrchRegistry, oid: &str, grew: &HashMap<
 
 const REINJECT_TIMEOUT_MS: u64 = 5 * 60 * 1000; // REINJECT_CONFIRM_TIMEOUT_MS
 const REINJECT_BUSY_DEFER_MS: u64 = 5 * 60 * 1000; // REINJECT_BUSY_DEFER_MAX_MS
-/// REINJECT_ACK_SETTLE_MS — `SUBMIT_MAX_WAIT` (45s) + 5s of blind-retry tail.
-/// Activity before this is provably not a response to the paste (rev-15 #2).
-const REINJECT_ACK_SETTLE_MS: u64 = 50 * 1000;
+/// REINJECT_ACK_SETTLE_MS — the ordinary submit path's worst case:
+/// `SUBMIT_MAX_WAIT` (45s) + `SUBMIT_CONFIRM_WINDOW` (600ms) + the SUM of
+/// `SUBMIT_RETRY_DELAYS` (2.5s + 4.5s = 7s, sequential sleeps, so the last
+/// blind Enter lands at +7s and not at +4.5s). Activity before this cannot be
+/// a response to the paste on that path (#535, rev-22 D1).
+const REINJECT_ACK_SETTLE_MS: u64 = 45_000 + 600 + 2_500 + 4_500;
 
 #[test]
 fn a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers() {
@@ -11389,6 +11392,15 @@ fn an_in_flight_tool_call_from_the_previous_turn_is_not_an_acknowledgment() {
     // This is the pair to `a_landed_re_grounding_is_never_re_sent_once_the_
     // agent_itself_answers` above — identical setup, the ONLY difference being
     // where the stamp falls relative to the settling floor.
+    //
+    // It is also the DRIFT TRIPWIRE for that floor (rev-22 D2). The constant is
+    // a const expression over `SUBMIT_MAX_WAIT` + `SUBMIT_CONFIRM_WINDOW` + the
+    // sum of `SUBMIT_RETRY_DELAYS`, and the mirror above is spelled out as those
+    // same four addends. Change any of them in production — add a third retry
+    // delay, lengthen one — and production's floor moves while the mirror does
+    // not, so the two boundary assertions below go red. Before that const
+    // expression existed, a change to `SUBMIT_RETRY_DELAYS` could widen the real
+    // false-ack window with the whole suite green.
     let (reg, _d, gid, oid) = compact_nudge_setup(0);
     let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
     let attempted = reinject_awaiting_confirmation(&reg, &oid, &grew);

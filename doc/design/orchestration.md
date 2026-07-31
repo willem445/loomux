@@ -2579,13 +2579,32 @@ output-burst form and #522 in its idle-pane form; re-introducing it here through
 would defeat the point of the batch.
 
 So the call site compares against `attempted_ms + REINJECT_ACK_SETTLE_MS`, never bare
-`attempted_ms`. The constant is **derived rather than picked**: `SUBMIT_MAX_WAIT` plus the
-`SUBMIT_RETRY_DELAYS` tail is the worst-case moment our own submit can still be in flight, so
-activity before it cannot be a response as a matter of *ordering* rather than of judgement. It
-costs the signal nothing — a sixth of `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~250s in which a
-genuine ack still resolves the phase, and an ack landing inside the floor is not lost, merely not
-counted yet (agents call loomux tools repeatedly; if none ever comes, the unchanged retry path
-runs, which is the pre-#535 behaviour).
+`attempted_ms`. The constant is **computed from the delivery constants that define the ordinary
+submit path** — `SUBMIT_MAX_WAIT` + `SUBMIT_CONFIRM_WINDOW` + the **sum** of `SUBMIT_RETRY_DELAYS`
+— as a const expression, so it moves by construction if any of them does. It costs the signal
+nothing: a sixth of `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~247s in which a genuine ack still
+resolves the phase, and an ack landing inside the floor is not lost, merely not counted yet
+(agents call loomux tools repeatedly; if none ever comes, the unchanged retry path runs, which is
+the pre-#535 behaviour).
+
+Two corrections worth recording, because both were wrong in a way that *read* as rigorous
+(rev-22):
+
+- **The first version of this constant was 2.6s short, in the unsafe direction.** It read
+  `SUBMIT_RETRY_DELAYS` as absolute offsets and took "the last one" as 4.5s. They are sequential
+  `sleep`s, so the last blind Enter lands at their **sum** (+7.0s), and `SUBMIT_CONFIRM_WINDOW`
+  between the first Enter and the retry loop was omitted entirely. Both source constants now
+  carry a back-pointer to this floor so the next editor sees the dependency, and the tail is
+  summed rather than hand-copied.
+- **It claimed more than it can deliver.** The doc said no activity before the floor could be a
+  response "as a matter of ordering rather than of judgement". That is false regardless of the
+  arithmetic: three `wait_for_question_clear` checkpoints (`QUESTION_HOLD_MAX`, 120s each) and
+  `HUMAN_INPUT_BLOCK_BOUND_MS` (10 min) sit between the decision and the last Enter, and any of
+  them pushes the Enter past the floor. Folding them in is not the fix — the floor would exceed
+  `REINJECT_CONFIRM_TIMEOUT_MS` and the mechanism would stop resolving anything. **The residual is
+  routed to #546**, with the related question of what could prove the notice was *read* rather
+  than that the agent is merely executing. The floor is a judgement about the common path, and now
+  says so; the earlier wording is the kind that stops the next reader from checking.
 
 Not the delivery ledger's own `submit_sent_ms`, which would be exact: that would re-couple the
 acknowledgment path to the delivery bookkeeping this whole change exists to stop depending on. A
