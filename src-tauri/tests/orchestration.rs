@@ -11304,12 +11304,21 @@ fn reinject_awaiting_confirmation(reg: &OrchRegistry, oid: &str, grew: &HashMap<
 
 const REINJECT_TIMEOUT_MS: u64 = 5 * 60 * 1000; // REINJECT_CONFIRM_TIMEOUT_MS
 const REINJECT_BUSY_DEFER_MS: u64 = 5 * 60 * 1000; // REINJECT_BUSY_DEFER_MAX_MS
-/// REINJECT_ACK_SETTLE_MS — the ordinary submit path's worst case:
-/// `SUBMIT_MAX_WAIT` (45s) + `SUBMIT_CONFIRM_WINDOW` (600ms) + the SUM of
-/// `SUBMIT_RETRY_DELAYS` (2.5s + 4.5s = 7s, sequential sleeps, so the last
-/// blind Enter lands at +7s and not at +4.5s). Activity before this cannot be
-/// a response to the paste on that path (#535, rev-22 D1).
-const REINJECT_ACK_SETTLE_MS: u64 = 45_000 + 600 + 2_500 + 4_500;
+/// REINJECT_ACK_SETTLE_MS — the ordinary (i.e. UNCONDITIONAL) submit path's
+/// worst case, stage by stage, deliberately spelled as addends rather than a
+/// total so this stays a tripwire rather than a copy:
+///   1. echo-verified typing: `ECHO_ATTEMPTS` (3) × (`ECHO_WINDOW` 2000 +
+///      `ECHO_RETRY_DELAY` 1500) = 10_500 — the retry sleep runs after the
+///      final attempt too
+///   2. `PASTE_SUBMIT_DELAY` 500
+///   3. `SUBMIT_MAX_WAIT` 45_000
+///   4. `SUBMIT_CONFIRM_WINDOW` 600
+///   5. sum of `SUBMIT_RETRY_DELAYS` 2_500 + 4_500 — sequential sleeps, so the
+///      last blind Enter lands at +7s, not +4.5s
+/// Activity before this cannot be a response to the paste on that path
+/// (#535, rev-22 D1 + rev-28 Q1).
+const REINJECT_ACK_SETTLE_MS: u64 =
+    3 * (2_000 + 1_500) + 500 + 45_000 + 600 + 2_500 + 4_500;
 
 #[test]
 fn a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers() {
@@ -11393,14 +11402,18 @@ fn an_in_flight_tool_call_from_the_previous_turn_is_not_an_acknowledgment() {
     // agent_itself_answers` above — identical setup, the ONLY difference being
     // where the stamp falls relative to the settling floor.
     //
-    // It is also the DRIFT TRIPWIRE for that floor (rev-22 D2). The constant is
-    // a const expression over `SUBMIT_MAX_WAIT` + `SUBMIT_CONFIRM_WINDOW` + the
-    // sum of `SUBMIT_RETRY_DELAYS`, and the mirror above is spelled out as those
-    // same four addends. Change any of them in production — add a third retry
-    // delay, lengthen one — and production's floor moves while the mirror does
-    // not, so the two boundary assertions below go red. Before that const
-    // expression existed, a change to `SUBMIT_RETRY_DELAYS` could widen the real
-    // false-ack window with the whole suite green.
+    // It is also the DRIFT TRIPWIRE for that floor (rev-22 D2), and the guard is
+    // bidirectional. Production's `REINJECT_ACK_SETTLE_MS` is a const expression
+    // over all five unconditional submit-path stages; the mirror above is spelled
+    // as those same addends and deliberately does NOT track. So:
+    //   - a stage lengthened in production (a third `SUBMIT_RETRY_DELAYS` entry,
+    //     a longer `ECHO_WINDOW`) widens the real floor, the "exactly at the
+    //     floor" stamp lands inside it, and the resolve assertion fails;
+    //   - a stage shortened lets the "1ms short" stamp clear the narrower floor,
+    //     resolve early, and the attempt-count assertion fails.
+    // Either way a human is told the acknowledgment window moved. Before the
+    // const expression existed, changing any of those constants could widen the
+    // real false-ack window with the whole suite green.
     let (reg, _d, gid, oid) = compact_nudge_setup(0);
     let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
     let attempted = reinject_awaiting_confirmation(&reg, &oid, &grew);

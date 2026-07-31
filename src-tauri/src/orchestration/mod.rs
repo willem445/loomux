@@ -1273,17 +1273,29 @@ const REINJECT_BUSY_DEFER_MAX_MS: u64 = REINJECT_CONFIRM_TIMEOUT_MS;
 ///
 /// **The ORDINARY SUBMIT PATH's worst case, computed from the constants that
 /// define it** — every quantity referenced, none written down, so the floor
-/// cannot drift out of step with the delivery code (rev-22 D2). On that path
-/// `deliver_prompt`:
+/// cannot drift out of step with the delivery code (rev-22 D2). "Ordinary" means
+/// *unconditional*: every stage below runs on every delivery. `deliver_prompt`:
 ///
-/// 1. waits for the pane to go quiet before pressing Enter, bounded by
+/// 1. types the paste under echo verification — up to `ECHO_ATTEMPTS` rounds,
+///    each polling for the TUI's redraw for up to `ECHO_WINDOW` and then
+///    sleeping `ECHO_RETRY_DELAY` before retyping (that sleep runs after the
+///    final attempt too, before the loop condition ends it);
+/// 2. sleeps `PASTE_SUBMIT_DELAY` between the paste and the Enter;
+/// 3. waits for the pane to go quiet before pressing Enter, bounded by
 ///    `SUBMIT_MAX_WAIT`;
-/// 2. watches for the submit's output burst for `SUBMIT_CONFIRM_WINDOW`;
-/// 3. makes blind Enter retries by sleeping each `SUBMIT_RETRY_DELAYS` entry in
+/// 4. watches for the submit's output burst for `SUBMIT_CONFIRM_WINDOW`;
+/// 5. makes blind Enter retries by sleeping each `SUBMIT_RETRY_DELAYS` entry in
 ///    turn — **sequential sleeps, so the last one lands at their SUM**, not at
-///    the last element. An earlier revision of this constant read that array as
-///    absolute offsets and came out 2.6s short, in the unsafe direction
-///    (rev-22 D1); hence the explicit sum below rather than any hand arithmetic.
+///    the last element.
+///
+/// **This constant has now been wrong twice, both times short and both times in
+/// a way that read as rigorous** — first by treating `SUBMIT_RETRY_DELAYS` as
+/// absolute offsets and omitting `SUBMIT_CONFIRM_WINDOW` (2.6s short, rev-22
+/// D1), then by summing only stages 3-5 while claiming to cover the ordinary
+/// path (11.2s short, rev-28 Q1). Both are recorded rather than quietly
+/// corrected, because the failure mode is not arithmetic — it is a sum that
+/// *looks* complete. **If you add a stage to `deliver_prompt` before the last
+/// Enter, it belongs in the expression below.**
 ///
 /// **What this does NOT cover, and is not claimed to** (rev-22 D3). Three
 /// `wait_for_question_clear` checkpoints sit between the decision and the last
@@ -1299,8 +1311,8 @@ const REINJECT_BUSY_DEFER_MAX_MS: u64 = REINJECT_CONFIRM_TIMEOUT_MS;
 /// wording claimed the latter, which is exactly the kind of sentence that stops
 /// the next reader from checking.
 ///
-/// The cost is nothing the signal can feel: a sixth of
-/// `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~247s in which a genuine ack still
+/// The cost is nothing the signal can feel: ~21% of
+/// `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~236s in which a genuine ack still
 /// resolves the phase. And a genuine ack landing *inside* the floor is not
 /// lost, merely not counted yet — agents call loomux tools repeatedly, so the
 /// next one resolves it; if none ever comes, the unchanged retry path runs,
@@ -1311,16 +1323,23 @@ const REINJECT_BUSY_DEFER_MAX_MS: u64 = REINJECT_CONFIRM_TIMEOUT_MS;
 /// bookkeeping this whole fix exists to stop depending on. A bound computed
 /// from our own timing constants needs no sampler to be working.
 const REINJECT_ACK_SETTLE_MS: u64 = {
-    // `while` rather than an iterator: `Iterator::sum` is not const.
+    // Stage 5. `while` rather than an iterator: `Iterator::sum` is not const.
     let mut tail_ms = 0u64;
     let mut i = 0;
     while i < SUBMIT_RETRY_DELAYS.len() {
         tail_ms += SUBMIT_RETRY_DELAYS[i].as_millis() as u64;
         i += 1;
     }
+    // Stage 1: every attempt can burn its full echo window AND its retry sleep.
+    let echo_ms = ECHO_ATTEMPTS as u64
+        * (ECHO_WINDOW.as_millis() as u64 + ECHO_RETRY_DELAY.as_millis() as u64);
     // `as_millis`, not `as_secs() * 1000`: the latter silently truncates a
     // sub-second change to any of these (rev-22 N1).
-    SUBMIT_MAX_WAIT.as_millis() as u64 + SUBMIT_CONFIRM_WINDOW.as_millis() as u64 + tail_ms
+    echo_ms                                             // 1: echo-verified typing
+        + PASTE_SUBMIT_DELAY.as_millis() as u64         // 2: paste → Enter gap
+        + SUBMIT_MAX_WAIT.as_millis() as u64            // 3: wait for quiet
+        + SUBMIT_CONFIRM_WINDOW.as_millis() as u64      // 4: submit-burst watch
+        + tail_ms // 5: blind Enter retries
 };
 /// Production bug fix (#410, PR #329 round 6): how long a `compact_pending`
 /// arm is given to reach a busy-then-quiet resolution (confirm or discard)
@@ -1438,6 +1457,10 @@ const ATTENTION_RECENT_INPUT_MS: u64 = 6000;
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
+///
+/// #535: an unconditional stage of the submit path, so it is also an input to
+/// `REINJECT_ACK_SETTLE_MS` and tracks automatically. Omitting it from that sum
+/// is one of the two ways that floor has already been wrong.
 const PASTE_SUBMIT_DELAY: Duration = Duration::from_millis(500);
 
 // Submission discipline: copilot ignores Enter while its agent is running
@@ -1666,12 +1689,23 @@ pub const COPILOT_AUTOPILOT_CONFIRM_KEYS: &[u8] = b"\x1b[I\r";
 // (observed live with copilot, whose input attaches well after its UI
 // paints) — wait and retype.
 /// How long a paste has to produce echo output before it counts as eaten.
+///
+/// #535: with `ECHO_ATTEMPTS`/`ECHO_RETRY_DELAY`, an input to
+/// `REINJECT_ACK_SETTLE_MS` — the echo loop runs on every delivery, before the
+/// Enter, so it is part of the worst case for "could the agent have read this
+/// yet". Lengthening any of the three widens that floor automatically.
 const ECHO_WINDOW: Duration = Duration::from_millis(2000);
 /// Minimum output growth that counts as the input box echoing the paste.
 const ECHO_MIN_BYTES: u64 = 8;
 /// Pause before retyping after an eaten paste (input attach may be close).
+///
+/// #535: an input to `REINJECT_ACK_SETTLE_MS` — see `ECHO_WINDOW`. Note this
+/// sleep also runs after the FINAL attempt, before the loop condition ends it,
+/// so the worst case is `ECHO_ATTEMPTS` of it, not `ECHO_ATTEMPTS - 1`.
 const ECHO_RETRY_DELAY: Duration = Duration::from_millis(1500);
 /// Total attempts before typing blind and letting the human see the result.
+///
+/// #535: an input to `REINJECT_ACK_SETTLE_MS` — see `ECHO_WINDOW`.
 const ECHO_ATTEMPTS: u32 = 3;
 /// Upper bound for `set_state` payloads.
 const MAX_STATE_BYTES: usize = 512 * 1024;
