@@ -8112,9 +8112,13 @@ pub const KICKOFF_REDELIVERY_MAX: u32 = 1;
 ///
 /// Sized to sit far above the residual an EATEN kickoff can produce and far
 /// below what a LANDED one produces. A landed kickoff makes the CLI echo the
-/// whole brief into its transcript and begin a reply — kilobytes at minimum,
-/// and a kickoff brief is itself larger than this. An eaten one leaves a
-/// stray Enter on an empty box: a repaint, nothing more. The asymmetry is
+/// brief into its transcript and begin a reply, and the monitor only ever
+/// looks after `PENDING_IDLE_QUIET` of total silence — so a turn that
+/// happened has painted kilobytes by then. (Review F3: an earlier version of
+/// this comment also claimed a kickoff brief is itself larger than this. It
+/// is not — real briefs run ~1-2 KB — and the discriminator never rested on
+/// that; the claim is deleted rather than softened.) An eaten kickoff leaves
+/// a stray Enter on an empty box: a repaint, nothing more. The asymmetry is
 /// deliberate — this bar being too HIGH only declines a recovery that was
 /// needed (falling back to today's badge, the pre-#517 behavior), while too
 /// LOW would re-deliver a brief that landed. Bias toward the reversible
@@ -8136,9 +8140,21 @@ pub enum KickoffDecline {
     HumanInput,
     /// A live interactive question owns the pane (#420).
     Question,
-    /// The pane produced a turn's worth of output after our submit — the
-    /// brief landed after all, whatever the confirmation tiers saw.
+    /// The pane produced a turn's worth of output after our submit, on a
+    /// pane we watched go ready before pasting — the brief landed after all,
+    /// whatever the confirmation tiers saw.
     TurnStarted,
+    /// The pane produced a turn's worth of output after our submit, but this
+    /// delivery pasted BLIND (`ReadyWait::TimedOut` — the boot wait hit
+    /// `READY_MAX_WAIT` with the CLI still painting), so that growth cannot
+    /// be attributed to a turn rather than to the boot paint that was
+    /// already running (review F5). Declines exactly like `TurnStarted` —
+    /// the conservative fallback is the same — but must not CLAIM a turn the
+    /// evidence does not support: `.loomux/lessons.md`, "a claim is a
+    /// deliverable". The delivery's own `prompt-typed` record carries
+    /// `ready_observed: false` alongside, so the two facts are greppable
+    /// together.
+    OutputUnattributable,
     /// The per-delivery re-delivery budget is spent.
     Exhausted,
 }
@@ -8153,6 +8169,7 @@ impl KickoffDecline {
             KickoffDecline::HumanInput => "human-input",
             KickoffDecline::Question => "question",
             KickoffDecline::TurnStarted => "turn-started",
+            KickoffDecline::OutputUnattributable => "output-unattributable",
             KickoffDecline::Exhausted => "redelivery-budget-spent",
         }
     }
@@ -8198,8 +8215,13 @@ pub enum KickoffRecovery {
 ///   pane a person is using" is a rule this feature has no business
 ///   weakening.
 /// - `output_since_submit` vs `turn_evidence_bytes` — the anti-double-
-///   delivery guard (see the section comment above).
+///   delivery guard (see the section comment above). `ready_observed`
+///   (review F5) only ever changes which DECLINE this reports, never whether
+///   it declines: growth on a pane we never watched go ready is
+///   `OutputUnattributable` rather than `TurnStarted`, because the boot paint
+///   that was still running is an equally good explanation for it.
 /// - `redeliveries_used` / `max_redeliveries` — the bound.
+#[allow(clippy::too_many_arguments)]
 pub fn kickoff_recovery_action(
     is_fresh_kickoff: bool,
     ledger_outstanding: bool,
@@ -8207,6 +8229,7 @@ pub fn kickoff_recovery_action(
     question_on_screen: bool,
     output_since_submit: u64,
     turn_evidence_bytes: u64,
+    ready_observed: bool,
     redeliveries_used: u32,
     max_redeliveries: u32,
 ) -> KickoffRecovery {
@@ -8223,12 +8246,101 @@ pub fn kickoff_recovery_action(
         return KickoffRecovery::Decline(KickoffDecline::Question);
     }
     if output_since_submit >= turn_evidence_bytes {
-        return KickoffRecovery::Decline(KickoffDecline::TurnStarted);
+        return KickoffRecovery::Decline(if ready_observed {
+            KickoffDecline::TurnStarted
+        } else {
+            KickoffDecline::OutputUnattributable
+        });
     }
     if redeliveries_used >= max_redeliveries {
         return KickoffRecovery::Decline(KickoffDecline::Exhausted);
     }
     KickoffRecovery::Redeliver
+}
+
+/// The kickoff treatment a lost-kickoff RE-delivery's own drain runs under
+/// (#517, review F4) — `None` when it must run under none at all.
+///
+/// **The finding.** The recovery used to nudge the drainer with `None`, so
+/// the re-delivery pasted with `wait_ready: false`. That is the one place
+/// this feature could have reproduced the bug it exists to fix: a CLI whose
+/// stdin reader has still not attached would eat the re-delivered brief too.
+/// It is NOT impossible by construction — merely unlikely, since the monitor
+/// only declares failure after `READY_MAX_WAIT` plus `PENDING_IDLE_QUIET`,
+/// by which point a healthy CLI has long been reading — and "unlikely" is
+/// not the bar for the ghost of the original defect. So the re-delivery gets
+/// the SAME boot wait the original kickoff had. It costs `READY_MIN_WAIT`
+/// (1.5s) on a pane that is already ready, which is nothing against a lost
+/// brief.
+///
+/// The other two flags are deliberately NOT copied from the original:
+/// - `confirm_autopilot: false` — copilot's consent dialog is triggered by
+///   the FIRST submit and has either been answered already or will never
+///   appear; re-arming that watcher would put a stray Enter into a pane
+///   whose state we are trying to recover.
+/// - `fresh_kickoff: false` — this is what bounds the whole feature at ONE
+///   recovery. A re-delivery that is itself eaten degrades to the loud
+///   pre-#517 badge instead of triggering another recovery, so there is no
+///   re-send loop even if every budget check were removed.
+///
+/// `None` when the re-delivery did NOT land alone at the front of the queue:
+/// kickoff treatment belongs to whichever entry the drainer's first pass
+/// actually picks up, and mirroring `deliver_prompt`'s own `was_first` rule
+/// keeps that decision in one place rather than relying on
+/// `FreshFirstAttempt`'s id guard to catch a mismatch after the fact.
+pub fn redelivery_treatment(was_first: bool) -> Option<RedeliveryTreatment> {
+    was_first.then_some(RedeliveryTreatment {
+        wait_ready: true,
+        confirm_autopilot: false,
+        fresh_kickoff: false,
+    })
+}
+
+/// The three flags `redelivery_treatment` decides, named rather than a bare
+/// `(bool, bool, bool)`: they are the same type and mean opposite things, so
+/// a positional tuple is one transposed edit away from arming the autopilot
+/// watcher on a recovery, or making a re-delivery recoverable and unbounding
+/// the feature. The public mirror of the private `FreshFirstAttempt` fields
+/// they populate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedeliveryTreatment {
+    /// Hold the paste until the CLI has painted — the F4 fix itself.
+    pub wait_ready: bool,
+    /// Watch for copilot's autopilot-consent dialog. Always false here.
+    pub confirm_autopilot: bool,
+    /// Whether THIS delivery may itself be recovered if lost. Always false
+    /// here — the bound on the whole feature.
+    pub fresh_kickoff: bool,
+}
+
+/// Whether the late monitor's live re-check should RE-WORD a badge that
+/// currently reads "loomux is re-sending it" (`blocker: None`), and to what.
+/// `None` = leave the in-flight wording alone.
+///
+/// Two reasons to leave it alone, and they are different facts:
+/// - `Exhausted` (#496 rev-47 NB1) — the budget arm firing on our OWN
+///   already-queued marker, which IS the "still re-sending" state the badge
+///   already shows. Only a REAL blocker is worth re-wording for.
+/// - `NotHolding` while a lost-kickoff re-delivery is in flight (#517,
+///   review F2) — "its text is gone — check the pane" is *true* here and
+///   still wrong to say: the text is gone precisely because the paste was
+///   eaten, which is why a re-delivery is queued. Without this arm the badge
+///   flips back to telling the human to act on a pane loomux is actively
+///   recovering, on the very next 5s tick, for as long as the re-delivery
+///   waits behind a busy drain or an occupied box. It self-corrects on the
+///   re-delivery's confirm or supersede, but a badge that says "your problem"
+///   about loomux's own in-flight work is exactly the honesty failure the
+///   NB1 re-check exists to prevent, pointed the other way.
+///
+/// Every other blocker re-words as before: `HumanInput` and `Question` are
+/// real, human-clearable states that outrank an in-flight recovery, and
+/// `QueueFull` means nothing was queued at all.
+pub fn stranded_reword(live: StrandedBlocker, redelivery_in_flight: bool) -> Option<StrandedBlocker> {
+    match live {
+        StrandedBlocker::Exhausted => None,
+        StrandedBlocker::NotHolding if redelivery_in_flight => None,
+        other => Some(other),
+    }
 }
 
 /// Whether a self-heal may admit its `StrandedSubmit` marker right now
@@ -8432,6 +8544,12 @@ fn run_late_confirmation_monitor(
     // "did the agent start a turn on our brief?" is measurable at
     // `DeclareFailed` time — the guard that makes a re-delivery safe.
     submit_output_baseline: u64,
+    // #517 review F5: whether this delivery's boot wait actually watched the
+    // CLI go ready, or timed out and pasted blind. Decides only whether
+    // growth-since-submit is reported as a turn or as unattributable — never
+    // whether the recovery declines. `true` for a delivery with no boot wait
+    // at all (nothing was ever in doubt about the pane's readiness).
+    ready_observed: bool,
 ) {
     let ptys = app.state::<crate::pty::PtyManager>();
     let started = std::time::Instant::now();
@@ -8576,13 +8694,13 @@ fn run_late_confirmation_monitor(
                             STRANDED_SELFHEAL_MAX_HEALS,
                         );
                         if let StrandedAction::Attention(blocker) = live {
-                            // `Exhausted` here would be the budget arm
-                            // firing on our own already-queued marker, which
-                            // is exactly the "still re-sending" state the
-                            // badge already shows — only a REAL blocker is
-                            // worth re-wording for.
-                            if blocker != StrandedBlocker::Exhausted {
-                                r.mark_stranded(&group, &agent, Some(blocker));
+                            // Which live blockers are worth re-wording for —
+                            // see `stranded_reword`. `redeliveries_used > 0`
+                            // is this monitor's own knowledge that a
+                            // lost-kickoff re-delivery is queued but not yet
+                            // drained (review F2).
+                            if let Some(word) = stranded_reword(blocker, redeliveries_used > 0) {
+                                r.mark_stranded(&group, &agent, Some(word));
                             }
                         }
                     }
@@ -8681,6 +8799,7 @@ fn run_late_confirmation_monitor(
                         showing_question,
                         cur_total.saturating_sub(submit_output_baseline),
                         KICKOFF_TURN_EVIDENCE_BYTES,
+                        ready_observed,
                         redeliveries_used,
                         KICKOFF_REDELIVERY_MAX,
                     );
@@ -8714,8 +8833,15 @@ fn run_late_confirmation_monitor(
                             // "declined: not-a-kickoff" record saying
                             // nothing about anything.
                             if recoverable_kickoff.is_some() {
-                                append_audit(&root, &group, "loomux", "kickoff-redelivery-skipped",
-                                    json!({ "to": agent, "reason": why.as_str() }));
+                                append_audit(&root, &group, "loomux", "kickoff-redelivery-skipped", json!({
+                                    "to": agent,
+                                    "reason": why.as_str(),
+                                    // Review F5: carried alongside the reason
+                                    // so a growth-based decline is always
+                                    // readable together with whether the
+                                    // paste that produced it went in blind.
+                                    "ready_observed": ready_observed,
+                                }));
                             }
                         }
                     }
@@ -9557,7 +9683,7 @@ fn deliver_now(
                 pty_id, hook_marker_path_for_monitor, hook_baseline, pasted_text_for_monitor,
                 delivery_from_for_monitor, submit_sent_ms, target_is_orchestrator,
                 already_failed, last_delivery_for_monitor, reg_for_monitor,
-                recoverable_kickoff, submit_baseline,
+                recoverable_kickoff, submit_baseline, ready_observed,
             );
         });
     }
@@ -22211,15 +22337,30 @@ impl OrchRegistry {
                 json!({ "to": agent_id, "reason": "already-queued", "id": admitted.id }));
             return false;
         }
-        self.audit(group, "loomux", "kickoff-redelivered",
-            json!({ "to": agent_id, "id": admitted.id, "via": "queue-front-door" }));
+        // Review F4: the re-delivery runs under the SAME boot wait the
+        // original kickoff had — see `redelivery_treatment` for why the
+        // other two flags are deliberately not copied with it, and why
+        // `was_first` gates it exactly as `deliver_prompt`'s front door does.
+        let treatment = redelivery_treatment(admitted.was_first).map(|t| FreshFirstAttempt {
+            id: admitted.id,
+            wait_ready: t.wait_ready,
+            confirm_autopilot: t.confirm_autopilot,
+            fresh_kickoff: t.fresh_kickoff,
+        });
+        self.audit(group, "loomux", "kickoff-redelivered", json!({
+            "to": agent_id, "id": admitted.id, "via": "queue-front-door",
+            // The F4 fix, visible in the record: a re-delivery that skipped
+            // the boot wait would be the original defect's ghost, so whether
+            // it got one is a fact the audit states rather than implies.
+            "boot_wait": treatment.as_ref().is_some_and(|t| t.wait_ready),
+        }));
         // Best-effort nudge, the same shape `deliver_prompt`'s
         // behind-the-queue path and `actuate_stranded` both use;
         // `ensure_drainer` is idempotent. Without an app handle (headless
         // tests) nothing can drain — the entry stays queued, which is the
         // honest state, and the caller's badge still fires.
         if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
-            reg.ensure_drainer(app, group.to_string(), pty_id, None);
+            reg.ensure_drainer(app, group.to_string(), pty_id, treatment);
         }
         true
     }

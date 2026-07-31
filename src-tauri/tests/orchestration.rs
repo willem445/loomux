@@ -49,6 +49,7 @@ use loomux_lib::orchestration::{
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     kickoff_recovery_action, KickoffDecline, KickoffRecovery,
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
+    redelivery_treatment, RedeliveryTreatment, stranded_reword,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
@@ -13592,10 +13593,12 @@ fn kickoff_recovery_declines_before_it_ever_re_delivers() {
     // a fresh spawn's brief may ever be re-sent by this path) and
     // `TurnStarted` ahead of the budget (a brief that landed must not be
     // re-sent even when budget remains).
+    // `ready_observed: true` throughout except where it is the subject —
+    // the ordinary case, where the boot wait watched the CLI go ready.
     let act = |kickoff, ledger, typed, question, growth, used| {
         kickoff_recovery_action(
             kickoff, ledger, typed, question, growth,
-            KICKOFF_TURN_EVIDENCE_BYTES, used, KICKOFF_REDELIVERY_MAX,
+            KICKOFF_TURN_EVIDENCE_BYTES, true, used, KICKOFF_REDELIVERY_MAX,
         )
     };
 
@@ -13651,6 +13654,162 @@ fn kickoff_recovery_declines_before_it_ever_re_delivers() {
         "a resume notice is re-derivable — it must not be re-pasted by this path"
     );
     assert!(!Delivery::MidSession.recovers_lost_kickoff());
+
+    // Review F5: growth on a pane we never watched go ready declines the
+    // same way, but must not CLAIM a turn — the boot paint that was still
+    // running explains it equally well, and an audit token that says
+    // "turn-started" about output nobody can attribute is a claim the
+    // evidence does not support.
+    assert_eq!(
+        kickoff_recovery_action(
+            true, true, false, false, KICKOFF_TURN_EVIDENCE_BYTES,
+            KICKOFF_TURN_EVIDENCE_BYTES, false, 0, KICKOFF_REDELIVERY_MAX,
+        ),
+        KickoffRecovery::Decline(KickoffDecline::OutputUnattributable),
+        "a blind paste's growth is unattributable, not evidence of a turn"
+    );
+    assert_eq!(
+        KickoffDecline::OutputUnattributable.as_str(),
+        "output-unattributable",
+        "the two growth declines must be distinguishable in the audit log"
+    );
+    // ...and `ready_observed` changes ONLY the label, never the outcome:
+    // both are declines, and neither is reachable without growth.
+    assert_eq!(
+        kickoff_recovery_action(
+            true, true, false, false, 0, KICKOFF_TURN_EVIDENCE_BYTES, false, 0, KICKOFF_REDELIVERY_MAX,
+        ),
+        KickoffRecovery::Redeliver,
+        "a blind paste with no growth is still the eaten-kickoff case — recover it"
+    );
+}
+
+#[test]
+fn a_re_delivery_gets_the_same_boot_wait_the_original_kickoff_had() {
+    // Review F4 — the one place this feature could reproduce the bug it
+    // exists to fix. The recovery used to nudge the drainer with `None`, so
+    // the re-delivered brief pasted with no boot wait at all; a CLI whose
+    // stdin reader still had not attached would eat it again. That is not
+    // impossible by construction — only unlikely — so the re-delivery is
+    // given the same wait, and this pins all three flags.
+    let t = redelivery_treatment(true).expect("a re-delivery alone at the front gets kickoff treatment");
+
+    assert!(
+        t.wait_ready,
+        "a re-delivery pasting into a still-booting CLI is the original defect's ghost"
+    );
+    assert!(
+        !t.confirm_autopilot,
+        "copilot's consent dialog answers the FIRST submit — re-arming it would put a stray \
+         Enter into the pane we are recovering"
+    );
+    assert!(
+        !t.fresh_kickoff,
+        "the re-delivery must NOT be recoverable itself — this is what bounds the feature at \
+         one recovery even if every budget check were removed"
+    );
+    // All three at once, by name: they are the same type and mean opposite
+    // things, so a transposed edit is exactly the failure this pins.
+    assert_eq!(
+        t,
+        RedeliveryTreatment { wait_ready: true, confirm_autopilot: false, fresh_kickoff: false }
+    );
+
+    // And the front-door rule it mirrors: kickoff treatment belongs to the
+    // entry the drainer's first pass actually picks up.
+    assert_eq!(
+        redelivery_treatment(false),
+        None,
+        "a re-delivery admitted behind an existing queue is not the drainer's first entry"
+    );
+}
+
+#[test]
+fn a_badge_never_tells_the_human_to_act_on_a_re_delivery_in_flight() {
+    // Review F2. The monitor keeps a raised badge honest on every
+    // `KeepWaiting` tick by re-running the live decision (#496 rev-47 NB1).
+    // For an eaten kickoff that live decision is permanently `NotHolding` —
+    // the text is gone, which is WHY a re-delivery is queued — so without
+    // this arm the badge flips back from "loomux is re-sending it" to "check
+    // the pane" on the very next 5s tick, for as long as the re-delivery
+    // waits behind a busy drain.
+    assert_eq!(
+        stranded_reword(StrandedBlocker::NotHolding, true),
+        None,
+        "loomux must not tell the human to act on work it is actively doing"
+    );
+    assert_eq!(
+        stranded_reword(StrandedBlocker::NotHolding, false),
+        Some(StrandedBlocker::NotHolding),
+        "with no recovery in flight the badge must still name the real state"
+    );
+
+    // The pre-existing rev-47 rule, unchanged: the budget arm firing on our
+    // own queued marker IS the in-flight state the badge already shows.
+    assert_eq!(stranded_reword(StrandedBlocker::Exhausted, false), None);
+    assert_eq!(stranded_reword(StrandedBlocker::Exhausted, true), None);
+
+    // Everything a human can actually clear still outranks an in-flight
+    // recovery — those are real blockers, not loomux's own pending work.
+    for blocker in [StrandedBlocker::HumanInput, StrandedBlocker::Question, StrandedBlocker::QueueFull] {
+        assert_eq!(
+            stranded_reword(blocker, true),
+            Some(blocker),
+            "{blocker:?} is human-clearable and must be said out loud even mid-recovery"
+        );
+    }
+}
+
+#[test]
+fn a_re_delivery_supersedes_the_monitor_that_triggered_it() {
+    // Review F1: the #519/#454 compose point, composed rather than asserted.
+    // The design note claims "the recovery cannot be raced by the monitor
+    // that triggered it". That rests on the re-delivery's own drain calling
+    // `record_inflight_delivery` before its Enter — which mints a FRESH
+    // `submit_sent_ms` — flipping the triggering monitor to `Superseded`.
+    // Drives the real functions in the real order.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5174u32;
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+
+    // The lost kickoff's own ledger entry: in flight, unconfirmed. Its
+    // monitor is watching under this `submit_sent_ms`.
+    let kickoff_ms = 1_000u64;
+    record_inflight_delivery(&last_delivery, pty, kickoff_ms, "loomux".to_string());
+    assert_eq!(
+        observe_ledger(&last_delivery, pty, kickoff_ms),
+        LedgerView { superseded: false, outstanding: true, newer_confirmed: false },
+        "before the recovery, the monitor still owns this pane"
+    );
+
+    // The recovery admits the brief...
+    assert!(reg.redeliver_lost_kickoff(&g.id, &w.id, "loomux", pty, KICKOFF_BRIEF));
+
+    // ...and the drain that picks it up records its own in-flight delivery
+    // before pressing Enter (#454's ordering — `deliver_now` mints a fresh
+    // `submit_sent_ms` for every delivery, so a re-delivery can never reuse
+    // the original's identity).
+    let redelivery_ms = kickoff_ms + 1;
+    record_inflight_delivery(&last_delivery, pty, redelivery_ms, "loomux".to_string());
+
+    let view = observe_ledger(&last_delivery, pty, kickoff_ms);
+    assert!(view.superseded, "the re-delivery must take ownership of the pane from the old monitor");
+    assert!(!view.outstanding, "the old monitor no longer has an outstanding delivery to act on");
+    assert_eq!(
+        late_monitor_tick(view.superseded, PromptLandedMatch::None, false, false, true, false),
+        MonitorAction::Superseded,
+        "the monitor that triggered the recovery exits without writing or notifying — it \
+         cannot race the re-delivery it asked for"
+    );
+
+    // The new delivery's own monitor owns the pane from here, and reads it
+    // as outstanding under its own identity — nothing is left unwatched.
+    assert_eq!(
+        observe_ledger(&last_delivery, pty, redelivery_ms),
+        LedgerView { superseded: false, outstanding: true, newer_confirmed: false },
+    );
 }
 
 #[test]
@@ -13846,6 +14005,7 @@ fn an_eaten_kickoff_badges_and_then_re_delivers_the_brief() {
         false, // no question
         0,     // the pane produced nothing after our submit — no turn started
         KICKOFF_TURN_EVIDENCE_BYTES,
+        true,  // the boot wait did watch this CLI go ready
         0,
         KICKOFF_REDELIVERY_MAX,
     );
@@ -13863,6 +14023,15 @@ fn an_eaten_kickoff_badges_and_then_re_delivers_the_brief() {
         None,
         "the badge must stop telling the human to act once loomux is re-sending"
     );
+    // Review F2: and it STAYS that way while the re-delivery waits to drain.
+    // The live re-check on every later tick still reads `NotHolding` (the
+    // text is gone — that is why a recovery is queued), so without the
+    // in-flight arm the badge would flip back within one 5s tick.
+    assert_eq!(
+        stranded_reword(StrandedBlocker::NotHolding, /* redelivery in flight */ true),
+        None,
+        "a queued-but-undrained recovery must not re-raise 'check the pane'"
+    );
 
     // And the counter-example, on the same pane state but with the one fact
     // that differs for a kickoff that DID land: the agent ran a turn.
@@ -13872,6 +14041,7 @@ fn an_eaten_kickoff_badges_and_then_re_delivers_the_brief() {
             true, false, false,
             KICKOFF_TURN_EVIDENCE_BYTES * 4,
             KICKOFF_TURN_EVIDENCE_BYTES,
+            true,
             0,
             KICKOFF_REDELIVERY_MAX,
         ),

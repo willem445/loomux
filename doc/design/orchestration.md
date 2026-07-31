@@ -5109,7 +5109,13 @@ demands, since a duplicate brief is a real cost. Four independent layers:
    the agent run its whole first turn; one that was eaten leaves the pane as boot left it. This
    is the live discriminator (two spawns silent, one working) expressed as a rule. The bar is
    set high on purpose: too high only declines a recovery that was needed, falling back to the
-   pre-#517 badge; too low re-sends a brief that landed. Bias toward the reversible mistake.
+   pre-#517 badge; too low re-sends a brief that landed. What makes 4 KB enough is not the
+   brief's own size (real briefs run ~1–2 KB — review F3 removed that claim from the code
+   comment) but the window: the monitor only looks after `PENDING_IDLE_QUIET` of *total*
+   silence, so a turn that happened has painted kilobytes by then. When the delivery pasted
+   blind (`ready_observed: false`), growth is reported as `OutputUnattributable` rather than
+   `TurnStarted` — same conservative decline, but the audit never claims a turn when the boot
+   paint it timed out on explains the bytes just as well (review F5). Bias toward the reversible mistake.
 4. `queue::admit`'s byte-identical coalesce, reported out of the same critical section that
    decided it (`AdmitOutcome::coalesced`) so a brief still waiting to drain can never occupy
    two slots — and a collapsed attempt is reported as NOT sent, so it does not burn the budget
@@ -5125,18 +5131,53 @@ resume, and a `MidSession` prompt has a sender still around; both keep the pre-#
 badge-and-stop behavior untouched. Every other `StrandedAction` is likewise untouched — this
 lives strictly inside `NotHolding`.
 
+**The re-delivery gets the boot wait too** (review F4). The recovery originally nudged the
+drainer with no kickoff treatment, so the re-delivered brief pasted with `wait_ready: false` —
+the one place this feature could reproduce the bug it exists to fix, since a CLI whose stdin
+reader still had not attached would eat the re-delivery as well. That is *unlikely* (the monitor
+only declares failure after `READY_MAX_WAIT` plus `PENDING_IDLE_QUIET`, by which point a healthy
+CLI has long been reading) but not impossible by construction, and unlikely is not the bar for
+the ghost of the original defect. `redelivery_treatment` now gives it the same wait, at a cost of
+`READY_MIN_WAIT` (1.5s) on a pane that is already ready. The other two flags are deliberately
+*not* copied: `confirm_autopilot: false`, because copilot's consent dialog answers the FIRST
+submit and re-arming that watcher would put a stray Enter into the pane being recovered; and
+`fresh_kickoff: false`, which is what bounds the whole feature at one recovery — a re-delivery
+that is itself eaten degrades to the loud pre-#517 badge rather than triggering another, so there
+is no re-send loop even with every budget check removed. The three are a named struct, not a
+`(bool, bool, bool)`: same type, opposite meanings, one transposed edit from arming the autopilot
+watcher or unbounding the feature. `was_first` gates the whole thing, mirroring
+`deliver_prompt`'s own rule that kickoff treatment belongs to the entry the drainer's first pass
+actually picks up.
+
 **Badge honesty.** `actuate_stranded` raises `NotHolding` ("its text is gone — check the pane")
 before the recovery runs. Once a re-delivery is admitted that is no longer the whole truth, so
 the note is re-worded to the in-flight form (`blocker: None`, "loomux is re-sending it") — the
 same wording an in-flight self-heal uses, and it clears on the monitor's normal evidence paths.
 The human is neither told to act nor left thinking nothing is happening.
 
+That re-wording has to *survive*, which the first cut of it did not (review F2). Every later
+`KeepWaiting` tick re-runs the rev-47 NB1 live check, and for an eaten kickoff that check reads
+`NotHolding` **permanently** — the text is gone, which is precisely why a recovery is queued —
+so the badge flipped straight back to "check the pane" on the next 5 s tick and stayed there until
+the re-delivery drained. `stranded_reword` is now the single decision for what a live re-check may
+say: it spares `Exhausted` (the pre-existing NB1 rule — the budget arm firing on our own queued
+marker *is* the in-flight state) and spares `NotHolding` while `redeliveries_used > 0`. Everything
+a human can actually clear — `HumanInput`, `Question`, `QueueFull` — still outranks an in-flight
+recovery and is said out loud. The shape of the bug is worth naming: a badge claiming "your
+problem" about loomux's own pending work is the same honesty failure the NB1 re-check exists to
+prevent, pointed the other way.
+
 **Interaction with #454 (supersede at a re-send's START).** These two land together and compose
 exactly the right way. #454 makes `deliver_now` call `record_inflight_delivery` *before* its
 confirm window, so a new delivery claims the pane the moment it presses Enter rather than when it
 finishes. The re-delivery admitted here is an ordinary delivery, so when the drainer runs it the
 old monitor's very next `observe_ledger` reads `superseded` and it exits without writing or
-notifying — the recovery cannot be raced by the monitor that triggered it. In the other direction,
+notifying — the recovery cannot be raced by the monitor that triggered it. That sequence is now
+composed in a test rather than argued here (review F1):
+`redeliver_lost_kickoff` → `record_inflight_delivery` (as the drain will, with a fresh
+`submit_sent_ms`) → `observe_ledger(original).superseded` → `late_monitor_tick == Superseded`,
+plus the new delivery reading as outstanding under its own identity so nothing is left unwatched.
+In the other direction,
 the `ledger.outstanding` this decision reads is the SAME atomic `LedgerView` the self-heal decision
 above judged from, so the two decisions taken on one tick can never disagree about whether the
 delivery is still outstanding.
