@@ -7235,9 +7235,18 @@ pub fn format_output_tail(text: &str, n_lines: usize) -> String {
 
 /// Decide whether a freshly spawned CLI is ready to receive typed input,
 /// from its output volume and how long that output has been stable. Pure so
-/// the thresholds are testable; the polling loop lives in `deliver_prompt`.
-pub fn cli_ready(output_len: usize, quiet_for: Duration, elapsed: Duration) -> bool {
-    elapsed >= READY_MIN_WAIT && output_len >= READY_MIN_OUTPUT && quiet_for >= READY_QUIET
+/// the thresholds are testable; the polling loop lives in `deliver_now`.
+///
+/// `output_total` is the pane's MONOTONIC byte counter
+/// (`PtyManager::output_total`), and `quiet_for` must be derived from that
+/// same counter — never from the output ring's current length (#517). The
+/// ring saturates at `OUTPUT_RING_CAP`, where its length stops changing
+/// while output keeps arriving (`OutputBuf`'s own doc), so a length-based
+/// caller reports a still-booting CLI as quiet and this function then
+/// declares it ready. Below saturation the two readings are equal, which is
+/// why the bug only showed on CLIs with a large boot paint.
+pub fn cli_ready(output_total: usize, quiet_for: Duration, elapsed: Duration) -> bool {
+    elapsed >= READY_MIN_WAIT && output_total >= READY_MIN_OUTPUT && quiet_for >= READY_QUIET
 }
 
 /// Wrap prompt text in a bracketed paste so multi-line prompts land in the
@@ -7978,6 +7987,176 @@ pub fn stranded_selfheal_action(
     StrandedAction::SelfHeal
 }
 
+// ───────────── #517: a fresh spawn's kickoff that never reached the pane ─────────────
+//
+// #496 PR-C (above) recovers a delivery whose text IS in the box and whose
+// Enter was withheld. A fresh spawn's kickoff fails a DIFFERENT way: the
+// paste itself is swallowed by a CLI whose stdin reader has not attached yet
+// (`ECHO_WINDOW`'s own comment: "observed live with copilot, whose input
+// attaches well after its UI paints"), so nothing ever lands in the box.
+// `stranded_selfheal_action` correctly refuses that state — `NotHolding`,
+// "there is nothing identifiable to re-submit" — and today the story ends
+// there: a badge, a notice, and a worker sitting idle with no brief until a
+// human or the orchestrator re-sends by hand. That is #517: six instances in
+// one day, and the reason the agent's own recovery ("re-send with
+// send_prompt") is a person's job.
+//
+// The recovery for THIS shape is not an Enter, it is the brief again — and
+// it goes through `deliver_prompt`'s own front door (#470), not a write from
+// the monitor thread, so it inherits ordered admission, the byte-identical
+// coalesce, the audit trail, and every paste guard. The kickoff was never
+// outside that machinery; only its FAILURE was.
+//
+// **Why this cannot double-deliver a kickoff that actually landed.** Three
+// independent layers, in the order they are consulted:
+//   1. A landed kickoff resolves before it ever gets here — `late_monitor_
+//      tick` returns `Confirm` on the `promptsubmit` hook record (installed
+//      for every spawned agent, both CLIs, at spawn) and the monitor exits.
+//      `DeclareFailed` is unreachable for it.
+//   2. `ledger_outstanding` — the durable artifact, not a pane heuristic.
+//   3. `output_since_submit` — a kickoff that landed makes the agent run its
+//      whole first turn; one that was eaten leaves the pane exactly as boot
+//      left it. This is the observed discriminator from the live data: two
+//      fresh spawns lost their brief and sat silent while a third received
+//      its brief and worked normally.
+// Plus the queue's own coalesce, which collapses a re-admission of
+// byte-identical text into an entry still waiting, and a budget of one.
+
+/// How many re-deliveries loomux may fire for ONE lost fresh kickoff (#517).
+/// One, for the same reason `STRANDED_SELFHEAL_MAX_HEALS` is one: the
+/// recovery acts on a pane whose state we can only observe indirectly, and
+/// the cost of a second wrong re-delivery (a duplicate brief the agent has
+/// to reconcile) is worse than the cost of stopping (a badge and a notice
+/// the human already has in front of them). Counted explicitly rather than
+/// relied on structurally, so the bound survives an edit to the caller's
+/// precedence and is directly testable.
+pub const KICKOFF_REDELIVERY_MAX: u32 = 1;
+
+/// Output growth since a kickoff's own submit baseline that counts as "this
+/// agent really did receive its brief and start a turn" (#517) — the guard
+/// that makes re-delivery safe.
+///
+/// Sized to sit far above the residual an EATEN kickoff can produce and far
+/// below what a LANDED one produces. A landed kickoff makes the CLI echo the
+/// whole brief into its transcript and begin a reply — kilobytes at minimum,
+/// and a kickoff brief is itself larger than this. An eaten one leaves a
+/// stray Enter on an empty box: a repaint, nothing more. The asymmetry is
+/// deliberate — this bar being too HIGH only declines a recovery that was
+/// needed (falling back to today's badge, the pre-#517 behavior), while too
+/// LOW would re-deliver a brief that landed. Bias toward the reversible
+/// mistake.
+pub const KICKOFF_TURN_EVIDENCE_BYTES: u64 = 4096;
+
+/// Why a lost-kickoff re-delivery was declined (#517) — carried into the
+/// audit so "loomux did not re-send" always says which condition stopped it,
+/// the same discipline `StrandedBlocker` gives the badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickoffDecline {
+    /// Not a fresh spawn's kickoff at all (a mid-session delivery, or a
+    /// resume re-sync). Only a FRESH kickoff's payload is unrecoverable
+    /// when it never lands — see `kickoff_recovery_action`'s doc.
+    NotAKickoff,
+    /// The ledger says this delivery is no longer outstanding.
+    Resolved,
+    /// A human typed into the pane after our submit.
+    HumanInput,
+    /// A live interactive question owns the pane (#420).
+    Question,
+    /// The pane produced a turn's worth of output after our submit — the
+    /// brief landed after all, whatever the confirmation tiers saw.
+    TurnStarted,
+    /// The per-delivery re-delivery budget is spent.
+    Exhausted,
+}
+
+impl KickoffDecline {
+    /// Stable audit token, kept separate from any human-facing wording so
+    /// one can change without silently breaking greps over the other.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KickoffDecline::NotAKickoff => "not-a-kickoff",
+            KickoffDecline::Resolved => "resolved",
+            KickoffDecline::HumanInput => "human-input",
+            KickoffDecline::Question => "question",
+            KickoffDecline::TurnStarted => "turn-started",
+            KickoffDecline::Exhausted => "redelivery-budget-spent",
+        }
+    }
+}
+
+/// What to do about a fresh kickoff the late monitor just declared `Failed`
+/// with nothing left in the box (#517).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickoffRecovery {
+    /// Re-admit the brief through the delivery queue's front door.
+    Redeliver,
+    /// Leave it to the attention badge `stranded_selfheal_action` already
+    /// raised, and audit why.
+    Decline(KickoffDecline),
+}
+
+/// The one decision point for #517. Pure, so the precedence is directly
+/// pinnable rather than an inline `if` chain a future edit could reorder —
+/// the argument `stranded_selfheal_action` and `late_monitor_tick` already
+/// make in this file.
+///
+/// Consulted ONLY after `stranded_selfheal_action` has returned
+/// `Attention(StrandedBlocker::NotHolding)`: that is the eaten-paste
+/// signature (the delivery failed AND its text is not in the box), and it is
+/// the only state where re-sending the text is the right recovery rather
+/// than pressing Enter. Every other `StrandedAction` keeps its pre-#517
+/// behavior untouched.
+///
+/// Inputs, in the order they are consulted:
+/// - `is_fresh_kickoff` — a FRESH spawn's brief, not a mid-session delivery
+///   and not a resume re-sync. Narrow on purpose: a fresh kickoff is the one
+///   payload with no other route to the agent (it is the agent's entire
+///   reason to exist, and nothing will re-send it), whereas a mid-session
+///   prompt has a sender who is still around and a resume notice is
+///   re-derivable from durable state.
+/// - `ledger_outstanding` — the DURABLE artifact: this pane's recorded
+///   `DeliveryOutcome` is still THIS delivery's and still unconfirmed.
+///   Checked before any pane reading, exactly as `stranded_selfheal_action`
+///   checks it first.
+/// - `human_typed_since` / `question_on_screen` — the same two absolutes the
+///   self-heal honors. A re-delivery pastes rather than pressing Enter, so
+///   it is less dangerous than a heal here, but "loomux does not act on a
+///   pane a person is using" is a rule this feature has no business
+///   weakening.
+/// - `output_since_submit` vs `turn_evidence_bytes` — the anti-double-
+///   delivery guard (see the section comment above).
+/// - `redeliveries_used` / `max_redeliveries` — the bound.
+pub fn kickoff_recovery_action(
+    is_fresh_kickoff: bool,
+    ledger_outstanding: bool,
+    human_typed_since: bool,
+    question_on_screen: bool,
+    output_since_submit: u64,
+    turn_evidence_bytes: u64,
+    redeliveries_used: u32,
+    max_redeliveries: u32,
+) -> KickoffRecovery {
+    if !is_fresh_kickoff {
+        return KickoffRecovery::Decline(KickoffDecline::NotAKickoff);
+    }
+    if !ledger_outstanding {
+        return KickoffRecovery::Decline(KickoffDecline::Resolved);
+    }
+    if human_typed_since {
+        return KickoffRecovery::Decline(KickoffDecline::HumanInput);
+    }
+    if question_on_screen {
+        return KickoffRecovery::Decline(KickoffDecline::Question);
+    }
+    if output_since_submit >= turn_evidence_bytes {
+        return KickoffRecovery::Decline(KickoffDecline::TurnStarted);
+    }
+    if redeliveries_used >= max_redeliveries {
+        return KickoffRecovery::Decline(KickoffDecline::Exhausted);
+    }
+    KickoffRecovery::Redeliver
+}
+
 /// Whether a self-heal may admit its `StrandedSubmit` marker right now
 /// (#496 PR-C), and if not, the audited reason. `None` = admit.
 ///
@@ -8172,6 +8351,13 @@ fn run_late_confirmation_monitor(
     already_failed: bool,
     last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
     reg: Option<Arc<OrchRegistry>>,
+    // #517: the brief to re-deliver if this turns out to be a fresh spawn's
+    // kickoff that never reached the pane. `None` for every other delivery.
+    recoverable_kickoff: Option<String>,
+    // #517: the pane's output counter as of this delivery's own Enter, so
+    // "did the agent start a turn on our brief?" is measurable at
+    // `DeclareFailed` time — the guard that makes a re-delivery safe.
+    submit_output_baseline: u64,
 ) {
     let ptys = app.state::<crate::pty::PtyManager>();
     let started = std::time::Instant::now();
@@ -8183,6 +8369,11 @@ fn run_late_confirmation_monitor(
     // fresh delivery to the same pane gets its own budget, which is correct:
     // its Enter is about different text.
     let mut heals_used = 0u32;
+    // #517: lost-kickoff re-deliveries fired by THIS monitor, counted
+    // against `KICKOFF_REDELIVERY_MAX`. Per-monitor (i.e. per-delivery) for
+    // the same reason `heals_used` is: a later delivery to the same pane is
+    // about different text and gets its own budget.
+    let mut redeliveries_used = 0u32;
     // #496 PR-C: whether our pasted text was still identifiably in the box at
     // the moment this delivery was declared stranded. A raised badge must be
     // able to come DOWN on evidence — a human who rescues the pane by
@@ -8394,6 +8585,62 @@ fn run_late_confirmation_monitor(
                         "to": agent, "reason": "no-registry",
                     }));
                 }
+
+                // #517: `NotHolding` is the eaten-paste signature — the
+                // delivery failed AND its text never reached the box, so
+                // there is no Enter for #496's self-heal to press. For a
+                // FRESH spawn's kickoff that is not the end of the story:
+                // the brief has no other route to the agent, so re-deliver
+                // it through the same front door. Scoped strictly INSIDE
+                // that one outcome so every other `StrandedAction` keeps
+                // its pre-#517 behavior untouched.
+                if action == StrandedAction::Attention(StrandedBlocker::NotHolding) {
+                    let recovery = kickoff_recovery_action(
+                        recoverable_kickoff.is_some(),
+                        ledger_outstanding,
+                        human_typed_since,
+                        showing_question,
+                        cur_total.saturating_sub(submit_output_baseline),
+                        KICKOFF_TURN_EVIDENCE_BYTES,
+                        redeliveries_used,
+                        KICKOFF_REDELIVERY_MAX,
+                    );
+                    // `Redeliver` implies `recoverable_kickoff.is_some()`
+                    // (it is the decision's first gate), so the zip below
+                    // can only be `None` when there is no registry to admit
+                    // through — never a silently skipped brief.
+                    match (recovery, recoverable_kickoff.as_deref().zip(reg.as_ref())) {
+                        (KickoffRecovery::Redeliver, Some((brief, r))) => {
+                            if r.redeliver_lost_kickoff(&group, &agent, &delivery_from, pty_id, brief) {
+                                redeliveries_used += 1;
+                                // The badge `actuate_stranded` just raised
+                                // says "its text is gone — check the pane".
+                                // That is no longer the whole truth: loomux
+                                // IS handling it. Re-word to the in-flight
+                                // form (`None`), the same one an in-flight
+                                // self-heal uses, so the human is neither
+                                // told to act nor left thinking nothing is.
+                                r.mark_stranded(&group, &agent, None);
+                            }
+                        }
+                        (KickoffRecovery::Redeliver, None) => {
+                            // No registry to admit through (bare/headless).
+                            append_audit(&root, &group, "loomux", "kickoff-redelivery-skipped",
+                                json!({ "to": agent, "reason": "no-registry" }));
+                        }
+                        (KickoffRecovery::Decline(why), _) => {
+                            // Only worth a line when this delivery was a
+                            // kickoff at all — every mid-session delivery
+                            // reaching `NotHolding` would otherwise write a
+                            // "declined: not-a-kickoff" record saying
+                            // nothing about anything.
+                            if recoverable_kickoff.is_some() {
+                                append_audit(&root, &group, "loomux", "kickoff-redelivery-skipped",
+                                    json!({ "to": agent, "reason": why.as_str() }));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -8417,6 +8664,13 @@ fn run_late_confirmation_monitor(
 pub struct AdmitOutcome {
     pub id: u64,
     pub was_first: bool,
+    /// #517: this admission collapsed into an ALREADY-QUEUED byte-identical
+    /// entry (`queue::AdmitDecision::Coalesce`) rather than adding one.
+    /// Reported out of the same critical section that decided it, so a
+    /// caller that must not act twice on one payload — the lost-kickoff
+    /// re-delivery — can tell "queued" from "already queued" without a
+    /// second, racy look at the queue.
+    pub coalesced: bool,
 }
 
 /// What `deliver_now` reports back to its caller — always `run_queue_drainer`
@@ -8475,6 +8729,14 @@ fn deliver_now(
     last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
     target_is_orchestrator: bool,
     reg: Option<Arc<OrchRegistry>>,
+    // #517: `Some(brief)` when this is a FRESH spawn's kickoff — the brief
+    // itself, so the late-confirmation monitor can re-deliver it if it turns
+    // out never to have reached the pane. `None` for every other delivery
+    // (mid-session, resume re-sync, or any replay), which keeps the pre-#517
+    // "badge and stop" behavior exactly as it was. Deliberately the TEXT and
+    // not a bool: the monitor must re-send the brief, never the flush header
+    // some attempt happened to prepend to it.
+    recoverable_kickoff: Option<String>,
 ) -> DeliverOutcome {
     let _guard = lock.lock_safe();
     let ptys = app.state::<crate::pty::PtyManager>();
@@ -8496,21 +8758,42 @@ fn deliver_now(
     };
 
     let start = std::time::Instant::now();
+    // #517: whether the boot wait actually OBSERVED the CLI go ready, or
+    // gave up at `READY_MAX_WAIT` and pasted blind. Audited below, because
+    // "we pasted into a CLI we never saw become ready" is the single most
+    // useful fact about a kickoff that then failed to confirm, and it was
+    // previously thrown away — both exits from this loop looked identical
+    // in the record.
+    let mut ready_observed = !wait_ready;
     if wait_ready {
-        let mut last_len = 0usize;
+        // #517: the change detector reads the pane's MONOTONIC output
+        // counter, never the ring's current length. `OutputBuf`'s own doc
+        // says why the counter exists: the ring saturates at
+        // `OUTPUT_RING_CAP` (256 KB) and "lengths stop changing" there. A
+        // CLI whose boot output exceeds that — a TUI repainting a splash
+        // while it loads config and MCP servers — froze `last_change` at the
+        // moment of saturation, so `cli_ready`'s quiet bar was met
+        // `READY_QUIET` later while the CLI was still painting and its stdin
+        // reader still unattached. The paste then went into the startup
+        // buffer and was swallowed, which is the lost-kickoff mechanism this
+        // fix is about. Every other progress loop in this file (the echo
+        // check, the submit-quiet wait, the late monitor) already reads the
+        // counter; this one was the outlier.
+        let mut last_total = 0u64;
         let mut last_change = std::time::Instant::now();
         loop {
             std::thread::sleep(READY_POLL);
-            let Some(out) = ptys.output_tail(pty_id) else {
+            let Some(total) = ptys.output_total(pty_id) else {
                 append_audit(&root, &group, "loomux", "prompt-failed",
                     json!({ "to": agent, "reason": "terminal closed while waiting for CLI to become ready" }));
                 return DeliverOutcome::Done;
             };
-            if out.len() != last_len {
-                last_len = out.len();
+            if total != last_total {
+                last_total = total;
                 last_change = std::time::Instant::now();
             }
-            if cli_ready(last_len, last_change.elapsed(), start.elapsed()) {
+            if cli_ready(last_total as usize, last_change.elapsed(), start.elapsed()) {
+                ready_observed = true;
                 break;
             }
             if start.elapsed() >= READY_MAX_WAIT {
@@ -9108,6 +9391,12 @@ fn deliver_now(
         "to": agent,
         "cli": cli,
         "waited_ms": start.elapsed().as_millis() as u64,
+        // #517: `null` when this delivery had no boot wait at all (a
+        // mid-session prompt), so "never waited" is distinguishable from
+        // "waited and gave up" — the same never-conflate-two-facts rule
+        // `tier1_still_holding_at_end` below already follows.
+        "ready_observed": wait_ready.then_some(ready_observed),
+        "fresh_kickoff": recoverable_kickoff.is_some(),
         "attempts": attempts,
         "echoed": echoed,
         "submit_waited_ms": submit_start.elapsed().as_millis() as u64,
@@ -9207,6 +9496,7 @@ fn deliver_now(
                 pty_id, hook_marker_path_for_monitor, hook_baseline, pasted_text_for_monitor,
                 delivery_from_for_monitor, submit_sent_ms, target_is_orchestrator,
                 already_failed, last_delivery_for_monitor, reg_for_monitor,
+                recoverable_kickoff, submit_baseline,
             );
         });
     }
@@ -9348,6 +9638,13 @@ struct FreshFirstAttempt {
     id: u64,
     wait_ready: bool,
     confirm_autopilot: bool,
+    /// #517: this attempt is a FRESH spawn's kickoff brief specifically
+    /// (`Delivery::FreshKickoff`), the one payload with no other route to
+    /// the agent if it never lands. Deliberately NOT the same fact as
+    /// `wait_ready`, which is also true for a resume re-sync: the boot wait
+    /// is about "hold the paste", this is about "the payload is
+    /// unrecoverable". See `kickoff_recovery_action`.
+    fresh_kickoff: bool,
 }
 
 fn run_queue_drainer(
@@ -9486,11 +9783,11 @@ fn run_queue_drainer(
         // notified once, at the moment this entry first became genuinely
         // queued, and a `BehindQueue` admission was never notified at all).
         let is_fresh_attempt = fresh_first.as_ref().is_some_and(|f| immediate_first_pass && f.id == front.id);
-        let (wait_ready, confirm_autopilot) = fresh_first
+        let (wait_ready, confirm_autopilot, fresh_kickoff) = fresh_first
             .as_ref()
             .filter(|_| is_fresh_attempt)
-            .map(|f| (f.wait_ready, f.confirm_autopilot))
-            .unwrap_or((false, false));
+            .map(|f| (f.wait_ready, f.confirm_autopilot, f.fresh_kickoff))
+            .unwrap_or((false, false, false));
 
         let outcome = match &front.payload {
             queue::QueuedPayload::Text(text) => {
@@ -9508,10 +9805,17 @@ fn run_queue_drainer(
                 } else {
                     text.clone()
                 };
+                // #517: the re-delivery payload is `text`, never `payload` —
+                // a flush header prepended for this attempt is about THIS
+                // drain, not part of the brief. `header_pending` is false on
+                // a fresh kickoff's own first pass (nothing was contended
+                // yet), so the two are equal in practice; passing `text`
+                // explicitly keeps that true even if that ever changes.
                 let out = deliver_now(
                     app.clone(), root, group.clone(), front.agent_id.clone(), pty_id,
                     payload, front.from.clone(), confirm_autopilot, wait_ready, cli, lock,
                     reg.last_delivery.clone(), target_is_orchestrator, reg_for_call,
+                    fresh_kickoff.then(|| text.clone()),
                 );
                 if matches!(out, DeliverOutcome::Done) {
                     header_pending = false;
@@ -21458,6 +21762,11 @@ impl OrchRegistry {
             id: admitted.id,
             wait_ready: delivery.wait_ready(),
             confirm_autopilot,
+            // #517: FRESH only. A `ResumeKickoff` also waits for boot, but
+            // its payload is a re-sync notice re-derivable from durable
+            // state on the next resume — not a brief that exists nowhere
+            // else — so it keeps the pre-#517 badge-and-stop behavior.
+            fresh_kickoff: delivery == Delivery::FreshKickoff,
         };
         reg.ensure_drainer(app, a.group.clone(), pty_id, Some(fresh_first));
         Ok(())
@@ -21534,7 +21843,7 @@ impl OrchRegistry {
                 // `admit` ran) can therefore never be true here; asserting
                 // it documents that invariant rather than trusting it silently.
                 debug_assert!(!was_first, "a coalesce match implies a pre-existing entry");
-                Ok(AdmitOutcome { id, was_first: false })
+                Ok(AdmitOutcome { id, was_first: false, coalesced: true })
             }
             queue::AdmitDecision::Admit => {
                 let id = self.queue_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -21547,7 +21856,7 @@ impl OrchRegistry {
                 drop(queues);
                 self.audit(group, "loomux", "delivery-queued",
                     json!({ "to": agent_id, "id": id, "reason": reason.as_str(), "depth": depth }));
-                Ok(AdmitOutcome { id, was_first })
+                Ok(AdmitOutcome { id, was_first, coalesced: false })
             }
         }
     }
@@ -21792,6 +22101,70 @@ impl OrchRegistry {
         };
         self.mark_stranded(group, agent_id, blocker);
         healed
+    }
+
+    /// Re-admit a lost fresh kickoff's brief through the delivery queue
+    /// (#517) — the actuation half of `kickoff_recovery_action`, split out so
+    /// the admission property ("the brief is re-delivered through the same
+    /// front door, exactly once") is testable without an `AppHandle`.
+    ///
+    /// **Why the front door and not a write.** The kickoff was never outside
+    /// #470's ordered admission; only its failure was. Re-admitting here
+    /// means the re-delivery is ordered against anything else queued for the
+    /// pane, inherits every paste guard (`deliver_now`'s human-input,
+    /// question and stranded-text checkpoints), and is confirmed by the same
+    /// three-state machinery (#451) as any other prompt — so a re-delivery
+    /// that ALSO fails is loud rather than a second silent loss. A raw write
+    /// from the monitor thread would race the drainer mid-paste and re-open
+    /// the ordering hole #470 closed, exactly as #496 PR-C's own note says.
+    ///
+    /// **Idempotence, at this layer.** `queue::admit`'s byte-identical
+    /// coalesce is consulted in the SAME critical section as the push
+    /// (`AdmitOutcome::coalesced`), so a brief still waiting in the queue can
+    /// never be queued a second time — and a coalesce is reported as NOT
+    /// admitted, so it does not burn the caller's re-delivery budget for a
+    /// send that never happened. This is the same "a declined admission must
+    /// not burn the budget" rule `actuate_stranded` follows.
+    ///
+    /// Returns whether a re-delivery was really admitted.
+    #[doc(hidden)] // pub for integration tests
+    pub fn redeliver_lost_kickoff(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        pty_id: u32,
+        text: &str,
+    ) -> bool {
+        let admitted = match self.enqueue_text(
+            group, agent_id, from, text, pty_id, queue::EnqueueReason::KickoffRecovery,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                // The pane's queue is at cap. Nothing was sent and nothing
+                // may claim otherwise — the badge `actuate_stranded` already
+                // raised stays up and says so.
+                self.audit(group, "loomux", "kickoff-redelivery-skipped",
+                    json!({ "to": agent_id, "reason": "queue-full", "error": e }));
+                return false;
+            }
+        };
+        if admitted.coalesced {
+            self.audit(group, "loomux", "kickoff-redelivery-skipped",
+                json!({ "to": agent_id, "reason": "already-queued", "id": admitted.id }));
+            return false;
+        }
+        self.audit(group, "loomux", "kickoff-redelivered",
+            json!({ "to": agent_id, "id": admitted.id, "via": "queue-front-door" }));
+        // Best-effort nudge, the same shape `deliver_prompt`'s
+        // behind-the-queue path and `actuate_stranded` both use;
+        // `ensure_drainer` is idempotent. Without an app handle (headless
+        // tests) nothing can drain — the entry stays queued, which is the
+        // honest state, and the caller's badge still fires.
+        if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
+            reg.ensure_drainer(app, group.to_string(), pty_id, None);
+        }
+        true
     }
 
     /// Raise (or update) a pane's stranded attention badge (#496 PR-C) and
