@@ -10288,13 +10288,13 @@ fn run_queue_drainer(
             // pane can badge again. Guarded on the blocker so a genuine
             // stranded badge (#496 PR-C) raised by some other mechanism is
             // never cleared by this one's recovery.
-            if reg.question_stale_notified.lock_safe().remove(&pty_id) {
-                if reg
+            let was_badged = reg.question_stale_notified.lock_safe().remove(&pty_id);
+            if was_badged
+                && reg
                     .stranded_note(&front.agent_id)
                     .is_some_and(|n| n.blocker == Some(StrandedBlocker::QuestionStale))
-                {
-                    reg.clear_stranded(&group, &front.agent_id, "question-hold-released");
-                }
+            {
+                reg.clear_stranded(&group, &front.agent_id, "question-hold-released");
             }
         }
 

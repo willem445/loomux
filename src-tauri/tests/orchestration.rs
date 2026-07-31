@@ -43,6 +43,7 @@ use loomux_lib::orchestration::{
     ContractCarrier, ReinjectShape,
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
+    write_admission, WriteAdmission, question_hold_stale, QUESTION_HOLD_STALE_AFTER,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -13508,11 +13509,11 @@ fn should_flush_before_paste_now_is_suppressed_by_a_live_question() {
         "sanity: the base decision alone would flush here"
     );
     assert!(
-        !should_flush_before_paste_now(Some(false), false, true),
+        !should_flush_before_paste_now(Some(false), false, true, false),
         "a live question must suppress the flush even when the base decision says to flush"
     );
     assert!(
-        should_flush_before_paste_now(Some(false), false, false),
+        should_flush_before_paste_now(Some(false), false, false, false),
         "with no question active, the base decision still governs"
     );
 }
@@ -13556,9 +13557,184 @@ fn a_recorded_unconfirmed_outcome_makes_the_next_deliverys_flush_fire() {
     // also proves the recording itself happens (not just its consequence).
     let recorded_on_abort = false; // DeliveryOutcome::confirmed, as the abort now records it
     assert!(
-        should_flush_before_paste_now(Some(recorded_on_abort), false, false),
+        should_flush_before_paste_now(Some(recorded_on_abort), false, false, false),
         "a delivery aborted pre-Enter must leave a `confirmed: false` outcome that the NEXT \
          delivery's flush decision reads as stranded text to clear"
+    );
+}
+
+// ---------- #532: the two safety signals, fired backwards ----------
+//
+// The human's report was a false positive followed by a missed true positive:
+// "held: question pending" on a totally EMPTY box, and then — the moment they
+// started typing — the queue submitting the held prompt over their in-progress
+// input. These pin that both halves are the SAME event. `prompt_wait_detected`
+// reads an append-only byte RING (`output_tail_bounded`), not a screen, so the
+// human's own echo is what pushes a stale question out of its window: the
+// keystroke that RELEASES the question gate is the keystroke that OCCUPIES the
+// box. A straight line of checkpoints therefore walks into the paste with a
+// green light it earned against a box that was empty two minutes earlier.
+
+#[test]
+fn write_admission_puts_human_content_ahead_of_a_question() {
+    // #510 is the absolute: holding too long costs a badge, submitting over a
+    // person's line costs everything. So `box_pending` outranks the question
+    // even when BOTH are true — a caller must never badge "question pending"
+    // (and, worse, resolve on the question clearing) while human characters
+    // are outstanding.
+    assert_eq!(write_admission(false, false), WriteAdmission::Go);
+    assert_eq!(write_admission(false, true), WriteAdmission::HoldQuestion);
+    assert_eq!(write_admission(true, false), WriteAdmission::HoldBoxOccupied);
+    assert_eq!(
+        write_admission(true, true),
+        WriteAdmission::HoldBoxOccupied,
+        "human content in the box outranks a question — reversing this precedence is the \
+         mutation that lets a question-clearing event admit a write over a person's line"
+    );
+    assert!(write_admission(false, false).go());
+    assert!(!write_admission(true, false).go());
+    assert!(!write_admission(false, true).go());
+}
+
+#[test]
+fn write_admission_badges_the_gate_that_actually_blocked() {
+    // The badge and the enqueue reason are derived from the admission rather
+    // than re-chosen at each call site, so a pane can never say "question
+    // pending" while the thing blocking it is the human's own line — which is
+    // exactly the mislabel #532's first half looked like from the outside.
+    assert_eq!(write_admission(false, false).held_reason(), None);
+    assert_eq!(
+        write_admission(true, true).held_reason(),
+        Some(HeldReason::BoxOccupied),
+        "with both gates up the badge must name the one that actually governs"
+    );
+    assert_eq!(
+        write_admission(false, true).held_reason(),
+        Some(HeldReason::InteractiveQuestion)
+    );
+}
+
+#[test]
+fn the_keystroke_that_clears_a_stale_question_must_not_admit_a_write() {
+    // THE SEQUENCE PIN, as pure state. This is the incident, step by step:
+    //
+    //   1. stale hold: box empty, detector still matching bytes in the ring
+    //   2. the human types: their echo pushes the question out of the window,
+    //      so `question_active` flips false — and their characters land in the
+    //      box, so `box_pending` flips true, in the SAME event
+    //   3. the drain must WAIT here. Before #532 the question gate was the
+    //      last one consulted, so its clearing was read as a green light.
+    //   4. the human submits or clears: box empties
+    //   5. only NOW may the write go.
+    let stale_hold = write_admission(false, true);
+    assert_eq!(stale_hold, WriteAdmission::HoldQuestion, "step 1: held on the stale question");
+
+    let human_starts_typing = write_admission(true, false);
+    assert!(
+        !human_starts_typing.go(),
+        "step 3: the question clearing must NOT admit a write — the same keystroke that \
+         cleared it put the human's characters in the box. This assertion is the whole bug: \
+         reading only the question gate here returns Go and submits mid-typing."
+    );
+    assert_eq!(
+        human_starts_typing,
+        WriteAdmission::HoldBoxOccupied,
+        "and the hold must now be attributed to the box, not still to the question"
+    );
+
+    let box_emptied = write_admission(false, false);
+    assert!(box_emptied.go(), "step 5: box empty and no question — now, and only now, write");
+}
+
+#[test]
+fn the_flush_press_reads_occupancy_not_just_the_keystroke_timestamp() {
+    // `human_typed_since` is `last_user_input_ms > submit_sent_ms` — a
+    // timestamp compare, which answers "did a keystroke land AFTER our own
+    // submit". That is strictly narrower than "is there human content in this
+    // box". A human who typed a line and left it sitting BEFORE our submit
+    // stamps at or before `submit_sent_ms`, so `human_typed_since` is FALSE
+    // and every pre-#532 gate waved the Enter through onto their line.
+    assert!(
+        should_flush_before_paste_now(Some(false), false, false, false),
+        "sanity: the stranded-flush case this guard exists for still fires"
+    );
+    assert!(
+        !should_flush_before_paste_now(Some(false), false, false, true),
+        "human content in the box must suppress the flush Enter even though the keystroke \
+         timestamp is older than our submit and no question is on screen — the exact hole \
+         `human_typed_since` alone cannot see"
+    );
+    // ...and occupancy must not become a second way to suppress the flush the
+    // guard exists FOR. Our own pasted text never moves `input_pending`
+    // (`note_user_input` runs on human writes only, never on `write_bytes`),
+    // so the stranded case reads `box_pending == false` and still flushes —
+    // pinned by the first assertion above rather than merely asserted here.
+    assert!(
+        !should_flush_before_paste_now(Some(true), false, false, false),
+        "a CONFIRMED previous delivery still means nothing to flush, unchanged"
+    );
+    assert!(
+        !should_flush_before_paste_now(None, false, false, false),
+        "the first delivery to a pane still never flushes, unchanged"
+    );
+}
+
+#[test]
+fn question_hold_stale_is_outranked_by_human_content_and_disabled_at_zero() {
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let held_since = 1_000_000u64;
+
+    assert!(
+        !question_hold_stale(held_since, held_since + bound - 1, false, bound),
+        "inside the bound the hold is ordinary — nothing to report"
+    );
+    assert!(
+        question_hold_stale(held_since, held_since + bound, false, bound),
+        "an EMPTY box held past the bound is the reported symptom and must badge"
+    );
+    assert!(
+        !question_hold_stale(held_since, held_since + bound * 10, true, bound),
+        "`box_pending` outranks the bound (#518's precedence, kept): a hold explained by the \
+         human's own line is not a stale-question report, however long it stands"
+    );
+    assert!(
+        !question_hold_stale(held_since, held_since + bound * 10, false, 0),
+        "`bound_ms == 0` disables the bound rather than firing instantly, so a mis-set \
+         constant degrades to silence instead of badging every pane"
+    );
+    assert!(
+        !question_hold_stale(held_since, held_since.saturating_sub(5_000), false, bound),
+        "a clock that reads backwards must not badge (saturating, not wrapping)"
+    );
+}
+
+#[test]
+fn the_stale_question_badge_never_claims_to_know_which_state_the_pane_is_in() {
+    // The whole argument for badging instead of releasing is that loomux
+    // CANNOT tell a live dialog from an answered one that has not scrolled
+    // away. The wording must therefore name both branches and give an action
+    // that is safe under either — a badge that asserted "this question is
+    // stale" would be exactly the unbacked claim the repo's own lessons file
+    // calls a defect.
+    let d = stranded_detail("w-3", Some(StrandedBlocker::QuestionStale));
+    assert!(d.contains("w-3"), "got: {d}");
+    assert!(
+        d.contains("answer it if one is on screen"),
+        "must stay correct for the LIVE-dialog branch, got: {d}"
+    );
+    assert!(
+        d.contains("stale"),
+        "must name the staleness hypothesis for the other branch, got: {d}"
+    );
+    assert_eq!(
+        StrandedBlocker::QuestionStale.as_str(),
+        "question-hold-stale",
+        "its own audit token, greppable apart from the live-question blocker"
+    );
+    assert_ne!(
+        StrandedBlocker::QuestionStale.as_str(),
+        StrandedBlocker::Question.as_str(),
+        "a stale-reading badge and a genuine live-question badge are different facts"
     );
 }
 
@@ -13595,6 +13771,89 @@ fn flush_stranded_text_enters_when_no_question_is_showing() {
     let fired = flush_stranded_text(&pm, 2, Some(false), false, b"\r");
 
     assert!(fired, "no question on screen — the stranded flush must fire");
+    assert_eq!(&*captured.lock().unwrap(), b"\r");
+}
+
+// ---------- #532: the drain must WAIT for the box, then flush ----------
+//
+// Same real-PTY discipline as the block above, and the same reason for it:
+// these drive the EXACT functions the drainer calls, and occupancy is moved
+// through `PtyManager::note_user_input` — the real path a keystroke takes from
+// the frontend's `write_pty` — rather than by poking a counter, so
+// `input_pending` behaves here exactly as it does in production. Mutating the
+// occupancy check out of `should_flush_before_paste_now` reds both.
+
+#[test]
+fn the_drain_press_declines_over_a_line_the_human_left_before_our_submit() {
+    let pm = PtyManager::default();
+    let pty_id = 532;
+    let captured = pm.register_fake_for_test(pty_id, b"idle input box, nothing pending");
+    let last_delivery: std::sync::Mutex<HashMap<u32, _>> = std::sync::Mutex::new(HashMap::new());
+
+    // ORDERING IS THE POINT. The human types a line and leaves it sitting
+    // BEFORE our delivery records its submit, so `human_typed_since`
+    // (`last_user_input_ms > submit_sent_ms`) reads FALSE — the timestamp
+    // compare is structurally blind to content that predates our own submit.
+    // No question is on screen either. Every pre-#532 gate says "flush".
+    pm.note_user_input(pty_id, "half a thought");
+    record_aborted_preenter_outcome(&last_delivery, pty_id, "w-1".to_string());
+    assert_eq!(
+        pm.input_pending(pty_id),
+        Some(true),
+        "precondition: the human's characters are outstanding in the box"
+    );
+
+    let fired = drain_stranded_submit(&pm, &last_delivery, "w-1".to_string(), pty_id, b"\r");
+
+    assert!(
+        !fired,
+        "the queue's press must decline while human content sits in the box — this is the \
+         #510 rule read at the moment of Enter rather than inherited from a timestamp"
+    );
+    assert!(
+        captured.lock().unwrap().is_empty(),
+        "no bytes should have reached the pty: {:?}",
+        captured.lock().unwrap()
+    );
+}
+
+#[test]
+fn the_drain_press_fires_once_the_box_is_empty_again() {
+    // The other half of "wait, THEN flush": declining must not become a new
+    // way to strand a delivery forever. Once the human's line is gone the same
+    // press fires, unchanged.
+    //
+    // `human_typed_since` is passed as the caller computes it. On this branch
+    // that caller still inlines the unbounded timestamp latch #518 found, so a
+    // human keystroke after our submit pins it true; #528's bounded
+    // `human_input_block` is what releases it again on positive evidence, and
+    // THIS PR is what makes that release safe — the press re-reads occupancy at
+    // the moment it fires rather than trusting the bound alone.
+    let pm = PtyManager::default();
+    let pty_id = 533;
+    let captured = pm.register_fake_for_test(pty_id, b"idle input box, nothing pending");
+
+    pm.note_user_input(pty_id, "half a thought");
+    assert_eq!(pm.input_pending(pty_id), Some(true));
+    assert!(
+        !flush_stranded_text(&pm, pty_id, Some(false), false, b"\r"),
+        "still occupied — still declining"
+    );
+
+    // The human submits their own line. `classify_human_input` reads this as
+    // `Submit`, which zeroes the occupancy counter outright (#111/#171).
+    pm.note_user_input(pty_id, "\r");
+    assert_eq!(
+        pm.input_pending(pty_id),
+        Some(false),
+        "precondition: the box is empty again"
+    );
+
+    assert!(
+        flush_stranded_text(&pm, pty_id, Some(false), false, b"\r"),
+        "box empty, no question, previous delivery unconfirmed — the withheld Enter must \
+         finally land, or the occupancy gate would be a permanent strand rather than a wait"
+    );
     assert_eq!(&*captured.lock().unwrap(), b"\r");
 }
 
