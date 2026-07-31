@@ -47,6 +47,8 @@ use loomux_lib::orchestration::{
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
+    kickoff_recovery_action, KickoffDecline, KickoffRecovery,
+    KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
@@ -13559,6 +13561,323 @@ fn stranded_selfheal_is_bounded_and_never_double_queues() {
     assert!(
         audits.iter().any(|e| e.action == "stranded-selfheal-skipped"),
         "the declined attempt is audited too, with its reason"
+    );
+}
+
+// ---------- #517: a fresh spawn's kickoff the pane never received ----------
+//
+// The failure these pin is NOT the one above. #496 PR-C rescues a delivery
+// whose text IS in the box with its Enter withheld. A fresh kickoff fails the
+// other way: a CLI whose stdin reader has not attached yet swallows the paste
+// outright, so nothing ever reaches the box, `stranded_selfheal_action`
+// correctly refuses (`NotHolding` — there is no Enter to press), and before
+// this change the story ended at a badge. The worker then idles with no brief
+// until a human re-sends it by hand: six instances in one day, two of three
+// fresh spawns on v1.1.0-beta, while a third received its brief normally.
+//
+// The guarantee added: a lost FRESH kickoff is re-delivered through the same
+// front door — bounded, audited, and never twice.
+
+/// A fresh spawn's task brief. Long and multi-line like the real thing, which
+/// matters: a brief this size is collapsed by the CLI's input box into a
+/// `[Pasted text …]` placeholder, so Tier 1 never governs a kickoff and the
+/// pane-reading signals a mid-session delivery relies on are unavailable.
+const KICKOFF_BRIEF: &str = "You are w-11, a worker agent.\n\nYour task:\nIssue #517 — \
+     spawn-time kickoff briefs are lost intermittently. Read it, fix it, open a PR.\n";
+
+#[test]
+fn kickoff_recovery_declines_before_it_ever_re_delivers() {
+    // The whole decision table, in precedence order — the ORDER is the
+    // property. Two arms carry the weight: `NotAKickoff` first (nothing but
+    // a fresh spawn's brief may ever be re-sent by this path) and
+    // `TurnStarted` ahead of the budget (a brief that landed must not be
+    // re-sent even when budget remains).
+    let act = |kickoff, ledger, typed, question, growth, used| {
+        kickoff_recovery_action(
+            kickoff, ledger, typed, question, growth,
+            KICKOFF_TURN_EVIDENCE_BYTES, used, KICKOFF_REDELIVERY_MAX,
+        )
+    };
+
+    // Not a fresh kickoff — checked first, so no mid-session prompt or
+    // resume re-sync can ever be re-pasted by this path however lost it looks.
+    assert_eq!(
+        act(false, true, false, false, 0, 0),
+        KickoffRecovery::Decline(KickoffDecline::NotAKickoff)
+    );
+
+    // The durable ledger outranks every pane reading, exactly as it does in
+    // `stranded_selfheal_action`.
+    assert_eq!(
+        act(true, false, false, false, 0, 0),
+        KickoffRecovery::Decline(KickoffDecline::Resolved)
+    );
+
+    // Loomux does not act on a pane a person is using.
+    assert_eq!(
+        act(true, true, true, false, 0, 0),
+        KickoffRecovery::Decline(KickoffDecline::HumanInput)
+    );
+    assert_eq!(
+        act(true, true, false, true, 0, 0),
+        KickoffRecovery::Decline(KickoffDecline::Question)
+    );
+
+    // The anti-double-delivery guard, and its precedence over the budget: a
+    // pane that produced a turn's worth of output after our submit received
+    // the brief, whatever the confirmation tiers saw. This is the live
+    // counter-example (rev-9) expressed as a rule.
+    assert_eq!(
+        act(true, true, false, false, KICKOFF_TURN_EVIDENCE_BYTES, 0),
+        KickoffRecovery::Decline(KickoffDecline::TurnStarted),
+        "a kickoff that visibly started a turn must never be re-delivered"
+    );
+
+    // The bound.
+    assert_eq!(
+        act(true, true, false, false, 0, KICKOFF_REDELIVERY_MAX),
+        KickoffRecovery::Decline(KickoffDecline::Exhausted),
+        "the re-delivery budget must be spent-able — no re-send loop"
+    );
+
+    // Everything clear: an eaten kickoff on a silent pane → re-deliver.
+    assert_eq!(act(true, true, false, false, 0, 0), KickoffRecovery::Redeliver);
+
+    // And the kind gate itself: FRESH only. A resume re-sync is re-derivable
+    // from durable state; a mid-session prompt has a sender still around.
+    assert!(Delivery::FreshKickoff.recovers_lost_kickoff());
+    assert!(
+        !Delivery::ResumeKickoff.recovers_lost_kickoff(),
+        "a resume notice is re-derivable — it must not be re-pasted by this path"
+    );
+    assert!(!Delivery::MidSession.recovers_lost_kickoff());
+}
+
+#[test]
+fn a_lost_fresh_kickoff_is_re_delivered_through_the_queue_front_door() {
+    // The recovery, wired: the brief goes back through the SAME admission
+    // every other delivery uses, so it inherits ordering, the paste guards
+    // and the three-state confirmation — a raw write from the monitor thread
+    // would race the drainer and re-open the ordering hole #470 closed.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5170u32;
+
+    let sent = reg.redeliver_lost_kickoff(&g.id, &w.id, "loomux", pty, KICKOFF_BRIEF);
+
+    assert!(sent, "a lost fresh kickoff must actually be re-admitted, not merely badged");
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap.len(), 1, "exactly one re-delivery");
+    assert_eq!(
+        snap[0].payload.text(),
+        Some(KICKOFF_BRIEF),
+        "the brief itself is re-delivered — verbatim, not a notice about it"
+    );
+    assert_eq!(
+        snap[0].reason,
+        queue::EnqueueReason::KickoffRecovery,
+        "a re-delivery and a first delivery are different facts in the record"
+    );
+
+    // Loud, never silent: the recovery is in the audit log with the brief's
+    // own queue id, so one payload's whole history stays reconstructible.
+    let audits = reg.audit_log(&g.id);
+    assert_eq!(
+        audits.iter().filter(|e| e.action == "kickoff-redelivered").count(),
+        1,
+        "every re-delivery is audited exactly once"
+    );
+}
+
+#[test]
+fn a_re_delivery_never_double_sends_a_brief_that_is_still_queued() {
+    // Idempotence layer 3 (after the hook confirming, and the ledger): the
+    // queue's own byte-identical coalesce. A brief still waiting to drain
+    // must not be queued a second time — and the collapsed attempt must not
+    // burn the budget for a send that never happened, or one wrong reading
+    // would cost the only re-delivery this delivery gets.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5171u32;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", KICKOFF_BRIEF, pty, queue::EnqueueReason::Arrival)
+        .unwrap();
+
+    let sent = reg.redeliver_lost_kickoff(&g.id, &w.id, "loomux", pty, KICKOFF_BRIEF);
+
+    assert!(!sent, "a coalesced re-delivery is not a send, and must not burn the budget");
+    assert_eq!(reg.queue_depth(pty), 1, "the same brief must never occupy two queue slots");
+    let audits = reg.audit_log(&g.id);
+    assert!(
+        audits.iter().any(|e| e.action == "kickoff-redelivery-skipped"),
+        "the declined re-delivery is audited too, with its reason"
+    );
+    assert_eq!(
+        audits.iter().filter(|e| e.action == "kickoff-redelivered").count(),
+        0,
+        "nothing may claim a re-delivery happened when the queue collapsed it"
+    );
+}
+
+#[test]
+fn the_boot_wait_never_calls_a_still_painting_cli_ready() {
+    // The mechanism that eats a kickoff paste in the first place, driven
+    // through the REAL wait loop against a REAL PtyManager. A CLI whose boot
+    // output exceeds the output ring's cap keeps producing bytes while the
+    // ring's LENGTH stops changing — so a length-based stability check reads
+    // "gone quiet" mid-boot and the paste lands in a stdin buffer nobody is
+    // reading yet. The counter cannot produce that reading.
+    let pm = PtyManager::default();
+    let pty = 5172u32;
+    pm.register_fake_for_test(pty, b"");
+
+    // A CLI still painting: every poll of the wait delivers another chunk of
+    // boot output, all the way past the ring's capacity. The clock advances
+    // one `READY_POLL` (250ms) per poll, so it also runs well past
+    // `READY_MIN_WAIT` and `READY_QUIET` — nothing here is "not enough time
+    // has passed", the pane is genuinely never quiet.
+    let chunk = vec![b'x'; 64 * 1024];
+    let clock = std::cell::Cell::new(Duration::ZERO);
+    let outcome = await_cli_ready(
+        || {
+            pm.append_fake_output_for_test(pty, &chunk);
+            pm.output_total(pty)
+        },
+        || clock.set(clock.get() + Duration::from_millis(250)),
+        || clock.get(),
+    );
+
+    assert!(
+        pm.output_total(pty).unwrap() > 256 * 1024,
+        "the pane must actually have saturated its ring — otherwise this proves nothing"
+    );
+    assert_eq!(
+        pm.output_tail(pty).unwrap().len(),
+        256 * 1024,
+        "the ring's length is pinned at the cap: the frozen signal the old wait trusted"
+    );
+    assert_eq!(
+        outcome,
+        ReadyWait::TimedOut,
+        "a CLI that never stops painting must never be declared ready — it must hit \
+         the cap and be pasted into knowingly, which is a state the audit can see"
+    );
+
+    // The bug itself, as a control: the SAME loop, the SAME pane, sampling
+    // the ring's length instead of the counter — the substitution the
+    // production call site used to make. It declares a still-painting CLI
+    // ready, which is how a kickoff paste reached a stdin reader that had
+    // not attached yet. Written out rather than described, so a future edit
+    // that reverts the call site to `output_tail().len()` is reverting to
+    // something this file states the consequence of.
+    let pm_len = PtyManager::default();
+    pm_len.register_fake_for_test(3172, b"");
+    let clock_len = std::cell::Cell::new(Duration::ZERO);
+    let via_ring_len = await_cli_ready(
+        || {
+            pm_len.append_fake_output_for_test(3172, &chunk);
+            pm_len.output_tail(3172).map(|t| t.len() as u64)
+        },
+        || clock_len.set(clock_len.get() + Duration::from_millis(250)),
+        || clock_len.get(),
+    );
+    assert_eq!(
+        via_ring_len,
+        ReadyWait::Ready,
+        "the frozen signal reads as quiet on a pane that is still painting — this is \
+         the defect, and the reason the wait must sample `output_total`"
+    );
+
+    // The control, so the assertion above is about the SIGNAL and not merely
+    // about time: a pane that really does go quiet is declared ready.
+    let pm2 = PtyManager::default();
+    pm2.register_fake_for_test(4172, &vec![b'y'; 4096]);
+    let clock2 = std::cell::Cell::new(Duration::ZERO);
+    let ready = await_cli_ready(
+        || pm2.output_total(4172),
+        || clock2.set(clock2.get() + Duration::from_millis(250)),
+        || clock2.get(),
+    );
+    assert_eq!(ready, ReadyWait::Ready, "a painted, quiet pane is ready — the wait still ends");
+}
+
+#[test]
+fn an_eaten_kickoff_badges_and_then_re_delivers_the_brief() {
+    // The whole #517 path composed in the monitor's own order, with only the
+    // pane readings faked: a fresh kickoff that was swallowed by a booting
+    // CLI leaves the ledger outstanding, no human input, no question, our
+    // text NOT in the box, and a pane that never produced a turn.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5173u32;
+
+    // Step 1 — #496 PR-C's decision, unchanged: there is no Enter to press,
+    // so the self-heal refuses and raises the badge. This is exactly where
+    // the story ended before #517, and it is why the worker sat idle.
+    let stranded = stranded_selfheal_action(
+        true,  // ledger: still outstanding
+        false, // no human typed
+        false, // no question
+        false, // our text is NOT in the box — the paste was eaten
+        0,
+        STRANDED_SELFHEAL_MAX_HEALS,
+    );
+    assert_eq!(
+        stranded,
+        StrandedAction::Attention(StrandedBlocker::NotHolding),
+        "the eaten-paste signature — an Enter would be a guess, so the self-heal must refuse"
+    );
+    reg.actuate_stranded(&g.id, &w.id, "loomux", pty, stranded);
+    assert_eq!(
+        reg.stranded_note(&w.id).expect("the human is told either way").blocker,
+        Some(StrandedBlocker::NotHolding)
+    );
+    assert_eq!(reg.queue_depth(pty), 0, "the self-heal alone queues nothing — this is the gap #517 closes");
+
+    // Step 2 — #517: inside that one outcome, and only for a fresh kickoff,
+    // the brief is re-delivered instead of the story ending at the badge.
+    let recovery = kickoff_recovery_action(
+        Delivery::FreshKickoff.recovers_lost_kickoff(),
+        true,  // ledger: still outstanding
+        false, // no human typed
+        false, // no question
+        0,     // the pane produced nothing after our submit — no turn started
+        KICKOFF_TURN_EVIDENCE_BYTES,
+        0,
+        KICKOFF_REDELIVERY_MAX,
+    );
+    assert_eq!(recovery, KickoffRecovery::Redeliver);
+    assert!(reg.redeliver_lost_kickoff(&g.id, &w.id, "loomux", pty, KICKOFF_BRIEF));
+    reg.mark_stranded(&g.id, &w.id, None);
+
+    assert_eq!(
+        reg.queue_snapshot(pty)[0].payload.text(),
+        Some(KICKOFF_BRIEF),
+        "the brief the agent never received is back in the pane's queue"
+    );
+    assert_eq!(
+        reg.stranded_note(&w.id).expect("still loud while loomux recovers").blocker,
+        None,
+        "the badge must stop telling the human to act once loomux is re-sending"
+    );
+
+    // And the counter-example, on the same pane state but with the one fact
+    // that differs for a kickoff that DID land: the agent ran a turn.
+    assert_eq!(
+        kickoff_recovery_action(
+            Delivery::FreshKickoff.recovers_lost_kickoff(),
+            true, false, false,
+            KICKOFF_TURN_EVIDENCE_BYTES * 4,
+            KICKOFF_TURN_EVIDENCE_BYTES,
+            0,
+            KICKOFF_REDELIVERY_MAX,
+        ),
+        KickoffRecovery::Decline(KickoffDecline::TurnStarted),
+        "the live counter-example: a reviewer that received its brief normally must \
+         not be handed a duplicate"
     );
 }
 

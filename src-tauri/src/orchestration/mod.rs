@@ -4534,6 +4534,19 @@ impl Delivery {
     pub fn confirms_autopilot_dialog(self) -> bool {
         matches!(self, Delivery::FreshKickoff | Delivery::ResumeKickoff)
     }
+    /// Whether a delivery of this kind may be RE-DELIVERED by the late
+    /// monitor when it turns out never to have reached the pane (#517).
+    ///
+    /// `FreshKickoff` only — deliberately narrower than the two predicates
+    /// above, which both include a resume. A fresh spawn's brief exists
+    /// nowhere else: nothing will re-send it, and the agent has no other way
+    /// to learn what it was spawned to do. A `ResumeKickoff` payload is a
+    /// re-sync notice re-derived from durable state (see
+    /// `resume_kickoff_notice`), and a `MidSession` prompt has a sender who
+    /// is still around — both keep the pre-#517 badge-and-stop behavior.
+    pub fn recovers_lost_kickoff(self) -> bool {
+        matches!(self, Delivery::FreshKickoff)
+    }
 }
 
 /// Whether a delivery should attempt the copilot autopilot-consent confirm.
@@ -7249,6 +7262,67 @@ pub fn cli_ready(output_total: usize, quiet_for: Duration, elapsed: Duration) ->
     elapsed >= READY_MIN_WAIT && output_total >= READY_MIN_OUTPUT && quiet_for >= READY_QUIET
 }
 
+/// How the fresh-boot readiness wait ended (#517).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyWait {
+    /// The CLI was observed painted and quiet — safe to paste.
+    Ready,
+    /// `READY_MAX_WAIT` expired with the CLI still not looking ready. The
+    /// caller pastes anyway (a visible prompt the human can re-submit beats
+    /// one silently withheld), but this is a materially different state from
+    /// `Ready` and is audited as such.
+    TimedOut,
+    /// The pty went away while waiting.
+    PaneClosed,
+}
+
+/// Hold a fresh boot's paste until the CLI has painted its UI and gone quiet
+/// — the loop `deliver_now` runs before a kickoff, with its clock and its
+/// output sampler injected so the loop itself is testable without a live
+/// pty or a real `AppHandle`.
+///
+/// **`sample_total` MUST be `PtyManager::output_total`, never the length of
+/// `output_tail` (#517).** That was the bug: `OutputBuf`'s own doc says the
+/// monotonic counter exists precisely because the ring saturates at
+/// `OUTPUT_RING_CAP` (256 KB), "where lengths stop changing". A CLI whose
+/// boot output exceeds the cap — a TUI repainting a splash while it loads
+/// config and MCP servers — froze the length at the moment of saturation, so
+/// the "output has been stable for `READY_QUIET`" test passed while the CLI
+/// was still painting and its stdin reader still unattached. loomux then
+/// pasted the kickoff into a startup buffer nobody was reading, and the
+/// brief was swallowed with no trace in the box for anything downstream to
+/// recover. Every other progress loop in this file (the echo check, the
+/// submit-quiet wait, the late monitor) already reads the counter; this one
+/// was the outlier. Below saturation the two readings are identical, which
+/// is why this only ever bit CLIs with a large boot paint — and why it read
+/// as intermittent rather than deterministic.
+///
+/// `poll_tick` performs one `READY_POLL` wait; `elapsed` reports time since
+/// the wait began (both real in production, synthetic in tests).
+pub fn await_cli_ready(
+    mut sample_total: impl FnMut() -> Option<u64>,
+    mut poll_tick: impl FnMut(),
+    mut elapsed: impl FnMut() -> Duration,
+) -> ReadyWait {
+    let mut last_total = 0u64;
+    let mut last_change = Duration::ZERO;
+    loop {
+        poll_tick();
+        let Some(total) = sample_total() else { return ReadyWait::PaneClosed };
+        let now = elapsed();
+        if total != last_total {
+            last_total = total;
+            last_change = now;
+        }
+        if cli_ready(last_total as usize, now.saturating_sub(last_change), now) {
+            return ReadyWait::Ready;
+        }
+        if now >= READY_MAX_WAIT {
+            return ReadyWait::TimedOut;
+        }
+    }
+}
+
 /// Wrap prompt text in a bracketed paste so multi-line prompts land in the
 /// CLI's input box instead of submitting at the first newline. The Enter is
 /// sent separately after `PASTE_SUBMIT_DELAY`.
@@ -8766,40 +8840,22 @@ fn deliver_now(
     // in the record.
     let mut ready_observed = !wait_ready;
     if wait_ready {
-        // #517: the change detector reads the pane's MONOTONIC output
-        // counter, never the ring's current length. `OutputBuf`'s own doc
-        // says why the counter exists: the ring saturates at
-        // `OUTPUT_RING_CAP` (256 KB) and "lengths stop changing" there. A
-        // CLI whose boot output exceeds that — a TUI repainting a splash
-        // while it loads config and MCP servers — froze `last_change` at the
-        // moment of saturation, so `cli_ready`'s quiet bar was met
-        // `READY_QUIET` later while the CLI was still painting and its stdin
-        // reader still unattached. The paste then went into the startup
-        // buffer and was swallowed, which is the lost-kickoff mechanism this
-        // fix is about. Every other progress loop in this file (the echo
-        // check, the submit-quiet wait, the late monitor) already reads the
-        // counter; this one was the outlier.
-        let mut last_total = 0u64;
-        let mut last_change = std::time::Instant::now();
-        loop {
-            std::thread::sleep(READY_POLL);
-            let Some(total) = ptys.output_total(pty_id) else {
+        // #517: the sampler is the pane's MONOTONIC output counter, never
+        // the ring's current length — see `await_cli_ready`'s doc for why
+        // that distinction is the lost-kickoff mechanism.
+        match await_cli_ready(
+            || ptys.output_total(pty_id),
+            || std::thread::sleep(READY_POLL),
+            || start.elapsed(),
+        ) {
+            ReadyWait::Ready => ready_observed = true,
+            // Paste anyway — better a visible prompt the human can
+            // re-submit than one silently withheld.
+            ReadyWait::TimedOut => {}
+            ReadyWait::PaneClosed => {
                 append_audit(&root, &group, "loomux", "prompt-failed",
                     json!({ "to": agent, "reason": "terminal closed while waiting for CLI to become ready" }));
                 return DeliverOutcome::Done;
-            };
-            if total != last_total {
-                last_total = total;
-                last_change = std::time::Instant::now();
-            }
-            if cli_ready(last_total as usize, last_change.elapsed(), start.elapsed()) {
-                ready_observed = true;
-                break;
-            }
-            if start.elapsed() >= READY_MAX_WAIT {
-                // Paste anyway — better a visible prompt the human
-                // can re-submit than one silently withheld.
-                break;
             }
         }
     }
@@ -21762,11 +21818,7 @@ impl OrchRegistry {
             id: admitted.id,
             wait_ready: delivery.wait_ready(),
             confirm_autopilot,
-            // #517: FRESH only. A `ResumeKickoff` also waits for boot, but
-            // its payload is a re-sync notice re-derivable from durable
-            // state on the next resume — not a brief that exists nowhere
-            // else — so it keeps the pre-#517 badge-and-stop behavior.
-            fresh_kickoff: delivery == Delivery::FreshKickoff,
+            fresh_kickoff: delivery.recovers_lost_kickoff(),
         };
         reg.ensure_drainer(app, a.group.clone(), pty_id, Some(fresh_first));
         Ok(())
