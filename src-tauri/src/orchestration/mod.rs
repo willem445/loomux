@@ -8671,7 +8671,12 @@ fn run_late_confirmation_monitor(
                 if action == StrandedAction::Attention(StrandedBlocker::NotHolding) {
                     let recovery = kickoff_recovery_action(
                         recoverable_kickoff.is_some(),
-                        ledger_outstanding,
+                        // #454: the SAME atomic ledger observation the
+                        // self-heal decision above judged from — never a
+                        // second read, so the two decisions taken on one
+                        // tick can never disagree about whether this
+                        // delivery is still outstanding.
+                        ledger.outstanding,
                         human_typed_since,
                         showing_question,
                         cur_total.saturating_sub(submit_output_baseline),

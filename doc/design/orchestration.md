@@ -5131,6 +5131,16 @@ the note is re-worded to the in-flight form (`blocker: None`, "loomux is re-send
 same wording an in-flight self-heal uses, and it clears on the monitor's normal evidence paths.
 The human is neither told to act nor left thinking nothing is happening.
 
+**Interaction with #454 (supersede at a re-send's START).** These two land together and compose
+exactly the right way. #454 makes `deliver_now` call `record_inflight_delivery` *before* its
+confirm window, so a new delivery claims the pane the moment it presses Enter rather than when it
+finishes. The re-delivery admitted here is an ordinary delivery, so when the drainer runs it the
+old monitor's very next `observe_ledger` reads `superseded` and it exits without writing or
+notifying — the recovery cannot be raced by the monitor that triggered it. In the other direction,
+the `ledger.outstanding` this decision reads is the SAME atomic `LedgerView` the self-heal decision
+above judged from, so the two decisions taken on one tick can never disagree about whether the
+delivery is still outstanding.
+
 **Honest residual.** The recovery is driven from `run_late_confirmation_monitor`, which needs a
 live `AppHandle` and so cannot be driven headless; the tests compose the same real functions in
 the monitor's own order with only the pane readings faked, which is the same bar #496 PR-C's
