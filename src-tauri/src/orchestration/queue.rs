@@ -934,7 +934,9 @@ mod tests {
             passes += 1;
             assert!(passes <= 4, "not converging");
             let plan = plan_flush(&q, QUEUE_FLUSH_MAX_BYTES);
-            q.retain(|e| !plan.batch.contains(&e.id) && !plan.superseded.contains(&e.id));
+            q.retain(|e| {
+                !plan.batch.contains(&e.id) && !plan.superseded.iter().any(|s| s.id == e.id)
+            });
         }
         assert_eq!(passes, 1, "the whole flushable backlog must submit in ONE pass");
     }
