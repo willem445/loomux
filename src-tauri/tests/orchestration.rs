@@ -13848,38 +13848,47 @@ fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
     }
 }
 
-/// The PATH a PowerShell/cmd pane actually hands the shim (#509): Windows' own
-/// system directory and nothing else. Git for Windows' `usr\bin` — where `tr`
-/// and every other tool the gate normalizes with lives — is NOT on it, which is
-/// exactly the condition under which the `gh api` gate fell open. `None` off
-/// Windows, where this scenario does not exist.
-fn powershell_style_path() -> Option<String> {
-    let root = std::env::var("SystemRoot").ok()?;
-    Some(format!("{root}\\system32"))
+/// A wrapper that reproduces what a PowerShell/cmd pane hands the shim (#509):
+/// a PATH carrying no Git for Windows coreutils. It runs whatever script it is
+/// given under `sh_abs`, so the same wrapper drives both the shim and the
+/// precondition probe.
+///
+/// The PATH is assigned **inside the shell**, not in the child's environment,
+/// and that is the whole point. Setting it via `Command::env_clear()` +
+/// `.env("PATH", …)` is not something a test can be built on: the MSYS runtime
+/// re-seeds PATH when a native Windows parent launches `sh.exe`, and on the
+/// GitHub windows runner it put the coreutils back — the un-repaired shim then
+/// found `tr`, behaved perfectly correctly, and the fail-closed pin failed for
+/// a reason with nothing to do with the code under test (#509, CI attempts 1
+/// and 2, identically). An assignment in the script runs after all of that —
+/// and it is verified, not assumed: see
+/// `assert_wrapper_really_hides_the_coreutils`.
+///
+/// `sh_abs` is baked in and the target is passed to it as a script argument
+/// rather than `exec`d directly: with PATH stripped there is no `sh` left to
+/// find, and a Windows checkout has no executable bit to rely on either.
+fn write_stripped_path_wrapper(root: &std::path::Path, sh_abs: &str) -> std::path::PathBuf {
+    let p = root.join("strip_path.sh");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\nPATH=\"/loomux-nonexistent-509\"\nexport PATH\nexec \"{sh_abs}\" \"$@\"\n"
+    )).unwrap();
+    p
 }
 
 /// Run the generated gh shim the way a `.cmd` delegator does — `sh.exe` by
-/// ABSOLUTE path (#335) — but with the caller's stripped PATH inherited, which
-/// is the whole point of #509. Returns (success, stderr).
+/// ABSOLUTE path (#335) — through the coreutils-free wrapper above.
+/// Returns (success, both output streams for the diagnostic).
 fn run_shim_with_stripped_path(
     sh_abs: &str,
+    wrapper: &std::path::Path,
     shim: &std::path::Path,
     group: &std::path::Path,
-    path: &str,
     argv: &[&str],
 ) -> (bool, String) {
-    let root = std::env::var("SystemRoot").unwrap_or_default();
     let out = std::process::Command::new(sh_abs)
+        .arg(wrapper)
         .arg(shim)
         .args(argv)
-        .env_clear()
-        // SystemRoot/windir are load-bearing for CreateProcess itself on
-        // Windows; TEMP keeps anything that wants a scratch dir happy. Nothing
-        // else is inherited — that IS the test.
-        .env("PATH", path)
-        .env("SystemRoot", &root)
-        .env("windir", &root)
-        .env("TEMP", std::env::temp_dir())
         .env("LOOMUX_GROUP_DIR", group)
         .env("FAKE_BASE", "main")
         .env("FAKE_DEFAULT", "main")
@@ -13896,6 +13905,24 @@ fn run_shim_with_stripped_path(
             String::from_utf8_lossy(&out.stdout).trim()
         ),
     )
+}
+
+/// Assert the wrapper's PRECONDITION: under it, `tr` really is unreachable.
+///
+/// Without this the stripped-PATH tests can pass for the wrong reason — a host
+/// where the coreutils stay reachable would exercise a shim that never had a
+/// problem, and quietly stop testing #509 at all. That is exactly how CI
+/// attempts 1 and 2 failed on the windows runner — the environment refused to
+/// be stripped and the un-repaired shim behaved perfectly — so the premise is
+/// now checked rather than assumed. A host where it cannot hold goes RED here,
+/// with that stated, instead of passing for the wrong reason.
+fn assert_wrapper_really_hides_the_coreutils(sh_abs: &str, wrapper: &std::path::Path, root: &std::path::Path) {
+    let probe = root.join("probe_tr.sh");
+    std::fs::write(&probe, "#!/bin/sh\nif command -v tr >/dev/null 2>&1; then echo FOUND; else echo MISSING; fi\n").unwrap();
+    let out = std::process::Command::new(sh_abs).arg(wrapper).arg(&probe).output().unwrap();
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(got, "MISSING",
+        "the stripped-PATH wrapper must make `tr` unreachable, else these tests prove nothing about #509 (got {got:?})");
 }
 
 /// **The #509 pin.** Invoked from a PowerShell/cmd pane the shim's `sh` inherits
@@ -13917,10 +13944,6 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
         eprintln!("SKIP gh_shim_gates_the_api_shapes…: no POSIX sh resolved");
         return;
     };
-    let Some(stripped) = powershell_style_path() else {
-        eprintln!("SKIP gh_shim_gates_the_api_shapes…: not Windows");
-        return;
-    };
     if paths.utils_dir.is_none() {
         eprintln!("SKIP gh_shim_gates_the_api_shapes…: no coreutils dir resolved on this machine");
         return;
@@ -13933,6 +13956,8 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
     let fake = write_fake_gh(root, &log);
     let shim = root.join("gh");
     std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &paths)).unwrap();
+    let wrapper = write_stripped_path_wrapper(root, &sh_abs);
+    assert_wrapper_really_hides_the_coreutils(&sh_abs, &wrapper, root);
 
     let ran = || std::fs::read_to_string(&log).unwrap_or_default();
     // Every one of these is a publish-to-the-world or merge shape that only the
@@ -13954,7 +13979,7 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
         (vec!["api", "graphql", "-f", "query=mutation M($t:String!){createRelease(input:{tagName:$t}){clientMutationId}}"], "graphql createRelease"),
     ] {
         let before = ran();
-        let (ok, err) = run_shim_with_stripped_path(&sh_abs, &shim, &group, &stripped, &argv);
+        let (ok, err) = run_shim_with_stripped_path(&sh_abs, &wrapper, &shim, &group, &argv);
         assert!(!ok, "{what} must be refused under a PowerShell-style PATH, {err}; fake gh saw: {}", ran());
         assert_eq!(ran(), before, "{what} must never reach the real gh (it did)");
         assert!(!err.contains("command not found"),
@@ -13964,7 +13989,7 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
     // assertion the mutation kills — without the PATH repair the dependency
     // self-check refuses this too.
     let before = ran();
-    let (ok, err) = run_shim_with_stripped_path(&sh_abs, &shim, &group, &stripped, &["api", "repos/o/r"]);
+    let (ok, err) = run_shim_with_stripped_path(&sh_abs, &wrapper, &shim, &group, &["api", "repos/o/r"]);
     assert!(ok, "an ordinary GET must still pass through, stderr: {err}");
     assert_ne!(ran(), before, "an ordinary GET must reach the real gh");
 }
@@ -13980,10 +14005,6 @@ fn gh_shim_without_its_coreutils_fails_closed_not_open() {
         eprintln!("SKIP gh_shim_without_its_coreutils…: no POSIX sh resolved");
         return;
     };
-    let Some(stripped) = powershell_style_path() else {
-        eprintln!("SKIP gh_shim_without_its_coreutils…: not Windows");
-        return;
-    };
     let td = tempfile::tempdir().unwrap();
     let root = td.path();
     let group = root.join("group");
@@ -13992,18 +14013,20 @@ fn gh_shim_without_its_coreutils_fails_closed_not_open() {
     let fake = write_fake_gh(root, &log);
     let shim = root.join("gh");
     std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &ShimPaths::default())).unwrap();
+    let wrapper = write_stripped_path_wrapper(root, &sh_abs);
+    assert_wrapper_really_hides_the_coreutils(&sh_abs, &wrapper, root);
 
     for argv in [
         vec!["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v1.2.3"],
         vec!["api", "repos/o/r"],
         vec!["pr", "merge", "1"],
     ] {
-        let (ok, err) = run_shim_with_stripped_path(&sh_abs, &shim, &group, &stripped, &argv);
+        let (ok, err) = run_shim_with_stripped_path(&sh_abs, &wrapper, &shim, &group, &argv);
         assert!(!ok, "{argv:?} must be refused when the shim cannot normalize, stderr: {err}");
     }
     assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "",
         "a shim that cannot normalize must never reach the real gh");
-    let (_, err) = run_shim_with_stripped_path(&sh_abs, &shim, &group, &stripped, &["api", "repos/o/r"]);
+    let (_, err) = run_shim_with_stripped_path(&sh_abs, &wrapper, &shim, &group, &["api", "repos/o/r"]);
     assert!(err.contains("cannot find the POSIX tool"),
         "the refusal must SAY what is missing, not just fail, got: {err}");
     let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
