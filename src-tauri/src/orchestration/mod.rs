@@ -22662,6 +22662,11 @@ impl OrchRegistry {
         pty_id: u32,
         reason: queue::EnqueueReason,
     ) -> Result<AdmitOutcome, String> {
+        // #467, and it must be FIRST: recovery seeds `queue_seq` past every
+        // id the previous process left on disk, so it has to run before this
+        // call mints one. See `recover_persisted_queue`'s id-collision note.
+        // A no-op (one `HashSet` probe) on every call after the first.
+        self.recover_persisted_queue(group);
         // Resolved BEFORE the `queues` lock, never under it: this reads the
         // agents map, and every other site in this file that needs both
         // takes agents first (`deliver_prompt`'s own `self.agent(...)`), so
@@ -22775,6 +22780,7 @@ impl OrchRegistry {
     /// still occupies a queue slot.
     #[doc(hidden)] // pub for integration tests
     pub fn enqueue_stranded_front(&self, group: &str, agent_id: &str, from: &str, pty_id: u32) -> Result<(), String> {
+        self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
         let target = self.durable_target(agent_id);
         let pushed = {
             let mut queues = self.queues.lock_safe();
@@ -22895,6 +22901,7 @@ impl OrchRegistry {
             Declined(&'static str),
             Pushed(Result<(u64, usize), usize>),
         }
+        self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
         let target = self.durable_target(agent_id);
         let admission = {
             let mut queues = self.queues.lock_safe();
@@ -23397,6 +23404,24 @@ impl OrchRegistry {
     /// delivery that triggered it — would turn a durability degradation
     /// into an outage of the thing being made durable.
     fn persist_queues(&self, group: &str) {
+        // **Never overwrite a snapshot nobody has read yet.** Recovery is
+        // lazy (see `recover_persisted_queue`), and the first thing that
+        // touches a group after a restart is not guaranteed to be a bind or
+        // a `queue_orphans` call — it can be an admission, which would
+        // rewrite the file with live state and destroy the previous
+        // process's backlog before anything looked at it. Hanging the
+        // read off the WRITE closes that by construction rather than by
+        // relying on call-site ordering. Idempotent and cheap after the
+        // first pass (one `HashSet` probe).
+        //
+        // Deliberately BEFORE `queue_persist` is acquired: recovery can send
+        // a `[loomux]` notice, which is itself a delivery, which persists —
+        // and `std::sync::Mutex` is not reentrant, so doing this under the
+        // writer lock would deadlock. The recursive call re-enters
+        // `recover_persisted_queue` as a no-op (the group is marked before
+        // any I/O runs) and takes the writer lock while this frame still
+        // holds nothing.
+        self.recover_persisted_queue(group);
         let _writer = self.queue_persist.lock_safe();
         let entries = self.group_queue_entries(group);
         let body = queue::serialize_snapshot(now_ms(), entries);
@@ -23470,6 +23495,23 @@ impl OrchRegistry {
             // rest is named rather than silently short.
             self.audit(group, "loomux", "queue-recover-skipped", json!({ "entries": skipped }));
         }
+        // **Push `queue_seq` past every id this snapshot holds, before any
+        // id is minted for this group in the new process.** The counter is
+        // in-memory and restarts at zero, so without this a fresh admission
+        // after a restart gets id 1 — the same id a recovered entry already
+        // carries. Two live consequences, both silent: `queue_orphans`'s
+        // live-id filter would hide a real orphan behind an unrelated fresh
+        // delivery that happened to reuse its number, and the audit scan
+        // would see the NEW id's `delivery-dequeued` close out the OLD id's
+        // `delivery-queued`. This is why every id-minting path calls
+        // recovery before it mints (see `enqueue_text`). Ids stay unique
+        // only WITHIN a group; a collision across groups is harmless
+        // because every consumer of an id — the live filter, the audit
+        // scan, the snapshot — is group-scoped.
+        let high = entries.iter().map(|e| e.delivery.id).max().unwrap_or(0);
+        let _ = self.queue_seq.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+            (cur < high).then_some(high)
+        });
         let split = queue::split_recovered(entries);
         for m in &split.markers {
             self.audit(group, "loomux", "delivery-dropped", json!({
@@ -23527,17 +23569,31 @@ impl OrchRegistry {
         }
         let oldest_ms = mine.iter().map(|e| e.delivery.enqueued_ms).min().unwrap_or_else(now_ms);
         let mut readmitted = 0usize;
-        for e in &mine {
+        // Re-admission can legitimately fail — the pane's queue is capped at
+        // `QUEUE_MAX_PER_PANE` like any other, and a recovered backlog can
+        // meet a queue that already has entries in it. An entry that fails
+        // goes BACK into staging rather than being dropped: it was taken out
+        // of the staging area by the partition above, and losing it there
+        // would be the exact silent loss this whole feature exists to
+        // prevent — worse than the original bug, because the sender was told
+        // long ago that it was safely queued.
+        let mut rejected: Vec<queue::PersistedEntry> = Vec::new();
+        for e in mine {
             let Some(text) = e.delivery.payload.text() else { continue };
-            if self
-                .enqueue_text(group, agent_id, &e.delivery.from, text, pty_id, queue::EnqueueReason::Recovered)
-                .is_ok()
-            {
-                readmitted += 1;
+            match self.enqueue_text(group, agent_id, &e.delivery.from, text, pty_id, queue::EnqueueReason::Recovered) {
+                Ok(_) => readmitted += 1,
+                Err(_) => rejected.push(e),
             }
         }
+        let offered = readmitted + rejected.len();
+        if !rejected.is_empty() {
+            self.audit(group, "loomux", "delivery-requeue-rejected", json!({
+                "to": agent_id, "pty": pty_id, "count": rejected.len(), "reason": "queue-full",
+            }));
+            self.recovered_queue.lock_safe().entry(group.to_string()).or_default().extend(rejected);
+        }
         self.audit(group, "loomux", "delivery-requeued", json!({
-            "to": agent_id, "pty": pty_id, "count": readmitted, "offered": mine.len(),
+            "to": agent_id, "pty": pty_id, "count": readmitted, "offered": offered,
         }));
         if readmitted > 0 {
             // Best-effort nudge: the entries are in the queue either way,

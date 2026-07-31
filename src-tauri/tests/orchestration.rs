@@ -1798,6 +1798,111 @@ fn one_groups_snapshot_never_contains_another_groups_queue() {
 }
 
 #[test]
+fn a_restart_never_re_mints_a_queue_id_the_snapshot_already_holds() {
+    // `queue_seq` is in-memory and restarts at zero, so a fresh admission
+    // after a restart would otherwise be handed id 1 — the same id a
+    // recovered entry already carries. Both consumers of an id break
+    // silently on that: `queue_orphans`'s live-id filter hides a real orphan
+    // behind an unrelated fresh delivery that reused its number, and the
+    // audit scan lets the NEW id's `delivery-dequeued` close out the OLD
+    // id's `delivery-queued`. Recovery seeds the counter past the snapshot's
+    // high-water mark, and every id-minting path runs recovery first.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["one", "two", "three"]);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+
+    let fresh = reg
+        .enqueue_text(&gid, &resumed.id, "orch-1", "brand new", 910, queue::EnqueueReason::Arrival)
+        .unwrap();
+    let recovered_ids: Vec<u64> = reg.queue_orphans(&gid).iter().map(|o| o.id).collect();
+    assert_eq!(recovered_ids.len(), 3, "the backlog must still be visible: {recovered_ids:?}");
+    assert!(!recovered_ids.contains(&fresh.id),
+        "a fresh id must never collide with one the snapshot still holds — got {} vs {recovered_ids:?}",
+        fresh.id);
+    assert!(fresh.id > *recovered_ids.iter().max().unwrap(),
+        "the counter must resume ABOVE the snapshot's high-water mark, not merely miss it");
+}
+
+#[test]
+fn an_admission_never_overwrites_a_snapshot_nobody_has_read_yet() {
+    // Recovery is lazy, so the first thing to touch a group after a restart
+    // is not guaranteed to be a bind or a `queue_orphans` call — it can be a
+    // plain admission, which rewrites `queue.json`. If that write ran before
+    // the read, the previous process's whole backlog would be destroyed by
+    // the act of queueing one new thing, silently, with nobody having looked
+    // at it. `persist_queues` reads first for exactly this.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["from before the restart"]);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+
+    // FIRST touch of this group in the new process is an admission, not a
+    // bind and not a queue_orphans call.
+    reg.enqueue_text(&gid, &resumed.id, "orch-1", "brand new", 900, queue::EnqueueReason::Arrival).unwrap();
+
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, 900), 1,
+        "the pre-restart backlog must still be there after an unrelated admission overwrote the file");
+    let live = reg.queue_snapshot(900);
+    let texts: Vec<Option<&str>> = live.iter().map(|e| e.payload.text()).collect();
+    assert!(texts.contains(&Some("from before the restart")) && texts.contains(&Some("brand new")));
+}
+
+#[test]
+fn a_recovered_entry_that_cannot_be_re_admitted_stays_an_orphan() {
+    // Re-admission is capped like every other admission (8 per pane). An
+    // entry rejected at that cap must go BACK to the staging area and keep
+    // being reported — dropping it would be a worse silent loss than the
+    // bug this feature fixes, since the sender was told long ago that it was
+    // safely queued.
+    let dir = tempfile::tempdir().unwrap();
+    let backlog: Vec<String> = (0..3).map(|i| format!("recovered-{i}")).collect();
+    let refs: Vec<&str> = backlog.iter().map(String::as_str).collect();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &refs);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+
+    // Fill the pane's queue to the cap with unrelated live traffic first, so
+    // the recovered backlog has nowhere to go.
+    let pty = 901u32;
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&gid, &resumed.id, "orch-1", &format!("live-{i}"), pty, queue::EnqueueReason::Arrival).unwrap();
+    }
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE);
+
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, pty), 0, "a full pane can take none of it");
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE, "and must not be pushed over its cap");
+
+    let orphans = reg.queue_orphans(&gid);
+    assert_eq!(orphans.len(), 3, "every rejected entry must still be reported: {orphans:?}");
+    assert!(orphans.iter().all(|o| o.text.is_some()), "with its payload intact, still re-sendable");
+    let rejected = reg
+        .audit_log(&gid)
+        .into_iter()
+        .find(|e| e.action == "delivery-requeue-rejected")
+        .expect("a rejected re-admission must be audited, not silent");
+    assert_eq!(rejected.detail["count"], json!(3));
+}
+
+#[test]
 fn queue_orphans_is_an_orchestrator_only_tool_and_reports_what_a_restart_lost() {
     // The #467 wiring itself: the derivation only becomes a recovery when
     // something the orchestrator's session-start re-sync actually calls can
