@@ -21,6 +21,7 @@ pub mod notify;
 pub mod profiles;
 pub mod queue;
 pub mod report;
+pub mod termgrid;
 pub mod workflow;
 
 use serde::{Deserialize, Serialize};
@@ -7232,6 +7233,11 @@ pub fn format_output_tail(text: &str, n_lines: usize) -> String {
     let start = collapsed.len().saturating_sub(n);
     collapsed[start..].join("\n")
 }
+
+/// Hard ceiling on what one `get_output` call may return, in bytes (#520).
+/// Declared here so the red-evidence tests can name it; **not enforced in
+/// this commit** — the next one applies it in `format_output_tail`.
+pub const OUTPUT_TAIL_MAX_BYTES: usize = 8 * 1024;
 
 /// Decide whether a freshly spawned CLI is ready to receive typed input,
 /// from its output volume and how long that output has been stable. Pure so
