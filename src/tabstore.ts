@@ -90,6 +90,20 @@ export interface PersistedPane {
    *  first, relaunches the group) from its delegates. Null for agent/terminal
    *  panes and for pre-#194.5 files. */
   role: string | null;
+  /** The orchestration GROUP this "orch" pane belonged to (#485). A tab can
+   *  hold panes from two different groups (split an orchestrator tab and
+   *  launch a second orchestrator into it — #481/#478 makes that the primary
+   *  gesture), and the tab-level `groupId` cannot express that: a whole-group
+   *  resume that reads the group off the TAB attributes every placeholder in
+   *  it to one group, dropping the other orchestrator and rejoining its
+   *  delegates into the wrong group. So each orch placeholder carries its own
+   *  group, and the resume partitions on THIS field.
+   *
+   *  Null for every non-orch kind, and for any snapshot written before #485 —
+   *  those decode as null and resume exactly as they used to (one group per
+   *  tab), except that an unattributable two-orchestrator set now fails loudly
+   *  instead of silently keeping one (see groupresume.ts). */
+  groupId: string | null;
   /** The file an EDITOR pane (#217) had open, root-relative — a PATH, never a buffer.
    *  A pane opened on a file is titled after it, so without this a restore would show a
    *  bare tree under a title naming a file it isn't showing. The content is re-read from
@@ -146,8 +160,22 @@ export type PersistedLayoutNode =
 export interface PersistedTab {
   name: string;
   color: string | null;
-  /** The orchestration group this tab owns, or null for a plain tab. */
+  /** The orchestration group this tab owns, or null for a plain tab.
+   *  SUPERSEDED by `groupIds` (#485) but still written and still read: it is
+   *  what an older build reads, and it is `groupIds[0]` whenever there is one.
+   *  Prefer `groupIds` in new code — a tab can own more than one group. */
   groupId: string | null;
+  /** EVERY orchestration group bound to this tab (#485), in binding order.
+   *  A tab holds two groups whenever an orchestrator is launched into a split
+   *  of an existing orchestrator tab (#481/#478's primary gesture) or a
+   *  restored group falls back into the active tab (`restoreSession`), and
+   *  restoring only the first left the second group's panes routing into a
+   *  freshly minted background tab.
+   *
+   *  Migration: absent (pre-#485) decodes as `[groupId]` (or omitted for a
+   *  plain tab), so an old snapshot keeps its binding exactly; a present-but-
+   *  malformed value degrades the same way rather than failing the tab. */
+  groupIds?: string[];
   /** Pane layout tree (#194). Absent/null = old file or a group-only tab →
    *  restore falls back to a single fresh shell. */
   layout?: PersistedLayoutNode | null;
@@ -197,7 +225,12 @@ export function encodeTabs(state: PersistedTabs): string {
     tabs: state.tabs.map((t) => ({
       name: t.name,
       color: t.color,
-      groupId: t.groupId,
+      // Both shapes are written (#485): `groupId` keeps a downgrade to an
+      // older build reading the tab's first group instead of nothing, and
+      // `groupIds` carries the rest. `groupId` is derived from `groupIds`
+      // when the caller supplied one, so the two can never disagree.
+      groupId: t.groupIds?.length ? t.groupIds[0] : t.groupId,
+      ...(t.groupIds?.length ? { groupIds: t.groupIds } : {}),
       // Only serialize a layout when present; an absent one keeps old-file shape.
       ...(t.layout ? { layout: t.layout } : {}),
       // Same for docked panes: omit the key entirely when there are none.
@@ -283,6 +316,10 @@ function decodePane(v: unknown): PersistedPane | null {
     shellKind: isShellKind(r.shellKind) ? r.shellKind : null,
     sessionId: typeof r.sessionId === "string" ? r.sessionId : null,
     role: typeof r.role === "string" ? r.role : null,
+    // #485: absent (pre-#485 snapshot) or malformed → null, which the resume
+    // path reads as "this placeholder doesn't know its group" rather than as
+    // a group named "" — see groupresume.ts's normalization.
+    groupId: typeof r.groupId === "string" && r.groupId.trim() ? r.groupId : null,
     file: typeof r.file === "string" ? r.file : null,
     embeds: decodeEmbeds(r.embeds, r.embed, r.taskEmbed),
   };
@@ -343,14 +380,28 @@ export function decodeTabs(raw: string | null): PersistedTabs | null {
       name?: unknown;
       color?: unknown;
       groupId?: unknown;
+      groupIds?: unknown;
       layout?: unknown;
       docked?: unknown;
     };
     if (typeof rec.name !== "string" || !rec.name.trim()) continue;
+    const groupId = typeof rec.groupId === "string" ? rec.groupId : null;
+    // #485: every bound group, deduped and emptied of junk entries. A missing
+    // or malformed `groupIds` falls back to the single legacy binding, so a
+    // pre-#485 snapshot decodes to exactly the one group it always did. A
+    // group id is a path segment on the backend, so nothing but a non-blank
+    // string is ever let through here.
+    const groupIds = Array.isArray(rec.groupIds)
+      ? [...new Set(rec.groupIds.filter((g): g is string => typeof g === "string" && !!g.trim()))]
+      : [];
+    const bound = groupIds.length ? groupIds : groupId ? [groupId] : [];
     const tab: PersistedTab = {
       name: rec.name,
       color: typeof rec.color === "string" ? rec.color : null,
-      groupId: typeof rec.groupId === "string" ? rec.groupId : null,
+      groupId: bound.length ? bound[0] : null,
+      // Omitted entirely for a plain tab, the same way `layout`/`docked` are —
+      // an absent key round-trips as absent.
+      ...(bound.length ? { groupIds: bound } : {}),
     };
     // Only attach `layout` when the source had one: an absent layout stays absent
     // (old-file shape, so the round-trip is exact), while a present-but-malformed

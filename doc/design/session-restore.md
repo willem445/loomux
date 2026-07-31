@@ -1024,9 +1024,10 @@ review and all real (correcting this doc's own first draft):**
   not read this fast path as a proof of sameness; it's a deliberate,
   arguably more defensible choice (the hinted group is the one the clicked
   tab is actually bound to) that happens to coincide with the full scan
-  outside that corner. #485 closing it (a session can never legitimately
-  belong to two groups) is what would make the two provably agree always,
-  not this PR.
+  outside that corner. #485 has since closed the way NEW two-group rows get
+  written (see below) — but rows written before that fix are still on disk,
+  so the corner remains reachable for existing data and the two are still
+  not provably equivalent. Neither this PR nor #485 makes them so.
 
 CLI boot time itself (the other component the issue calls out) is not
 loomux's to remove or measure — never spawn a real agent CLI to benchmark it
@@ -1147,3 +1148,159 @@ the fact — `onGridChanged` is `tabs.notifyLayoutChanged()`, not anything the
 pane's liveness depends on. So the "no inline retry" gap exists only on a
 path where there is nothing left to retry; it does not reach a genuinely
 stranded pane.
+
+### #485 — two groups in one tab: each restores its own, or fails loudly
+
+A tab can hold panes belonging to **two different orchestration groups**.
+That state is not exotic: `restoreSession`'s `owning ?? tabs.activeWorkspace`
+fallback has always been able to bind a restored group into whatever tab was
+active, and #481 (fixing #478) makes it reachable from the *primary* gesture —
+split an orchestrator tab, pick "Orchestrator", and the new group is bound to
+the tab you split. The persistence and resume layer could not represent it:
+
+- `tabs.snapshot()` stored **one** `groupId` per tab (`groupForWorkspace`,
+  a first-match over the binding map).
+- `resumeDormantGroup` swept **every** dormant orch placeholder in the tab
+  into one plan, taking the group from the TAB.
+- `planGroupResume` kept **one** orchestrator and rejoined **every** delegate
+  into that single group.
+
+So one click on a two-group tab resumed group A, dropped group B's
+orchestrator **with no message of any kind**, rejoined B's delegates toward
+A, and then cleared every dormant card — leaving a tab that looked fully
+restored with one group silently missing from it. The silence is the defect;
+a visible failure would have been a bad restore, this was an invisible one.
+
+**The rule this establishes: a session's group is a property of the SESSION,
+never of the tab it sits in.** Three layers now say so, and the middle one is
+the only one that could be called defence in depth — the outer two are each
+load-bearing on their own:
+
+1. **The record carries it.** `PersistedPane.groupId` (new, `tabstore.ts`) is
+   captured for every "orch" pane from `Pane.capture()`'s own `orchGroup`,
+   and rides into `panerestore.ts`'s `dormant-group` action. Absent in a
+   pre-#485 snapshot → `null`, which means "this placeholder doesn't know its
+   group", never a group named `""`.
+2. **The plan refuses to cross groups.** `planGroupResume(members, resumable,
+   group)` puts any member whose record names a *different* group into a new
+   `foreign` bucket — it cannot reach `rejoin`, so no downstream confusion can
+   turn it into a rejoin. `partitionByGroup` (same module) is the one rule
+   used both to pick a click's members and to pick which placeholders that
+   click may clear, so those two can't drift apart.
+3. **The join point enforces it.** `resume_recorded_session`
+   (`orchestration/mod.rs`) refuses outright — `resume-group-mismatch:`, the
+   same tagged-error contract `resumeerror.ts` already parses — when the
+   caller's group hint disagrees with the group the session's own record
+   names. Every rejoin in loomux funnels through this function, so this is
+   what makes a wrong-group rejoin unreachable rather than merely avoided by a
+   correct frontend.
+
+   **Scope of that claim, narrowly (review finding 1 on the PR).** The check
+   compares the caller's hint against a *recorded* membership, so it covers
+   exactly the sessions that have one — a roster row or an audit line in some
+   group. A session with **no** recording anywhere reaches the signature-only
+   fallback, which builds its record *from the hint itself*, making the
+   comparison vacuous by construction: the caller's claim would be the only
+   evidence. That was a real remaining route into the wrong group — a pre-#485
+   snapshot whose tab-derived hint names group A while the placeholder is
+   really group B's **pre-roster** worker, with B's own orchestrator pane
+   closed before exit (so the `ambiguous` check doesn't fire either). It is a
+   nearly-extinct population, and it was reachable, which is what matters for
+   a claim of impossibility.
+
+   So the fallback is now split by what the operation actually *is*:
+
+   - **Orchestrator** — reopening the control plane of a group whose
+     `group.json` is on disk is not a membership operation. The group's
+     identity comes from that file and no other group's roster is touched, so
+     the fallback survives (pinned by
+     `hint_restores_sessions_unknown_to_roster_and_audit`).
+   - **Delegate** — "rejoin into group X" *writes membership into X*. With
+     nothing to verify against, that is refused with its own tag,
+     `resume-group-unknown:` ("cannot be verified" is a different fact from
+     "contradicted", and deserves different copy and a different next step).
+
+   The cost is real, deliberate, and **terminal for that class** — this is the
+   part the first version of these notes got wrong (review round 2). It said
+   the human could "still reach that session from the session browser", which
+   is circular: `SessionsPanel.roleFor` falls back to the transcript-signature
+   classification (`orch_role`/`orch_group` off the scanner), so a pre-roster
+   delegate still shows an orch chip, clicking it hints the same group, and it
+   lands back on the same refusal. The browser has exactly one action per row
+   (`item.addEventListener("click", …onRestore)`) — there is no "open it
+   plainly" affordance to fall through to — and start-fresh is not an escape
+   either, since a fresh spawn would join the very group that could not be
+   verified. A wrong escape hatch in an error message is worse than none: it
+   sends the human in a circle and reads as though the door exists.
+
+   What is actually reachable, and what the copy now says in all of its
+   places:
+
+   - **No in-app rejoin.** Nothing puts this session back into a group. That
+     is the refusal working, not a gap to route around.
+   - **The conversation is not lost.** It reopens *outside* orchestration via
+     the CLI's own resume command — the session row's tooltip already shows it
+     (`item.title = s.resume_command`) — as a plain pane with no group
+     membership, which is precisely the thing that could not be verified.
+   - **The work continues** by the orchestrator spawning a fresh agent: a new
+     session in a group that vouches for it, not a recovery of this one.
+
+   Between the two arms of the fallback, **no delegate rejoin proceeds on a
+   group id only the caller vouches for**; that is the exact claim, and it is
+   the one the code makes.
+
+Why refuse at (3) rather than silently proceed with the record's own group,
+which would already put the agent in the right place? Because the caller acts
+on its own belief afterwards — it binds panes, routing and badges to the group
+it *asked* for. A disagreement resolved in silence still files the agent's
+pane under the wrong group in the UI. Two ids disagreeing means the caller's
+model is wrong, and the only safe move is to say so where the human clicked.
+`group-mismatch` deliberately does **not** offer "start fresh": a fresh
+session would be spawned into that same wrong group, which is the
+contamination the refusal exists to prevent.
+
+**What is loud, and where.** Each group in the tab keeps its own dormant
+card, and each card resumes its own group — so a group that cannot come back
+fails on *its own* card (`restorecard.ts`'s error state, #479), while the
+other group restores normally beside it. Nothing sweeps another group's card
+away; the second group's absence can no longer be mistaken for success.
+
+**The pre-#485 snapshot corner, and why it now fails instead of guessing.**
+An old snapshot records no per-pane group, so two orchestrator placeholders in
+one tab are indistinguishable from one group with a duplicate record. The old
+code preferred whichever was resumable — i.e. exactly the silent drop. The
+plan now reports `ambiguous` for that set and the click fails with a message
+pointing at the session browser, where each session's real group IS known.
+This flips one prior test's expectation on purpose ("with duplicate
+orchestrator records, a resumable one wins" is now scoped to records that both
+NAME the same group): a legible refusal on a rare genuine duplicate is a much
+better trade than a silent wrong-group restore on a common two-group tab.
+
+**Tab bindings are a set now.** `PersistedTab.groupIds` (new) carries every
+group bound to a tab; `groupId` is still written as `groupIds[0]` so an older
+build reads a binding rather than nothing, and a pre-#485 file decodes as
+`[groupId]`. Restore binds all of them (`main.ts`), so the second group's
+rejoined panes route back into the tab they were closed in instead of into a
+freshly minted background tab. `TabManager.groupForWorkspace` survives for the
+"is this an orchestration tab" questions (tab badge, close guard) with a doc
+comment saying what it must not be used for; `groupsForWorkspace` is the one
+to act on.
+
+**What this does NOT undo.** A session that already has a roster/audit row in
+a second group — residue a pre-#485 wrong-group rejoin left on disk — still
+resolves through `session_role_in_group`'s hinted-group fast path, agrees with
+itself, and passes the check. This closes the way new contamination is
+created; it does not clean up old contamination, and nothing in the code or
+these notes should be read as claiming it does. That is a claim about stale
+*data*, and it is the only gap left in this area: the two ways a *live* call
+could name the wrong group — a contradicted hint and an unverifiable one — are
+both refused above.
+
+**Where the coverage boundary sits.** The decision layers are unit/integration
+tested end to end (the partition, the plan, the schema round-trip, the join
+point, and the two refusals). What no test here touches is the DOM wiring, per
+this repo's convention: two Resume cards rendering side by side on one tab,
+the `ambiguous`/`group-mismatch` copy landing on the right card's error state,
+and per-group card clearing in a live grid. Exercising those needs a real
+window and real agent CLIs (hard constraint 3), so they are left to the
+human's own validation rather than approximated with a simulated DOM.

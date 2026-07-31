@@ -6,10 +6,15 @@
 // stranded), and nothing added beyond what was captured (the round-4 regression).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { planGroupResume, type GroupMember } from "../src/groupresume.ts";
+import { planGroupResume, partitionByGroup, type GroupMember } from "../src/groupresume.ts";
 
-// One CAPTURED group member (a dormant orch placeholder's recorded session + role).
-const m = (sessionId: string, role: string): GroupMember => ({ sessionId, role });
+// One CAPTURED group member (a dormant orch placeholder's recorded session + role,
+// and — since #485 — the group its own record names).
+const m = (sessionId: string, role: string, groupId?: string | null): GroupMember => ({
+  sessionId,
+  role,
+  groupId,
+});
 
 test("plans the WHOLE group: orchestrator first, workers rejoined", () => {
   const members = [m("w1", "worker"), m("orch", "orchestrator"), m("w2", "worker")];
@@ -101,8 +106,94 @@ test("a duplicated session id is planned only once (belt-and-braces dedup)", () 
   assert.deepEqual(plan.rejoin.map((x) => x.sessionId), ["w1"], "the duplicate row is dropped");
 });
 
-test("with duplicate orchestrator records, a resumable one wins", () => {
-  const members = [m("dead", "orchestrator"), m("alive", "orchestrator")];
-  const plan = planGroupResume(members, (id) => id === "alive");
+test("with duplicate orchestrator records OF THE SAME GROUP, a resumable one wins", () => {
+  // Both records name group g — so they really are two records of one group's
+  // orchestrator, and preferring the resumable one is safe. (#485 narrowed
+  // this: without a recorded group, two orchestrators are indistinguishable
+  // from two GROUPS, and picking one silently is the bug — see below.)
+  const members = [m("dead", "orchestrator", "g"), m("alive", "orchestrator", "g")];
+  const plan = planGroupResume(members, (id) => id === "alive", "g");
   assert.equal(plan.orchestrator?.sessionId, "alive");
+  assert.equal(plan.ambiguous, false);
+});
+
+// ---------- #485: one plan is one group ----------
+
+test("a member belonging to ANOTHER group is refused, never rejoined", () => {
+  // THE BUG. A tab holding two groups handed every placeholder in it to one
+  // plan: group B's worker was rejoined into group A, attaching it to an
+  // orchestrator that never spawned it. It must land in `foreign` — planning
+  // it is what made the contamination possible.
+  const members = [
+    m("orch-a", "orchestrator", "group-a"),
+    m("w-a", "worker", "group-a"),
+    m("w-b", "worker", "group-b"), // the other group's worker, same tab
+  ];
+  const plan = planGroupResume(members, () => true, "group-a");
+  assert.deepEqual(plan.rejoin.map((x) => x.sessionId), ["w-a"], "only group A's own delegate rejoins");
+  assert.deepEqual(plan.foreign.map((x) => x.sessionId), ["w-b"], "group B's worker is refused, not rejoined");
+  assert.equal(plan.orchestrator?.sessionId, "orch-a");
+});
+
+test("the OTHER group's orchestrator is not silently dropped into this plan either", () => {
+  // The second half of the same defect: with both orchestrators swept into one
+  // plan, one was kept and the other vanished without a word. Partitioned by
+  // group, each plan sees exactly its own — and B's is not "missing", it is
+  // simply not this plan's business (it has its own card to resume from).
+  const members = [m("orch-a", "orchestrator", "group-a"), m("orch-b", "orchestrator", "group-b")];
+  const a = planGroupResume(members, () => true, "group-a");
+  const b = planGroupResume(members, () => true, "group-b");
+  assert.equal(a.orchestrator?.sessionId, "orch-a");
+  assert.equal(b.orchestrator?.sessionId, "orch-b", "group B resumes its OWN orchestrator, not A's");
+  assert.deepEqual(a.foreign.map((x) => x.sessionId), ["orch-b"]);
+  assert.deepEqual(b.foreign.map((x) => x.sessionId), ["orch-a"]);
+  assert.equal(a.ambiguous, false, "two orchestrators that NAME their groups are not ambiguous");
+});
+
+test("two orchestrators with no recorded group is refused LOUDLY, not resolved by preference", () => {
+  // A pre-#485 snapshot records no group per pane, so a two-group tab is
+  // indistinguishable from one group with a duplicate record. The old code
+  // kept whichever was resumable and rejoined everything into it. Silence is
+  // the failure mode #485 is about, so the whole set is refused instead and
+  // the caller sends the human to the session browser.
+  const members = [m("orch-1", "orchestrator"), m("orch-2", "orchestrator"), m("w1", "worker")];
+  const plan = planGroupResume(members, (id) => id === "orch-2");
+  assert.equal(plan.ambiguous, true);
+  assert.equal(plan.orchestrator, null, "nothing is resumed on a guess");
+  assert.equal(plan.orchestratorUnresumable, false, "not a stale-transcript failure — a different message");
+});
+
+test("a member that names no group still plans normally (pre-#485 snapshot)", () => {
+  // Migration: a single-group tab saved by an older build has null everywhere
+  // and must behave exactly as it did — one orchestrator, every delegate
+  // rejoined, nothing refused.
+  const members = [m("orch", "orchestrator"), m("w1", "worker"), m("w2", "worker")];
+  const plan = planGroupResume(members, () => true, "group-a");
+  assert.equal(plan.orchestrator?.sessionId, "orch");
+  assert.deepEqual(plan.rejoin.map((x) => x.sessionId), ["w1", "w2"]);
+  assert.deepEqual(plan.foreign, [], "unattributed is not the same as foreign");
+  assert.equal(plan.ambiguous, false);
+});
+
+test("partitionByGroup splits a tab's placeholders by their OWN group", () => {
+  const recs = [
+    { id: "a1", groupId: "group-a" },
+    { id: "b1", groupId: "group-b" },
+    { id: "a2", groupId: "group-a" },
+    { id: "legacy", groupId: null },
+  ];
+  const a = partitionByGroup(recs, "group-a");
+  assert.deepEqual(a.mine.map((r) => r.id), ["a1", "a2"]);
+  assert.deepEqual(a.others.map((r) => r.id), ["b1", "legacy"], "another group's AND the unattributed stay out");
+  // A click on an unattributed placeholder claims only unattributed ones — it
+  // must never sweep in a record that positively names a group.
+  const legacy = partitionByGroup(recs, null);
+  assert.deepEqual(legacy.mine.map((r) => r.id), ["legacy"]);
+});
+
+test("partitionByGroup treats blank the same as absent (never a group named \"\")", () => {
+  const recs = [{ id: "blank", groupId: "  " }, { id: "absent" }, { id: "real", groupId: "g" }];
+  const out = partitionByGroup(recs, null);
+  assert.deepEqual(out.mine.map((r) => r.id), ["blank", "absent"]);
+  assert.deepEqual(out.others.map((r) => r.id), ["real"]);
 });

@@ -15,7 +15,9 @@ import {
 test("encode → decode round-trips name / color / group / active index", () => {
   const state: PersistedTabs = {
     tabs: [
-      { name: "loomux", color: "#9ece6a", groupId: "grp-1" },
+      // A bound tab now carries its group SET (#485); `groupId` stays as the
+      // first of them so an older build still reads a binding.
+      { name: "loomux", color: "#9ece6a", groupId: "grp-1", groupIds: ["grp-1"] },
       { name: "scratch", color: null, groupId: null },
     ],
     activeIndex: 1,
@@ -24,6 +26,52 @@ test("encode → decode round-trips name / color / group / active index", () => 
   const back = decodeTabs(encodeTabs(state));
   // Decode always resolves restorePref + schemaVersion (they drive Phase 4 boot).
   assert.deepEqual(back, { ...state, schemaVersion: SCHEMA_VERSION });
+});
+
+test("a tab bound to TWO groups round-trips both (#485)", () => {
+  // The state #481/#478 makes reachable from the primary split gesture: one
+  // tab, two orchestration groups. The old schema had room for one binding, so
+  // the second group came back unrouted — its rejoined panes landing in a
+  // freshly minted background tab instead of the tab they were closed in.
+  const state: PersistedTabs = {
+    tabs: [{ name: "two", color: null, groupId: "a", groupIds: ["a", "b"] }],
+    activeIndex: 0,
+    restorePref: "restore",
+  };
+  const back = decodeTabs(encodeTabs(state));
+  assert.deepEqual(back?.tabs[0].groupIds, ["a", "b"], "both bindings survive");
+  assert.equal(back?.tabs[0].groupId, "a", "the legacy field names the first, never a third value");
+});
+
+test("a pre-#485 tab (groupId only) decodes as a one-group set", () => {
+  // Migration: nothing invalidates, and a single-group tab binds exactly what
+  // it always did — as one entry in the set the resume path now reads.
+  const back = decodeTabs(
+    JSON.stringify({ tabs: [{ name: "t", color: null, groupId: "solo" }], activeIndex: 0 })
+  );
+  assert.deepEqual(back?.tabs[0].groupIds, ["solo"]);
+  assert.equal(back?.tabs[0].groupId, "solo");
+  // …and a plain tab stays plain: no bindings, and the key is omitted entirely.
+  const plain = decodeTabs(JSON.stringify({ tabs: [{ name: "t", color: null }], activeIndex: 0 }));
+  assert.equal(plain?.tabs[0].groupId, null);
+  assert.equal(plain?.tabs[0].groupIds, undefined);
+});
+
+test("a malformed groupIds degrades to the legacy binding, never a junk group id", () => {
+  // A group id is a path segment on the backend (group_dir), so a decode that
+  // let `null`/`""`/a number through would be handing that to a group-scoped
+  // command. Junk entries are dropped; nothing but a non-blank string survives.
+  const back = decodeTabs(
+    JSON.stringify({
+      tabs: [{ name: "t", color: null, groupId: "keep", groupIds: [null, "", 7, "  ", "real", "real"] }],
+      activeIndex: 0,
+    })
+  );
+  assert.deepEqual(back?.tabs[0].groupIds, ["real"], "only the usable entry survives, deduped");
+  const junk = decodeTabs(
+    JSON.stringify({ tabs: [{ name: "t", color: null, groupId: "keep", groupIds: "nope" }], activeIndex: 0 })
+  );
+  assert.deepEqual(junk?.tabs[0].groupIds, ["keep"], "a non-array falls back to the legacy binding");
 });
 
 test("docked panes round-trip (captured outside the layout tree, #194 P4)", () => {
@@ -43,6 +91,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             shellKind: null,
             sessionId: "abc",
             role: null,
+            groupId: null,
             file: null,
             embeds: [],
           },
@@ -106,7 +155,7 @@ test("decode drops malformed tab entries and coerces bad fields", () => {
   assert.deepEqual(back, {
     tabs: [
       { name: "keep", color: null, groupId: null },
-      { name: "second", color: "#7aa2f7", groupId: "g" },
+      { name: "second", color: "#7aa2f7", groupId: "g", groupIds: ["g"] },
     ],
     activeIndex: 0,
     restorePref: "ask",
@@ -161,6 +210,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         shellKind: "gitbash",
         sessionId: null,
         role: null,
+        groupId: null,
         file: null,
         embeds: [],
       },
@@ -182,6 +232,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: "abc-123",
             role: null,
+            groupId: null,
             file: null,
             embeds: [],
           },
@@ -198,6 +249,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: "orch-sess-9",
             role: "orchestrator",
+            groupId: null,
             file: null,
             embeds: [],
           },
@@ -216,6 +268,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             shellKind: null,
             sessionId: null,
             role: null,
+            groupId: null,
             file: null,
             embeds: [],
           },
@@ -247,6 +300,7 @@ test("a files leaf round-trips its root — and needed NO new field or schema bu
     shellKind: null,
     sessionId: null,
     role: null,
+    groupId: null,
     file: null,
     embeds: [],
   };
@@ -316,6 +370,7 @@ test("editor and git leaves round-trip their root — and the editor's open FILE
     shellKind: null,
     sessionId: null,
     role: null,
+    groupId: null,
     file,
     embeds: [],
   });
@@ -451,6 +506,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       shellKind: null,
       sessionId: null,
       role: null,
+      groupId: null,
       file: null,
       embeds: [],
     },
@@ -469,6 +525,7 @@ test("embed preferences ({view, side, share}), one per docked edge, round-trip t
     shellKind: null,
     sessionId: "orch-1",
     role: "orchestrator",
+    groupId: null,
     file: null,
     embeds: [
       { view: "group", side: "bottom", share: 0.42 },
@@ -500,6 +557,7 @@ test("git and editor are valid embed views too (#361 scope increase), round-trip
     shellKind: null,
     sessionId: "orch-1",
     role: "orchestrator",
+    groupId: null,
     file: null,
     embeds: [
       { view: "git", side: "left", share: 0.35 },
@@ -558,6 +616,7 @@ test("a malformed entry inside a valid embeds array is dropped, not the whole ar
             paneKind: "orch",
             name: "orchestrator",
             role: "orchestrator",
+            groupId: null,
             embeds: [
               { view: "group", side: "bottom", share: 0.4 }, // valid
               { view: "issues", side: "left", share: 0.3 }, // not a RESTORABLE kind
@@ -590,6 +649,7 @@ test("two entries claiming the SAME side: the first wins, the second is dropped"
             paneKind: "orch",
             name: "orchestrator",
             role: "orchestrator",
+            groupId: null,
             embeds: [
               { view: "tasks", side: "left", share: 0.3 },
               { view: "audit", side: "left", share: 0.5 }, // same side, stale/malformed data
@@ -622,6 +682,7 @@ test("a legacy single-slot embed:{view,share} (pre-multi-slot #361 shape) migrat
             paneKind: "orch",
             name: "orchestrator",
             role: "orchestrator",
+            groupId: null,
             embed: { view: "audit", share: 0.5 },
           },
         },
@@ -674,6 +735,7 @@ test("the newest present shape wins when a pane somehow carries more than one", 
             paneKind: "orch",
             name: "orchestrator",
             role: "orchestrator",
+            groupId: null,
             embeds: [{ view: "group", side: "right", share: 0.6 }],
             embed: { view: "audit", share: 0.5 }, // stale — ignored when `embeds` is present
             taskEmbed: 0.9, // stalest — ignored too

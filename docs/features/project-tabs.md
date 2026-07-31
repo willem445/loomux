@@ -153,6 +153,19 @@ divider positions you'd dragged. Each pane comes back by kind:
   reverting to looking like an untouched "Resume group" card; a toast covers the
   in-the-moment notice, and the card itself is what's still there if you come
   back to the tab later.
+- **A tab holding two orchestration groups** (split an orchestrator tab and
+  launch a second orchestrator into it, or restore a group into a tab that
+  already has one) restores **both**, separately: each group gets its own
+  **Resume group** card, and each card brings back that group's own
+  orchestrator and its own workers. Resuming one leaves the other's card
+  exactly where it was, so a group you haven't resumed yet is never mistaken
+  for one that's gone. A worker is only ever rejoined into the group its own
+  recorded session belongs to — if something asks for it under a different
+  group, the restore **fails with a message** instead of attaching it to the
+  wrong orchestrator. (Tabs saved by a version before this fix don't record
+  which group each pane belonged to; if such a tab holds two orchestrators,
+  the card says so and points you at the session browser, where each session's
+  group is known, rather than guessing at one.)
 
 **Start fresh** opens a single blank welcome tab and leaves the rest behind.
 

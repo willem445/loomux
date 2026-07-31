@@ -3084,6 +3084,11 @@ export class Pane implements VoiceTargetPane {
       sessionId: kind === "agent" || kind === "orch" ? this.agentSessionId : null,
       // The orchestration role distinguishes the orchestrator from its delegates.
       role: kind === "orch" ? this.orchRoleName : null,
+      // …and the group says WHICH group's orchestrator/delegate it is (#485).
+      // A tab can hold panes from two groups, so a whole-group resume that
+      // reads the group off the tab attributes them all to one; this is what
+      // lets it partition them by their own group instead.
+      groupId: kind === "orch" ? this.orchGroup : null,
       // An editor pane's OPEN FILE (#217) — a path, never a buffer. Without it a pane
       // opened on `src/pane.ts` (and titled after it) restores as a bare tree that
       // names a file it isn't showing. The file is re-read from disk on restore; what

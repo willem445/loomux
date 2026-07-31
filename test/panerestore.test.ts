@@ -34,6 +34,7 @@ const pane = (over: Partial<PersistedPane>): PersistedPane => ({
   shellKind: null,
   role: null,
   sessionId: null,
+  groupId: null,
   file: null,
   embeds: [],
   ...over,
@@ -197,8 +198,36 @@ test("an orchestration pane ALWAYS restores dormant — never auto-resumed", () 
     name: "orchestrator",
     sessionId: null,
     role: "orchestrator",
+    groupId: null,
     embeds: [],
   });
+});
+
+test("the placeholder carries WHICH group it belongs to (#485)", () => {
+  // A tab can hold panes from two orchestration groups. Without this the
+  // resume can only ask the TAB which group a placeholder belongs to, and a
+  // tab has one binding — so one group's orchestrator is dropped and its
+  // delegates rejoin the other. The action carries the pane's OWN group so
+  // the resume can partition on it.
+  const orch = planPaneRestore(
+    pane({ paneKind: "orch", name: "orch-b", sessionId: "s-orch-b", role: "orchestrator", groupId: "group-b" })
+  );
+  assert.deepEqual(orch, {
+    type: "dormant-group",
+    name: "orch-b",
+    sessionId: "s-orch-b",
+    role: "orchestrator",
+    groupId: "group-b",
+    embeds: [],
+  });
+  const worker = planPaneRestore(
+    pane({ paneKind: "orch", name: "w-b", sessionId: "s-w-b", role: "worker", groupId: "group-b" })
+  );
+  assert.equal(
+    worker.type === "dormant-group" && worker.groupId,
+    "group-b",
+    "a delegate names its own group too — that is what makes a wrong-group rejoin refusable"
+  );
 });
 
 test("even with a session id, a group stays dormant (the rule is keyed on kind, not id)", () => {
@@ -210,6 +239,7 @@ test("even with a session id, a group stays dormant (the rule is keyed on kind, 
     name: "worker-1",
     sessionId: "xyz-1",
     role: "worker",
+    groupId: null,
     embeds: [],
   });
 });
@@ -229,6 +259,7 @@ test("captured embed preferences (#361), one per docked side, ride the dormant p
     name: "orchestrator",
     sessionId: "s1",
     role: "orchestrator",
+    groupId: null,
     embeds,
   });
 });
@@ -246,6 +277,7 @@ test("git and editor dock preferences ride the dormant placeholder too (#361 sco
     name: "orchestrator",
     sessionId: "s1",
     role: "orchestrator",
+    groupId: null,
     embeds,
   });
 });

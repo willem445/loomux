@@ -4478,6 +4478,230 @@ fn worker_session_rejoin_requires_live_group_then_reuses_session() {
     assert!(resume_recorded_session(&reg, "0000-not-recorded", None, false).is_err());
 }
 
+// ---------- #485: a session only ever rejoins its OWN group ----------
+// The two-groups-one-tab bug: a tab can hold panes from two orchestration
+// groups, and the dormant-group Resume click used to name the group from the
+// TAB (one binding per tab) rather than from the pane's own captured record.
+// Every rejoin funnels through `resume_recorded_session`, so that is where a
+// caller's wrong group id has to be refused — a frontend that partitions its
+// placeholders correctly is a happy path, not a guarantee.
+
+#[test]
+fn rejoining_a_session_into_another_groups_id_is_refused_loudly() {
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo_a = tempfile::tempdir().unwrap();
+    let repo_b = tempfile::tempdir().unwrap();
+    let reg = Arc::new(relaunch_registry(dir.path()));
+    reg.set_port(45999);
+    let group_a = reg.create_group(&repo_a.path().to_string_lossy(), rails()).unwrap().id.clone();
+    let group_b = reg.create_group(&repo_b.path().to_string_lossy(), rails()).unwrap().id.clone();
+    // Both groups live, so the rejoin is refused for the group id ALONE —
+    // not incidentally, because the target group happened to be dead.
+    reg.spawn_agent(&group_a, Role::Orchestrator, "orch-a", "", false, None).unwrap();
+    reg.spawn_agent(&group_b, Role::Orchestrator, "orch-b", "", false, None).unwrap();
+    let w = reg.spawn_agent(&group_b, Role::Worker, "w-b", "t", false, None).unwrap();
+    let sid = w.session_id.clone().unwrap();
+    reg.mark_dead(&w.id, Some(0));
+
+    // Group A's id, group B's worker: the exact call the buggy tab-scoped
+    // resume made for every delegate in the tab.
+    let err = resume_recorded_session(&reg, &sid, Some((group_a.clone(), "worker".into())), false)
+        .expect_err("a rejoin into a group the session does not belong to must fail");
+    assert!(
+        err.starts_with("resume-group-mismatch:"),
+        "must carry the structured tag the frontend classifies on, got: {err}"
+    );
+    assert!(err.contains(&group_b), "must name the group the session DOES belong to, got: {err}");
+
+    // And it must be a refusal, not a slower path to the same contamination:
+    // A's roster never sees the session id. (The rejoin spawn is backgrounded,
+    // so give a real one time to land before concluding it never happened.)
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !reg.list_agents(&group_a).to_string().contains(&sid),
+        "group A must not have gained group B's session"
+    );
+
+    // The same session, named with its OWN group, still rejoins — the check
+    // refuses a wrong group, it does not break rejoining.
+    assert!(
+        resume_recorded_session(&reg, &sid, Some((group_b.clone(), "worker".into())), false)
+            .unwrap()
+            .is_none(),
+        "worker rejoin panes arrive via the spawn event, not the return value"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if reg.list_agents(&group_b).to_string().matches(&sid).count() >= 1 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the same-group rejoin did not complete");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_record_less_delegate_is_refused_rather_than_rejoined_on_the_hint_alone() {
+    // #485 review finding 1. The signature-only fallback below the roster/audit
+    // lookups builds its record FROM THE HINT, so for a session with no recorded
+    // membership anywhere the mismatch check is vacuous by construction — the
+    // caller's claim is the only "evidence" there is. That left one reachable
+    // route into the wrong group: a pre-#485 snapshot whose tab-derived hint
+    // names group A while the placeholder is really group B's pre-roster worker.
+    //
+    // A DELEGATE rejoin is a membership operation, so with nothing to verify
+    // against, the answer is a loud refusal rather than a rejoin on the caller's
+    // say-so. (An ORCHESTRATOR resume is not a membership operation — it reopens
+    // the control plane of a group whose group.json is on disk — so that arm of
+    // the fallback survives; `hint_restores_sessions_unknown_to_roster_and_audit`
+    // pins it.)
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let reg = Arc::new(relaunch_registry(dir.path()));
+    reg.set_port(45999);
+    let group = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap().id.clone();
+    // A live group, so the refusal is about the UNVERIFIABLE membership alone —
+    // not incidentally because there was nothing to rejoin into.
+    reg.spawn_agent(&group, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // A session id no roster row and no audit line anywhere names — but one that
+    // DOES have a resumable transcript in the CLI's own store. That combination
+    // is the whole point: without the store fixture the resume dies later on
+    // `resume-not-found` (the cwd resolution), which would mask the corner
+    // instead of testing it — exactly what this test asserted on its first run.
+    let sid = "99998888-7777-6666-8555-444433332222";
+    let store = scratch_dir("record-less-delegate");
+    // Its recorded cwd is its OWN workspace, not the group's main clone — a
+    // main-clone cwd is refused by a different guard (#338/#359), which would
+    // again mask this one rather than exercise it.
+    let workspace = tempfile::tempdir().unwrap();
+    fixture_claude_session(&store, sid, &workspace.path().to_string_lossy());
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
+    let outcome = resume_recorded_session(&reg, sid, Some((group.clone(), "worker".into())), false);
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
+    let err = outcome
+        .expect_err("a delegate whose group cannot be verified must not be rejoined on the hint");
+    assert!(
+        err.starts_with("resume-group-unknown:"),
+        "must carry its own structured tag — this is 'cannot be verified', not 'contradicted', got: {err}"
+    );
+    // The escape guidance must name a route that EXISTS (#485 review round 2).
+    // "Resume it from the session browser" was circular: the browser classifies
+    // a pre-roster session from its transcript signature and hints the same
+    // group, landing back here. A dead end told as a door is worse than a dead
+    // end told as one, so this pins that the message doesn't send the human in
+    // that circle.
+    let lowered = err.to_lowercase();
+    assert!(
+        !lowered.contains("resume it from the session browser"),
+        "must not point at the session browser — that route returns to this same refusal: {err}"
+    );
+    assert!(
+        lowered.contains("returns here") || lowered.contains("returns to"),
+        "must say the browser leads back here rather than leaving it as an option: {err}"
+    );
+    assert!(
+        lowered.contains("spawn a fresh agent") && lowered.contains("outside"),
+        "must name the two routes that do exist — a fresh agent for the work, and reopening the \
+         conversation outside orchestration: {err}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !reg.list_agents(&group).to_string().contains(sid),
+        "nothing may have been rejoined for a session whose membership is unverifiable"
+    );
+}
+
+#[test]
+fn two_groups_in_one_tab_both_restore_into_their_own_group() {
+    // The round trip the tab-scoped resume could not do at all: TWO dormant
+    // orchestrator groups resumed one after the other (the frontend now hints
+    // with each placeholder's own captured group), then each group's worker
+    // rejoined with that same per-member group id. Both groups end live, with
+    // their own workers, and neither worker lands in the other's roster.
+    use loomux_lib::orchestration::resume_recorded_session;
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let repo_a = tempfile::tempdir().unwrap();
+    let repo_b = tempfile::tempdir().unwrap();
+    let path_a = repo_a.path().to_string_lossy().into_owned();
+    let path_b = repo_b.path().to_string_lossy().into_owned();
+    let (group_a, group_b, orch_a_sid, orch_b_sid, w_a_sid, w_b_sid);
+    {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45999);
+        group_a = reg.create_group(&path_a, rails()).unwrap().id.clone();
+        group_b = reg.create_group(&path_b, rails()).unwrap().id.clone();
+        orch_a_sid = reg
+            .spawn_agent(&group_a, Role::Orchestrator, "orch-a", "", false, None)
+            .unwrap()
+            .session_id
+            .unwrap();
+        orch_b_sid = reg
+            .spawn_agent(&group_b, Role::Orchestrator, "orch-b", "", false, None)
+            .unwrap()
+            .session_id
+            .unwrap();
+        w_a_sid = reg
+            .spawn_agent(&group_a, Role::Worker, "w-a", "t", false, None)
+            .unwrap()
+            .session_id
+            .unwrap();
+        w_b_sid = reg
+            .spawn_agent(&group_b, Role::Worker, "w-b", "t", false, None)
+            .unwrap()
+            .session_id
+            .unwrap();
+    }
+    // "App restart": a new registry, nothing live — both groups dormant, the
+    // state a two-group tab comes back in.
+    let store = scratch_dir("two-group-restore");
+    fixture_claude_session(&store, &orch_a_sid, &path_a);
+    fixture_claude_session(&store, &orch_b_sid, &path_b);
+    loomux_lib::sessions::set_claude_projects_root_for_test(Some(store.clone()));
+    let reg = Arc::new(relaunch_registry(dir.path()));
+    reg.set_port(45999);
+
+    let req_a = resume_recorded_session(&reg, &orch_a_sid, Some((group_a.clone(), "orchestrator".into())), false)
+        .unwrap()
+        .expect("group A's orchestrator returns a pane spec");
+    let req_b = resume_recorded_session(&reg, &orch_b_sid, Some((group_b.clone(), "orchestrator".into())), false)
+        .unwrap()
+        .expect("group B's orchestrator must ALSO come back — not be dropped from the plan");
+    loomux_lib::sessions::set_claude_projects_root_for_test(None);
+    let _ = fs::remove_dir_all(&store);
+    assert_eq!(req_a.group_id, group_a);
+    assert_eq!(req_b.group_id, group_b);
+    assert!(reg.group(&group_a).is_some() && reg.group(&group_b).is_some(),
+        "both control planes must be live at once");
+
+    // Each worker rejoins its own group, named by its own captured record.
+    for (sid, gid) in [(&w_a_sid, &group_a), (&w_b_sid, &group_b)] {
+        assert!(
+            resume_recorded_session(&reg, sid, Some((gid.clone(), "worker".into())), false)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let roster_a = reg.list_agents(&group_a).to_string();
+        let roster_b = reg.list_agents(&group_b).to_string();
+        if roster_a.contains(&w_a_sid) && roster_b.contains(&w_b_sid) {
+            assert!(!roster_a.contains(&w_b_sid), "group B's worker must never appear in group A");
+            assert!(!roster_b.contains(&w_a_sid), "group A's worker must never appear in group B");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "both rejoins did not complete:\nA={roster_a}\nB={roster_b}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 // ---------- MCP dispatch: protocol, role filtering, cross-group access ----------
 
 fn setup_mcp() -> (OrchRegistry, tempfile::TempDir, Caller, Caller) {

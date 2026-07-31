@@ -11149,8 +11149,12 @@ impl OrchRegistry {
     /// can disagree in that corner. Hinted-group-wins is arguably the more
     /// defensible rule — it's the group the clicked tab is actually bound
     /// to — but it is a DIFFERENT tie-break, not a proof of sameness, and
-    /// this must not be sold as one until #485 removes the corner (a session
-    /// can never legitimately belong to two groups). A miss (stale/wrong
+    /// this must not be sold as one. #485 closed the way NEW two-group rows
+    /// were created (`resume_recorded_session` now refuses a rejoin whose
+    /// hint disagrees with the session's own record, and the dormant-group
+    /// Resume click hints with the placeholder's OWN captured group rather
+    /// than the tab's), but rows written before that fix are still on disk,
+    /// so the corner remains reachable for existing data. A miss (stale/wrong
     /// hint, or the id genuinely isn't in that group) falls through to the
     /// unchanged full scan in the caller.
     ///
@@ -22836,12 +22840,21 @@ fn register_orchestrator_pane(
 /// worker/reviewer session rejoins its live group; its pane arrives via the
 /// normal orch-spawn-request event (the spawn must not block this IPC
 /// thread, which also serves the bind), so `None` is returned.
+///
+/// THE GROUP A SESSION REJOINS IS ITS OWN, ALWAYS (#485). `hint` names the
+/// group the CALLER believes this session belongs to; the group it actually
+/// rejoins is the one its own record names. When the two disagree this
+/// refuses the resume outright (`resume-group-mismatch:`) rather than
+/// quietly resolving the disagreement in either direction — see the check
+/// below for why silently preferring the record is not good enough.
 pub fn resume_recorded_session(
     reg: &Arc<OrchRegistry>,
     session_id: &str,
     hint: Option<(String, String)>, // (group_id, role) from transcript signatures
     start_fresh: bool,
 ) -> Result<Option<SpawnRequest>, String> {
+    // Kept before the resolution chain below consumes `hint`.
+    let hinted_group = hint.as_ref().map(|(g, _)| g.clone());
     let record = hint
         .as_ref()
         // #479: the dormant-group Resume button (and any other caller that
@@ -22862,18 +22875,63 @@ pub fn resume_recorded_session(
                 .filter(|r| r.session_id == session_id)
                 .last()
         })
-        .or_else(|| {
-            // Sessions from before the roster (and before session-id
-            // tracking) are identified by loomux signatures in their own
-            // transcript; trust the hint if that group exists on disk.
-            let (group_id, role) = hint?;
+        .ok_or(())
+        .or_else(|()| {
+            // SIGNATURE-ONLY FALLBACK. Sessions from before the roster (and
+            // before session-id tracking) have no row anywhere; the session
+            // browser identifies them by loomux signatures in their own
+            // transcript and names the group via `hint`.
+            //
+            // #485 review finding 1: this fallback builds its record FROM the
+            // hint, so the mismatch check below is vacuous by construction for
+            // this class — the caller's claim is the only evidence there is.
+            // That is fine for an ORCHESTRATOR (reopening the control plane of
+            // a group whose `group.json` is on disk is not a membership
+            // operation: the group's identity comes from that file, and no
+            // other group's roster is touched), and it is NOT fine for a
+            // DELEGATE, where "rejoin into group X" writes membership into X
+            // on nothing but the caller's say-so. That was the one route left
+            // into the wrong group after the check below: a pre-#485 snapshot
+            // whose tab-derived hint names group A while the placeholder is
+            // really group B's pre-roster worker. So a record-less delegate is
+            // REFUSED — loudly, with its own tag, since "cannot be verified"
+            // is a different fact from "contradicted" (the check below) and
+            // deserves different copy. It costs the pre-roster delegate rejoin
+            // in a legacy tab, which the human can still reach through the
+            // session browser or have the orchestrator respawn; the trade is
+            // deliberate, and #485's whole point is that a silent wrong-group
+            // rejoin is worse than a legible refusal.
+            let (group_id, role) = hint.ok_or("this session is not part of a recorded orchestration")?;
+            if role != "orchestrator" {
+                // THE ESCAPE ROUTE HAS TO EXIST (#485 review round 2). This
+                // said "resume it from the session browser", which is
+                // circular: the browser classifies a pre-roster session from
+                // its transcript SIGNATURE (`SessionsPanel.roleFor`'s
+                // `orch_role`/`orch_group` fallback), so clicking it there
+                // hints the same group and lands right back on this line. A
+                // fresh spawn is not an escape either — it would join the very
+                // group that could not be verified. So this names what is
+                // actually reachable, and says plainly that a group rejoin is
+                // not among it.
+                return Err(format!(
+                    "resume-group-unknown: session {session_id} has no recorded orchestration \
+                     membership on this machine, so the group it belongs to cannot be verified — \
+                     refusing to rejoin it into {group_id} on the caller's say-so. Nothing can \
+                     rejoin this session INTO a group: the session browser classifies it from its \
+                     transcript alone and returns here, and a fresh spawn would join the \
+                     unverified group. What does work: the orchestrator can spawn a fresh agent \
+                     for the work, and the conversation itself is not lost — it reopens OUTSIDE \
+                     orchestration via the CLI's own resume command (shown in the session row's \
+                     tooltip), as a plain pane with no group membership."
+                ));
+            }
             if !reg.group_dir(&group_id).join("group.json").is_file() {
-                return None;
+                return Err("this session is not part of a recorded orchestration".to_string());
             }
             let group_live = reg.group_is_live(&group_id);
-            Some(SessionRole {
+            Ok(SessionRole {
                 session_id: session_id.to_string(),
-                agent_name: if role == "orchestrator" { "orchestrator".into() } else { "agent".into() },
+                agent_name: "orchestrator".into(),
                 group_id,
                 role,
                 group_live,
@@ -22885,8 +22943,58 @@ pub fn resume_recorded_session(
                 repo: None,
                 pr: None,
             })
-        })
-        .ok_or("this session is not part of a recorded orchestration")?;
+        })?;
+
+    // THE JOIN POINT (#485). Every rejoin in loomux funnels through here, so
+    // this is the one place that can make "a session joins a group that isn't
+    // its own" unreachable instead of merely unlikely — and one caller getting
+    // its group id from a TAB rather than from the session's own record (the
+    // two-groups-one-tab resume this closes) is exactly how that used to
+    // happen.
+    //
+    // EXACTLY WHAT THIS CHECK COVERS, stated narrowly on purpose (#485 review
+    // finding 1): a session that HAS a recorded membership — a roster row or an
+    // audit line in some group — can never be rejoined into a different one,
+    // because `record` above came from that recording and this compares it
+    // against what the caller asked for. A session with NO recording anywhere
+    // has nothing to compare against; that class is refused outright by the
+    // signature-only fallback above (delegates) rather than covered here, so
+    // that "cannot be verified" never resolves to "trust the caller". Between
+    // the two, no delegate rejoin proceeds on a group id that only the caller
+    // vouches for. What neither closes is stale DATA: rows a pre-#485 rejoin
+    // already wrote into the wrong group (see below).
+    //
+    // Why refuse instead of silently using `record.group_id` — which is what
+    // the spawn below would do anyway, and would already land the agent in
+    // the right group? Because the caller acts on its own belief afterwards:
+    // it binds panes, routing and badges to the group it ASKED for, so a
+    // disagreement resolved in silence still ends with the agent's pane
+    // filed under the wrong group in the UI. The two ids disagreeing means
+    // the caller's model of the world is wrong, and the only safe move is to
+    // say so where the human clicked. Tagged like every other resume failure
+    // (`resumeerror.ts` parses the `resume-<tag>:` prefix) so the frontend
+    // can report it specifically; deliberately NOT a `start fresh`-able kind
+    // — minting a fresh session would just create the contamination the
+    // refusal prevented.
+    //
+    // A hintless caller (the session browser resolves the group from the
+    // session record itself) has nothing to disagree with and is unaffected.
+    //
+    // WHAT THIS DOES NOT UNDO: a session that ALREADY has a roster/audit row
+    // in a second group — the residue a pre-#485 wrong-group rejoin left on
+    // disk — resolves through `session_role_in_group`'s hinted-group fast
+    // path to that hinted group, agrees with itself, and passes. This check
+    // stops new contamination from being created; it does not clean up old
+    // contamination, and nothing here should be read as claiming it does.
+    if let Some(hinted) = hinted_group.as_deref() {
+        if record.group_id != hinted {
+            return Err(format!(
+                "resume-group-mismatch: session {session_id} belongs to orchestration group \
+                 {}, not {hinted} — refusing to rejoin it into another group",
+                record.group_id
+            ));
+        }
+    }
 
     if record.role == "orchestrator" {
         if record.group_live {

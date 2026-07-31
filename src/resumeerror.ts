@@ -5,7 +5,7 @@
 // mapping from "raw error string" to "what the UI should offer" is
 // unit-tested (test/resumeerror.test.ts) rather than eyeballed in main.ts.
 
-/** The four resume-failure shapes the backend can report. `null` when the
+/** The resume-failure shapes the backend can report. `null` when the
  *  message carries no recognized tag at all (an unrelated error — e.g. "group
  *  already has a live orchestrator"). */
 export type ResumeFailureKind =
@@ -13,6 +13,18 @@ export type ResumeFailureKind =
   | "workspace-missing"
   | "ambiguous"
   | "store-unreadable"
+  /** The caller asked to resume a session INTO a group that isn't the one its
+   *  own record names, and the backend refused (#485). Never `offersStartFresh`
+   *  — a fresh session would be spawned into that same wrong group, which is
+   *  the contamination the refusal exists to prevent. */
+  | "group-mismatch"
+  /** The session has no recorded orchestration membership anywhere, so the
+   *  group a caller named for it cannot be verified — and a DELEGATE rejoin is
+   *  refused rather than taken on trust (#485 review finding 1). Distinct from
+   *  `group-mismatch`: nothing contradicted the caller, there was simply
+   *  nothing to check it against. Not `offersStartFresh` for the same reason —
+   *  a fresh session would join that unverified group. */
+  | "group-unknown"
   | null;
 
 const TAG_KIND: Record<string, ResumeFailureKind> = {
@@ -20,6 +32,8 @@ const TAG_KIND: Record<string, ResumeFailureKind> = {
   "resume-workspace-missing": "workspace-missing",
   "resume-ambiguous": "ambiguous",
   "resume-store-unreadable": "store-unreadable",
+  "resume-group-mismatch": "group-mismatch",
+  "resume-group-unknown": "group-unknown",
 };
 
 /** Extract the leading `resume-<tag>:` prefix from a thrown error's message,
@@ -41,17 +55,27 @@ export function offersStartFresh(kind: ResumeFailureKind): boolean {
   return kind === "not-found" || kind === "workspace-missing";
 }
 
-/** A short, human-readable reason for the two `offersStartFresh` kinds, for
- *  the confirm dialog's body. Falls back to a generic phrasing for any other
- *  kind (never called for `null`/other kinds by the caller, but total rather
- *  than partial so a future kind added here doesn't need a matching frontend
- *  edit to stay safe). */
+/** A short, human-readable reason for a resume failure — the confirm dialog's
+ *  body for the two `offersStartFresh` kinds, and a legible line for any other
+ *  kind that has one. Falls back to a generic phrasing for the rest, so it is
+ *  total rather than partial and a future kind can't leave a caller with
+ *  nothing to say. */
 export function resumeFailureReason(kind: ResumeFailureKind): string {
   switch (kind) {
     case "workspace-missing":
       return "Its recorded workspace no longer exists on disk — the worktree may have been removed.";
     case "not-found":
       return "It was not found in the session history on this machine — it may have been cleared.";
+    case "group-mismatch":
+      return "It belongs to a different orchestration group than the one being resumed — resume it from its own group.";
+    case "group-unknown":
+      // Deliberately does NOT point at the session browser (#485 review round
+      // 2): the browser classifies this class from the transcript signature
+      // and routes straight back into the same refusal, so that guidance was
+      // a loop. Nor does it offer a fresh spawn AS A REJOIN — that would join
+      // the unverified group. It names the two routes that exist and is
+      // explicit that a group rejoin isn't one of them.
+      return "loomux has no record of which orchestration group it belongs to, so it wasn't rejoined into one on a guess. Nothing will rejoin it into a group — but the conversation isn't lost: it reopens outside orchestration with the CLI's own resume command (shown in the session row's tooltip), and the orchestrator can spawn a fresh agent for the work.";
     default:
       return "It could not be resumed.";
   }
