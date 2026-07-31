@@ -37,40 +37,100 @@
 // different turn — and therefore always reads false. Nothing here decays on
 // wall-clock time: this is an origin test, not a recency one.
 
-/** A one-turn "the data leaving right now came from a human" flag. */
+// TWO SCOPES, because xterm does not emit all human input on one schedule.
+// Read from `@xterm/xterm` 6.0.0's own `lib/xterm.js` (quoted, not
+// paraphrased — the repo's standing rule for third-party facts):
+//
+//   `_finalizeComposition(e){…this._isSendingComposition=!0,setTimeout((()=>{
+//    …t.length>0&&this._coreService.triggerDataEvent(t,!0)}),0)}`
+//
+// An IME commit reaches the PTY from inside a `setTimeout(…, 0)` — a LATER
+// TASK than the `compositionend` that caused it. A microtask-scoped mark is
+// already closed by then, so CJK/Japanese/Korean typing would have been
+// classified non-human: the guard would silently stop protecting exactly the
+// users who most need a composition left alone. (#500's own doc names "a
+// future IME/composition path" as the kind of refresher its bound exists to
+// backstop; this is that path, and #518 must not create it.)
+//
+//   `_inputEvent(e){if(e.data&&"insertText"===e.inputType&&(!e.composed||
+//    !this._keyDownSeen)…{…this.coreService.triggerDataEvent(t,!0)…}}`
+//
+// And a plain `input` event — dead keys/accents, soft keyboards — sends
+// synchronously with no `onKey` involved at all.
+//
+// Both are still STRUCTURAL signals: they originate in DOM events on the
+// terminal's own textarea, and xterm never routes a query auto-reply through
+// the textarea — it calls `triggerDataEvent` directly. So the fix is to mark
+// from those events too, on the scope each one actually needs.
+//
+// The deferred scope fails toward "human" if its window is ever mis-sized,
+// which is the PRE-#518 behaviour: believing a human typed only ever makes
+// delivery hold more. Failing the other way is the clobber every guard here
+// exists to prevent, so the asymmetry is deliberate.
+
+/** A short-lived "the data leaving right now came from a human" flag. */
 export interface HumanOriginLatch {
-  /** A genuine keyboard or paste event just happened. */
+  /** A genuine keyboard or paste event just happened, and the data it
+   *  produces is emitted synchronously — `term.onKey`, `term.paste()`. Open
+   *  for the rest of this synchronous turn only. */
   mark(): void;
-  /** Whether we are still inside the turn a `mark()` opened. */
+  /** A human input event happened whose data xterm emits on a LATER TASK (an
+   *  IME commit) or through a path `onKey` never sees (`input`/`insertText`).
+   *  Open across the current turn AND the following macrotask, which is where
+   *  `_finalizeComposition`'s `setTimeout(…, 0)` lands. */
+  markDeferred(): void;
+  /** Whether a mark is currently open. */
   readonly isHuman: boolean;
 }
 
 /**
  * Create a human-origin latch.
  *
- * `schedule` runs the un-mark and defaults to `queueMicrotask`, which fires
+ * `schedule` closes a `mark()` and defaults to `queueMicrotask`, which fires
  * after the current synchronous turn drains and before any later task — so a
  * mark covers exactly the `onData` its own key/paste event produced, and
- * nothing that arrives later. It is injectable so the latch is unit-testable
- * with a manual queue, keeping this logic out of `pane.ts`'s hand-validated
- * DOM wiring (the repo's standing split).
+ * nothing that arrives later.
  *
- * Marks are generation-stamped: a second `mark()` inside the same turn
- * invalidates the first one's pending un-mark, so the earlier scheduled
- * callback cannot close the latch out from under a mark that came after it.
+ * `scheduleTask` closes a `markDeferred()` and defaults to a zero-delay
+ * `setTimeout`, deliberately the SAME primitive and delay xterm's
+ * `_finalizeComposition` uses to send an IME commit. Timers of equal delay
+ * fire in registration order, and xterm registers its send from its own
+ * `compositionend` handler — so a `markDeferred()` made from a
+ * `compositionend` listener that runs before xterm's own (see `pane.ts`: the
+ * listener is registered in the CAPTURE phase on an ancestor, which the DOM
+ * guarantees runs before any listener on the textarea itself) queues its close
+ * behind that send, and the latch is still open when the data arrives.
+ *
+ * Both are injectable so the scheduling rules are unit-testable with manual
+ * queues, keeping this logic out of `pane.ts`'s hand-validated DOM wiring (the
+ * repo's standing split).
+ *
+ * Marks are generation-stamped, across BOTH kinds: a later mark of either kind
+ * invalidates any earlier pending close, so a microtask close queued by a
+ * keystroke can never shut a composition's deferred mark, and vice versa. That
+ * matters in practice — a composition is routinely punctuated by key events.
  */
 export function createHumanOriginLatch(
   schedule: (fn: () => void) => void = queueMicrotask,
+  scheduleTask: (fn: () => void) => void = (fn) => {
+    setTimeout(fn, 0);
+  },
 ): HumanOriginLatch {
   let human = false;
   let generation = 0;
+  const open = (closeWith: (fn: () => void) => void): void => {
+    human = true;
+    const mine = ++generation;
+    closeWith(() => {
+      if (generation === mine) human = false;
+    });
+  };
   return {
     mark(): void {
-      human = true;
-      const mine = ++generation;
-      schedule(() => {
-        if (generation === mine) human = false;
-      });
+      open(schedule);
+    },
+    markDeferred(): void {
+      open(scheduleTask);
     },
     get isHuman(): boolean {
       return human;

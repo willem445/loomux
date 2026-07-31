@@ -1071,6 +1071,18 @@ export class Pane implements VoiceTargetPane {
     this.humanOrigin.mark();
   }
 
+  /** #518: the `markFirstInput` sibling for human input whose data xterm emits
+   *  on a later task (an IME commit) or through a path `onKey` never sees
+   *  (`input`/`insertText`). Same `firstInputMs` semantics — a composition IS
+   *  the human's first input into this process — but the origin mark is the
+   *  DEFERRED one, since the write it licenses has not happened yet. See the
+   *  listener registration in `start()` and `humanorigin.ts`'s scheduling
+   *  note. */
+  private markHumanInput(): void {
+    this.firstInputMs ??= Date.now();
+    this.humanOrigin.markDeferred();
+  }
+
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
   async start(opts: PaneOptions = {}, takeFocus = true): Promise<void> {
     this.setName(opts.name ?? "shell");
@@ -1190,6 +1202,29 @@ export class Pane implements VoiceTargetPane {
     // `onData` by escape-sequence prefix instead: bracketed paste itself
     // starts with ESC, so a naive filter would misfire on real pastes).
     this.term.onKey(() => this.markFirstInput());
+    // #518: the two human-input paths `onKey` never sees. Both are still
+    // structural — they are DOM events on the terminal's own textarea, and
+    // xterm never routes a query auto-reply through the textarea (it calls
+    // `triggerDataEvent` directly) — but neither is a key event:
+    //
+    //  - an IME commit, which `_finalizeComposition` sends from a
+    //    `setTimeout(…, 0)`, i.e. a LATER TASK than `compositionend`;
+    //  - `_inputEvent`'s `insertText` path (dead keys/accents, soft
+    //    keyboards), which sends synchronously with no `onKey` at all.
+    //
+    // Registered in the CAPTURE phase on `termEl`, an ANCESTOR of the
+    // textarea: the DOM runs ancestor-capture listeners before any listener on
+    // the target itself, so these mark the latch before xterm's own handlers
+    // (which are bound to the textarea) can emit anything. `markDeferred`
+    // keeps the mark open across the macrotask the IME send lands in — see
+    // `humanorigin.ts` for why that ordering holds and why its failure
+    // direction is the safe one.
+    //
+    // Without this, CJK/Japanese/Korean typing would classify as non-human and
+    // silently lose the very protection these guards exist to give.
+    for (const ev of ["compositionstart", "compositionupdate", "compositionend", "input"]) {
+      this.termEl.addEventListener(ev, () => this.markHumanInput(), true);
+    }
     this.resizeObs.observe(this.termEl);
     // A background (orchestrator-driven) spawn must not pull focus from the
     // pane the human is typing in (#117); grid.openPane decides takeFocus.
