@@ -790,13 +790,11 @@ mod tests {
 
     #[test]
     fn plan_flush_chunks_a_backlog_that_exceeds_the_byte_cap() {
-        let big = "x".repeat(200);
-        let entries = vec![
-            text_entry(1, &big),
-            text_entry(2, &big),
-            text_entry(3, &big),
-            text_entry(4, &big),
-        ];
+        // Equal-length but DISTINCT texts: byte-identical entries would be
+        // ruled superseded before the cap ever got a say (as an earlier
+        // draft of this test discovered the hard way).
+        let big = |i: u64| format!("{}{i}", "x".repeat(199));
+        let entries: Vec<QueuedDelivery> = (1..=4).map(|i| text_entry(i, &big(i))).collect();
         // Budget for ~2 entries (each costs len + FLUSH_ITEM_OVERHEAD).
         let cap = 2 * (200 + FLUSH_ITEM_OVERHEAD);
         let plan = plan_flush(&entries, cap);
@@ -876,7 +874,7 @@ mod tests {
         let out = coalesced_flush_text(&items, 0, 1_000);
         assert!(out.contains("+2 identical repeats coalesced"), "per-constituent repeat count: {out}");
         assert_eq!(
-            out.matches("identical repeat").count(),
+            out.matches("repeats coalesced").count(),
             1,
             "only the constituent that actually repeated is annotated: {out}"
         );

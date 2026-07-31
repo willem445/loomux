@@ -36,7 +36,13 @@ Every rung is a complete tool on its own — climb when you're ready:
    half-typed line is in the box, a question is on screen, or the agent
    turns out to have received the brief after all), the pane raises a red
    **stuck prompt** chip instead of waiting silently, so a wedged group is
-   never something you discover by accident. Hard-won lessons persist
+   never something you discover by accident. Prompts that pile up behind a
+   blocked pane are delivered as ONE itemized prompt when it clears —
+   oldest first, each still labelled with who sent it and how long it
+   waited — rather than costing the agent a turn apiece, and an exit the
+   orchestrator itself asked for (a kill, an idle-timeout) goes to the
+   audit log instead of interrupting it, since the roster already shows who
+   is alive. Hard-won lessons persist
    across groups via a committed `.loomux/lessons.md`, not just this run.
    The task board and the group lifecycle panel — each its own keystroke
    away on an orchestration pane — persist across a close/reopen and a group
