@@ -16666,14 +16666,29 @@ impl OrchRegistry {
                     // cause a spurious defer anyway: it lands while
                     // `elapsed < REINJECT_CONFIRM_TIMEOUT_MS`, where the
                     // disposition is `Wait` regardless of busy-ness.
-                    match reinject_disposition(
+                    // EVIDENCE (rev-22 N2 isolation, do not merge): the
+                    // plausible-looking regression "never spend the LAST
+                    // attempt into a live turn". The pure predicate and its
+                    // table are untouched; only this call site re-maps the
+                    // final Retry back to DeferBusy while the pane is busy, so
+                    // attempts 1..n-1 behave exactly as shipped (every
+                    // pre-existing test still passes) but the abandon/badge
+                    // escalation is never reached on a never-quiet pane.
+                    let mut __disp = reinject_disposition(
                         confirmed_delivery,
                         acked,
                         !currently_quiet,
                         now.saturating_sub(attempted_ms),
                         REINJECT_CONFIRM_TIMEOUT_MS,
                         REINJECT_BUSY_DEFER_MAX_MS,
-                    ) {
+                    );
+                    if __disp == ReinjectDisposition::Retry
+                        && !currently_quiet
+                        && a.compact_reinject_attempts >= MAX_REINJECT_ATTEMPTS
+                    {
+                        __disp = ReinjectDisposition::DeferBusy;
+                    }
+                    match __disp {
                         ReinjectDisposition::Resolved => {
                             a.compact_pending = false;
                             a.compact_reinject_attempted_ms = None;
