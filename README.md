@@ -237,6 +237,7 @@ src-tauri/src/
   fileedit.rs       file-editor overlay (#174): lazy tree, read/write (atomic + hash conflict), streaming gitignore-aware search/replace (#207) + path-only name enumeration (#214); server-side path safety
   filemgr.rs        file-MANAGER pane (#214): list, new file/folder, rename, delete-to-Recycle-Bin, open-with-default-app, open-with chooser, reveal-in-OS-file-manager; reuses fileedit's path choke point. Shell APIs come from the `windows` dep we already have (ShellExecuteW + SHFileOperationW)
   filehash.rs       file hashing (#214): SHA-256/512, SHA-1, CRC-32/16/8 — streamed off-thread on a worker (never the main thread), cancellable via the #207 registry
+  winpath.rs        fresh PATH/PATHEXT resolution (registry-merged, so a CLI installed mid-session is findable) + the `which`-style resolver shared by "open in editor" and direct-CLI spawn. Also resolves what the gh/git gate shims bake in: the absolute `sh.exe` (#335) and, from the same install layout, the POSIX coreutils dir the gate normalizes with (#509) — derived, never hardcoded. See doc/design/shim-path-integrity.md
   command_manifest.rs  single source of truth for the ACL manifest's 123 app-command names (#363) — shared by build.rs (include!, feeds the app manifest) and lib.rs (feeds tests/acl_manifest.rs, the coherence guard). See doc/design/acl-manifest.md
   lib.rs            Tauri wiring
 src-tauri/
