@@ -5120,8 +5120,18 @@ a bind.
    guaranteed only *within* a group, which is all that is needed: every consumer of an id — the live
    filter, the audit scan, the snapshot — is group-scoped.
 3. **The snapshot carries staged entries, not just live ones — and an id is closed in the audit
-   only when it leaves staging.** These are one fix, because either alone still loses work (review
-   round 1, finding 1). Writing live queues only meant the first admission after a restart rewrote
+   only when it leaves staging.** These are one fix because the two halves are **complementary**,
+   each closing a different view (review round 1, finding 1). Measured, not assumed — the isolated
+   mutation runs on #523 show that neither half alone produces the loss: reverting only the
+   snapshot half removes the payloads while the audit derivation still names the ids, and reverting
+   only the audit half closes that derivation while the snapshot still carries the payloads
+   (`a_second_restart_still_reports_a_backlog_nobody_had_read_yet` passes under that one). Only
+   together is the entry gone from both views.
+   **An earlier revision of this paragraph said "either alone still loses work"; that was an
+   overclaim and the runs disproved it.** It is corrected here rather than deleted because this
+   paragraph is the thing a future change will trust instead of re-deriving, and knowing that the
+   two halves are complementary rather than individually sufficient is exactly what would let
+   someone remove the "wrong" one. Writing live queues only meant the first admission after a restart rewrote
    the file without the backlog it had just staged into memory; and because `delivery-recovered`
    was written at *stage* time, the audit derivation — the one view needing no snapshot — was
    already closed. A process dying before the orchestrator's session-start `queue_orphans` call
