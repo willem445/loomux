@@ -4850,9 +4850,20 @@ stale: type a character and delete it") — asserting staleness would be exactly
 `.loomux/lessons.md` calls a defect.
 
 **Open, and deliberately not taken here.** The structural evidence this fix wanted is *rendered
-rows*. #530's `termgrid` composed-grid VT replay would let question detection run against what is
-actually on screen, which distinguishes still-displayed from scrolled-past for real. That is a
-follow-up issue, not a mid-flight dependency of this one.
+rows*, and #530 has since landed `orchestration::termgrid` — a dependency-free VT replay that
+composes the raw ring onto a screen. That is the right foundation for answering "is this question
+still **displayed**", which is the one question a byte ring cannot answer.
+
+It is not a drop-in, and the trap is worth writing down for whoever takes the follow-up:
+`termgrid::render_screen` returns **scrolled-off history rows followed by the on-screen rows,
+joined into one string**. Pointing `prompt_wait_detected` at that output unchanged would reproduce
+this exact bug — an answered question that scrolled off is still in the history half, so the
+detector would keep matching it, just as it does in the ring today. What the follow-up needs is a
+variant exposing **only the on-screen rows** (`Screen`'s `grid`, which the module already keeps
+separately from `history` but does not currently return on its own). With that, "the question is
+still displayed" becomes a real structural reading rather than a hypothesis, and
+`StrandedBlocker::QuestionStale` could become a release instead of a badge — which is the only
+thing that would justify one.
 
 ## Delivery queue (#445)
 
