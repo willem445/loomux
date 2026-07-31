@@ -179,6 +179,79 @@ pub fn resolve_sh(git_exe: &Path, path_env: &str, pathext: &str) -> Option<PathB
     resolve_program("sh", path_env, pathext)
 }
 
+/// Resolve the directory holding the POSIX **coreutils** the gate shims
+/// normalize with (`tr`, `head`, `tail`, `date`, `cat`, `rm`, `mv`), derived
+/// from a resolved `sh.exe`'s own install layout (#509).
+///
+/// `sh.exe` is launched by absolute path from the `.cmd` delegator (#335), so
+/// it inherits the *caller's* PATH — and a PowerShell/cmd pane's PATH does not
+/// carry Git for Windows' `usr\bin`. Every `tr` in the shim then failed with
+/// "command not found" and its command substitution yielded the empty string,
+/// which silently opened the `gh api` release/merge gate. The shims prepend
+/// this directory to fix that, so it must be found the same way `sh` is: by
+/// probing the install layout (never a hardcoded `C:\Program Files\Git\…` —
+/// CLAUDE.md constraint 8, #263).
+///
+/// Probed with `tr` specifically because that is the tool whose absence caused
+/// #509 and the one every normalization depends on; `sh` and the coreutils ship
+/// in the same `usr\bin` in every Git for Windows layout, but the *fallback*
+/// PATH lookup means we still return the directory `tr` actually lives in
+/// rather than assuming it sits beside `sh`.
+///
+/// The layout probe looks for `tr.exe` unconditionally — it is describing the
+/// Git for Windows install shape, exactly as `resolve_sh` above probes
+/// `sh.exe`, and it is not a platform bug that it finds nothing off Windows:
+/// there the caller (`resolve_shim_toolchain`) does not use this at all, and
+/// the PATH fallback below is the honest answer. A `cfg!(windows)`-switched
+/// probe name was worse than merely redundant — the ancestor walk climbs three
+/// levels, which from a temp directory on Linux reaches `/` and "resolves"
+/// `/usr/bin/tr`, i.e. a directory that has nothing to do with the `sh` it was
+/// asked about. Same false positive would apply to any short path.
+pub fn resolve_utils_dir(sh_exe: &Path, path_env: &str, pathext: &str) -> Option<PathBuf> {
+    let mut dir = sh_exe.parent().map(Path::to_path_buf);
+    for _ in 0..3 {
+        let Some(d) = dir else { break };
+        for rel in ["tr.exe", "usr/bin/tr.exe", "bin/tr.exe"] {
+            let cand = d.join(rel);
+            if cand.is_file() {
+                return cand.parent().map(Path::to_path_buf);
+            }
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    resolve_program("tr", path_env, pathext).and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Render a directory in the form an MSYS/Git-Bash `sh` understands **inside a
+/// `$PATH` list**: `C:\Program Files\Git\usr\bin` → `/c/Program Files/Git/usr/bin`.
+///
+/// This conversion is load-bearing, not cosmetic. A drive-letter entry in an
+/// MSYS `$PATH` is not resolvable — the runtime reads `C:/…` as a *relative*
+/// directory named `C:` — so prepending the Windows form buys exactly nothing
+/// and the shim's `tr` stays missing (measured in the #509 PR: the `C:/…` form
+/// still reported `head: command not found`, the `/c/…` form resolved
+/// `tr (GNU coreutils) 8.32`). A path with no drive letter (every POSIX host,
+/// and any UNC path we cannot express in this form) passes through with only
+/// its separators normalized.
+pub fn to_msys_dir(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let mut chars = s.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        // `C:/rest` / `C:` → `/c/rest`. Only a single ASCII drive letter
+        // followed by `:` qualifies; anything else is left alone.
+        (Some(d), Some(':'), sep) if d.is_ascii_alphabetic() && matches!(sep, Some('/') | None) => {
+            let rest = s[2..].trim_start_matches('/');
+            let low = d.to_ascii_lowercase();
+            if rest.is_empty() {
+                format!("/{low}")
+            } else {
+                format!("/{low}/{rest}")
+            }
+        }
+        _ => s,
+    }
+}
+
 /// Whether `path` can be handed straight to `CreateProcess` (portable-pty's
 /// `CommandBuilder`) as the pty child, versus needing a shell interpreter.
 ///
@@ -370,5 +443,80 @@ mod tests {
     #[test]
     fn native_executable_is_always_true_off_windows() {
         assert!(is_native_executable(Path::new("/usr/bin/claude")));
+    }
+
+    /// #509: the coreutils the gate normalizes with must be found from `sh`'s
+    /// own install layout. The `cmd\`-layout case: `sh.exe` in `usr\bin\` with
+    /// `tr` beside it.
+    #[test]
+    fn resolve_utils_finds_the_coreutils_dir_beside_sh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("usr").join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("sh.exe"), b"sh").unwrap();
+        // `tr.exe`, not a cfg-switched name: the probe describes the Git for
+        // Windows layout on every host (see resolve_utils_dir's note), so the
+        // fixture must too — otherwise this test would pass on Linux for the
+        // wrong reason, by finding the machine's real /usr/bin.
+        fs::write(bin.join("tr.exe"), b"tr").unwrap();
+        assert_eq!(resolve_utils_dir(&bin.join("sh.exe"), "", "").unwrap(), bin);
+    }
+
+    /// #509: the `bin\sh.exe` layout — Git for Windows ships an `sh.exe` in
+    /// `bin\` that has NO coreutils beside it; the real `tr` is in the `usr\bin\`
+    /// sibling one level up. Resolving "the directory sh lives in" would have
+    /// prepended a coreutils-free directory and left the gate exactly as broken,
+    /// so this walks the layout the way `resolve_sh` does.
+    #[test]
+    fn resolve_utils_walks_up_to_usr_bin_when_sh_has_no_coreutils_beside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shbin = tmp.path().join("bin");
+        fs::create_dir_all(&shbin).unwrap();
+        fs::write(shbin.join("sh.exe"), b"sh").unwrap();
+        let utils = tmp.path().join("usr").join("bin");
+        fs::create_dir_all(&utils).unwrap();
+        fs::write(utils.join("tr.exe"), b"tr").unwrap();
+        assert_eq!(resolve_utils_dir(&shbin.join("sh.exe"), "", "").unwrap(), utils);
+    }
+
+    /// #509: nothing in the layout and nothing on PATH — the caller must treat
+    /// this as "no coreutils dir to bake in" (the shim then still fails CLOSED
+    /// at run time via its own dependency self-check) rather than guess a path.
+    ///
+    /// This also pins the ancestor walk against reaching UNRELATED directories.
+    /// The first cut probed a cfg-switched bare `tr` off Windows and went red
+    /// here on Linux CI: the walk climbs three levels, which from a temp dir
+    /// reaches `/` and "resolved" the machine's own `/usr/bin` — a directory
+    /// with no relationship to the `sh` it was asked about. Whatever it returns
+    /// must come from the passed-in layout or from PATH, never from happening
+    /// to be near the filesystem root.
+    #[test]
+    fn resolve_utils_is_none_when_nothing_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sh = tmp.path().join("sh.exe");
+        fs::write(&sh, b"sh").unwrap();
+        assert!(resolve_utils_dir(&sh, "", ".EXE").is_none());
+        // Same shape one level deeper, so the walk has ancestors to climb and
+        // still must come back empty.
+        let nested = tmp.path().join("a").join("b").join("bin");
+        fs::create_dir_all(&nested).unwrap();
+        let sh2 = nested.join("sh.exe");
+        fs::write(&sh2, b"sh").unwrap();
+        assert!(resolve_utils_dir(&sh2, "", ".EXE").is_none());
+    }
+
+    /// #509: a `$PATH` entry an MSYS `sh` can actually resolve. A `C:/…` entry
+    /// reads as a relative directory named `C:` and finds nothing — measured,
+    /// not assumed.
+    #[test]
+    fn msys_dir_rewrites_a_drive_letter_and_leaves_posix_paths_alone() {
+        assert_eq!(to_msys_dir(Path::new(r"C:\Program Files\Git\usr\bin")), "/c/Program Files/Git/usr/bin");
+        assert_eq!(to_msys_dir(Path::new("D:/tools/bin")), "/d/tools/bin");
+        assert_eq!(to_msys_dir(Path::new(r"C:\")), "/c");
+        assert_eq!(to_msys_dir(Path::new("/usr/bin")), "/usr/bin");
+        // Not a drive letter — a UNC share, and a bare relative dir — pass through
+        // (separator-normalized) rather than being mangled into `/\/host/...`.
+        assert_eq!(to_msys_dir(Path::new(r"\\host\share\bin")), "//host/share/bin");
+        assert_eq!(to_msys_dir(Path::new("relative/bin")), "relative/bin");
     }
 }

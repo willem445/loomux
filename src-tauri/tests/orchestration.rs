@@ -34,6 +34,7 @@ use loomux_lib::orchestration::{
     resolve_output_text, format_output_tail, OUTPUT_TAIL_MAX_BYTES,
     gh_gate_decision, gh_is_merge_invocation, gh_positionals, gh_release_action, gh_repo_flag,
     gh_shim_cmd, gh_shim_sh, git_shim_cmd, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
+    resolve_shim_toolchain, ShimPaths,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     workflow_mode_notice,
@@ -12930,7 +12931,7 @@ fn git_tag_push_classifies_tag_pushes() {
 
 #[test]
 fn git_shim_script_bakes_real_git_and_gates_tag_push() {
-    let sh = git_shim_sh("C:/Program Files/Git/cmd/git.exe");
+    let sh = git_shim_sh("C:/Program Files/Git/cmd/git.exe", &shim_paths());
     assert!(sh.contains("REAL_GIT=\"C:/Program Files/Git/cmd/git.exe\""), "bakes the real git path");
     assert!(sh.starts_with("#!/bin/sh"));
     // Only `git push` is inspected; everything else execs immediately.
@@ -13308,6 +13309,14 @@ fn grants_are_not_writable_by_any_mcp_tool() {
     assert!(!gdir.join("dangerous_mode").exists(), "no MCP tool may create the dangerous_mode marker");
 }
 
+/// The shim paths the PRODUCT bakes in (#509), resolved the same way
+/// `ensure_shims` does. Every harness test builds its shim with these so it
+/// pins what actually ships — and so the shim's own dependency self-check finds
+/// the coreutils on a runner whose PATH carries `Git\bin` but not `Git\usr\bin`.
+fn shim_paths() -> ShimPaths {
+    resolve_shim_toolchain().1
+}
+
 /// Fake gh recording args and answering pr/repo view from env; anything else
 /// "succeeds". Returns its path. Shared by the harness tests.
 fn write_fake_gh(root: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
@@ -13337,7 +13346,7 @@ fn gh_shim_harness_grant_authorizes_one_merge_and_releases_are_gated() {
     let log = root.join("gh.log");
     let fake = write_fake_gh(root, &log);
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
 
     let run = |argv: &[&str], num: &str| -> bool {
@@ -13451,7 +13460,7 @@ fn gh_shim_harness_granted_merge_with_dash_r_repo_is_allowed_not_blocked_as_unve
     let log = root.join("gh.log");
     let fake = write_fake_gh_rejecting_dash_r_on_repo_view(root, &log);
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
 
     let run = |argv: &[&str], num: &str| -> (bool, String) {
@@ -13523,7 +13532,7 @@ fn gh_shim_harness_a_merge_that_fails_at_github_does_not_burn_the_one_time_grant
     let log = root.join("gh.log");
     let fake = write_fake_gh_with_merge_exit(root, &log);
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
 
     let run = |num: &str, merge_exit: &str| -> bool {
@@ -13604,7 +13613,7 @@ fn gh_shim_harness_a_release_publish_that_fails_at_github_does_not_burn_the_one_
     let log = root.join("gh.log");
     let fake = write_fake_gh_with_release_exit(root, &log);
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
 
     let run = |tag: &str, release_exit: &str| -> bool {
@@ -13669,7 +13678,7 @@ fn git_shim_harness_gates_tag_pushes() {
          fi\n\
          printf 'FAKE-GIT-RAN\\n'; exit 0\n").unwrap();
     let shim = root.join("git");
-    std::fs::write(&shim, git_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, git_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
     let run = |argv: &[&str], fake_tag: &str| -> bool {
         Command::new("sh").arg(&shim).args(argv)
@@ -13758,7 +13767,7 @@ fn git_shim_harness_a_tag_push_that_fails_does_not_burn_the_one_time_grant() {
     std::fs::create_dir_all(&group).unwrap();
     let fake = write_fake_git_with_push_exit(root);
     let shim = root.join("git");
-    std::fs::write(&shim, git_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, git_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
 
     let run = |push_exit: &str| -> bool {
@@ -13830,8 +13839,8 @@ fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
     // copies to the same mechanics. A one-sided edit to either fragment (a
     // claim race fixed in one shim but not the other, an audit event added
     // to one and not the other, …) must go red here, not drift silently.
-    let gh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
-    let git = git_shim_sh("C:/Program Files/Git/cmd/git.exe");
+    let gh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe", &shim_paths());
+    let git = git_shim_sh("C:/Program Files/Git/cmd/git.exe", &shim_paths());
     for f in ["loomux_grant_claim", "loomux_grant_settle"] {
         let a = extract_shell_fn(&gh, f);
         let b = extract_shell_fn(&git, f);
@@ -13839,11 +13848,664 @@ fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
     }
 }
 
+/// Record that a #509 pin could not arm — visibly, and in a way that cannot let
+/// coverage silently reach zero.
+///
+/// **rev-21 B2.** The first cut was `eprintln!` + `return`. A `return` from a
+/// `#[test]` IS a pass, and `ci.yml` runs `cargo test --locked` with no
+/// `--nocapture`, so libtest captures a passing test's stderr and prints
+/// nothing — grep all three #525 build jobs and there is not one SKIP line. The
+/// stated rationale, "skip loudly or run armed, nothing between", did not ship:
+/// on macOS and Windows these pins reported `... ok`, indistinguishable from
+/// armed. That is the same fail-open-while-looking-healthy shape as the bug this
+/// PR fixes, one level up, and it is why the mechanism — not the intent — had to
+/// change.
+///
+/// Two mechanisms, because visibility alone is not enough:
+///
+/// 1. **Visible.** The skip is appended to `$GITHUB_STEP_SUMMARY` when set —
+///    plain file IO that no test harness intercepts, rendered on the run page.
+///    A skip taken on CI is now readable rather than merely intended to be.
+/// 2. **Cannot reach zero.** On Linux this is not a skip at all, it FAILS.
+///    ubuntu-22.04 is the only job that arms these pins (run 30631911457
+///    observed the headline pin red there against the mutated shim), so an
+///    unarmed pin on Linux *is* #509 coverage at zero with CI green. Making it
+///    red is what turns "coverage should not silently vanish" from an
+///    aspiration into a property.
+fn pin_could_not_arm(test: &str, why: &str) {
+    use std::io::Write;
+    let msg = format!("SKIP {test}: {why}");
+    // Straight to fd 2, NOT `eprintln!`. libtest's capture is a thread-local
+    // consulted by the `print!`/`eprintln!` machinery; a direct write to the
+    // `Stderr` handle does not go through it, so this lands in the CI log of a
+    // PASSING test — which `eprintln!` demonstrably did not (zero SKIP lines
+    // across three #525 build jobs, rev-21 B2). Verified by reading the log of
+    // the run that introduced it, not by assuming: see the PR body.
+    let _ = writeln!(std::io::stderr(), "{msg}");
+    // Belt: the run-page summary, which survives even if a future libtest does
+    // capture fd 2.
+    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "- :warning: **#509 pin did not arm** — `{msg}`");
+        }
+    }
+    assert!(
+        !cfg!(target_os = "linux"),
+        "{msg}\n\nOn Linux the #509 stripped-PATH pins MUST arm: ubuntu-22.04 is the only job \
+         that arms them, so an unarmed pin here means #509 coverage is at ZERO while CI is \
+         green — precisely the failure this guard exists to make impossible. If a runner or \
+         image change made this legitimate, fix the harness or move the guard deliberately. Do \
+         not delete it to get back to green."
+    );
+}
+
+/// The MSYS form of a path, for baking into a shim fixture. Mirrors
+/// `winpath::to_msys_dir`, which an integration test cannot reach (`winpath` is
+/// a private module); the product's own conversion is pinned by
+/// `winpath::tests::msys_dir_rewrites_a_drive_letter_and_leaves_posix_paths_alone`.
+fn msys_dir_for_fixture(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let mut c = s.chars();
+    match (c.next(), c.next()) {
+        (Some(d), Some(':')) if d.is_ascii_alphabetic() => {
+            format!("/{}/{}", d.to_ascii_lowercase(), s[2..].trim_start_matches('/'))
+        }
+        _ => s,
+    }
+}
+
+/// Any POSIX `sh` this host can run a shim under — the product's own resolution
+/// on Windows, `/bin/sh` elsewhere. Unlike `stripped_path_harness` this asks for
+/// nothing but a shell, so a test that supplies its own `utils_dir` can run on
+/// every platform.
+fn any_posix_sh() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        resolve_shim_toolchain().0
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some("/bin/sh".to_string())
+    }
+}
+
+/// The POSIX tools the shims' dependency preamble asserts (#509). One list, two
+/// consumers: `stripped_path_harness` needs them all present in a single
+/// directory before it can arm a pin, and
+/// `gh_and_git_shim_deps_preamble_stays_byte_identical` pins that the generated
+/// script really covers exactly these. Mirrors the list in `shim_deps_preamble`
+/// — if that one grows a tool, this goes with it or the byte-identical test says
+/// so.
+const SHIM_DEP_TOOLS: [&str; 7] = ["tr", "head", "tail", "date", "cat", "rm", "mv"];
+
+/// The `(sh, ShimPaths)` a stripped-PATH harness should use on THIS host, or
+/// `None` if it cannot assemble one (#509).
+///
+/// On Windows this is the product's own resolution, so the pin exercises what
+/// actually ships. Off Windows `resolve_shim_toolchain` deliberately bakes
+/// nothing — there is no `.cmd` layer and the coreutils are simply on PATH —
+/// but the dependency preamble is the *same generated script*, so the test
+/// supplies the equivalent itself: `/bin/sh` plus the directory `tr` really
+/// lives in. That keeps the headline pin ARMED on the unix runners, where a
+/// POSIX `sh` honors a stripped PATH, instead of leaving it skipped on every
+/// platform CI builds.
+fn stripped_path_harness() -> Option<(String, ShimPaths)> {
+    #[cfg(target_os = "windows")]
+    {
+        let (sh, paths) = resolve_shim_toolchain();
+        if paths.utils_dir.is_none() {
+            return None;
+        }
+        sh.map(|s| (s, paths))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // EVERY dependency has to live in the ONE directory `utils_dir` names.
+        // The shim takes a single directory, not a list, because Git for Windows
+        // ships all of them in one `usr\bin` — so a host that splits them cannot
+        // supply a sufficient one and must SKIP rather than hand the shim a
+        // directory that was never going to work. macOS is exactly that host
+        // (`/usr/bin/tr` but `/bin/date`), and the first cut of this helper —
+        // "find `tr`, use its directory" — sent the macOS runner red: the shim
+        // correctly refused, naming `date`, for a reason with nothing to do with
+        // #509. Checking the whole set is what makes the skip honest.
+        for cand in ["/usr/bin", "/bin"] {
+            let dir = std::path::Path::new(cand);
+            if SHIM_DEP_TOOLS.into_iter().all(|d| dir.join(d).is_file()) {
+                return Some((
+                    "/bin/sh".to_string(),
+                    ShimPaths { utils_dir: Some(dir.display().to_string()), git_dir: None },
+                ));
+            }
+        }
+        None
+    }
+}
+
+/// A wrapper that reproduces what a PowerShell/cmd pane hands the shim (#509):
+/// a PATH carrying no Git for Windows coreutils. It runs whatever script it is
+/// given under `sh_abs`, so the same wrapper drives both the shim and the
+/// precondition probe.
+///
+/// The PATH is assigned **inside the shell**, not in the child's environment,
+/// and that is the whole point. Setting it via `Command::env_clear()` +
+/// `.env("PATH", …)` is not something a test can be built on: the MSYS runtime
+/// re-seeds PATH when a native Windows parent launches `sh.exe`, and on the
+/// GitHub windows runner it put the coreutils back — the un-repaired shim then
+/// found `tr`, behaved perfectly correctly, and the fail-closed pin failed for
+/// a reason with nothing to do with the code under test (#509, CI attempts 1
+/// and 2, identically). An assignment in the script runs after all of that —
+/// and it is verified, not assumed: see
+/// `assert_wrapper_really_hides_the_coreutils`.
+///
+/// `sh_abs` is baked in and the target is passed to it as a script argument
+/// rather than `exec`d directly: with PATH stripped there is no `sh` left to
+/// find, and a Windows checkout has no executable bit to rely on either.
+fn write_stripped_path_wrapper(root: &std::path::Path, sh_abs: &str) -> std::path::PathBuf {
+    let p = root.join("strip_path.sh");
+    std::fs::write(&p, format!(
+        "#!/bin/sh\nPATH=\"/loomux-nonexistent-509\"\nexport PATH\nexec \"{sh_abs}\" \"$@\"\n"
+    )).unwrap();
+    p
+}
+
+/// Run the generated gh shim the way a `.cmd` delegator does — `sh.exe` by
+/// ABSOLUTE path (#335) — through the coreutils-free wrapper above.
+/// Returns (success, both output streams for the diagnostic).
+fn run_shim_with_stripped_path(
+    sh_abs: &str,
+    wrapper: &std::path::Path,
+    shim: &std::path::Path,
+    group: &std::path::Path,
+    argv: &[&str],
+) -> (bool, String) {
+    let out = std::process::Command::new(sh_abs)
+        .arg(wrapper)
+        .arg(shim)
+        .args(argv)
+        .env("LOOMUX_GROUP_DIR", group)
+        .env("FAKE_BASE", "main")
+        .env("FAKE_DEFAULT", "main")
+        .env("FAKE_NUM", "1")
+        .output()
+        .unwrap();
+    // Both streams in the diagnostic: a shim that wrongly passes through says so
+    // on stdout (the real gh's output), and one that refuses says so on stderr.
+    (
+        out.status.success(),
+        format!(
+            "[stderr] {} [stdout] {}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+    )
+}
+
+/// Whether this host can actually express #509's condition — the shim's own
+/// `tr` failing — under the stripped-PATH wrapper.
+///
+/// **A functional capability probe, deliberately, not platform detection.** It
+/// runs `printf x | tr x y` and checks the output, rather than asking
+/// `command -v` or branching on the OS. What the gate depends on is `tr`
+/// *working*; a `tr` that resolves but cannot run and a `tr` that runs despite
+/// a stripped PATH are both answered correctly by executing it. Sniffing the
+/// platform would encode today's runner image as a fact about Windows, which it
+/// is not — this same host arms the pin when its `sh` honors the strip.
+///
+/// `false` means the environment refuses to be stripped, and the caller must
+/// then emit a LOUD, NAMED skip. That is not hypothetical: on the GitHub
+/// windows runner the Git-for-Windows coreutils stay reachable however PATH is
+/// set — via the child environment (#509 CI attempts 1–2) or assigned inside
+/// the shell before `exec` (attempt 3, where this probe reported `FOUND`).
+///
+/// The rule is: **skip loudly or run armed, never anything between.** Softening
+/// the check into a pass would leave a test that looks like it guards #509 and
+/// silently does not — the exact failure class `.loomux/lessons.md` calls "a
+/// claim is a deliverable". A host that cannot hide the coreutils is also a
+/// host on which #509 cannot reproduce, so skipping there loses no coverage
+/// that was ever available; it just has to say so out loud.
+fn stripped_path_hides_the_coreutils(sh_abs: &str, wrapper: &std::path::Path, root: &std::path::Path) -> bool {
+    let probe = root.join("probe_tr.sh");
+    std::fs::write(&probe, "#!/bin/sh\nprintf x | tr x y\n").unwrap();
+    let out = std::process::Command::new(sh_abs).arg(wrapper).arg(&probe).output().unwrap();
+    // A working `tr` prints exactly "y". Anything else — not found, broken, no
+    // output at all — means the condition IS expressible here.
+    String::from_utf8_lossy(&out.stdout).trim() != "y"
+}
+
+/// **rev-21 N2 — the invariant, and the one #509 pin that arms EVERYWHERE.**
+///
+/// A `tr` that RESOLVES but cannot RUN reproduces #509 exactly: empty
+/// substitution, gate matches nothing, tag deletion straight through. The
+/// startup self-check is structurally blind to it, because `command -v` proves
+/// resolution and nothing more — which is the gap rev-21 N1 names. The
+/// point-of-use guard (`loomux_norm_guard`) is what closes it, and this pins
+/// that it does.
+///
+/// Unlike the two stripped-PATH pins, this one needs the environment to hide
+/// nothing: it bakes a `utils_dir` of its own holding a deliberately broken
+/// `tr`, so the shim's own PATH repair puts that tool first on every platform.
+/// No capability probe, no skip, no `#[cfg]` — it arms on all four CI jobs,
+/// which is also why it is the pin that does not depend on ubuntu staying the
+/// only armed one.
+#[test]
+fn gh_shim_refuses_when_tr_resolves_but_cannot_run() {
+    use std::process::Command;
+    let Some(sh) = any_posix_sh() else {
+        pin_could_not_arm("gh_shim_refuses_when_tr_resolves_but_cannot_run", "no POSIX sh on this host");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let utils = root.join("utils");
+    std::fs::create_dir_all(&utils).unwrap();
+    // Resolvable — `command -v tr` finds it, so the startup probe is satisfied —
+    // and broken: it prints nothing and exits non-zero, exactly what a corrupt
+    // install, an arch mismatch or a fork failure looks like at the call site.
+    let broken_tr = utils.join("tr");
+    std::fs::write(&broken_tr, "#!/bin/sh\nexit 1\n").unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    // Only `tr` is shadowed: every other dependency still resolves from the
+    // inherited PATH, so the self-check passes and the ONLY thing wrong is that
+    // one normalizer cannot run.
+    std::fs::write(&shim, gh_shim_sh(
+        &fake.display().to_string(),
+        &ShimPaths { utils_dir: Some(msys_dir_for_fixture(&utils)), git_dir: None },
+    )).unwrap();
+    let _ = Command::new(&sh).arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), broken_tr.display())).status();
+
+    let out = Command::new(&sh).arg(&shim)
+        .args(["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v1.2.3"])
+        .env("LOOMUX_GROUP_DIR", &group)
+        .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", "1")
+        .output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(!out.status.success(),
+        "a published tag ref must not be deletable when `tr` cannot run, stderr: {err}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "",
+        "the real gh must never be reached");
+    assert!(err.contains("could not normalize"),
+        "the refusal must name the failed normalization, got: {err}");
+    // THE POINT: the startup dependency check did NOT save us here — `tr`
+    // resolved fine. If this ever starts firing instead, the guard below has
+    // stopped being the thing under test.
+    assert!(!err.contains("cannot find the POSIX tool"),
+        "this must be caught at the point of use, not by the resolution probe: {err}");
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("gate-degraded-normalize-failed"),
+        "and it must be audited distinctly from a missing tool, got: {audit}");
+}
+
+/// **The #509 pin.** Invoked from a PowerShell/cmd pane the shim's `sh` inherits
+/// a PATH with no Git for Windows coreutils, and every `tr` in it died with
+/// "command not found" — leaving its command substitution EMPTY and carrying on.
+/// Empty is not a safe default: an empty `path_low`/`low` matched none of the
+/// `gh api` release/merge arms, so `gh api -X DELETE …/git/refs/tags/v1.2.3` and
+/// a graphql `mergePullRequest` — both refused under Git Bash — sailed straight
+/// through to the real gh. This runs the REAL generated shim under exactly that
+/// PATH and pins that they are refused, and that an ordinary read still works.
+///
+/// MUTATION CHECK: take the PATH repair away (`ShimPaths::default()`) and the
+/// last assertion here goes red — see
+/// `gh_shim_without_its_coreutils_fails_closed_not_open`, which pins what the
+/// un-repaired shim does instead (refuse loudly, never pass through).
+#[test]
+fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
+    let Some((sh_abs, paths)) = stripped_path_harness() else {
+        pin_could_not_arm("gh_shim_gates_the_api_shapes…",
+            "no POSIX sh, or the 7 dependencies do not share one directory on this host");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &paths)).unwrap();
+    // The shim `exec`s the fake gh, which needs an executable bit on the unix
+    // runners. No-op on Windows.
+    let _ = std::process::Command::new(&sh_abs).arg("-c")
+        .arg(format!("chmod +x '{}'", fake.display())).status();
+    let wrapper = write_stripped_path_wrapper(root, &sh_abs);
+    if !stripped_path_hides_the_coreutils(&sh_abs, &wrapper, root) {
+        pin_could_not_arm("gh_shim_gates_the_api_shapes…",
+            "this host's sh cannot be made to hide the coreutils, so #509's condition is inexpressible here");
+        return;
+    }
+
+    let ran = || std::fs::read_to_string(&log).unwrap_or_default();
+    // Every one of these is a publish-to-the-world or merge shape that only the
+    // `tr`-normalized `gh api` arms catch. Each must be REFUSED, and the real gh
+    // must never be reached.
+    //
+    // The graphql queries use VARIABLES rather than inline string literals on
+    // purpose, and it is not cosmetic: an argument carrying a `"` is escaped by
+    // Rust's Windows spawner as `\"`, and the MSYS runtime that parses `sh.exe`'s
+    // command line splits on that — the argument arrives truncated at the first
+    // quote and the test stops testing what it says it does. (Measured: the
+    // literal form reached the shim as `query=mutation` and nothing else.)
+    // Variables are also the shape #196 r6 says a text scan must not be beaten
+    // by, so this is the harder case anyway.
+    for (argv, what) in [
+        (vec!["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v1.2.3"], "DELETE of a published tag ref"),
+        (vec!["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v9.9.9"], "POST of a release"),
+        (vec!["api", "graphql", "-f", "query=mutation M($id:ID!){mergePullRequest(input:{pullRequestId:$id}){clientMutationId}}"], "graphql mergePullRequest"),
+        (vec!["api", "graphql", "-f", "query=mutation M($t:String!){createRelease(input:{tagName:$t}){clientMutationId}}"], "graphql createRelease"),
+    ] {
+        let before = ran();
+        let (ok, err) = run_shim_with_stripped_path(&sh_abs, &wrapper, &shim, &group, &argv);
+        assert!(!ok, "{what} must be refused under a PowerShell-style PATH, {err}; fake gh saw: {}", ran());
+        assert_eq!(ran(), before, "{what} must never reach the real gh (it did)");
+        assert!(!err.contains("command not found"),
+            "the gate must not be normalizing with tools it cannot find, stderr: {err}");
+    }
+    // …and the shim is still USABLE: an ordinary read passes through. This is the
+    // assertion the mutation kills — without the PATH repair the dependency
+    // self-check refuses this too.
+    let before = ran();
+    let (ok, err) = run_shim_with_stripped_path(&sh_abs, &wrapper, &shim, &group, &["api", "repos/o/r"]);
+    assert!(ok, "an ordinary GET must still pass through, stderr: {err}");
+    assert_ne!(ran(), before, "an ordinary GET must reach the real gh");
+}
+
+/// The other half of the #509 mutation check: with NO coreutils dir baked in
+/// (the pre-fix state, and the state on a machine where shim-write time could
+/// not find one), the shim must refuse LOUDLY rather than run a gate that
+/// silently skips its own normalization. Fail closed, never open — including for
+/// the innocuous read that the repaired shim lets through above.
+#[test]
+fn gh_shim_without_its_coreutils_fails_closed_not_open() {
+    let Some((sh_abs, _)) = stripped_path_harness() else {
+        pin_could_not_arm("gh_shim_without_its_coreutils…",
+            "no POSIX sh, or the 7 dependencies do not share one directory on this host");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &ShimPaths::default())).unwrap();
+    let _ = std::process::Command::new(&sh_abs).arg("-c")
+        .arg(format!("chmod +x '{}'", fake.display())).status();
+    let wrapper = write_stripped_path_wrapper(root, &sh_abs);
+    if !stripped_path_hides_the_coreutils(&sh_abs, &wrapper, root) {
+        pin_could_not_arm("gh_shim_without_its_coreutils…",
+            "this host's sh cannot be made to hide the coreutils, so #509's condition is inexpressible here");
+        return;
+    }
+
+    for argv in [
+        vec!["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v1.2.3"],
+        vec!["api", "repos/o/r"],
+        vec!["pr", "merge", "1"],
+    ] {
+        let (ok, err) = run_shim_with_stripped_path(&sh_abs, &wrapper, &shim, &group, &argv);
+        assert!(!ok, "{argv:?} must be refused when the shim cannot normalize, stderr: {err}");
+    }
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "",
+        "a shim that cannot normalize must never reach the real gh");
+    let (_, err) = run_shim_with_stripped_path(&sh_abs, &wrapper, &shim, &group, &["api", "repos/o/r"]);
+    assert!(err.contains("cannot find the POSIX tool"),
+        "the refusal must SAY what is missing, not just fail, got: {err}");
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("gate-degraded-missing-dep"), "and it must be audited, got: {audit}");
+}
+
+/// #509 (second, separate cause): `gh pr create` died with
+/// `failed to run git: 'merge' is not recognized` because gh shells out to
+/// `git config --get-regexp ^branch\.<b>\.(remote|merge)$`, that resolved to our
+/// `git.cmd`, and the `cmd.exe /c` layer Windows needs to run a `.cmd` re-parses
+/// the command line — splitting it at the unquoted `|`. The shim answers by
+/// handing the real gh a PATH whose `git` is a native `git.exe`, for gh
+/// BUILT-IN subcommands only. Pinned behaviorally: the real gh sees the git dir
+/// first for `gh pr …`, and does NOT for a token that could be an alias or an
+/// extension (which run agent-authored code and keep the gated git).
+#[test]
+fn gh_shim_gives_the_real_gh_a_native_git_only_for_builtin_subcommands() {
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP gh_shim_gives_the_real_gh_a_native_git…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    // A fake gh that reports the PATH it was handed, so we can see what its own
+    // `git` lookup would find.
+    let log = root.join("path.log");
+    let fake = root.join("fakegh_path");
+    std::fs::write(&fake, format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$PATH\" > \"{}\"\nexit 0\n", log.display()
+    )).unwrap();
+    let gitdir = "/c/loomux-test-real-git";
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(
+        &fake.display().to_string(),
+        &ShimPaths { utils_dir: shim_paths().utils_dir, git_dir: Some(gitdir.into()) },
+    )).unwrap();
+    let _ = Command::new("sh").arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let path_seen = |argv: &[&str]| -> String {
+        let _ = std::fs::remove_file(&log);
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .status().unwrap();
+        std::fs::read_to_string(&log).unwrap_or_default()
+    };
+    let p = path_seen(&["pr", "view", "1"]);
+    assert!(p.starts_with(&format!("{gitdir}:")),
+        "`gh pr view` must hand the real gh a native git first on PATH, got: {p}");
+    let p = path_seen(&["repo", "view"]);
+    assert!(p.starts_with(&format!("{gitdir}:")), "…and `gh repo view` likewise, got: {p}");
+    // An alias or an extension runs agent-authored code: the GATED git stays.
+    for argv in [vec!["some-alias"], vec!["extension", "exec", "x"]] {
+        let p = path_seen(&argv);
+        assert!(!p.starts_with(&format!("{gitdir}:")),
+            "{argv:?} must NOT get the ungated git — it can run agent-authored code, got: {p}");
+    }
+}
+
+/// Normalizer sites deliberately NOT wrapped in `loomux_norm_guard`, each with
+/// the reason its emptiness is safe (#509 rev-32 NB2, re-keyed by rev-36 NBa).
+///
+/// `(variable, a substring identifying THAT SITE, reason)`. **The context
+/// substring is load-bearing, not decoration.** Keyed by variable name alone —
+/// as this list shipped — a NEW unguarded fail-open site that happened to reuse
+/// a generic name would inherit the exemption and pass silently; `rest` is the
+/// obvious candidate, and it appears twice already. That made this list's own
+/// "cannot rot into a blanket permission" claim false on the day it landed,
+/// which is worse than a wrong site: the list is the mechanism the entire
+/// guarded/exempt split rests on, so a false claim ABOUT it undermines every
+/// claim made THROUGH it. The pin also asserts each context matches exactly one
+/// site, so an entry cannot silently widen later either.
+const UNGUARDED_TR_SITES: &[(&str, &str, &str)] = &[
+    (
+        "cur_head",
+        "\"$cur_head\" | tr",
+        "the workflow gate's head oid: empty ⇒ the `[ -n \"$cur_head\" ] ||` on the very next          line blocks with unresolved-head, so the gate refuses rather than proceeds",
+    ),
+    (
+        "rest",
+        "*tagName:*)",
+        "tag EXTRACTION for grant keying, not gate matching: empty ⇒ empty rtag ⇒          loomux_release_gate is still entered and can then only allow via a blanket marker or          a grant file it cannot name — it never decides WHETHER to gate",
+    ),
+    ("rest", "*refs/tags/*)", "the same extraction, the refs/tags literal arm"),
+];
+
+/// **rev-32 NB2 / rev-36 NBa+NBb — nothing enforced guard COMPLETENESS, which is
+/// what let NB1 through.** NB1 was one unguarded fail-open normalizer (`ql`)
+/// sitting unnoticed among eleven `tr` sites, reachable only because a different
+/// guard happened to exit first. A human found it by reading; that is not a
+/// mechanism.
+///
+/// So: enumerate every `VAR=$(… | tr …)` in both generated shims and require each
+/// to be guarded within a few lines, or named in `UNGUARDED_TR_SITES` with its
+/// reason. Three properties make the pin itself trustworthy, each added because
+/// the previous cut quietly lacked it:
+///
+/// 1. **Exemptions are keyed by site, not by name** (NBa) — see the list above.
+/// 2. **The site count is asserted exactly** (NBb). `sites >= 1` only caught the
+///    scan dying completely. An exact count also catches the scan going
+///    half-blind: a site written `|tr` with no space, or split across two lines,
+///    drops out of the count and reddens here instead of silently ceasing to be
+///    checked. It equally catches a site ADDED without a decision.
+/// 3. **The pipe match tolerates whitespace** — `| tr`, `|tr`, `|  tr` all count,
+///    so property 2 is a tripwire for a genuinely new shape rather than for
+///    formatting.
+#[test]
+fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
+    let paths =
+        ShimPaths { utils_dir: Some("/c/git/usr/bin".into()), git_dir: Some("/c/git/cmd".into()) };
+    // The expected counts are part of the contract, not a snapshot: changing one
+    // is how you record "I added/removed a normalizer on purpose".
+    let shims = [
+        ("gh", gh_shim_sh("C:/gh.exe", &paths), 11usize),
+        ("git", git_shim_sh("C:/git.exe", &paths), 1usize),
+    ];
+    let mut all_sites: Vec<(String, String)> = Vec::new();
+    for (name, script, expected) in &shims {
+        let lines: Vec<&str> = script.lines().collect();
+        let mut sites = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            // Whitespace-insensitive pipe match, and skip comments: the preamble
+            // quotes `x=$(printf … | tr …)` while explaining the bug and would
+            // otherwise be reported as an unguarded site.
+            let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+            if !squashed.contains("|tr") || line.trim_start().starts_with('#') {
+                continue;
+            }
+            let Some(eq) = line.find("=$(") else { continue };
+            let var: String = line[..eq]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<char>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if var.is_empty() {
+                continue;
+            }
+            sites += 1;
+            all_sites.push((var.clone(), (*line).to_string()));
+            // `path_low`'s guard sits two lines below it, after `ref_low`.
+            let guarded = lines[i..(i + 4).min(lines.len())]
+                .iter()
+                .any(|l| l.contains("loomux_norm_guard") && l.contains(&format!("\"${var}\"")));
+            let exempt = UNGUARDED_TR_SITES
+                .iter()
+                .any(|(v, ctx, _)| *v == var.as_str() && line.contains(*ctx));
+            assert!(
+                guarded || exempt,
+                "{name} shim line {}: `{var}` is normalized through `tr` but is neither guarded                  by loomux_norm_guard nor listed in UNGUARDED_TR_SITES with a reason. An                  unguarded normalizer returns EMPTY when the tool fails, and empty matches no                  gate pattern — that is #509. Guard it, or add it WITH a context substring                  identifying this site and the reason its emptiness is safe.
+  {}",
+                i + 1,
+                line.trim()
+            );
+        }
+        assert_eq!(
+            sites, *expected,
+            "{name} shim: expected {expected} `| tr` sites, scanned {sites}. If you added or              removed a normalizer, update the count deliberately. If you did not, the SCAN has              gone blind to one — check for an assignment split across lines, which this              line-shaped scan cannot see, and which would otherwise stop being checked silently."
+        );
+    }
+    // NBa: every exemption must identify EXACTLY ONE real site. Zero means the
+    // entry is stale and would sit there waiting to cover an unrelated future
+    // site; more than one means the context is not specific enough to be an
+    // identity, which is the blanket-permission failure in a different dress.
+    for (var, ctx, _) in UNGUARDED_TR_SITES {
+        let n = all_sites
+            .iter()
+            .filter(|(v, l)| v.as_str() == *var && l.contains(*ctx))
+            .count();
+        assert_eq!(
+            n, 1,
+            "UNGUARDED_TR_SITES entry ({var:?}, {ctx:?}) matches {n} `| tr` sites; it must match              exactly one. Zero: the site is gone — delete the exemption rather than leaving it              to cover something else later. More than one: the context is a pattern, not a site              identity, and is exempting more than it names."
+        );
+    }
+}
+
+/// #509: the dependency preamble is one gate-integrity guarantee, not two
+/// copies that can drift. Same reasoning as the grant-fragment pin above — the
+/// gh and git shims are separate generated scripts with no shared shell lib, so
+/// a tool dropped from one list and not the other would silently leave one shim
+/// able to run with a normalizer it does not have.
+#[test]
+fn gh_and_git_shim_deps_preamble_stays_byte_identical() {
+    let paths = ShimPaths { utils_dir: Some("/c/git/usr/bin".into()), git_dir: Some("/c/git/cmd".into()) };
+    let gh = gh_shim_sh("C:/gh.exe", &paths);
+    let git = git_shim_sh("C:/git.exe", &paths);
+    let slice = |s: &str| -> String {
+        let start = s.find("# ── The gate's own toolchain").expect("preamble present");
+        let end = start + s[start..].find("\nunset _dep\n").expect("preamble terminator") + "\nunset _dep\n".len();
+        s[start..end].to_string()
+    };
+    assert_eq!(slice(&gh), slice(&git), "the #509 dependency preamble has drifted between the two shims");
+    // And it really does both halves: repair, then assert.
+    let p = slice(&gh);
+    assert!(p.contains("PATH=\"$LOOMUX_UTILS:$PATH\""), "prepends the resolved coreutils dir");
+    // rev-21 N5: match the LIST LINE, not the preamble text. `p.contains(" tr ")`
+    // was also satisfied by the prose above it, so a tool named only in a comment
+    // would have passed — the assertion would not have caught the drift it exists
+    // to catch. Compare the actual `for _dep in …` operand, exactly and in order.
+    let dep_line = p.lines().find(|l| l.trim_start().starts_with("for _dep in "))
+        .expect("the self-check's dependency list line");
+    let listed: Vec<&str> = dep_line
+        .trim()
+        .trim_start_matches("for _dep in ")
+        .trim_end_matches("; do")
+        .split_whitespace()
+        .collect();
+    assert_eq!(listed, SHIM_DEP_TOOLS.to_vec(),
+        "the shim's dependency list must be exactly SHIM_DEP_TOOLS; got {listed:?}");
+    assert!(p.contains("exit 1"), "a missing dependency must fail CLOSED");
+    // With nothing resolvable at write time there is no repair to emit — but the
+    // assertion still ships, so the shim refuses rather than half-normalizing.
+    let bare = gh_shim_sh("C:/gh.exe", &ShimPaths::default());
+    assert!(!bare.contains("LOOMUX_UTILS="), "no coreutils dir resolved → nothing to prepend");
+    assert!(bare.contains("gate-degraded-missing-dep"), "the self-check ships regardless");
+}
+
+/// #509: the gh shim only re-points `git` for gh's BUILT-IN commands. An alias
+/// (`gh myalias`, which for a `!`-alias runs a shell) and `gh extension …` run
+/// agent-authored programs, and those must keep the gated `git` on PATH. This
+/// pins the property structurally; the behavioral half is
+/// `gh_shim_gives_the_real_gh_a_native_git_only_for_builtin_subcommands`.
+#[test]
+fn gh_shim_git_plumbing_case_lists_only_builtin_subcommands() {
+    let sh = gh_shim_sh("C:/gh.exe", &ShimPaths { utils_dir: None, git_dir: Some("/c/git/cmd".into()) });
+    let arm = sh.lines().find(|l| l.contains("PATH=\"/c/git/cmd:$PATH\""))
+        .expect("the git-plumbing arm is emitted when a git dir resolved");
+    for builtin in ["pr", "repo", "issue", "release", "api"] {
+        assert!(arm.contains(builtin), "{builtin} is a gh built-in that shells out to git: {arm}");
+    }
+    for never in ["extension", "ext", "alias"] {
+        assert!(!arm.split('|').any(|t| t.trim_matches(|c: char| !c.is_ascii_alphanumeric()) == never),
+            "'{never}' must NOT re-point git — it runs agent-authored code: {arm}");
+    }
+    // No git dir resolved → no arm at all, rather than a `PATH=":$PATH"` that
+    // would silently put the current directory first.
+    let none = gh_shim_sh("C:/gh.exe", &ShimPaths::default());
+    assert!(!none.contains("The real gh's own git plumbing"), "nothing to prepend → nothing emitted");
+}
+
 #[test]
 fn gh_shim_script_bakes_real_gh_and_enforces_the_guards() {
     // The security-critical shim: pin that it bakes the real gh path, gates only
     // merges, checks BOTH markers, fails safe on an unverifiable base, and audits.
-    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe", &shim_paths());
     assert!(sh.contains("REAL_GH=\"C:/Program Files/GitHub CLI/gh.exe\""), "bakes the real gh path");
     assert!(sh.starts_with("#!/bin/sh"), "POSIX shebang so Git Bash runs it");
     // Only merges are gated; everything else execs the real gh immediately.
@@ -14081,7 +14743,7 @@ fn gh_shim_shell_harness_executes_the_gate() {
     )).unwrap();
     // Write the REAL shim, baked to call our fake gh.
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     // Make both executable in the MSYS/unix view.
     let _ = Command::new("sh").arg("-c")
         .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
@@ -14172,7 +14834,7 @@ fn gh_shim_allows_pr_create_and_blocks_merge_for_the_process_pane() {
         log = log.display()
     )).unwrap();
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c")
         .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
 
@@ -14206,7 +14868,7 @@ fn gh_shim_allows_pr_create_and_blocks_merge_for_the_process_pane() {
 fn gh_shim_script_gates_raw_api_release_shapes() {
     // #196: the raw `gh api`/graphql release surface must route through the SAME
     // single release-gate decision as `gh release …` — pinned in the shim text.
-    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe", &shim_paths());
     assert!(sh.contains("loomux_release_gate"), "a single shared release-gate function (no parallel checker)");
     assert!(sh.contains("git/refs/tags/"), "catches a v* tag-ref create/move via api");
     assert!(sh.contains("releases/*"), "catches the releases endpoint by URL segment");
@@ -14252,7 +14914,7 @@ fn gh_shim_harness_gates_raw_api_release_and_tag_ref_shapes() {
     let log = root.join("gh.log");
     let fake = write_fake_gh(root, &log);
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
 
     let run = |argv: &[&str]| -> bool {
@@ -14366,7 +15028,7 @@ fn gh_shim_harness_gates_raw_api_tag_ref_by_locus_defeating_decoys() {
     let log = root.join("gh.log");
     let fake = write_fake_gh(root, &log);
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
     // Body files: the ref lives in the JSON body (invisible to argv). A readable file is
     // PARSED (so a heads body is provably a branch; a tags body is gated + grant-keyed);
@@ -14497,7 +15159,7 @@ fn gh_shim_harness_gates_graphql_endpoint_variants_and_variable_ref() {
     let log = root.join("gh.log");
     let fake = write_fake_gh(root, &log);
     let shim = root.join("gh");
-    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
     let qfile = root.join("q.graphql");
     std::fs::write(&qfile, b"mutation { createRef(input: { name: \"refs/tags/v9\", oid: \"a\" }) { ref { id } } }").unwrap();
@@ -19925,7 +20587,7 @@ fn shim_with_fake_gh(bin: &Path) -> PathBuf {
          if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then exit \"${FAKE_CHECKS:-0}\"; fi\n\
          printf 'MERGED\\n'; exit 0\n").unwrap();
     let shim = bin.join("gh");
-    fs::write(&shim, gh_shim_sh(&fake.display().to_string())).unwrap();
+    fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     let _ = std::process::Command::new("sh").arg("-c")
         .arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
     shim
@@ -20228,7 +20890,7 @@ fn the_rust_gate_status_never_reports_satisfied_when_the_shim_would_refuse() {
 #[test]
 fn gh_shim_script_enforces_the_workflow_merge_gate() {
     // A source-text pin of the shape. Every behavioural claim is EXECUTED below.
-    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe");
+    let sh = gh_shim_sh("C:/Program Files/GitHub CLI/gh.exe", &shim_paths());
     assert!(sh.contains("loomux_block_wf"), "the workflow gate has its own refusal path");
     assert!(sh.contains("$LOOMUX_GROUP_DIR/merge_gate"), "keyed off the declared-gate spec file");
     assert!(sh.contains("verdicts/pr-$num/$g_r"), "reads the per-reviewer verdict files for THIS pr");
@@ -22394,7 +23056,7 @@ fn gh_cmd_shim_still_gates_a_merge_when_sh_is_stripped_from_the_invoking_path() 
     fs::create_dir_all(&shim_dir).unwrap();
 
     // The same POSIX gh shim the `sh`-invoked harness tests already exercise.
-    fs::write(shim_dir.join("gh"), gh_shim_sh(&fake.display().to_string())).unwrap();
+    fs::write(shim_dir.join("gh"), gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     // The Windows delegator, with the absolute sh path baked in (#335's fix) —
     // exactly what `ensure_shims`/`write_shim` would have resolved via
     // `winpath::resolve_sh` from git.exe's own install layout.
@@ -22463,7 +23125,7 @@ fn git_cmd_shim_still_gates_a_tag_push_when_sh_is_stripped_from_the_invoking_pat
     .unwrap();
     let shim_dir = root.join("shim");
     fs::create_dir_all(&shim_dir).unwrap();
-    fs::write(shim_dir.join("git"), git_shim_sh(&fake.display().to_string())).unwrap();
+    fs::write(shim_dir.join("git"), git_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
     fs::write(
         shim_dir.join("git.cmd"),
         git_shim_cmd(&fake.display().to_string(), Some(&sh_abs.replace('\\', "/"))),

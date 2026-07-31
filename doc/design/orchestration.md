@@ -3994,6 +3994,17 @@ consent is *blocked*, not advised.
   shell (in loomux or out) has an untouched `PATH` and pays zero shim overhead. On Windows the
   shim dir is first on `PATH`, and the agent's Bash tool (Git Bash, where Claude Code runs `gh`)
   resolves the extension-less `gh` script ahead of the real `gh.exe`.
+- **The shim's own toolchain (#509).** `sh` is launched by absolute path (#335) but still
+  inherits the *caller's* `PATH`, which off a PowerShell/cmd pane carries no Git for Windows
+  coreutils — so every `tr` the shim normalizes with failed "command not found", its command
+  substitution went **empty**, and the whole `gh api` release/merge arm matched nothing and fell
+  **open**. The shims now bake in the coreutils directory derived from their own `sh` install
+  (`winpath::resolve_utils_dir`, MSYS `/c/…` form) and **assert** every dependency resolves
+  before any gate logic runs, refusing loudly (`gate-degraded-missing-dep`) rather than
+  half-normalizing. The same PATH gap also broke `gh pr create` outright — a different cause
+  (cmd.exe re-parsing a `.cmd`'s arguments), fixed separately. See
+  `doc/design/shim-path-integrity.md` for the full audit, the fail-open/fail-closed table, and
+  the residual that fix leaves.
 - **The decision** is the pure, unit-tested `gh_gate_decision` (the shim mirrors it in shell,
   and a shell harness executes the real script against a fake gh to prove parity): only
   `gh pr merge` (and cheap `gh api` merge shapes — `gh_is_merge_invocation`) is gated. Detection
