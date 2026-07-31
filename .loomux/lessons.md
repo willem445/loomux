@@ -59,3 +59,28 @@ above). The cheap rule: commit the real work first — a small commit you
 amend or squash later — then patch for the red run, then restore. Never
 point a destructive git command at a file holding anything you haven't
 committed.
+
+## Any suppression driven by a fallible signal must be BOUNDED
+
+A guard that holds an action back "while X is true" needs an answer to *what
+if X is wrong and never clears*. On this repo the answer keeps being "a human
+notices and does it by hand": #496, #513 (27 min — per-attempt bound,
+unbounded retry loop), #518 (a false "user typing" pinning a delivery's
+human-input block for the late monitor's full 4h life). Bounds landed one at
+a time as each fired — #500 for the idle tick, #518 for the delivery hold.
+
+Three things learned the hard way:
+
+- **Fixing the signal does not excuse bounding the consumer.** #499 gated the
+  stamp at its source and #518 happened anyway: that gate is a byte-shape
+  match over an OPEN set of terminal auto-reply shapes, and the next shape is
+  always unmodelled. Fix the signal *and* bound what reads it.
+- **Releasing on evidence beats releasing on elapsed time.** A pure timeout
+  must be tuned against "what if the human really is mid-sentence" — which is
+  why #500's clamp needed a per-group knob. #518's releases only when a
+  second, independent reading says there is nothing to clobber
+  (`input_pending` false), so it needs no knob and cannot erode the rule it
+  sits under.
+- **Enumerate in writing.** "Extend this to every consumer" means grep the
+  subsystem and publish the list, the already-fine ones included. #518's
+  enumeration refuted the issue's own premise about where the gap was.

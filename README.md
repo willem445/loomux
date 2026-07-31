@@ -244,6 +244,7 @@ src/
   pty.ts            typed bridge to the backend (invoke + event bus)
   pane.ts           one pane: xterm instance + header UI -- or, for a CONTENT pane, a PTY-less surface: file manager (#214), file editor or git view (#217)
   heldbadge.ts      pure delivery-held badge presentation mapping (#246): reason -> header-chip label, for the moment loomux is withholding a prompt because it believes the pane's box is human-occupied, or (#420) because an interactive question/permission TUI is on screen and a blind Enter would silently answer it (DOM-free, unit-tested)
+  humanorigin.ts    pure one-turn "this PTY write came from a human" latch (#518): marked by `term.onKey` and the two `term.paste()` sites, read synchronously in `onData`, closed at the end of that turn. Terminal-manufactured data (OSC/DCS query replies, device attributes, focus reports) is emitted in a different turn and reads false — a structural origin test, not a byte-shape guess at an open set of reply shapes (#440 B2-R's argument, applied to the backend's keystroke clock). Rides through `ptywrite.ts` to `write_pty`'s `human` flag (DOM-free, unit-tested)
   grid.ts           split-tree layout, dividers, focus, drag/maximize/minimize
   layout.ts         pure drag-reorder geometry (unit-tested, DOM-free)
   tabs.ts           project tabs (#63): TabManager -- tab list, active tab, routing (DOM-free)
