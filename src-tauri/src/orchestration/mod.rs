@@ -8400,9 +8400,15 @@ pub enum StrandedBlocker {
     /// silently steers the agent, which is the exact harm #420 exists to
     /// prevent. So the bound stops the hold re-arming *silently* and names the
     /// staleness hypothesis to the human; it never converts into a write. See
-    /// `question_hold_stale`, and `doc/design/orchestration.md`'s #532 section
-    /// for the rendered-rows approach (#530's `termgrid`) that could answer
-    /// the question this variant can only ask.
+    /// `question_hold_stale`.
+    ///
+    /// The approach that could answer what this variant can only ask is
+    /// [`termgrid`] (#530): rendered rows, where "still displayed" is a
+    /// real reading. Note it is NOT a drop-in — `termgrid::render_screen`
+    /// returns scrolled-off history rows *followed by* the on-screen rows, so
+    /// pointing the detector at it unchanged would reproduce this same bug.
+    /// See `doc/design/orchestration.md`'s #532 section for what the follow-up
+    /// actually needs.
     QuestionStale,
 }
 
