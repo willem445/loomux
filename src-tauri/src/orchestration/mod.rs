@@ -260,6 +260,23 @@ pub struct ShimPaths {
     pub git_dir: Option<String>,
 }
 
+/// Escape a machine-derived path for interpolation inside shell **double**
+/// quotes (#509 rev-21 N4).
+///
+/// `"$dir"` still expands `$`, a backtick and `\` — so a Git install under a
+/// directory containing one of those would execute at shim runtime rather than
+/// name a directory. Not attacker-controllable and it fails closed (the
+/// dependency self-check then refuses), but the shims are careful about exactly
+/// this class everywhere else and a security script should not have a
+/// "probably fine" interpolation in it. Backslash first, or it would re-escape
+/// the escapes it just added.
+fn sh_dq_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+        .replace('"', "\\\"")
+}
+
 /// The dependency preamble both POSIX shims open with (#509): repair `PATH` so
 /// the coreutils the gate normalizes with resolve, then **prove** they do and
 /// fail CLOSED if they do not.
@@ -277,6 +294,11 @@ fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
     // so it inherits the CALLER's PATH — and a PowerShell/cmd pane's PATH does
     // not carry Git for Windows' `usr\bin`.
     let repair = match utils_dir {
+        // rev-21 N4: the path lands inside shell DOUBLE quotes, where `$`, a
+        // backtick and `\` still have meaning. It is machine-derived, not
+        // attacker-controlled, and a mangled value fails closed (the self-check
+        // below then refuses) — but this file is careful about exactly this
+        // class everywhere else, so it should be careful here too.
         Some(dir) => format!(
             "LOOMUX_UTILS=\"{dir}\"\n\
              case \":$PATH:\" in\n\
@@ -286,7 +308,8 @@ fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
              \x20 # the one to add. Set, don't prepend, in that case.\n\
              \x20 \"::\") PATH=\"$LOOMUX_UTILS\"; export PATH ;;\n\
              \x20 *) PATH=\"$LOOMUX_UTILS:$PATH\"; export PATH ;;\n\
-             esac\n"
+             esac\n",
+            dir = sh_dq_escape(dir),
         ),
         // Nothing resolved at write time: no repair to make, but the assertion
         // below still runs — a shim that cannot normalize must refuse, not guess.
@@ -314,7 +337,22 @@ fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
          \x20 loomux_audit \"gate-degraded-missing-dep\" \"{{\\\"dep\\\":\\\"$_dep\\\"}}\"\n\
          \x20 exit 1\n\
          done\n\
-         unset _dep\n"
+         unset _dep\n\
+         # THE INVARIANT (#509 rev-21 N2). The check above makes a failed normalizer\n\
+         # improbable; this makes it IMPOSSIBLE. A normalizer that returns EMPTY for a\n\
+         # NON-empty input has failed, and empty is precisely the value that matched no\n\
+         # gate arm and let a tag deletion through. So the gate never consumes one: it\n\
+         # refuses. This catches what a startup probe structurally cannot — a `tr` that\n\
+         # RESOLVES but cannot run (broken install, arch mismatch, fork failure)\n\
+         # reproduces #509 exactly, and `command -v` says it is fine. Checked at the\n\
+         # point of use, so it costs nothing per invocation.\n\
+         # $1=raw input $2=normalized output $3=field name for the audit\n\
+         loomux_norm_guard() {{\n\
+         \x20 [ -n \"$1\" ] && [ -z \"$2\" ] || return 0\n\
+         \x20 printf '%s\\n' \"loomux: the merge/release gate could not normalize $3 — the POSIX tool that folds its case resolved but produced nothing, so every gate pattern below would match against an empty string and let this command through. Refusing it instead (#509). Check that Git for Windows' coreutils are intact.\" >&2\n\
+         \x20 loomux_audit \"gate-degraded-normalize-failed\" \"{{\\\"field\\\":\\\"$3\\\"}}\"\n\
+         \x20 exit 1\n\
+         }}\n"
     )
 }
 
@@ -433,6 +471,7 @@ loomux_release_gate() { # $1=tag $2=action
     loomux_audit "release-gate-dangerous" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
   _safe=$(printf '%s' "$_tag" | tr -c 'A-Za-z0-9._-' '_')
+  loomux_norm_guard "$_tag" "$_safe" "release-grant-tag"
   _rg_gf=""
   [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$_safe" ] && _rg_gf="$LOOMUX_GROUP_DIR/release_grants/$_safe"
   if [ -n "$_rg_gf" ] && loomux_grant_claim "$_rg_gf"; then
@@ -500,7 +539,8 @@ if [ "$cmd" = "api" ]; then
   for tok in "$@"; do
     if [ -n "$aw" ]; then
       case "$aw" in
-        method) a_method=$(printf '%s' "$tok" | tr '[:lower:]' '[:upper:]') ;;
+        method) a_method=$(printf '%s' "$tok" | tr '[:lower:]' '[:upper:]')
+                loomux_norm_guard "$tok" "$a_method" "api-method" ;;
         field)
           a_hasparam=1
           case "$tok" in
@@ -515,8 +555,10 @@ if [ "$cmd" = "api" ]; then
     fi
     case "$tok" in
       -X|--method) aw="method"; continue ;;
-      -X?*)        a_method=$(printf '%s' "${tok#-X}" | tr '[:lower:]' '[:upper:]'); continue ;;
-      --method=*)  a_method=$(printf '%s' "${tok#--method=}" | tr '[:lower:]' '[:upper:]'); continue ;;
+      -X?*)        a_method=$(printf '%s' "${tok#-X}" | tr '[:lower:]' '[:upper:]')
+                   loomux_norm_guard "${tok#-X}" "$a_method" "api-method"; continue ;;
+      --method=*)  a_method=$(printf '%s' "${tok#--method=}" | tr '[:lower:]' '[:upper:]')
+                   loomux_norm_guard "${tok#--method=}" "$a_method" "api-method"; continue ;;
       -f|-F|--field|--raw-field) aw="field"; continue ;;
       --field=*|--raw-field=*)
         a_hasparam=1; v=${tok#*=}
@@ -553,6 +595,8 @@ if [ "$cmd" = "api" ]; then
   a_path=${a_url%%\?*}
   path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]')
   ref_low=$(printf '%s' "$a_ref" | tr '[:upper:]' '[:lower:]')
+  loomux_norm_guard "$a_path" "$path_low" "api-url-path"
+  loomux_norm_guard "$a_ref" "$ref_low" "api-ref-field"
 
   is_rel=0; rtag=""
   # Recognize the graphql endpoint by SUFFIX (like the REST URL arms below), not an
@@ -637,6 +681,7 @@ if [ "$cmd" = "pr" ] && [ "$sub" = "merge" ]; then
 elif [ "$cmd" = "api" ]; then
   all="$*"
   low=$(printf '%s' "$all" | tr '[:upper:]' '[:lower:]')
+  loomux_norm_guard "$all" "$low" "api-argv"
   case "$low" in *mergepullrequest*) is_merge=1 ;; esac
   case "$all" in *pulls*) case "$all" in *"/merge"*) is_merge=1 ;; esac ;; esac
 fi
@@ -942,7 +987,8 @@ fn gh_shim_git_plumbing(git_dir: Option<&str>) -> String {
          case \"$cmd\" in\n\
          \x20 {arms}) PATH=\"{dir}:$PATH\"; export PATH ;;\n\
          esac\n",
-        arms = GH_GIT_PLUMBING_CMDS.join("|")
+        arms = GH_GIT_PLUMBING_CMDS.join("|"),
+        dir = sh_dq_escape(dir),
     )
 }
 
@@ -1164,6 +1210,7 @@ fi
 # the grant usable for a retry, not burn it on a push that never landed
 # (same fix as #256's merge grant / #303's release grant).
 safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')
+loomux_norm_guard "$tag" "$safe" "release-grant-tag"
 gf=""
 [ -n "$LOOMUX_GROUP_DIR" ] && [ -n "$safe" ] && gf="$LOOMUX_GROUP_DIR/release_grants/$safe"
 _grant_claimed=""

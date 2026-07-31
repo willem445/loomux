@@ -13848,6 +13848,79 @@ fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
     }
 }
 
+/// Record that a #509 pin could not arm — visibly, and in a way that cannot let
+/// coverage silently reach zero.
+///
+/// **rev-21 B2.** The first cut was `eprintln!` + `return`. A `return` from a
+/// `#[test]` IS a pass, and `ci.yml` runs `cargo test --locked` with no
+/// `--nocapture`, so libtest captures a passing test's stderr and prints
+/// nothing — grep all three #525 build jobs and there is not one SKIP line. The
+/// stated rationale, "skip loudly or run armed, nothing between", did not ship:
+/// on macOS and Windows these pins reported `... ok`, indistinguishable from
+/// armed. That is the same fail-open-while-looking-healthy shape as the bug this
+/// PR fixes, one level up, and it is why the mechanism — not the intent — had to
+/// change.
+///
+/// Two mechanisms, because visibility alone is not enough:
+///
+/// 1. **Visible.** The skip is appended to `$GITHUB_STEP_SUMMARY` when set —
+///    plain file IO that no test harness intercepts, rendered on the run page.
+///    A skip taken on CI is now readable rather than merely intended to be.
+/// 2. **Cannot reach zero.** On Linux this is not a skip at all, it FAILS.
+///    ubuntu-22.04 is the only job that arms these pins (run 30631911457
+///    observed the headline pin red there against the mutated shim), so an
+///    unarmed pin on Linux *is* #509 coverage at zero with CI green. Making it
+///    red is what turns "coverage should not silently vanish" from an
+///    aspiration into a property.
+fn pin_could_not_arm(test: &str, why: &str) {
+    let msg = format!("SKIP {test}: {why}");
+    if let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "- :warning: **#509 pin did not arm** — `{msg}`");
+        }
+    }
+    eprintln!("{msg}");
+    assert!(
+        !cfg!(target_os = "linux"),
+        "{msg}\n\nOn Linux the #509 stripped-PATH pins MUST arm: ubuntu-22.04 is the only job \
+         that arms them, so an unarmed pin here means #509 coverage is at ZERO while CI is \
+         green — precisely the failure this guard exists to make impossible. If a runner or \
+         image change made this legitimate, fix the harness or move the guard deliberately. Do \
+         not delete it to get back to green."
+    );
+}
+
+/// The MSYS form of a path, for baking into a shim fixture. Mirrors
+/// `winpath::to_msys_dir`, which an integration test cannot reach (`winpath` is
+/// a private module); the product's own conversion is pinned by
+/// `winpath::tests::msys_dir_rewrites_a_drive_letter_and_leaves_posix_paths_alone`.
+fn msys_dir_for_fixture(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let mut c = s.chars();
+    match (c.next(), c.next()) {
+        (Some(d), Some(':')) if d.is_ascii_alphabetic() => {
+            format!("/{}/{}", d.to_ascii_lowercase(), s[2..].trim_start_matches('/'))
+        }
+        _ => s,
+    }
+}
+
+/// Any POSIX `sh` this host can run a shim under — the product's own resolution
+/// on Windows, `/bin/sh` elsewhere. Unlike `stripped_path_harness` this asks for
+/// nothing but a shell, so a test that supplies its own `utils_dir` can run on
+/// every platform.
+fn any_posix_sh() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        resolve_shim_toolchain().0
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Some("/bin/sh".to_string())
+    }
+}
+
 /// The POSIX tools the shims' dependency preamble asserts (#509). One list, two
 /// consumers: `stripped_path_harness` needs them all present in a single
 /// directory before it can arm a pin, and
@@ -13992,6 +14065,75 @@ fn stripped_path_hides_the_coreutils(sh_abs: &str, wrapper: &std::path::Path, ro
     String::from_utf8_lossy(&out.stdout).trim() != "y"
 }
 
+/// **rev-21 N2 — the invariant, and the one #509 pin that arms EVERYWHERE.**
+///
+/// A `tr` that RESOLVES but cannot RUN reproduces #509 exactly: empty
+/// substitution, gate matches nothing, tag deletion straight through. The
+/// startup self-check is structurally blind to it, because `command -v` proves
+/// resolution and nothing more — which is the gap rev-21 N1 names. The
+/// point-of-use guard (`loomux_norm_guard`) is what closes it, and this pins
+/// that it does.
+///
+/// Unlike the two stripped-PATH pins, this one needs the environment to hide
+/// nothing: it bakes a `utils_dir` of its own holding a deliberately broken
+/// `tr`, so the shim's own PATH repair puts that tool first on every platform.
+/// No capability probe, no skip, no `#[cfg]` — it arms on all four CI jobs,
+/// which is also why it is the pin that does not depend on ubuntu staying the
+/// only armed one.
+#[test]
+fn gh_shim_refuses_when_tr_resolves_but_cannot_run() {
+    use std::process::Command;
+    let Some(sh) = any_posix_sh() else {
+        pin_could_not_arm("gh_shim_refuses_when_tr_resolves_but_cannot_run", "no POSIX sh on this host");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let utils = root.join("utils");
+    std::fs::create_dir_all(&utils).unwrap();
+    // Resolvable — `command -v tr` finds it, so the startup probe is satisfied —
+    // and broken: it prints nothing and exits non-zero, exactly what a corrupt
+    // install, an arch mismatch or a fork failure looks like at the call site.
+    let broken_tr = utils.join("tr");
+    std::fs::write(&broken_tr, "#!/bin/sh\nexit 1\n").unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    // Only `tr` is shadowed: every other dependency still resolves from the
+    // inherited PATH, so the self-check passes and the ONLY thing wrong is that
+    // one normalizer cannot run.
+    std::fs::write(&shim, gh_shim_sh(
+        &fake.display().to_string(),
+        &ShimPaths { utils_dir: Some(msys_dir_for_fixture(&utils)), git_dir: None },
+    )).unwrap();
+    let _ = Command::new(&sh).arg("-c")
+        .arg(format!("chmod +x '{}' '{}'", fake.display(), broken_tr.display())).status();
+
+    let out = Command::new(&sh).arg(&shim)
+        .args(["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v1.2.3"])
+        .env("LOOMUX_GROUP_DIR", &group)
+        .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", "1")
+        .output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(!out.status.success(),
+        "a published tag ref must not be deletable when `tr` cannot run, stderr: {err}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "",
+        "the real gh must never be reached");
+    assert!(err.contains("could not normalize"),
+        "the refusal must name the failed normalization, got: {err}");
+    // THE POINT: the startup dependency check did NOT save us here — `tr`
+    // resolved fine. If this ever starts firing instead, the guard below has
+    // stopped being the thing under test.
+    assert!(!err.contains("cannot find the POSIX tool"),
+        "this must be caught at the point of use, not by the resolution probe: {err}");
+    let audit = std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("gate-degraded-normalize-failed"),
+        "and it must be audited distinctly from a missing tool, got: {audit}");
+}
+
 /// **The #509 pin.** Invoked from a PowerShell/cmd pane the shim's `sh` inherits
 /// a PATH with no Git for Windows coreutils, and every `tr` in it died with
 /// "command not found" — leaving its command substitution EMPTY and carrying on.
@@ -14008,7 +14150,8 @@ fn stripped_path_hides_the_coreutils(sh_abs: &str, wrapper: &std::path::Path, ro
 #[test]
 fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
     let Some((sh_abs, paths)) = stripped_path_harness() else {
-        eprintln!("SKIP gh_shim_gates_the_api_shapes…: no POSIX sh / no coreutils dir on this host");
+        pin_could_not_arm("gh_shim_gates_the_api_shapes…",
+            "no POSIX sh, or the 7 dependencies do not share one directory on this host");
         return;
     };
     let td = tempfile::tempdir().unwrap();
@@ -14025,9 +14168,8 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
         .arg(format!("chmod +x '{}'", fake.display())).status();
     let wrapper = write_stripped_path_wrapper(root, &sh_abs);
     if !stripped_path_hides_the_coreutils(&sh_abs, &wrapper, root) {
-        eprintln!("SKIP gh_shim_gates_the_api_shapes…: runner cannot hide coreutils from MSYS sh — \
-                   headline pin stays armed wherever the strip works (the unix runners, and any host \
-                   whose sh honors a stripped PATH); see the PR body");
+        pin_could_not_arm("gh_shim_gates_the_api_shapes…",
+            "this host's sh cannot be made to hide the coreutils, so #509's condition is inexpressible here"); see the PR body");
         return;
     }
 
@@ -14074,7 +14216,8 @@ fn gh_shim_gates_the_api_shapes_when_the_callers_path_lacks_git_coreutils() {
 #[test]
 fn gh_shim_without_its_coreutils_fails_closed_not_open() {
     let Some((sh_abs, _)) = stripped_path_harness() else {
-        eprintln!("SKIP gh_shim_without_its_coreutils…: no POSIX sh / no coreutils dir on this host");
+        pin_could_not_arm("gh_shim_without_its_coreutils…",
+            "no POSIX sh, or the 7 dependencies do not share one directory on this host");
         return;
     };
     let td = tempfile::tempdir().unwrap();
@@ -14089,8 +14232,8 @@ fn gh_shim_without_its_coreutils_fails_closed_not_open() {
         .arg(format!("chmod +x '{}'", fake.display())).status();
     let wrapper = write_stripped_path_wrapper(root, &sh_abs);
     if !stripped_path_hides_the_coreutils(&sh_abs, &wrapper, root) {
-        eprintln!("SKIP gh_shim_without_its_coreutils…: runner cannot hide coreutils from MSYS sh — \
-                   fail-closed pin stays armed wherever the strip works; see the PR body");
+        pin_could_not_arm("gh_shim_without_its_coreutils…",
+            "this host's sh cannot be made to hide the coreutils, so #509's condition is inexpressible here");
         return;
     }
 
@@ -14186,10 +14329,20 @@ fn gh_and_git_shim_deps_preamble_stays_byte_identical() {
     // And it really does both halves: repair, then assert.
     let p = slice(&gh);
     assert!(p.contains("PATH=\"$LOOMUX_UTILS:$PATH\""), "prepends the resolved coreutils dir");
-    for dep in SHIM_DEP_TOOLS {
-        assert!(p.contains(&format!(" {dep} ")) || p.contains(&format!(" {dep};")) || p.contains(&format!("in {dep} ")),
-            "the self-check must cover '{dep}', got:\n{p}");
-    }
+    // rev-21 N5: match the LIST LINE, not the preamble text. `p.contains(" tr ")`
+    // was also satisfied by the prose above it, so a tool named only in a comment
+    // would have passed — the assertion would not have caught the drift it exists
+    // to catch. Compare the actual `for _dep in …` operand, exactly and in order.
+    let dep_line = p.lines().find(|l| l.trim_start().starts_with("for _dep in "))
+        .expect("the self-check's dependency list line");
+    let listed: Vec<&str> = dep_line
+        .trim()
+        .trim_start_matches("for _dep in ")
+        .trim_end_matches("; do")
+        .split_whitespace()
+        .collect();
+    assert_eq!(listed, SHIM_DEP_TOOLS.to_vec(),
+        "the shim's dependency list must be exactly SHIM_DEP_TOOLS; got {listed:?}");
     assert!(p.contains("exit 1"), "a missing dependency must fail CLOSED");
     // With nothing resolvable at write time there is no repair to emit — but the
     // assertion still ships, so the shim refuses rather than half-normalizing.

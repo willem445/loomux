@@ -77,9 +77,26 @@ shims:
    Fail CLOSED and loud — the pre-#509 behavior was fail-open and silent, which
    is the one thing a gate must never be.
 
-The self-check is the durable half. The PATH repair fixes the failure we know
-about; the self-check means the *next* environment that strips a tool loudly
-refuses instead of quietly ungating.
+3. **Make it impossible, not merely improbable** (`loomux_norm_guard`, rev-21 N2).
+   The two above reduce the *probability* of a failed normalizer; neither can
+   eliminate it, because `command -v` proves a tool **resolves**, not that it
+   **runs**. A `tr` that resolves and then dies — corrupt install, arch
+   mismatch, fork failure — reproduces #509 exactly, and the startup probe
+   reports everything fine. So the gate never consumes a normalization at all:
+   a normalizer that returns EMPTY for a NON-empty input has failed by
+   construction, and the shim refuses (`gate-degraded-normalize-failed`) rather
+   than matching gate patterns against an empty string.
+
+   That is also *why* the resolution-only gap is closed here rather than by a
+   functional canary at startup: the canary would spend a subprocess on every
+   gated `gh` and `git` invocation, and the `git` shim sits on a hot path. The
+   guard costs nothing per call, and it covers strictly more — a tool that
+   breaks *between* the startup check and the call site is still caught.
+
+The invariant is the durable half. The PATH repair fixes the environment we know
+about, the self-check names a missing tool loudly, and the guard means no
+failure of any of these tools — missing or broken, now or later — can put an
+empty string in front of a gate pattern again.
 
 ## Failure 2 — `gh pr create` dies (a different cause)
 
@@ -119,6 +136,18 @@ built-ins: gh refuses to let a user alias or an extension shadow a built-in, so
 `gh <alias>` (a `!`-alias runs a shell) and `gh extension …` keep the gated git.
 A gh version that grows a new git-using command degrades to the old
 broken-argument behavior rather than opening anything.
+
+**The residual is slightly wider than "built-ins don't run agent code" suggests,
+and should be read as it is** (rev-21 N3). A built-in *can* reach agent-authored
+code: `gh pr create` / `gh issue create` in a TTY — which agent panes have —
+spawn an editor resolved from `GH_EDITOR`, `git config core.editor` or `EDITOR`,
+and `core.editor` is repo-local, agent-writable and persistent. That child
+inherits gh's PATH, i.e. the ungated git. This grants no *new* capability — the
+cheaper bypass of calling the real binary by absolute path is already conceded
+below — so it does not change the trade and is not a reason to widen or narrow
+the built-in list. It is a reason to state the boundary as "built-ins, which can
+still spawn an editor the agent named" rather than as "nothing here runs agent
+code", which would be false.
 
 Against the alternative — leaving `gh pr create` broken — this is the safer
 trade. A shim that breaks the sanctioned path pushes agents onto raw `gh api`,
