@@ -1835,9 +1835,10 @@ mod supersession_race_property {
             Monitor::Confirmed { misattributed: true } => {
                 out.violations.push(format!(
                     "MISATTRIBUTED CONFIRM: the old delivery's monitor resolved itself off the \
-                     NEWER delivery's promptsubmit record while the ledger still named {:?} \
-                     (newer delivery at step {} of {}) — a false delivery-confirmed-late, and a \
-                     \"no re-send needed\" correction about the re-send that made it land",
+                     NEWER delivery's promptsubmit record, on a tick whose ledger sample said \
+                     \"still mine\" (live ledger now names {:?}; newer delivery at step {} of \
+                     {}) — a false delivery-confirmed-late, and a \"no re-send needed\" \
+                     correction about the re-send that made it land",
                     state.ledger,
                     state.newer_pc,
                     program.len(),

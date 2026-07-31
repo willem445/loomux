@@ -1373,6 +1373,64 @@ own silent-suppression-leaves-no-audit-trace shape, which mirrors an existing sh
 `notify_delivery_held`/`notify_unconfirmed_delivery` and belongs to whatever workstream addresses
 that pattern generally (#445's own future territory), not a one-off fix here.
 
+### Supersession during a re-send's in-flight window (#454)
+
+B1's supersession rule is right; its TRIGGER was late. A newer delivery claimed the pane only
+by writing `last_delivery` at the END of its confirm window — under a second when its hook
+confirms in-window, ~9s worst case — while the `promptsubmit` record its Enter produces exists
+almost immediately. In that gap a stale monitor reads "still mine" from the ledger and matches
+the NEWER delivery's record as its own: a misattributed `delivery-confirmed-late` row and,
+if it had already declared `Failed`, a "no re-send needed" correction about the very re-send
+that is the only reason anything landed. #451 deferred this as a narrowed residual (the
+dangerous polarity — a correction arriving BEFORE a re-send and suppressing it — was already
+gone), and #454 is where it gets closed.
+
+**Re-derived on current main before being fixed**, since the machinery moved a lot in between
+(#445's queue, #470/#487's unified admission, #496 PR-C's self-heal). Unified admission
+serializes *deliveries* through one drainer per pane, but the late monitor is deliberately a
+detached thread holding no delivery mutex (that is what lets it outlive a ~52s delivery), so
+nothing about admission ordering constrains it. The race was still live. It is also wider than
+"a re-send of the same text": `PromptLandedMatch::Existence` matches any record past the
+monitor's baseline regardless of content, so on a Copilot pane ANY newer delivery's Enter is
+enough.
+
+**The fix is an ordering, in two halves, both required:**
+
+- `record_inflight_delivery` claims the pane in the ledger immediately BEFORE `deliver_now`'s
+  first Enter, so ledger claim ≺ Enter ≺ hook record.
+- the monitor takes its ledger observation AFTER its hook read (`observe_ledger`), so any hook
+  evidence a tick can act on is checked against a ledger state at least as new as the evidence.
+
+Together they close the window rather than narrowing it: a record a tick can see implies the
+claim already happened, so that tick's own ledger read sees supersession. With only the writer
+half, the gap shrinks from a whole confirm window to one tick's own work — still reachable,
+which is why "narrowed" was never "closed".
+
+**Why not a separate in-flight map**, which is the shape #454 itself suggested. Two maps means
+two locks means a torn observation — read the in-flight map, miss the newer delivery, then read
+the ledger — which is precisely the fused-lock defect #496 PR-C's admission gate had to be fixed
+for (rev-47 B1). The claim goes into the SAME map under the SAME lock, and `observe_ledger`
+returns every fact one tick decides from as a single value, so the single-observation discipline
+is the type's job rather than a convention. The in-flight claim reads as `confirmed: false` —
+the conservative value, identical to what a `Pending` delivery already leaves — so a delivery
+that dies mid-window still arms the next delivery's stranded flush.
+
+**One consequence, handled rather than absorbed.** A stale monitor now exits while the newer
+delivery is still in flight, so the `Superseded`-and-confirmed badge drop it used to perform a
+tick or two later can no longer happen for a delivery that confirms IN-window (which spawns no
+monitor of its own). `deliver_now` drops the badge itself on a `Confirmed` outcome — a better
+home for it anyway, since a confirmed delivery is direct proof the pane is not wedged.
+
+**Evidence.** `queue.rs`'s `supersession_race_property` searches every reachable interleaving of
+the newer delivery's steps, a genuinely-late record for the old delivery, and the monitor's two
+reads, with one knob per half of the fix. Fixed is clean; each single-knob mutation reddens; the
+as-shipped shape reddens (119 counter-examples). Two liveness tests keep "never confirm
+anything" from passing as a fix — a correct late confirm must stay reachable, including while a
+newer delivery races. `tests/orchestration.rs` drives the real seams through #454's own
+interleaving. Residual, stated as rev-19 n1 stated the same one: no test pins that `deliver_now`
+CALLS the recorder at its one call site; the property model's writer-knob mutation is what
+models that deletion.
+
 ## Decision-grade structured reports (#398)
 
 Every worker/reviewer/planner `report(...)` lands in the orchestrator's context window, and for
