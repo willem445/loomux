@@ -273,6 +273,17 @@ pub struct ShimPaths {
 /// edits that quietly narrow the check. Git for Windows ships all of them in
 /// one `usr\bin`, so the strict list costs nothing and cannot drift.
 fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
+    // ── EVIDENCE BRANCH ONLY — DO NOT MERGE (#509 red-before-green) ──────────
+    // Emit NOTHING, which makes the generated shim byte-for-byte the pre-#509
+    // script: no PATH repair and no dependency self-check. The signature and
+    // every call site are left intact on purpose, so the tests fail on
+    // BEHAVIOUR rather than on a compile error (the #529 pattern). The point is
+    // to watch the headline pin go red on the ubuntu runner — the one CI
+    // platform where it actually arms — instead of inferring that it would.
+    if true {
+        let _ = utils_dir;
+        return String::new();
+    }
     // `sh.exe` is launched by ABSOLUTE path from the `.cmd` delegator (#335),
     // so it inherits the CALLER's PATH — and a PowerShell/cmd pane's PATH does
     // not carry Git for Windows' `usr\bin`.
