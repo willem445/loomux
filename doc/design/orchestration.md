@@ -5082,10 +5082,11 @@ them was queued for a pty that no longer exists. They leave it exactly two ways.
 
 **`queue_orphans` merges two derivations** (`queue::merge_orphans`): the snapshot (payload included)
 and #445's audit scan (no payload, but needs no snapshot, so it still covers a group whose entries
-were queued by a build older than this one). Snapshot wins on a shared id. `delivery-recovered` was
-added to the audit scan's terminal set, because from the moment a restart reads an entry back the
-snapshot derivation owns it — left open, every recovered entry would be reported forever under an id
-nothing will ever close.
+were queued by a build older than this one). Snapshot wins on a shared id. `delivery-recovered` is
+in the audit scan's terminal set, but is written only when an entry actually LEAVES staging (a fresh
+`delivery-queued` id now tracks the payload) — see hazard 3 below for why closing it any earlier
+silently blinded the derivation that needs no snapshot. Until an entry leaves staging both views
+report it, which is what the merge exists to dedupe.
 
 **A defect this wiring exposed in the pre-existing derivation.** "Queued, never resolved" is
 satisfied by *every entry currently in the queue* — an undelivered entry has not been audited as
@@ -5096,7 +5097,9 @@ live ids and excludes them. (`queue_orphans_finds_an_enqueued_entry_with_no_term
 under #445, simulated its "restart" inside one process and so asserted the looser meaning; it now
 performs a real relaunch and additionally pins that a live entry is never reported.)
 
-**Three ordering hazards the lazy read creates, and how each is closed.** Making recovery lazy is
+**Five ordering hazards the lazy read creates, and how each is closed** (three found in
+self-review, two more in review round 1 — the pattern is worth naming: every one of them is
+"something observed the group between the restart and the end of recovery"). Making recovery lazy is
 what avoids inventing a "group restored" callback this registry does not have, but laziness means
 the *first* thing to touch a group after a restart decides what happens — and it is not necessarily
 a bind.
@@ -5116,7 +5119,36 @@ a bind.
    `enqueue_stranded_front`, `admit_stranded_selfheal`) runs recovery before it mints. Uniqueness is
    guaranteed only *within* a group, which is all that is needed: every consumer of an id — the live
    filter, the audit scan, the snapshot — is group-scoped.
-3. **A re-admission that fails goes back to staging.** Re-admission is capped like any other
+3. **The snapshot carries staged entries, not just live ones — and an id is closed in the audit
+   only when it leaves staging.** These are one fix, because either alone still loses work (review
+   round 1, finding 1). Writing live queues only meant the first admission after a restart rewrote
+   the file without the backlog it had just staged into memory; and because `delivery-recovered`
+   was written at *stage* time, the audit derivation — the one view needing no snapshot — was
+   already closed. A process dying before the orchestrator's session-start `queue_orphans` call
+   therefore lost the backlog from *both* views, permanently and silently, which is strictly worse
+   than not persisting at all (pre-#468 the audit scan would at least have kept naming the ids).
+   Restarts cluster, and the exposed set was exactly the case the feature exists for. Now: staged
+   entries and markers are written on every snapshot, so recovery is re-runnable across any number
+   of restarts; and `delivery-recovered` is written by `readmit_recovered` at the moment a fresh
+   `delivery-queued` id starts tracking the payload. Until then both views report the entry and
+   `merge_orphans` dedupes them. A `StrandedSubmit` marker never leaves staging, so it audits as
+   the non-terminal `queue-stranded-unreplayable` rather than `delivery-dropped` — it must never
+   stop being reported.
+4. **The once-only guard is held across the whole critical phase, not just the check.** It used to
+   be published in a temporary guard released before the file read, the `queue_seq` seed and the
+   staging insert, so a second thread arriving in that window saw "already recovered", returned,
+   and minted an id the snapshot still held — silently re-opening hazard 2 (review round 1,
+   finding 2). MCP dispatch is thread-per-request and the moment after a restart is precisely when
+   every agent in a group reports at once, so this is the feature's own acceptance scenario, not a
+   corner. Holding `recovered_groups` across phase 1 makes a concurrent first touch *wait* for the
+   seed, and closes the same window for `readmit_recovered` (which would otherwise see empty
+   staging mid-recovery and let a kickoff precede the backlog). The constraint this creates, and
+   the reason notices are collected and sent in a phase 2 after the guard drops: **nothing inside
+   phase 1 may deliver, enqueue, or otherwise re-enter recovery** — `std::sync::Mutex` is not
+   reentrant, so a same-thread re-entry deadlocks rather than looping. Auditing is safe (file I/O,
+   no callback); a notice is not, since a notice is a delivery, a delivery enqueues, and an enqueue
+   persists.
+5. **A re-admission that fails goes back to staging.** Re-admission is capped like any other
    (`QUEUE_MAX_PER_PANE`), and a recovered backlog can meet a pane that already has live traffic in
    it. A rejected entry returns to `recovered_queue` and keeps being reported by `queue_orphans`
    (audited as `delivery-requeue-rejected`). Dropping it there would be a *worse* silent loss than
@@ -5127,9 +5159,14 @@ a bind.
 - **A `StrandedSubmit` marker is never replayed.** Its whole meaning is a live pty's input-box
   contents — "the text is already pasted, press Enter" — which a restart destroys. Replaying it would
   press Enter on whatever the *new* session has in its box, most likely a human's half-typed line.
-  Markers are dropped at recovery, audited individually (`reason: stranded-marker-not-replayable`),
-  and announced through `stranded_lost_notice`, which says plainly that this text is NOT recoverable:
-  unlike a `Text` entry there are no bytes left to re-send, only the `prompt` audit line to read.
+  Markers are never re-admitted, audited individually as `queue-stranded-unreplayable` (reason
+  `queue::STRANDED_ORPHAN_REASON` — the same single string the orphan row and the MCP tool
+  description use, so grepping the audit for what the tool just showed you finds it), and announced
+  through `stranded_lost_notice`, which says plainly that this text is NOT recoverable: unlike a
+  `Text` entry there are no bytes left to re-send, only the `prompt` audit line to read. They are
+  also reported by `queue_orphans` with `text: null` — the notice is best-effort (recovery can run
+  before any orchestrator pane is bound) and "never silently dropped" cannot rest on a delivery
+  that is allowed not to happen.
 - **One double-delivery window remains.** A crash between the drainer's pop and the snapshot rewrite
   replays an entry that already landed. It is bounded — by the queue's existing byte-identical
   coalesce, which collapses the replay into whatever is queued, and by `pop_front_dequeued`

@@ -42,7 +42,11 @@ Every rung is a complete tool on its own — climb when you're ready:
    waited — rather than costing the agent a turn apiece, and an exit the
    orchestrator itself asked for (a kill, an idle-timeout) goes to the
    audit log instead of interrupting it, since the roster already shows who
-   is alive. Hard-won lessons persist
+   is alive. That queue is on disk, so **restarting loomux no longer loses
+   whatever was waiting in it**: deliveries re-queue themselves in their
+   original order once their pane is back, and anything whose pane is gone
+   for good is handed to the orchestrator as lost work — with the original
+   text — rather than disappearing. Hard-won lessons persist
    across groups via a committed `.loomux/lessons.md`, not just this run.
    The task board and the group lifecycle panel — each its own keystroke
    away on an orchestration pane — persist across a close/reopen and a group

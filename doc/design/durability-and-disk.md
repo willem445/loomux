@@ -78,6 +78,19 @@ torn file — the worst case is one update superseding another, never corruption
 `tabs.json` / `uistate.rs` (project tabs, PR #157) was **not** merged when this
 landed; that store already writes atomically (temp + rename) and needs nothing.
 
+**One precision about `atomic_write`'s contract, since this document is where
+people come to rely on it** (#523 review): the temp + fsync + rename path is
+crash-safe as described, but the *fallback* taken when the rename fails (the
+destination is briefly locked — antivirus, an open reader) is a plain in-place
+`fs::write`, which truncates before it writes. A crash inside that narrow
+fallback window can therefore still leave a truncated destination. It is the
+rare branch of a rare branch, and every reader of these files degrades
+gracefully on an unparseable one (`queue.json` falls back to the audit
+derivation; `tasks.json`/`state.json` to an empty value), but "never a
+truncated file" is an overstatement of what the helper guarantees — it is
+"never a truncated file on the rename path", which is the path essentially
+every write takes.
+
 `queue.json` (#468, added later) is the delivery queue's durable copy, and it is
 the one file in this table where the append-vs-replace choice was genuinely
 open: it records pending work, and the obvious shape for "what is pending" is a
