@@ -5229,6 +5229,137 @@ tests meet. The wiring line itself (the `NotHolding` arm calling `kickoff_recove
 covered by inspection plus the mutation control, not by an end-to-end driver. Independently
 verifying that a re-delivered brief was *processed* — as opposed to submitted — remains PR-D's
 processing-evidence work; this does not claim that guarantee either.
+## The human-input signal: a sourced bit and a bounded block (#518 / #522)
+
+**Problem.** On v1.1.0-beta a copilot orchestrator's prompt sat unsubmitted behind a badge
+claiming a human was typing in the pane. Nobody was. #510's self-heal declined — *correctly*,
+per its own rule — so a false signal became an indefinite badged hold that only a physical
+Enter cleared.
+
+**First, the premise correction.** The issue supposed the delivery hold reads a *different*
+signal from the one #499 gated. It does not. There is exactly one writer of the
+keystroke-recency clock (`PtyManager::note_user_input`) and every delivery-path consumer reads
+it back through `last_user_input_ms`. #499 shipped in the beta. So the defect is not an
+ungated consumer; it is two other things.
+
+**The consumers, enumerated** (an enumeration is a claim of completeness):
+
+| Consumer | Bounded before #518? |
+| --- | --- |
+| Pre-paste and pre-Enter typing holds → `HeldReason::Typing` | yes — `USER_QUIET_MAX_HOLD` |
+| `input_pending` → `HeldReason::BoxOccupied` | yes — `HUMAN_INPUT_HOLD_MAX` |
+| Idle tick's quiet clock | yes — #500 |
+| `human_typed_since` → suppresses `flush_stranded_text` | **no** |
+| `human_typed_since` in `drain_stranded_submit` (the press) | **no** |
+| Submit-retry suppression | no, but unreachable inside the retry window |
+| `stranded_selfheal_action` → `StrandedBlocker::HumanInput` | **no — the reported symptom** |
+| `tier1_trusted` — Tier-1 confirmation | n/a, scoped to the delivery |
+
+Each unbounded one inlined `last_user_input_ms > submit_sent_ms` — `tier1_trusted`'s inverse.
+**That expression is a latch.** One stamp after our submit pins it true for the life of the
+delivery *and* its late monitor, whose `KeepWaiting` arm re-asserts the badge off it every
+poll for up to `LATE_MONITOR_MAX_LIFETIME` (four hours). That is what makes a wrong signal an
+*indefinite* one rather than merely a wrong one.
+
+**Why the signal was wrong: an open set, not a missing case.** #499 classifies by byte shape —
+skip anything parsing as CSI/OSC/DCS. That covers every reply shape #179 catalogued, but the
+set is open, and #496's own plan §7 closed with *"which copilot emission recurs mid-session"*
+unanswered; the `phantom-input-gated` breadcrumb exists because we do not know. This repo
+already settled the argument in the other half of the same problem: #440 B2-R hit it for the
+frontend's `firstInputMs` and deliberately did **not** answer it with a better `onData` filter
+(bracketed paste itself starts with ESC, so shape-filtering misfires on real pastes). It took
+the signal from `term.onKey` and the two `term.paste()` sites — *a structural guarantee, not a
+pattern match against an open set*.
+
+**Fix 1 — source the bit.** `src/humanorigin.ts` is a one-turn latch marked by exactly the
+three call sites `markFirstInput()` already trusts. xterm fires `onKey` synchronously
+immediately before the `onData` it produced, and `term.paste()` triggers its `onData`
+synchronously from the call, so a human write reads the mark still open; a query reply is
+emitted while xterm parses program output — a different turn — and reads it closed. The flag
+is captured at `write()` time and carried *with* the data through the ordered writer, because
+the IPC send lands turns later and because chunking must not make chunks 2..n look
+foreign. `write_pty` gains `human: Option<bool>`; absent means `true`, so the command's
+existing shape keeps its meaning and an unstated origin degrades to the pre-#518 behaviour —
+the fail-safe direction, since believing a human typed only ever makes delivery hold *more*.
+The bit is **ANDed** with #499's shape gate, never substituted for it: #496 PR-A's deliberate
+Neutral/zero-delta tradeoff (an arrow key does not defer anything) is untouched.
+
+Occupancy (`input_box_len`) is deliberately *not* gated on the origin bit. An auto-reply
+already contributes a zero delta, so there is nothing to add — and under-counting occupancy is
+the one direction `box_occupancy_delta` commits to never taking, because reading an occupied
+box as empty is the clobber #111 exists to prevent. The bound below reads `input_pending` as
+its positive evidence, so that counter must stay governed by the conservative rule alone.
+
+**Fix 2 — bound the block.** One pure `human_input_block(last_user_input_ms, submit_sent_ms,
+box_pending, now_ms, bound_ms)` replaces every inline derivation, returning three-way
+(`None` / `Blocked` / `BoundedOut`) so a release is auditable rather than silent
+(`human-input-block-released`). `HUMAN_INPUT_BLOCK_BOUND_MS` is ten minutes, sized against the
+delivery machinery's own longest legitimate window — `REINJECT_CONFIRM_TIMEOUT_MS` (5 min) is
+already documented as comfortably longer than the entire worst-case hold chain — so the bound
+cannot elapse inside a live delivery.
+
+This is #500's rule applied a third time: *a suppression driven by a fallible signal must be
+BOUNDED, because nothing else will ever clear it.* It differs from #500's clamp in one
+deliberate way. #500 is classification-blind and releases on elapsed time alone. This one
+releases only on **positive evidence**: `box_pending` outranks the bound, so the block can
+never time out while a single human-typed character is outstanding. That ordering is the
+safety contract, and it is table-tested precisely because reordering it is how this becomes a
+bug that presses Enter over someone's half-written line. `box_occupancy_delta`'s own bias
+("never UNDER-count real occupancy") is what makes a `false` reading trustworthy here.
+
+Nothing about #510/#451/#420 is weakened. Once the block releases, precedence carries the
+decision into the **existing** `box_holds_paste` arm of `stranded_selfheal_action` — which is
+already exactly "deliver if the box is unchanged": our own text still at the tail means there
+is nothing of the human's there to merge with, and any other reading still lands on a badge
+(`NotHolding`), never a blind Enter. `drain_stranded_submit` re-derives through the same
+helper rather than forming a second opinion, because rev-47 NB1 is the failure mode where a
+marker admitted under one rule and pressed under another never fires at all.
+
+**Why no per-group guardrail.** #500's bound got one because it is classification-blind, so a
+group whose humans really do sit typing for twenty minutes has a legitimate reason to want it
+longer. This one cannot release without evidence that there is nothing to clobber, so there is
+no workflow for which a different value is more correct — and a knob with no correct second
+setting only ever gets set wrong.
+
+**#522 — an idle pane is not a stranded one.** The same monitor announced *"the prompt may be
+sitting unsubmitted in its pane; get_output it and re-send if needed"* about a worker that had
+finished its turn and gone idle at the CLI's rest prompt. The monitor knew only that no
+`PromptSubmit` hook record had appeared — which copilot never produces at all and a claude
+pane can miss — and read that absence as a strand. The cost is not noise: each one sends the
+orchestrator to `get_output` (the #520 token flood on an animated pane) and tempts a duplicate
+re-send, the loop #451/#510 exist to prevent.
+
+`unconfirmed_disposition(box_holds_paste, box_pending)` samples structural state *before* the
+notice, reusing the seams that already exist rather than inferring anything from output bytes.
+"Sitting unsubmitted" means our text is still identifiably at the box's tail, or the human's
+characters are outstanding; neither means the pane is done. The third condition #522 names —
+CLI at rest — is a *precondition* of reaching the decision rather than an input to it:
+`late_monitor_tick` returns `DeclareFailed` only when `quiet_long_enough`, and a pane mid-turn
+keeps `output_total` creeping (spinner and statusline frames included, #480), so it never gets
+that far. Taking it as a parameter would let a caller assert a state the surrounding code
+cannot produce.
+
+It deliberately does **not** mark the delivery confirmed. An idle reading is good enough to
+withhold an alarm, not to assert a landing; leaving the ledger unconfirmed keeps every
+downstream behaviour identical, including the residual `should_flush_before_paste` already
+blesses ("A false 'unconfirmed' here is safe: the flush Enter lands on an already empty box
+and is a no-op"). It also holds nothing across a restart: it reads live pane state, and a
+restart destroys the pty, so there is no delivery left to judge.
+
+**Test seams.** Two, both back-dating the *real* fields the real readers read rather than
+mocking a clock, so the tests drive the production path with production `now_ms()` and the
+shipped bound: `PtyManager::set_user_input_ms_for_test` and
+`record_stranded_outcome_at_for_test`. Without them the only way to reach a stale block is to
+sleep out ten minutes.
+
+**Honest residual.** The copilot-specific OSC 10/11/4 shapes still cannot be reproduced
+headless — `@xterm/headless` has no renderer/theme service to answer them from, and no `onKey`
+at all (which is itself why `onKey` is safe). `test/xterm-humaninput.test.ts` pins the general
+form via Device Attributes; the copilot shapes remain a live hand-check. And the origin bit
+is only as good as the frontend's own vectors: a future input path that reaches `writePty`
+without going through `markFirstInput()` would arrive marked non-human. That is the
+fail-*unsafe* direction for this one signal, which is why both marks hang off that single
+function rather than being re-derived at each call site.
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
