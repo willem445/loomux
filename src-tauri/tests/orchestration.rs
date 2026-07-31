@@ -11304,6 +11304,9 @@ fn reinject_awaiting_confirmation(reg: &OrchRegistry, oid: &str, grew: &HashMap<
 
 const REINJECT_TIMEOUT_MS: u64 = 5 * 60 * 1000; // REINJECT_CONFIRM_TIMEOUT_MS
 const REINJECT_BUSY_DEFER_MS: u64 = 5 * 60 * 1000; // REINJECT_BUSY_DEFER_MAX_MS
+/// REINJECT_ACK_SETTLE_MS — `SUBMIT_MAX_WAIT` (45s) + 5s of blind-retry tail.
+/// Activity before this is provably not a response to the paste (rev-15 #2).
+const REINJECT_ACK_SETTLE_MS: u64 = 50 * 1000;
 
 #[test]
 fn a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers() {
@@ -11329,9 +11332,10 @@ fn a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers() {
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "attempt 1 fired");
     assert!(reg.agent(&oid).unwrap().compact_pending, "awaiting confirmation");
 
-    // The agent answers: it calls a loomux MCP tool one second after the
-    // re-grounding was pasted. That is the re-sync the notice asks for.
-    reg.set_last_mcp_activity_ms_for_test(&oid, attempted + 1_000);
+    // The agent answers: it calls a loomux MCP tool once the notice has had
+    // time to be submitted and read — past `REINJECT_ACK_SETTLE_MS` (rev-15
+    // finding 2). That is the re-sync the notice asks for.
+    reg.set_last_mcp_activity_ms_for_test(&oid, attempted + REINJECT_ACK_SETTLE_MS + 1_000);
 
     // Cross the retry timeout — twice over, so this cannot pass merely by
     // being early. Pre-#535 this fired attempt 2, then attempt 3.
@@ -11369,6 +11373,51 @@ fn an_mcp_call_before_the_re_grounding_is_not_an_acknowledgment_of_it() {
     let _ = reg.compact_nudge_tick(attempted + REINJECT_TIMEOUT_MS, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 2,
         "an ack from BEFORE the attempt says nothing about this attempt — retry, exactly as before #535");
+}
+
+#[test]
+fn an_in_flight_tool_call_from_the_previous_turn_is_not_an_acknowledgment() {
+    // rev-15 finding 2. `attempted_ms` is when loomux DECIDED to paste — the
+    // agent cannot have read anything until the paste is written and the Enter
+    // actually pressed, which `deliver_prompt` may defer by up to
+    // `SUBMIT_MAX_WAIT` (45s) plus its blind-retry tail. So a tool call the
+    // agent had already decided on during its PREVIOUS turn, landing
+    // milliseconds after the decision, must not resolve the phase: that is a
+    // false landed-signal, the same family #112 (output-burst) and #522
+    // (idle-pane) exist to kill, arriving through a different door.
+    //
+    // This is the pair to `a_landed_re_grounding_is_never_re_sent_once_the_
+    // agent_itself_answers` above — identical setup, the ONLY difference being
+    // where the stamp falls relative to the settling floor.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let attempted = reinject_awaiting_confirmation(&reg, &oid, &grew);
+
+    // 200ms after the paste decision — an HTTP round trip, not a turn.
+    reg.set_last_mcp_activity_ms_for_test(&oid, attempted + 200);
+    let _ = reg.compact_nudge_tick(attempted + REINJECT_TIMEOUT_MS, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 2,
+        "a call that was in flight before the Enter was pressed is not a response to it — retry");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-confirmed"), 0,
+        "and it must never be recorded as a landing");
+
+    // The boundary itself, on the retry that just fired: one millisecond short
+    // of the floor still does not count…
+    let retried = attempted + REINJECT_TIMEOUT_MS;
+    reg.set_last_mcp_activity_ms_for_test(&oid, retried + REINJECT_ACK_SETTLE_MS - 1);
+    let _ = reg.compact_nudge_tick(retried + REINJECT_TIMEOUT_MS, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 3, "still inside the floor — attempt 3");
+
+    // …and one millisecond past it does. Without this half, a floor set so
+    // wide that NOTHING ever acks would pass the assertions above.
+    let retried2 = retried + REINJECT_TIMEOUT_MS;
+    reg.set_last_mcp_activity_ms_for_test(&oid, retried2 + REINJECT_ACK_SETTLE_MS);
+    let _ = reg.compact_nudge_tick(retried2 + REINJECT_TIMEOUT_MS, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "at the floor, an ack resolves — the floor delays the signal, it does not remove it");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-abandoned"), 0);
+    let confirmed = audit_entries(&reg, &gid, "compact-reinjection-confirmed");
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0]["detail"]["source"], "activity");
 }
 
 #[test]
@@ -11444,6 +11493,67 @@ fn a_retry_is_never_spent_into_a_live_turn_but_the_deferral_is_bounded() {
 }
 
 #[test]
+fn a_permanently_busy_pane_still_reaches_the_abandoned_record_and_the_lost_badge() {
+    // rev-15 finding 3. `REINJECT_BUSY_DEFER_MAX_MS`'s doc makes a load-bearing
+    // claim — a pane that never goes quiet "must not be able to suppress the
+    // retry forever, or scope item 3's safety net for a genuinely LOST
+    // re-grounding dies with it". The test above only drives that as far as
+    // attempt 2, and the pure-function table only pins one transition. Neither
+    // watches the ESCALATION actually happen, and "a bound whose exhaustion
+    // nobody has watched" is the #513 shape wearing a bound: a future edit that
+    // reset `compact_reinject_attempted_ms` in the `DeferBusy` arm would make
+    // `elapsed` restart every tick and hang forever, with the whole suite green.
+    //
+    // So: output advancing on EVERY tick from first attempt to terminal state,
+    // never once quiet, and assert the terminal state plus the reason the
+    // frontend actually renders — `compactionstatus.ts` keys the "re-grounding
+    // lost" badge off `compact_last_lost_reason`, so that field, not the audit
+    // line, is what makes this visible to a human.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let mut total = 50_000u64;
+    let flat: HashMap<String, u64> = [(oid.clone(), total)].into_iter().collect();
+    let attempted = reinject_awaiting_confirmation(&reg, &oid, &flat);
+    let mut busy_tick = |t: u64| {
+        total += 50_000; // always above `idle_activity_floor_bytes` — never quiet
+        let m: HashMap<String, u64> = [(oid.clone(), total)].into_iter().collect();
+        let _ = reg.compact_nudge_tick(t, &m, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+    };
+
+    // Each attempt costs its full window plus its full busy deferral, since the
+    // pane is never quiet: 3 attempts, then a 4th expiry that abandons.
+    let cycle = REINJECT_TIMEOUT_MS + REINJECT_BUSY_DEFER_MS;
+    let mut t = attempted;
+    for attempt in 2..=3u32 {
+        busy_tick(t + REINJECT_TIMEOUT_MS); // deferred, not spent
+        assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), attempt as usize - 1,
+            "attempt {attempt} must still be deferred while the pane is mid-turn");
+        t += cycle;
+        busy_tick(t);
+        assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), attempt as usize,
+            "the deferral is bounded — attempt {attempt} fires even though the pane never went quiet");
+    }
+    assert!(reg.agent(&oid).unwrap().compact_pending, "3rd attempt still awaiting its own window");
+
+    // The 4th expiry, pane STILL busy: the budget is spent, so it must abandon
+    // rather than defer forever.
+    busy_tick(t + REINJECT_TIMEOUT_MS);
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 3, "still bounded at MAX_REINJECT_ATTEMPTS");
+    t += cycle;
+    busy_tick(t);
+
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 3, "no 4th attempt");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-abandoned"), 1,
+        "a permanently busy pane still reaches the give-up — the deferral bounds the wait, it does not remove the escalation");
+    let a = reg.agent(&oid).unwrap();
+    assert!(!a.compact_pending, "latch released rather than wedged");
+    assert_eq!(a.compact_reinject_attempts, 0);
+    assert!(!a.compact_reinject_busy_deferred, "the deferral latch is cleared with the phase");
+    assert_eq!(a.compact_last_lost_reason.as_deref(), Some("reinjection-abandoned"),
+        "the badge-visible reason — this is what `compactionstatus.ts` renders as 're-grounding lost'");
+    assert!(a.compact_last_lost_ms.is_some(), "and it is stamped, so the badge can age out");
+}
+
+#[test]
 fn a_deferral_yields_to_the_acknowledgment_it_was_waiting_for() {
     // Ordering, stated as behaviour rather than as a claim in a doc comment:
     // evidence of a landing outranks both the clock and busy-ness. A pane that
@@ -11453,7 +11563,7 @@ fn a_deferral_yields_to_the_acknowledgment_it_was_waiting_for() {
     let mut total = 50_000u64;
     let flat: HashMap<String, u64> = [(oid.clone(), total)].into_iter().collect();
     let attempted = reinject_awaiting_confirmation(&reg, &oid, &flat);
-    reg.set_last_mcp_activity_ms_for_test(&oid, attempted + 500);
+    reg.set_last_mcp_activity_ms_for_test(&oid, attempted + REINJECT_ACK_SETTLE_MS + 500);
 
     total += 50_000;
     let busy: HashMap<String, u64> = [(oid.clone(), total)].into_iter().collect();

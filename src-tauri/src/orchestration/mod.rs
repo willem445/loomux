@@ -1259,6 +1259,37 @@ const MAX_REINJECT_ATTEMPTS: u32 = 3;
 /// same call for the same reason — a knob with no correct second setting only
 /// ever gets set wrong.
 const REINJECT_BUSY_DEFER_MAX_MS: u64 = REINJECT_CONFIRM_TIMEOUT_MS;
+/// #535 (rev-15 finding 2): how long after an attempt is DECIDED before an MCP
+/// call may be read as an acknowledgment of it.
+///
+/// Without a floor, `attempted_ms` is the moment loomux decided to paste — but
+/// the agent cannot have read anything until the paste is written AND the Enter
+/// is pressed. So a tool call the agent had already decided on during its
+/// *previous* turn, arriving milliseconds later, is indistinguishable from a
+/// response and resolves the phase for a notice the agent provably had not yet
+/// seen. That is a false landed-signal — the exact family #112 (the
+/// output-burst version) and #522 (the idle-pane version) exist to kill, and
+/// re-introducing it here through a different door would defeat the point.
+///
+/// **Derived, not picked.** `deliver_prompt` waits for the pane to go quiet
+/// before pressing Enter, bounded by `SUBMIT_MAX_WAIT` (45s), then makes spaced
+/// blind retries (`SUBMIT_RETRY_DELAYS`, last one at 4.5s). So `attempted_ms +
+/// SUBMIT_MAX_WAIT + that tail` is the worst-case moment the submit can still
+/// be in flight — before it, no activity can be a response to this notice,
+/// as a matter of ordering rather than of judgement. Rounded up to 5s of tail.
+///
+/// The cost is nothing the signal can feel: it is a sixth of
+/// `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~250s in which a genuine ack still
+/// resolves the phase. And a genuine ack landing *inside* the floor is not
+/// lost, merely not counted yet — agents call loomux tools repeatedly, so the
+/// next one resolves it; if none ever comes, the unchanged retry path runs,
+/// which is exactly the pre-#535 behaviour.
+///
+/// Why not the delivery ledger's own `submit_sent_ms`, which would be exact?
+/// Because that would re-couple the acknowledgment path to the delivery
+/// bookkeeping this whole fix exists to stop depending on. A worst-case bound
+/// derived from our own timing constants needs no sampler to be working.
+const REINJECT_ACK_SETTLE_MS: u64 = SUBMIT_MAX_WAIT.as_secs() * 1000 + 5_000;
 /// Production bug fix (#410, PR #329 round 6): how long a `compact_pending`
 /// arm is given to reach a busy-then-quiet resolution (confirm or discard)
 /// before the resolver forces an abandon — symmetric to `REINJECT_CONFIRM_
@@ -3366,11 +3397,22 @@ pub fn reinject_disposition(
 /// spinner repaint frames per #480, and `idle_output_is_activity`'s whole
 /// reason for existing).
 ///
-/// The comparison is `>=`, not `>`: the stamp and whatever `since_ms` is being
-/// compared against are both `now_ms()` readings, and a fast agent can
-/// genuinely answer inside the same millisecond. Erring the other way would
-/// discard the very ack this exists to notice — the same off-by-one that made
-/// one of #518's tests pass for the wrong reason.
+/// **Callers comparing against a PASTE time owe a settling floor** (rev-15
+/// finding 2). This fn answers "did the agent act after time T", which is not
+/// the same question as "did the agent act *in response to* what we pasted at
+/// T". Between deciding to paste and the Enter actually being pressed there is
+/// a real window (`SUBMIT_MAX_WAIT` + the `SUBMIT_RETRY_DELAYS` tail), and any
+/// call arriving inside it was decided during the agent's *previous* turn — a
+/// false landed-signal of exactly the kind #112 and #522 removed elsewhere. So
+/// pass `paste_ms + REINJECT_ACK_SETTLE_MS`, not `paste_ms`; see that constant
+/// for the derivation. The floor lives at the call site rather than in here so
+/// this stays a bare, reusable timestamp comparison — but a caller that skips
+/// it is wrong, not merely stricter.
+///
+/// The comparison is `>=` rather than `>` purely as a boundary convention, so
+/// a stamp landing in the same millisecond as `since_ms` counts. Nothing rests
+/// on that choice once the settling floor above is applied — it is not a claim
+/// that an agent can answer within a millisecond.
 ///
 /// `last_mcp_activity_ms == 0` is "never called" (`AgentEntry`'s seed) and can
 /// never satisfy a real `since_ms`, so a never-calling agent falls through to
@@ -16522,7 +16564,17 @@ impl OrchRegistry {
                     // alarms in one observed session) that a LANDED
                     // re-grounding was being re-pasted into a working agent.
                     // See `agent_acted_since` / `reinject_disposition`.
-                    let acked = agent_acted_since(a.last_mcp_activity_ms, attempted_ms);
+                    //
+                    // rev-15 finding 2: the floor, NOT a bare `attempted_ms`.
+                    // That stamp is when we decided to paste; the agent cannot
+                    // have read anything until the Enter is actually pressed,
+                    // so a call it had already decided on last turn would
+                    // otherwise resolve this phase for a notice it had not yet
+                    // seen. See `REINJECT_ACK_SETTLE_MS` for the derivation.
+                    let acked = agent_acted_since(
+                        a.last_mcp_activity_ms,
+                        attempted_ms.saturating_add(REINJECT_ACK_SETTLE_MS),
+                    );
                     // #535: `currently_quiet` is this tick's OWN floor-gated
                     // growth reading, computed above. `busy` is used ONLY to
                     // defer an attempt, never to claim one landed — output

@@ -2567,6 +2567,35 @@ writer) is stamped from exactly ONE tool, `message_orchestrator`, and is an expl
 `Role::Orchestrator`. `DeliveryConfirmation` is the unreliable signal this section exists to stop
 relying on.
 
+#### The settling floor (rev-15 finding 2)
+
+`attempted_ms` is when loomux **decided** to paste, not when the agent could first have read
+anything: `deliver_prompt` waits for the pane to go quiet before pressing Enter, bounded by
+`SUBMIT_MAX_WAIT` (45s), then makes spaced blind retries. So a tool call the agent had already
+decided on during its *previous* turn, arriving milliseconds after the decision, is
+indistinguishable from a response — and would resolve the phase for a notice the agent provably
+had not yet seen. That is a **false landed-signal**, the same family #112 removed in its
+output-burst form and #522 in its idle-pane form; re-introducing it here through a different door
+would defeat the point of the batch.
+
+So the call site compares against `attempted_ms + REINJECT_ACK_SETTLE_MS`, never bare
+`attempted_ms`. The constant is **derived rather than picked**: `SUBMIT_MAX_WAIT` plus the
+`SUBMIT_RETRY_DELAYS` tail is the worst-case moment our own submit can still be in flight, so
+activity before it cannot be a response as a matter of *ordering* rather than of judgement. It
+costs the signal nothing — a sixth of `REINJECT_CONFIRM_TIMEOUT_MS`, leaving ~250s in which a
+genuine ack still resolves the phase, and an ack landing inside the floor is not lost, merely not
+counted yet (agents call loomux tools repeatedly; if none ever comes, the unchanged retry path
+runs, which is the pre-#535 behaviour).
+
+Not the delivery ledger's own `submit_sent_ms`, which would be exact: that would re-couple the
+acknowledgment path to the delivery bookkeeping this whole change exists to stop depending on. A
+worst-case bound derived from our own timing constants needs no sampler to be working.
+
+The floor lives at the call site, not inside `agent_acted_since`, so the predicate stays a bare
+reusable timestamp comparison — but its doc states that **a caller comparing against a paste time
+owes the floor**, because a caller that skips it is wrong rather than merely stricter. #539's
+detector will be comparing against a paste time too.
+
 Deliberately built as a **shared** mechanism rather than shaped to its first caller:
 `agent_acted_since(last_mcp_activity_ms, since_ms)` takes a bare timestamp pair, and
 `OrchRegistry::last_mcp_activity_ms` is a public reader. #539 — the unconfirmed-delivery detector,
@@ -2618,8 +2647,16 @@ the live defect (and supplies **no** `DeliveryConfirmation` anywhere, which is e
 production case that misbehaved); `an_mcp_call_before_the_re_grounding_is_not_an_acknowledgment_
 of_it` is its pair, proving the comparison is read rather than mere non-zero-ness;
 `a_genuinely_lost_re_grounding_still_retries_and_still_abandons_at_the_bound` pins that the safety
-net survives; `a_retry_is_never_spent_into_a_live_turn_but_the_deferral_is_bounded` covers both
-halves of the deferral; `a_deferral_yields_to_the_acknowledgment_it_was_waiting_for` pins the
+net survives; `an_in_flight_tool_call_from_the_previous_turn_is_not_an_acknowledgment` pins the
+settling floor from both sides — 1ms short of it does not ack, exactly at it does, so a floor set
+so wide that nothing ever acked could not pass; `a_retry_is_never_spent_into_a_live_turn_but_the_
+deferral_is_bounded` covers both halves of the deferral;
+`a_permanently_busy_pane_still_reaches_the_abandoned_record_and_the_lost_badge` drives a pane that
+is never once quiet all the way through three attempts to the terminal state and asserts
+`compact_last_lost_reason` — the field `compactionstatus.ts` renders as the "re-grounding lost"
+badge — rather than only the attempt count, so a future edit that reset the clock inside the
+`DeferBusy` arm (hanging forever) could not pass;
+`a_deferral_yields_to_the_acknowledgment_it_was_waiting_for` pins the
 ordering as behaviour rather than as a claim in a comment; and
 `every_mcp_tool_call_stamps_the_shared_activity_clock_for_every_role` pins the wiring — the
 orchestrator case, the rejected-call case, and monotonicity.
