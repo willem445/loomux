@@ -240,11 +240,46 @@ impl PtyManager {
     /// behaviour for that one write, not toward the bug this PR fixes. Still
     /// written down here so a future CLI reply pattern that defeats it is
     /// something the next reader can find, not rediscover.
-    pub fn note_user_input(&self, id: u32, data: &str) {
+    ///
+    /// **#518: `human_origin` is the structural half of that gate.** Everything
+    /// above classifies by BYTE SHAPE, which is a pattern match against an
+    /// OPEN set: it covers the auto-reply shapes #179 catalogued and any
+    /// other well-formed CSI/OSC/DCS, but #496's own plan §7 closed with
+    /// "which copilot emission recurs mid-session" still unanswered — that is
+    /// why `record_phantom_gate`'s breadcrumb exists. #518 is the residue of
+    /// that open set firing in production: a copilot orchestrator's prompt
+    /// sat unsubmitted for want of a keystroke nobody made.
+    ///
+    /// The frontend already solved this exact problem once, for its own
+    /// `firstInputMs`, and NOT by filtering `onData` (#440 B2-R): it takes the
+    /// signal from `term.onKey` and the deliberate `term.paste()` sites, which
+    /// fire only for genuine keyboard/paste events and are unreachable by
+    /// anything the terminal manufactures on its own — "a structural
+    /// guarantee, not a pattern match against an open set of possible
+    /// auto-reply shapes". `human_origin` carries that same already-proven bit
+    /// across the IPC boundary so this stamp can use it too. The two
+    /// conditions are ANDed, not swapped: byte shape still has to agree, so a
+    /// genuine keystroke that carries no content (an arrow key) is excluded
+    /// exactly as #496 PR-A left it.
+    ///
+    /// `write_pty` defaults it to `true` when a caller says nothing, so an
+    /// unstated origin behaves exactly as it did before #518 — the fail-safe
+    /// direction, since believing a human typed only ever makes loomux hold
+    /// MORE.
+    ///
+    /// Occupancy (`input_box_len`) is deliberately NOT gated on this. A
+    /// terminal auto-reply already contributes a zero delta, so there is
+    /// nothing here for the origin bit to add — and under-counting occupancy
+    /// is the one direction `box_occupancy_delta`'s doc commits to never
+    /// taking, because reading an occupied box as empty is the clobber #111
+    /// exists to prevent. #518's bound (`human_input_block`) reads
+    /// `input_pending` as its positive evidence, so that counter must stay
+    /// governed by the conservative rule alone.
+    pub fn note_user_input(&self, id: u32, data: &str, human_origin: bool) {
         let classification = crate::orchestration::classify_human_input(data);
         let delta = crate::orchestration::box_occupancy_delta(data);
-        let keystroke_like =
-            classification != crate::orchestration::HumanInput::Neutral || delta != 0;
+        let keystroke_like = human_origin
+            && (classification != crate::orchestration::HumanInput::Neutral || delta != 0);
         {
             let mut ptys = self.ptys.lock_safe();
             let Some(pty) = ptys.get_mut(&id) else { return };
@@ -1199,9 +1234,25 @@ pub fn pty_backend_info() -> PtyBackendInfo {
     }
 }
 
+/// #518: `human` says whether this write ORIGINATED in a genuine keyboard or
+/// paste event, as opposed to data the terminal manufactured on its own
+/// (a query auto-reply). The frontend decides it structurally — see
+/// `note_user_input`'s doc and `src/humanorigin.ts` — because byte shape
+/// alone cannot, over an open set of reply shapes.
+///
+/// Optional, and absent means `true`: a caller that says nothing gets exactly
+/// the pre-#518 behaviour, and "assume a human typed" is the fail-safe
+/// default (it only ever makes delivery hold MORE). The parameter is additive,
+/// so the command's existing shape stays valid — `write_pty(id, data)` still
+/// compiles, still deserializes, and still means what it always meant.
 #[tauri::command]
-pub fn write_pty(state: State<PtyManager>, id: u32, data: String) -> Result<(), String> {
-    state.note_user_input(id, &data);
+pub fn write_pty(
+    state: State<PtyManager>,
+    id: u32,
+    data: String,
+    human: Option<bool>,
+) -> Result<(), String> {
+    state.note_user_input(id, &data, human.unwrap_or(true));
     let mut ptys = state.ptys.lock_safe();
     let pty = ptys.get_mut(&id).ok_or("pty not found")?;
     pty.writer

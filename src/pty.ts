@@ -63,8 +63,16 @@ export interface DirInfo {
 export const spawnPty = (opts: SpawnOptions): Promise<number> =>
   invoke<number>("spawn_pty", { ...opts });
 
-export const writePty = (id: number, data: string): Promise<void> =>
-  invoke("write_pty", { id, data });
+/** Write into a pane's PTY.
+ *
+ *  `human` (#518) says whether this data ORIGINATED in a genuine keyboard or
+ *  paste event rather than being manufactured by the terminal itself (a query
+ *  auto-reply — see `humanorigin.ts`). The backend gates its keystroke-recency
+ *  clock on it, so a copilot pane's OSC/DCS chatter can no longer read as a
+ *  human typing. Omitted means `true`: an unstated origin behaves exactly as
+ *  it did before #518, which is the fail-safe direction. */
+export const writePty = (id: number, data: string, human?: boolean): Promise<void> =>
+  invoke("write_pty", { id, data, human });
 
 export const resizePty = (id: number, cols: number, rows: number): Promise<void> =>
   invoke("resize_pty", { id, cols, rows });
