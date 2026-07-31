@@ -197,12 +197,21 @@ pub fn resolve_sh(git_exe: &Path, path_env: &str, pathext: &str) -> Option<PathB
 /// in the same `usr\bin` in every Git for Windows layout, but the *fallback*
 /// PATH lookup means we still return the directory `tr` actually lives in
 /// rather than assuming it sits beside `sh`.
+///
+/// The layout probe looks for `tr.exe` unconditionally — it is describing the
+/// Git for Windows install shape, exactly as `resolve_sh` above probes
+/// `sh.exe`, and it is not a platform bug that it finds nothing off Windows:
+/// there the caller (`resolve_shim_toolchain`) does not use this at all, and
+/// the PATH fallback below is the honest answer. A `cfg!(windows)`-switched
+/// probe name was worse than merely redundant — the ancestor walk climbs three
+/// levels, which from a temp directory on Linux reaches `/` and "resolves"
+/// `/usr/bin/tr`, i.e. a directory that has nothing to do with the `sh` it was
+/// asked about. Same false positive would apply to any short path.
 pub fn resolve_utils_dir(sh_exe: &Path, path_env: &str, pathext: &str) -> Option<PathBuf> {
-    let probe = if cfg!(windows) { "tr.exe" } else { "tr" };
     let mut dir = sh_exe.parent().map(Path::to_path_buf);
     for _ in 0..3 {
         let Some(d) = dir else { break };
-        for rel in [probe, &format!("usr/bin/{probe}"), &format!("bin/{probe}")] {
+        for rel in ["tr.exe", "usr/bin/tr.exe", "bin/tr.exe"] {
             let cand = d.join(rel);
             if cand.is_file() {
                 return cand.parent().map(Path::to_path_buf);
@@ -445,8 +454,11 @@ mod tests {
         let bin = tmp.path().join("usr").join("bin");
         fs::create_dir_all(&bin).unwrap();
         fs::write(bin.join("sh.exe"), b"sh").unwrap();
-        let tr = bin.join(if cfg!(windows) { "tr.exe" } else { "tr" });
-        fs::write(&tr, b"tr").unwrap();
+        // `tr.exe`, not a cfg-switched name: the probe describes the Git for
+        // Windows layout on every host (see resolve_utils_dir's note), so the
+        // fixture must too — otherwise this test would pass on Linux for the
+        // wrong reason, by finding the machine's real /usr/bin.
+        fs::write(bin.join("tr.exe"), b"tr").unwrap();
         assert_eq!(resolve_utils_dir(&bin.join("sh.exe"), "", "").unwrap(), bin);
     }
 
@@ -463,19 +475,34 @@ mod tests {
         fs::write(shbin.join("sh.exe"), b"sh").unwrap();
         let utils = tmp.path().join("usr").join("bin");
         fs::create_dir_all(&utils).unwrap();
-        fs::write(utils.join(if cfg!(windows) { "tr.exe" } else { "tr" }), b"tr").unwrap();
+        fs::write(utils.join("tr.exe"), b"tr").unwrap();
         assert_eq!(resolve_utils_dir(&shbin.join("sh.exe"), "", "").unwrap(), utils);
     }
 
     /// #509: nothing in the layout and nothing on PATH — the caller must treat
     /// this as "no coreutils dir to bake in" (the shim then still fails CLOSED
     /// at run time via its own dependency self-check) rather than guess a path.
+    ///
+    /// This also pins the ancestor walk against reaching UNRELATED directories.
+    /// The first cut probed a cfg-switched bare `tr` off Windows and went red
+    /// here on Linux CI: the walk climbs three levels, which from a temp dir
+    /// reaches `/` and "resolved" the machine's own `/usr/bin` — a directory
+    /// with no relationship to the `sh` it was asked about. Whatever it returns
+    /// must come from the passed-in layout or from PATH, never from happening
+    /// to be near the filesystem root.
     #[test]
     fn resolve_utils_is_none_when_nothing_found() {
         let tmp = tempfile::tempdir().unwrap();
         let sh = tmp.path().join("sh.exe");
         fs::write(&sh, b"sh").unwrap();
         assert!(resolve_utils_dir(&sh, "", ".EXE").is_none());
+        // Same shape one level deeper, so the walk has ancestors to climb and
+        // still must come back empty.
+        let nested = tmp.path().join("a").join("b").join("bin");
+        fs::create_dir_all(&nested).unwrap();
+        let sh2 = nested.join("sh.exe");
+        fs::write(&sh2, b"sh").unwrap();
+        assert!(resolve_utils_dir(&sh2, "", ".EXE").is_none());
     }
 
     /// #509: a `$PATH` entry an MSYS `sh` can actually resolve. A `C:/…` entry
