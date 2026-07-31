@@ -13848,6 +13848,15 @@ fn gh_and_git_shim_grant_claim_settle_fragments_stay_byte_identical() {
     }
 }
 
+/// The POSIX tools the shims' dependency preamble asserts (#509). One list, two
+/// consumers: `stripped_path_harness` needs them all present in a single
+/// directory before it can arm a pin, and
+/// `gh_and_git_shim_deps_preamble_stays_byte_identical` pins that the generated
+/// script really covers exactly these. Mirrors the list in `shim_deps_preamble`
+/// — if that one grows a tool, this goes with it or the byte-identical test says
+/// so.
+const SHIM_DEP_TOOLS: [&str; 7] = ["tr", "head", "tail", "date", "cat", "rm", "mv"];
+
 /// The `(sh, ShimPaths)` a stripped-PATH harness should use on THIS host, or
 /// `None` if it cannot assemble one (#509).
 ///
@@ -13870,11 +13879,22 @@ fn stripped_path_harness() -> Option<(String, ShimPaths)> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        for cand in ["/usr/bin/tr", "/bin/tr"] {
-            let p = std::path::Path::new(cand);
-            if p.is_file() {
-                let dir = p.parent().unwrap().display().to_string();
-                return Some(("/bin/sh".to_string(), ShimPaths { utils_dir: Some(dir), git_dir: None }));
+        // EVERY dependency has to live in the ONE directory `utils_dir` names.
+        // The shim takes a single directory, not a list, because Git for Windows
+        // ships all of them in one `usr\bin` — so a host that splits them cannot
+        // supply a sufficient one and must SKIP rather than hand the shim a
+        // directory that was never going to work. macOS is exactly that host
+        // (`/usr/bin/tr` but `/bin/date`), and the first cut of this helper —
+        // "find `tr`, use its directory" — sent the macOS runner red: the shim
+        // correctly refused, naming `date`, for a reason with nothing to do with
+        // #509. Checking the whole set is what makes the skip honest.
+        for cand in ["/usr/bin", "/bin"] {
+            let dir = std::path::Path::new(cand);
+            if SHIM_DEP_TOOLS.into_iter().all(|d| dir.join(d).is_file()) {
+                return Some((
+                    "/bin/sh".to_string(),
+                    ShimPaths { utils_dir: Some(dir.display().to_string()), git_dir: None },
+                ));
             }
         }
         None
@@ -14166,7 +14186,7 @@ fn gh_and_git_shim_deps_preamble_stays_byte_identical() {
     // And it really does both halves: repair, then assert.
     let p = slice(&gh);
     assert!(p.contains("PATH=\"$LOOMUX_UTILS:$PATH\""), "prepends the resolved coreutils dir");
-    for dep in ["tr", "head", "tail", "date", "cat", "rm", "mv"] {
+    for dep in SHIM_DEP_TOOLS {
         assert!(p.contains(&format!(" {dep} ")) || p.contains(&format!(" {dep};")) || p.contains(&format!("in {dep} ")),
             "the self-check must cover '{dep}', got:\n{p}");
     }
