@@ -441,6 +441,58 @@ fn a_block_name_cannot_break_the_generated_agent_files_yaml_frontmatter() {
 }
 
 #[test]
+fn a_verbose_persona_description_is_clamped_in_the_generated_agent_file() {
+    // #502: Claude Code loads EVERY agent definition's `description` into the
+    // session's agent roster and caps the AGGREGATE — the observed failure was
+    // "Agent descriptions are over the 15.0k-token limit (~15.6k tokens)".
+    // Description length is therefore a SHARED budget, not a per-file concern.
+    // loomux's own descriptions are already terse (the block id), but a
+    // repo-authored persona's `description:` is unbounded free text that flows
+    // straight into the generated file — one repo's essay would spend every
+    // session's budget. So it is clamped at the write.
+    let (reg, d) = test_registry();
+    let essay = "a very wordy persona description that keeps going and going ".repeat(40);
+    let repo = Repo::new()
+        .workflow(
+            "version: 1\nblocks:\n  - id: chatty\n    kind: worker\n    cli: claude\n    profile: .github/agents/chatty.md\n",
+        )
+        .agent_file("chatty.md", &format!("---\nname: chatty\ndescription: {essay}\n---\nBe brief.\n"));
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+
+    let b = g.guardrails.block("chatty").unwrap();
+    let cli = workflow::cli_of(b, &g.guardrails.agent_cli);
+    let persona = reg.resolve_persona(&g, b).unwrap();
+    assert!(
+        persona.as_ref().is_some_and(|p| p.description.chars().count() > 1_000),
+        "the persona itself must really carry an oversized description, or this pins nothing",
+    );
+    let instructions_body = instructions_lf(&reg, &g.id, &b.instructions_file());
+    let contract = block_contract_text(&instructions_body, persona.as_ref());
+    let inject = reg.persona_inject(&g.id, b, cli, persona.as_ref(), &contract);
+    let handle = inject.claude_agent.clone().expect("a generated Claude agent file handle");
+
+    let generated = fs::read_to_string(d.path().join("claude-agents").join(format!("{handle}.md"))).unwrap();
+    let fm = parse_agent_frontmatter(&generated);
+    let description = fm.get("description").expect("Claude requires `description`").clone();
+    assert!(
+        description.chars().count() <= 160,
+        "an unbounded persona description must not reach the roster verbatim ({} chars): {description}",
+        description.chars().count(),
+    );
+    assert!(
+        description.ends_with("..."),
+        "a clamped description must show it was cut rather than read as the whole thing: {description}",
+    );
+    assert!(
+        description.starts_with("a very wordy persona description"),
+        "the clamp keeps the FRONT of the description — the part that says what the agent is: {description}",
+    );
+    // The full persona TEXT is untouched: only the roster-facing description
+    // is a shared budget, and the body is what the agent actually reads.
+    assert!(generated.contains("Be brief."), "{generated}");
+}
+
+#[test]
 fn a_quoted_allow_pattern_keeps_its_commas_and_braces() {
     // Coordination with #223 (the workflow pane, which hit a corruption bug on
     // exactly this shape). A real tool pattern contains commas and brackets:

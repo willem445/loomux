@@ -5738,6 +5738,85 @@ const COPILOT_AGENT_BODY_DOCUMENTED_CAP_CHARS: usize = 30_000;
 /// for the case a workflow-declared persona is itself unusually large.
 const COPILOT_AGENT_BODY_SAFE_CHARS: usize = 27_000;
 
+/// #502: the ONE place the generated custom-agent file's naming lives —
+/// both writers (`write_claude_agent_file`, `write_copilot_agent_file`) and
+/// `end_group`'s reclaim (`reclaim_group_agent_files`) go through these, so
+/// that delete path can never drift from the write path's names. Drift here
+/// is not cosmetic: a delete path that re-derives the shape independently
+/// either misses files (they accumulate — #502's incident) or matches too
+/// widely (it deletes something loomux never wrote).
+///
+/// #464's `sweep_orphaned_agent_files` matches the same shape with its own
+/// literals rather than these constants. Left as it shipped deliberately:
+/// unifying it would be a behavior change to a reviewed, merged sweep for a
+/// cosmetic gain, and its rule is pinned by its own tests.
+///
+/// The shape is `loomux-<group>-<block>` plus a per-CLI extension, because
+/// a handle must be unique per group+block so concurrent groups never
+/// collide — see `write_claude_agent_file`'s doc.
+const GENERATED_AGENT_PREFIX: &str = "loomux-";
+const CLAUDE_AGENT_FILE_EXT: &str = ".md";
+const COPILOT_AGENT_FILE_EXT: &str = ".agent.md";
+
+fn generated_agent_handle(group: &str, block: &str) -> String {
+    format!("{GENERATED_AGENT_PREFIX}{group}-{block}")
+}
+
+/// #502: upper bound on a generated agent file's `description:` value.
+///
+/// Claude Code loads EVERY agent definition's description into the parent
+/// session's roster and caps the aggregate (observed: "Agent descriptions
+/// are over the 15.0k-token limit"), so description length is a shared
+/// budget, not a per-file concern. loomux's own descriptions are already
+/// terse (the block id — `worker`, `orchestrator`), but a repo-authored
+/// persona's `description:` frontmatter is free text of unbounded length,
+/// and it flows straight into the generated file. Clamping it keeps one
+/// repo's verbose persona from spending everyone's budget. 160 characters
+/// is comfortably more than the one-line "when to delegate to this agent"
+/// the field is documented to hold.
+const GENERATED_AGENT_DESCRIPTION_MAX_CHARS: usize = 160;
+
+/// Clamp a description to [`GENERATED_AGENT_DESCRIPTION_MAX_CHARS`],
+/// counting CHARACTERS (a repo persona's text is not guaranteed ASCII, and
+/// truncating mid-codepoint would panic on a byte slice).
+fn clamp_agent_description(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= GENERATED_AGENT_DESCRIPTION_MAX_CHARS {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(GENERATED_AGENT_DESCRIPTION_MAX_CHARS - 3).collect();
+    format!("{}...", kept.trim_end())
+}
+
+/// #502: which live orchestration group a generated agent file's stem
+/// belongs to — the **longest** group id whose `loomux-<group>-` prefix the
+/// stem carries, or `None` when no live group claims it (an orphan).
+///
+/// Longest-match, not first-match, because nothing stops one group id from
+/// being a prefix of another: with groups `g` and `g-x` alive, the stem
+/// `loomux-g-x-worker` is `g-x`'s worker, not a `g` file for a block named
+/// `x-worker`. First-match would let `end_group("g")` delete a LIVE group's
+/// file. The ambiguity is unresolvable from the filename alone (both
+/// readings are well-formed), so ownership is decided against the group
+/// registry — loomux's own source of truth — and resolved toward the more
+/// specific claim.
+///
+/// Its one caller, `end_group`'s `reclaim_group_agent_files`, takes its
+/// conservative direction from this: it deletes only what THIS group owns,
+/// so a stem a more specific live group claims is never touched.
+fn owning_group<'a>(stem: &str, groups: &'a [String]) -> Option<&'a str> {
+    groups
+        .iter()
+        .filter(|g| {
+            stem.strip_prefix(&format!("{GENERATED_AGENT_PREFIX}{g}-"))
+                .is_some_and(|block| !block.is_empty())
+        })
+        .max_by_key(|g| g.len())
+        .map(String::as_str)
+}
+
+
+
 /// Round 8 review (N3a): a short, CLI-agnostic self-check appended to EVERY
 /// generated agent file, on BOTH CLIs — delivery-independent insurance
 /// against a missed or delayed post-compact reinjection. loomux's own
@@ -6615,24 +6694,24 @@ pub fn set_copilot_trust_home_for_test(home: Option<PathBuf>) {
     COPILOT_TRUST_HOME_OVERRIDE.with(|c| *c.borrow_mut() = home);
 }
 
-/// Pre-trust an agent's workspace in copilot's config so its pane doesn't
-/// boot into a folder-trust dialog — which eats the kickoff paste and gets
-/// blind-answered by the submit retries. Best-effort: on any failure the
-/// dialog simply appears as before.
-#[doc(hidden)] // pub for integration tests (#475: the trust-granting write needs to be testable)
-pub fn pre_trust_copilot_folder(folder: &str) {
-    let home = COPILOT_TRUST_HOME_OVERRIDE
-        .with(|c| c.borrow().clone())
-        .or_else(|| std::env::var("COPILOT_HOME").map(PathBuf::from).ok())
-        .or_else(|| dirs::home_dir().map(|h| h.join(".copilot")))
-        .unwrap_or_default();
-    if home.as_os_str().is_empty() {
-        return;
-    }
+/// The write half of the trust grant, split from home RESOLUTION (#502) so
+/// there is exactly one place that decides WHERE the config lives:
+/// [`OrchRegistry::pre_trust_copilot_folder`], the sole entry point.
+///
+/// rev-38 round 3: this used to have a `pub` free sibling that resolved the
+/// home directory itself, leaving "production must call the contained one"
+/// to call-site discipline. Convention is not a mechanism — the sibling is
+/// gone, and the containment rule is now unavoidable rather than merely
+/// documented. `#475`'s tests drive the registry method, whose thread-local
+/// seam still gives them the exact resolution they fixture.
+///
+/// Module-private on purpose: nothing outside this module should be able to
+/// name a "write the trust grant HERE" primitive.
+fn pre_trust_copilot_folder_in(home: &Path, folder: &str) {
     let path = home.join("config.json");
     let text = fs::read_to_string(&path).unwrap_or_default();
     if let Some(updated) = add_trusted_folder(&text, folder) {
-        let _ = fs::create_dir_all(&home);
+        let _ = fs::create_dir_all(home);
         let _ = fs::write(&path, updated);
     }
 }
@@ -9814,7 +9893,123 @@ impl OrchRegistry {
         if let Some(dir) = self.claude_agents_dir_override.lock_safe().clone() {
             return Some(dir);
         }
-        dirs::home_dir().map(|h| h.join(".claude").join("agents"))
+        self.user_cli_dir(".claude", "agents")
+    }
+
+    /// #502, the RE-MINT root cause: a directory inside the user's home is
+    /// resolved ONLY for the registry that owns the user's live
+    /// orchestration state — the one rooted at [`default_root`]
+    /// (Self::default_root), which `lib.rs` constructs exactly once. Any
+    /// registry rooted elsewhere gets a directory inside its OWN root
+    /// instead, and can never write into the user's real CLI configuration.
+    ///
+    /// This was observed live, not theorized. After the 1,210 orphans of
+    /// #502 were deleted by hand, files for long-dead groups reappeared
+    /// within minutes — and the names said where from: group ids are
+    /// `<repo-dir-name>-<hash>` (`group_id_for_repo`), and the reappearing
+    /// ones were `loomux-tmp<random>-<hash>-*` and `loomux-repo-<hash>-*`,
+    /// i.e. `tempfile::tempdir()` directory names and the fake `C:/tmp/repo`
+    /// path — loomux's OWN test suite. It constructs throwaway registries
+    /// 50+ times and only its shared `test_registry` helper set the agents-
+    /// dir override, so every OTHER test that spawned an agent minted a real
+    /// multi-KB file in the developer's `~/.claude/agents` that nothing ever
+    /// deleted. That is where 67MB came from; the group-end reclaim and the
+    /// startup sweep are the belt, this is the cause.
+    ///
+    /// Fixed HERE rather than by adding the override to each of those call
+    /// sites: "every test remembers to opt out of writing to your home
+    /// directory" is not a property anyone can maintain, and the next test
+    /// added would silently reintroduce it. Deliberately not `cfg!(test)`-
+    /// gated either — integration tests link the lib as a normal dependent,
+    /// so `cfg(test)` is FALSE in them (which is exactly why the leak
+    /// survived this long), and the rule is sound on its own terms for any
+    /// caller: a registry that is not managing the user's live state has no
+    /// business writing the user's live CLI config.
+    ///
+    /// The failure direction is safe: if the app's root ever stops being
+    /// `default_root()`, generated agent files land in that root instead of
+    /// the user's home, and `persona_inject`'s existing write-failure
+    /// fallbacks (`--append-system-prompt-file` on Claude, kickoff text on
+    /// Copilot) still deliver the contract. Nothing silently writes where it
+    /// shouldn't.
+    fn user_cli_dir(&self, cli_dir: &str, sub: &str) -> Option<PathBuf> {
+        if self.is_live_registry() {
+            return dirs::home_dir().map(|h| h.join(cli_dir).join(sub));
+        }
+        Some(self.root.join(format!("{}-{sub}", cli_dir.trim_start_matches('.'))))
+    }
+
+    /// #502 (rev-38 review, B1): the containment PREDICATE, in one place —
+    /// is this the registry that owns the user's live orchestration state?
+    ///
+    /// Every path that would otherwise reach into the user's home asks this
+    /// one question: [`user_cli_dir`](Self::user_cli_dir) for the generated
+    /// agent dirs, and [`copilot_home_dir`](Self::copilot_home_dir) for
+    /// Copilot's hook config and its `trustedFolders` config. Factored out
+    /// because rev-38 found a third home-writing path that the first two had
+    /// each open-coded the rule for and this one had simply never been given
+    /// it — a rule copied per site is a rule the next site forgets.
+    fn is_live_registry(&self) -> bool {
+        self.root == Self::default_root()
+    }
+
+    /// Copilot's user-level home (`$COPILOT_HOME`, else `~/.copilot`) — or,
+    /// for a registry that is not the user's live one, a contained stand-in
+    /// inside its own root.
+    ///
+    /// #502 (rev-38 review, B1): `COPILOT_HOME` is checked only for the live
+    /// registry, deliberately. That variable names the user's REAL Copilot
+    /// home, which is precisely what a throwaway registry must not touch —
+    /// honoring it first would reopen the leak for anyone who has it set.
+    fn copilot_home_dir(&self) -> Option<PathBuf> {
+        if !self.is_live_registry() {
+            return Some(self.root.join("copilot-home"));
+        }
+        if let Ok(home) = std::env::var("COPILOT_HOME") {
+            if !home.trim().is_empty() {
+                return Some(PathBuf::from(home));
+            }
+        }
+        dirs::home_dir().map(|h| h.join(".copilot"))
+    }
+
+    /// Pre-trust an agent's workspace in copilot's config so its pane doesn't
+    /// boot into a folder-trust dialog — which eats the kickoff paste and gets
+    /// blind-answered by the submit retries. Best-effort: on any failure the
+    /// dialog simply appears as before.
+    ///
+    /// Pre-trust an agent's workspace in copilot's config so its pane doesn't
+    /// boot into a folder-trust dialog — which eats the kickoff paste and gets
+    /// blind-answered by the submit retries. Best-effort: on any failure the
+    /// dialog simply appears as before.
+    ///
+    /// **The only entry point** (rev-38 round 3). It briefly had a `pub` free
+    /// sibling that did its own home resolution, which left containment
+    /// depending on every caller picking this one — the same
+    /// convention-instead-of-mechanism shape that let the leak below happen
+    /// in the first place. There is now nothing else to call.
+    ///
+    /// #502 (rev-38 review, B1): the free function was the third uncontained
+    /// write into the user's home, and the worst of them on two counts the
+    /// other two don't share — `trustedFolders` is a SECURITY setting (it
+    /// suppresses Copilot's folder-trust prompt), and its entries are
+    /// per-workspace PATHS, so a suite spawning into fresh temp dirs appends
+    /// a new one every run and grows without bound. The agent-file
+    /// incident's exact shape, one directory over.
+    ///
+    /// #475's thread-local seam still wins when a test sets it: fixturing it
+    /// is an explicit statement about where this write should go, and that
+    /// beats a structural default. Everything else — including the 50+ tests
+    /// that build a registry without fixturing anything — lands inside the
+    /// registry's own root via `copilot_home_dir`.
+    #[doc(hidden)] // pub for integration tests (#475's seam drives this path)
+    pub fn pre_trust_copilot_folder(&self, folder: &str) {
+        if let Some(home) = COPILOT_TRUST_HOME_OVERRIDE.with(|c| c.borrow().clone()) {
+            pre_trust_copilot_folder_in(&home, folder);
+            return;
+        }
+        let Some(home) = self.copilot_home_dir() else { return };
+        pre_trust_copilot_folder_in(&home, folder);
     }
 
     /// Copilot's own custom-agent directory (`~/.copilot/agents`, per its
@@ -9827,7 +10022,8 @@ impl OrchRegistry {
         if let Some(dir) = self.copilot_agents_dir_override.lock_safe().clone() {
             return Some(dir);
         }
-        dirs::home_dir().map(|h| h.join(".copilot").join("agents"))
+        // #502: same containment rule as the Claude side — see `user_cli_dir`.
+        self.user_cli_dir(".copilot", "agents")
     }
 
     /// Reclaim generated custom-agent files (`loomux-<group>-<block>.md`,
@@ -17187,29 +17383,31 @@ impl OrchRegistry {
 
         // rev-4 review (N4; widened round #417 correction 6 for Claude's own
         // generated files): reclaim any generated custom-agent files this
-        // group's members ever got — `write_copilot_agent_file` (#416) and
+        // group ever got — `write_copilot_agent_file` (#416) and
         // `write_claude_agent_file` (round 6) — otherwise they accumulate in
         // `~/.copilot/agents`/`~/.claude/agents` forever and clutter each
-        // CLI's own agent list with dead groups' names. Best-effort per
-        // member (a handle a member never actually got a file for is just a
-        // missing-file no-op) and per CLI (a Claude-only group's Copilot
-        // sweep, and vice versa, are both harmless no-ops against a
-        // directory that never held that group's handles). NOT swept for
-        // orphans from a group that never reaches `end_group` at all (a
-        // crash, or state deleted out from under loomux) — a stray tiny
-        // markdown file the user can delete by hand is a cosmetic cost, not
-        // a resource or security one, so a startup reconciliation sweep is
-        // left as a deliberate follow-up rather than built speculatively
-        // here.
-        if let Some(dir) = self.copilot_agents_dir() {
-            for a in &members {
-                let _ = fs::remove_file(dir.join(format!("loomux-{group}-{}.agent.md", a.block)));
-            }
-        }
-        if let Some(dir) = self.claude_agents_dir() {
-            for a in &members {
-                let _ = fs::remove_file(dir.join(format!("loomux-{group}-{}.md", a.block)));
-            }
+        // CLI's own agent list with dead groups' names.
+        //
+        // #502 widened this from a per-MEMBER name list to a scan of the two
+        // agent dirs, because the member list is not the set of files this
+        // group has: a roster change retires a block whose file is already
+        // on disk, and a member entry can be gone (pruned, or state edited
+        // out from under loomux) while its file is not. The old shape left
+        // both behind. The scan asks the ownership question directly —
+        // "which live group does this file belong to?" (`owning_group`) —
+        // and deletes only what answers with THIS group. Best-effort and per
+        // CLI: a Claude-only group's Copilot pass, and vice versa, are
+        // harmless no-ops against a directory that never held this group's
+        // handles.
+        //
+        // This is the orderly-teardown half only. A group that never gets
+        // here at all (a crash, a kill) leaves its files behind, and
+        // reclaiming those is #464's `sweep_orphaned_agent_files` at
+        // startup — a separate, already-shipped mechanism this deliberately
+        // does not duplicate.
+        let reclaimed = self.reclaim_group_agent_files(group);
+        if !reclaimed.is_empty() {
+            self.audit(group, "loomux", "generated-agent-files-reclaimed", json!({ "files": reclaimed }));
         }
 
         // Total teardown: drop any pause (in-memory + marker) so a future
@@ -17238,6 +17436,131 @@ impl OrchRegistry {
             "worktrees_removed": worktrees_removed,
             "worktree_errors": worktree_errors,
         }))
+    }
+
+    /// #502: does this group still have state on disk? The same registry the
+    /// reclaim paths ask (`root/<group>`, see [`group_dir`](Self::group_dir)),
+    /// asked at WRITE time — so a write and a reclaim can never disagree
+    /// about whether a group exists.
+    ///
+    /// This is the "only write for groups that actually exist" half of the
+    /// re-mint fix, and it is deliberately a guard at the writers rather
+    /// than a fix to one caller: a generated agent file is a durable
+    /// artifact in a directory loomux doesn't own, so ANY path that reaches
+    /// a writer with a dead group id — a stale roster, a restore index, a
+    /// future periodic refresh nobody has written yet — must fail to
+    /// resurrect it, not just the one path that does so today. `create_group`
+    /// makes this directory before any spawn can reach a writer, so a live
+    /// group always passes.
+    fn group_state_exists(&self, group: &str) -> bool {
+        self.group_dir(group).is_dir()
+    }
+
+    /// Every group id loomux currently has state for: the subdirectory names
+    /// of the orchestration root, which IS the group registry on disk
+    /// (`group_dir` = `root/<group>`).
+    ///
+    /// `None` means **the registry could not be read**, which is NOT the
+    /// same as "there are no groups" and must never be flattened into it.
+    /// Ownership in [`reclaim_group_agent_files`]
+    /// (Self::reclaim_group_agent_files) is decided by asking which live
+    /// group CLAIMS a file, so an empty list says "nothing claims anything"
+    /// — which would dissolve the protection that stops `end_group("X")`
+    /// deleting a live `X-extra` group's files. That is failing toward
+    /// deletion, the one direction this must never fail in.
+    fn existing_group_ids(&self) -> Option<Vec<String>> {
+        match fs::read_dir(&self.root) {
+            Ok(entries) => Some(
+                entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .collect(),
+            ),
+            // Any failure at all, missing root included — #464's own review
+            // (B3) settled this rule for its sweep and it is adopted here
+            // verbatim rather than second-guessed: "I could not list my
+            // groups" must never be read as "I have no groups", because the
+            // second widens the blast radius instead of narrowing it. One
+            // rule, one behavior, both delete paths.
+            Err(_) => None,
+        }
+    }
+
+    /// #502: reclaim the generated custom-agent files belonging to ONE
+    /// group, from the CLIs' own user-level agent directories — the delete
+    /// half of [`end_group`](Self::end_group).
+    ///
+    /// Scoped deliberately to a group, because the ORPHAN half already
+    /// shipped separately: [`sweep_orphaned_agent_files`]
+    /// (Self::sweep_orphaned_agent_files) (#464) reclaims files no live
+    /// group claims, at startup. An earlier revision of this change carried
+    /// its own second sweep; two implementations of one mechanism is a
+    /// defect in waiting, so this keeps #464's and adds only what it does
+    /// not do — the per-group teardown path.
+    ///
+    /// This replaces a per-MEMBER name list, which structurally could not
+    /// see a file whose block a roster change retired, or whose member entry
+    /// was pruned while the file stayed on disk. Ownership is a property of
+    /// the FILE, not of who is still in the roster, so the directory is
+    /// scanned and each candidate asked who owns it.
+    ///
+    /// A file is eligible only when ALL of these hold:
+    ///
+    /// 1. it sits at the TOP LEVEL of the CLI's agent dir (`read_dir`, not
+    ///    recursive — Claude Code's own doc notes it scans `~/.claude/
+    ///    agents/` recursively, so a user may well have subfolders there;
+    ///    loomux writes flat and so reads flat);
+    /// 2. its name is `loomux-<group>-<block><ext>` — the exact shape
+    ///    [`generated_agent_handle`] writes, per CLI, with a non-empty block
+    ///    part;
+    /// 3. [`owning_group`] does not hand it to a MORE specific live group
+    ///    (see that function: group ids can prefix one another, and
+    ///    first-match logic would let `end_group("X")` delete live `X-extra`
+    ///    files).
+    ///
+    /// Every failure direction keeps the file: an unreadable agent dir, an
+    /// unreadable candidate, and an unreadable orchestration root — the last
+    /// aborting the whole pass, because the group list is what ownership is
+    /// decided from and an empty one would say "nothing claims anything".
+    /// That is the same rule #464's sweep already applies to itself, and it
+    /// is deliberately the same rule here rather than a second opinion.
+    ///
+    /// Returns the filenames actually removed. Best-effort throughout: a
+    /// reclaim failure must never fail a group teardown.
+    #[doc(hidden)] // pub for integration tests (the enumeration-failure rule is pinned on this)
+    pub fn reclaim_group_agent_files(&self, group: &str) -> Vec<String> {
+        let Some(groups) = self.existing_group_ids() else { return Vec::new() };
+        let mut removed = Vec::new();
+        for (dir, ext) in [
+            (self.claude_agents_dir(), CLAUDE_AGENT_FILE_EXT),
+            (self.copilot_agents_dir(), COPILOT_AGENT_FILE_EXT),
+        ] {
+            let Some(dir) = dir else { continue };
+            let Ok(entries) = fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                let Some(stem) = name.strip_suffix(ext) else { continue };
+                let is_ours = stem
+                    .strip_prefix(&format!("{GENERATED_AGENT_PREFIX}{group}-"))
+                    .is_some_and(|block| !block.is_empty());
+                // `owning_group` can only answer with a group at least as
+                // long as this one (the prefix test above already proves
+                // this group matches), so a different answer means a MORE
+                // specific live group claims the file — leave it alone.
+                if !is_ours || owning_group(stem, &groups).is_some_and(|o| o != group) {
+                    continue;
+                }
+                if fs::remove_file(&path).is_ok() {
+                    removed.push(name.to_string());
+                }
+            }
+        }
+        removed
     }
 
     /// The orchestrator's **This repo declares a workflow** section, or `""` for
@@ -18768,12 +19091,26 @@ impl OrchRegistry {
         if let Some(dir) = self.copilot_hooks_dir_override.lock_safe().clone() {
             return Some(dir);
         }
-        if let Ok(home) = std::env::var("COPILOT_HOME") {
-            if !home.trim().is_empty() {
-                return Some(PathBuf::from(home).join("hooks"));
-            }
-        }
-        dirs::home_dir().map(|h| h.join(".copilot").join("hooks"))
+        // #502: one of three uncontained writes into the user's home this
+        // issue closed — same defect class `user_cli_dir` closes for the
+        // agent dirs. Blast radius here is the smallest of the three: ONE
+        // idempotent, always-rewritten file the real app writes anyway
+        // (`loomux-compact.json`), never one per group, so it never
+        // accumulated the way the agent files did — but a throwaway registry
+        // still had no business rewriting the user's real Copilot hook
+        // config, and it was observed doing exactly that during a test run.
+        //
+        // rev-38 review (B1) corrected the record here: an earlier revision
+        // of this comment claimed this was "the LAST uncontained write" after
+        // auditing every `dirs::home_dir()` in the module. That was WRONG —
+        // `pre_trust_copilot_folder` was a third one, and the worst of them
+        // (a security setting, growing without bound). The audit missed it
+        // because it was a free function with no registry to ask, which is
+        // exactly why the containment rule now lives in ONE predicate
+        // (`is_live_registry`) that every home-resolving path consults,
+        // rather than being open-coded per site. `compact_hook_dir` was and
+        // remains root-relative already.
+        Some(self.copilot_home_dir()?.join("hooks"))
     }
 
     /// Write (or refresh) loomux's `PreCompact` hook config into Copilot's
@@ -19007,9 +19344,12 @@ impl OrchRegistry {
     /// `contract` value — a per-CLI decision the docs justify, not an
     /// oversight to reconcile.
     fn write_claude_agent_file(&self, group: &str, block: &workflow::Block, contract: &str, description: &str) -> Option<String> {
+        if !self.group_state_exists(group) {
+            return None;
+        }
         let dir = self.claude_agents_dir()?;
         fs::create_dir_all(&dir).ok()?;
-        let handle = format!("loomux-{group}-{}", block.id);
+        let handle = generated_agent_handle(group, &block.id);
         // `contract` is already control-character-clean (any persona text
         // folded into it was already sanitized at resolution time — see
         // `resolve_persona`'s `sanitize_persona` call) — and unlike the
@@ -19027,13 +19367,17 @@ impl OrchRegistry {
         // compaction never touches the system prompt, so this is belt-
         // and-braces on top of an already-reliable channel, not a
         // response to a known gap on Claude's side specifically.
+        //
+        // #502: `description` is length-clamped — see
+        // `GENERATED_AGENT_DESCRIPTION_MAX_CHARS` for the
+        // aggregate-description budget this protects.
         let instructions_path = self.group_dir(group).join(block.instructions_file());
         let body = format!(
             "---\nname: {handle}\ndescription: {}\n---\n{contract}{}\n",
-            yaml_double_quoted(description),
+            yaml_double_quoted(&clamp_agent_description(description)),
             compaction_self_check_clause(&instructions_path),
         );
-        let path = dir.join(format!("{handle}.md"));
+        let path = dir.join(format!("{handle}{CLAUDE_AGENT_FILE_EXT}"));
         fs::write(&path, body).ok()?;
         Some(handle)
     }
@@ -19109,9 +19453,12 @@ impl OrchRegistry {
         block: &workflow::Block,
         persona: Option<&ResolvedPersona>,
     ) -> Option<String> {
+        if !self.group_state_exists(group) {
+            return None;
+        }
         let dir = self.copilot_agents_dir()?;
         fs::create_dir_all(&dir).ok()?;
-        let handle = format!("loomux-{group}-{}", block.id);
+        let handle = generated_agent_handle(group, &block.id);
         let instructions_path = self.group_dir(group).join(block.instructions_file());
         let body_text = copilot_agent_body(block, persona, &instructions_path);
         // `.chars().count()`, not `.len()`: the documented cap is in
@@ -19141,9 +19488,9 @@ impl OrchRegistry {
         let description = format!("loomux {} agent for group {group}", block.id);
         let body = format!(
             "---\nname: {handle}\ndescription: {}\n---\n{body_text}\n",
-            yaml_double_quoted(&description)
+            yaml_double_quoted(&clamp_agent_description(&description))
         );
-        let path = dir.join(format!("{handle}.agent.md"));
+        let path = dir.join(format!("{handle}{COPILOT_AGENT_FILE_EXT}"));
         fs::write(&path, body).ok()?;
         Some(handle)
     }
@@ -19946,7 +20293,7 @@ impl OrchRegistry {
         };
 
         if cli == "copilot" {
-            pre_trust_copilot_folder(&cwd);
+            self.pre_trust_copilot_folder(&cwd);
         }
 
         // The block's persona, compiled to this CLI's native custom-agent flags
@@ -22222,7 +22569,7 @@ fn register_orchestrator_pane(
     let token = new_token();
     let agent_id = format!("orch-{}", reg.seq.fetch_add(1, Ordering::SeqCst) + 1);
     if cli == "copilot" {
-        pre_trust_copilot_folder(&group.repo);
+        reg.pre_trust_copilot_folder(&group.repo);
     }
     let cfg = reg.write_mcp_config(&group.id, &agent_id, &token, &cli)?;
     let resume = resume_session.is_some();
