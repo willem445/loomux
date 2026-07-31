@@ -23486,6 +23486,23 @@ impl OrchRegistry {
         if let Some(markers) = self.recovered_markers.lock_safe().get(group) {
             out.extend(markers.iter().cloned());
         }
+        // **Sorted by id, which for this group IS arrival order** (review
+        // round 2, N5). Appending staged after live is not restart-invariant:
+        // a cap-rejected entry from restart 1 would be written behind
+        // deliveries queued after it, and a SECOND restart would then re-admit
+        // them in that inverted order — silently breaking the per-pane arrival
+        // order this feature exists to preserve. `queue_seq` is monotonic per
+        // group and seeded past the snapshot on every recovery, so an old
+        // staged id always sorts ahead of a fresh live one.
+        //
+        // The one thing this costs, stated because the file is also a human
+        // forensic artifact: a `StrandedSubmit` marker is pushed to the FRONT
+        // of its pane's queue but minted with a HIGHER id, so its position in
+        // the file no longer mirrors its drain position. That is acceptable
+        // here and nowhere else — a marker is never replayed across a restart
+        // (`split_recovered`), so no recovery decision reads its file order,
+        // and its `pty_id` + id still identify it exactly.
+        out.sort_by_key(|e| e.delivery.id);
         out
     }
 
@@ -23647,42 +23664,51 @@ impl OrchRegistry {
     pub fn readmit_recovered(&self, group: &str, agent_id: &str, pty_id: u32) -> usize {
         self.recover_persisted_queue(group);
         let target = self.durable_target(agent_id);
-        let mine: Vec<queue::PersistedEntry> = {
-            let mut staged = self.recovered_queue.lock_safe();
-            let Some(list) = staged.get_mut(group) else { return 0 };
-            let (mine, theirs): (Vec<_>, Vec<_>) = std::mem::take(list).into_iter().partition(|e| {
-                queue::rebinds_to(&e.delivery, target.is_orchestrator, target.session_id.as_deref())
-            });
-            *list = theirs;
-            mine
+        let matches = |e: &queue::PersistedEntry| {
+            queue::rebinds_to(&e.delivery, target.is_orchestrator, target.session_id.as_deref())
         };
-        if mine.is_empty() {
-            return 0;
-        }
-        let oldest_ms = mine.iter().map(|e| e.delivery.enqueued_ms).min().unwrap_or_else(now_ms);
+
+        // **One entry leaves staging at a time, and only to become live**
+        // (review round 2, N4). The previous shape partitioned the whole
+        // matching set out of staging up front, so every entry after the one
+        // being admitted lived ONLY in a local vector: each `enqueue_text`
+        // persisted a snapshot containing neither them nor their live form,
+        // and a crash mid-loop dropped that whole remainder from the file.
+        // Taking them one at a time reduces the exposure to a single entry —
+        // the same irreducible width as `pop_front_dequeued`'s already-
+        // documented window, and for the same reason: two durable stores
+        // cannot be updated in one atomic step. It is also why the loop
+        // re-locks per iteration rather than hoisting the guard: holding
+        // `recovered_queue` across `enqueue_text` would invert this file's
+        // lock order (see `group_queue_entries`).
         let mut readmitted = 0usize;
-        // Re-admission can legitimately fail — the pane's queue is capped at
-        // `QUEUE_MAX_PER_PANE` like any other, and a recovered backlog can
-        // meet a queue that already has entries in it. An entry that fails
-        // goes BACK into staging rather than being dropped: it was taken out
-        // of the staging area by the partition above, and losing it there
-        // would be the exact silent loss this whole feature exists to
-        // prevent — worse than the original bug, because the sender was told
-        // long ago that it was safely queued.
+        let mut offered = 0usize;
+        let mut oldest_ms = u64::MAX;
+        // A rejected entry must not be retried forever inside this loop, so
+        // it is parked here and put back once the loop is done — it stays out
+        // of staging only for the rest of this call.
         let mut rejected: Vec<queue::PersistedEntry> = Vec::new();
-        for e in mine {
+        loop {
+            let next = {
+                let mut staged = self.recovered_queue.lock_safe();
+                let Some(list) = staged.get_mut(group) else { break };
+                match list.iter().position(|e| matches(e)) {
+                    Some(i) => list.remove(i),
+                    None => break,
+                }
+            };
+            offered += 1;
+            oldest_ms = oldest_ms.min(next.delivery.enqueued_ms);
             // A payload-less entry cannot be here (markers stage into
-            // `recovered_markers`, never `recovered_queue`) — but treat it as
+            // `recovered_markers`, never `recovered_queue`) — but park it as
             // rejected rather than `continue`ing, so an impossible case that
             // becomes possible later degrades to "still an orphan" instead of
             // to a silent drop out of the staging area.
-            // Owned, so nothing borrows `e` across the match arms below
-            // (the `Err` arm moves `e` back into staging).
-            let Some(text) = e.delivery.payload.text().map(str::to_string) else {
-                rejected.push(e);
+            let Some(text) = next.delivery.payload.text().map(str::to_string) else {
+                rejected.push(next);
                 continue;
             };
-            let from = e.delivery.from.clone();
+            let from = next.delivery.from.clone();
             match self.enqueue_text(group, agent_id, &from, &text, pty_id, queue::EnqueueReason::Recovered) {
                 Ok(fresh) => {
                     readmitted += 1;
@@ -23694,14 +23720,22 @@ impl OrchRegistry {
                     // it blinded the audit derivation to entries that only
                     // ever got staged.
                     self.audit(group, "loomux", "delivery-recovered", json!({
-                        "to": agent_id, "id": e.delivery.id, "readmitted_as": fresh.id,
-                        "queued_ms": now_ms().saturating_sub(e.delivery.enqueued_ms),
+                        "to": agent_id, "id": next.delivery.id, "readmitted_as": fresh.id,
+                        "queued_ms": now_ms().saturating_sub(next.delivery.enqueued_ms),
                     }));
                 }
-                Err(_) => rejected.push(e),
+                // Re-admission can legitimately fail — the pane's queue is
+                // capped at `QUEUE_MAX_PER_PANE` like any other, and a
+                // recovered backlog can meet a queue that already has entries
+                // in it. Losing it here would be the exact silent loss this
+                // whole feature exists to prevent — worse than the original
+                // bug, because the sender was told long ago it was queued.
+                Err(_) => rejected.push(next),
             }
         }
-        let offered = readmitted + rejected.len();
+        if offered == 0 {
+            return 0;
+        }
         if !rejected.is_empty() {
             self.audit(group, "loomux", "delivery-requeue-rejected", json!({
                 "to": agent_id, "pty": pty_id, "count": rejected.len(), "reason": "queue-full",
