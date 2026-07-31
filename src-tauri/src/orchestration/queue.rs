@@ -916,17 +916,31 @@ pub fn clamp_payload(text: &str, cap: usize) -> String {
 }
 
 /// Merge the two orphan views into the one an orchestrator reads (#467).
+///
 /// Snapshot entries WIN on a shared id: both describe the same delivery, and
 /// only the snapshot has its payload. Sorted by id, which for a monotonic
 /// `queue_seq` is enqueue order — so the list reads oldest-ask-first, the
 /// order it would have delivered in.
+///
+/// **`live` is what keeps this a list of LOSSES rather than a list of
+/// pending work**, and it is not an optimization. The audit derivation's
+/// rule — queued, never resolved — is satisfied by every entry sitting in
+/// the queue right now, because an entry that has not been delivered yet has
+/// not been audited as delivered yet either. So without this filter the tool
+/// would hand the orchestrator its own in-flight deliveries and tell it they
+/// were lost, and the documented response to a non-empty result is to
+/// RE-SEND — turning the recovery feature into a duplicate-delivery
+/// generator. Anything currently in memory is excluded, including entries
+/// this same restart just re-admitted (which are delivering, not lost).
 pub fn merge_orphans(
     snapshot: Vec<OrphanedQueueEntry>,
     audit: Vec<OrphanedQueueEntry>,
+    live: &std::collections::HashSet<u64>,
 ) -> Vec<OrphanedQueueEntry> {
     let mut out = snapshot;
     let seen: std::collections::HashSet<u64> = out.iter().map(|e| e.id).collect();
     out.extend(audit.into_iter().filter(|e| !seen.contains(&e.id)));
+    out.retain(|e| !live.contains(&e.id));
     out.sort_by_key(|e| e.id);
     out
 }
@@ -1448,6 +1462,168 @@ mod tests {
     #[test]
     fn orphan_scan_is_empty_for_no_audit_history() {
         assert!(orphaned_queue_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn orphan_scan_treats_recovery_as_terminal() {
+        // #467: once a restart reads an entry back out of the snapshot, the
+        // snapshot derivation owns it — either staged (reported WITH its
+        // payload) or re-admitted under a fresh id. Left open here it would
+        // be reported twice, forever, under an id nothing will ever close.
+        let lines = vec![
+            line("delivery-queued", Some(7), Some("w-5"), Some("arrival"), 1_000),
+            line("delivery-recovered", Some(7), Some("w-5"), None, 2_000),
+        ];
+        assert!(orphaned_queue_entries(&lines).is_empty());
+    }
+
+    // ---------- #468/#467: durability ----------
+
+    fn persisted(id: u64, text: &str) -> PersistedEntry {
+        PersistedEntry { pty_id: 42, delivery: text_entry(id, text) }
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_payload_bytes_exactly() {
+        // The whole value of persisting is that the bytes come back
+        // re-sendable. Non-ASCII and newlines are in here because a task
+        // brief has both and a lossy encoder would only show up on one.
+        let original = vec![persisted(1, "line one\nline two — em dash, ünïcode"), persisted(2, "")];
+        let (back, skipped) = parse_snapshot(&serialize_snapshot(1_234, original.clone()));
+        assert_eq!(skipped, 0);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].delivery.payload.text(), Some("line one\nline two — em dash, ünïcode"));
+        assert_eq!(back[1].delivery.payload.text(), Some(""), "an empty payload is not the same as a missing one");
+        assert_eq!(back[0].delivery.id, 1);
+        assert_eq!(back[0].pty_id, 42);
+    }
+
+    #[test]
+    fn a_snapshot_preserves_order() {
+        let (back, _) = parse_snapshot(&serialize_snapshot(0, vec![persisted(3, "c"), persisted(1, "a"), persisted(2, "b")]));
+        let texts: Vec<Option<&str>> = back.iter().map(|e| e.delivery.payload.text()).collect();
+        assert_eq!(texts, [Some("c"), Some("a"), Some("b")],
+            "file order IS drain order — parsing must never re-sort it");
+    }
+
+    #[test]
+    fn parsing_a_snapshot_skips_only_the_unreadable_entries() {
+        let good = serialize_snapshot(0, vec![persisted(1, "keep"), persisted(2, "also keep")]);
+        let mut v: serde_json::Value = serde_json::from_str(&good).unwrap();
+        v["entries"].as_array_mut().unwrap().insert(1, serde_json::json!({ "pty_id": "nonsense" }));
+        let (back, skipped) = parse_snapshot(&v.to_string());
+        assert_eq!(skipped, 1, "the caller must be able to audit what it lost");
+        assert_eq!(back.len(), 2, "one bad entry must not cost the good ones beside it");
+    }
+
+    #[test]
+    fn parsing_refuses_garbage_and_unknown_versions_without_panicking() {
+        assert_eq!(parse_snapshot("").0.len(), 0);
+        assert_eq!(parse_snapshot("not json at all").0.len(), 0);
+        assert_eq!(parse_snapshot("{}").0.len(), 0);
+        let future = serialize_snapshot(0, vec![persisted(1, "x")])
+            .replace("\"version\": 1", &format!("\"version\": {}", SNAPSHOT_VERSION + 1));
+        assert_eq!(parse_snapshot(&future).0.len(), 0,
+            "an unknown shape must be refused, not guessed at — the failure direction is pasting wrong bytes");
+    }
+
+    #[test]
+    fn an_entry_from_an_older_build_parses_but_has_no_durable_identity() {
+        // Forward compatibility in the safe direction: a snapshot written
+        // before `group`/`to_orchestrator`/`session_id` existed must still
+        // read back (so its payload is surfaced as an orphan) while matching
+        // nothing (so it is never replayed into a pane it wasn't for).
+        let legacy = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "written_ms": 1,
+            "entries": [{
+                "pty_id": 9, "id": 1, "agent_id": "w-1", "from": "orch-1",
+                "payload": { "kind": "text", "text": "hello" },
+                "reason": "arrival", "enqueued_ms": 5, "coalesced": 0,
+            }],
+        });
+        let (back, skipped) = parse_snapshot(&legacy.to_string());
+        assert_eq!((back.len(), skipped), (1, 0));
+        assert_eq!(back[0].delivery.payload.text(), Some("hello"));
+        assert!(!rebinds_to(&back[0].delivery, true, Some("some-session")),
+            "an entry with no recorded identity must match nothing, not everything");
+    }
+
+    #[test]
+    fn split_recovered_replays_text_and_refuses_markers() {
+        let marker = PersistedEntry {
+            pty_id: 1,
+            delivery: QueuedDelivery {
+                payload: QueuedPayload::StrandedSubmit,
+                ..text_entry(2, "unused")
+            },
+        };
+        let split = split_recovered(vec![persisted(1, "replay me"), marker, persisted(3, "me too")]);
+        assert_eq!(split.replayable.len(), 2);
+        assert_eq!(split.markers.len(), 1);
+        let texts: Vec<Option<&str>> = split.replayable.iter().map(|e| e.delivery.payload.text()).collect();
+        assert_eq!(texts, [Some("replay me"), Some("me too")], "removing a marker must not reorder what's left");
+    }
+
+    #[test]
+    fn rebinding_matches_the_orchestrator_or_the_same_session_and_nothing_else() {
+        let to_orch = QueuedDelivery { to_orchestrator: true, ..text_entry(1, "x") };
+        let to_worker = QueuedDelivery { session_id: Some("sess-a".into()), ..text_entry(2, "x") };
+
+        assert!(rebinds_to(&to_orch, true, None), "the group's one orchestrator is a durable target");
+        assert!(!rebinds_to(&to_orch, false, Some("sess-a")),
+            "an orchestrator-targeted entry must not land in a worker pane");
+        assert!(rebinds_to(&to_worker, false, Some("sess-a")), "same resumed session = same worker");
+        assert!(!rebinds_to(&to_worker, false, Some("sess-b")), "a different session is a different pane");
+        assert!(!rebinds_to(&to_worker, false, None), "a pane with no session id matches nothing");
+        assert!(!rebinds_to(&to_worker, true, None),
+            "being the orchestrator does not entitle a pane to a worker's backlog");
+
+        // `agent_id` is deliberately NOT a key: it is re-minted at restore,
+        // so two agents sharing one proves nothing. Both entries here carry
+        // agent_id "w-1" (from `text_entry`) and neither matches on it.
+        let anonymous = QueuedDelivery { session_id: Some(String::new()), ..text_entry(3, "x") };
+        assert!(!rebinds_to(&anonymous, false, Some("")),
+            "two empty session ids are not a match — they are two absences");
+    }
+
+    #[test]
+    fn merging_orphans_prefers_the_derivation_that_has_the_payload() {
+        let snap = OrphanedQueueEntry {
+            id: 1, agent_id: "w-1".into(), enqueued_ms: 10, reason: "arrival".into(),
+            text: Some("the real payload".into()), source: OrphanSource::Snapshot,
+        };
+        let from_audit = |id: u64| OrphanedQueueEntry {
+            id, agent_id: "w-1".into(), enqueued_ms: 10, reason: "arrival".into(),
+            text: None, source: OrphanSource::Audit,
+        };
+        let merged = merge_orphans(vec![snap.clone()], vec![from_audit(1), from_audit(2)], &Default::default());
+        assert_eq!(merged.len(), 2, "the same delivery must not be reported twice");
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged[0].text.as_deref(), Some("the real payload"),
+            "the snapshot derivation wins — it is the only one that can be re-sent");
+        assert_eq!(merged[1].source, OrphanSource::Audit, "an audit-only id is still reported, payload-less");
+
+        // An id still in the live queue is PENDING, not lost — reporting it
+        // would invite a re-send of something about to arrive.
+        let live: std::collections::HashSet<u64> = [2].into_iter().collect();
+        let filtered = merge_orphans(vec![snap], vec![from_audit(1), from_audit(2)], &live);
+        assert_eq!(filtered.iter().map(|e| e.id).collect::<Vec<_>>(), [1],
+            "an in-flight delivery must never be reported as lost work");
+    }
+
+    #[test]
+    fn clamping_a_payload_says_so_and_never_splits_a_char() {
+        let short = "fits fine";
+        assert_eq!(clamp_payload(short, 100), short, "an uncapped payload is returned untouched");
+
+        // A cap landing mid-character must not panic or produce invalid
+        // UTF-8 — em dashes are three bytes and task briefs are full of them.
+        let wide = "—".repeat(10);
+        let cut = clamp_payload(&wide, 10);
+        assert!(cut.starts_with("———"), "must cut on a char boundary: {cut}");
+        assert!(cut.contains("truncated"), "a cut payload must SAY it was cut: {cut}");
+        assert!(cut.contains("audit log"), "and where the full copy is: {cut}");
     }
 }
 

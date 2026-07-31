@@ -1764,24 +1764,520 @@ fn queue_orphans_finds_an_enqueued_entry_with_no_terminal_event() {
     // literally true, exercised end to end through the real audit file
     // (not a hand-built fixture — `queue.rs`'s own unit tests already cover
     // the pure scan logic in isolation).
-    let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-    let pty = 108u32;
+    //
+    // #467 tightened the definition this asserts: an orphan is queued,
+    // unresolved AND no longer live. The pre-#467 version of this test
+    // simulated a "restart" inside one process, so its unresolved entry was
+    // still sitting in the live queue — which the audit derivation cannot
+    // tell apart from a lost one, and which `queue_orphans` now excludes
+    // (see `queue::merge_orphans`'s doc: reporting an in-flight delivery as
+    // lost invites a re-send of something about to arrive). So the restart
+    // here is now a real one.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, agent, orphaned_id) = {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        let pty = 108u32;
 
-    reg.enqueue_text(&g.id, &w.id, "loomux", "resolved", pty, queue::EnqueueReason::Question).unwrap();
-    reg.enqueue_text(&g.id, &w.id, "loomux", "orphaned", pty, queue::EnqueueReason::BehindQueue).unwrap();
-    let snap = reg.queue_snapshot(pty);
-    let (resolved_id, orphaned_id) = (snap[0].id, snap[1].id);
+        reg.enqueue_text(&g.id, &w.id, "loomux", "resolved", pty, queue::EnqueueReason::Question).unwrap();
+        reg.enqueue_text(&g.id, &w.id, "loomux", "orphaned", pty, queue::EnqueueReason::BehindQueue).unwrap();
+        let snap = reg.queue_snapshot(pty);
+        let (resolved_id, orphaned_id) = (snap[0].id, snap[1].id);
 
-    // Simulate a restart: only the FIRST entry ever reaches a terminal
-    // audit event before the process (hypothetically) died.
-    reg.pop_front_dequeued(&g.id, pty, resolved_id, snap[0].enqueued_ms);
+        // Only the FIRST entry reaches a terminal audit event before the
+        // process dies.
+        reg.pop_front_dequeued(&g.id, pty, resolved_id, snap[0].enqueued_ms);
+        // While both are still in this process, NEITHER is an orphan: the
+        // survivor is pending, not lost.
+        assert!(reg.queue_orphans(&g.id).is_empty(),
+            "an entry still in the live queue must never be reported as lost work");
+        (g.id.clone(), w.id.clone(), orphaned_id)
+    };
 
-    let orphans = reg.queue_orphans(&g.id);
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    let orphans = reg.queue_orphans(&gid);
     assert_eq!(orphans.len(), 1, "exactly the unresolved entry must surface, got: {orphans:?}");
     assert_eq!(orphans[0].id, orphaned_id);
-    assert_eq!(orphans[0].agent_id, w.id);
+    assert_eq!(orphans[0].agent_id, agent);
+}
+
+// ---------------------------------------------------------------------------
+// #468 / #467 — the delivery queue survives a loomux restart.
+//
+// Every test below simulates a restart the way the rest of this file already
+// does (`relaunch_registry` over the SAME state dir — a fresh in-memory
+// registry reading the previous process's files), because that is the only
+// honest simulation available: a real restart re-mints pty ids and agent ids,
+// and a test that reused either would prove a rebinding mechanism this code
+// deliberately does not have. The one thing carried across is what a real
+// restore carries across — the group id on disk and a resumed CLI session id.
+// ---------------------------------------------------------------------------
+
+/// Enqueue `texts` for a worker in a fresh group and hand back everything a
+/// post-restart assertion needs. Kept as a helper because four tests need the
+/// identical "a process died with a non-empty queue" starting state and the
+/// interesting part of each is what happens AFTER.
+fn queued_then_crashed(dir: &Path, texts: &[&str]) -> (String, String, String) {
+    let reg = relaunch_registry(dir);
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 220u32;
+    for t in texts {
+        reg.enqueue_text(&g.id, &w.id, "orch-1", t, pty, queue::EnqueueReason::Arrival).unwrap();
+    }
+    assert_eq!(reg.queue_depth(pty), texts.len(), "fixture must actually have queued everything");
+    let session = w.session_id.clone().expect("a claude worker is assigned a session id at spawn");
+    (g.id.clone(), w.id.clone(), session)
+}
+
+#[test]
+fn a_queued_delivery_survives_a_restart_and_is_re_queued_in_order_for_a_resumed_session() {
+    // THE acceptance criterion for #467+#468, end to end: three prompts are
+    // queued behind a blocked pane, loomux dies, and after the restart they
+    // are back in the live queue — same payloads, same order — for the pane
+    // that came back with the same CLI session id.
+    //
+    // Order is asserted on the queue itself rather than on delivery, because
+    // the queue IS the ordering mechanism (#470): every delivery, recovered
+    // or fresh, is attempted only from the front of it, so a recovered entry
+    // sitting at position 0 is what "delivers first" means here. The paste
+    // itself needs a live pty and is hand-validation, per the design note.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old_agent, session) = queued_then_crashed(dir.path(), &["first", "second", "third"]);
+
+    // ---- the restart ----
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid, "the restart must resume the same group");
+    assert_eq!(reg.queue_depth(220), 0, "a fresh registry starts with nothing in memory");
+
+    // The orchestrator resumes that worker's session — a NEW agent id and a
+    // NEW pty, which is the whole point: neither is what the entries rebind
+    // by.
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session.clone()), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+    let new_pty = 999u32;
+    // Agent ids are minted off an in-memory counter that restarts with the
+    // process, so after a restart they REPEAT — the first worker spawned in
+    // this new process gets "w-1" whether or not it is the same worker. That
+    // is not a quirk of this test; it is why `agent_id` cannot be the
+    // rebinding key even though #468's filing proposed it, and why the
+    // session id is. Pinned rather than worked around, because the day this
+    // stops being true is the day someone might reasonably "simplify"
+    // `rebinds_to` back to comparing ids.
+    assert_eq!(resumed.id, _old_agent,
+        "a restart re-mints agent ids from zero — an id collision here is expected, not identity");
+
+    let n = reg.readmit_recovered(&gid, &resumed.id, new_pty);
+    assert_eq!(n, 3, "every queued payload must come back");
+
+    let snap = reg.queue_snapshot(new_pty);
+    let texts: Vec<Option<&str>> = snap.iter().map(|e| e.payload.text()).collect();
+    assert_eq!(texts, [Some("first"), Some("second"), Some("third")],
+        "arrival order must survive the restart — a recovered backlog delivers oldest first");
+    assert!(snap.iter().all(|e| e.reason == queue::EnqueueReason::Recovered),
+        "a recovered entry must audit as `recovered`, never as a fresh `arrival`");
+    // The payloads are bytes, not summaries: the whole value of persisting is
+    // that the orchestrator does not have to re-derive what it already sent.
+    assert_eq!(snap[0].from, "orch-1", "provenance survives too");
+}
+
+#[test]
+fn recovery_reads_the_persisted_snapshot_not_the_audit_log() {
+    // The mutation check the brief asks for, made structural rather than
+    // procedural: delete the durable artifact and the recovery above must
+    // fail. `audit.jsonl` is left completely intact, so if this still
+    // recovered three payloads it would prove recovery was reading the audit
+    // log (which cannot carry payloads through `queue_orphans`'s snapshot
+    // half at all) and that #468's persistence was doing nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["first", "second", "third"]);
+
+    let snapshot = dir.path().join(&gid).join("queue.json");
+    assert!(snapshot.exists(), "#468: every admission must leave a durable snapshot");
+    let body = fs::read_to_string(&snapshot).unwrap();
+    assert!(body.contains("\"first\"") && body.contains("\"third\""),
+        "the snapshot must carry payload BYTES, not just ids: {body}");
+    fs::remove_file(&snapshot).unwrap();
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, 999), 0,
+        "with no snapshot there is nothing to replay — this is what reddens if persistence is removed");
+
+    // ...but the loss is still VISIBLE, which is the #445 derivation this
+    // builds on rather than replaces: the audit scan alone still names the
+    // three ids, with no payload to offer.
+    let orphans = reg.queue_orphans(&gid);
+    assert_eq!(orphans.len(), 3, "the audit-derived fallback still surfaces the loss");
+    assert!(orphans.iter().all(|o| o.source == queue::OrphanSource::Audit && o.text.is_none()),
+        "an audit-derived orphan knows the id and target but never the payload: {orphans:?}");
+}
+
+#[test]
+fn an_unbindable_queued_delivery_is_surfaced_as_an_orphan_with_its_payload() {
+    // The other half of the acceptance criterion: a worker pane does NOT
+    // come back after a restart (loomux says so in its own restore kickoff),
+    // so its backlog has nothing to rebind to. It must be SURFACED, not
+    // silently dropped — with the payload, so the orchestrator can re-send
+    // rather than reconstruct from memory.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, old_agent, _session) = queued_then_crashed(dir.path(), &["go do the thing", "and then this"]);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+
+    let orphans = reg.queue_orphans(&gid);
+    assert_eq!(orphans.len(), 2, "nothing may vanish: {orphans:?}");
+    assert!(orphans.iter().all(|o| o.source == queue::OrphanSource::Snapshot),
+        "the snapshot derivation must win over the audit one — only it has the payloads");
+    assert_eq!(orphans[0].text.as_deref(), Some("go do the thing"));
+    assert_eq!(orphans[1].text.as_deref(), Some("and then this"));
+    assert_eq!(orphans[0].agent_id, old_agent, "the orphan names who it was for, stale id and all");
+    assert!(orphans[0].id < orphans[1].id, "oldest ask first");
+
+    // A DIFFERENT agent binding must not vacuum up somebody else's backlog:
+    // a fresh (non-resumed) worker shares neither the orchestrator role nor
+    // the session id, and `agent_id` alone proves nothing after a restart.
+    let other = reg.spawn_agent(&gid, Role::Worker, "other", "t", false, None).unwrap();
+    assert_eq!(reg.readmit_recovered(&gid, &other.id, 777), 0,
+        "an unrelated pane must never inherit a queued backlog");
+    assert_eq!(reg.queue_orphans(&gid).len(), 2, "and the orphans must still be there afterwards");
+}
+
+#[test]
+fn orchestrator_targeted_deliveries_rebind_to_the_restarted_orchestrator_pane() {
+    // The live incident this pair of issues was filed from: a restart mid-
+    // session wiped in-flight delivery state. Worker reports and loomux
+    // notices are queued to the ORCHESTRATOR, whose agent id is re-minted on
+    // restore just like everyone else's — `to_orchestrator` is what carries
+    // that target across, since a group has exactly one.
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+        let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+        reg.enqueue_text(&g.id, &orch.id, "w-1", "PR #123 is green", 300, queue::EnqueueReason::Arrival).unwrap();
+    }
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // A FRESH orchestrator (no resume_session at all) — the entry still
+    // rebinds, because "this group's orchestrator" is the durable identity,
+    // not the session and not the id.
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    assert_eq!(reg.readmit_recovered(&gid, &orch.id, 301), 1,
+        "a delivery addressed to the orchestrator must find the restarted orchestrator pane");
+    assert_eq!(reg.queue_snapshot(301)[0].payload.text(), Some("PR #123 is green"));
+    assert!(reg.queue_orphans(&gid).is_empty(),
+        "a re-queued entry must not ALSO be reported as an orphan — it is not lost, it is delivering");
+}
+
+#[test]
+fn recovery_never_double_delivers() {
+    // Three distinct double-delivery routes, all closed:
+    //   1. an entry that was already delivered before the crash;
+    //   2. re-binding the same pane twice (a second bind, a retry);
+    //   3. an entry recovered into a queue that already holds the same text.
+    let dir = tempfile::tempdir().unwrap();
+    // (1) The pre-crash process delivers the first entry, then dies with the
+    // second still queued. The pop is driven through the live registry, the
+    // way a real drain does it, so the snapshot update under test is the one
+    // production takes.
+    let (gid, session) = {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        reg.enqueue_text(&g.id, &w.id, "orch-1", "delivered already", 220, queue::EnqueueReason::Arrival).unwrap();
+        reg.enqueue_text(&g.id, &w.id, "orch-1", "still waiting", 220, queue::EnqueueReason::Arrival).unwrap();
+        let front = reg.queue_snapshot(220)[0].clone();
+        reg.pop_front_dequeued(&g.id, 220, front.id, front.enqueued_ms);
+        assert_eq!(reg.queue_depth(220), 1, "the delivered entry left the live queue");
+        (g.id.clone(), w.session_id.clone().unwrap())
+    };
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+
+    // (3) The pane already holds a byte-identical ask when recovery runs —
+    // the queue's existing coalesce is what makes recovery idempotent
+    // against it, rather than a second dedup mechanism invented here.
+    reg.enqueue_text(&gid, &resumed.id, "orch-1", "still waiting", 998, queue::EnqueueReason::Arrival).unwrap();
+
+    let n = reg.readmit_recovered(&gid, &resumed.id, 998);
+    assert_eq!(n, 1, "only the undelivered entry is offered back");
+    assert_eq!(reg.queue_depth(998), 1,
+        "a recovered payload identical to one already queued must COALESCE, never queue twice");
+    assert_eq!(reg.queue_snapshot(998)[0].coalesced, 1, "and the collapse must be counted");
+    let live = reg.queue_snapshot(998);
+    let texts: Vec<Option<&str>> = live.iter().map(|e| e.payload.text()).collect();
+    assert!(!texts.contains(&Some("delivered already")),
+        "an entry that already reached the pane before the crash must never come back");
+
+    // (2) A second bind of the same pane finds nothing left staged.
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, 998), 0,
+        "re-binding must not replay an already-recovered backlog");
+    assert_eq!(reg.queue_depth(998), 1, "and must not grow the queue");
+}
+
+#[test]
+fn a_stranded_submit_marker_is_never_replayed_across_a_restart() {
+    // The one genuinely lossy case, and the reason it must not be quietly
+    // replayed: a marker means "text is already in that pane's input box,
+    // press Enter." After a restart the box is gone; pressing Enter would
+    // submit whatever the NEW session has typed there — a human's half-
+    // written line, most likely. Dropped, audited, and announced as lost.
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    let session;
+    {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45999);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        session = w.session_id.clone().unwrap();
+        reg.enqueue_text(&g.id, &w.id, "orch-1", "a real payload", 220, queue::EnqueueReason::Arrival).unwrap();
+        reg.enqueue_stranded_front(&g.id, &w.id, "orch-1", 220).unwrap();
+        assert_eq!(reg.queue_snapshot(220)[0].payload, queue::QueuedPayload::StrandedSubmit);
+    }
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, 999), 1,
+        "the TEXT entry comes back; the marker must not");
+    let snap = reg.queue_snapshot(999);
+    assert_eq!(snap.len(), 1);
+    assert_eq!(snap[0].payload.text(), Some("a real payload"));
+    assert!(snap.iter().all(|e| e.payload != queue::QueuedPayload::StrandedSubmit),
+        "no marker may ever be re-admitted after a restart");
+
+    let dropped: Vec<_> = reg
+        .audit_log(&gid)
+        .into_iter()
+        .filter(|e| e.action == "delivery-dropped"
+            && e.detail["reason"] == json!("stranded-marker-not-replayable"))
+        .collect();
+    assert_eq!(dropped.len(), 1, "the loss must be named in the audit, not silent");
+    assert!(reg.queue_orphans(&gid).is_empty(),
+        "a dropped marker is closed out, not left dangling as a phantom orphan");
+}
+
+#[test]
+fn a_corrupt_snapshot_costs_only_the_entries_it_ate() {
+    // A snapshot is written by a process that may be killed mid-life on a
+    // disk that may be full, and read at startup where a panic takes the
+    // whole orchestration with it. One unreadable entry must cost that entry
+    // and nothing beside it, and the skip must be audited rather than
+    // leaving the count silently short.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["keep me", "and me"]);
+
+    let path = dir.path().join(&gid).join("queue.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["entries"].as_array_mut().unwrap().insert(1, json!({ "pty_id": "not-a-number" }));
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, 999), 2,
+        "both readable entries must still recover around the corrupt one");
+    let skipped = reg
+        .audit_log(&gid)
+        .into_iter()
+        .find(|e| e.action == "queue-recover-skipped")
+        .expect("a skipped entry must be audited, never silently short");
+    assert_eq!(skipped.detail["entries"], json!(1));
+}
+
+#[test]
+fn an_unknown_snapshot_version_recovers_nothing_rather_than_guessing() {
+    // Refusing a version this build does not know is the deliberate choice:
+    // the failure direction of guessing at an unknown shape is replaying the
+    // wrong bytes into somebody's terminal. The audit derivation still
+    // surfaces the loss, so refusing is not the same as losing.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["one", "two"]);
+    let path = dir.path().join(&gid).join("queue.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["version"] = json!(queue::SNAPSHOT_VERSION + 1);
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, 999), 0);
+    assert_eq!(reg.queue_orphans(&gid).len(), 2,
+        "the audit fallback still reports what the snapshot refused to interpret");
+}
+
+#[test]
+fn the_snapshot_tracks_the_live_queue_through_every_mutation() {
+    // #468's actual invariant, stated as one property rather than asserted
+    // once at enqueue: whatever the live queue holds is what the file holds.
+    // Every mutation path is walked (admit, coalesce, pop, drop) — a future
+    // mutator added without a `persist_queues` call reddens here.
+    let (reg, dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 240u32;
+    let path = dir.path().join(&g.id).join("queue.json");
+
+    let on_disk = |label: &str| -> Vec<String> {
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{label}: no snapshot: {e}"));
+        let (entries, skipped) = queue::parse_snapshot(&text);
+        assert_eq!(skipped, 0, "{label}: our own writer must never emit an unreadable entry");
+        entries.iter().filter_map(|e| e.delivery.payload.text().map(str::to_string)).collect()
+    };
+
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "a", pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "b", pty, queue::EnqueueReason::Arrival).unwrap();
+    assert_eq!(on_disk("after admits"), ["a", "b"]);
+
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "a", pty, queue::EnqueueReason::Arrival).unwrap();
+    assert_eq!(on_disk("after coalesce"), ["a", "b"], "a coalesce must not duplicate on disk either");
+
+    let front = reg.queue_snapshot(pty)[0].clone();
+    reg.pop_front_dequeued(&g.id, pty, front.id, front.enqueued_ms);
+    assert_eq!(on_disk("after pop"), ["b"], "a delivered entry must leave the snapshot immediately");
+
+    reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
+    assert!(on_disk("after drop").is_empty(), "a dropped queue must leave nothing behind to replay");
+}
+
+#[test]
+fn one_groups_snapshot_never_contains_another_groups_queue() {
+    // The live queue map is keyed by pty id, which is registry-GLOBAL: two
+    // groups share one `OrchRegistry`. Without the entry's own `group` stamp
+    // a snapshot would be written per group out of a map that isn't, and a
+    // restart would replay one repo's prompts into another's panes.
+    let (reg, dir) = test_registry();
+    let a = reg.create_group("C:/tmp/repo-a", rails()).unwrap();
+    let b = reg.create_group("C:/tmp/repo-b", rails()).unwrap();
+    assert_ne!(a.id, b.id);
+    let wa = reg.spawn_agent(&a.id, Role::Worker, "wa", "t", false, None).unwrap();
+    let wb = reg.spawn_agent(&b.id, Role::Worker, "wb", "t", false, None).unwrap();
+
+    reg.enqueue_text(&a.id, &wa.id, "orch-1", "for group a", 250, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&b.id, &wb.id, "orch-1", "for group b", 251, queue::EnqueueReason::Arrival).unwrap();
+
+    for (gid, mine, theirs) in [(&a.id, "for group a", "for group b"), (&b.id, "for group b", "for group a")] {
+        let body = fs::read_to_string(dir.path().join(gid).join("queue.json")).unwrap();
+        assert!(body.contains(mine), "{gid} must persist its own entry: {body}");
+        assert!(!body.contains(theirs), "{gid} must NOT persist another group's entry: {body}");
+    }
+}
+
+#[test]
+fn queue_orphans_is_an_orchestrator_only_tool_and_reports_what_a_restart_lost() {
+    // The #467 wiring itself: the derivation only becomes a recovery when
+    // something the orchestrator's session-start re-sync actually calls can
+    // read it. Role gate re-checked at dispatch (the listing filter is
+    // cosmetic, not the gate — `add-orch-tool`'s checklist).
+    let (reg, _d, co, cw) = setup_mcp();
+
+    let empty = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "queue_orphans", "arguments": {} })).unwrap();
+    assert_eq!(empty["isError"], false);
+    let v: Value = serde_json::from_str(empty["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["count"], json!(0), "the normal case is empty and must say so cleanly");
+
+    let denied = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "queue_orphans", "arguments": {} })).unwrap();
+    assert_eq!(denied["isError"], true, "a worker must not read the group's lost-delivery list");
+
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let names: Vec<&str> =
+        listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(names.contains(&"queue_orphans"), "the orchestrator must be able to SEE the tool: {names:?}");
+    let worker_listed = dispatch(&reg, &cw, "tools/list", &json!({})).unwrap();
+    let worker_names: Vec<&str> =
+        worker_listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    assert!(!worker_names.contains(&"queue_orphans"));
+}
+
+#[test]
+fn queue_orphans_tool_hands_back_the_payload_a_restart_could_not_deliver() {
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["re-send me verbatim"]);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "queue_orphans", "arguments": {} })).unwrap();
+    let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["count"], json!(1));
+    assert_eq!(v["orphans"][0]["text"], json!("re-send me verbatim"),
+        "the payload must come back verbatim — a summary is not re-sendable");
+    assert_eq!(v["orphans"][0]["source"], json!("snapshot"));
+    assert_eq!(v["orphans"][0]["truncated"], json!(false));
+    assert!(v["orphans"][0]["queued_minutes_ago"].as_u64().is_some());
+}
+
+#[test]
+fn an_oversized_orphan_payload_says_it_was_truncated() {
+    // A capped payload that read as complete would be the same claim-vs-
+    // reality defect this repo's lessons file names: the orchestrator would
+    // re-send a silently-shortened brief.
+    let dir = tempfile::tempdir().unwrap();
+    let big = "x".repeat(queue::ORPHAN_TEXT_CAP_BYTES + 500);
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &[big.as_str()]);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "queue_orphans", "arguments": {} })).unwrap();
+    let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["orphans"][0]["truncated"], json!(true));
+    assert_eq!(v["orphans"][0]["text_bytes"], json!(big.len()), "the true size is reported, not the cut one");
+    assert!(v["orphans"][0]["text"].as_str().unwrap().contains("truncated"),
+        "the cut must be visible in the text itself, not only in a sibling field");
 }
 
 #[test]
