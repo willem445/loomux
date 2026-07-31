@@ -849,6 +849,14 @@ pub fn stranded_lost_notice(count: usize) -> String {
     )
 }
 
+/// The `reason` a surfaced `StrandedSubmit` marker carries (#467), instead
+/// of the `EnqueueReason` it was admitted under — the admission reason
+/// ("question") would say why it was queued, when what the reader needs is
+/// why it cannot be replayed. Paired with `text: null`, which for this one
+/// case does not mean "an older build queued it" but "the bytes went into a
+/// terminal that no longer exists."
+pub const STRANDED_ORPHAN_REASON: &str = "stranded-submit-not-replayable";
+
 /// Where a surfaced orphan was reconstructed from (#467). Both sources are
 /// real and neither subsumes the other: the snapshot carries the payload
 /// bytes but only exists for entries queued by a build that writes one; the
