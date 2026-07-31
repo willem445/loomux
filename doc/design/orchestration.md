@@ -2533,6 +2533,97 @@ clear-on-decision behavior). All prior reinjection tests were updated to supply 
 `DeliveryConfirmation` before asserting final resolution; `compact_nudge_tick_never_loops_when_
 the_false_signal_repeats_every_cycle` (D4) stays pinned at zero, unaffected.
 
+### #535: the retry keys on the agent's ACKNOWLEDGMENT, not on our own delivery confirmation
+
+The delivery-confirmation gate above closed a real gap, and then became one of its own. The
+signal it waits on — `submit_sent_ms >= attempted_ms && confirmed` — is loomux **watching its own
+paste**, and that sampler misses routinely on a busy or repainting pane (~25 false `delivery
+unconfirmed` alarms in one observed session; the #451/#496/#522/#528 lineage). Nothing in the loop
+ever observed whether the **agent** had re-grounded. So on a pane where the submit went unseen, a
+re-grounding that had *landed* was re-pasted up to twice more into a working agent, and could
+finish as a `reinjection-abandoned` record claiming a contract restore that had in fact happened.
+Reported live: a copilot worker sitting at 2/3 while visibly on-track, correctly ignoring the
+duplicate because it already had the contract.
+
+#### The shared agent-activity clock
+
+`AgentEntry.last_mcp_activity_ms`, stamped by `OrchRegistry::note_agent_ack` from **one** site —
+the `tools/call` arm of `mcp::dispatch`. It means exactly one thing, and the distinction is the
+whole point of the mechanism:
+
+> **the agent's own code path executed** — a live process authenticated with this agent's token
+> and invoked a loomux tool. It does **not** mean *the pane painted*.
+
+Three properties, each load-bearing: **role-agnostic** (an orchestrator compacts and gets
+re-grounded like anything else); **stamped before the tool runs**, so a *rejected* call counts too
+(a permission denial proves the agent is alive and executing just as well as a success); and
+**monotone** (`max`, never a bare assignment — a clock a later caller could rewind would let one
+consumer erase another's evidence).
+
+None of the three clocks that already existed can answer this. `last_progress_ms` is rewritten to
+`now` by pty **output growth** in three separate ticks, so repaint noise above the activity floor
+advances it — it answers "did the pane emit", not "did the agent act". `note_agent_activity` (its
+writer) is stamped from exactly ONE tool, `message_orchestrator`, and is an explicit no-op for
+`Role::Orchestrator`. `DeliveryConfirmation` is the unreliable signal this section exists to stop
+relying on.
+
+Deliberately built as a **shared** mechanism rather than shaped to its first caller:
+`agent_acted_since(last_mcp_activity_ms, since_ms)` takes a bare timestamp pair, and
+`OrchRegistry::last_mcp_activity_ms` is a public reader. #539 — the unconfirmed-delivery detector,
+whose `unconfirmed_disposition` (#522/#528) reads only BOX structure and has no activity evidence
+at all — is the intended second consumer. It is **not** wired here; #535 adds no second call site.
+
+#### `reinject_disposition`
+
+Pure, four-way (`Resolved` / `Wait` / `DeferBusy` / `Retry`) so each outcome is separately
+auditable and directly pinnable. **The ordering is the contract:**
+
+1. `confirmed_delivery || acked` ⇒ `Resolved`. Evidence of a landing beats the clock — otherwise
+   the bug survives. The old signal is kept and checked first: when it fires it is authoritative;
+   it was only ever wrong by *omission*.
+2. `elapsed < timeout` ⇒ `Wait`. The clock beats busy-ness, so a chatty pane cannot defer before
+   it has even waited. (This is also why our own pasted notice echoing back can never cause a
+   spurious deferral: the echo lands inside this window.)
+3. `busy` ⇒ `DeferBusy`, bounded by `REINJECT_BUSY_DEFER_MAX_MS` **measured from the original
+   attempt** — a pane that simply keeps painting cannot extend the deferral a tick at a time.
+4. otherwise ⇒ `Retry`, and at `MAX_REINJECT_ATTEMPTS` abandon, both exactly as before.
+
+**Terminal output is deliberately not part of `acked`,** though #535's own write-up lists it.
+`output_total` counts our pasted notice echoing back plus statusline/spinner repaint frames
+(#480) — the reason `idle_output_is_activity` exists. And folding growth into `acked` would make
+`DeferBusy` **structurally unreachable** (busy ⇒ growth ⇒ ack ⇒ `Resolved`): an arm, an audit
+action and this paragraph all describing a behaviour the code could never have. Output feeds
+`busy` only, where its weakness is harmless — it defers an attempt, it never claims one succeeded.
+
+**The deferral is bounded** because scope's safety net depends on it: unbounded, a pane that never
+goes quiet (an animated statusline above the group's `idle_activity_floor_bytes`) would suppress
+the retry forever — on exactly the panes that misreport most. A **constant, not a `Guardrails`
+knob**, per #518's own call that a knob with no correct second setting only ever gets set wrong.
+`busy_defer_max_ms == 0` disables the deferral (pre-#535 behaviour) rather than expiring
+instantly, the same convention as `human_input_block(.., bound_ms)`: a mis-set `0` must degrade to
+the old behaviour, never to "defer nothing, ever".
+
+#### Observability
+
+`compact-reinjection-confirmed` gains `source`: `"delivery"` (our submit sampler saw it) vs
+`"activity"` (the agent answered). Two different facts — a timeline conflating them cannot show
+whether this fix is working in the field, which is the same provenance distinction `to_hook_armed`
+already draws. New `compact-reinjection-deferred-busy`, because "no retry fired" must read as a
+deliberate choice rather than a silently dropped one (`to_hook_native_skip`'s reason). Latched per
+attempt via `AgentEntry.compact_reinject_busy_deferred` — the poll runs every 10s while an arm is
+open, so an unlatched audit would write ~30 identical lines per deferral.
+
+Regression coverage: `a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers` pins
+the live defect (and supplies **no** `DeliveryConfirmation` anywhere, which is exactly the
+production case that misbehaved); `an_mcp_call_before_the_re_grounding_is_not_an_acknowledgment_
+of_it` is its pair, proving the comparison is read rather than mere non-zero-ness;
+`a_genuinely_lost_re_grounding_still_retries_and_still_abandons_at_the_bound` pins that the safety
+net survives; `a_retry_is_never_spent_into_a_live_turn_but_the_deferral_is_bounded` covers both
+halves of the deferral; `a_deferral_yields_to_the_acknowledgment_it_was_waiting_for` pins the
+ordering as behaviour rather than as a claim in a comment; and
+`every_mcp_tool_call_stamps_the_shared_activity_clock_for_every_role` pins the wiring — the
+orchestrator case, the rejected-call case, and monotonicity.
+
 ### #410 (round 6): the arm-pending timeout, and a request-starvation fix alongside it
 
 A third re-demo hit a new symptom: `request_compact` answered "a compact is already in flight for
