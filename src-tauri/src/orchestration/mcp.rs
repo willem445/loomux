@@ -332,6 +332,9 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
             tool("group_usage",
                 "Aggregate the group's token usage and estimated dollar cost into one summary, split live vs lifetime (killed/recycled agents still count). Tokens come from each agent's session transcript and are exact; dollars are estimated from a model price table (subscription/Max accounts show $0 in the CLI, so cite tokens). Fold it into your status updates so the human sees spend at a glance.",
                 json!({}), &[]),
+            tool("queue_orphans",
+                "Deliveries this group had QUEUED but never delivered when loomux last restarted, and that could not be re-bound to a live pane. Call it once on session start, with the rest of your re-sync — a restart is the only thing that produces these, so it is not worth re-polling. Returns {count, orphans:[{id, to, queued_minutes_ago, reason, source, text, text_bytes, truncated}]}, oldest ask first. `text` is the payload verbatim (capped at 8KB, with `truncated: true` and the full copy on that delivery's `prompt` line in the audit log) when it came from the durable queue snapshot — `source: \"snapshot\"`. `text` is null in exactly two cases, both meaning \"re-derive this one, don't guess\": `source: \"audit\"` (an entry queued by a loomux build older than the durable snapshot — id and target known, payload not), and `reason: \"stranded-submit-not-replayable\"` (the text had already been typed into that pane and was waiting only for Enter when loomux restarted; the pane is gone, so no bytes remain — the audit log's `prompt` line for that delivery is the only record of what it said). THESE ARE LOST WORK, NOT A LOG: each is something you or an agent sent that nobody ever received, so treat a non-empty result as a to-do list — re-send what still applies (the pane it was for is gone, so re-target it: a resumed session, or a fresh agent), and say what you dropped as stale rather than dropping it silently. An empty result is the normal case and needs no comment. Deliveries that DID re-bind (this group's orchestrator pane, or an agent resumed onto the same session id) were already re-queued automatically in their original order and are not listed here.",
+                json!({}), &[]),
         ]);
     } else {
         tools.extend([
@@ -482,6 +485,10 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         "group_usage" => {
             require_orchestrator(caller)?;
             Ok(reg.group_usage(&caller.group).to_string())
+        }
+        "queue_orphans" => {
+            require_orchestrator(caller)?;
+            Ok(reg.queue_orphans_json(&caller.group).to_string())
         }
 
         "spawn_agent" => {

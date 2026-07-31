@@ -65,6 +65,7 @@ that without a getrandom crate.
 | `group.json` | `create_group` | creation-time, single writer | → `atomic_write` |
 | `group.json` | `persist_max_agents` | — | already atomic; refactored onto the shared helper |
 | `usage.json` | `upsert_usage_snapshot` | `tasks_lock` | already atomic; refactored onto the shared helper |
+| `queue.json` | `persist_queues` (#468) | `queue_persist`, held across read-then-write | `atomic_write`. **Snapshot, not journal** — see below |
 | `audit.jsonl` | `append_audit` | `AUDIT_LOCK` (#240) | **append-only** — a failed append can't truncate prior lines, so `atomic_write` is the wrong tool. Its own atomicity problem, and its own fix: see Part 1b |
 | `configs/<id>.json`, role `*.md`, attachments | derived/one-shot | — | not mutable durable state — regenerated or uniquely named, so a failed write is retryable, not destructive; left as plain `fs::write` |
 
@@ -76,6 +77,34 @@ torn file — the worst case is one update superseding another, never corruption
 
 `tabs.json` / `uistate.rs` (project tabs, PR #157) was **not** merged when this
 landed; that store already writes atomically (temp + rename) and needs nothing.
+
+**One precision about `atomic_write`'s contract, since this document is where
+people come to rely on it** (#523 review): the temp + fsync + rename path is
+crash-safe as described, but the *fallback* taken when the rename fails (the
+destination is briefly locked — antivirus, an open reader) is a plain in-place
+`fs::write`, which truncates before it writes. A crash inside that narrow
+fallback window can therefore still leave a truncated destination. It is the
+rare branch of a rare branch, and every reader of these files degrades
+gracefully on an unparseable one (`queue.json` falls back to the audit
+derivation; `tasks.json`/`state.json` to an empty value), but "never a
+truncated file" is an overstatement of what the helper guarantees — it is
+"never a truncated file on the rename path", which is the path essentially
+every write takes.
+
+`queue.json` (#468, added later) is the delivery queue's durable copy, and it is
+the one file in this table where the append-vs-replace choice was genuinely
+open: it records pending work, and the obvious shape for "what is pending" is a
+journal of queue events like `audit.jsonl`'s. It is a **whole-file snapshot**
+instead. A journal would need replay logic to reconstruct current state,
+compaction to stay bounded, and would leave a half-replayed queue reachable if a
+record were lost; a pane's queue is capped at 8 entries, so the whole file is a
+few KB and `atomic_write` costs nothing to rewrite per mutation. Its writer lock
+is held across *read-then-write* (not just the write) so a stale snapshot can
+never land after a fresh one — the ordering hazard `state.json`'s
+last-writer-wins note above tolerates, which a queue cannot. Lock order is
+`queue_persist` → `queues`, and the write happens with no queue lock held: file
+I/O inside that critical section would stall every delivery in the registry. See
+`doc/design/orchestration.md`'s "Durability (#468/#467)".
 
 ## Part 1b — atomic appends (#240)
 

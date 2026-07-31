@@ -6349,6 +6349,52 @@ pub struct OrchRegistry {
     /// visibility notice (#445) — cleared when the queue empties, so a LATER
     /// long block on the same pane can notify again.
     queue_still_notified: Arc<Mutex<HashSet<u32>>>,
+    /// Serializes writers of every group's `queue.json` (#468).
+    ///
+    /// **Lock order: this BEFORE `queues`, never the reverse**, and it is
+    /// only ever taken by `persist_queues`, which is called with no other
+    /// lock held. Held across "read the live queues → write the file," which
+    /// is what makes a stale snapshot unable to land after a fresh one: a
+    /// mutation that completes after some writer's read must wait here and
+    /// then re-read, so the last write always reflects the last mutation.
+    /// Taking the `queues` lock first and doing the I/O under it would be
+    /// simpler and wrong twice over — file I/O under the queue lock stalls
+    /// every delivery in the registry, and this file is written on a path
+    /// (`enqueue_text`) whose whole ordering argument depends on that
+    /// critical section staying short.
+    queue_persist: Arc<Mutex<()>>,
+    /// Entries read back out of a group's `queue.json` at startup that have
+    /// not yet found a pane to go back to (#467), keyed by group.
+    ///
+    /// A staging area, deliberately NOT the live `queues` map: every entry
+    /// here was queued for a `pty_id` that no longer exists, and re-admitting
+    /// one under its old key would target whatever unrelated pane inherits
+    /// that number. Entries leave here exactly two ways — `readmit_recovered`
+    /// moves one into the live queue when its pane comes back with a matching
+    /// durable identity (`queue::rebinds_to`), or it stays and is reported by
+    /// `queue_orphans` for the orchestrator to re-derive. Nothing expires
+    /// them: an entry silently vanishing from here is the exact failure #445
+    /// exists to prevent.
+    recovered_queue: Arc<Mutex<HashMap<String, Vec<queue::PersistedEntry>>>>,
+    /// `StrandedSubmit` markers a restart made unreplayable (#467), kept
+    /// separately from `recovered_queue` and never offered to
+    /// `readmit_recovered`.
+    ///
+    /// They are here so the loss is reported through `queue_orphans` — a
+    /// DURABLE channel the orchestrator's session-start re-sync reads —
+    /// rather than only through the best-effort `[loomux]` notice recovery
+    /// also fires. That notice can genuinely fail to land: recovery can be
+    /// triggered by an admission (see `persist_queues`) at a moment when no
+    /// orchestrator pane is bound yet, and `deliver_to_orchestrator` is
+    /// best-effort by design. "Never silently dropped" cannot rest on a
+    /// delivery that is allowed to not happen.
+    recovered_markers: Arc<Mutex<HashMap<String, Vec<queue::PersistedEntry>>>>,
+    /// Groups whose `queue.json` has already been read back this process
+    /// (#467) — recovery is lazy (first touch by a bind or a
+    /// `queue_orphans` call) and must happen exactly once, or a second pass
+    /// would re-stage entries a first pass already re-admitted and deliver
+    /// them twice.
+    recovered_groups: Arc<Mutex<HashSet<String>>>,
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
     tasks_lock: Mutex<()>,
@@ -9704,6 +9750,18 @@ pub struct AdmitOutcome {
     pub coalesced: bool,
 }
 
+/// The part of a delivery target's identity that outlives a loomux restart
+/// (#467) — resolved once at admission by `OrchRegistry::durable_target` and
+/// stamped onto the queued entry, because at recovery time the agent it came
+/// from may not exist. See `queue::QueuedDelivery`'s `to_orchestrator` /
+/// `session_id` fields for why the obvious keys (`pty_id`, `agent_id`) are
+/// both re-minted by a restore and therefore cannot serve.
+#[derive(Clone, Debug, Default)]
+struct DurableTarget {
+    is_orchestrator: bool,
+    session_id: Option<String>,
+}
+
 /// What `deliver_now` reports back to its caller — always `run_queue_drainer`
 /// as of #470 (the front door no longer calls `deliver_now` directly; see
 /// its doc). `Done` means nothing is left to queue; the two `Aborted*`
@@ -10725,7 +10783,7 @@ fn run_queue_drainer(
         // (not the RAII guard alone) is what makes this exit atomic with
         // deregistering from `queue_draining` — see its doc.
         if ptys.output_total(pty_id).is_none() {
-            if let Some(entries) = reg.commit_exit(pty_id, generation, true) {
+            if let Some(entries) = reg.commit_exit(&group, pty_id, generation, true) {
                 reg.announce_dropped(&group, entries, queue::DropReason::AgentDied);
             }
             return;
@@ -10735,7 +10793,7 @@ fn run_queue_drainer(
         // Agent record gone or dead, but the pty somehow lingers (teardown
         // ordering) — same treatment as a closed pty.
         if agent.as_ref().map(|a| a.status == AgentStatus::Dead).unwrap_or(true) {
-            if let Some(entries) = reg.commit_exit(pty_id, generation, true) {
+            if let Some(entries) = reg.commit_exit(&group, pty_id, generation, true) {
                 reg.announce_dropped(&group, entries, queue::DropReason::AgentDied);
             }
             return;
@@ -10754,7 +10812,7 @@ fn run_queue_drainer(
         // holding `queues`'s lock across BOTH the emptiness check and the
         // `queue_draining` removal, so whichever of "a push" or "this
         // exit" the OS schedules first is fully visible to the other.
-        if let Some(entries) = reg.commit_exit(pty_id, generation, false) {
+        if let Some(entries) = reg.commit_exit(&group, pty_id, generation, false) {
             debug_assert!(entries.is_empty(), "force:false only commits when the queue was already empty");
             return;
         }
@@ -11786,6 +11844,10 @@ impl OrchRegistry {
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
             queues: Arc::new(Mutex::new(HashMap::new())),
             queue_seq: Arc::new(AtomicU64::new(0)),
+            queue_persist: Arc::new(Mutex::new(())),
+            recovered_queue: Arc::new(Mutex::new(HashMap::new())),
+            recovered_markers: Arc::new(Mutex::new(HashMap::new())),
+            recovered_groups: Arc::new(Mutex::new(HashSet::new())),
             queue_draining: Arc::new(Mutex::new(HashMap::new())),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
@@ -22891,6 +22953,10 @@ impl OrchRegistry {
                 self.by_pty.lock_safe().insert(pty_id, agent_id.clone());
                 self.audit(group_id, "loomux", "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
                 crate::obs::breadcrumb("agent-bind", &format!("agent={agent_id} pty={pty_id}"));
+                // #467: anything a restart left queued for THIS session goes
+                // in before the kickoff below — it arrived first, and
+                // admission order is delivery order.
+                self.readmit_recovered(group_id, &agent_id, pty_id);
                 if resume {
                     // Resumed sessions already have their role and history;
                     // deliver only the follow-up (if any) instead of the
@@ -23260,6 +23326,16 @@ impl OrchRegistry {
         pty_id: u32,
         reason: queue::EnqueueReason,
     ) -> Result<AdmitOutcome, String> {
+        // #467, and it must be FIRST: recovery seeds `queue_seq` past every
+        // id the previous process left on disk, so it has to run before this
+        // call mints one. See `recover_persisted_queue`'s id-collision note.
+        // A no-op (one `HashSet` probe) on every call after the first.
+        self.recover_persisted_queue(group);
+        // Resolved BEFORE the `queues` lock, never under it: this reads the
+        // agents map, and every other site in this file that needs both
+        // takes agents first (`deliver_prompt`'s own `self.agent(...)`), so
+        // reversing it here would be the one inversion that deadlocks.
+        let target = self.durable_target(agent_id);
         let mut queues = self.queues.lock_safe();
         let q = queues.entry(pty_id).or_default();
         let was_first = q.is_empty();
@@ -23290,6 +23366,11 @@ impl OrchRegistry {
                     .expect("admit() returned Coalesce, so a byte-identical entry must exist");
                 let depth = q.len();
                 drop(queues);
+                // A coalesce mutates the queue too (the surviving entry's
+                // `coalesced` counter), so the snapshot has to move with it
+                // or a recovery would under-report the flush header's
+                // de-duplication count.
+                self.persist_queues(group);
                 self.audit(group, "loomux", "delivery-coalesced",
                     json!({ "to": agent_id, "id": id, "coalesced": coalesced, "depth": depth }));
                 // A coalesce target, by definition, matched an entry
@@ -23305,9 +23386,19 @@ impl OrchRegistry {
                     id, agent_id: agent_id.to_string(), from: from.to_string(),
                     payload: queue::QueuedPayload::Text(text.to_string()),
                     reason, enqueued_ms: now_ms(), coalesced: 0,
+                    group: group.to_string(),
+                    to_orchestrator: target.is_orchestrator,
+                    session_id: target.session_id,
                 });
                 let depth = q.len();
                 drop(queues);
+                // Durability (#468) — AFTER the lock is dropped (this does
+                // file I/O) and BEFORE the audit line, so a crash between
+                // the two leaves a snapshot with no `delivery-queued` line
+                // rather than the reverse. Both orders lose one record; only
+                // this one loses the *forensic* record instead of the
+                // *payload*.
+                self.persist_queues(group);
                 self.audit(group, "loomux", "delivery-queued",
                     json!({ "to": agent_id, "id": id, "reason": reason.as_str(), "depth": depth }));
                 Ok(AdmitOutcome { id, was_first, coalesced: false })
@@ -23338,6 +23429,7 @@ impl OrchRegistry {
             }
         };
         if removed {
+            self.persist_queues(group);
             self.audit(group, "loomux", "delivery-dropped",
                 json!({ "id": id, "reason": "no-app-handle" }));
         }
@@ -23352,11 +23444,16 @@ impl OrchRegistry {
     /// still occupies a queue slot.
     #[doc(hidden)] // pub for integration tests
     pub fn enqueue_stranded_front(&self, group: &str, agent_id: &str, from: &str, pty_id: u32) -> Result<(), String> {
+        self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
+        let target = self.durable_target(agent_id);
         let pushed = {
             let mut queues = self.queues.lock_safe();
             let q = queues.entry(pty_id).or_default();
-            self.push_stranded_front_locked(q, agent_id, from)
+            self.push_stranded_front_locked(q, agent_id, from, group, &target)
         };
+        if pushed.is_ok() {
+            self.persist_queues(group);
+        }
         self.audit_stranded_push(group, agent_id, pushed).map(|_id| ())
     }
 
@@ -23373,6 +23470,8 @@ impl OrchRegistry {
         q: &mut VecDeque<queue::QueuedDelivery>,
         agent_id: &str,
         from: &str,
+        group: &str,
+        target: &DurableTarget,
     ) -> Result<(u64, usize), usize> {
         if q.len() >= queue::QUEUE_MAX_PER_PANE {
             return Err(q.len());
@@ -23382,6 +23481,14 @@ impl OrchRegistry {
             id, agent_id: agent_id.to_string(), from: from.to_string(),
             payload: queue::QueuedPayload::StrandedSubmit,
             reason: queue::EnqueueReason::Question, enqueued_ms: now_ms(), coalesced: 0,
+            // Stamped like any other entry even though a marker can never
+            // be REPLAYED after a restart (`queue::split_recovered`): the
+            // recovery path still has to name which group's snapshot it came
+            // out of and which pane it was for, to audit and surface the
+            // loss instead of dropping it quietly.
+            group: group.to_string(),
+            to_orchestrator: target.is_orchestrator,
+            session_id: target.session_id.clone(),
         });
         Ok((id, q.len()))
     }
@@ -23458,6 +23565,8 @@ impl OrchRegistry {
             Declined(&'static str),
             Pushed(Result<(u64, usize), usize>),
         }
+        self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
+        let target = self.durable_target(agent_id);
         let admission = {
             let mut queues = self.queues.lock_safe();
             let front_is_marker = queues
@@ -23470,7 +23579,7 @@ impl OrchRegistry {
                 Some(reason) => Admission::Declined(reason),
                 None => {
                     let q = queues.entry(pty_id).or_default();
-                    Admission::Pushed(self.push_stranded_front_locked(q, agent_id, from))
+                    Admission::Pushed(self.push_stranded_front_locked(q, agent_id, from, group, &target))
                 }
             }
         };
@@ -23481,6 +23590,9 @@ impl OrchRegistry {
                 Ok(false)
             }
             Admission::Pushed(pushed) => {
+                if pushed.is_ok() {
+                    self.persist_queues(group);
+                }
                 self.audit_stranded_push(group, agent_id, pushed)?;
                 self.audit(group, "loomux", "stranded-selfheal-submit",
                     json!({ "to": agent_id, "via": "queue-front-marker" }));
@@ -23788,19 +23900,32 @@ impl OrchRegistry {
     /// non-empty at this exact instant — returns `None`, and the caller
     /// (`run_queue_drainer`) loops again to pick up whatever raced in,
     /// rather than exiting and relying on a NEW drainer to notice it.
-    fn commit_exit(&self, pty_id: u32, generation: u64, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
-        let mut queues = self.queues.lock_safe();
-        let is_empty = queues.get(&pty_id).map(|q| q.is_empty()).unwrap_or(true);
-        if !force && !is_empty {
-            return None;
-        }
-        let entries: Vec<queue::QueuedDelivery> = queues.remove(&pty_id).map(Vec::from).unwrap_or_default();
-        // Still holding `queues`'s lock here — this is the atomic step.
-        let mut draining = self.queue_draining.lock_safe();
-        if draining.get(&pty_id) == Some(&generation) {
-            draining.remove(&pty_id);
-            drop(draining);
-            self.queue_still_notified.lock_safe().remove(&pty_id);
+    fn commit_exit(&self, group: &str, pty_id: u32, generation: u64, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
+        let entries = {
+            let mut queues = self.queues.lock_safe();
+            let is_empty = queues.get(&pty_id).map(|q| q.is_empty()).unwrap_or(true);
+            if !force && !is_empty {
+                return None;
+            }
+            let entries: Vec<queue::QueuedDelivery> =
+                queues.remove(&pty_id).map(Vec::from).unwrap_or_default();
+            // Still holding `queues`'s lock here — this is the atomic step.
+            let mut draining = self.queue_draining.lock_safe();
+            if draining.get(&pty_id) == Some(&generation) {
+                draining.remove(&pty_id);
+                drop(draining);
+                self.queue_still_notified.lock_safe().remove(&pty_id);
+            }
+            entries
+        };
+        // #468, OUTSIDE the critical section above — persisting is file I/O
+        // and the atomicity this function exists for is between `queues` and
+        // `queue_draining`, not between either and the disk. Only a
+        // force-exit that actually discarded something changes the snapshot;
+        // the normal exit removes an already-empty deque, which the
+        // group-filtered snapshot never contained anything for.
+        if !entries.is_empty() {
+            self.persist_queues(group);
         }
         Some(entries)
     }
@@ -23842,6 +23967,9 @@ impl OrchRegistry {
     pub fn drop_queue(&self, group: &str, pty_id: u32, reason: queue::DropReason) {
         let entries: Vec<queue::QueuedDelivery> =
             self.queues.lock_safe().remove(&pty_id).map(Vec::from).unwrap_or_default();
+        if !entries.is_empty() {
+            self.persist_queues(group);
+        }
         self.announce_dropped(group, entries, reason);
     }
 
@@ -23881,6 +24009,15 @@ impl OrchRegistry {
                 }
             }
         }
+        // #468: the delivered entry has to leave the snapshot before
+        // anything else, or a restart in the next instant replays something
+        // that already landed in the pane — the one double-delivery this
+        // design can actually produce. It is still a window, not a
+        // guarantee: a crash between the pop and this write re-delivers.
+        // That residual is bounded by the queue's existing byte-identical
+        // coalesce on re-admission and stated plainly in the design note
+        // rather than claimed away.
+        self.persist_queues(group);
         self.audit(group, "loomux", "delivery-dequeued",
             json!({ "id": id, "queued_ms": now_ms().saturating_sub(enqueued_ms) }));
     }
@@ -23921,6 +24058,15 @@ impl OrchRegistry {
                     }
                 }
             }
+            // #468, and NOT inherited from the single-entry branch above:
+            // that one delegates to `pop_front_dequeued`, which persists;
+            // this one pops directly, so it owes its own write. Per entry
+            // rather than once per batch, matching `pop_front_dequeued`
+            // exactly — it is what keeps the design note's residual "one
+            // entry wide" instead of "one flush batch wide", and this loop
+            // has already paid for N audit appends, so N small snapshot
+            // writes are noise beside the paste that preceded them.
+            self.persist_queues(group);
             self.audit(group, "loomux", "delivery-dequeued", json!({
                 "id": id,
                 "queued_ms": now_ms().saturating_sub(*enqueued_ms),
@@ -23985,6 +24131,17 @@ impl OrchRegistry {
                 None => Vec::new(),
             }
         };
+        // #468: this removes entries from the live queue AND moves coalesce
+        // counts onto their survivors, so the snapshot has to move with it —
+        // otherwise a restart resurrects a delivery that was deliberately
+        // superseded, and under-reports the survivor's fold count. One write
+        // for the whole set, not per entry: supersession removes byte-
+        // identical duplicates as a group, and a crash before this lands
+        // resurrects duplicates, which is exactly what the queue's own
+        // byte-identical coalesce absorbs on re-admission.
+        if !removed.is_empty() {
+            self.persist_queues(group);
+        }
         for (e, by) in removed {
             self.audit(group, "loomux", "delivery-dropped", json!({
                 "to": e.agent_id,
@@ -24036,18 +24193,504 @@ impl OrchRegistry {
         self.by_pty.lock_safe().insert(pty_id, agent_id.to_string());
     }
 
-    /// #445 intake finding: the in-memory queue's persistence argument
-    /// claims a restart's loss is "mechanically derivable from
-    /// audit.jsonl" — this makes that derivation real by scanning `group`'s
-    /// audit log for `delivery-queued` ids with no matching
-    /// `delivery-dequeued`/`delivery-dropped`. As of this PR nothing calls
-    /// this from the orchestrator's own session-start re-sync (that wiring
-    /// — a follow-up issue, filed at PR time — is what would make the loss
-    /// actually RECOVERABLE, not merely visible); until then this is a
-    /// forensic query a human or a future tool can run, not an automatic
-    /// safety net. See `queue.rs`'s module doc "Scope" section.
+    /// Path of `group`'s durable queue snapshot (#468). Sits beside
+    /// `state.json`/`tasks.json`/`audit.jsonl` in the group dir, because it
+    /// is the same kind of thing: state this group cannot afford to lose
+    /// when the process does.
+    fn queue_snapshot_path(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join("queue.json")
+    }
+
+    /// Write `group`'s live queues to disk (#468). Called after EVERY
+    /// mutation of `queues` that changes what is pending, always with no
+    /// lock held — see `queue_persist`'s doc for the lock order and for why
+    /// holding the persist lock across read-then-write is what stops a
+    /// stale snapshot landing after a fresh one.
+    ///
+    /// Best-effort by construction: a failed write leaves the previous good
+    /// snapshot (that is `atomic_write`'s whole contract) and is audited
+    /// rather than propagated, because the alternative — failing the
+    /// delivery that triggered it — would turn a durability degradation
+    /// into an outage of the thing being made durable.
+    fn persist_queues(&self, group: &str) {
+        // **Never overwrite a snapshot nobody has read yet.** Recovery is
+        // lazy (see `recover_persisted_queue`), and the first thing that
+        // touches a group after a restart is not guaranteed to be a bind or
+        // a `queue_orphans` call — it can be an admission, which would
+        // rewrite the file with live state and destroy the previous
+        // process's backlog before anything looked at it. Hanging the
+        // read off the WRITE closes that by construction rather than by
+        // relying on call-site ordering. Idempotent and cheap after the
+        // first pass (one `HashSet` probe).
+        //
+        // Deliberately BEFORE `queue_persist` is acquired: recovery can send
+        // a `[loomux]` notice, which is itself a delivery, which persists —
+        // and `std::sync::Mutex` is not reentrant, so doing this under the
+        // writer lock would deadlock. The recursive call re-enters
+        // `recover_persisted_queue` as a no-op (the group is marked before
+        // any I/O runs) and takes the writer lock while this frame still
+        // holds nothing.
+        self.recover_persisted_queue(group);
+        let _writer = self.queue_persist.lock_safe();
+        let entries = self.group_queue_entries(group);
+        let body = queue::serialize_snapshot(now_ms(), entries);
+        if let Err(e) = atomic_write(&self.queue_snapshot_path(group), body.as_bytes()) {
+            self.audit(group, "loomux", "queue-persist-failed", json!({ "error": e.to_string() }));
+        }
+    }
+
+    /// Everything `group` still owes a pane: the live queues, plus whatever a
+    /// previous restart staged and has not re-bound yet.
+    ///
+    /// Live entries come first, in exact drain order (per pane front-first,
+    /// panes by ascending pty id so the file is stable), filtered on the
+    /// entry's OWN `group` stamp rather than by re-deriving each pane's group
+    /// from the agents map — see `QueuedDelivery::group`.
+    ///
+    /// **Staged entries are included, and that is what makes recovery
+    /// survive a SECOND restart** (review round 1, finding 1). Writing live
+    /// queues only meant the first admission after a restart rewrote the file
+    /// without the backlog it had just staged into memory — so a process that
+    /// died before the orchestrator's session-start `queue_orphans` call took
+    /// the only remaining copy with it. Restarts cluster (a crash loop, or a
+    /// fleet restart followed by another), and the exposed set was precisely
+    /// the case this feature exists for: entries whose pane did not come
+    /// back. Re-admitted entries leave staging and reappear here as LIVE
+    /// under fresh ids, so nothing is written twice.
+    ///
+    /// Lock order is `queues` → `recovered_queue` → `recovered_markers`. The
+    /// only other site touching staging (`readmit_recovered`) takes and
+    /// releases `recovered_queue` before it ever calls into `queues`, so the
+    /// two never overlap in the opposite order.
+    fn group_queue_entries(&self, group: &str) -> Vec<queue::PersistedEntry> {
+        let mut out = Vec::new();
+        {
+            let queues = self.queues.lock_safe();
+            let mut ptys: Vec<u32> = queues.keys().copied().collect();
+            ptys.sort_unstable();
+            for pty_id in ptys {
+                let Some(q) = queues.get(&pty_id) else { continue };
+                for d in q.iter().filter(|d| d.group == group) {
+                    out.push(queue::PersistedEntry { pty_id, delivery: d.clone() });
+                }
+            }
+        }
+        if let Some(staged) = self.recovered_queue.lock_safe().get(group) {
+            out.extend(staged.iter().cloned());
+        }
+        if let Some(markers) = self.recovered_markers.lock_safe().get(group) {
+            out.extend(markers.iter().cloned());
+        }
+        // **Sorted by id, which for this group IS arrival order** (review
+        // round 2, N5). Appending staged after live is not restart-invariant:
+        // a cap-rejected entry from restart 1 would be written behind
+        // deliveries queued after it, and a SECOND restart would then re-admit
+        // them in that inverted order — silently breaking the per-pane arrival
+        // order this feature exists to preserve. `queue_seq` is monotonic per
+        // group and seeded past the snapshot on every recovery, so an old
+        // staged id always sorts ahead of a fresh live one.
+        //
+        // The one thing this costs, stated because the file is also a human
+        // forensic artifact: a `StrandedSubmit` marker is pushed to the FRONT
+        // of its pane's queue but minted with a HIGHER id, so its position in
+        // the file no longer mirrors its drain position. That is acceptable
+        // here and nowhere else — a marker is never replayed across a restart
+        // (`split_recovered`), so no recovery decision reads its file order,
+        // and its `pty_id` + id still identify it exactly.
+        out.sort_by_key(|e| e.delivery.id);
+        out
+    }
+
+    /// The durable identity of a delivery target (#467), resolved at
+    /// admission because that is the only moment the agent is guaranteed to
+    /// still exist. See `QueuedDelivery::to_orchestrator`/`session_id` for
+    /// why neither `pty_id` nor `agent_id` can serve. An unknown agent
+    /// (integration tests seeding a queue for a pane with no roster entry)
+    /// resolves to "no durable identity", which surfaces as an orphan —
+    /// the safe direction.
+    fn durable_target(&self, agent_id: &str) -> DurableTarget {
+        match self.agent(agent_id) {
+            Some(a) => DurableTarget {
+                is_orchestrator: a.role == Role::Orchestrator,
+                session_id: a.session_id.clone(),
+            },
+            None => DurableTarget { is_orchestrator: false, session_id: None },
+        }
+    }
+
+    /// Read `group`'s `queue.json` back after a restart (#467), exactly once
+    /// per process.
+    ///
+    /// **Lazy, not startup-wired, and that is deliberate.** There is no
+    /// single "a group was restored" callback in this registry — a group
+    /// comes back when its orchestrator pane rejoins, which is one of
+    /// several paths — so recovery hangs off first touch instead: a pane
+    /// binding (`readmit_recovered`), the orchestrator's session-start
+    /// `queue_orphans` call, or an admission (`persist_queues` runs it
+    /// before it can overwrite the file). `recovered_groups` makes it
+    /// idempotent: a second pass would re-stage entries the first already
+    /// re-admitted, and deliver them twice.
+    ///
+    /// **The `recovered_groups` guard is held across the whole critical
+    /// phase, not just the check (review round 1, finding 2).** It used to
+    /// be published in a temporary guard that was released before the file
+    /// read, the `queue_seq` seed and the staging insert — so a SECOND
+    /// thread arriving in that window saw "already recovered", returned, and
+    /// minted an id the snapshot still held. That is not a theoretical race:
+    /// MCP dispatch is thread-per-request, and the moment right after a
+    /// restart is exactly when every agent in a group reports at once (what
+    /// #524's fleet restart produced). Holding the guard makes a concurrent
+    /// first touch WAIT for the seed instead of racing it, and closes the
+    /// same window for `readmit_recovered`, which would otherwise see empty
+    /// staging mid-recovery and deliver a kickoff ahead of the backlog.
+    ///
+    /// **Hard invariant for anything added inside that critical section: it
+    /// may not deliver, enqueue, or otherwise re-enter recovery.**
+    /// `std::sync::Mutex` is not reentrant, so a re-entry on THIS thread
+    /// deadlocks rather than looping. Auditing is fine (file I/O, no
+    /// callback); notices are not, which is why every notice is collected
+    /// and sent in phase 2, after the guard drops.
+    ///
+    /// The snapshot file is NOT deleted here, and `persist_queues` writes
+    /// staged entries back out alongside the live ones — so recovery is
+    /// re-runnable across any number of restarts (review round 1, finding 1).
+    fn recover_persisted_queue(&self, group: &str) {
+        // ---- phase 1: under the guard, everything another thread must not
+        // observe half-done (the seed, and staging itself) ----
+        let notices: Vec<String> = {
+            let mut recovered = self.recovered_groups.lock_safe();
+            if !recovered.insert(group.to_string()) {
+                return;
+            }
+            // Publishing the mark here rather than at the end is safe
+            // BECAUSE the guard is held for the rest of the phase: no other
+            // thread can observe it until this scope ends, and every early
+            // return below (no file, unparseable file) still needs the group
+            // marked so recovery is not retried on every later call.
+            let Ok(text) = fs::read_to_string(self.queue_snapshot_path(group)) else {
+                return;
+            };
+            let (entries, skipped) = queue::parse_snapshot(&text);
+            if skipped > 0 {
+                // A partially-unreadable snapshot recovers what it can; the
+                // rest is named rather than silently short.
+                self.audit(group, "loomux", "queue-recover-skipped", json!({ "entries": skipped }));
+            }
+            // **Push `queue_seq` past every id this snapshot holds, before
+            // any id is minted for this group in the new process.** The
+            // counter is in-memory and restarts at zero, so without this a
+            // fresh admission after a restart gets id 1 — the same id a
+            // recovered entry already carries. Two live consequences, both
+            // silent: `queue_orphans`'s live-id filter would hide a real
+            // orphan behind an unrelated fresh delivery that happened to
+            // reuse its number, and the audit scan would see the NEW id's
+            // `delivery-dequeued` close out the OLD id's `delivery-queued`.
+            // Every id-minting path calls recovery before it mints (see
+            // `enqueue_text`), and the guard above is what makes "before"
+            // true for OTHER threads too. Ids stay unique only WITHIN a
+            // group; a collision across groups is harmless because every
+            // consumer of an id — the live filter, the audit scan, the
+            // snapshot — is group-scoped.
+            let high = entries.iter().map(|e| e.delivery.id).max().unwrap_or(0);
+            let _ = self.queue_seq.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                (cur < high).then_some(high)
+            });
+            let split = queue::split_recovered(entries);
+            let mut notices = Vec::new();
+            // **These audit lines are deliberately NOT terminal for the
+            // orphan scan** (review round 1, finding 1). The previous
+            // version closed each recovered id at STAGE time — which made
+            // the audit derivation, the one view that needs no snapshot,
+            // blind to entries that were only staged. Combined with a
+            // snapshot that held live entries only, a second restart lost
+            // them with no trace anywhere: strictly worse than not having
+            // persisted at all. An id is now closed exactly when its
+            // disposition becomes durable somewhere else — `readmit_
+            // recovered` writes `delivery-recovered` when the entry leaves
+            // staging under a fresh id — so until then BOTH views report it
+            // and `queue::merge_orphans` dedupes them.
+            for e in &split.replayable {
+                self.audit(group, "loomux", "queue-recovered", json!({
+                    "to": e.delivery.agent_id, "id": e.delivery.id,
+                    "queued_ms": now_ms().saturating_sub(e.delivery.enqueued_ms),
+                }));
+            }
+            for m in &split.markers {
+                self.audit(group, "loomux", "queue-stranded-unreplayable", json!({
+                    "to": m.delivery.agent_id, "id": m.delivery.id,
+                    "reason": queue::STRANDED_ORPHAN_REASON,
+                }));
+            }
+            if !split.markers.is_empty() {
+                notices.push(queue::stranded_lost_notice(split.markers.len()));
+                self.recovered_markers.lock_safe().insert(group.to_string(), split.markers);
+            }
+            if !split.replayable.is_empty() {
+                self.recovered_queue.lock_safe().insert(group.to_string(), split.replayable);
+            }
+            notices
+        };
+        // ---- phase 2: guard released. A notice is a delivery, a delivery
+        // enqueues, an enqueue persists, and persisting calls back into this
+        // function — which is exactly why it cannot happen above. ----
+        for n in notices {
+            let _ = self.deliver_to_orchestrator(group, &n, "loomux");
+        }
+    }
+
+    /// Re-admit whatever a restart left staged for the pane that just bound
+    /// (#467). Called from every bind site, BEFORE that pane's own kickoff
+    /// is delivered — an entry queued before the restart arrived before the
+    /// kickoff, and admission order is delivery order, so re-admitting after
+    /// the kickoff would silently reorder them.
+    ///
+    /// Matching is `queue::rebinds_to`'s rule (the group's orchestrator, or
+    /// the same CLI session id) — never `agent_id`, which is re-minted at
+    /// restore. Entries that match are re-admitted in their original order
+    /// through `enqueue_text`, the SAME front door every other delivery
+    /// uses: they take their place in the live queue by the ordinary
+    /// admission rules rather than being spliced in beside it, which is also
+    /// what makes the existing byte-identical coalesce cover the one
+    /// double-delivery window this design has (see `pop_front_dequeued`).
+    /// Entries that do not match stay staged for `queue_orphans`.
+    ///
+    /// Returns how many were re-admitted.
+    #[doc(hidden)] // pub for integration tests
+    pub fn readmit_recovered(&self, group: &str, agent_id: &str, pty_id: u32) -> usize {
+        self.recover_persisted_queue(group);
+        let target = self.durable_target(agent_id);
+        let matches = |e: &queue::PersistedEntry| {
+            queue::rebinds_to(&e.delivery, target.is_orchestrator, target.session_id.as_deref())
+        };
+
+        // **Exactly one entry is ever out of both durable stores at a time,
+        // on every path** (review round 2 N4; review round 3 blocking 1).
+        //
+        // Round 2's shape partitioned the whole matching set out of staging
+        // up front, so every entry after the one being admitted lived ONLY in
+        // a local vector and a crash mid-loop dropped the remainder. Taking
+        // them one at a time fixed the SUCCESS path but not the rejection
+        // path: a rejected entry was parked in a local vector until the loop
+        // ended, so a recovered backlog meeting a pane already at
+        // `QUEUE_MAX_PER_PANE` still had every matching entry outside both
+        // stores simultaneously — precisely the case hazard 5 covers. That
+        // left the design note asserting an invariant this branch of the code
+        // did not honour, which is the defect, not the window itself.
+        //
+        // So a rejected entry goes straight back into staging and the
+        // snapshot is rewritten before the next one is taken. `parked` is
+        // what stops the loop re-offering it forever, and it holds ids rather
+        // than entries so nothing is ever held outside a durable store to
+        // track it. The cost is one extra snapshot write per rejection, in a
+        // path that only runs when a full pane meets a recovered backlog.
+        //
+        // The loop re-locks per iteration rather than hoisting the guard
+        // because holding `recovered_queue` across `enqueue_text` would
+        // invert this file's lock order (see `group_queue_entries`).
+        let mut readmitted = 0usize;
+        let mut offered = 0usize;
+        let mut rejected = 0usize;
+        let mut oldest_ms = u64::MAX;
+        let mut parked: HashSet<u64> = HashSet::new();
+        // Return `entry` to staging and make that durable before anything
+        // else is taken out. Takes the id back so the caller can mark it
+        // parked without holding the entry.
+        let put_back = |entry: queue::PersistedEntry| -> u64 {
+            let id = entry.delivery.id;
+            self.recovered_queue.lock_safe().entry(group.to_string()).or_default().push(entry);
+            self.persist_queues(group);
+            id
+        };
+        loop {
+            let next = {
+                let mut staged = self.recovered_queue.lock_safe();
+                let Some(list) = staged.get_mut(group) else { break };
+                match list.iter().position(|e| matches(e) && !parked.contains(&e.delivery.id)) {
+                    Some(i) => list.remove(i),
+                    None => break,
+                }
+            };
+            offered += 1;
+            oldest_ms = oldest_ms.min(next.delivery.enqueued_ms);
+            // A payload-less entry cannot be here (markers stage into
+            // `recovered_markers`, never `recovered_queue`) — but put it back
+            // rather than `continue`ing past it, so an impossible case that
+            // becomes possible later degrades to "still an orphan" instead of
+            // to a silent drop out of the staging area.
+            let Some(text) = next.delivery.payload.text().map(str::to_string) else {
+                rejected += 1;
+                parked.insert(put_back(next));
+                continue;
+            };
+            let from = next.delivery.from.clone();
+            match self.enqueue_text(group, agent_id, &from, &text, pty_id, queue::EnqueueReason::Recovered) {
+                Ok(fresh) => {
+                    readmitted += 1;
+                    // Close the OLD id out here and nowhere else (review
+                    // round 1, finding 1): this is the moment its
+                    // disposition becomes durable somewhere else — a fresh
+                    // `delivery-queued` line, and a live queue entry the
+                    // snapshot now carries. Written before recovery stages,
+                    // it blinded the audit derivation to entries that only
+                    // ever got staged.
+                    self.audit(group, "loomux", "delivery-recovered", json!({
+                        "to": agent_id, "id": next.delivery.id, "readmitted_as": fresh.id,
+                        "queued_ms": now_ms().saturating_sub(next.delivery.enqueued_ms),
+                    }));
+                }
+                // Re-admission can legitimately fail — the pane's queue is
+                // capped at `QUEUE_MAX_PER_PANE` like any other, and a
+                // recovered backlog can meet a queue that already has entries
+                // in it. Losing it here would be the exact silent loss this
+                // whole feature exists to prevent — worse than the original
+                // bug, because the sender was told long ago it was queued.
+                // Back into staging and onto disk immediately; see the
+                // invariant comment above the loop.
+                Err(_) => {
+                    rejected += 1;
+                    parked.insert(put_back(next));
+                }
+            }
+        }
+        if offered == 0 {
+            return 0;
+        }
+        if rejected > 0 {
+            self.audit(group, "loomux", "delivery-requeue-rejected", json!({
+                "to": agent_id, "pty": pty_id, "count": rejected, "reason": "queue-full",
+            }));
+        }
+        self.audit(group, "loomux", "delivery-requeued", json!({
+            "to": agent_id, "pty": pty_id, "count": readmitted, "offered": offered,
+        }));
+        if readmitted > 0 {
+            // Best-effort nudge: the entries are in the queue either way,
+            // but nothing has spawned a drainer for a pane that was empty
+            // until this moment.
+            if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
+                reg.ensure_drainer(app, group.to_string(), pty_id, None);
+            }
+            let minutes = now_ms().saturating_sub(oldest_ms) / 60_000;
+            let target_is_orchestrator = target.is_orchestrator;
+            self.notify_queue(group, agent_id, target_is_orchestrator,
+                &queue::recovered_notice(agent_id, readmitted, minutes));
+        }
+        readmitted
+    }
+
+    /// Every delivery this group had queued that a restart caught mid-wait
+    /// and that has NOT been re-bound to a live pane (#467) — what the
+    /// orchestrator's session-start re-sync reads, via the `queue_orphans`
+    /// MCP tool, so lost work is re-derived instead of silently dropped.
+    ///
+    /// Two derivations, merged (`queue::merge_orphans`, snapshot wins on a
+    /// shared id):
+    /// - the `queue.json` snapshot (#468), which carries the payload bytes;
+    /// - the `audit.jsonl` scan #445 shipped (`delivery-queued` ids with no
+    ///   `delivery-dequeued`/`delivery-dropped`), which needs no snapshot
+    ///   and so still covers a group whose entries were queued by a build
+    ///   before this one — at the cost of knowing the id and target but not
+    ///   the text.
+    ///
+    /// Staged entries that a bind has already re-admitted are gone from the
+    /// staging area and closed out in the audit (`delivery-queued` under a
+    /// fresh id, then `delivery-dequeued` when it lands), so they do not
+    /// appear here twice.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_orphans(&self, group: &str) -> Vec<queue::OrphanedQueueEntry> {
+        self.recover_persisted_queue(group);
+        let row = |e: &queue::PersistedEntry, reason: String| queue::OrphanedQueueEntry {
+            id: e.delivery.id,
+            agent_id: e.delivery.agent_id.clone(),
+            enqueued_ms: e.delivery.enqueued_ms,
+            reason,
+            text: e.delivery.payload.text().map(str::to_string),
+            source: queue::OrphanSource::Snapshot,
+        };
+        let mut from_snapshot: Vec<queue::OrphanedQueueEntry> = self
+            .recovered_queue
+            .lock_safe()
+            .get(group)
+            .map(|list| list.iter().map(|e| row(e, e.delivery.reason.as_str().to_string())).collect())
+            .unwrap_or_default();
+        // Markers report too, with `text: null` and their own reason — they
+        // are the one case with no bytes left to re-send, and the tool's
+        // description points a null payload at the audit log's `prompt`
+        // line, which is exactly the right advice here.
+        from_snapshot.extend(
+            self.recovered_markers
+                .lock_safe()
+                .get(group)
+                .map(|list| {
+                    list.iter()
+                        .map(|e| row(e, queue::STRANDED_ORPHAN_REASON.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        );
+        // Ids sitting in the live queue right now — see `merge_orphans`'s
+        // doc for why excluding them is load-bearing and not a tidy-up: an
+        // in-flight delivery satisfies the audit derivation's "queued, never
+        // resolved" rule exactly, and reporting one as lost work invites the
+        // orchestrator to re-send something that is about to arrive.
+        let live: std::collections::HashSet<u64> = self
+            .queues
+            .lock_safe()
+            .values()
+            .flat_map(|q| q.iter())
+            .filter(|d| d.group == group)
+            .map(|d| d.id)
+            .collect();
+        queue::merge_orphans(from_snapshot, self.audit_derived_orphans(group), &live)
+    }
+
+    /// `queue_orphans` as the MCP tool returns it (#467) — the shape the
+    /// orchestrator's session-start re-sync reads.
+    ///
+    /// `text` is the FULL payload, not a preview, because the whole point of
+    /// the tool is that the orchestrator can re-send what was lost, and a
+    /// truncated brief is not re-sendable. It is capped at
+    /// `ORPHAN_TEXT_CAP_BYTES` all the same — a queued payload can be a
+    /// whole task brief and an orchestrator's context is the scarce resource
+    /// this codebase spends most carefully — with the cut named in-band
+    /// (`truncated`, `text_bytes`) and the audit log's own `prompt` line
+    /// holding the original, so a capped entry says so instead of quietly
+    /// handing back a shortened brief that reads complete.
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_orphans_json(&self, group: &str) -> Value {
+        let orphans = self.queue_orphans(group);
+        let now = now_ms();
+        let rows: Vec<Value> = orphans
+            .iter()
+            .map(|o| {
+                let full = o.text.as_deref().unwrap_or("");
+                let truncated = full.len() > queue::ORPHAN_TEXT_CAP_BYTES;
+                let text = queue::clamp_payload(full, queue::ORPHAN_TEXT_CAP_BYTES);
+                json!({
+                    "id": o.id,
+                    "to": o.agent_id,
+                    "queued_minutes_ago": now.saturating_sub(o.enqueued_ms) / 60_000,
+                    "reason": o.reason,
+                    "source": o.source.as_str(),
+                    // `null`, never `""` — an audit-derived orphan has no
+                    // payload to give, which is a different fact from an
+                    // empty one and the orchestrator has to act differently
+                    // on it (re-derive from the issue vs. re-send verbatim).
+                    "text": o.text.as_ref().map(|_| Value::String(text)).unwrap_or(Value::Null),
+                    "text_bytes": o.text.as_ref().map(|t| t.len()),
+                    "truncated": truncated,
+                })
+            })
+            .collect();
+        json!({ "count": rows.len(), "orphans": rows })
+    }
+
+    /// The pre-#468 orphan derivation, unchanged: scan `group`'s audit log
+    /// for `delivery-queued` ids with no matching `delivery-dequeued`/
+    /// `delivery-dropped`. Split out of `queue_orphans` so the snapshot
+    /// derivation can be merged over it (and so this one stays directly
+    /// testable on its own).
+    fn audit_derived_orphans(&self, group: &str) -> Vec<queue::OrphanedQueueEntry> {
         let entries = self.audit_log(group);
         let lines: Vec<queue::QueueAuditLine> = entries
             .iter()
@@ -25675,6 +26318,11 @@ fn register_orchestrator_pane(
         reg2.by_pty.lock_safe().insert(pty_id, agent_id.clone());
         reg2.audit(&group2.id, "loomux", "agent-bind", json!({ "agent": agent_id, "pty": pty_id }));
         crate::obs::breadcrumb("agent-bind", &format!("agent={agent_id} pty={pty_id} role=Orchestrator"));
+        // #467: the restart's own recovery point. This is the pane the
+        // group's queued-to-orchestrator deliveries (worker reports, loomux
+        // notices) re-bind to — and it runs BEFORE the restore kickoff
+        // below, so a pre-restart delivery still precedes it.
+        reg2.readmit_recovered(&group2.id, &agent_id, pty_id);
         let kickoff = if resume {
             // #411: an app restart is exactly the surprise discontinuity the
             // directive ledger exists to survive, but this fixed string used

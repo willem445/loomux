@@ -108,6 +108,9 @@ memory of it — is the contract.
   (`channel_status` shows `can_send: false`) — it will never reply, by design.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
   ledger, or (`replace: true`) rewrite the whole thing. See **Durability rules**.
+- `queue_orphans()` — deliveries a loomux restart caught still queued, that could not be
+  re-bound to a live pane. Lost work, with the payloads: call it once on session start with
+  the rest of your re-sync and act on every row. See **Durability rules**.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.
@@ -445,6 +448,15 @@ know what arrives late may be stale — read it before acting on anything that f
 you get a **`[loomux] ... DROPPED ...`** notice instead (the queue was already full, or the
 agent's pane closed while entries were waiting) — that one really is gone, and you do need to
 re-derive and re-send the work.
+
+A **loomux restart** no longer breaks that promise (#468/#467): the queue is written to disk, so
+what was waiting is still waiting afterwards. You may see one of three notices about it after a
+restart, and they mean different things. `... have been re-queued in their original order and are
+delivering now` — nothing to do but judge whether an ask that old still applies. `... could not be
+re-bound to a live pane` — call `queue_orphans()` and work the list (see **Durability rules**).
+`... waiting only for Enter when loomux restarted` — that one text really is unrecoverable, same
+as a `DROPPED` notice. **Never re-send on any of the three without checking `queue_orphans()`
+first**: two of them describe deliveries that are already on their way.
 
 When a worker reports a PR:
 1. `spawn_agent(kind: "reviewer", ...)` (or reuse an idle reviewer) with the PR number.
@@ -825,10 +837,25 @@ when the whole value is "the next orchestrator should just already know this."
   needs (live assignments agent → issue/branch/PR, context, decisions) — small, factual, updated
   after every plan change.
 - On session start: **re-read INVARIANTS**, then `list_tasks`, `get_state`,
-  `gh issue list --label agent-managed --state open`, `list_agents`, `list_notifications()` —
-  reconcile, and summarize for the human before doing anything. Notifications are in-memory
-  only (a restart drops them; a compaction just drops your memory of them) — re-register
-  anything `list_notifications()` shows you were still waiting on.
+  `gh issue list --label agent-managed --state open`, `list_agents`, `list_notifications()`,
+  `queue_orphans()` — reconcile, and summarize for the human before doing anything.
+  Notifications are in-memory only (a restart drops them; a compaction just drops your memory
+  of them) — re-register anything `list_notifications()` shows you were still waiting on.
+- **`queue_orphans()` is a to-do list, not a log.** A loomux restart can catch deliveries
+  queued behind a blocked pane. Ones addressed to your own pane, or to an agent resumed onto
+  the same session id, are re-queued automatically in their original order — you will see them
+  arrive, prefixed by a notice saying how long they waited. Everything else has no live pane to
+  go back to (your worker panes do not survive a restart) and lands here instead: each row is
+  something you or an agent sent that **nobody ever received**. Read it once at session start —
+  a restart is the only thing that produces these, so re-polling is wasted. For each row:
+  re-send it to a pane that exists now (a resumed session, a fresh agent) if it still applies,
+  or say you are dropping it as stale. Never drop one silently. `text` is the payload verbatim
+  when the durable snapshot had it. `text: null` means re-derive rather than guess, for one of
+  two reasons the row itself names: `source: "audit"` (an older loomux build queued it, so only
+  the id and target survive), or `reason: "stranded-submit-not-replayable"` (the text had already
+  been typed into that pane and was waiting only for Enter when loomux restarted — the pane is
+  gone, so no bytes remain; the `prompt` audit line for that delivery is the only record of what
+  it said). An empty result is the normal case and needs no comment.
 - Keep your context lean: never paste large diffs or files into it; monitor via reports,
   `get_output` tails and `gh` summaries.
 - **Compact at lulls** (INVARIANT 11). At natural quiet points — right after a merge gate or

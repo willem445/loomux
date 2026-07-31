@@ -34,23 +34,42 @@
 //! otherwise splits every backend feature this way (pure policy here,
 //! impure wiring in `mod.rs`) and `doc/design/orchestration.md`'s "Delivery
 //! queue (#445)" section — its "Ordering" subsection covers #470's redesign
-//! specifically — for the full design rationale, including the
-//! honestly-argued limits of the in-memory choice.
+//! specifically, and its "Durability (#468/#467)" subsection the on-disk
+//! snapshot below — for the full design rationale.
 //!
-//! **Scope, stated plainly (the persistence limitation):** this queue is
-//! in-memory only. A loomux restart during a blocked window loses whatever
-//! is queued at that instant — nothing replays it. `deliver_prompt` audits
-//! the `prompt` action with the full payload text before a delivery thread
-//! ever runs, and `orphaned_queue_entries` (below) can mechanically
-//! reconstruct which of those payloads were queued but never resolved
-//! (`delivery-dequeued`/`delivery-dropped`) by reading `audit.jsonl` alone —
-//! but as of this PR nothing in the orchestrator's session-start re-sync
-//! calls it, so the derivation being POSSIBLE does not yet make the loss
-//! RECOVERABLE. Do not claim otherwise; a follow-up issue wires this
-//! function into something the orchestrator actually reads.
+//! **Durability across a restart (#468/#467).** The queue is no longer
+//! in-memory only. Every mutation of a pane's queue rewrites that group's
+//! `queue.json` through `atomic_write` (the #133 precedent: temp file,
+//! fsync, rename — a disk-full or a crash mid-write leaves the previous
+//! good snapshot, never a truncated file), and a restart reads it back:
+//! `parse_snapshot` → `split_recovered` here, `OrchRegistry::
+//! recover_persisted_queue`/`readmit_recovered` in `mod.rs`. What that buys,
+//! stated exactly, because the honest limits are the point (see this
+//! module's `PersistedEntry` doc and `doc/design/orchestration.md`'s
+//! "Durability (#468/#467)" subsection):
+//!
+//! - A queued `Text` payload survives the restart with its bytes intact.
+//! - It is **re-admitted automatically** — same queue, same order — when the
+//!   pane it was addressed to comes back with a durable identity loomux can
+//!   match: the group's single orchestrator, or an agent resumed onto the
+//!   same CLI session id. Neither `pty_id` nor `agent_id` is that identity;
+//!   both are re-minted at restore.
+//! - Anything else (a worker pane simply gone after the restart) is
+//!   **surfaced, never silently dropped**: `queue_orphans` reports it with
+//!   its payload so the orchestrator's session-start re-sync can re-derive
+//!   and re-send it. `orphaned_queue_entries` below still derives the same
+//!   view from `audit.jsonl` alone, which is what covers entries queued by a
+//!   build older than this one (no snapshot on disk to read).
+//! - A `StrandedSubmit` marker is deliberately NOT replayable: it means
+//!   "text is already sitting in that pane's input box, press Enter." After
+//!   a restart the box is gone, so pressing Enter would submit whatever the
+//!   new session happens to have there. Recovery drops markers, audits each
+//!   one, and surfaces them — see `split_recovered`.
 
 use std::collections::VecDeque;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 /// A pane blocked for hours accumulates reports/kickoffs from at most a
 /// handful of agents — 8 is generous headroom, not a measured traffic
@@ -73,7 +92,8 @@ pub const QUEUE_STILL_QUEUED_NOTICE_AFTER: Duration = Duration::from_secs(30 * 6
 
 /// Why an entry entered the queue — carried into the audit line and (for
 /// the two hold-cap reasons) the sender-facing notice.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum EnqueueReason {
     /// The pre-paste box-occupied hold (#111) capped out — nothing pasted.
     BoxOccupied,
@@ -103,6 +123,16 @@ pub enum EnqueueReason {
     /// delivery are different facts, and reading "arrival" twice for one
     /// brief would hide the recovery that actually happened.
     KickoffRecovery,
+    /// #467/#468: this entry was read back out of a group's `queue.json`
+    /// after a loomux restart and re-admitted to the pane that came back
+    /// for it. Distinct from `Arrival` for the same audit-honesty reason
+    /// `Arrival` is distinct from `BehindQueue`: the payload did NOT arrive
+    /// now, it arrived before the restart and waited through it, and a
+    /// `delivery-queued` line claiming `arrival` would put the wrong clock
+    /// on it. Never reaches `queued_notice` — recovery announces itself
+    /// through `recovered_notice` instead, which can say how many and how
+    /// old.
+    Recovered,
 }
 
 impl EnqueueReason {
@@ -113,6 +143,7 @@ impl EnqueueReason {
             EnqueueReason::BehindQueue => "behind-queue",
             EnqueueReason::Arrival => "arrival",
             EnqueueReason::KickoffRecovery => "kickoff-recovery",
+            EnqueueReason::Recovered => "recovered",
         }
     }
 }
@@ -146,7 +177,14 @@ impl DropReason {
 /// already pasted before the pre-Enter question appeared — only the Enter
 /// was withheld) carries no text: draining it presses Enter via the
 /// existing stranded-text flush, never a fresh paste.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serialized with an explicit tag (`{"kind":"text","text":"…"}` /
+/// `{"kind":"stranded-submit"}`) rather than serde's default externally-
+/// tagged shape, so a human reading a group's `queue.json` after a crash
+/// sees what the entry is without knowing serde's conventions — the same
+/// reason `audit.jsonl` spells its actions out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "text", rename_all = "kebab-case")]
 pub enum QueuedPayload {
     Text(String),
     StrandedSubmit,
@@ -165,7 +203,17 @@ impl QueuedPayload {
 }
 
 /// One entry in a pane's FIFO delivery queue.
-#[derive(Clone, Debug)]
+///
+/// **Every field here is persisted** (#468) — this struct IS the on-disk
+/// record, not a projection of one, so a field added without thought about
+/// what it means after a restart is a field a recovery will read back
+/// stale. The three that exist ONLY for that restart (`group`,
+/// `to_orchestrator`, `session_id`) carry their own reasoning below;
+/// `#[serde(default)]` on them is what lets a `queue.json` written by an
+/// older build still parse (the fields simply come back empty, and such an
+/// entry is surfaced as an orphan rather than re-admitted — the safe
+/// direction).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueuedDelivery {
     /// Per-group monotonic id (`OrchRegistry`'s `queue_seq`, an `AtomicU64`
     /// — no getrandom, CLAUDE.md constraint 2). Carried in every audit line
@@ -188,6 +236,37 @@ pub struct QueuedDelivery {
     /// may be reading a de-duplicated ask, not a guess at which of several
     /// identical prompts is "the real one."
     pub coalesced: u32,
+    /// #468: which group's `queue.json` this entry belongs in. The live
+    /// queue map is keyed by `pty_id`, which is registry-global (groups
+    /// share one `OrchRegistry`), so without this the persister would have
+    /// to re-derive a pane's group from the agents map at write time — and
+    /// an entry whose agent has already been reaped would silently fall out
+    /// of every group's snapshot. Stamped at admission, where the group is
+    /// never in doubt.
+    #[serde(default)]
+    pub group: String,
+    /// #467: whether the target was this group's orchestrator — the one
+    /// delivery target with an identity that outlives a restart.
+    ///
+    /// Neither of the obvious keys does: `pty_id` is re-minted by the
+    /// terminal layer on every restore, and `agent_id` is re-minted too
+    /// (`orch-{seq}` / `w-{seq}` off a fresh in-memory counter), which is
+    /// why #468's own filing — "`agent_id` is kept so a durable follow-up
+    /// could rebind by agent (durable across a restore)" — does not hold
+    /// and is not what this implements. A group has exactly one
+    /// orchestrator, so "was this addressed to the orchestrator" survives
+    /// the restart even though the name it was addressed by does not.
+    #[serde(default)]
+    pub to_orchestrator: bool,
+    /// #467: the target agent's CLI conversation session id, when it had
+    /// one. This is the durable identity for a NON-orchestrator target:
+    /// `spawn_agent(resume_session, cwd)` reopens exactly this session, and
+    /// the resumed pane is the same worker in every sense that matters to a
+    /// delivery that was addressed to it before the restart. `None` for a
+    /// copilot pane that had not yet minted its id, and for any target
+    /// whose entry predates this field — both surface as orphans instead.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// The outcome of offering a new TEXT payload to a pane's queue. Pure — no
@@ -234,11 +313,13 @@ pub fn queue_full_error(agent_id: &str, depth: usize, blocked_reason: &str) -> S
 /// genuinely becomes held: a fresh delivery's OWN pre-paste/pre-Enter hold
 /// (#111/#420) caps out (`BoxOccupied`/`Question` — `mod.rs`'s
 /// `run_queue_drainer` gates this to that entry's very first attempt only,
-/// never a later retry of the same entry). Never called with `BehindQueue`
-/// or `Arrival` or `KickoffRecovery` — a delivery admitted behind an
-/// existing queue, or admitted alone and about to be attempted immediately,
-/// was never blocked by anything at the moment of admission, so there is
-/// nothing yet to
+/// never a later retry of the same entry). Never called with `BehindQueue`,
+/// `Arrival`, `KickoffRecovery` or `Recovered` — a delivery admitted behind
+/// an existing queue, admitted alone and about to be attempted immediately,
+/// or re-admitted by a recovery (#517's in-process kickoff re-delivery, or
+/// #467's read-back after a restart, which announces through
+/// `recovered_notice` instead) was never blocked by anything at the moment
+/// of admission, so there is nothing yet to
 /// announce; the eventual `flush_header_text` at drain time is what informs
 /// the recipient it was queued at all. Replaces the old "held: ... re-send
 /// when clear" wording — the #445 honesty fix: the payload is safe and WILL
@@ -251,6 +332,12 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
         EnqueueReason::BehindQueue => "another delivery to this pane was already queued",
         EnqueueReason::Arrival => "just arrived",
         EnqueueReason::KickoffRecovery => "a lost kickoff is being re-delivered",
+        // Unreachable in real code (`readmit_recovered` announces through
+        // `recovered_notice`, which can say how old the backlog is — this
+        // wording cannot). Spelled out rather than folded into a `_` arm so
+        // that a FUTURE reason added to this enum is a compile error here,
+        // which is what has kept every notice string in this module honest.
+        EnqueueReason::Recovered => "it was queued before a loomux restart",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
@@ -573,20 +660,313 @@ pub fn should_fire_still_queued_notice(
         && now_ms.saturating_sub(oldest_enqueued_ms) >= QUEUE_STILL_QUEUED_NOTICE_AFTER.as_millis() as u64
 }
 
-/// One audit-derived fact about a delivery that entered the queue but has
-/// no matching terminal event (`delivery-dequeued` / `delivery-dropped` /
-/// `delivery-coalesced`) for the same `id` — i.e. a restart happened while
-/// it was still waiting. See the module doc's "Scope" section: this
-/// function makes the derivation REAL, but nothing calls it from the
-/// orchestrator's own re-sync yet, so the loss is forensically visible, not
-/// yet recovered automatically.
+/// The on-disk snapshot format version (#468). Bumped only for a change a
+/// reader cannot absorb through `#[serde(default)]`; `parse_snapshot`
+/// refuses a version it does not know rather than guessing at the shape,
+/// because the failure direction of guessing is replaying the wrong bytes
+/// into somebody's terminal.
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+/// One entry as it sits in a group's `queue.json` (#468): the live entry
+/// plus the pane it was queued for.
+///
+/// `pty_id` is recorded for FORENSICS ONLY and is deliberately never used to
+/// re-bind on recovery — it is stale the instant the process exits (the
+/// terminal layer re-mints pty ids on every restore), and a recovery that
+/// trusted it would paste one pane's backlog into whatever unrelated pane
+/// inherited its number. Rebinding goes through `QueuedDelivery`'s
+/// `to_orchestrator`/`session_id` instead. It stays in the file because a
+/// human reading a post-crash snapshot alongside `audit.jsonl` (whose
+/// `agent-bind` lines carry the same number) needs to see which pane an
+/// entry was for.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistedEntry {
+    pub pty_id: u32,
+    #[serde(flatten)]
+    pub delivery: QueuedDelivery,
+}
+
+/// A whole group's queued deliveries, as written to `queue.json` (#468).
+///
+/// **A snapshot, not a journal.** Every mutation rewrites the whole file
+/// through `atomic_write` — the #133 precedent (temp file, fsync, rename),
+/// which is what makes a crash or a full disk leave the PREVIOUS good
+/// snapshot rather than a truncated file. An append-only journal (#240's
+/// precedent, which `audit.jsonl` uses) was the other candidate and is
+/// deliberately not what this is: a journal of queue events would need
+/// replay logic to reconstruct the current state, compaction to stay
+/// bounded, and would leave a half-replayed queue reachable if a record
+/// were ever lost — three failure modes bought for nothing, since a pane's
+/// queue is capped at `QUEUE_MAX_PER_PANE` (8) entries and the whole file is
+/// therefore tiny. The audit log remains the append-only event history;
+/// this file is only ever "what is queued right now."
+///
+/// `entries` are in exact drain order: per pane, front first, and panes in
+/// ascending `pty_id` so two snapshots of the same state are byte-identical
+/// (a stable file is a diffable one).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueueSnapshot {
+    pub version: u32,
+    pub written_ms: u64,
+    pub entries: Vec<PersistedEntry>,
+}
+
+/// Serialize a group's live queues for `atomic_write`. Pretty-printed
+/// deliberately: this file is read by humans doing post-crash forensics far
+/// more often than by the program, and it is at most a few KB.
+pub fn serialize_snapshot(written_ms: u64, entries: Vec<PersistedEntry>) -> String {
+    let snap = QueueSnapshot { version: SNAPSHOT_VERSION, written_ms, entries };
+    // `to_string_pretty` on a plain struct of plain data cannot fail; the
+    // fallback keeps that from being an `unwrap` on a durability path.
+    serde_json::to_string_pretty(&snap).unwrap_or_else(|_| String::from("{\"version\":1,\"written_ms\":0,\"entries\":[]}"))
+}
+
+/// Read a `queue.json` back. **Tolerant per entry, strict about version.**
+///
+/// A snapshot is written by a process that may have been killed mid-life,
+/// on a disk that may have been full, and it is read at startup where a
+/// panic or a hard error would take the whole orchestration down with it —
+/// so a file that will not parse at all, or whose `version` this build does
+/// not know, yields nothing (the caller then falls back to the audit-derived
+/// orphan view, which needs no snapshot), and a single malformed entry costs
+/// only that entry rather than every entry beside it. Returns the entries it
+/// could read plus the number it had to skip, so the caller can audit the
+/// skips instead of losing them silently.
+pub fn parse_snapshot(text: &str) -> (Vec<PersistedEntry>, usize) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return (Vec::new(), 0);
+    };
+    let version = value.get("version").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    if version != SNAPSHOT_VERSION as u64 {
+        return (Vec::new(), 0);
+    }
+    let Some(raw) = value.get("entries").and_then(serde_json::Value::as_array) else {
+        return (Vec::new(), 0);
+    };
+    let mut out = Vec::with_capacity(raw.len());
+    let mut skipped = 0usize;
+    for item in raw {
+        match serde_json::from_value::<PersistedEntry>(item.clone()) {
+            Ok(e) => out.push(e),
+            Err(_) => skipped += 1,
+        }
+    }
+    (out, skipped)
+}
+
+/// What a restart can and cannot do with a recovered snapshot — the split
+/// `OrchRegistry::recover_persisted_queue` acts on.
+#[derive(Clone, Debug, Default)]
+pub struct RecoverySplit {
+    /// `Text` payloads, in the file's own (drain) order. Held for the pane
+    /// they were addressed to and re-admitted if it comes back.
+    pub replayable: Vec<PersistedEntry>,
+    /// `StrandedSubmit` markers, which a restart makes meaningless — see
+    /// `split_recovered`'s doc. Audited and surfaced, never replayed.
+    pub markers: Vec<PersistedEntry>,
+}
+
+/// Split a recovered snapshot into what may be replayed and what may not.
+///
+/// The one thing here that is a JUDGEMENT and not bookkeeping: a
+/// `StrandedSubmit` marker means "this pane's input box already holds the
+/// text; press Enter." Its whole meaning is a live pty's box contents, which
+/// a restart destroys — the pane is gone, and the pane that comes back has
+/// its own (possibly human-typed) box. Replaying the marker would press
+/// Enter on whatever that is. So markers are dropped from the replay set,
+/// deliberately and loudly (the caller audits each one), and the text they
+/// referred to is genuinely lost: it was already pasted into a terminal that
+/// no longer exists, so unlike a `Text` entry there are no bytes left to
+/// re-send. That loss is REPORTED rather than papered over — see
+/// `stranded_lost_notice`.
+pub fn split_recovered(entries: Vec<PersistedEntry>) -> RecoverySplit {
+    let mut split = RecoverySplit::default();
+    for e in entries {
+        match e.delivery.payload {
+            QueuedPayload::Text(_) => split.replayable.push(e),
+            QueuedPayload::StrandedSubmit => split.markers.push(e),
+        }
+    }
+    split
+}
+
+/// Whether a recovered entry has a durable identity to re-bind to when
+/// `agent` comes back (#467). Pure so the matching rule is stated in one
+/// place and tested directly, rather than being an `if` buried in a bind
+/// callback: an entry re-binds when it was addressed to this group's
+/// orchestrator and `agent` IS that orchestrator, or when both carry the
+/// SAME non-empty CLI session id. Everything else — including two entries
+/// that merely share an `agent_id`, which is re-minted at restore and
+/// therefore proves nothing — does not match.
+pub fn rebinds_to(entry: &QueuedDelivery, agent_is_orchestrator: bool, agent_session: Option<&str>) -> bool {
+    if entry.to_orchestrator && agent_is_orchestrator {
+        return true;
+    }
+    match (entry.session_id.as_deref(), agent_session) {
+        (Some(a), Some(b)) => !a.is_empty() && a == b,
+        _ => false,
+    }
+}
+
+/// The `[loomux]` notice announcing that a restart's queued deliveries were
+/// re-admitted to a pane that came back for them (#467). Says how many and
+/// how long they waited, because "delivers automatically" is not enough
+/// information when the wait spanned a restart: the recipient needs to judge
+/// whether an hours-old ask still applies, which is exactly the staleness
+/// judgement #468's filing said durability should leave to a human rather
+/// than resolve with an age cutoff.
+pub fn recovered_notice(agent_id: &str, count: usize, oldest_minutes: u64) -> String {
+    let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
+    format!(
+        "[loomux] {n} to {agent_id} queued before a loomux restart {oldest_minutes} min ago have been \
+         re-queued in their original order and are delivering now — judge staleness before acting on them"
+    )
+}
+
+/// The notice for recovered entries that have NO pane to go back to (#467):
+/// the common case after a restart, since worker panes do not survive one.
+/// Not a drop — the payloads are intact and reported by `queue_orphans`,
+/// which is what the orchestrator's session-start re-sync reads — so the
+/// wording must not read like `dropped_notice`'s "not recoverable."
+pub fn orphaned_notice(count: usize) -> String {
+    let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
+    format!(
+        "[loomux] {n} queued before the last loomux restart could not be re-bound to a live pane — \
+         call queue_orphans() to read them (payloads intact) and re-send what still applies"
+    )
+}
+
+/// The notice for `StrandedSubmit` markers a restart made unreplayable —
+/// the one genuinely lossy case in recovery, so it says so plainly rather
+/// than folding into `orphaned_notice`'s "payloads intact." See
+/// `split_recovered`'s doc for why a marker cannot survive a restart.
+pub fn stranded_lost_notice(count: usize) -> String {
+    let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
+    format!(
+        "[loomux] {n} had already been typed into a pane and was waiting only for Enter when loomux \
+         restarted — that pane is gone, so the text is NOT recoverable; check the `prompt` audit lines \
+         for what it was and re-send if it still applies"
+    )
+}
+
+/// The `reason` a surfaced `StrandedSubmit` marker carries (#467), instead
+/// of the `EnqueueReason` it was admitted under — the admission reason
+/// ("question") would say why it was queued, when what the reader needs is
+/// why it cannot be replayed. Paired with `text: null`, which for this one
+/// case does not mean "an older build queued it" but "the bytes went into a
+/// terminal that no longer exists."
+///
+/// **One string, every channel** (review round 1, finding 3). This is the
+/// value in the `queue-stranded-unreplayable` audit line, in the orphan
+/// row's `reason`, and in the MCP tool's own description — it shipped for
+/// review as `stranded-marker-not-replayable` in the audit and
+/// `stranded-submit-not-replayable` everywhere else, so a human grepping the
+/// audit log for the string the tool had just shown them found nothing.
+pub const STRANDED_ORPHAN_REASON: &str = "stranded-submit-not-replayable";
+
+/// Where a surfaced orphan was reconstructed from (#467). Both sources are
+/// real and neither subsumes the other: the snapshot carries the payload
+/// bytes but only exists for entries queued by a build that writes one; the
+/// audit derivation works on any group's history back to whenever
+/// `delivery-queued` started being written, but knows only that an id was
+/// queued and never resolved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrphanSource {
+    /// Read out of the group's `queue.json` — payload included.
+    Snapshot,
+    /// Derived from `audit.jsonl` alone — no payload.
+    Audit,
+}
+
+impl OrphanSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrphanSource::Snapshot => "snapshot",
+            OrphanSource::Audit => "audit",
+        }
+    }
+}
+
+/// One delivery that entered the queue and never reached a terminal event —
+/// a restart caught it mid-wait. Derived from a group's `queue.json`
+/// snapshot (payload intact) or, for entries with no snapshot to read, from
+/// `audit.jsonl` alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrphanedQueueEntry {
     pub id: u64,
     pub agent_id: String,
     pub enqueued_ms: u64,
     pub reason: String,
+    /// The payload bytes, when the snapshot had them (`OrphanSource::
+    /// Snapshot`). `None` from the audit derivation — `audit.jsonl`'s
+    /// `delivery-queued` line carries the id, target and reason but not the
+    /// text; the paired `prompt` line does, which is what the tool
+    /// description points a reader at rather than this field pretending to.
+    pub text: Option<String>,
+    pub source: OrphanSource,
 }
+
+/// How much of a recovered payload `queue_orphans` hands back verbatim
+/// (#467). Generous on purpose — the tool exists so the orchestrator can
+/// RE-SEND lost work, and a brief cut to a preview is not re-sendable — but
+/// still a cap, because a pane's queue can hold eight full task briefs and
+/// an orchestrator's context is this codebase's scarcest resource. A cut is
+/// always named in-band; see `OrchRegistry::queue_orphans_json`.
+pub const ORPHAN_TEXT_CAP_BYTES: usize = 8192;
+
+/// Truncate `text` to at most `cap` bytes on a char boundary, appending a
+/// marker that says so. Never silently short: a caller handing this to an
+/// agent must be able to tell a complete payload from a clipped one, which
+/// is the same "a claim is a deliverable" rule the rest of this module's
+/// notice strings follow.
+pub fn clamp_payload(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[… truncated at {cap} bytes of {} — the full payload is in this group's audit log, on the `prompt` line for this delivery]", &text[..end], text.len())
+}
+
+/// Merge the two orphan views into the one an orchestrator reads (#467).
+///
+/// Snapshot entries WIN on a shared id: both describe the same delivery, and
+/// only the snapshot has its payload. Sorted by id, which for a monotonic
+/// `queue_seq` is enqueue order — so the list reads oldest-ask-first, the
+/// order it would have delivered in.
+///
+/// **`live` is what keeps this a list of LOSSES rather than a list of
+/// pending work**, and it is not an optimization. The audit derivation's
+/// rule — queued, never resolved — is satisfied by every entry sitting in
+/// the queue right now, because an entry that has not been delivered yet has
+/// not been audited as delivered yet either. So without this filter the tool
+/// would hand the orchestrator its own in-flight deliveries and tell it they
+/// were lost, and the documented response to a non-empty result is to
+/// RE-SEND — turning the recovery feature into a duplicate-delivery
+/// generator. Anything currently in memory is excluded, including entries
+/// this same restart just re-admitted (which are delivering, not lost).
+pub fn merge_orphans(
+    snapshot: Vec<OrphanedQueueEntry>,
+    audit: Vec<OrphanedQueueEntry>,
+    live: &std::collections::HashSet<u64>,
+) -> Vec<OrphanedQueueEntry> {
+    let mut out = snapshot;
+    let seen: std::collections::HashSet<u64> = out.iter().map(|e| e.id).collect();
+    out.extend(audit.into_iter().filter(|e| !seen.contains(&e.id)));
+    out.retain(|e| !live.contains(&e.id));
+    out.sort_by_key(|e| e.id);
+    out
+}
+
+/// One audit-derived fact about a delivery that entered the queue but has
+/// no matching terminal event (`delivery-dequeued` / `delivery-dropped` /
+/// `delivery-coalesced`) for the same `id` — i.e. a restart happened while
+/// it was still waiting. Kept as the fallback view for groups with no
+/// `queue.json` to read (a snapshot written by an older build, or none at
+/// all): `OrchRegistry::queue_orphans` merges it under the snapshot
+/// derivation, which carries payloads this one cannot.
 
 /// One audit line's shape, as far as this function needs it — deliberately
 /// minimal (not the full `AuditEntry`) so this stays testable with hand-built
@@ -601,11 +981,30 @@ pub struct QueueAuditLine<'a> {
 
 /// Scan a group's audit lines (oldest first, as `parse_audit_lines` already
 /// returns them) for `delivery-queued` ids with no later
-/// `delivery-dequeued`/`delivery-dropped` for that SAME id — a queue entry
-/// that a restart caught mid-wait. `delivery-coalesced` entries are not
-/// scanned for orphans: a coalesced payload was never independently
-/// queued — it was folded into the entry it duplicated, whose own id is
-/// what to check.
+/// `delivery-dequeued`/`delivery-dropped`/`delivery-recovered` for that SAME
+/// id — a queue entry that a restart caught mid-wait. `delivery-coalesced`
+/// entries are not scanned for orphans: a coalesced payload was never
+/// independently queued — it was folded into the entry it duplicated, whose
+/// own id is what to check.
+///
+/// `delivery-recovered` (#467) is terminal here, and **only ever written at
+/// the moment an entry actually leaves staging** — `readmit_recovered`, once
+/// a FRESH `delivery-queued` id is tracking the same payload. Closing it any
+/// earlier is a real defect, caught in review round 1: the first version
+/// wrote it when an entry was merely STAGED, which made this derivation —
+/// the one view that needs no snapshot to work — blind to exactly the
+/// entries that had not been re-bound. Paired with a snapshot that then held
+/// live queues only, a second restart lost them with no trace in either
+/// channel: strictly worse than never having persisted at all, since
+/// pre-#468 this scan would at least have kept reporting the ids forever.
+///
+/// So the rule this encodes: **an id is closed here only once its
+/// disposition is durable somewhere else.** Until then both views report it
+/// and `merge_orphans` dedupes them, snapshot first (it has the payload).
+/// That is also why a `StrandedSubmit` marker a restart made unreplayable
+/// audits as the NON-terminal `queue-stranded-unreplayable` rather than
+/// `delivery-dropped`: it never leaves staging, so it must never stop being
+/// reported.
 pub fn orphaned_queue_entries(lines: &[QueueAuditLine]) -> Vec<OrphanedQueueEntry> {
     let mut open: std::collections::HashMap<u64, (String, u64, String)> = std::collections::HashMap::new();
     for l in lines {
@@ -622,7 +1021,7 @@ pub fn orphaned_queue_entries(lines: &[QueueAuditLine]) -> Vec<OrphanedQueueEntr
                     );
                 }
             }
-            "delivery-dequeued" | "delivery-dropped" => {
+            "delivery-dequeued" | "delivery-dropped" | "delivery-recovered" => {
                 if let Some(id) = l.id {
                     open.remove(&id);
                 }
@@ -632,7 +1031,14 @@ pub fn orphaned_queue_entries(lines: &[QueueAuditLine]) -> Vec<OrphanedQueueEntr
     }
     let mut out: Vec<OrphanedQueueEntry> = open
         .into_iter()
-        .map(|(id, (agent_id, enqueued_ms, reason))| OrphanedQueueEntry { id, agent_id, enqueued_ms, reason })
+        .map(|(id, (agent_id, enqueued_ms, reason))| OrphanedQueueEntry {
+            id,
+            agent_id,
+            enqueued_ms,
+            reason,
+            text: None,
+            source: OrphanSource::Audit,
+        })
         .collect();
     out.sort_by_key(|e| e.id);
     out
@@ -651,6 +1057,9 @@ mod tests {
             reason: EnqueueReason::Question,
             enqueued_ms: 1_000,
             coalesced: 0,
+            group: "g-1".into(),
+            to_orchestrator: false,
+            session_id: None,
         }
     }
 
@@ -689,6 +1098,9 @@ mod tests {
             reason: EnqueueReason::Question,
             enqueued_ms: 1_000,
             coalesced: 0,
+            group: "g-1".into(),
+            to_orchestrator: false,
+            session_id: None,
         });
         // Empty string would trivially "match" a bad comparison — pin the
         // marker is simply never a coalesce target at all.
@@ -771,6 +1183,11 @@ mod tests {
     // ---------- #533-A: coalesced flush ----------
 
     fn marker_entry(id: u64) -> QueuedDelivery {
+        // #468's three durability fields carry no meaning for #533-A's
+        // flush-planning tests (a marker is never replayed across a restart),
+        // but they are stamped rather than defaulted-away so this helper stays
+        // a faithful `QueuedDelivery` — see the struct's own doc on why every
+        // field here is persisted.
         QueuedDelivery {
             id,
             agent_id: "w-1".into(),
@@ -779,6 +1196,9 @@ mod tests {
             reason: EnqueueReason::Question,
             enqueued_ms: 1_000,
             coalesced: 0,
+            group: "g-1".into(),
+            to_orchestrator: false,
+            session_id: None,
         }
     }
 
@@ -1076,6 +1496,168 @@ mod tests {
     #[test]
     fn orphan_scan_is_empty_for_no_audit_history() {
         assert!(orphaned_queue_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn orphan_scan_treats_recovery_as_terminal() {
+        // #467: once a restart reads an entry back out of the snapshot, the
+        // snapshot derivation owns it — either staged (reported WITH its
+        // payload) or re-admitted under a fresh id. Left open here it would
+        // be reported twice, forever, under an id nothing will ever close.
+        let lines = vec![
+            line("delivery-queued", Some(7), Some("w-5"), Some("arrival"), 1_000),
+            line("delivery-recovered", Some(7), Some("w-5"), None, 2_000),
+        ];
+        assert!(orphaned_queue_entries(&lines).is_empty());
+    }
+
+    // ---------- #468/#467: durability ----------
+
+    fn persisted(id: u64, text: &str) -> PersistedEntry {
+        PersistedEntry { pty_id: 42, delivery: text_entry(id, text) }
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_payload_bytes_exactly() {
+        // The whole value of persisting is that the bytes come back
+        // re-sendable. Non-ASCII and newlines are in here because a task
+        // brief has both and a lossy encoder would only show up on one.
+        let original = vec![persisted(1, "line one\nline two — em dash, ünïcode"), persisted(2, "")];
+        let (back, skipped) = parse_snapshot(&serialize_snapshot(1_234, original.clone()));
+        assert_eq!(skipped, 0);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].delivery.payload.text(), Some("line one\nline two — em dash, ünïcode"));
+        assert_eq!(back[1].delivery.payload.text(), Some(""), "an empty payload is not the same as a missing one");
+        assert_eq!(back[0].delivery.id, 1);
+        assert_eq!(back[0].pty_id, 42);
+    }
+
+    #[test]
+    fn a_snapshot_preserves_order() {
+        let (back, _) = parse_snapshot(&serialize_snapshot(0, vec![persisted(3, "c"), persisted(1, "a"), persisted(2, "b")]));
+        let texts: Vec<Option<&str>> = back.iter().map(|e| e.delivery.payload.text()).collect();
+        assert_eq!(texts, [Some("c"), Some("a"), Some("b")],
+            "file order IS drain order — parsing must never re-sort it");
+    }
+
+    #[test]
+    fn parsing_a_snapshot_skips_only_the_unreadable_entries() {
+        let good = serialize_snapshot(0, vec![persisted(1, "keep"), persisted(2, "also keep")]);
+        let mut v: serde_json::Value = serde_json::from_str(&good).unwrap();
+        v["entries"].as_array_mut().unwrap().insert(1, serde_json::json!({ "pty_id": "nonsense" }));
+        let (back, skipped) = parse_snapshot(&v.to_string());
+        assert_eq!(skipped, 1, "the caller must be able to audit what it lost");
+        assert_eq!(back.len(), 2, "one bad entry must not cost the good ones beside it");
+    }
+
+    #[test]
+    fn parsing_refuses_garbage_and_unknown_versions_without_panicking() {
+        assert_eq!(parse_snapshot("").0.len(), 0);
+        assert_eq!(parse_snapshot("not json at all").0.len(), 0);
+        assert_eq!(parse_snapshot("{}").0.len(), 0);
+        let future = serialize_snapshot(0, vec![persisted(1, "x")])
+            .replace("\"version\": 1", &format!("\"version\": {}", SNAPSHOT_VERSION + 1));
+        assert_eq!(parse_snapshot(&future).0.len(), 0,
+            "an unknown shape must be refused, not guessed at — the failure direction is pasting wrong bytes");
+    }
+
+    #[test]
+    fn an_entry_from_an_older_build_parses_but_has_no_durable_identity() {
+        // Forward compatibility in the safe direction: a snapshot written
+        // before `group`/`to_orchestrator`/`session_id` existed must still
+        // read back (so its payload is surfaced as an orphan) while matching
+        // nothing (so it is never replayed into a pane it wasn't for).
+        let legacy = serde_json::json!({
+            "version": SNAPSHOT_VERSION,
+            "written_ms": 1,
+            "entries": [{
+                "pty_id": 9, "id": 1, "agent_id": "w-1", "from": "orch-1",
+                "payload": { "kind": "text", "text": "hello" },
+                "reason": "arrival", "enqueued_ms": 5, "coalesced": 0,
+            }],
+        });
+        let (back, skipped) = parse_snapshot(&legacy.to_string());
+        assert_eq!((back.len(), skipped), (1, 0));
+        assert_eq!(back[0].delivery.payload.text(), Some("hello"));
+        assert!(!rebinds_to(&back[0].delivery, true, Some("some-session")),
+            "an entry with no recorded identity must match nothing, not everything");
+    }
+
+    #[test]
+    fn split_recovered_replays_text_and_refuses_markers() {
+        let marker = PersistedEntry {
+            pty_id: 1,
+            delivery: QueuedDelivery {
+                payload: QueuedPayload::StrandedSubmit,
+                ..text_entry(2, "unused")
+            },
+        };
+        let split = split_recovered(vec![persisted(1, "replay me"), marker, persisted(3, "me too")]);
+        assert_eq!(split.replayable.len(), 2);
+        assert_eq!(split.markers.len(), 1);
+        let texts: Vec<Option<&str>> = split.replayable.iter().map(|e| e.delivery.payload.text()).collect();
+        assert_eq!(texts, [Some("replay me"), Some("me too")], "removing a marker must not reorder what's left");
+    }
+
+    #[test]
+    fn rebinding_matches_the_orchestrator_or_the_same_session_and_nothing_else() {
+        let to_orch = QueuedDelivery { to_orchestrator: true, ..text_entry(1, "x") };
+        let to_worker = QueuedDelivery { session_id: Some("sess-a".into()), ..text_entry(2, "x") };
+
+        assert!(rebinds_to(&to_orch, true, None), "the group's one orchestrator is a durable target");
+        assert!(!rebinds_to(&to_orch, false, Some("sess-a")),
+            "an orchestrator-targeted entry must not land in a worker pane");
+        assert!(rebinds_to(&to_worker, false, Some("sess-a")), "same resumed session = same worker");
+        assert!(!rebinds_to(&to_worker, false, Some("sess-b")), "a different session is a different pane");
+        assert!(!rebinds_to(&to_worker, false, None), "a pane with no session id matches nothing");
+        assert!(!rebinds_to(&to_worker, true, None),
+            "being the orchestrator does not entitle a pane to a worker's backlog");
+
+        // `agent_id` is deliberately NOT a key: it is re-minted at restore,
+        // so two agents sharing one proves nothing. Both entries here carry
+        // agent_id "w-1" (from `text_entry`) and neither matches on it.
+        let anonymous = QueuedDelivery { session_id: Some(String::new()), ..text_entry(3, "x") };
+        assert!(!rebinds_to(&anonymous, false, Some("")),
+            "two empty session ids are not a match — they are two absences");
+    }
+
+    #[test]
+    fn merging_orphans_prefers_the_derivation_that_has_the_payload() {
+        let snap = OrphanedQueueEntry {
+            id: 1, agent_id: "w-1".into(), enqueued_ms: 10, reason: "arrival".into(),
+            text: Some("the real payload".into()), source: OrphanSource::Snapshot,
+        };
+        let from_audit = |id: u64| OrphanedQueueEntry {
+            id, agent_id: "w-1".into(), enqueued_ms: 10, reason: "arrival".into(),
+            text: None, source: OrphanSource::Audit,
+        };
+        let merged = merge_orphans(vec![snap.clone()], vec![from_audit(1), from_audit(2)], &Default::default());
+        assert_eq!(merged.len(), 2, "the same delivery must not be reported twice");
+        assert_eq!(merged[0].id, 1);
+        assert_eq!(merged[0].text.as_deref(), Some("the real payload"),
+            "the snapshot derivation wins — it is the only one that can be re-sent");
+        assert_eq!(merged[1].source, OrphanSource::Audit, "an audit-only id is still reported, payload-less");
+
+        // An id still in the live queue is PENDING, not lost — reporting it
+        // would invite a re-send of something about to arrive.
+        let live: std::collections::HashSet<u64> = [2].into_iter().collect();
+        let filtered = merge_orphans(vec![snap], vec![from_audit(1), from_audit(2)], &live);
+        assert_eq!(filtered.iter().map(|e| e.id).collect::<Vec<_>>(), [1],
+            "an in-flight delivery must never be reported as lost work");
+    }
+
+    #[test]
+    fn clamping_a_payload_says_so_and_never_splits_a_char() {
+        let short = "fits fine";
+        assert_eq!(clamp_payload(short, 100), short, "an uncapped payload is returned untouched");
+
+        // A cap landing mid-character must not panic or produce invalid
+        // UTF-8 — em dashes are three bytes and task briefs are full of them.
+        let wide = "—".repeat(10);
+        let cut = clamp_payload(&wide, 10);
+        assert!(cut.starts_with("———"), "must cut on a char boundary: {cut}");
+        assert!(cut.contains("truncated"), "a cut payload must SAY it was cut: {cut}");
+        assert!(cut.contains("audit log"), "and where the full copy is: {cut}");
     }
 }
 
