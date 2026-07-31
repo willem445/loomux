@@ -23505,9 +23505,10 @@ impl OrchRegistry {
                             .find(|s| s.id == e.id)
                             .map(|s| s.by)
                             .expect("partition matched on this exact list");
-                        if let Some(survivor) = q.iter_mut().find(|k| k.id == by) {
-                            survivor.coalesced = survivor.coalesced.saturating_add(1 + e.coalesced);
-                        }
+                        // RED-EVIDENCE BRANCH ONLY (#533 rev-13 F4): the
+                        // pre-fix shape — remove the duplicate, lose its
+                        // coalesce count.
+                        let _ = by;
                         out.push((e, by));
                     }
                     out
@@ -23786,8 +23787,12 @@ impl OrchRegistry {
         if a.role == Role::Orchestrator {
             return Err("refusing to kill the orchestrator; close its pane instead".into());
         }
-        // Checked BEFORE the app handle and before the stamp: with no pty
-        // there is nothing to kill, so there is nothing to attribute either.
+        // RED-EVIDENCE BRANCH ONLY (#533 rev-13 F1): the PRE-FIX shape —
+        // stamp unconditionally, kill conditionally. Only this hoist is
+        // reverted; the app-handle lookup stays below (as the fix placed
+        // it), because with it back at the top the suite returns before the
+        // stamp and the defect becomes unreachable rather than absent.
+        self.record_exit_initiator(agent_id, initiator);
         let Some(pty) = a.pty_id else {
             self.audit(&a.group, "loomux", "agent-kill-noop", json!({
                 "agent": agent_id,
