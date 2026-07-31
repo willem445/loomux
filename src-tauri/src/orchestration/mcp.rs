@@ -286,7 +286,7 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
                     "text": { "type": "string" },
                 }),
                 &["agent_id", "text"]),
-            tool("get_output", "Read the last N lines of an agent's terminal (ANSI-stripped; repeated spinner/redraw frames collapsed to one, so N still means N distinct lines on a busy, animated pane).",
+            tool("get_output", "Read the last N lines of an agent's terminal AS RENDERED — the pane's output is replayed onto a composed screen, so a TUI's in-place redraws (spinner frames, cycling status verbs, a repainted input box) overwrite each other exactly as they do on a human's screen instead of piling up as text. N means N distinct content lines. Hard-capped at 8KB per call whatever N you ask for; if it binds, the reply says so and how many bytes were dropped.",
                 json!({
                     "agent_id": { "type": "string" },
                     "lines": { "type": "integer", "description": "default 60, max 500" },

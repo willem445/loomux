@@ -1739,6 +1739,31 @@ fn get_output_is_hard_capped_in_bytes_whatever_lines_asks_for() {
 }
 
 #[test]
+fn get_output_byte_cap_never_splits_a_multibyte_character() {
+    // The cap counts BYTES, and pane output is full of multibyte glyphs — box
+    // drawing, arrows, spinner stars, ellipses. Cutting at a byte offset that
+    // lands inside one panics the whole `get_output` call. Sibling of the cap
+    // test above (the same "disable the cap" mutation reddens both on the
+    // length assertion); this one additionally pins the boundary handling,
+    // which a pure-ASCII fixture cannot reach.
+    let mut text = String::new();
+    for i in 1..=400 {
+        text.push_str(&format!("│ {i:04} ↓ {}\n", "…".repeat(60)));
+    }
+    let out = format_output_tail(&text, 500);
+    assert!(
+        out.len() <= OUTPUT_TAIL_MAX_BYTES,
+        "the cap must bind on multibyte content too, got {}",
+        out.len()
+    );
+    assert!(out.contains("0400"), "the newest content must survive, got:\n{out}");
+    assert!(
+        out.chars().count() > 100,
+        "the surviving text must still decode as characters, got:\n{out}"
+    );
+}
+
+#[test]
 fn claude_command_minimizes_init_approvals_without_bypass() {
     let (reg, _d) = test_registry();
     let cfg = Path::new("C:/x/cfg.json");

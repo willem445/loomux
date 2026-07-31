@@ -5672,6 +5672,68 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   free-form profile files; the only thing carried over is the general direction of
   differentiating agents per role. #5's disposition (close vs adapt) is the human's call.
 
+## `get_output` composed-screen capture (#520)
+
+`get_output` is the orchestrator's only direct look at a pane, and it was the most expensive
+tool in the set. It read the pty's raw ring, deleted the escape sequences (`strip_ansi`), and
+collapsed *consecutive identical* lines (`collapse_repeated_frames`, #480/#496 PR-E). Against a
+CLI that redraws whole lines that works. Against a modern TUI it does nothing at all, and Claude
+Code v2.1.x is the worst case observed live (2026-07-30): a 30-line read returned ~12k tokens of
+interleaved animation residue, and two calls burned ~24k tokens — 15% of a fresh compact.
+
+**Why the line collapse could never have caught it.** Three independent reasons, all structural:
+
+- The TUI repaints **partial lines** — cursor addressed to one column, a few cells rewritten.
+  Delete the escapes and consecutive frames concatenate into a single ever-growing string, so
+  there are no two "lines" to compare in the first place.
+- The status **verb cycles** (`Shenaniganing…` → `Roosting…`) and a token counter **ticks**, so
+  even a full-line repaint is never byte-identical, and `spinner_frame_core`'s stable-core trick
+  (deliberately conservative — it strips one leading glyph and one trailing paren group, nothing
+  fuzzy) has no stable core to find.
+- The input box holding the delivered prompt sits inside the repainted region, so the prompt text
+  itself multiplies 5-10x across the capture.
+
+Retuning the dedup cannot fix any of these; the axis is wrong. Deleting escape sequences throws
+away the one piece of information that makes the stream readable — **where each write landed**.
+
+**The fix: replay, don't dedup.** `orchestration::termgrid::render_screen` is a small,
+dependency-free VT replay: feed it the raw ring plus the pane's real geometry (`PtyManager::size`)
+and it returns the composed screen — rows that scrolled off the top, then the rows currently on
+screen. A redraw is only noise because it *overwrites* something; replaying the writes makes the
+overwrite happen, exactly as it does in the human's terminal. Three hundred spinner frames painted
+over each other become the one frame that is genuinely there.
+
+This is CLI-generic in the strongest available sense (CLAUDE.md constraint 8): the module knows
+nothing about spinners, verbs, or any CLI's vocabulary — only about ECMA-48. That is also why the
+issue's fallback shape (similarity-based frame collapse plus stripping animation artifacts as a
+pattern class) was **not** implemented: it was the "failing that" branch, the replay landed, and
+adding a heuristic on top would reintroduce exactly the over-collapse risk #501's review round
+spent its time closing, for output that is already one screen.
+
+**Deliberate limits.** Not a terminal emulator: SGR/colour, character sets and wide-character
+widths are parsed only far enough to be skipped, so a double-width CJK glyph occupies one cell
+here and two in the pane (cosmetic in a monitoring read). Replay starts blind — the ring is a
+256 KB *tail*, so it begins mid-stream against a blank grid — which is fine for absolute-addressed
+paints and clamps for a relative move off the top edge. And the alternate screen is parked rather
+than cleared, so a pager that exits leaves the pane reading as the human sees it.
+
+**Blast radius.** `strip_ansi` is unchanged and still serves every other caller (`box_holds_paste`,
+`prompt_wait_detected`, the compact/menu detectors, #522's confirmation sampling). This changes
+what the orchestrator *reads*, never what loomux *decides*. The `last_exit_tail` fallback (#281)
+was captured as already-stripped text — there is no escape stream left to replay — so it keeps the
+line-collapse treatment alone.
+
+**The byte cap.** Independently of all the above, `format_output_tail` now bounds the *payload*:
+`OUTPUT_TAIL_MAX_BYTES` (8 KB), whatever `lines` asked for, keeping the newest end and stating on
+the dropped line how many bytes went. `lines` bounds distinct content lines; bytes bound the
+reply — whichever binds first wins. A pane rendering a 200-column build log can put several KB on
+a single line, and 500 of those is a six-figure token bill answering a small question; no amount
+of redraw collapsing bounds that, because none of it is a redraw. The marker reports the fact
+(bytes dropped, cap hit) rather than characterising the dropped bytes as "animation residue" the
+way #520 proposed: by the time the cap runs the replay has already removed the redraw churn, so
+what is left is as likely to be a legitimately enormous log, and labelling it residue would be a
+claim the code cannot back.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a
