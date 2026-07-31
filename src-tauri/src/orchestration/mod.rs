@@ -281,6 +281,10 @@ fn shim_deps_preamble(utils_dir: Option<&str>) -> String {
             "LOOMUX_UTILS=\"{dir}\"\n\
              case \":$PATH:\" in\n\
              \x20 *\":$LOOMUX_UTILS:\"*) ;;\n\
+             \x20 # An EMPTY inherited PATH would leave a TRAILING colon, and a trailing empty\n\
+             \x20 # entry means the CURRENT DIRECTORY — not something a security shim should be\n\
+             \x20 # the one to add. Set, don't prepend, in that case.\n\
+             \x20 \"::\") PATH=\"$LOOMUX_UTILS\"; export PATH ;;\n\
              \x20 *) PATH=\"$LOOMUX_UTILS:$PATH\"; export PATH ;;\n\
              esac\n"
         ),
