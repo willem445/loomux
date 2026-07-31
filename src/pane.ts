@@ -38,6 +38,7 @@ import {
   steerBoxHeight,
 } from "./steer";
 import { createOrderedWriter } from "./ptywrite";
+import { createHumanOriginLatch } from "./humanorigin";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
@@ -643,6 +644,13 @@ export class Pane implements VoiceTargetPane {
    *  and `respawnFresh()`; never touched by `adoptSessionId` (adopting an id
    *  doesn't respawn or re-prompt anything). */
   private firstInputMs: number | null = null;
+  /** #518: the per-turn "this data came from a human" flag `onData` stamps
+   *  each write with. Marked by `markFirstInput()` (i.e. by `term.onKey` and
+   *  the two `term.paste()` sites — the same structural signal `firstInputMs`
+   *  already trusts), read synchronously in the `onData` handler. Unlike
+   *  `firstInputMs` it belongs to the PANE, not to one process: it carries no
+   *  state across turns and so has nothing to reset on respawn. */
+  private humanOrigin = createHumanOriginLatch();
   private shiftTimer: number | undefined;
   private fit = new FitAddon();
   private resizeObs: ResizeObserver;
@@ -1043,17 +1051,24 @@ export class Pane implements VoiceTargetPane {
     this.setName("shell");
   }
 
-  /** Mark the human's first input into this pane's CURRENT process (#440 B2;
-   *  review round 3, B2-R). Idempotent — only the FIRST call after a
-   *  `start`/`respawnFresh` resets `firstInputMs` to null does anything.
-   *  Called from `term.onKey` (real keyboard events only) and from both
+  /** Mark genuine human input into this pane (#440 B2, review round 3 B2-R;
+   *  #518). Called from `term.onKey` (real keyboard events only) and from both
    *  `this.term.paste(...)` call sites (`pasteFromClipboard`,
    *  `pasteToTerminal` — loomux owns paste entirely, #402, so these two are
    *  the only paste vectors). Deliberately NEVER called from `term.onData`
    *  — see that handler's comment for why it can't tell a keystroke from
-   *  data xterm generated on its own. */
+   *  data xterm generated on its own.
+   *
+   *  Two consumers, deliberately with different lifetimes. `firstInputMs` is
+   *  idempotent — only the first call after a `start`/`respawnFresh` reset
+   *  does anything. `humanOrigin` is marked on EVERY call: it is a per-turn
+   *  origin flag for the write that is about to follow, not a once-per-process
+   *  fact (#518, see `humanorigin.ts`). Both hang off this one function so
+   *  "what counts as human input" has a single answer and a future input
+   *  vector can only be added in one place. */
   private markFirstInput(): void {
     this.firstInputMs ??= Date.now();
+    this.humanOrigin.mark();
   }
 
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
@@ -1150,7 +1165,15 @@ export class Pane implements VoiceTargetPane {
     // Everything is wired before the process exists: input queues in the
     // ordered writer until the PTY is ready, and the output router buffers
     // until we attach.
-    this.term.onData((data) => this.writer.write(data));
+    // #518: the origin flag is read RIGHT HERE, synchronously, because that is
+    // the only moment it means anything. xterm fires `onKey` immediately
+    // before the `onData` it produced (and `term.paste()` triggers its own
+    // `onData` synchronously from the call), so a human-originated write reads
+    // the mark still open; a query auto-reply is emitted while xterm parses
+    // program output — a different turn — and reads it closed. The writer
+    // carries the flag with the data from here on, since the actual IPC send
+    // happens later and asynchronously.
+    this.term.onData((data) => this.writer.write(data, this.humanOrigin.isHuman));
     // #440 B2 (review round 3, B2-R): `onData` is NOT a human-input signal —
     // it fires for EVERYTHING the terminal sends to the PTY, including data
     // xterm generates entirely on its own with no key pressed: OSC 10/11
@@ -1215,7 +1238,7 @@ export class Pane implements VoiceTargetPane {
       }
       // Bind the ordered writer to this PTY and flush anything typed/pasted
       // while it was starting, in arrival order.
-      this.writer.ready((data) => writePty(ptyId, data));
+      this.writer.ready((data, human) => writePty(ptyId, data, human));
     } catch (err) {
       // Never leave a dead black pane: surface the failure in-terminal.
       this.term.writeln(`\x1b[91mloomux: failed to start shell\x1b[0m`);

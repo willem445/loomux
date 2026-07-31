@@ -45,38 +45,48 @@ export function chunkForPty(data: string, max: number = PTY_WRITE_CHUNK): string
 
 export interface OrderedWriter {
   /** Queue input for delivery. Before `ready`, it is buffered; after, it is
-   *  chunked and sent strictly in order (one invoke in flight at a time). */
-  write(data: string): void;
+   *  chunked and sent strictly in order (one invoke in flight at a time).
+   *
+   *  `human` (#518) is the origin bit for this data — see `humanorigin.ts`. It
+   *  is captured HERE, at enqueue time, not read at send time: sends are
+   *  asynchronous and can land many turns after the key event that produced
+   *  them, by which point the latch is long closed. Carrying it with the data
+   *  is also what keeps a chunked paste whole — every chunk of one paste
+   *  inherits the same origin, instead of only the first one counting. */
+  write(data: string, human?: boolean): void;
   /** Bind the actual sender (available once the PTY id is known) and flush any
    *  buffered input in arrival order. */
-  ready(send: (data: string) => Promise<void>): void;
+  ready(send: (data: string, human: boolean) => Promise<void>): void;
   /** Count of items buffered while not yet ready (for tests/introspection). */
   readonly pendingCount: number;
 }
 
 /** Create an ordered writer. `chunk` is exposed for tests. */
 export function createOrderedWriter(chunk: number = PTY_WRITE_CHUNK): OrderedWriter {
-  let send: ((data: string) => Promise<void>) | null = null;
+  let send: ((data: string, human: boolean) => Promise<void>) | null = null;
   // The tail of the delivery chain: each write appends `.then(send)` so the
   // next send only starts after the previous resolves — FIFO, single in-flight.
   let chain: Promise<void> = Promise.resolve();
-  const pending: string[] = [];
+  const pending: { data: string; human: boolean }[] = [];
 
-  const pump = (data: string): void => {
+  const pump = (data: string, human: boolean): void => {
     const s = send!;
     for (const part of chunkForPty(data, chunk)) {
-      chain = chain.then(() => s(part)).catch(() => {});
+      chain = chain.then(() => s(part, human)).catch(() => {});
     }
   };
 
   return {
-    write(data: string): void {
-      if (send) pump(data);
-      else pending.push(data);
+    // #518: `human` defaults to `true` for a caller that says nothing — the
+    // same fail-safe default the backend command takes, so an un-updated call
+    // site keeps its pre-#518 meaning rather than silently losing the guard.
+    write(data: string, human: boolean = true): void {
+      if (send) pump(data, human);
+      else pending.push({ data, human });
     },
-    ready(sender: (data: string) => Promise<void>): void {
+    ready(sender: (data: string, human: boolean) => Promise<void>): void {
       send = sender;
-      for (const data of pending.splice(0)) pump(data);
+      for (const item of pending.splice(0)) pump(item.data, item.human);
     },
     get pendingCount(): number {
       return pending.length;
