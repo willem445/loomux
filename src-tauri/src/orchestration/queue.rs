@@ -93,6 +93,16 @@ pub enum EnqueueReason {
     /// misleading if it claimed the SAME reason a genuinely-blocked
     /// admission gets.
     Arrival,
+    /// #517: a fresh spawn's kickoff brief that the pane never received —
+    /// the paste was swallowed by a CLI whose stdin reader had not attached
+    /// yet, so nothing ever reached the input box and there is no stranded
+    /// text for #496's Enter-press self-heal to rescue. The late-confirmation
+    /// monitor re-admits the SAME text here, through this same front door,
+    /// rather than writing to the pane itself. Its own reason (not
+    /// `Arrival`) purely for audit-trail honesty: a re-delivery and a first
+    /// delivery are different facts, and reading "arrival" twice for one
+    /// brief would hide the recovery that actually happened.
+    KickoffRecovery,
 }
 
 impl EnqueueReason {
@@ -102,6 +112,7 @@ impl EnqueueReason {
             EnqueueReason::Question => "question",
             EnqueueReason::BehindQueue => "behind-queue",
             EnqueueReason::Arrival => "arrival",
+            EnqueueReason::KickoffRecovery => "kickoff-recovery",
         }
     }
 }
@@ -224,9 +235,10 @@ pub fn queue_full_error(agent_id: &str, depth: usize, blocked_reason: &str) -> S
 /// (#111/#420) caps out (`BoxOccupied`/`Question` — `mod.rs`'s
 /// `run_queue_drainer` gates this to that entry's very first attempt only,
 /// never a later retry of the same entry). Never called with `BehindQueue`
-/// or `Arrival` — a delivery admitted behind an existing queue, or admitted
-/// alone and about to be attempted immediately, was never blocked by
-/// anything at the moment of admission, so there is nothing yet to
+/// or `Arrival` or `KickoffRecovery` — a delivery admitted behind an
+/// existing queue, or admitted alone and about to be attempted immediately,
+/// was never blocked by anything at the moment of admission, so there is
+/// nothing yet to
 /// announce; the eventual `flush_header_text` at drain time is what informs
 /// the recipient it was queued at all. Replaces the old "held: ... re-send
 /// when clear" wording — the #445 honesty fix: the payload is safe and WILL
@@ -238,6 +250,7 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
         EnqueueReason::Question => "an interactive question is on screen",
         EnqueueReason::BehindQueue => "another delivery to this pane was already queued",
         EnqueueReason::Arrival => "just arrived",
+        EnqueueReason::KickoffRecovery => "a lost kickoff is being re-delivered",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"

@@ -452,6 +452,32 @@ impl PtyManager {
         );
         captured
     }
+
+    /// Test-only: append `bytes` to a registered pty's output ring exactly
+    /// as the real reader thread does — bump `total`, extend the ring, drain
+    /// the overflow past `OUTPUT_RING_CAP`. `register_fake_for_test` seeds a
+    /// ring once and there is no reader thread behind a fake, so this is the
+    /// only way a test can exercise what orchestration sees as a pane KEEPS
+    /// producing output — in particular the saturated-ring case (#517),
+    /// where the ring's length stops changing while `total` keeps climbing.
+    ///
+    /// Mirrors the reader's body deliberately rather than sharing it: the
+    /// reader also owns blocking IO and a Tauri `emit`, neither of which a
+    /// headless test has. Keeping the cap arithmetic identical is the point
+    /// — a test whose ring saturated differently from production's would
+    /// prove nothing about production.
+    #[doc(hidden)] // pub for integration tests
+    pub fn append_fake_output_for_test(&self, id: u32, bytes: &[u8]) {
+        let ptys = self.ptys.lock_safe();
+        let Some(pty) = ptys.get(&id) else { return };
+        let mut out = pty.output.lock_safe();
+        out.total += bytes.len() as u64;
+        out.ring.extend(bytes);
+        let overflow = out.ring.len().saturating_sub(OUTPUT_RING_CAP);
+        if overflow > 0 {
+            out.ring.drain(..overflow);
+        }
+    }
 }
 
 /// Minimum spacing between `phantom-input-gated` breadcrumbs for the SAME
