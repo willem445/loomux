@@ -39,7 +39,7 @@ use loomux_lib::orchestration::{
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     workflow_mode_notice,
     GhGate, GitTagPush,
-    normalize_remote_web_base, ORCHESTRATOR_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
+    normalize_remote_web_base, ORCHESTRATOR_TPL, WORKER_TPL, REVIEWER_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
     // #534 / #513(c): composed-grid question evidence.
     prompt_wait_match, question_hold_predicate_sampled, question_shown, grid_evidence_for,
@@ -1155,6 +1155,71 @@ fn orchestrator_template_no_longer_instructs_a_re_send_on_a_held_delivery() {
         ORCHESTRATOR_TPL.contains("queued"),
         "the template must describe the new hold-means-queued behavior"
     );
+}
+
+// ---------- #590: no role may block a turn waiting on CI ----------
+//
+// Live deadlock, #577: a worker registered a `notify_when` CI watch (right)
+// AND ALSO blocked its own turn on a shell-level wait for the same checks
+// (fatal). The PR had gone CONFLICTING under two merges, so GitHub was never
+// going to create the check-suites that wait was blocked on — and the watch's
+// own CONFLICTING notice (#337, built for exactly this) is delivered by TYPING
+// INTO THE PANE, which a pane mid-turn cannot accept. The turn was waiting on
+// a resolution queued behind itself; a host watchdog plus a human reading the
+// pane by hand broke it, 20+ minutes later.
+//
+// `orchestrator.md` had carried this rule for weeks ("never sit in a wait
+// loop, never `sleep`"); the DELEGATE templates never got it, which is the
+// whole gap #590 names. The two tests below pin it where it can actually
+// regress — the live templates — rather than only in the pre222 golden, which
+// fails as "re-bless me" and teaches nobody which rule went missing.
+
+/// Every role that can register a CI watch is told what the watch is for and
+/// which case it exists to catch. Concepts, not sentences: the tool to call,
+/// the kind to call it with, and `CONFLICTING` — the state whose notice is the
+/// ONLY thing that will ever arrive, because no check-suite is ever created
+/// for it. Prose may be rewritten freely; a version missing any of these is no
+/// longer telling the reader how to stop waiting.
+#[test]
+fn every_role_template_names_the_ci_watch_and_the_conflicting_case() {
+    for (role, tpl) in
+        [("orchestrator", ORCHESTRATOR_TPL), ("worker", WORKER_TPL), ("reviewer", REVIEWER_TPL)]
+    {
+        for concept in ["notify_when", "pr_checks", "CONFLICTING"] {
+            assert!(
+                tpl.contains(concept),
+                "{role}.md no longer names `{concept}` — a role that cannot name the watch, \
+                 or the one PR state that never produces checks, has been left to wait (#590)"
+            );
+        }
+    }
+}
+
+/// The delegate half, and the one #590 actually filed. A worker or reviewer
+/// wakes ONLY when something is typed into its pane, so for them "don't poll"
+/// is not enough advice — the rule has to say **end the turn**, and it has to
+/// carry its own why (the deadlock), or it reads as a performance preference
+/// and loses to "I'll just wait for this one run".
+#[test]
+fn delegate_templates_forbid_blocking_a_turn_on_ci() {
+    for (role, tpl) in [("worker", WORKER_TPL), ("reviewer", REVIEWER_TPL)] {
+        let lower = tpl.to_lowercase();
+        assert!(
+            lower.contains("end the turn"),
+            "{role}.md must tell the delegate to END THE TURN after registering the watch — \
+             a delegate only wakes on a pane delivery, and a mid-turn pane takes none (#590)"
+        );
+        assert!(
+            lower.contains("deadlock"),
+            "{role}.md must state the deadlock mechanism, not just the prohibition: a rule \
+             with no why is a rule a delegate talks itself out of once (#590)"
+        );
+        assert!(
+            lower.contains("sleep"),
+            "{role}.md must name `sleep` (and its relatives) as banned — the rule has to name \
+             the thing it bans or it is advice about polling frequency (#590)"
+        );
+    }
 }
 
 // ---------- #445: delivery queue — registry-level bookkeeping ----------
