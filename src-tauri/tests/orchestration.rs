@@ -17654,6 +17654,94 @@ fn a_queue_full_pane_badges_queue_full_not_a_spent_heal() {
     );
 }
 
+// ---------- #563 RED-BEFORE-GREEN EVIDENCE (this branch is NOT for merge) ----------
+//
+// These are the base-compatible subset of the tests shipped on
+// fix/563-copilot-hold-visibility, run here against UNFIXED main so the
+// failures are on the record. Every assertion below uses only pre-#563 public
+// API, so this file COMPILES on main — a compile error would mask the
+// behaviour instead of demonstrating it.
+
+#[test]
+fn red563_a_held_pane_reports_nothing_inside_the_bound() {
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let held = 1_000_000u64;
+    let one_poll_in = held + 2_000;
+    assert_ne!(
+        held_escalation(WriteAdmission::HoldBoxOccupied, held, one_poll_in, bound, false),
+        HeldEscalation::None,
+        "#563: a pane held two seconds into an hours-long hold reports NOTHING"
+    );
+    assert_ne!(
+        held_escalation(WriteAdmission::HoldQuestion, held, one_poll_in, bound, false),
+        HeldEscalation::None,
+        "#563: same for a question hold"
+    );
+}
+
+#[test]
+fn red563_a_recovered_pane_is_not_cleared_unless_it_was_badged() {
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    assert_eq!(
+        held_escalation(WriteAdmission::Go, 1_000_000, 1_060_000, bound, false),
+        HeldEscalation::Clear,
+        "#563: a chip raised without an escalation would never come down"
+    );
+}
+
+#[test]
+fn red563_queue_full_at_the_front_door_badges_nothing() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5632u32;
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+            .unwrap();
+    }
+    let lost = "review round 3 findings: the gate re-arms on every retry";
+    reg.enqueue_text(&g.id, &w.id, "orchestrator", lost, pty, queue::EnqueueReason::Arrival)
+        .expect_err("at cap, the newest arrival is rejected");
+
+    let dropped = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-dropped")
+        .next_back()
+        .expect("a rejected delivery must be audited");
+    assert_eq!(
+        dropped.detail["preview"], lost,
+        "#563: the drop does not name WHAT was lost, so it cannot be re-sent"
+    );
+    assert_eq!(
+        reg.stranded_note(&w.id).and_then(|n| n.blocker),
+        Some(StrandedBlocker::QueueFull),
+        "#563: the front door raises no badge, and on an orchestrator pane the badge is the \
+         only channel that survives"
+    );
+}
+
+#[test]
+fn red563_nothing_warns_before_the_queue_hits_the_cap() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5631u32;
+    // Two slots short of the cap — the point at which a warning is still a warning.
+    for i in 0..(queue::QUEUE_MAX_PER_PANE - 2) {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+            .unwrap();
+    }
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "delivery-queue-pressure"),
+        "#563: there is no state between 'fine' and 'work has already been lost'"
+    );
+    assert!(
+        reg.stranded_note(&w.id).is_some(),
+        "#563: and nothing badges the pane while anything can still be done about it"
+    );
+}
+
 #[test]
 fn a_dead_agents_stranded_badge_is_pruned() {
     // The map is latched (nothing about a wedged pane changes on its own), so
