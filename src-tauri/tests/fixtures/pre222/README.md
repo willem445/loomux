@@ -385,3 +385,38 @@ a human, not a re-run.
 Line endings are normalized before comparison (there is no `.gitattributes`, so these
 are CRLF on Windows and LF elsewhere) — the assertion is about the words, not about
 the checkout.
+
+## Verifying a re-bless by hand — and the CRLF trap
+
+Reviewing a re-bless means checking two things, and #594's review named them: the **patch**
+on each golden is identical to the patch on its live template (nothing extra rode along),
+**and** the whole **file** equals its live template with that file's keys stripped (nothing
+pre-existing silently drifted). Level 1 alone passes a golden that was correct in the diff
+and stale everywhere else; level 2 alone passes one where an unrelated edit was smuggled in
+alongside a legitimate one.
+
+**Level 2 is where the reviews keep going wrong, and it is not a disagreement about the
+content.** Two consecutive reviews (#594, #603) reported a level-2 mismatch that was not
+real: the golden's committed bytes are LF, the live template in a Windows working tree is
+CRLF, and a `sed`/`diff` comparison of the two therefore differs on **every line** while the
+words are identical (#498). What follows is a mismatch report that names no specific line,
+which reads exactly like "the whole file drifted".
+
+So compare **bytes with the keys removed, in binary, without a line-based tool** — the same
+substitution `render_with_legacy_vars` does, not a text filter:
+
+```sh
+python -c "
+keys={'orchestrator':['{{WORKFLOW}}','{{POST_MERGE_WORKFLOW_HOOK}}'],
+      'worker':['{{BLOCK_NOTE}}','{{ADVISOR_CONSULT_NOTE}}'],
+      'reviewer':['{{BLOCK_NOTE}}'],'planner':['{{BLOCK_NOTE}}']}
+for f,ks in keys.items():
+    live=open('src-tauri/src/orchestration/templates/%s.md'%f,'rb').read()
+    for k in ks: live=live.replace(k.encode(),b'')
+    gold=open('src-tauri/tests/fixtures/pre222/%s.md'%f,'rb').read()
+    print(f, 'OK' if live==gold else 'MISMATCH')
+"
+```
+
+Both files come out of the same working tree, so both carry that tree's line endings and the
+comparison is honest either way. If it still says MISMATCH, that is a real one.
