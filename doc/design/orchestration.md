@@ -7245,6 +7245,146 @@ pinned at the resolve site inside
 pure function would stay green if the wiring were never written), and `compactionstatus.test.ts`
 pins that the two sources never render as one label.
 
+## Agent ids that survive a restart, and the delivery id that rides on them (#524, #455)
+
+Two issues, one property, one change — which is the first thing to justify, since a PR that
+merges two tickets owes an argument that they were one.
+
+**The property: an agent id is minted once and never again.** Everything else here follows.
+The kickoff delivery id #455 needs is unique and durable *because* the agent id is, so it
+costs one format string; solve #455 alone and it needs a durable counter of its own, a second
+mechanism doing the first one's job.
+
+### #524 — the counter was in-memory, so ids recycled
+
+`OrchRegistry::seq` is a plain `AtomicU32` and every id — `w-3`, `rev-8`, `solo-2`, `orch-1` —
+takes its suffix from it. It started at 0 on every construction, so the first worker of every
+launch was `w-1` whether or not a previous `w-1` still had artifacts pointing at it. The
+persisted surface keyed by an agent id is wide: the board's `assignee`, audit attribution, watch
+and channel identity, and the default branch/worktree name `agent/<id>`.
+
+This is observed, not theorized. #227 is a spawn colliding with a stale `agent/rev-8` branch
+after a restart reset the counter (the #227 base-descent guard caught it; the workaround was
+explicit branch names). #523 had to re-key queue-orphan recovery onto `to_orchestrator` +
+`session_id` because `agent_id` could point at the wrong live agent post-restart. Queue
+recovery therefore stays keyed on the session and is untouched by this change; the rest of that
+surface is what this fixes.
+
+**`mint_agent_seq` is now the only way a value leaves the counter.** All four mint sites
+(`spawn_agent_ex`, `solo_prepare`, `solo_adopt`, `register_orchestrator_pane`) call it, and it
+does three things under one lock:
+
+1. **Seed**, once per process, from durable state.
+2. **`fetch_add`.**
+3. **Persist** the new high-water mark through `atomic_write`.
+
+All three under one lock deliberately. Persisting outside the critical section would let two
+concurrent spawns write their marks out of order and leave the file *below* an id already handed
+out — the exact reuse this closes — and the alternative fix, a read-modify-write of the file per
+mint, is strictly more I/O for the same guarantee. Mints happen at spawn, a few per session.
+
+**The write lands before the id is returned.** That is what makes the guarantee survive a crash
+mid-spawn: at the moment the mark is durable the caller has not yet cut a worktree, written a
+roster row, or emitted an audit line, so there is no window in which an artifact outlives the
+mark that reserved its id. (Before this, `persist_agent_record` ran *after* `git_worktree_add`,
+so even a roster-derived mark would have missed a branch left by a spawn that died in between.)
+
+A failed write is audited (`agent-seq-persist-failed`) and not propagated, which is
+`persist_queues`' rule for `persist_queues`' reason: failing the spawn would turn a durability
+degradation into an outage of the thing being made durable.
+
+### Where the mark lives — and why the "derive it" alternative is the *floor*, not the mechanism
+
+The issue offered two shapes: (a) persist the counter per group, or derive it from state loomux
+already keeps. Both are in the change, each where it is actually right.
+
+`agent-seq.json` sits at the orchestration **root**. The counter is registry-global — one `seq`
+serves every group and the solo pseudo-group — so per-group persistence would need a
+max-across-every-group read before the first mint, and would still lose the mark whenever a
+group dir is swept, while the artifacts keyed by the ids it handed out do not go with it. A
+stale `agent/rev-8` in the human's repo colliding with a re-minted `rev-8` is #227, exactly. A
+plain file at the root is invisible to both root scans (`session_roles` needs a `group.json`,
+`existing_group_ids` filters on `is_dir()`). Write mechanics: see the `agent-seq.json` row in
+`doc/design/durability-and-disk.md`.
+
+**Derivation is the migration floor.** With no counter file — a fresh install, or the first
+launch after upgrading to this build — the seed scans every group's `agents.json`, the durable
+roster loomux has always kept, for the highest id suffix. Without that fallback an existing
+install's protection would begin only *after* the collision it exists to prevent, which is the
+whole population that has already hit this. As the *mechanism* it would be worse in two
+directions the file is not: it misses an agent whose spawn died between the mint and the roster
+write, and it forgets everything a group sweep removes. So: file first, roster as the floor, and
+the scan costs nothing on the normal path because it runs only when the file is absent.
+
+**Honest residual.** A git branch left in the human's repo is still not consulted. Delete the
+whole orchestration root and ids restart while `agent/w-1` branches survive. That is much
+narrower than what shipped before — which did it on *every* restart — but it is not nothing, and
+the issue's option (b), treating `agent_id` as ephemeral-by-contract and keying every persisted
+layer on the session UUID, remains the honest model. This is (a), as filed.
+
+### #455 — a delivery id, keyed on *acted on*
+
+No root cause is available and this does not claim one. The audit rules loomux out as the
+duplicator: the kickoff text appears in exactly one `prompt` action, every `prompt-typed` row for
+that agent carries `attempts: 1`, and the delivery that carried it records
+`confirm_state: "confirmed"`. One paste, one Enter, one audit row — the duplication happened
+after the bytes left loomux (most plausibly the CLI processing one queued paste twice, since the
+pane was demonstrably mid-turn). What the issue identifies as missing is not the root cause but
+**delivery identity**: nothing stamped a delivery, so no receiver could say *"I have already seen
+this one"*.
+
+So every kickoff header now carries `Delivery id: <group>/<agent>/k1`, and all four role
+templates gain a `## Duplicate deliveries` section stating the rule: *a brief whose delivery id
+you have already **acted on** is a duplicate — acknowledge it in one line and do nothing else.*
+
+**Why the agent's own identity is a delivery identity.** There is exactly one kickoff per spawned
+agent, and after #524 an agent id is never re-minted for the life of an install, so
+`<group>/<agent>` names one delivery uniquely and forever with nothing new persisted. A resume
+mints a *fresh* agent id (`spawn_agent_ex` takes a new suffix whether or not `resume_session` is
+set), so a resumed session's transcript can never contain the id its new kickoff carries — the
+one case where a per-agent counter alone would have failed. The `k1` tail keeps the token reading
+as a delivery id rather than the agent id repeated, and leaves the namespace open.
+
+### Composing with #517/#585, which is the half that needed care
+
+That recovery **deliberately re-sends** a kickoff it has evidence never arrived. Two ways to get
+this wrong, both avoided:
+
+*A per-paste id* would hand the re-delivery a fresh token, so a receiver could not recognise a
+re-send of work it had already done — and it would break `queue::admit`'s byte-identical
+coalesce, which is the **fourth** of that recovery's own duplicate-protection layers. So the id
+lives in the kickoff **text**, which `redeliver_lost_kickoff` re-admits byte-for-byte: the id
+rides along unchanged, and nothing in the queue, the coalesce, or the gate stack moves.
+
+*Keying the rule on "seen"* would make an agent no-op the re-delivery of a kickoff it never
+received — turning that recovery back into the silent loss it was built to end. The rule is
+therefore keyed on **acted on**: "have I already acted on this id?", never "have I seen these
+bytes?". A brief you never got to act on is work that has not been done. The two cases separate
+cleanly:
+
+| what happened | id the receiver sees | what it does |
+| --- | --- | --- |
+| the CLI re-processed one paste | the same id, already acted on | acknowledge, no-op |
+| #517/#585 re-delivered a lost kickoff | the same id, **not** acted on | act on it, once |
+| a resume, or a different agent | a different id | act on it, once |
+
+**Mid-session prompts are deliberately not stamped.** A unique id per `send_prompt` would defeat
+the byte-identical coalesce that already collapses a repeated mid-session ask, and a mid-session
+sender is still around to re-send — the same asymmetry `Delivery::recovers_lost_kickoff()`
+already draws between a kickoff (unrecoverable if lost) and everything else.
+
+**All four roles, not three.** An orchestrator that re-processes its own kickoff re-runs a whole
+session start; a header present on three roles out of four is the asymmetry that later reads as a
+bug. `orchestrator.md` additionally says how to *read* a delegate that reports a duplicate: it
+did the work once, not zero times.
+
+**What this does not claim.** It is a mitigation, not a fix: it makes a duplicated brief
+*recognisable* by the receiver, which is a behavioral guardrail an agent can still fail to
+follow. It does nothing about the CLI-side duplication itself, and #455 stays open for that.
+
+**No queue mutation** anywhere in this change, so no new `persist_queues` obligation arises under
+the #523 table.
+
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
 **Problem.** Worker reports and orchestrator kickoffs are delivered by bracketed-pasting
