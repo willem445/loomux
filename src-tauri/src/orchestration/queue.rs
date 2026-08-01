@@ -645,6 +645,121 @@ pub fn still_queued_notice(agent_id: &str, depth: usize, minutes: u64) -> String
     )
 }
 
+/// #563: the depth at which a pane's queue stops being "backed up" and starts
+/// being "about to lose work".
+///
+/// Six of eight, i.e. two admissions of headroom. Sized against what the
+/// warning is FOR rather than against traffic: at `QUEUE_DRAIN_POLL` (2s) a
+/// held pane admits new deliveries as fast as its senders produce them, so a
+/// threshold that leaves only one slot would routinely be crossed and
+/// exhausted inside the same poll tick and the warning would arrive with the
+/// loss rather than before it. Two slots is the smallest headroom that can
+/// still be a *warning*. Below `QUEUE_MAX_PER_PANE` by construction — see
+/// `capacity_state`'s `debug_assert`.
+pub const QUEUE_NEAR_FULL_AT: usize = 6;
+
+/// #563: how close a pane's delivery queue is to dropping work.
+///
+/// Exists because "the queue filled completely" was, before this, a fact
+/// loomux only ever learned at the instant it was already losing a payload.
+/// There was no state between "fine" and "a delivery has just been thrown
+/// away", so nothing could be said in advance and nothing said it afterwards
+/// on the one pane (an orchestrator's) where the in-band notice channel is
+/// structurally suppressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CapacityState {
+    /// Room to spare.
+    Normal,
+    /// At or past `QUEUE_NEAR_FULL_AT` — still accepting, but the next few
+    /// arrivals will be rejected. This is the state that has to be loud.
+    Approaching,
+    /// At `QUEUE_MAX_PER_PANE`. Every further arrival is dropped.
+    Full,
+}
+
+impl CapacityState {
+    /// Stable audit token, kept separate from any human-facing wording for the
+    /// same reason `StrandedBlocker::as_str` is.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CapacityState::Normal => "normal",
+            CapacityState::Approaching => "approaching",
+            CapacityState::Full => "full",
+        }
+    }
+}
+
+/// Classify a pane's queue depth (#563). Pure, so the thresholds are pinnable
+/// and so the caller's edge-trigger ("fire only when this goes UP") is a
+/// comparison of two of these rather than a second spelling of the constants.
+pub fn capacity_state(depth: usize) -> CapacityState {
+    debug_assert!(
+        QUEUE_NEAR_FULL_AT < QUEUE_MAX_PER_PANE,
+        "a near-full threshold at or past the cap could never warn in advance"
+    );
+    if depth >= QUEUE_MAX_PER_PANE {
+        CapacityState::Full
+    } else if depth >= QUEUE_NEAR_FULL_AT {
+        CapacityState::Approaching
+    } else {
+        CapacityState::Normal
+    }
+}
+
+/// The longest a dropped payload's preview may run in an audit line (#563).
+/// Long enough to identify which delivery was lost, short enough that a pane
+/// dropping repeatedly cannot bloat `audit.jsonl` (which rotates, and is the
+/// only record of the loss).
+pub const DROPPED_PREVIEW_MAX: usize = 160;
+
+/// A one-line, bounded preview of a payload that could NOT be queued (#563).
+///
+/// A drop that names only `{to, reason, depth}` — the pre-#563 audit line —
+/// tells a reader that something was lost but not WHAT, which is the
+/// difference between a recoverable incident and an unrecoverable one: the
+/// sender can re-send a delivery it can identify. Newlines are collapsed so
+/// the preview stays one JSON string a human can read in a log viewer, and
+/// truncation is marked (`…`) rather than silent, because a preview that looks
+/// complete but isn't is the same unbacked claim `.loomux/lessons.md` catalogues.
+///
+/// Truncation is by CHARS, not bytes — slicing a UTF-8 string at an arbitrary
+/// byte offset panics, and this runs on the delivery path.
+pub fn dropped_payload_preview(text: &str) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= DROPPED_PREVIEW_MAX {
+        return one_line;
+    }
+    let kept: String = one_line.chars().take(DROPPED_PREVIEW_MAX).collect();
+    format!("{kept}…")
+}
+
+/// The "this pane's queue is nearly full" notice (#563). Names the numbers
+/// rather than saying "nearly", so a reader can tell how much room is left
+/// without knowing loomux's constants.
+///
+/// Goes to the group's orchestrator via `notify_queue` — which means it is
+/// suppressed when the pane in question IS the orchestrator's. That is exactly
+/// why this notice is never the only channel: the caller also raises an
+/// attention badge, which no role suppresses. See `StrandedBlocker::QueueNearFull`.
+pub fn pressure_notice(agent_id: &str, depth: usize, cap: usize) -> String {
+    format!(
+        "[loomux] {agent_id}'s delivery queue is {depth}/{cap} — it is held and backing up; \
+         once it hits {cap} further deliveries are DROPPED, not queued"
+    )
+}
+
+/// The "this pane's queue is FULL" notice (#563) — the transition INTO
+/// `CapacityState::Full`, fired before anything has actually been rejected
+/// (the entry that filled the last slot was accepted). Says what happens next
+/// rather than claiming a loss that has not happened yet; the loss itself gets
+/// its own `delivery-dropped` record naming the payload.
+pub fn at_capacity_notice(agent_id: &str, cap: usize) -> String {
+    format!(
+        "[loomux] {agent_id}'s delivery queue is FULL ({cap}/{cap}) — every further delivery \
+         to it is DROPPED, not queued, until the pane is released"
+    )
+}
+
 /// Whether `depth` (queue length) freshly crosses the still-queued notice
 /// threshold this poll tick — pure edge trigger so the impure caller can
 /// fire the notice exactly once per queue lifetime rather than every 2s
