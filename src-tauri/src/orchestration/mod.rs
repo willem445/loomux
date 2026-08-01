@@ -24935,7 +24935,8 @@ impl OrchRegistry {
             // `--disallowedTools` stays emitted too — see
             // `CLAUDE_READONLY_SETTINGS_ALLOW`'s doc for the citation that
             // makes the cross-layer direction sound as well.
-            let deny = readonly_settings_deny(containment);
+            // MUTATION (scratch, do not merge): drop the deny key.
+            let deny: Vec<&str> = Vec::new();
             if !deny.is_empty() {
                 p.insert("deny".into(), json!(deny));
             }
@@ -25861,9 +25862,6 @@ impl OrchRegistry {
                 // `auto`/`acceptEdits` and total under `dontAsk`. Any new flag
                 // added to this branch belongs below this line too, never
                 // between `--allowedTools` and its values.
-                if let Some(hs) = hook_settings {
-                    cmd.push_str(&format!(" --settings \"{}\"", hs.display()));
-                }
                 if containment.denies_edits() {
                     // Deny the file-editing tools — and, for a ReadOnly class,
                     // the git mutation subcommands — outright
@@ -25887,6 +25885,11 @@ impl OrchRegistry {
                     // CLAUDE_READONLY_DENY_GIT (see their docs for the
                     // drift-pin test, #448).
                     cmd.push_str(" --disallowedTools");
+                    // MUTATION (scratch, do not merge): a flag emitted mid-list,
+                    // the exact regression shape #610 was on the allow side.
+                    if let Some(hs) = hook_settings {
+                        cmd.push_str(&format!(" --settings \"{}\"", hs.display()));
+                    }
                     for t in CLAUDE_EDIT_DENY_TOOLS {
                         cmd.push_str(&format!(" {t}"));
                     }
@@ -26052,12 +26055,13 @@ impl OrchRegistry {
                 // N2) — omitted entirely when this agent has nothing to put in
                 // one. After the allow values, never before them: see the
                 // string form's comment for the #610 defect that ordering fixes.
-                if let Some(hs) = hook_settings {
-                    push(&mut a, "--settings");
-                    a.push(hs.display().to_string());
-                }
                 if containment.denies_edits() {
                     push(&mut a, "--disallowedTools");
+                    // MUTATION (scratch, do not merge): mirror of the string form.
+                    if let Some(hs) = hook_settings {
+                        push(&mut a, "--settings");
+                        a.push(hs.display().to_string());
+                    }
                     for t in CLAUDE_EDIT_DENY_TOOLS {
                         push(&mut a, t);
                     }
