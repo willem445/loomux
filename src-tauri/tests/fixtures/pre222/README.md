@@ -283,6 +283,28 @@ so far:
   `planner.md` are untouched — `queue_orphans` is orchestrator-only, and a delegate's side of
   the queue contract (never re-send on a `queued` notice) did not change.
 
+- **#590, delegates never block a turn on CI** — `worker.md` and `reviewer.md` only
+  (`orchestrator.md` and `planner.md` did not move). Live deadlock on #577: a worker
+  registered a `notify_when` CI watch **and also** blocked its own turn on a shell-level wait
+  for the same checks. The PR had gone `CONFLICTING` under two merges, so GitHub was never
+  going to create the check-suites that wait was blocked on — and the watch's own CONFLICTING
+  notice (#337, built for exactly this) is delivered by *typing into the pane*, which a pane
+  mid-turn cannot accept. The turn was waiting on a resolution queued behind itself; 20+
+  minutes, broken by the host watchdog plus a human reading the pane by hand. `orchestrator.md`
+  had carried this rule for weeks (**Monitoring open PRs**: "never sit in a wait loop, never
+  `sleep`") and the delegate templates never got it, which is the entire gap. Both now carry a
+  **Never block a turn on CI** section stating the deadlock mechanism in one sentence, the
+  register / **end the turn** / act-on-the-notice shape, that reading a state once is fine and
+  only *waiting* is banned, and that `CONFLICTING` is the case waiting can never discover
+  because no check-suite is ever created for it. `worker.md`'s git-workflow CI bullet now
+  points at that section instead of restating half of it, and its **Loop until green** no
+  longer reads as an in-turn poll loop; `reviewer.md`'s `notify_when` tool bullet gains the
+  same pointer, and its version of the rule is the first time a default group's reviewer is
+  told which watch kind to register or that a `CONFLICTING` PR never produces checks at all.
+  `orchestrator.md` is deliberately untouched — confirmed to carry its own version, and
+  duplicating it would have been the change this fixture exists to make visible. Layer 2 of
+  #590 (host-side detection of an undeliverable notice) is parked for design and is not here.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
