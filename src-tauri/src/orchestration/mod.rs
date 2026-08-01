@@ -27033,18 +27033,13 @@ impl OrchRegistry {
         // in the same position relative to admission — because a pause-held
         // delivery is an ordinary delivery now. What distinguishes it lives
         // where it belongs: the `delivery-queued` line's `reason`.
-        // SCRATCH COMMIT — REVERTED IN THE NEXT COMMIT. This is the pre-#569
-        // destroy-with-Ok pause branch, restored so CI can run the new tests
-        // against the OLD behavior and show them red. Only the BEHAVIOR is
-        // reverted: `EnqueueReason::GroupPaused`, `FlushCause`,
-        // `flush_paused_queues` and the drainer's pause gate all stay, so the
-        // tests still COMPILE and fail on their assertions — a compile error
-        // would mask the behavior rather than test it.
+        self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
         if self.is_paused(&a.group) {
-            self.audit(&a.group, from, "prompt-suppressed-paused", json!({ "to": agent_id, "text": text }));
+            self.enqueue_text(
+                &a.group, agent_id, from, text, pty_id, queue::EnqueueReason::GroupPaused,
+            )?;
             return Ok(());
         }
-        self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
         // #470: `Arrival` regardless of whether this lands alone or behind
         // an existing entry — accurate either way (this call site IS the
