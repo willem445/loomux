@@ -52,6 +52,24 @@ re-grounding notice, so it survives even a compact you never saw coming. Once re
 curate it: `note_directive(text, replace: true)` with the tail you were just shown, minus
 anything done or no longer relevant.
 
+## Duplicate deliveries
+
+Your kickoff carries a `Delivery id:` line. The rule: **a brief whose delivery id you have
+already acted on is a duplicate — acknowledge it in one line and do nothing else.** No
+re-reviewing the PR, no second review posted, no second verdict. Record the id the first time
+you act on it; `note_directive` is the natural place, since it is already how a directive
+survives a compact.
+
+loomux types a kickoff **once** — audit-confirmed, not assumed (#455). The duplication happens
+after the bytes leave loomux, when the CLI re-processes one queued paste, so the second copy is
+the *same paste* and carries the *same delivery id*.
+
+**A re-delivery is not a duplicate.** When loomux can see that a kickoff never reached your
+pane, it deliberately re-sends that same brief — same bytes, so the same delivery id
+(#517/#585). If you have not acted on that id yet, this is the first time you are really seeing
+it: act on it, once, normally. The test is always *"have I already acted on this id?"*, never
+*"have I seen these bytes?"* — a brief you never got to act on is work that has not been done.
+
 ## Never block a turn on CI
 
 If a PR's checks have to resolve before you can finish a review, register

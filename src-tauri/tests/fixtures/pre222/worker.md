@@ -67,6 +67,24 @@ Once a compact re-grounds you and shows you your own ledger tail, curate it: cal
 `note_directive(text, replace: true)` with that tail minus anything already done or no longer
 relevant, so it stays a living record instead of an ever-growing dump.
 
+## Duplicate deliveries
+
+Your kickoff carries a `Delivery id:` line. The rule: **a brief whose delivery id you have
+already acted on is a duplicate — acknowledge it in one line and do nothing else.** No
+re-running the task, no second PR, no re-applied migration. Record the id the first time you
+act on it; `note_directive` is the natural place, since it is already how a directive survives
+a compact.
+
+loomux types a kickoff **once** — audit-confirmed, not assumed (#455). The duplication happens
+after the bytes leave loomux, when the CLI re-processes one queued paste, so the second copy is
+the *same paste* and carries the *same delivery id*.
+
+**A re-delivery is not a duplicate.** When loomux can see that a kickoff never reached your
+pane, it deliberately re-sends that same brief — same bytes, so the same delivery id
+(#517/#585). If you have not acted on that id yet, this is the first time you are really seeing
+it: act on it, once, normally. The test is always *"have I already acted on this id?"*, never
+*"have I seen these bytes?"* — a brief you never got to act on is work that has not been done.
+
 ## Execute the plan step by step
 
 Work the brief as a sequence of small steps — the planner's own decomposition, when one posted a

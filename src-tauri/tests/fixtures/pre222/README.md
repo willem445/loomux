@@ -327,6 +327,25 @@ so far:
   and `list_verdicts` pins verdicts by SHA. Duplicating a worker's authoring rule into three
   more templates would have been the change this fixture exists to make visible.
 
+- **#455, a delivery id and what makes a repeat a duplicate** — all four files, one new
+  **Duplicate deliveries** section each. Live incident: a worker received the same kickoff
+  brief twice and recognised it only by noticing it had asked the same question before. The
+  audit rules loomux out as the duplicator — one `prompt` action, `attempts: 1`, one Enter —
+  so the duplication happens after the bytes leave loomux (the CLI re-processing one queued
+  paste), and nothing stamped a delivery so a receiver could say *"I have already seen this
+  one"*. Every kickoff header now carries `Delivery id: <group>/<agent>/k1`, and the rule each
+  template states is: **a brief whose delivery id you have already acted on is a duplicate —
+  acknowledge it in one line and do nothing else.**
+
+  The half that needed the care is the exception, because #517/#585's kickoff recovery
+  **deliberately re-sends a brief that never arrived**, byte-for-byte and therefore with the
+  same delivery id. So the rule is keyed on *acted on*, never on *seen*: a re-delivery of a
+  kickoff the agent never got to act on is acted on once, normally, and the templates say so
+  in as many words. The per-role wording differs only in what "do nothing else" forbids (a
+  second PR, a second review, a second plan, a re-dispatch); `orchestrator.md` additionally
+  gets one line on how to READ a delegate that reports a duplicate — it did the work once, not
+  zero times.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
