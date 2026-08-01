@@ -23989,6 +23989,19 @@ fn write_wall_transcript(proj: &std::path::Path, sid: &str, err: &str) {
     fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
 }
 
+/// Spawn a worker, record a session that hit `err`, and reap it — the state
+/// the process-pro actually reads. Reaping is not test-scaffolding
+/// convenience: `session_digest` exists to read sessions after the worker
+/// that produced them is gone, and the live-agent guardrail (`rails()` caps
+/// at 2) would otherwise make a multi-session fixture impossible to build at
+/// all.
+fn finished_session(reg: &OrchRegistry, g: &str, proj: &std::path::Path, name: &str, err: &str) -> String {
+    let w = reg.spawn_agent(g, Role::Worker, name, "task", false, None).unwrap();
+    write_wall_transcript(proj, w.session_id.as_ref().unwrap(), err);
+    reg.mark_dead(&w.id, Some(0));
+    w.id
+}
+
 fn digest_for_agent(reg: &OrchRegistry, cp: &Caller, agent: &str) -> Value {
     let r = dispatch(reg, cp, "tools/call",
         &json!({ "name": "session_digest", "arguments": { "agent": agent } })).unwrap();
@@ -24009,22 +24022,17 @@ fn session_digest_corroborates_a_wall_a_second_session_also_hit() {
     // Two workers, two different worktrees, the SAME wall — the error text
     // even carries each one's own absolute path, exactly as a real pair of
     // transcripts would, which is what the key normalization has to survive.
-    let a = reg.spawn_agent(&g.id, Role::Worker, "wa", "task a", false, None).unwrap();
-    let b = reg.spawn_agent(&g.id, Role::Worker, "wb", "task b", false, None).unwrap();
-    write_wall_transcript(proj.path(), a.session_id.as_ref().unwrap(),
+    let a = finished_session(&reg, &g.id, proj.path(), "wa",
         "error[E0433]: failed to resolve at C:/wt/feat-a/src/lib.rs:12:5");
-    write_wall_transcript(proj.path(), b.session_id.as_ref().unwrap(),
+    let b = finished_session(&reg, &g.id, proj.path(), "wb",
         "error[E0433]: failed to resolve at C:/wt/feat-b/src/lib.rs:87:9");
 
     let cp = process_caller(&reg, &g.id);
-    reg.mark_dead(&a.id, Some(0));
-    reg.mark_dead(&b.id, Some(0));
-
-    let digest = digest_for_agent(&reg, &cp, &a.id);
+    let digest = digest_for_agent(&reg, &cp, &a);
     let w = digest["windows"].as_array().unwrap().iter().find(|w| w["signature"] == "tool_error")
         .unwrap_or_else(|| panic!("expected a tool_error window: {digest}"));
     assert_eq!(w["recurrence"], 1, "the other worker hit the same wall: {digest}");
-    assert_eq!(w["corroborated_by"], json!([b.id]), "and it must say WHICH session: {digest}");
+    assert_eq!(w["corroborated_by"], json!([b]), "and it must say WHICH session: {digest}");
     assert_eq!(digest["sessions_scanned"], 1, "{digest}");
     assert_eq!(digest["corroboration_capped"], false, "{digest}");
 }
@@ -24039,13 +24047,11 @@ fn session_digest_reports_a_one_off_as_a_one_off() {
     reg.set_claude_projects_dir(proj.path().to_path_buf());
     let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
 
-    let a = reg.spawn_agent(&g.id, Role::Worker, "wa", "task a", false, None).unwrap();
-    let b = reg.spawn_agent(&g.id, Role::Worker, "wb", "task b", false, None).unwrap();
-    write_wall_transcript(proj.path(), a.session_id.as_ref().unwrap(), "error[E0433]: failed to resolve");
-    write_wall_transcript(proj.path(), b.session_id.as_ref().unwrap(), "error[E0599]: no method named foo");
+    let a = finished_session(&reg, &g.id, proj.path(), "wa", "error[E0433]: failed to resolve");
+    finished_session(&reg, &g.id, proj.path(), "wb", "error[E0599]: no method named foo");
 
     let cp = process_caller(&reg, &g.id);
-    let digest = digest_for_agent(&reg, &cp, &a.id);
+    let digest = digest_for_agent(&reg, &cp, &a);
     let w = digest["windows"].as_array().unwrap().iter().find(|w| w["signature"] == "tool_error").unwrap();
     assert_eq!(w["recurrence"], 0, "a different error is a different wall: {digest}");
     assert_eq!(w["corroborated_by"], json!([]), "{digest}");
@@ -24068,11 +24074,15 @@ fn session_digest_never_corroborates_a_session_with_itself() {
     let a = reg.spawn_agent(&g.id, Role::Worker, "wa", "task a", false, None).unwrap();
     let sid = a.session_id.clone().unwrap();
     write_wall_transcript(proj.path(), &sid, "error[E0433]: failed to resolve");
+    reg.mark_dead(&a.id, Some(0));
     // A SECOND roster row pointing at the same session — what a resume/rejoin
     // records. It is the same evidence read twice, not a second opinion, so
     // `session_digest` must still see zero OTHER sessions.
-    reg.spawn_agent_ex(&g.id, Role::Worker, None, "wb", "task b", false, None, None, Some(sid.clone()), None, None)
+    let b = reg
+        .spawn_agent_ex(&g.id, Role::Worker, None, "wb", "task b", false, None, None, Some(sid.clone()), None, None)
         .unwrap();
+    assert_eq!(b.session_id.as_deref(), Some(sid.as_str()), "the resumed row must carry the same session id");
+    reg.mark_dead(&b.id, Some(0));
 
     let cp = process_caller(&reg, &g.id);
     let digest = digest_for_agent(&reg, &cp, &a.id);
@@ -24089,20 +24099,17 @@ fn session_digest_reports_when_the_corroboration_scan_was_capped() {
     let proj = tempfile::tempdir().unwrap();
     let (reg, _d) = test_registry();
     reg.set_claude_projects_dir(proj.path().to_path_buf());
-    let mut rails = rails_with_process_block();
-    rails.max_agents = 64;
-    let g = reg.create_group("C:/tmp/repo", rails).unwrap();
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
 
-    let target = reg.spawn_agent(&g.id, Role::Worker, "wt", "target", false, None).unwrap();
-    write_wall_transcript(proj.path(), target.session_id.as_ref().unwrap(), "error[E0433]: failed to resolve");
-    // Comfortably more other sessions than the scan reads.
+    let target = finished_session(&reg, &g.id, proj.path(), "wt", "error[E0433]: failed to resolve");
+    // Comfortably more other sessions than the scan reads, all hitting the
+    // same wall — so a scan that read them all would report every one.
     for i in 0..12 {
-        let w = reg.spawn_agent(&g.id, Role::Worker, &format!("w{i}"), "other", false, None).unwrap();
-        write_wall_transcript(proj.path(), w.session_id.as_ref().unwrap(), "error[E0433]: failed to resolve");
+        finished_session(&reg, &g.id, proj.path(), &format!("wo{i}"), "error[E0433]: failed to resolve");
     }
 
     let cp = process_caller(&reg, &g.id);
-    let digest = digest_for_agent(&reg, &cp, &target.id);
+    let digest = digest_for_agent(&reg, &cp, &target);
     assert_eq!(digest["corroboration_capped"], true, "{digest}");
     let scanned = digest["sessions_scanned"].as_u64().unwrap();
     assert!(scanned > 0 && scanned < 13, "a capped scan reads some, not all: {digest}");
