@@ -2812,8 +2812,7 @@ pub fn cli_can_host(cli: &str, role: Role) -> Result<(), String> {
     let Some(caps) = cli_caps(cli) else {
         return Ok(()); // unknown CLIs are rejected by the SUPPORTED_CLIS check, not here
     };
-    // MUTATION (scratch, reverted next commit): the gate waves everything through.
-    if true || want.rank() <= caps.max_containment.rank() {
+    if want.rank() <= caps.max_containment.rank() {
         return Ok(());
     }
     Err(format!(
@@ -3732,9 +3731,8 @@ pub const GEMINI_SETTINGS_ENV: &str = "GEMINI_CLI_SYSTEM_SETTINGS_PATH";
 /// its MCP identity because git wasn't installed would be a confusing failure a
 /// long way from its cause. Pure, so the mapping is testable without a spawn.
 pub fn cli_extra_env(cli: &str, cfg: &Path) -> Vec<(String, String)> {
-    // MUTATION (scratch, reverted next commit): the settings file never reaches the pane.
     match cli {
-        "gemini" if false => vec![(GEMINI_SETTINGS_ENV.to_string(), cfg.display().to_string())],
+        "gemini" => vec![(GEMINI_SETTINGS_ENV.to_string(), cfg.display().to_string())],
         _ => Vec::new(),
     }
 }
@@ -3760,13 +3758,11 @@ pub fn gemini_settings_json(
 ) -> String {
     let mut cfg = json!({
         "mcpServers": one_server_map(json!({
-            // MUTATION (scratch, reverted next commit): SSE key instead of streamable-HTTP.
-            "url": format!("http://127.0.0.1:{port}/mcp"),
+            "httpUrl": format!("http://127.0.0.1:{port}/mcp"),
             "headers": { "X-Loomux-Agent": token },
         }))
     });
-    // MUTATION (scratch, reverted next commit): no deny layers in the settings file.
-    if false && containment.denies_edits() {
+    if containment.denies_edits() {
         let mut exclude: Vec<String> =
             GEMINI_EDIT_DENY_TOOLS.iter().map(|t| t.to_string()).collect();
         if containment.denies_git_mutation() {
@@ -3779,8 +3775,7 @@ pub fn gemini_settings_json(
         }
         cfg["tools"] = json!({ "exclude": exclude });
     }
-    // MUTATION (scratch, reverted next commit): the policy file is never referenced.
-    if let Some(p) = policy.filter(|_| false) {
+    if let Some(p) = policy {
         cfg["adminPolicyPaths"] = json!([p.display().to_string()]);
     }
     serde_json::to_string_pretty(&cfg).unwrap()
@@ -3807,8 +3802,7 @@ pub fn gemini_policy_toml(containment: Containment) -> String {
          # in this agent's generated settings file, so these denials outrank the\n\
          # user's own policies and the yolo approval mode alike.\n",
     );
-    // MUTATION (scratch, reverted next commit): never emit any rules.
-    if true || !containment.denies_edits() {
+    if !containment.denies_edits() {
         return out;
     }
     for tool in GEMINI_EDIT_DENY_TOOLS {
