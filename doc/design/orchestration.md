@@ -6698,6 +6698,17 @@ a pointer at the log that still holds every one verbatim. A relay that silently 
 would read as complete while being short, which is the defect class this whole lineage exists to
 eliminate.
 
+**Branch order: an orchestrator target during a pause IS parked.** `notify_queue` checks
+`target_is_orchestrator` *before* `is_paused`, so the paragraph below is about a **worker** target
+during a pause; an orchestrator-target notice never reaches the pause branch at all. That order is
+deliberate rather than incidental (review NB2), and `note_queue_capacity` on the orchestrator's own
+pane is the live path that exercises it. A pause suppresses *deliveries*, and the relay is not one:
+a paused orchestrator can still call tools, and its own pane's queue pressure is exactly what it
+should learn about while everything else is held. Pinned by
+`during_a_pause_a_worker_target_is_only_audited_but_an_orchestrator_target_still_parks`, which
+asserts both branches — the earlier test asserted only the worker case while its name claimed the
+general one.
+
 **What is deliberately NOT parked.** `notify_queue`'s *paused-group* branch — and #615
 (enqueue-while-paused) sharpened that decision rather than weakening it. Since option 2 a pause is
 a **delay, not a discard**: the deliveries behind it sit in the pane's durable queue and are
@@ -6732,9 +6743,27 @@ orchestrator quoting its relayed queue notices back into a summary is exactly th
 most exposed to the latch. So the relay is shaped to stay *maskable*: the header and every
 constituent notice already lead with the marker, the bullet is `•` (in `deframe`'s strip set) and
 not `-` (which is not), and the elision line carries the marker instead of opening with prose.
-`every_row_of_the_relay_block_is_maskable_by_the_question_gates_notice_rule` asserts the whole
-block masks to nothing, so a later edit that reintroduces a `-` fails rather than quietly handing
-one row back to the detector.
+The invariant is enforced from **both ends**, because they fail differently (review NB3).
+`every_row_of_the_relay_block_is_maskable_by_the_question_gates_notice_rule` pins how the block is
+*rendered*, so a later edit that reintroduces a `-` fails rather than quietly handing one row back
+to the detector. `every_notice_that_can_reach_the_inbox_is_a_single_marker_led_line` pins what may
+go *into* it — the six notice constructors across `notify_queue`'s seven call sites — because a
+constructor growing a second line would break maskability with the renderer and every call site
+unchanged. That list is maintained by hand, which is exactly why `OrchNoticeInbox::park` also
+carries a `debug_assert` written *through* `mask_loomux_notices` itself: a seventh constructor
+added without touching the list still fails, at the door, in any debug build (and CI's test builds
+are debug). Release builds never pay for it and never panic a live session over it — the degraded
+outcome is a gate that holds too long, which `QuestionStale` already reports.
+
+**Residual, and its boundary is filed rather than implied.** `mask_loomux_notices` claims one row
+per marker, so any loomux text that occupies *several* rows keeps everything past the first —
+`pause_suppression_notice` and `coalesced_flush_text` are the real multi-row cases, and their
+continuation rows ride the pty unmasked. That is **#632**, filed out of this review rather than
+half-addressed here. It is named in this section because the boundary is what makes this change
+reviewable: #578 is single-row by construction and adds no pane rows at all (the relay rides a tool
+result, never the pty), so it neither contributes to #632 nor is blocked by it. Closing #632 needs
+loomux to know *what* it wrote to a pane rather than that a row claims it did — delivery
+machinery, not detection.
 
 `HoldChannel::survives_orchestrator_target` also stopped being a `!matches!` negation and became an
 exhaustive match: a channel added later must state its own answer rather than defaulting to

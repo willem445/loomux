@@ -19312,26 +19312,66 @@ fn a_failed_tool_call_still_carries_the_relay() {
 }
 
 #[test]
-fn a_paused_groups_queue_notice_is_suppressed_but_never_parked() {
-    // #578 parks the ORCHESTRATOR-TARGET suppression and nothing else, and
-    // #615 (enqueue-while-paused) sharpened that: a pause is now a DELAY, not
-    // a discard, so the deliveries behind it are flushed at resume and
-    // `flush_header_text` announces them then. Relaying this notice minutes
-    // later out of a parked buffer would say "queued" about a delivery that has
-    // since landed. The residual loss a pause can still cause (a pane at
-    // `QUEUE_MAX_PER_PANE` refusing admissions) is `announce_pause_suppression`'s
-    // to report, not this buffer's.
+fn during_a_pause_a_worker_target_is_only_audited_but_an_orchestrator_target_still_parks() {
+    // The BRANCH ORDER inside `notify_queue` is the behavior here, so it is
+    // asserted directly rather than implied by a case that could not have
+    // parked anyway (review NB2 — the earlier version of this test passed
+    // `target_is_orchestrator: false` and then claimed, by its name, that a
+    // paused group never parks. Both halves of that are now pinned, and they
+    // differ).
+    //
+    // `target_is_orchestrator` is checked BEFORE `is_paused`, so an
+    // orchestrator-target notice raised during a pause is PARKED. That is the
+    // right way round: a pause suppresses deliveries, and the relay is not one
+    // — a paused orchestrator can still call tools, and its own pane's queue
+    // pressure is exactly what it should learn about while everything else is
+    // held. The live path is `note_queue_capacity` on the orchestrator's own
+    // pane, which resolves the target itself and is not gated on the pause.
     let (reg, _d, co, cw) = setup_mcp();
     reg.pause_group(&co.group).unwrap();
+
+    // Worker target — the pause branch. Audited, never parked. #615 is why:
+    // a pause is now a DELAY, so the delivery behind it is flushed at resume
+    // and `flush_header_text` announces it then; relaying this minutes later
+    // out of a buffer would say "queued" about a delivery that has landed.
     reg.notify_queue(&co.group, &cw.agent_id, false,
         &queue::queued_notice(&cw.agent_id, queue::EnqueueReason::BoxOccupied));
+    let sup = reg
+        .audit_log(&co.group)
+        .into_iter()
+        .find(|e| e.action == "notice-suppressed" && e.detail["to"] == json!(cw.agent_id))
+        .expect("a paused group's queue notice is suppressed AND audited");
+    assert_eq!(sup.detail["reason"], json!("group-paused"), "got: {}", sup.detail);
+    assert_eq!(sup.detail["parked"], Value::Null, "the pause branch parks nothing");
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    assert_eq!(r["content"].as_array().unwrap().len(), 1, "so there is nothing to relay");
+
+    // Orchestrator target, same pause — the branch above it, which parks.
+    let own = queue::at_capacity_notice(&co.agent_id, queue::QUEUE_MAX_PER_PANE);
+    reg.notify_queue(&co.group, &co.agent_id, true, &own);
+    let sup = reg
+        .audit_log(&co.group)
+        .into_iter()
+        .filter(|e| e.action == "notice-suppressed" && e.detail["to"] == json!(co.agent_id))
+        .next_back()
+        .expect("still audited");
+    assert_eq!(
+        sup.detail["reason"], json!("target-is-orchestrator"),
+        "the orchestrator-target branch runs first, so the pause never sees this one: {}",
+        sup.detail
+    );
+    assert_eq!(sup.detail["parked"], json!(true), "and it parks: {}", sup.detail);
 
     let r = dispatch(&reg, &co, "tools/call",
         &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    let blocks = r["content"].as_array().unwrap();
     assert_eq!(
-        r["content"].as_array().unwrap().len(), 1,
-        "a pause-suppressed notice must not be parked — #569 already reports it at resume"
+        blocks.len(), 2,
+        "a paused orchestrator must still learn about its OWN pane — the relay is not a \
+         delivery, so the pause has no reason to withhold it"
     );
+    assert!(blocks[1]["text"].as_str().unwrap().contains(&own), "verbatim: {blocks:?}");
 }
 
 #[test]
@@ -19393,6 +19433,42 @@ fn every_row_of_the_relay_block_is_maskable_by_the_question_gates_notice_rule() 
         "every row of the relay must be maskable, or an orchestrator echoing it into its own \
          pane re-arms the very question gate this text is about — got leftovers from: {relay}"
     );
+}
+
+#[test]
+fn every_notice_that_can_reach_the_inbox_is_a_single_marker_led_line() {
+    // The other half of the maskability invariant (review NB3), and it is a
+    // different failure from the one above: that test pins how the BLOCK is
+    // rendered, this one pins what may go INTO it. A constructor's wording
+    // drifting — a second line, a lost prefix — would break maskability with
+    // every call site and the renderer unchanged, so neither test alone covers
+    // it.
+    //
+    // These six are the complete set of text `notify_queue` can be handed, one
+    // per notice constructor across its seven call sites. The list is
+    // maintained by hand against those call sites, which is exactly why
+    // `OrchNoticeInbox::park`'s `debug_assert` exists as well: a seventh
+    // constructor added without touching this list still fails, at the door,
+    // in any debug build — and CI's test builds are debug.
+    let all = [
+        queue::queued_notice("o-1", queue::EnqueueReason::BoxOccupied),
+        queue::still_queued_notice("o-1", 2, 30),
+        queue::dropped_notice("o-1", 2, queue::DropReason::QueueFull),
+        queue::recovered_notice("o-1", 2, 30),
+        queue::at_capacity_notice("o-1", queue::QUEUE_MAX_PER_PANE),
+        queue::pressure_notice("o-1", queue::QUEUE_NEAR_FULL_AT, queue::QUEUE_MAX_PER_PANE),
+    ];
+    for n in &all {
+        assert!(
+            mask_loomux_notices(n).is_empty(),
+            "a notice that can be parked must be ONE marker-led line, or the row it lands on \
+             survives the question gate's mask: {n:?}"
+        );
+    }
+    // And a relay built out of every one of them still masks away entirely —
+    // the composition, not just the parts.
+    let relay = orch_notice_relay_text(&all, 2).expect("a relay with content");
+    assert_eq!(mask_loomux_notices(&relay).trim(), "", "leftovers from: {relay}");
 }
 
 #[test]

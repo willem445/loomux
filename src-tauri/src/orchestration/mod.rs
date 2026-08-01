@@ -15185,7 +15185,25 @@ impl OrchNoticeInbox {
     /// Oldest-first eviction on purpose: the newest notice is the one whose
     /// claim is still true — a `dropped_notice` from ten minutes ago has been
     /// superseded by whatever the queue did since.
+    ///
+    /// **The maskability invariant is checked at the door** (#576/#621, review
+    /// NB3). [`orch_notice_relay_text`] can only keep every row maskable if
+    /// every notice it is given is itself one marker-led line; a caller passing
+    /// a multi-line or unprefixed string would produce rows
+    /// [`mask_loomux_notices`] cannot claim, and the failure would surface in
+    /// the rendered block, far from the call site that caused it. Asserted
+    /// through `mask_loomux_notices` itself rather than by re-deriving the
+    /// rule, so the check cannot drift from what it is standing in for.
+    /// `debug_assert` because CI's test builds are debug (so it fires where a
+    /// mistake is introduced) while a release build never panics a live session
+    /// over it — the degraded outcome is a gate that holds too long, which
+    /// `QuestionStale` already reports.
     pub fn park(&mut self, text: &str) {
+        debug_assert!(
+            mask_loomux_notices(text).is_empty(),
+            "a parked queue notice must be a single {LOOMUX_NOTICE_MARKER}-led line or the relay \
+             block stops being maskable (#576/#621) — got {text:?}"
+        );
         self.notices.push(text.to_string());
         if self.notices.len() > ORCH_NOTICE_INBOX_MAX {
             let overflow = self.notices.len() - ORCH_NOTICE_INBOX_MAX;
@@ -28614,6 +28632,16 @@ impl OrchRegistry {
             return;
         }
         if self.is_paused(group) {
+            // **Reached only by a non-orchestrator target**, because the branch
+            // above returns first, and that order is deliberate (review NB2).
+            // An orchestrator-target notice raised while the group is paused —
+            // `note_queue_capacity` on the orchestrator's own pane is the live
+            // path — IS parked, and should be: a pause suppresses DELIVERIES,
+            // and the relay is not one. A paused orchestrator can still call
+            // tools, and its own pane's queue pressure is precisely what it
+            // should learn about while everything else is held.
+            //
+            // What follows is therefore about a WORKER target during a pause.
             // Deliberately NOT parked (#578), and #615 sharpened the reason
             // rather than weakening it. Since option 2 (enqueue-while-paused)
             // a pause is a DELAY, not a discard: the deliveries behind it sit
