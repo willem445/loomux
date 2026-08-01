@@ -709,6 +709,16 @@ persisted in `group.json`, and clamped in `clamped()`.
   the audit log and mutates no queue, so it owes no `persist_queues` call; the notice itself
   goes through the ordinary front door, which already does.
 
+  **It is bounded twice, and the second bound is the load-bearing one.** A long pause can
+  swallow an unbounded number of deliveries, and this notice is itself a delivery — one pasted
+  into a pane, spending that agent's context. Per item, `queue::dropped_payload_preview` caps a
+  preview at `DROPPED_PREVIEW_MAX` (160 chars, truncation marked, never silent); that alone
+  bounds nothing, because the *count* is what a pause controls. So the notice names at most
+  `PAUSE_SUPPRESSION_LIST_MAX` (8) individually and summarizes the rest as a count pointing at
+  the audit log, which holds every discarded payload in full — `prompt-suppressed-paused`
+  carries `text`, not a preview. Worst case is therefore a ~2 KB paste however long the pause
+  ran, and the fix cannot become the problem it was raised against.
+
   The window is bounded by the most recent `group-pause` line and by nothing else — a
   `prompt-suppressed-paused` line can only be written while paused, so everything after that
   marker belongs to the window it opened, and the scan survives an app restart mid-pause
