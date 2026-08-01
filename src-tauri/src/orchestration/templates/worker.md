@@ -88,8 +88,9 @@ plan itself, rather than silently continuing as though it had verified clean.
   work in the shared repo, create your assigned branch off the default branch **before
   changing anything**; never commit to the default branch.
 - Commit in logical units with clear messages referencing the issue (`#N`).
-- Push and open a PR with `gh pr create`, linking the issue (`Closes #N`) and describing
-  what changed, why, and how it was tested.
+- Push and open a PR with `gh pr create`, linking the issue (`Closes #N` **only if this PR
+  finishes it** — otherwise `Part of #N`; see **Definition of done**) and describing what
+  changed, why, and how it was tested.
 - **Never merge.** The human gatekeeps merges. Do not touch branches other than yours.
 - **Waiting on your own PR's CI?** Register `notify_when(kind: "pr_checks", pr: <n>)`,
   `report("progress", ...)`, and end the turn — see **Never block a turn on CI** below,
@@ -176,15 +177,32 @@ A task is done when ALL of these hold:
    like any other — stated, it is reviewable; unstated, the PR is **not done**. Anything outside
    those four evidences the normal way, and a change that *feels* untestable but isn't on the list
    is a change you haven't found the test for yet.
-4. Docs updated: user-facing documentation for user-visible changes, plus a short design
+4. **Every CI citation is re-derived after the push it describes.** A run citation is a fact
+   about a **SHA**, not a fact about the PR — so any push or rebase silently invalidates every
+   run id, run link and "green on all three platforms" already sitting in the body, and that
+   text survives the push untouched: nothing rewrites it for you, and a reader has no way to
+   tell. After **any** push or rebase, treat every citation in the body as **stale until
+   re-derived**: list the runs for the new head (`gh run list --branch <your branch> --json
+   headSha,databaseId,conclusion`), assert the run's `headSha` **is** the head you are reporting
+   on (`git rev-parse HEAD`), then update the body — before you `report`, not after a reviewer
+   asks. Three stale-green citations landed in one batch: #571 cited a run three commits behind
+   head, and #588 cited a pre-rebase run at review 1 and then the *same* pre-rebase run again
+   after the rebase at review 2. Every one was caught by a reviewer; none by the worker who
+   wrote it.
+5. Docs updated: user-facing documentation for user-visible changes, plus a short design
    note (in the repo's docs convention) for non-obvious architecture decisions.
-5. Code matches the repo's existing style, conventions, and **stated constraints**. Read the
+6. Code matches the repo's existing style, conventions, and **stated constraints**. Read the
    contributor docs (`CLAUDE.md` / `AGENTS.md` / `CONTRIBUTING.md`) and the design notes before
    you add a **dependency**, change a **public contract** (a command signature, a wire shape, a
    file format, a persisted schema), duplicate a mechanism the repo already has, or reach across
    a module boundary. Each of those needs its argument *in the PR* — and a contract change needs
    a design note — because that is the bar the orchestrator sends work back on, plan or PR.
-6. PR is open, issue linked, and you have `report`ed `done` with the PR URL.
+7. PR is open, issue linked, and you have `report`ed `done` with the PR URL. **The link keyword
+   has to match your scope:** `Closes #N` only when this PR finishes the issue outright —
+   anything partial links as `Part of #N` (or `Mitigates #N`) instead. A **squash merge honors a
+   `Closes` in the PR body regardless of how partial the change actually was**, and no hedging
+   sentence elsewhere in the body stops it: #569 and #590 were both auto-closed that way this
+   session with real scope still open on them, and had to be spotted and reopened by hand.
 
 ## Review findings
 
