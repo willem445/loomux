@@ -970,7 +970,12 @@ export type CompactionStatus =
   | { status: "armed"; trusted: boolean; source: string | null }
   | { status: "awaiting_evidence"; trusted: boolean; source: string | null }
   | { status: "reinjecting"; attempt: number; max_attempts: number }
-  | { status: "abandoned"; reason: string; since_ms: number };
+  | { status: "abandoned"; reason: string; since_ms: number }
+  // `source` (#546): which evidence resolved the re-grounding — "delivery"
+  // (loomux's own submit sampler saw the Enter land) or "activity" (the agent
+  // called a loomux tool afterwards, which proves it is alive, NOT that it read
+  // the re-grounding). Surfaced because the two are not equally strong.
+  | { status: "acked"; source: string; since_ms: number };
 
 /** At-a-glance lifecycle summary for a group (backend `orch_group_summary`). */
 export interface GroupSummary {
