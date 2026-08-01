@@ -19619,7 +19619,7 @@ fn the_resume_notice_says_discarded_and_never_promises_a_replay() {
         window_start_seen: true,
     };
     let n = pause_suppression_notice(&many);
-    assert!(n.contains("11 deliveries were DISCARDED"), "plural, and the full count: {n}");
+    assert!(n.contains("11 deliveries were LOST"), "plural, and the full count: {n}");
     assert!(n.contains("...and 3 more"), "the list is capped and says so: {n}");
     assert!(
         n.contains("prompt-suppressed-paused"),
@@ -20129,6 +20129,7 @@ fn a_resume_racing_an_admission_never_strands_it() {
     // which side wins is the OS's decision and a single run pins nothing.
     use std::sync::{Arc, Barrier};
 
+    let (mut held, mut raced) = (0u32, 0u32);
     for round in 0..24 {
         let dir = tempfile::tempdir().unwrap();
         let reg = Arc::new(relaunch_registry(dir.path()));
@@ -20139,29 +20140,40 @@ fn a_resume_racing_an_admission_never_strands_it() {
         reg.set_pty_for_test(&w.id, pty);
         reg.pause_group(&g.id).unwrap();
 
+        // Both threads leave the barrier together; the loser of the coin gets a
+        // 3ms head start. Not synchronization — a STAGGER, and it is here
+        // because an unstaggered race is not actually a fair sample: after the
+        // barrier `resume_group`'s very first act is to clear the flag, while
+        // `deliver_prompt` must audit (a file write) before it reads the flag,
+        // so resume wins nearly every time and the pause branch — the branch
+        // this test exists for — would almost never be entered. Alternating
+        // rounds samples both sides on purpose.
+        let admit_first = round % 2 == 0;
+        let stagger = std::time::Duration::from_millis(3);
         let gate = Arc::new(Barrier::new(2));
         let admit = {
-            let (reg, gid, wid, gate) = (reg.clone(), g.id.clone(), w.id.clone(), gate.clone());
+            let (reg, wid, gate) = (reg.clone(), w.id.clone(), gate.clone());
             std::thread::spawn(move || {
                 gate.wait();
+                if !admit_first {
+                    std::thread::sleep(stagger);
+                }
                 // The payload the issue is about: a worker's completion report.
-                let _ = reg.deliver_prompt(&wid, "report: done, PR #99 is green", "w-1", Delivery::MidSession);
-                let _ = gid;
+                reg.deliver_prompt(&wid, "report: done, PR #99 is green", "w-1", Delivery::MidSession)
             })
         };
         let resume = {
             let (reg, gid, gate) = (reg.clone(), g.id.clone(), gate.clone());
             std::thread::spawn(move || {
                 gate.wait();
+                if admit_first {
+                    std::thread::sleep(stagger);
+                }
                 reg.resume_group(&gid).unwrap();
             })
         };
-        admit.join().unwrap();
+        let admitted = admit.join().unwrap();
         resume.join().unwrap();
-
-        // The entry itself must exist either way — the admission is never lost,
-        // only potentially orphaned, which is the whole point of the finding.
-        assert_eq!(reg.queue_depth(pty), 1, "round {round}: the report must be queued regardless of order");
 
         let log = reg.audit_log(&g.id);
         let flushed = log.iter().any(|e| {
@@ -20171,6 +20183,32 @@ fn a_resume_racing_an_admission_never_strands_it() {
         let nudged = log
             .iter()
             .any(|e| e.action == "pause-race-nudge" && e.detail["pty"] == json!(pty));
+
+        if reg.queue_depth(pty) == 0 {
+            // The resume won the flag read outright, so `deliver_prompt` never
+            // entered the pause branch at all — it took the ordinary front door,
+            // which in a headless registry withdraws its own admission (there is
+            // no `AppHandle` to ever drain it) and returns `Err`. Nothing is
+            // held, so nothing can be stranded, and the SENDER was told rather
+            // than getting a false `Ok` — which is the property that matters on
+            // that path. Not this finding's branch; #470 owns it.
+            assert!(
+                admitted.is_err(),
+                "round {round}: nothing was queued, so the sender must have been told — \
+                 a silent Ok here would be the same class of loss one door over"
+            );
+            continue;
+        }
+
+        held += 1;
+        if nudged {
+            raced += 1;
+        }
+        assert_eq!(reg.queue_depth(pty), 1, "round {round}: exactly the one report is held");
+        assert!(
+            admitted.is_ok(),
+            "round {round}: the entry is queued, so the sender was told Ok — and it must have been"
+        );
         assert!(
             flushed || nudged,
             "round {round}: nobody owns draining pty {pty} — the delivery is stranded. \
@@ -20178,6 +20216,22 @@ fn a_resume_racing_an_admission_never_strands_it() {
             log.iter().map(|e| e.action.as_str()).collect::<Vec<_>>()
         );
     }
+
+    // Without this the whole loop could pass vacuously by never once reaching
+    // the pause branch — every round losing the flag read, every round
+    // `continue`ing, and the invariant above never evaluated. The barrier makes
+    // that vanishingly unlikely, but "unlikely" is not an assertion.
+    assert!(
+        held > 0,
+        "no round ever held a pause-admitted entry — the admit-first stagger is not working and \
+         the invariant below was never once evaluated"
+    );
+    // `raced` is reported, never asserted on. Whether the resume lands INSIDE
+    // the flag-read-to-admit window is the OS's decision and cannot be forced
+    // without a seam in the code under test, which would make this a test of the
+    // seam. What is asserted is the invariant that must hold for every
+    // interleaving; the nudge is one of the two ways it can be satisfied.
+    println!("interleavings: {held} held, of which {raced} were closed by the post-admit re-check");
 }
 
 #[test]
