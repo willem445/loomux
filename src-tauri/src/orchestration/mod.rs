@@ -6412,9 +6412,9 @@ pub struct TaskSummary {
     /// constraint, restated in #582 because a dependency graph is exactly the
     /// shape that tempts an expansion). Bounded by board size, and skipped
     /// entirely when empty so a board that uses no links pays nothing.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // STUB (red-evidence commit): empty link arrays serialize on every row.
     pub deps: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // STUB (red-evidence commit): empty link arrays serialize on every row.
     pub related: Vec<String>,
     /// Derived at read time, never stored and never written back into
     /// `status` (#582): `queued` with every dep `done`. One `list_tasks` call
