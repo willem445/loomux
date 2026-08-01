@@ -62,7 +62,7 @@ use loomux_lib::orchestration::{
     pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
     PauseSuppression, SuppressedCause, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
     // #579: front-door refusals, the losses with no queue id to report them under.
-    front_door_refusals, RefusedPayload, REFUSED_LIST_MAX,
+    front_door_refusals, RefusedPayload, AUDIT_VIEW_LIMIT, REFUSED_LIST_MAX,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -3405,10 +3405,10 @@ fn a_refusal_reports_no_text_rather_than_bytes_it_cannot_verify() {
     // somebody's terminal, so a mismatch reports `text: None` and the reader
     // falls back to the preview.
     let matching = refusal_line(9_000, "w-1", "orch-1", "the payload that was refused", "arrival");
-    let verified = front_door_refusals(&[
-        prompt_line(8_000, "w-1", "orch-1", "the payload that was refused"),
-        matching.clone(),
-    ]);
+    let verified = front_door_refusals(
+        &[prompt_line(8_000, "w-1", "orch-1", "the payload that was refused"), matching.clone()],
+        false,
+    );
     assert_eq!(verified.items[0].text.as_deref(), Some("the payload that was refused"),
         "the happy path: both fingerprints agree");
 
@@ -3416,7 +3416,8 @@ fn a_refusal_reports_no_text_rather_than_bytes_it_cannot_verify() {
     // check is what refuses it; a length-only join would hand back these bytes.
     let same_length = "the payload that was REFUSED".to_string();
     assert_eq!(same_length.len(), "the payload that was refused".len(), "fixture must be length-equal");
-    let wrong = front_door_refusals(&[prompt_line(8_000, "w-1", "orch-1", &same_length), matching.clone()]);
+    let wrong =
+        front_door_refusals(&[prompt_line(8_000, "w-1", "orch-1", &same_length), matching.clone()], false);
     assert_eq!(wrong.items[0].text, None, "a length-only match must not be trusted");
     assert_eq!(wrong.items[0].preview, queue::dropped_payload_preview("the payload that was refused"),
         "and the preview the refusal recorded is still what the reader gets");
@@ -3424,11 +3425,11 @@ fn a_refusal_reports_no_text_rather_than_bytes_it_cannot_verify() {
     // A `prompt` line to a DIFFERENT target never pairs, however well it
     // matches — that pane's delivery is not this one.
     let other_target =
-        front_door_refusals(&[prompt_line(8_000, "w-1", "w-2", "the payload that was refused"), matching.clone()]);
+        front_door_refusals(&[prompt_line(8_000, "w-1", "w-2", "the payload that was refused"), matching.clone()], false);
     assert_eq!(other_target.items[0].text, None);
     // Nor does one from a different sender.
     let other_sender =
-        front_door_refusals(&[prompt_line(8_000, "w-9", "orch-1", "the payload that was refused"), matching]);
+        front_door_refusals(&[prompt_line(8_000, "w-9", "orch-1", "the payload that was refused"), matching], false);
     assert_eq!(other_sender.items[0].text, None);
 }
 
@@ -3449,7 +3450,7 @@ fn a_pre_563_refusal_line_is_still_reported_and_says_what_it_cannot_name() {
     // A `prompt` line that WOULD have matched a modern line is present, and
     // must still not be attached — with no `bytes` recorded there is nothing to
     // verify against, and an unverified guess is the one thing this must not do.
-    let r = front_door_refusals(&[prompt_line(6_000, "w-1", "orch-1", "something"), legacy]);
+    let r = front_door_refusals(&[prompt_line(6_000, "w-1", "orch-1", "something"), legacy], false);
     assert_eq!(r.total, 1, "the loss is real and must be reported");
     assert_eq!(r.items[0].from, "?", "unknowable, and said so rather than invented");
     assert_eq!(r.items[0].to, "orch-1");
@@ -3477,7 +3478,7 @@ fn a_refused_stranded_marker_reports_the_pane_state_it_left_behind() {
             "consequence": "text is pasted in the pane with nothing queued to submit it",
         }),
     };
-    let r = front_door_refusals(&[marker]);
+    let r = front_door_refusals(&[marker], false);
     assert_eq!(r.items[0].payload, RefusedPayload::StrandedSubmit);
     assert_eq!(r.items[0].text, None, "there are no bytes to re-send, and never were");
     assert_eq!(r.items[0].bytes, None);
@@ -3516,6 +3517,92 @@ fn the_refused_list_is_capped_and_says_how_many_it_left_out() {
     assert_eq!(v["refused"][0]["text"], json!(format!("lost report {extra}")));
     assert_eq!(v["refused"][REFUSED_LIST_MAX - 1]["text"],
         json!(format!("lost report {}", REFUSED_LIST_MAX + extra - 1)));
+}
+
+/// One audit entry as a `audit.jsonl` line — the four keys
+/// `parse_audit_lines` reads. Lets a test lay down a timeline LONGER than
+/// `AUDIT_VIEW_LIMIT` in one write instead of 5000 `reg.audit()` appends.
+fn audit_jsonl_line(e: &AuditEntry) -> String {
+    json!({ "ts_ms": e.ts_ms, "actor": e.actor, "action": e.action, "detail": e.detail }).to_string()
+}
+
+#[test]
+fn a_truncated_audit_window_is_reported_as_truncated_not_as_complete() {
+    // Review NB1. `audit_log` keeps only the most recent `AUDIT_VIEW_LIMIT`
+    // entries, so `refused_count` was never a count of a group's refusals —
+    // only of those in the readable tail. Composed with `refused_omitted`
+    // (total minus listed) that produced the strongest claim the shape can
+    // make from the weakest evidence: a group whose refusals sit in the older
+    // half reports `refused_count: 0, refused_omitted: 0`, which reads as
+    // "nothing was ever refused" from a scan that never saw the evidence —
+    // the exact silent truncation #579's own design note promised not to do.
+    //
+    // The fixture puts three refusals at the START of a timeline longer than
+    // the window and one at the END, so the window provably cuts real
+    // refusals away: the test asserts the flag is what tells the reader so.
+    let (reg, d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let mut lines: Vec<String> = Vec::new();
+    for i in 0..3 {
+        let text = format!("an OLD refused report {i}");
+        lines.push(audit_jsonl_line(&prompt_line(1_000, "w-1", &orch.id, &text)));
+        lines.push(audit_jsonl_line(&refusal_line(1_001, "w-1", &orch.id, &text, "arrival")));
+    }
+    // Enough filler to push those six entries out of the window entirely.
+    for i in 0..AUDIT_VIEW_LIMIT {
+        lines.push(audit_jsonl_line(&AuditEntry {
+            ts_ms: 2_000,
+            actor: "loomux".into(),
+            action: "seeded".into(),
+            detail: json!({ "seq": i }),
+        }));
+    }
+    let recent = "the one refused report still in the window";
+    lines.push(audit_jsonl_line(&prompt_line(3_000, "w-2", &orch.id, recent)));
+    lines.push(audit_jsonl_line(&refusal_line(3_001, "w-2", &orch.id, recent, "arrival")));
+    // Written last: `create_group`/`spawn_agent` audit lines of their own, and
+    // this replaces the whole log with a timeline whose length is the point.
+    fs::write(d.path().join(&g.id).join("audit.jsonl"), lines.join("\n") + "\n").unwrap();
+
+    let r = reg.front_door_refusals(&g.id);
+    assert!(r.window_truncated,
+        "the window really was cut ({} entries written, limit {AUDIT_VIEW_LIMIT}) and the \
+         derivation must say so", lines.len());
+    assert_eq!(r.total, 1, "only the refusal inside the window is countable: {:?}", r.items);
+    assert_eq!(r.items[0].text.as_deref(), Some(recent));
+
+    let v = orphans_tool(&reg, &co);
+    assert_eq!(v["refused_window_truncated"], json!(true),
+        "and the flag must reach the tool result, not stop at the Rust struct: {v}");
+    // The trap this closes, spelled out: these two fields are the ones a reader
+    // would otherwise take as "that was all of them".
+    assert_eq!(v["refused_count"], json!(1));
+    assert_eq!(v["refused_omitted"], json!(0),
+        "the LIST cap dropped nothing here — which is exactly why a reader needs a separate \
+         signal for the WINDOW cap having dropped three");
+}
+
+#[test]
+fn an_untruncated_window_says_its_count_is_complete() {
+    // The other half of the flag, and the reason it is not simply hardcoded
+    // true: an ordinary group's count really is complete, and a derivation that
+    // always hedged would train a reader to ignore the hedge. Also pins that
+    // the flag is not inferred from `entries.len()` — this log is far short of
+    // the cap, and a real refusal is present, so nothing about the refusal
+    // itself may set it.
+    let (reg, _d) = test_registry();
+    let pty = 5874u32;
+    let (gid, orch, w) = orch_pane_at_capacity(&reg, pty);
+    reg.deliver_prompt(&orch.id, "a refused report", &w.id, Delivery::MidSession).unwrap_err();
+
+    let r = reg.front_door_refusals(&gid);
+    assert_eq!(r.total, 1);
+    assert!(!r.window_truncated, "a short log is not a truncated one");
+    let co = reg.resolve_token(&orch.token).unwrap();
+    assert_eq!(orphans_tool(&reg, &co)["refused_window_truncated"], json!(false));
 }
 
 #[test]

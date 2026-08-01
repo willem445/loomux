@@ -6473,14 +6473,36 @@ join would have accepted.
   id. Refusals carrying that reason are excluded, or one lost payload would appear twice in one
   tool result whose documented response is "re-send" (`a_recovery_re_admission_refused_at_the_cap_
   is_reported_once_as_an_orphan`).
-- **It does not claim to be complete.** Unlike orphans, which `QUEUE_MAX_PER_PANE` already bounds
-  at 8 per pane, refusals accumulate without limit — a pane held at capacity refuses every arrival
-  for as long as it stays there. So the list is capped at `REFUSED_LIST_MAX` (8, borrowing
-  `PAUSE_SUPPRESSION_LIST_MAX`'s argument for the analogous cost: not a paste into a pane this
-  time, but a read into an orchestrator's context, at up to `ORPHAN_TEXT_CAP_BYTES` per row). The
-  most recent survive, since a pane at capacity keeps refusing; `refused_count` states the true
-  total and `refused_omitted` what was left in `audit.jsonl`. A capped list reported as complete is
-  the silent truncation `.loomux/lessons.md` names.
+- **It does not claim to be complete — at either of the TWO caps it sits under.** Unlike orphans,
+  which `QUEUE_MAX_PER_PANE` already bounds at 8 per pane, refusals accumulate without limit — a
+  pane held at capacity refuses every arrival for as long as it stays there. So the *list* is capped
+  at `REFUSED_LIST_MAX` (8, borrowing `PAUSE_SUPPRESSION_LIST_MAX`'s argument for the analogous
+  cost: not a paste into a pane this time, but a read into an orchestrator's context, at up to
+  `ORPHAN_TEXT_CAP_BYTES` per row). The most recent survive, since a pane at capacity keeps
+  refusing; `refused_count` states the true total and `refused_omitted` what the list cap left in
+  `audit.jsonl`.
+
+  **The second cap is the one the first version of this bullet missed** (review NB1), and it is
+  worth recording because the bullet was already *about* not doing this. The scan reads
+  `audit_log`, which keeps only the most recent `AUDIT_VIEW_LIMIT` (5000) entries — so `total` was
+  never a count of a group's refusals, only of those in the readable tail, and `refused_omitted`
+  measured the list cap against a window that had itself been cut. The composition is what makes it
+  a defect rather than a hedge: a busy group whose refusals all sit in the older half reports
+  `refused_count: 0, refused_omitted: 0` — the *strongest* claim this shape can make, "nothing was
+  ever refused", asserted by a scan that never saw the evidence. That is the silent truncation
+  `.loomux/lessons.md` names, produced inside the bullet promising not to produce it, which is how
+  a no-silent-caps rule fails in practice: the author bounds the cap they happen to be thinking
+  about.
+
+  Closed with `refused_window_truncated`, reported by `audit_log_windowed` — the reader that
+  performs the cut, and therefore the only place that knows it happened. It is a **required
+  parameter** of `front_door_refusals`, not a field filled in afterwards, so a future call site
+  cannot omit it and quietly restore the complete-looking count. Deliberately NOT inferred
+  downstream from `entries.len() == AUDIT_VIEW_LIMIT`: a log holding exactly the cap was not
+  truncated, and a derivation that called that "truncated" would cry wolf on a boundary it has no
+  way to resolve. Same job as #569's `PauseSuppression::window_start_seen` — a scan that ran off the
+  start of its own timeline has to say so — and the same lineage; the only difference is that an
+  exact signal is available here (`a_truncated_audit_window_is_reported_as_truncated_not_as_complete`).
 - **It does not pretend a refusal is restart-shaped.** The orphan list is produced by exactly one
   thing, which is why its advice is "call it once at session start." Refusals happen in ordinary
   operation, so that list can be non-empty on a session with no restart in it — and every one of
@@ -6496,6 +6518,27 @@ its box. "Re-send it" is the wrong instruction there, so the row carries the aud
 `consequence` string verbatim rather than a second wording of it, and points the reader at the pane.
 Reporting only the prompt case would have made the list's own claim false, which is the failure mode
 a partial list presented as complete always is.
+
+**What this list still does NOT cover — enumerated and filed, not closed (#633, review NB2).** The
+claim `refused` makes is exactly "every writer of `delivery-dropped` with `reason:
+"queue-full-at-call"`", which is the two sites above — *not* "every way a delivery can fail to
+arrive with nobody told." Three paths remain invisible to every derivation, and naming them is what
+keeps the claim above from quietly widening into the "surfaced, never silently dropped" overclaim
+#445's own history is about:
+
+- `deliver_prompt`'s **`agent … is dead`** and **`agent has no terminal yet`** refusals, which write
+  no audit line at all — so nothing downstream can surface them, however good the derivation. The
+  second is #615's own residue: it turned a silent `Ok` into a silent `Err`.
+- `withdraw_unprocessable`'s **`no-app-handle`** drop, which *is* audited — and is therefore the one
+  audited drop reason this scan's `reason == "queue-full-at-call"` filter passes over in silence.
+  Documented unreachable in production (`self.app` is set once at startup), which is why it is an
+  exclusion rather than a bug, but an unstated exclusion is the thing this section is about, so the
+  filter itself now says so in a comment.
+
+#633 owns both halves: audit-line every `deliver_prompt` refusal path with its own reason string,
+and then decide whether `no-app-handle` should surface here or stay excluded with the reason in
+writing. Until then the honest statement of what an orchestrator gets from `refused` is: every
+delivery this build refused **at the queue cap**, bounded by the two caps above.
 
 **Overlap with #569's resume notice, on purpose.** A refusal inside a pause window is also reported
 by `announce_pause_suppression` at resume (`SuppressedCause::QueueFullDuringPause`). That notice is a

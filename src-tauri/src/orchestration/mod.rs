@@ -8454,7 +8454,8 @@ pub fn parse_audit_lines_counted(text: &str) -> (Vec<AuditEntry>, usize) {
 /// Upper bound on entries returned to the viewer: the audit grows fast (full
 /// prompt texts) and only the most recent slice is worth rendering. Keeps the
 /// payload bounded even against a rotated + current pair near the 8 MB cap.
-const AUDIT_VIEW_LIMIT: usize = 5000;
+#[doc(hidden)] // pub for integration tests
+pub const AUDIT_VIEW_LIMIT: usize = 5000;
 
 /// #569: WHY one delivery a pause window lost is gone — the two are not the
 /// same event and must not be reported as one (review B2).
@@ -8773,6 +8774,22 @@ pub struct FrontDoorRefusals {
     /// `items.len()`: a caller that reports a capped list as complete is the
     /// silent-truncation defect `.loomux/lessons.md` names.
     pub total: usize,
+    /// Whether the audit window the scan ran over had itself been cut at
+    /// `AUDIT_VIEW_LIMIT` (#579 review NB1) — i.e. whether `total` is a count
+    /// of ALL this group's refusals or only of the readable tail.
+    ///
+    /// **Why this is load-bearing and not a nicety.** `total` and the
+    /// `refused_omitted` derived from it are honest about the *list* cap and
+    /// silent about the *window* cap, and the two compose badly: a group with
+    /// 6000 audit entries and four refusals among the oldest thousand reports
+    /// `refused_count: 0, refused_omitted: 0` — which reads as "nothing was
+    /// refused", the strongest possible claim, from a scan that never saw the
+    /// evidence. One bounded flag turns that into "nothing was refused in what
+    /// I could read," which is the true statement and the one the reader can
+    /// act on (go read `audit.jsonl`). Same job as #569's
+    /// `PauseSuppression::window_start_seen`, in the same lineage, for the same
+    /// reason: a scan that ran off the start of its timeline has to say so.
+    pub window_truncated: bool,
 }
 
 /// #579: how many refusals `queue_orphans` lists individually. Deliberately
@@ -8822,10 +8839,17 @@ pub const REFUSED_LIST_MAX: usize = 8;
 /// too would show one lost payload twice in one tool result, and the documented
 /// response to both lists is to re-send.
 ///
+/// `window_truncated` is passed IN rather than guessed at from `entries.len()`
+/// — see [`OrchRegistry::audit_log_windowed`], which is where the cut happens
+/// and therefore the only place that knows. It is a required parameter, not a
+/// field a caller fills in afterwards, so a future call site cannot forget it
+/// and silently re-introduce a complete-looking count over a partial window
+/// (#579 review NB1).
+///
 /// Pure: entries in, summary out, no registry and no filesystem — the same split
 /// [`suppressed_during_pause`] follows, and for the same reason (this reads
 /// `AuditEntry`, which lives here rather than in `queue.rs`).
-pub fn front_door_refusals(entries: &[AuditEntry]) -> FrontDoorRefusals {
+pub fn front_door_refusals(entries: &[AuditEntry], window_truncated: bool) -> FrontDoorRefusals {
     // (sender, target) -> the full text of the last `prompt` line between them.
     let mut offered: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
@@ -8837,6 +8861,16 @@ pub fn front_door_refusals(entries: &[AuditEntry]) -> FrontDoorRefusals {
             }
             continue;
         }
+        // `queue-full-at-call` and nothing else, stated rather than implied
+        // (#633, review NB2). `delivery-dropped` is written for other reasons
+        // too, and each is skipped here for a reason: `agent-died`/`queue-full`
+        // (a whole queue dropped) carry an `id` and are already reported by the
+        // orphan derivations, and `no-app-handle` — `withdraw_unprocessable`'s
+        // undo — is unreachable in production, since `self.app` is set once at
+        // startup and only a bare test registry lacks it. That last one is the
+        // ONE audited drop reason this filter passes over in silence, so #633
+        // owns deciding whether it should surface here; until then the skip is
+        // deliberate and written down rather than merely true.
         if e.action != "delivery-dropped" || e.detail["reason"] != json!("queue-full-at-call") {
             continue;
         }
@@ -8889,7 +8923,7 @@ pub fn front_door_refusals(entries: &[AuditEntry]) -> FrontDoorRefusals {
     if total > REFUSED_LIST_MAX {
         items.drain(..total - REFUSED_LIST_MAX);
     }
-    FrontDoorRefusals { items, total }
+    FrontDoorRefusals { items, total, window_truncated }
 }
 
 fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
@@ -16243,6 +16277,30 @@ impl OrchRegistry {
     /// is not appending whole lines, which is a bug worth seeing rather than a
     /// timeline that quietly comes up short.
     pub fn audit_log(&self, group: &str) -> Vec<AuditEntry> {
+        self.audit_log_windowed(group).0
+    }
+
+    /// `audit_log`, plus **whether the `AUDIT_VIEW_LIMIT` window actually cut
+    /// anything** (#579 review NB1).
+    ///
+    /// The viewer never needed this: a timeline showing the most recent 5000
+    /// entries is what it is for. A *derivation* does, and the difference is
+    /// not cosmetic. `front_door_refusals` counts refusals in what it was
+    /// handed and reports `refused_omitted` as the difference between that
+    /// count and what it listed — so on a truncated read it would report
+    /// `refused_omitted: 0` while older refusals had been cut away before it
+    /// ever saw them: a capped list reading as complete, which is the exact
+    /// failure mode #579's own design note names and `.loomux/lessons.md`
+    /// catalogues.
+    ///
+    /// Reported by the reader that KNOWS, rather than inferred downstream from
+    /// `entries.len() == AUDIT_VIEW_LIMIT`: a log holding exactly the cap was
+    /// not truncated, and a derivation that called that "truncated" would cry
+    /// wolf on a boundary it has no way to resolve. Same job as #569's
+    /// `PauseSuppression::window_start_seen` — say when the scan ran off the
+    /// start of its own timeline — with an exact signal available here because
+    /// this is where the cut happens.
+    pub fn audit_log_windowed(&self, group: &str) -> (Vec<AuditEntry>, bool) {
         let dir = self.group_dir(group);
         let mut text = String::new();
         for name in ["audit.1.jsonl", "audit.jsonl"] {
@@ -16259,10 +16317,11 @@ impl OrchRegistry {
             // keeps its torn lines forever (see `audit_skips_notified`).
             crate::obs::breadcrumb("audit-lines-unreadable", &format!("group={group} skipped={skipped}"));
         }
-        if entries.len() > AUDIT_VIEW_LIMIT {
+        let truncated = entries.len() > AUDIT_VIEW_LIMIT;
+        if truncated {
             entries.drain(0..entries.len() - AUDIT_VIEW_LIMIT);
         }
-        entries
+        (entries, truncated)
     }
 
     // ---------- durable state ----------
@@ -29725,7 +29784,11 @@ impl OrchRegistry {
     /// accepted since.
     #[doc(hidden)] // pub for integration tests
     pub fn front_door_refusals(&self, group: &str) -> FrontDoorRefusals {
-        front_door_refusals(&self.audit_log(group))
+        // `audit_log_windowed`, not `audit_log`: the derivation has to know
+        // whether its own timeline was cut, or a count over a partial window
+        // reads as a count over all of history (#579 review NB1).
+        let (entries, window_truncated) = self.audit_log_windowed(group);
+        front_door_refusals(&entries, window_truncated)
     }
 
     /// `queue_orphans` as the MCP tool returns it (#467) — the shape the
@@ -29818,8 +29881,14 @@ impl OrchRegistry {
             "count": rows.len(),
             "orphans": rows,
             "refused_count": refusals.total,
-            // What the cap left out — stated, never implied by a short list.
+            // What the LIST cap left out — stated, never implied by a short list.
             "refused_omitted": refusals.total.saturating_sub(refused.len()),
+            // ...and whether the WINDOW the count itself came from was cut
+            // (#579 review NB1). Without this, `refused_count: 0,
+            // refused_omitted: 0` over a truncated read is the strongest
+            // possible claim — "nothing was refused" — made by a scan that
+            // never saw the older half of the log.
+            "refused_window_truncated": refusals.window_truncated,
             "refused": refused,
         })
     }
