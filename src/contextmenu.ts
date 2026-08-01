@@ -14,8 +14,19 @@
 // open (#391, folded into #380) — a plugin pane's native child webview swallows both
 // paint and pointer events under a DOM overlay, so a menu opened over one would
 // otherwise render behind it and be unclickable.
+//
+// SUBMENUS need their own rect (#391 W3). `.ctxmenu-sub` is `position: absolute;
+// left: 100%` (styles.css) — it renders to the RIGHT of the root, outside its border
+// box, and `getBoundingClientRect()` on the root does not grow to cover an
+// absolutely-positioned descendant. So the original wiring registered the root and left
+// every open submenu unclipped: "Hash →" / "New →" over a plugin pane were exactly the
+// dead menu items #391 was filed about, still dead. Two halves, both needed — the
+// registered getter reports the submenu rects (`menuRects` below), and the hover/focus
+// edges that open a submenu `poke()` the registry, because CSS `:hover`/`:focus-within`
+// opens one with no JS event of its own for a plugin pane to re-clip on.
 
 import { overlayState } from "./overlaystate";
+import type { ElementRect } from "./pluginwindow";
 
 /** Generic menu-item shape shared by every context menu in the app. `A` is the
  *  caller's own action union (filemenu.ts's `MenuAction`, panemenu.ts's
@@ -65,7 +76,7 @@ export function showContextMenu<A>(
   root.className = "ctxmenu";
   root.tabIndex = -1;
 
-  const closeOverlaySlot = overlayState.open(() => root.getBoundingClientRect());
+  const closeOverlaySlot = overlayState.open(() => menuRects(root));
   const cleanups: (() => void)[] = [];
   const dispose = () => {
     if (openMenu?.el !== root) return;
@@ -114,6 +125,28 @@ export function showContextMenu<A>(
   openMenu = { el: root, dispose };
 }
 
+/** Everything this menu currently covers: its own box, plus every submenu panel
+ *  (open or not — a closed one is `display: none`, so it measures all-zero and the
+ *  registry drops it, which keeps this a plain unconditional read with no
+ *  `getComputedStyle` visibility guess). Deliberately a LIST, never a bounding box
+ *  around the lot: the root and an open submenu are side by side with dead space
+ *  above/below the submenu, and a bounding box would punch that dead space out of the
+ *  plugin's webview too — a hole showing nothing. */
+function menuRects(root: HTMLElement): ElementRect[] {
+  const rects: ElementRect[] = [root.getBoundingClientRect()];
+  for (const sub of root.querySelectorAll<HTMLElement>(".ctxmenu-sub")) {
+    rects.push(sub.getBoundingClientRect());
+  }
+  return rects;
+}
+
+/** Standalone so every `addEventListener` above shares one function identity — a
+ *  fresh closure per row per edge would be four more objects a menu has to carry for
+ *  no reason, and these listeners die with the menu's own element anyway. */
+function pokeOverlays(): void {
+  overlayState.poke();
+}
+
 /** One level of the menu (the top level, or a submenu panel). */
 function buildLevel<A>(items: MenuItem<A>[], fire: (a: A) => void): HTMLElement {
   const list = document.createElement("div");
@@ -141,6 +174,17 @@ function buildLevel<A>(items: MenuItem<A>[], fire: (a: A) => void): HTMLElement 
       row.appendChild(sub);
       // Hover/focus opens it; CSS does the showing, so there is no timer to leak.
       row.tabIndex = 0;
+      // ...but CSS showing it means there is no event for anyone ELSE either, and a
+      // plugin pane re-clips its native webview only when the registry notifies
+      // (#391 W3). These four edges are exactly the ones that flip
+      // `:hover`/`:focus-within`, so each one is a "my rect set just changed" —
+      // `poke()`, not `open()`: the submenu is part of THIS menu's slot, not a
+      // second overlay with a lifetime of its own. Cheap by construction, since a
+      // menu has a handful of rows and they fire on human pointer motion.
+      row.addEventListener("pointerenter", pokeOverlays);
+      row.addEventListener("pointerleave", pokeOverlays);
+      row.addEventListener("focusin", pokeOverlays);
+      row.addEventListener("focusout", pokeOverlays);
       list.appendChild(row);
       continue;
     }

@@ -5,6 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { OverlayRegistry } from "../src/overlaystate.ts";
+import { computeExcludeRects } from "../src/pluginocclusion.ts";
 
 const RECT_A = { left: 0, top: 0, width: 10, height: 10 };
 const RECT_B = { left: 20, top: 20, width: 5, height: 5 };
@@ -72,6 +73,71 @@ test("a getter returning null contributes nothing rather than throwing", () => {
   reg.open(() => RECT_A);
   assert.equal(reg.openCount, 2, "still counted as open");
   assert.deepEqual(reg.currentRects(), [RECT_A]);
+});
+
+// #391 W3: a context menu is ONE overlay whose visible area is several disjoint
+// boxes — `.ctxmenu-sub` is `position: absolute; left: 100%`, so it renders outside
+// the root's border box and the root's own rect never covers it. Registering the
+// root alone left submenu items over a plugin pane painted behind the native child
+// webview and dead to the pointer, which is #391's reported symptom.
+test("a getter may report SEVERAL rects — a menu root plus its open submenu — and all are reported", () => {
+  const reg = new OverlayRegistry();
+  const ROOT = { left: 100, top: 100, width: 190, height: 120 };
+  const SUB = { left: 290, top: 95, width: 160, height: 60 }; // starts where ROOT ends
+  reg.open(() => [ROOT, SUB]);
+  assert.deepEqual(reg.currentRects(), [ROOT, SUB]);
+});
+
+test("a multi-rect overlay is still ONE open overlay, closed by its one closer", () => {
+  const reg = new OverlayRegistry();
+  const close = reg.open(() => [RECT_A, RECT_B]);
+  assert.equal(reg.openCount, 1, "one menu, not one per panel");
+  close();
+  assert.deepEqual(reg.currentRects(), []);
+});
+
+// A closed submenu is `display: none` -> an all-zero rect at the viewport origin.
+// Left in, a pane whose own rect starts at (0,0) would take a phantom hole from it;
+// dropped here, a call site can return its whole set unconditionally instead of
+// guessing at each sub-box's computed visibility.
+test("an empty rect contributes nothing — a closed submenu measures all-zero", () => {
+  const reg = new OverlayRegistry();
+  const CLOSED_SUB = { left: 0, top: 0, width: 0, height: 0 };
+  reg.open(() => [RECT_A, CLOSED_SUB]);
+  assert.deepEqual(reg.currentRects(), [RECT_A]);
+});
+
+test("an empty rect from a single-rect getter is dropped too", () => {
+  const reg = new OverlayRegistry();
+  reg.open(() => ({ left: 4, top: 4, width: 0, height: 12 }));
+  assert.equal(reg.openCount, 1, "still counted as open");
+  assert.deepEqual(reg.currentRects(), []);
+});
+
+test("an empty array contributes nothing and does not throw", () => {
+  const reg = new OverlayRegistry();
+  reg.open(() => []);
+  reg.open(() => RECT_A);
+  assert.equal(reg.openCount, 2);
+  assert.deepEqual(reg.currentRects(), [RECT_A]);
+});
+
+// End to end through the two modules that decide what the native HWND clip is:
+// the registry's rect set -> pluginocclusion's pane-local holes. This is the shape
+// #391 is actually about — "the submenu's items are clickable over a plugin pane"
+// reduces to "a second hole was punched where the submenu is".
+test("a menu with an open submenu over a plugin pane punches a hole for BOTH panels", () => {
+  const reg = new OverlayRegistry();
+  const pane = { left: 0, top: 0, width: 800, height: 600 }; // a plugin pane filling the window
+  const root = { left: 100, top: 100, width: 190, height: 120 };
+  const sub = { left: 290, top: 95, width: 160, height: 60 };
+  reg.open(() => [root, sub]);
+
+  const holes = computeExcludeRects(pane, reg.currentRects());
+  assert.deepEqual(holes, [
+    { x: 100, y: 100, width: 190, height: 120 },
+    { x: 290, y: 95, width: 160, height: 60 },
+  ]);
 });
 
 test("subscribe fires on every open/close edge", () => {
