@@ -653,41 +653,15 @@ pub fn validate_open_request(
             req.api_version, BROKER_API_VERSION
         ));
     }
-    // The refusal names WHAT is missing, not just that something is: on a
-    // widened manifest it carries the delta (`ApprovalStatus::Widened`'s
-    // `added`), so the human re-approving an upgraded plugin is told "it now
-    // also wants fs.read" rather than being handed the whole list again to
-    // diff by eye. This string is surfaced verbatim by the pane's consent
-    // surface (`src/pluginpaneview.ts`), so it is written for a human.
-    match crate::plugingrants::approval_status(
-        &crate::plugingrants::load_grants(plugins_root),
-        &req.plugin_id,
-        &req.capabilities,
-    ) {
-        crate::plugingrants::ApprovalStatus::Approved => {}
-        crate::plugingrants::ApprovalStatus::NeverApproved => {
-            return Err(format!(
-                "{}: `{}` has not been approved to use [{}] — review its capabilities first",
-                crate::plugingrants::NOT_APPROVED_CODE,
-                req.plugin_id,
-                crate::plugingrants::normalize_capabilities(&req.capabilities).join(", ")
-            ));
-        }
-        crate::plugingrants::ApprovalStatus::Widened { added } => {
-            return Err(format!(
-                "{}: `{}` now also wants [{}], which was not part of what was approved — review it again",
-                crate::plugingrants::NOT_APPROVED_CODE,
-                req.plugin_id,
-                added.join(", ")
-            ));
-        }
-    }
+    // MUTATION (scratch, #377 red-before-green): the approval gate removed —
+    // this is exactly the pre-#377 behavior of the base branch, where a
+    // manifest's declared capabilities were auto-granted at install.
+    let _ = plugins_root; // (mutation) the grant store is no longer consulted
     Ok(ValidatedOpenRequest {
         granted,
-        root: req
-            .root
-            .as_ref()
-            .map(|_| plugins_root.join(&req.plugin_id).to_string_lossy().into_owned()),
+        // MUTATION (scratch, #377 NB3 red-before-green): trust the caller's
+        // root verbatim, as the base branch did.
+        root: req.root.clone(),
     })
 }
 
