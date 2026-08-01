@@ -12289,6 +12289,23 @@ pub fn question_shown(ring: Option<&QuestionMatch>, visible: Option<&str>) -> bo
     }
 }
 
+/// Is a composed screen worth reading as evidence, or is it a replay that
+/// began blind and was never painted over (#534)?
+///
+/// A composition with essentially nothing on it is not a clear screen; it is
+/// an absent one, and the distinction is the whole difference between "the
+/// dialog is gone" and "we did not see the dialog". Returning `None` costs a
+/// hold that was already going to happen; the alternative is treating a blank
+/// grid as proof.
+///
+/// It is not a coherence check and does not pretend to be one — a garbled but
+/// well-populated composition passes here. See the design note's limits
+/// section for what that leaves open.
+pub fn trustworthy_composition(visible: String) -> Option<String> {
+    (visible.lines().filter(|l| !l.trim().is_empty()).count() >= GRID_MIN_RENDERED_ROWS)
+        .then_some(visible)
+}
+
 /// What the guard held for, recorded for the abort audit (#513(c)/F2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestionWitnessed {
@@ -12451,14 +12468,7 @@ fn question_sample(ptys: &crate::pty::PtyManager, pty_id: u32) -> QuestionSample
     // size, no grid evidence.
     let visible = match (raw.as_deref(), ptys.size(pty_id)) {
         (Some(bytes), Some((cols, rows))) => {
-            let v = termgrid::render_visible(bytes, cols, rows);
-            // A composition with essentially nothing on it is a replay that
-            // began blind and was never painted over, not a clear screen.
-            // Treat it as unreadable: the cost is a hold that was already
-            // going to happen, and the alternative is calling a blank grid
-            // proof that a dialog is gone.
-            (v.lines().filter(|l| !l.trim().is_empty()).count() >= GRID_MIN_RENDERED_ROWS)
-                .then_some(v)
+            trustworthy_composition(termgrid::render_visible(bytes, cols, rows))
         }
         _ => None,
     };
