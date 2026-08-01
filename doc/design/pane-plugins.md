@@ -1313,21 +1313,39 @@ monitor, which repaints continuously, so a frozen or blanked region is
 obvious. Split so the plugin pane fills a good part of the window, then for
 each row open the overlay so it visibly OVERLAPS the plugin pane:
 
+**Completeness invariant: every `overlayState.open()` call site has at least
+one row here.** Not a nicety — this matrix is the only evidence the pointer
+half ever gets, so a missing row means a green pass reports coverage it does
+not have, and says nothing while doing it. Two rows were missing when this
+was first written (`editor.ts`'s config dialog and `gitview.ts`'s own
+`.git-menu` — rows 2 and 12 below), and both were missed the same way: each
+LOOKS covered by a neighbouring row while carrying its OWN registration.
+`editorConfigDialog` is an independent copy of the `.launcher-overlay`
+pattern rather than a `modal.ts` caller, and `.git-menu` is hand-rolled
+rather than a `contextmenu.ts` caller — so rows 1 and 3 exercise a sibling's
+wiring, not theirs. That is the same "looks covered" trap `.ctxmenu-sub`
+sprang one layer down. Check the invariant rather than eyeballing it:
+`grep -rn 'overlayState\.open(' src/*.ts` — eleven call sites today (the two
+`sessions.ts` hits are prose in its header comment, not calls), each mapped
+to what opens it by the ledger in `overlaystate.ts`.
+
 | # | Overlay | Open it with | Pass = |
 | --- | --- | --- | --- |
 | 1 | Confirm/prompt modal | close a pane with unsaved state, or any confirm | its buttons are visible AND respond to a click |
-| 2 | Context menu | right-click a file in the file explorer | menu items visible, a click fires the action |
-| 3 | **Context submenu** | hover "New →" / "Hash →" in that menu | the SUBMENU panel is visible and its items click (#391 W3 — the case that was still broken) |
-| 4 | Tab right-click menu | right-click a project tab | items visible and clickable |
-| 5 | Tab hover preview | hover a tab until the thumbnail appears | thumbnail visible over the plugin, not behind it |
-| 6 | Tab color palette | tab menu → colour swatch | swatches visible, picking one applies |
-| 7 | Toast | any action that toasts (e.g. a copy) | toast readable over the plugin |
-| 8 | **Fatal banner** | trigger any uncaught error, or call `showFatal` from devtools | banner readable AND a click dismisses it (#391 W3 — newly registered) |
-| 9 | **#377 consent prompt** | open a second, unapproved plugin while a plugin pane is already showing | the approve/decline dialog is visible and both buttons click (it is a `modal.ts` modal, so it rides the same wiring as row 1 — but it is the modal most likely to be opened with a plugin pane on screen, so it is worth its own pass) |
-| 10 | In-pane view, floating | Alt+G git view on a pane overlapping the plugin | overlay fully visible, rows selectable |
-| 11 | In-pane view, docked | dock that same view to a side | plugin pane RESIZES around it — no hole punched, no bleed |
-| 12 | Sessions sidebar | Ctrl+Shift+P, watch the whole animation | the panel stays interactive throughout AND the plugin keeps painting past the 344px edge (this one must NOT blank — that was the reverted PR #392's bug) |
-| 13 | Everything closed | close each overlay above | the plugin repaints its full rect with no leftover hole |
+| 2 | Editor config dialog | the file editor's own config/settings dialog | its controls are visible and respond to a click — `editor.ts` registers ITSELF, so row 1 passing says nothing about this one |
+| 3 | Context menu | right-click a file in the file explorer | menu items visible, a click fires the action |
+| 4 | **Context submenu** | hover "New →" / "Hash →" in that menu | the SUBMENU panel is visible and its items click (#391 W3 — the case that was still broken) |
+| 5 | Tab right-click menu | right-click a project tab | items visible and clickable |
+| 6 | Tab hover preview | hover a tab until the thumbnail appears | thumbnail visible over the plugin, not behind it |
+| 7 | Tab color palette | tab menu → colour swatch | swatches visible, picking one applies |
+| 8 | Toast | any action that toasts (e.g. a copy) | toast readable over the plugin |
+| 9 | **Fatal banner** | trigger any uncaught error, or call `showFatal` from devtools | banner readable AND a click dismisses it (#391 W3 — newly registered) |
+| 10 | **#377 consent prompt** | open a second, unapproved plugin while a plugin pane is already showing | the approve/decline dialog is visible and both buttons click (it is a `modal.ts` modal, so it rides the same wiring as row 1 — but it is the modal most likely to be opened with a plugin pane on screen, so it is worth its own pass) |
+| 11 | In-pane view, floating | Alt+G git view on a pane overlapping the plugin | overlay fully visible, rows selectable |
+| 12 | Git view's OWN menu | inside that git view, open its commit / ref-chip / branch-switcher menu (`.git-menu`) — not a right-click context menu | items visible and clickable — `gitview.ts` hand-rolls this menu and registers it itself, so neither row 3 nor row 11 covers it |
+| 13 | In-pane view, docked | dock that same view to a side | plugin pane RESIZES around it — no hole punched, no bleed |
+| 14 | Sessions sidebar | Ctrl+Shift+P, watch the whole animation | the panel stays interactive throughout AND the plugin keeps painting past the 344px edge (this one must NOT blank — that was the reverted PR #392's bug) |
+| 15 | Everything closed | close each overlay above | the plugin repaints its full rect with no leftover hole |
 
 Two failure shapes to name precisely when reporting one, because they have
 opposite causes: **bleed** (the plugin paints over the overlay, or eats its
