@@ -3161,12 +3161,69 @@ pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
 ///   target repo's own `.claude/settings.json` beats any allow rule here, in
 ///   every mode.
 ///
+/// **`Bash(git *)` is a prefix pattern, so it positively matches `git commit`
+/// and `git push` — what carves them back out, and why that is now cited
+/// rather than assumed (#614 review B1).** Before this list existed, the
+/// carve-out was `--disallowedTools "Bash(git commit *)" "Bash(git push *)"`
+/// alone, i.e. an *argv* deny expected to beat a *settings-file* allow. That is
+/// exactly the kind of cross-mechanism equivalence the paragraph above refuses
+/// to assume for allows, and it would have been inconsistent to assume it for
+/// denies. It is not an assumption: the
+/// [permissions reference](https://code.claude.com/docs/en/permissions) settles
+/// it twice, and both quotes are verbatim (fetched 2026-08-01).
+///
+/// First, the flags are in the same precedence domain as settings rules — its
+/// "Settings precedence" section opens "Permission rules follow the same
+/// settings precedence as all other Claude Code settings", lists **"Command
+/// line arguments: temporary session overrides"** as level 2, and names these
+/// exact flags in it: "If a tool is denied at any level, no other level can
+/// allow it. For example, a managed settings deny can't be overridden by
+/// `--allowedTools`, and `--disallowedTools` can add restrictions beyond what
+/// managed settings define." Second, within any level deny wins outright:
+/// "Rules are evaluated in order: deny, then ask, then allow. The first match
+/// in that order determines the outcome, and rule specificity doesn't change
+/// the order", and "deny rules from any scope are evaluated before allow
+/// rules".
+///
+/// So `--disallowedTools` beating this list is documented, not inherited from a
+/// comment written when both flags lived on argv. `readonly_settings_deny`
+/// writes the same denials into this same `permissions` object anyway — belt
+/// and braces, the identical stance this constant takes toward
+/// `--allowedTools`, and it removes even the cross-layer question by putting
+/// the allow and the deny that must beat it in one object.
+///
 /// `readonly_pane_settings_carry_permissions_allow` pins the list, including
 /// #465's no-bare-mutation-grant invariant restated for this layer: nothing but
 /// `mcp__loomux`, a scoped `Name(...)` pattern, or one of the two enumerated
 /// research tools may ever appear here.
 pub const CLAUDE_READONLY_SETTINGS_ALLOW: &[&str] =
     &["mcp__loomux", "Bash(git *)", "Bash(gh *)", "WebFetch", "WebSearch"];
+
+/// The `permissions.deny` rules that ride the same `--settings` object as
+/// [`CLAUDE_READONLY_SETTINGS_ALLOW`] (#614 review B1) — **derived from the
+/// same two predicates `build_agent_command` uses for `--disallowedTools`, not
+/// a third literal list**, so the two layers cannot drift and a new
+/// [`Containment`] tier changes both at once or neither.
+///
+/// Today only a read-only pane gets a `permissions` block at all, and a
+/// read-only pane satisfies both predicates — so in practice this returns both
+/// lists. Expressing it as the predicates rather than as a flat concatenation
+/// is the point: it states *which tier earns which denial*, which is the thing
+/// a future tier would get wrong.
+///
+/// Returns an empty vec for a tier with nothing to deny; the caller writes no
+/// `deny` key at all in that case, for the same reason it writes no empty
+/// `hooks` key (see `write_hook_settings_file`).
+fn readonly_settings_deny(containment: Containment) -> Vec<&'static str> {
+    let mut deny: Vec<&'static str> = Vec::new();
+    if containment.denies_edits() {
+        deny.extend_from_slice(CLAUDE_EDIT_DENY_TOOLS);
+    }
+    if containment.denies_git_mutation() {
+        deny.extend_from_slice(CLAUDE_READONLY_DENY_GIT);
+    }
+    deny
+}
 
 /// Claude Code tool names Claude Code's own permission engine recognizes, per
 /// the official [Tools reference](https://code.claude.com/docs/en/tools-reference)
@@ -19013,6 +19070,18 @@ impl OrchRegistry {
             let token = new_token();
             let cfg = self.write_mcp_config(SOLO_GROUP, &agent_id, &token, cli)?;
             let args = match cli {
+                // Every join site APPENDS this string (`launcher.ts`,
+                // `panerestore.ts`, `sessions.rs`), so on an autopilot solo
+                // launch the line ends up with TWO `--allowedTools`
+                // occurrences: `single_pane_autopilot_flags`' git/gh pair and
+                // this one. That is NOT #610's defect — nothing splices into
+                // either value list, so each stays contiguous — and it is
+                // harmless because such a pane runs `--permission-mode auto`,
+                // which approves git/gh without consulting an allow list at
+                // all. Whether repeated occurrences accumulate or last-wins is
+                // undocumented and deliberately NOT relied on here; if a solo
+                // pane ever needs an allow list to be honoured (a read-only
+                // solo tier, say), merge the two into one occurrence first.
                 "claude" => format!(
                     "--mcp-config \"{}\" --strict-mcp-config --allowedTools mcp__loomux",
                     cfg.display()
@@ -24820,9 +24889,19 @@ impl OrchRegistry {
     /// - `hooks` — the #417/#112 compact-lifecycle config, absent when
     ///   `compact_hook_settings` has nothing to write (no `sh` resolvable).
     /// - `permissions` — #610, for a [`Containment::is_read_only`] pane only:
-    ///   [`CLAUDE_READONLY_SETTINGS_ALLOW`], the surface `dontAsk` is
-    ///   documented to consult (see that constant for the full argument and
-    ///   the WebFetch/`git fetch` decisions).
+    ///   [`CLAUDE_READONLY_SETTINGS_ALLOW`] under `allow` (the surface `dontAsk`
+    ///   is documented to consult — see that constant for the full argument and
+    ///   the WebFetch/`git fetch` decisions) and, since #614's review, the
+    ///   matching `deny` from `readonly_settings_deny` so the rule that must
+    ///   beat `Bash(git *)`'s prefix match sits in the same object as the allow
+    ///   itself.
+    ///
+    /// **The name is now imprecise, deliberately** (same reasoning as
+    /// `COMPACT_HOOK_SCRIPT`'s "Naming, kept imprecise on purpose"): this
+    /// function and its `{agent_id}-hooks.json` output can carry a `permissions`
+    /// block and no hooks at all. Renaming would strand every already-spawned
+    /// agent whose `--settings` argv bakes in the old path, which is a worse
+    /// trade than an imprecise name one comment can fix.
     ///
     /// **The `None` policy changed with #610, and only for hooks.** This used
     /// to return `None` whenever hooks were unavailable, and the caller then
@@ -24845,9 +24924,23 @@ impl OrchRegistry {
         containment: Containment,
     ) -> Option<PathBuf> {
         let hooks = self.compact_hook_settings(group, agent_id);
-        let permissions = containment
-            .is_read_only()
-            .then(|| json!({ "allow": CLAUDE_READONLY_SETTINGS_ALLOW }));
+        let permissions = containment.is_read_only().then(|| {
+            let mut p = serde_json::Map::new();
+            p.insert("allow".into(), json!(CLAUDE_READONLY_SETTINGS_ALLOW));
+            // #614 review B1: the denials ride the SAME object as the allow
+            // they have to beat, so `Bash(git *)`'s prefix match over
+            // `git commit`/`git push` is carved out inside one documented
+            // precedence domain ("Rules are evaluated in order: deny, then
+            // ask, then allow") instead of across two mechanisms.
+            // `--disallowedTools` stays emitted too — see
+            // `CLAUDE_READONLY_SETTINGS_ALLOW`'s doc for the citation that
+            // makes the cross-layer direction sound as well.
+            let deny = readonly_settings_deny(containment);
+            if !deny.is_empty() {
+                p.insert("deny".into(), json!(deny));
+            }
+            Value::Object(p)
+        });
         if hooks.is_none() && permissions.is_none() {
             return None;
         }

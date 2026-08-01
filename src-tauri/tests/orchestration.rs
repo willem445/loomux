@@ -4517,10 +4517,18 @@ fn claude_gets_a_settings_flag_only_when_hook_settings_is_some() {
 /// other flag emitted mid-list terminates the list — everything after it is a
 /// stray positional, not an allow rule.
 fn claude_allowed_tools_values(tokens: &[String]) -> Vec<String> {
+    claude_flag_values(tokens, "--allowedTools")
+}
+
+/// The same extraction for any one flag's value list. Shared so the deny side
+/// (#614 review N1) is pinned by the same rule as the allow side rather than
+/// by a second, subtly different reimplementation of "where does a value list
+/// end".
+fn claude_flag_values(tokens: &[String], flag: &str) -> Vec<String> {
     let start = tokens
         .iter()
-        .position(|t| t == "--allowedTools")
-        .expect("a claude command must set --allowedTools")
+        .position(|t| t == flag)
+        .unwrap_or_else(|| panic!("a claude command must set {flag}: {tokens:?}"))
         + 1;
     let end = tokens[start..]
         .iter()
@@ -4580,6 +4588,52 @@ fn claude_allow_patterns_are_not_severed_from_the_allowedtools_flag() {
                      for {containment:?} — it was emitted AFTER another flag (--settings), which \
                      terminates the list, so Claude never receives it as an allow rule at all. \
                      Value list seen: {allowed:?}\n  line: {line}"
+                );
+            }
+        }
+    }
+}
+
+/// #614 review N1: the same contiguity property, for the DENY list — the
+/// direction that fails **open**.
+///
+/// The deny list is contiguous today, so this pins no live defect. What it
+/// closes is the coverage gap that let #610 live for two releases: every
+/// existing pin on the deny list's ordering (the full-line goldens, the
+/// `windows(4)` argv check) is built with `hook_settings: None`, and
+/// `--settings` is a flag that appears ONLY on a real spawn. A future flag with
+/// that same "only present sometimes" shape, emitted between
+/// `--disallowedTools` and its values, would sever the git denials with every
+/// other test green — and unlike a severed allow, a severed deny is silent: the
+/// planner just quietly gains `git commit`.
+#[test]
+fn claude_deny_patterns_are_not_severed_from_the_disallowedtools_flag() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let hooks = Path::new("C:/x/cfg-hooks.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+
+    for (containment, want) in [
+        (Containment::ReadOnly, [CLAUDE_EDIT_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT].concat()),
+        (Containment::NoEdits, CLAUDE_EDIT_DENY_TOOLS.to_vec()),
+    ] {
+        let line = reg.build_agent_command(
+            "claude", "opus", true, cfg, Some(hooks), gdir, wd, None, false, containment,
+            &PersonaInject::default(),
+        );
+        let argv = reg.build_agent_argv(
+            "claude", "opus", true, cfg, Some(hooks), gdir, wd, None, false, containment,
+            &PersonaInject::default(),
+        );
+        for (form, tokens) in [("command", shell_tokenize(&line)), ("argv", argv)] {
+            let denied = claude_flag_values(&tokens, "--disallowedTools");
+            for w in &want {
+                assert!(
+                    denied.iter().any(|t| t == w),
+                    "#614/N1: {w:?} is missing from the {form} form's --disallowedTools value \
+                     list for {containment:?} — a flag emitted mid-list would terminate it and \
+                     silently drop the denial. Value list seen: {denied:?}\n  line: {line}"
                 );
             }
         }
@@ -4670,6 +4724,29 @@ fn readonly_pane_settings_carry_permissions_allow() {
             KNOWN_CLAUDE_TOOLS.contains(&rule.as_str()),
             "#610/#448: {rule:?} is not a known Claude Code tool name — an allow rule that \
              matches no tool grants nothing, silently. See KNOWN_CLAUDE_TOOLS' refresh procedure."
+        );
+    }
+
+    // #614 review B1: `Bash(git *)` is a PREFIX pattern, so as a live
+    // `permissions.allow` rule it positively matches `git commit -m …` and
+    // `git push`. The carve-out must therefore be reachable from inside this
+    // same object, not only from `--disallowedTools` in another layer —
+    // otherwise the read-only tier's one guarantee (no mutation) rests on a
+    // cross-mechanism precedence that this PR's own reasoning refuses to
+    // assume for allows. Deny is derived from the same predicates argv uses,
+    // so a new Containment tier moves both layers or neither.
+    let deny: Vec<String> = cfg["permissions"]["deny"]
+        .as_array()
+        .unwrap_or_else(|| panic!("#614/B1: read-only pane's settings carry no permissions.deny: {cfg}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    for want in CLAUDE_EDIT_DENY_TOOLS.iter().chain(CLAUDE_READONLY_DENY_GIT.iter()) {
+        assert!(
+            deny.iter().any(|r| r == want),
+            "#614/B1: {want:?} missing from the settings deny list {deny:?} — the argv \
+             --disallowedTools value alone would leave it in a different precedence layer \
+             from the allow rule it has to beat."
         );
     }
 
