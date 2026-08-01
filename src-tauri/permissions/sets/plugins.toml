@@ -1,0 +1,7 @@
+[[set]]
+identifier = "plugins"
+description = "Pane-plugins backend host (#360 Slice B): list discovered plugins and install one from a local source folder."
+permissions = [
+    "allow-list-plugins",
+    "allow-install-plugin",
+]

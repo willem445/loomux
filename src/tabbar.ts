@@ -14,6 +14,7 @@ import { swapEditor } from "./domutil";
 import { attentionPresentation } from "./attention";
 import { pauseGroup, resumeGroup, groupSummary, groupUsage } from "./orchestration";
 import { tabCounts } from "./tabcounts";
+import { overlayState } from "./overlaystate";
 
 // Reuse the orchestration group palette (orchbadge.ts GROUP_COLORS) so a tab's
 // color vocabulary matches the group-accent colors the panes already use.
@@ -75,6 +76,14 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
    *  see `wireDrag`) can tell a drag is in progress without threading a
    *  reference through every tab element. */
   private draggingId: string | null = null;
+  /** Closers for the shared overlay registry (#391, folded into #380) — one
+   *  slot per popover kind rather than one shared slot, since opening the
+   *  menu/palette explicitly closes the preview first but not vice versa
+   *  (openPreview never closes an open menu/palette) — a shared slot could
+   *  get overwritten while the popover it belonged to is still open. */
+  private overlayCloseMenu: (() => void) | null = null;
+  private overlayClosePreview: (() => void) | null = null;
+  private overlayClosePalette: (() => void) | null = null;
 
   private el: HTMLElement;
   private tabs: TabManager<T>;
@@ -565,12 +574,15 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
 
     this.anchorPopover(pop, anchor.getBoundingClientRect());
     this.palette = pop;
+    this.overlayClosePalette ??= overlayState.open(() => pop.getBoundingClientRect());
     this.dismissOnOutside(pop, () => this.closePalette());
   }
 
   private closePalette(): void {
     this.palette?.remove();
     this.palette = null;
+    this.overlayClosePalette?.();
+    this.overlayClosePalette = null;
   }
 
   /** Right-click context menu: pause/resume the tab's orchestration group
@@ -624,12 +636,15 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     menu.style.left = `${x}px`;
     menu.style.top = `${y}px`;
     this.menu = menu;
+    this.overlayCloseMenu ??= overlayState.open(() => menu.getBoundingClientRect());
     this.dismissOnOutside(menu, () => this.closeMenu());
   }
 
   private closeMenu(): void {
     this.menu?.remove();
     this.menu = null;
+    this.overlayCloseMenu?.();
+    this.overlayCloseMenu = null;
   }
 
   /** Live hover thumbnail (#63): a composite of the tab's FULL
@@ -644,6 +659,7 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     document.body.appendChild(pop);
     this.preview = pop;
     this.previewWsId = ws.id;
+    this.overlayClosePreview ??= overlayState.open(() => pop.getBoundingClientRect());
 
     const anchorRect = anchor.getBoundingClientRect();
     const paint = () => {
@@ -794,6 +810,8 @@ export class TabBar<T extends ManagedWorkspace = ManagedWorkspace> {
     this.preview?.remove();
     this.preview = null;
     this.previewWsId = null;
+    this.overlayClosePreview?.();
+    this.overlayClosePreview = null;
   }
 
   private anchorPopover(pop: HTMLElement, r: DOMRect): void {

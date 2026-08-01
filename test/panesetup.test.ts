@@ -29,6 +29,7 @@ function input(over: Partial<PaneSetupInput>): PaneSetupInput {
     name: "",
     autopilot: true,
     shellKind: "powershell",
+    pluginId: "",
     ...over,
   };
 }
@@ -191,12 +192,37 @@ test("every content kind is a content kind — the predicate the form hides fiel
   // The form hides its CLI / count / worktree / autopilot / shell fields off this ONE
   // predicate rather than listing the kinds at each site. A kind missing from it would
   // silently render an agent's fields on a pane that can never spawn a process.
-  for (const kind of ["files", "editor", "git", "workflow"] as const) {
+  for (const kind of ["files", "editor", "git", "workflow", "plugin"] as const) {
     assert.equal(isContentKind(kind), true, `${kind} must be a content kind`);
   }
   for (const kind of ["agent", "orchestrator", "terminal"] as const) {
     assert.equal(isContentKind(kind), false);
   }
+});
+
+// ---------- plugin (#360 Slice D) ----------
+
+test("a plugin pane needs a pluginId — the one content kind whose input isn't a path", () => {
+  const res = planPaneSetup(input({ kind: "plugin", pluginId: "  " }));
+  assert.equal(res.ok, false);
+  assert.ok(!res.ok && res.focus === "plugin");
+  assert.match(res.ok ? "" : res.error, /plugin/i);
+});
+
+test("a plugin pane plans a pluginId + name, and nothing else — no repo, no root, no command", () => {
+  const res = planPaneSetup(input({ kind: "plugin", pluginId: " resource-monitor ", name: " monitor " }));
+  assert.ok(res.ok);
+  // Deep-equal: this kind carries no path/spawn inputs at all — a `root` sneaking
+  // into the plan would mean something is treating it like its four siblings, which
+  // is exactly the mistake this kind exists to NOT make (its identity is WHICH
+  // plugin, not a folder or repo).
+  assert.deepEqual(res.plan, { kind: "plugin", pluginId: "resource-monitor", name: "monitor" });
+});
+
+test("a plugin pane's name defaults to the plugin's own id when left blank", () => {
+  const res = planPaneSetup(input({ kind: "plugin", pluginId: "resource-monitor", name: "" }));
+  assert.ok(res.ok && res.plan.kind === "plugin");
+  assert.equal(res.plan.name, "resource-monitor");
 });
 
 test("both new kinds default their name to the root's own short name", () => {

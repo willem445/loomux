@@ -1,0 +1,219 @@
+/* Resource Monitor example plugin (#360 Slice F). A self-contained dark
+   theme matching loomux's own palette (src/styles.css's --bg-app/--panel/
+   --accent/--danger) for visual consistency with the host — this window has
+   no access to the host's stylesheet or CSS variables (separate origin), so
+   the values are inlined rather than shared. No host "theme" event exists
+   yet to sync light/dark (see this plugin's PR description for that gap). */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: #131318;
+  color: #ccd1de;
+  font: 13px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif;
+}
+
+.rm-root {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.rm-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 14px;
+  background: linear-gradient(180deg, #1a1a24, #17171f);
+  border-bottom: 1px solid #262633;
+  flex: none;
+}
+
+.rm-title {
+  font-weight: 600;
+  color: #ccd1de;
+  white-space: nowrap;
+}
+
+.rm-summary {
+  flex: 1;
+  color: #7d8496;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.rm-btn {
+  background: #1e1e29;
+  color: #ccd1de;
+  border: 1px solid #262633;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.rm-btn:hover {
+  border-color: #44578c;
+  color: #ccd1de;
+}
+
+.rm-interval-label {
+  color: #7d8496;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rm-select {
+  background: #1e1e29;
+  color: #ccd1de;
+  border: 1px solid #262633;
+  border-radius: 6px;
+  padding: 3px 6px;
+  font: inherit;
+}
+
+.rm-status {
+  padding: 8px 14px;
+  color: #7d8496;
+  border-bottom: 1px solid #20202b;
+  flex: none;
+}
+
+.rm-status-error {
+  color: #f7768e;
+}
+
+.rm-table-wrap {
+  flex: 1;
+  overflow: auto;
+}
+
+.rm-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.rm-table thead {
+  position: sticky;
+  top: 0;
+  background: #17171f;
+  z-index: 1;
+}
+
+.rm-table th {
+  text-align: left;
+  padding: 6px 10px;
+  color: #7d8496;
+  font-weight: 500;
+  border-bottom: 1px solid #262633;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.rm-sortable {
+  cursor: pointer;
+}
+
+.rm-sortable:hover {
+  color: #ccd1de;
+}
+
+.rm-sort-active {
+  color: #7aa2f7;
+}
+
+.rm-sort-arrow {
+  margin-left: 4px;
+  font-size: 10px;
+}
+
+.rm-table td {
+  padding: 5px 10px;
+  border-bottom: 1px solid #1c1c25;
+}
+
+.rm-table tbody tr:hover {
+  background: rgba(122, 162, 247, 0.06);
+}
+
+.rm-name {
+  max-width: 0;
+  width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rm-num {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.rm-cpu {
+  display: table-cell;
+}
+
+.rm-bar {
+  display: inline-block;
+  width: 60px;
+  height: 6px;
+  background: #1e1e29;
+  border-radius: 3px;
+  overflow: hidden;
+  vertical-align: middle;
+  margin-right: 8px;
+}
+
+.rm-bar-fill {
+  height: 100%;
+  background: #7aa2f7;
+  border-radius: 3px;
+}
+
+.rm-bar-fill.rm-bar-warm {
+  background: #e0af68;
+}
+
+.rm-bar-fill.rm-bar-hot {
+  background: #f7768e;
+}
+
+.rm-cpu-label {
+  display: inline-block;
+  min-width: 44px;
+  text-align: right;
+  vertical-align: middle;
+}
+
+.rm-empty {
+  text-align: center;
+  color: #7d8496;
+  padding: 20px 10px;
+}
+
+.rm-footer {
+  flex: none;
+  padding: 6px 14px;
+  color: #7d8496;
+  font-size: 11px;
+  border-top: 1px solid #20202b;
+  background: #131318;
+}
