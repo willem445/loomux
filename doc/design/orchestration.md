@@ -5085,7 +5085,7 @@ so a match the ring made and the screen does not hold was overwritten or scrolle
 never seen. Both readings also come from **one** tail read: a second read would sample a different
 instant, and the guard would be comparing two screens and calling the difference evidence.
 
-Four things it still cannot see, stated rather than mitigated:
+Five things it still cannot see, stated rather than mitigated:
 
 - **A resize racing the read.** Geometry is *required*, never defaulted — no `size()`, no grid
   evidence — because `get_output` can fall back to 80x24 (a wrong width only re-wraps prose a
@@ -5100,6 +5100,12 @@ Four things it still cannot see, stated rather than mitigated:
   than `GRID_MIN_RENDERED_ROWS` non-empty rows is `Unreadable` rather than clear
   (`trustworthy_composition`). "The screen is blank" is not "the screen is clear". This is a floor,
   not a coherence check: a garbled but well-populated composition passes it.
+- **A CLI whose resting screen is one line.** The floor above is a row count, and it assumes a
+  boxed UI — every CLI loomux drives today paints at least an input box. One that does not
+  composes to `Unreadable` forever, so this feature simply never engages for it and the pane keeps
+  the pre-#534 badge-only behaviour. Safe direction, and disclosed rather than detected: if a
+  Tier-B CLI with a minimal prompt is ever added, this is the assumption to revisit, and the
+  fix would be a content-based trust test rather than a taller floor.
 
 ### The release rule, exactly
 
@@ -5131,6 +5137,47 @@ false `NotRendered` is the expensive error and a false `StillRendered` is the ch
   statusline and input box. The comparison is whitespace-flattened, so a line the ring saw as one
   write and the screen wrapped across two rows still counts as displayed.
 
+### The needle is re-read in its own terms, and why that had to be a type
+
+The second sub-reading is only worth anything if it can actually find the thing again. Round 1
+gave every match one needle — the matched **line** — and that is unsound for one signal class, in
+the false-release direction. Review caught it; it is recorded here because the shape of the
+mistake generalizes.
+
+`m.line` comes from `strip_ansi` of the byte ring. `strip_ansi` deletes cursor addressing, so a
+CLI that repaints one physical row by cursor address — which `termgrid`'s own header documents as
+the flagship CLI's normal behaviour — yields a *concatenation of several frames* that was never on
+any screen. Such a needle can never be found on a clean grid.
+
+For the four token-bearing signals that is harmless: the token is short, repaint-stable, and
+checked first. For `pointer-option` it was fatal, because that signal's evidence is a **position**
+(a glyph leading a line), so it had no token and fell through to the line search. The check
+therefore returned false for a menu that was plainly displayed, and since the pointer rule in
+`prompt_wait_match` reads only the last three painted lines — chronological again — a live menu
+sitting above the input box and status chrome made *both* sub-readings empty. `NotRendered`,
+release, Enter into a live menu: the #420 harm, reached by the one class that could not defend
+itself.
+
+Two changes, and the second matters more than the first:
+
+- **`pointer_rendered` re-reads the signal itself, spatially.** Every rendered row, deframed by
+  the same `leads_with_pointer` rule the ring detector uses — one definition, so a re-read cannot
+  drift looser (pinning holds open on prose) or tighter (releasing into a live menu) than the
+  detector it stands in for. The line search survives as an *additional* disjunct for both kinds:
+  when the line is clean it is the most specific evidence there is, and when it is a repaint
+  artifact it simply fails, which can add a hold but never remove one.
+- **`QuestionNeedle` is an enum, not an `Option<&str>`.** The round-1 shape encoded "no token" as
+  `None` and left what to do about it to a comment — and the comment was wrong. With two named
+  kinds, `match_still_rendered` must handle each explicitly and a sixth signal class cannot
+  inherit the hole by defaulting. The general lesson: *when a fallback is unsound for one member
+  of a set, the set is the wrong type.*
+
+One ordering change follows from the same reasoning: `menu-footer` is now reported **before**
+`pointer-option`. Real menus routinely paint both, and the reported match decides which needle the
+re-read gets — so among signals that fired on the same dialog, prefer the one whose evidence
+survives recomposition. This cannot change the boolean (a disjunction), only which evidence is
+recorded and re-read.
+
 `mask_own_paste` runs on **both** readings or the guard contradicts itself: our own just-pasted,
 not-yet-submitted text sits in the input box, where it is genuinely *rendered* — and stays
 rendered, unlike in the ring, where it scrolls out of a 4 KiB window soon enough. A brief quoting
@@ -5146,16 +5193,25 @@ invoked — a prompt held too long is recoverable by a human who is told; an Ent
 a live consent dialog is not recoverable at all — is unchanged and is why the release is fenced
 this narrowly.
 
-Four independent things must all hold before an Enter follows a grid-driven release:
+Four things must all hold before an Enter follows a grid-driven release. They are **not four
+independent signals** — saying so would overclaim, and two of them are re-samples of the same
+signal class at a later instant. What they defend against is transients, which is a real and
+different property from independence:
 
-1. Two **consecutive** clear polls (`QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS`) — unchanged from
-   rev-19 R1, and the reason TUI redraw churn cannot false-clear: the composed screen is rebuilt
-   from different bytes every frame, but the answer only changes when the dialog stops being
-   painted.
+1. Two **consecutive** clear polls (`QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS`), unchanged from
+   rev-19 R1. This is what makes ordinary TUI redraw churn safe — but by hysteresis, not by the
+   grid: a poll landing *inside* a repaint (erased, chrome painted, dialog row not yet) genuinely
+   composes clear, and two such polls in a row would release. The sub-window is narrow (a fully
+   erased screen is `Unreadable`, so it must be erased *and* ≥2 rows painted *and* miss the dialog
+   row, twice in a row at 250 ms), and `d4b` pins that boundary rather than asserting it away.
 2. A composition that passed `trustworthy_composition`.
 3. `write_admission` re-reading box occupancy **at the instant of the write** (#532), plus the
-   pre-Enter `preenter_admission`.
-4. The pre-Enter checkpoint re-deriving all of the above after the paste.
+   pre-Enter `preenter_admission`. Box occupancy *is* an independent signal here; the question
+   half of that same gate is not, because `question_active_now` deliberately reads the grid too
+   (see its doc — otherwise it would re-assert, one call later, the hold the guard had just
+   released). Its value is the later instant, not a second opinion.
+4. The pre-Enter checkpoint re-deriving all of the above after the paste — again a re-sample, and
+   again valuable for the same reason: it is taken after a paste that may have taken seconds.
 
 **On "release when the question is gone AND the box is empty".** The box conjunct is not
 re-derived inside the question predicate, and that is a decision rather than an omission. It is
@@ -5183,7 +5239,12 @@ record (`delivery-aborted-question`, `delivery-held-for-question`, and the retry
 
 - `signal` — which detector rule fired (`yes-no-token`, `permission-phrase`, `numbered-menu`,
   `pointer-option`, `menu-footer`). The fastest way to spot a rule misfiring on prose.
-- `line` — the normalized line it fired on, capped at `QuestionMatch::MAX_LINE`.
+- `line` — the normalized line it fired on, capped at `QuestionMatch::MAX_LINE`. Diagnostic only:
+  it is a `strip_ansi` artifact and nothing may *decide* on it (see the needle section above).
+  Up to 200 normalized characters of pane content therefore reach `audit.jsonl`. That is not a new
+  exposure class — the same file already persists the **full text of every delivered prompt**
+  (`prompt`, per delivery) and every queued payload — and it is strictly narrower: only
+  question-shaped lines, only on a hold or abort, capped, lowercased, local.
 - `grid` — `still-rendered` / `not-rendered` / `unreadable`: whether the composed screen agreed.
 
 `matched: null` is a real answer, not a missing field: on an abort record it means the outcome and

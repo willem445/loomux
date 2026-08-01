@@ -4968,6 +4968,58 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
     prompt_wait_match(tail).is_some()
 }
 
+/// Strip a line's leading box border / bullet / indent so a menu pointer
+/// inside a bordered dialog (`│ ❯ Yes`) is seen to *lead* its content.
+///
+/// Module-scope since #534 rev-13: the composed screen has to apply the SAME
+/// rule the ring detector does when re-reading the pointer signal
+/// ([`pointer_rendered`]), and two copies of a de-framing rule is exactly how
+/// the two readings would drift apart.
+fn deframe(l: &str) -> &str {
+    l.trim_start_matches(|c: char| {
+        c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
+            || c.is_whitespace()
+    })
+}
+
+/// The glyphs that mark a menu's highlighted choice when they LEAD a line.
+const POINTER_GLYPHS: [char; 3] = ['❯', '›', '→'];
+
+/// Does this line LEAD with a menu pointer, after any box framing?
+///
+/// The single definition of the pointer rule (#534 rev-13). Both readings call
+/// it — the ring detector over its last painted lines, [`pointer_rendered`]
+/// over every rendered row — because a re-read that is looser than the detector
+/// it stands in for would pin holds open on ordinary prose, and one that is
+/// tighter would release into a live menu. Neither is allowed to drift.
+fn leads_with_pointer(line: &str) -> bool {
+    let d = deframe(line);
+    POINTER_GLYPHS.iter().any(|g| d.starts_with(*g))
+}
+
+/// Does any rendered row lead with a menu pointer (#534 rev-13)?
+///
+/// The composed-screen re-reading of the `pointer-option` signal, and the fix
+/// for a false-RELEASE path review found in round 2. That signal is the only
+/// one whose evidence is a **position** rather than a substring, so it has no
+/// token to look for again; the round-1 code fell back to looking for the
+/// matched *line*, and that line comes from `strip_ansi` of the raw ring, which
+/// deletes cursor-address sequences and so can concatenate several repaints of
+/// one physical row into a string that was never on screen
+/// (`termgrid`'s own header documents that exact behaviour for Claude Code).
+/// Such a needle can never be found on a clean grid, so the check silently
+/// became a no-op — in the one direction this change must never be wrong in.
+///
+/// This looks for the signal itself instead of a stringly artifact of it, and
+/// **spatially**: every rendered row, not the last three. That window is
+/// `prompt_wait_match`'s, and it is CHRONOLOGICAL — correct for a stream where
+/// recent means last, wrong for a screen where a live menu can sit above rows
+/// of statusline and input box. Inheriting it here is what let step 3 of the
+/// review's scenario read "no question on screen" with the menu plainly on it.
+fn pointer_rendered(visible: &str) -> bool {
+    visible.lines().any(|l| leads_with_pointer(&l.trim().to_lowercase()))
+}
+
 /// What [`prompt_wait_detected`] matched, not merely *that* it matched (#534,
 /// closing #513(c)/F2).
 ///
@@ -4999,15 +5051,6 @@ pub fn prompt_wait_match(tail: &str) -> Option<QuestionMatch> {
     }
     let recent = &lines[lines.len().saturating_sub(12)..];
 
-    // Strip a line's leading box border / bullet / indent so a menu pointer
-    // inside a bordered dialog (`│ ❯ Yes`) is seen to *lead* its content.
-    fn deframe(l: &str) -> &str {
-        l.trim_start_matches(|c: char| {
-            c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
-                || c.is_whitespace()
-        })
-    }
-
     // The last few non-empty lines — "the last thing the CLI painted". Both
     // prose-like signals (pointer, footer) are read only from here (#40 review):
     // a live menu paints its pointer/footer last, whereas finished-turn prose
@@ -5029,29 +5072,15 @@ pub fn prompt_wait_match(tail: &str) -> Option<QuestionMatch> {
     // Explicit yes/no confirmation tokens. Reported first: the least
     // ambiguous evidence there is, and the most useful line to see in an audit.
     if let Some((token, line)) = token_in(recent, YES_NO_TOKENS) {
-        return Some(QuestionMatch::new("yes-no-token", Some(token), line));
+        return Some(QuestionMatch::token("yes-no-token", token, line));
     }
     // Stock permission / trust / continue phrasings from Claude Code & Copilot.
     if let Some((token, line)) = token_in(recent, PERMISSION_PHRASES) {
-        return Some(QuestionMatch::new("permission-phrase", Some(token), line));
+        return Some(QuestionMatch::token("permission-phrase", token, line));
     }
     // A numbered yes/no menu even without the pointer glyph.
     if let Some((token, line)) = token_in(recent, NUMBERED_MENU_TOKENS) {
-        return Some(QuestionMatch::new("numbered-menu", Some(token), line));
-    }
-    // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
-    // *leads* a line's content (after any box frame) is menu-shaped; the same
-    // glyph mid-line is pervasive in ordinary output — pasted shell prompts
-    // (`demo ❯ npm run dev`), UI breadcrumbs (`Home › Prefs`), diff/log arrows.
-    // Requiring it to lead rules those out; requiring it in the last painted
-    // lines also rules out a *leading* glyph in finished prose above the idle box.
-    if let Some(line) = last_painted.iter().find(|l| {
-        let d = deframe(l.as_str());
-        d.starts_with('❯') || d.starts_with('›') || d.starts_with('→')
-    }) {
-        // No token: this signal is a *position* (glyph leading a line), not a
-        // substring, so `match_still_rendered` has only the line to go on.
-        return Some(QuestionMatch::new("pointer-option", None, line));
+        return Some(QuestionMatch::token("numbered-menu", token, line));
     }
     // Interactive selection-menu footer (AskUserQuestion / Copilot / inquirer).
     // Claude Code's AskUserQuestion highlights the active option with reverse
@@ -5060,8 +5089,29 @@ pub fn prompt_wait_match(tail: &str) -> Option<QuestionMatch> {
     // read only from the last painted lines. NOTE: matched on single lines, so a
     // footer wrapped across rows in a very narrow pane, or a localized / reworded
     // footer, won't match — a known gap (see design doc).
+    //
+    // #534 rev-13: reported BEFORE the pointer, which is a change from round 1.
+    // Real menus routinely paint both, and when they do the reported match
+    // decides which needle the composed-screen re-read gets. The footer's is a
+    // literal token; the pointer's is a position, which is strictly harder to
+    // re-find and was the round-2 blocking finding. So among two signals that
+    // fired on the same dialog, prefer the one whose evidence survives
+    // recomposition. This cannot change the boolean — that is a disjunction —
+    // only which evidence gets recorded and re-read.
     if let Some((token, line)) = token_in(last_painted, MENU_FOOTER_TOKENS) {
-        return Some(QuestionMatch::new("menu-footer", Some(token), line));
+        return Some(QuestionMatch::token("menu-footer", token, line));
+    }
+    // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
+    // *leads* a line's content (after any box frame) is menu-shaped; the same
+    // glyph mid-line is pervasive in ordinary output — pasted shell prompts
+    // (`demo ❯ npm run dev`), UI breadcrumbs (`Home › Prefs`), diff/log arrows.
+    // Requiring it to lead rules those out; requiring it in the last painted
+    // lines also rules out a *leading* glyph in finished prose above the idle box.
+    if let Some(line) = last_painted.iter().find(|l| leads_with_pointer(l.as_str())) {
+        // A POSITION, not a substring — re-read on the grid by
+        // `pointer_rendered`, never by searching for `line` (see the needle's
+        // own doc for what happens when that distinction is left implicit).
+        return Some(QuestionMatch::new("pointer-option", QuestionNeedle::LeadingPointer, line));
     }
     None
 }
@@ -5088,21 +5138,46 @@ const NUMBERED_MENU_TOKENS: &[&str] = &["1. yes", "❯ 1."];
 const MENU_FOOTER_TOKENS: &[&str] =
     &["enter to select", "enter to confirm", "use arrow", "arrow keys", "↑↓", "↑/↓"];
 
+/// How a match can be looked for AGAIN on a composed screen (#534 rev-13).
+///
+/// An enum rather than the `Option<&'static str>` this replaces, because the
+/// round-1 shape encoded "no token" as `None` and left what to do about it to
+/// a comment — and the comment was wrong. A signal whose evidence is a
+/// position has to be re-read positionally; falling back to the matched *line*
+/// made the check a silent no-op (see [`pointer_rendered`]). Spelling the two
+/// kinds out means [`match_still_rendered`] must handle each explicitly, and a
+/// sixth signal class added later cannot inherit the hole by defaulting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestionNeedle {
+    /// A literal substring. Short and repaint-stable, so it survives both
+    /// re-wrapping at a different width and a partial redraw.
+    Token(&'static str),
+    /// A pointer glyph LEADING a line — a position, not a substring. Re-read
+    /// with [`pointer_rendered`], never by string search.
+    LeadingPointer,
+}
+
 /// One question-shaped thing [`prompt_wait_match`] found, and where.
 ///
 /// `line` is the detector's OWN normalization of the screen line (trimmed,
 /// lowercased) rather than the raw bytes — that is the form the detector
-/// reasons in, so it is the form both the audit and the grid comparison should
-/// see. Bounded at [`QuestionMatch::MAX_LINE`] characters: an audit field must
-/// not become a channel for an arbitrarily long line a pane happened to paint.
+/// reasons in, so it is the form the audit should see. Bounded at
+/// [`QuestionMatch::MAX_LINE`] characters: an audit field must not become a
+/// channel for an arbitrarily long line a pane happened to paint.
+///
+/// **`line` is diagnostic, not evidence.** It comes from `strip_ansi` of the
+/// byte ring, which deletes cursor addressing, so a redraw-fragmented row can
+/// arrive here as a concatenation that was never on screen. It is exactly what
+/// an incident reviewer wants to read and exactly what a screen search must
+/// not depend on — that dependency is the round-2 blocking finding. Use
+/// `needle` for anything that decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestionMatch {
     /// Stable kebab-case name of the signal class that fired. This is audit
     /// vocabulary — renaming one silently breaks reading old logs against new.
     pub signal: &'static str,
-    /// The literal substring that fired, when the signal is a token match.
-    /// `None` for `pointer-option`, which is a position rather than a token.
-    pub token: Option<&'static str>,
+    /// What to look for when asking whether this is still on screen.
+    pub needle: QuestionNeedle,
     /// The normalized line the signal was found on, truncated.
     pub line: String,
 }
@@ -5113,8 +5188,12 @@ impl QuestionMatch {
     /// pane spraying a single enormous line cannot bloat the audit.
     pub const MAX_LINE: usize = 200;
 
-    fn new(signal: &'static str, token: Option<&'static str>, line: &str) -> Self {
-        QuestionMatch { signal, token, line: line.chars().take(Self::MAX_LINE).collect() }
+    fn new(signal: &'static str, needle: QuestionNeedle, line: &str) -> Self {
+        QuestionMatch { signal, needle, line: line.chars().take(Self::MAX_LINE).collect() }
+    }
+
+    fn token(signal: &'static str, token: &'static str, line: &str) -> Self {
+        Self::new(signal, QuestionNeedle::Token(token), line)
     }
 }
 
@@ -5142,18 +5221,31 @@ fn flatten_rendered(visible: &str) -> String {
 /// unrelated screen content — a `❯ npm run dev` in prose the CLI has not
 /// scrolled away yet — from either causing or preventing a release.
 ///
-/// Both the token and the whole line are checked, and either is enough:
-/// the token is short and survives re-wrapping, the line is specific and
-/// survives a CLI that repainted its dialog with different chrome. `None` +
-/// nothing found is a genuine negative; there is no third answer here, because
-/// "the composition could not be trusted" is decided before this is called
-/// (see [`question_shown`]).
+/// The needle is re-read in its OWN terms, and that is the round-2 fix: a
+/// `Token` by substring, a `LeadingPointer` by position. Round 1 had only a
+/// substring path and fell back to searching for `m.line`, which comes from
+/// `strip_ansi` of the byte ring — cursor addressing deleted, so a
+/// redraw-fragmented row arrives as a concatenation that was never on screen
+/// and can never be found on a clean grid. For `pointer-option`, the only
+/// signal with no token, that made this whole check a silent no-op in the
+/// false-RELEASE direction. See [`pointer_rendered`].
+///
+/// The line search is kept as an ADDITIONAL disjunct for both kinds, never the
+/// only one: when the line is clean it is the most specific evidence available,
+/// and when it is a repaint artifact it simply fails to match — it can add a
+/// hold, never remove one.
+///
+/// A negative here is a genuine "not on this screen"; there is no third answer,
+/// because "the composition could not be trusted" is decided before this is
+/// called (see [`question_shown`]).
 pub fn match_still_rendered(visible: &str, m: &QuestionMatch) -> bool {
     let flat = flatten_rendered(visible);
-    if let Some(token) = m.token {
-        if flat.contains(token) {
-            return true;
-        }
+    let by_needle = match m.needle {
+        QuestionNeedle::Token(t) => flat.contains(t),
+        QuestionNeedle::LeadingPointer => pointer_rendered(visible),
+    };
+    if by_needle {
+        return true;
     }
     let line = flatten_rendered(&m.line);
     !line.is_empty() && flat.contains(&line)

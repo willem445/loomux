@@ -44,7 +44,7 @@ use loomux_lib::orchestration::{
     // #534 / #513(c): composed-grid question evidence.
     prompt_wait_match, question_hold_predicate_sampled, question_shown, grid_evidence_for,
     match_still_rendered, trustworthy_composition, witness_audit,
-    GridEvidence, QuestionMatch, QuestionSample, QuestionWitness, QuestionWitnessed,
+    GridEvidence, QuestionMatch, QuestionNeedle, QuestionSample, QuestionWitness, QuestionWitnessed,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     agent_acted_since, reinject_disposition, ReinjectDisposition,
@@ -25494,20 +25494,40 @@ fn b2_prompt_wait_match_names_the_signal_and_the_line_it_fired_on() {
     // These are the fields that end that.
     let m = prompt_wait_match("building...\nOverwrite the file? (y/n)").expect("y/n must match");
     assert_eq!(m.signal, "yes-no-token");
-    assert_eq!(m.token, Some("(y/n)"));
+    assert_eq!(m.needle, QuestionNeedle::Token("(y/n)"));
     assert_eq!(m.line, "overwrite the file? (y/n)", "the detector's own normalization, not raw bytes");
 
     let m = prompt_wait_match("Do you trust the files in this folder?").expect("permission must match");
     assert_eq!(m.signal, "permission-phrase");
-    assert_eq!(m.token, Some("do you trust"));
+    assert_eq!(m.needle, QuestionNeedle::Token("do you trust"));
 
     let m = prompt_wait_match("pick one\n  option a\n> option b\n❯ option c").expect("pointer must match");
     assert_eq!(m.signal, "pointer-option");
-    assert_eq!(m.token, None, "a leading glyph is a position, not a substring");
+    assert_eq!(
+        m.needle,
+        QuestionNeedle::LeadingPointer,
+        "a leading glyph is a POSITION — re-read positionally, never by string search"
+    );
     assert_eq!(m.line, "❯ option c");
 
     let m = prompt_wait_match("choose\n  a\n  b\nuse arrow keys to move").expect("footer must match");
     assert_eq!(m.signal, "menu-footer");
+}
+
+#[test]
+fn b5_a_dialog_painting_both_footer_and_pointer_reports_the_token_bearing_one() {
+    // #534 rev-13. Real menus routinely paint both, and the reported match
+    // decides which needle the composed-screen re-read gets: the footer's is a
+    // literal token, the pointer's is a position that is strictly harder to
+    // re-find (and was round 2's blocking finding). Among two signals that
+    // fired on the same dialog, prefer the evidence that survives
+    // recomposition.
+    let both = "which option?\n  Yes\n❯ No\n↑↓ to select, enter to confirm";
+    let m = prompt_wait_match(both).expect("both signals are present");
+    assert_eq!(m.signal, "menu-footer", "the token-bearing signal is reported");
+    assert!(matches!(m.needle, QuestionNeedle::Token(_)));
+    // And the boolean is untouched by the ordering — it is a disjunction.
+    assert!(prompt_wait_detected(both));
 }
 
 #[test]
@@ -25617,6 +25637,131 @@ fn c6_a_matched_line_re_wrapped_across_rows_still_counts_as_rendered() {
     );
 }
 
+// ---- C8-C11: the `pointer-option` class (#534 rev-13, round-2 blocking) ----
+//
+// This signal is the only one whose evidence is a POSITION rather than a
+// substring. Round 1 gave it no needle and let `match_still_rendered` fall back
+// to searching for the matched line — which comes from `strip_ansi` of the byte
+// ring, cursor addressing deleted, so a redraw-fragmented row arrives as a
+// concatenation that was never on screen and can never be found on a clean
+// grid. The compensating check silently became a no-op, in the false-RELEASE
+// direction, for exactly the layout it was added to compensate for.
+
+/// The review's scenario, built as bytes rather than asserted about: a CLI
+/// repaints one physical row by cursor address, so `strip_ansi` concatenates
+/// the frames into a line that never existed on any screen.
+fn redraw_fragmented_pointer_tail() -> String {
+    // Two paints of the same row, cursor-addressed between them — exactly what
+    // `termgrid`'s own header documents for Claude Code.
+    let raw = b"\x1b[5;1H\xe2\x9d\xaf Yes, allow once\x1b[5;1H\xe2\x9d\xaf Yes, allow once".to_vec();
+    strip_ansi(&raw)
+}
+
+#[test]
+fn c8_a_redraw_fragmented_pointer_line_is_a_needle_that_can_never_be_found() {
+    // The precondition the whole finding rests on. If this ever stops being
+    // true the tests below would pass for the wrong reason, so pin it.
+    let tail = redraw_fragmented_pointer_tail();
+    let m = prompt_wait_match(&tail).expect("a leading pointer still matches on the ring");
+    assert_eq!(m.signal, "pointer-option");
+    assert!(
+        m.line.matches("yes, allow once").count() > 1,
+        "the recorded line is a multi-frame concatenation, not a screen row: {:?}",
+        m.line
+    );
+    // A clean grid showing that menu does NOT contain the concatenation.
+    let clean_screen = "❯ yes, allow once\n  no, and tell me why";
+    assert!(
+        !flat_contains_line(clean_screen, &m.line),
+        "this is why a line search cannot be the only reading for this class"
+    );
+}
+
+/// Does the composed screen contain the match's recorded line, whitespace
+/// flattened — i.e. the round-1 check, isolated so C8 can show it failing on a
+/// screen that plainly shows the menu.
+fn flat_contains_line(visible: &str, line: &str) -> bool {
+    let flat = visible.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
+    flat.contains(&line.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+}
+
+#[test]
+fn c9_a_live_pointer_menu_above_the_chrome_holds_though_every_other_reading_says_clear() {
+    // The false-release path, end to end, at the decision that would have
+    // pressed Enter into a live menu.
+    //
+    // Every ingredient is the defining case for this signal class: a bare
+    // pointer menu matches none of the token rules (that is the only way
+    // `pointer-option` is reached at all), and it sits ABOVE the input box and
+    // status chrome, so the detector's own last-3-lines pointer window cannot
+    // see it either.
+    let m = prompt_wait_match(&redraw_fragmented_pointer_tail()).expect("matches on the ring");
+    let screen = "❯ yes, allow once\n  no, and tell me why\n\nesc to cancel\n\n> \nready";
+
+    // The two readings that were relied on in round 1, both genuinely clear:
+    assert!(
+        !prompt_wait_detected(screen),
+        "precondition: the menu is more than 3 non-empty rows from the bottom, \
+         so the detector's CHRONOLOGICAL window cannot see it on a SPATIAL layout"
+    );
+    assert!(
+        !flat_contains_line(screen, &m.line),
+        "precondition: the concatenated needle is not on the clean screen"
+    );
+
+    // ...and yet the menu is plainly displayed, so this must hold.
+    assert!(
+        match_still_rendered(screen, &m),
+        "the pointer is re-read positionally across ALL rendered rows"
+    );
+    assert_eq!(grid_evidence_for(&m, Some(screen)), GridEvidence::StillRendered);
+    assert!(
+        question_shown(Some(&m), Some(screen)),
+        "a live menu must never release — this is the #420 harm the whole change is fenced against"
+    );
+}
+
+#[test]
+fn c10_a_pointer_menu_genuinely_gone_still_releases() {
+    // The other half: the fix must not degrade this class into "never
+    // releases". With no pointer anywhere on the composed screen, the evidence
+    // is as good as any token class's.
+    let m = prompt_wait_match(&redraw_fragmented_pointer_tail()).expect("matches on the ring");
+    let answered = "npm test running\nall good\n\n> \nready";
+    assert!(!match_still_rendered(answered, &m));
+    assert_eq!(grid_evidence_for(&m, Some(answered)), GridEvidence::NotRendered);
+    assert!(!question_shown(Some(&m), Some(answered)), "answered and gone -> release");
+}
+
+#[test]
+fn c11_the_pointer_re_read_is_spatial_not_chronological() {
+    // The root mismatch, isolated. `prompt_wait_match` reads its pointer from
+    // the last 3 non-empty lines because a stream's "recent" means "last"; a
+    // screen's does not. Inheriting that window on the grid is what made the
+    // menu in C9 invisible, so the re-read must scan every rendered row —
+    // including one at the very top, under box framing.
+    let m = prompt_wait_match(&redraw_fragmented_pointer_tail()).expect("matches on the ring");
+    let mut screen = String::from("│ ❯ yes, allow once\n");
+    for i in 0..20 {
+        screen.push_str(&format!("status row {i}\n"));
+    }
+    assert!(!prompt_wait_detected(&screen), "precondition: outside the detector's own window");
+    assert!(
+        match_still_rendered(&screen, &m),
+        "a deframed leading glyph anywhere on the screen is the menu, wherever it sits"
+    );
+
+    // Mid-line glyphs are NOT the signal — that is the false-positive rule the
+    // ring detector already encodes, and the re-read must not be looser than
+    // the detector it is standing in for, or ordinary prose would pin a hold
+    // open forever.
+    let prose = "run it with demo ❯ npm run dev\nsee Home › Prefs\n> \nready";
+    assert!(
+        !match_still_rendered(prose, &m),
+        "a glyph mid-line is pervasive in ordinary output and is not a menu"
+    );
+}
+
 #[test]
 fn c7_a_blank_composition_is_unreadable_not_clear() {
     // A replay that began mid-stream and was never painted over composes to
@@ -25709,6 +25854,50 @@ fn d4_tui_redraw_churn_around_a_live_dialog_never_false_clears() {
     for i in 0..6 {
         assert!(pred(), "frame {i}: repaint churn is not an answer — the dialog is still there");
     }
+}
+
+#[test]
+fn d4b_a_poll_landing_mid_repaint_is_survived_by_the_hysteresis_not_by_the_grid() {
+    // #534 rev-13, review N1. `d4` only covers "the bytes change, the answer
+    // does not" — every frame there repaints the dialog. It does NOT cover a
+    // poll landing INSIDE a repaint: after the erase, before the dialog row is
+    // painted. That composition genuinely reads clear, and pretending
+    // otherwise would be the unbacked claim the lessons file calls a defect.
+    //
+    // What actually defends it is stated honestly here rather than in prose:
+    // (a) a fully-erased screen composes to nothing and is `Unreadable`, not
+    // clear; (b) a partly-painted one does read clear, so it takes TWO
+    // consecutive such polls to release, which is the hysteresis doing the
+    // work — not the grid.
+    let dialog = "Do you want to run npm test? (y/n)";
+    let mut full = b"\x1b[H\x1b[2J".to_vec();
+    full.extend_from_slice(&painted(&[dialog, "  Yes", "  No", "working"]));
+    // Erased, chrome painted, dialog row not yet.
+    let mut mid = b"\x1b[H\x1b[2J".to_vec();
+    mid.extend_from_slice(&painted(&["  Yes", "  No"]));
+    // Erased and nothing painted at all.
+    let erased = b"\x1b[H\x1b[2J".to_vec();
+
+    assert_eq!(
+        trustworthy_composition(loomux_lib::orchestration::termgrid::render_visible(&erased, 80, 10)),
+        None,
+        "(a) a fully-erased screen is Unreadable, so it can never be read as 'the dialog is gone'"
+    );
+
+    // (b) one mid-repaint poll between two good frames must not release.
+    let seq = [full.clone(), mid, full];
+    let call = std::sync::atomic::AtomicU32::new(0);
+    let pred = question_hold_predicate_sampled(
+        move || {
+            let n = call.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+            sample_from_raw(&seq[n.min(seq.len() - 1)], 80, 10)
+        },
+        None,
+        None,
+    );
+    assert!(pred(), "poll 1: dialog painted -> hold");
+    assert!(pred(), "poll 2: mid-repaint reads clear, but one clear read is not enough");
+    assert!(pred(), "poll 3: repaint completed -> the clear streak is broken, still holding");
 }
 
 #[test]
