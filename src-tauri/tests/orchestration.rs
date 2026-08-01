@@ -64,7 +64,8 @@ use loomux_lib::orchestration::{
     redelivery_treatment, RedeliveryTreatment, stranded_reword,
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
     box_reading, tier1_scan_bytes, BoxReading,
-    HUMAN_INPUT_BLOCK_BOUND_MS, UNCONFIRMED_ACK_SETTLE_MS, record_stranded_outcome_at_for_test,
+    HUMAN_INPUT_BLOCK_BOUND_MS, UNCONFIRMED_ACK_SETTLE_MS, UNCONFIRMED_NOTICE_IDS_MAX,
+    record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
@@ -20467,6 +20468,161 @@ fn the_coalesced_notice_reads_as_one_ask_and_names_every_delivery() {
     assert!(many.contains("(ids 11, 22, 33)"), "every constituent named: {many}");
     assert!(many.contains("ONCE"), "one probe answers all of them: {many}");
     assert!(!many.contains("1 delivery to"), "no singular wording on a coalesced line: {many}");
+
+    // rev-13 N3: this notice is itself a paste into a pane, so the id list is
+    // bounded and the remainder points at the audit log — which keeps every
+    // id. Same argument, and the same number, as `PAUSE_SUPPRESSION_LIST_MAX`.
+    let ids: Vec<u64> = (1..=(UNCONFIRMED_NOTICE_IDS_MAX as u64 + 3)).collect();
+    let capped = unconfirmed_delivery_notice("w-3", &ids);
+    assert!(capped.contains(&format!("{} deliveries", ids.len())), "the COUNT is never truncated: {capped}");
+    assert!(capped.contains("and 3 more — see the audit log"), "the remainder is named, not dropped: {capped}");
+    assert!(
+        !capped.contains(&format!(", {}", ids.len())),
+        "the last id is past the cap and must not be listed: {capped}"
+    );
+}
+
+#[test]
+fn the_notice_audit_records_whether_it_actually_reached_anyone() {
+    // rev-13 N4. `deliver_to_orchestrator` is best-effort and its "no live
+    // orchestrator" branch audits nothing of its own, so auditing before the
+    // attempt and discarding the result asserts a notice that never went
+    // anywhere — and coalescing makes that single false record stand for every
+    // id in the batch at once. Same shape as #569's `pause-suppression-notice`.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    // Orchestrator not bound to a pane yet: the notice cannot land.
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, 6_001);
+    reg.flush_unconfirmed_notices(&g.id, &w.id);
+    let undelivered = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-unconfirmed-notice")
+        .expect("the attempt is recorded either way");
+    assert_eq!(undelivered.detail["delivered"], false, "it did not land, and the record must say so");
+    assert!(
+        undelivered.detail["error"].as_str().is_some_and(|e| e.contains("terminal")),
+        "and why: {:?}",
+        undelivered.detail["error"]
+    );
+
+    // Bound: the same call now genuinely lands.
+    reg.set_pty_for_test(&orch.id, 944);
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, 6_002);
+    reg.flush_unconfirmed_notices(&g.id, &w.id);
+    let delivered = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-unconfirmed-notice")
+        .next_back()
+        .expect("second notice");
+    assert_eq!(delivered.detail["delivered"], true);
+    assert!(delivered.detail["error"].is_null(), "nothing to report: {:?}", delivered.detail["error"]);
+}
+
+#[test]
+fn a_delivery_corrected_inside_the_window_is_never_announced_as_unconfirmed() {
+    // rev-13 finding A — a false alarm the coalescing delay CREATED, in the
+    // change whose whole purpose is removing false alarms.
+    //
+    // `late_monitor_tick` checks `hook_match` before `already_failed`, so a
+    // late prompt-landed record arriving after a failure was declared is a
+    // first-class outcome (`Confirm { correction: true }` is named for it),
+    // and the monitor polls every 5s — two or three of those ticks land inside
+    // a 15s window. Pre-#539 the alarm was already out before any correction
+    // could exist, so the orchestrator could only ever read them in that
+    // order. Buffered, the correction overtakes the alarm and it reads them
+    // backwards: "it landed" at t+5s, then "unconfirmed … id N …" at t+15s —
+    // a `get_output` probe plus the tempting re-send #451/#510 exist to stop.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 942);
+
+    // t+0: two deliveries on the same pane both declare failure.
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, 9_001);
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, 9_002);
+    // t+5s: a late hook record proves 9_001 landed after all.
+    assert!(
+        reg.retract_unconfirmed_delivery(&g.id, &w.id, 9_001),
+        "an id still in the bucket must be withdrawable — the window has not closed"
+    );
+    // t+15s: the window closes.
+    reg.flush_unconfirmed_notices(&g.id, &w.id);
+
+    let notices = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-unconfirmed-notice")
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1, "the surviving alarm still goes out");
+    assert_eq!(
+        notices[0].detail["delivery_ids"],
+        json!([9_002]),
+        "the corrected delivery must not be named — it demonstrably landed"
+    );
+    let delivered = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "prompt")
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .find(|t| t.contains("unconfirmed"))
+        .expect("the surviving alarm is delivered");
+    assert!(!delivered.contains("9001"), "the corrected id must not reach the pane: {delivered}");
+    assert!(delivered.contains("9002"), "the real one must: {delivered}");
+
+    // The withdrawal is discoverable after the fact (#445), naming what is left.
+    let retracted = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-unconfirmed-retracted")
+        .expect("a withdrawn alarm leaves a trace");
+    assert_eq!(retracted.detail["delivery_id"], 9_001);
+    assert_eq!(retracted.detail["remaining"], 1);
+}
+
+#[test]
+fn a_bucket_emptied_by_retraction_announces_nothing_at_all() {
+    // The other half rev-13 named: when the correction takes the LAST id, the
+    // already-armed timer still fires. It must find nothing and say nothing —
+    // an empty coalesced notice would be an alarm about no delivery.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 943);
+
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, 9_100);
+    assert!(reg.retract_unconfirmed_delivery(&g.id, &w.id, 9_100));
+    reg.flush_unconfirmed_notices(&g.id, &w.id);
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-unconfirmed-notice"),
+        "the only alarm was withdrawn — the window must close in silence"
+    );
+
+    // Withdrawing something that was never buffered — or was already flushed —
+    // is a no-op, NOT a claim. That `false` is what tells the caller the
+    // orchestrator has already read the alarm and is owed a correction.
+    assert!(!reg.retract_unconfirmed_delivery(&g.id, &w.id, 9_100), "already gone");
+    assert!(!reg.retract_unconfirmed_delivery(&g.id, &w.id, 4_242), "never buffered");
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, 9_200);
+    reg.flush_unconfirmed_notices(&g.id, &w.id);
+    assert!(
+        !reg.retract_unconfirmed_delivery(&g.id, &w.id, 9_200),
+        "an id whose notice HAS gone out cannot be withdrawn — that alarm is already read, \
+         and a correction is what it is owed"
+    );
+
+    // And a fresh alarm after all that still opens a window of its own, so a
+    // retraction cannot wedge the pane into permanent silence.
+    assert!(
+        reg.buffer_unconfirmed_delivery(&g.id, &w.id, 9_300),
+        "a later alarm opens a new bucket and arms its own timer"
+    );
 }
 
 #[test]

@@ -1857,6 +1857,14 @@ const LATE_MONITOR_POLL: Duration = Duration::from_secs(5);
 /// deadline. Coalescing is a pure win against the cost it targets, which is
 /// orchestrator turns, not milliseconds.
 const UNCONFIRMED_NOTICE_COALESCE_WINDOW: Duration = Duration::from_secs(15);
+/// #539 (rev-13 N3): how many delivery ids the coalesced notice names before
+/// it summarizes the rest. Deliberately the SAME number as
+/// `PAUSE_SUPPRESSION_LIST_MAX`, whose doc makes the argument this borrows: a
+/// notice is itself a delivery pasted into a pane, so a list it cannot bound
+/// is a paste it cannot bound. The audit log holds every id either way
+/// (`delivery-unconfirmed-notice` records the full `delivery_ids` array), so
+/// nothing is lost by capping the pasted copy.
+pub const UNCONFIRMED_NOTICE_IDS_MAX: usize = PAUSE_SUPPRESSION_LIST_MAX;
 /// How long the pane's own output must stay quiet — checked ONLY once the
 /// normal confirm/retry window has already closed without a decision —
 /// before "no evidence yet" is treated as "genuinely done and still no
@@ -10796,9 +10804,27 @@ fn run_late_confirmation_monitor(
                 );
                 append_audit(&root, &group, "loomux", "delivery-confirmed-late", json!({
                     "to": agent, "confirm_source": "hook", "confirm_merged": merged, "was_failed": correction,
+                    // #539: the id the coalescing bucket knows this delivery
+                    // by, so the retraction below is checkable from the record.
+                    "delivery_id": submit_sent_ms,
                 }));
                 if let Some(r) = &reg {
-                    if correction {
+                    // #539 (rev-13 finding A): withdraw this delivery from the
+                    // coalescing bucket BEFORE anything else. Its alarm may
+                    // still be waiting out a 15s window that this very tick
+                    // has just proven wrong, and a notice naming an id we
+                    // already know landed is precisely the false alarm this
+                    // change exists to remove. Unconditional, and ordered
+                    // ahead of the correction notice: if the alarm is still
+                    // buffered there is nothing to correct, because it never
+                    // went out. See `retract_unconfirmed_delivery`.
+                    let withdrawn = r.retract_unconfirmed_delivery(&group, &agent, submit_sent_ms);
+                    // The correction notice is for an alarm the orchestrator
+                    // has ALREADY read. A withdrawn one never reached it, so
+                    // sending "stand down, the earlier alarm was wrong" would
+                    // refer to a message that does not exist — one more turn
+                    // spent, about nothing.
+                    if correction && !withdrawn {
                         r.notify_delivery_confirmed_late(&group, &agent, target_is_orchestrator);
                     }
                     // #496 PR-C: the prompt landed after all — whatever
@@ -14181,11 +14207,23 @@ pub fn should_notify_unconfirmed(target_is_orchestrator: bool, confirmed: bool) 
 /// several deliveries in play the recovery is ONE `get_output`, not one per
 /// id, which is the whole point of coalescing.
 ///
+/// **The id list is capped** (rev-13 N3) at `UNCONFIRMED_NOTICE_IDS_MAX`, with
+/// the remainder pointed at the audit log — which holds every id, since
+/// `delivery-unconfirmed-notice` records the whole `delivery_ids` array. This
+/// notice is itself a delivery pasted into a pane, and an uncapped list is the
+/// shape `PAUSE_SUPPRESSION_LIST_MAX` and `dropped_payload_preview` were both
+/// written for. Realistic batches are far below the cap; the cap exists so the
+/// worst case is bounded rather than because the common case needs it.
+///
 /// An empty slice cannot reach here (`flush_unconfirmed_notices` returns
 /// early on an empty bucket); it degrades to the plural wording with no ids
 /// rather than panicking.
 pub fn unconfirmed_delivery_notice(agent_id: &str, delivery_ids: &[u64]) -> String {
-    let ids = delivery_ids.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+    let shown = delivery_ids.len().min(UNCONFIRMED_NOTICE_IDS_MAX);
+    let mut ids = delivery_ids[..shown].iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+    if delivery_ids.len() > shown {
+        ids.push_str(&format!(", and {} more — see the audit log", delivery_ids.len() - shown));
+    }
     if delivery_ids.len() == 1 {
         format!(
             "[loomux] delivery to {agent_id} unconfirmed (id {ids}) — the prompt may be sitting \
@@ -27564,6 +27602,76 @@ impl OrchRegistry {
         opened
     }
 
+    /// Withdraw ONE delivery's buffered alarm before the window closes (#539,
+    /// rev-13 finding A) — the delivery turned out to have landed after all.
+    ///
+    /// **The defect this closes is one the coalescing delay itself created.**
+    /// `late_monitor_tick` checks `hook_match` before `already_failed`, so a
+    /// late `promptsubmit` record arriving AFTER a failure was declared is a
+    /// first-class outcome (`Confirm { correction: true }` exists for exactly
+    /// it) — and the monitor keeps polling every `LATE_MONITOR_POLL` (5s), so
+    /// two or three of those ticks land inside a 15s window. Pre-#539 the
+    /// alarm had already gone out before any correction could exist, so the
+    /// orchestrator could only ever see "unconfirmed" then "correction, it
+    /// landed". With a buffer in between, the correction can overtake the
+    /// alarm and the orchestrator gets them backwards: "it landed" at t+5s,
+    /// then "unconfirmed … id N …" at t+15s — a `get_output` probe plus the
+    /// tempting re-send that #451/#510 exist to prevent. A change whose whole
+    /// purpose is removing false unconfirmed notices must not manufacture one.
+    ///
+    /// **Retract, rather than re-derive at flush.** The flush has nothing to
+    /// re-derive FROM: `last_delivery` holds the most recent `DeliveryOutcome`
+    /// per pty, not one per delivery id, so for a multi-id batch no ledger can
+    /// answer "is id N specifically still unconfirmed". The path that learns
+    /// the delivery resolved is the one that knows which id resolved, so the
+    /// withdrawal belongs there.
+    ///
+    /// Called unconditionally on `MonitorAction::Confirm`, not only when
+    /// `correction` is set: an id that was never buffered is simply absent and
+    /// this is a no-op, which is a cheaper thing to be sure of than the exact
+    /// equivalence between "an alarm fired" and "`already_failed` is true".
+    ///
+    /// If this empties the bucket the key is dropped, and an already-armed
+    /// timer will fire into nothing (harmless — `flush_unconfirmed_notices`
+    /// returns early on an empty bucket). A LATER alarm for the same pane then
+    /// opens a fresh bucket and arms its own timer, so the worst case is a
+    /// notice delivered sooner than a full window — less coalescing, never a
+    /// lost or a spurious notice.
+    ///
+    /// **The invariant this rests on:** a flush REMOVES the whole bucket, so
+    /// an id still in it has provably not been announced yet. "Withdrawn" and
+    /// "the orchestrator never heard about it" are therefore the same fact —
+    /// which is what lets the caller skip the correction notice for a
+    /// withdrawn id (a correction refers to an alarm the reader has already
+    /// seen; for one that never went out it would be a turn spent describing
+    /// a message that does not exist).
+    ///
+    /// Returns whether anything was actually withdrawn, so the audit can say
+    /// so and a test can assert it.
+    #[doc(hidden)] // pub for integration tests
+    pub fn retract_unconfirmed_delivery(&self, group: &str, agent_id: &str, delivery_id: u64) -> bool {
+        let (withdrawn, remaining) = {
+            let mut pending = self.unconfirmed_pending.lock_safe();
+            let key = (group.to_string(), agent_id.to_string());
+            let Some(bucket) = pending.get_mut(&key) else { return false };
+            let before = bucket.len();
+            bucket.retain(|id| *id != delivery_id);
+            let remaining = bucket.len();
+            if remaining == 0 {
+                pending.remove(&key);
+            }
+            (remaining < before, remaining)
+        };
+        if withdrawn {
+            self.audit(group, "loomux", "delivery-unconfirmed-retracted", json!({
+                "to": agent_id, "delivery_id": delivery_id, "remaining": remaining,
+                "reason": "a prompt-landed signal arrived for this delivery before the \
+                           coalescing window closed — it must not be announced as unconfirmed",
+            }));
+        }
+        withdrawn
+    }
+
     /// Emit the one coalesced unconfirmed-delivery notice for a pane's
     /// buffered alarms (#539) and clear the bucket.
     ///
@@ -27595,10 +27703,18 @@ impl OrchRegistry {
             }));
             return;
         }
+        // rev-13 N4: the record follows the attempt, and says whether it
+        // landed. Auditing first and discarding the result asserts a notice
+        // that a dead/unbound orchestrator never received — and coalescing
+        // makes that one false record stand for every id in the batch at once.
+        // `deliver_to_orchestrator`'s "no live orchestrator" branch audits
+        // nothing of its own, so this is the only place it can be recorded.
+        // Same shape as #569's `pause-suppression-notice`.
+        let outcome = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id, &ids), "loomux");
         self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({
             "to": agent_id, "delivery_ids": ids, "coalesced": ids.len(),
+            "delivered": outcome.is_ok(), "error": outcome.as_ref().err(),
         }));
-        let _ = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id, &ids), "loomux");
     }
 
     /// #112 round 2 — additive to the #445 seam (a NEW notice path;

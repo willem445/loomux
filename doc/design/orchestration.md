@@ -6764,8 +6764,74 @@ from.
 The per-delivery gates (`should_notify_unconfirmed`, i.e. confirmed / orchestrator-target) stay at
 alarm time because they are per-delivery facts. The **paused** gate is re-verified at flush time
 per #532 — a window is 15s of wall clock in which a human can pause the group — and its
-suppression audit names every id it swallowed (#445). Nothing touches `persist_queues`: this adds
-no queue mutation, so #523's mutation-site table is unchanged.
+suppression audit names every id it swallowed (#445). The id list pasted into the pane is capped at
+`UNCONFIRMED_NOTICE_IDS_MAX` (the same number, for the same reason, as
+`PAUSE_SUPPRESSION_LIST_MAX`: a notice is itself a paste), with the remainder pointed at the audit
+log, which keeps every id. The `delivery-unconfirmed-notice` record follows the delivery attempt
+and carries `delivered` + `error`, because `deliver_to_orchestrator` is best-effort and its "no
+live orchestrator" branch audits nothing of its own — auditing first would assert a notice that
+never went anywhere, and coalescing would make that one false record stand for the whole batch.
+Nothing touches `persist_queues`: this adds no queue mutation, so #523's mutation-site table is
+unchanged.
+
+#### The window must be able to give an alarm back (rev-13 finding A)
+
+A delay creates an ordering that did not exist before it, and this one creates a bad one.
+`late_monitor_tick` checks `hook_match` *before* `already_failed`, so a late `promptsubmit` record
+arriving after a failure was declared is a first-class outcome — `Confirm { correction: true }`
+exists for exactly it — and the monitor keeps polling every `LATE_MONITOR_POLL`, so two or three
+of those ticks land inside a 15s window. Pre-#539 the alarm was already out before any correction
+could exist, so the orchestrator could only ever read "unconfirmed", then "correction, it landed".
+Buffered, the correction overtakes the alarm and it reads them backwards: *it landed* at t+5s,
+then *unconfirmed … id N …* at t+15s. That is a `get_output` probe plus the tempting re-send
+#451/#510 exist to prevent — a **new** false alarm, manufactured by the mechanism whose whole
+purpose is removing false alarms.
+
+So `MonitorAction::Confirm` **retracts** the id from the bucket
+(`retract_unconfirmed_delivery`). Retraction rather than a re-read at flush time, because the
+flush has nothing to re-read *from*: `last_delivery` holds the most recent `DeliveryOutcome` per
+pty, not one per delivery id, so for a multi-id batch no ledger can answer "is id *N* specifically
+still unconfirmed". The path that learns a delivery resolved is the one that knows which id
+resolved.
+
+Two consequences worth stating rather than leaving to be discovered:
+
+- **A flush removes the whole bucket**, so an id still in it has provably not been announced. That
+  makes "withdrawn" and "the orchestrator never heard about it" the same fact — which is why a
+  withdrawn id also suppresses the **correction notice**. A correction refers to an alarm the
+  reader has already seen; for one that never went out it would be a turn spent describing a
+  message that does not exist. An id whose notice *has* gone out cannot be withdrawn, so it still
+  gets its correction exactly as before.
+- **Emptying the bucket drops the key**, and the already-armed timer then fires into nothing
+  (harmless — the flush returns early on an empty bucket). A later alarm opens a fresh bucket and
+  arms its own timer, so the worst case is a notice delivered *sooner* than a full window: less
+  coalescing, never a lost or a spurious notice, and never permanent silence.
+
+#### Two residuals, dispositioned rather than left implicit
+
+**A restart inside the window drops the buffered alarms (rev-13 N1) — accepted.**
+`unconfirmed_pending` is in-memory and the timer is a detached thread, so both die with the
+process. The tempting fix — a startup sweep re-noticing every `delivery-failed-idle` with no
+matching notice — would be *wrong*, not merely expensive: the notice's actionable ask is
+"`get_output` it and re-send if needed", and a restart destroys the pty, so there is no pane left
+to read and nothing left to be stranded in. That is the same argument #522's own section already
+makes for the disposition ("it holds nothing across a restart… there is no delivery left to
+judge") and the same reason `StrandedSubmit` markers are deliberately never replayed. What the
+lost buffer owes is a *record*, and that already exists: `delivery-unconfirmed-buffered` is
+written per id at buffer time, carrying `delivery_id` and `window_ms`, so "a notice was owed and
+the process died before it went out" is reconstructible from the log even though the notification
+is not re-sent.
+
+**A pause-suppressed batch is not picked up by #569's resume notice (rev-13 N2) — deliberate.**
+Folding these ids into `suppressed_during_pause` is a one-line change and it would be the wrong
+one twice. #569's notice is scoped to *payloads a sender was told `Ok` about and which then ceased
+to exist*; an unconfirmed alarm is loomux's own observation, not lost work. And that observation
+is exactly the kind a resume must not replay: it was taken when the pane was seen idle with our
+text at the tail, and after an arbitrary pause that reading is stale in precisely the way #532
+forbids acting on. The standing net is the right one — the pane's next delivery re-derives the box
+state and flushes stranded text if any is really there — with the `notice-suppressed` audit line
+naming every swallowed id meanwhile. Re-alarming at resume would need its own decision (re-observe
+the pane, never replay the old reading), which is a follow-up, not a one-liner.
 
 ### #546 option 3: the badge states which evidence closed the phase
 
@@ -6813,7 +6879,14 @@ coalescer exactly as production composes them (the only thing skipped is the sle
 the delivered text, the audit, and flush idempotency;
 `the_coalesced_notice_reads_as_one_ask_and_names_every_delivery` pins the wording both ways;
 `a_group_paused_during_the_window_suppresses_the_flush_and_says_which_ids` pins the #532 re-check
-and the #445 trace. For #546, `a_resolved_re_grounding_surfaces_which_evidence_closed_it` and
+and the #445 trace; `a_delivery_corrected_inside_the_window_is_never_announced_as_unconfirmed`
+pins finding A end to end (a two-id bucket, one corrected mid-window, the flush naming only the
+survivor in both the audit and the delivered text);
+`a_bucket_emptied_by_retraction_announces_nothing_at_all` covers the empty-bucket close, the
+no-op return that keeps a correction owed for an alarm already read, and that a later alarm still
+opens a window (a retraction cannot wedge a pane into silence);
+`the_notice_audit_records_whether_it_actually_reached_anyone` drives both directions of the
+`delivered` flag against a real unbound-then-bound orchestrator. For #546, `a_resolved_re_grounding_surfaces_which_evidence_closed_it` and
 `a_fresh_loss_is_never_hidden_behind_an_older_resolution` pin the derivation, the wiring is
 pinned at the resolve site inside
 `a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers` (a test that stopped at the
