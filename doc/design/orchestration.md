@@ -1508,6 +1508,119 @@ tail and then polled against a narrow one would read the box as cleared on the f
 confirm a delivery nothing observed. The five call sites (precondition, confirm loop, retry loop,
 and the late monitor's two) all size from `pasted_text` for that reason.
 
+#### Measuring the residual, rather than tuning against a guess (#583)
+
+#559 left one thing accepted rather than fixed: **the slack is counted in raw bytes, and spent
+after stripping.** `tier1_scan_bytes` asks for `paste + BOX_TAIL_SCAN_BYTES` *raw* bytes, but
+`box_reading` compares what `strip_ansi` + `normalize_prompt_text` leave behind, and a TUI's
+repaint stream loses a lot of both — escape sequences to the stripper, box padding to the
+whitespace collapse. So the read has to survive a retention rate nothing measured, and near the
+flush cap there is very little of it to spend:
+
+| Paste (normalized) | Read asked for | Breakeven retention — below this, `Unverifiable` |
+|---|---|---|
+| 512 chars | 4,608 B | 11% |
+| 1 KiB | 5,120 B | 20% |
+| 4 KiB | 8,192 B | 50% |
+| 8 KiB | 12,288 B | 67% |
+| 16 KiB | 20,480 B | 80% |
+| 24 KiB (`QUEUE_FLUSH_MAX_BYTES`) | 28,672 B | **85%** |
+| past `TIER1_SCAN_MAX_BYTES` | 28,672 B (ceilinged) | unreachable — see below |
+
+The shape of the table is the concern, not any one row: the tolerance *shrinks* exactly as the
+paste grows, so the deliveries that most need Tier 1 to govern are the ones whose read has least
+room to be wrong. A 1 KiB prompt tolerates an 80% loss; a coalesced flush at the cap tolerates 14%.
+
+**One regime needs no measurement at all.** The read is ceilinged at `TIER1_SCAN_MAX_BYTES`, and a
+single queue entry larger than the flush cap still delivers alone (`plan_flush`'s "the cap is a
+CEILING, never a floor"). Above that ceiling the window is smaller than the needle *before any tail
+is read*, so the delivery is `Unverifiable` at 100% retention — a pane emitting pure text with not
+one escape in it still cannot be verified. No slack tuning reaches that regime; only a different
+ceiling would, which is a different decision from the one this measurement informs. It is pinned by
+`a_paste_past_the_scan_ceiling_is_unverifiable_at_any_density`.
+
+Everything below the ceiling turns on live retention, which is a property of a CLI's repaint stream
+— not derivable, so #583 is instrumented rather than answered here.
+
+**What is recorded.** `Tier1ScanCensus` measures the read the reading was decided from — the same
+read, never a second one — and both records carry it as `tier1_scan_census`:
+
+| Field | Meaning |
+|---|---|
+| `requested_bytes` | what `tier1_scan_bytes` asked the ring for |
+| `tail_bytes` | raw bytes the ring actually returned; `null` = no read at all (pty gone) |
+| `tail_chars` | what those bytes came to after `strip_ansi` + `normalize_prompt_text` |
+| `paste_chars` | the needle's own normalized length (**not** `tier1_paste_bytes`, which is raw) |
+| `margin_chars` | `tail_chars - paste_chars`; **negative is exactly the `Unverifiable` arm** |
+| `retained_pct` | `tail_chars * 100 / tail_bytes` — the measured density the slack must buy through |
+
+Lengths only: the audit never carries pasted text, and nothing here changes that.
+
+Two sites, deliberately:
+
+- **`prompt-typed`**, beside `tier1_decline` — on **every** delivery, `Holds` included. The question
+  is a distribution, and a sample selected on the outcome cannot answer it: the successes are where
+  the remaining headroom shows, and "how close did the ones that worked run" is most of the signal.
+- **`delivery-unconfirmed-box-unverifiable`**, the late monitor's own reading — sampled minutes
+  later against a much fuller ring. A second, differently-timed sample of the same question rather
+  than a duplicate of the first.
+
+`margin_chars` deciding the same cliff `box_reading` does is pinned by
+`the_census_margin_is_the_same_cliff_the_reading_decides` — if the audit's arithmetic could drift
+from the code's, a live distribution would answer a different question convincingly, which is worse
+than not measuring.
+
+**One producer-side interaction, so a live log is not misread (#632/#638).** Every framing row of a
+coalesced flush is now marker-led, which adds the marker's bytes per constituent to the paste
+itself — so `paste_chars` (and with it `requested_bytes`) is a little larger for coalesced
+deliveries than it was before that change. It needs no correction when reading the numbers: each
+record's breakeven is computed from its OWN `paste_chars` and `requested_bytes`, so every row
+carries its own bar rather than being compared against a table constant. Nor does it move anything
+past the ceiling: `FLUSH_ITEM_OVERHEAD`'s per-item charge is unchanged and still bounds the
+composed text at `QUEUE_FLUSH_MAX_BYTES`, so the only pastes above `TIER1_SCAN_MAX_BYTES` remain
+the single oversized entries that were always there.
+
+**How to read the numbers.** Against a live group's `audit.jsonl`:
+
+```sh
+# Outcome by paste size (4 KiB buckets) — the headline distribution.
+jq -r 'select(.action=="prompt-typed") | .detail
+       | [ (.tier1_scan_census.paste_chars/4096|floor), (.tier1_decline // "holds") ] | @tsv' \
+  audit.jsonl | sort | uniq -c
+
+# Retention, counting only reads that FILLED the window (see the confounder below).
+jq -r 'select(.action=="prompt-typed") | .detail.tier1_scan_census
+       | select(.tail_bytes == .requested_bytes)
+       | [.paste_chars, .retained_pct, .margin_chars] | @tsv' audit.jsonl
+```
+
+The confounder to exclude first: `tail_bytes < requested_bytes` means the ring simply had not
+accumulated that much output yet. That is a short *pane*, not a dense one, and `retained_pct` over
+such a read describes the pane's whole history rather than its escape density. Four readings, and
+what each one implies:
+
+1. **Near-cap deliveries mostly `holds`, with `margin_chars` comfortably positive** — the residual is
+   theoretical. Close #583; the constant stays.
+2. **Mostly `unverifiable`, on FULL windows, with `retained_pct` under the breakeven above** — the
+   slack is the problem, and the fix is sized from the measured low-percentile retention: either a
+   proportional slack (ask for `paste / ρ` rather than `paste + K`) or strip before sizing and re-read.
+   Both cost scan bytes per delivery, which is why neither is worth doing on a guess.
+3. **`unverifiable` with `tail_bytes < requested_bytes`** — a short ring, not density. Widening the
+   slack buys nothing; the pane had not spoken yet, and only waiting or re-reading would help.
+4. **`paste_chars` past the ceiling** — the proven regime above. Read it separately or it will
+   contaminate the retention distribution with reads that were foregone before they happened.
+
+Nothing in this section decides anything at runtime — it is instrumentation, on purpose. The right
+slack is a tuning decision this makes answerable; taking it now would be the same "two constants
+chosen for unrelated reasons" move #559 was about, one number further along.
+
+**Boundaries with the work in flight** (#636, #640, both in the audit/notice area at the time of
+writing): this adds one nested field to two existing `json!` records and introduces no new record,
+no new vocabulary, and no change to any existing field. `Tier1ScanCensus::to_json` is the single
+place the shape is built, for the same reason `BoxReading::as_str` sits next to its enum — two
+records of one fact in two vocabularies cannot be aggregated, and this record exists only to be
+aggregated.
+
 #### Tier 2: the hook, no longer bounded by the window
 
 "Stop requiring it in-window" — a late `promptsubmit` match upgrades `Pending` (or corrects an

@@ -11441,6 +11441,107 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
     BoxReading::NotHolding
 }
 
+/// One Tier 1 box read, MEASURED (#583) — the numbers the `BoxReading` beside
+/// it was decided from, so a live group's audit log can say whether the read
+/// is routinely too short rather than only that this one was.
+///
+/// #559 sized the read from the paste and accepted a residual: the slack it
+/// adds (`BOX_TAIL_SCAN_BYTES`) is counted in RAW bytes, while the containment
+/// it protects runs on the tail AFTER `strip_ansi` and `normalize_prompt_text`.
+/// A repaint-heavy TUI tail can therefore strip below the length of the very
+/// paste it is meant to contain, and near-cap deliveries land in
+/// `Unverifiable` — the SAFE direction (stated, notified, never a false
+/// confirm), but delivering none of the verification coverage the derived read
+/// was for. Whether that is the norm or the exception turns on one number
+/// nothing recorded: how many characters survive per raw byte of a live pane's
+/// tail.
+///
+/// So this is instrumentation, and ONLY instrumentation — nothing here decides
+/// anything, deliberately. #583's question is what the distribution is; the
+/// slack is a tuning decision that should follow the measurement rather than a
+/// guess about it. `tier1_decline` already says WHICH reading was reached;
+/// this says how close it ran, in the terms that would size a fix:
+/// `retained_pct` is the density the slack has to buy through, and
+/// `margin_chars` is the headroom this read had over its own needle.
+#[doc(hidden)] // pub for integration tests
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tier1ScanCensus {
+    /// What `tier1_scan_bytes` asked the ring for.
+    pub requested_bytes: usize,
+    /// Raw bytes the ring actually returned — short of `requested_bytes`
+    /// whenever the pane has simply not produced that much output yet, which
+    /// is the confounder any reading of `tail_chars` has to rule out first.
+    /// `None` is no read AT ALL (pty gone), never `Some(0)`: those are
+    /// different facts, and not conflating them is the whole of #559.
+    pub tail_bytes: Option<usize>,
+    /// What those bytes came to after `strip_ansi` + `normalize_prompt_text` —
+    /// the haystack the containment check actually gets.
+    pub tail_chars: Option<usize>,
+    /// The needle's own normalized length. Not the same number as
+    /// `tier1_paste_bytes` (which is raw), and it is this one the arithmetic
+    /// compares against.
+    pub paste_chars: usize,
+}
+
+impl Tier1ScanCensus {
+    /// Measure one read. `read` is `None` when no read happened at all;
+    /// otherwise `(raw bytes returned, the stripped text those bytes made)` —
+    /// ONE option rather than two, so a call site cannot answer "was there a
+    /// read" two ways.
+    pub fn measure(requested_bytes: usize, read: Option<(usize, &str)>, pasted: &str) -> Self {
+        Self {
+            requested_bytes,
+            tail_bytes: read.map(|(raw, _)| raw),
+            // The same normalization `box_reading` compares through, not a
+            // char count of the stripped text: whitespace collapse is a real
+            // part of the shrink (a TUI pads every box row out to the terminal
+            // width), and a census that measured only the ANSI half would
+            // under-report the loss that actually decides the reading.
+            tail_chars: read.map(|(_, stripped)| normalize_prompt_text(stripped).len()),
+            paste_chars: normalize_prompt_text(pasted).len(),
+        }
+    }
+
+    /// Characters of headroom the read had over the text it was looking for.
+    /// **Negative is exactly the `Unverifiable` arm** for every paste
+    /// `deliver_prompt` can actually make (a non-empty one): `box_reading`
+    /// compares the same two normalized lengths, so a histogram of this over a
+    /// live group IS the distribution #583 asks for rather than a proxy for
+    /// it. An empty paste is `NotHolding` for its own reason and never reaches
+    /// that arm, so the equivalence holds there vacuously rather than by
+    /// exception. `None` is the one `Unverifiable` this cannot speak for — no
+    /// read happened, so there is no margin, which is itself the reading.
+    pub fn margin_chars(&self) -> Option<i64> {
+        self.tail_chars.map(|chars| chars as i64 - self.paste_chars as i64)
+    }
+
+    /// Characters surviving per 100 raw bytes read — the ANSI/whitespace
+    /// density #583 exists to measure, since it is what a raw-byte slack has
+    /// to buy through. `None` when nothing was read, and also for a zero-byte
+    /// read, where the ratio is undefined rather than 0%.
+    pub fn retained_pct(&self) -> Option<u32> {
+        let raw = self.tail_bytes.filter(|n| *n > 0)?;
+        let chars = self.tail_chars?;
+        Some(((chars as u64 * 100) / raw as u64) as u32)
+    }
+
+    /// The audit shape, built once here rather than at each `json!` site — the
+    /// same argument `BoxReading::as_str` makes next to its own enum: two
+    /// records of one fact in two vocabularies cannot be aggregated, and this
+    /// record exists only to be aggregated. The derived fields are carried
+    /// rather than left to the reader for the same reason.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "requested_bytes": self.requested_bytes,
+            "tail_bytes": self.tail_bytes,
+            "tail_chars": self.tail_chars,
+            "paste_chars": self.paste_chars,
+            "margin_chars": self.margin_chars(),
+            "retained_pct": self.retained_pct(),
+        })
+    }
+}
+
 /// The `promptsubmit` hook marker path for one agent — a sibling of the
 /// `.precompact.json`/`.sessionstart-compact.json` markers in the same
 /// group's `hooks/` dir (`read_hook_marker_ts`'s doc). JSONL, not a single
@@ -11772,12 +11873,13 @@ fn run_late_confirmation_monitor(
                 // so an oversized coalesced flush is no longer read as an
                 // empty box. `holds_paste` stays as the name for the ONE
                 // question the rest of this arm asks of it.
-                let reading = box_reading(
-                    ptys.output_tail_bounded(pty_id, tier1_scan)
-                        .map(|b| strip_ansi(&b))
-                        .as_deref(),
-                    &pasted_text,
-                );
+                // #583: the raw length is kept beside the stripped text (never
+                // re-read) so the `Unverifiable` record below can say HOW short
+                // the tail came back, not only that it did.
+                let box_read =
+                    ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| (b.len(), strip_ansi(&b)));
+                let reading =
+                    box_reading(box_read.as_ref().map(|(_, t)| t.as_str()), &pasted_text);
                 let holds_paste = reading == BoxReading::Holds;
                 // #559: the decline is stated wherever it is reached, not only
                 // where it changes the outcome — an `Unverifiable` reading on
@@ -11790,6 +11892,17 @@ fn run_late_confirmation_monitor(
                         "reason": "pasted text is larger than the pane tail loomux could read",
                         "paste_bytes": pasted_text.len(),
                         "scan_bytes": tier1_scan,
+                        // #583: the same census `prompt-typed` carries, from
+                        // the same read this reading was decided from. Sampled
+                        // minutes later than the precondition's, against a
+                        // fuller ring — a second, differently-timed sample of
+                        // the same question, not a duplicate of the first.
+                        "tier1_scan_census": Tier1ScanCensus::measure(
+                            tier1_scan,
+                            box_read.as_ref().map(|(raw, t)| (*raw, t.as_str())),
+                            &pasted_text,
+                        )
+                        .to_json(),
                     }));
                 }
                 // #522: a pane that is simply DONE — our text consumed, no
@@ -12642,9 +12755,19 @@ fn deliver_now(
     // box as cleared on the very first poll and confirm a delivery nothing
     // observed — the one failure mode strictly worse than declining.
     let tier1_scan = tier1_scan_bytes(&pasted_text);
-    let tier1_precondition_tail =
-        ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| strip_ansi(&b));
-    let tier1_precondition = box_reading(tier1_precondition_tail.as_deref(), &pasted_text);
+    // #583: the raw byte count is kept beside the stripped text — one read,
+    // measured as well as classified. A census taken from a SECOND read would
+    // answer a question nobody asked (a different tail, a different instant),
+    // so both come out of this one.
+    let tier1_read =
+        ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| (b.len(), strip_ansi(&b)));
+    let tier1_precondition =
+        box_reading(tier1_read.as_ref().map(|(_, t)| t.as_str()), &pasted_text);
+    let tier1_census = Tier1ScanCensus::measure(
+        tier1_scan,
+        tier1_read.as_ref().map(|(raw, t)| (*raw, t.as_str())),
+        &pasted_text,
+    );
     let tier1_governs = tier1_precondition == BoxReading::Holds;
     // The decline is stated, not inferred from an absent `true` (#559). It is
     // carried on `prompt-typed` below rather than as its own event because
@@ -12996,6 +13119,12 @@ fn deliver_now(
         "tier1_decline": tier1_decline,
         "tier1_paste_bytes": pasted_text.len(),
         "tier1_scan_bytes": tier1_scan,
+        // #583: the same read, measured — `Tier1ScanCensus`. Carried on EVERY
+        // delivery, `Holds` included, because the question is a distribution:
+        // "does the slack survive live ANSI density near the cap" cannot be
+        // answered from the failures alone (that sample is selected on the
+        // outcome). The successes are where the remaining headroom shows.
+        "tier1_scan_census": tier1_census.to_json(),
         // #112 round 3 (rev-20 N3): `null` when Tier 1 never
         // governed this delivery at all (nothing was ever measured,
         // not "measured and false") — a bare `bool` here would
