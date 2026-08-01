@@ -100,6 +100,18 @@ import {
 } from "./restorecard";
 import { listPlugins } from "./pluginhost";
 import { resolvePluginPaneManifest } from "./pluginpaneview";
+import { overlayState, type OverlayCloser } from "./overlaystate";
+
+/** The banner's slot in the shared overlay registry while it is showing
+ *  (#391 W3). `#app-error` is `position: fixed`, `z-index: 100` and
+ *  click-to-dismiss — geometrically the same layer as `.app-toast`, which
+ *  toast.ts has registered since #380 — but it was never wired, so over a
+ *  plugin pane the fatal banner was painted behind the native child webview
+ *  AND the click that dismisses it was swallowed: the one message a user most
+ *  needs to read, both unreadable and stuck. Same `??=` shape toast.ts uses,
+ *  for the same reason: a second error re-uses the one live slot rather than
+ *  leaking a second. */
+let fatalOverlayClose: OverlayCloser | null = null;
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -108,11 +120,17 @@ function showFatal(msg: string): void {
   if (!el) {
     el = document.createElement("div");
     el.id = "app-error";
-    el.addEventListener("click", () => el!.classList.remove("visible"));
+    el.addEventListener("click", () => {
+      el!.classList.remove("visible");
+      fatalOverlayClose?.();
+      fatalOverlayClose = null;
+    });
     document.body.appendChild(el);
   }
   el.textContent = msg;
   el.classList.add("visible");
+  const banner = el;
+  fatalOverlayClose ??= overlayState.open(() => banner.getBoundingClientRect());
 }
 window.addEventListener("error", (e) => {
   // The banner only shows e.message, which for a cross-module DOM error hides

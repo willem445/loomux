@@ -1188,6 +1188,75 @@ are stated, without drifting from what was actually agreed:
   `"resize"` truly isn't firing in the live app despite the empirical repro,
   and is the next thing to re-investigate, stated honestly rather than
   assumed away.
+- **#391 close-out (W3 of the re-land arc): the ledger is the mechanism, and
+  it rots.** The clipping machinery above is only ever as complete as
+  `overlaystate.ts`'s enumeration of what to clip against — an overlay nobody
+  registered is invisible to it, and the failure mode is silent: the plugin
+  keeps painting, that one overlay is just dead. `overlaystate.ts`'s header
+  asserted "EVERY covering DOM overlay is either wired or deliberately
+  excluded", which was true when #380 wrote it. Re-derived from scratch
+  against the re-landed tree, it had lost two:
+
+  - **Context-menu submenus.** `.ctxmenu-sub` is `position: absolute;
+    left: 100%` — it renders OUTSIDE `.ctxmenu`'s border box, and
+    `getBoundingClientRect()` on an element does not grow to include an
+    absolutely-positioned descendant. The registered root rect therefore
+    never covered the submenu, so the file explorer's "New →" / "Hash →"
+    items over a plugin pane stayed exactly as #391 first described them:
+    painted behind the native child webview and unclickable. The fix has two
+    halves and needs both — `overlayState.open()` now accepts a MULTI-RECT
+    getter (`OverlayRectSource`), and the hover/focus edges that open a
+    submenu call `overlayState.poke()`, because CSS `:hover`/`:focus-within`
+    opens one with no JS event for a plugin pane to re-clip on. A bounding
+    box around root+submenu was the cheaper fix and the wrong one: the root
+    and the submenu sit side by side with dead space above and below, and a
+    bounding box punches that dead space out of the plugin too — a hole
+    showing nothing.
+  - **`#app-error`**, the fatal-error banner (`main.ts`'s `showFatal`).
+    Byte-for-byte the same CSS layer as `.app-toast`, which toast.ts has
+    registered since #380, and click-to-dismiss — so over a plugin pane it
+    was both unreadable and un-dismissable. The one message a user most needs
+    to read was the one the plugin ate.
+
+  Everything else re-derived clean: `pane.ts`'s in-pane views are wired ONCE
+  in `openView`'s floating branch (so the unit is `EMBED_KINDS`, not six
+  hand-listed toggles — a seventh kind is covered the day it is added), and
+  every module the plan flagged as a new-since-#380 candidate
+  (`taskboard.ts`, `auditwindow.ts`, `dragsession.ts`, `embedsplit.ts`,
+  `settings.ts`, …) turned out to be a DOM-free pure model, which by the
+  repo's own convention cannot be an overlay at all. The exclusion list is
+  now grouped by WHY (structurally cannot overlap / bounded by an
+  already-registered parent / transient and non-interactive) and carries a
+  "how to re-derive this list" recipe — two greps and a mapping step — on the
+  view that the next reader needs the method, not a promise. The one trap
+  worth restating here: "it is a DOM child of a registered overlay" is NOT
+  sufficient. `.ctxmenu-sub` is a child too. Check where the CSS puts the
+  box, not where the DOM puts the node.
+
+  **Re-checked against #377's approval gate** (merged into the re-land branch
+  while this was open, PR #623). The gate adds two things that look like they
+  belong on this list and don't: `pluginconsent.ts` is DOM-free and its prompt
+  is rendered by `modal.ts`, already wired since #380; and `.pane-plugin`'s
+  "Review permissions…" surface is drawn exactly where a plugin webview would
+  go, but only from `open()`'s catch — the webview does not exist on that
+  path, `ready` is false, and `repositionNow` early-returns, so nothing is
+  over it to clip. It is the covered thing's substitute, not a cover. That
+  second one is worth keeping in view: in-pane chrome shown while `ready` is
+  TRUE would be a genuinely new case for this list, and the only one of these
+  categories that could arrive without touching an overlay file at all.
+
+  **Why the pointer half still has no automated test, and what covers it
+  instead.** An e2e spec was scoped for this ("click a modal button over a
+  plugin pane") and deliberately not written: Playwright drives `main`'s
+  webview through CDP, so a synthesized click is dispatched INTO that webview
+  directly and never traverses the OS hit-test path `SetWindowRgn` governs.
+  Such a spec would pass identically with the region clip working, broken, or
+  deleted — a decoration that reads as coverage. The pointer half is
+  therefore verified by the human clickability matrix in the merge checklist,
+  and the automated tests pin the layer that IS pinnable without an OS: the
+  registry's rect set and `pluginocclusion.ts`'s pane-local hole math
+  (`test/overlaystate.test.ts`, including the end-to-end
+  registry → holes assertion for the submenu case).
 - **Slice E** (metrics — **done**, `procmetrics.rs`) exposes `sys_processes`
   -shaped data **only** through the `metrics.system` broker handler — never as
   a command a plugin (or any other webview script) could `invoke` directly.
@@ -1225,3 +1294,61 @@ are stated, without drifting from what was actually agreed:
 A bundled example plugin (the resource monitor) lives at
 `src-tauri/resources/plugins/resource-monitor/` and ships already installed
 (#360 Slice F).
+
+## Human validation: the overlay clickability matrix (#391)
+
+The plugin's content is a native child webview whose paint AND hit-testing
+are governed by an OS-level region clip (`SetWindowRgn`, `pluginregion.rs`).
+No automated test in this repo reaches that path — the frontend unit tests
+stop at the rect math, `cargo test` never creates a real `HWND` with a real
+overlay over it, and a Playwright click is injected into `main`'s webview
+below the OS hit-test layer entirely (see the #391 close-out note above).
+So this matrix is not "extra assurance on top of the tests"; for the pointer
+half it is the ONLY evidence that exists, and it is a merge gate for any
+change touching `overlaystate.ts`, `pluginocclusion.ts`, `pluginregion.rs`,
+or a call site that registers an overlay.
+
+Run it against a plugin pane showing live content — the bundled resource
+monitor, which repaints continuously, so a frozen or blanked region is
+obvious. Split so the plugin pane fills a good part of the window, then for
+each row open the overlay so it visibly OVERLAPS the plugin pane:
+
+**Completeness invariant: every `overlayState.open()` call site has at least
+one row here.** Not a nicety — this matrix is the only evidence the pointer
+half ever gets, so a missing row means a green pass reports coverage it does
+not have, and says nothing while doing it. Two rows were missing when this
+was first written (`editor.ts`'s config dialog and `gitview.ts`'s own
+`.git-menu` — rows 2 and 12 below), and both were missed the same way: each
+LOOKS covered by a neighbouring row while carrying its OWN registration.
+`editorConfigDialog` is an independent copy of the `.launcher-overlay`
+pattern rather than a `modal.ts` caller, and `.git-menu` is hand-rolled
+rather than a `contextmenu.ts` caller — so rows 1 and 3 exercise a sibling's
+wiring, not theirs. That is the same "looks covered" trap `.ctxmenu-sub`
+sprang one layer down. Check the invariant rather than eyeballing it:
+`grep -rn 'overlayState\.open(' src/*.ts` — eleven call sites today (the two
+`sessions.ts` hits are prose in its header comment, not calls), each mapped
+to what opens it by the ledger in `overlaystate.ts`.
+
+| # | Overlay | Open it with | Pass = |
+| --- | --- | --- | --- |
+| 1 | Confirm/prompt modal | close a pane with unsaved state, or any confirm | its buttons are visible AND respond to a click |
+| 2 | Editor config dialog | the file editor's own config/settings dialog | its controls are visible and respond to a click — `editor.ts` registers ITSELF, so row 1 passing says nothing about this one |
+| 3 | Context menu | right-click a file in the file explorer | menu items visible, a click fires the action |
+| 4 | **Context submenu** | hover "New →" / "Hash →" in that menu | the SUBMENU panel is visible and its items click (#391 W3 — the case that was still broken) |
+| 5 | Tab right-click menu | right-click a project tab | items visible and clickable |
+| 6 | Tab hover preview | hover a tab until the thumbnail appears | thumbnail visible over the plugin, not behind it |
+| 7 | Tab color palette | tab menu → colour swatch | swatches visible, picking one applies |
+| 8 | Toast | any action that toasts (e.g. a copy) | toast readable over the plugin |
+| 9 | **Fatal banner** | trigger any uncaught error, or call `showFatal` from devtools | banner readable AND a click dismisses it (#391 W3 — newly registered) |
+| 10 | **#377 consent prompt** | open a second, unapproved plugin while a plugin pane is already showing | the approve/decline dialog is visible and both buttons click (it is a `modal.ts` modal, so it rides the same wiring as row 1 — but it is the modal most likely to be opened with a plugin pane on screen, so it is worth its own pass) |
+| 11 | In-pane view, floating | Alt+G git view on a pane overlapping the plugin | overlay fully visible, rows selectable |
+| 12 | Git view's OWN menu | inside that git view, open its commit / ref-chip / branch-switcher menu (`.git-menu`) — not a right-click context menu | items visible and clickable — `gitview.ts` hand-rolls this menu and registers it itself, so neither row 3 nor row 11 covers it |
+| 13 | In-pane view, docked | dock that same view to a side | plugin pane RESIZES around it — no hole punched, no bleed |
+| 14 | Sessions sidebar | Ctrl+Shift+P, watch the whole animation | the panel stays interactive throughout AND the plugin keeps painting past the 344px edge (this one must NOT blank — that was the reverted PR #392's bug) |
+| 15 | Everything closed | close each overlay above | the plugin repaints its full rect with no leftover hole |
+
+Two failure shapes to name precisely when reporting one, because they have
+opposite causes: **bleed** (the plugin paints over the overlay, or eats its
+clicks) means a rect was never registered — a ledger gap. **A hole** (a blank
+notch in the plugin where no overlay is) means a rect was registered too
+large, kept after close, or unioned when it should have stayed a list.
