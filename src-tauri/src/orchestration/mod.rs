@@ -7881,8 +7881,12 @@ fn sanitize_agent_name(name: &str) -> String {
 /// change. Mid-session prompts are deliberately NOT stamped today — a unique id
 /// per send would defeat the queue's byte-identical coalesce, which is the
 /// mechanism that already collapses a repeated mid-session ask.
-#[doc(hidden)] // pub for integration tests
-pub fn kickoff_delivery_id(group_id: &str, agent_id: &str) -> String {
+///
+/// Private on purpose: the tests build this token as a literal `format!` rather
+/// than calling it, so an expectation derived from the code cannot move with the
+/// code — the same independence argument `tests/fixtures/pre222` makes about the
+/// golden templates.
+fn kickoff_delivery_id(group_id: &str, agent_id: &str) -> String {
     format!("{group_id}/{agent_id}/k1")
 }
 
@@ -7908,8 +7912,7 @@ fn kickoff_delivery_note(group_id: &str, agent_id: &str) -> String {
 /// counter. Used to derive the #524 high-water floor from rosters written
 /// before the counter file existed; deliberately total and lossless-in-doubt
 /// (an unparseable tail contributes nothing rather than a guess).
-#[doc(hidden)] // pub for integration tests
-pub fn agent_id_suffix(id: &str) -> Option<u32> {
+fn agent_id_suffix(id: &str) -> Option<u32> {
     id.rsplit_once('-').and_then(|(_, tail)| tail.parse().ok())
 }
 
@@ -16049,6 +16052,11 @@ impl OrchRegistry {
     /// rule `persist_queues` follows, for the same reason: failing the spawn
     /// would turn a durability degradation into an outage of the thing being
     /// made durable.
+    ///
+    /// A spawn that mints and then fails (a guardrail refusal, a worktree that
+    /// won't cut) leaves its id spent, which is unchanged from before this and
+    /// deliberately not "fixed": returning an id to the pool is exactly the
+    /// reuse this closes. The sequence has gaps; that is what a gap means.
     fn mint_agent_seq(&self, group: &str) -> u32 {
         let _writer = self.agent_seq_persist.lock_safe();
         self.seed_agent_seq_locked();
