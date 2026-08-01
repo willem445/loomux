@@ -695,6 +695,37 @@ persisted in `group.json`, and clamped in `clamped()`.
   replayed: agents re-sync from the board/state on the next prompt after resume, which is the
   point. The flag is mirrored to a `paused` marker file so a pause survives an app restart
   (re-seeded in `create_group`).
+
+  **Resume says what the pause threw away (#569).** Suppression was audited and nothing else,
+  which made pause the last non-crash path where a payload its sender had been told `Ok` about
+  simply ceased to exist — a worker's `report("done")` fired mid-pause evaporated, and the
+  orchestrator went on waiting for a report that would never arrive. `resume_group` now reads
+  the window's `prompt-suppressed-paused` lines back out of the audit log
+  (`suppressed_during_pause`, pure) and delivers one notice naming every discarded
+  `from → to` with a bounded payload preview (`pause_suppression_notice`). Three things this
+  deliberately is *not*: it does not replay anything, it does not queue anything, and it mints
+  no delivery id — a suppressed delivery never reached the front door, so there is no id to
+  join against, the same conclusion #563 reached at `enqueue_text`'s `RejectFull` arm. It reads
+  the audit log and mutates no queue, so it owes no `persist_queues` call; the notice itself
+  goes through the ordinary front door, which already does.
+
+  The window is bounded by the most recent `group-pause` line and by nothing else — a
+  `prompt-suppressed-paused` line can only be written while paused, so everything after that
+  marker belongs to the window it opened, and the scan survives an app restart mid-pause
+  because the audit log does. `group-resume` is deliberately not treated as a boundary:
+  `create_group` audits that same action name for a group RESTORED from disk. If the marker has
+  rotated out of the readable log the notice says so rather than presenting a possibly
+  over-counted list as exact.
+
+  And the notice must not become the next silent loss: it is an in-band delivery, so it fails
+  exactly when a pause has run long enough for the orchestrator to idle out — the case with the
+  most to report. When it fails, every distinct live target pane gets the
+  `StrandedBlocker::PauseSuppressed` badge instead, the channel #563 established for holds an
+  orchestrator-targeted notice cannot reach (no role suppression, no orchestrator required). A
+  pane already carrying another mechanism's badge is left alone. Enqueue-while-paused
+  (#569 option 2) is **not** implemented and is not implied by any of this: it would make
+  drain-on-resume re-spend tokens a human paused to stop, which changes pause's cost-containment
+  contract and is the human's call, not a worker's.
 - **Idle-worker auto-kill.** Each worker/reviewer carries `idle_since_ms`, stamped when it is
   spawned without a task or reports `done`/`blocked`, and cleared when the orchestrator sends
   it a prompt (`send_prompt`). A background reaper (`start_idle_reaper`, 30s tick) kills any

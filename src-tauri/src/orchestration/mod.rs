@@ -7770,6 +7770,128 @@ pub fn parse_audit_lines_counted(text: &str) -> (Vec<AuditEntry>, usize) {
 /// payload bounded even against a rotated + current pair near the 8 MB cap.
 const AUDIT_VIEW_LIMIT: usize = 5000;
 
+/// #569: one delivery a pause window destroyed, recovered from the audit log.
+///
+/// **Why there is no id here.** `deliver_prompt`'s pause branch returns
+/// *before* the front door, so a suppressed delivery never enters a queue and
+/// no id is ever minted for it — the same situation #563 met at
+/// `enqueue_text`'s `RejectFull` arm, and answered the same way: name the
+/// payload by `{from, to, preview}`, which the record actually establishes,
+/// rather than by an id that would join to nothing. Minting one here would
+/// also mean running `recover_persisted_queue` on the paused delivery path
+/// purely to keep `queue_seq` collision-free (see `enqueue_text`'s "#467, and
+/// it must be FIRST" note) — real machinery, and I/O, for a cosmetic field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuppressedDelivery {
+    /// Whoever called `deliver_prompt` — the audit entry's actor.
+    pub from: String,
+    /// The agent the payload was headed for.
+    pub to: String,
+    /// One-line, bounded preview of the discarded payload
+    /// (`queue::dropped_payload_preview`, reused so a lost payload reads the
+    /// same wherever it is reported).
+    pub preview: String,
+}
+
+/// #569: everything ONE pause window swallowed, oldest first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PauseSuppression {
+    pub items: Vec<SuppressedDelivery>,
+    /// Whether the `group-pause` line that OPENED this window was still in the
+    /// entries handed to [`suppressed_during_pause`]. False means the scan ran
+    /// off the start of a timeline that is both rotated on disk and capped at
+    /// `AUDIT_VIEW_LIMIT` by `audit_log`, so the list may reach back into an
+    /// EARLIER pause — a caveat the notice states rather than swallows, since
+    /// an over-count presented as exact is the same unbacked claim
+    /// `.loomux/lessons.md` catalogues.
+    pub window_start_seen: bool,
+}
+
+/// #569: read a pause window's discarded deliveries out of `entries`
+/// (oldest-first audit timeline), scanning BACKWARDS from the end.
+///
+/// **Why `group-pause` alone bounds the window.** A `prompt-suppressed-paused`
+/// line can only be written while the group is paused, so any such line after
+/// the most recent `group-pause` belongs to the window that line opened —
+/// there is no intervening resume it could have survived. `group-resume` is
+/// deliberately NOT a boundary: `create_group` audits that same action name
+/// for a group RESTORED from disk (a different event with the same string), so
+/// stopping on it would silently truncate a window that spanned an app
+/// restart. `group-pause` has no such collision.
+///
+/// Pure: takes entries, returns a summary, touches no registry state — so the
+/// window arithmetic is testable without a paused group or a filesystem.
+pub fn suppressed_during_pause(entries: &[AuditEntry]) -> PauseSuppression {
+    let mut items = Vec::new();
+    let mut window_start_seen = false;
+    for e in entries.iter().rev() {
+        if e.action == "group-pause" {
+            window_start_seen = true;
+            break;
+        }
+        if e.action != "prompt-suppressed-paused" {
+            continue;
+        }
+        items.push(SuppressedDelivery {
+            from: e.actor.clone(),
+            to: e.detail["to"].as_str().unwrap_or("?").to_string(),
+            preview: queue::dropped_payload_preview(e.detail["text"].as_str().unwrap_or("")),
+        });
+    }
+    items.reverse(); // scanned newest-first; report in the order they arrived
+    PauseSuppression { items, window_start_seen }
+}
+
+/// How many discarded deliveries the resume notice names individually before
+/// it summarizes the rest. A long pause can swallow an unbounded number of
+/// them and this notice is itself a delivery — one pasted into a pane — so the
+/// list is capped and the remainder is pointed at the audit log, which holds
+/// every payload IN FULL (`prompt-suppressed-paused` carries `text`, not a
+/// preview).
+pub const PAUSE_SUPPRESSION_LIST_MAX: usize = 8;
+
+/// #569: the resume-time notice naming what a pause discarded.
+///
+/// The sentence has to do one job the audit line cannot: correct the
+/// "queued means safe" model the #445/#523 batch established everywhere else.
+/// Pause is the one remaining path where a caller was told `Ok` and the
+/// payload ceased to exist, so the notice says DISCARDED and says that nothing
+/// will be replayed — a reader who assumes a replay is coming waits forever,
+/// which is the exact stall #569 was filed for.
+///
+/// Pure so the copy is unit-testable, matching `queue::dropped_notice` /
+/// `delivery_held_detail`.
+pub fn pause_suppression_notice(s: &PauseSuppression) -> String {
+    let n = s.items.len();
+    let (count, verb) = if n == 1 {
+        ("1 delivery".to_string(), "was")
+    } else {
+        (format!("{n} deliveries"), "were")
+    };
+    let mut out = format!(
+        "[loomux] Group resumed — {count} to this group's panes {verb} DISCARDED while it was \
+         paused. Pause does not queue: none of this will be replayed, so anything you are still \
+         waiting on has to be re-requested. Discarded:"
+    );
+    for it in s.items.iter().take(PAUSE_SUPPRESSION_LIST_MAX) {
+        out.push_str(&format!("\n  - {} -> {}: {}", it.from, it.to, it.preview));
+    }
+    if n > PAUSE_SUPPRESSION_LIST_MAX {
+        out.push_str(&format!(
+            "\n  - ...and {} more — every discarded payload is in this group's audit log in full \
+             (action `prompt-suppressed-paused`).",
+            n - PAUSE_SUPPRESSION_LIST_MAX
+        ));
+    }
+    if !s.window_start_seen {
+        out.push_str(
+            "\n  (The `group-pause` line that opened this window is no longer in the readable \
+             audit log, so this list may reach back into an earlier pause.)",
+        );
+    }
+    out
+}
+
 fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
     let mut out = tpl.to_string();
     for (k, v) in vars {
@@ -9158,6 +9280,28 @@ pub enum StrandedBlocker {
     /// See `doc/design/orchestration.md`'s #532 section for what the follow-up
     /// actually needs.
     QuestionStale,
+    /// #569: deliveries aimed at this pane were DISCARDED while the group was
+    /// paused, and the resume-time notice that would have said so could not be
+    /// delivered to the group's orchestrator.
+    ///
+    /// **Why this is a badge and not only the notice.** The notice
+    /// (`announce_pause_suppression`) is an in-band delivery to the
+    /// orchestrator, so it fails exactly when a paused group has been left long
+    /// enough for its orchestrator to idle out or be killed — which is the
+    /// longest, most damaging pause, not the mildest. A notice that goes
+    /// missing precisely in the worst case is the same silent-loss shape #569
+    /// exists to close, one level up. `mark_stranded` has no role suppression
+    /// and needs no orchestrator at all, so it is the channel that survives
+    /// (the #563 argument, applied to a different hold).
+    ///
+    /// **It claims only what the audit record establishes**: that something
+    /// addressed to this pane was thrown away, and that nothing is queued to
+    /// arrive. It does NOT say the pane is held, that text is sitting
+    /// unsubmitted in its box, or that loomux is re-sending anything — none of
+    /// which a suppression record shows, and each of which is some other
+    /// variant's sentence (`HumanInput`, `Exhausted`, the `None` heal wording).
+    /// Cleared like any other badge, by `clear_stranded`.
+    PauseSuppressed,
 }
 
 impl StrandedBlocker {
@@ -9174,6 +9318,7 @@ impl StrandedBlocker {
             StrandedBlocker::QueueNearFull => "queue-near-full",
             StrandedBlocker::QueueAtCapacity => "queue-at-capacity",
             StrandedBlocker::QuestionStale => "question-hold-stale",
+            StrandedBlocker::PauseSuppressed => "pause-suppressed",
         }
     }
 }
@@ -9603,6 +9748,43 @@ pub struct StrandedNote {
     pub since_ms: u64,
 }
 
+/// #569: whether the resume-time suppression notice's FALLBACK badge fires
+/// for one pane that lost deliveries to a pause.
+///
+/// Pure, and separate from `announce_pause_suppression`, because the branch
+/// that matters most cannot be reached in a headless integration test: with no
+/// `AppHandle`, `deliver_prompt` always ends in `Err("no app handle")` after
+/// admitting, so "the notice landed, therefore no badge" is unobservable there
+/// (the same limitation `delivered_texts`' doc in the test file describes from
+/// the other side). Extracting the decision makes all three rules assertable
+/// directly, which is the only way "delivered ⇒ never badge" gets tested at
+/// all rather than asserted in a comment.
+///
+/// - `notice_delivered` — the orchestrator has the full list, so a chip on
+///   every pane that missed something would be noise on top of a channel that
+///   already worked.
+/// - `target_alive` — a dead pane's badge is a chip nobody can act on.
+/// - `existing` — never stomp another mechanism's badge (`note_queue_capacity`
+///   follows the same rule): whatever raised it is telling the human to look at
+///   this same pane, and a *held* pane's badge is the more urgent claim because
+///   it names something still fixable. An in-flight heal (`Some(note)` whose
+///   own `blocker` is `None`) counts as somebody else's badge for the same
+///   reason. Our OWN badge is re-stamped rather than skipped, so a second pause
+///   that loses more does not go quiet.
+pub fn pause_badge_decision(
+    notice_delivered: bool,
+    target_alive: bool,
+    existing: Option<StrandedNote>,
+) -> bool {
+    if notice_delivered || !target_alive {
+        return false;
+    }
+    match existing {
+        None => true,
+        Some(n) => matches!(n.blocker, Some(StrandedBlocker::PauseSuppressed)),
+    }
+}
+
 /// The badge/tooltip wording for a stranded pane (#496 PR-C) — pure, and
 /// deliberately phrased as what the HUMAN should do, since the entire point
 /// of the badge is that a wedged pane is never discovered by accident.
@@ -9665,6 +9847,17 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
                 "{name}'s prompt has been held for minutes on a question loomux still detects in this pane — \
                  answer it if one is on screen; if the pane looks clear, that reading is stale: type a \
                  character and delete it to release the hold"
+            )
+        }
+        // #569: past tense, and no action for the PANE — there is nothing to
+        // release here. What was addressed to this pane is gone, and the only
+        // repair is upstream: whoever sent it has to send it again. Says so,
+        // and claims nothing about the pane's own state (see the variant's doc).
+        Some(StrandedBlocker::PauseSuppressed) => {
+            format!(
+                "{name} was sent deliveries that were DISCARDED while this group was paused, and \
+                 loomux could not reach the orchestrator to say so — nothing is queued for that \
+                 pane. Whatever it is waiting on has to be sent again"
             )
         }
     }
@@ -12856,7 +13049,24 @@ pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
             HoldChannel::OrchestratorNotice,
             HoldChannel::CallerError,
         ],
-        HoldClass::GroupPaused => &[HoldChannel::PausedGroupUi],
+        // #569. Three channels, each carrying a different moment, and the
+        // distinction matters because two of them fire only at resume:
+        //  - `PausedGroupUi` is the hold itself — the human set the pause and
+        //    the group UI shows it for as long as it lasts. Unchanged.
+        //  - `OrchestratorNotice` is `announce_pause_suppression`, at resume:
+        //    what the pause DISCARDED. Not suppressed here the way
+        //    `notify_queue`'s is, because by the time it is sent the group is
+        //    already unpaused and the pane it names is not the pane it is
+        //    blocked behind — but it still needs a live orchestrator.
+        //  - `AttentionBadge` is that notice's fallback when there is no live
+        //    orchestrator to take it (see `StrandedBlocker::PauseSuppressed`).
+        // Pause remains the one hold that DESTROYS a payload rather than
+        // holding it, so none of these three is a replay: they are visibility.
+        HoldClass::GroupPaused => &[
+            HoldChannel::PausedGroupUi,
+            HoldChannel::OrchestratorNotice,
+            HoldChannel::AttentionBadge,
+        ],
     }
 }
 
@@ -15214,16 +15424,76 @@ impl OrchRegistry {
         Ok(())
     }
 
-    /// Resume a paused group: prompt/kickoff delivery flows again. Queued
+    /// Resume a paused group: prompt/kickoff delivery flows again. Suppressed
     /// prompts are not replayed — agents resync from the board/state on the
-    /// next prompt, which is the point of idling out.
+    /// next prompt, which is the point of idling out — but as of #569 the
+    /// orchestrator is TOLD what the pause threw away
+    /// (`announce_pause_suppression`). Visibility only; the discard semantics
+    /// are unchanged and deliberately so (option 2 of #569, enqueue-while-
+    /// paused, changes pause's cost-containment contract and is a human call).
     pub fn resume_group(&self, group: &str) -> Result<(), String> {
         let was = self.paused.lock_safe().remove(group);
         if was {
             let _ = fs::remove_file(self.group_dir(group).join("paused"));
+            // Read the window BEFORE the resume line lands, so the timeline the
+            // scan walks is exactly the pause and nothing after it. The pause
+            // flag is already cleared above, which is what lets the notice
+            // below actually deliver rather than suppressing itself.
+            let swallowed = suppressed_during_pause(&self.audit_log(group));
             self.audit(group, "human", "group-resume", json!({}));
+            self.announce_pause_suppression(group, &swallowed);
         }
         Ok(())
+    }
+
+    /// #569: tell the orchestrator what a just-ended pause DISCARDED.
+    ///
+    /// **Why this exists at all.** A delivery into a paused group is destroyed
+    /// and its caller told `Ok` — after #445/#523 the only remaining non-crash
+    /// path where a payload the sender was told succeeded ceases to exist. It
+    /// was audited and nothing else, so a worker's `report("done")` fired
+    /// during a pause simply evaporated and the orchestrator went on waiting
+    /// for it. The audit line was always there; nobody was ever shown it.
+    ///
+    /// **Reads, never mutates.** The suppressed set comes out of the audit log
+    /// — no new state, no new `queues` mutation, and therefore no
+    /// `persist_queues` obligation (see `doc/design/orchestration.md`'s
+    /// persistence table). The one write anywhere on this path is the notice
+    /// itself, admitted through the ordinary front door
+    /// (`deliver_to_orchestrator` → `deliver_prompt` → `enqueue_text`), which
+    /// already owns that obligation and is already a row in that table.
+    ///
+    /// **And the notice must not be the next silent loss.** It is an in-band
+    /// delivery, so it fails when the group has no live orchestrator left to
+    /// take it — the long unattended pause, i.e. the case with the most to
+    /// report. On failure every distinct live target gets the badge channel
+    /// instead, which has no role suppression and needs no orchestrator
+    /// (#563's argument). A pane already carrying somebody else's badge is
+    /// left alone: that badge is telling the human to look at the same pane
+    /// and it is not ours to overwrite, matching `note_queue_capacity`.
+    fn announce_pause_suppression(&self, group: &str, swallowed: &PauseSuppression) {
+        if swallowed.items.is_empty() {
+            return;
+        }
+        let outcome =
+            self.deliver_to_orchestrator(group, &pause_suppression_notice(swallowed), "loomux");
+        self.audit(group, "loomux", "pause-suppression-notice", json!({
+            "count": swallowed.items.len(),
+            "window_start_seen": swallowed.window_start_seen,
+            "delivered": outcome.is_ok(),
+            "error": outcome.as_ref().err(),
+        }));
+        let delivered = outcome.is_ok();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for it in &swallowed.items {
+            if !seen.insert(it.to.as_str()) {
+                continue; // one badge per pane, however many payloads it lost
+            }
+            let alive = self.agent(&it.to).is_some_and(|a| a.status != AgentStatus::Dead);
+            if pause_badge_decision(delivered, alive, self.stranded_note(&it.to)) {
+                self.mark_stranded(group, &it.to, Some(StrandedBlocker::PauseSuppressed));
+            }
+        }
     }
 
     /// Flip a worker/reviewer between idle (awaiting/finished a task) and
