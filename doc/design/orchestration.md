@@ -9415,9 +9415,9 @@ blocked, never *by what*), and `assignee` was a plain field written by whoever c
 `upsert_task` last, so nothing structurally stopped two workers being pointed at the same item.
 
 Slice A is the model and the backend; the board UI (chips, ready affordance, dep editing) is
-slice B and lands separately, so nothing in this section is visible to the human yet — a
-dependency set through the orchestrator's tools shows up on the human's board only once B renders
-it. The one behavior change a human can already reach is delete-strip, below.
+slice B, in its own section below — nothing in *this* section is visible to the human on its own,
+since a dependency set through the orchestrator's tools shows up on the board only once B renders
+it. The one behavior change a human could reach with A alone is delete-strip, below.
 
 **Two flat fields, not a typed link array.** `Task` gains `deps: Vec<String>` (blocking) and
 `related: Vec<String>` (annotation), both ids of tasks on the *same* board. A shared
@@ -9516,6 +9516,68 @@ second persistence mechanism for a race that can't occur), hash ids (ids are min
 lock on one board), a link-type zoo (`supersedes`/`discovered-from`), a ready-work query
 language (one derived bool on rows already there), and memory-decay features (`cap_task_notes`
 owns board boundedness). No new dependencies, front or back.
+
+## The board's side of the dependency graph (#582, slice B)
+
+Slice A made the structure persistable; slice B is what the human actually sees. Without it a
+dependency set through the orchestrator's tools is invisible on the board — the issue's fourth
+proposed step ("a task blocked by an unfinished dep reads visually distinct from one merely
+sitting in `queued`") is a rendering claim, and only this slice can make it true.
+
+**The board derives readiness itself, and that duplication is the design.** `ready` is a
+`TaskSummary` field, and `TaskSummary` is the MCP `list_tasks` row — the *orchestrator's* path.
+The human's board reads full `Task`s over `orch_tasks`, a separate command, so it computes
+readiness from `deps` + the statuses already in that payload (`taskboard.ts`: `depState`,
+`unmetDeps`, `isReady`, mirroring `dep_satisfied`/`unmet_deps`/`task_ready`). The alternative —
+adding a derived flag to the human command's wire shape — would be a new contract for something
+the board can compute exactly from data it already has, and it would still need the frontend
+rule for the chips (`met` vs `unmet` per dep is not a single bool). Both sides are pinned by
+their own tests, including the case that would matter if they drifted: only `done` satisfies an
+edge, and an id naming no live task counts as **unmet**, never satisfied.
+
+**The blocked/ready pair is the whole visual point, and it is deliberately quiet.** A `queued`
+task with an unfinished dep recedes (opacity), and a `queued` task whose deps are all done gets a
+`▸ ready` chip next to ▶ Start. No new accent color was introduced: the board already spends
+amber on "waiting on YOU" (`awaiting-human`) and blue on live work, and a third accent competing
+with those would cost more than it explains — the chips on the line below name *what* a row is
+waiting for, which is the part prose in `set_state` could never do.
+
+The ready mark is gated on the **board** using deps at all (`boardUsesDeps`), not on the task
+having them. Every queued row on a dep-free board is trivially ready, so an ungated mark would
+land on every queued row of every existing board and carry no information. Gating per-*task*
+instead was rejected for the opposite reason: once some task declares a dep, a plain queued row
+genuinely is startable, and marking only the linked rows would leave the rest ambiguous.
+
+**The links line exists only when there are links.** A row with no `deps`/`related` (and no open
+picker) renders exactly as it does today, so adopting this feature costs a dep-free board no
+vertical space at all — worth stating because the board is the human's primary surface and its
+row height is its density budget. A dep chip carries **✓ met / ✗ unmet / ⚠ missing**; `missing`
+is its own state rather than folded into unmet because its cause and fix differ — the backend
+validates ids on write and strips them on delete, so a link naming nothing can only come from a
+hand-edited `tasks.json`, and the answer is "remove it", not "wait for it".
+
+**Editing goes through the path that already exists.** Every add/remove sends the WHOLE `deps`
+array on the board's existing `orch_upsert_task` invoke (array args are replace-or-untouched,
+never a delta), so it inherits that path's validation, its audit row, and its error toast. The
+picker therefore does **not** pre-filter choices that would close a cycle: the backend rejects
+those inside its lock with an error naming the path, and a frontend cycle walk would be a second
+copy of an authoritative rule that could only ever disagree with it. Letting the human pick a
+cycle and be told why is strictly better than a picker that silently omits an option for reasons
+it can't explain. `related` is rendered read-only for the matching reason: `orch_upsert_task`
+takes `deps` and not `related` (slice A), so an editing affordance here would have nothing to
+call.
+
+**Picker state lives in the view model, not the DOM.** The board re-renders on every
+`orch-tasks-changed` event, and a `<select>` is not an `INPUT`/`TEXTAREA`, so the existing
+mid-edit refresh deferral (`isEditing`) does not cover it. Holding the open picker's task id in
+the view (`picking`, pruned on refresh like the multi-select) means a background refresh
+re-renders it instead of closing it mid-choice; a separate one-shot `pickingFocus` flag means
+only the render that *opened* it takes focus, so a later refresh can't yank focus back from
+wherever the human has moved.
+
+Frontend logic that needs tests is DOM-free per the repo's convention (`taskboard.ts` +
+`test/taskboard.test.ts`, `node:test`); the DOM wiring in `tasksview.ts` is validated by hand, so
+the PR lists what a human pass has to cover rather than simulating a DOM.
 
 ## Risks / limitations
 

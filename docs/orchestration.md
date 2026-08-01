@@ -223,6 +223,42 @@ reads dimmed and in italics — so an old assignee on a done, reopened, or stall
 task never looks like the same agent is still sitting there. `done` items dim
 further still, receding behind whatever's still active.
 
+### Dependencies — what's actually startable
+
+A task can declare that it waits on other tasks on the same board. The
+orchestrator sets these when a plan implies ordering (that's what stops "what's
+unblocked right now" from being re-derived from prose after every restart), and
+you can edit them yourself:
+
+- **🔗 on a row** opens a picker of the board's other tasks — choose one and this
+  task now waits for it.
+- A row with links grows a second line: **blocked by** chips, one per
+  dependency, marked **✓** (that one is `done`) or **✗** (it isn't yet). Hover a
+  chip for the other task's title and status; **✕** on it removes the link. A
+  red **⚠** chip means the link names no task on this board at all — only
+  reachable by hand-editing `tasks.json`, and worth removing, because it counts
+  as unmet forever.
+- **see also** chips are non-blocking annotations the orchestrator keeps. They
+  are shown read-only here and never affect anything below.
+- A `queued` task still waiting on something **dims**, so it can't be read as
+  work anyone could pick up; one whose dependencies are all done is marked
+  **▸ ready**, next to ▶ Start. The ready mark appears only once some task on
+  the board actually declares a dependency — on a board that uses none, every
+  queued item is trivially ready and the badge would say nothing.
+
+Only `done` satisfies a dependency: an item sitting at `pr` or `human-testing` is
+work *you* haven't signed off yet, so anything depending on it keeps waiting.
+Dependencies never move a status on their own — nothing is auto-flipped to
+`blocked` — they only change how the board reads. (`blocked` stays the status for
+blockers *outside* the board.)
+
+Edits are validated where the board is stored, not here, so the rules are the
+same whether you or the orchestrator made them: a link must name a live task, a
+task can't depend on itself, and a **cycle is refused** with an error naming the
+loop (`t-1 → t-3 → t-2 → t-1`) — you'll see it in the board's toast, and nothing
+is written. Deleting a task strips it from every remaining task's links in the
+same write, so a delete never leaves a dangling dependency behind.
+
 ## Steering, attention, and audit
 
 These deserve their own detail — see:
