@@ -9265,8 +9265,12 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   native custom-agent flag (its persona rides the kickoff prompt, like an
   inline-`prompt:` copilot block), no `allow:` widening (those patterns are
   Claude/Copilot tool-matcher strings — translating them would be inventing
-  semantics), and no compact nudge (its command is `/compress`, not `/compact`;
-  teaching #287's machinery a per-CLI spelling is a separate piece of work).
+  semantics), no compact nudge (its command is `/compress`, not `/compact`;
+  teaching #287's machinery a per-CLI spelling is a separate piece of work), and
+  no `session_digest` (#324/#646's transcript reader has a claude arm and a
+  copilot arm; gemini falls to its `other =>` error arm — which is moot today
+  anyway, since gemini mints its own session ids and loomux therefore records
+  `session_id: None` for a gemini agent, so no digest ever reaches that call).
 
   ##### Codex: evaluated, recorded, not shipped
 

@@ -545,6 +545,9 @@ Two differences worth knowing before you pick gemini for a lane:
 - **No compact nudge.** loomux's context-pressure nudge types `/compact`,
   which gemini doesn't have (its command is `/compress`), so gemini agents
   are skipped rather than sent a command that doesn't exist.
+- **No session history features.** loomux can't resume a gemini session or
+  read its transcript — gemini mints its own session ids rather than
+  accepting one, so there's nothing for loomux to record and reopen later.
 
 **Why not codex?** It was evaluated for this and deliberately left out: codex
 can't deny its editing tool by name, and its sandbox is all-or-nothing —
