@@ -1613,7 +1613,12 @@ const REINJECT_ACK_SETTLE_MS: u64 = {
 /// not proof of a read), and it is why the activity input governs only the one
 /// arm where the box was independently OBSERVED to no longer hold our text;
 /// see `unconfirmed_disposition`'s precedence table.
-const UNCONFIRMED_ACK_SETTLE_MS: u64 = {
+///
+/// `pub` so the integration test can assert the shipped value against its own
+/// stage-by-stage derivation. The sibling constant is private and mirrored by
+/// hand instead, which catches a drifting value only if someone remembers to
+/// re-derive it; comparing against the real one catches it always.
+pub const UNCONFIRMED_ACK_SETTLE_MS: u64 = {
     let mut tail_ms = 0u64;
     let mut i = 0;
     while i < SUBMIT_RETRY_DELAYS.len() {

@@ -58,7 +58,7 @@ use loomux_lib::orchestration::{
     redelivery_treatment, RedeliveryTreatment, stranded_reword,
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
     box_reading, tier1_scan_bytes, BoxReading,
-    HUMAN_INPUT_BLOCK_BOUND_MS, record_stranded_outcome_at_for_test,
+    HUMAN_INPUT_BLOCK_BOUND_MS, UNCONFIRMED_ACK_SETTLE_MS, record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
@@ -25353,7 +25353,7 @@ fn an_unverifiable_reading_is_never_classified_as_an_idle_pane() {
 /// only for what is still ahead of that stamp:
 ///   4. `SUBMIT_CONFIRM_WINDOW` 600
 ///   5. sum of `SUBMIT_RETRY_DELAYS` 2_500 + 4_500
-const UNCONFIRMED_ACK_SETTLE_MS: u64 = 600 + 2_500 + 4_500;
+const UNCONFIRMED_ACK_SETTLE_MS_DERIVED: u64 = 600 + 2_500 + 4_500;
 
 #[test]
 fn a_pane_whose_agent_kept_working_is_busy_not_unconfirmed() {
@@ -25443,6 +25443,13 @@ fn activity_inside_the_settling_floor_is_the_previous_turn_talking() {
     // can still be pressing Enter for `UNCONFIRMED_ACK_SETTLE_MS` after that —
     // a call arriving inside that window was decided during the agent's
     // PREVIOUS turn and says nothing about our delivery.
+    // The shipped constant, checked against the derivation above rather than
+    // mirrored on trust: a stage added to (or removed from) the post-submit
+    // chain must move both or fail here.
+    assert_eq!(
+        UNCONFIRMED_ACK_SETTLE_MS, UNCONFIRMED_ACK_SETTLE_MS_DERIVED,
+        "the floor must be exactly the submit-burst watch plus the blind-retry tail — no more          (stages already spent before `submit_sent_ms`) and no less (our own Enter is still landing)"
+    );
     let submit = 900_000u64;
     let floor = submit + UNCONFIRMED_ACK_SETTLE_MS;
     assert!(
