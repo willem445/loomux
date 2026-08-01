@@ -416,6 +416,18 @@ export class PluginPaneView {
    *  `modal`'s `title`/`body`/`bodyLines`, all of which are rendered with
    *  `textContent`. */
   private async reviewCapabilities(): Promise<void> {
+    // One prompt at a time: a double-click would otherwise stack two identical
+    // overlays, and dismissing one would leave the other floating over the app.
+    if (this.reviewBtn.disabled) return;
+    this.reviewBtn.disabled = true;
+    try {
+      await this.promptAndApprove();
+    } finally {
+      this.reviewBtn.disabled = false;
+    }
+  }
+
+  private async promptAndApprove(): Promise<void> {
     const m = this.manifest;
     const approve = await modal<boolean>((resolve) => ({
       title: `Allow "${m.displayName}" to run?`,
