@@ -9579,6 +9579,19 @@ Frontend logic that needs tests is DOM-free per the repo's convention (`taskboar
 `test/taskboard.test.ts`, `node:test`); the DOM wiring in `tasksview.ts` is validated by hand, so
 the PR lists what a human pass has to cover rather than simulating a DOM.
 
+**The directive ledger is not this, and the two must not be merged** — #582's fourth open question,
+recorded here because it is a decision a future author has to find *before* deciding to unify them.
+The ledger (`note_directive`, *docs/orchestration.md* §compact) persists **prose**: a directive as
+the human phrased it, per agent, append-only, replayed verbatim into that one pane's post-compact
+re-grounding notice. The board persists **structure**: validated ids, group-scoped, read by tools
+and rendered above. That they survive the same event — a compact — is the whole trap; it is the
+only thing they have in common. Unifying them would have to either force a human's sentence through
+a schema whose one option is to reject it, or let unvalidated free text into the readiness
+derivation, and it would turn a per-agent record into a group-shared one where every agent's
+directives land in everyone else's context. They are complementary and deliberately kept apart: a
+dep says *t-5 waits on t-3*, a ledger line says *why the human wanted it that way*. The relationship
+to aim for is that a reader of one can find the other — never that either becomes the other.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a
