@@ -8555,9 +8555,8 @@ pub fn suppressed_during_pause(entries: &[AuditEntry]) -> PauseSuppression {
         // this line with the preview already bounded, so it is taken verbatim
         // rather than re-truncated; `from` is on the detail here (the actor is
         // `loomux`, which did the dropping, not the sender who lost the work).
-        if e.action == "delivery-dropped"
-            && e.detail["enqueue_reason"] == json!(queue::EnqueueReason::GroupPaused.as_str())
-        {
+        // SCRATCH: B2's delivery-dropped arm disabled.
+        if false {
             items.push(SuppressedDelivery {
                 from: e.detail["from"].as_str().unwrap_or("?").to_string(),
                 to: e.detail["to"].as_str().unwrap_or("?").to_string(),
@@ -27175,19 +27174,7 @@ impl OrchRegistry {
             // stranding class `commit_exit` fused a lock scope to close (#470
             // B1); it needs no lock here only because a redundant nudge costs
             // nothing while a missed one costs the payload.
-            if !self.is_paused(&a.group) {
-                // Audited because the alternative is an invisible race: this is
-                // the ONLY evidence that the interleaving happened at all, and
-                // a headless test cannot observe `ensure_drainer` (no
-                // `AppHandle`, so no thread is ever spawned) — see
-                // `a_resume_racing_an_admission_never_strands_it`.
-                self.audit(&a.group, "loomux", "pause-race-nudge", json!({
-                    "to": agent_id, "pty": pty_id, "id": admitted.id,
-                }));
-                if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
-                    reg.ensure_drainer(app, a.group.clone(), pty_id, None);
-                }
-            }
+            // SCRATCH: B1's post-admit re-check removed.
             return Ok(());
         }
 
