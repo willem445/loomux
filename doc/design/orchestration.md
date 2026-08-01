@@ -6881,12 +6881,25 @@ that a still-queued entry was resolved — a silent gap upgraded into a false al
 stays an orphan (correctly — it is still there) and `front_door_refusals` skips it for the same
 one-loss-one-row reason.
 
-**Boundary with the two siblings in flight.** #636 (#590 layer 2) is about a delivery that IS
-queued and cannot be *typed* — a pane holding a `[loomux]` notice while mid-turn — so its subject
-always has a live queue id and belongs to the hold-episode and orphan machinery, never here; a
-payload can be refused (no id, this list) or held (id, that one), never both, so the two cannot
-double-report by construction. #638 (#632) is about the row markers on loomux-authored notice
-*text* and touches no delivery-outcome record at all. Neither overlaps the reason set above.
+**Boundary with #636, which is sharper than "they don't overlap".** #636 (#590 layer 2) is about a
+delivery that IS queued and cannot be *typed* — a pane holding a `[loomux]` notice while mid-turn.
+Its subject always has a live queue id and belongs to the hold-episode and orphan machinery; a
+payload can be refused (no id, this list) or held (id, that one), never both, so **the held payload
+cannot appear in both lists**.
+
+What that formulation misses, and what landing the two together actually surfaced: #636's
+escalation *notice* — the one that reports the held delivery — is itself a delivery, and it can be
+refused like any other. Those are two different events about one situation, and both being visible
+is correct rather than a double-report: the held payload is reported by #636 (still queued, will
+land), and a refused notice ABOUT it is reported here (never queued, lost). `notice-undeliverable`
+is a different audit action from `delivery-dropped`, so the derivation keeps them apart
+structurally, which is what `an_undeliverable_notice_is_never_reported_as_a_front_door_refusal`
+pins from #636's side. That test needed its fixture — not its assertion — corrected when #633
+landed: it left the orchestrator with no pane, so the escalation notice to that pane was genuinely
+refused, and pre-#633 that loss was simply invisible.
+
+#638 (#632) is about the row markers on loomux-authored notice *text* and touches no
+delivery-outcome record at all. Neither sibling overlaps the reason set above.
 
 ### Coalesced flush: one drain pass, one prompt (#533-A)
 

@@ -21224,11 +21224,27 @@ fn an_undeliverable_notice_is_never_reported_as_a_front_door_refusal() {
     // dropped-ish line" would silently swallow this one.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 5915u32;
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 8_000_000u64;
+
+    // #633: the escalation below delivers its notice TO THE ORCHESTRATOR, so
+    // that pane has to be able to take one or the fixture generates a refusal
+    // of its own — a real one, correctly reported, and nothing to do with what
+    // this test is about. Pre-#633 an orchestrator with no pane swallowed that
+    // notice in silence, which is exactly the loss #633 made visible; the
+    // assertion below stayed at `total == 0` rather than being widened to
+    // tolerate it, because the incidental refusal is a fixture gap and not the
+    // property under test. A pane plus one entry already queued is what makes
+    // the notice land: the admission is not `was_first`, so it needs no app
+    // handle to be accepted (test mode has none, and an empty-queue admission
+    // would be withdrawn as `no-app-handle` instead).
+    let orch_pty = 5916u32;
+    reg.set_pty_for_test(&orch.id, orch_pty);
+    reg.enqueue_text(&g.id, &orch.id, "loomux", "already queued for the orchestrator", orch_pty,
+        queue::EnqueueReason::Arrival).unwrap();
 
     reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-4", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();
