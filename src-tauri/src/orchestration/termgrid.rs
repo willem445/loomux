@@ -46,10 +46,13 @@
 //!   against a blank grid with the cursor home. Absolute-addressed paints land
 //!   correctly; a relative move off the top edge clamps instead of reaching
 //!   content that scrolled out of the ring long ago.
-//! - **Only `get_output` uses this.** [`super::strip_ansi`] is unchanged and
-//!   still serves every other caller (`box_holds_paste`, `prompt_wait_detected`,
-//!   the compact/menu detectors) — this changes what the orchestrator *reads*,
-//!   never what loomux *decides* (#522's confirmation sampling included).
+//! - **`get_output` reads [`render_screen`]; the question guard reads
+//!   [`render_visible`].** [`super::strip_ansi`] is unchanged and still serves
+//!   every other caller (`box_holds_paste`, the compact/menu detectors). #530
+//!   changed only what the orchestrator *reads*; #534 is the first place a
+//!   composed screen also informs what loomux *decides*, and it does so through
+//!   [`render_visible`] — see that function's doc for why the two must not be
+//!   confused.
 
 use std::collections::VecDeque;
 
@@ -100,10 +103,16 @@ struct Screen {
     saved_cursor: Option<(usize, usize)>,
     /// Primary screen, parked while an alternate screen is active.
     parked: Option<Vec<Vec<char>>>,
+    /// Whether rows scrolling off the top are retained (#534). A
+    /// [`render_visible`] replay sets this false: it answers "what is on
+    /// screen NOW", so a scrolled-off row is not merely uninteresting to it,
+    /// it is the thing the caller must not see. Dropping the row at the
+    /// source rather than filtering later means no reader can reach it.
+    keep_history: bool,
 }
 
 impl Screen {
-    fn new(cols: u16, rows: u16) -> Self {
+    fn new(cols: u16, rows: u16, keep_history: bool) -> Self {
         let cols = (cols as usize).clamp(2, MAX_COLS);
         let rows = (rows as usize).clamp(2, MAX_ROWS);
         Screen {
@@ -118,10 +127,14 @@ impl Screen {
             scroll_bot: rows - 1,
             saved_cursor: None,
             parked: None,
+            keep_history,
         }
     }
 
     fn push_history(&mut self, line: String) {
+        if !self.keep_history {
+            return;
+        }
         self.history.push_back(line);
         while self.history.len() > MAX_HISTORY_ROWS {
             // O(1). A `Vec` front-drain costs O(cap) *per scroll* once the cap
@@ -309,6 +322,27 @@ impl Screen {
         }
         rows.join("\n")
     }
+
+    /// The rows a human is looking at RIGHT NOW, and nothing else (#534).
+    ///
+    /// Three things are deliberately excluded, and each exclusion is the
+    /// point rather than an optimization:
+    ///
+    /// - `history` — rows that scrolled off the top. Never populated at all
+    ///   under `keep_history: false`, so this is belt and braces.
+    /// - `parked` — the primary screen sitting behind an active alternate
+    ///   screen. [`Screen::into_text`] shows it because a `get_output` reader
+    ///   wants the context a pager is covering; it is by definition NOT
+    ///   displayed, so a "is this still on screen" reading must not see it.
+    /// - trailing blank rows, right-trimmed cells — cosmetic only, and
+    ///   identical to `into_text`'s treatment so the two agree on content.
+    fn into_visible(self) -> String {
+        let mut rows: Vec<String> = self.grid.iter().map(|r| row_text(r)).collect();
+        while rows.last().is_some_and(|r| r.is_empty()) {
+            rows.pop();
+        }
+        rows.join("\n")
+    }
 }
 
 /// One CSI sequence's numeric parameters, `;`-separated, defaults applied by
@@ -326,8 +360,47 @@ fn param(params: &[u32], idx: usize, default: u32) -> u32 {
 ///
 /// This is the whole of #520's fix: an overwrite in the stream becomes an
 /// overwrite here, so redraw churn never reaches the caller in the first place.
+///
+/// **Not a "what is displayed" reading.** The history half makes this the
+/// wrong input for any decision phrased as "is X still on screen" — see
+/// [`render_visible`], which exists precisely because pointing a detector at
+/// this output would reproduce the bug it was meant to fix (#534).
 pub fn render_screen(bytes: &[u8], cols: u16, rows: u16) -> String {
-    let mut s = Screen::new(cols, rows);
+    replay(bytes, cols, rows, true).into_text()
+}
+
+/// Replay `bytes` and return ONLY the rows currently on screen (#534) —
+/// scrolled-off history is dropped as it scrolls, never retained and filtered.
+///
+/// ## Why this is a separate function and not a flag on the caller's side
+///
+/// [`render_screen`] returns *history rows followed by on-screen rows, joined
+/// into one string*. Pointing `super::prompt_wait_detected` at that output
+/// would reproduce the exact bug #534 exists to fix: an answered question that
+/// scrolled off is still in the history half, so the detector keeps matching
+/// it — byte-ring behaviour with extra steps. The whole structural claim of
+/// #534 is *"a question that is no longer RENDERED is answered"*, and only a
+/// rendered-rows-only read can make it. Callers must not have to remember to
+/// slice the history off; there is nothing here to slice.
+///
+/// ## What this can and cannot prove
+///
+/// It can prove a **negative about the composition**: replay these bytes at
+/// this geometry and the text is not among the cells. It cannot prove a
+/// negative about the human's screen, because the replay begins mid-stream
+/// against a blank grid (see *Deliberate limits* at the top of this module) —
+/// content painted before `bytes` begins and never repainted since is absent
+/// here and present there. A caller turning "absent" into an action owes that
+/// gap an argument; `super::question_shown` is the one that does.
+pub fn render_visible(bytes: &[u8], cols: u16, rows: u16) -> String {
+    replay(bytes, cols, rows, false).into_visible()
+}
+
+/// The shared VT replay. `keep_history` decides only whether rows leaving the
+/// top of the screen are retained — the composition itself is identical, so
+/// the two public readings can never disagree about what is ON the grid.
+fn replay(bytes: &[u8], cols: u16, rows: u16, keep_history: bool) -> Screen {
+    let mut s = Screen::new(cols, rows, keep_history);
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -458,7 +531,7 @@ pub fn render_screen(bytes: &[u8], cols: u16, rows: u16) -> String {
             }
         }
     }
-    s.into_text()
+    s
 }
 
 fn apply_csi(s: &mut Screen, body: &[u8], final_byte: u8) {
