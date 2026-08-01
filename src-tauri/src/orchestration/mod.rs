@@ -11489,15 +11489,15 @@ impl Tier1ScanCensus {
     /// ONE option rather than two, so a call site cannot answer "was there a
     /// read" two ways.
     pub fn measure(requested_bytes: usize, read: Option<(usize, &str)>, pasted: &str) -> Self {
-        // #583 red-before-green placeholder: the census reports exactly what
-        // the pre-#583 record already knew (what was asked for, and how long
-        // the needle is) and nothing about what came back. Replaced by the
-        // real measurement in the next commit — see the PR's red run.
-        let _ = read;
         Self {
             requested_bytes,
-            tail_bytes: None,
-            tail_chars: None,
+            tail_bytes: read.map(|(raw, _)| raw),
+            // The same normalization `box_reading` compares through, not a
+            // char count of the stripped text: whitespace collapse is a real
+            // part of the shrink (a TUI pads every box row out to the terminal
+            // width), and a census that measured only the ANSI half would
+            // under-report the loss that actually decides the reading.
+            tail_chars: read.map(|(_, stripped)| normalize_prompt_text(stripped).len()),
             paste_chars: normalize_prompt_text(pasted).len(),
         }
     }
