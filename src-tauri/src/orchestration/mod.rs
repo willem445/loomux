@@ -12567,10 +12567,11 @@ struct DrainerGuard {
 
 impl Drop for DrainerGuard {
     fn drop(&mut self) {
-        let mut draining = self.queue_draining.lock_safe();
-        if draining.get(&self.pty_id) == Some(&self.generation) {
-            draining.remove(&self.pty_id);
-        }
+        // SCRATCH — #497 EXPERIMENT (b), reverted in the next commit. The
+        // generation check is removed: this is the round-1-shipped bug, in
+        // REAL code rather than as the model's `guard_checks_generation`
+        // knob. Does anything in `cargo test` go red?
+        self.queue_draining.lock_safe().remove(&self.pty_id);
     }
 }
 
@@ -27551,6 +27552,12 @@ impl OrchRegistry {
         if !entries.is_empty() {
             self.persist_queues(group);
         }
+        // SCRATCH — #497 EXPERIMENT (a), reverted in the next commit. A
+        // plausible NEW call site performing a RAW, ungenerationed
+        // `queue_draining` removal: "the queue is gone, so clear its drainer
+        // registration too" is exactly the shape a future change would reach
+        // for, and it is precisely what #497 asks whether anything catches.
+        self.queue_draining.lock_safe().remove(&pty_id);
         // #560: the queue is gone, so nothing is being held on this pane — the
         // same end-of-episode `commit_exit` performs for the drainer's own exits
         // (there it must be atomic with the emptiness check, which is why it is
