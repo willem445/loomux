@@ -25870,14 +25870,27 @@ fn d4b_a_poll_landing_mid_repaint_is_survived_by_the_hysteresis_not_by_the_grid(
     // consecutive such polls to release, which is the hysteresis doing the
     // work — not the grid.
     let dialog = "Do you want to run npm test? (y/n)";
+    // CUMULATIVE, as a real ring is — otherwise the byte ring would lose the
+    // dialog along with the screen and the test would prove nothing about the
+    // grid, which is the whole point of these polls.
     let mut full = b"\x1b[H\x1b[2J".to_vec();
     full.extend_from_slice(&painted(&[dialog, "  Yes", "  No", "working"]));
-    // Erased, chrome painted, dialog row not yet.
-    let mut mid = b"\x1b[H\x1b[2J".to_vec();
+    // Erased, chrome painted, dialog row not yet: the ring still holds the
+    // dialog, the SCREEN genuinely does not.
+    let mut mid = full.clone();
+    mid.extend_from_slice(b"\x1b[H\x1b[2J");
     mid.extend_from_slice(&painted(&["  Yes", "  No"]));
-    // Erased and nothing painted at all.
-    let erased = b"\x1b[H\x1b[2J".to_vec();
+    // Erased with nothing painted at all.
+    let mut erased = full.clone();
+    erased.extend_from_slice(b"\x1b[H\x1b[2J");
+    let mut repainted = mid.clone();
+    repainted.extend_from_slice(b"\x1b[H\x1b[2J");
+    repainted.extend_from_slice(&painted(&[dialog, "  Yes", "  No", "working"]));
 
+    assert!(
+        prompt_wait_detected(&strip_ansi(&mid)),
+        "precondition: the RING still matches through the repaint — only the screen went clear"
+    );
     assert_eq!(
         trustworthy_composition(loomux_lib::orchestration::termgrid::render_visible(&erased, 80, 10)),
         None,
@@ -25885,7 +25898,7 @@ fn d4b_a_poll_landing_mid_repaint_is_survived_by_the_hysteresis_not_by_the_grid(
     );
 
     // (b) one mid-repaint poll between two good frames must not release.
-    let seq = [full.clone(), mid, full];
+    let seq = [full, mid, repainted];
     let call = std::sync::atomic::AtomicU32::new(0);
     let pred = question_hold_predicate_sampled(
         move || {
