@@ -68,6 +68,22 @@ test("a non-finite width is treated as no width", () => {
 
 // --- ticks -----------------------------------------------------------------
 
+test("ticks land on multiples of the step even when the window starts mid-step", () => {
+  // The window a live view actually has: "12h back from now", where now is an
+  // arbitrary instant. If the first tick were simply `startMs`, every tick
+  // would read as a random time (12:07:13, 15:07:13, …) — and a window whose
+  // edges happen to be round would hide that entirely, which is why this case
+  // starts deliberately off-step.
+  const ragged = { startMs: twelveHours.startMs + 7 * MIN + 13_000, endMs: twelveHours.endMs + 7 * MIN + 13_000 };
+  const { stepMs, ticks } = niceTicks(ragged, 6);
+  assert.ok(ticks.length > 0);
+  for (const t of ticks) {
+    assert.equal(t % stepMs, 0, `tick ${new Date(t).toISOString()} is not on a step boundary`);
+    assert.ok(t >= ragged.startMs && t <= ragged.endMs);
+  }
+  assert.notEqual(ticks[0], ragged.startMs, "the first tick is the next round instant, not the edge");
+});
+
 test("ticks land on multiples of the step, inside the window", () => {
   const { stepMs, ticks } = niceTicks(twelveHours, 6);
   assert.ok(ticks.length > 0);
