@@ -48,8 +48,9 @@ Under *Auto*, **group Copilot** agents run in Copilot's true **autopilot mode**
 (`--autopilot`) — an unattended worker should persist autonomously rather than
 pause to ask — and loomux answers the resulting "Enable autopilot mode" consent
 dialog for them automatically at spawn (your group-level *Auto* choice is the
-consent). A lone single pane, where you're present to answer, does not enter
-autopilot mode.
+consent). A lone Copilot pane launched with the **Autopilot** checkbox on gets
+the same flags and the same dialog-answering watcher — see
+[getting started](getting-started.html#your-first-agent-pane).
 
 The launcher warns inline when any selected role's CLI isn't installed, and an
 agent pane that dies with an error stays open so you can read what happened.

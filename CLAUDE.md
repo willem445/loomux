@@ -2,8 +2,8 @@
 
 Tauri 2 desktop terminal multiplexer for AI agent management. Rust backend
 (`src-tauri/`), vanilla-TypeScript frontend (`src/` — no UI framework), xterm.js
-terminals, Vite. The README's *Architecture* section maps every module; deeper
-designs live in `doc/design/`.
+terminals, Vite. `doc/design/architecture.md` maps every module; deeper designs
+live in `doc/design/`.
 
 ## Commands
 
@@ -157,5 +157,6 @@ narrow their ask back down to the original ticket on your own judgment.
   `agent-managed` (an orchestrator owns it), `agent-ready` (groomed — go),
   `agent-investigation` (research only — post findings as an issue comment,
   no code), `agent-prototype` (build for demo/feedback).
-- User-visible behavior changes must update the matching README section;
-  substantial designs get a `doc/design/*.md` note.
+- User-visible behavior changes must update the matching user-docs page under
+  `docs/` (the README is a pitch, not a manual — only touch it when the pitch
+  itself changes); substantial designs get a `doc/design/*.md` note.

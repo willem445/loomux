@@ -62,7 +62,7 @@ and costs the human a debugging session later.
    still red and what you tried, and say the same on the issue, rather than marking
    the PR ready. Never spawn a real agent CLI — it burns the human's paid credits,
    and no test in this repo does it.
-4. **Update the doc the change touches** — the README section for user-visible
+4. **Update the doc the change touches** — the `docs/` page for user-visible
    behaviour. If it needs a *new* design note, that is a sign the task was not
    quick: escalate.
 5. **Mark the PR ready and stop.** `gh pr ready` on the draft from step 3, with the

@@ -4,8 +4,9 @@ Project-scoped **tabs**: each project's panes (plain terminals, agent panes,
 orchestrator + worker groups) live in their own tab; switching tabs swaps the
 whole workspace; tabs are renamable, colorable, show a live status + attention
 alert + hover preview, and persist across restarts. User-facing usage lives in
-the README ([Project tabs](../../README.md#project-tabs)); this note is the
-architecture and the decisions behind it.
+the user docs ([Project tabs](https://willem445.github.io/loomux/features/project-tabs),
+source: [`docs/features/project-tabs.md`](../../docs/features/project-tabs.md));
+this note is the architecture and the decisions behind it.
 
 This is **Option A** from the issue #63 investigation: one `Grid` per tab,
 swapped via `display:none`. `Grid`/`Pane` and the backend are reused essentially
@@ -328,8 +329,8 @@ tab-routing; the GL-drop policy was closed to cover background-spawned panes;
 the preview cost was formalized and its sanitizer extracted + tested; and every
 prototype TODO/stub was resolved or documented as a deliberate decision (the
 boot-revive scope above). The prototype's separate demo walkthrough has been
-retired — its content now lives in this note plus the README user section
-([Project tabs](../../README.md#project-tabs)).
+retired — its content now lives in this note plus the user-docs page
+([`docs/features/project-tabs.md`](../../docs/features/project-tabs.md)).
 
 ## Interaction with maximize (#155)
 
