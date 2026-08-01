@@ -7886,7 +7886,13 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
      `--settings` after it, in both `build_agent_command` and `build_agent_argv`.
      `claude_allow_patterns_are_not_severed_from_the_allowedtools_flag` pins contiguity
      rather than presence, across every tier and both spawn forms, so the next flag added
-     to that branch cannot silently reopen this.
+     to that branch cannot silently reopen this. Its twin
+     `claude_deny_patterns_are_not_severed_from_the_disallowedtools_flag` (review N1) does
+     the same for `--disallowedTools`, which pins no live defect but closes the same
+     coverage gap on the side that fails **open**: every pre-existing pin on deny ordering
+     was built with `hook_settings: None`, and `--settings` is a flag that appears only on
+     a real spawn — a severed *allow* announces itself immediately, a severed *deny* is
+     silent.
   2. *Allows must live in settings.* This is the clause the #465 argument above was
      missing, and it is worth stating as a rule rather than a fix: **the quoted contract
      for `dontAsk` names `permissions.allow`, a settings-file concept, and nothing in
@@ -7934,6 +7940,33 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     an injection surface and a data-egress channel. The escape hatch needs no loomux
     feature — a `WebFetch` deny rule in the target repo's own `.claude/settings.json` beats
     any allow rule here, in every mode.
+  - **The denies had to move with the allow (review B1).** `Bash(git *)` is a *prefix*
+    pattern, so as a live `permissions.allow` rule it positively matches `git commit` and
+    `git push` — and before the review, the only thing carving them back out was
+    `--disallowedTools`, i.e. an *argv* deny expected to beat a *settings-file* allow. That
+    is precisely the cross-mechanism equivalence the clause above refuses to assume for
+    allows, so assuming it for denies would have been the same mistake pointed the other
+    way — and pointed at the read-only tier's one real guarantee. Worth stating plainly
+    because it is the failure shape of #610 itself: a permission mechanism that *looks*
+    right on argv, unobserved because nothing tests it.
+
+    Two things closed it, and both were worth doing. First, it is in fact **documented**,
+    not assumed — the [permissions reference](https://code.claude.com/docs/en/permissions)
+    puts the flags in the same precedence domain as settings rules ("Permission rules
+    follow the same settings precedence as all other Claude Code settings", with **"Command
+    line arguments: temporary session overrides"** as level 2, and naming these very flags:
+    *"If a tool is denied at any level, no other level can allow it. For example, a managed
+    settings deny can't be overridden by `--allowedTools`, and `--disallowedTools` can add
+    restrictions beyond what managed settings define."*), and settles deny-vs-allow within
+    a level outright (*"Rules are evaluated in order: deny, then ask, then allow. The first
+    match in that order determines the outcome, and rule specificity doesn't change the
+    order"*; *"deny rules from any scope are evaluated before allow rules"*). Second, the
+    denials are now **also** written into the same `permissions` object as the allow
+    (`readonly_settings_deny`, derived from the same two `Containment` predicates
+    `--disallowedTools` uses, never a third literal list) — so the rule and the rule that
+    beats it live in one object and the cross-layer question does not have to be asked at
+    all. `--disallowedTools` stays emitted: the same belt-and-braces stance this section
+    takes for allows, for the same reason.
   - **#465's no-bare-grant invariant is restated for the new layer, not weakened.**
     `readonly_pane_settings_carry_permissions_allow` asserts that every rule in the
     settings allow list is `mcp__loomux`, a scoped `Name(...)` pattern, or one of the two
