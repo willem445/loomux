@@ -917,7 +917,12 @@ when the whole value is "the next orchestrator should just already know this."
   bytes were already pasted into that pane and only the Enter was refused, so that pane is
   sitting with an unsubmitted prompt in its box — look at the pane rather than re-sending.
   `refused_count` counts every refusal in the readable audit log; only the most recent 8 are
-  listed, and `refused_omitted` says how many were left in `audit.jsonl`. Reading this list
+  listed, and `refused_omitted` says how many were left in `audit.jsonl`. **Check
+  `refused_window_truncated` before you read `refused_count: 0` as "nothing was refused"** — true
+  means the audit window itself was cut at 5000 entries, so the count covers only the readable
+  tail and older refusals may exist that nothing here ever saw; grep `audit.jsonl` for
+  `queue-full-at-call` if you need the full history. False means the count is complete.
+  Reading this list
   re-admits nothing — a refused delivery stays refused, and re-sending it is your deliberate
   call, because slipping it back in now would reorder it against everything the pane has
   accepted since.
