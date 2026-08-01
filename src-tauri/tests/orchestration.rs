@@ -20874,6 +20874,91 @@ fn a_held_kickoff_is_not_reported_as_an_undeliverable_notice() {
 }
 
 #[test]
+fn a_bound_crossed_with_nothing_queued_does_not_burn_the_report() {
+    // rev-128's blocking finding, and the scenario is one step from the filed
+    // incident: the orchestrator sends a worker a follow-up while it is
+    // mid-turn, the delivery is held, and the episode opens on WORK. The bound
+    // elapses with no notice queued — correctly silent. THEN the worker's own
+    // CI watch fires and queues `watch_conflicting_notice` behind that entry:
+    // #590's exact payload, on a pane that cannot take it. That must be
+    // reported, and before this fix it never was, for as long as the pane
+    // stayed held (unbounded).
+    //
+    // **Deliberately run in the configuration where the badge SUCCEEDS**, which
+    // is the common one and the one the fix has to cover. Nothing else owns this
+    // agent's badge, so `mark_stranded` applies, `HoldEpisode::badged` goes true
+    // — and `held_escalation` then returns `None`, not `Badge`, on every later
+    // poll. So a fix that only reorders the one-shot inside the `Badge` arm
+    // would still be silent here: there is no second `Badge` poll to try again.
+    // That is why the report is evaluated on the BOUND, not on the verdict, and
+    // why this test asserts the verdict is `None` at the moment it fires.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5916u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 9_000_000u64;
+    let step = |now| {
+        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, now, bound,
+            Some(0))
+    };
+
+    // An ordinary follow-up from the orchestrator — work, not a notice.
+    reg.enqueue_text(&g.id, &w.id, "o-1", "any word on the rebase?", pty,
+        queue::EnqueueReason::Arrival).unwrap();
+
+    assert_eq!(step(t0), HeldEscalation::Chip(HeldReason::BoxOccupied), "the episode opens");
+    assert_eq!(
+        step(t0 + bound),
+        HeldEscalation::Badge(StrandedBlocker::HumanInput),
+        "the bound elapses and the human-facing escalation fires as it always did"
+    );
+    assert!(
+        reg.hold_episode_badged(pty),
+        "and the badge was RAISED, not declined — this is the common configuration, and the one \
+         in which no further poll ever returns Badge again"
+    );
+    assert!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").is_empty(),
+        "nothing loomux said is queued here, so there is correctly nothing to report yet — the \
+         defect is what this silence used to COST"
+    );
+
+    // The watch fires. Its notice lands behind the work already waiting, on a
+    // pane that is still held — #590, exactly.
+    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-5", 577),
+        pty, queue::EnqueueReason::BehindQueue).unwrap();
+
+    assert_eq!(
+        step(t0 + bound + 2_000),
+        HeldEscalation::None,
+        "the badge is already up, so the escalation verdict is None — the report must NOT be \
+         riding on the Badge arm, or it can never fire from here"
+    );
+    let lines = audit_entries(&reg, &g.id, "notice-undeliverable");
+    assert_eq!(
+        lines.len(),
+        1,
+        "the report survived the poll that had nothing to say, and fires on the poll that does"
+    );
+    assert_eq!(lines[0]["detail"]["notices"], 1, "one of the two queued entries is loomux's");
+    assert_eq!(lines[0]["detail"]["depth"], 2);
+    assert_eq!(lines[0]["detail"]["cause"], "pane-mid-turn");
+
+    // And it is still at-most-once per episode: the one-shot is claimed by the
+    // poll that reports, not by the poll that merely looked.
+    step(t0 + bound + 4_000);
+    step(t0 + bound + 6_000);
+    assert_eq!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").len(),
+        1,
+        "a stuck pane is polled every couple of seconds — claiming on report rather than on the \
+         bound must not turn into a report per poll"
+    );
+}
+
+#[test]
 fn an_undeliverable_notice_is_never_reported_as_a_front_door_refusal() {
     // The #579/#630 seam, pinned rather than argued. #630's refused list and
     // this classification are about opposite halves of one distinction: a
