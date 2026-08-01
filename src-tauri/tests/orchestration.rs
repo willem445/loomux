@@ -53,6 +53,8 @@ use loomux_lib::orchestration::{
     write_admission, WriteAdmission, preenter_admission, hold_bound_elapsed,
     held_escalation, HeldEscalation, QUESTION_HOLD_STALE_AFTER,
     hold_channels, HoldChannel, HoldClass,
+    pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
+    PauseSuppression, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -17633,6 +17635,8 @@ fn stranded_detail_names_the_blocker_the_human_must_clear() {
         Some(StrandedBlocker::QueueNearFull),
         Some(StrandedBlocker::QueueAtCapacity),
         Some(StrandedBlocker::QuestionStale),
+        // #569: appended for the same reason — see the note above.
+        Some(StrandedBlocker::PauseSuppressed),
     ]
     .into_iter()
     .map(|b| stranded_detail("w-1", b))
@@ -17804,6 +17808,386 @@ fn every_hold_class_reaches_a_human_who_is_not_the_orchestrator_channel() {
     assert!(!HoldChannel::OrchestratorNotice.survives_orchestrator_target());
     assert!(HoldChannel::HeldChip.survives_orchestrator_target());
     assert!(HoldChannel::AttentionBadge.survives_orchestrator_target());
+}
+
+// ---------- #569: a pause discards, and resume says what it discarded ----------
+
+/// One audit entry, as `suppressed_during_pause` reads them.
+fn audit(actor: &str, action: &str, detail: Value) -> AuditEntry {
+    AuditEntry { ts_ms: 0, actor: actor.to_string(), action: action.to_string(), detail }
+}
+
+/// A `prompt-suppressed-paused` line: actor is the SENDER, `to`/`text` the
+/// payload — exactly the shape `deliver_prompt`'s pause branch writes.
+fn suppressed(from: &str, to: &str, text: &str) -> AuditEntry {
+    audit(from, "prompt-suppressed-paused", json!({ "to": to, "text": text }))
+}
+
+/// The full text of every prompt this group actually offered its panes, read
+/// off the `prompt` audit line `deliver_prompt` writes BEFORE it admits. That
+/// line is the only place a headless test can see delivered wording: with no
+/// `AppHandle` the admission is withdrawn again and `deliver_prompt` returns
+/// `Err("no app handle")`, so nothing survives in the queue to read back.
+fn offered_prompts(reg: &OrchRegistry, group: &str) -> Vec<String> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == "prompt")
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn suppressed_during_pause_reads_only_the_window_the_last_pause_opened() {
+    // The window arithmetic, on a synthetic timeline — a pause, a resume, a
+    // SECOND pause, and the scan must report the second window's two payloads
+    // and not the first window's one. Getting this wrong re-reports deliveries
+    // the orchestrator was already told about on an earlier resume, which
+    // trains a reader to ignore the notice.
+    let entries = vec![
+        audit("human", "group-pause", json!({})),
+        suppressed("w-1", "orch-1", "stale: from the FIRST window"),
+        audit("human", "group-resume", json!({})),
+        audit("orch-1", "prompt", json!({ "to": "w-1", "text": "unrelated" })),
+        audit("human", "group-pause", json!({})),
+        suppressed("w-2", "orch-1", "report: done, PR #123 is green"),
+        audit("loomux", "delivery-queued", json!({ "to": "w-2" })),
+        suppressed("human", "w-3", "also update the README"),
+    ];
+
+    let s = suppressed_during_pause(&entries);
+    assert!(s.window_start_seen, "the opening `group-pause` was right there in the timeline");
+    assert_eq!(
+        s.items,
+        vec![
+            SuppressedDelivery {
+                from: "w-2".into(),
+                to: "orch-1".into(),
+                preview: "report: done, PR #123 is green".into(),
+            },
+            SuppressedDelivery {
+                from: "human".into(),
+                to: "w-3".into(),
+                preview: "also update the README".into(),
+            },
+        ],
+        "only THIS window's suppressions, in arrival order, sender and target both named"
+    );
+}
+
+#[test]
+fn suppressed_during_pause_does_not_stop_at_a_group_restore_that_shares_the_resume_name() {
+    // `create_group` audits `group-resume` for a group RESTORED from disk —
+    // the same action string `resume_group` writes for a human resuming a
+    // pause. A scan that treated it as a window boundary would silently
+    // truncate every pause that outlived an app restart, which is exactly the
+    // long unattended pause with the most to report. `group-pause` has no such
+    // collision, so it is the only boundary.
+    let entries = vec![
+        audit("human", "group-pause", json!({})),
+        suppressed("w-1", "orch-1", "sent before the restart"),
+        audit("loomux", "group-resume", json!({ "repo": "C:/tmp/repo", "max_agents": 4 })),
+        suppressed("w-1", "orch-1", "sent after it"),
+    ];
+
+    let s = suppressed_during_pause(&entries);
+    assert!(s.window_start_seen);
+    assert_eq!(
+        s.items.len(),
+        2,
+        "a restart mid-pause must not cut the window in half: {:?}",
+        s.items
+    );
+}
+
+#[test]
+fn suppressed_during_pause_says_so_when_the_window_start_has_rotated_away() {
+    // `audit_log` returns at most AUDIT_VIEW_LIMIT entries off a rotating
+    // file, so the `group-pause` that opened the window can genuinely be gone.
+    // The count is then a possible OVER-count (it may reach back into an
+    // earlier pause) and must be reported as one — a list presented as exact
+    // when it isn't is the unbacked claim `.loomux/lessons.md` catalogues.
+    let entries = vec![suppressed("w-1", "orch-1", "no opening marker above me")];
+
+    let s = suppressed_during_pause(&entries);
+    assert_eq!(s.items.len(), 1, "the readable suppressions are still reported");
+    assert!(!s.window_start_seen, "and the missing boundary is flagged, not assumed");
+    assert!(
+        pause_suppression_notice(&s).contains("may reach back into an earlier pause"),
+        "the caveat has to reach the reader, not just the struct: {}",
+        pause_suppression_notice(&s)
+    );
+}
+
+#[test]
+fn the_resume_notice_says_discarded_and_never_promises_a_replay() {
+    // The one job this copy has that the audit line cannot do: correct the
+    // "queued means safe" model every other #445/#523 path established. A
+    // reader who assumes a replay is coming waits forever — the exact stall
+    // #569 was filed for.
+    let s = PauseSuppression {
+        items: vec![SuppressedDelivery {
+            from: "w-2".into(),
+            to: "orch-1".into(),
+            preview: "report: done, PR #123 is green".into(),
+        }],
+        window_start_seen: true,
+    };
+    let n = pause_suppression_notice(&s);
+
+    assert!(n.contains("1 delivery was DISCARDED"), "loud, and singular reads as singular: {n}");
+    assert!(n.contains("w-2 -> orch-1"), "names sender and target: {n}");
+    assert!(n.contains("PR #123 is green"), "and the payload, so it can be re-requested: {n}");
+    assert!(
+        n.contains("nothing here will be replayed") && n.contains("re-requested"),
+        "must say the recovery is a RE-SEND, not a replay loomux will do: {n}"
+    );
+    assert!(
+        !n.contains("may reach back"),
+        "no truncation caveat when the window start was seen: {n}"
+    );
+
+    let many = PauseSuppression {
+        items: (0..PAUSE_SUPPRESSION_LIST_MAX + 3)
+            .map(|i| SuppressedDelivery {
+                from: format!("w-{i}"),
+                to: "orch-1".into(),
+                preview: format!("payload {i}"),
+            })
+            .collect(),
+        window_start_seen: true,
+    };
+    let n = pause_suppression_notice(&many);
+    assert!(n.contains("11 deliveries were DISCARDED"), "plural, and the full count: {n}");
+    assert!(n.contains("...and 3 more"), "the list is capped and says so: {n}");
+    assert!(
+        n.contains("prompt-suppressed-paused"),
+        "and points at the log that holds the rest in full: {n}"
+    );
+    assert!(!n.contains("payload 9"), "beyond the cap is summarized, not listed: {n}");
+}
+
+#[test]
+fn the_fallback_badge_fires_only_when_the_notice_did_not_land_on_a_free_live_pane() {
+    // Extracted precisely so this table is assertable: with no `AppHandle` a
+    // headless registry can never produce a DELIVERED notice, so
+    // "delivered => never badge" is unreachable through the registry and would
+    // otherwise be a claim in a comment.
+    let others = [
+        None,                                        // an in-flight heal
+        Some(StrandedBlocker::HumanInput),
+        Some(StrandedBlocker::QuestionStale),
+        Some(StrandedBlocker::QueueAtCapacity),
+    ];
+
+    assert!(
+        pause_badge_decision(false, true, None),
+        "undelivered notice + live unbadged pane is the whole point of the fallback"
+    );
+    assert!(
+        !pause_badge_decision(true, true, None),
+        "a notice the orchestrator took makes a chip on every pane pure noise"
+    );
+    assert!(!pause_badge_decision(false, false, None), "a dead pane's chip helps nobody");
+    for blocker in others {
+        assert!(
+            !pause_badge_decision(false, true, Some(StrandedNote { blocker, since_ms: 1 })),
+            "another mechanism's badge is not ours to overwrite: {blocker:?}"
+        );
+    }
+    assert!(
+        pause_badge_decision(
+            false,
+            true,
+            Some(StrandedNote { blocker: Some(StrandedBlocker::PauseSuppressed), since_ms: 1 })
+        ),
+        "our OWN badge is re-stamped, so a second lossy pause does not go quiet"
+    );
+}
+
+#[test]
+fn resuming_names_every_delivery_the_pause_destroyed() {
+    // The end-to-end property: three deliveries vanish into a pause, and the
+    // resume tells the orchestrator what they were. Before this, the audit
+    // line was the only record and nothing ever showed it to anyone — a
+    // worker's `report("done")` fired mid-pause simply evaporated.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5690);
+    reg.set_pty_for_test(&w.id, 5691);
+
+    reg.pause_group(&g.id).unwrap();
+    // Each of these returns Ok and destroys its payload — that IS the defect.
+    reg.deliver_prompt(&orch.id, "report: done, PR #123 is green", "w-1", Delivery::MidSession)
+        .unwrap();
+    reg.deliver_prompt(&w.id, "also update the README", "orch-1", Delivery::MidSession).unwrap();
+    reg.deliver_prompt(&orch.id, "blocked: needs a human call", "w-2", Delivery::MidSession)
+        .unwrap();
+    assert!(
+        offered_prompts(&reg, &g.id).is_empty(),
+        "precondition: a paused group offers its panes nothing at all"
+    );
+
+    reg.resume_group(&g.id).unwrap();
+
+    let notice = offered_prompts(&reg, &g.id)
+        .into_iter()
+        .find(|t| t.contains("DISCARDED"))
+        .expect("resume must offer the orchestrator a notice naming what was lost");
+    for payload in ["PR #123 is green", "update the README", "needs a human call"] {
+        assert!(notice.contains(payload), "every discarded payload is named: {notice}");
+    }
+    for pair in [
+        format!("w-1 -> {}", orch.id),
+        format!("orch-1 -> {}", w.id),
+        format!("w-2 -> {}", orch.id),
+    ] {
+        assert!(notice.contains(&pair), "sender and target both named ({pair}): {notice}");
+    }
+
+    let tally = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "pause-suppression-notice")
+        .expect("the tally is recorded whether or not the notice lands");
+    assert_eq!(tally.detail["count"], json!(3));
+    assert_eq!(tally.detail["window_start_seen"], json!(true));
+}
+
+#[test]
+fn a_paused_group_stays_silent_until_it_is_actually_resumed() {
+    // The notice belongs to the resume, not to the suppression. Firing it
+    // while still paused would be a delivery into a group the human
+    // deliberately silenced — and it would be suppressed anyway, so the only
+    // thing it could produce is another discarded payload.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5692);
+    reg.set_pty_for_test(&w.id, 5693);
+
+    reg.pause_group(&g.id).unwrap();
+    for i in 0..4 {
+        reg.deliver_prompt(&orch.id, &format!("report {i}"), &w.id, Delivery::MidSession).unwrap();
+    }
+
+    let log = reg.audit_log(&g.id);
+    assert!(
+        log.iter().all(|e| e.action != "pause-suppression-notice"),
+        "no tally while the pause is still on"
+    );
+    assert!(log.iter().all(|e| e.action != "prompt"), "and nothing offered to any pane");
+    assert!(reg.stranded_note(&orch.id).is_none(), "and no badge raised mid-pause");
+
+    // A pause that swallowed nothing must also stay silent on the way out —
+    // otherwise every routine pause/resume cycle costs the orchestrator a turn
+    // to read "0 deliveries were discarded".
+    let g2 = reg.create_group("C:/tmp/repo2", rails()).unwrap();
+    reg.spawn_agent(&g2.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.pause_group(&g2.id).unwrap();
+    reg.resume_group(&g2.id).unwrap();
+    assert!(
+        reg.audit_log(&g2.id).iter().all(|e| e.action != "pause-suppression-notice"),
+        "an empty pause window says nothing"
+    );
+}
+
+#[test]
+fn resume_badges_the_panes_that_lost_work_when_the_notice_itself_cannot_be_delivered() {
+    // The notice is an in-band delivery, so it fails exactly when a pause has
+    // run long enough for the orchestrator to idle out or be killed — the
+    // longest pause, with the most to report. A fix whose only channel goes
+    // missing in its own worst case is the defect it was meant to close, one
+    // level up.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let dead = reg.spawn_agent(&g.id, Role::Worker, "dead", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5694);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&w.id, "you have a new task", "orch-1", Delivery::MidSession).unwrap();
+    reg.deliver_prompt(&w.id, "and a second one", "orch-1", Delivery::MidSession).unwrap();
+    reg.deliver_prompt(&dead.id, "never arrived", "orch-1", Delivery::MidSession).unwrap();
+    // The orchestrator is gone by the time the human comes back.
+    reg.mark_dead(&orch.id, Some(0));
+    reg.mark_dead(&dead.id, Some(0));
+
+    reg.resume_group(&g.id).unwrap();
+
+    let tally = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "pause-suppression-notice")
+        .expect("the tally is recorded even when nothing can be told");
+    assert_eq!(tally.detail["delivered"], json!(false), "and it must not claim it was told");
+    assert!(
+        tally.detail["error"].as_str().unwrap_or_default().contains("orchestrator"),
+        "naming why: {:?}",
+        tally.detail
+    );
+
+    let note = reg.stranded_note(&w.id).expect("the pane that lost work must be badged");
+    assert_eq!(note.blocker, Some(StrandedBlocker::PauseSuppressed));
+    assert!(
+        reg.stranded_note(&dead.id).is_none(),
+        "a dead pane's badge is a chip nobody can act on"
+    );
+    // One badge for a pane that lost two payloads, not one per payload.
+    assert_eq!(
+        reg.audit_log(&g.id)
+            .iter()
+            .filter(|e| e.action == "stranded-attention" && e.detail["to"] == json!(w.id))
+            .count(),
+        1,
+        "one badge per pane, however many payloads it lost"
+    );
+}
+
+#[test]
+fn the_resume_notice_mutates_no_queue_of_its_own() {
+    // #523's persistence table: every `queues` mutation owes a
+    // `persist_queues` call. This path READS suppression records out of the
+    // audit log and mutates no queue at all, so it owes nothing and adds no
+    // row — and the way that stays true is that the notice goes through the
+    // ordinary front door (already a row) rather than writing anywhere itself.
+    // The discriminator: a pane that never had a queue must still have none
+    // afterwards, and the snapshot on disk must agree with memory.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5695); // the TARGET has a pane; nothing may be queued for it
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&w.id, "swallowed", "orch-1", Delivery::MidSession).unwrap();
+    assert_eq!(reg.queue_depth(5695), 0, "precondition: a suppressed delivery is never queued");
+
+    reg.resume_group(&g.id).unwrap();
+
+    assert_eq!(
+        reg.queue_depth(5695),
+        0,
+        "the resume notice goes to the ORCHESTRATOR — it must not enqueue anything for the \
+         panes it merely names"
+    );
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "queue-persist-failed"),
+        "and whatever the front door did persist, persisted"
+    );
+    // Nothing was ever admitted for this group, so no snapshot may claim
+    // otherwise: a phantom entry here would be work loomux thinks it still
+    // owes a pane and would re-admit on the next restart.
+    let snap = reg.state_root().join(&g.id).join("queue.json");
+    if let Ok(body) = fs::read_to_string(&snap) {
+        assert!(
+            !body.contains("swallowed"),
+            "a DISCARDED payload must never reappear in the durable queue: {body}"
+        );
+    }
 }
 
 #[test]

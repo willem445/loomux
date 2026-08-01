@@ -8123,9 +8123,9 @@ pub fn pause_suppression_notice(s: &PauseSuppression) -> String {
         (format!("{n} deliveries"), "were")
     };
     let mut out = format!(
-        "[loomux] Group resumed — {count} to this group's panes {verb} DISCARDED while it was \
-         paused. Pause does not queue: none of this will be replayed, so anything you are still \
-         waiting on has to be re-requested. Discarded:"
+        "[loomux] Group resumed — {count} {verb} DISCARDED while this group was paused. Pause \
+         does not queue and nothing here will be replayed, so anything you are still waiting on \
+         has to be re-requested. Discarded:"
     );
     for it in s.items.iter().take(PAUSE_SUPPRESSION_LIST_MAX) {
         out.push_str(&format!("\n  - {} -> {}: {}", it.from, it.to, it.preview));
