@@ -7135,12 +7135,50 @@ discarded.
 
 **Boundaries with the neighbouring work, stated because each one is a live issue.**
 
-- **#579/#630 (the `queue_orphans` refused list).** Disjoint by construction, not by convention.
-  #630 surfaces deliveries **refused at the front door** — `enqueue_text`'s `RejectFull` arm returns
-  before an id is minted, so they never enter a queue at all. This one is about a delivery that *is*
-  queued, holds an id, and cannot land. An entry is in exactly one of the two sets, and the channels
-  differ in kind as well: #630 is a pull an orchestrator makes at session start, this is a push at
-  the moment the bound elapses.
+- **#579/#630 (the `queue_orphans` refused list).** #630 landed while this was in review, so the
+  boundary below is re-derived against `front_door_refusals` as shipped rather than against the
+  issue's description of it.
+
+  **Disjoint by construction, and the construction is now checkable.** That scan matches
+  `action == "delivery-dropped"` **and** `reason == "queue-full-at-call"`, and nothing else — the
+  filter says so in its own comment. `notice-undeliverable` is neither, so it can never enter that
+  list by accident of wording. The deeper reason is the same one #579 was split out for: a refusal
+  is `enqueue_text`'s `RejectFull` arm, which returns before `queue_seq.fetch_add`, so a refused
+  delivery has no id and no queue entry. This classification requires the opposite — a payload that
+  IS queued, holds an id, and cannot land. A delivery is in exactly one of the two states. The
+  channels differ in kind too: #630 is a pull an orchestrator makes at session start, this is a push
+  at the moment the bound elapses.
+
+  **The one interaction that does exist runs through the notice's own delivery, not through the
+  scan.** The notice is delivered to the ORCHESTRATOR's pane, so if that pane is at
+  `QUEUE_MAX_PER_PANE` the notice is itself refused — and then correctly appears in #630's refused
+  list, `from: "loomux"`, as the one loss that list was built to make visible. That is a
+  complementary report, not a duplicate: the audit line records the *diagnosis* (written first and
+  unconditionally, see #633 below), the refused row records that the *notice delivery* was lost, and
+  the two are different facts about different objects. What it is worth knowing is that re-sending
+  such a row hands over a diagnosis whose hold may have cleared since — stale, not wrong.
+
+  **And it needs no cap headroom, unlike #615's pause-loss notice**, which is the sharpest way to
+  see why. That one had to be admitted past the cap because it *reports the cap*, so on a full pane
+  it was certain to be destroyed by the very condition it described. The equivalent loop here would
+  need the stuck pane to be the orchestrator's own — and that is exactly the case `notify_queue`
+  never enqueues at all: it parks for #578's inbox instead. So the one configuration in which the
+  cap could eat this report is the one configuration in which the cap is not in the path. Same
+  argument `HoldChannel::OrchestratorInbox` already makes: a full queue is a condition this reports,
+  not an obstacle to reporting it.
+
+  **Audit volume, which #630 asked the next writer to account for.** Its own note records that #624
+  raised a busy group's audit volume (one line per queue notice), making `AUDIT_VIEW_LIMIT` easier
+  to reach and NB1's `refused_window_truncated` more load-bearing than when it was written. This
+  change adds to that too, and the bound is what makes it small: `notice-undeliverable` is
+  **once per hold episode**, and an episode ends only when the pane accepts a delivery — so it is
+  one line per stuck-pane incident, not one per poll, and a pane stuck for an hour still contributes
+  exactly one. The parked `notice-suppressed` line it can produce on an orchestrator's own pane is
+  bounded the same way. Where volume does push refusals out of the readable window, the honest
+  reporting already exists and is untouched: `audit_log_windowed` reports the cut and
+  `refused_window_truncated` carries it into the tool result. #630 also pinned that a parked
+  orchestrator notice is not a refusal (`a_parked_orchestrator_notice_is_not_a_refusal`); this
+  change adds a second producer of exactly that shape, and that test covers it unchanged.
 - **#632 (multi-row mask gap).** Not touched, and not contributed to: `undeliverable_notice` is one
   marker-led line by construction, pinned by
   `the_undeliverable_notice_is_one_marker_led_line_that_names_the_pane_and_the_cause` and by

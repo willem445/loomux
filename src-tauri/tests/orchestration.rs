@@ -20874,6 +20874,56 @@ fn a_held_kickoff_is_not_reported_as_an_undeliverable_notice() {
 }
 
 #[test]
+fn an_undeliverable_notice_is_never_reported_as_a_front_door_refusal() {
+    // The #579/#630 seam, pinned rather than argued. #630's refused list and
+    // this classification are about opposite halves of one distinction: a
+    // refusal is `enqueue_text`'s `RejectFull` arm, which returns before
+    // `queue_seq.fetch_add`, so it has NO id and no queue entry; this fires
+    // only for a payload that IS queued, holds an id, and cannot land. Showing
+    // one event in both would be a duplicate-delivery generator in a tool whose
+    // documented response is "re-send what still applies" — the same failure
+    // #630's own `recovered` exclusion and its
+    // `a_parked_orchestrator_notice_is_not_a_refusal` exist to prevent.
+    //
+    // Written as a test because the scan is a string match over audit actions:
+    // nothing about `notice-undeliverable` being a different word from
+    // `delivery-dropped` is enforced by a type, and a later widening to "any
+    // dropped-ish line" would silently swallow this one.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5915u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 8_000_000u64;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-4", 577),
+        pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
+        Some(0));
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound,
+        bound, Some(0));
+    assert_eq!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").len(),
+        1,
+        "the diagnosis fired — otherwise this test proves nothing about what the scan does with it"
+    );
+
+    let refusals = reg.front_door_refusals(&g.id);
+    assert_eq!(
+        refusals.total, 0,
+        "a queued-but-undeliverable notice is not a front-door refusal: it holds an id and is \
+         still in the pane's queue, so nothing was declined and there is nothing to re-send — \
+         got {:?}",
+        refusals.items
+    );
+    assert!(
+        refusals.items.is_empty(),
+        "and the capped list agrees with the total it reports"
+    );
+}
+
+#[test]
 fn an_orchestrators_own_stuck_pane_parks_its_notice_in_the_inbox() {
     // The case the whole issue turns on, and the one that would be silent
     // without #578's inbox. `notify_queue` refuses to type a notice into an
