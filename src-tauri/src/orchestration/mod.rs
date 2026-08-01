@@ -8804,6 +8804,113 @@ impl RefusedPayload {
     }
 }
 
+/// #633: WHY a delivery was refused at the front door — the discriminator that
+/// turns [`front_door_refusals`] from a queue-full list into a refusal list.
+///
+/// **Why this exists at all.** #630 scanned for exactly one `delivery-dropped`
+/// reason (`queue-full-at-call`) because it was the only refusal that wrote an
+/// audit line. `deliver_prompt`'s two PRE-admission refusals — the target is
+/// dead, the target has no terminal bound — wrote nothing, so no derivation
+/// could ever surface them; #615 created the second of those by turning a silent
+/// `Ok` into a silent `Err`, which is a strictly better contract for the sender
+/// and no better at all for anyone reading the log afterwards. A refusal that
+/// leaves no record cannot be enumerated by anything, which is the whole #579
+/// class. So every refusal now writes a line, each under its own reason string,
+/// and this enum is what a reader joins on.
+///
+/// **Every arm is a real, distinct instruction to whoever reads the row**, which
+/// is why this is a typed discriminator rather than the raw string carried
+/// through: a queue-full refusal says "the pane is busy, this may be worth
+/// re-sending later"; a dead-target refusal says "re-target it, that pane is
+/// gone"; a no-terminal refusal says "it was too early, send it again once the
+/// pane binds". Collapsing them into one row shape would make the list
+/// enumerable and still not actionable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// `enqueue_text`'s `RejectFull` arm (#563/#579): the target pane's queue
+    /// was already at `queue::QUEUE_MAX_PER_PANE`.
+    QueueFull,
+    /// `deliver_prompt_as` (#633): the target agent's status was
+    /// [`AgentStatus::Dead`]. Refused BEFORE admission, so no id was minted and
+    /// no queue was touched.
+    AgentDead,
+    /// `deliver_prompt_as` (#633): the target agent had no `pty_id` bound yet —
+    /// a queue is keyed by pane, so there was nowhere to hold the payload.
+    /// Created as an `Err` by #615 (it was a silent `Ok` before), audited by
+    /// #633.
+    NoTerminal,
+    /// `withdraw_unprocessable` (#470): the admission succeeded and was then
+    /// UNDONE because no `AppHandle` existed to ever drain it. Unreachable in
+    /// production — see [`front_door_refusals`] for why it is surfaced anyway.
+    NoAppHandle,
+    /// `withdraw_unprocessable` (#470), the sibling case: an `AppHandle`
+    /// existed but the registry was not held in an `Arc`, so no drainer could
+    /// be spawned. Pre-#633 this wrote the `no-app-handle` reason too — one
+    /// line claiming a cause that was not the one that fired.
+    RegistryNotShared,
+}
+
+impl RefusalReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefusalReason::QueueFull => "queue-full-at-call",
+            RefusalReason::AgentDead => "agent-dead-at-call",
+            RefusalReason::NoTerminal => "no-terminal-at-call",
+            RefusalReason::NoAppHandle => "no-app-handle",
+            RefusalReason::RegistryNotShared => "registry-not-shared",
+        }
+    }
+
+    /// Parse a `delivery-dropped` line's `reason` back into an arm — `None` for
+    /// every reason that is NOT a front-door refusal, which is what makes
+    /// [`front_door_refusals`]'s filter an enumeration rather than a guess.
+    pub fn from_audit(reason: &str) -> Option<Self> {
+        match reason {
+            "queue-full-at-call" => Some(RefusalReason::QueueFull),
+            "agent-dead-at-call" => Some(RefusalReason::AgentDead),
+            "no-terminal-at-call" => Some(RefusalReason::NoTerminal),
+            "no-app-handle" => Some(RefusalReason::NoAppHandle),
+            "registry-not-shared" => Some(RefusalReason::RegistryNotShared),
+            _ => None,
+        }
+    }
+
+    /// What this refusal means for the payload, in the reader's terms — carried
+    /// on the audit line itself (`consequence`) so one string serves every
+    /// channel, the same discipline the stranded-marker refusal already
+    /// follows.
+    ///
+    /// `None` for [`RefusalReason::QueueFull`], and deliberately: that row
+    /// already says what happened in fields the reader has (`queue_depth`,
+    /// `enqueue_reason`) and at length in `queue_orphans`' own description, and
+    /// its ONE case with a consequence — a refused `StrandedSubmit` marker,
+    /// which leaves pasted-but-unsubmitted text in the pane — writes its own
+    /// string from `audit_stranded_push` (#579). Restating that prose here
+    /// would be a second copy of a sentence already maintained elsewhere, which
+    /// is the failure mode `consequence` was introduced to avoid.
+    fn consequence(self) -> Option<&'static str> {
+        Some(match self {
+            RefusalReason::QueueFull => return None,
+            RefusalReason::AgentDead => {
+                "the target agent was already dead — nothing was queued, and that pane will \
+                 never take it; re-target this to a live or resumed agent"
+            }
+            RefusalReason::NoTerminal => {
+                "the target agent had no terminal bound yet, so there was no queue to hold \
+                 this — nothing was queued; re-send once the pane binds"
+            }
+            RefusalReason::NoAppHandle => {
+                "loomux had no app handle to process this pane's queue, so the admission was \
+                 withdrawn rather than left to strand — nothing is queued"
+            }
+            RefusalReason::RegistryNotShared => {
+                "the registry was not shared, so no drainer could be started — the admission \
+                 was withdrawn rather than left to strand; nothing is queued"
+            }
+        })
+    }
+}
+
 /// #579: one delivery REFUSED at the front door — the target pane's queue was
 /// already at `queue::QUEUE_MAX_PER_PANE`, so nothing was ever queued.
 ///
@@ -8837,9 +8944,17 @@ pub struct RefusedDelivery {
     /// The pane the payload was headed for.
     pub to: String,
     pub refused_ms: u64,
+    /// Why loomux refused it (#633) — the discriminator the reader acts on.
+    pub reason: RefusalReason,
     /// The pane's queue depth at the moment of refusal — `QUEUE_MAX_PER_PANE`
-    /// in every real case, carried through rather than assumed.
-    pub depth: usize,
+    /// in every real `queue-full-at-call` case, carried through rather than
+    /// assumed.
+    ///
+    /// `None` (#633) for a refusal that never reached the queue at all: a
+    /// dead-target or no-terminal refusal returns before admission, so there is
+    /// no depth to report and reporting `0` would be a measurement nobody took
+    /// dressed as one that says the pane was empty.
+    pub depth: Option<usize>,
     /// Which [`EnqueueReason`](queue::EnqueueReason) the refused admission was
     /// made under, when the line recorded one. `None` for a marker refusal
     /// (never admitted under a reason) and for a pre-#563 line.
@@ -8915,6 +9030,43 @@ pub const REFUSED_LIST_MAX: usize = 8;
 /// The audit line is the only record that will ever exist, and since #572 it
 /// carries enough to act on: `from`, `bytes` and a bounded `preview`.
 ///
+/// **Every refusal, not just the capped one (#633).** #579 shipped scanning one
+/// reason because one reason was all that wrote a line. `deliver_prompt_as`
+/// refuses two ways BEFORE admission — the target is dead, the target has no
+/// terminal bound — and both wrote nothing at all, so this derivation, the
+/// orphan derivations and a human reading `audit.jsonl` were equally blind to
+/// them; #615 made the no-terminal case an `Err` instead of a silent `Ok`,
+/// which fixed the sender's contract and left the record exactly as empty. Each
+/// now writes its own [`RefusalReason`], and the filter above is an enumeration
+/// over that enum rather than an equality test against one string.
+///
+/// **Where the payload comes from differs by reason, and it has to.** A
+/// queue-full refusal happens AFTER `deliver_prompt` has audited `prompt` with
+/// the full text, so #579 recovers the bytes by pairing (below). The two
+/// pre-admission refusals happen BEFORE that line is written — and moving the
+/// `prompt` write earlier was rejected, because `prompt` is what the whole
+/// suite (and `delivered_texts`) reads as "this was offered to a pane", and a
+/// delivery to a dead agent was never offered to anything. So those lines carry
+/// their own `text` inline, and this reads it verbatim: it is the same line and
+/// the same write, so there is no join to get wrong and nothing to verify
+/// against. That is a rare line (a refusal), not a per-delivery cost.
+///
+/// **The no-app-handle drop is SURFACED, not excluded (#633's other half).**
+/// `withdraw_unprocessable`'s undo is unreachable in production — `set_app` and
+/// `set_self_arc` both run in `lib.rs`'s `setup` block, before the MCP server
+/// thread that is the only way an agent can call `deliver_prompt` at all — and
+/// #630 excluded it on exactly that argument, silently. Two things decided it
+/// the other way here. First, once the list is reason-discriminated the cost is
+/// one enum arm, so the exclusion was buying nothing. Second, "unreachable in
+/// production" is a claim about today's startup order that nothing enforces,
+/// and the failure mode of it going stale is precisely the #579 class: a loss
+/// nothing can enumerate. Surfacing it means a broken assumption shows up as a
+/// row instead of as silence. It does not double-report: the withdrawal's own
+/// line carries the `id`, which CLOSES that id for
+/// `queue::orphaned_queue_entries`, so the entry is gone from the orphan
+/// derivation by the time it appears here — one loss, one row, the same rule
+/// the `recovered` exclusion below enforces from the other side.
+///
 /// **Recovering the payload, verified rather than assumed.** `deliver_prompt`
 /// audits `prompt` — with the FULL text — immediately before it admits, on both
 /// the paused and unpaused paths, so the bytes a refusal lost are still in the
@@ -8962,21 +9114,24 @@ pub fn front_door_refusals(entries: &[AuditEntry], window_truncated: bool) -> Fr
             }
             continue;
         }
-        // `queue-full-at-call` and nothing else, stated rather than implied
-        // (#633, review NB2). `delivery-dropped` is written for other reasons
-        // too, and each is skipped here for a reason: `agent-died`/`queue-full`
-        // (a whole queue dropped) carry an `id` and are already reported by the
-        // orphan derivations, and `no-app-handle` — `withdraw_unprocessable`'s
-        // undo — is unreachable in production, since `self.app` is set once at
-        // startup and only a bare test registry lacks it. That last one is the
-        // ONE audited drop reason this filter passes over in silence, so #633
-        // owns deciding whether it should surface here; until then the skip is
-        // deliberate and written down rather than merely true.
-        if e.action != "delivery-dropped" || e.detail["reason"] != json!("queue-full-at-call") {
+        if e.action != "delivery-dropped" {
             continue;
         }
+        // An ENUMERATION of the refusal reasons, not a guess at them (#633).
+        // `delivery-dropped` is written for reasons that are not front-door
+        // refusals at all, and each is skipped here for a stated reason:
+        // `agent-died` and `queue-full` (a whole queue dropped at once) carry
+        // an `id` and are already reported by the id-keyed orphan derivations,
+        // so listing them here too would show one loss twice in one tool
+        // result — the duplicate-delivery defect `merge_orphans`'s live-id
+        // filter exists to prevent. Anything `RefusalReason::from_audit` does
+        // not know is skipped by the same rule: an unmodelled reason is not
+        // silently folded into a list whose documented response is "re-send".
+        let Some(reason) = e.detail["reason"].as_str().and_then(RefusalReason::from_audit) else {
+            continue;
+        };
         let to = e.detail["to"].as_str().unwrap_or("?").to_string();
-        let depth = e.detail["depth"].as_u64().unwrap_or(0) as usize;
+        let depth = e.detail["depth"].as_u64().map(|d| d as usize);
         if e.detail["payload"] == json!(RefusedPayload::StrandedSubmit.as_str()) {
             items.push(RefusedDelivery {
                 // A marker push is loomux's own act, and its line records no
@@ -8985,6 +9140,7 @@ pub fn front_door_refusals(entries: &[AuditEntry], window_truncated: bool) -> Fr
                 from: e.actor.clone(),
                 to,
                 refused_ms: e.ts_ms,
+                reason,
                 depth,
                 enqueue_reason: None,
                 payload: RefusedPayload::StrandedSubmit,
@@ -9002,22 +9158,33 @@ pub fn front_door_refusals(entries: &[AuditEntry], window_truncated: bool) -> Fr
         let from = e.detail["from"].as_str().unwrap_or("?").to_string();
         let bytes = e.detail["bytes"].as_u64().map(|b| b as usize);
         let preview = e.detail["preview"].as_str().unwrap_or("").to_string();
-        let text = bytes.and_then(|bytes| {
-            offered.get(&(from.clone(), to.clone())).filter(|t| {
-                t.len() == bytes && queue::dropped_payload_preview(t.as_str()) == preview
-            })
-        });
+        // #633: a pre-admission refusal carries its own payload, because no
+        // `prompt` line was ever written for it to pair with — see this
+        // function's doc. When the line has one, it IS the record: same line,
+        // same write, nothing to join and so nothing to verify against.
+        // Otherwise fall back to #579's verified pairing.
+        let text = match e.detail["text"].as_str() {
+            Some(inline) => Some(inline.to_string()),
+            None => bytes
+                .and_then(|bytes| {
+                    offered.get(&(from.clone(), to.clone())).filter(|t| {
+                        t.len() == bytes && queue::dropped_payload_preview(t.as_str()) == preview
+                    })
+                })
+                .cloned(),
+        };
         items.push(RefusedDelivery {
             from,
             to,
             refused_ms: e.ts_ms,
+            reason,
             depth,
             enqueue_reason,
             payload: RefusedPayload::Prompt,
             bytes,
             preview,
-            text: text.cloned(),
-            consequence: None,
+            text,
+            consequence: e.detail["consequence"].as_str().map(str::to_string),
         });
     }
     let total = items.len();
@@ -28383,11 +28550,40 @@ impl OrchRegistry {
         delivery: Delivery,
         reason: queue::EnqueueReason,
     ) -> Result<(), String> {
+        // #633: an unknown agent is the ONE refusal here that stays unaudited,
+        // and structurally rather than by choice — `audit` writes into a
+        // GROUP's log, `deliver_prompt` is keyed by agent id alone, and an
+        // agent that does not exist has no group to file the line under.
+        // Writing it anywhere else (a "no group" bucket, the caller's own
+        // group) would put a record where nothing reads and no derivation
+        // scopes. It is also the one refusal that loses nothing an operator
+        // could act on: there is no pane, no session and no payload owner to
+        // re-target to — only a caller that named an id that never existed,
+        // and that caller is told synchronously.
         let a = self.agent(agent_id).ok_or("unknown agent")?;
+        // The two PRE-admission refusals (#633). Both wrote nothing before —
+        // #615 turned the second from a silent `Ok` into a silent `Err`, which
+        // is a better contract for the sender and no record at all for anyone
+        // reading afterwards. A refusal with no audit line cannot be surfaced
+        // by `front_door_refusals`, by the orphan derivations, or by a human
+        // grepping `audit.jsonl`: it is the #579 class exactly.
+        //
+        // The line carries its own `text`, unlike the queue-full refusal
+        // further down, because the `prompt` line is written BELOW this point
+        // and deliberately stays there — see `front_door_refusals`'s doc for
+        // why `prompt` must keep meaning "offered to a pane".
         if a.status == AgentStatus::Dead {
+            self.audit_delivery_refused(
+                &a.group, agent_id, from, text, RefusalReason::AgentDead,
+            );
             return Err(format!("agent {agent_id} is dead"));
         }
-        let pty_id = a.pty_id.ok_or("agent has no terminal yet")?;
+        let Some(pty_id) = a.pty_id else {
+            self.audit_delivery_refused(
+                &a.group, agent_id, from, text, RefusalReason::NoTerminal,
+            );
+            return Err("agent has no terminal yet".into());
+        };
         // Pause guardrail (#569, option 2 — the human's call): while a group
         // is paused loomux still delivers NOTHING to its panes, so agents
         // finish their turn and idle out exactly as before. What changed is
@@ -28495,11 +28691,21 @@ impl OrchRegistry {
         // an empty queue really means empty rather than silently stranding
         // a payload nothing will ever drain.
         let Some(app) = self.app.lock_safe().clone() else {
-            self.withdraw_unprocessable(&a.group, pty_id, admitted.id);
+            self.withdraw_unprocessable(
+                &a.group, agent_id, from, text, pty_id, admitted.id,
+                RefusalReason::NoAppHandle,
+            );
             return Err("no app handle".into());
         };
         let Some(reg) = self.arc() else {
-            self.withdraw_unprocessable(&a.group, pty_id, admitted.id);
+            // #633: its OWN reason. Both arms used to withdraw under
+            // `no-app-handle`, so the log named a cause that had not fired —
+            // an app handle plainly existed, since this line is below the one
+            // that unwrapped it.
+            self.withdraw_unprocessable(
+                &a.group, agent_id, from, text, pty_id, admitted.id,
+                RefusalReason::RegistryNotShared,
+            );
             return Err("registry not shared".into());
         };
 
@@ -28700,7 +28906,25 @@ impl OrchRegistry {
     /// can ever drain the entry. Pops `id` off the front IF it's still
     /// there (the only place it could be — nothing else has had a chance to
     /// pop yet) and audits the withdrawal so it's never silently missing.
-    fn withdraw_unprocessable(&self, group: &str, pty_id: u32, id: u64) {
+    ///
+    /// #633 gave it the refusal's own `reason` (the two call sites both used to
+    /// withdraw under `no-app-handle`, so one of them named a cause that had not
+    /// fired) and the `{to, from, bytes, preview}` a refusal line needs to be
+    /// actionable — the same fields #563 added to the queue-full refusal, for
+    /// the same reason: a sender can re-send a delivery it can identify and
+    /// cannot re-send an anonymous one. The payload itself stays recoverable by
+    /// #579's verified pairing rather than inline, because by this point
+    /// `deliver_prompt` HAS written the `prompt` line carrying the full text.
+    fn withdraw_unprocessable(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        text: &str,
+        pty_id: u32,
+        id: u64,
+        reason: RefusalReason,
+    ) {
         let removed = self.queues.mutate(group, self, |queues| {
             let removed = match queues.get_mut(&pty_id) {
                 Some(q) if q.front().is_some_and(|f| f.id == id) => {
@@ -28720,9 +28944,64 @@ impl OrchRegistry {
             (removed, dirty)
         });
         if removed {
-            self.audit(group, "loomux", "delivery-dropped",
-                json!({ "id": id, "reason": "no-app-handle" }));
+            self.audit(group, "loomux", "delivery-dropped", json!({
+                "id": id, "reason": reason.as_str(), "to": agent_id, "from": from,
+                "bytes": text.len(), "preview": queue::dropped_payload_preview(text),
+                "consequence": reason.consequence(),
+            }));
+        } else {
+            // #633: the branch that used to write NOTHING. The pop is
+            // conditional (the id may no longer be the front), and when it does
+            // not fire the caller still returns `Err` to its sender while the
+            // entry stays queued — a delivery reported as failed and a payload
+            // still sitting in a pane's queue, with no line joining the two.
+            //
+            // A DIFFERENT action on purpose, and not `delivery-dropped`:
+            // `queue::orphaned_queue_entries` CLOSES an id on that action, so
+            // writing one here would tell the orphan derivation that a still-
+            // queued entry had been resolved — turning a silent gap into a
+            // false all-clear, which is worse. This action closes nothing, the
+            // entry keeps being reported as an orphan by id (correctly: it is
+            // still there), and `front_door_refusals` skips it for that same
+            // reason — one loss, one row.
+            self.audit(group, "loomux", "delivery-withdraw-missed", json!({
+                "queued_id": id, "reason": reason.as_str(), "to": agent_id, "from": from,
+                "pty": pty_id,
+                "consequence": "the sender was told this delivery failed, but the entry was no \
+                                longer at the front of the queue and is STILL QUEUED — it is \
+                                reported as an orphan by id, not as a refusal",
+            }));
         }
+    }
+
+    /// #633: audit a delivery `deliver_prompt_as` refused BEFORE it ever
+    /// reached the queue — a dead target, or one with no terminal bound yet.
+    ///
+    /// Deliberately shaped like `enqueue_text`'s `queue-full-at-call` line so
+    /// `front_door_refusals` reads one row shape, with two differences that are
+    /// facts rather than omissions: no `id` (nothing was minted, so nothing for
+    /// `queue::orphaned_queue_entries` to open or close) and no `depth`/
+    /// `enqueue_reason` (admission was never attempted — a `0` there would be a
+    /// measurement nobody took, reading as "the pane was empty").
+    ///
+    /// It carries `text` in full, unlike the queue-full line, because it is
+    /// written BEFORE `deliver_prompt`'s own `prompt` line and so has nothing to
+    /// pair with. See `front_door_refusals`'s doc for why the `prompt` write is
+    /// not simply moved above these refusals instead.
+    fn audit_delivery_refused(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        text: &str,
+        reason: RefusalReason,
+    ) {
+        self.audit(group, "loomux", "delivery-dropped", json!({
+            "to": agent_id, "reason": reason.as_str(), "from": from,
+            "bytes": text.len(), "preview": queue::dropped_payload_preview(text),
+            "text": text,
+            "consequence": reason.consequence(),
+        }));
     }
 
     /// Push a `StrandedSubmit` marker to the FRONT of `pty_id`'s queue
@@ -30677,6 +30956,14 @@ impl OrchRegistry {
                     "from": r.from,
                     "to": r.to,
                     "refused_minutes_ago": now.saturating_sub(r.refused_ms) / 60_000,
+                    // #633: WHY, so the reader knows which of the four
+                    // instructions applies. `queue-full-at-call` is the only
+                    // value #630 could ever produce, so a reader written
+                    // against that build sees no change on the rows it knew.
+                    "reason": r.reason.as_str(),
+                    // `null` (#633) when the refusal never reached the queue:
+                    // a dead-target or no-terminal refusal took no depth
+                    // measurement, and `0` would read as "the pane was empty".
                     "queue_depth": r.depth,
                     "enqueue_reason": r.enqueue_reason,
                     "payload": r.payload.as_str(),
