@@ -390,10 +390,7 @@ const KEY_ERROR_TOKENS: usize = 6;
 /// `…/worktrees/feat-b/src/x.rs`). Keeping any leading directory would make
 /// cross-worktree recurrence structurally uncountable.
 fn path_basename(p: &str) -> String {
-    // SCRATCH (red-before-green run 3, reverted next commit): the plausible
-    // wrong implementation — keep the whole recorded path, so the same file
-    // keys differently from each worktree.
-    p.trim().to_lowercase()
+    p.rsplit(['/', '\\']).next().unwrap_or(p).trim().to_lowercase()
 }
 
 /// The program a shell-like command invokes: first whitespace token, reduced
@@ -423,10 +420,7 @@ fn normalize_key_token(t: &str) -> String {
     if t.contains('/') || t.contains('\\') {
         return "<path>".into();
     }
-    // SCRATCH (red-before-green run 3, reverted next commit): the plausible
-    // wrong implementation — blank EVERY token containing a digit, which also
-    // eats the error code that distinguishes one failure from another.
-    if t.chars().any(|c| c.is_ascii_digit()) {
+    if t.chars().any(|c| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | ',' | '-' | '#' | '%' | '+')) {
         return "#".into();
     }
     t.to_lowercase()
