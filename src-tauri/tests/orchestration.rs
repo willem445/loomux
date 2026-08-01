@@ -5742,7 +5742,7 @@ fn delete_done_removes_only_done_and_notifies_once() {
     // per-task notices are the token waste the issue calls out).
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
 
     // Five tasks, three of them done, interleaved with non-done ones.
     let ids: Vec<String> = ["a", "b", "c", "d", "e"]
@@ -5758,6 +5758,7 @@ fn delete_done_removes_only_done_and_notifies_once() {
     // The pause branch fires inside deliver_to_orchestrator, past the coalescing
     // point, so the audited count equals the notice count (#569: it queues now,
     // which is why the orchestrator needs a pane to hold it).
+    pause_with_pane(&reg, &g.id, &orch.id, 6400);
 
     let removed = reg.delete_done_tasks(&g.id, "human").unwrap();
     removed.iter().for_each(|id| assert!(ids.contains(id)));
@@ -5805,7 +5806,7 @@ fn delete_selected_removes_only_named_ids_and_notifies_once() {
     // selection), and an empty selection a silent no-op.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
 
     // Four tasks in assorted statuses — selection is by id, not status.
     let ids: Vec<String> = ["a", "b", "c", "d"]
@@ -5815,6 +5816,7 @@ fn delete_selected_removes_only_named_ids_and_notifies_once() {
 
     // Pause so the best-effort notice is queued-and-audited rather than pasted
     // (as in the delete-done test — test mode has no PTY to deliver into).
+    pause_with_pane(&reg, &g.id, &orch.id, 6401);
 
     // Select two real ids plus one that never existed: the unknown id is
     // skipped, the two real ones go, and the removed set is exactly those two.
@@ -6274,10 +6276,11 @@ fn proceed_flips_to_in_progress_audits_and_sends_one_notice() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     // An orchestrator must exist for the notice to have a target; pause the group
-    // so delivery is suppressed-but-audited (test mode has no pane to type into),
-    // letting us observe the exact notice — and prove there is exactly one.
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.pause_group(&g.id).unwrap();
+    // so delivery is queued-and-audited rather than pasted (test mode has no pane
+    // to type into), letting us observe the exact notice — and prove there is
+    // exactly one.
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6402);
 
     let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Prototype the sidebar"), Some("prototype"), None)).unwrap();
     // Proceed is the human's promote verdict: unlike Start it is NOT rejected by
