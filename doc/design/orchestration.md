@@ -5657,10 +5657,27 @@ release a hold the ring is still asserting, and loomux's own text is **genuinely
 readings agree it is on screen, and both are right about the pixels. It is simply not a question,
 which is a claim about *authorship*, and no reading of the screen can make it.
 
-**The fix.** `mask_loomux_notices` drops rows leading with the `[loomux]` marker, applied to both
-readings in `question_hold_predicate_sampled` and in the late-confirmation monitor's own scan
-(which drives the idle trigger and self-latches identically). It needs no per-pane state, which is
-precisely why it reaches the outer drainer gate that has no `pasted_text` to work with.
+**The fix.** `mask_loomux_notices` drops rows leading with the `[loomux]` marker. It needs no
+per-pane state, which is precisely why it reaches the outer drainer gate that has no `pasted_text`
+to work with. Four readers of a live pane apply it:
+
+- both readings inside `question_hold_predicate_sampled` — so every question-gate call site;
+- the late-confirmation monitor's own scan, which drives the idle trigger and self-latches
+  identically;
+- `attention_tick` and `plain_pane_attention`, the two attention-chip readers (#6/#40).
+
+The chip readers were **missed in the first cut and found in review** (rev-126), which is the
+useful part of the story. The same notice that latches the gate also satisfies the chip's
+"parked on a question" test — and satisfies its quiet precondition *because* a held pane is idle —
+so it raises `waiting on a prompt` about a question nobody asked. That is arguably the worse of
+the two: the gate's latch is at least escalated at ten minutes by `QuestionStale`, whereas a wrong
+chip is reported to nobody and simply trains the human to ignore chips.
+
+The split that allowed the omission is deliberate and kept: `prompt_wait_detected` answers *"is
+this question-shaped"*, never *"whose text is this"*, and `mask_own_paste` needs a per-call
+argument that signature does not have — so **callers mask, the detector detects**. The cost is
+that a new consumer can forget, so `prompt_wait_detected`'s own doc now says so and names this
+miss.
 
 ### The marker is unforgeable in one direction only
 

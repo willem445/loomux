@@ -29715,3 +29715,81 @@ fn e5b_the_marker_is_what_sanitized_untrusted_text_can_never_contain() {
         "so text arriving through the sanitizer is never mistaken for loomux's own writing"
     );
 }
+
+#[test]
+fn e7_a_relayed_notice_raises_no_attention_chip_while_a_real_dialog_still_does() {
+    // rev-126's finding: the SAME self-latch, arriving at a different
+    // consumer. `attention_tick` reads the pane tail through
+    // `prompt_wait_detected` to raise the "waiting on a prompt" chip, and a
+    // pane holding a relayed `[loomux] … (y/n)` notice is output-quiet
+    // precisely BECAUSE it is idle — so the quiet gate that is supposed to
+    // mean "parked on a question" is satisfied by loomux's own prose about
+    // one. Fixing only the delivery gate left this reader behind.
+    //
+    // Two independent registries so neither case can inherit the other's
+    // latched `attn_quiet` / `attn_waiting_ack` state.
+    let now = 1_000_000_000_000u64;
+    let no_input: HashMap<String, u64> = HashMap::new();
+
+    // A genuine dialog must still raise the chip — the guard against "fixed"
+    // meaning "switched off".
+    let (reg_real, _d1, _g1, wid_real) = attention_setup();
+    let out_real: HashMap<String, u64> = [(wid_real.clone(), 512u64)].into_iter().collect();
+    let real: HashMap<String, String> =
+        [(wid_real.clone(), strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    reg_real.attention_tick(now, &out_real, &real, &no_input);
+    let flagged = reg_real.attention_tick(now + 5000, &out_real, &real, &no_input);
+    assert!(
+        flagged.iter().any(|i| i.agent_id == wid_real && i.reason == "waiting"),
+        "a real Copilot dialog must still raise the waiting chip"
+    );
+
+    // The same pane, quiet for just as long, holding only loomux's own
+    // relayed notice: no chip.
+    let (reg_notice, _d2, _g2, wid_notice) = attention_setup();
+    let out_notice: HashMap<String, u64> = [(wid_notice.clone(), 512u64)].into_iter().collect();
+    let notice: HashMap<String, String> =
+        [(wid_notice.clone(), format!("{LOOMUX_REPORT_RELAY}\n  ? for shortcuts"))]
+            .into_iter()
+            .collect();
+    reg_notice.attention_tick(now, &out_notice, &notice, &no_input);
+    let quiet = reg_notice.attention_tick(now + 5000, &out_notice, &notice, &no_input);
+    assert!(
+        quiet.iter().all(|i| !(i.agent_id == wid_notice && i.reason == "waiting")),
+        "loomux's own relayed notice must not raise a `waiting` chip — a wrong chip trains \
+         the human to ignore chips, and unlike the gate's latch nothing reports it (#576): {quiet:?}"
+    );
+}
+
+#[test]
+fn e8_a_plain_pane_holding_a_relayed_notice_raises_no_chip_either() {
+    // `plain_pane_attention` is the second unmasked reader rev-126 found. A
+    // plain pane is never delivered to, so it takes a human pasting a notice
+    // in to read it — but the two readings must not disagree about what counts
+    // as a question, and a shell pane wrongly flagged as "waiting on your
+    // input" is the same false chip.
+    let now = 1_000_000_000_000u64;
+    let no_input: HashMap<u32, u64> = HashMap::new();
+    let no_agents: HashSet<u32> = HashSet::new();
+    let out: HashMap<u32, u64> = [(7u32, 256u64)].into_iter().collect();
+
+    let (reg_real, _d1, _g1, _w1) = attention_setup();
+    let real: HashMap<u32, String> =
+        [(7u32, strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    reg_real.plain_pane_attention(now, &out, &real, &no_input, &no_agents);
+    let flagged = reg_real.plain_pane_attention(now + 5000, &out, &real, &no_input, &no_agents);
+    assert!(
+        flagged.iter().any(|i| i.pty_id == Some(7) && i.reason == "waiting"),
+        "a real dialog on a plain pane must still raise the chip"
+    );
+
+    let (reg_notice, _d2, _g2, _w2) = attention_setup();
+    let notice: HashMap<u32, String> =
+        [(7u32, format!("{LOOMUX_REPORT_RELAY}\n$ "))].into_iter().collect();
+    reg_notice.plain_pane_attention(now, &out, &notice, &no_input, &no_agents);
+    let quiet = reg_notice.plain_pane_attention(now + 5000, &out, &notice, &no_input, &no_agents);
+    assert!(
+        quiet.is_empty(),
+        "a plain pane showing only loomux's own notice is not waiting on anything: {quiet:?}"
+    );
+}

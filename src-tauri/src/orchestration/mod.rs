@@ -5198,6 +5198,16 @@ pub fn low_disk_notice(free_bytes: u64) -> String {
 ///   prose does neither. So the pointer must lead a de-framed line, and the
 ///   footer is only read from the last few non-empty lines — once the CLI
 ///   redraws its idle input box below the prose, the phrase falls out of range.
+/// **Callers mask; this function only detects.** It answers "is this text
+/// question-shaped", never "whose text is this" — so every caller reading a
+/// live pane owes it [`mask_loomux_notices`] first (and, where the caller knows
+/// what it just pasted, `mask_own_paste`). Masking is deliberately NOT folded
+/// in here: the two are different questions, and `mask_own_paste` needs a
+/// per-call argument this signature does not have. The cost of that split is
+/// that a new consumer can forget — which is exactly what happened to the two
+/// attention-chip readers in `attention_tick` / `plain_pane_attention`, found
+/// in review after the delivery gate had already been fixed (#576 rev-126).
+/// If you are adding a third reader of a live pane, mask it.
 pub fn prompt_wait_detected(tail: &str) -> bool {
     prompt_wait_match(tail).is_some()
 }
@@ -23088,7 +23098,16 @@ impl OrchRegistry {
             let waiting = !recently_typed
                 && !waiting_ack.contains(&a.id)
                 && quiet_for >= ATTENTION_QUIET_MS
-                && tails.get(&a.id).map(|t| prompt_wait_detected(t)).unwrap_or(false);
+                // #576, rev-126: masked here too. This is the same self-latch
+                // the delivery gate has, arriving at a different consumer: a
+                // relayed `[loomux] w-7 reports blocked: … (y/n)` sits in the
+                // tail, the pane is quiet BECAUSE it is idle, and the chip
+                // says "waiting on a prompt" about a question nobody asked.
+                // Worse here than at the gate, in one respect — the gate's
+                // latch is at least reported at ten minutes by
+                // `QuestionStale`, whereas a wrong chip just trains the human
+                // to ignore chips.
+                && tails.get(&a.id).map(|t| prompt_wait_detected(&mask_loomux_notices(t))).unwrap_or(false);
 
             let report = reports.get(a.id.as_str()).copied();
             let (reason, detail): (&'static str, String) = if report == Some("blocked") {
@@ -23162,7 +23181,12 @@ impl OrchRegistry {
             let waiting = !recently_typed
                 && !waiting_ack.contains(&key)
                 && quiet_for >= ATTENTION_QUIET_MS
-                && tails.get(&pty).map(|t| prompt_wait_detected(t)).unwrap_or(false);
+                // #576, rev-126: masked for the same reason as the agent path
+                // above. A plain pane is not delivered to, so it is the less
+                // likely of the two to hold a notice — but a human pasting one
+                // in to read it is enough, and the two readings must not
+                // disagree about what counts as a question.
+                && tails.get(&pty).map(|t| prompt_wait_detected(&mask_loomux_notices(t))).unwrap_or(false);
             if waiting {
                 out.push(AttentionItem {
                     agent_id: String::new(),
