@@ -5630,6 +5630,78 @@ attempt**, which may predate the final round (and may sit beside `blocked_on: "b
 gate that actually ended it). A later round that saw nothing does not erase it, deliberately: on
 this exit the useful fact is that the pane had a dialog during the attempt at all.
 
+## #576: loomux's own notices are not questions
+
+**Problem.** `prompt_wait_detected` asks "does this pane look parked on a question", and loomux's
+own notices are text *about* questions. A relayed `report` note or `message_orchestrator` text
+lands in a pane as one line:
+
+```
+[loomux] w-119 reports blocked: Copilot is asking "Do you want to run npm test? (y/n)" and I cannot answer it
+```
+
+That satisfies two **structured** signals at once — `do you want to run` (permission-phrase) and
+`(y/n)` (yes-no-token). Structured signals are honored across the last twelve non-empty lines, so
+unlike the prose-like ones they are *not* pushed out of range when the CLI redraws its input box
+underneath. The gate latches, and a held pane emits no fresh output, so nothing ever pushes the
+text back out of the scan window: it does not clear itself. An orchestrator pane is the most
+exposed, since relayed worker prose is most of what gets written to it.
+
+The three `question_active_now` call sites all pass `pasted_text: None` — each runs *before* the
+entry it is considering has written anything — so `mask_own_paste` has nothing of its own to mask.
+The offending text belongs to the **previous** delivery, which nothing was keeping.
+
+**What #534 already covers, and why it cannot cover this.** The rendered-rows reading above is not
+re-litigated here: scrolled-off history already cannot satisfy the gate. But #534 lets the *grid*
+release a hold the ring is still asserting, and loomux's own text is **genuinely rendered** — both
+readings agree it is on screen, and both are right about the pixels. It is simply not a question,
+which is a claim about *authorship*, and no reading of the screen can make it.
+
+**The fix.** `mask_loomux_notices` drops rows leading with the `[loomux]` marker, applied to both
+readings in `question_hold_predicate_sampled` and in the late-confirmation monitor's own scan
+(which drives the idle trigger and self-latches identically). It needs no per-pane state, which is
+precisely why it reaches the outer drainer gate that has no `pasted_text` to work with.
+
+### The marker is unforgeable in one direction only
+
+`notify::sanitize_gh_text` rewrites `[`→`(` and `]`→`)` in every untrusted field before it is
+formatted into a notice, and `intake`'s own test pins that a third-party issue title can never
+produce the marker. So nothing an agent sends **through** loomux can carry it.
+
+An agent's **pane output is not sanitized at all.** An agent can print a marker row itself —
+echoing a notice back, quoting one in a summary, or induced to by a hostile prompt. A marker row
+is therefore evidence that *someone wrote a notice-shaped row*, never proof that loomux wrote this
+one, and the mask is scoped to exactly what that weaker claim supports: **the one row the marker
+leads, never the rows around it.**
+
+The rejected alternative is the tempting one. A notice is one logical line (`truncate_notice`
+strips control characters, so it cannot contain a newline) and a terminal wraps one logical line
+into a contiguous run of non-blank rows — so masking the whole run would also catch a `(y/n)` that
+wrapped onto row two. It is rejected because the marker cannot support it: a run-mask hands any
+pane the power to delete the rows below an attacker-chosen row, and a genuine permission dialog
+painted there would be masked into "no question", releasing an Enter into it. That is the #420
+harm, reached from pane output. **Failing open is the dangerous direction**; a hold that should
+have cleared is the cheap error, and the ten-minute `QuestionStale` badge already covers it.
+
+`e3` and `e4` in `tests/orchestration.rs` stand guard: a genuine dialog sharing a pane with an
+agent-printed marker row still latches, including the no-blank-row shape a run-mask would have
+swallowed whole.
+
+### Residual, stated rather than mitigated
+
+- A notice that **wraps** keeps whatever tokens landed past its first row (`e6` pins this).
+- A marker row that has itself **scrolled off** leaves its continuation unmarked.
+- A row that both leads with the marker and *is itself* the live question would be masked. This is
+  the one-row-wide false-release surface, and it needs a CLI that prefixes its own dialog rows with
+  our marker — an agent printing the whole thing has not rendered a dialog, only prose about one.
+
+The first two are under-masks, in the safe direction. Closing them needs loomux to know *what* it
+wrote to a pane rather than merely that a row claims it did — a per-pane record of delivered text.
+No such record exists today: `DeliveryOutcome` keeps `{confirmed, submit_sent_ms, from}` and
+deliberately not the text, and the only copy lives as a stack local in `deliver_now` that dies when
+the delivery returns. Adding one is **delivery machinery, not detection**, and is the honest shape
+of the remaining fix.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,

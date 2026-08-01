@@ -11217,7 +11217,12 @@ fn run_late_confirmation_monitor(
             && ptys
                 .output_tail_bounded(pty_id, LATE_MONITOR_QUESTION_SCAN_BYTES)
                 .map(|b| strip_ansi(&b))
-                .map(|t| prompt_wait_detected(&mask_own_paste(&t, &pasted_text)))
+                // #576: the same two masks the hold predicate applies, in the
+                // same order. This scan drives the late monitor's idle
+                // trigger, so a self-latch here reads as "the human is still
+                // expected to answer" and stalls the delivery's completion
+                // exactly like the gate's own latch stalls the write.
+                .map(|t| prompt_wait_detected(&mask_own_paste(&mask_loomux_notices(&t), &pasted_text)))
                 .unwrap_or(false);
         let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
         // #454: the ledger observation is taken AFTER the hook read, never
@@ -13892,6 +13897,81 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
         .join("\n")
 }
 
+/// The marker every notice loomux writes into a pane opens with, and the whole
+/// basis of [`mask_loomux_notices`] (#576).
+///
+/// It is trustworthy for that job because it **cannot be forged from outside**:
+/// `notify::sanitize_gh_text` rewrites `[`→`(` and `]`→`)` in every untrusted
+/// field before it is formatted into a notice, and `intake`'s own test pins
+/// that a third-party issue title can never produce this string. So a rendered
+/// row opening with it was written by loomux.
+///
+/// **Unforgeable only in the delivery direction, and that asymmetry is the
+/// whole design constraint here.** Nothing an agent sends *through* loomux can
+/// carry it. But an agent's pane output is not sanitized at all, so an agent
+/// can print these bytes itself — echoing a notice back, quoting one in a
+/// summary, or induced to by a hostile prompt. A marker row is therefore
+/// evidence that *someone wrote a notice-shaped row*, never proof that loomux
+/// wrote this one, and [`mask_loomux_notices`] is scoped to exactly what that
+/// weaker claim can support.
+pub const LOOMUX_NOTICE_MARKER: &str = "[loomux]";
+
+/// Remove the rows loomux itself wrote into this pane before the question
+/// detector ever sees them (#576).
+///
+/// **The bug.** `prompt_wait_detected` asks "does this pane look parked on a
+/// question", and loomux's own notices are text *about* questions: a relayed
+/// `report` note or `message_orchestrator` text lands as
+/// `[loomux] w-7 reports blocked: Copilot asked "do you want to run npm test?
+/// (y/n)"`. That satisfies two of the detector's structured signals, so the
+/// gate latches — and because a held pane emits nothing new, no fresh output
+/// ever pushes it back out of the scan window. An orchestrator pane is the most
+/// exposed, since relayed worker prose is most of what gets written to it.
+///
+/// #534 does not cover this and could not: it lets the *grid* release a hold
+/// the ring is still asserting, but our own text is genuinely **rendered**, so
+/// both readings agree it is on screen. They are right — it is on screen. It is
+/// simply not a question, and only the marker can say so.
+///
+/// **Exactly one row per marker, and never the rows around it.** The tempting
+/// version masks the marker's whole wrap-run: a notice is one logical line
+/// (`truncate_notice` strips control characters, so it cannot contain a
+/// newline), a terminal wraps one logical line into a contiguous run of
+/// non-blank rows, and only the first row carries the marker — so a run-mask
+/// would also catch a `(y/n)` that wrapped onto row two. It is rejected because
+/// the marker cannot support it. Since an agent can print a marker row itself
+/// (see [`LOOMUX_NOTICE_MARKER`]), a run-mask hands any pane the power to
+/// delete the seven rows below an attacker-chosen row — and a genuine
+/// permission dialog painted there would be masked into "no question", which
+/// releases an Enter into it. That is the #420 harm, reachable from pane
+/// output. Failing OPEN is the dangerous direction, so the mask claims only
+/// the row the marker actually leads.
+///
+/// **What that leaves, stated rather than mitigated.** A notice that wraps
+/// keeps whatever tokens landed past the first row, so a wide pane is fixed and
+/// a narrow one is improved rather than cured; a marker row that has itself
+/// scrolled off leaves its continuation unmarked and unmasked. Both are
+/// under-masks — the gate holds when it might have cleared, which is the cheap
+/// error the ten-minute `QuestionStale` badge already covers. Closing them
+/// needs loomux to know *what* it wrote to a pane, not merely that a row claims
+/// it did; that means a per-pane record of delivered text, which is delivery
+/// machinery rather than detection and is deliberately not built here.
+///
+/// The residual false-release surface is correspondingly one row wide: a pane
+/// would have to paint a row that both leads with the marker and *is itself*
+/// the live question. A CLI paints its dialog rows itself and does not prefix
+/// them with our marker, and an agent printing the whole thing has not rendered
+/// a dialog at all — it has printed prose about one.
+pub fn mask_loomux_notices(tail: &str) -> String {
+    tail.lines()
+        // De-framed so a notice echoed inside a box UI (`│ [loomux] …`) is
+        // still seen to LEAD its row — the same rule, and the same reason,
+        // as `leads_with_pointer`. Lowercased so a re-cased echo still matches.
+        .filter(|l| !deframe(l).to_lowercase().starts_with(LOOMUX_NOTICE_MARKER))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The live interactive-question guard's hold decision (#420), generic over
 /// the tail read so it's integration-tested with a scripted closure — no
 /// `PtyManager`, no real PTY (rev-15 B4: the old production-bound version of
@@ -14131,9 +14211,18 @@ where
         // inconsistent with itself: our own just-pasted text sits in the box
         // and is therefore *rendered*, so an unmasked grid read would answer
         // "still displayed" about our own paste (rev-15 N1 / rev-19 B-A).
-        let mask = |t: &str| match &pasted_text {
-            Some(p) => mask_own_paste(t, p),
-            None => t.to_string(),
+        // Two masks, both on BOTH readings. `mask_own_paste` needs this
+        // delivery's text and so is `None` at every checkpoint that runs before
+        // one (`question_active_now`'s three call sites); `mask_loomux_notices`
+        // needs nothing, which is exactly why it closes #576 — the outer
+        // drainer gate has no `pasted_text` to mask with, yet the pane is full
+        // of the PREVIOUS delivery's notices.
+        let mask = |t: &str| {
+            let t = mask_loomux_notices(t);
+            match &pasted_text {
+                Some(p) => mask_own_paste(&t, p),
+                None => t,
+            }
         };
         let ring_match =
             s.ring.as_deref().and_then(|out| prompt_wait_match(&mask(&strip_ansi(out))));
