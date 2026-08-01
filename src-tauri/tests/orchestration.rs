@@ -21752,6 +21752,50 @@ fn a_dropped_preview_is_bounded_single_line_and_marks_its_own_truncation() {
 }
 
 #[test]
+fn a_dropped_preview_is_idempotent_so_re_collapsing_a_stored_one_is_free() {
+    // #632 applies this function a SECOND time, at render time, to a preview
+    // that was already bounded when it was audited: `pause_suppression_notice`
+    // reads previews back out of a durable `audit.jsonl` that an EARLIER
+    // loomux build may have written, and a preview carrying a newline would
+    // split an item into two rows with only the first marker-led. Re-collapsing
+    // is the cheap structural fix — but only if it is a no-op for text this
+    // build wrote, or the notice would silently disagree with the audit line it
+    // is reporting, and #579/#630's refusal matcher recomputes this exact
+    // function and compares it to the stored `preview` for equality.
+    //
+    // Both branches have to be checked. The short branch is the easy one; the
+    // TRUNCATED branch is the one that could plausibly differ, since its output
+    // is `MAX` chars plus a `…` that a second pass has to not re-truncate or
+    // double.
+    for original in [
+        "report: done, PR #123 is green",
+        "one\ntwo   three",
+        "",
+        "   leading and trailing   ",
+    ] {
+        let once = queue::dropped_payload_preview(original);
+        assert_eq!(
+            queue::dropped_payload_preview(&once),
+            once,
+            "re-collapsing a stored preview must be a no-op: {original:?}"
+        );
+    }
+    // The truncated branch, including the case where the cut lands on a space
+    // (so the second pass sees `…` preceded by whitespace and must not shift).
+    for filler in ["x", "word ", "é", "a b "] {
+        let long = filler.repeat(queue::DROPPED_PREVIEW_MAX * 2);
+        let once = queue::dropped_payload_preview(&long);
+        assert!(once.ends_with('…'), "precondition — this case truncates: {once}");
+        assert_eq!(
+            queue::dropped_payload_preview(&once),
+            once,
+            "a truncated preview must survive a second pass unchanged, or #632's render-time \
+             re-collapse would rewrite what the audit line recorded: {once:?}"
+        );
+    }
+}
+
+#[test]
 fn capacity_state_leaves_headroom_to_warn_in() {
     // A threshold at the cap could never warn in advance, and one too close to
     // it would be crossed and exhausted inside a single drain poll.
