@@ -27462,6 +27462,27 @@ impl OrchRegistry {
         let _ = self.queue_draining.claim(pty_id, || self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1);
     }
 
+    /// SCRATCH — #562/#497 COMPILE CHECK, reverted in the next commit.
+    ///
+    /// The three shapes the two issues exist to make unrepresentable, in
+    /// one function so one CI run reports all of them. Every line below is
+    /// something that compiled and merged clean before this PR — (1) and
+    /// (3) are literally the two mutations CI passed green on in `0ed4dfe`,
+    /// this branch's first commit. The run on THIS commit is the evidence
+    /// that they no longer compile.
+    #[doc(hidden)]
+    pub fn scratch_compile_check(&self, group: &str, pty_id: u32) {
+        // (1) #562: mutate the queues and persist nothing — the exact shape
+        //     #533's `drop_superseded` and `pop_batch_dequeued` shipped with.
+        self.queues.lock_safe().remove(&pty_id);
+        // (2) #562: reach past the API to the map itself.
+        self.queues.inner.lock_safe().clear();
+        // (3) #497: a raw ungenerationed drainer deregistration at a new
+        //     call site.
+        self.queue_draining.lock_safe().remove(&pty_id);
+        let _ = group;
+    }
+
     /// This pane's current stranded state, if any (#496 PR-C). Test/read-only
     /// seam; `attention_tick` reads the map directly under its own lock.
     #[doc(hidden)] // pub for integration tests
