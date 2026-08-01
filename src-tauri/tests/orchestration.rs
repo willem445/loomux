@@ -58,6 +58,8 @@ use loomux_lib::orchestration::{
     // #560: the per-pane hold EPISODE that owns the escalation clock.
     ends_hold_episode, opens_hold_episode, HoldObservation,
     hold_channels, HoldChannel, HoldClass,
+    // #590 L2: the host-side diagnosis for a pane holding loomux's own notice.
+    undeliverable_cause, undeliverable_notice, UndeliverableCause,
     // #578: the orchestrator-target notice relay.
     orch_notice_relay_text, OrchNoticeInbox, ORCH_NOTICE_INBOX_MAX,
     pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
@@ -19700,7 +19702,7 @@ fn every_hold_class_reaches_a_human_who_is_not_the_orchestrator_channel() {
     // precisely the pane #563 was reported on.
     assert_eq!(
         HoldClass::ALL.len(),
-        13,
+        14,
         "a new HoldClass must be added to HoldClass::ALL (and this count bumped) or the \
          completeness of this test is a fiction"
     );
@@ -19993,10 +19995,10 @@ fn every_notice_that_can_reach_the_inbox_is_a_single_marker_led_line() {
     // every call site and the renderer unchanged, so neither test alone covers
     // it.
     //
-    // These six are the complete set of text `notify_queue` can be handed, one
-    // per notice constructor across its seven call sites. The list is
+    // These seven are the complete set of text `notify_queue` can be handed,
+    // one per notice constructor across its eight call sites. The list is
     // maintained by hand against those call sites, which is exactly why
-    // `OrchNoticeInbox::park`'s `debug_assert` exists as well: a seventh
+    // `OrchNoticeInbox::park`'s `debug_assert` exists as well: an eighth
     // constructor added without touching this list still fails, at the door,
     // in any debug build — and CI's test builds are debug.
     let all = [
@@ -20006,6 +20008,8 @@ fn every_notice_that_can_reach_the_inbox_is_a_single_marker_led_line() {
         queue::recovered_notice("o-1", 2, 30),
         queue::at_capacity_notice("o-1", queue::QUEUE_MAX_PER_PANE),
         queue::pressure_notice("o-1", queue::QUEUE_NEAR_FULL_AT, queue::QUEUE_MAX_PER_PANE),
+        // #590 L2: the eighth call site, on `hold_escalation_step`.
+        undeliverable_notice("o-1", 1, 2, 10, UndeliverableCause::PaneMidTurn),
     ];
     for n in &all {
         assert!(
@@ -20344,7 +20348,7 @@ fn a_writable_poll_never_re_badges_a_pane_that_was_already_escalated() {
     let pty = 5601u32;
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 1_000_000u64;
-    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound);
+    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound, None);
 
     assert_eq!(
         step(WriteAdmission::HoldBoxOccupied, t0),
@@ -20431,7 +20435,7 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
 
     // The pane is held; the episode opens. Then the paste lands and the Enter is
     // withheld: the text entry is replaced by a marker minted right now.
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None);
     reg.enqueue_text(&g.id, &w.id, "loomux", "the brief", pty, queue::EnqueueReason::Arrival).unwrap();
     reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
     reg.note_hold(&g.id, &w.id, pty, HoldObservation::Aborted, t0 + 1_000);
@@ -20466,7 +20470,7 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
          the very event that proves the pane is stuck"
     );
     assert_eq!(
-        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 2, now, bound),
+        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 2, now, bound, None),
         HeldEscalation::Badge(StrandedBlocker::QuestionStale),
         "and the step the drainer actually calls takes the episode clock, not the front entry"
     );
@@ -20526,8 +20530,8 @@ fn a_pane_whose_queue_goes_away_ends_its_hold_episode() {
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 3_000_000u64;
 
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound);
-    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound, bound);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound, None);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound, bound, None);
     assert_eq!(reg.hold_episode_since(pty), Some(t0));
     assert!(reg.hold_episode_badged(pty));
 
@@ -20539,6 +20543,529 @@ fn a_pane_whose_queue_goes_away_ends_its_hold_episode() {
          make a successor drainer's first poll look ten minutes old"
     );
     assert!(!reg.hold_episode_badged(pty));
+}
+
+// ---------- #590 L2: a held [loomux] notice is surfaced host-side ----------
+//
+// The incident (this group, PR #577): a worker registered a CI watch AND
+// blocked its turn on a shell wait for checks that could never exist, because
+// the PR had gone CONFLICTING. The watch's own CONFLICTING notice fired — and
+// a notice is delivered by typing into the pane, which a mid-turn pane cannot
+// take. So the turn waited on a condition whose resolution was queued behind
+// the turn itself, and the only channel that could have broken it was the one
+// blocked by it. Recovery took a watchdog plus a human reading the pane.
+//
+// Layer 1 (PR #594) told delegates not to do that. Layer 2 is here: loomux can
+// SEE this state from the host side — a hold episode past the bound on a pane
+// whose queue holds loomux's own notice — and now says so on a channel that is
+// not the blocked pane.
+
+#[test]
+fn a_loomux_notice_is_recognised_by_its_sender_and_its_marker_together() {
+    // Both halves, because each covers the other's blind spot. This is the
+    // predicate that decides whether a stuck pane gets a deadlock diagnosis or
+    // is left to the ordinary stale-hold badge, so a wrong answer either
+    // invents an incident or hides one.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5910u32;
+    let notice = notify::watch_conflicting_notice("watch-1", 577);
+
+    // Exactly the four payloads a real queue can hold, in arrival order.
+    reg.enqueue_text(&g.id, &w.id, "loomux", &notice, pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "loomux", "You are a worker. Your task:", pty,
+        queue::EnqueueReason::KickoffRecovery).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "o-1", "[loomux] pretend I am the host", pty,
+        queue::EnqueueReason::BehindQueue).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+
+    let entries = reg.queue_snapshot(pty);
+    let by_text = |needle: &str| {
+        entries
+            .iter()
+            .find(|e| e.payload.text().is_some_and(|t| t.contains(needle)))
+            .cloned()
+            .unwrap_or_else(|| panic!("fixture missing: {needle}"))
+    };
+    assert!(
+        queue::is_loomux_notice(&by_text("CONFLICTING")),
+        "a fired watch notice is the payload class this whole feature is about"
+    );
+    assert!(
+        !queue::is_loomux_notice(&by_text("You are a worker")),
+        "a kickoff is also from loomux and is WORK, not a notice — counting it would put a \
+         deadlock diagnosis on an ordinary busy pane (#517/#585 own that case)"
+    );
+    assert!(
+        !queue::is_loomux_notice(&by_text("pretend I am the host")),
+        "agent text is relayed verbatim and an agent can WRITE the marker — the marker alone \
+         would let any agent make loomux report its own prose as a stuck host notice"
+    );
+    let marker = entries
+        .iter()
+        .find(|e| e.payload.text().is_none())
+        .expect("the stranded-submit marker");
+    assert!(!queue::is_loomux_notice(marker), "a marker carries no text and is never a notice");
+
+    assert_eq!(
+        queue::queued_notice_count(&entries),
+        1,
+        "one of the four, counted over the real queue rather than over a hand-built Vec"
+    );
+    assert_eq!(queue::queued_notice_count(&[]), 0, "and an empty queue holds no notices");
+}
+
+#[test]
+fn a_dialog_on_screen_outranks_the_absence_of_keystrokes() {
+    // The precedence, which is the one ordering a future edit must not swap.
+    // `last_user_input_ms` is stamped only for keystroke-like input (#496), and
+    // its stated tradeoff is that arrow keys and menu navigation classify
+    // Neutral with a zero occupancy delta and never stamp it. So a human
+    // sitting in a permission dialog looks EXACTLY like a pane with no human
+    // at all — and reading the dialog first is what keeps that from being
+    // reported as a mid-turn stall.
+    let started = 1_000_000u64;
+    assert_eq!(
+        undeliverable_cause(Some(HeldReason::InteractiveQuestion), Some(0), started),
+        UndeliverableCause::QuestionOnScreen,
+        "a rendered dialog is an observation; the keystroke clock is an inference from absence"
+    );
+    assert_eq!(
+        undeliverable_cause(Some(HeldReason::InteractiveQuestion), Some(started + 5_000), started),
+        UndeliverableCause::QuestionOnScreen,
+        "and a human answering it does not turn it into the box-occupied case"
+    );
+
+    // The box-occupied cases, split on the one question that matters: has a
+    // human touched this pane at any point in the whole time it has been
+    // refusing our delivery?
+    assert_eq!(
+        undeliverable_cause(Some(HeldReason::BoxOccupied), Some(started - 1), started),
+        UndeliverableCause::PaneMidTurn,
+        "a stamp from BEFORE the episode is a fact about an earlier session at this pane — it \
+         says nothing about what is in the box now"
+    );
+    assert_eq!(
+        undeliverable_cause(Some(HeldReason::BoxOccupied), Some(0), started),
+        UndeliverableCause::PaneMidTurn,
+        "and a pane no human has ever typed into reads 0, not None"
+    );
+    assert_eq!(
+        undeliverable_cause(Some(HeldReason::BoxOccupied), Some(started), started),
+        UndeliverableCause::HumanTyping,
+        "a keystroke AT the episode boundary counts as during it — the safe direction, since \
+         the cost of being wrong here is a softer notice, not a missed one"
+    );
+    assert_eq!(
+        undeliverable_cause(Some(HeldReason::Typing), Some(started + 60_000), started),
+        UndeliverableCause::HumanTyping,
+        "#43's typing gate lands in the same cell as #111's box gate — both mean the box"
+    );
+
+    // And the two ways to have nothing to classify from.
+    assert_eq!(
+        undeliverable_cause(Some(HeldReason::BoxOccupied), None, started),
+        UndeliverableCause::Unknown,
+        "a closed pty has no stamp — and a notice must never assert a cause it did not observe"
+    );
+    assert_eq!(
+        undeliverable_cause(None, Some(0), started),
+        UndeliverableCause::Unknown,
+        "no gate, no diagnosis"
+    );
+}
+
+#[test]
+fn the_undeliverable_notice_is_one_marker_led_line_that_names_the_pane_and_the_cause() {
+    // Maskability first (#621/#624): this text can be parked in the
+    // orchestrator inbox, and `OrchNoticeInbox::park`'s own debug_assert
+    // enforces the same invariant at the door. A second row here would ride an
+    // orchestrator's pane unmasked and could re-arm the question gate the
+    // notice is about.
+    // Asserted through #632's `unmaskable_framing_rows` rather than through a
+    // bare `mask_loomux_notices(..).is_empty()`, so this notice sits under the
+    // SAME expression of the rule as the multi-row producers #638 brought under
+    // it. The two are equivalent for a one-row notice; what the shared helper
+    // buys is that a later sweep over "every loomux-authored row is maskable"
+    // finds this one where it expects to, and that a regression names the rows
+    // that survived instead of only asserting that something did.
+    for cause in [
+        UndeliverableCause::PaneMidTurn,
+        UndeliverableCause::HumanTyping,
+        UndeliverableCause::QuestionOnScreen,
+        UndeliverableCause::Unknown,
+    ] {
+        let n = undeliverable_notice("w-8", 1, 3, 10, cause);
+        assert_eq!(
+            unmaskable_framing_rows(&n, &[]),
+            Vec::<String>::new(),
+            "every row of every cause must be one `mask_loomux_notices` can claim: {n:?}"
+        );
+        // And the distinct claim the helper does NOT make: that there is only
+        // ever one row to begin with. `park`'s `debug_assert` enforces it at the
+        // door, and this is the constructor-side statement of the same thing.
+        assert_eq!(n.lines().count(), 1, "a parked notice must be a single line: {n:?}");
+    }
+
+    let n = undeliverable_notice("w-8", 1, 3, 10, UndeliverableCause::PaneMidTurn);
+    assert!(n.contains("notice undeliverable 10 min"), "the headline the issue asked for: {n}");
+    assert!(n.contains("w-8"), "which pane: {n}");
+    assert!(n.contains("1 of 3"), "how much of the backlog is loomux's own: {n}");
+    assert!(n.contains("pane mid-turn"), "the diagnosis: {n}");
+    assert!(
+        n.contains("no human keystroke since the hold began"),
+        "and the evidence behind it, so a reader can check the claim rather than trust it: {n}"
+    );
+    assert!(
+        n.contains("do not wait on it"),
+        "the whole point is that this pane will not clear itself: {n}"
+    );
+
+    let human = undeliverable_notice("w-8", 1, 1, 10, UndeliverableCause::HumanTyping);
+    assert!(
+        human.contains("will clear when they submit it"),
+        "a human mid-line is NOT a stall and must not read like one: {human}"
+    );
+    let many = undeliverable_notice("w-8", 2, 4, 10, UndeliverableCause::PaneMidTurn);
+    assert!(many.contains("2 of 4 deliveries"), "plural reads naturally too: {many}");
+    assert!(many.contains("are loomux's own notices"), "{many}");
+}
+
+#[test]
+fn a_pane_holding_loomuxs_own_notice_past_the_bound_tells_the_orchestrator() {
+    // The wiring, through the exact step the drainer calls. Before #590 L2 this
+    // pane produced a chip and a badge — both of which reach a HUMAN AT THE
+    // WINDOW — and nothing at all for the orchestrator agent until
+    // `still_queued_notice` at THIRTY minutes. The live incident was diagnosed
+    // by hand at ~20, so on this timeline nothing would ever have fired.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5911u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 4_000_000u64;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-1", 577),
+        pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_text(&g.id, &w.id, "o-1", "any word yet?", pty, queue::EnqueueReason::BehindQueue)
+        .unwrap();
+
+    // A pane no human has touched since long before the hold opened: the #590
+    // shape, where the box belongs to the CLI's own turn and not to a person.
+    let step = |now| {
+        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, now, bound,
+            Some(t0 - 60_000))
+    };
+
+    assert_eq!(step(t0), HeldEscalation::Chip(HeldReason::BoxOccupied), "the episode opens");
+    assert!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").is_empty(),
+        "and says nothing yet — inside the bound this is an ordinary held pane, and a notice \
+         per poll would be the audit flood every one-shot in this file exists to prevent"
+    );
+
+    assert_eq!(step(t0 + bound), HeldEscalation::Badge(StrandedBlocker::HumanInput));
+    let lines = audit_entries(&reg, &g.id, "notice-undeliverable");
+    assert_eq!(lines.len(), 1, "the bound elapses and loomux says so, once");
+    assert_eq!(lines[0]["detail"]["to"], w.id);
+    assert_eq!(lines[0]["detail"]["cause"], "pane-mid-turn");
+    assert_eq!(lines[0]["detail"]["notices"], 1, "one of the two queued entries is ours");
+    assert_eq!(lines[0]["detail"]["depth"], 2);
+    assert_eq!(lines[0]["detail"]["minutes"], bound / 60_000);
+    assert_eq!(
+        lines[0]["detail"]["blocked_on"], "box-occupied",
+        "the gate the drainer actually stopped on, so the diagnosis and the reading agree"
+    );
+
+    // ONE per episode, not one per poll — and the pane stays stuck, which is
+    // precisely when a re-notifying implementation would flood.
+    step(t0 + bound + 2_000);
+    step(t0 + bound + 4_000);
+    assert_eq!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").len(),
+        1,
+        "a stuck pane is polled every couple of seconds for as long as it is stuck"
+    );
+
+    // A delivery landing ends the episode; a LATER hold is a new one, and gets
+    // its own notice. Suppressing the second would be the mirror-image bug —
+    // the pane went stuck again and nobody would be told.
+    reg.note_hold(&g.id, &w.id, pty, HoldObservation::Delivered, t0 + bound + 6_000);
+    let t1 = t0 + bound + 8_000;
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, t1, bound,
+        Some(t0 - 60_000));
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 2, t1 + bound,
+        bound, Some(t1 + 1_000));
+    let lines = audit_entries(&reg, &g.id, "notice-undeliverable");
+    assert_eq!(lines.len(), 2, "a fresh episode is a fresh incident");
+    assert_eq!(
+        lines[1]["detail"]["cause"], "human-typing",
+        "and the cause is re-read, not remembered: this time a human HAS typed since the hold \
+         began, which is not a stall and must not be reported as one"
+    );
+}
+
+#[test]
+fn the_notice_still_fires_when_another_mechanism_already_owns_the_badge() {
+    // The one-shot cannot be the badge's. `hold_escalation_step` declines to
+    // RAISE over another mechanism's badge (#532 rev-12 NB5) and therefore
+    // leaves `HoldEpisode::badged` false, so `held_escalation` keeps returning
+    // `Badge` on every later poll. Keying the orchestrator notice on the badge
+    // would then either fire it every two seconds or — if nested inside the
+    // decline — never fire it at all, on a pane that is doubly stuck.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5912u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 5_000_000u64;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-2", 577),
+        pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.mark_stranded(&g.id, &w.id, Some(StrandedBlocker::QueueNearFull));
+
+    let step = |now| {
+        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, now, bound,
+            Some(0))
+    };
+    step(t0);
+    step(t0 + bound);
+    assert!(
+        !reg.hold_episode_badged(pty),
+        "the badge was declined, exactly as #532 intends — someone else's is already up"
+    );
+    assert_eq!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").len(),
+        1,
+        "and the orchestrator is told anyway: the badge is the HUMAN's channel and this is not"
+    );
+    step(t0 + bound + 2_000);
+    step(t0 + bound + 4_000);
+    assert_eq!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").len(),
+        1,
+        "still once per episode, on the very path where the badge one-shot cannot help"
+    );
+}
+
+#[test]
+fn a_held_kickoff_is_not_reported_as_an_undeliverable_notice() {
+    // The gate, and it is what keeps this from being a second, noisier copy of
+    // `QueueStaleEscalation`. A kickoff is `from: "loomux"` too; it is work
+    // waiting on a busy pane, with its own recovery (#517/#585), and the pane
+    // holding it is not deadlocked against loomux by construction the way a
+    // pane holding a notice is.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5913u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 6_000_000u64;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", "You are a worker. Your task: fix #1", pty,
+        queue::EnqueueReason::KickoffRecovery).unwrap();
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
+        Some(0));
+    let escalation = reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1,
+        t0 + bound, bound, Some(0));
+
+    assert_eq!(
+        escalation,
+        HeldEscalation::Badge(StrandedBlocker::HumanInput),
+        "the ordinary stale-hold escalation is untouched — this pane IS stuck and the human is \
+         still told about it"
+    );
+    assert!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").is_empty(),
+        "but nothing loomux said is trapped here, so there is no deadlock to diagnose"
+    );
+}
+
+#[test]
+fn a_bound_crossed_with_nothing_queued_does_not_burn_the_report() {
+    // rev-128's blocking finding, and the scenario is one step from the filed
+    // incident: the orchestrator sends a worker a follow-up while it is
+    // mid-turn, the delivery is held, and the episode opens on WORK. The bound
+    // elapses with no notice queued — correctly silent. THEN the worker's own
+    // CI watch fires and queues `watch_conflicting_notice` behind that entry:
+    // #590's exact payload, on a pane that cannot take it. That must be
+    // reported, and before this fix it never was, for as long as the pane
+    // stayed held (unbounded).
+    //
+    // **Deliberately run in the configuration where the badge SUCCEEDS**, which
+    // is the common one and the one the fix has to cover. Nothing else owns this
+    // agent's badge, so `mark_stranded` applies, `HoldEpisode::badged` goes true
+    // — and `held_escalation` then returns `None`, not `Badge`, on every later
+    // poll. So a fix that only reorders the one-shot inside the `Badge` arm
+    // would still be silent here: there is no second `Badge` poll to try again.
+    // That is why the report is evaluated on the BOUND, not on the verdict, and
+    // why this test asserts the verdict is `None` at the moment it fires.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5916u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 9_000_000u64;
+    let step = |now| {
+        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, now, bound,
+            Some(0))
+    };
+
+    // An ordinary follow-up from the orchestrator — work, not a notice.
+    reg.enqueue_text(&g.id, &w.id, "o-1", "any word on the rebase?", pty,
+        queue::EnqueueReason::Arrival).unwrap();
+
+    assert_eq!(step(t0), HeldEscalation::Chip(HeldReason::BoxOccupied), "the episode opens");
+    assert_eq!(
+        step(t0 + bound),
+        HeldEscalation::Badge(StrandedBlocker::HumanInput),
+        "the bound elapses and the human-facing escalation fires as it always did"
+    );
+    assert!(
+        reg.hold_episode_badged(pty),
+        "and the badge was RAISED, not declined — this is the common configuration, and the one \
+         in which no further poll ever returns Badge again"
+    );
+    assert!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").is_empty(),
+        "nothing loomux said is queued here, so there is correctly nothing to report yet — the \
+         defect is what this silence used to COST"
+    );
+
+    // The watch fires. Its notice lands behind the work already waiting, on a
+    // pane that is still held — #590, exactly.
+    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-5", 577),
+        pty, queue::EnqueueReason::BehindQueue).unwrap();
+
+    assert_eq!(
+        step(t0 + bound + 2_000),
+        HeldEscalation::None,
+        "the badge is already up, so the escalation verdict is None — the report must NOT be \
+         riding on the Badge arm, or it can never fire from here"
+    );
+    let lines = audit_entries(&reg, &g.id, "notice-undeliverable");
+    assert_eq!(
+        lines.len(),
+        1,
+        "the report survived the poll that had nothing to say, and fires on the poll that does"
+    );
+    assert_eq!(lines[0]["detail"]["notices"], 1, "one of the two queued entries is loomux's");
+    assert_eq!(lines[0]["detail"]["depth"], 2);
+    assert_eq!(lines[0]["detail"]["cause"], "pane-mid-turn");
+
+    // And it is still at-most-once per episode: the one-shot is claimed by the
+    // poll that reports, not by the poll that merely looked.
+    step(t0 + bound + 4_000);
+    step(t0 + bound + 6_000);
+    assert_eq!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").len(),
+        1,
+        "a stuck pane is polled every couple of seconds — claiming on report rather than on the \
+         bound must not turn into a report per poll"
+    );
+}
+
+#[test]
+fn an_undeliverable_notice_is_never_reported_as_a_front_door_refusal() {
+    // The #579/#630 seam, pinned rather than argued. #630's refused list and
+    // this classification are about opposite halves of one distinction: a
+    // refusal is `enqueue_text`'s `RejectFull` arm, which returns before
+    // `queue_seq.fetch_add`, so it has NO id and no queue entry; this fires
+    // only for a payload that IS queued, holds an id, and cannot land. Showing
+    // one event in both would be a duplicate-delivery generator in a tool whose
+    // documented response is "re-send what still applies" — the same failure
+    // #630's own `recovered` exclusion and its
+    // `a_parked_orchestrator_notice_is_not_a_refusal` exist to prevent.
+    //
+    // Written as a test because the scan is a string match over audit actions:
+    // nothing about `notice-undeliverable` being a different word from
+    // `delivery-dropped` is enforced by a type, and a later widening to "any
+    // dropped-ish line" would silently swallow this one.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5915u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 8_000_000u64;
+
+    reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-4", 577),
+        pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
+        Some(0));
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound,
+        bound, Some(0));
+    assert_eq!(
+        audit_entries(&reg, &g.id, "notice-undeliverable").len(),
+        1,
+        "the diagnosis fired — otherwise this test proves nothing about what the scan does with it"
+    );
+
+    let refusals = reg.front_door_refusals(&g.id);
+    assert_eq!(
+        refusals.total, 0,
+        "a queued-but-undeliverable notice is not a front-door refusal: it holds an id and is \
+         still in the pane's queue, so nothing was declined and there is nothing to re-send — \
+         got {:?}",
+        refusals.items
+    );
+    assert!(
+        refusals.items.is_empty(),
+        "and the capped list agrees with the total it reports"
+    );
+}
+
+#[test]
+fn an_orchestrators_own_stuck_pane_parks_its_notice_in_the_inbox() {
+    // The case the whole issue turns on, and the one that would be silent
+    // without #578's inbox. `notify_queue` refuses to type a notice into an
+    // orchestrator's own pane — correctly, since it would queue behind the very
+    // block it reports — so before #578 the diagnosis would have been written
+    // and discarded. It parks instead and rides back on the orchestrator's next
+    // MCP tool result: a call the orchestrator itself made, which is also proof
+    // it is running and reading at that instant.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let pty = 5914u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 7_000_000u64;
+
+    reg.enqueue_text(&g.id, &orch.id, "loomux", &notify::watch_conflicting_notice("watch-3", 577),
+        pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.hold_escalation_step(&g.id, &orch.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound,
+        Some(0));
+    reg.hold_escalation_step(&g.id, &orch.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound,
+        bound, Some(0));
+
+    let suppressed = audit_entries(&reg, &g.id, "notice-suppressed");
+    assert_eq!(suppressed.len(), 1, "the in-band notice is suppressed, as it must be");
+    assert_eq!(suppressed[0]["detail"]["reason"], "target-is-orchestrator");
+    assert_eq!(suppressed[0]["detail"]["parked"], true, "and parked rather than discarded (#578)");
+
+    let relay = reg.take_orchestrator_notices(&g.id).expect("the relay carries it");
+    assert!(relay.contains("notice undeliverable"), "the diagnosis reaches the agent: {relay}");
+    assert!(relay.contains(&orch.id), "about its own pane: {relay}");
+    assert_eq!(
+        mask_loomux_notices(&relay).trim(),
+        "",
+        "and every row of the relay stays maskable with this notice in it (#621): {relay}"
+    );
+    assert!(
+        reg.take_orchestrator_notices(&g.id).is_none(),
+        "drained once — a relayed notice must not repeat on the next tool call"
+    );
+    assert_eq!(
+        reg.queue_depth(pty),
+        1,
+        "nothing was enqueued for the blocked pane: the notice about a pane cannot be allowed to \
+         queue behind that pane's own block"
+    );
 }
 
 // ---------- #569: the LEGACY discard scan, and what resume says about it -------

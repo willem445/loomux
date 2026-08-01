@@ -13563,6 +13563,10 @@ fn run_queue_drainer(
                 depth,
                 now_ms(),
                 QUESTION_HOLD_STALE_AFTER.as_millis() as u64,
+                // #590 L2: the pane's human-keystroke stamp, read from the same
+                // `ptys` this poll already consulted for `box_pending`, so the
+                // classification and the gate reading describe the same instant.
+                ptys.last_user_input_ms(pty_id),
             );
             match escalation {
                 // #563: the pane is held right now — say so right now. This
@@ -15211,6 +15215,33 @@ struct HoldEpisode {
     /// writable poll intervened; what changed is that a writable poll no longer
     /// resets it.
     badged: bool,
+    /// #590 L2: whether `notice-undeliverable` has been reported for THIS
+    /// episode ([`OrchRegistry::note_undeliverable_notice`]).
+    ///
+    /// **Its own flag rather than a read of `badged`**, which is the whole
+    /// reason it exists as a field, and the two come apart in BOTH directions:
+    ///
+    /// - a badge RAISE sets `badged`, after which `held_escalation` returns
+    ///   `None` for the rest of the episode (`if already_badged`), so sharing
+    ///   the flag would mean never reporting after the instant the bound was
+    ///   crossed;
+    /// - a badge raise DECLINED — another mechanism already owns the badge —
+    ///   leaves `badged` false while `Badge` comes back on every poll, so
+    ///   sharing it would mean re-reporting every couple of seconds, on the
+    ///   pane with the most wrong with it.
+    ///
+    /// **Set by the poll that REPORTS, never by one that merely looked**
+    /// (rev-128's blocking finding). Claiming it at the top of
+    /// [`OrchRegistry::note_undeliverable_notice`] spent an episode's only
+    /// report on a poll that found nothing queued, which silenced the case
+    /// where a notice joins a pane that is ALREADY held — one step from #590's
+    /// own incident, and unbounded, since an episode ends only when the pane
+    /// accepts a delivery.
+    ///
+    /// Same lifetime as the rest of the episode: cleared when the pane accepts
+    /// a delivery, and forgotten across a restart, so the worst a restart costs
+    /// is one repeated diagnosis of a pane that is still stuck.
+    notice_reported: bool,
 }
 
 /// #560: what one drainer iteration observed about a pane, as a closed set, and
@@ -15367,6 +15398,20 @@ pub enum HoldClass {
     QueueFull,
     /// The human paused the group, so loomux delivers nothing (`deliver_prompt`).
     GroupPaused,
+    /// #590 L2: a hold that has outlived `QUESTION_HOLD_STALE_AFTER` **on a
+    /// pane whose queue holds one of loomux's own `[loomux]` notices**
+    /// (`queue::is_loomux_notice`).
+    ///
+    /// A strict subset of [`HoldClass::QueueStaleEscalation`]'s panes, split
+    /// out because the two are not the same event to a reader. A stale hold on
+    /// a kickoff is work waiting; a stale hold on a NOTICE means an agent is
+    /// being kept from something loomux decided it needed to know — and in
+    /// #590's incident that agent was blocked *on the very condition the
+    /// undelivered notice reported*, so the pane could not clear itself and no
+    /// channel reached anyone who could. Hence the extra two channels: this is
+    /// the only hold classification whose harm lands on an AGENT rather than
+    /// on a human's attention.
+    UndeliverableNotice,
 }
 
 impl HoldClass {
@@ -15387,6 +15432,7 @@ impl HoldClass {
         HoldClass::QueueNearFull,
         HoldClass::QueueFull,
         HoldClass::GroupPaused,
+        HoldClass::UndeliverableNotice,
     ];
 
     /// Dense index into [`HoldClass::ALL`]. Exhaustive on purpose: a new
@@ -15408,6 +15454,7 @@ impl HoldClass {
             HoldClass::QueueNearFull => 10,
             HoldClass::QueueFull => 11,
             HoldClass::GroupPaused => 12,
+            HoldClass::UndeliverableNotice => 13,
         }
     }
 }
@@ -15574,7 +15621,171 @@ pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
             HoldChannel::OrchestratorNotice,
             HoldChannel::AttentionBadge,
         ],
+        // #590 L2. A separate classification from `QueueStaleEscalation`
+        // rather than two more channels bolted onto it, because the two say
+        // different things and only one of them is unconditionally true.
+        // `QueueStaleEscalation` fires for ANY pane held past the bound and
+        // reaches the human only; this one fires for the subset where the held
+        // payload is loomux's OWN notice, and reaches the orchestrator agent
+        // too. Folding the extra channels into that row would make the table
+        // claim an orchestrator-facing channel for a held kickoff, which
+        // nothing sends.
+        HoldClass::UndeliverableNotice => &[
+            HoldChannel::AttentionBadge,
+            HoldChannel::HeldChip,
+            HoldChannel::OrchestratorNotice,
+            HoldChannel::OrchestratorInbox,
+        ],
     }
+}
+
+/// #590 L2: what a held pane's own readings say about WHO is holding it, at
+/// the moment loomux concludes that its own notice cannot be delivered there.
+///
+/// **Why the diagnosis is worth a type.** The channel this feeds is read by
+/// the orchestrator *agent*, and the two hold reasons the drainer can report
+/// (`box-occupied`, `question`) do not distinguish the cases that need
+/// opposite responses: a human's half-written line (wait — a person is right
+/// there) from a CLI's own turn state (do not wait — the pane will not clear
+/// until the agent's turn ends, and the notice sitting undelivered may be the
+/// very thing that would end it). #590's incident is the second one and read
+/// on the wire exactly like the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UndeliverableCause {
+    /// The box is occupied and **no human keystroke has landed in this pane
+    /// since the hold episode opened** (`PtyManager::last_user_input_ms`, which
+    /// #496 gates on `classify_human_input` so a terminal's own query replies
+    /// never stamp it). So whatever occupies the box is not a person's — it is
+    /// the pane's own CLI, mid-turn.
+    ///
+    /// **What this claim is, exactly.** It is *negative* evidence — "not a
+    /// human" — plus the box reading, and that is the actionable half. It is
+    /// not proof that a turn is running: `input_pending` is documented to latch
+    /// over an already-empty box (a bare ESC, a TUI line-clear, a CLI consuming
+    /// the line), so a quiescent pane with a latched counter reads the same. The
+    /// wording therefore states the evidence it has rather than the inference
+    /// alone, and every response it invites (look at the pane, do not wait for
+    /// it) is correct under both readings.
+    PaneMidTurn,
+    /// The box is occupied and a human HAS typed in this pane since the episode
+    /// opened. #510's absolute is doing exactly what it exists to do; the badge
+    /// and the chip are the right channels and the orchestrator should not
+    /// treat this as a stall.
+    HumanTyping,
+    /// #420: a question/permission dialog owns the pane's Enter key. Checked
+    /// BEFORE the keystroke evidence because it is a direct observation of the
+    /// pane rather than an inference from its absence — and because it covers
+    /// that evidence's documented blind spot: a human navigating a dialog with
+    /// arrow keys classifies `Neutral` with a zero occupancy delta and never
+    /// stamps `last_user_input_ms` (#496's stated tradeoff), so a
+    /// keystroke-first order would report a human mid-menu as a pane mid-turn.
+    QuestionOnScreen,
+    /// No reading to classify from — a closed pty, or a hold with no gate
+    /// attributed to it. Named rather than folded into one of the others so a
+    /// notice never asserts a cause it did not observe.
+    Unknown,
+}
+
+impl UndeliverableCause {
+    /// The audit-line token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UndeliverableCause::PaneMidTurn => "pane-mid-turn",
+            UndeliverableCause::HumanTyping => "human-typing",
+            UndeliverableCause::QuestionOnScreen => "question-on-screen",
+            UndeliverableCause::Unknown => "unknown",
+        }
+    }
+
+    /// The clause [`undeliverable_notice`] renders, which is where the
+    /// diagnosis becomes an instruction. Each one names the evidence behind it,
+    /// so a reader can check the claim instead of trusting it.
+    fn phrase(self) -> &'static str {
+        match self {
+            UndeliverableCause::PaneMidTurn => {
+                "pane mid-turn (no human keystroke since the hold began), so nothing but that \
+                 agent's own turn ending will clear it — read the pane, do not wait on it"
+            }
+            UndeliverableCause::HumanTyping => {
+                "a human has typed in this pane since the hold began, so it is waiting behind \
+                 their line and will clear when they submit it"
+            }
+            UndeliverableCause::QuestionOnScreen => {
+                "a question/permission dialog owns the pane and needs an answer before anything \
+                 can be delivered into it"
+            }
+            UndeliverableCause::Unknown => {
+                "loomux could not read the pane's input state, so it cannot say what is holding it"
+            }
+        }
+    }
+}
+
+/// #590 L2: classify a held pane at the escalation bound.
+///
+/// `held` is the blocking gate the drainer's own `write_admission` reported
+/// (`WriteAdmission::held_reason`), `last_user_input_ms` the pane's
+/// human-keystroke stamp (`None` when the pty is gone), and
+/// `episode_started_ms` the hold episode's start ([`HoldEpisode`]).
+///
+/// **The comparison is against the episode, not against a fresh window**, and
+/// that is why this needs no new constant. The question worth answering is not
+/// "did a human type recently" — recently against what? — but "has a human
+/// touched this pane at any point in the whole time it has been refusing our
+/// delivery". A stamp older than the episode is a fact about some earlier
+/// session at this pane and says nothing about what is in the box now.
+///
+/// Pure, so the precedence (dialog beats keystroke evidence beats its absence)
+/// is directly pinnable — it is the one ordering a future edit must not swap.
+pub fn undeliverable_cause(
+    held: Option<HeldReason>,
+    last_user_input_ms: Option<u64>,
+    episode_started_ms: u64,
+) -> UndeliverableCause {
+    match held {
+        None => UndeliverableCause::Unknown,
+        Some(HeldReason::InteractiveQuestion) => UndeliverableCause::QuestionOnScreen,
+        Some(HeldReason::Typing) | Some(HeldReason::BoxOccupied) => match last_user_input_ms {
+            None => UndeliverableCause::Unknown,
+            Some(ms) if ms >= episode_started_ms => UndeliverableCause::HumanTyping,
+            Some(_) => UndeliverableCause::PaneMidTurn,
+        },
+    }
+}
+
+/// #590 L2: the orchestrator-facing notice for a pane that has been holding
+/// loomux's own notice past the escalation bound.
+///
+/// **One line, marker-led**, like every other text that can reach
+/// [`OrchNoticeInbox::park`] — see that method's `debug_assert`, and #621 for
+/// why a row loomux writes must be one `mask_loomux_notices` can claim.
+///
+/// **What it says that `queue::still_queued_notice` does not**, which is the
+/// whole reason it exists as a second notice rather than a reworded first one:
+/// that the stuck payload is loomux's OWN notice (so an agent is waiting on
+/// something it will never be told), and a cause for the hold. The still-queued
+/// notice fires at 30 minutes and reports depth and elapsed time; #590's live
+/// incident was diagnosed and cleared by a human at ~20, so that notice never
+/// fired at all, and had it fired it would have said "nothing lost, delivers
+/// automatically once clear" — true, and precisely the wrong thing to read
+/// about a pane that cannot clear itself.
+pub fn undeliverable_notice(
+    agent_id: &str,
+    notices: usize,
+    depth: usize,
+    minutes: u64,
+    cause: UndeliverableCause,
+) -> String {
+    let subject = if notices == 1 {
+        format!("1 of {depth} deliveries queued for {agent_id} is loomux's own notice")
+    } else {
+        format!("{notices} of {depth} deliveries queued for {agent_id} are loomux's own notices")
+    };
+    format!(
+        "{LOOMUX_NOTICE_MARKER} notice undeliverable {minutes} min: {subject}, and the pane has \
+         accepted nothing since — {}",
+        cause.phrase()
+    )
 }
 
 /// #578: how many parked notices one group's orchestrator inbox holds before
@@ -28830,7 +29041,12 @@ impl OrchRegistry {
         match episodes.get(&pty_id) {
             Some(open) => Some(open.started_ms),
             None if opens_hold_episode(observation) => {
-                episodes.insert(pty_id, HoldEpisode { started_ms: now_ms, announced: false, badged: false });
+                episodes.insert(pty_id, HoldEpisode {
+                    started_ms: now_ms,
+                    announced: false,
+                    badged: false,
+                    notice_reported: false,
+                });
                 Some(now_ms)
             }
             // A writable poll on a pane with no open episode: nothing to open
@@ -28886,7 +29102,14 @@ impl OrchRegistry {
         depth: usize,
         now_ms: u64,
         bound_ms: u64,
+        last_user_input_ms: Option<u64>,
     ) -> HeldEscalation {
+        // #590 L2: threaded in rather than read here because this method has no
+        // `PtyManager` — the caller does. It is the same class of parameter as
+        // `depth`: one live pane reading the drainer already holds, passed so
+        // the whole decision downstream of it stays reachable by a headless
+        // test. What it feeds ([`undeliverable_cause`]) is pure and pinned
+        // separately.
         if admission.go() {
             // Provisional recovery. The chip comes down (the caller's job) but
             // the episode stands until a delivery actually lands.
@@ -28942,7 +29165,170 @@ impl OrchRegistry {
                 self.mark_stranded(group, agent_id, Some(blocker));
             }
         }
+        // #590 L2. Evaluated on the BOUND, not on `escalation`, and outside the
+        // `Badge` arm entirely — rev-128's blocking finding, plus the half its
+        // remedy did not reach.
+        //
+        // The badge is the human's channel and this is the orchestrator agent's,
+        // and the two arms of `held_escalation` they need are not the same one:
+        //
+        // - a RAISED badge sets `HoldEpisode::badged`, after which
+        //   `held_escalation` returns `None` for the rest of the episode
+        //   (`if already_badged`), so there is never a second `Badge` poll;
+        // - a DECLINED raise (another mechanism owns the badge) leaves `badged`
+        //   false, so `Badge` comes back every poll.
+        //
+        // Nested in that arm, this fires exactly once and only at the instant
+        // the bound is crossed — which is the whole defect: an episode that
+        // crosses the bound holding only work would never look again, and the
+        // notice that arrives afterwards (the watch firing behind a held
+        // follow-up — one step from #590's own incident) stays silent for as
+        // long as the pane stays held. Keyed on the bound instead, every later
+        // poll re-asks, and `HoldEpisode::notice_reported` — claimed by the poll
+        // that REPORTS, never by one that merely looked — keeps it to one per
+        // episode.
+        if hold_bound_elapsed(started_ms, now_ms, bound_ms) {
+            self.note_undeliverable_notice(
+                group,
+                agent_id,
+                pty_id,
+                admission,
+                started_ms,
+                bound_ms,
+                last_user_input_ms,
+            );
+        }
         escalation
+    }
+
+    /// #590 L2: at the escalation bound, is one of loomux's OWN notices sitting
+    /// in this pane's queue — and if so, say so on a channel that is not the
+    /// blocked pane. Once per hold episode.
+    ///
+    /// **Why this is worth reporting when a plain stale hold is not.** Every
+    /// other payload waiting on a busy pane is work, and a busy pane finishing
+    /// its turn delivers it; the chip and the badge are the right channels and
+    /// the human at the window is the right reader. A *notice* is the one
+    /// payload whose non-delivery can be the reason the pane stays busy:
+    /// #590's worker was blocked on a CI condition that
+    /// `notify::watch_conflicting_notice` had already resolved, in a notice it
+    /// could not be told. That is not a hold a human's attention fixes — it is
+    /// a hold whose only readers are elsewhere.
+    ///
+    /// **The queue is re-read here rather than taken as a parameter**, matching
+    /// `note_queue_capacity`'s rule for the same reason: every caller then
+    /// states the same fact the same way, and the whole decision stays
+    /// reachable by a headless test (`run_queue_drainer` needs an `AppHandle`,
+    /// so anything left inline there is testable by nothing — #560's first
+    /// symptom lived in exactly those lines).
+    ///
+    /// **Called on every poll past the bound, and the order of the three steps
+    /// below is the fix for rev-128's blocking finding.** It reads the flag,
+    /// then the queue, and claims the one-shot only when it is about to report:
+    ///
+    /// 1. `notice_reported` first, so the steady state after a report is one
+    ///    flag read per poll and nothing else;
+    /// 2. the queue snapshot, taken only while this episode is still unreported
+    ///    — bounded work (one lock read plus a clone of at most
+    ///    `queue::QUEUE_MAX_PER_PANE` entries) on a thread that is already
+    ///    polling a pty every `queue::QUEUE_DRAIN_POLL`;
+    /// 3. the claim, by the poll that REPORTS, never by one that merely looked.
+    ///
+    /// Claiming before the zero-notice gate — the original order — spent the
+    /// episode's only report on a poll that had nothing to say, so an episode
+    /// that crossed the bound holding only work never looked again and the
+    /// notice that arrived afterwards was silent for as long as the pane stayed
+    /// held. There was no tension to trade off here: the alternative the old
+    /// comment weighed this against (a one-shot that re-arms on queue content
+    /// and fires repeatedly for one hold) is not what this order produces —
+    /// `notice_reported` is set once and never cleared inside an episode, so
+    /// re-asking on each poll costs a re-read, never a second report.
+    fn note_undeliverable_notice(
+        &self,
+        group: &str,
+        agent_id: &str,
+        pty_id: u32,
+        admission: WriteAdmission,
+        started_ms: u64,
+        bound_ms: u64,
+        last_user_input_ms: Option<u64>,
+    ) {
+        // Step 1. Cheap, and the common case once a pane has been reported.
+        // An episode that is gone entirely is treated as reported rather than
+        // as a reason to report with no one-shot to hold it — the failure
+        // direction that floods.
+        let unreported = self
+            .hold_episodes
+            .lock_safe()
+            .get(&pty_id)
+            .is_some_and(|e| !e.notice_reported);
+        if !unreported {
+            return;
+        }
+        // Step 2. Resolved BEFORE the queue read, never after: `enqueue_text`
+        // states the house rule for the two maps — agents first, then queues —
+        // because every site that needs both takes them in that order and one
+        // inversion is all a deadlock needs. `queue_snapshot` does release its
+        // guard before returning, so this is discipline rather than a live bug,
+        // which is exactly when it is cheap to keep.
+        let target_is_orchestrator = self
+            .agent(agent_id)
+            .is_some_and(|a| a.role == Role::Orchestrator);
+        let entries = self.queue_snapshot(pty_id);
+        let notices = queue::queued_notice_count(&entries);
+        if notices == 0 {
+            // The gate, and what keeps this from being a second, noisier copy
+            // of `HoldClass::QueueStaleEscalation`. Nothing has been spent: the
+            // next poll asks again, which is what lets a notice joining an
+            // already-held pane still be reported.
+            return;
+        }
+        // Step 3. Claim, and re-check under the lock so the flag is read and
+        // written in one critical section rather than across the queue read
+        // above. One drainer per pane makes a race impossible today; the
+        // re-check means this stays correct if that ever stops being true.
+        let claimed = {
+            let mut episodes = self.hold_episodes.lock_safe();
+            match episodes.get_mut(&pty_id) {
+                Some(e) if !e.notice_reported => {
+                    e.notice_reported = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !claimed {
+            return;
+        }
+        let cause =
+            undeliverable_cause(admission.held_reason(), last_user_input_ms, started_ms);
+        let minutes = bound_ms / 60_000;
+        // The durable half, and the one a test can read: `notify_queue`'s own
+        // delivery can be refused with no record at all when the orchestrator
+        // pane is dead or unbound (#633), so the audit line is written FIRST
+        // and unconditionally.
+        self.audit(group, "loomux", "notice-undeliverable", json!({
+            "to": agent_id,
+            "pty": pty_id,
+            "minutes": minutes,
+            "notices": notices,
+            "depth": entries.len(),
+            "cause": cause.as_str(),
+            "blocked_on": admission.enqueue_reason().as_str(),
+        }));
+        // Through `notify_queue`, which is what makes the orchestrator's OWN
+        // stuck pane work: that branch parks the notice for #578's inbox
+        // instead of typing it into the pane it is about. Nothing is enqueued
+        // for the blocked pane on any path, so the notice cannot queue behind
+        // the block it reports — and a parked notice about the orchestrator's
+        // pane cannot re-trigger this either, since parking creates no queue
+        // entry and the one-shot above is already spent.
+        self.notify_queue(
+            group,
+            agent_id,
+            target_is_orchestrator,
+            &undeliverable_notice(agent_id, notices, entries.len(), minutes, cause),
+        );
     }
 
     /// Whether a drainer thread is currently registered for `pty_id` — i.e.

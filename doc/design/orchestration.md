@@ -7047,6 +7047,184 @@ drains its inbox — by construction, since this channel is a pull. That case is
 chip's, and it is why they remain listed. The desktop-toast path (`notify_desktop`, opt-in per
 group via the attention scan) is unchanged and still rides the badge.
 
+## A notice the pane cannot take is a fact loomux can see (#590 layer 2)
+
+**Problem, from a live incident (PR #577, this group).** A worker registered a `notify_when` CI
+watch — correct — and *also* blocked its turn on a shell-level wait for checks on its new head.
+Two merges had landed underneath it, so the PR was `CONFLICTING`, and GitHub never creates
+check-suites for a PR with no clean merge ref: the shell wait was on a condition that could not
+occur. Meanwhile the watch fired and `notify::watch_conflicting_notice` — which #337 built for
+exactly this case — was queued for that pane. A `[loomux]` notice is delivered by **typing into a
+pane**, and a pane mid-turn cannot take a delivery. So the turn waited on a resolution that was
+queued behind the turn itself, and the one channel that could have broken the deadlock was the one
+the deadlock blocked. 20+ minutes, ended by the host watchdog plus a human reading the pane.
+
+**Layer 1** (PR #594, `75e9a07`) is the delegate rule — register the watch, END the turn, act on
+the notice — now in `worker.md`, `reviewer.md`, the `ci-validate` skill and `.loomux/lessons.md`.
+It is a rule about what an agent should not do, which is the cheap half and not a mechanism.
+**Layer 2, here,** is the observation an agent *cannot make about itself*: from the host side this
+state is fully visible, and before this nothing looked.
+
+**What the pre-existing escalation reached, and why neither arm covered it.** The hold was already
+detected: `hold_escalation_step` opens a per-pane hold episode (#560) and escalates at
+`QUESTION_HOLD_STALE_AFTER` (ten minutes). But `HoldClass::QueueStaleEscalation`'s channels are the
+held chip and the attention badge, and both reach **a human at the window** — the exact reader an
+unattended run does not have, and the reader whose absence is what made the incident cost 20
+minutes. The one channel that reaches the orchestrator *agent* for a stuck pane is
+`queue::still_queued_notice`, at **thirty** minutes: on this timeline it never fired, and had it
+fired it would have said *"nothing lost, delivers automatically once clear"* — true of a queue in
+general, and precisely the wrong thing to read about a pane that cannot clear itself.
+
+**The gate: the held payload is loomux's OWN notice.** `queue::is_loomux_notice` requires **both**
+`from == "loomux"` and a `[loomux]`-led payload, and each half covers the other's blind spot. `from`
+alone over-matches — a kickoff brief is also from loomux and is *work*, with its own recovery
+(#517/#585) — and a stale hold on work is an ordinary busy pane, already correctly served by the
+chip and the badge. The marker alone under-guards, because agent text is relayed verbatim and
+`LOOMUX_NOTICE_MARKER`'s own doc states the limit in these words: a marker row is evidence that
+someone wrote a notice-shaped row, never proof that loomux wrote *this* one. Requiring both rests
+the answer on a field an agent cannot set and a prefix loomux always writes.
+
+That gate is what makes this a *different event* rather than a louder copy of the stale-hold badge,
+and it is why it is a separate `HoldClass::UndeliverableNotice` rather than two more channels on
+`QueueStaleEscalation`'s row. Folding them in would make the hold-channel table — whose entire
+purpose is to be checkable — claim an orchestrator-facing channel for a held kickoff, which nothing
+sends.
+
+**The diagnosis, and the evidence behind it.** `undeliverable_cause` answers *who* is holding the
+pane, because the drainer's two hold reasons (`box-occupied`, `question`) do not distinguish the
+cases that need opposite responses: a human's half-written line (wait — a person is right there)
+from a CLI's own turn state (do not wait — the pane will not clear until that agent's turn ends).
+The precedence is **dialog → keystroke evidence → its absence**:
+
+- `QuestionOnScreen` first, because a rendered dialog is a direct observation rather than an
+  inference from absence — *and* because it covers the keystroke signal's documented blind spot.
+  `PtyManager::last_user_input_ms` is stamped only for keystroke-like input (#496), whose stated
+  tradeoff is that arrow keys and menu navigation classify `Neutral` with a zero occupancy delta and
+  never stamp it. A keystroke-first order would report a human mid-menu as a pane mid-turn.
+- `HumanTyping` when a keystroke landed **at or after the hold episode opened**. The comparison is
+  against the episode rather than a fresh window, which is why this needed no new constant: the
+  question worth asking is not "did a human type recently" (recently against what?) but "has a human
+  touched this pane at any point in the whole time it has been refusing our delivery".
+- `PaneMidTurn` otherwise — #590's shape. **What that claim is, exactly:** negative evidence ("not a
+  human") plus the box reading. It is *not* proof that a turn is running, since `input_pending` is
+  documented to latch over an already-empty box, and the notice's wording therefore states the
+  evidence (`no human keystroke since the hold began`) alongside the diagnosis, so a reader can
+  check it. Every response the wording invites — read the pane, do not wait on it — is correct under
+  both readings.
+- `Unknown` when the pty is gone or no gate is attributed. Named rather than folded into a
+  neighbour, so a notice never asserts a cause it did not observe.
+
+**One-shot per hold episode, and deliberately not the badge's one-shot.** `HoldEpisode` gains
+`notice_reported` rather than reading `badged`, because the two come apart in *both* directions: a
+badge RAISE sets `badged`, after which `held_escalation` returns `None` for the rest of the episode
+(`if already_badged`), while a raise DECLINED — another mechanism already owns the badge — leaves
+`badged` false and `Badge` comes back on every poll. Sharing the flag would therefore mean never
+reporting after the instant the bound was crossed in the first case, and re-reporting every two
+seconds in the second. The badge is the human's channel and this is the orchestrator agent's; they
+fail independently and need independent state.
+
+**Evaluated on the bound, and claimed by the poll that reports** (rev-128's blocking finding, and
+the half its remedy did not reach). The report started life *inside* the `Badge` arm, claiming
+`notice_reported` before it read the queue and returning at the zero-notice gate having already
+spent it. Two defects compounded there. Claiming first meant an episode that crossed the bound
+holding only *work* burned its only report; and living in the `Badge` arm meant that in the common
+configuration — the raise succeeds, `badged` goes true — no later poll returns `Badge` at all, so
+nothing looked again even after the flag was fixed. The failure is one step from #590's own
+incident: an orchestrator follow-up held on a mid-turn worker opens the episode on work, the bound
+elapses silently, the worker's own CI watch then fires and queues `watch_conflicting_notice` behind
+it — #590's exact payload — and nothing surfaces it, for as long as the pane stays held.
+
+So the call is keyed on `hold_bound_elapsed` and sits outside the `Badge` arm, and
+`note_undeliverable_notice` reads the flag, then the queue, then claims. There was no tension to
+trade off: `notice_reported` is set once and never cleared inside an episode, so re-asking on each
+poll costs a re-read and never a second report. The steady state after a report is one flag read per
+poll; before it, one flag read plus a snapshot of at most `queue::QUEUE_MAX_PER_PANE` entries, on a
+thread already polling a pty every `queue::QUEUE_DRAIN_POLL`. Pinned by
+`a_bound_crossed_with_nothing_queued_does_not_burn_the_report`, which runs in the badge-*raised*
+configuration and asserts the escalation verdict is `None` at the instant the report fires — so a
+fix that only reordered the flag inside the `Badge` arm fails it.
+
+**Composition with #578, which is the case the issue actually turns on.** The notice goes out
+through `notify_queue`, so when the stuck pane is the **orchestrator's own**, that function's
+orchestrator-target branch parks it for the notice inbox instead of typing it into the pane it is
+about — and it rides back on that orchestrator's next MCP tool result, a call the orchestrator
+itself made, which is also proof it is running and reading at that instant. Nothing is enqueued for
+the blocked pane on any path, so the notice cannot queue behind the block it reports; and a parked
+notice cannot re-trigger this classification either, because parking creates no queue entry and the
+episode's one-shot is already spent. Before #578 this exact case would have been written and
+discarded.
+
+**Boundaries with the neighbouring work, stated because each one is a live issue.**
+
+- **#579/#630 (the `queue_orphans` refused list).** #630 landed while this was in review, so the
+  boundary below is re-derived against `front_door_refusals` as shipped rather than against the
+  issue's description of it.
+
+  **Disjoint by construction, and the construction is now checkable.** That scan matches
+  `action == "delivery-dropped"` **and** `reason == "queue-full-at-call"`, and nothing else — the
+  filter says so in its own comment. `notice-undeliverable` is neither, so it can never enter that
+  list by accident of wording. The deeper reason is the same one #579 was split out for: a refusal
+  is `enqueue_text`'s `RejectFull` arm, which returns before `queue_seq.fetch_add`, so a refused
+  delivery has no id and no queue entry. This classification requires the opposite — a payload that
+  IS queued, holds an id, and cannot land. A delivery is in exactly one of the two states. The
+  channels differ in kind too: #630 is a pull an orchestrator makes at session start, this is a push
+  at the moment the bound elapses.
+
+  **The one interaction that does exist runs through the notice's own delivery, not through the
+  scan.** The notice is delivered to the ORCHESTRATOR's pane, so if that pane is at
+  `QUEUE_MAX_PER_PANE` the notice is itself refused — and then correctly appears in #630's refused
+  list, `from: "loomux"`, as the one loss that list was built to make visible. That is a
+  complementary report, not a duplicate: the audit line records the *diagnosis* (written first and
+  unconditionally, see #633 below), the refused row records that the *notice delivery* was lost, and
+  the two are different facts about different objects. What it is worth knowing is that re-sending
+  such a row hands over a diagnosis whose hold may have cleared since — stale, not wrong.
+
+  **And it needs no cap headroom, unlike #615's pause-loss notice**, which is the sharpest way to
+  see why. That one had to be admitted past the cap because it *reports the cap*, so on a full pane
+  it was certain to be destroyed by the very condition it described. The equivalent loop here would
+  need the stuck pane to be the orchestrator's own — and that is exactly the case `notify_queue`
+  never enqueues at all: it parks for #578's inbox instead. So the one configuration in which the
+  cap could eat this report is the one configuration in which the cap is not in the path. Same
+  argument `HoldChannel::OrchestratorInbox` already makes: a full queue is a condition this reports,
+  not an obstacle to reporting it.
+
+  **Audit volume, which #630 asked the next writer to account for.** Its own note records that #624
+  raised a busy group's audit volume (one line per queue notice), making `AUDIT_VIEW_LIMIT` easier
+  to reach and NB1's `refused_window_truncated` more load-bearing than when it was written. This
+  change adds to that too, and the bound is what makes it small: `notice-undeliverable` is
+  **once per hold episode**, and an episode ends only when the pane accepts a delivery — so it is
+  one line per stuck-pane incident, not one per poll, and a pane stuck for an hour still contributes
+  exactly one. The parked `notice-suppressed` line it can produce on an orchestrator's own pane is
+  bounded the same way. Where volume does push refusals out of the readable window, the honest
+  reporting already exists and is untouched: `audit_log_windowed` reports the cut and
+  `refused_window_truncated` carries it into the tool result. #630 also pinned that a parked
+  orchestrator notice is not a refusal (`a_parked_orchestrator_notice_is_not_a_refusal`); this
+  change adds a second producer of exactly that shape, and that test covers it unchanged.
+- **#632 (multi-row mask gap) — closed by #638 while this was in review**, so this is no longer an
+  open boundary but a rule this notice has to sit inside. It always did, by construction:
+  `undeliverable_notice` renders one marker-led line for every `UndeliverableCause`, and it is the
+  **seventh** constructor in `every_notice_that_can_reach_the_inbox_is_a_single_marker_led_line`,
+  across `notify_queue`'s **eighth** call site — two different counts that an earlier draft of this
+  bullet collapsed into one wrong number. The maskability assertion now runs through #638's shared
+  `unmaskable_framing_rows` rather than a local `mask_loomux_notices(..).is_empty()`, so this notice
+  is checked by the same expression as the multi-row producers #638 brought under the rule, and a
+  regression names the rows that survived instead of only asserting that some did. The single-row
+  property is asserted separately, because "every row is maskable" and "there is one row" are
+  different claims and only the second is what `OrchNoticeInbox::park`'s `debug_assert` enforces.
+- **#633 (silent `deliver_prompt` refusals).** The residual this change inherits rather than
+  creates. `notify_queue`'s delivery to a live orchestrator can be refused with no audit line at all
+  when that pane is dead or unbound, so the `notice-undeliverable` audit line is written **first and
+  unconditionally** — the durable record does not depend on the notice landing. Closing #633 would
+  make the delivery half observable too; nothing here needs it to be correct.
+
+**Residual, stated.** A *second* notice joining a pane whose episode has already reported gets no
+report of its own — one per episode is the bound, and an episode ends when the pane accepts a
+delivery. That is a genuine limit rather than the one this section used to claim: the earlier
+version said a notice arriving later in an episode never got a report at all and called that "the
+conservative direction", which was a defect being described as a design (see the paragraph above).
+And `PaneMidTurn` remains an inference from absence — see above for what the wording does and does
+not claim.
+
 ## Kill-exit notices: recorded initiator, not inferred (#533-B)
 
 **Problem.** `[loomux] agent X exited (kill or idle-timeout) — not a crash` prompted the
