@@ -199,6 +199,7 @@ export class TimelineView {
         this.windowId = preset.id;
         // A window change invalidates the selected cluster's span.
         this.selected = null;
+        this.syncChips(); // the active-preset highlight is chrome, not render output
         this.lastSig = "";
         this.render();
       });
@@ -617,7 +618,7 @@ export class TimelineView {
     this.detailEl.append(head);
 
     const { shown, hidden } = detailSlice(members);
-    for (const i of shown) this.detailEl.append(this.renderDetailRow(this.filtered[i], i));
+    for (const i of shown) this.detailEl.append(this.renderDetailRow(this.filtered[i]));
     if (hidden > 0) {
       this.detailEl.append(
         el(
@@ -629,8 +630,10 @@ export class TimelineView {
     }
   }
 
-  private renderDetailRow(ev: TimelineEvent, index: number): HTMLElement {
-    const key = `${ev.ts_ms}|${ev.kind}|${index}`;
+  private renderDetailRow(ev: TimelineEvent): HTMLElement {
+    // Keyed by the EVENT, never by its index: a follow poll shifts every index
+    // in `filtered`, which would silently collapse (or worse, move) an open row.
+    const key = `${ev.ts_ms}|${ev.kind}|${ev.label}`;
     const row = el("div", "timeline-detail-row");
     const top = el("div", "timeline-detail-top expandable");
     top.append(el("span", "timeline-detail-caret", this.expanded.has(key) ? "▾" : "▸"));
