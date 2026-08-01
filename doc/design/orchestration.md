@@ -6647,6 +6647,24 @@ without going through `markFirstInput()` would arrive marked non-human. That is 
 fail-*unsafe* direction for this one signal, which is why both marks hang off that single
 function rather than being re-derived at each call site.
 
+**And that enumeration is now executable (#570).** "One function, so a vector can only be
+added in one place" is a convention, not a mechanism — it was arrived at by hand twice (#440
+B2-R, then #518) and lived nowhere a compiler or a test could read it, so the next path to skip
+it would have degraded the bit silently. `test/inputvectors.test.ts` is the tripwire: a
+data-driven scan of `src/` that pins five call shapes — an explicit `.paste()`, an `onKey`
+handler, `writePty` going through the ordered writer, `writePty` carrying its origin argument,
+and `onData` consulting the latch — and names the offending `file:line` and what is unsafe
+about it when one fires. Comments and literals are stripped first, because most occurrences of
+these shapes in `src/` are the prose *about* them, including this subsystem's own design
+argument in `humanorigin.ts`. It is a tripwire and not a proof: it knows today's shapes, and a
+genuinely novel vector (a new xterm API, a raw `invoke("write_pty")`) is not in its table — so
+the file's last test asserts every rule still matches real code, since a rule that has drifted
+away from the code reports green about a file it no longer reads. No product code changed for
+it: the one seam that could carry a debug assertion, `createOrderedWriter`'s
+`write(data, human = true)`, defaults to human deliberately (an un-updated call site keeps its
+pre-#518 meaning), so an assertion there would fire on the documented fail-safe rather than on
+the defect.
+
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
 **Problem.** Worker reports and orchestrator kickoffs are delivered by bracketed-pasting
