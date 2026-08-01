@@ -29507,3 +29507,157 @@ fn d7_the_ring_only_predicate_is_unchanged_by_all_of_this() {
     let pred = question_hold_predicate(move || Some(raw.clone()), None);
     assert!(pred(), "no composed screen to consult -> the byte ring's word is final");
 }
+
+// ---------- #576: loomux's own notice rows must not latch the question gate ----------
+
+/// The exact line `mcp.rs` composes when it relays a worker's `report` note
+/// into the orchestrator's pane (`[loomux] {agent_id} reports {status}:
+/// {note}`), carrying a note that is *about* a dialog.
+///
+/// Two of the detector's STRUCTURED signals live in this one row — `do you
+/// want to run` (permission-phrase) and `(y/n)` (yes-no-token) — and neither
+/// is a question anyone is asking this pane. Structured signals are honored
+/// across the last twelve non-empty lines, so unlike the prose-like ones they
+/// are not pushed out of range when the CLI redraws its input box underneath:
+/// nothing a quiet pane does will clear them.
+const LOOMUX_REPORT_RELAY: &str = "[loomux] w-119 reports blocked: Copilot is asking \
+\"Do you want to run npm test? (y/n)\" and I cannot answer it myself";
+
+/// A pane at rest: the relayed notice, then the CLI's redrawn idle input box.
+/// Modelled on `tests/fixtures/attention/idle-input-box.txt` — the box is what
+/// a real CLI paints under a submitted message, and it is deliberately present
+/// so these tests cannot pass merely because the pane was empty.
+fn pane_with_relayed_notice() -> Vec<u8> {
+    painted(&[
+        LOOMUX_REPORT_RELAY,
+        "",
+        "╭──────────────────────────────────╮",
+        "│ > Try \"fix the build\"            │",
+        "╰──────────────────────────────────╯",
+        "  ? for shortcuts",
+    ])
+}
+
+#[test]
+fn e1_a_relayed_report_note_must_not_latch_the_ring_only_gate() {
+    // THE #576 bug, at the reading that triggers it. `pasted_text` is `None`
+    // because that is what all three `question_active_now` call sites pass:
+    // the checkpoint runs BEFORE the entry it is considering has written
+    // anything, so `mask_own_paste` has nothing of its own to mask and
+    // structurally cannot help here. The pane's ring nonetheless holds the
+    // PREVIOUS delivery's text, which is loomux's own.
+    let raw = pane_with_relayed_notice();
+    let pred = question_hold_predicate(move || Some(raw.clone()), None);
+    assert!(
+        !pred(),
+        "loomux's own relayed report note is text ABOUT a question, not a question being \
+         asked of this pane — the gate must not latch on what loomux itself wrote (#576)"
+    );
+}
+
+#[test]
+fn e2_a_relayed_report_note_must_not_latch_the_two_reading_gate_either() {
+    // The same notice put to BOTH readings, which is the production shape and
+    // the reason #534 could not already have fixed this: our own text is
+    // genuinely rendered, so the grid agrees it is on screen — and the grid is
+    // right. It is simply not a question.
+    let raw = pane_with_relayed_notice();
+
+    // Preconditions, so a drifting fixture fails loudly instead of passing for
+    // a reason these tests are not about. Both stay true after the fix:
+    // `prompt_wait_detected` itself is untouched, and so is the composition.
+    assert!(
+        prompt_wait_detected(&strip_ansi(&raw)),
+        "unmasked, the ring matches — that is the trigger #576 is about"
+    );
+    let visible = loomux_lib::orchestration::termgrid::render_visible(&raw, 120, 12);
+    assert!(
+        visible.contains("reports blocked"),
+        "and the notice is genuinely RENDERED, which is exactly why #534's grid release \
+         cannot reach this: both readings agree, and both are correct about the pixels"
+    );
+
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 12), None, None);
+    assert!(
+        !pred(),
+        "the only question-shaped text on this pane is loomux's own notice — release (#576)"
+    );
+}
+
+#[test]
+fn e3_a_quoted_marker_row_must_not_hide_a_genuine_dialog_below_it() {
+    // The adversarial case, and the reason the mask claims ONE row.
+    //
+    // The `[loomux]` marker is unforgeable only in the DELIVERY direction:
+    // `notify::sanitize_gh_text` rewrites `[`/`]` in every untrusted field, so
+    // nothing an agent sends THROUGH loomux can carry it. An agent's own pane
+    // output is not sanitized at all, so an agent can print a marker row
+    // itself — echoing a notice back, quoting one in a summary, or induced to
+    // by a hostile prompt.
+    //
+    // If masking a marker row also swallowed the rows around it, that row
+    // would become a way to hide a live permission dialog from the gate, and
+    // the Enter the gate then released would answer it. That is the #420 harm,
+    // reachable from pane output. Failing OPEN is the dangerous direction.
+    let raw = painted(&[
+        "[loomux] w-3 reports done: PR #900 is green",
+        "◆ Allow Copilot to run the following command?",
+        "",
+        "  $ rm -rf build",
+        "",
+        "│ ❯ Yes",
+        "│   No, and tell Copilot what to do differently",
+        "",
+        "Use arrow keys · Enter to confirm · Esc to cancel",
+    ]);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 14), None, None);
+    assert!(
+        pred(),
+        "a genuine dialog sharing a pane with a quoted [loomux] row must STILL latch — \
+         masking a marker row must never release an Enter into a live question (#576)"
+    );
+}
+
+#[test]
+fn e4_a_dialog_painted_directly_under_a_marker_row_still_latches() {
+    // The same hazard with NO blank row between the marker row and the
+    // question — precisely the shape a wrap-run mask ("mask the marker row and
+    // every non-blank row after it") would have swallowed whole. A run-mask is
+    // the tempting way to cover a notice that wrapped; this stands guard
+    // against reintroducing it as a "wrap fix" later.
+    let raw = painted(&[
+        "[loomux] w-3 reports done: PR #900 is green",
+        "Do you want to run npm test? (y/n)",
+    ]);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None);
+    assert!(
+        pred(),
+        "only the row the marker LEADS is masked — the dialog row beneath it must survive (#576)"
+    );
+}
+
+#[test]
+fn e6_a_notice_that_wraps_keeps_the_tokens_past_its_first_row() {
+    // A LIMIT pinned as known, not a bug pinned as correct.
+    //
+    // Only the row the marker leads is masked, so a notice on a pane narrow
+    // enough to wrap it leaves its continuation rows unmarked and still
+    // matching. That is an UNDER-mask: the gate holds where it might have
+    // cleared — the cheap error, already surfaced to the human by the
+    // ten-minute `QuestionStale` badge — rather than the expensive one this
+    // change refuses to risk (see e3/e4).
+    //
+    // Closing it needs loomux to know WHAT it wrote to a pane rather than
+    // merely that a row claims it did, i.e. a per-pane record of delivered
+    // text. That is delivery machinery, not detection, and is deliberately not
+    // built here.
+    let raw = painted(&[
+        "[loomux] w-119 reports blocked: Copilot is asking",
+        "\"Do you want to run npm test? (y/n)\" and I cannot answer it",
+    ]);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None);
+    assert!(
+        pred(),
+        "documented residual: a wrapped notice's later rows are unmarked and still latch (#576)"
+    );
+}
