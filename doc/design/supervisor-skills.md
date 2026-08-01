@@ -321,6 +321,145 @@ role templates, not a role_hint block's own instructions file) —
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`
 stays green unchanged.
 
+## Cross-session recurrence: answering the durability filter (#324)
+
+Everything above ships a process-pro that reads **one** session. Its
+durability filter — *"would a fresh worker, on a different task in this repo,
+hit the same wall?"* — is a question about **other** sessions, and
+`session_digest` took exactly one of `task`/`agent`/`pr` and returned exactly
+one session's windows. So the filter could only ever be answered from the
+agent's own impression of how hard that session looked.
+
+That is the **self-assessment bias the whole role is built against**,
+reintroduced one layer up. #324's issue body is explicit about both halves:
+*"not every struggle is a skill… mint one from every merge and you get bloat,
+low-quality entries, eventually skills that mislead"*, and *"the stronger
+signal is recurrence — three workers hitting the same wall beats one worker
+struggling once."* The cold read removed the bias from **whose account** the
+evidence comes from; it did nothing about **how much** evidence there is.
+
+**What the digest now carries.** Every friction window gets a normalized
+`key`, plus `recurrence` (how many OTHER sessions in the group produced a
+window with that key) and `corroborated_by` (up to `MAX_CORROBORATED_BY` = 5
+of their agent ids, so a proposal's claim is checkable rather than merely
+asserted). The digest gets `sessions_scanned` and `corroboration_capped`.
+
+**The key is the whole design, and it is asymmetric on purpose.** A window's
+`summary` is written for a human and is therefore full of exactly what makes
+one wall look like two: worktree-absolute paths, line numbers, byte counts.
+`key` keeps only what identifies the wall. Two normalizations do the work:
+
+- **Path-shaped tokens collapse to `<path>`, and a file key is its basename.**
+  This is load-bearing, not cosmetic: two loomux workers on one repo run in
+  *different worktrees*, so the identical wall carries a different absolute
+  path in each transcript. A key that kept the path would make cross-session
+  recurrence structurally uncountable — every count 0, the feature silently
+  inert. Pinned by `the_same_wall_from_two_worktrees_produces_one_key`.
+- **Purely numeric tokens collapse to `#`; mixed alphanumerics never do.** A
+  line number is a per-session accident. `E0433` is not. Blanking digits
+  wholesale would fold `E0433` and `E0599` into one key and report a
+  recurrence that never happened. Pinned from both sides —
+  `line_numbers_do_not_split_a_key` and
+  `two_different_error_codes_do_not_share_a_key`.
+
+The two failure directions are **not** equally bad, and the normalization is
+tuned accordingly. Too specific → under-counts → a real recurrence reads as a
+one-off: a miss, but no worse than the n=1 status quo it replaces. Too loose
+→ over-counts → the tool *manufactures evidence* for a lesson nobody hit
+twice, and does it with a number that looks objective. Prefer the miss.
+
+**Counting is per session, not per window.** One flailing transcript that hit
+the same wall nine times contributes 1 (`session_friction_keys` dedups before
+comparison), and the target's own session is excluded — a session is not
+evidence about itself, and neither is a *resume* of it, which is why the scan
+dedups by session id rather than by roster row. Without those two rules a
+single bad session could manufacture its own corroboration, and a number that
+only ever says "yes" is not a filter.
+
+### Recurrence is derived on read — and what that costs
+
+Each `session_digest` call reads up to `MAX_CORROBORATION_SESSIONS` = 8 other
+transcripts in the group and runs the same extraction over each. Nothing is
+cached and nothing is persisted, so **the cost is paid per call**: ~8 extra
+transcript reads plus 8 extraction passes, on a tool that is called a handful
+of times per merge by a single agent. That is the honest bill; it is small
+because the caller is rare, not because the work is free.
+
+Two consequences are reported rather than hidden, on the same
+"never-silently-truncate" discipline as `dropped_windows`:
+
+- `sessions_scanned` — how many were **actually read**. A session whose
+  transcript is missing or unparseable is skipped, not fatal, so this is a
+  real denominator, not a ceiling. `0` means **a young group with nothing to
+  compare against**, which is a different claim from "nothing recurred" — the
+  persona is required to say which one it is rather than propose on evidence
+  it doesn't have.
+- `corroboration_capped` — `true` when the group had more comparable sessions
+  than the cap reads. Every `recurrence` is then a **floor, not a total**.
+
+### Deviation: derived-on-read, not a staging ledger
+
+#324's issue body sketches a different shape: *"extract candidates eagerly
+per-merge into a staging area, then a lighter consolidation pass promotes
+what recurs or is high-confidence, dedupes, and opens the PR. Creation eager
+and local; promotion deliberate."* This implements the **goal** of that
+sketch (promotion gated on recurrence) with a different **mechanism**. The
+fork is recorded here so it can be reversed cheaply if the human wants the
+original shape.
+
+Why derived-on-read won:
+
+1. **A staging ledger is agent-writable state, and this agent is the one
+   being measured.** The ledger would have to be written by the process-pro
+   (nothing else knows a candidate exists), then read back by the next
+   process-pro as evidence. An agent that can write its own corroboration can
+   manufacture it — accidentally, by re-filing the same candidate, or by a
+   window whose quoted content is instruction-shaped (the untrusted-digest
+   risk this design already carries a two-layer guard for). Derived-on-read
+   is computed from transcripts **no agent authors** — a Claude/Copilot CLI
+   writes them — so the evidence and the agent proposing on it are
+   structurally separate. #459 already tracks `.loomux/workflow.yml` as an
+   agent-writable live gate input; adding a second such surface to close
+   *this* particular loop would have been the wrong trade.
+2. **A ledger's freshness is a whole extra problem.** Candidates go stale
+   (the wall gets fixed), need eviction (the #268 4 KB oldest-drop problem,
+   one level down), and need a schema that survives loomux upgrades.
+   Derived-on-read has exactly one staleness rule: it reads what is on disk
+   now.
+3. **The eager/deliberate split the sketch buys is already there.** Extraction
+   *is* eager and local — it happens on every `session_digest` call. Promotion
+   *is* deliberate — it is the human merge gate on the process-pro's PR. The
+   sketch's two phases map onto machinery that already exists; the ledger was
+   the sketch's way of getting the recurrence *count* between them, and that
+   count is exactly what is now computed directly.
+
+What the deviation gives up, stated plainly: a ledger could count recurrence
+across sessions whose **transcripts have been deleted or rotated away**, and
+across *groups* (a second orchestration group on the same repo). Derived-on-read
+sees only what is on disk and only within the group. If either turns out to
+matter in practice, the ledger is the answer and this section is the argument
+to reverse.
+
+**Where the contract lives.** The recurrence semantics are written into the
+`session_digest` **tool description** (`mcp.rs`), not only into
+`.github/agents/process.md` — deliberately, and unlike the untrusted-digest
+guard, which additionally rides the non-overridable `mechanics_core`
+addendum. The reason is the difference in kind: the untrusted-digest sentinel
+is a **security** boundary a repo must not be able to drop by swapping in its
+own `mode: replace` persona, so it is enforced. "Prefer a corroborated wall"
+is **quality guidance about a tool's return value**, and the tool description
+is the one place every caller reads regardless of persona — including a
+future built-in persona (#384) or a repo-authored replacement. The shipped
+persona carries it too, pinned by
+`the_shipped_process_persona_keys_durability_off_recurrence_not_its_own_impression`.
+
+**What recurrence still can't see**, and the persona says so: a wall the
+group hit only once that is nevertheless certain to recur — a documented
+invariant somebody violated. Proposing on a `recurrence: 0` window stays
+legitimate; it just has to be argued in the PR as structural rather than
+incidental, instead of `recurrence: 0` being quietly read as "no evidence
+either way".
+
 ## Slices (see the plan comment on #250 for the full breakdown)
 
 - **A — role_hint foundation**: the field, its parse-time validation, the

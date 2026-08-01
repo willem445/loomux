@@ -17301,7 +17301,66 @@ impl OrchRegistry {
             }
         };
         let events = self.read_session_transcript_events(&cli, &session_id)?;
-        Ok(digest::build_digest(&events, final_diff_ref, outcome, title))
+        let mut digest = digest::build_digest(&events, final_diff_ref, outcome, title);
+        // The #324 recurrence pass. Everything above this line describes ONE
+        // session, which is exactly as much as the process-pro's durability
+        // filter ("would a fresh worker on a different task in this repo hit
+        // the same wall?") cannot be answered from. This reads the group's
+        // other recorded sessions and answers it mechanically.
+        let (others, capped) = self.corroborating_session_keys(group, &session_id);
+        digest.sessions_scanned = others.len();
+        digest.corroboration_capped = capped;
+        digest::apply_recurrence(&mut digest, &others);
+        Ok(digest)
+    }
+
+    /// How many OTHER sessions one `session_digest` call reads to compute
+    /// recurrence. The cost of this feature is linear in it — each one is a
+    /// transcript read plus a friction-extraction pass — and it is charged
+    /// per call, because nothing is cached (see
+    /// `doc/design/supervisor-skills.md`, "Recurrence is derived on read").
+    /// Small on purpose: recurrence is a yes/no-ish signal ("did anyone else
+    /// hit this?"), and the difference between scanning 8 sessions and 40 is
+    /// a much larger bill for a marginally better answer.
+    const MAX_CORROBORATION_SESSIONS: usize = 8;
+
+    /// Read the group's other recorded sessions and return each one's deduped
+    /// friction keys, plus whether the scan was capped (#324).
+    ///
+    /// Newest first and one entry per SESSION id: an agent that rejoined its
+    /// own session appears once, so a resumed pane cannot corroborate itself.
+    /// The target session is excluded for the same reason — a session is not
+    /// evidence about itself, which is the whole cold-read premise this
+    /// feature inherits from #324's issue body.
+    ///
+    /// A session whose transcript can't be read (reaped, a CLI whose
+    /// transcripts loomux can't parse, a `Task.session` pointing at nothing)
+    /// is skipped, not fatal: corroboration is a bonus signal on top of a
+    /// digest that must still be returned. `sessions_scanned` on the digest
+    /// reports how many were ACTUALLY read, so a skip is visible as a smaller
+    /// denominator rather than silently inflating confidence.
+    fn corroborating_session_keys(&self, group: &str, target_session: &str) -> (Vec<(String, Vec<String>)>, bool) {
+        let mut recs = self.merged_records(group);
+        recs.sort_by_key(|r| std::cmp::Reverse(r.updated_ms));
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut candidates: Vec<(String, String, String)> = Vec::new();
+        for r in &recs {
+            let Some(sid) = r.session.clone() else { continue };
+            if sid == target_session || !seen.insert(sid.clone()) {
+                continue;
+            }
+            candidates.push((r.id.clone(), self.cli_for_record(group, r), sid));
+        }
+        let capped = candidates.len() > Self::MAX_CORROBORATION_SESSIONS;
+        candidates.truncate(Self::MAX_CORROBORATION_SESSIONS);
+        let out = candidates
+            .into_iter()
+            .filter_map(|(label, cli, sid)| {
+                let events = self.read_session_transcript_events(&cli, &sid).ok()?;
+                Some((label, digest::session_friction_keys(&events)))
+            })
+            .collect::<Vec<_>>();
+        (out, capped)
     }
 
     /// The CLI a roster row's block/role resolves to, dead-agent-safe (unlike

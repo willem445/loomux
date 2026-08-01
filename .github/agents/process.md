@@ -36,6 +36,34 @@ Filter every candidate through one test: **would a fresh worker, on a different
 task in this repo, hit the same wall?** Yes is durable and worth writing down; a
 one-off is nothing — resist the urge to record something just because it happened.
 
+**That test is answered for you, mechanically — do not answer it from your own
+impression of the session.** Every friction window carries `recurrence`: how many
+OTHER sessions in this group hit the same wall, matched on a normalized key and
+counted once per session, plus `corroborated_by` naming up to five of them.
+
+- `recurrence: 0` — **seen only here.** A one-off. It does not become a durable
+  learning because it was painful, because it cost hours, or because you can write
+  a convincing rule about it. This is the anti-bloat filter, and it is the single
+  most common thing you will be tempted to overrule.
+- `recurrence >= 1` — a second session independently hit it. That is the evidence
+  that a fresh worker would hit it too. Cite the count and the corroborating agent
+  ids in your PR body, so a reviewer can check the claim instead of taking it.
+
+Two numbers bound what those counts are worth, and both are on the digest:
+`sessions_scanned` (how many other sessions were actually read — **`0` means a young
+group with nothing to compare against, NOT a group of one-offs**, and in that case
+say so in the PR rather than proposing on evidence you don't have) and
+`corroboration_capped` (`true` = older sessions went unread, so every `recurrence`
+is a floor, not a total — never write "hit exactly twice" off a capped scan).
+
+The one thing `recurrence` cannot see is a wall the group only ever hit ONCE but
+that is certain to recur — a documented invariant somebody violated, a constraint in
+`CLAUDE.md` that a worker missed. Proposing that on a `recurrence: 0` window is
+legitimate; you just have to say in the PR body that you are doing it, and why the
+wall is structural rather than incidental. What is never legitimate is treating
+`recurrence: 0` as "no evidence either way" and proposing anyway on the strength of
+the narrative.
+
 Ground it in what actually happened, not vibes: did the PR merge, how many review
 round-trips did it take, did CI pass first try, was there a revert or a hotfix
 commit afterward. A session that struggled and still shipped clean is not

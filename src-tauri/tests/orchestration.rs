@@ -23937,6 +23937,36 @@ fn session_digest_requires_exactly_one_identifier() {
     assert!(both["content"][0]["text"].as_str().unwrap().contains("exactly one"));
 }
 
+/// A wrongly-TYPED identifier must say so, not report itself as a missing one
+/// (#642's `arg_bool`/`arg_str_array` rule, applied to this arm on rebase).
+/// `pr` is the realistic case: the tool's own description invites "PR number,
+/// #n, or URL", so a bare JSON number is the natural thing to send — and
+/// through plain `arg_str` it reads as absent, answering a call that DID pass
+/// exactly one identifier with "exactly one … is required". That message
+/// sends the caller hunting for a bug in its call shape instead of its arg
+/// type, which is the silent-skip failure #582 legislated against.
+#[test]
+fn session_digest_rejects_a_wrongly_typed_identifier_instead_of_reading_it_as_absent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
+    let cp = process_caller(&reg, &g.id);
+
+    let numeric = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "pr": 646 } })).unwrap();
+    assert_eq!(numeric["isError"], true);
+    let msg = numeric["content"][0]["text"].as_str().unwrap();
+    assert!(msg.contains("pr must be a string"), "must name the type problem, got: {msg}");
+    assert!(!msg.contains("exactly one"), "must NOT report a supplied identifier as missing: {msg}");
+
+    // Explicit null keeps meaning "not supplied" — otherwise a caller that
+    // spells an absent optional as `null` could never call this tool at all.
+    let nulls = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "task": "t-1", "agent": null, "pr": null } })).unwrap();
+    let nulls_msg = nulls["content"][0]["text"].as_str().unwrap();
+    assert!(!nulls_msg.contains("must be a string"), "null is absent, not a type error: {nulls_msg}");
+    assert!(!nulls_msg.contains("exactly one"), "one identifier WAS supplied: {nulls_msg}");
+}
+
 /// Review finding NB4: `Task.session` is agent-settable via `upsert_task`,
 /// and it reaches a filesystem path join — a `..`/separator-laden value must
 /// be rejected before that join, end to end through the real MCP tool, not
@@ -23961,6 +23991,160 @@ fn session_digest_rejects_a_path_traversal_session_id() {
         &json!({ "name": "session_digest", "arguments": { "task": task_id } })).unwrap();
     assert_eq!(r["isError"], true);
     assert!(r["content"][0]["text"].as_str().unwrap().contains("invalid session id"), "{r}");
+}
+
+// ---------- session_digest recurrence (#324) ----------
+//
+// The demo (#358) answered "what went wrong in THIS session". The
+// process-pro's actual filter — "would a fresh worker on a different task in
+// this repo hit the same wall?" — is a question about OTHER sessions, and
+// with n=1 it could only ever be answered from the agent's own impression of
+// how hard the session looked. That is the self-assessment bias #324's issue
+// body was written to design out. These tests pin the mechanical answer.
+
+/// Write a Claude transcript for `sid` under the fake projects root, with one
+/// tool error carrying `err` — the "wall" a session hit.
+fn write_wall_transcript(proj: &std::path::Path, sid: &str, err: &str) {
+    let encoded = proj.join("C--tmp-repo");
+    fs::create_dir_all(&encoded).unwrap();
+    let transcript = format!(
+        "{}\n{}\n{}\n",
+        json!({"type":"user","timestamp":"2026-07-15T10:00:00.000Z",
+            "message":{"role":"user","content":"do the thing"}}),
+        json!({"type":"assistant","timestamp":"2026-07-15T10:00:01.000Z","message":{"role":"assistant",
+            "content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"cargo check"}}]}}),
+        json!({"type":"user","timestamp":"2026-07-15T10:00:02.000Z","message":{"role":"user",
+            "content":[{"type":"tool_result","tool_use_id":"c1","is_error":true,"content":err}]}}),
+    );
+    fs::write(encoded.join(format!("{sid}.jsonl")), transcript).unwrap();
+}
+
+/// Spawn a worker, record a session that hit `err`, and reap it — the state
+/// the process-pro actually reads. Reaping is not test-scaffolding
+/// convenience: `session_digest` exists to read sessions after the worker
+/// that produced them is gone, and the live-agent guardrail (`rails()` caps
+/// at 2) would otherwise make a multi-session fixture impossible to build at
+/// all.
+fn finished_session(reg: &OrchRegistry, g: &str, proj: &std::path::Path, name: &str, err: &str) -> String {
+    let w = reg.spawn_agent(g, Role::Worker, name, "task", false, None).unwrap();
+    write_wall_transcript(proj, w.session_id.as_ref().unwrap(), err);
+    reg.mark_dead(&w.id, Some(0));
+    w.id
+}
+
+fn digest_for_agent(reg: &OrchRegistry, cp: &Caller, agent: &str) -> Value {
+    let r = dispatch(reg, cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "agent": agent } })).unwrap();
+    assert_eq!(r["isError"], false, "{r}");
+    serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// The core of #324: a second session that hit the SAME wall turns a window
+/// from "one worker struggled" into evidence a fresh worker would hit it too
+/// — and it names which session, so the claim is checkable.
+#[test]
+fn session_digest_corroborates_a_wall_a_second_session_also_hit() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
+
+    // Two workers, two different worktrees, the SAME wall — the error text
+    // even carries each one's own absolute path, exactly as a real pair of
+    // transcripts would, which is what the key normalization has to survive.
+    let a = finished_session(&reg, &g.id, proj.path(), "wa",
+        "error[E0433]: failed to resolve at C:/wt/feat-a/src/lib.rs:12:5");
+    let b = finished_session(&reg, &g.id, proj.path(), "wb",
+        "error[E0433]: failed to resolve at C:/wt/feat-b/src/lib.rs:87:9");
+
+    let cp = process_caller(&reg, &g.id);
+    let digest = digest_for_agent(&reg, &cp, &a);
+    let w = digest["windows"].as_array().unwrap().iter().find(|w| w["signature"] == "tool_error")
+        .unwrap_or_else(|| panic!("expected a tool_error window: {digest}"));
+    assert_eq!(w["recurrence"], 1, "the other worker hit the same wall: {digest}");
+    assert_eq!(w["corroborated_by"], json!([b]), "and it must say WHICH session: {digest}");
+    assert_eq!(digest["sessions_scanned"], 1, "{digest}");
+    assert_eq!(digest["corroboration_capped"], false, "{digest}");
+}
+
+/// The negative that gives the positive its meaning: a wall nobody else hit
+/// must come back 0, even though another session WAS read. A digest that
+/// corroborated everything would be worth nothing.
+#[test]
+fn session_digest_reports_a_one_off_as_a_one_off() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
+
+    let a = finished_session(&reg, &g.id, proj.path(), "wa", "error[E0433]: failed to resolve");
+    finished_session(&reg, &g.id, proj.path(), "wb", "error[E0599]: no method named foo");
+
+    let cp = process_caller(&reg, &g.id);
+    let digest = digest_for_agent(&reg, &cp, &a);
+    let w = digest["windows"].as_array().unwrap().iter().find(|w| w["signature"] == "tool_error").unwrap();
+    assert_eq!(w["recurrence"], 0, "a different error is a different wall: {digest}");
+    assert_eq!(w["corroborated_by"], json!([]), "{digest}");
+    // …and the reader can tell this apart from "nothing to compare against":
+    // a session WAS scanned, it just didn't match.
+    assert_eq!(digest["sessions_scanned"], 1, "{digest}");
+}
+
+/// A session is not evidence about itself. An agent that rejoined its own
+/// session has two roster rows carrying one session id, and counting the
+/// second row would let a session corroborate itself — a number that only
+/// ever says "yes" is not a filter.
+#[test]
+fn session_digest_never_corroborates_a_session_with_itself() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
+
+    let a = reg.spawn_agent(&g.id, Role::Worker, "wa", "task a", false, None).unwrap();
+    let sid = a.session_id.clone().unwrap();
+    write_wall_transcript(proj.path(), &sid, "error[E0433]: failed to resolve");
+    reg.mark_dead(&a.id, Some(0));
+    // A SECOND roster row pointing at the same session — what a resume/rejoin
+    // records. It is the same evidence read twice, not a second opinion, so
+    // `session_digest` must still see zero OTHER sessions.
+    let b = reg
+        .spawn_agent_ex(&g.id, Role::Worker, None, "wb", "task b", false, None, None, Some(sid.clone()), None, None)
+        .unwrap();
+    assert_eq!(b.session_id.as_deref(), Some(sid.as_str()), "the resumed row must carry the same session id");
+    reg.mark_dead(&b.id, Some(0));
+
+    let cp = process_caller(&reg, &g.id);
+    let digest = digest_for_agent(&reg, &cp, &a.id);
+    let w = digest["windows"].as_array().unwrap().iter().find(|w| w["signature"] == "tool_error").unwrap();
+    assert_eq!(w["recurrence"], 0, "the target's own session must never corroborate it: {digest}");
+    assert_eq!(digest["sessions_scanned"], 0, "{digest}");
+}
+
+/// Recurrence is derived on read from a CAPPED scan, so a count is a floor,
+/// not a total — and the digest has to say so, or a capped scan reads as an
+/// exhaustive one (the same reason `dropped_windows` exists).
+#[test]
+fn session_digest_reports_when_the_corroboration_scan_was_capped() {
+    let proj = tempfile::tempdir().unwrap();
+    let (reg, _d) = test_registry();
+    reg.set_claude_projects_dir(proj.path().to_path_buf());
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
+
+    let target = finished_session(&reg, &g.id, proj.path(), "wt", "error[E0433]: failed to resolve");
+    // Comfortably more other sessions than the scan reads, all hitting the
+    // same wall — so a scan that read them all would report every one.
+    for i in 0..12 {
+        finished_session(&reg, &g.id, proj.path(), &format!("wo{i}"), "error[E0433]: failed to resolve");
+    }
+
+    let cp = process_caller(&reg, &g.id);
+    let digest = digest_for_agent(&reg, &cp, &target);
+    assert_eq!(digest["corroboration_capped"], true, "{digest}");
+    let scanned = digest["sessions_scanned"].as_u64().unwrap();
+    assert!(scanned > 0 && scanned < 13, "a capped scan reads some, not all: {digest}");
+    let w = digest["windows"].as_array().unwrap().iter().find(|w| w["signature"] == "tool_error").unwrap();
+    assert_eq!(w["recurrence"].as_u64().unwrap(), scanned, "every scanned session hit the same wall: {digest}");
 }
 
 #[test]

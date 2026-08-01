@@ -877,6 +877,52 @@ fn the_shipped_process_persona_dedups_against_committed_destinations_before_prop
 }
 
 #[test]
+fn the_shipped_process_persona_keys_durability_off_recurrence_not_its_own_impression() {
+    // #324 productionization. The persona has always carried the durability
+    // filter ("would a fresh worker on a different task in this repo hit the
+    // same wall?"), but until `session_digest` reported cross-session
+    // recurrence there was no way to ANSWER it: the digest covered exactly one
+    // session, so the agent could only consult its own impression of how hard
+    // that session looked — the self-assessment bias the cold read exists to
+    // remove, reintroduced one layer up. Pinned on the REAL shipped file, for
+    // the same reason as the two tests above: `mode: replace` makes this the
+    // swappable half, and a repo that writes its own process persona is
+    // exactly the repo that would silently lose the filter.
+    let repo = repo_root();
+    let process_doc = fs::read_to_string(Path::new(&repo).join(".github/agents/process.md")).unwrap();
+    let flat_doc = flat(&process_doc);
+
+    assert!(
+        process_doc.contains("recurrence") && process_doc.contains("corroborated_by"),
+        "process.md must point the durability filter at the digest's recurrence fields: {process_doc}"
+    );
+    // The load-bearing direction: a one-off stays a one-off however painful it
+    // looked. Without this the field is decoration the agent can narrate past.
+    assert!(
+        flat_doc.contains("recurrence: 0"),
+        "must say what a zero count MEANS, not merely that the field exists: {process_doc}"
+    );
+    assert!(
+        flat_doc.contains("do not answer it from your own impression"),
+        "must forbid substituting its own impression for the count — that is the bias this \
+         whole role is built against: {process_doc}"
+    );
+    // A capped/young scan must not read as a confident zero. `sessions_scanned:
+    // 0` is "nothing to compare against", which is a different claim from "this
+    // never recurred", and a persona that conflates them proposes on evidence
+    // it does not have.
+    assert!(
+        process_doc.contains("sessions_scanned") && process_doc.contains("corroboration_capped"),
+        "must name both bounds on the count: {process_doc}"
+    );
+    assert!(
+        // `flat` lowercases, so match lowercase.
+        flat_doc.contains("a young group with nothing to compare against, not a group of one-offs"),
+        "must distinguish a young group from a group of one-offs: {process_doc}"
+    );
+}
+
+#[test]
 fn the_shipped_process_persona_enforces_terse_house_style_and_a_post_merge_base(
 ) {
     // #358 human-directed refinement, from a live testbed run: the process-pro's

@@ -321,10 +321,120 @@ pub struct FrictionWindow {
     pub end: usize,
     /// Short human-readable description of the wall + (if resolved) the fix.
     pub summary: String,
+    /// A deliberately COARSE, cross-session-stable identifier for *the wall*
+    /// (#324 recurrence): the same key means "two sessions hit the same thing",
+    /// which is the only evidence that separates a durable lesson from a
+    /// one-off. See `friction_key`'s module section for the normalization and
+    /// what it deliberately throws away.
+    pub key: String,
+    /// How many OTHER sessions in this group produced a window with this same
+    /// `key`. `0` means "seen only in this session" — a one-off, and the whole
+    /// point of the field: it is the mechanical answer to the process-pro's
+    /// filter question ("would a fresh worker hit the same wall?"), which it
+    /// otherwise has to answer from its own impression of a single session.
+    ///
+    /// The pure extractor always leaves this `0`; only
+    /// `OrchRegistry::session_digest`, which can read the group's other
+    /// transcripts, fills it in via `apply_recurrence`.
+    pub recurrence: usize,
+    /// Which sessions corroborated it (agent ids), capped at
+    /// `MAX_CORROBORATED_BY`. `recurrence` is the FULL count and is never
+    /// capped, so a truncated list can't read as a smaller number — same
+    /// count-vs-content discipline as `SessionDigest::dropped_windows`.
+    pub corroborated_by: Vec<String>,
+}
+
+impl FrictionWindow {
+    fn new(signature: FrictionSignature, start: usize, end: usize, summary: String, key: String) -> Self {
+        FrictionWindow { signature, start, end, summary, key, recurrence: 0, corroborated_by: Vec::new() }
+    }
 }
 
 fn is_edit_tool(name: &str) -> bool {
     matches!(name, "Edit" | "Write" | "MultiEdit")
+}
+
+// ---------------------------------------------------------------------------
+// Friction keys — the cross-session identity of a wall (#324 recurrence)
+// ---------------------------------------------------------------------------
+//
+// A friction window's `summary` is written for a human to read, so it is full
+// of the things that make two hits of the SAME wall look different: absolute
+// worktree paths, line numbers, byte counts, a branch name. `key` is the
+// opposite — the smallest string that still says "this is that wall", so the
+// same wall in two sessions produces one key and recurrence is countable
+// without an LLM.
+//
+// The bias is deliberately toward UNDER-matching being visible and
+// OVER-matching being invisible: a key that is too specific shows up as
+// `recurrence: 0` on something that did recur (the agent then treats a real
+// lesson as a one-off — a miss, and the status quo, which is what today's
+// n=1 digest already forces on every window). A key that is too loose shows
+// up as a confident count for two unrelated walls, which is worse: it
+// manufactures evidence. So every normalization below drops a field only when
+// that field is a per-session accident (a path, a line number), never when it
+// is what distinguishes one failure from another (an error code, a
+// subcommand).
+
+/// How many leading tokens of an error message make up its key shape. Enough
+/// to carry a compiler's error code and the head of its message
+/// (`error[E0433]: failed to resolve: use of undeclared crate`), short enough
+/// that the part that varies per session (a path, a symbol name) usually
+/// falls outside it.
+const KEY_ERROR_TOKENS: usize = 6;
+
+/// Last path component, lowercased. A key must survive the same file being
+/// edited from two different worktrees — the whole point of corroboration is
+/// comparing sessions, and two loomux workers on one repo have DIFFERENT
+/// absolute paths for the identical file (`…/worktrees/feat-a/src/x.rs` vs
+/// `…/worktrees/feat-b/src/x.rs`). Keeping any leading directory would make
+/// cross-worktree recurrence structurally uncountable.
+fn path_basename(p: &str) -> String {
+    p.rsplit(['/', '\\']).next().unwrap_or(p).trim().to_lowercase()
+}
+
+/// The program a shell-like command invokes: first whitespace token, reduced
+/// to its basename so `/usr/bin/npm` and `npm` are one program.
+fn command_program(cmd: &str) -> String {
+    cmd.split_whitespace().next().map(path_basename).unwrap_or_default()
+}
+
+/// Reduce one token of an error message to a cross-session-stable form.
+///
+/// Two classes get replaced, and only two:
+/// - anything path-shaped (contains a separator) → `<path>`, because worktree
+///   roots differ per session by construction;
+/// - a purely numeric token (line numbers, counts, durations, `1,234`,
+///   `12:34`) → `#`.
+///
+/// Everything else is kept verbatim (lowercased). In particular a token that
+/// MIXES digits and letters — `error[e0433]`, `ts2345`, `0xc0000139` — is kept
+/// whole, because that is precisely the token that distinguishes one failure
+/// from another. Blanking digits wholesale would collapse `E0433` and `E0599`
+/// into one key and count two unrelated compile errors as a recurrence.
+fn normalize_key_token(t: &str) -> String {
+    let t = t.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | ',' | ';'));
+    if t.is_empty() {
+        return String::new();
+    }
+    if t.contains('/') || t.contains('\\') {
+        return "<path>".into();
+    }
+    if t.chars().any(|c| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | ',' | '-' | '#' | '%' | '+')) {
+        return "#".into();
+    }
+    t.to_lowercase()
+}
+
+/// The key shape of an error message: its first `KEY_ERROR_TOKENS` meaningful
+/// tokens, each normalized.
+fn normalize_error_shape(text: &str) -> String {
+    text.split_whitespace()
+        .map(normalize_key_token)
+        .filter(|t| !t.is_empty())
+        .take(KEY_ERROR_TOKENS)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn looks_like_test_command(cmd: &str) -> bool {
@@ -355,7 +465,16 @@ fn detect_tool_error_windows(events: &[TranscriptEvent]) -> Vec<FrictionWindow> 
         else {
             continue;
         };
-        let EventKind::ToolCall { name, .. } = &events[call_idx].kind else { unreachable!() };
+        let EventKind::ToolCall { name, command, file_path, .. } = &events[call_idx].kind else { unreachable!() };
+        // The key names WHAT failed and HOW, not where: the tool, the program
+        // it ran (or the file it touched — a `Read`/`Edit` error has no
+        // command), and the normalized head of the error text.
+        let subject = command
+            .as_deref()
+            .map(command_program)
+            .or_else(|| file_path.as_deref().map(path_basename))
+            .unwrap_or_default();
+        let key = format!("tool_error:{name}:{subject}:{}", normalize_error_shape(text));
         let mut end = events.len() - 1;
         for (j, e2) in events.iter().enumerate().skip(i + 1) {
             let EventKind::ToolResult { tool_use_id: id2, is_error: false, .. } = &e2.kind else { continue };
@@ -369,12 +488,13 @@ fn detect_tool_error_windows(events: &[TranscriptEvent]) -> Vec<FrictionWindow> 
                 break;
             }
         }
-        windows.push(FrictionWindow {
-            signature: FrictionSignature::ToolError,
-            start: call_idx,
+        windows.push(FrictionWindow::new(
+            FrictionSignature::ToolError,
+            call_idx,
             end,
-            summary: format!("{name} failed: {}", truncate(text, 120)),
-        });
+            format!("{name} failed: {}", truncate(text, 120)),
+            key,
+        ));
     }
     windows
 }
@@ -394,11 +514,24 @@ fn detect_near_duplicate_commands(events: &[TranscriptEvent]) -> Vec<FrictionWin
     calls
         .windows(2)
         .filter(|w| w[0].1 == w[1].1 && is_near_duplicate_command(w[0].2, w[1].2))
-        .map(|w| FrictionWindow {
-            signature: FrictionSignature::NearDuplicateCommand,
-            start: w[0].0,
-            end: w[1].0,
-            summary: format!("re-ran with a substituted first token: {:?} then {:?}", w[0].2, w[1].2),
+        .map(|w| {
+            // The substitution itself IS the lesson ("tried npm, this repo is
+            // pnpm"), so the key is the ordered pair plus the subcommand that
+            // stayed the same — `npm->pnpm:install` and `npm->pnpm:run` are
+            // different walls with the same fix, and both recur on their own.
+            let sub = w[1].2.split_whitespace().nth(1).unwrap_or("").to_lowercase();
+            let key = format!(
+                "near_duplicate:{}->{}:{sub}",
+                command_program(w[0].2),
+                command_program(w[1].2)
+            );
+            FrictionWindow::new(
+                FrictionSignature::NearDuplicateCommand,
+                w[0].0,
+                w[1].0,
+                format!("re-ran with a substituted first token: {:?} then {:?}", w[0].2, w[1].2),
+                key,
+            )
         })
         .collect()
 }
@@ -407,26 +540,33 @@ fn detect_near_duplicate_commands(events: &[TranscriptEvent]) -> Vec<FrictionWin
 /// invocation's result comes back clean.
 fn detect_test_red_to_green(events: &[TranscriptEvent]) -> Vec<FrictionWindow> {
     let mut windows = Vec::new();
-    let mut pending_fail: Option<usize> = None;
+    // The failing call's index AND its key material — a red-to-green key has
+    // to name WHICH test failure, not merely "tests went red here", or every
+    // session in the group corroborates every other one and the count stops
+    // meaning anything (see the over-matching note on the key section).
+    let mut pending_fail: Option<(usize, String, String)> = None;
     for (i, e) in events.iter().enumerate() {
         let EventKind::ToolCall { id, command: Some(cmd), .. } = &e.kind else { continue };
         if !looks_like_test_command(cmd) {
             continue;
         }
         let result = events[i + 1..].iter().enumerate().find_map(|(k, e2)| match &e2.kind {
-            EventKind::ToolResult { tool_use_id, is_error, .. } if tool_use_id == id => Some((i + 1 + k, *is_error)),
+            EventKind::ToolResult { tool_use_id, is_error, text, .. } if tool_use_id == id => {
+                Some((i + 1 + k, *is_error, text.as_str()))
+            }
             _ => None,
         });
-        let Some((ridx, is_error)) = result else { continue };
+        let Some((ridx, is_error, rtext)) = result else { continue };
         if is_error {
-            pending_fail = Some(i);
-        } else if let Some(fail_idx) = pending_fail.take() {
-            windows.push(FrictionWindow {
-                signature: FrictionSignature::TestRedToGreen,
-                start: fail_idx,
-                end: ridx,
-                summary: "a test run failed, then a later run passed".into(),
-            });
+            pending_fail = Some((i, command_program(cmd), normalize_error_shape(rtext)));
+        } else if let Some((fail_idx, program, shape)) = pending_fail.take() {
+            windows.push(FrictionWindow::new(
+                FrictionSignature::TestRedToGreen,
+                fail_idx,
+                ridx,
+                "a test run failed, then a later run passed".into(),
+                format!("test_red_to_green:{program}:{shape}"),
+            ));
         }
     }
     windows
@@ -461,11 +601,17 @@ fn detect_reverted_edits(events: &[TranscriptEvent]) -> Vec<FrictionWindow> {
     edits
         .windows(2)
         .filter(|w| w[0].1 == w[1].1 && edit_overlaps(w[0].3, w[1].2))
-        .map(|w| FrictionWindow {
-            signature: FrictionSignature::RevertedEdit,
-            start: w[0].0,
-            end: w[1].0,
-            summary: format!("{} edited again, touching the exact text the previous edit wrote", w[0].1),
+        .map(|w| {
+            FrictionWindow::new(
+                FrictionSignature::RevertedEdit,
+                w[0].0,
+                w[1].0,
+                format!("{} edited again, touching the exact text the previous edit wrote", w[0].1),
+                // Basename, not the recorded path: the same file is edited
+                // from a different worktree in every session (see
+                // `path_basename`).
+                format!("reverted_edit:{}", path_basename(w[0].1)),
+            )
         })
         .collect()
 }
@@ -541,6 +687,61 @@ pub struct SessionDigest {
     /// — 0 for an uncapped digest. Always present, never silent (review
     /// finding NB1): a consumer can tell a clean session from a truncated one.
     pub dropped_windows: usize,
+    /// How many OTHER sessions in this group were read to compute the
+    /// `recurrence` counts on the windows above (#324). `0` means nothing was
+    /// available to compare against — a *young group*, not a group of
+    /// one-offs, and the difference is the whole reason this is reported
+    /// rather than inferred from `recurrence: 0` everywhere.
+    ///
+    /// Always present. The pure builder leaves it `0`;
+    /// `OrchRegistry::session_digest` sets it.
+    pub sessions_scanned: usize,
+    /// `true` when the group had MORE comparable sessions than
+    /// `MAX_CORROBORATION_SESSIONS` allows and the oldest were not read. A
+    /// `recurrence` count is then a floor, not a total — say so rather than
+    /// let a capped scan read as an exhaustive one (same discipline as
+    /// `dropped_windows`).
+    pub corroboration_capped: bool,
+}
+
+/// How many corroborating session ids a window carries. The `recurrence`
+/// COUNT is never capped — only this list is — so truncation can never
+/// understate how often a wall recurred.
+pub const MAX_CORROBORATED_BY: usize = 5;
+
+/// Attach cross-session recurrence to a digest's windows (#324).
+///
+/// `others` is one entry per OTHER session read from the same group: a label
+/// (the agent id, which is what a human or an agent can actually go look at)
+/// and that session's deduped friction keys. Pure and total — the I/O of
+/// finding and reading those sessions belongs to
+/// `OrchRegistry::session_digest`, mirroring this module's existing
+/// pure/impure split.
+///
+/// Counting is per SESSION, not per window: a single session that hit the
+/// same wall nine times contributes 1, because the question the count answers
+/// is "did anyone ELSE hit this?", not "how noisy was one transcript?". That
+/// is also what keeps a single flailing session from manufacturing its own
+/// evidence.
+pub fn apply_recurrence(digest: &mut SessionDigest, others: &[(String, Vec<String>)]) {
+    for w in digest.windows.iter_mut() {
+        let mut hits: Vec<String> =
+            others.iter().filter(|(_, keys)| keys.iter().any(|k| k == &w.key)).map(|(label, _)| label.clone()).collect();
+        w.recurrence = hits.len();
+        hits.truncate(MAX_CORROBORATED_BY);
+        w.corroborated_by = hits;
+    }
+}
+
+/// Every distinct friction key in one session's event stream — the compact
+/// form `apply_recurrence` compares against. Deduped, so a session that hit
+/// one wall repeatedly counts once (see `apply_recurrence`), and sorted so
+/// the value is stable for tests and cheap to eyeball.
+pub fn session_friction_keys(events: &[TranscriptEvent]) -> Vec<String> {
+    let mut keys: Vec<String> = extract_friction_windows(events).into_iter().map(|w| w.key).collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// Build a digest from a normalized event stream. `final_diff_ref`/`outcome`
@@ -562,7 +763,19 @@ pub fn build_digest(
         })
         .or(initial_prompt_fallback);
     let (windows, dropped_windows) = cap_windows(extract_friction_windows(events), MAX_WINDOWS);
-    SessionDigest { initial_prompt, final_diff_ref, outcome, windows, dropped_windows }
+    // `sessions_scanned`/`corroboration_capped` stay 0/false here and every
+    // window's `recurrence` stays 0: this builder sees exactly ONE session by
+    // construction. The registry fills them in via `apply_recurrence` once it
+    // has read the group's other transcripts.
+    SessionDigest {
+        initial_prompt,
+        final_diff_ref,
+        outcome,
+        windows,
+        dropped_windows,
+        sessions_scanned: 0,
+        corroboration_capped: false,
+    }
 }
 
 #[cfg(test)]
@@ -862,5 +1075,156 @@ mod tests {
     #[test]
     fn iso8601_rejects_a_non_utc_shape() {
         assert_eq!(parse_iso8601_ms("2024-01-01T00:00:00+02:00"), None);
+    }
+
+    // ---- #324: friction keys and cross-session recurrence ----
+    //
+    // Two failure modes are being guarded against here, and they are not
+    // symmetric. A key that is too SPECIFIC under-counts (a real recurrence
+    // reads as a one-off) — bad, but no worse than the n=1 status quo. A key
+    // that is too LOOSE over-counts, which manufactures evidence for a lesson
+    // nobody actually hit twice. So there is a test for each direction.
+
+    /// The single most load-bearing normalization: two loomux workers on one
+    /// repo run in DIFFERENT worktrees, so the identical wall carries a
+    /// different absolute path in each transcript. If the key kept the path,
+    /// cross-session recurrence would be structurally uncountable — every
+    /// count would be 0 and the feature would silently do nothing.
+    #[test]
+    fn the_same_wall_from_two_worktrees_produces_one_key() {
+        let mk = |root: &str| {
+            let cmd = format!("cargo test --manifest-path {root}/src-tauri/Cargo.toml");
+            let err = format!("error[E0433]: failed to resolve at {root}/src/lib.rs:12:5");
+            vec![tool_call(0, "t1", "Bash", Some(cmd.as_str()), None), tool_result("t1", true, &err)]
+        };
+        let a = extract_friction_windows(&mk("C:/wt/feat-a"));
+        let b = extract_friction_windows(&mk("C:/wt/feat-b"));
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(b.len(), 1, "{b:?}");
+        assert_eq!(a[0].key, b[0].key, "the same wall in two worktrees must key the same");
+    }
+
+    /// The over-matching guard. Two different compile errors are two
+    /// different walls; collapsing them would report a recurrence that never
+    /// happened.
+    #[test]
+    fn two_different_error_codes_do_not_share_a_key() {
+        let mk = |code: &str| {
+            let err = format!("error[{code}]: something went wrong");
+            vec![tool_call(0, "t1", "Bash", Some("cargo test"), None), tool_result("t1", true, &err)]
+        };
+        let a = extract_friction_windows(&mk("E0433"));
+        let b = extract_friction_windows(&mk("E0599"));
+        assert_ne!(a[0].key, b[0].key, "distinct error codes must stay distinct: {}", a[0].key);
+    }
+
+    /// …and the under-matching guard on the other side of the same
+    /// normalizer: a line number is a per-session accident, not part of the
+    /// wall's identity.
+    #[test]
+    fn line_numbers_do_not_split_a_key() {
+        let mk = |line: &str| {
+            let err = format!("assertion failed at line {line} of the fixture");
+            vec![tool_call(0, "t1", "Bash", Some("cargo test"), None), tool_result("t1", true, &err)]
+        };
+        assert_eq!(extract_friction_windows(&mk("12"))[0].key, extract_friction_windows(&mk("4071"))[0].key);
+    }
+
+    #[test]
+    fn a_reverted_edit_keys_on_the_file_not_its_worktree_path() {
+        let mk = |root: &str| {
+            let p = format!("{root}/src/layout.ts");
+            vec![edit_call("e1", &p, "old", "mid"), edit_call("e2", &p, "mid", "new")]
+        };
+        let a = extract_friction_windows(&mk("C:/wt/feat-a"));
+        let b = extract_friction_windows(&mk("/home/x/wt/feat-b"));
+        assert_eq!(a[0].key, b[0].key);
+        assert_eq!(a[0].key, "reverted_edit:layout.ts");
+    }
+
+    #[test]
+    fn a_near_duplicate_rerun_keys_on_the_substitution_that_fixed_it() {
+        let events = vec![
+            tool_call(0, "t1", "Bash", Some("npm install"), None),
+            tool_result("t1", true, "npm: command not found"),
+            tool_call(2, "t2", "Bash", Some("pnpm install"), None),
+            tool_result("t2", false, "done"),
+        ];
+        let w = extract_friction_windows(&events);
+        let nd = w.iter().find(|w| w.signature == FrictionSignature::NearDuplicateCommand).unwrap();
+        assert_eq!(nd.key, "near_duplicate:npm->pnpm:install");
+    }
+
+    fn digest_of(events: &[TranscriptEvent]) -> SessionDigest {
+        build_digest(events, None, None, None)
+    }
+
+    fn one_wall() -> Vec<TranscriptEvent> {
+        vec![
+            tool_call(0, "t1", "Bash", Some("cargo test"), None),
+            tool_result("t1", true, "error[E0433]: failed to resolve"),
+        ]
+    }
+
+    /// The builder sees exactly one session, so it must never invent a
+    /// recurrence — the registry is the only thing that can fill these in.
+    #[test]
+    fn the_pure_builder_reports_no_recurrence_and_no_scan() {
+        let d = digest_of(&one_wall());
+        assert_eq!(d.windows[0].recurrence, 0);
+        assert!(d.windows[0].corroborated_by.is_empty());
+        assert_eq!(d.sessions_scanned, 0);
+        assert!(!d.corroboration_capped);
+    }
+
+    #[test]
+    fn a_wall_no_other_session_hit_stays_a_one_off() {
+        let mut d = digest_of(&one_wall());
+        apply_recurrence(&mut d, &[("w-9".into(), vec!["tool_error:Bash:cargo:something else".into()])]);
+        assert_eq!(d.windows[0].recurrence, 0, "an unrelated key must not corroborate");
+        assert!(d.windows[0].corroborated_by.is_empty());
+    }
+
+    #[test]
+    fn a_wall_another_session_also_hit_is_corroborated_and_named() {
+        let mut d = digest_of(&one_wall());
+        let key = d.windows[0].key.clone();
+        apply_recurrence(&mut d, &[("w-9".into(), vec![key.clone()]), ("w-4".into(), vec!["other".into()])]);
+        assert_eq!(d.windows[0].recurrence, 1);
+        assert_eq!(d.windows[0].corroborated_by, vec!["w-9".to_string()]);
+    }
+
+    /// Counting is per SESSION: one flailing transcript that hit the same
+    /// wall repeatedly is still one voice, or a single bad session could
+    /// manufacture its own corroboration.
+    #[test]
+    fn one_sessions_repeats_count_once_not_once_per_hit() {
+        let mut d = digest_of(&one_wall());
+        let key = d.windows[0].key.clone();
+        apply_recurrence(&mut d, &[("w-9".into(), vec![key.clone(), key.clone(), key])]);
+        assert_eq!(d.windows[0].recurrence, 1, "three hits in ONE session is one corroborating session");
+    }
+
+    /// `session_friction_keys` is what makes the rule above hold at the
+    /// source: a session's key set is deduped before it is ever compared.
+    #[test]
+    fn a_sessions_key_set_is_deduped() {
+        let mut events = one_wall();
+        events.extend(one_wall());
+        assert!(extract_friction_windows(&events).len() >= 2, "two hits should yield two windows");
+        assert_eq!(session_friction_keys(&events).len(), 1, "…but one key");
+    }
+
+    /// The id list is capped; the COUNT never is. A reader that trusted the
+    /// list's length would understate a widely-recurring wall.
+    #[test]
+    fn the_corroborating_id_list_caps_but_the_count_does_not() {
+        let mut d = digest_of(&one_wall());
+        let key = d.windows[0].key.clone();
+        let others: Vec<(String, Vec<String>)> =
+            (0..MAX_CORROBORATED_BY + 3).map(|i| (format!("w-{i}"), vec![key.clone()])).collect();
+        apply_recurrence(&mut d, &others);
+        assert_eq!(d.windows[0].recurrence, MAX_CORROBORATED_BY + 3);
+        assert_eq!(d.windows[0].corroborated_by.len(), MAX_CORROBORATED_BY);
     }
 }
