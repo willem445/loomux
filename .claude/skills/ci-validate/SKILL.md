@@ -76,8 +76,8 @@ dropped:
 - **Read stderr; the exit code is ambiguous.** It's `0` clean, `1` for a
   formatting diff *and* for a parse error, `101` for a lexer error. The only
   reliable signal is that **parse errors go to stderr and formatting diffs go
-  to stdout** — so with stdout discarded, any output at all means your Rust
-  doesn't parse.
+  to stdout** — so with stdout discarded, an `error:`/`error[E….]:` line on
+  stderr means your Rust doesn't parse. Fix it before pushing.
 
 Pointing it at `src/lib.rs` parses the whole module tree (rustfmt recurses
 into child modules), which takes ~3s for this crate — cheap enough to use as
@@ -100,10 +100,9 @@ what `>/dev/null` is for). So:
 **rustfmt is a parser, not a build.** It doesn't invoke cargo, doesn't invoke
 `rustc` for codegen, resolves no dependencies, produces no artifacts, and
 writes nothing to `target/` — verified on a worktree that had no `target/`:
-after a whole-crate run it still had none, `git status` was clean, and the
-run took ~3s. So it
-sits inside both bans at once: the #320 CPU ban (no meaningful CPU, nothing
-to run concurrently across worktrees) and the #488 disk ban (zero bytes
+after a whole-crate run it still had none, `git status` was clean, and the run
+took ~3s. So it sits inside both bans at once: the #320 CPU ban (no meaningful
+CPU, nothing to contend across worktrees) and the #488 disk ban (zero bytes
 written).
 
 **`cargo check` and `cargo build` remain banned, and the argument above does
