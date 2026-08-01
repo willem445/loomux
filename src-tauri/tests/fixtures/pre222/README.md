@@ -415,6 +415,24 @@ so far:
   whoever merges, so neither template could carry both halves without telling an agent to
   police a step it never takes.
 
+- **#579, `queue_orphans` grew a second list** — `orchestrator.md` only, three places: the
+  tool's one-line entry in the tool list, one sentence in the delivery-notice section, and a
+  new **Durability rules** bullet. A delivery refused at the front door (the target pane was
+  already at the per-pane cap of 8) never gets a queue id, so neither id-keyed orphan
+  derivation could ever see it — the sender got its synchronous error and nothing the
+  orchestrator calls could enumerate the loss. It now surfaces as `refused`, beside `orphans`.
+  The re-bless is worth it for the two ways the new list does NOT behave like the old one, both
+  of which an orchestrator will get wrong if nobody tells it: it is **not restart-shaped** (a
+  full pane refuses arrivals during perfectly ordinary operation, so a non-empty `refused` on a
+  session with no restart in it is not a bug), and its rows were **already reported to their
+  senders** in-band, so the ones actually needing action are those whose sender has since died
+  and those loomux sent to itself. The bullet also states what `text: null` means here versus in
+  the orphan list, and that reading the list re-admits nothing. Review NB1 added one more
+  sentence to that bullet: check `refused_window_truncated` before reading `refused_count: 0` as
+  "nothing was refused", because the audit window the count comes from is itself capped at 5000
+  entries — a reader who takes a partial count for a complete one stops looking exactly when
+  there is something to find.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

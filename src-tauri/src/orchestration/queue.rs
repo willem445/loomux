@@ -348,6 +348,12 @@ pub enum AdmitDecision {
     Coalesce,
     /// The pane's queue is already at `QUEUE_MAX_PER_PANE` — reject the
     /// NEWEST, never evict the oldest.
+    ///
+    /// This is the one outcome that leaves NO queue entry and therefore no id
+    /// (`enqueue_text` returns before it mints one), so nothing in this module
+    /// can report it: `orphaned_queue_entries` and `merge_orphans` both key on
+    /// an id. #579 surfaces it from `audit.jsonl` instead, as
+    /// `queue_orphans`'s second list — see `mod.rs`'s `front_door_refusals`.
     RejectFull,
 }
 
