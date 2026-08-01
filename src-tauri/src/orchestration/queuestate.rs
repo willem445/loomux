@@ -170,9 +170,9 @@ impl QueueMap {
             let mut entries = self.inner.lock_safe();
             f(&mut entries)
         };
-        // SCRATCH MUTATION 1 (#562) — reverted next commit: the verdict is
-        // ignored and the snapshot is never written.
-        let _ = (dirty.write_needed(), writer, group);
+        if dirty.write_needed() {
+            writer.write_queue_snapshot(group);
+        }
         out
     }
 }
@@ -217,10 +217,10 @@ impl DrainerRegistry {
     /// section, which is what makes `ensure_drainer` idempotent under
     /// concurrent callers rather than merely usually-idempotent.
     pub fn claim(&self, pty_id: u32, mint: impl FnOnce() -> u64) -> Option<u64> {
-        // SCRATCH MUTATION 3 (#497) — reverted next commit: the
-        // idempotence check is dropped, so a claim always mints and always
-        // overwrites whoever held the pane.
         let mut inner = self.inner.lock_safe();
+        if inner.contains_key(&pty_id) {
+            return None;
+        }
         let generation = mint();
         inner.insert(pty_id, generation);
         Some(generation)
@@ -238,10 +238,12 @@ impl DrainerRegistry {
     /// checked by review; it now holds because there is nothing else to
     /// call.
     pub fn release(&self, pty_id: u32, generation: u64) -> bool {
-        // SCRATCH MUTATION 2 (#497) — reverted next commit: the round-1
-        // shipped bug, an unconditional removal that ignores `generation`.
-        let _ = generation;
-        self.inner.lock_safe().remove(&pty_id).is_some()
+        let mut inner = self.inner.lock_safe();
+        if inner.get(&pty_id) == Some(&generation) {
+            inner.remove(&pty_id);
+            return true;
+        }
+        false
     }
 }
 
