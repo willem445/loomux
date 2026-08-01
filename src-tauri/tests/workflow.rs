@@ -4575,6 +4575,7 @@ fn verdicts(
                     agent_id: "rev-1".into(),
                     verdict: *v,
                     head: head.to_string(),
+                    body_digest: String::new(),
                     summary: "…".into(),
                     ts_ms: 1,
                 },
@@ -4961,6 +4962,7 @@ fn verdict_file_round_trips_with_its_attribution() {
         agent_id: "rev-4".into(),
         verdict: workflow::Verdict::Fail,
         head: "a3f9c21".into(),
+        body_digest: workflow::body_digest("## What\n\nA fix.\n"),
         summary: "release-gate bypass:\n  gh api can create a v* tag ref".into(),
         ts_ms: 1_720_000_000_000,
     };
@@ -4968,6 +4970,11 @@ fn verdict_file_round_trips_with_its_attribution() {
     assert!(
         text.starts_with("fail\na3f9c21\n"),
         "the verdict word is line 1 and the reviewed head line 2 — that IS the shim's read"
+    );
+    assert_eq!(
+        text.lines().nth(4),
+        Some(rec.body_digest.as_str()),
+        "and the reviewed body's digest is line 5 — the shim's `head -n5 | tail -n1` (#565)"
     );
     let back = workflow::parse_verdict_file(151, "rev-security", &text).unwrap();
     assert_eq!(back, rec, "the record must survive the round trip, multi-line summary and all");

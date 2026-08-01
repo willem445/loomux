@@ -396,6 +396,30 @@ loomux_block_release() { # $1=tag $2=action
   loomux_audit "release-gate-blocked" "{\"tag\":\"$1\",\"action\":\"$2\"}"
   exit 1
 }
+# The digest the `also: body-unchanged` condition compares (#565): stdin → 64
+# lowercase hex on stdout, or NOTHING when this host has no usable sha256 tool —
+# and nothing REFUSES at the call site, which is why this may return empty at all.
+#
+# Deliberately NOT added to the dependency preamble's proven list. That list is
+# emitted byte-identically into the git shim too and is asserted before EVERY
+# gated command on every host; a hasher is needed only by a condition a repo opts
+# into, so requiring it there would refuse merges on hosts that never declare it.
+# macOS ships `shasum` and no `sha256sum`; Linux and Git for Windows ship
+# `sha256sum`; `openssl dgst -r` is the last resort. All three print `<hex> ?-`,
+# so one parameter expansion takes the digest off any of them — and anything that
+# is not exactly 64 hex characters (an openssl too old for `-r`, a tool that
+# resolved but produced nothing) becomes empty, i.e. refuse.
+loomux_sha256() { # stdin → 64 hex chars, or empty
+  if command -v sha256sum >/dev/null 2>&1; then _h=$(sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then _h=$(shasum -a 256)
+  elif command -v openssl >/dev/null 2>&1; then _h=$(openssl dgst -sha256 -r)
+  else _h=''
+  fi
+  _h=${_h%% *}
+  [ "${#_h}" -eq 64 ] || _h=''
+  case "$_h" in *[!0-9a-f]*) _h='' ;; esac
+  printf '%s' "$_h"
+}
 # #256/#303: CLAIM a one-time grant without spending it yet — a gated command
 # (merge OR release/tag publish) must consume its grant only when the real
 # `gh` call it authorizes actually SUCCEEDS (live incident: a merge grant
@@ -856,6 +880,45 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
         if ! "$REAL_GH" pr checks $rf "$num" >/dev/null 2>&1; then
           loomux_block_wf "ci-not-green" "the gate requires ci-green and 'gh pr checks $num' is not all-green (failing, still running, or no checks reported)"
         fi ;;
+      # #565: the head oid pins the CODE a verdict reviewed. It does not pin the PR
+      # BODY — which a squash merge turns into the permanent commit message, so a
+      # `pass` recorded against one body and merged with another lands text no
+      # reviewer read. Opt-in, because that is only true of repos that squash.
+      #
+      # ASYMMETRIC, and that is the whole design: only PASSES are checked here. A
+      # fail/escalate whose body moved afterwards is the fix loop working as
+      # intended, and re-staling it would ping-pong forever — body finding → worker
+      # fixes the body → verdict auto-stales → re-review → repeat. The Rust half
+      # REPORTS that side (`list_verdicts`, the gate status line) so the orchestrator
+      # can spot an already-fixed finding; nothing acts on it automatically.
+      body-unchanged)
+        b_raw=$("$REAL_GH" pr view $rf "$num" --json body --jq .body 2>/dev/null) \
+          || loomux_block_wf "unresolved-body" "the gate requires body-unchanged and loomux could not read the PR's body, so it cannot tell whether what would become the squash commit message is what the reviewers passed"
+        # The canonical form both halves digest, and ALL of it: strip CR (a CRLF and
+        # an LF body are the same commit message), then exactly one trailing newline
+        # — `$(…)` ate them all, `printf '%s\n'` puts one back. Kept this small on
+        # purpose: every extra rule is one the Rust half (`workflow::canonical_body`)
+        # and this shell would have to keep agreeing about forever.
+        b_norm=$(printf '%s' "$b_raw" | tr -d '\r')
+        loomux_norm_guard "$b_raw" "$b_norm" "the PR body"
+        b_now=$(printf '%s\n' "$b_norm" | loomux_sha256)
+        [ -n "$b_now" ] || loomux_block_wf "no-sha256" "the gate requires body-unchanged but this host has no usable sha256 tool (sha256sum, shasum or openssl), so loomux cannot compare the PR body against the one the reviewers passed — a condition it cannot check refuses the merge"
+        b_bad=""
+        for b_r in $g_revs; do
+          b_vf="$LOOMUX_GROUP_DIR/verdicts/pr-$num/$b_r"
+          [ -f "$b_vf" ] || continue
+          # Only a LIVE pass — the verdict word on line 1, recorded against the head
+          # that would merge. (A pass the threshold does not need is still checked:
+          # "this reviewer approved a different commit message" is true either way,
+          # and re-recording is the same action whether or not it was load-bearing.)
+          [ "$(head -n1 "$b_vf" 2>/dev/null)" = "pass" ] || continue
+          [ "$(head -n2 "$b_vf" 2>/dev/null | tail -n1)" = "$cur_head" ] || continue
+          # Line 5 is the body digest it reviewed. Absent (a verdict recorded before
+          # #565, or one whose body gh could not read) reads as EMPTY, which equals
+          # no digest and so refuses — unknown is never "unbound, therefore fine".
+          [ "$(head -n5 "$b_vf" 2>/dev/null | tail -n1)" = "$b_now" ] || b_bad="$b_bad $b_r"
+        done
+        [ -z "$b_bad" ] || loomux_block_wf "body-changed" "the PR body is not the one reviewer(s)$b_bad passed — and this repo squash-merges, so that body becomes the permanent commit message. Whoever edited it, the fix is the same: those reviewers re-read the body as it stands and re-record" ;;
       *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this loomux build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade loomux" ;;
     esac
   done
@@ -7292,6 +7355,11 @@ pub struct OrchRegistry {
     /// exercised through the real MCP dispatch against a repo that isn't on GitHub;
     /// mirrors `claude_projects_dir`. `None` in the app, always.
     pr_head_override: Mutex<Option<String>>,
+    /// Test seam (#565), the body half of `pr_head_override`: when set, `pr_body`
+    /// returns this instead of shelling out to `gh pr view --json body`. Lets the
+    /// integration tests record a verdict against a known body and then edit it —
+    /// the race #565 is about — without a live GitHub PR. `None` in the app.
+    pr_body_override: Mutex<Option<String>>,
     /// Groups the human has paused: loomux stops delivering prompts/kickoffs
     /// to them so their agents idle out (see `deliver_prompt`). Mirrored to a
     /// `paused` marker file per group so it survives restarts.
@@ -15366,6 +15434,7 @@ impl OrchRegistry {
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
             pr_head_override: Mutex::new(None),
+            pr_body_override: Mutex::new(None),
             paused: Mutex::new(HashSet::new()),
             spawn_times: Mutex::new(HashMap::new()),
             self_arc: Mutex::new(Weak::new()),
@@ -24110,7 +24179,14 @@ impl OrchRegistry {
                      the PR afterwards — even a lint fix — your pass goes **stale**, the gate \
                      reopens, and the merge is refused until you review the new head and record \
                      again. Expect to be called back after a fix; do not assume an earlier pass \
-                     still covers the PR. `list_verdicts(pr)` shows you where the gate stands."
+                     still covers the PR. `list_verdicts(pr)` shows you where the gate stands.\n\
+                     \n\
+                     **And to the PR body you reviewed** (#565). loomux digests the body when you \
+                     record, so a body edited afterwards is visible instead of silent — which \
+                     matters because a squash merge makes that body the permanent commit message. \
+                     Two things follow: read the body as reviewed content, not as a preamble; and \
+                     if you fail a PR *on its body*, expect the fix to change the body under your \
+                     verdict — that is the loop working, and you clear it by re-recording."
                 )
             }
             None => String::new(),
@@ -25004,6 +25080,89 @@ impl OrchRegistry {
         *self.pr_head_override.lock_safe() = sha;
     }
 
+    /// The PR's **body** right now, via the real gh — the other half of what a
+    /// verdict reviews (#565), and on a squash-merging repo the text that becomes
+    /// the permanent commit message.
+    ///
+    /// `None` when gh is absent, unauthenticated, or the PR isn't there. That is
+    /// deliberately distinct from `Some(String::new())`, a PR with a genuinely
+    /// empty body: the first means *unknown* (fail closed — no digest is recorded
+    /// and nothing may claim the body is unchanged), the second is a real body that
+    /// digests like any other.
+    fn pr_body(&self, repo: &str, pr: u64) -> Option<String> {
+        if let Some(body) = self.pr_body_override.lock_safe().clone() {
+            return Some(body);
+        }
+        if !Path::new(repo).is_dir() {
+            return None;
+        }
+        let gh = crate::winpath::resolve_program(
+            "gh",
+            &crate::winpath::launch_path(),
+            &crate::winpath::launch_pathext(),
+        )?;
+        let mut cmd = std::process::Command::new(gh);
+        cmd.current_dir(repo)
+            .args(["pr", "view", &pr.to_string(), "--json", "body", "--jq", ".body"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — never flash a console
+        }
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The digest of the PR's body as it stands now — what a recorded verdict's
+    /// `body_digest` is compared against. `None` when the body can't be read.
+    fn pr_body_digest(&self, group: &str, pr: u64) -> Option<String> {
+        let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
+        self.pr_body(&repo, pr).map(|b| workflow::body_digest(&b))
+    }
+
+    /// Test seam: pretend `gh pr view --json body` returns this for every PR.
+    #[doc(hidden)]
+    pub fn set_pr_body_override(&self, body: Option<String>) {
+        *self.pr_body_override.lock_safe() = body;
+    }
+
+    /// Which reviewers' verdicts were recorded against a PR body that has since
+    /// changed (#565), split by verdict class — because the two halves want
+    /// **opposite** handling and reporting them as one list is how a fix loop
+    /// becomes a ping-pong:
+    ///
+    /// - `passed` — a `pass` whose body moved afterwards. This is the hazard: what
+    ///   is about to become permanent history is not what was approved.
+    /// - `blocking` — a `fail`/`escalate` whose body moved afterwards. This is
+    ///   *expected*; it is the fix loop working. It is worth SAYING (it is exactly
+    ///   the #525 race: a finding about the body, already fixed by the time the
+    ///   verdict landed, and no mechanism could tell the orchestrator) but nothing
+    ///   about it may auto-stale a verdict — that would make every body fix
+    ///   re-trigger the review that asked for it.
+    ///
+    /// Empty on both counts when the current body cannot be read, or when the
+    /// verdicts carry no digest: "cannot tell" is reported by the gate that refuses,
+    /// never as a drift claim here.
+    fn body_drift(&self, group: &str, pr: u64) -> (Vec<String>, Vec<String>) {
+        let Some(now) = self.pr_body_digest(group, pr) else {
+            return (Vec::new(), Vec::new());
+        };
+        let (mut passed, mut blocking) = (Vec::new(), Vec::new());
+        for v in self.verdicts(group, pr) {
+            if v.body_changed(Some(&now)) == Some(true) {
+                if v.verdict.is_blocking() {
+                    blocking.push(v.block);
+                } else {
+                    passed.push(v.block);
+                }
+            }
+        }
+        (passed, blocking)
+    }
+
     /// Record a reviewer's verdict on a PR (the `review_verdict` MCP tool) — the
     /// durable, attributed state the merge gate reads.
     ///
@@ -25060,12 +25219,20 @@ impl OrchRegistry {
         // not bind to a commit can never open a gate on its own.
         let repo = self.group(group).map(|g| g.repo).unwrap_or_default();
         let head = self.pr_head(&repo, num).unwrap_or_default();
+        // …and the BODY it reviewed (#565). Computed here, never passed in: a
+        // property that depends on the reviewer remembering to include it is an
+        // intention, not a mechanism — and a reviewer cannot record the digest of a
+        // body it did not read if it never touches the digest at all. Unreadable
+        // body → empty, which reads as unknown and can satisfy nothing.
+        let body_digest =
+            self.pr_body(&repo, num).map(|b| workflow::body_digest(&b)).unwrap_or_default();
         let rec = workflow::ReviewVerdict {
             pr: num,
             block,
             agent_id: a.id.clone(),
             verdict,
             head,
+            body_digest,
             summary,
             ts_ms: now_ms(),
         };
@@ -25081,6 +25248,7 @@ impl OrchRegistry {
             "block": rec.block,
             "verdict": rec.verdict.as_str(),
             "head": rec.head,
+            "body_digest": rec.body_digest,
             "summary": rec.summary.chars().take(500).collect::<String>(),
         }));
         Ok(rec)
@@ -25165,7 +25333,29 @@ impl OrchRegistry {
             }
             parts.join("; ")
         };
-        Some(match outcome {
+        // #565: the body a verdict reviewed is not covered by the head SHA, and on a
+        // squash-merging repo it is the commit message. Reported on BOTH classes and
+        // enforced on neither here — enforcement is the opt-in `also: body-unchanged`
+        // condition, checked at merge time in the shim, exactly like `ci-green`.
+        let (drift_passed, drift_blocking) = self.body_drift(group, pr);
+        let mut body_note = String::new();
+        if !drift_passed.is_empty() {
+            body_note.push_str(&format!(
+                " BODY CHANGED SINCE PASS: {} passed a DIFFERENT PR body than the one on the PR \
+                 now — and the body is what a squash merge records as the commit message. Have \
+                 them re-read and re-record before merging.",
+                drift_passed.join(", ")
+            ));
+        }
+        if !drift_blocking.is_empty() {
+            body_note.push_str(&format!(
+                " BODY CHANGED SINCE a blocking verdict from {}: expected if the finding was \
+                 about the body — it may already be fixed. Check the current body before routing \
+                 that finding back to the worker; the reviewer clears it by re-recording.",
+                drift_blocking.join(", ")
+            ));
+        }
+        let line = match outcome {
             workflow::GateOutcome::Satisfied => format!(
                 "merge gate for PR #{pr}: SATISFIED by the reviewer verdicts ({}) for the current \
                  revision.{also} The human merge gate still applies on the default branch.",
@@ -25188,7 +25378,8 @@ impl OrchRegistry {
                  it cannot tell whether the recorded verdicts reviewed the code that would merge. \
                  The merge is refused until it can. {GATE_REFUSAL_EXITS}"
             ),
-        })
+        };
+        Some(format!("{line}{body_note}"))
     }
 
     pub fn resolve_token(&self, token: &str) -> Option<Caller> {

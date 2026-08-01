@@ -219,7 +219,7 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
             json!({ "id": { "type": "string", "description": "Task id, e.g. t-3" } }),
             &["id"]),
         tool("list_verdicts",
-            "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Omit pr to list every PR with a recorded verdict.",
+            "Read the recorded review verdicts for a PR: which reviewer block recorded what (pass | fail | escalate), when, and its summary — plus, when this repo's .loomux/workflow.yml declares a merge gate, whether that gate is satisfied. This is STATE, not a notification: it is what the loomux gh interceptor reads when it decides whether to allow `gh pr merge`. Each verdict also carries `body_changed` when loomux can tell whether the PR body moved since it was recorded (absent = it cannot tell): on a `pass` that means the text a squash merge would commit is not what was approved — send the reviewer back; on a `fail`/`escalate` it means the body was edited afterwards, so check whether the finding is already fixed before routing it to a worker. Omit pr to list every PR with a recorded verdict.",
             json!({
                 "pr": { "type": "string", "description": "PR number, #n, or URL. Omit to list all PRs with verdicts." },
             }),
@@ -358,7 +358,7 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
     // enforcement (a worker that could file its own PASS would make the gate a prop).
     if role == Role::Reviewer {
         tools.push(tool("review_verdict",
-            "Record your REVIEW OUTCOME for a pull request. This is durable, attributed state — not a notification — and when this repo's .loomux/workflow.yml declares a merge gate, it is what loomux's gh interceptor reads before allowing `gh pr merge`. Call it once you have finished reviewing, after posting your review on the PR, and then report() to the orchestrator as usual. verdict: `pass` (reviewed, nothing blocking), `fail` (blocking findings — fix and re-review), `escalate` (you will not decide this one: ambiguous requirement, out of your depth, a risk you won't sign off on — a human must look). fail and escalate BOTH refuse the merge, and one blocking verdict beats any number of passes, so never record `pass` to be agreeable or to unblock the queue. Your verdict is bound to the PR's CURRENT HEAD COMMIT: if the author pushes anything afterwards, your pass goes STALE and the gate reopens until you review the new commits and record again — so review the head as it stands, and expect to be asked again after a fix. Re-recording replaces your own earlier verdict (that is how you upgrade a `fail` to a `pass`, and how you refresh a stale one). The summary must stand on its own for a human reading it a week later: what you reviewed, and what decided the verdict. Verdict words are lowercase.",
+            "Record your REVIEW OUTCOME for a pull request. This is durable, attributed state — not a notification — and when this repo's .loomux/workflow.yml declares a merge gate, it is what loomux's gh interceptor reads before allowing `gh pr merge`. Call it once you have finished reviewing, after posting your review on the PR, and then report() to the orchestrator as usual. verdict: `pass` (reviewed, nothing blocking), `fail` (blocking findings — fix and re-review), `escalate` (you will not decide this one: ambiguous requirement, out of your depth, a risk you won't sign off on — a human must look). fail and escalate BOTH refuse the merge, and one blocking verdict beats any number of passes, so never record `pass` to be agreeable or to unblock the queue. Your verdict is bound to the PR's CURRENT HEAD COMMIT: if the author pushes anything afterwards, your pass goes STALE and the gate reopens until you review the new commits and record again — so review the head as it stands, and expect to be asked again after a fix. Re-recording replaces your own earlier verdict (that is how you upgrade a `fail` to a `pass`, and how you refresh a stale one). loomux ALSO records a digest of the PR body as it stands when you call this — you never pass it and cannot forget it — because on a squash-merging repo that body becomes the permanent commit message: it is reviewed content, so review it, and expect to be asked again if it is edited after you pass. The summary must stand on its own for a human reading it a week later: what you reviewed, and what decided the verdict. Verdict words are lowercase.",
             json!({
                 "pr": { "type": "string", "description": "PR number, #n, or URL — the PR you reviewed." },
                 "verdict": { "type": "string", "enum": ["pass", "fail", "escalate"], "description": "pass | fail | escalate, lowercase. Never guessed: an unrecognized value is rejected." },
@@ -1030,9 +1030,32 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let out: Vec<Value> = prs
                 .into_iter()
                 .map(|pr| {
+                    // #565: a verdict pins the head SHA, so a moved head is visible.
+                    // The PR BODY is not part of that SHA and moves silently — and
+                    // on a squash-merging repo it is the commit message. `body_changed`
+                    // is the same staleness question asked of the other half of the
+                    // reviewed artifact, per verdict: true/false when it can be
+                    // answered, ABSENT when it cannot (no digest recorded, or the
+                    // body unreadable now) — never a `false` that means "we didn't
+                    // check". Handling is asymmetric and the gate line says which is
+                    // which: on a `pass` it is a hazard, on a `fail` it is the fix
+                    // loop and quite possibly a finding that is already fixed.
+                    let now = reg.pr_body_digest(&caller.group, pr);
+                    let verdicts: Vec<Value> = reg
+                        .verdicts(&caller.group, pr)
+                        .into_iter()
+                        .map(|v| {
+                            let changed = v.body_changed(now.as_deref());
+                            let mut val = serde_json::to_value(&v).unwrap_or(Value::Null);
+                            if let (Some(changed), Some(obj)) = (changed, val.as_object_mut()) {
+                                obj.insert("body_changed".into(), json!(changed));
+                            }
+                            val
+                        })
+                        .collect();
                     json!({
                         "pr": pr,
-                        "verdicts": reg.verdicts(&caller.group, pr),
+                        "verdicts": verdicts,
                         "gate": reg.gate_status_line(&caller.group, pr),
                     })
                 })
