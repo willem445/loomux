@@ -14842,31 +14842,146 @@ fn gh_shim_gives_the_real_gh_a_native_git_only_for_builtin_subcommands() {
 }
 
 /// Normalizer sites deliberately NOT wrapped in `loomux_norm_guard`, each with
-/// the reason its emptiness is safe (#509 rev-32 NB2, re-keyed by rev-36 NBa).
+/// the reason its emptiness is safe (#509 rev-32 NB2, re-keyed by rev-36 NBa,
+/// text-pinned by #564 O2).
 ///
-/// `(variable, a substring identifying THAT SITE, reason)`. **The context
-/// substring is load-bearing, not decoration.** Keyed by variable name alone —
-/// as this list shipped — a NEW unguarded fail-open site that happened to reuse
-/// a generic name would inherit the exemption and pass silently; `rest` is the
-/// obvious candidate, and it appears twice already. That made this list's own
-/// "cannot rot into a blanket permission" claim false on the day it landed,
-/// which is worse than a wrong site: the list is the mechanism the entire
-/// guarded/exempt split rests on, so a false claim ABOUT it undermines every
-/// claim made THROUGH it. The pin also asserts each context matches exactly one
-/// site, so an entry cannot silently widen later either.
-const UNGUARDED_TR_SITES: &[(&str, &str, &str)] = &[
+/// `(variable, a substring identifying THAT SITE, the site's EXACT source line,
+/// reason)`.
+///
+/// **The context substring is load-bearing, not decoration.** Keyed by variable
+/// name alone — as this list shipped — a NEW unguarded fail-open site that
+/// happened to reuse a generic name would inherit the exemption and pass
+/// silently; `rest` is the obvious candidate, and it appears twice already. That
+/// made this list's own "cannot rot into a blanket permission" claim false on
+/// the day it landed, which is worse than a wrong site: the list is the
+/// mechanism the entire guarded/exempt split rests on, so a false claim ABOUT it
+/// undermines every claim made THROUGH it. The pin also asserts each context
+/// matches exactly one site, so an entry cannot silently widen later either.
+///
+/// **The third field closes #564 O2 — the exempted LINE, verbatim.** Context +
+/// count catch an exemption that stops matching, or matches too much. Neither
+/// can catch an exempted line REWRITTEN IN PLACE while keeping its context: same
+/// variable, same surrounding shape, different behaviour, still exactly one
+/// match. The reason recorded here was decided about a specific line, so the
+/// pin holds that line still: any edit to it — even a harmless one — reddens and
+/// forces the reason to be re-decided rather than inherited. Update this text
+/// only together with the reason beside it, never to make the assertion quiet.
+const UNGUARDED_TR_SITES: &[(&str, &str, &str, &str)] = &[
     (
         "cur_head",
         "\"$cur_head\" | tr",
+        r#"cur_head=$(printf '%s' "$cur_head" | tr '[:upper:]' '[:lower:]')"#,
         "the workflow gate's head oid: empty ⇒ the `[ -n \"$cur_head\" ] ||` on the very next          line blocks with unresolved-head, so the gate refuses rather than proceeds",
     ),
     (
         "rest",
         "*tagName:*)",
+        r#"*tagName:*)   rest=${a_query#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;"#,
         "tag EXTRACTION for grant keying, not gate matching: empty ⇒ empty rtag ⇒          loomux_release_gate is still entered and can then only allow via a blanket marker or          a grant file it cannot name — it never decides WHETHER to gate",
     ),
-    ("rest", "*refs/tags/*)", "the same extraction, the refs/tags literal arm"),
+    (
+        "rest",
+        "*refs/tags/*)",
+        r#"*refs/tags/*) rest=${a_query#*refs/tags/}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;"#,
+        "the same extraction, the refs/tags literal arm",
+    ),
 ];
+
+/// Does this generated-shim line ASSIGN a variable from a `tr` pipeline — and if
+/// so, which variable? The per-line scan behind
+/// `every_shim_normalizer_is_guarded_or_explicitly_exempted`, lifted out of that
+/// test's body so the scanner is testable in its own right (#564 O3) instead of
+/// only observable through the pin it drives.
+///
+/// The match is whitespace-INSENSITIVE (`| tr`, `|tr`, `|  tr` all count) so the
+/// site count is a tripwire for a genuinely new shape rather than for
+/// formatting, but it is token-AWARE, which the first cut was not:
+///
+/// * a comment is not a site — the dependency preamble quotes
+///   `x=$(printf … | tr …)` while explaining #509, and would otherwise be
+///   reported as an unguarded one;
+/// * `… || true` is not a site (#564 O3). Squashed of whitespace it reads
+///   `||true`, whose second `|` is followed by `tr`, so a plain substring test
+///   sees a `tr` pipeline in a shell OR. It over-counts rather than under-counts,
+///   so it was never a gate risk — it is fixed because a scan with known false
+///   positives is one somebody eventually loosens to make quiet, and the
+///   loosening is where the risk enters.
+fn tr_pipeline_assignment_var(line: &str) -> Option<String> {
+    if line.trim_start().starts_with('#') {
+        return None;
+    }
+    let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    // "|tr" must end a word: the next character may not continue it. ("|tr" is
+    // ASCII, so the byte after it is always a char boundary.)
+    let piped_to_tr = squashed.match_indices("|tr").any(|(i, _)| {
+        squashed[i + 3..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_')
+    });
+    if !piped_to_tr {
+        return None;
+    }
+    let eq = line.find("=$(")?;
+    let var: String = line[..eq]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if var.is_empty() {
+        None
+    } else {
+        Some(var)
+    }
+}
+
+/// #564 O3 — the scan that drives the completeness pin, pinned itself.
+///
+/// The pin's whole value is that its count is exact, so what the scan counts has
+/// to be what a reader would call a normalizer site. `|| true` was counted as
+/// one (it only escaped the site tally because the audit line it appears on has
+/// no `=$(` in it as well), and a known-false-positive scan is a scan someone
+/// later relaxes to silence it.
+#[test]
+fn the_tr_site_scan_reads_pipelines_and_not_shell_operators() {
+    // Every shape the pin claims to see, including a real site from each shim.
+    for line in [
+        r#"  path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]')"#,
+        r#"  path_low=$(printf '%s' "$a_path" |tr '[:upper:]' '[:lower:]')"#,
+        r#"  path_low=$(printf '%s' "$a_path" |  tr '[:upper:]' '[:lower:]')"#,
+        r#"safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')"#,
+    ] {
+        assert_eq!(
+            tr_pipeline_assignment_var(line).as_deref(),
+            Some(if line.trim_start().starts_with("safe") { "safe" } else { "path_low" }),
+            "a `tr` pipeline assignment must be seen as a site: {line}"
+        );
+    }
+    // THE O3 CASE: a shell OR, on a line that also assigns from a substitution.
+    // Squashed it contains `|tr` — inside `||true` — and it is not a site.
+    assert_eq!(
+        tr_pipeline_assignment_var(r#"  ts=$(date +%s) >> "$f" 2>/dev/null || true"#),
+        None,
+        "`|| true` is a shell OR, not a `tr` pipeline (#564 O3)"
+    );
+    // Nor is any other word that merely starts with `tr`.
+    assert_eq!(
+        tr_pipeline_assignment_var(r#"  x=$(cat f | truncate-tool)"#),
+        None,
+        "`|truncate-tool` is not `| tr`"
+    );
+    // A comment quoting the shape (the #509 preamble does) is not a site.
+    assert_eq!(
+        tr_pipeline_assignment_var(r#"  # Before #509: `x=$(printf … | tr …)` set x EMPTY"#),
+        None,
+        "a comment is not a site"
+    );
+    // A pipeline with nothing assigned is not a site either.
+    assert_eq!(tr_pipeline_assignment_var(r#"  printf '%s' "$x" | tr a b"#), None);
+}
 
 /// **rev-32 NB2 / rev-36 NBa+NBb — nothing enforced guard COMPLETENESS, which is
 /// what let NB1 through.** NB1 was one unguarded fail-open normalizer (`ql`)
@@ -14876,7 +14991,7 @@ const UNGUARDED_TR_SITES: &[(&str, &str, &str)] = &[
 ///
 /// So: enumerate every `VAR=$(… | tr …)` in both generated shims and require each
 /// to be guarded within a few lines, or named in `UNGUARDED_TR_SITES` with its
-/// reason. Three properties make the pin itself trustworthy, each added because
+/// reason. Four properties make the pin itself trustworthy, each added because
 /// the previous cut quietly lacked it:
 ///
 /// 1. **Exemptions are keyed by site, not by name** (NBa) — see the list above.
@@ -14885,9 +15000,23 @@ const UNGUARDED_TR_SITES: &[(&str, &str, &str)] = &[
 ///    half-blind: a site written `|tr` with no space, or split across two lines,
 ///    drops out of the count and reddens here instead of silently ceasing to be
 ///    checked. It equally catches a site ADDED without a decision.
-/// 3. **The pipe match tolerates whitespace** — `| tr`, `|tr`, `|  tr` all count,
-///    so property 2 is a tripwire for a genuinely new shape rather than for
-///    formatting.
+/// 3. **The pipe match tolerates whitespace but respects word boundaries** —
+///    `| tr`, `|tr`, `|  tr` all count so property 2 is a tripwire for a
+///    genuinely new shape rather than for formatting, while `|| true` and
+///    `| truncate` do not (#564 O3, `tr_pipeline_assignment_var`).
+/// 4. **Each exempted site's line is pinned verbatim** (#564 O2). Properties
+///    1–2 catch an exemption that drifts off its site; none of them catches the
+///    site being rewritten UNDERNEATH a still-matching exemption.
+///
+/// **What this pin does NOT prove, stated because a pin that overclaims is worse
+/// than one that doesn't exist** (#552, and #564 O1): it proves *every site it
+/// can see is guarded*, never *every site is one it can see*. It is a text scan
+/// for one shape — a normalizer written another way (`sed`, backticks, an
+/// assignment split across lines) is invisible to it AND leaves its count
+/// correct, so both halves pass. That residual is why
+/// `no_single_broken_text_tool_can_let_a_gated_command_through` exists: it asks
+/// the question behaviourally, of the running shim, where the shape a normalizer
+/// is written in does not matter.
 #[test]
 fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
     let paths =
@@ -14903,25 +15032,9 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
         let lines: Vec<&str> = script.lines().collect();
         let mut sites = 0usize;
         for (i, line) in lines.iter().enumerate() {
-            // Whitespace-insensitive pipe match, and skip comments: the preamble
-            // quotes `x=$(printf … | tr …)` while explaining the bug and would
-            // otherwise be reported as an unguarded site.
-            let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-            if !squashed.contains("|tr") || line.trim_start().starts_with('#') {
-                continue;
-            }
-            let Some(eq) = line.find("=$(") else { continue };
-            let var: String = line[..eq]
-                .chars()
-                .rev()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect::<Vec<char>>()
-                .into_iter()
-                .rev()
-                .collect();
-            if var.is_empty() {
-                continue;
-            }
+            // One scanner, pinned separately (`tr_pipeline_assignment_var` /
+            // `the_tr_site_scan_reads_pipelines_and_not_shell_operators`).
+            let Some(var) = tr_pipeline_assignment_var(line) else { continue };
             sites += 1;
             all_sites.push((var.clone(), (*line).to_string()));
             // `path_low`'s guard sits two lines below it, after `ref_low`.
@@ -14930,7 +15043,7 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
                 .any(|l| l.contains("loomux_norm_guard") && l.contains(&format!("\"${var}\"")));
             let exempt = UNGUARDED_TR_SITES
                 .iter()
-                .any(|(v, ctx, _)| *v == var.as_str() && line.contains(*ctx));
+                .any(|(v, ctx, _, _)| *v == var.as_str() && line.contains(*ctx));
             assert!(
                 guarded || exempt,
                 "{name} shim line {}: `{var}` is normalized through `tr` but is neither guarded                  by loomux_norm_guard nor listed in UNGUARDED_TR_SITES with a reason. An                  unguarded normalizer returns EMPTY when the tool fails, and empty matches no                  gate pattern — that is #509. Guard it, or add it WITH a context substring                  identifying this site and the reason its emptiness is safe.
@@ -14948,15 +15061,191 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
     // entry is stale and would sit there waiting to cover an unrelated future
     // site; more than one means the context is not specific enough to be an
     // identity, which is the blanket-permission failure in a different dress.
-    for (var, ctx, _) in UNGUARDED_TR_SITES {
-        let n = all_sites
+    for (var, ctx, pinned, reason) in UNGUARDED_TR_SITES {
+        let hits: Vec<&String> = all_sites
             .iter()
             .filter(|(v, l)| v.as_str() == *var && l.contains(*ctx))
-            .count();
+            .map(|(_, l)| l)
+            .collect();
         assert_eq!(
-            n, 1,
-            "UNGUARDED_TR_SITES entry ({var:?}, {ctx:?}) matches {n} `| tr` sites; it must match              exactly one. Zero: the site is gone — delete the exemption rather than leaving it              to cover something else later. More than one: the context is a pattern, not a site              identity, and is exempting more than it names."
+            hits.len(), 1,
+            "UNGUARDED_TR_SITES entry ({var:?}, {ctx:?}) matches {} `| tr` sites; it must match              exactly one. Zero: the site is gone — delete the exemption rather than leaving it              to cover something else later. More than one: the context is a pattern, not a site              identity, and is exempting more than it names.",
+            hits.len()
         );
+        // #564 O2: …and it must still be the SAME line. An exemption records a
+        // reason decided about specific code; rewriting that code in place, with
+        // the same variable and the same context, leaves the count and the
+        // context match untouched while the reason quietly stops being true of
+        // what it now exempts.
+        assert_eq!(
+            hits[0].trim(), *pinned,
+            "UNGUARDED_TR_SITES entry ({var:?}, {ctx:?}) still matches exactly one site, but that              site has been REWRITTEN. Its exemption reason — {reason} — was decided about the              pinned line, not this one. Re-read the reason against the new line and decide again:              if emptiness is still safe here, update the pinned text WITH the reason; if it is              not, guard the site instead. Do not update the text alone to get back to green."
+        );
+    }
+}
+
+/// The external text tools a normalizer in these shims could plausibly be
+/// written with (#564 O1). The first seven are the ones the dependency preamble
+/// asserts today (`SHIM_DEP_TOOLS`); the rest are what a future normalizer is
+/// most likely to reach for instead.
+///
+/// Sabotaging a tool nothing uses is a no-op today, and that is the point: the
+/// day something *does* use one in front of a gate decision without a guard, the
+/// sweep below is what says so — whatever shape the line is written in, and
+/// whether or not anybody remembered to add the tool to the preamble's list.
+const CANDIDATE_NORMALIZER_TOOLS: &[&str] =
+    &["tr", "head", "tail", "date", "cat", "rm", "mv", "sed", "awk", "cut", "rev", "expr"];
+
+/// **#564 O1 — the completeness question asked BEHAVIOURALLY, of the running
+/// shim.**
+///
+/// `every_shim_normalizer_is_guarded_or_explicitly_exempted` is a text scan for
+/// one shape, so it proves "every site I can see is guarded" and never "every
+/// site is one I can see": a normalizer written with `sed`, in backticks, or
+/// split across two lines is invisible to it *and* leaves its exact site count
+/// correct, so both halves of that pin pass while an unguarded fail-open site
+/// sits in the gate. #509 was exactly that failure — an empty normalization in
+/// front of a gate pattern — and shape is not what makes it dangerous.
+///
+/// So ask the question the way the bug arrives: break ONE text tool at a time —
+/// resolvable, so the startup `command -v` probe is satisfied, and silently
+/// producing nothing, which is what a corrupt install, an arch mismatch or a
+/// fork failure looks like at the call site — and require every gated command to
+/// still be REFUSED and never to reach the real binary. A new normalizer that
+/// consumes a broken tool's empty output in front of a gate decision reddens
+/// this test whatever it looks like in the source.
+///
+/// Arms on every platform: it bakes its own `utils_dir` holding the stub, so the
+/// shim's own PATH repair puts it first (same technique as
+/// `gh_shim_refuses_when_tr_resolves_but_cannot_run`, which pins the single-tool
+/// `tr` case in depth — this generalizes it across tools and gated shapes).
+///
+/// **What it still does not prove**, since a pin that overclaims is the thing
+/// #552 is about: it enumerates COMMAND SHAPES and TOOLS, so a normalizer on a
+/// code path no shape below reaches, or one built from a tool not listed above,
+/// is outside it. It is a strictly larger net than the text scan, not a complete
+/// one. What no listed shape can hide from it is the class that matters: a
+/// gated command reaching the real binary because something in front of the gate
+/// normalized to nothing.
+#[test]
+fn no_single_broken_text_tool_can_let_a_gated_command_through() {
+    use std::process::Command;
+    let Some(sh) = any_posix_sh() else {
+        pin_could_not_arm("no_single_broken_text_tool_can_let_a_gated_command_through", "no POSIX sh on this host");
+        return;
+    };
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake_gh = write_fake_gh(root, &log);
+    // Fake git: confirms no bare v* as a tag (every gated shape below names
+    // `refs/tags/…` outright), and announces itself for anything else.
+    let fake_git = root.join("fakegit_sweep");
+    std::fs::write(&fake_git,
+        "#!/bin/sh\nif [ \"$1\" = \"rev-parse\" ]; then exit 1; fi\nprintf 'FAKE-GIT-RAN\\n'; exit 0\n").unwrap();
+    let chmod = |p: &std::path::Path| {
+        let _ = Command::new(&sh).arg("-c").arg(format!("chmod +x '{}'", p.display())).status();
+    };
+    chmod(&fake_gh);
+    chmod(&fake_git);
+
+    // A shim pair built against `utils` — the directory the generated script
+    // prepends to PATH, and so the one whose contents win every tool lookup.
+    let build = |label: &str, utils: &std::path::Path| -> (std::path::PathBuf, std::path::PathBuf) {
+        let paths = ShimPaths { utils_dir: Some(msys_dir_for_fixture(utils)), git_dir: None };
+        let gh = root.join(format!("gh_{label}"));
+        std::fs::write(&gh, gh_shim_sh(&fake_gh.display().to_string(), &paths)).unwrap();
+        let git = root.join(format!("git_{label}"));
+        std::fs::write(&git, git_shim_sh(&fake_git.display().to_string(), &paths)).unwrap();
+        chmod(&gh);
+        chmod(&git);
+        (gh, git)
+    };
+    // (success, stdout, stderr). The real binary announces itself on STDOUT —
+    // that, not the exit code, is what says a gated command actually ran.
+    let run = |shim: &std::path::Path, argv: &[&str]| -> (bool, String, String) {
+        let out = Command::new(&sh).arg(shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", "1")
+            .output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // The gated shapes swept per tool. Each is a publish-to-the-world or a merge,
+    // and each reaches its decision through a different part of the shim. The
+    // graphql query uses a VARIABLE rather than an inline string literal for the
+    // measured quoting reason in `gh_shim_gates_the_api_shapes_…` (an argument
+    // carrying a `"` is truncated on the way into MSYS `sh.exe`).
+    let gated_gh: [(&[&str], &str); 4] = [
+        (&["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v1.2.3"], "DELETE of a published tag ref"),
+        (&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v9.9.9"], "POST of a release"),
+        (&["api", "graphql", "-f", "query=mutation M($t:String!){createRelease(input:{tagName:$t}){clientMutationId}}"], "graphql createRelease"),
+        (&["api", "-X", "PUT", "repos/o/r/pulls/1/merge"], "REST merge of a PR"),
+    ];
+    let gated_git: [(&[&str], &str); 1] =
+        [(&["push", "origin", "refs/tags/v1.2.3"], "push of a release tag")];
+
+    // ── The control: nothing sabotaged (an EMPTY utils dir, so every tool
+    // resolves from the inherited PATH as usual). It has to establish two things
+    // before the sweep means anything — that these shapes are refused HERE too
+    // (so the sweep is not asserting a refusal that has nothing to do with the
+    // sabotage), and that the shim otherwise WORKS (so a sweep run refusing
+    // everything is a decision, not a broken harness).
+    let control_utils = root.join("utils_control");
+    std::fs::create_dir_all(&control_utils).unwrap();
+    let (gh_ctl, git_ctl) = build("control", &control_utils);
+    let (ok, out, err) = run(&gh_ctl, &["api", "repos/o/r"]);
+    if !ok || !out.contains("FAKE-GH-RAN") {
+        // The host's own PATH cannot even run the shim's dependency check — the
+        // sweep would then "pass" by refusing everything for the wrong reason.
+        pin_could_not_arm(
+            "no_single_broken_text_tool_can_let_a_gated_command_through",
+            &format!("this host's PATH cannot satisfy the shim's own dependencies: [stdout] {out} [stderr] {err}"),
+        );
+        return;
+    }
+    let (ok, out, _) = run(&git_ctl, &["push", "origin", "main"]);
+    assert!(ok && out.contains("FAKE-GIT-RAN"), "control: an ordinary branch push must pass through, got: {out}");
+    for (argv, what) in gated_gh.iter().chain(gated_git.iter()) {
+        let shim = if argv[0] == "push" { &git_ctl } else { &gh_ctl };
+        let (ok, out, err) = run(shim, argv);
+        assert!(!ok && !out.contains("FAKE-"),
+            "control: {what} must be refused with every tool intact — [stdout] {out} [stderr] {err}");
+    }
+
+    // ── The sweep.
+    for tool in CANDIDATE_NORMALIZER_TOOLS {
+        let utils = root.join(format!("utils_{tool}"));
+        std::fs::create_dir_all(&utils).unwrap();
+        // Resolvable (so `command -v` is satisfied and the startup probe is NOT
+        // what refuses) and silently empty (exit 0, no output) — the harder half
+        // of #509's condition, since nothing is printed to hint at it.
+        let stub = utils.join(tool);
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        chmod(&stub);
+        let (gh, git) = build(tool, &utils);
+        for (argv, what) in gated_gh.iter().chain(gated_git.iter()) {
+            let is_git = argv[0] == "push";
+            let shim = if is_git { &git } else { &gh };
+            let ran = if is_git { "FAKE-GIT-RAN" } else { "FAKE-GH-RAN" };
+            let (ok, out, err) = run(shim, argv);
+            assert!(!out.contains(ran),
+                "with `{tool}` broken, {what} REACHED the real binary — a normalizer in front of \
+                 this gate consumed an empty result (#509/#564 O1). [stdout] {out} [stderr] {err}");
+            assert!(!ok,
+                "with `{tool}` broken, {what} must be refused — [stdout] {out} [stderr] {err}");
+            // …and refused BY THE GATE. Without this the sweep would pass just as
+            // happily on a shim that died of a shell error, which proves nothing.
+            assert!(err.contains("loomux:"),
+                "with `{tool}` broken, {what} was refused but not by the gate (no loomux refusal \
+                 on stderr) — [stdout] {out} [stderr] {err}");
+        }
     }
 }
 
