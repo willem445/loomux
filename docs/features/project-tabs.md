@@ -102,9 +102,11 @@ show a small placeholder); docked panes aren't shown.
 
 Right-click a tab and choose **Pause project** to hold prompt / kickoff delivery
 to that project's agents, so they idle out and stop spending while you're away;
-**Resume project** re-enables delivery. A paused tab shows a **⏸**. This is the
-per-tab form of the group pause described in the
-[orchestration guide](../orchestration.html).
+**Resume project** re-enables delivery. A paused tab shows a **⏸**. Deliveries
+that arrive while you're paused are held rather than dropped, and are delivered
+when you resume — see the
+[orchestration guide](../orchestration.html), which describes the group pause
+this is the per-tab form of, including what happens to a very long pause.
 
 ## Restore your session on launch
 

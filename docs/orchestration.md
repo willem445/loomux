@@ -358,7 +358,18 @@ one-glance summary — how many agents are live, the role breakdown, uptime, eac
 agent's state, and running session cost with a group total. From here you can:
 
 - **Pause** the group — loomux stops delivering prompts so its agents finish
-  their turn and idle out (reversible with resume).
+  their turn and idle out (reversible with resume). **Pausing holds deliveries
+  rather than dropping them**: nothing is typed into a pane while you're
+  paused, so nobody spends tokens, but a worker's `done` report fired
+  mid-pause is queued — on disk, so it survives a restart taken during the
+  pause — and delivered when you resume, labelled as having waited on the
+  pause rather than on a blocked pane. Two things still refuse rather than
+  wait, because both are you acting *now*: the compose strip's **Send** and a
+  task's **Start** button both tell you to resume first instead of deferring
+  your message to a moment you haven't picked. And the hold is not unlimited —
+  each pane queues at most 8 deliveries, so a very long pause on a busy pane
+  can start refusing new ones; the sender is told, and on resume the
+  orchestrator is told what was refused.
 - **End orchestration** — kills *every* agent in the group at once (two-click
   confirm; it's destructive). An optional **remove worktrees** checkbox also
   deletes each agent's git worktree — uncommitted changes are lost, but the
