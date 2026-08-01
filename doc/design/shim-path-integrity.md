@@ -133,8 +133,23 @@ without a guard, reddens it.
 Its own limit, equally plainly: it enumerates **command shapes** and **tools**. A
 normalizer on a code path no listed shape reaches, or built from a tool not in
 `CANDIDATE_NORMALIZER_TOOLS` (which deliberately includes tools nothing uses
-today), is outside it. It is a strictly larger net than the text scan, not a
-complete one — the two are kept because they are blind to different things.
+today), is outside it. It is a **different** net from the text scan — neither one
+contains the other, and neither is complete; both are kept because they are blind
+to different things.
+
+The counter-examples run both ways, and are worth stating so nobody later reads
+one pin as subsuming the other and deletes it (#564 rev-1 B1):
+
+* **The scan catches what the sweep cannot see.** An unguarded site added inside
+  a code path no swept shape reaches reddens the scan and nothing else. The
+  workflow-verdict gate used to be exactly that region — the sweep now enters it
+  (a `merge_gate` fixture and a `gh pr merge` shape), which shrinks the region
+  but does not remove it: `also: ci-green`, the malformed-gate arms and the
+  `--input`-body parse are all still unswept.
+* **The sweep catches what the scan cannot see.** A normalizer in an unrecognised
+  shape — `sed`, backticks, split across lines — is invisible to the scan *and*
+  leaves its exact count correct. That is O1, and it is observed, not argued:
+  see the evidence runs cited in PR #612.
 
 ## Failure 2 — `gh pr create` dies (a different cause)
 

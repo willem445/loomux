@@ -14887,55 +14887,108 @@ const UNGUARDED_TR_SITES: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// Does this generated-shim line ASSIGN a variable from a `tr` pipeline — and if
-/// so, which variable? The per-line scan behind
+/// Is `text` a `tr` PIPELINE — a `|` whose command WORD is `tr`?
+///
+/// Indifferent to the spacing between the two (`| tr`, `|tr`, `|  tr` all
+/// count), so the site count the pin asserts is a tripwire for a genuinely new
+/// shape rather than for formatting — but `tr` has to be the whole word, which
+/// the first cut got wrong in both directions:
+///
+/// * `… || true` counted as a site (#564 O3): the second `|` is followed by
+///   `tr`, and a substring test cannot tell that from a pipeline. Same for
+///   `| truncate`. Over-counting is the fail-safe direction, so it was never a
+///   gate risk — it is fixed because a scan with known false positives is one
+///   somebody eventually loosens to make quiet, and the loosening is where the
+///   risk enters.
+/// * The first fix for that squashed the whitespace out and then demanded a word
+///   boundary — which the squashing had just destroyed. `| tr A a` becomes
+///   `|trAa` and stops counting: a real site, missed. Nothing in the shipped
+///   shims is written that way (every one passes `-c`, `-d` or a `'[:class:]'`
+///   next), so the count did not move and the mistake would have sat there until
+///   somebody wrote the plainest possible `tr` call. Caught by simulating the
+///   scanner against the real templates before pushing, not by the count.
+///
+/// So: find the pipe, skip the spacing, and require `tr` not to run on into a
+/// longer word.
+fn is_tr_pipeline(text: &str) -> bool {
+    text.char_indices().filter(|(_, c)| *c == '|').any(|(i, _)| {
+        text[i + 1..]
+            .trim_start()
+            .strip_prefix("tr")
+            .is_some_and(|after| {
+                after.chars().next().map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_')
+            })
+    })
+}
+
+/// Which variables does this generated-shim line assign from a `tr` pipeline?
+/// The per-line scan behind
 /// `every_shim_normalizer_is_guarded_or_explicitly_exempted`, lifted out of that
 /// test's body so the scanner is testable in its own right (#564 O3) instead of
 /// only observable through the pin it drives.
 ///
-/// The match is whitespace-INSENSITIVE (`| tr`, `|tr`, `|  tr` all count) so the
-/// site count is a tripwire for a genuinely new shape rather than for
-/// formatting, but it is token-AWARE, which the first cut was not:
+/// **Every `=$(…)` on the line, not the first** (#564 rev-1 B2). The first cut
+/// took `line.find("=$(")` and asked whether the LINE contained a `tr` pipeline
+/// anywhere, which is wrong twice over: a second normalizer appended beside an
+/// existing site was neither counted nor checked (invisible, and leaving the
+/// exact count correct — the O1 shape inside the shape the scan claims to
+/// recognise), and a `tr` pipeline in the *second* substitution was attributed to
+/// the *first* substitution's variable. The shim already writes several
+/// statements per line — the two exempted `rest=…; rest=$(… | tr …); rtag=…`
+/// arms are exactly that shape — so this is the natural next edit, not a
+/// hypothetical. Each substitution is now delimited by its own matching `)` and
+/// tested for a `tr` pipeline on its own.
 ///
-/// * a comment is not a site — the dependency preamble quotes
-///   `x=$(printf … | tr …)` while explaining #509, and would otherwise be
-///   reported as an unguarded one;
-/// * `… || true` is not a site (#564 O3). Squashed of whitespace it reads
-///   `||true`, whose second `|` is followed by `tr`, so a plain substring test
-///   sees a `tr` pipeline in a shell OR. It over-counts rather than under-counts,
-///   so it was never a gate risk — it is fixed because a scan with known false
-///   positives is one somebody eventually loosens to make quiet, and the
-///   loosening is where the risk enters.
-fn tr_pipeline_assignment_var(line: &str) -> Option<String> {
+/// A comment is never a site: the dependency preamble quotes
+/// `x=$(printf … | tr …)` while explaining #509, and would otherwise be reported
+/// as an unguarded one.
+///
+/// Still line-shaped, and that residual is real: an assignment split across two
+/// lines is invisible here, which is what the count assertion's hint names.
+fn tr_pipeline_assignment_vars(line: &str) -> Vec<String> {
     if line.trim_start().starts_with('#') {
-        return None;
+        return Vec::new();
     }
-    let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-    // "|tr" must end a word: the next character may not continue it. ("|tr" is
-    // ASCII, so the byte after it is always a char boundary.)
-    let piped_to_tr = squashed.match_indices("|tr").any(|(i, _)| {
-        squashed[i + 3..]
-            .chars()
-            .next()
-            .map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_')
-    });
-    if !piped_to_tr {
-        return None;
+    let mut vars = Vec::new();
+    let mut from = 0usize;
+    while let Some(off) = line[from..].find("=$(") {
+        let eq = from + off; // the `=`
+        let open = eq + 2; // the `(`
+        // The substitution ends at ITS matching `)`. An unbalanced `)` inside
+        // quotes would end it early and could only ADD sites (the tail is then
+        // rescanned), which reddens the count rather than hiding a site — the
+        // fail-safe direction for a scan whose job is to notice new ones.
+        let mut depth = 0usize;
+        let mut close = line.len();
+        for (k, c) in line[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = open + k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if is_tr_pipeline(&line[open..close]) {
+            let var: String = line[..eq]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<char>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if !var.is_empty() {
+                vars.push(var);
+            }
+        }
+        from = eq + 3;
     }
-    let eq = line.find("=$(")?;
-    let var: String = line[..eq]
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect::<Vec<char>>()
-        .into_iter()
-        .rev()
-        .collect();
-    if var.is_empty() {
-        None
-    } else {
-        Some(var)
-    }
+    vars
 }
 
 /// #564 O3 — the scan that drives the completeness pin, pinned itself.
@@ -14948,39 +15001,93 @@ fn tr_pipeline_assignment_var(line: &str) -> Option<String> {
 #[test]
 fn the_tr_site_scan_reads_pipelines_and_not_shell_operators() {
     // Every shape the pin claims to see, including a real site from each shim.
-    for line in [
-        r#"  path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]')"#,
-        r#"  path_low=$(printf '%s' "$a_path" |tr '[:upper:]' '[:lower:]')"#,
-        r#"  path_low=$(printf '%s' "$a_path" |  tr '[:upper:]' '[:lower:]')"#,
-        r#"safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')"#,
+    for (line, want) in [
+        (r#"  path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]')"#, "path_low"),
+        (r#"  path_low=$(printf '%s' "$a_path" |tr '[:upper:]' '[:lower:]')"#, "path_low"),
+        (r#"  path_low=$(printf '%s' "$a_path" |  tr '[:upper:]' '[:lower:]')"#, "path_low"),
+        (r#"safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9._-' '_')"#, "safe"),
+        // The plainest possible `tr` call, whose next token starts with a LETTER.
+        // No shipped site is written this way, which is exactly why it belongs
+        // here: the first fix for the `|| true` false positive squashed the
+        // whitespace out before demanding a word boundary, and silently stopped
+        // seeing this shape without moving the count (#564 rev-1).
+        (r#"  low=$(printf '%s' "$x" | tr A a)"#, "low"),
+        (r#"  low=$(printf '%s' "$x" |tr A a)"#, "low"),
     ] {
         assert_eq!(
-            tr_pipeline_assignment_var(line).as_deref(),
-            Some(if line.trim_start().starts_with("safe") { "safe" } else { "path_low" }),
+            tr_pipeline_assignment_vars(line),
+            vec![want.to_string()],
             "a `tr` pipeline assignment must be seen as a site: {line}"
         );
     }
+    let none: Vec<String> = Vec::new();
     // THE O3 CASE: a shell OR, on a line that also assigns from a substitution.
     // Squashed it contains `|tr` — inside `||true` — and it is not a site.
     assert_eq!(
-        tr_pipeline_assignment_var(r#"  ts=$(date +%s) >> "$f" 2>/dev/null || true"#),
-        None,
+        tr_pipeline_assignment_vars(r#"  ts=$(date +%s) >> "$f" 2>/dev/null || true"#),
+        none,
         "`|| true` is a shell OR, not a `tr` pipeline (#564 O3)"
     );
     // Nor is any other word that merely starts with `tr`.
     assert_eq!(
-        tr_pipeline_assignment_var(r#"  x=$(cat f | truncate-tool)"#),
-        None,
+        tr_pipeline_assignment_vars(r#"  x=$(cat f | truncate-tool)"#),
+        none,
         "`|truncate-tool` is not `| tr`"
     );
     // A comment quoting the shape (the #509 preamble does) is not a site.
     assert_eq!(
-        tr_pipeline_assignment_var(r#"  # Before #509: `x=$(printf … | tr …)` set x EMPTY"#),
-        None,
+        tr_pipeline_assignment_vars(r#"  # Before #509: `x=$(printf … | tr …)` set x EMPTY"#),
+        none,
         "a comment is not a site"
     );
     // A pipeline with nothing assigned is not a site either.
-    assert_eq!(tr_pipeline_assignment_var(r#"  printf '%s' "$x" | tr a b"#), None);
+    assert_eq!(tr_pipeline_assignment_vars(r#"  printf '%s' "$x" | tr a b"#), none);
+}
+
+/// **#564 rev-1 B2 — one line can hold more than one normalizer, and the scan
+/// has to see all of them.**
+///
+/// The first cut took the FIRST `=$(` on the line and asked whether the LINE
+/// contained a `tr` pipeline anywhere. Both halves of that are wrong in the same
+/// direction: a second normalizer appended beside an existing site is neither
+/// counted nor guard-checked, while the exact count — the property that is
+/// supposed to catch "a site was ADDED without a decision" — stays correct,
+/// because the line was already counted once. That is O1's shape hiding inside
+/// the shape the scan claims to recognise, and the shim already writes lines like
+/// it (the two exempted `rest=…; rest=$(… | tr …); rtag=…` arms).
+#[test]
+fn the_tr_site_scan_sees_every_assignment_on_a_line() {
+    // The B2 shape: a guarded site with a second, unguarded normalizer appended.
+    // Both must come back — the caller checks each one for a guard separately.
+    assert_eq!(
+        tr_pipeline_assignment_vars(
+            r#"  path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]'); mth=$(printf '%s' "$a_method" | tr '[:upper:]' '[:lower:]')"#
+        ),
+        vec!["path_low".to_string(), "mth".to_string()],
+        "a second normalizer on the same line is a second site (#564 rev-1 B2)"
+    );
+    // Each substitution is judged on its OWN contents: a `tr` pipeline in the
+    // second one must not be attributed to the first one's variable, which is
+    // what a whole-line match did.
+    assert_eq!(
+        tr_pipeline_assignment_vars(r#"  n=$(date +%s); low=$(printf '%s' "$x" | tr A a)"#),
+        vec!["low".to_string()],
+        "the `tr` belongs to the substitution it is IN, not to the first assignment on the line"
+    );
+    // …and the mirror: a `tr` in the first, something else in the second.
+    assert_eq!(
+        tr_pipeline_assignment_vars(r#"  low=$(printf '%s' "$x" | tr A a); n=$(date +%s)"#),
+        vec!["low".to_string()]
+    );
+    // The real exempted shape — a `${…}` expansion (`=${`, not `=$(`) before the
+    // substitution, and `)` characters after it — still yields exactly one site.
+    assert_eq!(
+        tr_pipeline_assignment_vars(
+            r#"          *tagName:*)   rest=${a_query#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;"#
+        ),
+        vec!["rest".to_string()],
+        "the exempted extraction arm is one site, not zero and not two"
+    );
 }
 
 /// **rev-32 NB2 / rev-36 NBa+NBb — nothing enforced guard COMPLETENESS, which is
@@ -14999,11 +15106,16 @@ fn the_tr_site_scan_reads_pipelines_and_not_shell_operators() {
 ///    scan dying completely. An exact count also catches the scan going
 ///    half-blind: a site written `|tr` with no space, or split across two lines,
 ///    drops out of the count and reddens here instead of silently ceasing to be
-///    checked. It equally catches a site ADDED without a decision.
+///    checked. It catches a site ADDED without a decision **to the extent the
+///    scanner sees it** — which is every `=$(… | tr …)` on a line, since #564
+///    rev-1 B2, but still one LINE at a time. A `tr` site split across two lines
+///    is invisible AND leaves the count correct; so is any normalizer not built
+///    from `tr`. Neither is a hypothetical the count covers — the paragraph
+///    below names where that class is actually caught.
 /// 3. **The pipe match tolerates whitespace but respects word boundaries** —
 ///    `| tr`, `|tr`, `|  tr` all count so property 2 is a tripwire for a
 ///    genuinely new shape rather than for formatting, while `|| true` and
-///    `| truncate` do not (#564 O3, `tr_pipeline_assignment_var`).
+///    `| truncate` do not (#564 O3, `is_tr_pipeline`).
 /// 4. **Each exempted site's line is pinned verbatim** (#564 O2). Properties
 ///    1–2 catch an exemption that drifts off its site; none of them catches the
 ///    site being rewritten UNDERNEATH a still-matching exemption.
@@ -15032,29 +15144,32 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
         let lines: Vec<&str> = script.lines().collect();
         let mut sites = 0usize;
         for (i, line) in lines.iter().enumerate() {
-            // One scanner, pinned separately (`tr_pipeline_assignment_var` /
-            // `the_tr_site_scan_reads_pipelines_and_not_shell_operators`).
-            let Some(var) = tr_pipeline_assignment_var(line) else { continue };
-            sites += 1;
-            all_sites.push((var.clone(), (*line).to_string()));
-            // `path_low`'s guard sits two lines below it, after `ref_low`.
-            let guarded = lines[i..(i + 4).min(lines.len())]
-                .iter()
-                .any(|l| l.contains("loomux_norm_guard") && l.contains(&format!("\"${var}\"")));
-            let exempt = UNGUARDED_TR_SITES
-                .iter()
-                .any(|(v, ctx, _, _)| *v == var.as_str() && line.contains(*ctx));
-            assert!(
-                guarded || exempt,
-                "{name} shim line {}: `{var}` is normalized through `tr` but is neither guarded                  by loomux_norm_guard nor listed in UNGUARDED_TR_SITES with a reason. An                  unguarded normalizer returns EMPTY when the tool fails, and empty matches no                  gate pattern — that is #509. Guard it, or add it WITH a context substring                  identifying this site and the reason its emptiness is safe.
+            // One scanner, pinned separately (`tr_pipeline_assignment_vars` /
+            // `the_tr_site_scan_reads_pipelines_and_not_shell_operators` +
+            // `…_sees_every_assignment_on_a_line`). A line can hold more than one
+            // site, and each is counted and checked on its own (#564 rev-1 B2).
+            for var in tr_pipeline_assignment_vars(line) {
+                sites += 1;
+                all_sites.push((var.clone(), (*line).to_string()));
+                // `path_low`'s guard sits two lines below it, after `ref_low`.
+                let guarded = lines[i..(i + 4).min(lines.len())]
+                    .iter()
+                    .any(|l| l.contains("loomux_norm_guard") && l.contains(&format!("\"${var}\"")));
+                let exempt = UNGUARDED_TR_SITES
+                    .iter()
+                    .any(|(v, ctx, _, _)| *v == var.as_str() && line.contains(*ctx));
+                assert!(
+                    guarded || exempt,
+                    "{name} shim line {}: `{var}` is normalized through `tr` but is neither guarded                  by loomux_norm_guard nor listed in UNGUARDED_TR_SITES with a reason. An                  unguarded normalizer returns EMPTY when the tool fails, and empty matches no                  gate pattern — that is #509. Guard it, or add it WITH a context substring                  identifying this site and the reason its emptiness is safe.
   {}",
-                i + 1,
-                line.trim()
-            );
+                    i + 1,
+                    line.trim()
+                );
+            }
         }
         assert_eq!(
             sites, *expected,
-            "{name} shim: expected {expected} `| tr` sites, scanned {sites}. If you added or              removed a normalizer, update the count deliberately. If you did not, the SCAN has              gone blind to one — check for an assignment split across lines, which this              line-shaped scan cannot see, and which would otherwise stop being checked silently."
+            "{name} shim: expected {expected} `| tr` sites, scanned {sites}. If you added or              removed a normalizer, update the count deliberately. If you did not, the SCAN has              gone blind to one — and knowing HOW it can go blind is part of the contract: it              reads one LINE at a time, so an assignment split across two lines is invisible to              it (every `=$(…)` WITHIN a line is seen, since #564 rev-1 B2). It is also blind to              any normalizer not built from `tr`; that class is covered behaviourally instead, by              `no_single_broken_text_tool_can_let_a_gated_command_through`."
         );
     }
     // NBa: every exemption must identify EXACTLY ONE real site. Zero means the
@@ -15093,8 +15208,17 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
 /// day something *does* use one in front of a gate decision without a guard, the
 /// sweep below is what says so — whatever shape the line is written in, and
 /// whether or not anybody remembered to add the tool to the preamble's list.
-const CANDIDATE_NORMALIZER_TOOLS: &[&str] =
-    &["tr", "head", "tail", "date", "cat", "rm", "mv", "sed", "awk", "cut", "rev", "expr"];
+///
+/// `grep` earns its place ahead of the rest of that tier (#564 rev-1 N2): a gate
+/// is a MATCHER, and `grep` is what a shell author reaches for the moment `case`
+/// stops being expressive enough — so it is the likeliest tool for a future gate
+/// decision to consume. `wc`, `sort`, `uniq`, `basename` and `dirname` are the
+/// next tier and are deliberately NOT here: each costs a further ~1s of sweep on
+/// the slowest platform, and none of them is a plausible *matcher*. Add one when
+/// a normalizer plausibly reaches for it, not pre-emptively.
+const CANDIDATE_NORMALIZER_TOOLS: &[&str] = &[
+    "tr", "head", "tail", "date", "cat", "rm", "mv", "sed", "awk", "cut", "rev", "expr", "grep",
+];
 
 /// **#564 O1 — the completeness question asked BEHAVIOURALLY, of the running
 /// shim.**
@@ -15123,10 +15247,22 @@ const CANDIDATE_NORMALIZER_TOOLS: &[&str] =
 /// **What it still does not prove**, since a pin that overclaims is the thing
 /// #552 is about: it enumerates COMMAND SHAPES and TOOLS, so a normalizer on a
 /// code path no shape below reaches, or one built from a tool not listed above,
-/// is outside it. It is a strictly larger net than the text scan, not a complete
-/// one. What no listed shape can hide from it is the class that matters: a
-/// gated command reaching the real binary because something in front of the gate
+/// is outside it. It is a **different** net from the text scan — neither one
+/// contains the other, and neither is complete; both are kept because they are
+/// blind to different things (#564 rev-1 B1). An unguarded site inside a code
+/// path no shape below reaches reddens the scan and NOT this test; a normalizer
+/// in a shape the scan cannot see reddens this test and NOT the scan. Reading
+/// either as subsuming the other is how one of them gets deleted in a tidy-up.
+/// What no listed shape can hide from it is the class that matters: a gated
+/// command reaching the real binary because something in front of the gate
 /// normalized to nothing.
+///
+/// Concretely unswept today, so nobody has to re-derive it: the `also: ci-green`
+/// condition, the malformed-gate arms, and the `--input`-body ref parse. The
+/// group fixture below deliberately covers the workflow-verdict gate itself
+/// (#564 rev-1 N1) — the highest-value gate in the file, and the home of the
+/// exempted `cur_head` normalizer, whose exemption reason is a claim about
+/// behaviour and so belongs here rather than only in a comment.
 #[test]
 fn no_single_broken_text_tool_can_let_a_gated_command_through() {
     use std::process::Command;
@@ -15138,8 +15274,48 @@ fn no_single_broken_text_tool_can_let_a_gated_command_through() {
     let root = td.path();
     let group = root.join("group");
     std::fs::create_dir_all(&group).unwrap();
+
+    // ── The group fixture. An EMPTY group dir left the highest-value gate in the
+    // file entirely unswept (#564 rev-1 N1): the workflow-verdict gate is behind
+    // `[ -f $LOOMUX_GROUP_DIR/merge_gate ]`, so with no such file none of these
+    // invocations entered it — and `cur_head`, one of the three exempted
+    // normalizers, lives inside it. Its exemption's stated reason is that the
+    // `[ -n "$cur_head" ] ||` on the very next line blocks; that is a claim about
+    // BEHAVIOUR, so the sweep should be the thing holding it.
+    //
+    // `autonomous` + `auto_merge` blanket-open the HUMAN gate deliberately, so
+    // that for `gh pr merge` the workflow gate is the only thing left between the
+    // command and the real gh. Without that the merge is refused by the human
+    // gate whatever the verdicts say, and the sweep would be pinning the wrong
+    // refusal. (The release/tag shapes are unaffected: they need `auto_release`.)
+    for marker in ["autonomous", "auto_merge"] {
+        std::fs::write(group.join(marker), b"").unwrap();
+    }
+    std::fs::write(group.join("merge_gate"), "require all-pass\nreviewer rev-1\n").unwrap();
+    // A PASS whose head line is EMPTY — a hand-written or truncated verdict file.
+    // With every tool working this is STALE (it cannot cover the current head) and
+    // the merge is refused. It is chosen because it is the shape that turns a
+    // failed `cur_head` normalization into a bypass: an empty `cur_head` compares
+    // equal to an empty recorded head, and the stale verdict silently becomes a
+    // pass for any revision — #197's failure class, reached through #509's.
+    std::fs::create_dir_all(group.join("verdicts/pr-1")).unwrap();
+    std::fs::write(group.join("verdicts/pr-1/rev-1"), "pass\n\n").unwrap();
+
+    // Fake gh: as `write_fake_gh`, plus an answer for the workflow gate's
+    // `--json headRefOid` lookup, which that shared fixture has no notion of.
     let log = root.join("gh.log");
-    let fake_gh = write_fake_gh(root, &log);
+    let fake_gh = root.join("fakegh_sweep");
+    std::fs::write(&fake_gh, format!(
+        "#!/bin/sh\n\
+         echo \"ARGS: $*\" >> \"{log}\"\n\
+         if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n\
+        \x20 for a in \"$@\"; do case \"$a\" in *headRefOid*) printf '%s\\n' \"$FAKE_HEAD\"; exit 0 ;; esac; done\n\
+        \x20 printf '%s %s\\n' \"$FAKE_BASE\" \"$FAKE_NUM\"; exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf '%s\\n' \"$FAKE_DEFAULT\"; exit 0; fi\n\
+         printf 'FAKE-GH-RAN\\n'; exit 0\n",
+        log = log.display()
+    )).unwrap();
     // Fake git: confirms no bare v* as a tag (every gated shape below names
     // `refs/tags/…` outright), and announces itself for anything else.
     let fake_git = root.join("fakegit_sweep");
@@ -15169,6 +15345,7 @@ fn no_single_broken_text_tool_can_let_a_gated_command_through() {
         let out = Command::new(&sh).arg(shim).args(argv)
             .env("LOOMUX_GROUP_DIR", &group)
             .env("FAKE_BASE", "main").env("FAKE_DEFAULT", "main").env("FAKE_NUM", "1")
+            .env("FAKE_HEAD", "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c")
             .output().unwrap();
         (
             out.status.success(),
@@ -15182,11 +15359,17 @@ fn no_single_broken_text_tool_can_let_a_gated_command_through() {
     // graphql query uses a VARIABLE rather than an inline string literal for the
     // measured quoting reason in `gh_shim_gates_the_api_shapes_…` (an argument
     // carrying a `"` is truncated on the way into MSYS `sh.exe`).
-    let gated_gh: [(&[&str], &str); 4] = [
+    let gated_gh: [(&[&str], &str); 5] = [
         (&["api", "-X", "DELETE", "repos/o/r/git/refs/tags/v1.2.3"], "DELETE of a published tag ref"),
         (&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v9.9.9"], "POST of a release"),
         (&["api", "graphql", "-f", "query=mutation M($t:String!){createRelease(input:{tagName:$t}){clientMutationId}}"], "graphql createRelease"),
         (&["api", "-X", "PUT", "repos/o/r/pulls/1/merge"], "REST merge of a PR"),
+        // #564 rev-1 N1. NOT the REST shape above, which is refused earlier as
+        // `api-merge` and never reaches the workflow gate: only `gh pr merge`
+        // resolves the base/number and then enters the `merge_gate` block, where
+        // the exempted `cur_head` normalizer lives. The human gate is blanket-open
+        // here (see the fixture), so a refusal of this shape IS the workflow gate.
+        (&["pr", "merge", "1"], "merge of a PR under an unsatisfied workflow gate"),
     ];
     let gated_git: [(&[&str], &str); 1] =
         [(&["push", "origin", "refs/tags/v1.2.3"], "push of a release tag")];
