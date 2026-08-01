@@ -1160,7 +1160,11 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
    crash". */
 .pane-plugin {
   flex: 1; min-height: 0; min-width: 0;
-  display: flex; align-items: center; justify-content: center;
+  /* Column, so the #377 capability-approval surface can put its "Review
+     permissions…" button UNDER the status line. A single child (the normal
+     "Opening …" / error case) centres identically either way. */
+  display: flex; flex-direction: column; gap: 10px;
+  align-items: center; justify-content: center;
 }
 .pane-plugin-status {
   color: var(--text-dim);

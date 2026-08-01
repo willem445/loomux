@@ -721,9 +721,12 @@ fn a_widened_manifest_re_prompts_and_names_only_the_newly_added_capability() {
 
     install_declaring(plugins_root.path(), "demo", "2.0.0", &["storage", "fs.read"], false);
     let req = open_req("demo", &["storage", "fs.read"], Some("ignored"));
+    let refusal = validate_open_request(plugins_root.path(), &req)
+        .expect_err("a widened manifest must NOT ride the earlier, narrower approval");
     assert!(
-        validate_open_request(plugins_root.path(), &req).is_err(),
-        "a widened manifest must NOT ride the earlier, narrower approval"
+        refusal.contains("fs.read") && !refusal.contains("storage"),
+        "the re-prompt must name the DELTA — what the plugin newly wants — not re-list what was \
+         already approved, got: {refusal}"
     );
     assert_eq!(
         approval_status(&load_grants(plugins_root.path()), "demo", &caps(&["storage", "fs.read"])),

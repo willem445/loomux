@@ -83,7 +83,7 @@ rows, and none will ever let a plugin invent a fifth:
 | --- | --- | --- |
 | `panel` | Render into the pane's content box. | Implicit — every plugin gets this merely by existing. Declaring it in `capabilities` is accepted as a harmless no-op (so the sample above stays valid), but you don't have to list it. |
 | `storage` | A namespaced per-plugin key/value store (`storage.get`/`storage.set`). | Your own bucket only — no other plugin, and no host code, can read or overwrite it. |
-| `fs.read` | Read files **under your plugin pane's own root only**. | Path-jailed, no exceptions. Unavailable (and rejected at validation) on a `rootless: true` plugin. |
+| `fs.read` | Read files **under your plugin's own installed folder only**. | Path-jailed, no exceptions, and the jail is worked out by loomux itself from your plugin's id — nothing the pane sends can widen it. Unavailable (and rejected at validation) on a `rootless: true` plugin. |
 | `metrics.system` | Subscribe to a read-only, bounded stream of system + per-process CPU/RAM stats. | Curated payload — name, pid, cpu%, rss only; no cmdline, no paths, no environment. Capped at 32 processes/tick, polling clamped to 1–10s regardless of what you request. |
 
 **Not in the enum, so unreachable no matter what you write:** any filesystem
@@ -92,16 +92,40 @@ command, and the network (see CSP, below). The broker has no handler
 function for any of these — there's no code path to find a bug in, because
 there is no code path.
 
-**Capabilities are auto-granted in v1, not yet a reviewed human decision.**
-Declaring a capability in your manifest and passing validation is enough —
-installing copies the folder and every declared capability is live
-immediately, with no approval prompt shown along the way. Nothing in the
-protocol lets a plugin widen its own grant after install, but nothing today
-shows the human what they're granting either; an install-time approval step
-is planned ([#377](https://github.com/willem445/loomux/issues/377)) and is a
-required blocker before general availability. In the meantime this is
-bounded by the enum itself — the four rows above are all a manifest can ever
-ask for, and none of them reach a write, git/gh/PTY, or the network.
+## Capabilities need the human's permission before they do anything
+
+Declaring a capability asks for it; it doesn't get it
+([#377](https://github.com/willem445/loomux/issues/377)). Installing a plugin
+is just a folder copy and grants **nothing**. The first time someone opens
+your plugin, loomux shows them what it declares — one plain-language line per
+capability, with `fs.read` and `metrics.system` flagged as the ones that
+reach data on the machine — and the pane only runs if they choose **Allow**.
+
+What that means in practice:
+
+- **Until it's allowed**, the pane shows why it hasn't started plus a
+  **Review permissions…** button. Nothing pops up on its own: reopening a
+  saved workspace full of plugin panes never throws a stack of dialogs at
+  you, it just leaves each pane waiting for a click.
+- **Declining costs nothing.** Nothing is written; press the button again
+  whenever you want.
+- **The answer is remembered** per plugin, in
+  `<app-data>/loomux/plugins/grants.json`, and survives restarts.
+- **Asking for more re-asks.** If a new version of a plugin adds a capability
+  it didn't have, the next open stops and names the *new* one. Asking for
+  **less** doesn't re-ask — you already allowed more than it now wants.
+- **If the file is lost or damaged**, loomux re-asks rather than assuming
+  yes. The damaged copy is kept aside as `grants.corrupt.json`.
+- **Nothing but you can answer.** No plugin, script, or agent can write that
+  file through loomux — the command that records an approval is reachable
+  only from loomux's own trusted window.
+
+The bundled `resource-monitor` example prompts on first open exactly like a
+third-party plugin would.
+
+This sits on top of the enum, it doesn't replace it: the four rows above are
+still all a manifest can ever ask for, and none of them reach a write,
+git/gh/PTY, or the network.
 
 ## Talking to the broker
 
@@ -227,6 +251,11 @@ onto the machine is a manual, human act:
 3. In loomux, open a new pane, pick **Plugin**, and select it from the list.
    A folder with an invalid manifest simply doesn't show up — it isn't
    surfaced as an error in the picker.
+4. The first time you open it, the pane asks permission for what the manifest
+   declares — press **Review permissions…**, read the list, and choose
+   **Allow**. That answer is remembered; see
+   [Capabilities need the human's permission](#capabilities-need-the-humans-permission-before-they-do-anything)
+   for when it re-asks.
 
 A plugin pane persists like any other content pane. If the plugin gets
 uninstalled between sessions, the pane fails soft to the welcome form with a

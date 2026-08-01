@@ -653,13 +653,34 @@ pub fn validate_open_request(
             req.api_version, BROKER_API_VERSION
         ));
     }
-    if !crate::plugingrants::is_approved(plugins_root, &req.plugin_id, &req.capabilities) {
-        return Err(format!(
-            "{}: `{}` has not been approved to use [{}] — a human has to review its capabilities first",
-            crate::plugingrants::NOT_APPROVED_CODE,
-            req.plugin_id,
-            crate::plugingrants::normalize_capabilities(&req.capabilities).join(", ")
-        ));
+    // The refusal names WHAT is missing, not just that something is: on a
+    // widened manifest it carries the delta (`ApprovalStatus::Widened`'s
+    // `added`), so the human re-approving an upgraded plugin is told "it now
+    // also wants fs.read" rather than being handed the whole list again to
+    // diff by eye. This string is surfaced verbatim by the pane's consent
+    // surface (`src/pluginpaneview.ts`), so it is written for a human.
+    match crate::plugingrants::approval_status(
+        &crate::plugingrants::load_grants(plugins_root),
+        &req.plugin_id,
+        &req.capabilities,
+    ) {
+        crate::plugingrants::ApprovalStatus::Approved => {}
+        crate::plugingrants::ApprovalStatus::NeverApproved => {
+            return Err(format!(
+                "{}: `{}` has not been approved to use [{}] — review its capabilities first",
+                crate::plugingrants::NOT_APPROVED_CODE,
+                req.plugin_id,
+                crate::plugingrants::normalize_capabilities(&req.capabilities).join(", ")
+            ));
+        }
+        crate::plugingrants::ApprovalStatus::Widened { added } => {
+            return Err(format!(
+                "{}: `{}` now also wants [{}], which was not part of what was approved — review it again",
+                crate::plugingrants::NOT_APPROVED_CODE,
+                req.plugin_id,
+                added.join(", ")
+            ));
+        }
     }
     Ok(ValidatedOpenRequest {
         granted,

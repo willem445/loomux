@@ -146,20 +146,20 @@ breaks main" into "CI is red." Three tests:
    (string search + bracket match, not a hand count) and diffs them against
    `command_manifest::APP_COMMANDS`. Fails if a command is registered in one
    list but not the other.
-2. **`app_commands_len_is_139`** (`app_commands_len_is_120` at this design's
+2. **`app_commands_len_is_140`** (`app_commands_len_is_120` at this design's
    original landing) — a drift tripwire against the current count. The test's
    own assertion message carries the authoritative running tally; the short
    version is 120 per the #363 plan's original audit, +12 from unrelated
    feature work since (#364, #316/#355, #287/#328/#329, #370, #405/#332,
-   #456, #457, #507), and +7 from the pane-plugins feature itself (see the
-   addendum below).
-3. **`main_has_all_139_and_zero_permission_denies_dangerous_spread`** — the
+   #456, #457, #507), +7 from the pane-plugins feature itself and +1 from its
+   capability approval gate (see the two addenda below).
+3. **`main_has_all_140_and_zero_permission_denies_dangerous_spread`** — the
    one that matters most. It builds a real (headless) `tauri::test` mock app
    — `tauri::test::mock_builder()` + `.build(tauri::generate_context!())` —
    using the app's **actual on-disk `capabilities/`/`permissions/`**, the
    same resolution `build.rs` feeds the shipped binary. This is not a
    reimplementation of ACL resolution; it exercises Tauri's real resolver.
-   It registers all 139 stub commands sharing the real commands' bare names
+   It registers all 140 stub commands sharing the real commands' bare names
    (zero-arg no-ops — no PTYs, no git/gh calls, no orchestration side
    effects), invokes every one of them against the `main` window label and
    asserts none are denied, then invokes the plan's representative dangerous
@@ -196,7 +196,7 @@ non-main webview" case. It is a **partial** answer, deliberately:
   plugin/non-main webview can be confined to zero or a curated grant, and
   that confinement is genuinely enforced by Tauri's resolver — the hard
   prerequisite #360 Slice C needed.
-- **What it does not close:** `main` is still granted all 139 commands, and
+- **What it does not close:** `main` is still granted all 140 commands, and
   the app CSP (`tauri.conf.json`'s `app.security.csp`) is still `null`. A
   script injected *into main* — e.g. via the frontend's own XSS surface —
   still reaches every command exactly as before this change. And #189's core
@@ -257,3 +257,24 @@ unrelated feature work. #360 adds seven of its own, taking it to 139:
 All seven are otherwise ordinary entries in `APP_COMMANDS` and
 `generate_handler!`, subject to the same all-or-nothing flip as every other
 command.
+
+## Update (#377): 139 → 140 commands
+
+The pane-plugins install-time capability approval gate
+([#377](https://github.com/willem445/loomux/issues/377), `plugingrants.rs`)
+adds one command, `plugin_approve_capabilities` — the single writer of the
+per-plugin capability-grant store, and therefore the single thing that makes
+a plugin's declared capabilities live at all.
+
+It is granted **main-only**, folded into the existing
+`permissions/sets/plugins.toml` set (which only `main-ui` aggregates),
+alongside `list_plugins`/`install_plugin`. Two tests pin that, both in
+`tests/acl_manifest.rs`: it is in the dangerous spread the zero-permission
+probe must be denied, and in the `MUST_BE_DENIED` list for a real
+`plugin-*` child webview. A webview that could reach it could approve
+itself, which is precisely the self-approval CLAUDE.md's constraint 9
+forbids — so "never widen this beyond the `plugins` set" is a rule with a
+red test behind it, not a comment.
+
+The count tripwire and the two `_139`-suffixed test names moved to 140 in
+the same change.
