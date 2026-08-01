@@ -14299,8 +14299,10 @@ pub enum HoldObservation {
 /// drainer, because that removal has to be atomic with the queue check.
 pub fn ends_hold_episode(observation: HoldObservation) -> bool {
     match observation {
-        HoldObservation::Delivered => true,
-        HoldObservation::HeldPoll | HoldObservation::WritablePoll | HoldObservation::Aborted => false,
+        // NEUTERED for #560's red run: pre-#560, a single writable poll ended
+        // the episode — `HeldEscalation::Clear` dropped the badge one-shot.
+        HoldObservation::Delivered | HoldObservation::WritablePoll => true,
+        HoldObservation::HeldPoll | HoldObservation::Aborted => false,
     }
 }
 
@@ -26960,6 +26962,13 @@ impl OrchRegistry {
     /// seam — every mutation goes through [`OrchRegistry::note_hold`].
     #[doc(hidden)] // pub for integration tests
     pub fn hold_episode_since(&self, pty_id: u32) -> Option<u64> {
+        // NEUTERED for #560's red run: pre-#560 the clock was the FRONT queue
+        // entry's `enqueued_ms`, which `enqueue_stranded_front`'s marker resets.
+        if let Some(front_ms) =
+            self.queues.lock_safe().get(&pty_id).and_then(|q| q.front()).map(|e| e.enqueued_ms)
+        {
+            return Some(front_ms);
+        }
         self.hold_episodes.lock_safe().get(&pty_id).map(|e| e.started_ms)
     }
 
@@ -27006,9 +27015,18 @@ impl OrchRegistry {
             self.note_hold(group, agent_id, pty_id, HoldObservation::WritablePoll, now_ms);
             return HeldEscalation::Clear;
         }
-        let started_ms = self
+        let episode_ms = self
             .note_hold(group, agent_id, pty_id, HoldObservation::HeldPoll, now_ms)
             .unwrap_or(now_ms);
+        // NEUTERED for #560's red run: pre-#560 this step read the FRONT queue
+        // entry's stamp, not the pane's episode.
+        let started_ms = self
+            .queues
+            .lock_safe()
+            .get(&pty_id)
+            .and_then(|q| q.front())
+            .map(|e| e.enqueued_ms)
+            .unwrap_or(episode_ms);
         // One audit line per hold EPISODE, not per poll and not per reason
         // change — the record has to show that loomux held and said so, without
         // becoming an entry every two seconds for as long as the hold stands
@@ -27272,7 +27290,7 @@ impl OrchRegistry {
         // record would hand a future drainer on this pty a clock from a queue
         // that no longer exists — the mirror of the stale `queue_pressure` entry
         // #563 had to clear for exactly the same reason.
-        self.hold_episodes.lock_safe().remove(&pty_id);
+        // NEUTERED for #560's red run: pre-#560 there was no episode to end here.
         // #563: the queue is now empty, so any pressure badge this pane was
         // carrying is no longer true. Before `announce_dropped`, so the drop
         // notice is the last word rather than being followed by a release.

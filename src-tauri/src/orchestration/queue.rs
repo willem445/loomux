@@ -801,10 +801,10 @@ pub fn at_capacity_notice(agent_id: &str, cap: usize) -> String {
 ///
 /// So: the earlier of the two, and `None` when no episode is open.
 pub fn undelivered_since(oldest_entry_ms: u64, hold_since_ms: Option<u64>) -> u64 {
-    match hold_since_ms {
-        Some(held) => oldest_entry_ms.min(held),
-        None => oldest_entry_ms,
-    }
+    // NEUTERED for #560's red run: pre-#560 the notice took the front entry's
+    // stamp and knew nothing about the pane's hold episode.
+    let _ = hold_since_ms;
+    oldest_entry_ms
 }
 
 /// Whether this pane's undelivered work freshly crosses the still-queued notice
