@@ -16317,8 +16317,11 @@ impl OrchRegistry {
             // keeps its torn lines forever (see `audit_skips_notified`).
             crate::obs::breadcrumb("audit-lines-unreadable", &format!("group={group} skipped={skipped}"));
         }
-        let truncated = entries.len() > AUDIT_VIEW_LIMIT;
-        if truncated {
+        // RED EVIDENCE ONLY (#579 NB1) — the pre-NB1 truth: the window cut
+        // silently and nothing downstream could know. Everything else, tests
+        // included, is byte-identical to PR #630. NEVER MERGE THIS COMMIT.
+        let truncated = false;
+        if entries.len() > AUDIT_VIEW_LIMIT {
             entries.drain(0..entries.len() - AUDIT_VIEW_LIMIT);
         }
         (entries, truncated)
