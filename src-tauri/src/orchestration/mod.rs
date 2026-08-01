@@ -7018,15 +7018,23 @@ pub struct OrchRegistry {
     /// would re-stage entries a first pass already re-admitted and deliver
     /// them twice.
     recovered_groups: Arc<Mutex<HashSet<String>>>,
-    /// #532: panes whose question hold has already raised the one-shot
-    /// possibly-stale badge ([`StrandedBlocker::QuestionStale`]). The drainer
-    /// evaluates `held_escalation` on every `QUEUE_DRAIN_POLL` tick, and
-    /// `mark_stranded` audits on every call — without this the audit log would
-    /// gain a line every two seconds for as long as the pane stayed held,
-    /// which is the same flood the badge exists to replace. Cleared the moment
-    /// the pane reads deliverable again, so a LATER hold on the same pane
-    /// badges again rather than being silently suppressed by the first.
-    question_stale_notified: Arc<Mutex<HashSet<u32>>>,
+    /// #560: each pane's open hold EPISODE — when it began, and what has
+    /// already been said about it. Keyed by `pty_id`, in memory only (see
+    /// [`HoldEpisode`] for the restart argument).
+    ///
+    /// **Why one record and not two flags (#560).** #532 kept the escalation's
+    /// clock and its one-shot in two different places: the clock was the front
+    /// queue entry's `enqueued_ms` and the one-shot was a `HashSet<u32>` of
+    /// already-badged panes. *Those two do not describe the same thing*, and
+    /// both of #560's symptoms are that mismatch — a writable poll reset the
+    /// one-shot without resetting the clock (re-badge churn), and
+    /// `enqueue_stranded_front`'s fresh `now_ms()` marker reset the clock
+    /// without ending the episode (a deferred badge on a pane that never
+    /// recovered). Fusing them into one record with one lifecycle makes the
+    /// divergence unrepresentable rather than merely fixed: there is no way to
+    /// clear the one-shot without ending the episode, because they are the
+    /// same value.
+    hold_episodes: Arc<Mutex<HashMap<u32, HoldEpisode>>>,
     /// #563: the last capacity state each pane's queue was OBSERVED in, so
     /// pressure is reported on the transition up and released on the
     /// transition down.
@@ -7035,8 +7043,10 @@ pub struct OrchRegistry {
     /// a `HashSet` of "already warned" panes would latch, and a pane that
     /// drained, recovered and backed up again would be silent the second time
     /// — which is exactly the failure mode
-    /// [`OrchRegistry::question_stale_notified`]'s own doc had to fix by
-    /// clearing itself. Storing the state instead makes both directions fall
+    /// [`OrchRegistry::hold_episodes`]'s `question_stale_notified` predecessor
+    /// had to fix by clearing itself (#560 replaced that flag with the episode
+    /// record, but the failure mode it names is unchanged).
+    /// Storing the state instead makes both directions fall
     /// out of one comparison. Release is on EVIDENCE (a depth that has
     /// actually come back down), never on elapsed time — `.loomux/lessons.md`,
     /// "releasing on evidence beats releasing on elapsed time".
@@ -11415,6 +11425,37 @@ fn deliver_now(
     // some attempt happened to prepend to it.
     recoverable_kickoff: Option<String>,
 ) -> DeliverOutcome {
+    // ⚠ #561 — READ THIS BEFORE ADDING A STAGE BELOW.
+    //
+    // `REINJECT_ACK_SETTLE_MS` (~line 1573) is a const expression that SUMS the
+    // unconditional pre-Enter stages of this function — the echo-verified typing
+    // loop, `PASTE_SUBMIT_DELAY`, `SUBMIT_MAX_WAIT`, `SUBMIT_CONFIRM_WINDOW` and
+    // the sequential `SUBMIT_RETRY_DELAYS`. The membership rule is: **if you add
+    // a stage that runs on EVERY delivery before the last Enter, it belongs in
+    // that expression.** A conditional stage (a hold that only fires when a gate
+    // trips) does not; see that constant's own doc for what it deliberately
+    // excludes and why (#546).
+    //
+    // The rule is written at the constant too. It is repeated here because that
+    // is not where it gets broken: the constant came out short TWICE (#535
+    // rev-22 D1, rev-28 Q1), both times because someone editing THIS function
+    // had no reason to scroll nine thousand lines up. A rule only discoverable
+    // from the place you are not standing is a request, not a guard — and the
+    // bidirectional test mirror catches a change to the CONSTANT, not the
+    // addition of a STAGE, which is exactly this drift vector.
+    //
+    // Getting it wrong is not cosmetic. The constant is a settling FLOOR added
+    // to the moment we decided to paste, and an MCP call from the target agent
+    // is only counted as acknowledging that paste if it lands after the floor
+    // (#535's re-grounding ack, `agent_acted_since`). Too short, and a call the
+    // agent had already decided on during its PREVIOUS turn resolves the phase
+    // for a notice it has not read yet — the same false landed-signal class #112
+    // and #522 removed elsewhere. The two times this constant was wrong it was
+    // short both times.
+    //
+    // #561 option 2 (making the stage list data the code consumes, so adding a
+    // stage necessarily adds it to the bound) is the version that cannot be
+    // forgotten; this comment is option 1, and it is a request, not a guard.
     let _guard = lock.lock_safe();
     let ptys = app.state::<crate::pty::PtyManager>();
     let paste = bracketed_paste(&text);
@@ -12669,7 +12710,18 @@ fn run_queue_drainer(
             // unanswered question/box is the DESIGNED case for this
             // feature, not a leak — see `queue::still_queued_notice`'s doc.
             let already_notified = reg.queue_still_notified.lock_safe().contains(&pty_id);
-            if queue::should_fire_still_queued_notice(front.enqueued_ms, now_ms(), already_notified) {
+            // #560: the same defect the escalation clock had. `front.enqueued_ms`
+            // is the FRONT entry's stamp, and a `StrandedSubmit` marker pushed
+            // by `enqueue_stranded_front` makes the front the YOUNGEST entry —
+            // so this notice was deferred by the very event that proves the pane
+            // is stuck. `undelivered_since` takes the earlier of the pane's open
+            // hold episode and the oldest entry actually queued; see its doc for
+            // why BOTH terms are load-bearing.
+            let oldest_entry_ms =
+                entries.iter().map(|e| e.enqueued_ms).min().unwrap_or(front.enqueued_ms);
+            let waiting_since =
+                queue::undelivered_since(oldest_entry_ms, reg.hold_episode_since(pty_id));
+            if queue::should_fire_still_queued_notice(waiting_since, now_ms(), already_notified) {
                 reg.queue_still_notified.lock_safe().insert(pty_id);
                 let minutes = queue::QUEUE_STILL_QUEUED_NOTICE_AFTER.as_secs() / 60;
                 let target_is_orchestrator = a.role == Role::Orchestrator;
@@ -12691,52 +12743,30 @@ fn run_queue_drainer(
             // delivery actually LIVES, since `deliver_now` holds only for its
             // own capped waits while this re-arms them with no cap, so it is
             // also where the aggregate hold has to be bounded and reported.
-            let already_badged = reg.question_stale_notified.lock_safe().contains(&pty_id);
-            match held_escalation(
+            //
+            // #560: and the whole step is `hold_escalation_step`'s, not eight
+            // lines here, for the reason that method's doc gives: this function
+            // needs a real `AppHandle`, so anything inline here is unreachable
+            // by every test in this repo — which is how #560's badge churn
+            // survived a review round that verified `held_escalation` itself.
+            // What is left below is only the pane-header chip, which is
+            // genuinely drainer-local state.
+            let escalation = reg.hold_escalation_step(
+                &group,
+                &front.agent_id,
+                pty_id,
                 admission,
-                front.enqueued_ms,
+                depth,
                 now_ms(),
                 QUESTION_HOLD_STALE_AFTER.as_millis() as u64,
-                already_badged,
-            ) {
+            );
+            match escalation {
                 // #563: the pane is held right now — say so right now. This
                 // arm is the fix: pre-#563 it did not exist, `held_escalation`
                 // returned `None` for every poll inside the bound, and the
                 // pane showed nothing at all until the ten-minute escalation.
-                HeldEscalation::Chip(reason) => {
-                    if chip_reason.get().is_none() {
-                        // One audit line per hold EPISODE, not per poll and not
-                        // per reason change — the record has to show that
-                        // loomux held and said so, without becoming an entry
-                        // every two seconds for as long as the hold stands (the
-                        // same reasoning `mark_stranded`'s one-shot rests on).
-                        // The CHIP re-words when the blocking gate changes
-                        // (rev-10 finding 3); the audit deliberately does not,
-                        // because an alternating pane would then flood the log
-                        // with the flapping this line exists to summarise.
-                        reg.audit(&group, "loomux", "delivery-held-in-queue", json!({
-                            "to": front.agent_id, "stage": "queue-poll",
-                            "blocked_on": admission.enqueue_reason().as_str(),
-                            "held_ms": now_ms().saturating_sub(front.enqueued_ms),
-                            "depth": depth,
-                        }));
-                    }
-                    raise_chip(&front.agent_id, reason);
-                }
-                HeldEscalation::Badge(blocker) => {
-                    // rev-12 NB5: guard the RAISE, not just the clear. The
-                    // first cut guarded only the clear and claimed a genuine
-                    // #496 PR-C badge was "never cleared by this one's
-                    // recovery" — but `mark_stranded` overwrites
-                    // unconditionally, so that badge became ours and the
-                    // guarded clear then removed it. Declining to overwrite
-                    // makes the comment true: another mechanism's badge is
-                    // already telling the human this pane needs them, which is
-                    // what this escalation exists to achieve anyway.
-                    if reg.stranded_note(&front.agent_id).is_none() {
-                        reg.question_stale_notified.lock_safe().insert(pty_id);
-                        reg.mark_stranded(&group, &front.agent_id, Some(blocker));
-                    }
+                HeldEscalation::Chip(reason) => raise_chip(&front.agent_id, reason),
+                HeldEscalation::Badge(_) => {
                     // #563: a hold can reach the bound having never been
                     // chipped — a drainer starting on an entry enqueued long
                     // ago evaluates its very first poll already past it. The
@@ -12745,23 +12775,24 @@ fn run_queue_drainer(
                         raise_chip(&front.agent_id, reason);
                     }
                 }
-                HeldEscalation::Clear => {
-                    // #563: fires on every writable poll now, so both clears
-                    // are guarded — `lower_chip` on our own `chip_reason`, and
-                    // `clear_stranded` (below) on the badge being ours.
-                    lower_chip();
-                    reg.question_stale_notified.lock_safe().remove(&pty_id);
-                    // Still blocker-guarded: between our raise and now, another
-                    // mechanism may have re-badged this pane for its own
-                    // reason, and that badge is not ours to drop.
-                    if reg
-                        .stranded_note(&front.agent_id)
-                        .is_some_and(|n| matches!(n.blocker, Some(StrandedBlocker::QuestionStale) | Some(StrandedBlocker::HumanInput)))
-                    {
-                        reg.clear_stranded(&group, &front.agent_id, "delivery-hold-released");
+                // #563: fires on every writable poll now, and `lower_chip` is
+                // guarded on our own `chip_reason`, so a pane that was never
+                // chipped costs no event. #560: the BADGE no longer comes down
+                // here — a writable poll is a provisional reading, not proof the
+                // delivery can land, and dropping the badge on it (then
+                // re-raising it on the next held poll) is symptom 1. The badge
+                // now comes down where the pane proves it: `Delivered`.
+                HeldEscalation::Clear => lower_chip(),
+                // #560: the badge is up and the bound has elapsed — nothing to
+                // change about it. The chip is still raised, because it may have
+                // been lowered by a `Clear` earlier in this same episode and the
+                // pane is held right now. `raise_chip` is idempotent per reason,
+                // so a steady hold still emits exactly one event.
+                HeldEscalation::None => {
+                    if let Some(reason) = admission.held_reason() {
+                        raise_chip(&front.agent_id, reason);
                     }
                 }
-                HeldEscalation::None => {}
             }
             if !admission.go() {
                 continue; // keep polling — no cap
@@ -12885,13 +12916,28 @@ fn run_queue_drainer(
         // single-entry batch takes the identical pre-#533 path.
         let closed: Vec<(u64, u64)> = batch.iter().map(|e| (e.id, e.enqueued_ms)).collect();
 
+        // #560: the hold episode's lifecycle, at the ONE place that knows
+        // whether this pane accepted a delivery. `Done` is the only evidence
+        // that ends an episode (`ends_hold_episode`); either abort OPENS one if
+        // the poll above did not, which is what covers a hold that lives
+        // entirely inside `deliver_now` — every poll reads writable, every
+        // attempt then aborts, and pre-#560 nothing ever started a clock.
+        let observation = match outcome {
+            DeliverOutcome::Done => HoldObservation::Delivered,
+            DeliverOutcome::AbortedPrePaste(_) | DeliverOutcome::AbortedPreEnter(_) => {
+                HoldObservation::Aborted
+            }
+        };
+        reg.note_hold(&group, &front.agent_id, pty_id, observation, now_ms());
+
         match outcome {
             DeliverOutcome::Done => {
                 reg.pop_batch_dequeued(&group, pty_id, &closed);
                 reg.queue_still_notified.lock_safe().remove(&pty_id);
-                // #532: same lifecycle — a delivered entry means whatever was
-                // holding this pane is over, so a LATER hold badges afresh.
-                reg.question_stale_notified.lock_safe().remove(&pty_id);
+                // #532/#560: the hold episode ended at the `note_hold` call
+                // above — a delivered entry means whatever was holding this pane
+                // is over, so a LATER hold clocks and badges afresh.
+                lower_chip();
             }
             DeliverOutcome::AbortedPrePaste(reason) => {
                 // Nothing pasted (or the stranded flush declined) — leave
@@ -13939,8 +13985,9 @@ const PREPASTE_RECHECK_ROUNDS: u32 = 3;
 /// either constant: the drainer thread that evaluates this bound is the same
 /// thread that blocks inside `deliver_now`, so while a delivery is holding,
 /// nothing is polling. The consequence to know is on the other side — time to
-/// badge is measured from `enqueued_ms` but only *sampled* between attempts, so
-/// a pane that keeps entering `deliver_now` can take up to roughly 19 minutes
+/// badge is measured from the pane's hold-episode start ([`HoldEpisode`], #560;
+/// `enqueued_ms` before that) but only *sampled* between attempts, so a pane
+/// that keeps entering `deliver_now` can take up to roughly 19 minutes
 /// to badge, not 10. Sizing this constant against the hold chain would be
 /// reasoning about a race that cannot happen; sizing it against how long a
 /// human will accept silence is the real constraint.
@@ -13979,10 +14026,13 @@ pub const QUESTION_HOLD_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 /// it fire instantly, so a mis-set constant degrades to silence rather than to
 /// a badge on every pane.
 ///
-/// `held_since_ms` is the front queue entry's `enqueued_ms` — the moment this
-/// delivery stopped being attempted and started being *held* — so the clock
-/// measures the thing the human experienced (a prompt that has not moved),
-/// not the lifetime of any one attempt.
+/// `held_since_ms` is the PANE's hold-episode start ([`HoldEpisode`], #560) —
+/// the moment this pane last failed to accept a delivery and has not accepted
+/// one since — so the clock measures the thing the human experienced (a pane
+/// that has not moved), not the lifetime of any one attempt and not the age of
+/// whichever entry happens to be at the queue front. It was `front.enqueued_ms`
+/// until #560; see [`ends_hold_episode`] for why an entry-scoped clock could be
+/// restarted by a `StrandedSubmit` marker on a pane that never recovered.
 #[doc(hidden)] // pub for integration tests
 pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> bool {
     if bound_ms == 0 {
@@ -14136,6 +14186,131 @@ pub fn held_escalation(
         // `unreachable!()`: this runs on a detached drainer thread, where a
         // panic is a silently dead pane (rev-19 N9's finding, same reasoning).
         WriteAdmission::Go => HeldEscalation::None,
+    }
+}
+
+/// #560: one pane's open hold episode — *this pane has not accepted a delivery
+/// since `started_ms`* — and what has already been said about it.
+///
+/// **The episode, not the entry.** #532 measured its escalation from the front
+/// queue entry's `enqueued_ms`, which is a fact about a *payload*, not about the
+/// pane. The two come apart the moment the queue front changes under a pane that
+/// never recovered, which is exactly what `enqueue_stranded_front` does after an
+/// `AbortedPreEnter`: it pops the batch that was pasted and pushes a
+/// `StrandedSubmit` marker carrying a fresh `now_ms()`, handing the bound a
+/// brand-new clock for a pane that has been blocked continuously. Keying on the
+/// pane instead makes "held since T" mean what both the badge's wording and the
+/// one-shot already assumed it meant.
+///
+/// **In memory, and what a restart does.** This is not queue state and owes no
+/// `persist_queues` call (#468) — the same argument its `question_stale_notified`
+/// predecessor made. A restart therefore forgets any mid-flight episode: the
+/// process that would have badged is gone, `queue.json` recovery re-admits the
+/// payloads (#467), and the fresh drainer opens a new episode on its first
+/// failed observation, so the ten-minute clock restarts from the restart. That
+/// is the right direction to be wrong in — persisting it would badge instantly
+/// on boot for a hold a human may well have resolved while loomux was down,
+/// which is a false claim on the badge whose whole job is to be trustworthy —
+/// and the loss is bounded by the restart already announcing itself through
+/// recovery notices and `queue_orphans`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HoldEpisode {
+    /// When this pane's current hold episode began — the drainer's first
+    /// observation that the pane did not accept a delivery.
+    started_ms: u64,
+    /// Whether `delivery-held-in-queue` has been written for THIS episode. One
+    /// line per episode, not per poll: the record has to show that loomux held
+    /// and said so without becoming an entry every two seconds.
+    ///
+    /// #560: this replaces keying that one-shot on the drainer's pane-header
+    /// chip being down. The chip is LIVE state (it follows the gate on every
+    /// poll and comes down the instant the pane reads writable), so keying an
+    /// episode-scoped audit line on it churned for the same reason the badge
+    /// did — a flickering pane re-raised the chip and re-wrote the line.
+    announced: bool,
+    /// Whether the ten-minute escalation badge ([`StrandedBlocker::QuestionStale`]
+    /// / [`StrandedBlocker::HumanInput`]) has fired for THIS episode — the
+    /// `already_badged` input [`held_escalation`] takes.
+    ///
+    /// **Stated limit.** This says *we raised it*, not *it is still up*: another
+    /// mechanism's `clear_stranded` (the late monitor's `Resolved` arm, or
+    /// `attention_tick` pruning a dead agent) can take the badge down while this
+    /// stays `true`, and the escalation will not re-raise until the episode
+    /// ends. Not repaired here on purpose — a re-raise loop would fight whatever
+    /// just cleared it, and the one realistic clearer (`Resolved`) means the
+    /// delivery resolved, which produces the `Delivered` observation that ends
+    /// the episode anyway. Pre-#560 the same latch existed for as long as no
+    /// writable poll intervened; what changed is that a writable poll no longer
+    /// resets it.
+    badged: bool,
+}
+
+/// #560: what one drainer iteration observed about a pane, as a closed set, and
+/// the single place that says which observations END its hold episode.
+///
+/// **Why a type rather than four `if`s at the call sites.** The rule this
+/// encodes — *a momentary writable reading is not the end of an episode; a
+/// delivery landing is* — is the entire fix for #560's first symptom, and the
+/// pre-#560 code expressed the opposite rule implicitly, by clearing the badge
+/// one-shot inside the drainer's `HeldEscalation::Clear` arm. Nothing named it,
+/// so nothing could test it and nothing failed when it was wrong. Matching
+/// exhaustively in [`ends_hold_episode`] means a future observation cannot be
+/// added without deciding, in writing and in one place, what it does to the
+/// clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldObservation {
+    /// A poll found the pane not writable (`write_admission` held).
+    HeldPoll,
+    /// A poll found the pane writable. **Provisional**, not proof: the drainer
+    /// goes straight on to `deliver_now`, which re-reads both gates at the
+    /// paste and at the Enter and can abort on either — so "writable at the
+    /// instant of one poll" is precisely the reading a flickering pane produces
+    /// between two aborted attempts.
+    WritablePoll,
+    /// An attempt ran and did not deliver (`AbortedPrePaste`/`AbortedPreEnter`).
+    /// OPENS an episode if none is open: a hold that lives entirely inside
+    /// `deliver_now` (every poll reads writable, every attempt then aborts)
+    /// would otherwise never start a clock at all, and that pane is exactly as
+    /// stuck as one that fails at the poll.
+    Aborted,
+    /// A delivery LANDED (`DeliverOutcome::Done`) — the pane accepted a write.
+    Delivered,
+}
+
+/// #560: does this observation end the pane's hold episode?
+///
+/// Only evidence that the pane actually **accepted** a delivery does. The
+/// alternative — ending an episode on a writable reading — is what #532
+/// effectively did, and it fails in both directions at once:
+///
+/// - *Churn.* A badged pane that reads writable for one poll and then aborts
+///   drops and re-raises its badge (`stranded-attention` / `stranded-cleared`
+///   per flicker), which is the audit flood the one-shot exists to prevent.
+/// - *Suppression, which is worse.* If the clock restarted on every writable
+///   poll, a pane whose occupancy toggles faster than the bound — a human
+///   typing with a delivery queued behind them, #560's own reported scenario —
+///   would never badge **at all**. That re-creates the #532 bug class
+///   ("an escalation that never fires") and violates the rule
+///   [`hold_bound_elapsed`]'s doc states outright: an escalation must not be
+///   suppressible by the signals it exists to report on.
+///
+/// The queue emptying ends an episode too, but not through here: `commit_exit`
+/// drops the record in the same generation-guarded step that deregisters the
+/// drainer, because that removal has to be atomic with the queue check.
+pub fn ends_hold_episode(observation: HoldObservation) -> bool {
+    match observation {
+        HoldObservation::Delivered => true,
+        HoldObservation::HeldPoll | HoldObservation::WritablePoll | HoldObservation::Aborted => false,
+    }
+}
+
+/// #560: does this observation OPEN a hold episode (start the clock) if none is
+/// open yet? Both of the drainer's ways of failing to deliver do; a writable
+/// poll neither opens nor closes one.
+pub fn opens_hold_episode(observation: HoldObservation) -> bool {
+    match observation {
+        HoldObservation::HeldPoll | HoldObservation::Aborted => true,
+        HoldObservation::WritablePoll | HoldObservation::Delivered => false,
     }
 }
 
@@ -14648,7 +14823,7 @@ impl OrchRegistry {
             queue_draining: Arc::new(Mutex::new(HashMap::new())),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
-            question_stale_notified: Arc::new(Mutex::new(HashSet::new())),
+            hold_episodes: Arc::new(Mutex::new(HashMap::new())),
             queue_pressure: Arc::new(Mutex::new(HashMap::new())),
             unconfirmed_pending: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
@@ -26730,6 +26905,186 @@ impl OrchRegistry {
         }
     }
 
+    /// #560: record one drainer observation against `pty_id`'s hold episode,
+    /// returning when the (possibly just-opened) episode began, or `None` when
+    /// no episode is open.
+    ///
+    /// The only place [`ends_hold_episode`]/[`opens_hold_episode`] are
+    /// consulted, so the lifecycle rule — *what starts and what ends an
+    /// episode* — is applied identically to every observation instead of being
+    /// re-spelled per call site, which is how #532's clock and its one-shot
+    /// came to disagree in the first place.
+    ///
+    /// **It is NOT the only writer of [`OrchRegistry::hold_episodes`], and an
+    /// earlier version of this doc said it was** (#599 review, rev-10). Four
+    /// functions write the map, at six points, every one of them deliberate —
+    /// enumerated here so the safety argument invites the audit rather than
+    /// ending it:
+    ///
+    /// | writer | writes | why not here |
+    /// | --- | --- | --- |
+    /// | `note_hold` | inserts (episode opens) | — |
+    /// | `note_hold` | removes (episode ends) | — |
+    /// | [`OrchRegistry::hold_escalation_step`] | sets `announced` | needs the audit-line decision it is making |
+    /// | [`OrchRegistry::hold_escalation_step`] | sets `badged` | gated on `stranded_note`, which the lifecycle rule knows nothing about |
+    /// | `commit_exit` | removes | must be ATOMIC with the emptiness check + `queue_draining` removal |
+    /// | `drop_queue` | removes | the pane's queue is gone; no observation describes it |
+    ///
+    /// What IS true, and is the invariant worth relying on: the two fields that
+    /// have to agree — `started_ms` and `badged` — are only ever created and
+    /// destroyed together, because they live in one value that is inserted whole
+    /// and removed whole. Every writer above either creates the record, destroys
+    /// it, or sets a one-shot flag inside a record that already exists. None can
+    /// reset the clock while leaving the one-shot armed, or vice versa, which is
+    /// the exact divergence #560 exists to make unrepresentable.
+    ///
+    /// Ending an episode also drops the escalation badge it raised, if that
+    /// badge is still ours: the blocker check is the same one the pre-#560
+    /// `Clear` arm made, moved to the point where the pane has *proved* it can
+    /// accept a delivery rather than merely read writable for one poll.
+    /// Another mechanism's badge is never ours to drop (#532 rev-12 NB5).
+    #[doc(hidden)] // pub for integration tests
+    pub fn note_hold(
+        &self,
+        group: &str,
+        agent_id: &str,
+        pty_id: u32,
+        observation: HoldObservation,
+        now_ms: u64,
+    ) -> Option<u64> {
+        if ends_hold_episode(observation) {
+            let had = self.hold_episodes.lock_safe().remove(&pty_id);
+            // Only clear the badge if this episode is the one that raised it.
+            // A `Delivered` on a pane that was never escalated must not reach
+            // in and drop some other mechanism's badge.
+            if had.is_some_and(|e| e.badged)
+                && self
+                    .stranded_note(agent_id)
+                    .is_some_and(|n| matches!(n.blocker, Some(StrandedBlocker::QuestionStale) | Some(StrandedBlocker::HumanInput)))
+            {
+                self.clear_stranded(group, agent_id, "delivery-hold-released");
+            }
+            return None;
+        }
+        let mut episodes = self.hold_episodes.lock_safe();
+        match episodes.get(&pty_id) {
+            Some(open) => Some(open.started_ms),
+            None if opens_hold_episode(observation) => {
+                episodes.insert(pty_id, HoldEpisode { started_ms: now_ms, announced: false, badged: false });
+                Some(now_ms)
+            }
+            // A writable poll on a pane with no open episode: nothing to open
+            // (it is not held) and nothing to close.
+            None => None,
+        }
+    }
+
+    /// #560: when `pty_id`'s open hold episode began, if one is open.
+    ///
+    /// Read-only itself. It does NOT imply that every mutation goes through
+    /// [`OrchRegistry::note_hold`] — an earlier version of this doc claimed
+    /// that and it was false (#599 review, rev-10); see `note_hold`'s own doc
+    /// for the enumeration of all four writers and why each is where it is.
+    #[doc(hidden)] // pub for integration tests
+    pub fn hold_episode_since(&self, pty_id: u32) -> Option<u64> {
+        self.hold_episodes.lock_safe().get(&pty_id).map(|e| e.started_ms)
+    }
+
+    /// #560: has `pty_id`'s open hold episode already raised its escalation
+    /// badge? The `already_badged` input [`held_escalation`] takes. Read-only
+    /// seam.
+    #[doc(hidden)] // pub for integration tests
+    pub fn hold_episode_badged(&self, pty_id: u32) -> bool {
+        self.hold_episodes.lock_safe().get(&pty_id).is_some_and(|e| e.badged)
+    }
+
+    /// #532/#560/#563: ONE held drainer poll's escalation step — open (or
+    /// continue) the pane's hold episode, write the once-per-episode audit
+    /// line, decide via [`held_escalation`], and raise the badge if it is due.
+    ///
+    /// **Why this is a registry method and not eight lines in the drainer**
+    /// (the `flush_stranded_text` argument, one function over). `run_queue_
+    /// drainer` needs a real `AppHandle`, which a headless integration test
+    /// cannot build — so anything left inline there is unreachable by every
+    /// test in this repo, and #560's first symptom is precisely a defect that
+    /// lived in those inline lines while `held_escalation`'s own contract stayed
+    /// green and pinned. Everything that needs no `AppHandle` lives here; the
+    /// caller is left with the pane-header chip, which is genuinely drainer-
+    /// local UI state.
+    ///
+    /// The returned [`HeldEscalation`] is `held_escalation`'s verdict verbatim,
+    /// so the caller can still drive the chip off it. A `Clear` deliberately
+    /// does NOT end the episode — see [`ends_hold_episode`].
+    #[doc(hidden)] // pub for integration tests
+    #[allow(clippy::too_many_arguments)]
+    pub fn hold_escalation_step(
+        &self,
+        group: &str,
+        agent_id: &str,
+        pty_id: u32,
+        admission: WriteAdmission,
+        depth: usize,
+        now_ms: u64,
+        bound_ms: u64,
+    ) -> HeldEscalation {
+        if admission.go() {
+            // Provisional recovery. The chip comes down (the caller's job) but
+            // the episode stands until a delivery actually lands.
+            self.note_hold(group, agent_id, pty_id, HoldObservation::WritablePoll, now_ms);
+            return HeldEscalation::Clear;
+        }
+        let started_ms = self
+            .note_hold(group, agent_id, pty_id, HoldObservation::HeldPoll, now_ms)
+            .unwrap_or(now_ms);
+        // One audit line per hold EPISODE, not per poll and not per reason
+        // change — the record has to show that loomux held and said so, without
+        // becoming an entry every two seconds for as long as the hold stands
+        // (the same reasoning `mark_stranded`'s one-shot rests on). The CHIP
+        // re-words when the blocking gate changes (#563 rev-10 finding 3); the
+        // audit deliberately does not, because an alternating pane would then
+        // flood the log with the flapping this line exists to summarise.
+        let announce = {
+            let mut episodes = self.hold_episodes.lock_safe();
+            match episodes.get_mut(&pty_id) {
+                Some(e) if !e.announced => {
+                    e.announced = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if announce {
+            self.audit(group, "loomux", "delivery-held-in-queue", json!({
+                "to": agent_id, "stage": "queue-poll",
+                "blocked_on": admission.enqueue_reason().as_str(),
+                "held_ms": now_ms.saturating_sub(started_ms),
+                "depth": depth,
+            }));
+        }
+        let escalation = held_escalation(
+            admission,
+            started_ms,
+            now_ms,
+            bound_ms,
+            self.hold_episode_badged(pty_id),
+        );
+        if let HeldEscalation::Badge(blocker) = escalation {
+            // #532 rev-12 NB5: guard the RAISE, not just the clear.
+            // `mark_stranded` overwrites unconditionally, so badging over
+            // another mechanism's badge would make it ours — and our clear
+            // would then remove it. Declining to overwrite costs nothing: that
+            // badge is already telling the human this pane needs them, which is
+            // all this escalation exists to achieve.
+            if self.stranded_note(agent_id).is_none() {
+                if let Some(e) = self.hold_episodes.lock_safe().get_mut(&pty_id) {
+                    e.badged = true;
+                }
+                self.mark_stranded(group, agent_id, Some(blocker));
+            }
+        }
+        escalation
+    }
+
     /// Whether a drainer thread is currently registered for `pty_id` — i.e.
     /// whether something may be mid-`deliver_now` on this pane's queue front
     /// (#496 PR-C's admission gate; see `stranded_admission_gate`). Also the
@@ -26834,8 +27189,8 @@ impl OrchRegistry {
     /// because double-firing a generation-checked removal is harmless by
     /// construction.
     ///
-    /// Also clears `pty_id` from `queue_still_notified` and (#532)
-    /// `question_stale_notified` in the SAME
+    /// Also clears `pty_id` from `queue_still_notified` and (#532/#560) its
+    /// `hold_episodes` record in the SAME
     /// generation-checked step (review round 2, N3) — folded in here
     /// rather than left as a separate post-return call at each exit site,
     /// which had the identical stale-clear shape (a committed-but-not-yet-
@@ -26865,13 +27220,17 @@ impl OrchRegistry {
                 draining.remove(&pty_id);
                 drop(draining);
                 self.queue_still_notified.lock_safe().remove(&pty_id);
-                // #532: cleared with its sibling, for the same reason — this
-                // pane's queue is done, so nothing is being held on it any
-                // more. An in-memory one-shot flag, NOT queue state: it owes
-                // no `persist_queues` call (#468), and clearing it inside the
-                // same generation guard is what stops a successor drainer's
-                // freshly-armed flag being stripped by a predecessor's exit.
-                self.question_stale_notified.lock_safe().remove(&pty_id);
+                // #532/#560: cleared with its sibling, for the same reason —
+                // this pane's queue is done, so nothing is being held on it any
+                // more. This is the "the queue emptied" end of a hold episode
+                // ([`ends_hold_episode`]'s doc names it), and it lives HERE
+                // rather than going through `note_hold` because it has to be
+                // atomic with the emptiness check and the `queue_draining`
+                // removal above. In-memory state, NOT queue state: it owes no
+                // `persist_queues` call (#468), and clearing it inside the same
+                // generation guard is what stops a successor drainer's
+                // freshly-opened episode being stripped by a predecessor's exit.
+                self.hold_episodes.lock_safe().remove(&pty_id);
                 // #563: same lifecycle, same reasoning — this pane's queue is
                 // done, so its remembered capacity edge is about a queue that
                 // no longer exists. Left behind, it would make a successor
@@ -26933,6 +27292,14 @@ impl OrchRegistry {
         if !entries.is_empty() {
             self.persist_queues(group);
         }
+        // #560: the queue is gone, so nothing is being held on this pane — the
+        // same end-of-episode `commit_exit` performs for the drainer's own exits
+        // (there it must be atomic with the emptiness check, which is why it is
+        // written out there rather than shared with this line). Left behind, the
+        // record would hand a future drainer on this pty a clock from a queue
+        // that no longer exists — the mirror of the stale `queue_pressure` entry
+        // #563 had to clear for exactly the same reason.
+        self.hold_episodes.lock_safe().remove(&pty_id);
         // #563: the queue is now empty, so any pressure badge this pane was
         // carrying is no longer true. Before `announce_dropped`, so the drop
         // notice is the last word rather than being followed by a release.

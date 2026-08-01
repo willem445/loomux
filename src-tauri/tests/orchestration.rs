@@ -52,6 +52,8 @@ use loomux_lib::orchestration::{
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     write_admission, WriteAdmission, preenter_admission, hold_bound_elapsed,
     held_escalation, HeldEscalation, QUESTION_HOLD_STALE_AFTER,
+    // #560: the per-pane hold EPISODE that owns the escalation clock.
+    ends_hold_episode, opens_hold_episode, HoldObservation,
     hold_channels, HoldChannel, HoldClass,
     pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
     PauseSuppression, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
@@ -18032,6 +18034,277 @@ fn every_hold_class_reaches_a_human_who_is_not_the_orchestrator_channel() {
     assert!(!HoldChannel::OrchestratorNotice.survives_orchestrator_target());
     assert!(HoldChannel::HeldChip.survives_orchestrator_target());
     assert!(HoldChannel::AttentionBadge.survives_orchestrator_target());
+}
+
+// ---------- #560: the escalation clock is the PANE's hold episode ----------
+//
+// #532 measured its ten-minute escalation from the front queue ENTRY's
+// `enqueued_ms` while keying its one-shot on `pty_id`. Those two do not describe
+// the same thing, and both reported symptoms are that mismatch:
+//
+//  1. a writable poll dropped the one-shot but not the clock, so the very next
+//     held poll found the bound already elapsed and re-badged — audit churn on
+//     exactly the pane the feature exists for (a human typing with a delivery
+//     queued behind them toggles occupancy on every Enter);
+//  2. `enqueue_stranded_front` pushes a `StrandedSubmit` marker at the FRONT
+//     carrying a fresh `now_ms()`, so a pasted-but-unsubmitted delivery handed
+//     the bound a brand-new clock on a pane that had been blocked continuously.
+//
+// Each test below drives one of them through the real code path — the registry
+// methods `run_queue_drainer` actually calls, since the drainer itself needs an
+// `AppHandle` no headless test can build.
+
+/// How many audit lines of `action` this group has written. Distinct from the
+/// substring-counting `audit_count` above on purpose: a churn assertion has to
+/// match the `action` FIELD exactly, or a detail value that happens to contain
+/// the same text would inflate it.
+fn hold_audit_count(reg: &OrchRegistry, group: &str, action: &str) -> usize {
+    reg.audit_log(group).iter().filter(|e| e.action == action).count()
+}
+
+#[test]
+fn only_an_accepted_delivery_ends_a_hold_episode() {
+    // The lifecycle rule itself, which is the whole of symptom 1's fix. Stated
+    // as a closed set so that a future observation cannot be added without
+    // deciding, in one place, what it does to the clock.
+    assert!(
+        ends_hold_episode(HoldObservation::Delivered),
+        "a delivery LANDING is the pane proving it can accept a write — that, and nothing \
+         weaker, ends the episode"
+    );
+    assert!(
+        !ends_hold_episode(HoldObservation::WritablePoll),
+        "a writable POLL is provisional: the drainer goes straight on to deliver_now, which \
+         re-reads both gates and can still abort. Ending the episode here is #560 symptom 1 — \
+         and if it also restarted the clock, a pane flickering faster than the bound would \
+         never badge AT ALL, which is the #532 bug class over again"
+    );
+    assert!(!ends_hold_episode(HoldObservation::HeldPoll));
+    assert!(!ends_hold_episode(HoldObservation::Aborted));
+
+    // Both ways of failing to deliver start a clock. `Aborted` matters on its
+    // own: a hold that lives entirely inside `deliver_now` (every poll reads
+    // writable, every attempt then aborts) would otherwise never open an
+    // episode, and that pane is exactly as stuck as one that fails at the poll.
+    assert!(opens_hold_episode(HoldObservation::HeldPoll));
+    assert!(opens_hold_episode(HoldObservation::Aborted));
+    assert!(!opens_hold_episode(HoldObservation::WritablePoll));
+    assert!(
+        !opens_hold_episode(HoldObservation::Delivered),
+        "and the one observation that ends an episode must never also open one"
+    );
+}
+
+#[test]
+fn a_writable_poll_never_re_badges_a_pane_that_was_already_escalated() {
+    // Symptom 1, end to end, through the step the drainer calls.
+    //
+    // The pre-#560 sequence: badge at ten minutes → the gates clear for a single
+    // poll → `Clear` drops the one-shot → the next held poll finds the bound
+    // (measured from an entry timestamp that did not move) already elapsed and
+    // badges again. One `stranded-attention` + one `stranded-cleared` per
+    // flicker, on a pane that never stopped being stuck.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5601u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 1_000_000u64;
+    let step = |admission, now| reg.hold_escalation_step(&g.id, &w.id, pty, admission, 1, now, bound);
+
+    assert_eq!(
+        step(WriteAdmission::HoldBoxOccupied, t0),
+        HeldEscalation::Chip(HeldReason::BoxOccupied),
+        "the first held poll opens the episode and chips (#563)"
+    );
+    assert_eq!(reg.hold_episode_since(pty), Some(t0), "the clock is the PANE's, stamped once");
+    assert_eq!(step(WriteAdmission::HoldBoxOccupied, t0 + 2_000), HeldEscalation::Chip(HeldReason::BoxOccupied));
+    assert_eq!(
+        step(WriteAdmission::HoldBoxOccupied, t0 + bound),
+        HeldEscalation::Badge(StrandedBlocker::HumanInput),
+        "and the escalation still fires exactly where #532 put it"
+    );
+    assert!(reg.hold_episode_badged(pty));
+
+    // THE FLICKER — the human presses Enter, the box empties for one poll.
+    assert_eq!(step(WriteAdmission::Go, t0 + bound + 2_000), HeldEscalation::Clear);
+    assert_eq!(
+        reg.hold_episode_since(pty),
+        Some(t0),
+        "a writable poll does NOT restart the clock — it is a reading, not a delivery"
+    );
+    assert!(
+        reg.hold_episode_badged(pty),
+        "and it does not disarm the one-shot either; the clock and the one-shot are now the \
+         SAME record, so they cannot come apart"
+    );
+    assert_eq!(
+        step(WriteAdmission::HoldBoxOccupied, t0 + bound + 4_000),
+        HeldEscalation::None,
+        "so the next held poll has nothing new to say — no second badge"
+    );
+
+    assert_eq!(
+        hold_audit_count(&reg, &g.id, "stranded-attention"), 1,
+        "one escalation per hold episode, across the flicker — the churn is the defect"
+    );
+    assert_eq!(
+        hold_audit_count(&reg, &g.id, "stranded-cleared"), 0,
+        "and nothing was cleared: the pane never accepted a delivery"
+    );
+    assert_eq!(
+        hold_audit_count(&reg, &g.id, "delivery-held-in-queue"), 1,
+        "the once-per-episode hold line churned the same way — it was keyed on the pane-header \
+         chip, which is LIVE state that comes down on every writable poll"
+    );
+
+    // Only the delivery landing ends it — and then a LATER hold is a new
+    // episode, with its own clock and its own badge.
+    reg.note_hold(&g.id, &w.id, pty, HoldObservation::Delivered, t0 + bound + 6_000);
+    assert_eq!(reg.hold_episode_since(pty), None);
+    assert!(!reg.hold_episode_badged(pty));
+    assert_eq!(
+        hold_audit_count(&reg, &g.id, "stranded-cleared"), 1,
+        "the badge comes down where the pane PROVED it could accept a write"
+    );
+
+    let t1 = t0 + bound + 8_000;
+    assert_eq!(step(WriteAdmission::HoldQuestion, t1), HeldEscalation::Chip(HeldReason::InteractiveQuestion));
+    assert_eq!(reg.hold_episode_since(pty), Some(t1), "a later hold clocks afresh, never from t0");
+    assert_eq!(
+        step(WriteAdmission::HoldQuestion, t1 + bound),
+        HeldEscalation::Badge(StrandedBlocker::QuestionStale),
+        "and badges afresh — suppressing the SECOND escalation would be the mirror-image bug"
+    );
+    assert_eq!(hold_audit_count(&reg, &g.id, "delivery-held-in-queue"), 2, "one line per episode, two episodes");
+}
+
+#[test]
+fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
+    // Symptom 2, against the real `enqueue_stranded_front`.
+    //
+    // A delivery that pastes and then has its Enter withheld pops its batch and
+    // pushes a `StrandedSubmit` marker at the FRONT, stamped `now_ms()`. Read
+    // the bound off the front entry and the ten-minute clock restarts from that
+    // moment — on a pane whose whole problem is that it has been blocked the
+    // entire time.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5602u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 2_000_000u64;
+
+    // The pane is held; the episode opens. Then the paste lands and the Enter is
+    // withheld: the text entry is replaced by a marker minted right now.
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound);
+    reg.enqueue_text(&g.id, &w.id, "loomux", "the brief", pty, queue::EnqueueReason::Arrival).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+    reg.note_hold(&g.id, &w.id, pty, HoldObservation::Aborted, t0 + 1_000);
+
+    let front = reg.queue_snapshot(pty).remove(0);
+    assert_eq!(front.payload, queue::QueuedPayload::StrandedSubmit, "the marker is the front entry");
+    assert!(
+        front.enqueued_ms > t0,
+        "and it really is younger than the hold — otherwise this test proves nothing about a \
+         clock that could be pushed (front.enqueued_ms = {}, hold began {t0})",
+        front.enqueued_ms
+    );
+    assert_eq!(
+        reg.hold_episode_since(pty),
+        Some(t0),
+        "the pane's clock is untouched by the marker: an aborted attempt is not a recovery"
+    );
+
+    // At t0 + bound the pane has been blocked for the full ten minutes, so the
+    // escalation is due. Read off the marker instead and it is not — that
+    // difference IS the defect.
+    let now = t0 + bound;
+    assert_eq!(
+        held_escalation(WriteAdmission::HoldQuestion, reg.hold_episode_since(pty).unwrap(), now, bound, false),
+        HeldEscalation::Badge(StrandedBlocker::QuestionStale),
+        "the episode clock escalates on time"
+    );
+    assert_eq!(
+        held_escalation(WriteAdmission::HoldQuestion, front.enqueued_ms, now, bound, false),
+        HeldEscalation::Chip(HeldReason::InteractiveQuestion),
+        "while the marker's own stamp would still be inside the bound — the badge deferred by \
+         the very event that proves the pane is stuck"
+    );
+    assert_eq!(
+        reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 2, now, bound),
+        HeldEscalation::Badge(StrandedBlocker::QuestionStale),
+        "and the step the drainer actually calls takes the episode clock, not the front entry"
+    );
+}
+
+#[test]
+fn the_still_queued_clock_is_not_restarted_by_a_stranded_marker() {
+    // The same defect, on the 30-minute notice. It was measured from the FRONT
+    // entry's stamp, and `enqueue_stranded_front` makes the front the YOUNGEST
+    // entry in the queue — so a pasted-but-unsubmitted delivery pushed the
+    // notice out by the very event that proves the pane is stuck.
+    //
+    // An integration test rather than one of `queue.rs`'s own inline unit tests
+    // purely so it shares a target with the four above: `cargo test` stops at
+    // the first failing target, and a red-evidence run that dies in the lib
+    // suite never reaches `tests/orchestration.rs` at all.
+    let threshold_ms = queue::QUEUE_STILL_QUEUED_NOTICE_AFTER.as_millis() as u64;
+    let held_since = 1_000_000u64;
+    let now = held_since + threshold_ms;
+    // The marker was minted one second ago; it is the only entry left, because
+    // the batch it stood for was popped when the paste landed.
+    let marker_ms = now - 1_000;
+
+    assert!(
+        !queue::should_fire_still_queued_notice(marker_ms, now, false),
+        "reading the marker's own stamp, the pane looks one second old — this is the defect"
+    );
+    assert!(
+        queue::should_fire_still_queued_notice(queue::undelivered_since(marker_ms, Some(held_since)), now, false),
+        "the pane has had undelivered work for the full threshold, and the hold episode is the \
+         only reading that still says so"
+    );
+
+    // The other direction, which is why the entry term is kept: a delivery
+    // landing ends the episode, but entries the flush could not fit stay queued
+    // and must keep their own age.
+    let old_entry = now - threshold_ms;
+    assert_eq!(queue::undelivered_since(old_entry, None), old_entry);
+    assert!(queue::should_fire_still_queued_notice(queue::undelivered_since(old_entry, None), now, false));
+    // And with both, the EARLIER wins in either arrangement.
+    assert_eq!(queue::undelivered_since(old_entry, Some(now)), old_entry);
+    assert_eq!(queue::undelivered_since(now, Some(old_entry)), old_entry);
+}
+
+#[test]
+fn a_pane_whose_queue_goes_away_ends_its_hold_episode() {
+    // The other end of the lifecycle: the queue emptying, not a delivery
+    // landing. Exercised here through `drop_queue` (the standalone path); the
+    // drainer's own exits do the same inside `commit_exit`'s generation-guarded
+    // step, which cannot go through `note_hold` because that removal has to be
+    // atomic with the emptiness check. A record left behind would hand the NEXT
+    // drainer on this pty a clock from a queue that no longer exists.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5603u32;
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let t0 = 3_000_000u64;
+
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0, bound);
+    reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldBoxOccupied, 1, t0 + bound, bound);
+    assert_eq!(reg.hold_episode_since(pty), Some(t0));
+    assert!(reg.hold_episode_badged(pty));
+
+    reg.drop_queue(&g.id, pty, queue::DropReason::AgentDied);
+    assert_eq!(
+        reg.hold_episode_since(pty),
+        None,
+        "the pane's queue is gone, so nothing is being held on it — and a stale record would \
+         make a successor drainer's first poll look ten minutes old"
+    );
+    assert!(!reg.hold_episode_badged(pty));
 }
 
 // ---------- #569: a pause discards, and resume says what it discarded ----------
