@@ -97,6 +97,18 @@
 //   Structurally cannot overlap a plugin pane:
 //   - restoresplash.ts's `.restore-splash` boot splash — shown before any
 //     pane (let alone a plugin pane) exists.
+//   - `.pane-plugin`'s own status line and #377 "Review permissions…" button
+//     — the one surface that LOOKS like it must be the exception, since it is
+//     the only DOM this registry deals with that is deliberately drawn where
+//     a plugin webview goes. It isn't: `PluginPaneView.showConsentRequired`
+//     runs only from `open()`'s catch, so the webview does not exist (`ready`
+//     is false and `repositionNow` early-returns) and there is nothing over
+//     it to clip. It is the covered thing's SUBSTITUTE, not a cover. If a
+//     future path ever shows in-pane chrome while `ready` is true, that is a
+//     new entry on this list and not a small change.
+//   - pluginconsent.ts (#377) — DOM-free; it decides what the consent prompt
+//     SAYS, and the prompt itself is rendered by modal.ts, which is already
+//     wired above. Nothing to register separately.
 //   - launcher.ts's `.pane-welcome` form, and `.pane-dormant`'s restore card
 //     — each IS a pane's own persistent content ("closed by closing the pane
 //     itself"), not a dismissable overlay that opens over OTHER content the

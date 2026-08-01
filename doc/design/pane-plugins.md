@@ -1233,6 +1233,18 @@ are stated, without drifting from what was actually agreed:
   sufficient. `.ctxmenu-sub` is a child too. Check where the CSS puts the
   box, not where the DOM puts the node.
 
+  **Re-checked against #377's approval gate** (merged into the re-land branch
+  while this was open, PR #623). The gate adds two things that look like they
+  belong on this list and don't: `pluginconsent.ts` is DOM-free and its prompt
+  is rendered by `modal.ts`, already wired since #380; and `.pane-plugin`'s
+  "Review permissions…" surface is drawn exactly where a plugin webview would
+  go, but only from `open()`'s catch — the webview does not exist on that
+  path, `ready` is false, and `repositionNow` early-returns, so nothing is
+  over it to clip. It is the covered thing's substitute, not a cover. That
+  second one is worth keeping in view: in-pane chrome shown while `ready` is
+  TRUE would be a genuinely new case for this list, and the only one of these
+  categories that could arrive without touching an overlay file at all.
+
   **Why the pointer half still has no automated test, and what covers it
   instead.** An e2e spec was scoped for this ("click a modal button over a
   plugin pane") and deliberately not written: Playwright drives `main`'s
@@ -1311,10 +1323,11 @@ each row open the overlay so it visibly OVERLAPS the plugin pane:
 | 6 | Tab color palette | tab menu → colour swatch | swatches visible, picking one applies |
 | 7 | Toast | any action that toasts (e.g. a copy) | toast readable over the plugin |
 | 8 | **Fatal banner** | trigger any uncaught error, or call `showFatal` from devtools | banner readable AND a click dismisses it (#391 W3 — newly registered) |
-| 9 | In-pane view, floating | Alt+G git view on a pane overlapping the plugin | overlay fully visible, rows selectable |
-| 10 | In-pane view, docked | dock that same view to a side | plugin pane RESIZES around it — no hole punched, no bleed |
-| 11 | Sessions sidebar | Ctrl+Shift+P, watch the whole animation | the panel stays interactive throughout AND the plugin keeps painting past the 344px edge (this one must NOT blank — that was the reverted PR #392's bug) |
-| 12 | Everything closed | close each overlay above | the plugin repaints its full rect with no leftover hole |
+| 9 | **#377 consent prompt** | open a second, unapproved plugin while a plugin pane is already showing | the approve/decline dialog is visible and both buttons click (it is a `modal.ts` modal, so it rides the same wiring as row 1 — but it is the modal most likely to be opened with a plugin pane on screen, so it is worth its own pass) |
+| 10 | In-pane view, floating | Alt+G git view on a pane overlapping the plugin | overlay fully visible, rows selectable |
+| 11 | In-pane view, docked | dock that same view to a side | plugin pane RESIZES around it — no hole punched, no bleed |
+| 12 | Sessions sidebar | Ctrl+Shift+P, watch the whole animation | the panel stays interactive throughout AND the plugin keeps painting past the 344px edge (this one must NOT blank — that was the reverted PR #392's bug) |
+| 13 | Everything closed | close each overlay above | the plugin repaints its full rect with no leftover hole |
 
 Two failure shapes to name precisely when reporting one, because they have
 opposite causes: **bleed** (the plugin paints over the overlay, or eats its
