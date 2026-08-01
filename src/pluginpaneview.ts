@@ -116,7 +116,14 @@ export interface PluginPaneManifest {
    *  — defense in depth, never a caller's validation as the only check. */
   capabilities: string[];
   apiVersion: number;
-  /** Absolute path to the plugin's install folder; null for `rootless: true`. */
+  /** Absolute path to the plugin's install folder; null for `rootless: true`.
+   *  **Since #377 the backend does not take this path on trust** — it derives
+   *  the `fs.read` jail itself from `plugins_root_dir().join(&plugin_id)`, so
+   *  what actually crosses to `plugin_open_window` here is only the
+   *  null-or-not distinction (the rootless signal). The path is still
+   *  computed and sent because it is the honest local answer to "where is
+   *  this plugin installed" and because the wire type stays `Option<String>`;
+   *  nothing downstream reads its contents. */
   root: string | null;
   /** The manifest's `name` field, VERBATIM — untrusted third-party text (design
    *  note: "Plugin-provided text is untrusted, regardless of transport"). This
