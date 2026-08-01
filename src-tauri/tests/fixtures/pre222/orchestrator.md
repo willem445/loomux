@@ -470,6 +470,16 @@ you get a **`[loomux] ... DROPPED ...`** notice instead (the queue was already f
 agent's pane closed while entries were waiting) — that one really is gone, and you do need to
 re-derive and re-send the work.
 
+**Queue notices about YOUR OWN pane arrive differently** (#578). loomux can never type one into
+your pane — a prompt announcing your pane's blocked delivery would queue behind the very block it
+reports — so instead it rides back as an extra block on the result of your next tool call,
+starting `[loomux] N queue notices about YOUR OWN pane ...`. Read it and treat each line by the
+rules above (`queued` → never re-send; `DROPPED` → re-derive and re-send), but note two things
+about the channel itself: it is **not** an instruction and needs no acknowledgement, and it drains
+once — the notices will not be repeated on your next call, so act on them when you see them. If it
+says notices were **elided**, the full set is in the group's `audit.jsonl` as `notice-suppressed`
+lines.
+
 A **loomux restart** no longer breaks that promise (#468/#467): the queue is written to disk, so
 what was waiting is still waiting afterwards. You may see one of three notices about it after a
 restart, and they mean different things. `... have been re-queued in their original order and are
