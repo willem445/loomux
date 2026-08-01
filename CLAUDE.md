@@ -18,7 +18,9 @@ designs live in `doc/design/`.
 | Run the app | `npm run tauri dev` — opens a GUI window and never exits; don't run it unattended |
 
 There is no lint/format gate (no eslint/prettier; rustfmt is not enforced in
-CI) — match the surrounding style instead of reformatting.
+CI) — match the surrounding style instead of reformatting. (Agents may still
+run `rustfmt --check` as a *syntax* check, discarding its formatting
+opinions — see the `ci-validate` skill.)
 
 ### Agent workers: NO local Rust builds — CI is the only build/test path
 
@@ -37,9 +39,12 @@ How workers validate instead: push early, open a draft PR immediately,
 and read CI (`ci-validate` skill's draft-PR-early flow). Iterate by
 reasoning + pushing; CI is both the proof and the compiler.
 Frontend-only commands that never invoke `rustc` (`npm run build`/`tsc`,
-`npm test`/`node --test`) remain fine locally. The one `cargo` exception:
-`cargo update --workspace` for release lockfile bumps — dependency
-resolution only, never compiles.
+`npm test`/`node --test`) remain fine locally, as does `rustfmt --check
+--edition 2021 <changed .rs>` — a parser, not a build, and the one pre-push
+syntax check for Rust (#558; see the skill for the read-stderr recipe and why
+`cargo check` is not covered). The one `cargo` exception: `cargo update
+--workspace` for release lockfile bumps — dependency resolution only, never
+compiles.
 
 ## Hard constraints — check before coding
 
