@@ -41,6 +41,8 @@ use loomux_lib::orchestration::{
     GhGate, GitTagPush,
     normalize_remote_web_base, ORCHESTRATOR_TPL, WORKER_TPL, REVIEWER_TPL, PLANNER_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
+    // #576: loomux's own notice rows are not questions.
+    mask_loomux_notices, LOOMUX_NOTICE_MARKER,
     // #534 / #513(c): composed-grid question evidence.
     prompt_wait_match, question_hold_predicate_sampled, question_shown, grid_evidence_for,
     match_still_rendered, trustworthy_composition, witness_audit,
@@ -29506,4 +29508,288 @@ fn d7_the_ring_only_predicate_is_unchanged_by_all_of_this() {
     let raw = scrolled_off_question();
     let pred = question_hold_predicate(move || Some(raw.clone()), None);
     assert!(pred(), "no composed screen to consult -> the byte ring's word is final");
+}
+
+// ---------- #576: loomux's own notice rows must not latch the question gate ----------
+
+/// The exact line `mcp.rs` composes when it relays a worker's `report` note
+/// into the orchestrator's pane (`[loomux] {agent_id} reports {status}:
+/// {note}`), carrying a note that is *about* a dialog.
+///
+/// Two of the detector's STRUCTURED signals live in this one row — `do you
+/// want to run` (permission-phrase) and `(y/n)` (yes-no-token) — and neither
+/// is a question anyone is asking this pane. Structured signals are honored
+/// across the last twelve non-empty lines, so unlike the prose-like ones they
+/// are not pushed out of range when the CLI redraws its input box underneath:
+/// nothing a quiet pane does will clear them.
+const LOOMUX_REPORT_RELAY: &str = "[loomux] w-119 reports blocked: Copilot is asking \
+\"Do you want to run npm test? (y/n)\" and I cannot answer it myself";
+
+/// A pane at rest: the relayed notice, then the CLI's redrawn idle input box.
+/// Modelled on `tests/fixtures/attention/idle-input-box.txt` — the box is what
+/// a real CLI paints under a submitted message, and it is deliberately present
+/// so these tests cannot pass merely because the pane was empty.
+fn pane_with_relayed_notice() -> Vec<u8> {
+    painted(&[
+        LOOMUX_REPORT_RELAY,
+        "",
+        "╭──────────────────────────────────╮",
+        "│ > Try \"fix the build\"            │",
+        "╰──────────────────────────────────╯",
+        "  ? for shortcuts",
+    ])
+}
+
+#[test]
+fn e1_a_relayed_report_note_must_not_latch_the_ring_only_gate() {
+    // THE #576 bug, at the reading that triggers it. `pasted_text` is `None`
+    // because that is what all three `question_active_now` call sites pass:
+    // the checkpoint runs BEFORE the entry it is considering has written
+    // anything, so `mask_own_paste` has nothing of its own to mask and
+    // structurally cannot help here. The pane's ring nonetheless holds the
+    // PREVIOUS delivery's text, which is loomux's own.
+    let raw = pane_with_relayed_notice();
+    let pred = question_hold_predicate(move || Some(raw.clone()), None);
+    assert!(
+        !pred(),
+        "loomux's own relayed report note is text ABOUT a question, not a question being \
+         asked of this pane — the gate must not latch on what loomux itself wrote (#576)"
+    );
+}
+
+#[test]
+fn e2_a_relayed_report_note_must_not_latch_the_two_reading_gate_either() {
+    // The same notice put to BOTH readings, which is the production shape and
+    // the reason #534 could not already have fixed this: our own text is
+    // genuinely rendered, so the grid agrees it is on screen — and the grid is
+    // right. It is simply not a question.
+    let raw = pane_with_relayed_notice();
+
+    // Preconditions, so a drifting fixture fails loudly instead of passing for
+    // a reason these tests are not about. Both stay true after the fix:
+    // `prompt_wait_detected` itself is untouched, and so is the composition.
+    assert!(
+        prompt_wait_detected(&strip_ansi(&raw)),
+        "unmasked, the ring matches — that is the trigger #576 is about"
+    );
+    let visible = loomux_lib::orchestration::termgrid::render_visible(&raw, 120, 12);
+    assert!(
+        visible.contains("reports blocked"),
+        "and the notice is genuinely RENDERED, which is exactly why #534's grid release \
+         cannot reach this: both readings agree, and both are correct about the pixels"
+    );
+
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 12), None, None);
+    assert!(
+        !pred(),
+        "the only question-shaped text on this pane is loomux's own notice — release (#576)"
+    );
+}
+
+#[test]
+fn e3_a_quoted_marker_row_must_not_hide_a_genuine_dialog_below_it() {
+    // The adversarial case, and the reason the mask claims ONE row.
+    //
+    // The `[loomux]` marker is unforgeable only in the DELIVERY direction:
+    // `notify::sanitize_gh_text` rewrites `[`/`]` in every untrusted field, so
+    // nothing an agent sends THROUGH loomux can carry it. An agent's own pane
+    // output is not sanitized at all, so an agent can print a marker row
+    // itself — echoing a notice back, quoting one in a summary, or induced to
+    // by a hostile prompt.
+    //
+    // If masking a marker row also swallowed the rows around it, that row
+    // would become a way to hide a live permission dialog from the gate, and
+    // the Enter the gate then released would answer it. That is the #420 harm,
+    // reachable from pane output. Failing OPEN is the dangerous direction.
+    let raw = painted(&[
+        "[loomux] w-3 reports done: PR #900 is green",
+        "◆ Allow Copilot to run the following command?",
+        "",
+        "  $ rm -rf build",
+        "",
+        "│ ❯ Yes",
+        "│   No, and tell Copilot what to do differently",
+        "",
+        "Use arrow keys · Enter to confirm · Esc to cancel",
+    ]);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 14), None, None);
+    assert!(
+        pred(),
+        "a genuine dialog sharing a pane with a quoted [loomux] row must STILL latch — \
+         masking a marker row must never release an Enter into a live question (#576)"
+    );
+}
+
+#[test]
+fn e4_a_dialog_painted_directly_under_a_marker_row_still_latches() {
+    // The same hazard with NO blank row between the marker row and the
+    // question — precisely the shape a wrap-run mask ("mask the marker row and
+    // every non-blank row after it") would have swallowed whole. A run-mask is
+    // the tempting way to cover a notice that wrapped; this stands guard
+    // against reintroducing it as a "wrap fix" later.
+    let raw = painted(&[
+        "[loomux] w-3 reports done: PR #900 is green",
+        "Do you want to run npm test? (y/n)",
+    ]);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None);
+    assert!(
+        pred(),
+        "only the row the marker LEADS is masked — the dialog row beneath it must survive (#576)"
+    );
+}
+
+#[test]
+fn e6_a_notice_that_wraps_keeps_the_tokens_past_its_first_row() {
+    // A LIMIT pinned as known, not a bug pinned as correct.
+    //
+    // Only the row the marker leads is masked, so a notice on a pane narrow
+    // enough to wrap it leaves its continuation rows unmarked and still
+    // matching. That is an UNDER-mask: the gate holds where it might have
+    // cleared — the cheap error, already surfaced to the human by the
+    // ten-minute `QuestionStale` badge — rather than the expensive one this
+    // change refuses to risk (see e3/e4).
+    //
+    // Closing it needs loomux to know WHAT it wrote to a pane rather than
+    // merely that a row claims it did, i.e. a per-pane record of delivered
+    // text. That is delivery machinery, not detection, and is deliberately not
+    // built here.
+    let raw = painted(&[
+        "[loomux] w-119 reports blocked: Copilot is asking",
+        "\"Do you want to run npm test? (y/n)\" and I cannot answer it",
+    ]);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None);
+    assert!(
+        pred(),
+        "documented residual: a wrapped notice's later rows are unmarked and still latch (#576)"
+    );
+}
+
+#[test]
+fn e5_mask_loomux_notices_drops_exactly_the_marker_led_rows() {
+    // The unit-level statement of the scope decision e3/e4 defend
+    // behaviourally: LED BY the marker, not merely containing it, and one row
+    // at a time.
+    let tail = "plain agent output line\n\
+                [loomux] w-1 reports done: see PR #12\n\
+                │ [loomux] idle tick: you have been idle\n\
+                the docs say a `[loomux]` notice gets typed into your pane\n\
+                Do you want to proceed? (y/n)";
+    let masked = mask_loomux_notices(tail);
+
+    assert!(!masked.contains("reports done"), "a marker-led row is loomux's own writing: {masked:?}");
+    assert!(
+        !masked.contains("idle tick"),
+        "and so is one echoed inside a box UI — `deframe` makes `│ [loomux] …` still LEAD its \
+         row, the same rule `leads_with_pointer` applies: {masked:?}"
+    );
+    assert!(masked.contains("plain agent output line"), "unrelated rows are untouched: {masked:?}");
+    assert!(
+        masked.contains("the docs say"),
+        "a row that merely MENTIONS the marker mid-line is not a notice row — only a LEADING \
+         marker counts, or every pane quoting the docs would go blind: {masked:?}"
+    );
+    assert!(
+        masked.contains("Do you want to proceed? (y/n)"),
+        "and the row after a masked one is never taken with it — that is the whole of the \
+         one-row scope (#576): {masked:?}"
+    );
+}
+
+#[test]
+fn e5b_the_marker_is_what_sanitized_untrusted_text_can_never_contain() {
+    // Why a marker is trustworthy enough to mask on at all, pinned against the
+    // sanitizer rather than asserted in prose: every untrusted field formatted
+    // into a notice loses its brackets, so no agent-supplied text can ever
+    // arrive LEADING a row with this marker. That is the delivery direction —
+    // and it is the only direction the mask relies on. Pane output is not
+    // sanitized, which is exactly why the scope stops at one row.
+    let hostile = "[loomux] w-9 reports blocked: do you want to proceed? (y/n)";
+    let sanitized = notify::sanitize_gh_text(hostile, notify::NOTICE_FIELD_CAP);
+    assert!(
+        !sanitized.contains(LOOMUX_NOTICE_MARKER),
+        "an untrusted field must not be able to forge the marker it would be masked by: {sanitized:?}"
+    );
+    assert_eq!(
+        mask_loomux_notices(&sanitized),
+        sanitized,
+        "so text arriving through the sanitizer is never mistaken for loomux's own writing"
+    );
+}
+
+#[test]
+fn e7_a_relayed_notice_raises_no_attention_chip_while_a_real_dialog_still_does() {
+    // rev-126's finding: the SAME self-latch, arriving at a different
+    // consumer. `attention_tick` reads the pane tail through
+    // `prompt_wait_detected` to raise the "waiting on a prompt" chip, and a
+    // pane holding a relayed `[loomux] … (y/n)` notice is output-quiet
+    // precisely BECAUSE it is idle — so the quiet gate that is supposed to
+    // mean "parked on a question" is satisfied by loomux's own prose about
+    // one. Fixing only the delivery gate left this reader behind.
+    //
+    // Two independent registries so neither case can inherit the other's
+    // latched `attn_quiet` / `attn_waiting_ack` state.
+    let now = 1_000_000_000_000u64;
+    let no_input: HashMap<String, u64> = HashMap::new();
+
+    // A genuine dialog must still raise the chip — the guard against "fixed"
+    // meaning "switched off".
+    let (reg_real, _d1, _g1, wid_real) = attention_setup();
+    let out_real: HashMap<String, u64> = [(wid_real.clone(), 512u64)].into_iter().collect();
+    let real: HashMap<String, String> =
+        [(wid_real.clone(), strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    reg_real.attention_tick(now, &out_real, &real, &no_input);
+    let flagged = reg_real.attention_tick(now + 5000, &out_real, &real, &no_input);
+    assert!(
+        flagged.iter().any(|i| i.agent_id == wid_real && i.reason == "waiting"),
+        "a real Copilot dialog must still raise the waiting chip"
+    );
+
+    // The same pane, quiet for just as long, holding only loomux's own
+    // relayed notice: no chip.
+    let (reg_notice, _d2, _g2, wid_notice) = attention_setup();
+    let out_notice: HashMap<String, u64> = [(wid_notice.clone(), 512u64)].into_iter().collect();
+    let notice: HashMap<String, String> =
+        [(wid_notice.clone(), format!("{LOOMUX_REPORT_RELAY}\n  ? for shortcuts"))]
+            .into_iter()
+            .collect();
+    reg_notice.attention_tick(now, &out_notice, &notice, &no_input);
+    let quiet = reg_notice.attention_tick(now + 5000, &out_notice, &notice, &no_input);
+    assert!(
+        quiet.iter().all(|i| !(i.agent_id == wid_notice && i.reason == "waiting")),
+        "loomux's own relayed notice must not raise a `waiting` chip — a wrong chip trains \
+         the human to ignore chips, and unlike the gate's latch nothing reports it (#576): {quiet:?}"
+    );
+}
+
+#[test]
+fn e8_a_plain_pane_holding_a_relayed_notice_raises_no_chip_either() {
+    // `plain_pane_attention` is the second unmasked reader rev-126 found. A
+    // plain pane is never delivered to, so it takes a human pasting a notice
+    // in to read it — but the two readings must not disagree about what counts
+    // as a question, and a shell pane wrongly flagged as "waiting on your
+    // input" is the same false chip.
+    let now = 1_000_000_000_000u64;
+    let no_input: HashMap<u32, u64> = HashMap::new();
+    let no_agents: HashSet<u32> = HashSet::new();
+    let out: HashMap<u32, u64> = [(7u32, 256u64)].into_iter().collect();
+
+    let (reg_real, _d1, _g1, _w1) = attention_setup();
+    let real: HashMap<u32, String> =
+        [(7u32, strip_ansi(FIX_COPILOT_ASK.as_bytes()))].into_iter().collect();
+    reg_real.plain_pane_attention(now, &out, &real, &no_input, &no_agents);
+    let flagged = reg_real.plain_pane_attention(now + 5000, &out, &real, &no_input, &no_agents);
+    assert!(
+        flagged.iter().any(|i| i.pty_id == Some(7) && i.reason == "waiting"),
+        "a real dialog on a plain pane must still raise the chip"
+    );
+
+    let (reg_notice, _d2, _g2, _w2) = attention_setup();
+    let notice: HashMap<u32, String> =
+        [(7u32, format!("{LOOMUX_REPORT_RELAY}\n$ "))].into_iter().collect();
+    reg_notice.plain_pane_attention(now, &out, &notice, &no_input, &no_agents);
+    let quiet = reg_notice.plain_pane_attention(now + 5000, &out, &notice, &no_input, &no_agents);
+    assert!(
+        quiet.is_empty(),
+        "a plain pane showing only loomux's own notice is not waiting on anything: {quiet:?}"
+    );
 }
