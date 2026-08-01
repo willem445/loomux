@@ -13996,6 +13996,27 @@ pub fn mask_loomux_notices(tail: &str) -> String {
         .join("\n")
 }
 
+/// EVIDENCE-ONLY BRANCH (#632). This is the new shared predicate, and nothing
+/// else from the fix: the two PRODUCERS are left exactly as `main` has them.
+/// It is here so the new tests fail on their ASSERTIONS rather than on a
+/// missing symbol — a compile error masks behaviour instead of testing it, and
+/// is not valid red evidence. Not for merge; this branch exists to be read
+/// once and closed.
+pub fn unmaskable_framing_rows(rendered: &str, payloads: &[&str]) -> Vec<String> {
+    let payload_rows: HashSet<&str> = payloads
+        .iter()
+        .flat_map(|p| p.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    mask_loomux_notices(rendered)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !payload_rows.contains(l))
+        .map(str::to_string)
+        .collect()
+}
+
 /// The live interactive-question guard's hold decision (#420), generic over
 /// the tail read so it's integration-tested with a scripted closure — no
 /// `PtyManager`, no real PTY (rev-15 B4: the old production-bound version of
