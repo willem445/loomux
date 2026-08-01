@@ -52,8 +52,10 @@
 //! - It is **re-admitted automatically** — same queue, same order — when the
 //!   pane it was addressed to comes back with a durable identity loomux can
 //!   match: the group's single orchestrator, or an agent resumed onto the
-//!   same CLI session id. Neither `pty_id` nor `agent_id` is that identity;
-//!   both are re-minted at restore.
+//!   same CLI session id. Neither `pty_id` nor `agent_id` is that identity:
+//!   `pty_id` is re-minted at restore, and `agent_id` — durable since #524,
+//!   so it never names a *different* agent — still names no LIVE pane after
+//!   one, because a restore spawns a new agent with a new id.
 //! - Anything else (a worker pane simply gone after the restart) is
 //!   **surfaced, never silently dropped**: `queue_orphans` reports it with
 //!   its payload so the orchestrator's session-start re-sync can re-derive
@@ -249,11 +251,15 @@ pub struct QueuedDelivery {
     /// delivery target with an identity that outlives a restart.
     ///
     /// Neither of the obvious keys does: `pty_id` is re-minted by the
-    /// terminal layer on every restore, and `agent_id` is re-minted too
-    /// (`orch-{seq}` / `w-{seq}` off a fresh in-memory counter), which is
-    /// why #468's own filing — "`agent_id` is kept so a durable follow-up
-    /// could rebind by agent (durable across a restore)" — does not hold
-    /// and is not what this implements. A group has exactly one
+    /// terminal layer on every restore, and `agent_id` — while it no longer
+    /// RECYCLES (#524 made the counter durable, so an old id can never name
+    /// a *different* agent) — still names nothing LIVE after a restart,
+    /// because a restore spawns a fresh agent with a fresh id rather than
+    /// reviving the old one. So #468's own filing — "`agent_id` is kept so
+    /// a durable follow-up could rebind by agent (durable across a
+    /// restore)" — does not hold and is not what this implements. Its
+    /// failure mode is simply better now: an id-keyed rebind would find no
+    /// target rather than the WRONG target. A group has exactly one
     /// orchestrator, so "was this addressed to the orchestrator" survives
     /// the restart even though the name it was addressed by does not.
     #[serde(default)]
@@ -931,8 +937,9 @@ pub fn split_recovered(entries: Vec<PersistedEntry>) -> RecoverySplit {
 /// callback: an entry re-binds when it was addressed to this group's
 /// orchestrator and `agent` IS that orchestrator, or when both carry the
 /// SAME non-empty CLI session id. Everything else — including two entries
-/// that merely share an `agent_id`, which is re-minted at restore and
-/// therefore proves nothing — does not match.
+/// that merely share an `agent_id`, which a restore never revives (#524
+/// stopped it naming a different agent; it still names no live one) and
+/// which therefore proves nothing — does not match.
 pub fn rebinds_to(entry: &QueuedDelivery, agent_is_orchestrator: bool, agent_session: Option<&str>) -> bool {
     if entry.to_orchestrator && agent_is_orchestrator {
         return true;
@@ -1748,8 +1755,9 @@ mod tests {
         assert!(!rebinds_to(&to_worker, true, None),
             "being the orchestrator does not entitle a pane to a worker's backlog");
 
-        // `agent_id` is deliberately NOT a key: it is re-minted at restore,
-        // so two agents sharing one proves nothing. Both entries here carry
+        // `agent_id` is deliberately NOT a key: a restore never revives one
+        // (and since #524 never re-mints one either), so two entries sharing
+        // one prove nothing about a live pane. Both entries here carry
         // agent_id "w-1" (from `text_entry`) and neither matches on it.
         let anonymous = QueuedDelivery { session_id: Some(String::new()), ..text_entry(3, "x") };
         assert!(!rebinds_to(&anonymous, false, Some("")),

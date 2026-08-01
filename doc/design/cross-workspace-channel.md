@@ -170,8 +170,11 @@ slice's job, per the issue's worker split) — the field shapes above are the fr
 
 Same rationale as #243's watches: a channel is a live, in-session connection, not durable
 state the way `state.json`/the task board/the PR itself are. Persisting membership across a
-restart would mean rebinding it across a group-resume where agent ids are re-minted per
-run — real complexity for a feature the issue itself frames as brief, explicit sharing. After
+restart would mean rebinding it across a group-resume that spawns *new* agents with new ids
+rather than reviving the old ones — real complexity for a feature the issue itself frames as
+brief, explicit sharing. (#524 made ids durable in the sense that one is never handed out
+twice; it did not make a dead agent's id resolve to a live pane, which is what a rebind would
+need.) After
 a restart the human re-connects; `channel_status()` on session start tells an agent whether
 it's still connected to anything (mirroring the notification backend's `list_notifications()`
 re-sync convention, now in the orchestrator/worker/reviewer templates).

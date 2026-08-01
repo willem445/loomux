@@ -5723,10 +5723,11 @@ pub struct AgentEntry {
     ///   the unreliable signal #535 exists to stop relying on.
     ///
     /// Read by `reinject_acked`/`reinject_disposition`. In-memory only, seeded
-    /// `0` on every construction: a restart re-mints agent ids from an
-    /// in-memory counter (the rev-4 B1 lesson in `compact_nudge_tick`), and a
+    /// `0` on every construction: a restart spawns fresh agents rather than
+    /// reviving old ones (the rev-4 B1 lesson in `compact_nudge_tick`), and a
     /// `0` seed cannot be mistaken for a fresh ack the way a `now_ms()` seed
-    /// or a persisted value could.
+    /// or a persisted value could. #524 made the *id* durable, not the
+    /// agent — nothing here becomes carry-over-able because of it.
     pub last_mcp_activity_ms: u64,
     /// #496 hardening: Unix-ms of this agent's last OUTPUT-based quiet-clock
     /// reset only — i.e. the last time `last_progress_ms` above moved because
@@ -16098,9 +16099,12 @@ impl OrchRegistry {
             task: entry.task.clone(),
             branch: entry.branch.clone(),
         };
-        // Match by (id, session): agent ids restart at 1 every app run, so
-        // a bare-id match would overwrite a previous run's record and lose
-        // that session's identity. A session-bearing record also supersedes
+        // Match by (id, session). Since #524 an id is never re-minted, so a
+        // bare-id match can no longer overwrite a DIFFERENT run's record —
+        // but the pair stays, and not merely out of caution: rosters written
+        // before #524 are still on disk and do contain repeated ids, and the
+        // session half is what keeps a copilot placeholder (session `None`)
+        // upgradable in place. A session-bearing record also supersedes
         // this run's placeholder for the same id — copilot writes an entry
         // with no session at spawn, then upgrades it once its session id is
         // discovered (only placeholders have session == None).
@@ -16272,7 +16276,9 @@ impl OrchRegistry {
     }
 
     /// Roster + audit backfill, deduped by session (roster wins). Sessions
-    /// are the stable key; agent ids recycle across app runs.
+    /// are the stable key: ids stopped recycling in #524, but rosters written
+    /// before it are still on disk and do repeat them, so dedup by id would
+    /// still merge two different agents' records on existing installs.
     fn merged_records(&self, group: &str) -> Vec<AgentRecord> {
         // One group's roster + full audit log read and parsed — the unit
         // `GROUP_RECORD_SCANS` counts, so a test can pin how MANY groups a
