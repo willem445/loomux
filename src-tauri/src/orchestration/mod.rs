@@ -7285,6 +7285,13 @@ pub struct OrchRegistry {
     /// Groups the human has paused: loomux stops delivering prompts/kickoffs
     /// to them so their agents idle out (see `deliver_prompt`). Mirrored to a
     /// `paused` marker file per group so it survives restarts.
+    ///
+    /// Read on TWO delivery paths since #569, and both are load-bearing: the
+    /// front door holds an arriving payload in the pane's queue rather than
+    /// pasting it, and `run_queue_drainer` refuses to paste what is already
+    /// queued. Neither alone is sufficient — see `deliver_prompt`'s pause
+    /// branch for the restart case that reaches the drainer without passing
+    /// the front door.
     paused: Mutex<HashSet<String>>,
     /// Per-group spawn timestamps (Unix-ms) for the spawn-rate guardrail;
     /// pruned to the trailing hour on each check.
@@ -8427,15 +8434,22 @@ const AUDIT_VIEW_LIMIT: usize = 5000;
 
 /// #569: one delivery a pause window destroyed, recovered from the audit log.
 ///
-/// **Why there is no id here.** `deliver_prompt`'s pause branch returns
-/// *before* the front door, so a suppressed delivery never enters a queue and
-/// no id is ever minted for it — the same situation #563 met at
-/// `enqueue_text`'s `RejectFull` arm, and answered the same way: name the
-/// payload by `{from, to, preview}`, which the record actually establishes,
-/// rather than by an id that would join to nothing. Minting one here would
-/// also mean running `recover_persisted_queue` on the paused delivery path
-/// purely to keep `queue_seq` collision-free (see `enqueue_text`'s "#467, and
-/// it must be FIRST" note) — real machinery, and I/O, for a cosmetic field.
+/// **Transitional as of #569 option 2 — this build never creates one.** The
+/// only writer of `prompt-suppressed-paused` was `deliver_prompt`'s pause
+/// branch, and that branch now ADMITS the payload to the pane's durable queue
+/// instead of discarding it. So every record this type can be built from was
+/// written by a loomux that predates enqueue-while-paused, and the only way to
+/// meet one is to pause under an older build, upgrade, and resume — a real
+/// sequence, and the reason the scan is kept rather than deleted: those
+/// payloads genuinely are gone, and this notice is the only thing that will
+/// ever say so.
+///
+/// **Why there is no id here.** The pre-#569 pause branch returned *before*
+/// the front door, so a suppressed delivery never entered a queue and no id
+/// was ever minted for it — the same situation #563 met at `enqueue_text`'s
+/// `RejectFull` arm, and answered the same way: name the payload by
+/// `{from, to, preview}`, which the record actually establishes, rather than
+/// by an id that would join to nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuppressedDelivery {
     /// Whoever called `deliver_prompt` — the audit entry's actor.
@@ -8505,14 +8519,17 @@ pub fn suppressed_during_pause(entries: &[AuditEntry]) -> PauseSuppression {
 /// preview).
 pub const PAUSE_SUPPRESSION_LIST_MAX: usize = 8;
 
-/// #569: the resume-time notice naming what a pause discarded.
+/// #569: the resume-time notice naming what a pause discarded — under an
+/// OLDER loomux.
 ///
-/// The sentence has to do one job the audit line cannot: correct the
-/// "queued means safe" model the #445/#523 batch established everywhere else.
-/// Pause is the one remaining path where a caller was told `Ok` and the
-/// payload ceased to exist, so the notice says DISCARDED and says that nothing
-/// will be replayed — a reader who assumes a replay is coming waits forever,
-/// which is the exact stall #569 was filed for.
+/// Reworked by #569 option 2 rather than deleted. Pause now queues, so this
+/// fires only for the one window where a payload can still have been
+/// destroyed: a group paused by a build that discarded, resumed by a build
+/// that does not. The wording has to say WHICH pause it is talking about,
+/// because the two behaviors now coexist in one group's history and a reader
+/// who takes "nothing will be replayed" as the current rule would re-request
+/// work that is, in fact, about to arrive on its own — a duplicate, which is
+/// exactly what `queued_notice`'s "do NOT re-send" exists to prevent.
 ///
 /// Pure so the copy is unit-testable, matching `queue::dropped_notice` /
 /// `delivery_held_detail`.
@@ -8524,9 +8541,10 @@ pub fn pause_suppression_notice(s: &PauseSuppression) -> String {
         (format!("{n} deliveries"), "were")
     };
     let mut out = format!(
-        "[loomux] Group resumed — {count} {verb} DISCARDED while this group was paused. Pause \
-         does not queue and nothing here will be replayed, so anything you are still waiting on \
-         has to be re-requested. Discarded:"
+        "[loomux] Group resumed — {count} {verb} DISCARDED by an EARLIER loomux version that did \
+         not queue while paused. Those payloads are gone and will not be replayed, so anything \
+         you are still waiting on from them has to be re-requested. (Pause queues now: anything \
+         held by THIS pause is delivering on its own — do not re-request it.) Discarded:"
     );
     for it in s.items.iter().take(PAUSE_SUPPRESSION_LIST_MAX) {
         out.push_str(&format!("\n  - {} -> {}: {}", it.from, it.to, it.preview));
@@ -10211,6 +10229,11 @@ pub enum StrandedBlocker {
     /// #569: deliveries aimed at this pane were DISCARDED while the group was
     /// paused, and the resume-time notice that would have said so could not be
     /// delivered to the group's orchestrator.
+    ///
+    /// **Transitional, like the notice it backs.** Option 2 (enqueue-while-
+    /// paused) means a pause taken by this build discards nothing, so this
+    /// badge can only be raised for a group paused under an older loomux and
+    /// resumed under this one — see `announce_pause_suppression`.
     ///
     /// **Why this is a badge and not only the notice.** The notice
     /// (`announce_pause_suppression`) is an in-band delivery to the
@@ -12913,6 +12936,32 @@ fn run_queue_drainer(
             debug_assert!(entries.is_empty(), "force:false only commits when the queue was already empty");
             return;
         }
+        // #569: the human paused this group — the queue HOLDS. Nothing is
+        // planned, nothing is pasted, no notice is spent and no hold clock
+        // runs: a pause is not a stuck pane, and escalating one as though it
+        // were would badge the human about a state they set themselves.
+        //
+        // Deliberately AFTER `commit_exit`, so a paused pane with an empty
+        // queue still exits its drainer instead of polling for the whole
+        // pause; and BEFORE the liveness checks' effects are undone by
+        // nothing — a pane whose agent died mid-pause is caught by those
+        // checks above and its queue is dropped and announced through the
+        // ordinary `AgentDied` path, not silently retained forever.
+        //
+        // Reached at all only because `deliver_prompt`'s pause branch is not
+        // the sole way a drainer starts: `readmit_recovered` kicks one when a
+        // pane rebinds after a restart, which for a group paused across that
+        // restart would otherwise paste straight into the pause.
+        //
+        // The chip comes down because the pane is no longer held on anything
+        // the human can clear from the pane — the group's paused state is
+        // what is holding it, and the group UI already says so
+        // (`HoldClass::GroupPaused`'s `PausedGroupUi` channel).
+        if reg.is_paused(&group) {
+            lower_chip();
+            std::thread::sleep(queue::QUEUE_DRAIN_POLL);
+            continue;
+        }
         // Not empty (confirmed above) — safe to peek normally now; only
         // this single-consumer thread ever pops the front, so nothing can
         // make it empty again out from under us before we act on it.
@@ -12961,10 +13010,25 @@ fn run_queue_drainer(
             matches!(front.payload, queue::QueuedPayload::StrandedSubmit),
             "plan_flush's stranded flag must match the planned front entry's payload"
         );
-        if !immediate_first_pass || depth > 1 {
+        // #569: WHY this batch waited, which is also the header's wording.
+        // Computed from the batch rather than from `reg.is_paused` — by the
+        // time a pause-held entry drains the group is unpaused by definition,
+        // so the live flag says nothing; the entries' own admission reasons
+        // are the record of what happened to them.
+        let cause = queue::flush_cause(&batch);
+        if !immediate_first_pass || depth > 1 || cause == queue::FlushCause::GroupPaused {
             // Genuine contention observed: either this pass needed a retry
             // at all, or more than the one entry we started with is now
             // backed up. Sticky for the rest of this drain's lifetime.
+            //
+            // #569 adds the third term. A lone delivery held through a pause
+            // reaches a FRESH drainer at resume, whose very first pass is
+            // `immediate_first_pass` with `depth == 1` — the uncontended
+            // shape — so without this it would land as a bare payload with
+            // nothing saying it had been waiting since before the pause. That
+            // silence is the receiver-side half of the stall #569 was filed
+            // for: a report arriving with no timestamp context reads as
+            // current.
             header_pending = true;
         }
 
@@ -13112,7 +13176,7 @@ fn run_queue_drainer(
                             })
                         })
                         .collect();
-                    queue::coalesced_flush_text(&items, plan.remaining, now_ms())
+                    queue::coalesced_flush_text(&items, plan.remaining, now_ms(), cause)
                 } else if header_pending {
                     // #445: the flush header ("N deliveries queued ... are
                     // now delivering") rides on the front of the FIRST
@@ -13124,7 +13188,7 @@ fn run_queue_drainer(
                         let queues = reg.queues.read();
                         queues.get(&pty_id).map(|q| q.iter().map(|e| e.coalesced as usize).sum()).unwrap_or(0)
                     };
-                    format!("{}\n\n{text}", queue::flush_header_text(depth.max(1), coalesced))
+                    format!("{}\n\n{text}", queue::flush_header_text(depth.max(1), coalesced, cause))
                 } else {
                     text.clone()
                 };
@@ -14783,19 +14847,26 @@ pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
             HoldChannel::OrchestratorNotice,
             HoldChannel::CallerError,
         ],
-        // #569. Three channels, each carrying a different moment, and the
-        // distinction matters because two of them fire only at resume:
-        //  - `PausedGroupUi` is the hold itself — the human set the pause and
-        //    the group UI shows it for as long as it lasts. Unchanged.
-        //  - `OrchestratorNotice` is `announce_pause_suppression`, at resume:
-        //    what the pause DISCARDED. Not suppressed here the way
-        //    `notify_queue`'s is, because by the time it is sent the group is
-        //    already unpaused and the pane it names is not the pane it is
-        //    blocked behind — but it still needs a live orchestrator.
-        //  - `AttentionBadge` is that notice's fallback when there is no live
-        //    orchestrator to take it (see `StrandedBlocker::PauseSuppressed`).
-        // Pause remains the one hold that DESTROYS a payload rather than
-        // holding it, so none of these three is a replay: they are visibility.
+        // #569, and re-stated for option 2 (enqueue-while-paused), which
+        // changed what this hold DOES: the payload is now held in the pane's
+        // durable queue and flushed on resume, so a pause is a delay, no
+        // longer the one hold that destroys what it withholds.
+        //
+        //  - `PausedGroupUi` is the hold itself and, on this build, the whole
+        //    of it: the human set the pause, the group UI shows it for as long
+        //    as it lasts, and the deliveries behind it are safe. The one
+        //    classification a human cannot be surprised by — now also the one
+        //    with nothing to warn them about.
+        //  - `OrchestratorNotice` / `AttentionBadge` are
+        //    `announce_pause_suppression` and its no-live-orchestrator
+        //    fallback (`StrandedBlocker::PauseSuppressed`). Both are still
+        //    real call sites, so they are still listed — but they fire ONLY
+        //    for a pause taken by a build that predates option 2 and resumed
+        //    by this one. A pause taken here has nothing for them to report.
+        //
+        // The resume flush itself is not a channel: it is a delivery to the
+        // agent that was waiting, not a way for a HUMAN to learn about a hold,
+        // which is the only question this table answers.
         HoldClass::GroupPaused => &[
             HoldChannel::PausedGroupUi,
             HoldChannel::OrchestratorNotice,
@@ -16207,11 +16278,16 @@ impl OrchRegistry {
     /// assigns a worker, so the board reflects real assignment rather than
     /// intent. The notice is best-effort (the board is the source of truth).
     ///
-    /// A paused group is rejected up front (mirroring `steer_orchestrator`):
-    /// its delivery is silently suppressed and queued prompts aren't replayed
-    /// on resume, so without this guard the nudge would vanish — with a note
-    /// left behind implying it landed. Reject before any mutation so no note is
-    /// appended, and let the human resume first.
+    /// A paused group is rejected up front (mirroring `steer_orchestrator`),
+    /// and #569 changed the reason without changing the answer. The original
+    /// one — the nudge would be discarded and a note left behind implying it
+    /// landed — no longer holds: pause queues now, so the nudge would arrive
+    /// on resume. What still holds is that this is a HUMAN clicking Start on a
+    /// group they have paused, and the two readings of that click ("start it
+    /// now" vs "start it whenever I get around to resuming") are far enough
+    /// apart to be worth a synchronous error instead of a silent guess. Reject
+    /// before any mutation so no note is appended, and let the human resume
+    /// first — the same call `steer_orchestrator` makes for the same reason.
     pub fn start_task(&self, group: &str, id: &str) -> Result<Task, String> {
         self.ensure_queued(group, id)?;
         if self.is_paused(group) {
@@ -17398,6 +17474,15 @@ impl OrchRegistry {
     /// Pause a group: loomux stops delivering prompts and kickoffs to its
     /// agents, so they finish their current turn and idle out (containing
     /// unattended spend) without being killed. Durable via a marker file.
+    ///
+    /// #569 option 2: deliveries that arrive during the pause are HELD in the
+    /// target pane's durable queue and flushed on `resume_group`, not
+    /// destroyed. The cost containment is unchanged while the pause lasts —
+    /// nothing pastes, so no agent is woken and no tokens are spent — and the
+    /// spend it defers is re-incurred at resume, which is the contract change
+    /// the human signed off on: a pause that loses a worker's `report("done")`
+    /// costs more than the tokens it saved, because the orchestrator then
+    /// waits on a report that is never coming.
     pub fn pause_group(&self, group: &str) -> Result<(), String> {
         let newly = self.paused.lock_safe().insert(group.to_string());
         if newly {
@@ -17409,13 +17494,21 @@ impl OrchRegistry {
         Ok(())
     }
 
-    /// Resume a paused group: prompt/kickoff delivery flows again. Suppressed
-    /// prompts are not replayed — agents resync from the board/state on the
-    /// next prompt, which is the point of idling out — but as of #569 the
-    /// orchestrator is TOLD what the pause threw away
-    /// (`announce_pause_suppression`). Visibility only; the discard semantics
-    /// are unchanged and deliberately so (option 2 of #569, enqueue-while-
-    /// paused, changes pause's cost-containment contract and is a human call).
+    /// Resume a paused group: prompt/kickoff delivery flows again, and
+    /// everything the pause HELD is flushed to the pane it was addressed to,
+    /// in arrival order, behind the standard flush header
+    /// (`flush_paused_queues`).
+    ///
+    /// #569 option 2, the human's decision: a paused group's deliveries are
+    /// queued, not destroyed. Pause is still a cost-containment hold — nothing
+    /// pastes and no agent is woken while it lasts — but the containment is
+    /// now a DELAY rather than a loss, so a worker's `report("done")` fired
+    /// during a pause reaches the orchestrator on resume instead of
+    /// evaporating and leaving it waiting forever.
+    ///
+    /// `announce_pause_suppression` survives only as a transitional path: it
+    /// reports what a build PREDATING this change discarded, and there is
+    /// nothing for it to find on any pause taken by this one. See its doc.
     pub fn resume_group(&self, group: &str) -> Result<(), String> {
         let was = self.paused.lock_safe().remove(group);
         if was {
@@ -17427,18 +17520,88 @@ impl OrchRegistry {
             let swallowed = suppressed_during_pause(&self.audit_log(group));
             self.audit(group, "human", "group-resume", json!({}));
             self.announce_pause_suppression(group, &swallowed);
+            self.flush_paused_queues(group);
         }
         Ok(())
     }
 
-    /// #569: tell the orchestrator what a just-ended pause DISCARDED.
+    /// #569: start draining every pane this group left holding entries.
     ///
-    /// **Why this exists at all.** A delivery into a paused group is destroyed
-    /// and its caller told `Ok` — after #445/#523 the only remaining non-crash
-    /// path where a payload the sender was told succeeded ceases to exist. It
-    /// was audited and nothing else, so a worker's `report("done")` fired
-    /// during a pause simply evaporated and the orchestrator went on waiting
-    /// for it. The audit line was always there; nobody was ever shown it.
+    /// **Why resume owns this.** `deliver_prompt`'s pause branch admits into
+    /// the pane's queue and deliberately does NOT spawn a drainer — a paused
+    /// group must have nothing running that could paste. That leaves the
+    /// #470 invariant ("the admission that saw an empty queue owns starting
+    /// the processor") temporarily unmet ON PURPOSE, and this is the single
+    /// place that discharges it. If this function is ever removed or made
+    /// conditional, every payload a pause held is stranded — queued, audited,
+    /// persisted, and never delivered.
+    ///
+    /// **Not filtered on liveness, deliberately.** A pane whose agent died
+    /// mid-pause still gets a drainer here; that drainer's own first-pass
+    /// liveness checks then drop the queue through the ordinary
+    /// `commit_exit(force: true)` → `announce_dropped(AgentDied)` path, which
+    /// is audited and notified. Skipping dead panes here would leave those
+    /// entries sitting in `queues` and in `queue.json` with nothing to ever
+    /// look at them again — a silent retention, which is the same defect
+    /// class as the silent discard this issue is about.
+    ///
+    /// **Also the restart path.** A loomux restarted in the middle of a pause
+    /// reads its queues back through `recover_persisted_queue`, and this is
+    /// what starts them moving when the human resumes.
+    ///
+    /// Idempotent: `ensure_drainer` no-ops for a pane already draining, so a
+    /// double resume costs nothing. Best-effort in exactly one respect — with
+    /// no `AppHandle` (a bare test registry) no thread can be spawned at all,
+    /// the same limitation every other drainer-spawning site has.
+    fn flush_paused_queues(&self, group: &str) {
+        let panes: Vec<u32> = {
+            let queues = self.queues.read();
+            let mut panes: Vec<u32> = queues
+                .iter()
+                .filter(|(_, q)| q.iter().any(|d| d.group == group))
+                .map(|(pty_id, _)| *pty_id)
+                .collect();
+            // Ascending, so the audit line below reads the same on every run
+            // (a `HashMap`'s iteration order does not).
+            panes.sort_unstable();
+            panes
+        };
+        if panes.is_empty() {
+            return;
+        }
+        let app = self.app.lock_safe().clone();
+        let reg = self.arc();
+        // `started` rather than a bare "pause-flush" line: with no `AppHandle`
+        // nothing is spawned, and an audit entry claiming a flush began when
+        // none did is the unbacked-claim defect `.loomux/lessons.md` catalogues
+        // — the log is the only record a reader will ever have of this moment.
+        self.audit(group, "loomux", "pause-flush", json!({
+            "panes": panes,
+            "started": app.is_some() && reg.is_some(),
+        }));
+        if let (Some(app), Some(reg)) = (app, reg) {
+            for pty_id in panes {
+                reg.ensure_drainer(app.clone(), group.to_string(), pty_id, None);
+            }
+        }
+    }
+
+    /// #569: tell the orchestrator what a just-ended pause DISCARDED — under
+    /// a build that predates enqueue-while-paused.
+    ///
+    /// **Why this exists at all.** Before option 2, a delivery into a paused
+    /// group was destroyed and its caller told `Ok` — after #445/#523 the only
+    /// remaining non-crash path where a payload the sender was told succeeded
+    /// ceased to exist. It was audited and nothing else, so a worker's
+    /// `report("done")` fired during a pause simply evaporated and the
+    /// orchestrator went on waiting for it.
+    ///
+    /// **And why it still exists.** Option 2 fixed the behavior, not the
+    /// history: a group paused under an older loomux and resumed under this
+    /// one has those `prompt-suppressed-paused` lines in its audit log and
+    /// those payloads really are gone. `swallowed` is empty for every pause
+    /// this build takes, so on the ordinary path this function returns at its
+    /// first line and nothing below it runs.
     ///
     /// **Reads, never mutates.** The suppressed set comes out of the audit log
     /// — no new state, no new `queues` mutation, and therefore no
@@ -26834,15 +26997,44 @@ impl OrchRegistry {
         if a.status == AgentStatus::Dead {
             return Err(format!("agent {agent_id} is dead"));
         }
-        // Pause guardrail: while a group is paused, loomux delivers nothing
-        // to its panes so agents finish their turn and idle out. The attempt
-        // is audited (nothing is silently lost from the record) and reported
-        // as success so callers don't error or retry.
+        let pty_id = a.pty_id.ok_or("agent has no terminal yet")?;
+        // Pause guardrail (#569, option 2 — the human's call): while a group
+        // is paused loomux still delivers NOTHING to its panes, so agents
+        // finish their turn and idle out exactly as before. What changed is
+        // where the payload goes in the meantime: it is ADMITTED to this
+        // pane's durable queue and flushed, in arrival order, when the human
+        // resumes — rather than destroyed with the caller told `Ok`, which
+        // was the last non-crash path where something a sender was told
+        // succeeded ceased to exist (#445/#523's "queued means safe" model,
+        // with pause as the one hole in it).
+        //
+        // **No drainer is kicked here, and that is the whole design.** The
+        // unpaused path below hands the `was_first` admission responsibility
+        // for spawning `run_queue_drainer`; a paused group must not have one
+        // running at all, because the point of a pause is that nothing pastes
+        // and nothing spends. `resume_group` picks that obligation up
+        // (`flush_paused_queues`) for every pane holding entries, which is
+        // also what covers a loomux restart in the middle of a pause: the
+        // entries come back through `recover_persisted_queue` and the resume
+        // is what starts draining them.
+        //
+        // `run_queue_drainer` ALSO refuses to paste while paused, and that
+        // second layer is load-bearing rather than belt-and-braces: a pane
+        // rebinding after a restart calls `readmit_recovered`, which kicks a
+        // drainer of its own with no idea the group is paused.
+        //
+        // The `pty_id` resolution moved ABOVE this branch on purpose: a queue
+        // is keyed by pane, so a target with no terminal yet has nowhere to
+        // hold anything, and the honest answer is the same `Err` an unpaused
+        // delivery to that same agent already gets. Pre-#569 it returned `Ok`
+        // — a success for a payload that was simply discarded.
         if self.is_paused(&a.group) {
-            self.audit(&a.group, from, "prompt-suppressed-paused", json!({ "to": agent_id, "text": text }));
+            self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
+            self.enqueue_text(
+                &a.group, agent_id, from, text, pty_id, queue::EnqueueReason::GroupPaused,
+            )?;
             return Ok(());
         }
-        let pty_id = a.pty_id.ok_or("agent has no terminal yet")?;
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
         // #470: `Arrival` regardless of whether this lands alone or behind
@@ -28791,9 +28983,15 @@ impl OrchRegistry {
     /// Human steering from the loomux compose strip (#43, option C): enqueue
     /// `text` to the group's orchestrator through the SAME per-pane serialized
     /// delivery path worker reports use. Rejects empty text and a paused group
-    /// up front so the strip can tell the human why nothing was sent — a paused
-    /// group's delivery is silently suppressed, so without this guard a steered
-    /// message would vanish with no feedback. A dead/absent orchestrator
+    /// up front so the strip can tell the human why nothing was sent.
+    ///
+    /// #569 changed that guard's reason, not its answer: a paused group's
+    /// delivery is no longer discarded, it is queued until resume. But this is
+    /// a human typing into the compose strip *now*, and a message that silently
+    /// waits an unknown number of hours is not what the strip's Send button
+    /// promises — an immediate error the human can act on (resume, then send)
+    /// beats deferring their sentence to a moment they haven't chosen yet.
+    /// `start_task` rejects for the same reason. A dead/absent orchestrator
     /// surfaces as the "no live orchestrator" error from delivery.
     #[doc(hidden)] // pub for integration tests
     pub fn steer_orchestrator(&self, group: &str, text: &str) -> Result<(), String> {
