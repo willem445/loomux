@@ -7839,18 +7839,109 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     *executing* code to answer a question — confirming a compile error is real (not just
     plausible from reading), running an existing test to see current behavior before
     proposing a change to it, checking whether a dependency actually resolves, or timing/
-    profiling anything. Also lost: pulling a reference down to ground a plan against —
-    `curl` isn't in the built-in read-only Bash set and `WebFetch` is domain-gated, so
-    neither is reachable by default. `gh api` stays available (it's `gh`, already
-    pre-approved) and covers GitHub itself, but not a CLI vendor's own documentation —
-    exactly the raw-text fetch the `agent-cli-reference` skill requires instead of
-    working from memory, so a planning task that needs it is now grounded in recall
-    alone. A plan that would have said "confirmed: `cargo check` reproduces
+    profiling anything. A plan that would have said "confirmed: `cargo check` reproduces
     the reported error at line N" now says "reading the code, this looks like it would
     reproduce the reported error" — a real loss of grounding, silent in the sense that a
     vaguer plan doesn't announce *why* it's vaguer. `templates/planner.md`'s "say so in
     the plan rather than assuming it ran" instruction is the mitigation available today:
     it turns a silent gap into a stated one, not a closed one.
+
+    *(Doc-fetching was on this lost list until #610 and no longer is — that section
+    below records the decision and its residual. The execution gap above is unchanged.)*
+
+  **#610: an allow list `dontAsk` never received — and the clause the argument above was
+  missing.** Everything above is the right argument and it shipped in a form that could
+  not take effect. Three planner panes in one session had `gh` **entirely** denied (plus
+  `git fetch` and `WebFetch`) while read-only `git` kept working, so a planner could not
+  read its own brief or post its plan; the orchestrator relayed both by hand. Two
+  hypotheses were filed with the issue and both were wrong; the docs and the session's own
+  evidence settle it three ways:
+
+  - *Refuted — "`dontAsk` does not honor `--allowedTools`."* `mcp__loomux` is a
+    `--allowedTools` value and it demonstrably worked on every affected pane (the relay
+    workaround ran through `report`/`message_orchestrator`).
+  - *Refuted — "the CLI takes one value per flag occurrence."* Per the
+    [CLI reference](https://code.claude.com/docs/en/cli-reference), `--allowedTools` takes
+    space-separated values in one occurrence; the page's own example is
+    `"Bash(git log *)" "Bash(git diff *)" "Read"`.
+  - *The actual defect — flag ordering.* #417 inserted `--settings` **between**
+    `--allowedTools`'s first value (`mcp__loomux`) and the `"Bash(git *)" "Bash(gh *)"`
+    patterns that follow it. A space-separated value list ends at the next flag, so from
+    that release on the patterns were not allow rules at all — they were stray positional
+    arguments. `mcp__loomux`, the single value emitted before `--settings`, is exactly the
+    single capability the planners kept. `PersonaInject::extra_allow` (a worker's or
+    reviewer's, never a planner's — see the capability closure above) rode the same
+    truncation.
+
+  It stayed invisible for two releases because only a `dontAsk` pane can observe it:
+  workers and reviewers run `auto`/`acceptEdits`, which approve `gh` without consulting an
+  allow list at all. That is the general lesson worth keeping — **the pane with the
+  tightest permission mode is the only honest test of a permission change**, and every
+  other tier is masking, not corroboration.
+
+  The fix is two layers, one repairing the defect and one moving the guarantee to the
+  surface the contract actually names:
+
+  1. *Ordering.* The whole `--allowedTools` value list is emitted contiguously, with
+     `--settings` after it, in both `build_agent_command` and `build_agent_argv`.
+     `claude_allow_patterns_are_not_severed_from_the_allowedtools_flag` pins contiguity
+     rather than presence, across every tier and both spawn forms, so the next flag added
+     to that branch cannot silently reopen this.
+  2. *Allows must live in settings.* This is the clause the #465 argument above was
+     missing, and it is worth stating as a rule rather than a fix: **the quoted contract
+     for `dontAsk` names `permissions.allow`, a settings-file concept, and nothing in
+     Claude Code's docs says `--allowedTools` values become `permissions.allow` rules.**
+     The mode's own doc sentence was being satisfied by a *different* mechanism than the
+     one it names — which is fine right up until a parse detail changes, as one had. So a
+     read-only pane's rules now also go where the contract points them:
+     `CLAUDE_READONLY_SETTINGS_ALLOW`, written into the `--settings` file loomux already
+     generates (#417). `--allowedTools` stays too — the two layers are cheap and
+     independent, the same belt-and-braces stance #465 takes on `--disallowedTools`.
+
+  Consequences of (2) worth naming:
+
+  - **The settings file is no longer hooks-only, and no longer optional for a read-only
+    pane.** It used to be written only when there were hooks to put in it (`None`
+    otherwise, and the caller omitted `--settings`). Fail-open is right for a hook — the
+    cost is a missed compact nudge — and wrong for permissions, since a `dontAsk` pane
+    with no allow rules can do nothing at all. A read-only pane therefore always gets a
+    file now; the empty case (`None`) survives only for a non-read-only agent with no
+    hooks. Keys that would be empty are omitted rather than written as `{}`: `--settings`
+    values "override the same keys" per the CLI reference, so an empty `hooks` object is a
+    claim, not a placeholder.
+  - **Additive, on a cited guarantee.** Per the
+    [settings reference](https://code.claude.com/docs/en/settings), permission rules
+    "merge across scopes rather than override", so loomux's layer never displaces the
+    user's own allow/deny rules and a user `deny` still beats every allow loomux writes.
+    That sentence is the one doc-grounded assumption this layer rests on; loomux never
+    parses or rewrites the user's settings to achieve it.
+  - **`git fetch` needed no decision, only the fix.** It is a git subcommand, so
+    `Bash(git *)` covers it, and `CLAUDE_READONLY_DENY_GIT` carves out only
+    `commit`/`push`. It writes nothing but local remote-tracking refs and mutates no
+    remote, which is why it is not denied — it was unreachable purely because the whole
+    allow list never arrived.
+  - **`WebFetch`/`WebSearch`: allowed, deliberately.** The paragraph above used to record
+    "pulling a reference down to ground a plan" as permanently lost; that loss was never
+    load-bearing enough to keep, and this repo's own `agent-cli-reference` skill *requires*
+    reading a vendor's official reference before designing anything CLI-dependent — a
+    planner that cannot fetch is a planner that must design from recall, which is the
+    failure mode that skill exists to end. Both tools are non-mutating, and the read-only
+    tier's guarantee is about mutation, so nothing about the containment contract moves.
+    They are **bare grants and are recorded as such**: the permissions reference states
+    `WebFetch(domain:*)` "is equivalent to a bare `WebFetch` rule", so a scoped-looking
+    spelling would be decoration, and loomux (constraint #8) cannot know which domains a
+    given repo's planner needs. The residual is real and stated: an arbitrary-host fetch is
+    an injection surface and a data-egress channel. The escape hatch needs no loomux
+    feature — a `WebFetch` deny rule in the target repo's own `.claude/settings.json` beats
+    any allow rule here, in every mode.
+  - **#465's no-bare-grant invariant is restated for the new layer, not weakened.**
+    `readonly_pane_settings_carry_permissions_allow` asserts that every rule in the
+    settings allow list is `mcp__loomux`, a scoped `Name(...)` pattern, or one of the two
+    enumerated research tools — so a bare `Bash`, or anything in `CLAUDE_EDIT_DENY_TOOLS`,
+    fails CI on the allow side exactly as
+    `claude_readonly_allowed_tools_contain_no_unscoped_grant` already makes it fail on the
+    flag side. The exemption is a closed, named set of two non-mutating tools, not a
+    loophole.
 
   - **Copilot: documented open, not closed — and the issue's "no containment at all"
     premise needs a correction first.** `COPILOT_EDIT_DENY_TOOLS` still denies
