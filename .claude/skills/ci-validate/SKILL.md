@@ -1,6 +1,6 @@
 ---
 name: ci-validate
-description: Why agent workers never build or test Rust locally (hard ban — CI is the only cargo path) and how to validate through the draft-PR-early CI flow; frontend node-only commands stay local.
+description: Why agent workers never build or test Rust locally (hard ban — CI is the only cargo path) and how to validate through the draft-PR-early CI flow; the one permitted local check on `.rs` files is `rustfmt --check` as a parser; frontend node-only commands stay local.
 ---
 
 # Local iteration vs. CI proof
@@ -33,6 +33,10 @@ line drawn on scope/duration, not on any mechanism's state.
 > **Frontend-only commands that never invoke `rustc` stay local-OK**:
 > `npm run build`/`tsc` (the typecheck), `npm test`/`node --test`, a
 > single frontend test file. These cost megabytes, not gigabytes.
+>
+> **One local check on `.rs` files is permitted, because it isn't a
+> build**: `rustfmt --check` parses. See the next section — run it before
+> every push that touches Rust.
 
 CI is the sole authority for the CI gate, and now also the sole build
 path. A worker citing a local run as validation is citing evidence it
@@ -43,6 +47,92 @@ task board (#133), crashed loomux outright (#464), and killed the app
 mid-session twice more on 2026-07-30. CI spends GitHub's disk, not this
 machine's. If your worktree has a `target/` from before this rule,
 `cargo clean` it now.
+
+## The syntax check: `rustfmt --check` (#558)
+
+The ban above left workers with no way to know whether the Rust they just
+wrote *parses*. The cheapest possible defect then cost a full CI round: a
+scripted rewrite that cut at the first `);` — which happened to sit inside a
+string literal — left a dangling fragment and an unbalanced brace, and all
+three build jobs failed to compile, not on assertions but on parsing (#558).
+
+**Run this before every push that touches `.rs` files**, from `src-tauri/`:
+
+```sh
+rustfmt --check --edition 2021 <changed .rs files> >/dev/null
+```
+
+Three things about that command line, each of which will bite you if
+dropped:
+
+- **`--edition 2021` is mandatory.** rustfmt's CLI defaults to edition 2015,
+  where `async fn` is a hard parse error — without the flag you get
+  confident, wrong `error[E0670]`s on perfectly good code. The crate is
+  edition 2021 (`src-tauri/Cargo.toml`).
+- **`>/dev/null` is deliberate — discard stdout, and the redirect is not
+  optional.** `--check` prints a *formatting* diff (`Diff in …`) for anything
+  not rustfmt-shaped, and this repo is deliberately not rustfmt-formatted:
+  hundreds of lines for a small file, but **12,483 for
+  `src/orchestration/mod.rs`** and **14,997 for a whole-crate run** — measured.
+  Forget the redirect on the file you are most likely to be editing and you
+  dump ~12k lines of diff into your own context, which costs far more than the
+  CI round this check was saving. They are noise here, not findings.
+- **Read stderr; the exit code is ambiguous.** It's `0` clean, `1` for a
+  formatting diff *and* for a parse error, `101` for a lexer error. The
+  reliable signal is that **problems go to stderr and formatting diffs go to
+  stdout**: a healthy run prints *nothing* to stderr no matter what the exit
+  code says. So with stdout discarded, **any output at all on stderr means
+  stop and read it** — don't grep for a particular token. It may be a parse
+  error (`error:` / `error[E….]:`), a lexer error, or a module rustfmt
+  couldn't resolve, which arrives as `Error writing files: failed to resolve
+  mod …` and contains no `error:` token at all. Fix it before pushing.
+
+When a change spans many files, parse the whole module tree instead — rustfmt
+recurses into child modules, and a parse error in a child is reported by name:
+
+```sh
+rustfmt --check --edition 2021 src/lib.rs >/dev/null
+```
+
+That takes ~3-5s for this crate. Keep the `>/dev/null`: without it this is the
+~15,000-line case above.
+
+### This is a syntax check, NOT a formatting gate
+
+This repo has no lint/format gate and rustfmt is deliberately not enforced in
+CI. Nothing here changes that. rustfmt is being used as the parser it
+contains, and its opinions about formatting are explicitly discarded (that's
+what `>/dev/null` is for). So:
+
+- Never run bare `rustfmt` (without `--check`) on a repo file — `--check`
+  writes nothing; plain `rustfmt` rewrites in place.
+- Never commit a reformatting, and never "fix" a `Diff in …` line.
+- Match the surrounding style, exactly as before.
+
+### Why this is permitted under the ban
+
+**rustfmt is a parser, not a build.** It doesn't invoke cargo, doesn't invoke
+`rustc` for codegen, resolves no dependencies, produces no artifacts, and
+writes nothing to `target/` — verified on a worktree that had no `target/`:
+after a whole-crate run it still had none, `git status` was clean, and the run
+took ~3-5s. So it sits inside both bans at once: the #320 CPU ban (no meaningful
+CPU, nothing to contend across worktrees) and the #488 disk ban (zero bytes
+written).
+
+**`cargo check` and `cargo build` remain banned, and the argument above does
+not extend to them.** `cargo check` resolves the dependency graph and builds
+metadata for every dependency into `target/` — that first full dependency
+compile, 5-8 GB per worktree, *is* the thing #488 banned. "It doesn't produce
+a binary" was never the distinction; "it doesn't write to `target/`" is.
+There is no `--parse-only`-shaped cargo invocation that qualifies.
+
+### What it does not catch
+
+Parse errors only. Anything semantic sails straight through — type errors,
+unresolved names, borrow-check failures, and (verified) a `format!` with the
+wrong number of arguments. A clean rustfmt run is **not** validation and is
+never cited as one; it only buys back the CI round that a syntax error would
+have wasted. The definition of validated below is unchanged.
 
 ## The Cargo.lock exception
 
@@ -91,8 +181,9 @@ iteration:
    merge ref to run against — so the watch resolves right away with a
    distinct "is CONFLICTING" notice instead of hanging toward expiry; that
    means rebase, not "still waiting on CI".
-5. **Iterate by pushing fixes.** Quick local iteration (capped, per above) is
-   fine between pushes — it just isn't the thing you cite as passing.
+5. **Iterate by pushing fixes.** Between pushes, the local steps available to
+   you are the frontend ones and `rustfmt --check` (above) — never a cargo
+   build or test, and neither is the thing you cite as passing.
 6. **Mark the PR ready once green:**
    ```sh
    gh pr ready <pr>
