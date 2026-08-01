@@ -305,6 +305,28 @@ so far:
   duplicating it would have been the change this fixture exists to make visible. Layer 2 of
   #590 (host-side detection of an undeliverable notice) is parked for design and is not here.
 
+- **#596, a worker's claims are about a SHA and a scope** — `worker.md` only (`reviewer.md`,
+  `orchestrator.md` and `planner.md` did not move). Two stale-claim families from one batch,
+  both a true sentence that quietly stopped being true while the text stayed put. **Green is a
+  fact about a SHA**: any push or rebase invalidates every run id and "green on all three
+  platforms" already in the PR body, and the body survives untouched, so the claim rots
+  silently — #571 cited a run three commits behind head, and #588 cited a pre-rebase run at
+  review 1 and then the *same* pre-rebase run again after the rebase at review 2. Three
+  instances, two workers, every one caught by a reviewer and none by its author, which is why
+  the new **DoD item 4** is a procedure (`gh run list --json headSha,…`, assert against `git
+  rev-parse HEAD`, update the body before reporting) rather than an exhortation to be careful.
+  It sits deliberately next to red-before-green so it rides the same checklist. **`Closes #N`
+  is a fact about scope**: a squash merge honors the keyword out of the squashed commit message
+  however partial the change was, so **DoD item 7** now reserves `Closes` for the PR that
+  finishes an issue and sends partial scope to `Part of #N` / `Mitigates #N`, naming the squash
+  mechanism so the choice doesn't read as style — #569 and #590 were both auto-closed this way
+  in one session and reopened by hand. The git-workflow PR bullet stops offering `Closes #N` as
+  the only way to link an issue. The other three roles are untouched on purpose: the PR body is
+  written by the *worker*, and the reviewer/orchestrator side of head-staleness is already
+  carried elsewhere — `orchestrator.md` states that a new head re-stales every recorded verdict,
+  and `list_verdicts` pins verdicts by SHA. Duplicating a worker's authoring rule into three
+  more templates would have been the change this fixture exists to make visible.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
