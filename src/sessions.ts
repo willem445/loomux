@@ -1,12 +1,45 @@
 // Session browser sidebar: lists resumable Claude Code and Copilot CLI
 // sessions discovered by the backend; clicking one restores it into a
 // new pane.
+//
+// #380 round 2 correction: earlier rounds (#391/#393/#400/#414) treated this
+// panel as a COVERING DOM overlay — the same class as a modal or context menu
+// — needing a registered exclude rect (`overlayState.open()`/`close()`) so a
+// plugin pane's native webview could clip a hole for it. That model is wrong
+// for THIS panel. `#sessions` (`styles.css`) is `flex: none; width: 344px;
+// transition: width`, a genuine flex SIBLING of `#grid-area` inside
+// `#workspace { display: flex }` (`index.html`) — not `position: absolute`/
+// `fixed`. Opening or closing it never paints over another pane's rect at any
+// point in its transition; it PUSHES `#grid-area`'s available width via
+// ordinary flexbox reflow, which changes every plugin pane's own BOUNDS, not
+// what covers them. So this file no longer registers `#sessions` as a
+// covering overlay at all — `overlayState.open()`/`close()` never contributed
+// a meaningful exclude rect for it (confirmed both by the intersection math
+// in `pluginocclusion.ts`, which can't produce a nonempty rect for two
+// regions that never overlap, and by live telemetry: `exclude` was 0 in every
+// state, every time).
+//
+// What this panel still needs to do: every plugin pane's own generic
+// `ResizeObserver` (`pluginpaneview.ts`'s `"resize"` source) already re-fires
+// on every tick of this panel's `width` transition — confirmed empirically —
+// so bounds tracking DURING the transition is that mechanism's job, not this
+// file's (see `pluginpaneview.ts`'s `repositionGate` doc comment for the
+// actual fix to the "stale for several seconds" symptom: an unthrottled burst
+// of native IPC calls, one per animation frame, was the real bottleneck, not
+// a missing trigger). This file provides exactly ONE thing on top: an
+// authoritative SETTLE recompute once the transition has fully committed
+// (`transitionend` + `requestAnimationFrame`, below), via `overlayState`'s
+// generic `poke()` notify bus — used here purely as "something every
+// subscribed plugin pane should recompute against," never paired with an
+// `open()`/`close()` registration, since this panel never has a rect worth
+// registering.
 
 import { listSessions, type SessionInfo } from "./pty";
 import type { SessionRoleInfo } from "./orchestration";
 import { taskSummary, repoBranchLine, prLabel } from "./sessionmeta";
 import { RefreshGate } from "./refreshgate";
 import { SessionStore } from "./sessionstore";
+import { overlayState } from "./overlaystate";
 
 const ROLE_CHIPS: Record<string, string> = {
   orchestrator: "ORCH",
@@ -77,6 +110,22 @@ export class SessionBrowser {
     inner.className = "sessions-inner";
     inner.append(head, this.searchEl, this.listEl);
     this.el.appendChild(inner);
+
+    // #380 round 2: the ONE authoritative recompute this file owes every
+    // subscribed plugin pane — once `#sessions`'s own `width` transition has
+    // fully committed, not on every tick of it (see this file's header
+    // comment for why "during" is `pluginpaneview.ts`'s job, not this file's).
+    // `requestAnimationFrame` after `transitionend` ensures the read a
+    // subscriber does in response lands after the settled frame has actually
+    // painted, not merely been requested. Lives for the component's whole
+    // lifetime (constructed once in `main.ts`, never disposed) rather than
+    // attached/detached per open/close — there's no ongoing cost to a listener
+    // that only ever fires on this element's own `width` transition ending.
+    this.el.addEventListener("transitionend", (e) => {
+      if (e.target === this.el && e.propertyName === "width") {
+        requestAnimationFrame(() => overlayState.poke());
+      }
+    });
   }
 
   get visible(): boolean {

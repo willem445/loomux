@@ -98,6 +98,20 @@ import {
   nextRestoreCardState,
   type RestoreCardState,
 } from "./restorecard";
+import { listPlugins } from "./pluginhost";
+import { resolvePluginPaneManifest } from "./pluginpaneview";
+import { overlayState, type OverlayCloser } from "./overlaystate";
+
+/** The banner's slot in the shared overlay registry while it is showing
+ *  (#391 W3). `#app-error` is `position: fixed`, `z-index: 100` and
+ *  click-to-dismiss — geometrically the same layer as `.app-toast`, which
+ *  toast.ts has registered since #380 — but it was never wired, so over a
+ *  plugin pane the fatal banner was painted behind the native child webview
+ *  AND the click that dismisses it was swallowed: the one message a user most
+ *  needs to read, both unreadable and stuck. Same `??=` shape toast.ts uses,
+ *  for the same reason: a second error re-uses the one live slot rather than
+ *  leaking a second. */
+let fatalOverlayClose: OverlayCloser | null = null;
 
 // Surface unexpected errors as a visible banner instead of a silently
 // broken UI — a user-facing "crash" should always come with a message.
@@ -106,11 +120,17 @@ function showFatal(msg: string): void {
   if (!el) {
     el = document.createElement("div");
     el.id = "app-error";
-    el.addEventListener("click", () => el!.classList.remove("visible"));
+    el.addEventListener("click", () => {
+      el!.classList.remove("visible");
+      fatalOverlayClose?.();
+      fatalOverlayClose = null;
+    });
     document.body.appendChild(el);
   }
   el.textContent = msg;
   el.classList.add("visible");
+  const banner = el;
+  fatalOverlayClose ??= overlayState.open(() => banner.getBoundingClientRect());
 }
 window.addEventListener("error", (e) => {
   // The banner only shows e.message, which for a cross-module DOM error hides
@@ -650,6 +670,7 @@ async function openActionPane(
         groupId: null, // an agent pane belongs to no orchestration group (#485)
         file: null,
         embeds: [],
+        pluginId: null,
       };
       let pane: Pane;
       // #479 B: this card's whole reason for existing IS "no resumable
@@ -843,6 +864,31 @@ async function openActionPane(
       );
       return openWelcomeIn(ws, dir, anchor);
     }
+    case "open-plugin": {
+      // A plugin pane (#360 Slice D) comes back by looking up its recorded pluginId
+      // against the CURRENT installed set — never a snapshot of the manifest as it
+      // was when captured, since a reinstall/upgrade between sessions can change the
+      // plugin's own root/entry/capabilities and the pane must follow that, not a
+      // stale one. No recorded id, or the plugin no longer installed, both fail soft
+      // to the welcome form in this one slot with a toast — never a crash, never a
+      // silently dropped pane (doc/design/pane-plugins.md, "What later slices owe
+      // this note").
+      const manifests = a.pluginId ? await listPlugins().catch(() => []) : [];
+      const found = a.pluginId ? manifests.find((m) => m.id === a.pluginId) : undefined;
+      if (!found) {
+        showToast(
+          `Plugin pane "${a.name}": ${a.pluginId ? `"${a.pluginId}" is no longer installed` : "no plugin was recorded"}. Pick one to reopen it.`,
+          "info"
+        );
+        return openWelcomeIn(ws, dir, anchor);
+      }
+      return ws.grid.openContentPane(
+        events,
+        { kind: "plugin", name: a.name, plugin: await resolvePluginPaneManifest(found), background: true },
+        dir,
+        anchor
+      );
+    }
     case "dormant-group": {
       // The one credit/process-storm-sensitive case: keep the WHOLE group dormant.
       // The Resume button revives it via resumeOrchSession — the only path that
@@ -867,6 +913,7 @@ async function openActionPane(
         // for byte, and resumeDormantGroup can reapply them once the pane
         // they belong to is actually resumed.
         embeds: a.embeds,
+        pluginId: null,
       };
       const content = dormantCard({
         action: "Resume group",
@@ -1411,6 +1458,15 @@ async function handleWelcomeSubmit(
     pane.startContent({ kind: result.kind, name: result.name, root: result.root });
     // Converted in place — no grid open/close fired, so notify explicitly (this is
     // what re-renders the tab strip and re-persists the layout), same as terminal.
+    onGridChanged();
+    return;
+  }
+
+  if (result.kind === "plugin") {
+    // Same in-place conversion as its four siblings — synchronous, no PTY — except
+    // there's no root to pass: the form already resolved the CURRENT manifest
+    // (list_plugins, re-probed right before firing) into what startContent needs.
+    pane.startContent({ kind: "plugin", name: result.name, plugin: result.manifest });
     onGridChanged();
     return;
   }

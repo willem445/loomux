@@ -153,6 +153,14 @@ pub const APP_COMMANDS: &[&str] = &[
     "fm_reveal",
     // filehash (1)
     "fm_hash_start",
+    // plugins (2, #360 Slice B) + the install-approval gate's one writer
+    // (#377). plugin_approve_capabilities persists a HUMAN's capability
+    // decision, so it is main-only (granted via the "plugins" set, which only
+    // "main-ui" aggregates) and must never be granted to a plugin-* webview
+    // or reachable from any agent surface — see plugingrants.rs.
+    "list_plugins",
+    "install_plugin",
+    "plugin_approve_capabilities",
     // obs (1)
     "take_startup_notice",
     // uistate (4)
@@ -164,4 +172,19 @@ pub const APP_COMMANDS: &[&str] = &[
     "voice_start",
     "voice_stop",
     "voice_cancel",
+    // pluginbroker (4) — #360 Slice C/D. plugin_open_window/plugin_close_window
+    // are main-only (granted via the "misc" set); the other two are the ONLY
+    // commands a plugin-* webview's capability grants
+    // (permissions/sets/plugin-broker.toml).
+    "plugin_open_window",
+    "plugin_close_window",
+    "plugin_broker_request",
+    "plugin_broker_open_channel",
+    // pluginregion (1) — #391, folded into #380, renamed/extended by the
+    // #380 sessions-occlusion fix. Main-only (granted via the "main-ui" set,
+    // same as plugin_open_window/plugin_close_window): sets the plugin child
+    // webview's bounds AND clips its own HWND to exclude whatever DOM overlay
+    // rects currently cover its pane, in one atomic command. Never granted to
+    // a plugin-* webview itself.
+    "plugin_set_frame",
 ];

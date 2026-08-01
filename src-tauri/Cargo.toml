@@ -12,7 +12,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# "unstable" reaches Window::add_child (multiwebview), which #360 Slice D
+# uses to host a plugin as a real embedded child webview of the main window
+# instead of a separate WebviewWindow — see doc/design/pane-plugins.md and
+# the findings comment on #360 (spike: fix/360-plugin-embed commit e337c95).
+# Adds zero new crates: tauri-runtime-wry's own `unstable = []` is a pure
+# cfg-gate (confirmed via `cargo tree -e features` before/after enabling it),
+# so this does not affect the getrandom/ProcessPrng constraint this file's
+# getrandom note (below) already tracks.
+tauri = { version = "2", features = ["unstable"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 portable-pty = "0.9"
@@ -147,6 +155,33 @@ windows = { version = "0.57", features = [
     # RAII-guarded. That is the whole reason this was NOT a naive `async fn`. See
     # `filemgr::ComApartment` and doc/design/files-pane.md.
     "Win32_System_Com",
+] }
+# A SECOND, differently-versioned copy of the same crate, deliberately: Tauri's
+# own dependency tree (tao 0.35.3 / webview2-com 0.38.2, both pulled in
+# transitively) already resolves plain `windows` to 0.61.3, two majors ahead of
+# this crate's own long-standing 0.57 pin above. `pluginregion.rs` (#391,
+# folded into #380) needs to pass an `HWND` obtained from Tauri's own
+# `PlatformWebview::controller()` (an `ICoreWebView2Controller` built against
+# 0.61's types) into `SetWindowRgn`/`CreateRectRgn`/etc — and windows-rs's
+# handle newtypes are NOT cross-version-compatible even when the underlying
+# Win32 API is identical (0.57's `HWND(isize)` vs 0.61's
+# `HWND(*mut c_void)` are different Rust types the compiler will not unify).
+# Bumping the shared `windows` dep above to 0.61 was tried and reverted: it
+# breaks metrics.rs's PDH/DXGI calls, which pass raw counter/query handles
+# through several `windows` 0.57-shaped signatures this crate doesn't own or
+# want to touch for an unrelated z-order fix. Aliasing to a second crate name
+# instead keeps every existing Windows call site (filemgr.rs, pty.rs,
+# metrics.rs) on its proven 0.57 types untouched, and gives pluginregion.rs
+# the exact 0.61 types the WebView2 interop boundary actually hands it. Yes,
+# this means two copies of `windows` in the build — an accepted, documented
+# cost of not destabilizing working code for a one-file interop need; a future
+# PR that has reason to touch metrics.rs's PDH/DXGI calls anyway could
+# collapse this back to one version.
+windows061 = { package = "windows", version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Voice-prompt prototype (#58): native mic capture via WASAPI. Windows-scoped on

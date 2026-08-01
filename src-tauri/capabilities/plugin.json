@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "plugin",
+  "description": "#360 Slice C/D: the real capability every plugin child webview is bound to. `webviews: [\"plugin-*\"]` matches every child webview pluginbroker::plugin_open_window creates (label scheme `plugin-<id>-<seq>`) — `webviews`, not `windows`, because #360 Slice D embeds the plugin as a child webview of the MAIN window (Window::add_child): its window label is always \"main\", never `plugin-*`, so only a `webviews`-scoped grant can address it without also matching (and granting) main's own webview. Grants exactly the plugin-broker permission set — the two broker commands (plugin_broker_request, plugin_broker_open_channel) and nothing else in the app's command surface. This is the real, populated sibling of plugin-zero-template.json (#363) — that file stays literally empty as the base template and the tests/acl_manifest.rs zero-grant proof; this one is what a shipped plugin webview actually gets. Widening this beyond \"plugin-broker\" (and never to \"main-ui\") is a reviewed contract change — see doc/design/pane-plugins.md's capability model.",
+  "webviews": ["plugin-*"],
+  "permissions": ["plugin-broker"]
+}

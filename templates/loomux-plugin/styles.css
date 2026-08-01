@@ -1,0 +1,22 @@
+/* A separate file, not an inline <style> block, on purpose: the plugin://
+   CSP is `style-src 'self' plugin:` with no `unsafe-inline`, so an inline
+   <style> element (or a style="..." attribute) would be silently dropped by
+   the browser — a linked stylesheet from your own origin is what actually
+   renders under this policy. */
+body {
+  margin: 0;
+  padding: 1rem;
+  font: 14px/1.4 system-ui, sans-serif;
+  color: #e6e6e6;
+  background: #131318;
+}
+button {
+  font: inherit;
+  padding: 0.35rem 0.8rem;
+  margin-top: 0.75rem;
+}
+code {
+  background: #1e1e26;
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+}

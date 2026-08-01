@@ -86,3 +86,36 @@ export function zoneToPlacement(zone: DropZone): Placement | null {
       return null;
   }
 }
+
+/** A rectangle in the shape `getBoundingClientRect()` returns, reduced to the
+ *  four fields this module needs — not `DOMRect` itself, which needs a
+ *  browser, so this stays testable without one. */
+export interface PaneBox {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/** Whether a pane relocated to a new screen position with its SIZE unchanged
+ *  — the case `Grid.swap()` produces by design (it deliberately preserves
+ *  each slot's flex across a drag-reorder so neither pane ever resizes a PTY)
+ *  and that neither a content view's own `ResizeObserver` nor a window
+ *  `resize` listener will ever fire for, since both only trigger on a size
+ *  change (#380: a drag-reorder swap left a plugin pane's native child
+ *  webview painted over the wrong pane's screen position, because nothing
+ *  told it the pane had moved).
+ *
+ *  `Grid` wraps every mutation that can relocate an EXISTING pane's element
+ *  in a before/after snapshot and calls this for each one, rather than
+ *  re-deriving "does this specific method resize" by hand per call site —
+ *  the same general check also catches any FUTURE position-only path the
+ *  same way, without needing its own bespoke notify call threaded in by
+ *  hand. A pane with no on-screen box after the move (still docked, still
+ *  hidden) is excluded: there's nothing visible to re-sync. */
+export function isPositionOnlyMove(before: PaneBox, after: PaneBox): boolean {
+  if (after.width <= 0 || after.height <= 0) return false;
+  const samePosition = before.left === after.left && before.top === after.top;
+  const sameSize = before.width === after.width && before.height === after.height;
+  return !samePosition && sameSize;
+}
