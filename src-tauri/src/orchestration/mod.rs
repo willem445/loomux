@@ -1589,6 +1589,45 @@ const REINJECT_ACK_SETTLE_MS: u64 = {
         + SUBMIT_CONFIRM_WINDOW.as_millis() as u64      // 4: submit-burst watch
         + tail_ms // 5: blind Enter retries
 };
+
+/// #539: the settling floor `unconfirmed_disposition`'s activity input is
+/// measured from — `REINJECT_ACK_SETTLE_MS`'s sibling, for the same reason and
+/// with a deliberately different sum.
+///
+/// **Why not simply reuse `REINJECT_ACK_SETTLE_MS`.** That floor is measured
+/// from the moment a re-grounding was *decided*, so it must cover the whole
+/// decision→Enter chain (stages 1-5 of its expression). This one is measured
+/// from `submit_sent_ms`, which `deliver_now` stamps immediately BEFORE the
+/// first Enter is written — stages 1-3 (echo-verified typing, the paste→Enter
+/// gap, the wait for quiet) are already spent by then, and charging for them
+/// again would push the floor past the point where a genuine post-delivery
+/// call still counts. What remains after that stamp is exactly the part of our
+/// own submit machinery that can still be pressing Enter: the submit-burst
+/// watch and the blind retry tail.
+///
+/// **What it does NOT bound, stated rather than implied.** An agent that was
+/// mid-turn when our Enter landed can make loomux calls belonging to its
+/// PREVIOUS turn for as long as that turn runs — minutes, not milliseconds —
+/// and no constant computed from delivery timings can separate those from a
+/// call made in response to us. That residual is #546's question (liveness is
+/// not proof of a read), and it is why the activity input governs only the one
+/// arm where the box was independently OBSERVED to no longer hold our text;
+/// see `unconfirmed_disposition`'s precedence table.
+///
+/// `pub` so the integration test can assert the shipped value against its own
+/// stage-by-stage derivation. The sibling constant is private and mirrored by
+/// hand instead, which catches a drifting value only if someone remembers to
+/// re-derive it; comparing against the real one catches it always.
+pub const UNCONFIRMED_ACK_SETTLE_MS: u64 = {
+    let mut tail_ms = 0u64;
+    let mut i = 0;
+    while i < SUBMIT_RETRY_DELAYS.len() {
+        tail_ms += SUBMIT_RETRY_DELAYS[i].as_millis() as u64;
+        i += 1;
+    }
+    SUBMIT_CONFIRM_WINDOW.as_millis() as u64 + tail_ms
+};
+
 /// Production bug fix (#410, PR #329 round 6): how long a `compact_pending`
 /// arm is given to reach a busy-then-quiet resolution (confirm or discard)
 /// before the resolver forces an abandon — symmetric to `REINJECT_CONFIRM_
@@ -1801,6 +1840,31 @@ const BOX_TAIL_WINDOW_SLACK: usize = 200;
 /// cheap (a tail read + a marker-file read), so this can be fairly tight
 /// without real cost.
 const LATE_MONITOR_POLL: Duration = Duration::from_secs(5);
+/// #539: how long a pane's first unconfirmed-delivery alarm waits for
+/// stragglers before it is delivered as ONE notice naming every buffered
+/// delivery (`OrchRegistry::unconfirmed_pending`).
+///
+/// Sized from `LATE_MONITOR_POLL`, not picked round: alarms that need
+/// coalescing are ones raised by *different* monitors on the same pane, and a
+/// monitor only re-reads the ledger (and so only notices it has been
+/// superseded) once per poll. Three polls is enough for a straggler that was
+/// two ticks behind the first alarm to still land inside the window, and
+/// stops well short of the point where a genuine strand's alarm feels late.
+///
+/// The latency it adds is paid on a condition that already took
+/// `PENDING_IDLE_QUIET` (60s) of observed silence to establish, and whose
+/// recovery is a human or an orchestrator reading the pane back — never a
+/// deadline. Coalescing is a pure win against the cost it targets, which is
+/// orchestrator turns, not milliseconds.
+const UNCONFIRMED_NOTICE_COALESCE_WINDOW: Duration = Duration::from_secs(15);
+/// #539 (rev-13 N3): how many delivery ids the coalesced notice names before
+/// it summarizes the rest. Deliberately the SAME number as
+/// `PAUSE_SUPPRESSION_LIST_MAX`, whose doc makes the argument this borrows: a
+/// notice is itself a delivery pasted into a pane, so a list it cannot bound
+/// is a paste it cannot bound. The audit log holds every id either way
+/// (`delivery-unconfirmed-notice` records the full `delivery_ids` array), so
+/// nothing is lost by capping the pasted copy.
+pub const UNCONFIRMED_NOTICE_IDS_MAX: usize = PAUSE_SUPPRESSION_LIST_MAX;
 /// How long the pane's own output must stay quiet — checked ONLY once the
 /// normal confirm/retry window has already closed without a decision —
 /// before "no evidence yet" is treated as "genuinely done and still no
@@ -4007,6 +4071,21 @@ pub enum CompactionStatus {
     /// within `COMPACTION_STATUS_RECENT_WINDOW_MS` of now — worth a human's
     /// attention, but only briefly.
     Abandoned { reason: String, since_ms: u64 },
+    /// #546 (option 3): a re-grounding that RESOLVED within
+    /// `COMPACTION_STATUS_RECENT_WINDOW_MS`, carrying the evidence that
+    /// resolved it — `"delivery"` or `"activity"` (see
+    /// `AgentEntry::compact_last_ack_source`).
+    ///
+    /// The variant exists because the two are not equally strong and the
+    /// system cannot tell a human which one it got unless it says so.
+    /// `"delivery"` is loomux watching its own Enter land; `"activity"` is the
+    /// agent's own process reaching loomux afterwards, which proves liveness
+    /// and NOT that the re-grounding was read. #546 is explicit that no
+    /// artifact loomux can observe today proves the read, so the honest move
+    /// is to make the residual legible rather than to claim it away — the
+    /// same reason `Armed`'s `source` distinguishes a hook-confirmed
+    /// compaction from an inferred one (#417).
+    Acked { source: &'static str, since_ms: u64 },
 }
 
 /// Pure derivation of `CompactionStatus` from already-tracked `AgentEntry`
@@ -4023,6 +4102,10 @@ pub fn compaction_status(
     last_lost_ms: Option<u64>,
     now: u64,
     evidence: Option<&'static str>,
+    // #546: the evidence that resolved the most recent re-grounding, and
+    // when — see `AgentEntry::compact_last_ack_source`.
+    last_ack_source: Option<&'static str>,
+    last_ack_ms: Option<u64>,
 ) -> CompactionStatus {
     if reinject_attempted_ms.is_some() {
         return CompactionStatus::Reinjecting { attempt: reinject_attempts, max_attempts: MAX_REINJECT_ATTEMPTS };
@@ -4034,12 +4117,29 @@ pub fn compaction_status(
             CompactionStatus::Armed { trusted: compact_pending_trusted, source: evidence }
         };
     }
-    if let (Some(reason), Some(ms)) = (last_lost_reason, last_lost_ms) {
-        if now.saturating_sub(ms) < COMPACTION_STATUS_RECENT_WINDOW_MS {
-            return CompactionStatus::Abandoned { reason: reason.to_string(), since_ms: ms };
+    // #546: both of the remaining states are "a recent terminal outcome", and
+    // an agent that has compacted more than once can carry a stamp for each.
+    // The MORE RECENT one wins rather than a fixed ranking: a fixed one would
+    // either let a resolved re-grounding hide a fresh loss (unsafe) or let an
+    // old loss hide today's resolution (misleading). Ties go to the loss —
+    // the louder of the two, and the only one that asks a human for anything.
+    let lost = last_lost_reason
+        .zip(last_lost_ms)
+        .filter(|(_, ms)| now.saturating_sub(*ms) < COMPACTION_STATUS_RECENT_WINDOW_MS);
+    let acked = last_ack_source
+        .zip(last_ack_ms)
+        .filter(|(_, ms)| now.saturating_sub(*ms) < COMPACTION_STATUS_RECENT_WINDOW_MS);
+    match (lost, acked) {
+        (Some((reason, lost_ms)), Some((_, ack_ms))) if lost_ms >= ack_ms => {
+            CompactionStatus::Abandoned { reason: reason.to_string(), since_ms: lost_ms }
         }
+        (Some(_), Some((source, ack_ms))) => CompactionStatus::Acked { source, since_ms: ack_ms },
+        (Some((reason, lost_ms)), None) => {
+            CompactionStatus::Abandoned { reason: reason.to_string(), since_ms: lost_ms }
+        }
+        (None, Some((source, ack_ms))) => CompactionStatus::Acked { source, since_ms: ack_ms },
+        (None, None) => CompactionStatus::None,
     }
-    CompactionStatus::None
 }
 
 /// Compact-nudge (#328): whether context usage has crossed the group's
@@ -5824,6 +5924,27 @@ pub struct AgentEntry {
     pub compact_last_lost_reason: Option<String>,
     /// Unix-ms `compact_last_lost_reason` was set. See its doc.
     pub compact_last_lost_ms: Option<u64>,
+    /// #546 (option 3): WHICH evidence resolved the most recent re-grounding
+    /// — `"delivery"` (loomux's own submit sampler saw the Enter land) or
+    /// `"activity"` (the agent's own process called a loomux tool
+    /// afterwards). Paired with `compact_last_ack_ms`; the same value
+    /// `compact-reinjection-confirmed` audits as `source`.
+    ///
+    /// It is surfaced (not merely audited) because the two prove different
+    /// things and only one of them is about our paste. `"activity"` proves
+    /// the agent is alive and executing its contract — it does NOT prove the
+    /// re-grounding was READ, which is #546's whole finding: a genuinely lost
+    /// paste on an agent that is busy for some other reason resolves this way
+    /// and nothing else says so. A human glancing at the lifecycle panel is
+    /// the last reader who can catch that, and they can only catch it if the
+    /// panel says which evidence closed the phase.
+    ///
+    /// `&'static str` rather than `String` for the same reason
+    /// `compact_pending_evidence` is: the value is one of two literals chosen
+    /// in this module, never anything read from outside it.
+    pub compact_last_ack_source: Option<&'static str>,
+    /// Unix-ms `compact_last_ack_source` was set. See its doc.
+    pub compact_last_ack_ms: Option<u64>,
     /// Lifecycle-panel surfacing (PR #329 round 6): the last context-token
     /// reading `compact_nudge_tick` observed for this agent (from `usage::
     /// compaction_signal_in`, the SAME bounded tail-read the compact-nudge
@@ -6927,6 +7048,36 @@ pub struct OrchRegistry {
     /// Remembering who it was raised for is the only reading that survives the
     /// queue itself.
     queue_pressure: Arc<Mutex<HashMap<u32, (queue::CapacityState, String)>>>,
+    /// #539: unconfirmed-delivery alarms buffered for one coalesced notice
+    /// per pane, keyed by `(group, agent_id, eaten)` and holding each buffered
+    /// delivery's id (its `submit_sent_ms`) in the order they were raised.
+    ///
+    /// **`eaten` is part of the KEY, not a field on the batch** (#585 + #539).
+    /// The two alarms carry materially different instructions — "was LOST, its
+    /// text never reached the box, re-send it" versus "may be sitting
+    /// unsubmitted, get_output it" — so one coalesced line could not
+    /// truthfully cover both. Merging them would put a claim on ids it is
+    /// false for, which is the defect class this repo blocks. Keying on it
+    /// gives each kind its own window and its own accurate wording; the only
+    /// cost is that a pane raising both kinds inside one window pays two
+    /// notices instead of one, still bounded and still far below the
+    /// per-delivery cost this feature replaced.
+    ///
+    /// The cost this exists to stop is the orchestrator's, not loomux's:
+    /// every one of these notices is an agent turn plus the `get_output`
+    /// probe it prompts, so N alarms landing on one pane inside a window
+    /// cost N turns to answer a single question ("is anything actually stuck
+    /// on that pane?"). Two deliveries to the same pane can each declare
+    /// failure within one `LATE_MONITOR_POLL` of the other — supersession
+    /// only retires the older monitor at its NEXT tick — and an in-window
+    /// `Failed` from `deliver_now` can land alongside a monitor's. Same
+    /// collapse-at-source shape #533-A used for the flush itself: one
+    /// message, every constituent named, nothing dropped.
+    ///
+    /// A bucket only ever exists between a first alarm and its flush, so
+    /// this map is empty in the ordinary case and cannot grow without a
+    /// pending timer that will drain it.
+    unconfirmed_pending: Arc<Mutex<HashMap<(String, String, bool), Vec<u64>>>>,
 
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
@@ -9239,6 +9390,19 @@ pub enum UnconfirmedDisposition {
     /// one — the text is gone, not stuck) and let the caller fall through to
     /// the strand path so the badge and `kickoff_recovery_action` are reached.
     EatenNotify,
+    /// #539: the box was observed to no longer hold our text AND the agent's
+    /// own process reached loomux after this delivery settled. The pane is not
+    /// idle — it is working (and #585's turn evidence agrees: the pane painted
+    /// a turn's worth of output since our Enter) — and the only thing still
+    /// arguing for an alarm is `box_pending`, a signal known to latch true
+    /// over an empty box. Reachable ONLY from the `box_pending` cell: an empty
+    /// box with no human text is #585's territory, and activity must never
+    /// silence an eaten delivery there. Record
+    /// it and stop, but under its own name: "we watched the pane go quiet with
+    /// an empty box" and "we watched the agent act" are different facts, and a
+    /// timeline that showed them as one could not tell whether #539's evidence
+    /// is doing any work.
+    ActiveAuditOnly,
     /// Our text is still in the box, or the reading is indeterminate. This is
     /// the genuine strand the notice exists for — announce it unchanged.
     Notify,
@@ -9289,6 +9453,12 @@ pub enum FailedArmRoute {
 pub fn failed_arm_route(disposition: UnconfirmedDisposition) -> FailedArmRoute {
     match disposition {
         UnconfirmedDisposition::IdleAuditOnly => FailedArmRoute::QuietStop,
+        // #539: silent for the same reason `IdleAuditOnly` is — the pane is
+        // demonstrably not stranded — but reached on different evidence, so it
+        // keeps its own audit action at the call site. The totality of this
+        // match is what forced the new variant to be routed consciously
+        // instead of falling through a wildcard into an escalation.
+        UnconfirmedDisposition::ActiveAuditOnly => FailedArmRoute::QuietStop,
         UnconfirmedDisposition::EatenNotify => FailedArmRoute::Escalate { eaten: true },
         UnconfirmedDisposition::Notify => FailedArmRoute::Escalate { eaten: false },
     }
@@ -9368,14 +9538,61 @@ pub fn failed_arm_route(disposition: UnconfirmedDisposition) -> FailedArmRoute {
 /// than a turn's output since our Enter AND the box no longer holds our
 /// text — which is not a finished pane under any reading.
 ///
-/// **Composition with #539.** PR #588 adds an `agent_acted` input (the MCP
-/// activity clock) to the `NotHolding`/`box_pending: true` cell. It is a
-/// strictly better signal than output bytes — it proves the agent's own code
-/// ran — but it governs a different cell and does not reach this one, which is
-/// why this change is additive rather than a duplicate of it. Whichever lands
-/// second, the two compose as evidence-OR: any independent sign that the agent
-/// acted on our delivery justifies silence, and the absence of all of them is
-/// what must speak.
+/// - `agent_acted` (#539) — `agent_acted_since(last_mcp_activity_ms,
+///   submit_sent_ms + UNCONFIRMED_ACK_SETTLE_MS)`: the agent's OWN process
+///   authenticated with its token and invoked a loomux tool after this
+///   delivery settled. #535 built this clock and named this function as its
+///   intended second consumer; until then the detector had no evidence about
+///   the agent at all, only about the box, which is why panes that had
+///   reported and pushed within the same minute still drew the alarm.
+/// - `kickoff_recoverable` (#539) — whether this delivery is a fresh spawn's
+///   kickoff that #517 could still re-deliver.
+///
+/// **The merged table (#585 + #539).** These two landed against the same
+/// function within hours of each other and both split the `NotHolding` row, so
+/// the composition is stated here in full rather than left to be inferred from
+/// match order:
+///
+/// | `reading` | `box_pending` | `turn_evidence` | `agent_acted` | `kickoff_recoverable` | result |
+/// |---|---|---|---|---|---|
+/// | `Holds` | any | any | any | any | `Notify` |
+/// | `Unverifiable` | any | any | any | any | `Notify` |
+/// | `NotHolding` | `true` | `true` | `true` | `false` | `ActiveAuditOnly` (#539) |
+/// | `NotHolding` | `true` | `true` | `true` | `true` | `Notify` (kickoff veto) |
+/// | `NotHolding` | `true` | otherwise | | | `Notify` |
+/// | `NotHolding` | `false` | `true` | — | — | `IdleAuditOnly` (#585) |
+/// | `NotHolding` | `false` | `false` | — | — | `EatenNotify` (#585) |
+///
+/// The `—` are not shorthand for "any": `agent_acted` is **structurally
+/// absent** from the `box_pending: false` arms, and that is the load-bearing
+/// half of this merge.
+///
+/// **Why AND, not OR — correcting this doc's own earlier prediction.** #585
+/// shipped anticipating that #539 would compose as *evidence-OR* ("any
+/// independent sign that the agent acted on our delivery justifies silence").
+/// That is not what shipped, and the difference matters in exactly the cell
+/// #585 exists to protect. An MCP call is **not** a sign that the agent acted
+/// on *our delivery* — it is a sign the agent's process is alive. An agent
+/// whose paste was eaten still calls loomux: every role's instructions end
+/// with "if you have no task yet, report progress and wait". So under OR, a
+/// lost kickoff on a pane with no turn evidence would be silenced by the very
+/// report that proves the agent never got its brief — re-deading the recovery
+/// #585 had just un-deaded, from a different input.
+///
+/// Hence two rules, both restrictions rather than extensions:
+/// - `agent_acted` is read **only** in the `box_pending` cell. The
+///   `IdleAuditOnly`/`EatenNotify` split below is #585's alone.
+/// - Inside that cell it must be accompanied by `turn_evidence`. Silence
+///   requires the pane to have *painted a turn since our Enter* AND the agent
+///   to have *reached loomux after it settled* — two independent post-submit
+///   observations, neither of which the other can manufacture. The panes this
+///   was built for (#539's ~28 false alarms, agents that "had reported and
+///   pushed within the same minute") satisfy both by construction, so the fix
+///   loses nothing it was aimed at.
+///
+/// The honest summary is that the two changes compose as evidence-AND within
+/// one cell and as disjoint ownership across the rest of the row — which is
+/// stricter than either author predicted alone, and strictly safer than both.
 ///
 /// "CLI at rest / turn complete" is the third condition #522 names, and it is
 /// already a PRECONDITION of ever reaching this decision rather than an input
@@ -9386,6 +9603,52 @@ pub fn failed_arm_route(disposition: UnconfirmedDisposition) -> FailedArmRoute {
 /// Taking it as an input anyway would let a caller pass `true` for a pane that
 /// is demonstrably busy, inventing a state the surrounding code cannot
 /// produce.
+///
+/// **Precedence, and what #539 deliberately does NOT touch.** Activity is
+/// added as evidence; it never overrides evidence that points the other way:
+///
+/// | `reading` | `box_pending` | `agent_acted` | result |
+/// |---|---|---|---|
+/// | `Holds` | any | any | `Notify` |
+/// | `Unverifiable` | any | any | `Notify` |
+/// | `NotHolding` | `true` | `true` | `ActiveAuditOnly` (#539) |
+/// | `NotHolding` | `true` | `false` | `Notify` |
+/// | `NotHolding` | `false` | any | `IdleAuditOnly` |
+///
+/// - `Holds` is a direct observation that our text is sitting unsubmitted.
+///   An agent can be busy for reasons that have nothing to do with our paste,
+///   so liveness must not silence a strand we can see.
+/// - `Unverifiable` is #559's honest-uncertainty arm and stays untouched. We
+///   have no box reading at all there, and activity is not a reading of the
+///   box: suppressing on it would re-create exactly the defect #559 fixed
+///   (silence drawn from an answer the pane was never consulted about), just
+///   sourced from a different signal.
+/// - So activity governs precisely ONE cell — the one where the box was
+///   observed to have lost our text and the only remaining argument for an
+///   alarm is `box_pending`, i.e. `PtyManager::input_pending`, which is known
+///   to latch >0 over an empty box (bare ESC, a TUI line-clear, a CLI
+///   consuming the line — see the design note's input-origin section). Two
+///   independent readings — the box no longer holds our text, and the agent
+///   itself reached loomux afterwards — is the same "release on a second,
+///   independent reading" shape #518 used, not a timer.
+///
+/// **The suppression is bounded by construction** (`.loomux/lessons.md`: any
+/// suppression driven by a fallible signal must be BOUNDED). It is not a hold
+/// that waits for a condition to clear, so there is no "what if the signal is
+/// wrong and never clears" state to get stuck in: it is a one-shot decision
+/// taken against a POSITIVE stamp that must already exist. No stamp, no
+/// suppression — a pane with no activity signal keeps its pre-#539 behaviour
+/// exactly. The activity evidence IS the bound.
+///
+/// **Why `kickoff_recoverable` vetoes the suppression.** #517's lost-kickoff
+/// re-delivery is reached through the notify path on a `NotHolding` reading,
+/// and a spawn whose brief never arrived is precisely an agent that will call
+/// a loomux tool anyway: every role's instructions end with "if you have no
+/// task yet, report progress and wait". So on a kickoff, an activity stamp is
+/// as consistent with "the brief was eaten and the agent announced itself
+/// idle" as with "the brief landed" — the one case where this evidence points
+/// at nothing. Rather than let it silence the only recovery a fresh spawn has,
+/// a recoverable kickoff always takes the unchanged path.
 ///
 /// Note what this does NOT do: it does not mark the delivery confirmed. An
 /// idle-pane reading is good enough to withhold an alarm, not to assert
@@ -9399,20 +9662,35 @@ pub fn unconfirmed_disposition(
     reading: BoxReading,
     box_pending: bool,
     turn_evidence: bool,
+    agent_acted: bool,
+    kickoff_recoverable: bool,
 ) -> UnconfirmedDisposition {
     match reading {
         // Our text is still in the box — the genuine strand.
         BoxReading::Holds => UnconfirmedDisposition::Notify,
         // #559: no reading. Silence here would be a claim ("the pane is
         // idle") drawn from an answer that was fixed before the pane was
-        // consulted.
+        // consulted. #539 does not weaken this: activity is evidence about
+        // the agent, never about the box.
         BoxReading::Unverifiable => UnconfirmedDisposition::Notify,
         // Observed empty of our text — idle only if it is empty of the
         // human's too.
-        BoxReading::NotHolding if box_pending => UnconfirmedDisposition::Notify,
+        // #539 + #585, merged deliberately (see this function's doc). The
+        // human-input cell is the ONLY one activity governs, and it now
+        // requires turn evidence as well — see "Why AND, not OR" in the doc.
+        BoxReading::NotHolding if box_pending => {
+            if agent_acted && turn_evidence && !kickoff_recoverable {
+                UnconfirmedDisposition::ActiveAuditOnly
+            } else {
+                UnconfirmedDisposition::Notify
+            }
+        }
         // #585: and only if the pane can show it actually ran a turn. This is
         // the cell that swallowed every lost kickoff this feature exists to
-        // catch — see this function's doc.
+        // catch — see this function's doc. #539 does NOT reach past here:
+        // `agent_acted` is deliberately absent from both arms below, because
+        // an agent that calls a tool while our paste is missing is the
+        // SYMPTOM of the eaten delivery, not evidence against it.
         BoxReading::NotHolding if turn_evidence => UnconfirmedDisposition::IdleAuditOnly,
         BoxReading::NotHolding => UnconfirmedDisposition::EatenNotify,
     }
@@ -10705,9 +10983,27 @@ fn run_late_confirmation_monitor(
                 );
                 append_audit(&root, &group, "loomux", "delivery-confirmed-late", json!({
                     "to": agent, "confirm_source": "hook", "confirm_merged": merged, "was_failed": correction,
+                    // #539: the id the coalescing bucket knows this delivery
+                    // by, so the retraction below is checkable from the record.
+                    "delivery_id": submit_sent_ms,
                 }));
                 if let Some(r) = &reg {
-                    if correction {
+                    // #539 (rev-13 finding A): withdraw this delivery from the
+                    // coalescing bucket BEFORE anything else. Its alarm may
+                    // still be waiting out a 15s window that this very tick
+                    // has just proven wrong, and a notice naming an id we
+                    // already know landed is precisely the false alarm this
+                    // change exists to remove. Unconditional, and ordered
+                    // ahead of the correction notice: if the alarm is still
+                    // buffered there is nothing to correct, because it never
+                    // went out. See `retract_unconfirmed_delivery`.
+                    let withdrawn = r.retract_unconfirmed_delivery(&group, &agent, submit_sent_ms);
+                    // The correction notice is for an alarm the orchestrator
+                    // has ALREADY read. A withdrawn one never reached it, so
+                    // sending "stand down, the earlier alarm was wrong" would
+                    // refer to a message that does not exist — one more turn
+                    // spent, about nothing.
+                    if correction && !withdrawn {
                         r.notify_delivery_confirmed_late(&group, &agent, target_is_orchestrator);
                     }
                     // #496 PR-C: the prompt landed after all — whatever
@@ -10775,10 +11071,25 @@ fn run_late_confirmation_monitor(
                 // same discipline the shared `ledger` observation follows.
                 let output_since_submit = cur_total.saturating_sub(submit_output_baseline);
                 let turn_evidence = output_since_submit >= KICKOFF_TURN_EVIDENCE_BYTES;
+                // #539: the agent's OWN post-delivery MCP call, read from the
+                // shared clock #535 stamps at the `tools/call` funnel. Read
+                // once, here, rather than per tick: this is the only arm that
+                // consults it. `None` (no registry, or an id no longer in the
+                // roster) is "no evidence", which leaves the pre-#539
+                // behaviour untouched — the fail-safe direction for a reading
+                // we cannot take.
+                let acted = reg
+                    .as_ref()
+                    .and_then(|r| r.last_mcp_activity_ms(&agent))
+                    .is_some_and(|stamp| {
+                        agent_acted_since(stamp, submit_sent_ms.saturating_add(UNCONFIRMED_ACK_SETTLE_MS))
+                    });
                 let disposition = unconfirmed_disposition(
                     reading,
                     ptys.input_pending(pty_id).unwrap_or(true),
                     turn_evidence,
+                    acted,
+                    recoverable_kickoff.is_some(),
                 );
                 // #585: the precedence itself, as a VALUE — see
                 // `failed_arm_route`. The defect this issue fixed was a
@@ -10789,9 +11100,31 @@ fn run_late_confirmation_monitor(
                 // assertable at all.
                 let route = failed_arm_route(disposition);
                 if route == FailedArmRoute::QuietStop {
-                    append_audit(&root, &group, "loomux", "delivery-unconfirmed-idle-pane", json!({
-                        "to": agent, "confirm_source": "idle", "confirm_state": "unconfirmed",
-                        "reason": "pane idle — box holds neither our paste nor human input",
+                    // #539 + #585: ONE route, TWO reasons to be silent, and
+                    // they must not share a record — "we watched the pane go
+                    // quiet with an empty box" and "we watched the agent act"
+                    // are different observations, and a shared action string
+                    // could not say which one suppressed the alarm. The route
+                    // stays the single source of the control-flow decision
+                    // (#585's point: precedence as a value); this only picks
+                    // how to say it.
+                    let (action, why) = match disposition {
+                        UnconfirmedDisposition::ActiveAuditOnly => (
+                            "delivery-unconfirmed-agent-active",
+                            "box no longer holds our paste, the pane ran a turn on it, and the agent                              called a loomux tool after this delivery settled — busy, not stranded                              (liveness, not a read)",
+                        ),
+                        _ => (
+                            "delivery-unconfirmed-idle-pane",
+                            "pane idle — box holds neither our paste nor human input",
+                        ),
+                    };
+                    append_audit(&root, &group, "loomux", action, json!({
+                        "to": agent, "confirm_state": "unconfirmed",
+                        "confirm_source": if disposition == UnconfirmedDisposition::ActiveAuditOnly { "activity" } else { "idle" },
+                        // #539: the id the coalesced notice names deliveries by.
+                        "delivery_id": submit_sent_ms,
+                        "settle_ms": UNCONFIRMED_ACK_SETTLE_MS,
+                        "reason": why,
                         // #585: the evidence the silence rests on, recorded
                         // WITH the silence. Without it this row asserted an
                         // idle pane and offered nothing to check the assertion
@@ -10827,9 +11160,11 @@ fn run_late_confirmation_monitor(
                 // about reaching `Failed` changes that value.
                 append_audit(&root, &group, "loomux", "delivery-failed-idle", json!({
                     "to": agent, "confirm_source": "idle", "confirm_state": "failed",
+                    // #539: the id the coalesced notice names this delivery by.
+                    "delivery_id": submit_sent_ms,
                 }));
                 if let Some(r) = &reg {
-                    r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false, eaten);
+                    r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false, eaten, submit_sent_ms);
                 }
                 // #518: bounded (see `human_input_block`). Once this releases,
                 // precedence carries the decision straight into the EXISTING
@@ -11942,7 +12277,10 @@ fn deliver_now(
                 // accurate one here. Only the late monitor, which reads the
                 // box again after the pane has gone quiet, can see a delivery
                 // whose text is gone.
-                r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false, false);
+                // #539: this pane's in-window alarm coalesces with any raised
+                // by a still-live monitor for an EARLIER delivery — same
+                // (group, agent, eaten) bucket, which is the point.
+                r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false, false, submit_sent_ms);
             }
         }
         DeliveryConfirmState::Pending => {}
@@ -14079,14 +14417,66 @@ pub fn should_notify_unconfirmed(target_is_orchestrator: bool, confirmed: bool) 
     !target_is_orchestrator && !confirmed
 }
 
-/// The one-shot notice delivered to the orchestrator for an unconfirmed delivery
-/// to `agent_id` (#103). Points it at the recovery move: read the pane back and
-/// re-send if the prompt is stuck.
-pub fn unconfirmed_delivery_notice(agent_id: &str) -> String {
-    format!(
-        "[loomux] delivery to {agent_id} unconfirmed — the prompt may be sitting \
-         unsubmitted in its pane; get_output it and re-send if needed"
-    )
+/// The notice delivered to the orchestrator for the unconfirmed deliveries to
+/// `agent_id` buffered by one coalescing window (#103, coalesced in #539).
+///
+/// **Why it names ids.** Pre-#539 this was one notice per delivery and the
+/// orchestrator could tell them apart only by arrival order. Coalescing makes
+/// that impossible — several alarms arrive as one line — so each constituent
+/// is named. `delivery_ids` are `submit_sent_ms` stamps: the identity the
+/// delivery ledger and `late_monitor_tick`'s supersession check already key on
+/// (no two deliveries to a pane share one), and the only id EVERY delivery
+/// has, queued or straight through the front door. The same value is written
+/// as `delivery_id` on this pane's `delivery-failed-idle` /
+/// `delivery-unconfirmed-*` audit lines, so a reader can resolve any id in
+/// this notice back to the record it came from.
+///
+/// The verb agrees with the count, per #533's `flush_header_text` — every one
+/// of these lines is read by an agent as an instruction, and one that doesn't
+/// parse is one more reason to skim it. The plural also changes the ASK: with
+/// several deliveries in play the recovery is ONE `get_output`, not one per
+/// id, which is the whole point of coalescing.
+///
+/// **The id list is capped** (rev-13 N3) at `UNCONFIRMED_NOTICE_IDS_MAX`, with
+/// the remainder pointed at the audit log — which holds every id, since
+/// `delivery-unconfirmed-notice` records the whole `delivery_ids` array. This
+/// notice is itself a delivery pasted into a pane, and an uncapped list is the
+/// shape `PAUSE_SUPPRESSION_LIST_MAX` and `dropped_payload_preview` were both
+/// written for. Realistic batches are far below the cap; the cap exists so the
+/// worst case is bounded rather than because the common case needs it.
+///
+/// An empty slice cannot reach here (`flush_unconfirmed_notices` returns
+/// early on an empty bucket); it degrades to the plural wording with no ids
+/// rather than panicking.
+pub fn unconfirmed_delivery_notice(agent_id: &str, delivery_ids: &[u64]) -> String {
+    let ids = notice_id_list(delivery_ids);
+    if delivery_ids.len() == 1 {
+        format!(
+            "[loomux] delivery to {agent_id} unconfirmed (id {ids}) — the prompt may be sitting \
+             unsubmitted in its pane; get_output it and re-send if needed"
+        )
+    } else {
+        format!(
+            "[loomux] {n} deliveries to {agent_id} unconfirmed (ids {ids}) — one or more prompts \
+             may be sitting unsubmitted in its pane; get_output it ONCE and re-send whichever \
+             did not land",
+            n = delivery_ids.len()
+        )
+    }
+}
+
+/// The capped, comma-joined id list both coalesced notices render (#539,
+/// rev-13 N3). Shared so `delivery_eaten_notice` and
+/// `unconfirmed_delivery_notice` cannot drift into different caps — they are
+/// two wordings of the same batch shape, and a cap that applied to one of them
+/// would be a bound that looked enforced and was not.
+fn notice_id_list(delivery_ids: &[u64]) -> String {
+    let shown = delivery_ids.len().min(UNCONFIRMED_NOTICE_IDS_MAX);
+    let mut ids = delivery_ids[..shown].iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+    if delivery_ids.len() > shown {
+        ids.push_str(&format!(", and {} more — see the audit log", delivery_ids.len() - shown));
+    }
+    ids
 }
 
 /// #585: the notice for a delivery whose text was EATEN — the box was read and
@@ -14103,12 +14493,27 @@ pub fn unconfirmed_delivery_notice(agent_id: &str) -> String {
 /// class. `.loomux/lessons.md`, "a claim is a deliverable": the notice states
 /// what was observed, and names the idle pane the orchestrator is about to see
 /// so an idle pane is not mistaken for a refutation.
-pub fn delivery_eaten_notice(agent_id: &str) -> String {
-    format!(
-        "[loomux] delivery to {agent_id} was LOST — its text never reached the pane's box \
-         and the pane ran no turn on it. Re-send it. (get_output will show an idle pane: \
-         that is the symptom, not evidence the delivery landed.)"
-    )
+///
+/// #539 coalesces these per pane like the unconfirmed ones, so it names every
+/// id it stands for and agrees with its own count. The parenthetical is kept
+/// verbatim in both forms: it is the part that stops an idle pane being read
+/// as a refutation, and it is no less needed when several were lost at once.
+pub fn delivery_eaten_notice(agent_id: &str, delivery_ids: &[u64]) -> String {
+    let ids = notice_id_list(delivery_ids);
+    if delivery_ids.len() == 1 {
+        format!(
+            "[loomux] delivery to {agent_id} was LOST (id {ids}) — its text never reached the \
+             pane's box and the pane ran no turn on it. Re-send it. (get_output will show an \
+             idle pane: that is the symptom, not evidence the delivery landed.)"
+        )
+    } else {
+        format!(
+            "[loomux] {n} deliveries to {agent_id} were LOST (ids {ids}) — their text never \
+             reached the pane's box and the pane ran no turn on them. Re-send them. (get_output \
+             will show an idle pane: that is the symptom, not evidence they landed.)",
+            n = delivery_ids.len()
+        )
+    }
 }
 
 /// #112 round 2: the correction notice for a delivery that already drew
@@ -14245,6 +14650,7 @@ impl OrchRegistry {
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
             question_stale_notified: Arc::new(Mutex::new(HashSet::new())),
             queue_pressure: Arc::new(Mutex::new(HashMap::new())),
+            unconfirmed_pending: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
             pr_head_override: Mutex::new(None),
@@ -18117,6 +18523,8 @@ impl OrchRegistry {
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
+            compact_last_ack_source: None,
+            compact_last_ack_ms: None,
             last_context_tokens: None,
             last_context_model: None,
             compact_inference_guard_until_ms: 0,
@@ -18259,6 +18667,8 @@ impl OrchRegistry {
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
+            compact_last_ack_source: None,
+            compact_last_ack_ms: None,
             last_context_tokens: None,
             last_context_model: None,
             compact_inference_guard_until_ms: 0,
@@ -19249,6 +19659,15 @@ impl OrchRegistry {
                             // that conflates them cannot be used to tell
                             // whether this fix is working in the field.
                             let source = if confirmed_delivery { "delivery" } else { "activity" };
+                            // #546 (option 3): the same provenance, kept on
+                            // the entry so it can be SURFACED and not merely
+                            // audited. `"activity"` closes this phase on
+                            // proof the agent is alive, never on proof it
+                            // read the re-grounding, and the lifecycle panel
+                            // is the last place a human can notice the
+                            // difference. See `compact_last_ack_source`.
+                            a.compact_last_ack_source = Some(source);
+                            a.compact_last_ack_ms = Some(now);
                             to_reinject_confirmed.push((a.id.clone(), a.group.clone(), source));
                         }
                         // Still within the timeout, a delivery may be
@@ -22173,6 +22592,8 @@ impl OrchRegistry {
                         a.compact_last_lost_ms,
                         now,
                         a.compact_pending_evidence,
+                        a.compact_last_ack_source,
+                        a.compact_last_ack_ms,
                     ),
                     "context": {
                         "tokens": a.last_context_tokens,
@@ -25310,6 +25731,8 @@ impl OrchRegistry {
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
+            compact_last_ack_source: None,
+            compact_last_ack_ms: None,
             last_context_tokens: None,
             last_context_model: None,
             compact_inference_guard_until_ms: 0,
@@ -27429,34 +27852,211 @@ impl OrchRegistry {
         target_is_orchestrator: bool,
         confirmed: bool,
         eaten: bool,
+        delivery_id: u64,
     ) {
         if !should_notify_unconfirmed(target_is_orchestrator, confirmed) {
             // #445: every suppression path leaves a trace — a suppressed
             // notification must be discoverable after the fact, never just
             // vanish (the routed #451 finding this issue also owns).
             self.audit(group, "loomux", "notice-suppressed", json!({
-                "kind": "unconfirmed-delivery", "to": agent_id,
+                "kind": "unconfirmed-delivery", "to": agent_id, "delivery_id": delivery_id,
+                "eaten": eaten,
                 "reason": if target_is_orchestrator { "target-is-orchestrator" } else { "already-confirmed" },
             }));
             return;
         }
         if self.is_paused(group) {
-            self.audit(group, "loomux", "notice-suppressed",
-                json!({ "kind": "unconfirmed-delivery", "to": agent_id, "reason": "group-paused" }));
+            self.audit(group, "loomux", "notice-suppressed", json!({
+                "kind": "unconfirmed-delivery", "to": agent_id, "delivery_id": delivery_id,
+                "eaten": eaten, "reason": "group-paused",
+            }));
             return;
         }
-        // #585: the audit distinguishes the two, so "how often is a delivery
-        // actually eaten?" stays greppable apart from "how often is one merely
-        // unconfirmed?" — the question this whole issue turned on, which the
-        // pre-#585 log could not answer.
-        self.audit(group, "loomux", "delivery-unconfirmed-notice",
-            json!({ "to": agent_id, "eaten": eaten }));
-        let text = if eaten {
-            delivery_eaten_notice(agent_id)
-        } else {
-            unconfirmed_delivery_notice(agent_id)
+        // #539: buffer, don't send. The alarm is emitted by
+        // `flush_unconfirmed_notices` at the end of a short window so that N
+        // alarms on one pane cost the orchestrator one turn instead of N.
+        if !self.buffer_unconfirmed_delivery(group, agent_id, eaten, delivery_id) {
+            return; // an armed window already owns this bucket
+        }
+        // Exactly one timer per bucket — armed by the alarm that CREATED it,
+        // never re-armed by the ones that join it, so the window cannot be
+        // extended a delivery at a time by a pane that keeps failing (the
+        // same "bounded from the ORIGINAL attempt" rule #535's busy deferral
+        // follows). The thread is the whole deferral: it sleeps, then calls
+        // the same flush a caller can call directly.
+        //
+        // A registry with no `self_arc` (a bare/headless construction — see
+        // `set_self_arc`) has no owner to hand the window to, so it flushes
+        // inline and behaves exactly as it did pre-#539. That is the honest
+        // degrade rather than a bucket nothing would ever drain.
+        let Some(me) = self.arc() else {
+            self.flush_unconfirmed_notices(group, agent_id, eaten);
+            return;
         };
-        let _ = self.deliver_to_orchestrator(group, &text, "loomux");
+        let (g, a) = (group.to_string(), agent_id.to_string());
+        std::thread::spawn(move || {
+            std::thread::sleep(UNCONFIRMED_NOTICE_COALESCE_WINDOW);
+            me.flush_unconfirmed_notices(&g, &a, eaten);
+        });
+    }
+
+    /// Add one alarm to a pane's coalescing bucket (#539), returning whether
+    /// this call OPENED the bucket (and therefore owes it a flush).
+    ///
+    /// Split out of `notify_unconfirmed_delivery` so the two halves of the
+    /// coalescer — accumulate, then emit — are separately callable, and so a
+    /// test can compose them exactly as production does with the only
+    /// difference being that it does not sleep out the window. The gates
+    /// (`should_notify_unconfirmed`, paused) stay in the caller: they are
+    /// per-delivery facts evaluated when the alarm is raised, and the one
+    /// pane-wide gate that can change during the window is re-checked at
+    /// flush time per #532.
+    #[doc(hidden)] // pub for integration tests
+    pub fn buffer_unconfirmed_delivery(&self, group: &str, agent_id: &str, eaten: bool, delivery_id: u64) -> bool {
+        let opened = {
+            let mut pending = self.unconfirmed_pending.lock_safe();
+            let bucket =
+                pending.entry((group.to_string(), agent_id.to_string(), eaten)).or_default();
+            bucket.push(delivery_id);
+            bucket.len() == 1
+        };
+        self.audit(group, "loomux", "delivery-unconfirmed-buffered", json!({
+            "to": agent_id, "delivery_id": delivery_id, "opened_window": opened, "eaten": eaten,
+            "window_ms": UNCONFIRMED_NOTICE_COALESCE_WINDOW.as_millis() as u64,
+        }));
+        opened
+    }
+
+    /// Withdraw ONE delivery's buffered alarm before the window closes (#539,
+    /// rev-13 finding A) — the delivery turned out to have landed after all.
+    ///
+    /// **The defect this closes is one the coalescing delay itself created.**
+    /// `late_monitor_tick` checks `hook_match` before `already_failed`, so a
+    /// late `promptsubmit` record arriving AFTER a failure was declared is a
+    /// first-class outcome (`Confirm { correction: true }` exists for exactly
+    /// it) — and the monitor keeps polling every `LATE_MONITOR_POLL` (5s), so
+    /// two or three of those ticks land inside a 15s window. Pre-#539 the
+    /// alarm had already gone out before any correction could exist, so the
+    /// orchestrator could only ever see "unconfirmed" then "correction, it
+    /// landed". With a buffer in between, the correction can overtake the
+    /// alarm and the orchestrator gets them backwards: "it landed" at t+5s,
+    /// then "unconfirmed … id N …" at t+15s — a `get_output` probe plus the
+    /// tempting re-send that #451/#510 exist to prevent. A change whose whole
+    /// purpose is removing false unconfirmed notices must not manufacture one.
+    ///
+    /// **Retract, rather than re-derive at flush.** The flush has nothing to
+    /// re-derive FROM: `last_delivery` holds the most recent `DeliveryOutcome`
+    /// per pty, not one per delivery id, so for a multi-id batch no ledger can
+    /// answer "is id N specifically still unconfirmed". The path that learns
+    /// the delivery resolved is the one that knows which id resolved, so the
+    /// withdrawal belongs there.
+    ///
+    /// Called unconditionally on `MonitorAction::Confirm`, not only when
+    /// `correction` is set: an id that was never buffered is simply absent and
+    /// this is a no-op, which is a cheaper thing to be sure of than the exact
+    /// equivalence between "an alarm fired" and "`already_failed` is true".
+    ///
+    /// If this empties the bucket the key is dropped, and an already-armed
+    /// timer will fire into nothing (harmless — `flush_unconfirmed_notices`
+    /// returns early on an empty bucket). A LATER alarm for the same pane then
+    /// opens a fresh bucket and arms its own timer, so the worst case is a
+    /// notice delivered sooner than a full window — less coalescing, never a
+    /// lost or a spurious notice.
+    ///
+    /// **The invariant this rests on:** a flush REMOVES the whole bucket, so
+    /// an id still in it has provably not been announced yet. "Withdrawn" and
+    /// "the orchestrator never heard about it" are therefore the same fact —
+    /// which is what lets the caller skip the correction notice for a
+    /// withdrawn id (a correction refers to an alarm the reader has already
+    /// seen; for one that never went out it would be a turn spent describing
+    /// a message that does not exist).
+    ///
+    /// Returns whether anything was actually withdrawn, so the audit can say
+    /// so and a test can assert it.
+    #[doc(hidden)] // pub for integration tests
+    pub fn retract_unconfirmed_delivery(&self, group: &str, agent_id: &str, delivery_id: u64) -> bool {
+        // Both kinds: a correction resolves the DELIVERY, and which flavour
+        // of alarm it happened to raise is not something the confirming tick
+        // knows, or should have to.
+        let (withdrawn, remaining) = {
+            let mut pending = self.unconfirmed_pending.lock_safe();
+            let mut withdrawn = false;
+            let mut remaining = 0usize;
+            for eaten in [false, true] {
+                let key = (group.to_string(), agent_id.to_string(), eaten);
+                let Some(bucket) = pending.get_mut(&key) else { continue };
+                let before = bucket.len();
+                bucket.retain(|id| *id != delivery_id);
+                remaining += bucket.len();
+                withdrawn |= bucket.len() < before;
+                if bucket.is_empty() {
+                    pending.remove(&key);
+                }
+            }
+            (withdrawn, remaining)
+        };
+        if withdrawn {
+            self.audit(group, "loomux", "delivery-unconfirmed-retracted", json!({
+                "to": agent_id, "delivery_id": delivery_id, "remaining": remaining,
+                "reason": "a prompt-landed signal arrived for this delivery before the \
+                           coalescing window closed — it must not be announced as unconfirmed",
+            }));
+        }
+        withdrawn
+    }
+
+    /// Emit the one coalesced unconfirmed-delivery notice for a pane's
+    /// buffered alarms (#539) and clear the bucket.
+    ///
+    /// Called by the timer `notify_unconfirmed_delivery` arms, and directly by
+    /// tests so the coalescing is assertable without sleeping on a real
+    /// window. Idempotent: the bucket is TAKEN, so a second call for the same
+    /// pane finds nothing and returns without delivering an empty notice.
+    ///
+    /// The paused check is repeated here rather than trusted from arm time
+    /// (#532): a group can be paused during the window, and delivery to a
+    /// paused group is suppressed anyway — spending the notice budget into one
+    /// would be a write whose gate was verified against a state that no longer
+    /// holds. The suppression is audited with every id it swallowed, so the
+    /// deliveries are still discoverable (#445).
+    #[doc(hidden)] // pub for integration tests
+    pub fn flush_unconfirmed_notices(&self, group: &str, agent_id: &str, eaten: bool) {
+        let ids = self
+            .unconfirmed_pending
+            .lock_safe()
+            .remove(&(group.to_string(), agent_id.to_string(), eaten))
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return;
+        }
+        if self.is_paused(group) {
+            self.audit(group, "loomux", "notice-suppressed", json!({
+                "kind": "unconfirmed-delivery", "to": agent_id, "delivery_ids": ids,
+                "eaten": eaten, "reason": "group-paused",
+            }));
+            return;
+        }
+        // rev-13 N4: the record follows the attempt, and says whether it
+        // landed. Auditing first and discarding the result asserts a notice
+        // that a dead/unbound orchestrator never received — and coalescing
+        // makes that one false record stand for every id in the batch at once.
+        // `deliver_to_orchestrator`'s "no live orchestrator" branch audits
+        // nothing of its own, so this is the only place it can be recorded.
+        // Same shape as #569's `pause-suppression-notice`.
+        // #585: the wording follows the bucket, so "was LOST, re-send it" can
+        // only ever be said about ids actually read as eaten. The audit keeps
+        // `eaten` too, so "how often is a delivery actually eaten?" stays
+        // greppable apart from "how often is one merely unconfirmed?".
+        let text = if eaten {
+            delivery_eaten_notice(agent_id, &ids)
+        } else {
+            unconfirmed_delivery_notice(agent_id, &ids)
+        };
+        let outcome = self.deliver_to_orchestrator(group, &text, "loomux");
+        self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({
+            "to": agent_id, "delivery_ids": ids, "coalesced": ids.len(), "eaten": eaten,
+            "delivered": outcome.is_ok(), "error": outcome.as_ref().err(),
+        }));
     }
 
     /// #112 round 2 — additive to the #445 seam (a NEW notice path;
@@ -28933,6 +29533,8 @@ fn register_orchestrator_pane(
         compact_pending_armed_ms: None,
         compact_last_lost_reason: None,
         compact_last_lost_ms: None,
+        compact_last_ack_source: None,
+        compact_last_ack_ms: None,
         last_context_tokens: None,
         last_context_model: None,
         compact_inference_guard_until_ms: 0,
