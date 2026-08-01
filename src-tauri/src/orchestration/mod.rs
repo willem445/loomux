@@ -14219,7 +14219,8 @@ pub fn should_notify_unconfirmed(target_is_orchestrator: bool, confirmed: bool) 
 /// early on an empty bucket); it degrades to the plural wording with no ids
 /// rather than panicking.
 pub fn unconfirmed_delivery_notice(agent_id: &str, delivery_ids: &[u64]) -> String {
-    let shown = delivery_ids.len().min(UNCONFIRMED_NOTICE_IDS_MAX);
+    // EVIDENCE NEUTERING: pre-round-3 — the list was unbounded.
+    let shown = delivery_ids.len();
     let mut ids = delivery_ids[..shown].iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
     if delivery_ids.len() > shown {
         ids.push_str(&format!(", and {} more — see the audit log", delivery_ids.len() - shown));
@@ -27653,9 +27654,10 @@ impl OrchRegistry {
         let (withdrawn, remaining) = {
             let mut pending = self.unconfirmed_pending.lock_safe();
             let key = (group.to_string(), agent_id.to_string());
+            // EVIDENCE NEUTERING: pre-round-3 — nothing retracts a single id.
             let Some(bucket) = pending.get_mut(&key) else { return false };
             let before = bucket.len();
-            bucket.retain(|id| *id != delivery_id);
+            let _ = delivery_id;
             let remaining = bucket.len();
             if remaining == 0 {
                 pending.remove(&key);
@@ -27710,11 +27712,11 @@ impl OrchRegistry {
         // `deliver_to_orchestrator`'s "no live orchestrator" branch audits
         // nothing of its own, so this is the only place it can be recorded.
         // Same shape as #569's `pause-suppression-notice`.
-        let outcome = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id, &ids), "loomux");
+        // EVIDENCE NEUTERING: pre-round-3 — claim first, discard the result.
         self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({
             "to": agent_id, "delivery_ids": ids, "coalesced": ids.len(),
-            "delivered": outcome.is_ok(), "error": outcome.as_ref().err(),
         }));
+        let _ = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id, &ids), "loomux");
     }
 
     /// #112 round 2 — additive to the #445 seam (a NEW notice path;
