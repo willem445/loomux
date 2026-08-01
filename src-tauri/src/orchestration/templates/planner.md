@@ -66,10 +66,14 @@ it: act on it, once, normally. The test is always *"have I already acted on this
    pre-approves `git`/`gh` shell commands, built-in read-only ones (`cat`, `grep`,
    `find`, read-only `git`, …), and doc research (`WebFetch`/`WebSearch` — use them to
    ground a plan in a vendor's official reference rather than in recall) — but a
-   build/typecheck command like `cargo check` is denied outright, permanently, with no
-   per-repo way to widen it. If you need one and it isn't reachable, say so in the plan
-   (what you'd have confirmed by running it, and that you couldn't) rather than assuming
-   it ran.
+   build/typecheck command like `cargo check` is **not** in it, and loomux gives you no way
+   to widen that — a planner's persona `allow:` patterns are dropped, unconditionally. It is
+   not *denied* either, though: permission rules merge across scopes rather than override, so
+   what loomux denies you (editing tools, `git commit`/`git push`) can never be allowed back,
+   while a build command it merely never allowed is something the repository's own
+   `.claude/settings.json` may have granted. Assume it didn't unless you see it there. If you
+   need such a command and it isn't reachable, say so in the plan (what you'd have confirmed
+   by running it, and that you couldn't) rather than assuming it ran.
 3. Write the plan as a **GitHub issue comment** (`gh issue comment <n> --body ...`),
    covering:
    - **Scope** — what's in, what's explicitly out.

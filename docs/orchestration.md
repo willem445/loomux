@@ -104,8 +104,14 @@ That last pair means a planner pane can reach arbitrary hosts, which is worth
 knowing if you plan on sensitive repositories; to switch it off, add a `WebFetch`
 (or `WebSearch`) entry to `permissions.deny` in the repository's own
 `.claude/settings.json` — a deny rule there beats anything loomux pre-approves.
-Running a build or test command is *not* pre-approved and cannot be enabled, so a
-plan will say when it could not confirm something by running it.
+Running a build or test command is *not* pre-approved, and loomux offers no way to
+widen that — a planner's persona `allow:` patterns are dropped, unconditionally.
+Your own `.claude/settings.json` can still add one if you decide to: permission
+rules merge across scopes rather than override — the same merge rule that makes
+the `WebFetch` switch-off above work. So what loomux *denies* there is no way to
+allow, but what it merely leaves out of its allow-list — general `Bash`, and so
+`cargo check` — a repo-level `permissions.allow` can grant. Absent that, a plan
+will say when it could not confirm something by running it.
 
 **No agent ever merges.** Agents open PRs; you merge, after your own review.
 

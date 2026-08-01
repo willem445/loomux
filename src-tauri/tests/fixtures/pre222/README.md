@@ -369,6 +369,52 @@ so far:
   properties that change how it should be handled — it needs no acknowledgement, and it
   **drains once**, so it will not be repeated on the next call.
 
+- **#622, a planner's build command is un-allowed, not denied** — `planner.md` only. The
+  correction to the half #610 left standing. The template said a build/typecheck command is
+  *"denied outright, permanently, with no per-repo way to widen it"*, which is false by the
+  same merge-across-scopes rule that makes the escape hatch beside it work: loomux emits no
+  general `Bash` denial (`CLAUDE_EDIT_DENY_TOOLS` is `Edit`/`Write`/`NotebookEdit`,
+  `CLAUDE_READONLY_DENY_GIT` is `git commit`/`git push`), so a repo-level
+  `permissions.allow` merges in and grants it. The error was conservative — it understated
+  what a user controls rather than overstating containment — which is why it shipped and why
+  it is worth fixing now rather than never: a planner told a capability is impossible will
+  not look for it, and a user who wanted their planner to typecheck was told not to try. What
+  the template says now separates the two directions: what loomux *denies* can never be
+  allowed back, what it merely never allowed the repository's own `.claude/settings.json` may
+  have granted, and assume it didn't unless you see it there. `docs/orchestration.md` carries
+  the same correction for the human-facing side; the other three templates never made the
+  claim.
+
+- **#625, `/tmp` is one namespace and a squash reads your prose** — `worker.md`,
+  `reviewer.md` and `orchestrator.md` (`planner.md` writes no files and merges nothing).
+  Two incidents, both a shared resource that looks private from inside one agent.
+
+  **Scratch files.** A worker wrote its PR body to `/tmp/body.md` and `gh pr edit
+  --body-file`'d it; another worker had picked the same path seconds earlier, and PR #621 was
+  published carrying #612's body. Restored, nothing lost — but only because a worker re-read
+  its own PR, since the path has no lock, no error and no warning: the second writer wins and
+  both agents are told it worked. Worktrees isolate the repo and nothing else on the machine,
+  so `worker.md` (a new git-workflow bullet) and `reviewer.md` (beside its `--body-file`
+  carve-out, the one place it is told to write a file at all) now say scratch goes under the
+  agent's own worktree — `./.scratch/`, gitignored — never a bare `/tmp` name. Same
+  shared-namespace class as the `git stash` bullet already next to it (#299) and the retired
+  `CARGO_TARGET_DIR` (#263).
+
+  **Closing keywords.** #569 was auto-closed by a squash for the *second* time in one
+  session. The first (#586) was the ordinary trap `worker.md` already covered — `Closes` on
+  partial scope. The second was PR #615, which linked `Part of #569` deliberately and
+  explained the choice at length, and whose explanation ended "Please close #569 by hand if
+  you agree": GitHub's scan is textual and context-blind, matching `close`/`fix`/`resolve`
+  next to `#N` anywhere in the body or in any commit message a squash aggregates, including
+  inside the sentence arguing against closing. Choosing the right keyword is therefore not
+  enough, and that is the new half. `worker.md`'s DoD item 7 gains the authoring side (grep
+  your own body and `git log` for the pattern before posting); `orchestrator.md` gains the
+  merge side as its own subsection before the post-merge routine (scrub the aggregated
+  message before merging; re-read the partly-addressed issues after, and reopen what closed).
+  Split that way on purpose: the body is written by the worker and the squash is performed by
+  whoever merges, so neither template could carry both halves without telling an agent to
+  police a step it never takes.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
