@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
@@ -5723,10 +5723,11 @@ pub struct AgentEntry {
     ///   the unreliable signal #535 exists to stop relying on.
     ///
     /// Read by `reinject_acked`/`reinject_disposition`. In-memory only, seeded
-    /// `0` on every construction: a restart re-mints agent ids from an
-    /// in-memory counter (the rev-4 B1 lesson in `compact_nudge_tick`), and a
+    /// `0` on every construction: a restart spawns fresh agents rather than
+    /// reviving old ones (the rev-4 B1 lesson in `compact_nudge_tick`), and a
     /// `0` seed cannot be mistaken for a fresh ack the way a `now_ms()` seed
-    /// or a persisted value could.
+    /// or a persisted value could. #524 made the *id* durable, not the
+    /// agent — nothing here becomes carry-over-able because of it.
     pub last_mcp_activity_ms: u64,
     /// #496 hardening: Unix-ms of this agent's last OUTPUT-based quiet-clock
     /// reset only — i.e. the last time `last_progress_ms` above moved because
@@ -6923,7 +6924,36 @@ pub struct OrchRegistry {
     /// request, so its own wiring is already assertable.
     test_spawn_requests: Mutex<HashMap<String, SpawnRequest>>,
     port: AtomicU16,
+    /// Agent-id counter: `w-3`, `rev-8`, `solo-2`, `orch-1` all mint their
+    /// numeric suffix here. **Registry-global, not per-group** — one counter
+    /// serves every group and the solo pseudo-group, which is why its durable
+    /// high-water mark lives at the orchestration ROOT and not in a group dir
+    /// (see `agent_seq_path`).
+    ///
+    /// Never read or bumped directly: `mint_agent_seq` is the only way to take
+    /// a value from it, because a mint that is not persisted is the #524
+    /// defect. Seeded lazily from disk on the first mint (`seed_agent_seq`),
+    /// so `new()` stays I/O-free for the many registries the test suite builds
+    /// and never uses.
     seq: AtomicU32,
+    /// Whether `seq` has been seeded from the durable high-water mark yet.
+    /// Read and set only under `agent_seq_persist`, so the seed happens
+    /// exactly once and can never interleave with a mint that would then be
+    /// overwritten by it.
+    agent_seq_seeded: AtomicBool,
+    /// Serializes the whole agent-id mint: seed → `fetch_add` → persist (#524).
+    ///
+    /// Held across all three deliberately. Persisting outside the critical
+    /// section would let two concurrent spawns write their marks out of order
+    /// (the file ending up BELOW an id already handed out — the exact reuse
+    /// this closes), and the alternative fix, a read-modify-write of the file
+    /// per mint, is strictly more I/O for the same guarantee. Mints happen at
+    /// spawn, a few per session, so serializing them costs nothing measurable.
+    ///
+    /// **Lock order: takes no other registry lock while held**, and no caller
+    /// holds one when it calls in — the same discipline `queue_persist`
+    /// follows, and for the same reason (this does file I/O).
+    agent_seq_persist: Mutex<()>,
     /// Per-pane delivery locks so two prompts to the SAME pane can't
     /// interleave keystrokes, while a slow delivery (waiting out a busy
     /// CLI) doesn't block deliveries to other panes.
@@ -7835,6 +7865,66 @@ pub(crate) fn resolve_worker_resume_cwd(
 /// all-control/whitespace name); callers decide what an empty result means.
 fn sanitize_agent_name(name: &str) -> String {
     name.trim().chars().filter(|c| !c.is_control()).take(40).collect()
+}
+
+/// The delivery id stamped into a kickoff's header (#455) — the token a
+/// receiving agent compares against the deliveries it has already **acted on**.
+///
+/// **Why the agent's own identity is a delivery identity here.** There is
+/// exactly one kickoff per spawned agent, and since #524 an agent id is never
+/// re-minted for the life of an install, so `<group>/<agent>` already names one
+/// delivery uniquely and forever. Nothing new has to be persisted to make this
+/// id durable — it is durable *because* the counter above now is, which is why
+/// the two halves of this change belong in one PR. A resume mints a fresh agent
+/// id (`spawn_agent_ex` always takes a new suffix, resume or not), so a resumed
+/// session's transcript can never contain the id its new kickoff carries.
+///
+/// **Stable by construction across a re-delivery.** The id lives in the kickoff
+/// TEXT, and #517/#585's `redeliver_lost_kickoff` re-admits that same text
+/// byte-for-byte — so a re-delivered brief carries the id it always had, and
+/// `queue::admit`'s byte-identical coalesce (the fourth of that recovery's
+/// duplicate-protection layers) keeps working untouched. Stamping a fresh id
+/// per paste would have broken both.
+///
+/// The `k1` tail says *kickoff, delivery 1*: it keeps the token reading as a
+/// delivery id rather than as the agent id repeated, and leaves room for a
+/// mid-session stamp to extend the same namespace later without a format
+/// change. Mid-session prompts are deliberately NOT stamped today — a unique id
+/// per send would defeat the queue's byte-identical coalesce, which is the
+/// mechanism that already collapses a repeated mid-session ask.
+///
+/// Private on purpose: the tests build this token as a literal `format!` rather
+/// than calling it, so an expectation derived from the code cannot move with the
+/// code — the same independence argument `tests/fixtures/pre222` makes about the
+/// golden templates.
+fn kickoff_delivery_id(group_id: &str, agent_id: &str) -> String {
+    format!("{group_id}/{agent_id}/k1")
+}
+
+/// The one-line kickoff header carrying [`kickoff_delivery_id`]. Self-carrying
+/// on purpose: an agent whose instructions file failed to read still gets the
+/// rule's gist, and the rule's full form (including why a re-delivery is not a
+/// duplicate) lives in the role templates.
+fn kickoff_delivery_note(group_id: &str, agent_id: &str) -> String {
+    format!(
+        "Delivery id: {id} — if you have ALREADY ACTED ON this delivery id, this is a \
+         duplicate paste of one delivery, not new work: say so and do nothing else (see \
+         \"Duplicate deliveries\" in your instructions).",
+        id = kickoff_delivery_id(group_id, agent_id),
+    )
+}
+
+/// The counter value a minted agent id carries: `w-3` → 3, `rev-12` → 12,
+/// `solo-7` → 7. `None` for anything that is not `<prefix>-<number>`.
+///
+/// Splits on the LAST `-` because a block prefix is not guaranteed to be one
+/// token — `Role::prefix()` returns `rev` today, but the id format is
+/// `{prefix}-{seq}` for whatever the prefix is, and only the tail is the
+/// counter. Used to derive the #524 high-water floor from rosters written
+/// before the counter file existed; deliberately total and lossless-in-doubt
+/// (an unparseable tail contributes nothing rather than a guess).
+fn agent_id_suffix(id: &str) -> Option<u32> {
+    id.rsplit_once('-').and_then(|(_, tail)| tail.parse().ok())
 }
 
 /// Add a folder to copilot's `trustedFolders` config, returning the new
@@ -14811,7 +14901,10 @@ impl OrchRegistry {
             pending_binds: Mutex::new(HashMap::new()),
             test_spawn_requests: Mutex::new(HashMap::new()),
             port: AtomicU16::new(0),
+            // Seeded from disk on the first mint, not here — see `seq`'s doc.
             seq: AtomicU32::new(0),
+            agent_seq_seeded: AtomicBool::new(false),
+            agent_seq_persist: Mutex::new(()),
             delivery: Mutex::new(HashMap::new()),
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
             queues: Arc::new(Mutex::new(HashMap::new())),
@@ -16038,6 +16131,159 @@ impl OrchRegistry {
         );
     }
 
+    // ---------- durable agent-id high-water mark (#524) ----------
+
+    /// Path of the durable agent-id high-water mark (#524).
+    ///
+    /// At the orchestration ROOT, beside the group dirs rather than inside
+    /// one, because [`seq`](Self::seq) is registry-global: the same counter
+    /// mints `w-3` in one group and `rev-4` in the next. A per-group file (the
+    /// issue's literal option (a)) would need a max-across-every-group read
+    /// before the first mint, and would still LOSE the mark whenever a group
+    /// dir is swept — while the artifacts keyed by the ids it handed out do
+    /// not go with it. A stale `agent/rev-8` branch in the human's repo,
+    /// colliding with a freshly re-minted `rev-8`, is the collision #227
+    /// actually hit.
+    ///
+    /// A plain file here is invisible to both root scans: `session_roles`
+    /// skips any entry without a `group.json`, and `existing_group_ids`
+    /// filters on `is_dir()`.
+    fn agent_seq_path(&self) -> PathBuf {
+        self.root.join("agent-seq.json")
+    }
+
+    /// Seed [`seq`](Self::seq) from durable state, exactly once. **Caller must
+    /// hold `agent_seq_persist`.**
+    ///
+    /// Two sources, in order of authority:
+    ///
+    /// 1. `agent-seq.json` — written by every mint since #524, so it is by
+    ///    construction at least as high as any id this install handed out.
+    /// 2. Failing that (a fresh install has no file; so does the first launch
+    ///    after upgrading to a build that has this), the **durable roster** —
+    ///    `agents.json` in every group dir. That file already exists and
+    ///    already records every id, so an install that predates the counter
+    ///    file does not have to re-mint its way through a collision before
+    ///    the protection starts working. This is the "derive it from state you
+    ///    already keep" alternative the issue asks to weigh, used where it is
+    ///    genuinely better (migration) rather than as the mechanism, because
+    ///    as the mechanism it fails in two directions the file does not: it
+    ///    misses an agent whose spawn crashed between the mint and the roster
+    ///    write, and it forgets everything when a group dir is swept.
+    fn seed_agent_seq_locked(&self) {
+        if self.agent_seq_seeded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let from_file = fs::read_to_string(self.agent_seq_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v["high_water"].as_u64())
+            .map(|n| n.min(u32::MAX as u64) as u32);
+        // **Both sources, always the higher** — not the file with the roster
+        // as a fallback (rev-13's blocking finding on #604). Consulting the
+        // roster only when the file is missing trusts a file that is known to
+        // be able to LIE: `mint_agent_seq` audits a failed write and does not
+        // propagate it, so the id it just returned goes on to be worktreed,
+        // rostered and audited while the mark that reserved it never reached
+        // disk. The file then parses to a value BELOW the roster, the old
+        // `match` took it at face value, and the next restart reissued a live
+        // id — #524's own bug, back through #524's own degraded path.
+        //
+        // The floor's two weaknesses (it misses a spawn that died before its
+        // roster write; it forgets a swept group dir) are arguments against
+        // the roster as the ONLY source, which is what they were written for.
+        // A max inherits each source's strength and neither's weakness, and
+        // costs one directory scan per process — which the migration path
+        // already paid for.
+        let mark = from_file.unwrap_or(0).max(self.agent_seq_floor_from_rosters());
+        // `fetch_max`, not `store`: a seed may never move the counter
+        // BACKWARDS, which is the one direction that reintroduces the bug.
+        self.seq.fetch_max(mark, Ordering::SeqCst);
+    }
+
+    /// Highest agent-id suffix recorded in any group's durable roster — one of
+    /// the two sources `seed_agent_seq_locked` takes the max of, never a
+    /// fallback consulted only when the other is missing (see its comment).
+    /// Best-effort by construction: an unreadable root, group dir, or
+    /// `agents.json` contributes nothing rather than failing a spawn.
+    fn agent_seq_floor_from_rosters(&self) -> u32 {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return 0;
+        };
+        let mut high = 0u32;
+        for e in entries.flatten().filter(|e| e.path().is_dir()) {
+            let Ok(text) = fs::read_to_string(e.path().join("agents.json")) else {
+                continue;
+            };
+            let Ok(list) = serde_json::from_str::<Vec<AgentRecord>>(&text) else {
+                continue;
+            };
+            for r in list {
+                if let Some(n) = agent_id_suffix(&r.id) {
+                    high = high.max(n);
+                }
+            }
+        }
+        high
+    }
+
+    /// Take the next agent-id suffix, durably (#524) — the ONLY way a value
+    /// leaves [`seq`](Self::seq).
+    ///
+    /// Seed, `fetch_add` and persist all happen under one lock, so the file
+    /// can never end up below an id already handed out (see
+    /// `agent_seq_persist`'s doc). The write lands BEFORE the id is returned,
+    /// which is what makes the guarantee survive a crash mid-spawn: the
+    /// caller has not yet cut a worktree, written a roster row, or emitted an
+    /// audit line, so there is no window where an artifact outlives the mark
+    /// that reserved its id.
+    ///
+    /// A failed write is audited to `group` and not propagated — the same
+    /// rule `persist_queues` follows, for the same reason: failing the spawn
+    /// would turn a durability degradation into an outage of the thing being
+    /// made durable.
+    ///
+    /// A spawn that mints and then fails (a guardrail refusal, a worktree that
+    /// won't cut) leaves its id spent, which is unchanged from before this and
+    /// deliberately not "fixed": returning an id to the pool is exactly the
+    /// reuse this closes. The sequence has gaps; that is what a gap means.
+    fn mint_agent_seq(&self, group: &str) -> u32 {
+        let _writer = self.agent_seq_persist.lock_safe();
+        self.seed_agent_seq_locked();
+        // `saturating_add` under the lock, not `fetch_add` (rev-13 N1). A
+        // stored `high_water` at `u32::MAX` — implausible, but the one input
+        // where the parse-side clamp does NOT fail safe — made the atomic wrap
+        // to 0 and the `+ 1` overflow, and `[profile.release]` sets no
+        // `overflow-checks`, so the shipped binary would wrap silently where
+        // `cargo test` panics. Wrapping is the worst possible failure here: it
+        // reissues from `w-1` and collides with EVERY live id at once.
+        // Saturating instead pins the counter at the ceiling — still broken,
+        // but broken in the direction that hands out no id twice until the
+        // next mint, and it says so out loud rather than looking healthy.
+        // Load/store is safe because every mint holds this lock and nothing
+        // else touches `seq`.
+        let prev = self.seq.load(Ordering::SeqCst);
+        let seq = prev.saturating_add(1);
+        self.seq.store(seq, Ordering::SeqCst);
+        if seq == prev {
+            self.audit(group, "loomux", "agent-seq-exhausted", json!({
+                "seq": seq,
+                "detail": "agent-id counter is at u32::MAX — ids are no longer unique",
+            }));
+        }
+        let body = serde_json::to_string_pretty(&json!({
+            "high_water": seq,
+            "updated_ms": now_ms(),
+        }))
+        .unwrap();
+        if let Err(e) = atomic_write(&self.agent_seq_path(), body.as_bytes()) {
+            self.audit(group, "loomux", "agent-seq-persist-failed", json!({
+                "seq": seq, "error": e.to_string(),
+            }));
+        }
+        seq
+    }
+
     // ---------- durable roster (session ↔ role mapping, resume) ----------
 
     /// Upsert an agent into the group's `agents.json`. Best-effort like the
@@ -16062,9 +16308,12 @@ impl OrchRegistry {
             task: entry.task.clone(),
             branch: entry.branch.clone(),
         };
-        // Match by (id, session): agent ids restart at 1 every app run, so
-        // a bare-id match would overwrite a previous run's record and lose
-        // that session's identity. A session-bearing record also supersedes
+        // Match by (id, session). Since #524 an id is never re-minted, so a
+        // bare-id match can no longer overwrite a DIFFERENT run's record —
+        // but the pair stays, and not merely out of caution: rosters written
+        // before #524 are still on disk and do contain repeated ids, and the
+        // session half is what keeps a copilot placeholder (session `None`)
+        // upgradable in place. A session-bearing record also supersedes
         // this run's placeholder for the same id — copilot writes an entry
         // with no session at spawn, then upgrades it once its session id is
         // discovered (only placeholders have session == None).
@@ -16236,7 +16485,9 @@ impl OrchRegistry {
     }
 
     /// Roster + audit backfill, deduped by session (roster wins). Sessions
-    /// are the stable key; agent ids recycle across app runs.
+    /// are the stable key: ids stopped recycling in #524, but rosters written
+    /// before it are still on disk and do repeat them, so dedup by id would
+    /// still merge two different agents' records on existing installs.
     fn merged_records(&self, group: &str) -> Vec<AgentRecord> {
         // One group's roster + full audit log read and parsed — the unit
         // `GROUP_RECORD_SCANS` counts, so a test can pin how MANY groups a
@@ -18636,7 +18887,7 @@ impl OrchRegistry {
     /// (empty for a delivery-only CLI).
     pub fn solo_prepare(&self, cli: &str, cwd: &str, name: &str) -> Result<Value, String> {
         self.ensure_solo_group();
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq = self.mint_agent_seq(SOLO_GROUP);
         let agent_id = format!("solo-{seq}");
         let display = sanitize_agent_name(name);
         let display = if display.is_empty() { agent_id.clone() } else { display };
@@ -18802,7 +19053,7 @@ impl OrchRegistry {
             return Ok(json!({ "agent_id": existing }));
         }
         self.ensure_solo_group();
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq = self.mint_agent_seq(SOLO_GROUP);
         let agent_id = format!("solo-{seq}");
         let display = sanitize_agent_name(name);
         let display = if display.is_empty() { agent_id.clone() } else { display };
@@ -25672,7 +25923,7 @@ impl OrchRegistry {
         let cli = cli.to_string();
         let model = workflow::model_of(&block, &group.guardrails.agent_cli).to_string();
 
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq = self.mint_agent_seq(group_id);
         let agent_id = format!("{}-{seq}", block.prefix());
         let token = new_token();
         // Name precedence (#95r): a caller-supplied name is the orchestrator's
@@ -26228,9 +26479,14 @@ impl OrchRegistry {
                  First read your role instructions: {ins}\n\
                  Guardrails (enforced by loomux): max {max} live agents, worker model {wm}, reviewer model {rm}, planner model {pm}.\n\
                  Group config: auto-merge is {automerge}; auto-release is {autorelease}; supervised dangerous mode is {dangerous} (see the merge-gate section of your instructions); autonomous idle-tick mode is {autonomous}.{roster}{lessons}\n\
+                 {delivery}\n\
                  Start by calling get_state, run `gh issue list --label agent-managed --state open`, call list_agents, \
                  reconcile them, then give the human a short status summary and wait for direction.",
                 gid = g.id, repo = g.repo, ins = instructions.display(),
+                // #455: every kickoff — an orchestrator's included — carries the
+                // id a duplicate paste would repeat. A header on three roles out
+                // of four is the asymmetry that later reads as a bug.
+                delivery = kickoff_delivery_note(&g.id, &a.id),
                 max = g.guardrails.max_agents, wm = g.guardrails.model_for(Role::Worker),
                 rm = g.guardrails.model_for(Role::Reviewer), pm = g.guardrails.model_for(Role::Planner),
                 // The declared roster (#222) — the orchestrator cannot spawn a
@@ -26252,9 +26508,12 @@ impl OrchRegistry {
             Role::Worker | Role::Reviewer | Role::Planner => {
                 let head = format!(
                     "You are \"{name}\" ({id}), a {role} agent in loomux group {gid} for repository {repo}.\n\
-                     First read your role instructions: {ins}\n{note}",
+                     First read your role instructions: {ins}\n{note}\n{delivery}",
                     name = a.name, id = a.id, role = a.role.as_str(),
                     gid = g.id, repo = g.repo, ins = instructions.display(), note = branch_note,
+                    // #455: the id a duplicate paste of this brief would repeat,
+                    // sitting immediately above the brief it identifies.
+                    delivery = kickoff_delivery_note(&g.id, &a.id),
                 );
                 if a.task.trim().is_empty() {
                     format!("{head}\nNo task is assigned yet. After reading the instructions, call report(\"progress\", \"ready\") and wait for prompts.")
@@ -29787,7 +30046,7 @@ fn register_orchestrator_pane(
     }
     let cli = cli.to_string();
     let token = new_token();
-    let agent_id = format!("orch-{}", reg.seq.fetch_add(1, Ordering::SeqCst) + 1);
+    let agent_id = format!("orch-{}", reg.mint_agent_seq(&group.id));
     if cli == "copilot" {
         reg.pre_trust_copilot_folder(&group.repo);
     }

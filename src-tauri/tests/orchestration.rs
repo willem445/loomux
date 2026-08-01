@@ -39,7 +39,7 @@ use loomux_lib::orchestration::{
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     workflow_mode_notice,
     GhGate, GitTagPush,
-    normalize_remote_web_base, ORCHESTRATOR_TPL, WORKER_TPL, REVIEWER_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
+    normalize_remote_web_base, ORCHESTRATOR_TPL, WORKER_TPL, REVIEWER_TPL, PLANNER_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
     // #534 / #513(c): composed-grid question evidence.
     prompt_wait_match, question_hold_predicate_sampled, question_shown, grid_evidence_for,
@@ -1294,6 +1294,295 @@ fn worker_template_reserves_closes_for_a_pr_that_finishes_the_issue() {
     );
 }
 
+// ---------- #524 / #455: identity durability ----------
+//
+// Two halves of one property, which is why they share a section: an agent id
+// that is never re-minted is what makes the kickoff's delivery id (#455) unique
+// and durable without persisting anything else.
+//
+// Nothing below names a function this PR introduced. The restart tests go
+// through `spawn_agent` and the delivery-id tests build the expected token as a
+// literal `format!` — the same independence argument `tests/fixtures/pre222`
+// makes about the golden templates: an expectation derived from the code's own
+// helper moves with it and pins nothing. It also means this exact test source
+// compiles and runs against the base commit, which is what made the red-before-
+// green evidence a behavior failure rather than a build failure.
+
+#[test]
+fn agent_ids_are_never_re_minted_after_a_restart() {
+    // #524: the ids were minted from an in-memory counter that restarted at 0
+    // with the process, so the first worker of every launch was `w-1` — and
+    // every persisted artifact keyed by that id (a board `assignee`, an audit
+    // row, an `agent/w-1` branch left in the human's repo) silently belonged to
+    // someone else. #227 hit exactly that with a stale `agent/rev-8`.
+    let dir = tempfile::tempdir().unwrap();
+    let before: Vec<String> = {
+        let reg = relaunch_registry(dir.path());
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        vec![
+            reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id,
+            reg.spawn_agent(&g.id, Role::Reviewer, "r", "t", false, None).unwrap().id,
+        ]
+    };
+
+    // ---- the restart: a brand-new registry over the same state root ----
+    let reg = relaunch_registry(dir.path());
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let after = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id;
+
+    assert!(
+        !before.contains(&after),
+        "a restart re-minted {after:?}, an id the previous run already handed out ({before:?}) \
+         — every artifact still referencing it now points at the wrong agent (#524)"
+    );
+    assert!(
+        id_suffix(&after) > before.iter().map(|id| id_suffix(id)).max().unwrap(),
+        "the counter must RESUME above the previous run's high-water mark, not merely differ: \
+         {after:?} against {before:?}"
+    );
+}
+
+#[test]
+fn a_missing_counter_file_reseeds_from_the_durable_roster() {
+    // The install that already exists. Nothing wrote `agent-seq.json` before
+    // this change, so on the first launch after upgrading the only record of
+    // which ids are spent is `agents.json` — the durable roster loomux has
+    // always kept. Without this fallback the protection would start working
+    // only AFTER the very collision it exists to prevent.
+    let dir = tempfile::tempdir().unwrap();
+    // Two, not more: `rails()` caps a group at `max_agents: 2` and a third
+    // spawn is refused by the guardrail, which would fail this test on an
+    // unwrap instead of on the property it is about (caught by the red run —
+    // the first cut asked for three).
+    let before = ids_from_a_previous_run(dir.path(), 2);
+    // Removing a file that does not exist is the same no-op on either side of
+    // this change, so the two runs differ only in whether ids repeat.
+    let _ = std::fs::remove_file(dir.path().join("agent-seq.json"));
+    assert!(
+        !dir.path().join("agent-seq.json").exists(),
+        "the fixture must really have taken the counter file away"
+    );
+
+    let after = id_after_restart(dir.path());
+    assert!(
+        !before.contains(&after),
+        "with the counter file gone the roster is the only durable record of spent ids, and \
+         {after:?} collides with {before:?} (#524)"
+    );
+}
+
+/// The numeric tail of an agent id, re-derived here rather than imported: see
+/// this section's header for why no test below names a function the change
+/// introduced.
+fn id_suffix(id: &str) -> u32 {
+    id.rsplit_once('-').and_then(|(_, n)| n.parse().ok()).unwrap_or_else(|| {
+        panic!("{id:?} is not a minted `<prefix>-<seq>` agent id")
+    })
+}
+
+/// Spawn `n` workers into a fresh group on `dir` and return their ids, letting
+/// the registry drop — the "a previous run happened here" fixture the durability
+/// tests below all start from. Capped by `rails()`'s `max_agents: 2`.
+fn ids_from_a_previous_run(dir: &Path, n: usize) -> Vec<String> {
+    let reg = relaunch_registry(dir);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    (0..n).map(|_| reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id).collect()
+}
+
+/// Restart over `dir` and mint one more id.
+fn id_after_restart(dir: &Path) -> String {
+    let reg = relaunch_registry(dir);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id
+}
+
+#[test]
+fn a_counter_file_behind_the_roster_heals_instead_of_reissuing() {
+    // rev-13's blocking finding on #604, and the case the first cut got wrong.
+    //
+    // `mint_agent_seq` audits a failed persist and deliberately does NOT
+    // propagate it — so the id it just returned goes on to be worktreed,
+    // rostered and audited while the mark that reserved it never reached disk.
+    // The file then parses to a value BELOW the roster. Reading the file as
+    // authoritative whenever it parses takes that lie at face value, and the
+    // next restart reissues a live id: #524's own bug, through #524's own
+    // degraded path.
+    //
+    // Not a tail risk on this repo. `atomic_write` fails on disk-full — its
+    // own `sync_all()` comment calls that "the disk-full guard" — and there
+    // are three recorded disk-exhaustion incidents here (#134, #320, #488),
+    // one of which crashed loomux itself. "Failed write, then a restart" is
+    // close to the modal way this fires.
+    let dir = tempfile::tempdir().unwrap();
+    let spent = ids_from_a_previous_run(dir.path(), 2);
+
+    // Exactly the on-disk state a mint whose write failed leaves behind: the
+    // roster records both agents, the counter file is a valid JSON document
+    // that lags one behind.
+    let stale = format!(r#"{{"high_water":{},"updated_ms":1}}"#, id_suffix(&spent[0]));
+    std::fs::write(dir.path().join("agent-seq.json"), stale).unwrap();
+
+    let after = id_after_restart(dir.path());
+    assert!(
+        !spent.contains(&after),
+        "a counter file behind the roster must heal UP against it, not be believed: minted \
+         {after:?} again after {spent:?} (rev-13 blocking, #524)"
+    );
+}
+
+#[test]
+fn a_counter_at_the_ceiling_saturates_instead_of_wrapping_to_one() {
+    // rev-13 N1. A stored `high_water` at `u32::MAX` is the one input where
+    // the parse-side clamp does not fail in the safe direction: `fetch_add`
+    // wrapped the atomic to 0 and reissued from `w-1`, colliding with every
+    // live id at once — and with no `overflow-checks` in `[profile.release]`
+    // the shipped binary did it silently where `cargo test` would panic.
+    //
+    // Saturating is still a broken state, but it is broken in the direction
+    // that reuses nothing, and `agent-seq-exhausted` says so in the audit.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("agent-seq.json"),
+        format!(r#"{{"high_water":{},"updated_ms":1}}"#, u32::MAX),
+    )
+    .unwrap();
+
+    let id = id_after_restart(dir.path());
+    assert_ne!(
+        id, "w-1",
+        "a counter at the ceiling must never wrap to zero and reissue from the start — that \
+         collides with every live id at once (rev-13 N1)"
+    );
+    assert_eq!(id, format!("w-{}", u32::MAX), "it should pin at the ceiling instead");
+}
+
+#[test]
+fn an_unusable_counter_file_falls_back_to_the_roster() {
+    // rev-13 N3: the corrupt-file paths were correct but asserted only by
+    // inspection. Stated plainly, since it bears on how this evidence reads —
+    // **these cases pass on the parent commit too.** Their behavior does not
+    // change in this round; they are the coverage the blocking finding was
+    // hiding in, and they now also pin that the `unwrap_or(0)` half of the new
+    // max cannot swallow the roster when the file is unusable.
+    for (label, body) in [
+        ("empty", ""),
+        ("not json at all", "high_water = 9"),
+        ("wrong value type", r#"{"high_water":"five"}"#),
+        ("negative", r#"{"high_water":-3}"#),
+        ("field missing", r#"{"updated_ms":1}"#),
+        ("truncated mid-write", r#"{"high_wat"#),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let spent = ids_from_a_previous_run(dir.path(), 2);
+        std::fs::write(dir.path().join("agent-seq.json"), body).unwrap();
+
+        let after = id_after_restart(dir.path());
+        assert!(
+            !spent.contains(&after),
+            "an unusable counter file ({label}) must fall through to the roster, not read as \
+             zero and reissue: minted {after:?} again after {spent:?}"
+        );
+    }
+}
+
+#[test]
+fn every_kickoff_carries_a_delivery_id_that_is_stable_across_rebuilds() {
+    // #455: nothing stamped a delivery, so a receiver had no way to recognise
+    // "I have already acted on this one" — the mitigation the issue asks for
+    // even before the CLI-side root cause is known.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "Fix #7", false, None).unwrap();
+    let o = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    let k = reg.kickoff_prompt(&w, &g, "note", None);
+    assert!(
+        k.contains(&format!("Delivery id: {}/{}/k1", g.id, w.id)),
+        "a delegate kickoff must carry its delivery id: {k}"
+    );
+    assert!(
+        k.contains("ALREADY ACTED ON"),
+        "the header must carry the rule's operative test, not just an opaque token — an agent \
+         whose instructions file failed to read still has to be able to act on it: {k}"
+    );
+
+    // Every kickoff, not three roles out of four: an orchestrator that
+    // re-processes its own kickoff re-runs a whole session start.
+    let ok = reg.kickoff_prompt(&o, &g, "", None);
+    assert!(
+        ok.contains(&format!("Delivery id: {}/{}/k1", g.id, o.id)),
+        "an orchestrator kickoff must carry one too: {ok}"
+    );
+
+    // THE property #517/#585's re-delivery depends on. That recovery re-admits
+    // the brief BYTE-IDENTICALLY, and `queue::admit`'s byte-identical coalesce
+    // is one of its duplicate-protection layers — an id minted per paste would
+    // break the coalesce and hand the receiver a fresh id for work it may
+    // already have done.
+    assert_eq!(
+        k,
+        reg.kickoff_prompt(&w, &g, "note", None),
+        "a kickoff's delivery id must be a property of the delivery, not minted per build"
+    );
+    assert_ne!(
+        reg.kickoff_prompt(&w, &g, "note", None),
+        ok,
+        "two agents must not share a delivery id"
+    );
+}
+
+#[test]
+fn the_kickoff_header_points_at_a_section_every_template_actually_has() {
+    // A header that names a section the reader's own instructions file does not
+    // contain is worse than no header: it tells the agent a rule exists and
+    // then hides it.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let k = reg.kickoff_prompt(&w, &g, "note", None);
+    assert!(k.contains("Duplicate deliveries"), "the header must name the section: {k}");
+    for (role, tpl) in
+        [("orchestrator", ORCHESTRATOR_TPL), ("worker", WORKER_TPL), ("reviewer", REVIEWER_TPL),
+         ("planner", PLANNER_TPL)]
+    {
+        assert!(
+            tpl.contains("## Duplicate deliveries"),
+            "{role}.md has no `## Duplicate deliveries` section for the kickoff header to point at"
+        );
+    }
+}
+
+/// The rule itself, pinned on the LIVE templates rather than only in the
+/// `pre222` golden — which fails on any template edit at all, as *"re-bless
+/// me"*, and so teaches nobody which rule went missing (#594's placement
+/// argument, same file).
+///
+/// Three concepts, not sentences. The prose may be rewritten; a version missing
+/// any of these has stopped stating the rule:
+///
+/// - the token exists and is called a **delivery id**;
+/// - the test is **already acted on** — not "already seen", which would make an
+///   agent no-op a brief it never got to act on;
+/// - a **re-delivery is not a duplicate**, which is what keeps this composable
+///   with #517/#585's deliberate re-send of a lost kickoff.
+#[test]
+fn every_role_template_distinguishes_a_duplicate_paste_from_a_re_delivery() {
+    for (role, tpl) in
+        [("orchestrator", ORCHESTRATOR_TPL), ("worker", WORKER_TPL), ("reviewer", REVIEWER_TPL),
+         ("planner", PLANNER_TPL)]
+    {
+        let lower = tpl.to_lowercase();
+        for concept in ["delivery id", "already acted on", "re-delivery is not a duplicate"] {
+            assert!(
+                lower.contains(concept),
+                "{role}.md no longer says {concept:?} — without all three the rule either has no \
+                 token to key on, keys on having SEEN the bytes (so a lost kickoff's re-delivery \
+                 gets dropped as a duplicate), or forbids the re-delivery outright (#455/#585)"
+            );
+        }
+    }
+}
+
 // ---------- #445: delivery queue — registry-level bookkeeping ----------
 //
 // `deliver_now`'s pipeline and the drainer thread cannot be exercised here
@@ -2012,16 +2301,24 @@ fn a_queued_delivery_survives_a_restart_and_is_re_queued_in_order_for_a_resumed_
                         Some(session.clone()), Some(dir.path().to_string_lossy().to_string()), None)
         .unwrap();
     let new_pty = 999u32;
-    // Agent ids are minted off an in-memory counter that restarts with the
-    // process, so after a restart they REPEAT — the first worker spawned in
-    // this new process gets "w-1" whether or not it is the same worker. That
-    // is not a quirk of this test; it is why `agent_id` cannot be the
-    // rebinding key even though #468's filing proposed it, and why the
-    // session id is. Pinned rather than worked around, because the day this
-    // stops being true is the day someone might reasonably "simplify"
-    // `rebinds_to` back to comparing ids.
-    assert_eq!(resumed.id, _old_agent,
-        "a restart re-mints agent ids from zero — an id collision here is expected, not identity");
+    // This assertion is INVERTED as of #524, and the inversion is the point.
+    //
+    // It used to read `assert_eq!(resumed.id, _old_agent)` — agent ids were
+    // minted off an in-memory counter that restarted with the process, so the
+    // first worker of every launch was `w-1` whether or not it was the same
+    // worker, and this test pinned that collision as expected behavior. #524
+    // made the counter durable, so a restart now resumes ABOVE the previous
+    // run's high-water mark and the collision cannot happen.
+    //
+    // What the line was really defending is unchanged and still defended here:
+    // `agent_id` is not the rebinding key, the session id is. That is now shown
+    // the stronger way — the recovery below re-binds three payloads to an agent
+    // whose id does NOT match the one they were queued for, which no
+    // id-comparing `rebinds_to` could do. Restoring an id-equality shortcut
+    // would fail on the next four assertions rather than pass silently.
+    assert_ne!(resumed.id, _old_agent,
+        "a restart must never re-mint a spent agent id (#524) — and the recovery below must \
+         still work across the change of id, because it keys on the session");
 
     let n = reg.readmit_recovered(&gid, &resumed.id, new_pty);
     assert_eq!(n, 3, "every queued payload must come back");

@@ -135,6 +135,27 @@ the same PR, stop: that isn't diligence, it's exactly the context spend #398 exi
 means either the report is missing the one fact you actually needed — tell the worker/reviewer so
 the next one carries it — or you're re-checking out of habit.
 
+## Duplicate deliveries
+
+Your kickoff carries a `Delivery id:` line, and so does every delegate's. The rule: **a brief
+whose delivery id you have already acted on is a duplicate — acknowledge it in one line and do
+nothing else.** No re-running the session-start reconcile as though it were a new session, no
+re-dispatching work you already dispatched. Record the id the first time you act on it
+(`note_directive`).
+
+loomux types a kickoff **once** — audit-confirmed, not assumed (#455). The duplication happens
+after the bytes leave loomux, when the CLI re-processes one queued paste, so the second copy is
+the *same paste* and carries the *same delivery id*.
+
+**A re-delivery is not a duplicate.** When loomux can see that a kickoff never reached a pane,
+it deliberately re-sends that same brief — same bytes, so the same delivery id (#517/#585). If
+the receiver has not acted on that id yet, this is the first time it is really seeing it: act
+on it, once, normally. The test is always *"have I already acted on this id?"*, never *"have I
+seen these bytes?"* — a brief nobody got to act on is work that has not been done.
+
+A delegate that reports its brief was a duplicate has therefore **done the work once**, not
+zero times: read its earlier report rather than re-spawning it.
+
 ## Cost guardrails (enforced by loomux)
 
 Unattended orchestration burns money over time, so loomux enforces these automatically —

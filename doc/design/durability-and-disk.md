@@ -68,6 +68,7 @@ that without a getrandom crate.
 | `queue.json` | `persist_queues` (#468) | `queue_persist`, held across read-then-write | `atomic_write`. **Snapshot, not journal** — see below |
 | `audit.jsonl` | `append_audit` | `AUDIT_LOCK` (#240) | **append-only** — a failed append can't truncate prior lines, so `atomic_write` is the wrong tool. Its own atomicity problem, and its own fix: see Part 1b |
 | `configs/<id>.json`, role `*.md`, attachments | derived/one-shot | — | not mutable durable state — regenerated or uniquely named, so a failed write is retryable, not destructive; left as plain `fs::write` |
+| `agent-seq.json` (#524) | `mint_agent_seq` | `agent_seq_persist`, held across seed-then-mint-then-write | `atomic_write`. **At the orchestration ROOT, not in a group dir** — see below |
 
 `state.json` is written by `set_state` **without a lock**. Two concurrent
 `set_state` calls are still safe under `atomic_write`: each writes its own
@@ -105,6 +106,36 @@ last-writer-wins note above tolerates, which a queue cannot. Lock order is
 `queue_persist` → `queues`, and the write happens with no queue lock held: file
 I/O inside that critical section would stall every delivery in the registry. See
 `doc/design/orchestration.md`'s "Durability (#468/#467)".
+
+`agent-seq.json` (#524) is the one entry in this table that is **not** in a
+group dir, and that placement is the design decision rather than an oversight.
+The counter it protects is registry-global — one `seq` mints `w-3` in one group
+and `rev-4` in the next — so a per-group copy would need a max-across-every-group
+read before the first mint and would still lose the mark whenever a group dir is
+swept, while the artifacts keyed by the ids it handed out (a board `assignee`, an
+audit row, an `agent/<id>` branch in the human's repo) do not go with it. A plain
+file at the root is invisible to both root scans: `session_roles` skips any entry
+without a `group.json`, and `existing_group_ids` filters on `is_dir()`.
+
+Its lock is held across seed → mint → write for the same reason `queue_persist`
+is held across read-then-write: persisting outside the critical section lets two
+concurrent mints write out of order and leave the file *below* an id already
+handed out, which is precisely the reuse the file exists to prevent. The write
+also lands **before** the id is returned to the caller, so a crash mid-spawn
+cannot leave an artifact without its mark.
+
+**This is the one file in the table whose failed write is recoverable from
+somewhere else, and that is deliberate.** A failed write is audited
+(`agent-seq-persist-failed`) and not propagated — `persist_queues`' rule, for
+`persist_queues`' reason — which means the id is handed out anyway and the file
+is left *behind* what has actually been issued. Since `atomic_write`'s failure
+mode is disk-full and this project has three recorded disk-exhaustion incidents
+(above), that is a correlated risk rather than a tail one. So the reader
+compensates: the seed takes `max(agent-seq.json, highest id in every group's
+agents.json)` rather than believing the file whenever it parses, and a mint whose
+write failed is still covered by the roster row its spawn goes on to write. See
+`doc/design/orchestration.md`'s "Agent ids that survive a restart" for the
+invariant that buys and the narrow window it does not.
 
 ## Part 1b — atomic appends (#240)
 
