@@ -1570,6 +1570,16 @@ Two sites, deliberately:
 from the code's, a live distribution would answer a different question convincingly, which is worse
 than not measuring.
 
+**One producer-side interaction, so a live log is not misread (#632/#638).** Every framing row of a
+coalesced flush is now marker-led, which adds the marker's bytes per constituent to the paste
+itself — so `paste_chars` (and with it `requested_bytes`) is a little larger for coalesced
+deliveries than it was before that change. It needs no correction when reading the numbers: each
+record's breakeven is computed from its OWN `paste_chars` and `requested_bytes`, so every row
+carries its own bar rather than being compared against a table constant. Nor does it move anything
+past the ceiling: `FLUSH_ITEM_OVERHEAD`'s per-item charge is unchanged and still bounds the
+composed text at `QUEUE_FLUSH_MAX_BYTES`, so the only pastes above `TIER1_SCAN_MAX_BYTES` remain
+the single oversized entries that were always there.
+
 **How to read the numbers.** Against a live group's `audit.jsonl`:
 
 ```sh
