@@ -486,6 +486,26 @@ fn arg_str_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, String>
     }
 }
 
+/// A string argument that must actually BE a string when present (#324,
+/// applying #582's rule above to `session_digest`'s three identifiers).
+/// Absent or null is `None`; a present-but-wrong-typed value is an error, not
+/// a silent `None`.
+///
+/// `arg_str` cannot make that distinction — it returns `None` for both — and
+/// for an identifier argument the two mean opposite things. `session_digest`'s
+/// own description invites `"PR number, #n, or URL"`, so `{"pr": 646}` is the
+/// natural thing for a caller to send; through `arg_str` that reads as *no
+/// identifier at all* and comes back "exactly one of task, agent, or pr is
+/// required" — a message that contradicts what the caller plainly did, and
+/// sends it looking for a bug in its own call shape rather than its arg type.
+fn arg_str_strict<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(format!("{key} must be a string")),
+    }
+}
+
 /// A boolean argument (#582: `claim`). Absent or null is `false`; a non-bool
 /// is an error rather than a defaulted `false`, so `"claim": "true"` can never
 /// read as "no claim requested" and hand the same task out twice.
@@ -1145,9 +1165,9 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             if caller.role != Role::Worker || caller.role_hint.as_deref() != Some("process") {
                 return Err("permission denied: session_digest is for process-hinted worker blocks".into());
             }
-            let task = arg_str(args, "task");
-            let agent = arg_str(args, "agent");
-            let pr = arg_str(args, "pr");
+            let task = arg_str_strict(args, "task")?;
+            let agent = arg_str_strict(args, "agent")?;
+            let pr = arg_str_strict(args, "pr")?;
             let provided = [task.is_some(), agent.is_some(), pr.is_some()].into_iter().filter(|b| *b).count();
             if provided != 1 {
                 return Err("exactly one of task, agent, or pr is required".into());
