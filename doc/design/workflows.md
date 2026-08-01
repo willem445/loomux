@@ -922,6 +922,22 @@ over a body carrying CRLF, trailing blank lines, trailing spaces, non-ASCII and
 `$`-bearing text — it can only pass if two independent implementations produced the
 same 64 characters.
 
+**What this deliberately does NOT cover: the PR title.** GitHub takes a squash
+commit's *subject* from the PR title, which is as editable as the body — so the
+squash record is pinned here only from the second line down. Covering it means the
+shim joining two `--json` fields into one canonical string, which is a **second
+canonical-form contract that the shell and Rust halves would have to keep agreeing
+about forever** — the same class of coupling this section spent its whole design
+budget keeping to two rules. That earns its own change with its own executed
+cross-check, rather than riding in on this one. #565 stays open on exactly that
+residual; it is the follow-up artifact, and nothing in the mechanism below has to
+change to add it (one more field in `pr_body`'s query, one more line in
+`canonical_body`, one more `--jq` expression in the shim).
+
+The issue also names a planner's **issue body** as a candidate. That one is not a
+smaller version of this: it is part of no commit, and no gate reads it, so it needs
+its own argument for what a digest would be *for* before it gets one.
+
 Fail-closed, like the head binding: a verdict with **no** digest (recorded by a
 build older than this one, or with the body unreadable at record time) can never
 show the body unchanged, so `body-unchanged` refuses on it. The hasher itself is

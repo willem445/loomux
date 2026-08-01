@@ -1415,8 +1415,16 @@ pub fn canonical_body(body: &str) -> String {
 }
 
 /// sha256 of [`canonical_body`], lowercase hex. The one definition; the shim
-/// pipes the same canonical bytes through `sha256sum`/`shasum`/`openssl`, and
-/// `the_shim_and_rust_agree_on_the_body_digest` executes both against one body.
+/// pipes the same canonical bytes through `sha256sum`/`shasum`/`openssl`.
+///
+/// The two implementations are held together by an executed test, not by this
+/// comment: case 1 of
+/// `the_shim_refuses_a_merge_whose_body_moved_after_the_pass_when_the_repo_opts_in`
+/// records a verdict through the real MCP tool and then merges through the real
+/// shim over the SAME body — a body carrying CRLF, trailing blank lines, trailing
+/// spaces, non-ASCII and `$`-bearing text — so the merge is allowed only if both
+/// sides produced the same 64 characters. Disagreement surfaces as that case
+/// failing with the gate's own refusal text.
 pub fn body_digest(body: &str) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
