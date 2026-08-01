@@ -6407,6 +6407,101 @@ survive a fair lock. Closed by unifying admission rather than by widening the fa
 "Ordering", above, for the full argument and `queue.rs`'s `unified_admission_property` module for
 the exhaustive proof.
 
+### Front-door refusals (#579)
+
+**The one loss with no queue entry to its name.** Every mechanism above is keyed on a delivery
+id, because every mechanism above is about a payload that WAS queued. A delivery refused at the
+cap never was: `enqueue_text`'s `RejectFull` arm returns before `queue_seq.fetch_add`, so no id is
+minted and the payload cannot join `orphaned_queue_entries`'s open/close map, `merge_orphans`'s
+dedupe, or the live-id filter. It is not that `queue_orphans` under-reported refusals — it was
+structurally incapable of seeing one. #563 met the same problem from the audit side and split this
+out rather than folding it into #572's visibility fix, precisely because closing it means touching
+the `queue_orphans` wire shape, and that is a public-contract change owed its own argument.
+
+**The contract choice: a second list.** Three shapes were available and two are worse.
+
+- *A synthetic id* — mint a number for a refusal so it can ride in the existing `orphans` array.
+  Rejected: `id` is not decoration, it is the join key three separate consumers run on, and a
+  number that joins against nothing while looking like one that does is the "a claim is a
+  deliverable" defect in wire form. It would also collide with `queue_seq`'s real ids or need a
+  disjoint range nothing else knows about.
+- *`Option<u64>`* — widen `OrphanedQueueEntry.id`. Rejected: every existing row's id becomes
+  nullable, for the benefit of rows that can never have one, and every downstream reader has to
+  learn a `None` case that means "this row is a different kind of thing." If the row is a
+  different kind of thing, say so in the shape.
+- *A second list* — `refused`, beside `orphans`, keyed on `{from, to, preview}`, the same naming
+  #569's `SuppressedDelivery` settled on for the same reason. Chosen. `count`/`orphans` keep their
+  exact pre-#579 bytes, so the change is additive for every existing reader, and the new keys are
+  always present (`refused_count`, `refused_omitted`, `refused`) so a reader never has to
+  distinguish "no refusals" from "this build does not report them".
+
+The decisive argument is behavioral, not aesthetic. An orphan is a payload loomux still **holds** —
+staged in `recovered_queue`, re-admitted the instant its pane rebinds. A refusal was **declined**,
+and the sender told so synchronously. Putting refusals in the orphan list would put them within
+reach of `readmit_recovered`, and silently re-admitting an hour-old declined delivery would reorder
+it against everything the pane accepted in the meantime — the third acceptance criterion #579 filed.
+Being audit-derived and read-only, `front_door_refusals` cannot do that even by accident, and
+`reporting_a_refusal_never_re_admits_it` pins it because "read-only" is the kind of property a
+later refactor spends without noticing.
+
+**Recovering the payload — verified, not assumed.** #572 made the refusal line identifiable
+(`from`, `bytes`, a bounded `preview`); #579's acceptance asks for enough to *re-send*, and a
+160-char preview is not that. The bytes do survive: `deliver_prompt` audits `prompt` with the FULL
+text immediately before it admits, on both the paused and unpaused paths. So a refusal is paired
+with the most recent `prompt` line from the same sender to the same target, and that line is
+accepted only if **both** of its fingerprints match what the refusal itself recorded —
+`text.len() == bytes`, and `queue::dropped_payload_preview(text) == preview`, recomputed. Two checks
+rather than positional adjacency, because audit writes from concurrent delivery threads interleave
+and "the line just before" is not a guarantee. On any mismatch the row reports `text: null` and the
+reader falls back to the preview, which is the safe direction: the failure mode of guessing here is
+handing an orchestrator the wrong bytes to paste into somebody's terminal.
+
+The residual, stated: a second `prompt` line for the same (sender, target) pair, written by another
+thread inside the window between this delivery's own `prompt` line and its refusal, whose text also
+agrees on total byte length *and* on its whitespace-collapsed first `DROPPED_PREVIEW_MAX` chars.
+That is either the same payload or a near-twin of it; it is not closed, and
+`a_refusal_reports_no_text_rather_than_bytes_it_cannot_verify` pins the length-only case a weaker
+join would have accepted.
+
+**Three things the list deliberately does not do.**
+
+- **It does not double-report.** A recovery re-admission refused at the cap (`readmit_recovered`,
+  `EnqueueReason::Recovered`, hazard 5 above) writes the same `queue-full-at-call` line, but that
+  entry goes back into staging and keeps being reported as an *orphan* — with its payload, by an
+  id. Refusals carrying that reason are excluded, or one lost payload would appear twice in one
+  tool result whose documented response is "re-send" (`a_recovery_re_admission_refused_at_the_cap_
+  is_reported_once_as_an_orphan`).
+- **It does not claim to be complete.** Unlike orphans, which `QUEUE_MAX_PER_PANE` already bounds
+  at 8 per pane, refusals accumulate without limit — a pane held at capacity refuses every arrival
+  for as long as it stays there. So the list is capped at `REFUSED_LIST_MAX` (8, borrowing
+  `PAUSE_SUPPRESSION_LIST_MAX`'s argument for the analogous cost: not a paste into a pane this
+  time, but a read into an orchestrator's context, at up to `ORPHAN_TEXT_CAP_BYTES` per row). The
+  most recent survive, since a pane at capacity keeps refusing; `refused_count` states the true
+  total and `refused_omitted` what was left in `audit.jsonl`. A capped list reported as complete is
+  the silent truncation `.loomux/lessons.md` names.
+- **It does not pretend a refusal is restart-shaped.** The orphan list is produced by exactly one
+  thing, which is why its advice is "call it once at session start." Refusals happen in ordinary
+  operation, so that list can be non-empty on a session with no restart in it — and every one of
+  them was already reported to its sender in-band. The tool description and `orchestrator.md` both
+  say so, and say which rows actually need action: those whose sender has since died, and those
+  where `from` is `loomux` itself, because then nobody was listening.
+
+**Two shapes, because `queue-full-at-call` is written twice.** `enqueue_text`'s arm refuses a text
+payload (`payload: "prompt"`, recoverable bytes). `audit_stranded_push`'s refuses a `StrandedSubmit`
+marker (`payload: "stranded-submit"`), which never had text at all — the bytes were already pasted
+into the pane and only the Enter was queued, so that pane is sitting with an unsubmitted prompt in
+its box. "Re-send it" is the wrong instruction there, so the row carries the audit line's own
+`consequence` string verbatim rather than a second wording of it, and points the reader at the pane.
+Reporting only the prompt case would have made the list's own claim false, which is the failure mode
+a partial list presented as complete always is.
+
+**Overlap with #569's resume notice, on purpose.** A refusal inside a pause window is also reported
+by `announce_pause_suppression` at resume (`SuppressedCause::QueueFullDuringPause`). That notice is a
+single best-effort delivery into the very pane that was full; this list is a durable, re-readable
+derivation. The row's `enqueue_reason` (`group-paused`) is what tells a reader the two are describing
+one event, and the duplication is worth it in the direction it runs: a notice that never landed is
+exactly the case #579 exists for.
+
 ### Coalesced flush: one drain pass, one prompt (#533-A)
 
 **Problem.** The queue above solved "hold means queued, never doomed" and then charged for it by
