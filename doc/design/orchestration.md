@@ -5179,6 +5179,14 @@ up", which was true when a `Clear` also ended the episode and is not any more �
 the chip on that arm too. `raise_chip` is idempotent per reason, so a steady hold still emits
 exactly one event.
 
+**One stated limit.** `badged` records *we raised it*, not *it is still up*. Another mechanism's
+`clear_stranded` — the late monitor's `Resolved` arm, `attention_tick` pruning a dead agent — can
+take the badge down while the flag stays set, and the escalation will not re-raise until the
+episode ends. Deliberately not repaired: a re-raise loop would fight whatever just cleared it, and
+the one realistic clearer (`Resolved`) means the delivery resolved, which produces the `Delivered`
+observation that ends the episode anyway. The same latch existed before #560 for as long as no
+writable poll intervened; what changed is that a writable poll no longer resets it.
+
 **What #560 does not touch.** `held_escalation` itself: its precedence, its one-shot semantics and
 its `Clear` arm are unchanged and their tests are untouched. Only the value handed to `held_since_ms`
 and the caller's handling of `Clear` changed. `unconfirmed_disposition` and the confirmation

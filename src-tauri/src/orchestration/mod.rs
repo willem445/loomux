@@ -14231,6 +14231,17 @@ struct HoldEpisode {
     /// Whether the ten-minute escalation badge ([`StrandedBlocker::QuestionStale`]
     /// / [`StrandedBlocker::HumanInput`]) has fired for THIS episode — the
     /// `already_badged` input [`held_escalation`] takes.
+    ///
+    /// **Stated limit.** This says *we raised it*, not *it is still up*: another
+    /// mechanism's `clear_stranded` (the late monitor's `Resolved` arm, or
+    /// `attention_tick` pruning a dead agent) can take the badge down while this
+    /// stays `true`, and the escalation will not re-raise until the episode
+    /// ends. Not repaired here on purpose — a re-raise loop would fight whatever
+    /// just cleared it, and the one realistic clearer (`Resolved`) means the
+    /// delivery resolved, which produces the `Delivered` observation that ends
+    /// the episode anyway. Pre-#560 the same latch existed for as long as no
+    /// writable poll intervened; what changed is that a writable poll no longer
+    /// resets it.
     badged: bool,
 }
 
