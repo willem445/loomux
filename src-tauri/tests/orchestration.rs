@@ -95,6 +95,7 @@ use loomux_lib::orchestration::{
     PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
     CLAUDE_EDIT_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
     COPILOT_EDIT_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
+    SUPPORTED_CLIS,
 };
 use loomux_lib::pty::{phantom_gate_tick, PtyManager};
 use serde_json::{json, Value};
@@ -5821,6 +5822,103 @@ fn build_agent_argv_matches_command_line() {
                 }
             }
         }
+    }
+}
+
+// ── #267 stage 2: gemini as a reviewer-capable orchestration CLI ───────────
+
+/// #267 stage 2. `SUPPORTED_CLIS` is the gate every other layer keys off — the
+/// workflow parser (`parse_workflow`), the spawn guardrail (`spawn_agent_ex`)
+/// and the launcher roster all consult it — so "a workflow.yml can declare a
+/// gemini-backed reviewer" is, first, this membership.
+///
+/// Stage 1 (PR #355) shipped the docs/template nudge to run one reviewer on a
+/// different CLI than the worker; with only claude and copilot in this list,
+/// that nudge could only ever buy a *second Claude-family opinion*. Gemini is
+/// the first genuinely different model family loomux can spawn.
+#[test]
+fn gemini_is_a_supported_orchestration_cli() {
+    assert!(
+        SUPPORTED_CLIS.contains(&"gemini"),
+        "#267 stage 2: gemini must be a spawnable orchestration CLI so a workflow.yml can \
+         declare a gemini-backed reviewer — SUPPORTED_CLIS is {SUPPORTED_CLIS:?}"
+    );
+}
+
+/// The gemini adapter builds a *gemini* invocation, not the claude fallback.
+///
+/// Pins the three seams a reviewer block actually needs, each of which is a
+/// different CLI's spelling of something loomux already does for claude and
+/// copilot:
+///
+/// - **`--allowed-mcp-server-names loomux`** — gemini's analogue of claude's
+///   `--strict-mcp-config`: the reviewer reaches `review_verdict` and nothing
+///   the user's own settings might have added. (The server itself is declared
+///   in the generated settings file, not on argv — gemini has no
+///   `--mcp-config`-equivalent flag; see `write_mcp_config`.)
+/// - **`--approval-mode`** — the unattended posture, gemini's `yolo` against
+///   claude's `--permission-mode`.
+/// - **`--include-directories <group_dir>`** — the group state dir, gemini's
+///   `--add-dir`.
+///
+/// It also asserts the two spawn forms agree, the same drift guard
+/// `build_agent_argv_matches_command_line` applies to every other CLI.
+#[test]
+fn gemini_reviewer_command_is_a_gemini_invocation() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let cmd = reg.build_agent_command(
+        "gemini", "pro", true, cfg, None, gdir, wd, None, false, Containment::NoEdits,
+        &PersonaInject::default(),
+    );
+    assert!(
+        cmd.starts_with("gemini "),
+        "a gemini block must spawn gemini, not fall through to the claude adapter: {cmd}"
+    );
+    for want in [
+        "--model pro",
+        "--approval-mode yolo",
+        "--allowed-mcp-server-names loomux",
+    ] {
+        assert!(cmd.contains(want), "gemini command is missing {want:?}: {cmd}");
+    }
+    assert!(
+        cmd.contains(&format!("--include-directories \"{}\"", gdir.display())),
+        "the group state dir must be in gemini's workspace: {cmd}"
+    );
+    // Claude's flags are claude's. A half-built command that mixes the two
+    // would be worse than the fallback it replaced.
+    for never in ["--mcp-config", "--permission-mode", "--disallowedTools", "--add-dir"] {
+        assert!(!cmd.contains(never), "gemini command must not carry claude's {never:?}: {cmd}");
+    }
+    let argv = reg.build_agent_argv(
+        "gemini", "pro", true, cfg, None, gdir, wd, None, false, Containment::NoEdits,
+        &PersonaInject::default(),
+    );
+    assert_eq!(argv[0], "gemini", "argv[0] is what the pane spawns directly: {argv:?}");
+    assert_eq!(shell_tokenize(&cmd), argv, "the two spawn forms must not drift: {cmd}");
+}
+
+/// A gemini block's default model is gemini's *reasoning* tier, not claude's
+/// model names leaking through `default_model`'s claude branch.
+///
+/// `pro` for every class, deliberately, unlike claude's strong/mid split:
+/// gemini's documented alias set is `pro` (complex reasoning) vs `flash`
+/// (speed), and the entire point of a cross-model reviewer (#267) is a second
+/// *strong* opinion — a reviewer defaulted onto a speed tier would be the
+/// weakened reviewer this stage exists to avoid. A block may still pin its own
+/// `model:`.
+#[test]
+fn gemini_blocks_default_to_geminis_reasoning_tier() {
+    let g = Guardrails { agent_cli: "gemini".into(), ..Guardrails::default() };
+    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
+        assert_eq!(
+            g.model_for(role),
+            "pro",
+            "a gemini {role:?} must default to a gemini model alias, not a claude one"
+        );
     }
 }
 
