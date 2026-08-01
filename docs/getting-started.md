@@ -113,10 +113,23 @@ in a pane:
 
 The **Autopilot — pre-approve all tools** checkbox (on by default) launches the
 agent with tools pre-approved so it stops prompting you to approve each edit or
-command — Claude Code's native Auto mode plus pre-approved `git`/`gh`, or
-Copilot's `--allow-all-tools --allow-all-paths`. Uncheck it to launch in the
-CLI's normal interactive mode. Loomux never uses
-`--dangerously-skip-permissions`. Your last choice is remembered for next time.
+command — Claude Code's native Auto mode plus pre-approved `git`/`gh`, or, for
+Copilot, the same true autopilot mode an orchestration worker gets (`--autopilot
+--allow-all-tools --allow-all-paths`). Copilot only opens its blocking "Enable
+autopilot mode" dialog on the pane's first submit, which for a lone pane is your
+own first Enter — so loomux runs a watcher that answers it for you rather than
+leaving it on screen. Uncheck the box to launch in the CLI's normal interactive
+mode. Loomux never uses `--dangerously-skip-permissions`. Your last choice is
+remembered for next time.
+
+That posture survives a **restore**, too (an app restart, or resuming from the
+session browser) — but only when loomux launched the session itself *and*
+recorded an unambiguous toggle state for it. For Claude that record is per
+session, so it's never ambiguous; for Copilot — which hands loomux no session id
+at launch — it's per folder, so two sessions launched from the same folder with
+the toggle flipped between them deliberately resolve to *no* flags rather than a
+guess. A session with no such record comes back in plain interactive mode instead
+of guessing; `Shift+Tab` still cycles it into autopilot by hand.
 
 Want more than one agent? Set **Panes** above 1 on the Agent kind to spawn *N*
 independent agent panes at once. And when you're ready to hand a whole queue of

@@ -307,6 +307,16 @@ label text read straight out of `src/launcher.ts`/`pane.ts`/`grid.ts`. That's
 a real fragility cost (a class rename breaks a test with no relation to the
 behavior it tests) and the most obvious near-term follow-up.
 
+## Running it (the two commands)
+
+Build the isolated test binary once, then run the suite (this recipe used to
+live in the README; #609 moved it here with the rest of the developer detail):
+
+```sh
+npx tauri build --debug --no-bundle --config src-tauri/tauri.e2e.conf.json
+npm run test:e2e
+```
+
 ## How agent workers should use this
 
 E2E belongs to CI, same line as the rest of this repo's local-vs-CI split

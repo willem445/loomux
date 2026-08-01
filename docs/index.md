@@ -52,7 +52,9 @@ This site is the **user** guide. If you want to build on loomux, the developer
 docs stay in the repository:
 
 - [`README.md`](https://github.com/willem445/loomux/blob/main/README.md) — the
-  stack, the build/run commands, and the architecture map.
+  pitch, the stack, and the build/run commands.
+- [`doc/design/architecture.md`](https://github.com/willem445/loomux/blob/main/doc/design/architecture.md)
+  — the source tree, module by module, and the extension seams.
 - [`CLAUDE.md`](https://github.com/willem445/loomux/blob/main/CLAUDE.md) — the
   hard constraints and code conventions for working in this codebase.
 - [`doc/design/`](https://github.com/willem445/loomux/tree/main/doc/design) —

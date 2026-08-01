@@ -43,9 +43,9 @@ invisible to agents and auditors.
    wrong-role rejection, and the cross-group rejection. Never spawn a real
    agent CLI.
 
-6. **Docs — README "Agent orchestration" section** if the tool changes what a
-   human sees (new pane behavior, board fields, audit rows). Deeper design
-   rationale goes in `doc/design/orchestration.md`.
+6. **Docs — `docs/orchestration.md`** (the user-docs orchestration guide) if the
+   tool changes what a human sees (new pane behavior, board fields, audit rows).
+   Deeper design rationale goes in `doc/design/orchestration.md`.
 
 ## Design norms to preserve
 
