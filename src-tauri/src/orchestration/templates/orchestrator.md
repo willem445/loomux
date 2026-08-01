@@ -108,9 +108,11 @@ memory of it — is the contract.
   (`channel_status` shows `can_send: false`) — it will never reply, by design.
 - `note_directive(text, replace?)` — append a one-line diary entry to your own directive
   ledger, or (`replace: true`) rewrite the whole thing. See **Durability rules**.
-- `queue_orphans()` — deliveries a loomux restart caught still queued, that could not be
-  re-bound to a live pane. Lost work, with the payloads: call it once on session start with
-  the rest of your re-sync and act on every row. See **Durability rules**.
+- `queue_orphans()` — deliveries nobody ever received, in two lists: `orphans` (a loomux
+  restart caught them queued, and they could not be re-bound to a live pane) and `refused`
+  (declined at the front door because the target pane's queue was already full). Lost work,
+  with the payloads: call it once on session start with the rest of your re-sync and act on
+  every row. See **Durability rules**.
 
 Workers report back with `report(...)`; their reports and exit notices appear in your
 pane as `[loomux] ...` messages.{{WORKFLOW}}
@@ -468,7 +470,9 @@ flush delivers is a `[loomux] N deliveries queued ...` header so you (and the pa
 know what arrives late may be stale — read it before acting on anything that follows. Only act if
 you get a **`[loomux] ... DROPPED ...`** notice instead (the queue was already full, or the
 agent's pane closed while entries were waiting) — that one really is gone, and you do need to
-re-derive and re-send the work.
+re-derive and re-send the work. A delivery **refused at the front door** (the target pane was
+already 8 deep when it arrived) sends you no notice at all — its sender got the error instead —
+so that one surfaces only in `queue_orphans()`'s `refused` list.
 
 **Queue notices about YOUR OWN pane arrive differently** (#578). loomux can never type one into
 your pane — a prompt announcing your pane's blocked delivery would queue behind the very block it
@@ -901,6 +905,22 @@ when the whole value is "the next orchestrator should just already know this."
   been typed into that pane and was waiting only for Enter when loomux restarted — the pane is
   gone, so no bytes remain; the `prompt` audit line for that delivery is the only record of what
   it said). An empty result is the normal case and needs no comment.
+- **`refused` is the second list, and it is not restart-shaped.** A delivery to a pane whose
+  queue is already full (8 deep) is declined at the door: nothing is queued, no id is minted,
+  and the SENDER gets a synchronous error. So this list can be non-empty on an ordinary session
+  with no restart in it, and most rows were already handled by whoever sent them — the ones that
+  matter are those whose sender has since died, and those where `from` is `loomux` itself,
+  because then nobody was listening. Check before re-sending, and prefer asking the sender over
+  guessing. `text` is re-sendable verbatim when non-null (recovered from that delivery's own
+  `prompt` audit line and verified against the refusal's recorded size and preview); when null,
+  `preview` and `bytes` are what you have. `payload: "stranded-submit"` never had text: its
+  bytes were already pasted into that pane and only the Enter was refused, so that pane is
+  sitting with an unsubmitted prompt in its box — look at the pane rather than re-sending.
+  `refused_count` counts every refusal in the readable audit log; only the most recent 8 are
+  listed, and `refused_omitted` says how many were left in `audit.jsonl`. Reading this list
+  re-admits nothing — a refused delivery stays refused, and re-sending it is your deliberate
+  call, because slipping it back in now would reorder it against everything the pane has
+  accepted since.
 - Keep your context lean: never paste large diffs or files into it; monitor via reports,
   `get_output` tails and `gh` summaries.
 - **Compact at lulls** (INVARIANT 11). At natural quiet points — right after a merge gate or

@@ -8678,6 +8678,220 @@ pub fn pause_suppression_notice(s: &PauseSuppression) -> String {
     out
 }
 
+/// #579: what a front-door refusal was carrying — the two shapes
+/// `queue-full-at-call` is written for, which need different advice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusedPayload {
+    /// `enqueue_text`'s `RejectFull` arm: a text delivery. Its bytes are
+    /// recoverable from the paired `prompt` line — see
+    /// [`front_door_refusals`].
+    Prompt,
+    /// `audit_stranded_push`'s rejection: a `StrandedSubmit` marker, which
+    /// never carried text at all (the bytes were already pasted into the
+    /// pane; only the Enter was queued). Nothing to re-send — the pane needs
+    /// an Enter, or its text re-pasted by hand.
+    StrandedSubmit,
+}
+
+impl RefusedPayload {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RefusedPayload::Prompt => "prompt",
+            RefusedPayload::StrandedSubmit => "stranded-submit",
+        }
+    }
+}
+
+/// #579: one delivery REFUSED at the front door — the target pane's queue was
+/// already at `queue::QUEUE_MAX_PER_PANE`, so nothing was ever queued.
+///
+/// **Why this is a separate type from [`queue::OrphanedQueueEntry`] rather than
+/// that struct with an optional id.** A refused delivery never reached
+/// `queue_seq.fetch_add`, so it has no id — and `OrphanedQueueEntry.id: u64` is
+/// the wire shape of the `queue_orphans` MCP tool as well as the join key both
+/// orphan derivations run on (`queue::merge_orphans` dedupes on it, the audit
+/// scan opens and closes on it). Widening it to `Option<u64>` would make every
+/// existing row's id nullable for the benefit of rows that can never have one,
+/// and a synthetic id would be a number that joins against nothing while
+/// looking like one that does. So refusals are surfaced as their own list, on
+/// their own key — `{from, to, preview}`, the same naming [`SuppressedDelivery`]
+/// settled on for the same reason. See `doc/design/orchestration.md`'s
+/// "Front-door refusals (#579)".
+///
+/// The other half of that argument is behavioral: an orphan is a payload
+/// loomux still HOLDS (staged in `recovered_queue`, re-admitted the moment its
+/// pane rebinds), while a refusal was explicitly declined and the sender told
+/// so synchronously. Keeping them in one list would put refusals within reach
+/// of `readmit_recovered`, and silently re-admitting a declined delivery later
+/// would reorder it against everything the pane accepted in the meantime.
+/// Being audit-derived and read-only, this list structurally cannot do that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedDelivery {
+    /// Whoever called `deliver_prompt` — off the audit line's `from` detail,
+    /// not its actor (the actor is `loomux`, which did the refusing, not the
+    /// sender who lost the work). `"?"` for a pre-#563 line that recorded
+    /// only `{to, reason, depth}`.
+    pub from: String,
+    /// The pane the payload was headed for.
+    pub to: String,
+    pub refused_ms: u64,
+    /// The pane's queue depth at the moment of refusal — `QUEUE_MAX_PER_PANE`
+    /// in every real case, carried through rather than assumed.
+    pub depth: usize,
+    /// Which [`EnqueueReason`](queue::EnqueueReason) the refused admission was
+    /// made under, when the line recorded one. `None` for a marker refusal
+    /// (never admitted under a reason) and for a pre-#563 line.
+    pub enqueue_reason: Option<String>,
+    pub payload: RefusedPayload,
+    /// `text.len()` as the refusal recorded it, so the true size is known even
+    /// when the bytes are not recoverable. `None` on a pre-#563 line.
+    pub bytes: Option<usize>,
+    /// The bounded one-line preview the refusal line carries
+    /// (`queue::dropped_payload_preview`) — empty for a marker refusal and a
+    /// pre-#563 line.
+    pub preview: String,
+    /// The full payload, recovered from the paired `prompt` audit line and
+    /// VERIFIED against this refusal's own record — see
+    /// [`front_door_refusals`]. `None` when it could not be verified, which is
+    /// a different fact from an empty payload and asks for different handling
+    /// (re-derive rather than re-send verbatim).
+    pub text: Option<String>,
+    /// The consequence a marker refusal states in its own audit line, carried
+    /// verbatim rather than re-worded here — one string, every channel.
+    pub consequence: Option<String>,
+}
+
+/// #579: every front-door refusal the readable audit window holds, plus how
+/// many there were in total — see [`front_door_refusals`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrontDoorRefusals {
+    /// Oldest first, capped at [`REFUSED_LIST_MAX`] — the MOST RECENT that
+    /// many, since a pane at capacity keeps refusing and the newest refusals
+    /// are the ones still likely to matter.
+    pub items: Vec<RefusedDelivery>,
+    /// How many refusals the scan found, before the cap. Never implied by
+    /// `items.len()`: a caller that reports a capped list as complete is the
+    /// silent-truncation defect `.loomux/lessons.md` names.
+    pub total: usize,
+}
+
+/// #579: how many refusals `queue_orphans` lists individually. Deliberately
+/// the same number as [`PAUSE_SUPPRESSION_LIST_MAX`], and for a related but
+/// not identical reason: that cap bounds a notice PASTED into a pane, this one
+/// bounds a tool result READ INTO an orchestrator's context — and each row here
+/// can carry up to `queue::ORPHAN_TEXT_CAP_BYTES` of recovered payload, so an
+/// uncapped list is an unbounded read. Unlike the orphan list, which the
+/// per-pane cap of 8 already bounds, refusals accumulate without limit: a pane
+/// held at capacity refuses every arrival for as long as it stays there.
+/// Everything past the cap stays in `audit.jsonl`, and `FrontDoorRefusals::
+/// total` says how much was left there.
+pub const REFUSED_LIST_MAX: usize = 8;
+
+/// #579: read a group's front-door refusals out of `entries` (an oldest-first
+/// audit timeline, as `audit_log` returns them).
+///
+/// A delivery refused at the cap is the one loss with NO queue entry to its
+/// name: `enqueue_text`'s `RejectFull` arm returns before `queue_seq.fetch_add`,
+/// so it can never join the id-keyed orphan derivations, which is exactly why
+/// #563 split this out (#579) instead of folding it into #572's visibility fix.
+/// The audit line is the only record that will ever exist, and since #572 it
+/// carries enough to act on: `from`, `bytes` and a bounded `preview`.
+///
+/// **Recovering the payload, verified rather than assumed.** `deliver_prompt`
+/// audits `prompt` — with the FULL text — immediately before it admits, on both
+/// the paused and unpaused paths, so the bytes a refusal lost are still in the
+/// log. This pairs a refusal with the most recent `prompt` line from the SAME
+/// sender to the SAME target, and accepts it only if BOTH of that line's
+/// fingerprints match the refusal's own record: `text.len() == bytes`, and
+/// `queue::dropped_payload_preview(text) == preview` recomputed. Two checks
+/// rather than positional adjacency, because audit writes from concurrent
+/// delivery threads interleave and "the line just before" is not a guarantee.
+/// If either check fails the row reports `text: None` and the reader falls back
+/// to the preview — the safe direction, since the failure mode of guessing here
+/// is handing an orchestrator the wrong bytes to paste into somebody's terminal.
+/// The residual it does not close: a second `prompt` line for the same
+/// (sender, target) pair, written by another thread inside the window between
+/// this delivery's own `prompt` line and its refusal, whose text ALSO matches
+/// both fingerprints — i.e. the same payload, or one that agrees on length and
+/// on its whitespace-collapsed first `queue::DROPPED_PREVIEW_MAX` chars.
+///
+/// **`recovered` refusals are deliberately excluded.** A recovery re-admission
+/// refused at the cap (`readmit_recovered`, `EnqueueReason::Recovered`) writes
+/// this same line, but that entry is put straight back into staging and keeps
+/// being reported as an ORPHAN — with its payload, and by an id. Listing it here
+/// too would show one lost payload twice in one tool result, and the documented
+/// response to both lists is to re-send.
+///
+/// Pure: entries in, summary out, no registry and no filesystem — the same split
+/// [`suppressed_during_pause`] follows, and for the same reason (this reads
+/// `AuditEntry`, which lives here rather than in `queue.rs`).
+pub fn front_door_refusals(entries: &[AuditEntry]) -> FrontDoorRefusals {
+    // (sender, target) -> the full text of the last `prompt` line between them.
+    let mut offered: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let mut items: Vec<RefusedDelivery> = Vec::new();
+    for e in entries {
+        if e.action == "prompt" {
+            if let (Some(to), Some(text)) = (e.detail["to"].as_str(), e.detail["text"].as_str()) {
+                offered.insert((e.actor.clone(), to.to_string()), text.to_string());
+            }
+            continue;
+        }
+        if e.action != "delivery-dropped" || e.detail["reason"] != json!("queue-full-at-call") {
+            continue;
+        }
+        let to = e.detail["to"].as_str().unwrap_or("?").to_string();
+        let depth = e.detail["depth"].as_u64().unwrap_or(0) as usize;
+        if e.detail["payload"] == json!(RefusedPayload::StrandedSubmit.as_str()) {
+            items.push(RefusedDelivery {
+                // A marker push is loomux's own act, and its line records no
+                // `from` — the actor is the honest answer here, unlike on a
+                // prompt refusal where a sender lost the work.
+                from: e.actor.clone(),
+                to,
+                refused_ms: e.ts_ms,
+                depth,
+                enqueue_reason: None,
+                payload: RefusedPayload::StrandedSubmit,
+                bytes: None,
+                preview: String::new(),
+                text: None,
+                consequence: e.detail["consequence"].as_str().map(str::to_string),
+            });
+            continue;
+        }
+        let enqueue_reason = e.detail["enqueue_reason"].as_str().map(str::to_string);
+        if enqueue_reason.as_deref() == Some(queue::EnqueueReason::Recovered.as_str()) {
+            continue;
+        }
+        let from = e.detail["from"].as_str().unwrap_or("?").to_string();
+        let bytes = e.detail["bytes"].as_u64().map(|b| b as usize);
+        let preview = e.detail["preview"].as_str().unwrap_or("").to_string();
+        let text = bytes.and_then(|bytes| {
+            offered.get(&(from.clone(), to.clone())).filter(|t| {
+                t.len() == bytes && queue::dropped_payload_preview(t.as_str()) == preview
+            })
+        });
+        items.push(RefusedDelivery {
+            from,
+            to,
+            refused_ms: e.ts_ms,
+            depth,
+            enqueue_reason,
+            payload: RefusedPayload::Prompt,
+            bytes,
+            preview,
+            text: text.cloned(),
+            consequence: None,
+        });
+    }
+    let total = items.len();
+    if total > REFUSED_LIST_MAX {
+        items.drain(..total - REFUSED_LIST_MAX);
+    }
+    FrontDoorRefusals { items, total }
+}
+
 fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
     let mut out = tpl.to_string();
     for (k, v) in vars {
@@ -29498,6 +29712,22 @@ impl OrchRegistry {
         queue::merge_orphans(from_snapshot, self.audit_derived_orphans(group), &live)
     }
 
+    /// Every delivery this group REFUSED at the front door (#579) — the target
+    /// pane's queue was at `queue::QUEUE_MAX_PER_PANE`, so nothing was queued
+    /// and there is no id to report it under. Derived from `audit.jsonl` alone
+    /// (`front_door_refusals`, pure), because the audit line is the only record
+    /// a refusal ever produces.
+    ///
+    /// Read-only by construction: nothing here touches `recovered_queue`, so a
+    /// refused delivery can never be re-admitted as a side effect of being
+    /// reported — the one thing #579 asked to be sure of, since a delivery
+    /// declined an hour ago would reorder against everything the pane has
+    /// accepted since.
+    #[doc(hidden)] // pub for integration tests
+    pub fn front_door_refusals(&self, group: &str) -> FrontDoorRefusals {
+        front_door_refusals(&self.audit_log(group))
+    }
+
     /// `queue_orphans` as the MCP tool returns it (#467) — the shape the
     /// orchestrator's session-start re-sync reads.
     ///
@@ -29510,6 +29740,21 @@ impl OrchRegistry {
     /// (`truncated`, `text_bytes`) and the audit log's own `prompt` line
     /// holding the original, so a capped entry says so instead of quietly
     /// handing back a shortened brief that reads complete.
+    ///
+    /// **`refused` is a SECOND list, added additively (#579).** `count`/
+    /// `orphans` keep their exact pre-#579 shape — including `id: u64`,
+    /// non-null — and refusals sit beside them under their own keys. The two
+    /// are different facts and the reader has to act differently on each: an
+    /// orphan is a payload loomux still holds and will re-admit if its pane
+    /// comes back, a refusal is one that was declined outright and never
+    /// existed as a queue entry. See `front_door_refusals` for why an
+    /// `Option<u64>` id or a synthetic one was rejected.
+    ///
+    /// The audit log is read twice here (once for the orphan derivation, once
+    /// for the refusals) rather than threaded through both. This tool is called
+    /// once per orchestrator session by design, so the second parse is cheaper
+    /// than widening `queue_orphans`'s signature to carry entries it does not
+    /// otherwise need.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_orphans_json(&self, group: &str) -> Value {
         let orphans = self.queue_orphans(group);
@@ -29536,7 +29781,47 @@ impl OrchRegistry {
                 })
             })
             .collect();
-        json!({ "count": rows.len(), "orphans": rows })
+        let refusals = self.front_door_refusals(group);
+        let refused: Vec<Value> = refusals
+            .items
+            .iter()
+            .map(|r| {
+                // Capped exactly like an orphan's payload, and named in-band
+                // for the same reason: a shortened brief that reads complete
+                // gets re-sent as if it were the whole thing.
+                let truncated =
+                    r.text.as_deref().is_some_and(|t| t.len() > queue::ORPHAN_TEXT_CAP_BYTES);
+                json!({
+                    "from": r.from,
+                    "to": r.to,
+                    "refused_minutes_ago": now.saturating_sub(r.refused_ms) / 60_000,
+                    "queue_depth": r.depth,
+                    "enqueue_reason": r.enqueue_reason,
+                    "payload": r.payload.as_str(),
+                    // The payload's TRUE size as the refusal recorded it —
+                    // still known when the bytes themselves are not.
+                    "bytes": r.bytes,
+                    "preview": r.preview,
+                    // `null`, never `""`: "the bytes could not be verified" is
+                    // a different instruction from "the payload was empty".
+                    "text": r
+                        .text
+                        .as_deref()
+                        .map(|t| Value::String(queue::clamp_payload(t, queue::ORPHAN_TEXT_CAP_BYTES)))
+                        .unwrap_or(Value::Null),
+                    "truncated": truncated,
+                    "consequence": r.consequence,
+                })
+            })
+            .collect();
+        json!({
+            "count": rows.len(),
+            "orphans": rows,
+            "refused_count": refusals.total,
+            // What the cap left out — stated, never implied by a short list.
+            "refused_omitted": refusals.total.saturating_sub(refused.len()),
+            "refused": refused,
+        })
     }
 
     /// The pre-#468 orphan derivation, unchanged: scan `group`'s audit log

@@ -61,6 +61,8 @@ use loomux_lib::orchestration::{
     orch_notice_relay_text, OrchNoticeInbox, ORCH_NOTICE_INBOX_MAX,
     pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
     PauseSuppression, SuppressedCause, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
+    // #579: front-door refusals, the losses with no queue id to report them under.
+    front_door_refusals, RefusedPayload, REFUSED_LIST_MAX,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -3208,6 +3210,359 @@ fn an_oversized_orphan_payload_says_it_was_truncated() {
     assert_eq!(v["orphans"][0]["text_bytes"], json!(big.len()), "the true size is reported, not the cut one");
     assert!(v["orphans"][0]["text"].as_str().unwrap().contains("truncated"),
         "the cut must be visible in the text itself, not only in a sibling field");
+}
+
+// ---------------------------------------------------------------------------
+// #579 — deliveries REFUSED at the front door.
+//
+// `enqueue_text`'s `RejectFull` arm returns before `queue_seq.fetch_add`, so a
+// refused delivery never gets an id — and both orphan derivations open and
+// close on an id (`queue::orphaned_queue_entries`, `merge_orphans`). It is
+// therefore structurally invisible to them, which is why #563 split this out
+// rather than folding it into #572's visibility fix. `queue_orphans` reports
+// them as a second, audit-derived list.
+// ---------------------------------------------------------------------------
+
+/// A refusal line as `enqueue_text`'s `RejectFull` arm writes it. Hand-built
+/// only for the shapes a real refusal cannot produce in a headless test (a
+/// pre-#563 line, a marker refusal, a recovery re-admission's own reason); the
+/// end-to-end tests below drive the real one.
+fn refusal_line(ts_ms: u64, from: &str, to: &str, text: &str, enqueue_reason: &str) -> AuditEntry {
+    AuditEntry {
+        ts_ms,
+        actor: "loomux".into(),
+        action: "delivery-dropped".into(),
+        detail: json!({
+            "to": to, "reason": "queue-full-at-call", "depth": queue::QUEUE_MAX_PER_PANE,
+            "from": from, "enqueue_reason": enqueue_reason,
+            "bytes": text.len(), "preview": queue::dropped_payload_preview(text),
+        }),
+    }
+}
+
+/// The `prompt` line `deliver_prompt` writes — with the FULL text — immediately
+/// before it admits, which is what makes a refused payload recoverable at all.
+fn prompt_line(ts_ms: u64, from: &str, to: &str, text: &str) -> AuditEntry {
+    AuditEntry {
+        ts_ms,
+        actor: from.into(),
+        action: "prompt".into(),
+        detail: json!({ "to": to, "text": text }),
+    }
+}
+
+/// `queue_orphans` through the real MCP dispatch, as an orchestrator reads it.
+fn orphans_tool(reg: &OrchRegistry, caller: &Caller) -> Value {
+    let r = dispatch(reg, caller, "tools/call",
+        &json!({ "name": "queue_orphans", "arguments": {} })).unwrap();
+    assert_eq!(r["isError"], false);
+    serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// A group whose orchestrator pane is already at capacity, plus the worker that
+/// is about to lose a report to it — the case #579 is actually about, since a
+/// fleet's reports all converge on that one pane. Returns the group, the two
+/// agents and the orchestrator's pty.
+fn orch_pane_at_capacity(reg: &OrchRegistry, pty: u32) -> (String, AgentRecord, AgentRecord) {
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, pty);
+    // Distinct texts, or `admit`'s byte-identical coalescing would fold them
+    // into one entry and the pane would never reach its cap.
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &orch.id, "loomux", &format!("[loomux] advisory {i}"), pty,
+            queue::EnqueueReason::Arrival).unwrap();
+    }
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE, "precondition: the pane is full");
+    (g.id.clone(), orch, w)
+}
+
+#[test]
+fn queue_orphans_surfaces_a_front_door_refusal_with_the_payload_it_declined() {
+    // #579's acceptance criterion, end to end and through the real tool: a
+    // worker's completion report is refused at a full orchestrator pane, and
+    // before this nothing the orchestrator ever calls could enumerate it. The
+    // `count == 0` assertion is the point of the whole issue — the pre-#579
+    // view is not merely unhelpful here, it is structurally blind, because
+    // there is no id for it to key on.
+    let (reg, _d) = test_registry();
+    let pty = 5870u32;
+    let (gid, orch, w) = orch_pane_at_capacity(&reg, pty);
+
+    let report = "report: done, PR #77 is green — CI green on all three platforms";
+    let err = reg.deliver_prompt(&orch.id, report, &w.id, Delivery::MidSession).unwrap_err();
+    assert!(err.contains("NOT queued"), "the SENDER is still told synchronously: {err}");
+
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let v = orphans_tool(&reg, &co);
+    assert_eq!(v["count"], json!(0),
+        "a refusal mints no id, so neither id-keyed orphan derivation can ever see it: {v}");
+    assert_eq!(v["refused_count"], json!(1), "and it must not therefore be invisible: {v}");
+    assert_eq!(v["refused_omitted"], json!(0));
+
+    let row = &v["refused"][0];
+    assert_eq!(row["from"], json!(w.id),
+        "the SENDER who lost the work — the audit actor is `loomux`, which did the refusing");
+    assert_eq!(row["to"], json!(orch.id));
+    assert_eq!(row["text"], json!(report),
+        "the payload verbatim, recovered from its own `prompt` line — a preview is not re-sendable");
+    assert_eq!(row["bytes"], json!(report.len()));
+    assert_eq!(row["truncated"], json!(false));
+    assert_eq!(row["payload"], json!("prompt"));
+    assert_eq!(row["queue_depth"], json!(queue::QUEUE_MAX_PER_PANE));
+    assert_eq!(row["enqueue_reason"], json!("arrival"));
+    assert_eq!(row["consequence"], Value::Null, "only a marker refusal has one");
+    assert!(row["refused_minutes_ago"].as_u64().is_some(), "age is reported: {row}");
+    assert!(row["preview"].as_str().unwrap().contains("PR #77"),
+        "the bounded preview is there too, for when `text` cannot be verified: {row}");
+    // The claim in `front_door_refusals`'s doc, checked rather than asserted in
+    // prose: the group id is what scopes this, not the audit file at large.
+    assert_eq!(reg.front_door_refusals(&gid).total, 1);
+}
+
+#[test]
+fn reporting_a_refusal_never_re_admits_it() {
+    // #579 acceptance 3, and the reason refusals are a separate list rather
+    // than optional-id rows in the orphan one: an orphan is a payload loomux
+    // still HOLDS and re-admits the moment its pane rebinds, while a refusal
+    // was declined outright. Re-admitting a declined delivery later would
+    // reorder it against everything the pane accepted in the meantime. This
+    // holds by construction (the derivation is read-only over `audit.jsonl`),
+    // which is exactly the kind of property a later refactor can spend
+    // silently — so it is pinned.
+    let (reg, _d) = test_registry();
+    let pty = 5871u32;
+    let (_gid, orch, w) = orch_pane_at_capacity(&reg, pty);
+    let before: Vec<u64> = reg.queue_snapshot(pty).iter().map(|e| e.id).collect();
+
+    let report = "report: blocked, needs a human call on #42";
+    reg.deliver_prompt(&orch.id, report, &w.id, Delivery::MidSession).unwrap_err();
+
+    let co = reg.resolve_token(&orch.token).unwrap();
+    // Twice: staged orphans are never cleared, and a refusal must be just as
+    // stable — reading it is not an acknowledgement and must not consume it.
+    for pass in 1..=2 {
+        let v = orphans_tool(&reg, &co);
+        assert_eq!(v["refused_count"], json!(1), "pass {pass}: {v}");
+    }
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE,
+        "the pane must not have grown by the refused entry");
+    assert_eq!(reg.queue_snapshot(pty).iter().map(|e| e.id).collect::<Vec<u64>>(), before,
+        "and not one queued entry may have moved");
+    assert!(reg.queue_snapshot(pty).iter().all(|e| e.payload.text() != Some(report)),
+        "the refused payload must never appear in the queue it was declined from");
+}
+
+#[test]
+fn a_recovery_re_admission_refused_at_the_cap_is_reported_once_as_an_orphan() {
+    // A rejected re-admission (`readmit_recovered`) writes the SAME
+    // `queue-full-at-call` line as a fresh refusal, but that entry goes back
+    // into staging and keeps being reported as an orphan — with its payload
+    // and by an id. Listing it in `refused` as well would show one lost
+    // payload twice in one tool result, and the documented response to both
+    // lists is to re-send: a duplicate-delivery generator, the same defect
+    // `merge_orphans`'s live-id filter exists to prevent.
+    let dir = tempfile::tempdir().unwrap();
+    let backlog: Vec<String> = (0..3).map(|i| format!("recovered-{i}")).collect();
+    let refs: Vec<&str> = backlog.iter().map(String::as_str).collect();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &refs);
+
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+    let pty = 902u32;
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&gid, &resumed.id, "orch-1", &format!("live-{i}"), pty,
+            queue::EnqueueReason::Arrival).unwrap();
+    }
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, pty), 0, "a full pane can take none of it");
+
+    // The refusals really were written — this is not a test that passes because
+    // nothing happened.
+    let refused_lines = reg
+        .audit_log(&gid)
+        .into_iter()
+        .filter(|e| e.action == "delivery-dropped" && e.detail["reason"] == json!("queue-full-at-call"))
+        .count();
+    assert_eq!(refused_lines, 3, "three re-admissions were refused at the cap");
+
+    assert_eq!(reg.queue_orphans(&gid).len(), 3, "and all three are reported as orphans");
+    assert_eq!(reg.front_door_refusals(&gid).total, 0,
+        "so none of them may be reported as a refusal too — one loss, one row");
+}
+
+#[test]
+fn a_refusal_reports_no_text_rather_than_bytes_it_cannot_verify() {
+    // The pairing rule is verified, not positional: a `prompt` line is accepted
+    // as a refusal's payload only if BOTH its byte length and its recomputed
+    // preview match what the refusal itself recorded. The failure direction of
+    // guessing here is handing an orchestrator the wrong bytes to paste into
+    // somebody's terminal, so a mismatch reports `text: None` and the reader
+    // falls back to the preview.
+    let matching = refusal_line(9_000, "w-1", "orch-1", "the payload that was refused", "arrival");
+    let verified = front_door_refusals(&[
+        prompt_line(8_000, "w-1", "orch-1", "the payload that was refused"),
+        matching.clone(),
+    ]);
+    assert_eq!(verified.items[0].text.as_deref(), Some("the payload that was refused"),
+        "the happy path: both fingerprints agree");
+
+    // Same sender, same target, same LENGTH — a different payload. The preview
+    // check is what refuses it; a length-only join would hand back these bytes.
+    let same_length = "the payload that was REFUSED".to_string();
+    assert_eq!(same_length.len(), "the payload that was refused".len(), "fixture must be length-equal");
+    let wrong = front_door_refusals(&[prompt_line(8_000, "w-1", "orch-1", &same_length), matching.clone()]);
+    assert_eq!(wrong.items[0].text, None, "a length-only match must not be trusted");
+    assert_eq!(wrong.items[0].preview, queue::dropped_payload_preview("the payload that was refused"),
+        "and the preview the refusal recorded is still what the reader gets");
+
+    // A `prompt` line to a DIFFERENT target never pairs, however well it
+    // matches — that pane's delivery is not this one.
+    let other_target =
+        front_door_refusals(&[prompt_line(8_000, "w-1", "w-2", "the payload that was refused"), matching.clone()]);
+    assert_eq!(other_target.items[0].text, None);
+    // Nor does one from a different sender.
+    let other_sender =
+        front_door_refusals(&[prompt_line(8_000, "w-9", "orch-1", "the payload that was refused"), matching]);
+    assert_eq!(other_sender.items[0].text, None);
+}
+
+#[test]
+fn a_pre_563_refusal_line_is_still_reported_and_says_what_it_cannot_name() {
+    // `audit.jsonl` outlives the build that wrote it. Before #563 a refusal
+    // recorded only `{to, reason, depth}` — enough to know something was lost,
+    // never enough to know what. Such a row must still be REPORTED (the loss
+    // is real) while naming nothing it cannot back: no sender, no size, no
+    // payload. A row that invented a `from` would be worse than a row that
+    // says it does not know.
+    let legacy = AuditEntry {
+        ts_ms: 7_000,
+        actor: "loomux".into(),
+        action: "delivery-dropped".into(),
+        detail: json!({ "to": "orch-1", "reason": "queue-full-at-call", "depth": 8 }),
+    };
+    // A `prompt` line that WOULD have matched a modern line is present, and
+    // must still not be attached — with no `bytes` recorded there is nothing to
+    // verify against, and an unverified guess is the one thing this must not do.
+    let r = front_door_refusals(&[prompt_line(6_000, "w-1", "orch-1", "something"), legacy]);
+    assert_eq!(r.total, 1, "the loss is real and must be reported");
+    assert_eq!(r.items[0].from, "?", "unknowable, and said so rather than invented");
+    assert_eq!(r.items[0].to, "orch-1");
+    assert_eq!(r.items[0].bytes, None);
+    assert_eq!(r.items[0].text, None);
+    assert_eq!(r.items[0].preview, "");
+    assert_eq!(r.items[0].payload, RefusedPayload::Prompt);
+}
+
+#[test]
+fn a_refused_stranded_marker_reports_the_pane_state_it_left_behind() {
+    // The other front-door refusal: `audit_stranded_push`'s rejection of a
+    // `StrandedSubmit` marker. It never carried text — the bytes were already
+    // pasted into the pane and only the Enter was queued — so "re-send it" is
+    // the wrong instruction and the row must not read like the prompt case.
+    // Its `consequence` is carried through verbatim from the audit line rather
+    // than re-worded here: one string, every channel.
+    let marker = AuditEntry {
+        ts_ms: 5_000,
+        actor: "loomux".into(),
+        action: "delivery-dropped".into(),
+        detail: json!({
+            "to": "w-3", "reason": "queue-full-at-call", "depth": 8,
+            "payload": "stranded-submit",
+            "consequence": "text is pasted in the pane with nothing queued to submit it",
+        }),
+    };
+    let r = front_door_refusals(&[marker]);
+    assert_eq!(r.items[0].payload, RefusedPayload::StrandedSubmit);
+    assert_eq!(r.items[0].text, None, "there are no bytes to re-send, and never were");
+    assert_eq!(r.items[0].bytes, None);
+    assert_eq!(r.items[0].enqueue_reason, None, "a marker is not admitted under an EnqueueReason");
+    assert_eq!(r.items[0].from, "loomux", "the marker push is loomux's own act");
+    assert_eq!(
+        r.items[0].consequence.as_deref(),
+        Some("text is pasted in the pane with nothing queued to submit it"),
+        "the reader needs to know to look at the pane, not to re-send"
+    );
+}
+
+#[test]
+fn the_refused_list_is_capped_and_says_how_many_it_left_out() {
+    // Unlike orphans, which the per-pane cap of 8 already bounds, refusals
+    // accumulate without limit: a pane held at capacity refuses every arrival
+    // for as long as it stays there. So the list is capped — and a capped list
+    // reported as complete is the silent truncation `.loomux/lessons.md` names,
+    // which is what `refused_count`/`refused_omitted` exist to prevent.
+    let (reg, _d) = test_registry();
+    let pty = 5872u32;
+    let (_gid, orch, w) = orch_pane_at_capacity(&reg, pty);
+    let extra = 2;
+    for i in 0..REFUSED_LIST_MAX + extra {
+        reg.deliver_prompt(&orch.id, &format!("lost report {i}"), &w.id, Delivery::MidSession)
+            .unwrap_err();
+    }
+
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let v = orphans_tool(&reg, &co);
+    assert_eq!(v["refused_count"], json!(REFUSED_LIST_MAX + extra), "the true total, not the listed one");
+    assert_eq!(v["refused"].as_array().unwrap().len(), REFUSED_LIST_MAX);
+    assert_eq!(v["refused_omitted"], json!(extra), "and what was left in audit.jsonl is stated");
+    // The MOST RECENT survive, in chronological order: a pane at capacity keeps
+    // refusing, so the newest refusals are the ones still likely to matter.
+    assert_eq!(v["refused"][0]["text"], json!(format!("lost report {extra}")));
+    assert_eq!(v["refused"][REFUSED_LIST_MAX - 1]["text"],
+        json!(format!("lost report {}", REFUSED_LIST_MAX + extra - 1)));
+}
+
+#[test]
+fn an_oversized_refused_payload_says_it_was_truncated() {
+    // Same rule as an orphan's payload, for the same reason: a shortened brief
+    // that reads complete gets re-sent as if it were the whole thing.
+    let (reg, _d) = test_registry();
+    let pty = 5873u32;
+    let (_gid, orch, w) = orch_pane_at_capacity(&reg, pty);
+    let big = "x".repeat(queue::ORPHAN_TEXT_CAP_BYTES + 500);
+    reg.deliver_prompt(&orch.id, &big, &w.id, Delivery::MidSession).unwrap_err();
+
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let v = orphans_tool(&reg, &co);
+    let row = &v["refused"][0];
+    assert_eq!(row["truncated"], json!(true));
+    assert_eq!(row["bytes"], json!(big.len()), "the true size is reported, not the cut one");
+    assert!(row["text"].as_str().unwrap().contains("truncated"),
+        "the cut must be visible in the text itself, not only in a sibling field");
+}
+
+#[test]
+fn the_orphan_list_keeps_its_pre_579_shape_beside_the_refused_one() {
+    // #579's contract decision, pinned: refusals were added as a SECOND list
+    // rather than by widening `OrphanedQueueEntry.id` to `Option<u64>` or by
+    // minting a synthetic id. `id` is the wire shape of this tool AND the join
+    // key both orphan derivations run on, so a nullable id would be a cost paid
+    // by every existing row for the benefit of rows that can never have one.
+    // The day someone "unifies" the two lists, this says why not.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["re-send me verbatim"]);
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let v = orphans_tool(&reg, &co);
+    assert_eq!(v["count"], json!(1));
+    assert_eq!(v["orphans"][0]["text"], json!("re-send me verbatim"));
+    assert!(v["orphans"][0]["id"].as_u64().is_some(),
+        "an orphan's id must stay a number — never null, never synthetic: {v}");
+    // The new keys are always present, so a reader never has to distinguish
+    // "no refusals" from "this loomux does not report them".
+    assert_eq!(v["refused_count"], json!(0));
+    assert_eq!(v["refused_omitted"], json!(0));
+    assert_eq!(v["refused"], json!([]));
 }
 
 #[test]
