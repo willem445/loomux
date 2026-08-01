@@ -65,7 +65,8 @@ use loomux_lib::orchestration::{
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
     failed_arm_route, FailedArmRoute,
     box_reading, tier1_scan_bytes, BoxReading,
-    HUMAN_INPUT_BLOCK_BOUND_MS, record_stranded_outcome_at_for_test,
+    HUMAN_INPUT_BLOCK_BOUND_MS, UNCONFIRMED_ACK_SETTLE_MS, UNCONFIRMED_NOTICE_IDS_MAX,
+    record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
@@ -968,7 +969,7 @@ fn unconfirmed_notice_fires_only_for_a_stranded_worker_delivery() {
 
 #[test]
 fn unconfirmed_notice_text_names_the_agent_and_the_recovery_move() {
-    let msg = unconfirmed_delivery_notice("w-3");
+    let msg = unconfirmed_delivery_notice("w-3", &[4_242]);
     assert!(msg.starts_with("[loomux] "), "notice is a loomux system message: {msg}");
     assert!(msg.contains("w-3"), "notice must name the stranded agent: {msg}");
     assert!(msg.contains("unconfirmed"), "notice must state the condition: {msg}");
@@ -5657,7 +5658,7 @@ fn audit_rotates_at_cap_and_backfill_reads_both_generations() {
     // Force a rotation with a tiny cap: the spawn entry moves to audit.1.
     rotate_audit_if_needed(&gdir, 1);
     assert!(gdir.join("audit.1.jsonl").is_file(), "rotation must produce the old generation");
-    reg.audit(&g.id, "loomux", "post-rotate", serde_json::json!({}));
+    reg.audit(&g.id, "loomux", "post-rotate", json!({}));
     assert!(gdir.join("audit.jsonl").is_file());
     // Session mapping still resolves from the rotated generation.
     let sessions: Vec<String> = reg.session_roles().into_iter().map(|r| r.session_id).collect();
@@ -5736,7 +5737,7 @@ fn session_roles_backfills_task_and_branch_from_the_spawn_audit_for_pre_roster_g
     reg.set_port(46011);
     let g = reg.create_group("C:/tmp/repo-legacy", rails()).unwrap();
     let gdir = reg.state_root().join(&g.id);
-    let line = serde_json::json!({
+    let line = json!({
         "ts_ms": 5, "actor": "loomux", "action": "agent-spawn",
         "detail": {
             "agent": "w-9", "role": "worker", "name": "legacy-worker",
@@ -5804,7 +5805,7 @@ fn audit_log_reads_both_generations_oldest_first() {
     rotate_audit_if_needed(&gdir, 1);
     assert!(gdir.join("audit.1.jsonl").is_file());
     // Append a fresh entry to the new current log.
-    reg.audit(&g.id, "human", "prompt", serde_json::json!({ "to": "w-1", "text": "hello" }));
+    reg.audit(&g.id, "human", "prompt", json!({ "to": "w-1", "text": "hello" }));
 
     let entries = reg.audit_log(&g.id);
     let actions: Vec<&str> = entries.iter().map(|e| e.action.as_str()).collect();
@@ -11288,22 +11289,22 @@ fn compaction_status_narrates_every_real_state_machine_phase() {
     // already-tracked state — pin each real phase maps to the right variant,
     // never a phase the state machine can't actually be in.
     assert_eq!(
-        compaction_status(false, false, false, None, 0, None, None, 1_000, None),
+        compaction_status(false, false, false, None, 0, None, None, 1_000, None, None, None),
         CompactionStatus::None,
         "no arm, no reinjection, no lost outcome"
     );
     assert_eq!(
-        compaction_status(true, true, false, None, 0, None, None, 1_000, None),
+        compaction_status(true, true, false, None, 0, None, None, 1_000, None, None, None),
         CompactionStatus::Armed { trusted: true, source: None },
         "pending, not yet observed busy — trusted arm"
     );
     assert_eq!(
-        compaction_status(true, false, false, None, 0, None, None, 1_000, None),
+        compaction_status(true, false, false, None, 0, None, None, 1_000, None, None, None),
         CompactionStatus::Armed { trusted: false, source: None },
         "pending, not yet observed busy — inference arm"
     );
     assert_eq!(
-        compaction_status(true, false, true, None, 0, None, None, 1_000, None),
+        compaction_status(true, false, true, None, 0, None, None, 1_000, None, None, None),
         CompactionStatus::AwaitingEvidence { trusted: false, source: None },
         "pending, busy observed — waiting on quiet to resolve"
     );
@@ -11311,24 +11312,95 @@ fn compaction_status_narrates_every_real_state_machine_phase() {
         // #417: a hook-armed pending is ALSO trusted (no inference gate), but
         // carries `source: Some("hook")` so the panel can distinguish it from
         // the loomux-initiated trusted arm above.
-        compaction_status(true, true, false, None, 0, None, None, 1_000, Some("hook")),
+        compaction_status(true, true, false, None, 0, None, None, 1_000, Some("hook"), None, None),
         CompactionStatus::Armed { trusted: true, source: Some("hook") },
         "pending, not yet observed busy — hook-confirmed arm"
     );
     assert_eq!(
-        compaction_status(true, true, false, Some(900), 2, None, None, 1_000, None),
+        compaction_status(true, true, false, Some(900), 2, None, None, 1_000, None, None, None),
         CompactionStatus::Reinjecting { attempt: 2, max_attempts: 3 },
         "reinject_attempted_ms set takes priority over the arm phase"
     );
     assert_eq!(
-        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 1_000, None),
+        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 1_000, None, None, None),
         CompactionStatus::Abandoned { reason: "arm-timeout".to_string(), since_ms: 500 },
         "a recent lost outcome, no active arm"
     );
     assert_eq!(
-        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 500 + 10 * 60 * 1000, None),
+        compaction_status(false, false, false, None, 0, Some("arm-timeout"), Some(500), 500 + 10 * 60 * 1000, None, None, None),
         CompactionStatus::None,
         "a lost outcome outside the recency window reads as none, not a stale problem"
+    );
+}
+
+#[test]
+fn a_resolved_re_grounding_surfaces_which_evidence_closed_it() {
+    // #546 (option 3). `acked` resolves on one of two signals that are NOT
+    // equally strong: "delivery" is loomux watching its own Enter land;
+    // "activity" is only the agent's own process reaching loomux afterwards,
+    // which proves it is alive and executing — never that it READ the
+    // re-grounding. The uncovered case #546 names is a genuinely lost paste on
+    // an agent that is busy for some other reason: it resolves as confirmed
+    // with `source="activity"`, the agent carries on without the contract, and
+    // nothing says so. Before this, the distinction existed only inside an
+    // audit line, so the panel a human actually watches could not show it.
+    assert_eq!(
+        compaction_status(false, false, false, None, 0, None, None, 1_000, None, Some("activity"), Some(600)),
+        CompactionStatus::Acked { source: "activity", since_ms: 600 },
+        "a recently-acked re-grounding is a real state, carrying the evidence that closed it"
+    );
+    assert_eq!(
+        compaction_status(false, false, false, None, 0, None, None, 1_000, None, Some("delivery"), Some(600)),
+        CompactionStatus::Acked { source: "delivery", since_ms: 600 },
+        "the stronger source must be distinguishable from the weaker one"
+    );
+    // Same recency rule as `Abandoned` — an old resolution is not today's news.
+    assert_eq!(
+        compaction_status(
+            false, false, false, None, 0, None, None, 600 + 10 * 60 * 1000, None,
+            Some("activity"), Some(600),
+        ),
+        CompactionStatus::None,
+        "an ack outside the recency window reads as none, not as a lingering claim"
+    );
+    // A live arm still outranks both: a NEW compaction in progress is what the
+    // panel must show, not the outcome of the last one.
+    assert_eq!(
+        compaction_status(true, true, false, None, 0, None, None, 1_000, None, Some("activity"), Some(600)),
+        CompactionStatus::Armed { trusted: true, source: None },
+        "a fresh arm is not hidden behind the previous cycle's resolution"
+    );
+}
+
+#[test]
+fn a_fresh_loss_is_never_hidden_behind_an_older_resolution() {
+    // An agent that has compacted more than once carries a stamp for each
+    // outcome, so the two recent-terminal states can both be in range. The
+    // MORE RECENT wins rather than a fixed ranking: a fixed one would either
+    // let a resolved re-grounding hide a fresh loss (unsafe) or let an old
+    // loss hide today's resolution (misleading).
+    let lost = |lost_ms, ack_ms| {
+        compaction_status(
+            false, false, false, None, 0, Some("reinjection-abandoned"), Some(lost_ms),
+            10_000, None, Some("activity"), Some(ack_ms),
+        )
+    };
+    assert_eq!(
+        lost(9_000, 5_000),
+        CompactionStatus::Abandoned { reason: "reinjection-abandoned".to_string(), since_ms: 9_000 },
+        "a loss AFTER the last ack is the current state — surfacing the stale ack would be a \
+         claim the state machine has already withdrawn"
+    );
+    assert_eq!(
+        lost(5_000, 9_000),
+        CompactionStatus::Acked { source: "activity", since_ms: 9_000 },
+        "and an ack after an older loss is equally the current state"
+    );
+    // Ties go to the loss: it is the louder of the two and the only one that
+    // asks a human for anything.
+    assert_eq!(
+        lost(7_000, 7_000),
+        CompactionStatus::Abandoned { reason: "reinjection-abandoned".to_string(), since_ms: 7_000 }
     );
 }
 
@@ -12320,6 +12392,14 @@ fn a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers() {
     assert_eq!(confirmed.len(), 1);
     assert_eq!(confirmed[0]["detail"]["source"], "activity",
         "resolved by the agent's own activity, not by a delivery confirmation");
+    // #546 (option 3): the same provenance is kept on the ENTRY, not only in
+    // the audit line, because the audit log is not what a human watching a
+    // pane reads. Pinned at the resolve site rather than only against
+    // `compaction_status`: a test that stops at the pure derivation would stay
+    // green if this wiring were never written at all.
+    assert_eq!(a.compact_last_ack_source, Some("activity"),
+        "the panel must be able to say this phase closed on liveness, not on a proven read");
+    assert!(a.compact_last_ack_ms.is_some(), "and when, so the surfacing can age out");
 }
 
 #[test]
@@ -19604,12 +19684,20 @@ fn group_summary_surfaces_live_compaction_state_and_cached_context_usage() {
     assert_eq!(a2["compaction"]["attempt"], 1);
     assert_eq!(a2["compaction"]["max_attempts"], 3);
 
-    // Delivery confirms: reads back to none, not a lingering state.
+    // Delivery confirms: the in-flight phase is gone — no lingering `armed`,
+    // `awaiting_evidence` or `reinjecting`. #546 (option 3): what remains for
+    // the recency window is the RESOLUTION, carrying which evidence closed it.
+    // Here that is our own submit sampler, so the panel says `delivery` — the
+    // stronger of the two claims, and the one a reader must be able to tell
+    // apart from a resolution that only ever saw the agent stay alive.
     let confirmed = confirmed_delivery(&oid, FAR + 2_000);
     let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &tokens, &HashMap::new(), &confirmed);
     let s3 = reg.group_summary(&gid);
     let a3 = s3["agents"].as_array().unwrap().iter().find(|a| a["id"] == oid.as_str()).unwrap();
-    assert_eq!(a3["compaction"]["status"], "none", "confirmed and resolved — no lingering state");
+    assert_eq!(a3["compaction"]["status"], "acked", "resolved — the phase is closed, not in flight");
+    assert_eq!(a3["compaction"]["source"], "delivery", "and the panel says WHICH evidence closed it");
+    assert!(a3["compaction"]["since_ms"].as_u64().is_some(), "stamped, so the surfacing ages out");
+    assert!(a3["compaction"]["attempt"].is_null(), "no in-flight attempt survives the resolution");
 }
 
 #[test]
@@ -20357,21 +20445,307 @@ fn unconfirmed_delivery_notifies_the_orchestrator_and_suppresses_the_exceptions(
     };
 
     // Confirmed delivery to the worker: the prompt landed, nothing to chase.
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, true, false);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, true, false, 1_001);
     assert!(notices(&reg).is_empty(), "a confirmed delivery must not notify");
 
     // Unconfirmed delivery TO the orchestrator: a notice about it would itself be
     // a delivery to the orchestrator — an endless loop. Suppressed.
-    reg.notify_unconfirmed_delivery(&g.id, &orch.id, true, false, false);
+    reg.notify_unconfirmed_delivery(&g.id, &orch.id, true, false, false, 1_002);
     assert!(notices(&reg).is_empty(), "an unconfirmed delivery to the orchestrator must not notify");
 
     // The real case: an unconfirmed delivery to the worker → exactly one notice,
     // audited to loomux, naming the stranded agent.
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, false);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, false, 1_003);
     let after = notices(&reg);
     assert_eq!(after.len(), 1, "an unconfirmed worker delivery notifies exactly once");
     assert_eq!(after[0].actor, "loomux", "the notice is a loomux system message");
     assert_eq!(after[0].detail["to"], w.id, "the notice names the stranded worker");
+}
+
+#[test]
+fn several_alarms_on_one_pane_cost_the_orchestrator_one_turn_not_n() {
+    // #539, the other half of the cost. Two deliveries to the same pane can
+    // each declare failure within one `LATE_MONITOR_POLL` of the other —
+    // supersession only retires the older monitor at its NEXT tick — and an
+    // in-window `Failed` from `deliver_now` can land alongside a monitor's.
+    // Pre-#539 that was N notices asking the orchestrator the SAME question
+    // (is anything actually stuck on that pane?), each costing a turn plus a
+    // `get_output` probe.
+    //
+    // The two halves are driven exactly as production composes them; the only
+    // thing skipped is the sleep between them.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    // The notice is a real delivery to the orchestrator, and `deliver_prompt`
+    // refuses a pane with no terminal before it audits anything — so the text
+    // this test reads back only exists once the orchestrator is bound.
+    reg.set_pty_for_test(&orch.id, 941);
+
+    assert!(reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 7_001), "the first alarm opens the window");
+    assert!(!reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 7_002), "a joiner must not arm a second timer");
+    assert!(!reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 7_003));
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-unconfirmed-notice"),
+        "nothing is announced until the window closes"
+    );
+
+    reg.flush_unconfirmed_notices(&g.id, &w.id, false);
+    let notices = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-unconfirmed-notice")
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1, "three alarms, one notice");
+    assert_eq!(notices[0].detail["coalesced"], 3);
+    assert_eq!(
+        notices[0].detail["delivery_ids"],
+        json!([7_001, 7_002, 7_003]),
+        "every constituent is named — coalescing must not lose which deliveries it stood for"
+    );
+
+    // The text the orchestrator actually reads names all three, so it can tell
+    // them apart in a line that no longer arrives once per delivery.
+    let delivered = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "prompt")
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .find(|t| t.contains("unconfirmed"))
+        .expect("the coalesced notice is delivered to the orchestrator");
+    for id in ["7001", "7002", "7003"] {
+        assert!(delivered.contains(id), "id {id} missing from: {delivered}");
+    }
+
+    // Idempotent: the bucket is TAKEN, so a second flush (a duplicate timer, a
+    // retry) cannot deliver an empty or repeated notice.
+    reg.flush_unconfirmed_notices(&g.id, &w.id, false);
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-unconfirmed-notice").count(),
+        1,
+        "flushing an already-drained bucket must announce nothing"
+    );
+}
+
+#[test]
+fn the_coalesced_notice_reads_as_one_ask_and_names_every_delivery() {
+    // The wording, pinned directly. The plural changes the ASK — one
+    // `get_output`, not one per id — which is the entire point of coalescing,
+    // and a line that told the orchestrator to probe N times would spend the
+    // turns the feature exists to save.
+    let one = unconfirmed_delivery_notice("w-3", &[1_753_000_000_123]);
+    assert!(one.contains("delivery to w-3 unconfirmed"), "got: {one}");
+    assert!(one.contains("(id 1753000000123)"), "the single id is named too: {one}");
+    assert!(one.contains("get_output it and re-send if needed"), "the recovery move is unchanged: {one}");
+
+    let many = unconfirmed_delivery_notice("w-3", &[11, 22, 33]);
+    assert!(many.contains("3 deliveries to w-3 unconfirmed"), "the verb agrees with the count: {many}");
+    assert!(many.contains("(ids 11, 22, 33)"), "every constituent named: {many}");
+    assert!(many.contains("ONCE"), "one probe answers all of them: {many}");
+    assert!(!many.contains("1 delivery to"), "no singular wording on a coalesced line: {many}");
+
+    // rev-13 N3: this notice is itself a paste into a pane, so the id list is
+    // bounded and the remainder points at the audit log — which keeps every
+    // id. Same argument, and the same number, as `PAUSE_SUPPRESSION_LIST_MAX`.
+    let ids: Vec<u64> = (1..=(UNCONFIRMED_NOTICE_IDS_MAX as u64 + 3)).collect();
+    let capped = unconfirmed_delivery_notice("w-3", &ids);
+    assert!(capped.contains(&format!("{} deliveries", ids.len())), "the COUNT is never truncated: {capped}");
+    assert!(capped.contains("and 3 more — see the audit log"), "the remainder is named, not dropped: {capped}");
+    assert!(
+        !capped.contains(&format!(", {}", ids.len())),
+        "the last id is past the cap and must not be listed: {capped}"
+    );
+}
+
+#[test]
+fn the_notice_audit_records_whether_it_actually_reached_anyone() {
+    // rev-13 N4. `deliver_to_orchestrator` is best-effort and its "no live
+    // orchestrator" branch audits nothing of its own, so auditing before the
+    // attempt and discarding the result asserts a notice that never went
+    // anywhere — and coalescing makes that single false record stand for every
+    // id in the batch at once. Same shape as #569's `pause-suppression-notice`.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    // Orchestrator not bound to a pane yet: the notice cannot land.
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 6_001);
+    reg.flush_unconfirmed_notices(&g.id, &w.id, false);
+    let undelivered = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-unconfirmed-notice")
+        .expect("the attempt is recorded either way");
+    assert_eq!(undelivered.detail["delivered"], false, "it did not land, and the record must say so");
+    assert!(
+        undelivered.detail["error"].as_str().is_some_and(|e| e.contains("terminal")),
+        "and why: {:?}",
+        undelivered.detail["error"]
+    );
+
+    // Bind the pane and the FIRST failure mode is gone — the record must move
+    // with it rather than repeat a stale reason. A headless registry has no
+    // `AppHandle`, so `deliver_prompt` still cannot complete (`Err("no app
+    // handle")`) and `delivered: true` is unreachable here by construction;
+    // what IS assertable, and what N4 is actually about, is that the flag and
+    // the reason are read back from the real attempt instead of asserted ahead
+    // of it. A hardcoded record could not change its reason.
+    reg.set_pty_for_test(&orch.id, 944);
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 6_002);
+    reg.flush_unconfirmed_notices(&g.id, &w.id, false);
+    let second = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-unconfirmed-notice")
+        .next_back()
+        .expect("second notice");
+    assert_eq!(second.detail["delivered"], false, "still undeliverable headless — and it says so");
+    let why = second.detail["error"].as_str().unwrap_or_default().to_string();
+    assert!(!why.contains("terminal"), "the terminal-less reason is stale now: {why}");
+    assert!(!why.is_empty(), "an undelivered notice always names why: {why}");
+    // The pane DID get the paste attempt both times — `deliver_prompt` audits
+    // `prompt` before it can fail on the app handle — so the honest record is
+    // "attempted, not confirmed delivered", which is exactly the distinction
+    // this field exists to draw.
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "prompt").count(),
+        1,
+        "only the bound attempt gets far enough to be pasted at all"
+    );
+}
+
+#[test]
+fn a_delivery_corrected_inside_the_window_is_never_announced_as_unconfirmed() {
+    // rev-13 finding A — a false alarm the coalescing delay CREATED, in the
+    // change whose whole purpose is removing false alarms.
+    //
+    // `late_monitor_tick` checks `hook_match` before `already_failed`, so a
+    // late prompt-landed record arriving after a failure was declared is a
+    // first-class outcome (`Confirm { correction: true }` is named for it),
+    // and the monitor polls every 5s — two or three of those ticks land inside
+    // a 15s window. Pre-#539 the alarm was already out before any correction
+    // could exist, so the orchestrator could only ever read them in that
+    // order. Buffered, the correction overtakes the alarm and it reads them
+    // backwards: "it landed" at t+5s, then "unconfirmed … id N …" at t+15s —
+    // a `get_output` probe plus the tempting re-send #451/#510 exist to stop.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 942);
+
+    // t+0: two deliveries on the same pane both declare failure.
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 9_001);
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 9_002);
+    // t+5s: a late hook record proves 9_001 landed after all.
+    assert!(
+        reg.retract_unconfirmed_delivery(&g.id, &w.id, 9_001),
+        "an id still in the bucket must be withdrawable — the window has not closed"
+    );
+    // t+15s: the window closes.
+    reg.flush_unconfirmed_notices(&g.id, &w.id, false);
+
+    let notices = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-unconfirmed-notice")
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1, "the surviving alarm still goes out");
+    assert_eq!(
+        notices[0].detail["delivery_ids"],
+        json!([9_002]),
+        "the corrected delivery must not be named — it demonstrably landed"
+    );
+    let delivered = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "prompt")
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .find(|t| t.contains("unconfirmed"))
+        .expect("the surviving alarm is delivered");
+    assert!(!delivered.contains("9001"), "the corrected id must not reach the pane: {delivered}");
+    assert!(delivered.contains("9002"), "the real one must: {delivered}");
+
+    // The withdrawal is discoverable after the fact (#445), naming what is left.
+    let retracted = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-unconfirmed-retracted")
+        .expect("a withdrawn alarm leaves a trace");
+    assert_eq!(retracted.detail["delivery_id"], 9_001);
+    assert_eq!(retracted.detail["remaining"], 1);
+}
+
+#[test]
+fn a_bucket_emptied_by_retraction_announces_nothing_at_all() {
+    // The other half rev-13 named: when the correction takes the LAST id, the
+    // already-armed timer still fires. It must find nothing and say nothing —
+    // an empty coalesced notice would be an alarm about no delivery.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 943);
+
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 9_100);
+    assert!(reg.retract_unconfirmed_delivery(&g.id, &w.id, 9_100));
+    reg.flush_unconfirmed_notices(&g.id, &w.id, false);
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-unconfirmed-notice"),
+        "the only alarm was withdrawn — the window must close in silence"
+    );
+
+    // Withdrawing something that was never buffered — or was already flushed —
+    // is a no-op, NOT a claim. That `false` is what tells the caller the
+    // orchestrator has already read the alarm and is owed a correction.
+    assert!(!reg.retract_unconfirmed_delivery(&g.id, &w.id, 9_100), "already gone");
+    assert!(!reg.retract_unconfirmed_delivery(&g.id, &w.id, 4_242), "never buffered");
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 9_200);
+    reg.flush_unconfirmed_notices(&g.id, &w.id, false);
+    assert!(
+        !reg.retract_unconfirmed_delivery(&g.id, &w.id, 9_200),
+        "an id whose notice HAS gone out cannot be withdrawn — that alarm is already read, \
+         and a correction is what it is owed"
+    );
+
+    // And a fresh alarm after all that still opens a window of its own, so a
+    // retraction cannot wedge the pane into permanent silence.
+    assert!(
+        reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 9_300),
+        "a later alarm opens a new bucket and arms its own timer"
+    );
+}
+
+#[test]
+fn a_group_paused_during_the_window_suppresses_the_flush_and_says_which_ids() {
+    // #532's rule applied to the deferral this adds: the paused gate is
+    // re-verified at the moment of submit, not trusted from when the alarm was
+    // raised — a window is 15s of wall clock in which a human can pause the
+    // group. And per #445 the suppression names every id it swallowed, so the
+    // deliveries stay discoverable after the fact.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 8_001);
+    reg.buffer_unconfirmed_delivery(&g.id, &w.id, false, 8_002);
+    reg.pause_group(&g.id).unwrap();
+    reg.flush_unconfirmed_notices(&g.id, &w.id, false);
+
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-unconfirmed-notice"),
+        "a group paused mid-window must not spend the notice budget"
+    );
+    let suppressed = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "notice-suppressed" && e.detail["kind"] == "unconfirmed-delivery")
+        .expect("the suppression is audited");
+    assert_eq!(suppressed.detail["reason"], "group-paused");
+    assert_eq!(suppressed.detail["delivery_ids"], json!([8_001, 8_002]));
 }
 
 #[test]
@@ -20385,7 +20759,7 @@ fn unconfirmed_notice_is_suppressed_while_the_group_is_paused() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     reg.pause_group(&g.id).unwrap();
 
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, false);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, false, 1_003);
     assert!(
         reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-unconfirmed-notice"),
         "a paused group must not raise the unconfirmed notice"
@@ -25580,7 +25954,7 @@ fn an_idle_pane_produces_no_actionable_unconfirmed_notice() {
     // pasted text still identifiably at the box's tail, or human characters
     // outstanding. Neither => the pane is done, not stuck.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, false, true),
+        unconfirmed_disposition(BoxReading::NotHolding, false, true, false, false),
         UnconfirmedDisposition::IdleAuditOnly,
         "our paste consumed and no human input outstanding: the delivery landed or is moot — \
          record it, never send the orchestrator to re-deliver something that is not stuck"
@@ -25592,17 +25966,17 @@ fn a_genuinely_stranded_pane_still_gets_the_notice() {
     // The half that must NOT be softened. #522 narrows WHEN the notice fires,
     // and a fix that narrowed it to nothing would re-open #496's silent wedge.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::Holds, false, true),
+        unconfirmed_disposition(BoxReading::Holds, false, true, false, false),
         UnconfirmedDisposition::Notify,
         "our text still sitting in the box IS the strand — announce it exactly as before"
     );
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, true, true),
+        unconfirmed_disposition(BoxReading::NotHolding, true, true, false, false),
         UnconfirmedDisposition::Notify,
         "a human's own line in the box is not an idle pane, and they still need telling"
     );
     assert_eq!(
-        unconfirmed_disposition(BoxReading::Holds, true, true),
+        unconfirmed_disposition(BoxReading::Holds, true, true, false, false),
         UnconfirmedDisposition::Notify,
         "both at once is the least idle a pane can be"
     );
@@ -25689,18 +26063,18 @@ fn an_unverifiable_reading_is_never_classified_as_an_idle_pane() {
     // withholds the notice for a pane that was OBSERVED at rest; a reading
     // that never happened is not that pane.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::Unverifiable, false, true),
+        unconfirmed_disposition(BoxReading::Unverifiable, false, true, false, false),
         UnconfirmedDisposition::Notify,
         "a box we could not read is not an idle pane — the stranded batch must be announced"
     );
     assert_eq!(
-        unconfirmed_disposition(BoxReading::Unverifiable, true, true),
+        unconfirmed_disposition(BoxReading::Unverifiable, true, true, false, false),
         UnconfirmedDisposition::Notify
     );
     // #522's own behavior, unchanged: an INFORMATIVE empty box still stays
     // quiet. A fix that notified on everything would just re-open #522.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, false, true),
+        unconfirmed_disposition(BoxReading::NotHolding, false, true, false, false),
         UnconfirmedDisposition::IdleAuditOnly,
         "the observed-idle pane must still draw no notice"
     );
@@ -25731,7 +26105,7 @@ fn an_eaten_paste_is_not_an_idle_pane() {
     // `IdleAuditOnly` — silence — which is how a lost kickoff stranded an
     // agent with no badge, no notice, and no recovery.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, false, false),
+        unconfirmed_disposition(BoxReading::NotHolding, false, false, false, false),
         UnconfirmedDisposition::EatenNotify,
         "an empty box with no turn behind it is a LOST delivery, not a finished pane — \
          it must escalate, never go quiet"
@@ -25745,7 +26119,7 @@ fn a_pane_that_finished_its_turn_still_stays_quiet() {
     // evidence by construction, so it still says nothing. A fix that notified
     // on every empty box would simply re-open #522.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, false, true),
+        unconfirmed_disposition(BoxReading::NotHolding, false, true, false, false),
         UnconfirmedDisposition::IdleAuditOnly,
         "a pane that demonstrably ran a turn on our text is done, not eaten — stay quiet"
     );
@@ -25772,7 +26146,7 @@ fn the_silence_bar_and_the_redelivery_bar_are_the_same_bar() {
     // One byte below the bar: BOTH say "no turn happened".
     let below = KICKOFF_TURN_EVIDENCE_BYTES - 1;
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, false, below >= KICKOFF_TURN_EVIDENCE_BYTES),
+        unconfirmed_disposition(BoxReading::NotHolding, false, below >= KICKOFF_TURN_EVIDENCE_BYTES, false, false),
         UnconfirmedDisposition::EatenNotify,
         "below the bar the delivery is eaten and must escalate"
     );
@@ -25785,7 +26159,7 @@ fn the_silence_bar_and_the_redelivery_bar_are_the_same_bar() {
     // Exactly at the bar: BOTH say "a turn happened".
     let at = KICKOFF_TURN_EVIDENCE_BYTES;
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, false, at >= KICKOFF_TURN_EVIDENCE_BYTES),
+        unconfirmed_disposition(BoxReading::NotHolding, false, at >= KICKOFF_TURN_EVIDENCE_BYTES, false, false),
         UnconfirmedDisposition::IdleAuditOnly,
         "at the bar the pane ran a turn and silence is correct"
     );
@@ -25793,6 +26167,51 @@ fn the_silence_bar_and_the_redelivery_bar_are_the_same_bar() {
         recovery(at),
         KickoffRecovery::Decline(KickoffDecline::TurnStarted),
         "at the bar the recovery must decline — the two paths agree the brief landed"
+    );
+}
+
+// ───────── #539: the detector finally gets evidence about the AGENT ─────────
+//
+// Every input `unconfirmed_disposition` had was about the BOX. So a pane whose
+// agent had reported and pushed within the same minute — demonstrably working —
+// could still draw the actionable "the prompt may be sitting unsubmitted;
+// get_output it and re-send" alarm, because `input_pending` said a human had
+// characters outstanding. That counter is known to latch >0 over an empty box
+// (a bare ESC, a TUI line-clear, a CLI consuming the line), and there was no
+// second opinion anywhere in the decision. ~28 of these in one session, each
+// costing an orchestrator turn plus the `get_output` probe it prompts.
+//
+// #535 built the missing signal — an MCP activity clock stamped at the
+// `tools/call` dispatch funnel, i.e. the agent's OWN process reaching loomux —
+// and named this function as its intended second consumer.
+
+/// `UNCONFIRMED_ACK_SETTLE_MS` — the settling floor #539 measures activity
+/// from, spelled as addends rather than a total so it stays a tripwire rather
+/// than a copy. Measured from `submit_sent_ms`, which is stamped immediately
+/// BEFORE the first Enter, so unlike `REINJECT_ACK_SETTLE_MS` above it charges
+/// only for what is still ahead of that stamp:
+///   4. `SUBMIT_CONFIRM_WINDOW` 600
+///   5. sum of `SUBMIT_RETRY_DELAYS` 2_500 + 4_500
+const UNCONFIRMED_ACK_SETTLE_MS_DERIVED: u64 = 600 + 2_500 + 4_500;
+
+#[test]
+fn a_pane_whose_agent_kept_working_is_busy_not_unconfirmed() {
+    // The live shape: our paste is gone from the box (observed, not inferred),
+    // `input_pending` still reads true, and the agent has called a loomux tool
+    // since. Two independent readings say the delivery is done with; one
+    // fallible counter says otherwise. Audit it, do not alarm.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, true, true, true, false),
+        UnconfirmedDisposition::ActiveAuditOnly,
+        "box observed empty of our text AND the agent acted afterwards — the pane is working, \
+         and telling the orchestrator to get_output and re-send costs a turn to learn nothing"
+    );
+    // The guarantee the fix rests on: NO activity signal changes nothing at
+    // all. Same inputs, stamp absent, pre-#539 behaviour verbatim.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, true, true, false, false),
+        UnconfirmedDisposition::Notify,
+        "no evidence about the agent must leave the honest alarm exactly as it was"
     );
 }
 
@@ -25808,7 +26227,7 @@ fn an_eaten_paste_is_routed_to_the_recovery_not_past_it() {
     // stopped, which is why `kickoff_recovery_action` produced zero rows —
     // fired or declined — across the entire recorded audit history.
     assert_eq!(
-        failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, false)),
+        failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, false, false, false)),
         FailedArmRoute::Escalate { eaten: true },
         "an eaten paste must reach the notice, the badge and the kickoff recovery — \
          stopping here is exactly the defect #585 fixed"
@@ -25818,7 +26237,7 @@ fn an_eaten_paste_is_routed_to_the_recovery_not_past_it() {
     // stops, so this does not become "escalate on everything" (which would
     // re-open #522's flood rather than fix #585).
     assert_eq!(
-        failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, true)),
+        failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, true, false, false)),
         FailedArmRoute::QuietStop,
         "a pane that demonstrably ran a turn is still not a strand"
     );
@@ -25828,12 +26247,12 @@ fn an_eaten_paste_is_routed_to_the_recovery_not_past_it() {
     // routing an eaten delivery through the stuck wording is what sent it
     // hunting for text that was not there.
     assert_eq!(
-        failed_arm_route(unconfirmed_disposition(BoxReading::Holds, false, false)),
+        failed_arm_route(unconfirmed_disposition(BoxReading::Holds, false, false, false, false)),
         FailedArmRoute::Escalate { eaten: false }
     );
     // #559's honest-uncertainty arm keeps escalating, unchanged.
     assert_eq!(
-        failed_arm_route(unconfirmed_disposition(BoxReading::Unverifiable, false, false)),
+        failed_arm_route(unconfirmed_disposition(BoxReading::Unverifiable, false, false, false, false)),
         FailedArmRoute::Escalate { eaten: false }
     );
 
@@ -25841,7 +26260,7 @@ fn an_eaten_paste_is_routed_to_the_recovery_not_past_it() {
     // the eaten-paste pane readings, the arm escalates AND the recovery it
     // reaches re-delivers. This is the composition #517's own test asserted by
     // hand — now with its first step taken from the shipped precedence.
-    let route = failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, false));
+    let route = failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, false, false, false));
     assert!(matches!(route, FailedArmRoute::Escalate { .. }), "the arm must not stop");
     assert_eq!(
         kickoff_recovery_action(
@@ -25856,6 +26275,43 @@ fn an_eaten_paste_is_routed_to_the_recovery_not_past_it() {
 }
 
 #[test]
+fn activity_never_outranks_evidence_that_points_the_other_way() {
+    // The half that must NOT be softened, one arm at a time. Liveness is
+    // evidence about the AGENT; it is never evidence about the BOX, so it can
+    // only ever break a tie the box did not decide.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::Holds, true, true, true, false),
+        UnconfirmedDisposition::Notify,
+        "our text is sitting there unsubmitted — an agent busy for some OTHER reason does not \
+         make a visible strand go away"
+    );
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::Holds, false, true, true, false),
+        UnconfirmedDisposition::Notify
+    );
+    // #559's honest-uncertainty arm, untouched. Suppressing here would
+    // re-create the exact defect #559 fixed — silence drawn from an answer the
+    // pane was never consulted about — merely sourced from a different signal.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::Unverifiable, false, true, true, false),
+        UnconfirmedDisposition::Notify,
+        "a box we could not read is not a box we watched go empty; activity is not a box reading"
+    );
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::Unverifiable, true, true, true, false),
+        UnconfirmedDisposition::Notify
+    );
+    // And the pre-existing silent arm keeps its OWN name: an idle pane and a
+    // busy one are different observations, and a shared verdict would make the
+    // audit log unable to say which one suppressed the alarm.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, false, true, true, false),
+        UnconfirmedDisposition::IdleAuditOnly,
+        "an empty box with no human input is idle whether or not the agent is also busy"
+    );
+}
+
+#[test]
 fn the_eaten_notice_says_the_text_is_gone_rather_than_stuck() {
     // `.loomux/lessons.md`, "a claim is a deliverable". The pre-#585 notice
     // tells the orchestrator the prompt "may be sitting unsubmitted in its
@@ -25864,7 +26320,7 @@ fn the_eaten_notice_says_the_text_is_gone_rather_than_stuck() {
     // wrong". That misreading is exactly how #585's two live losses were
     // missed, and the speculative re-sends it invites are the #455
     // duplicate-kickoff class.
-    let eaten = delivery_eaten_notice("w-14");
+    let eaten = delivery_eaten_notice("w-14", &[77]);
     assert!(eaten.contains("w-14"), "the notice must name the agent that lost the delivery");
     assert!(
         !eaten.contains("sitting unsubmitted"),
@@ -25876,8 +26332,8 @@ fn the_eaten_notice_says_the_text_is_gone_rather_than_stuck() {
     );
     // And the two notices stay distinguishable — a caller that picked the
     // wrong one would send the orchestrator hunting for text that is not there.
-    assert_ne!(eaten, unconfirmed_delivery_notice("w-14"));
-    assert!(unconfirmed_delivery_notice("w-14").contains("sitting unsubmitted"));
+    assert_ne!(eaten, unconfirmed_delivery_notice("w-14", &[77]));
+    assert!(unconfirmed_delivery_notice("w-14", &[77]).contains("sitting unsubmitted"));
 }
 
 #[test]
@@ -25891,7 +26347,7 @@ fn an_eaten_delivery_notifies_with_the_eaten_wording_and_records_which_it_was() 
     reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
 
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, true);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, true, 5501);
 
     let notices = reg
         .audit_log(&g.id)
@@ -25909,7 +26365,7 @@ fn an_eaten_delivery_notifies_with_the_eaten_wording_and_records_which_it_was() 
     // delivery on the same seam must still record `eaten: false`. Without this
     // half, a hard-coded `true` would pass the assertion above.
     let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
-    reg.notify_unconfirmed_delivery(&g.id, &w2.id, false, false, false);
+    reg.notify_unconfirmed_delivery(&g.id, &w2.id, false, false, false, 5502);
     let stuck = reg
         .audit_log(&g.id)
         .into_iter()
@@ -25920,6 +26376,120 @@ fn an_eaten_delivery_notifies_with_the_eaten_wording_and_records_which_it_was() 
         stuck[0].detail["eaten"], false,
         "a merely-unconfirmed delivery must stay distinguishable from an eaten one"
     );
+}
+
+#[test]
+fn activity_can_never_silence_an_eaten_delivery() {
+    // The hazard of merging #585 and #539, pinned directly. Both split the
+    // `NotHolding` row, and a mechanical resolution that kept #539's
+    // `IdleAuditOnly` arm would have re-deaded the kickoff recovery #585 had
+    // just un-deaded — from a different input, so #585's own tests would all
+    // still pass.
+    //
+    // The reason activity must not reach these two arms is not conservatism:
+    // an MCP call is a sign the AGENT is alive, never a sign it acted on OUR
+    // delivery. An agent whose paste was eaten still calls loomux — every
+    // role's instructions end with "if you have no task yet, report progress
+    // and wait" — so under evidence-OR the report proving the brief was lost
+    // would be the thing that silenced the alarm about losing it.
+    for acted in [false, true] {
+        for kickoff in [false, true] {
+            assert_eq!(
+                unconfirmed_disposition(BoxReading::NotHolding, false, false, acted, kickoff),
+                UnconfirmedDisposition::EatenNotify,
+                "no turn ran and the box lost our text: the delivery was EATEN, and neither an \
+                 activity stamp ({acted}) nor the kickoff flag ({kickoff}) may downgrade that"
+            );
+            assert_eq!(
+                unconfirmed_disposition(BoxReading::NotHolding, false, true, acted, kickoff),
+                UnconfirmedDisposition::IdleAuditOnly,
+                "and with a turn behind it, #585 owns the silence — activity changes nothing here"
+            );
+        }
+    }
+    // The eaten arm keeps escalating all the way through the route, so the
+    // recovery below it stays reachable (#585's whole point).
+    assert_eq!(
+        failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, false, true, false)),
+        FailedArmRoute::Escalate { eaten: true },
+        "an active agent must not turn a lost delivery into a quiet stop"
+    );
+}
+
+#[test]
+fn activity_alone_is_not_enough_a_turn_must_also_have_run() {
+    // The second restriction the merge adds: inside the one cell activity DOES
+    // govern, it must be accompanied by turn evidence. Two independent
+    // post-submit observations — the pane painted a turn, and the agent
+    // reached loomux — neither of which the other can manufacture.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, true, false, true, false),
+        UnconfirmedDisposition::Notify,
+        "an agent that called a tool while the pane ran NO turn on our text is the previous \
+         turn talking; silence there would be the eaten case wearing a human-input hat"
+    );
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, true, true, true, false),
+        UnconfirmedDisposition::ActiveAuditOnly,
+        "with both observations present the alarm is the false one #539 exists to remove"
+    );
+    // And the route agrees, so the two silent dispositions cannot diverge in
+    // control flow even though they carry different audit actions.
+    assert_eq!(
+        failed_arm_route(UnconfirmedDisposition::ActiveAuditOnly),
+        FailedArmRoute::QuietStop,
+        "ActiveAuditOnly is silent for the same reason IdleAuditOnly is"
+    );
+}
+
+#[test]
+fn a_recoverable_kickoff_is_never_silenced_by_the_agents_own_idle_report() {
+    // The one case where an activity stamp is evidence of nothing. #517's
+    // lost-kickoff re-delivery is reached through the notify path, and an
+    // agent whose brief never arrived is precisely the agent that calls a
+    // loomux tool anyway — every role's instructions end with "if you have no
+    // task yet, report progress and wait". So on a fresh spawn's kickoff, a
+    // stamp is as consistent with "the brief was eaten and the agent announced
+    // itself idle" as with "the brief landed".
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, true, true, true, true),
+        UnconfirmedDisposition::Notify,
+        "a recoverable kickoff must reach #517's recovery — the agent reporting itself idle is \
+         the SYMPTOM of the lost brief, and must not be read as proof it arrived"
+    );
+    // Without the kickoff, the identical inputs suppress — so this test is
+    // pinning the veto, not a coincidence of the other three inputs.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, true, true, true, false),
+        UnconfirmedDisposition::ActiveAuditOnly
+    );
+}
+
+#[test]
+fn activity_inside_the_settling_floor_is_the_previous_turn_talking() {
+    // The floor, at the boundary and on both sides of it. `submit_sent_ms` is
+    // stamped immediately before the first Enter, and our own submit machinery
+    // can still be pressing Enter for `UNCONFIRMED_ACK_SETTLE_MS` after that —
+    // a call arriving inside that window was decided during the agent's
+    // PREVIOUS turn and says nothing about our delivery.
+    // The shipped constant, checked against the derivation above rather than
+    // mirrored on trust: a stage added to (or removed from) the post-submit
+    // chain must move both or fail here.
+    assert_eq!(
+        UNCONFIRMED_ACK_SETTLE_MS, UNCONFIRMED_ACK_SETTLE_MS_DERIVED,
+        "the floor must be exactly the submit-burst watch plus the blind-retry tail — no more          (stages already spent before `submit_sent_ms`) and no less (our own Enter is still landing)"
+    );
+    let submit = 900_000u64;
+    let floor = submit + UNCONFIRMED_ACK_SETTLE_MS;
+    assert!(
+        !agent_acted_since(floor - 1, floor),
+        "one millisecond inside the floor is still the previous turn"
+    );
+    assert!(agent_acted_since(floor, floor), "at the floor it counts");
+    // The seed value can never satisfy a real floor, so an agent that has
+    // never called a tool falls through to the unchanged path rather than
+    // accidentally suppressing anything.
+    assert!(!agent_acted_since(0, floor), "never-called is never an ack");
 }
 
 #[test]
@@ -26052,12 +26622,12 @@ fn an_ordinary_delivery_classifies_exactly_as_it_did_before() {
     assert_eq!(box_reading(Some(holding_tail), pasted), BoxReading::Holds);
     assert_eq!(box_reading(Some(&consumed_tail), pasted), BoxReading::NotHolding);
     assert_eq!(
-        unconfirmed_disposition(box_reading(Some(&consumed_tail), pasted), false, true),
+        unconfirmed_disposition(box_reading(Some(&consumed_tail), pasted), false, true, false, false),
         UnconfirmedDisposition::IdleAuditOnly,
         "the #522 quiet path is reached by exactly the deliveries it always was"
     );
     assert_eq!(
-        unconfirmed_disposition(box_reading(Some(holding_tail), pasted), false, true),
+        unconfirmed_disposition(box_reading(Some(holding_tail), pasted), false, true, false, false),
         UnconfirmedDisposition::Notify
     );
 }
