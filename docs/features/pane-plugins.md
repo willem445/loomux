@@ -119,6 +119,12 @@ What that means in practice:
 - **Nothing but you can answer.** No plugin, script, or agent can write that
   file through loomux — the command that records an approval is reachable
   only from loomux's own trusted window.
+- **Deleting a plugin's folder doesn't forget your answer.** The remembered
+  decision is keyed by the plugin's `id`, so if you delete a plugin by hand
+  and later drop in a *different* plugin reusing that same `id`, it inherits
+  the answer — unless it asks for more than you allowed, which always
+  re-asks. Until there's a proper uninstall action, remove the plugin's entry
+  from `grants.json` too if that matters to you.
 
 The bundled `resource-monitor` example prompts on first open exactly like a
 third-party plugin would.

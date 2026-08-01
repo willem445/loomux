@@ -39,6 +39,31 @@
 //! writing `grants.json` to make a test pass, too. Tests inject
 //! `plugins_root` and go through these functions).
 //!
+//! **Known limitation — identity is the plugin id, and records are never
+//! pruned (rev-126 N2 on #623).** A record outlives the folder it was made
+//! for: "uninstalling" today means a human deleting `plugins/<id>/` by hand
+//! (there is no uninstall command), and nothing removes the record. So a
+//! DIFFERENT plugin later installed under the SAME id, declaring an equal or
+//! **narrower** capability set, opens on the earlier consent without
+//! prompting. Widening is still caught — a replacement can never get more
+//! than what was approved for that id — so the residual is precisely
+//! "equal-or-narrower under a reused id after a hand-deletion".
+//!
+//! This is deliberately NOT fixed by pruning orphaned records here, for three
+//! reasons: (1) a prune is timing-dependent and misses the main path anyway —
+//! `plugins::install_plugin_from` does `remove_dir_all` + copy inside ONE
+//! call, so a re-install never exposes an absence for any load-time or
+//! boot-time pruner to observe; (2) it would be incomplete while looking
+//! closed — `uistate::plugin_storage_dir()`'s `<id>.json` blob has the
+//! identical inheritance property, so a same-id replacement inherits the
+//! previous plugin's stored data whether or not its grant was pruned; (3) it
+//! points the wrong way on failure — a transiently unreadable `plugins_root`
+//! would make every record look orphaned and silently discard the human's
+//! decisions, which live nowhere else. The right home is a real uninstall
+//! command, which knows the human's intent at the moment it happens and can
+//! drop the grant record and the storage namespace together, with no timing
+//! dependence. Tracked as the follow-up filed off #623's review.
+//!
 //! **Storage.** `<data dir>/loomux/plugins/grants.json`, a sibling of the
 //! per-plugin `storage/` dir, written with `uistate.rs`'s atomic-write +
 //! quarantine discipline rather than a second storage layer. It is a plain

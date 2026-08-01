@@ -290,6 +290,27 @@ command also re-reads the manifest from disk and refuses
 folder rewritten between the prompt and the click cannot convert consent to
 `["storage"]` into a grant of something wider.
 
+**Known limitation, stated rather than half-fixed: identity is the plugin
+`id`.** A grant record outlives the folder it was made for. "Uninstalling" is
+a human deleting `plugins/<id>/` by hand — there is no uninstall command yet
+— and nothing prunes the record, so a *different* plugin later installed
+under the *same* id, declaring an equal or **narrower** set, opens on the
+earlier consent without prompting. Widening is still caught, so a replacement
+can never obtain more than was approved for that id; the residual is exactly
+"equal-or-narrower under a reused id after a hand-deletion".
+
+Pruning orphaned records was considered and deliberately rejected as a
+half-answer (rev-126 N2 on #623): `install_plugin_from` deletes and re-copies
+inside a single call, so the main replacement path never exposes an absence a
+pruner could observe; `storage`'s per-`pluginId` blob has the identical
+inheritance property, so pruning grants alone would look closed while leaving
+the same hole one row down in the capability table; and a transiently
+unreadable plugins root would make every record look orphaned and discard
+decisions that live nowhere else. This belongs with a real **uninstall
+command**, which knows the human's intent at the moment it happens and can
+drop the grant and the storage namespace together — tracked as the follow-up
+from #623's review.
+
 **Open human decision — the bundled example.** Whether the first-party
 `resource-monitor` should ship with a **pre-seeded** grant (zero-click demo,
 at the cost of the "no capability is live without a human decision"
