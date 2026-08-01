@@ -48,6 +48,7 @@ use loomux_lib::orchestration::{
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     write_admission, WriteAdmission, preenter_admission, hold_bound_elapsed,
     held_escalation, HeldEscalation, QUESTION_HOLD_STALE_AFTER,
+    hold_channels, HoldChannel, HoldClass,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -16171,15 +16172,26 @@ fn the_escalation_is_one_shot_and_comes_down_when_the_pane_recovers() {
         HeldEscalation::Clear,
         "the pane becoming writable is what ends the episode — the badge must come down"
     );
+    // #563 changed both of the assertions below, and it is worth being exact
+    // about why rather than just editing the expectations: as written they
+    // PINNED the invisible window this issue is about. The first said a
+    // writable pane has nothing to clear (true only while the chip did not
+    // exist); the second said a hold inside the bound reports nothing at all,
+    // which is the defect stated as a property. Neither guarantee is lost —
+    // "no spurious audit" is now enforced at the caller's guarded clear, and
+    // "the BADGE is for a hold that outlasted the bound" is asserted directly
+    // above and in `a_held_pane_is_reported_from_the_first_poll...`.
     assert_eq!(
         held_escalation(WriteAdmission::Go, held, now, bound, false),
-        HeldEscalation::None,
-        "...but a writable pane we never badged has nothing to clear, so no spurious audit"
+        HeldEscalation::Clear,
+        "a writable pane clears whether or not it was ever badged — a chip raised inside the \
+         bound has to come down too, and only the caller knows what it put up"
     );
     assert_eq!(
         held_escalation(WriteAdmission::HoldQuestion, held, held + bound - 1, bound, false),
-        HeldEscalation::None,
-        "a young hold is ordinary — the badge is for a hold that has outlasted the bound"
+        HeldEscalation::Chip(HeldReason::InteractiveQuestion),
+        "a young hold is ordinary — but ordinary is not invisible: it chips, and only the \
+         escalation waits for the bound"
     );
 }
 
@@ -17598,6 +17610,12 @@ fn stranded_detail_names_the_blocker_the_human_must_clear() {
         Some(StrandedBlocker::NotHolding),
         Some(StrandedBlocker::Exhausted),
         Some(StrandedBlocker::QueueFull),
+        // #563: appended (never inserted) — the index-based assertions below
+        // name specific rows, and shifting them would silently re-point them
+        // at the wrong blocker while still passing.
+        Some(StrandedBlocker::QueueNearFull),
+        Some(StrandedBlocker::QueueAtCapacity),
+        Some(StrandedBlocker::QuestionStale),
     ]
     .into_iter()
     .map(|b| stranded_detail("w-1", b))
@@ -17652,6 +17670,358 @@ fn a_queue_full_pane_badges_queue_full_not_a_spent_heal() {
         reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-selfheal-skipped"),
         "and the skip is audited with its reason"
     );
+}
+
+// ---------- #563: no invisible hold, no silent queue-full ----------
+//
+// The incident: a copilot orchestrator's deliveries were held against a pane
+// that looked EMPTY, with no warning at all, until the delivery queue filled
+// completely and work was dropped. The investigation (issue comment) found two
+// structural causes, and each test below pins one of them.
+
+#[test]
+fn a_held_pane_is_reported_from_the_first_poll_not_only_after_the_bound() {
+    // #563's core defect, at the decision that owns it.
+    //
+    // The pane-header chip only ever existed INSIDE one `deliver_now` attempt,
+    // around its individually-capped waits. The hold a human actually sits in
+    // front of lives BETWEEN attempts, in `run_queue_drainer`'s poll loop —
+    // and that loop consulted `held_escalation`, which returned `None` for
+    // every poll inside `QUESTION_HOLD_STALE_AFTER`. Ten minutes of a pane
+    // saying nothing while loomux withheld every delivery to it, and (per that
+    // constant's own doc) up to ~19 in practice because the bound is only
+    // sampled between attempts.
+    //
+    // A hold that is visible is an inconvenience; a hold that is invisible
+    // until the queue overflows is a work-loss event.
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let held = 1_000_000u64;
+    let one_poll_in = held + 2_000; // a single QUEUE_DRAIN_POLL tick
+
+    let box_hold = held_escalation(WriteAdmission::HoldBoxOccupied, held, one_poll_in, bound, false);
+    assert_ne!(
+        box_hold,
+        HeldEscalation::None,
+        "a pane held two seconds into an hours-long hold must report SOMETHING — reporting \
+         nothing until the bound is #563"
+    );
+    assert_eq!(
+        box_hold,
+        HeldEscalation::Chip(HeldReason::BoxOccupied),
+        "and what it reports is the chip, naming the gate that is actually blocking"
+    );
+
+    let question_hold = held_escalation(WriteAdmission::HoldQuestion, held, one_poll_in, bound, false);
+    assert_ne!(question_hold, HeldEscalation::None);
+    assert_eq!(
+        question_hold,
+        HeldEscalation::Chip(HeldReason::InteractiveQuestion),
+        "a question hold chips as a question, not as leftover typing — the two ask the human \
+         for different actions"
+    );
+
+    // The escalation is unchanged: still at the bound, still one-shot. #563 is
+    // about the silence BEFORE it, and a fix that moved the badge earlier
+    // instead would trade one wrong behaviour for another (a badge on every
+    // ordinary two-second hold).
+    assert_eq!(
+        held_escalation(WriteAdmission::HoldBoxOccupied, held, held + bound, bound, false),
+        HeldEscalation::Badge(StrandedBlocker::HumanInput),
+        "the ten-minute escalation still fires exactly where it did"
+    );
+}
+
+#[test]
+fn a_recovered_pane_is_cleared_even_when_it_was_never_escalated() {
+    // The mirror-image bug the fix must not introduce. With a chip that can be
+    // up without a badge ever having fired, "we badged, so there is something
+    // to clear" stopped being a safe inference: a pane held for two minutes
+    // and then released would keep a permanent ⏸ chip, which is worse than no
+    // chip at all — a stale "held" badge trains a human to ignore the real one.
+    let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
+    let (held, now) = (1_000_000u64, 1_060_000u64);
+
+    assert_eq!(
+        held_escalation(WriteAdmission::Go, held, now, bound, false),
+        HeldEscalation::Clear,
+        "a writable pane must clear, even though nothing was ever escalated — the chip is what \
+         is coming down. Callers guard their own clears, so this costs no spurious audit line"
+    );
+    assert_eq!(
+        held_escalation(WriteAdmission::Go, held, now, bound, true),
+        HeldEscalation::Clear,
+        "and the badged case still clears, exactly as before"
+    );
+}
+
+#[test]
+fn every_hold_class_reaches_a_human_who_is_not_the_orchestrator_channel() {
+    // The enumeration, executable. #563 happened because "which holds are
+    // visible" lived nowhere a compiler or test could check it — so a hold
+    // classification with no channel at all (the drainer's poll hold) could
+    // exist for as long as it did without anything failing.
+    //
+    // Two properties, and the second is the one that matters: `notify_queue`
+    // returns early whenever the target IS the group's orchestrator, so a
+    // classification whose only channel is the in-band notice is silent on
+    // precisely the pane #563 was reported on.
+    assert_eq!(
+        HoldClass::ALL.len(),
+        13,
+        "a new HoldClass must be added to HoldClass::ALL (and this count bumped) or the \
+         completeness of this test is a fiction"
+    );
+    for (i, class) in HoldClass::ALL.iter().enumerate() {
+        assert_eq!(class.ordinal(), i, "HoldClass::ALL must be in ordinal order: {class:?}");
+        let channels = hold_channels(*class);
+        assert!(!channels.is_empty(), "{class:?} has no channel at all — that is an invisible hold");
+        assert!(
+            channels.iter().any(|c| c.survives_orchestrator_target()),
+            "{class:?} is reported ONLY through channels an orchestrator target suppresses \
+             ({channels:?}) — invisible exactly where it matters most"
+        );
+    }
+
+    // And the predicate itself is not vacuously true, or the loop above proves
+    // nothing.
+    assert!(!HoldChannel::OrchestratorNotice.survives_orchestrator_target());
+    assert!(HoldChannel::HeldChip.survives_orchestrator_target());
+    assert!(HoldChannel::AttentionBadge.survives_orchestrator_target());
+}
+
+#[test]
+fn queue_pressure_warns_before_the_cap_and_releases_on_evidence() {
+    // "The delivery queue filled completely" was, before this, a fact loomux
+    // only ever learned at the instant it was already throwing a payload away.
+    // There was no state between "fine" and "work has just been lost", so
+    // nothing could warn while warning was still useful.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5631u32;
+
+    // Fill to one below the near-full threshold: still ordinary.
+    for i in 0..(queue::QUEUE_NEAR_FULL_AT - 1) {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+            .unwrap();
+    }
+    assert!(
+        !reg.audit_log(&g.id).iter().any(|e| e.action == "delivery-queue-pressure"),
+        "a queue with headroom must stay quiet, or the warning becomes noise nobody reads"
+    );
+    assert!(reg.stranded_note(&w.id).is_none(), "and unbadged");
+
+    // The admission that crosses the threshold is the last moment a warning
+    // can still be a warning.
+    reg.enqueue_text(&g.id, &w.id, "loomux", "crosses", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    let pressure: Vec<_> = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-queue-pressure")
+        .collect();
+    assert_eq!(pressure.len(), 1, "exactly one line on the transition — not one per arrival");
+    assert_eq!(pressure[0].detail["state"], "approaching");
+    assert_eq!(
+        pressure[0].detail["depth"].as_u64(),
+        Some(queue::QUEUE_NEAR_FULL_AT as u64)
+    );
+    assert_eq!(
+        reg.stranded_note(&w.id).and_then(|n| n.blocker),
+        Some(StrandedBlocker::QueueNearFull),
+        "badged through a channel `notify_queue`'s orchestrator suppression cannot swallow"
+    );
+
+    // Sitting at pressure is not a new event every time something arrives.
+    reg.enqueue_text(&g.id, &w.id, "loomux", "another", pty, queue::EnqueueReason::BehindQueue).unwrap();
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "delivery-queue-pressure").count(),
+        1,
+        "edge-triggered: a pane parked at 7/8 must not narrate every arrival"
+    );
+
+    // Release is on EVIDENCE — a depth that actually came back down — never on
+    // elapsed time (.loomux/lessons.md). Drain back under the threshold.
+    let entries = reg.queue_snapshot(pty);
+    for e in entries.iter().take(2) {
+        reg.pop_front_dequeued(&g.id, pty, e.id, e.enqueued_ms);
+    }
+    assert_eq!(
+        reg.stranded_note(&w.id).and_then(|n| n.blocker),
+        None,
+        "a queue that has genuinely drained releases its pressure badge"
+    );
+    assert!(
+        reg.audit_log(&g.id)
+            .iter()
+            .any(|e| e.action == "delivery-queue-pressure" && e.detail["state"] == "normal"),
+        "and the release is in the record, not just the absence of a badge"
+    );
+}
+
+#[test]
+fn a_queue_full_drop_names_what_it_dropped_and_badges_the_pane() {
+    // The work-loss half. At the cap the NEWEST arrival is rejected, and
+    // before #563 its audit line recorded only `{to, reason, depth}`: enough
+    // to know something was lost, never enough to know what. No id is minted
+    // for a rejected entry, so there is nothing else in the log to join
+    // against — and `audit.jsonl` rotates, so that line is the only record
+    // that will ever exist. A sender can re-send a delivery it can identify.
+    //
+    // The other half: the rejection was announced only through `notify_queue`
+    // (suppressed on an orchestrator target) and a synchronous `Err` to the
+    // CALLING agent. On the pane #563 was reported on, that is nothing at all.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5632u32;
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue)
+            .unwrap();
+    }
+
+    let lost = "review round 3 findings: the gate re-arms on every retry";
+    let err = reg
+        .enqueue_text(&g.id, &w.id, "orchestrator", lost, pty, queue::EnqueueReason::Arrival)
+        .expect_err("at cap, the newest arrival is rejected");
+    assert!(err.contains(&w.id), "the synchronous error still names the target: {err}");
+
+    let dropped = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-dropped")
+        .next_back()
+        .expect("a rejected delivery must be audited");
+    assert_eq!(
+        dropped.detail["preview"], lost,
+        "the drop must name WHAT was lost — an anonymous drop cannot be re-sent"
+    );
+    assert_eq!(dropped.detail["from"], "orchestrator", "and who sent it");
+    assert_eq!(dropped.detail["bytes"].as_u64(), Some(lost.len() as u64), "and how much was lost");
+
+    assert_eq!(
+        reg.stranded_note(&w.id).and_then(|n| n.blocker),
+        Some(StrandedBlocker::QueueAtCapacity),
+        "and the pane is badged — on an orchestrator pane the badge is the ONLY channel that \
+         survives, and before #563 the front door raised none. `QueueAtCapacity`, not \
+         `QueueFull`: this caller read a DEPTH, not a refused re-send (rev-10 finding 1)"
+    );
+}
+
+#[test]
+fn a_dropped_preview_is_bounded_single_line_and_marks_its_own_truncation() {
+    // A preview that looks complete but isn't is the same unbacked claim
+    // .loomux/lessons.md catalogues — a reader would conclude they had seen
+    // the whole payload.
+    assert_eq!(
+        queue::dropped_payload_preview("one\ntwo   three"),
+        "one two three",
+        "collapsed to one line so it stays readable in a log viewer"
+    );
+    let long = "x".repeat(queue::DROPPED_PREVIEW_MAX * 3);
+    let preview = queue::dropped_payload_preview(&long);
+    assert!(preview.ends_with('…'), "truncation is marked, never silent: {preview}");
+    assert_eq!(preview.chars().count(), queue::DROPPED_PREVIEW_MAX + 1);
+    // Chars, not bytes: slicing UTF-8 at an arbitrary byte offset panics, and
+    // this runs on the delivery path where a panic is a silently dead pane.
+    let multibyte = "é".repeat(queue::DROPPED_PREVIEW_MAX * 2);
+    assert!(queue::dropped_payload_preview(&multibyte).ends_with('…'));
+}
+
+#[test]
+fn capacity_state_leaves_headroom_to_warn_in() {
+    // A threshold at the cap could never warn in advance, and one too close to
+    // it would be crossed and exhausted inside a single drain poll.
+    assert!(queue::QUEUE_NEAR_FULL_AT < queue::QUEUE_MAX_PER_PANE);
+    assert_eq!(queue::capacity_state(0), queue::CapacityState::Normal);
+    assert_eq!(queue::capacity_state(queue::QUEUE_NEAR_FULL_AT - 1), queue::CapacityState::Normal);
+    assert_eq!(queue::capacity_state(queue::QUEUE_NEAR_FULL_AT), queue::CapacityState::Approaching);
+    assert_eq!(queue::capacity_state(queue::QUEUE_MAX_PER_PANE - 1), queue::CapacityState::Approaching);
+    assert_eq!(queue::capacity_state(queue::QUEUE_MAX_PER_PANE), queue::CapacityState::Full);
+    assert_eq!(
+        queue::capacity_state(queue::QUEUE_MAX_PER_PANE + 5),
+        queue::CapacityState::Full,
+        "a depth past the cap (recovery re-admission racing an arrival) is still Full, not a panic"
+    );
+    assert!(
+        queue::QUEUE_MAX_PER_PANE - queue::QUEUE_NEAR_FULL_AT >= 2,
+        "at least two slots of headroom, or the warning arrives with the loss rather than before it"
+    );
+}
+
+#[test]
+fn the_near_full_badge_does_not_claim_a_delivery_was_already_lost() {
+    // A claim is a deliverable, even in a tooltip (.loomux/lessons.md).
+    // `QueueFull`'s wording asserts loomux COULD NOT queue something, which is
+    // false while the queue is still accepting — the same unbacked-claim class
+    // that made `QuestionStale` a separate variant from `Question`.
+    let near = stranded_detail("w-1", Some(StrandedBlocker::QueueNearFull));
+    let full = stranded_detail("w-1", Some(StrandedBlocker::QueueFull));
+    assert_ne!(near, full, "the two states must not read identically");
+    assert!(
+        !near.contains("could not"),
+        "nothing has been lost yet — the badge must not say otherwise: {near}"
+    );
+    assert!(near.contains("nearly full"), "it names the real state: {near}");
+    assert!(
+        near.contains("dropped"),
+        "and what happens if the pane is left alone, which is the whole point of warning early: {near}"
+    );
+}
+
+#[test]
+fn the_capacity_badges_state_a_hold_as_a_condition_never_as_a_fact() {
+    // rev-10 finding 1, and it is the same false-claim class this whole issue
+    // exists to eliminate — reached from the other side.
+    //
+    // `note_queue_capacity` decides on DEPTH ALONE. It never reads
+    // `write_admission`, `held_escalation`, or any hold state; the raise sits
+    // in `enqueue_text`'s `Admit` arm and runs on every admission. So a pane
+    // whose drainer is perfectly healthy but whose senders outrun it — a fleet
+    // of workers reporting into one orchestrator pane — reaches these
+    // thresholds with NO hold at all. A badge that tells that human to "press
+    // Enter or answer what's on screen" sends them hunting for a dialog that
+    // does not exist, and a badge that wastes someone's time once is a badge
+    // they discount next time. That is the "trains a human to ignore the real
+    // one" harm the drainer's ChipGuard exists to prevent.
+    for blocker in [StrandedBlocker::QueueNearFull, StrandedBlocker::QueueAtCapacity] {
+        let detail = stranded_detail("w-1", Some(blocker));
+        assert!(
+            detail.contains("If it is held"),
+            "{blocker:?} must offer the hold as a condition to check, not assert it: {detail}"
+        );
+        // The unconditional forms the first cut shipped. Each would be a claim
+        // about state this caller has not read.
+        for forbidden in ["is held and", "the pane is held —", "press Enter in the pane"] {
+            assert!(
+                !detail.contains(forbidden),
+                "{blocker:?} asserts a hold it never established ({forbidden:?}): {detail}"
+            );
+        }
+    }
+
+    // ...and the depth-derived at-capacity badge is NOT `QueueFull`, whose
+    // wording is about a refused self-heal re-send and stranded text in the
+    // box — both true where `actuate_stranded` raises it, neither established
+    // by a depth reading.
+    let at_capacity = stranded_detail("w-1", Some(StrandedBlocker::QueueAtCapacity));
+    let refused_resend = stranded_detail("w-1", Some(StrandedBlocker::QueueFull));
+    assert_ne!(at_capacity, refused_resend, "two different facts must not share one sentence");
+    assert!(
+        !at_capacity.contains("re-send"),
+        "no re-send was attempted on the depth path: {at_capacity}"
+    );
+
+    // The notices carry the same discipline — they are the other half of the
+    // same report and would otherwise contradict the badge beside them.
+    let pressure = queue::pressure_notice("w-1", 6, 8);
+    assert!(pressure.contains("If the pane is held"), "conditional, not asserted: {pressure}");
+    assert!(pressure.contains("6/8"), "and it names the numbers it actually read: {pressure}");
+    let at_cap = queue::at_capacity_notice("w-1", 8);
+    assert!(
+        !at_cap.contains("until the pane is released"),
+        "a full queue does not imply a held pane: {at_cap}"
+    );
+    assert!(at_cap.contains("until it drains"), "it says what actually ends the state: {at_cap}");
 }
 
 #[test]

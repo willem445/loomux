@@ -6652,6 +6652,27 @@ pub struct OrchRegistry {
     /// the pane reads deliverable again, so a LATER hold on the same pane
     /// badges again rather than being silently suppressed by the first.
     question_stale_notified: Arc<Mutex<HashSet<u32>>>,
+    /// #563: the last capacity state each pane's queue was OBSERVED in, so
+    /// pressure is reported on the transition up and released on the
+    /// transition down.
+    ///
+    /// An edge trigger, not a one-shot flag, and the difference is the point:
+    /// a `HashSet` of "already warned" panes would latch, and a pane that
+    /// drained, recovered and backed up again would be silent the second time
+    /// — which is exactly the failure mode
+    /// [`OrchRegistry::question_stale_notified`]'s own doc had to fix by
+    /// clearing itself. Storing the state instead makes both directions fall
+    /// out of one comparison. Release is on EVIDENCE (a depth that has
+    /// actually come back down), never on elapsed time — `.loomux/lessons.md`,
+    /// "releasing on evidence beats releasing on elapsed time".
+    ///
+    /// Stores the agent id alongside the state, and that is load-bearing
+    /// rather than convenience: the RELEASE transition is observed on a pop
+    /// that may have just emptied the queue, so at the moment the badge has to
+    /// come down there is no queue entry left to say whose badge it is.
+    /// Remembering who it was raised for is the only reading that survives the
+    /// queue itself.
+    queue_pressure: Arc<Mutex<HashMap<u32, (queue::CapacityState, String)>>>,
 
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
@@ -9053,6 +9074,46 @@ pub enum StrandedBlocker {
     /// that one's wording says a heal already fired and did not take, which
     /// would be a false claim here — nothing was attempted at all.
     QueueFull,
+    /// #563: the pane's delivery queue has reached `queue::QUEUE_NEAR_FULL_AT`
+    /// — nothing has been lost yet, and the point of the badge is that it says
+    /// so *before* anything is.
+    ///
+    /// **Why this is a separate variant and not `QueueFull`.** `QueueFull`'s
+    /// wording asserts that loomux *could not queue* something, which would be
+    /// a false claim while the queue is still accepting — the same
+    /// unbacked-claim class that made `QuestionStale` a separate variant from
+    /// `Question` and `QueueFull` a separate one from `Exhausted`. The two
+    /// also want different actions from the human: `QueueFull` says "work has
+    /// already been dropped, go look"; this one says "release the pane and
+    /// nothing will be".
+    ///
+    /// **Why a badge and not only a notice.** The in-band channel
+    /// (`notify_queue`) is suppressed whenever the target is the group's own
+    /// orchestrator, which is precisely the pane #563 was reported on. A badge
+    /// has no such suppression, so this is the channel that survives the case
+    /// that matters. Released on evidence — the depth falling back to
+    /// `CapacityState::Normal` — never on a timer.
+    QueueNearFull,
+    /// #563: the pane's queue has reached `queue::QUEUE_MAX_PER_PANE`, read
+    /// from the DEPTH and nothing else.
+    ///
+    /// **Why this is not `QueueFull` (rev-10 finding 1, applied consistently).**
+    /// `QueueFull`'s wording says loomux *could not even queue a re-send* and
+    /// tells the human to *press Enter in the pane*. Both are true where it is
+    /// raised, from `actuate_stranded`: there a self-heal really was refused
+    /// and stranded text really is sitting in the box. Neither is established
+    /// by a depth reading — `note_queue_capacity` never consults hold state,
+    /// and the transition INTO `Full` fires on the admission that took the last
+    /// slot, before anything has been rejected at all. Reusing `QueueFull`
+    /// there would send a human to press Enter on a pane with nothing to
+    /// submit: the same false-claim class this issue exists to eliminate, and
+    /// the same reason `QuestionStale` was minted rather than reusing
+    /// `Question`.
+    ///
+    /// Says what depth establishes and then stops: the queue is at the cap, so
+    /// arrivals are being dropped. Released on the same evidence
+    /// `QueueNearFull` is — a depth that has actually come back down.
+    QueueAtCapacity,
     /// #532: the interactive-question guard has held this pane's delivery for
     /// longer than [`QUESTION_HOLD_STALE_AFTER`], and loomux cannot tell
     /// whether the question it still detects is real.
@@ -9110,6 +9171,8 @@ impl StrandedBlocker {
             StrandedBlocker::NotHolding => "not-holding",
             StrandedBlocker::Exhausted => "heal-budget-spent",
             StrandedBlocker::QueueFull => "queue-full",
+            StrandedBlocker::QueueNearFull => "queue-near-full",
+            StrandedBlocker::QueueAtCapacity => "queue-at-capacity",
             StrandedBlocker::QuestionStale => "question-hold-stale",
         }
     }
@@ -9560,6 +9623,37 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
         }
         Some(StrandedBlocker::QueueFull) => {
             format!("{name}'s pane has a full delivery queue, so loomux could not even queue a re-send — press Enter in the pane")
+        }
+        // #563: says what is true NOW (nothing lost) and what happens if the
+        // pane is left alone (deliveries start being dropped). Deliberately
+        // does not claim a re-send failed — that is `QueueFull`'s sentence,
+        // and it would be false here.
+        //
+        // rev-10 finding 1: nor does it claim the pane is HELD.
+        // `note_queue_capacity` raises this badge on depth alone and never
+        // reads any hold state, so a pane whose senders simply outrun a healthy
+        // drainer lands here with nothing to release. The hold is offered as a
+        // condition for the human to check — "if the pane is held" — because
+        // that is the shape of what loomux actually knows. See
+        // `queue::pressure_notice`'s doc for the full argument.
+        Some(StrandedBlocker::QueueNearFull) => {
+            format!(
+                "{name}'s delivery queue is nearly full and still filling — deliveries are \
+                 arriving faster than that pane accepts them. If it is held (unsubmitted text, \
+                 or a question on screen), releasing it drains the backlog; at the cap further \
+                 deliveries are dropped"
+            )
+        }
+        // #563 / rev-10 finding 1: the depth-derived counterpart to
+        // `QueueFull`. States the consequence (arrivals are being dropped) and
+        // the same conditional check, and claims nothing about a re-send that
+        // this badge's caller never attempted.
+        Some(StrandedBlocker::QueueAtCapacity) => {
+            format!(
+                "{name}'s delivery queue is FULL — further deliveries to that pane are being \
+                 DROPPED, not queued. If it is held (unsubmitted text, or a question on screen), \
+                 releasing it drains the backlog"
+            )
         }
         // #532: this wording must stay honest about WHICH state loomux is in,
         // because it does not know. It names both branches and gives an action
@@ -11160,6 +11254,68 @@ fn run_queue_drainer(
     // #470 also spawns this thread for the common, uncontended, zero-hold
     // case, which must never claim anything was "queued while blocked."
     let mut header_pending = false;
+    // #563: which reason THIS drainer currently has the pane-header
+    // delivery-held chip up for, or `None` for no chip. Owned here rather than
+    // in `held_escalation` for the reason `HeldEscalation::Chip`'s doc gives:
+    // "is the pane held" is a fact about the pane, "have we said so, and as
+    // what" is drainer state. Kept per-drainer (not in the registry) because a
+    // drainer is per-pty and its exit is exactly when the chip must come down —
+    // see the `ChipGuard` below, which drops it on EVERY exit from this
+    // function, including the early returns for a closed pty or a dead agent.
+    //
+    // **The REASON, not just a bool (rev-10 finding 3).** A bool made the
+    // reason freeze at whatever the first blocked poll saw, for the whole
+    // episode. The two gates genuinely alternate mid-hold — that alternation is
+    // the documented behaviour `PREPASTE_RECHECK_ROUNDS` exists for — and the
+    // two chips read materially differently ("submit or clear the text in this
+    // pane's box" vs "an interactive question is on screen, answer it"). A
+    // frozen reason can tell a human to clear an empty box while a dialog is
+    // what is actually waiting, which is a false claim on the very badge this
+    // PR added to stop false silence.
+    //
+    // (a `Cell`, purely so the RAII guard below can share it with the loop
+    // body — nothing here is concurrent.)
+    let chip_reason: std::cell::Cell<Option<HeldReason>> = std::cell::Cell::new(None);
+    // #563: a chip left up by a drainer that exited would be a permanent lie
+    // on a pane nothing is holding — the mirror image of the bug this fixes,
+    // and worse, because a stale "held" chip trains a human to ignore the real
+    // one. RAII rather than a clear before each `return`: this function has
+    // four exits and a future edit would add a fifth.
+    struct ChipGuard<'a> {
+        app: &'a AppHandle,
+        pty_id: u32,
+        shown: &'a std::cell::Cell<Option<HeldReason>>,
+    }
+    impl Drop for ChipGuard<'_> {
+        fn drop(&mut self) {
+            if self.shown.get().is_some() {
+                let _ = self
+                    .app
+                    .emit("orch-delivery-held-cleared", delivery_held_cleared_event(self.pty_id));
+            }
+        }
+    }
+    let _chip_guard = ChipGuard { app: &app, pty_id, shown: &chip_reason };
+    // Raise/lower the chip. `raise` is called on every held poll and emits only
+    // when the chip is not already up FOR THIS REASON, so a pane held for hours
+    // on one gate produces one event rather than one every `QUEUE_DRAIN_POLL`,
+    // while a pane whose blocking gate actually changes re-words its chip. The
+    // frontend's `setHeld` overwrites, so a re-emit needs no paired clear.
+    let raise_chip = |agent_id: &str, reason: HeldReason| {
+        if chip_reason.get() != Some(reason) {
+            chip_reason.set(Some(reason));
+            let _ = app.emit(
+                "orch-delivery-held",
+                delivery_held_event(agent_id, &group, pty_id, reason),
+            );
+        }
+    };
+    let lower_chip = || {
+        if chip_reason.get().is_some() {
+            chip_reason.set(None);
+            let _ = app.emit("orch-delivery-held-cleared", delivery_held_cleared_event(pty_id));
+        }
+    };
     let mut iteration = 0u32;
     loop {
         iteration += 1;
@@ -11302,6 +11458,30 @@ fn run_queue_drainer(
                 QUESTION_HOLD_STALE_AFTER.as_millis() as u64,
                 already_badged,
             ) {
+                // #563: the pane is held right now — say so right now. This
+                // arm is the fix: pre-#563 it did not exist, `held_escalation`
+                // returned `None` for every poll inside the bound, and the
+                // pane showed nothing at all until the ten-minute escalation.
+                HeldEscalation::Chip(reason) => {
+                    if chip_reason.get().is_none() {
+                        // One audit line per hold EPISODE, not per poll and not
+                        // per reason change — the record has to show that
+                        // loomux held and said so, without becoming an entry
+                        // every two seconds for as long as the hold stands (the
+                        // same reasoning `mark_stranded`'s one-shot rests on).
+                        // The CHIP re-words when the blocking gate changes
+                        // (rev-10 finding 3); the audit deliberately does not,
+                        // because an alternating pane would then flood the log
+                        // with the flapping this line exists to summarise.
+                        reg.audit(&group, "loomux", "delivery-held-in-queue", json!({
+                            "to": front.agent_id, "stage": "queue-poll",
+                            "blocked_on": admission.enqueue_reason().as_str(),
+                            "held_ms": now_ms().saturating_sub(front.enqueued_ms),
+                            "depth": depth,
+                        }));
+                    }
+                    raise_chip(&front.agent_id, reason);
+                }
                 HeldEscalation::Badge(blocker) => {
                     // rev-12 NB5: guard the RAISE, not just the clear. The
                     // first cut guarded only the clear and claimed a genuine
@@ -11316,8 +11496,19 @@ fn run_queue_drainer(
                         reg.question_stale_notified.lock_safe().insert(pty_id);
                         reg.mark_stranded(&group, &front.agent_id, Some(blocker));
                     }
+                    // #563: a hold can reach the bound having never been
+                    // chipped — a drainer starting on an entry enqueued long
+                    // ago evaluates its very first poll already past it. The
+                    // badge must never be the ONLY thing up.
+                    if let Some(reason) = admission.held_reason() {
+                        raise_chip(&front.agent_id, reason);
+                    }
                 }
                 HeldEscalation::Clear => {
+                    // #563: fires on every writable poll now, so both clears
+                    // are guarded — `lower_chip` on our own `chip_reason`, and
+                    // `clear_stranded` (below) on the badge being ours.
+                    lower_chip();
                     reg.question_stale_notified.lock_safe().remove(&pty_id);
                     // Still blocker-guarded: between our raise and now, another
                     // mechanism may have re-badged this pane for its own
@@ -12315,14 +12506,48 @@ pub fn hold_bound_elapsed(held_since_ms: u64, now_ms: u64, bound_ms: u64) -> boo
 /// (#532, extracted for rev-12 B1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeldEscalation {
-    /// Nothing to do: either the hold is young, or it has already been badged
-    /// and nothing has changed.
+    /// Nothing to do: the hold has already been badged and nothing has changed
+    /// (the chip raised earlier in the episode stays up — see `Chip`).
     None,
+    /// #563: the pane is held RIGHT NOW and the human should see that right
+    /// now. Raise the pane-header delivery-held chip naming this reason.
+    ///
+    /// This is the outcome that did not exist before #563, and its absence was
+    /// the whole bug. `deliver_now` badges its own capped in-attempt waits
+    /// (`emit_held`), but the hold a human actually sits in front of lives
+    /// BETWEEN attempts, in `run_queue_drainer`'s poll loop — which used to
+    /// `continue` on a blocked admission with no UI event of any kind. So the
+    /// chip existed only for the seconds inside one attempt, and the pane went
+    /// dark for the whole sustained hold, until `Badge` fired
+    /// `QUESTION_HOLD_STALE_AFTER` (ten minutes, in practice up to ~19) later.
+    ///
+    /// Deliberately NOT one-shot in this function. The caller owns idempotence
+    /// (it tracks whether the chip is up), for the same reason `Badge`'s
+    /// one-shot is an INPUT: a decision that "the pane is held" is a fact
+    /// about right now, whereas "have we said so already" is caller state.
+    Chip(HeldReason),
     /// Raise the pane's attention badge, naming this blocker. Fires at most
     /// once per hold episode — the caller's one-shot is an INPUT here
     /// (`already_badged`), not a second decision made somewhere else.
+    ///
+    /// #563: the chip must be up here too. A hold that reaches the bound
+    /// without ever having been chipped is reachable — a drainer that starts
+    /// on an entry enqueued long ago evaluates its first poll already past the
+    /// bound — so the caller raises the chip on this arm as well rather than
+    /// assuming a prior `Chip` did.
     Badge(StrandedBlocker),
-    /// The pane is writable again: drop the badge this escalation raised.
+    /// The pane is writable again: drop whatever this escalation raised — the
+    /// chip, the badge, or both.
+    ///
+    /// #563: this now fires on EVERY writable poll, not only when a badge was
+    /// raised. With a chip that can be up without a badge ever having fired,
+    /// "we badged, so there is something to clear" stopped being derivable
+    /// here, and the alternative — a sixth parameter — would have made this
+    /// function's contract depend on two separate pieces of caller state. The
+    /// caller's clears are already guarded (`clear_stranded` audits only when
+    /// a badge was really up; the chip clear is gated on the caller's own
+    /// `chip_reason`), so a `Clear` for a pane with nothing up is a no-op, not
+    /// a spurious audit line.
     Clear,
 }
 
@@ -12340,12 +12565,16 @@ pub enum HeldEscalation {
 /// doctrine was stated in this file and then not followed one function over.
 ///
 /// Precedence:
-/// - Writable (`admission.go()`) ⇒ `Clear` if we had badged, else `None`. The
-///   pane recovering is what ends the episode, not a timer.
-/// - Inside the bound ⇒ `None`.
+/// - Writable (`admission.go()`) ⇒ `Clear`. The pane recovering is what ends
+///   the episode, not a timer. (#563: unconditional now — see `Clear`'s doc.)
+/// - Inside the bound ⇒ `Chip(reason)` (#563). The escalation is not due, but
+///   the pane is held and the human must be able to SEE that from the first
+///   poll. This arm returned `None` before #563, and that silence — not a
+///   misclassification — is what the issue reports.
 /// - Already badged ⇒ `None`. The one-shot lives here so "at most once per
 ///   episode" is a property of this function rather than of whichever caller
-///   remembers to check a set first.
+///   remembers to check a set first. The chip stays up; only the badge is
+///   one-shot.
 /// - Otherwise ⇒ `Badge`, naming the gate that is actually blocking:
 ///   `HoldQuestion` ⇒ [`StrandedBlocker::QuestionStale`] (loomux may be reading
 ///   a question that is no longer on screen), `HoldBoxOccupied` ⇒
@@ -12390,12 +12619,25 @@ pub fn held_escalation(
     already_badged: bool,
 ) -> HeldEscalation {
     if admission.go() {
-        return if already_badged { HeldEscalation::Clear } else { HeldEscalation::None };
+        return HeldEscalation::Clear;
     }
+    // #563: held, and inside the bound — the escalation is not due yet, but the
+    // VISIBILITY is due immediately. Returning `None` here (the pre-#563
+    // behaviour) is precisely the invisible window the issue reports: nothing
+    // at all reported the hold until the bound elapsed.
     if !hold_bound_elapsed(held_since_ms, now_ms, bound_ms) {
-        return HeldEscalation::None;
+        return match admission.held_reason() {
+            Some(reason) => HeldEscalation::Chip(reason),
+            // Unreachable — `admission.go()` returned above, and every other
+            // variant has a reason. Named rather than `unreachable!()` for the
+            // same reason the `Go` arm below is: this runs on a detached
+            // drainer thread, where a panic is a silently dead pane.
+            None => HeldEscalation::None,
+        };
     }
     if already_badged {
+        // The badge is up and stays up; so does the chip the caller raised
+        // earlier in this episode. Nothing to change.
         return HeldEscalation::None;
     }
     match admission {
@@ -12438,6 +12680,183 @@ impl HeldReason {
             HeldReason::BoxOccupied => "box-occupied",
             HeldReason::InteractiveQuestion => "question",
         }
+    }
+}
+
+/// #563: every way loomux can withhold a delivery, as a closed set.
+///
+/// **Why this exists as a type rather than a paragraph.** #563 is an
+/// *invisible* hold: a delivery held against an empty-looking pane, with no
+/// warning, until the queue filled and work was dropped. The reason it could
+/// happen is that "which holds are visible" was never written down anywhere a
+/// compiler or a test could check — the pane-header chip covered the holds
+/// inside one delivery attempt (`deliver_now`) and simply did not exist for
+/// the hold BETWEEN attempts (`run_queue_drainer`'s poll loop), and nothing
+/// anywhere said so. A prose table would have rotted the same way; this one
+/// fails the build.
+///
+/// The enforcement is two-part and neither half is decorative:
+/// - [`hold_channels`] matches exhaustively, so a new hold classification
+///   cannot be added without declaring how a human learns about it;
+/// - `every_hold_class_reaches_a_human` (integration tests) asserts every
+///   classification has at least one channel that
+///   [`HoldChannel::survives_orchestrator_target`] — because the in-band
+///   notice channel is suppressed on exactly the pane #563 was reported on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldClass {
+    /// #43, pre-paste: the human is actively typing in the pane.
+    PrePasteTyping,
+    /// #111/#510, pre-paste: a human line is sitting unsubmitted in the box.
+    PrePasteBoxOccupied,
+    /// #420, pre-paste: a question/permission TUI owns the Enter key.
+    PrePasteQuestion,
+    /// #532, pre-paste: the two gates kept re-arming for
+    /// `PREPASTE_RECHECK_ROUNDS`, so the attempt gave up without pasting.
+    PrePasteRecheckExhausted,
+    /// #43, pre-Enter: the human started typing during the paste settle.
+    PreEnterTyping,
+    /// #420, pre-Enter: a dialog appeared while our paste was settling.
+    PreEnterQuestion,
+    /// #532, pre-Enter: human-typed content is in the box at submit time.
+    PreEnterBoxOccupied,
+    /// #563: the drainer's poll found the box occupied BETWEEN attempts. This
+    /// is where a sustained hold actually lives, and it is the classification
+    /// that had no channel at all before #563.
+    QueuePollBoxOccupied,
+    /// #563: as above, blocked on the interactive-question gate.
+    QueuePollQuestion,
+    /// #532: a poll hold that has outlived `QUESTION_HOLD_STALE_AFTER`.
+    QueueStaleEscalation,
+    /// #563: the pane's queue has reached `queue::QUEUE_NEAR_FULL_AT` —
+    /// nothing lost yet, and the warning exists to keep it that way.
+    QueueNearFull,
+    /// #445/#563: the queue is at `queue::QUEUE_MAX_PER_PANE`; further
+    /// arrivals are rejected outright.
+    QueueFull,
+    /// The human paused the group, so loomux delivers nothing (`deliver_prompt`).
+    GroupPaused,
+}
+
+impl HoldClass {
+    /// Every classification. Maintained against [`HoldClass::ordinal`]'s
+    /// exhaustive match and the length assertion in
+    /// `every_hold_class_reaches_a_human`.
+    pub const ALL: &'static [HoldClass] = &[
+        HoldClass::PrePasteTyping,
+        HoldClass::PrePasteBoxOccupied,
+        HoldClass::PrePasteQuestion,
+        HoldClass::PrePasteRecheckExhausted,
+        HoldClass::PreEnterTyping,
+        HoldClass::PreEnterQuestion,
+        HoldClass::PreEnterBoxOccupied,
+        HoldClass::QueuePollBoxOccupied,
+        HoldClass::QueuePollQuestion,
+        HoldClass::QueueStaleEscalation,
+        HoldClass::QueueNearFull,
+        HoldClass::QueueFull,
+        HoldClass::GroupPaused,
+    ];
+
+    /// Dense index into [`HoldClass::ALL`]. Exhaustive on purpose: a new
+    /// variant cannot compile without being given an index, and the test then
+    /// fails until `ALL` lists it — so the completeness of `ALL` is enforced
+    /// rather than trusted.
+    pub fn ordinal(self) -> usize {
+        match self {
+            HoldClass::PrePasteTyping => 0,
+            HoldClass::PrePasteBoxOccupied => 1,
+            HoldClass::PrePasteQuestion => 2,
+            HoldClass::PrePasteRecheckExhausted => 3,
+            HoldClass::PreEnterTyping => 4,
+            HoldClass::PreEnterQuestion => 5,
+            HoldClass::PreEnterBoxOccupied => 6,
+            HoldClass::QueuePollBoxOccupied => 7,
+            HoldClass::QueuePollQuestion => 8,
+            HoldClass::QueueStaleEscalation => 9,
+            HoldClass::QueueNearFull => 10,
+            HoldClass::QueueFull => 11,
+            HoldClass::GroupPaused => 12,
+        }
+    }
+}
+
+/// #563: how a human can learn that a delivery is being withheld.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldChannel {
+    /// The pane-header `⏸ held` chip (`orch-delivery-held`). A UI event keyed
+    /// on `pty_id` alone — no role or pause suppression anywhere in its path
+    /// (`src/orchestration.ts`'s listener, `heldbadge.ts`'s mapping).
+    HeldChip,
+    /// The pane's attention badge (`mark_stranded` → `stranded_detail`). Also
+    /// a UI channel, also unsuppressed by role.
+    AttentionBadge,
+    /// An in-band `[loomux] …` notice delivered to the group's orchestrator
+    /// (`notify_queue`).
+    ///
+    /// **Never sufficient on its own.** It is suppressed outright when the
+    /// held pane IS the orchestrator's (a notice about the orchestrator's
+    /// blocked pane would queue behind the very block it reports) and again
+    /// while the group is paused. #563 was reported on an orchestrator pane;
+    /// classifications whose only channel was this one were, on that pane,
+    /// silent.
+    OrchestratorNotice,
+    /// A synchronous `Err` returned to the agent that called the MCP tool
+    /// (`queue::queue_full_error`). Reaches the *sender*, never the human and
+    /// never the held pane's own agent.
+    CallerError,
+    /// The group's paused state, which the human set and the group UI shows.
+    /// The one classification a human cannot be surprised by.
+    PausedGroupUi,
+}
+
+impl HoldChannel {
+    /// Whether this channel still reaches a human when the held pane IS the
+    /// group's own orchestrator — the #563 case, and the property the
+    /// completeness test asserts.
+    pub fn survives_orchestrator_target(self) -> bool {
+        !matches!(self, HoldChannel::OrchestratorNotice)
+    }
+}
+
+/// #563: the channels each hold classification actually fires. Exhaustive, so
+/// a hold added later cannot be silent by omission.
+///
+/// This is a description of what the code does, not an aspiration — every arm
+/// is backed by a call site, and the arms that changed in #563
+/// (`QueuePoll*`, `QueueNearFull`, `QueueFull`) changed because the call sites
+/// did.
+pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
+    match class {
+        // `deliver_now`'s in-attempt holds all badge via `emit_held`.
+        HoldClass::PrePasteTyping
+        | HoldClass::PrePasteBoxOccupied
+        | HoldClass::PrePasteQuestion
+        | HoldClass::PreEnterTyping
+        | HoldClass::PreEnterQuestion => &[HoldChannel::HeldChip],
+        // These two abort the attempt without ever having badged (the recheck
+        // loop's gates alternated; the pre-Enter box gate is a single reading,
+        // not a hold). Neither leaves the pane unattended: the entry stays at
+        // the front of the queue and the drainer's poll — which now chips
+        // immediately — is the next thing to look at it.
+        HoldClass::PrePasteRecheckExhausted | HoldClass::PreEnterBoxOccupied => {
+            &[HoldChannel::HeldChip, HoldChannel::OrchestratorNotice]
+        }
+        // #563's fix: the poll hold chips from the first blocked tick and
+        // escalates to a badge at `QUESTION_HOLD_STALE_AFTER`.
+        HoldClass::QueuePollBoxOccupied | HoldClass::QueuePollQuestion => {
+            &[HoldChannel::HeldChip, HoldChannel::AttentionBadge]
+        }
+        HoldClass::QueueStaleEscalation => &[HoldChannel::AttentionBadge, HoldChannel::HeldChip],
+        // #563's fix: a badge (orchestrator-safe) alongside the notice.
+        HoldClass::QueueNearFull => {
+            &[HoldChannel::AttentionBadge, HoldChannel::OrchestratorNotice]
+        }
+        HoldClass::QueueFull => &[
+            HoldChannel::AttentionBadge,
+            HoldChannel::OrchestratorNotice,
+            HoldChannel::CallerError,
+        ],
+        HoldClass::GroupPaused => &[HoldChannel::PausedGroupUi],
     }
 }
 
@@ -12635,6 +13054,7 @@ impl OrchRegistry {
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
             question_stale_notified: Arc::new(Mutex::new(HashSet::new())),
+            queue_pressure: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
             pr_head_override: Mutex::new(None),
@@ -24121,8 +24541,24 @@ impl OrchRegistry {
             queue::AdmitDecision::RejectFull => {
                 let depth = q.len();
                 drop(queues);
-                self.audit(group, "loomux", "delivery-dropped",
-                    json!({ "to": agent_id, "reason": "queue-full-at-call", "depth": depth }));
+                // #563: NAME WHAT DROPPED. The pre-#563 line recorded only
+                // `{to, reason, depth}` — enough to know something was lost,
+                // never enough to know what, and no id is minted for a
+                // rejected entry so there is nothing else in the log to join
+                // against. A sender can re-send a delivery it can identify;
+                // it cannot re-send an anonymous one. `audit.jsonl` rotates,
+                // so this line is the only record that will ever exist.
+                self.audit(group, "loomux", "delivery-dropped", json!({
+                    "to": agent_id, "reason": "queue-full-at-call", "depth": depth,
+                    "from": from, "enqueue_reason": reason.as_str(),
+                    "bytes": text.len(), "preview": queue::dropped_payload_preview(text),
+                }));
+                // Nothing mutated `queues` on this arm, so no `persist_queues`
+                // is owed (see doc/design/orchestration.md's persistence
+                // table) — but the pane IS at capacity, and on an orchestrator
+                // target the `Err` below is the ONLY other signal and goes to
+                // the calling agent, never to the human.
+                self.note_queue_capacity(group, pty_id, Some(agent_id));
                 Err(queue::queue_full_error(agent_id, depth, reason.as_str()))
             }
             queue::AdmitDecision::Coalesce => {
@@ -24179,6 +24615,9 @@ impl OrchRegistry {
                 self.persist_queues(group);
                 self.audit(group, "loomux", "delivery-queued",
                     json!({ "to": agent_id, "id": id, "reason": reason.as_str(), "depth": depth }));
+                // #563: the admission that takes a pane to `Approaching` is
+                // the last moment a warning can still be a warning.
+                self.note_queue_capacity(group, pty_id, Some(agent_id));
                 Ok(AdmitOutcome { id, was_first, coalesced: false })
             }
         }
@@ -24232,7 +24671,14 @@ impl OrchRegistry {
         if pushed.is_ok() {
             self.persist_queues(group);
         }
-        self.audit_stranded_push(group, agent_id, pushed).map(|_id| ())
+        let out = self.audit_stranded_push(group, agent_id, pushed).map(|_id| ());
+        // #563: either the marker took a slot (depth up) or it was refused at
+        // cap — both are capacity facts, and the refusal is the one that
+        // leaves pasted-but-unsubmitted text in the pane with nothing queued
+        // to press it. `audit_stranded_push` records the loss; this makes it
+        // visible on a pane whose in-band notice channel is suppressed.
+        self.note_queue_capacity(group, pty_id, Some(agent_id));
+        out
     }
 
     /// The push itself, performed on an ALREADY-HELD `queues` entry (#496
@@ -24281,8 +24727,15 @@ impl OrchRegistry {
     ) -> Result<u64, String> {
         match pushed {
             Err(depth) => {
-                self.audit(group, "loomux", "delivery-dropped",
-                    json!({ "to": agent_id, "reason": "queue-full-at-call", "depth": depth }));
+                // #563: names what was lost, like the front door's rejection
+                // does. A marker carries no text — what it stands for IS the
+                // fact recorded here, and without `payload` a reader cannot
+                // tell this line apart from a rejected prompt.
+                self.audit(group, "loomux", "delivery-dropped", json!({
+                    "to": agent_id, "reason": "queue-full-at-call", "depth": depth,
+                    "payload": "stranded-submit",
+                    "consequence": "text is pasted in the pane with nothing queued to submit it",
+                }));
                 Err(queue::queue_full_error(agent_id, depth, "question"))
             }
             Ok((id, depth)) => {
@@ -24371,6 +24824,10 @@ impl OrchRegistry {
                 if pushed.is_ok() {
                     self.persist_queues(group);
                 }
+                // #563: before the `?` — a rejected marker is exactly the case
+                // whose capacity state most needs reporting, and an early
+                // return would skip it.
+                self.note_queue_capacity(group, pty_id, Some(agent_id));
                 self.audit_stranded_push(group, agent_id, pushed)?;
                 self.audit(group, "loomux", "stranded-selfheal-submit",
                     json!({ "to": agent_id, "via": "queue-front-marker" }));
@@ -24701,6 +25158,12 @@ impl OrchRegistry {
                 // same generation guard is what stops a successor drainer's
                 // freshly-armed flag being stripped by a predecessor's exit.
                 self.question_stale_notified.lock_safe().remove(&pty_id);
+                // #563: same lifecycle, same reasoning — this pane's queue is
+                // done, so its remembered capacity edge is about a queue that
+                // no longer exists. Left behind, it would make a successor
+                // drainer's first reading look like a fall from `Full` and
+                // emit a release for a pane that never recovered.
+                self.queue_pressure.lock_safe().remove(&pty_id);
             }
             entries
         };
@@ -24756,6 +25219,10 @@ impl OrchRegistry {
         if !entries.is_empty() {
             self.persist_queues(group);
         }
+        // #563: the queue is now empty, so any pressure badge this pane was
+        // carrying is no longer true. Before `announce_dropped`, so the drop
+        // notice is the last word rather than being followed by a release.
+        self.note_queue_capacity(group, pty_id, None);
         self.announce_dropped(group, entries, reason);
     }
 
@@ -24779,6 +25246,134 @@ impl OrchRegistry {
             return;
         }
         let _ = self.deliver_to_orchestrator(group, text, "loomux");
+    }
+
+    /// #563: re-read `pty_id`'s queue depth and, if its capacity state has
+    /// CHANGED since the last reading, say so — loudly, and through a channel
+    /// that survives an orchestrator target.
+    ///
+    /// **Why this exists.** Before #563 a queue filling up was observable at
+    /// exactly one instant: the moment a payload was already being thrown away.
+    /// There was no "approaching" state, so nothing could warn in advance; and
+    /// the drop itself was announced only through `notify_queue`, which is
+    /// suppressed whenever the target is the group's own orchestrator — the
+    /// pane the incident was reported on. So a queue could fill completely and
+    /// silently. Both halves are fixed here: a threshold below the cap, and an
+    /// attention badge (no role suppression) alongside the notice.
+    ///
+    /// **Edge-triggered, and released on evidence.** Only a *transition* acts,
+    /// so a pane sitting at 7/8 for an hour produces one audit line and one
+    /// badge rather than one per arrival. The release condition is the depth
+    /// genuinely coming back down (`CapacityState::Normal`), never elapsed time
+    /// — a queue that is still full after ten minutes is more urgent, not less.
+    ///
+    /// **Never stomps another mechanism's badge**, matching
+    /// `run_queue_drainer`'s escalation: if some other subsystem has already
+    /// flagged this pane, that flag is telling the human the same thing this
+    /// one would (go look at this pane) and it is not ours to overwrite. Our
+    /// own badge IS upgraded, so `Approaching` → `Full` re-words rather than
+    /// sticking at the softer sentence.
+    ///
+    /// Takes no lock across the notice/badge calls, and re-reads depth rather
+    /// than accepting it as a parameter, so every caller — admission,
+    /// rejection, dequeue, drop — states the same fact the same way.
+    /// `hint` is the target a caller already knows (the admission paths do);
+    /// every other caller passes `None` and the agent is resolved from the
+    /// queue, then from the remembered pressure record, then from `by_pty`.
+    #[doc(hidden)] // pub for integration tests
+    pub fn note_queue_capacity(&self, group: &str, pty_id: u32, hint: Option<&str>) {
+        let (depth, front_agent) = {
+            let queues = self.queues.lock_safe();
+            let q = queues.get(&pty_id);
+            (
+                q.map(|q| q.len()).unwrap_or(0),
+                q.and_then(|q| q.front()).map(|e| e.agent_id.clone()),
+            )
+        };
+        let state = queue::capacity_state(depth);
+        // Resolution order, most-authoritative first. `remembered` is what
+        // makes the release transition work at all: by then the queue may be
+        // empty, so nothing else can name whose badge is coming down.
+        let (prev, remembered) = {
+            let m = self.queue_pressure.lock_safe();
+            match m.get(&pty_id) {
+                Some((s, who)) => (*s, Some(who.clone())),
+                None => (queue::CapacityState::Normal, None),
+            }
+        };
+        let agent_id = hint
+            .map(str::to_string)
+            .or(front_agent)
+            .or(remembered)
+            .or_else(|| self.by_pty.lock_safe().get(&pty_id).cloned());
+        {
+            let mut m = self.queue_pressure.lock_safe();
+            match (&agent_id, state) {
+                // Nothing to remember once the pane is back to normal.
+                (_, queue::CapacityState::Normal) => {
+                    m.remove(&pty_id);
+                }
+                (Some(who), _) => {
+                    m.insert(pty_id, (state, who.clone()));
+                }
+                // Under pressure with nobody to attribute it to (teardown
+                // ordering, or a bare registry with no agent at all). Not
+                // recorded, so a later call with a resolvable target still
+                // sees the transition rather than having it swallowed here.
+                (None, _) => {}
+            }
+        }
+        if state == prev {
+            return;
+        }
+        let Some(agent_id) = agent_id else {
+            return;
+        };
+        self.audit(group, "loomux", "delivery-queue-pressure", json!({
+            "to": agent_id, "pty": pty_id, "depth": depth, "cap": queue::QUEUE_MAX_PER_PANE,
+            "state": state.as_str(), "was": prev.as_str(),
+        }));
+        let existing = self.stranded_note(&agent_id).and_then(|n| n.blocker);
+        // Ours to upgrade and to clear: exactly the two badges THIS function
+        // raises. `QueueFull` is deliberately absent — `actuate_stranded`
+        // raises it about a refused re-send, which a depth falling back does
+        // not resolve, so clearing it here would drop another mechanism's
+        // still-true badge.
+        let ours = matches!(
+            existing,
+            Some(StrandedBlocker::QueueNearFull) | Some(StrandedBlocker::QueueAtCapacity)
+        );
+        if state == queue::CapacityState::Normal {
+            if ours {
+                self.clear_stranded(group, &agent_id, "queue-pressure-released");
+            }
+            return;
+        }
+        let (blocker, text) = if state == queue::CapacityState::Full {
+            (
+                // rev-10 finding 1: NOT `QueueFull` — that one's wording
+                // asserts a refused re-send and stranded text in the box,
+                // neither of which a depth reading establishes.
+                StrandedBlocker::QueueAtCapacity,
+                queue::at_capacity_notice(&agent_id, queue::QUEUE_MAX_PER_PANE),
+            )
+        } else {
+            (
+                StrandedBlocker::QueueNearFull,
+                queue::pressure_notice(&agent_id, depth, queue::QUEUE_MAX_PER_PANE),
+            )
+        };
+        if existing.is_none() || ours {
+            self.mark_stranded(group, &agent_id, Some(blocker));
+        }
+        let target_is_orchestrator =
+            self.agent(&agent_id).map(|a| a.role == Role::Orchestrator).unwrap_or(false);
+        // Suppressed on an orchestrator target (and audited as such) — which is
+        // exactly why the badge above is raised first and unconditionally.
+        // Terminates: the only notice this can generate is one delivery to the
+        // orchestrator's own pane, and a pressure reading on THAT pane
+        // suppresses here rather than sending a third.
+        self.notify_queue(group, &agent_id, target_is_orchestrator, &text);
     }
 
     /// Pop `id` off the FRONT of `pty_id`'s queue if it's still there (the
@@ -24806,6 +25401,10 @@ impl OrchRegistry {
         self.persist_queues(group);
         self.audit(group, "loomux", "delivery-dequeued",
             json!({ "id": id, "queued_ms": now_ms().saturating_sub(enqueued_ms) }));
+        // #563: the depth just came down — the evidence the pressure badge
+        // releases on. Release is here, on a real reading, and nowhere on a
+        // timer.
+        self.note_queue_capacity(group, pty_id, None);
     }
 
     /// Close out EVERY constituent of one coalesced flush (#533-A) — the
@@ -24860,6 +25459,10 @@ impl OrchRegistry {
                 "combined": ids.len(),
             }));
         }
+        // #563: once, after the whole batch — a batch pops several entries at
+        // one instant, and reporting a capacity transition per pop would
+        // narrate a fall the pane never actually sat in.
+        self.note_queue_capacity(group, pty_id, None);
     }
 
     /// Remove constituents that `queue::plan_flush` ruled superseded
@@ -24937,6 +25540,10 @@ impl OrchRegistry {
                 "folded_coalesced": 1 + e.coalesced,
             }));
         }
+        // #563: supersession is the other way a depth falls, and a pane whose
+        // pressure was relieved by dedup rather than by delivery must release
+        // its badge just the same.
+        self.note_queue_capacity(group, pty_id, None);
     }
 
     /// Current queue depth for `pty_id` (0 if none exists) — a read-only
