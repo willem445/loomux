@@ -6493,7 +6493,7 @@ pub fn board_summaries(tasks: &[Task]) -> Vec<TaskSummary> {
 /// the board — which is what lets `unmet_deps` treat an unknown id as unmet
 /// without that reading being the normal case. The two rules together keep the
 /// invariant "every link names a live task", with delete-strip as the third.
-fn normalize_links(raw: Vec<String>, _self_id: &str, _board: &[Task], _field: &str) -> Result<Vec<String>, String> {
+fn normalize_links(raw: Vec<String>, self_id: &str, board: &[Task], field: &str) -> Result<Vec<String>, String> {
     // STUB (red-evidence commit): no trim/dedup, no self-link or existence check.
     return Ok(raw.clone());
     #[allow(unreachable_code)]
