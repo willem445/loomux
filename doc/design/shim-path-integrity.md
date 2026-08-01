@@ -98,6 +98,59 @@ about, the self-check names a missing tool loudly, and the guard means no
 failure of any of these tools — missing or broken, now or later — can put an
 empty string in front of a gate pattern again.
 
+### Guard completeness — what each pin proves, and what it cannot (#564)
+
+The guard above is only worth its claim if *every* normalizer has one, so two
+different pins ask that question, and they fail in different directions. Stating
+the limits here is the point: the pin's original "cannot rot into a blanket
+permission" wording had to be corrected in review for overclaiming (#552), and an
+artifact that asserts a correctness it does not have is worse than one that
+asserts nothing.
+
+**The text scan** (`every_shim_normalizer_is_guarded_or_explicitly_exempted`)
+enumerates every `VAR=$(… | tr …)` in both generated shims and requires each to be
+guarded, or listed in `UNGUARDED_TR_SITES` with a reason. It asserts the site
+count exactly, requires each exemption to match exactly one site, and pins each
+exempted line verbatim. What it proves is "**every site I can see is guarded**" —
+never "every site is one I can see". Three residuals, from #564:
+
+| | |
+| --- | --- |
+| **O1** | A normalizer written in a shape the scan does not match — `sed`, backticks, an assignment split across two lines — is invisible **and** leaves the exact count correct, so both halves pass. This is the residual risk of pinning a text pattern rather than a behaviour, and no amount of pattern-widening removes it. |
+| **O2** | *Closed.* An exempted line rewritten IN PLACE, keeping its variable and its context, still matched exactly one site while the exemption's stated reason quietly stopped being true of it. Each exempted line is now pinned verbatim, so any edit reddens and the reason has to be re-decided. |
+| **O3** | *Closed.* `… \|\| true` squashes to `\|\|true`, which contains `\|tr`, so the scan read a shell OR as a `tr` pipeline. Fail-safe (it over-counted), and it never reached the site tally because those lines carry no `=$(` — fixed anyway, because a scan with known false positives is one somebody later loosens to make quiet, and the loosening is where the risk enters. |
+
+**The behavioural sweep**
+(`no_single_broken_text_tool_can_let_a_gated_command_through`) is the answer to
+O1, which is the only one a text scan cannot close from the inside. It breaks
+**one text tool at a time** — resolvable, so `command -v` is satisfied, and
+silently producing nothing, which is what a corrupt install or a fork failure
+looks like at the call site — and requires every gated shape to still be refused
+and never to reach the real binary. Shape is irrelevant to it: a normalizer added
+in any syntax, consuming any of the listed tools in front of a gate decision
+without a guard, reddens it.
+
+Its own limit, equally plainly: it enumerates **command shapes** and **tools**. A
+normalizer on a code path no listed shape reaches, or built from a tool not in
+`CANDIDATE_NORMALIZER_TOOLS` (which deliberately includes tools nothing uses
+today), is outside it. It is a **different** net from the text scan — neither one
+contains the other, and neither is complete; both are kept because they are blind
+to different things.
+
+The counter-examples run both ways, and are worth stating so nobody later reads
+one pin as subsuming the other and deletes it (#564 rev-1 B1):
+
+* **The scan catches what the sweep cannot see.** An unguarded site added inside
+  a code path no swept shape reaches reddens the scan and nothing else. The
+  workflow-verdict gate used to be exactly that region — the sweep now enters it
+  (a `merge_gate` fixture and a `gh pr merge` shape), which shrinks the region
+  but does not remove it: `also: ci-green`, the malformed-gate arms and the
+  `--input`-body parse are all still unswept.
+* **The sweep catches what the scan cannot see.** A normalizer in an unrecognised
+  shape — `sed`, backticks, split across lines — is invisible to the scan *and*
+  leaves its exact count correct. That is O1, and it is observed, not argued:
+  see the evidence runs cited in PR #612.
+
 ## Failure 2 — `gh pr create` dies (a different cause)
 
 #509 assumed the same PATH cause. It is not. `gh pr create|status|…` shells out
@@ -157,6 +210,14 @@ that wants to evade has the cheaper route of calling the real binary by absolute
 path.
 
 ## What is still not fixed
+
+**O1 is narrowed, not eliminated** (see *Guard completeness* above). Nothing
+enumerates normalizer sites from behaviour alone: the text scan is blind to
+shapes, the behavioural sweep is blind to command paths and tools it does not
+list, and a new normalizer that both scans miss would be unguarded. Closing it
+outright means the shims stopping being generated shell — the gate logic in a
+native binary, where a normalizer is a function call rather than a line of text
+— which is a packaging change, not a test change.
 
 An argument an **agent** types with an unquoted shell metacharacter is still
 mangled by the same `cmd.exe /c` layer when it runs `gh`/`git` from a
