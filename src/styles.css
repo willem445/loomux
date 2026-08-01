@@ -2015,6 +2015,61 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .task-chip.link:hover { color: #cdd8f5; text-decoration: underline; }
 
+/* Dependency links (#582). The links line only exists on rows that HAVE links
+   (or an open picker), so a board using no dependencies keeps exactly the row
+   height it has today. */
+.task-links {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 5px;
+  padding: 1px 0 2px 1px;
+}
+.task-links-label {
+  flex: none; font-size: 9px; letter-spacing: 0.2px;
+  color: var(--text-dim); opacity: 0.75;
+}
+.task-chip.dep {
+  display: inline-flex; align-items: center; gap: 3px; max-width: none;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+/* Satisfied / still-blocking / names-nothing. Green and amber are the same
+   done/waiting language the status chips already use; the ⚠ red is for a link
+   pointing at no task at all, which only a hand-edited tasks.json can produce
+   and which needs a different fix (remove it) than merely waiting. */
+.task-chip.dep.met { background: rgba(158, 206, 106, 0.14); color: #b4e878; }
+.task-chip.dep.unmet { background: rgba(224, 175, 104, 0.16); color: #e0af68; }
+.task-chip.dep.missing { background: rgba(247, 118, 142, 0.16); color: #f7899d; }
+.task-chip.dep .dep-mark { font-size: 9px; opacity: 0.9; }
+.task-chip.related {
+  font-family: "Cascadia Mono", Consolas, monospace; font-style: italic; opacity: 0.75;
+}
+/* Per-chip remove (✕): dim until the chip is hovered, so a row of deps reads
+   as information first and controls second. */
+.task-dep-remove {
+  background: none; border: none; padding: 0 0 0 2px; margin: 0;
+  font: inherit; font-size: 8.5px; line-height: 1; color: inherit;
+  opacity: 0; cursor: pointer;
+}
+.task-chip.dep:hover .task-dep-remove { opacity: 0.7; }
+.task-dep-remove:hover { opacity: 1 !important; color: var(--danger); }
+.task-dep-picker {
+  font: inherit; font-size: 9.5px; max-width: 220px;
+  border-radius: 4px; padding: 1px 4px;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border-soft);
+}
+.task-dep-picker option { background: var(--panel-2); color: var(--text); }
+.task-btn.deplink { font-size: 9px; }
+/* "▸ ready" (#582): a queued item whose deps are all done — shown only on a
+   board that uses deps at all. Blue, matching the ▶ Start button it sits next
+   to, because it marks the same thing: this one can begin now. */
+.task-chip.ready {
+  flex: none; background: rgba(125, 207, 255, 0.14); color: #7dcfff; font-weight: 600;
+}
+/* The counterpart: a queued item waiting on an unfinished dep recedes, so it
+   can't be mistaken for work anyone could pick up. No new accent color — the
+   amber left-accent already means "waiting on YOU" and the blue one "live
+   work"; the chips below name what this one is actually waiting for. */
+.task-row.task-row-dep-blocked { opacity: 0.68; }
+.task-row.task-row-dep-blocked:hover { opacity: 0.92; }
+
 /* Merge-gate action buttons (approve / request changes) and the queued-task
    start button share the same compact pill shape. */
 .task-btn.approve, .task-btn.changes, .task-btn.start, .task-btn.proceed {
