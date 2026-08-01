@@ -38,6 +38,23 @@ plan is posted, call `note_directive(text)` to record it BEFORE you act on it �
 entry kept at the moment you receive it. loomux embeds your ledger verbatim in the mandatory
 post-compact re-grounding notice, so it survives even a compact you never saw coming.
 
+## Duplicate deliveries
+
+Your kickoff carries a `Delivery id:` line. The rule: **a brief whose delivery id you have
+already acted on is a duplicate — acknowledge it in one line and do nothing else.** No
+re-planning the item, no second plan posted. Record the id the first time you act on it;
+`note_directive` is the natural place, since it is already how a directive survives a compact.
+
+loomux types a kickoff **once** — audit-confirmed, not assumed (#455). The duplication happens
+after the bytes leave loomux, when the CLI re-processes one queued paste, so the second copy is
+the *same paste* and carries the *same delivery id*.
+
+**A re-delivery is not a duplicate.** When loomux can see that a kickoff never reached your
+pane, it deliberately re-sends that same brief — same bytes, so the same delivery id
+(#517/#585). If you have not acted on that id yet, this is the first time you are really seeing
+it: act on it, once, normally. The test is always *"have I already acted on this id?"*, never
+*"have I seen these bytes?"* — a brief you never got to act on is work that has not been done.
+
 ## Planning protocol
 
 1. Read the work item in full: `gh issue view <n> --comments`. Note the acceptance
