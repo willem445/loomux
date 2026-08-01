@@ -20683,6 +20683,13 @@ fn the_undeliverable_notice_is_one_marker_led_line_that_names_the_pane_and_the_c
     // enforces the same invariant at the door. A second row here would ride an
     // orchestrator's pane unmasked and could re-arm the question gate the
     // notice is about.
+    // Asserted through #632's `unmaskable_framing_rows` rather than through a
+    // bare `mask_loomux_notices(..).is_empty()`, so this notice sits under the
+    // SAME expression of the rule as the multi-row producers #638 brought under
+    // it. The two are equivalent for a one-row notice; what the shared helper
+    // buys is that a later sweep over "every loomux-authored row is maskable"
+    // finds this one where it expects to, and that a regression names the rows
+    // that survived instead of only asserting that something did.
     for cause in [
         UndeliverableCause::PaneMidTurn,
         UndeliverableCause::HumanTyping,
@@ -20690,10 +20697,15 @@ fn the_undeliverable_notice_is_one_marker_led_line_that_names_the_pane_and_the_c
         UndeliverableCause::Unknown,
     ] {
         let n = undeliverable_notice("w-8", 1, 3, 10, cause);
-        assert!(
-            mask_loomux_notices(&n).is_empty(),
-            "every cause must render ONE marker-led line: {n:?}"
+        assert_eq!(
+            unmaskable_framing_rows(&n, &[]),
+            Vec::<String>::new(),
+            "every row of every cause must be one `mask_loomux_notices` can claim: {n:?}"
         );
+        // And the distinct claim the helper does NOT make: that there is only
+        // ever one row to begin with. `park`'s `debug_assert` enforces it at the
+        // door, and this is the constructor-side statement of the same thing.
+        assert_eq!(n.lines().count(), 1, "a parked notice must be a single line: {n:?}");
     }
 
     let n = undeliverable_notice("w-8", 1, 3, 10, UndeliverableCause::PaneMidTurn);

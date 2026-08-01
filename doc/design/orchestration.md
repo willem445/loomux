@@ -7200,11 +7200,17 @@ discarded.
   `refused_window_truncated` carries it into the tool result. #630 also pinned that a parked
   orchestrator notice is not a refusal (`a_parked_orchestrator_notice_is_not_a_refusal`); this
   change adds a second producer of exactly that shape, and that test covers it unchanged.
-- **#632 (multi-row mask gap).** Not touched, and not contributed to: `undeliverable_notice` is one
-  marker-led line by construction, pinned by
-  `the_undeliverable_notice_is_one_marker_led_line_that_names_the_pane_and_the_cause` and by
-  `OrchNoticeInbox::park`'s `debug_assert`, and it is now the eighth entry in the
-  inbox-constructor enumeration.
+- **#632 (multi-row mask gap) — closed by #638 while this was in review**, so this is no longer an
+  open boundary but a rule this notice has to sit inside. It always did, by construction:
+  `undeliverable_notice` renders one marker-led line for every `UndeliverableCause`, and it is the
+  **seventh** constructor in `every_notice_that_can_reach_the_inbox_is_a_single_marker_led_line`,
+  across `notify_queue`'s **eighth** call site — two different counts that an earlier draft of this
+  bullet collapsed into one wrong number. The maskability assertion now runs through #638's shared
+  `unmaskable_framing_rows` rather than a local `mask_loomux_notices(..).is_empty()`, so this notice
+  is checked by the same expression as the multi-row producers #638 brought under the rule, and a
+  regression names the rows that survived instead of only asserting that some did. The single-row
+  property is asserted separately, because "every row is maskable" and "there is one row" are
+  different claims and only the second is what `OrchNoticeInbox::park`'s `debug_assert` enforces.
 - **#633 (silent `deliver_prompt` refusals).** The residual this change inherits rather than
   creates. `notify_queue`'s delivery to a live orchestrator can be refused with no audit line at all
   when that pane is dead or unbound, so the `notice-undeliverable` audit line is written **first and
