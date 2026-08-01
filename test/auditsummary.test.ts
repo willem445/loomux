@@ -151,3 +151,38 @@ test("channel-direction (#271 W3 addendum) names the channel and the sender swap
   );
   assert.equal(s, "channel chan-3: sender changed from w-1 to rev-2");
 });
+
+// #569: pause is the one path that DISCARDS a payload its sender was told `Ok`
+// about, and before this both of its audit actions fell to the raw-JSON default
+// arm — a reader scanning the timeline saw a JSON blob where a work-loss event
+// was, which is how the defect stayed invisible for as long as it did.
+
+test("prompt-suppressed-paused reads as a discard, not as a delivery", () => {
+  const s = summarize(
+    entry("prompt-suppressed-paused", { to: "orch-1", text: "report: done, PR #123 is green" }, "w-2")
+  );
+  assert.match(s, /discarded/, "the word has to be there — this payload no longer exists");
+  assert.match(s, /orch-1/, "and the pane that never got it");
+  assert.match(s, /PR #123 is green/, "and the payload, so it can be re-sent");
+});
+
+test("prompt-suppressed-paused truncates a multi-line payload to its first line", () => {
+  const s = summarize(entry("prompt-suppressed-paused", { to: "w-1", text: "line one\nline two" }, "orch-1"));
+  assert.match(s, /line one/);
+  assert.doesNotMatch(s, /line two/);
+});
+
+test("the resume tally says whether the orchestrator was actually told", () => {
+  const told = summarize(entry("pause-suppression-notice", { count: 3, delivered: true }, "loomux"));
+  assert.equal(told, "3 deliveries discarded while paused — orchestrator notified on resume");
+
+  // The honesty case: "the orchestrator was told" is a claim, and this line is
+  // the one that has to be right about it.
+  const untold = summarize(
+    entry("pause-suppression-notice", { count: 1, delivered: false, error: "no live orchestrator in this group" }, "loomux")
+  );
+  assert.equal(
+    untold,
+    "1 delivery discarded while paused — could NOT notify the orchestrator (no live orchestrator in this group); panes badged instead"
+  );
+});
