@@ -20127,6 +20127,20 @@ fn a_resume_racing_an_admission_never_strands_it() {
     // interleaving: the whole finding is that the two sides are unsynchronized,
     // so a model with a seam in it would be proving the seam. Repeated, because
     // which side wins is the OS's decision and a single run pins nothing.
+    //
+    // **What this test is NOT, stated so nobody reads it as more than it is.**
+    // It does not go red when the fix is removed — verified, not assumed: run
+    // 30704213481 deleted the post-admit re-check and this test still passed,
+    // because the losing interleaving needs the resume to land between the flag
+    // read and the admission, and the stagger that makes the pause branch
+    // reachable at all also gives the entry time to be queued before
+    // `flush_paused_queues` looks. Forcing that window open would take a seam
+    // in the code under test, and a test of a seam is not a test of the race.
+    // So this is an invariant GUARD over real interleavings — it will catch a
+    // future change that breaks the property on a common ordering — and not
+    // evidence that the re-check is load-bearing. The argument for the re-check
+    // is in `deliver_prompt`'s comment; the argument that it costs nothing is
+    // that `ensure_drainer` no-ops on a pane already draining.
     use std::sync::{Arc, Barrier};
 
     let (mut held, mut raced) = (0u32, 0u32);

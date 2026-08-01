@@ -817,6 +817,15 @@ persisted in `group.json`, and clamped in `clamped()`.
   `ensure_drainer` at all, so the audit line is what
   `a_resume_racing_an_admission_never_strands_it` asserts, over 24 real threaded interleavings.
 
+  That test is an invariant **guard**, not evidence the re-check is load-bearing, and the
+  distinction is recorded because conflating the two is how a coverage claim outlives the thing
+  it claimed to cover. Removing the re-check does not redden it — checked, not assumed (run
+  30704213481) — because the losing interleaving needs the resume to land between the flag read
+  and the admission, and the stagger that makes the pause branch reachable at all also gives the
+  entry time to be queued before `flush_paused_queues` looks. Forcing that window open needs a
+  seam in the code under test, and a test of a seam is not a test of the race. The re-check is
+  justified by the argument above, and by costing nothing when it is unnecessary.
+
   **The resume-time loss notice, now covering two causes.** Nothing writes
   `prompt-suppressed-paused` any more, so that half needs a group paused under a build that
   discarded and resumed under one that queues — real, and the reason the scan was kept rather
