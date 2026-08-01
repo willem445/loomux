@@ -69,7 +69,7 @@ use loomux_lib::orchestration::{
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
-    unconfirmed_delivery_notice, watchdog_should_notify, worktree_cleanup_targets,
+    unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
     AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
@@ -20281,17 +20281,17 @@ fn unconfirmed_delivery_notifies_the_orchestrator_and_suppresses_the_exceptions(
     };
 
     // Confirmed delivery to the worker: the prompt landed, nothing to chase.
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, true);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, true, false);
     assert!(notices(&reg).is_empty(), "a confirmed delivery must not notify");
 
     // Unconfirmed delivery TO the orchestrator: a notice about it would itself be
     // a delivery to the orchestrator — an endless loop. Suppressed.
-    reg.notify_unconfirmed_delivery(&g.id, &orch.id, true, false);
+    reg.notify_unconfirmed_delivery(&g.id, &orch.id, true, false, false);
     assert!(notices(&reg).is_empty(), "an unconfirmed delivery to the orchestrator must not notify");
 
     // The real case: an unconfirmed delivery to the worker → exactly one notice,
     // audited to loomux, naming the stranded agent.
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, false);
     let after = notices(&reg);
     assert_eq!(after.len(), 1, "an unconfirmed worker delivery notifies exactly once");
     assert_eq!(after[0].actor, "loomux", "the notice is a loomux system message");
@@ -20309,7 +20309,7 @@ fn unconfirmed_notice_is_suppressed_while_the_group_is_paused() {
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     reg.pause_group(&g.id).unwrap();
 
-    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false);
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, false);
     assert!(
         reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-unconfirmed-notice"),
         "a paused group must not raise the unconfirmed notice"
@@ -25404,7 +25404,7 @@ fn an_idle_pane_produces_no_actionable_unconfirmed_notice() {
     // pasted text still identifiably at the box's tail, or human characters
     // outstanding. Neither => the pane is done, not stuck.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, false),
+        unconfirmed_disposition(BoxReading::NotHolding, false, true),
         UnconfirmedDisposition::IdleAuditOnly,
         "our paste consumed and no human input outstanding: the delivery landed or is moot — \
          record it, never send the orchestrator to re-deliver something that is not stuck"
@@ -25416,17 +25416,17 @@ fn a_genuinely_stranded_pane_still_gets_the_notice() {
     // The half that must NOT be softened. #522 narrows WHEN the notice fires,
     // and a fix that narrowed it to nothing would re-open #496's silent wedge.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::Holds, false),
+        unconfirmed_disposition(BoxReading::Holds, false, true),
         UnconfirmedDisposition::Notify,
         "our text still sitting in the box IS the strand — announce it exactly as before"
     );
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, true),
+        unconfirmed_disposition(BoxReading::NotHolding, true, true),
         UnconfirmedDisposition::Notify,
         "a human's own line in the box is not an idle pane, and they still need telling"
     );
     assert_eq!(
-        unconfirmed_disposition(BoxReading::Holds, true),
+        unconfirmed_disposition(BoxReading::Holds, true, true),
         UnconfirmedDisposition::Notify,
         "both at once is the least idle a pane can be"
     );
@@ -25513,20 +25513,177 @@ fn an_unverifiable_reading_is_never_classified_as_an_idle_pane() {
     // withholds the notice for a pane that was OBSERVED at rest; a reading
     // that never happened is not that pane.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::Unverifiable, false),
+        unconfirmed_disposition(BoxReading::Unverifiable, false, true),
         UnconfirmedDisposition::Notify,
         "a box we could not read is not an idle pane — the stranded batch must be announced"
     );
     assert_eq!(
-        unconfirmed_disposition(BoxReading::Unverifiable, true),
+        unconfirmed_disposition(BoxReading::Unverifiable, true, true),
         UnconfirmedDisposition::Notify
     );
     // #522's own behavior, unchanged: an INFORMATIVE empty box still stays
     // quiet. A fix that notified on everything would just re-open #522.
     assert_eq!(
-        unconfirmed_disposition(BoxReading::NotHolding, false),
+        unconfirmed_disposition(BoxReading::NotHolding, false, true),
         UnconfirmedDisposition::IdleAuditOnly,
         "the observed-idle pane must still draw no notice"
+    );
+}
+
+// ───────── #585: an empty box with no turn behind it is a LOST delivery ─────────
+//
+// `NotHolding` on a quiet pane has two causes and the reading cannot tell them
+// apart: the CLI consumed our text and ran its turn (#522's case, where an
+// alarm is noise), or the paste was never accepted at all (a blind paste into
+// a CLI whose stdin reader had not attached; an Enter that landed on a busy
+// CLI). #522 modelled only the first and returned from `DeclareFailed` ~90
+// lines above the `NotHolding` test that gates #517's recovery — so across
+// this project's whole recorded audit history `kickoff_recovery_action` fired
+// zero times and declined-with-a-reason zero times, against 13
+// `delivery-unconfirmed-idle-pane` records and 3 fresh kickoffs whose submit
+// was never confirmed. One agent sat idle 11 minutes on a kickoff nobody knew
+// was lost; two more had a follow-up brief silently eaten.
+//
+// The discriminator is `KICKOFF_TURN_EVIDENCE_BYTES` — already trusted, 90
+// lines below, to gate the far more dangerous re-delivery decision.
+
+#[test]
+fn an_eaten_paste_is_not_an_idle_pane() {
+    // THE regression. Box observed empty of our text, empty of the human's,
+    // and the pane produced less than a turn's output since our Enter: our
+    // text is gone and nothing ever ran on it. Pre-#585 this was
+    // `IdleAuditOnly` — silence — which is how a lost kickoff stranded an
+    // agent with no badge, no notice, and no recovery.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, false, false),
+        UnconfirmedDisposition::EatenNotify,
+        "an empty box with no turn behind it is a LOST delivery, not a finished pane — \
+         it must escalate, never go quiet"
+    );
+}
+
+#[test]
+fn a_pane_that_finished_its_turn_still_stays_quiet() {
+    // The half that must NOT regress: #522's flood stays suppressed exactly
+    // where #522 aimed it. A worker that ran a turn and went idle has turn
+    // evidence by construction, so it still says nothing. A fix that notified
+    // on every empty box would simply re-open #522.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, false, true),
+        UnconfirmedDisposition::IdleAuditOnly,
+        "a pane that demonstrably ran a turn on our text is done, not eaten — stay quiet"
+    );
+}
+
+#[test]
+fn the_silence_bar_and_the_redelivery_bar_are_the_same_bar() {
+    // The structural invariant, and the one this issue is really about: two
+    // decisions on the same tick asking the same question ("did the agent act
+    // on our text?") must never answer it differently. They disagreed by
+    // omission before — the silence path did not consult the bar at all — so
+    // pin them to the same threshold rather than trusting a comment.
+    //
+    // `kickoff_recovery_action`'s other inputs are held at the values that
+    // reach the growth test: a fresh kickoff, still outstanding, no human, no
+    // question, budget unspent.
+    let recovery = |growth: u64| {
+        kickoff_recovery_action(
+            true, true, false, false, growth,
+            KICKOFF_TURN_EVIDENCE_BYTES, true, 0, KICKOFF_REDELIVERY_MAX,
+        )
+    };
+
+    // One byte below the bar: BOTH say "no turn happened".
+    let below = KICKOFF_TURN_EVIDENCE_BYTES - 1;
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, false, below >= KICKOFF_TURN_EVIDENCE_BYTES),
+        UnconfirmedDisposition::EatenNotify,
+        "below the bar the delivery is eaten and must escalate"
+    );
+    assert_eq!(
+        recovery(below),
+        KickoffRecovery::Redeliver,
+        "below the bar the recovery must fire — the two paths agree the brief was lost"
+    );
+
+    // Exactly at the bar: BOTH say "a turn happened".
+    let at = KICKOFF_TURN_EVIDENCE_BYTES;
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, false, at >= KICKOFF_TURN_EVIDENCE_BYTES),
+        UnconfirmedDisposition::IdleAuditOnly,
+        "at the bar the pane ran a turn and silence is correct"
+    );
+    assert_eq!(
+        recovery(at),
+        KickoffRecovery::Decline(KickoffDecline::TurnStarted),
+        "at the bar the recovery must decline — the two paths agree the brief landed"
+    );
+}
+
+#[test]
+fn the_eaten_notice_says_the_text_is_gone_rather_than_stuck() {
+    // `.loomux/lessons.md`, "a claim is a deliverable". The pre-#585 notice
+    // tells the orchestrator the prompt "may be sitting unsubmitted in its
+    // pane" — for an eaten paste that is false, and acting on it sends the
+    // orchestrator to `get_output`, where an idle pane reads as "nothing is
+    // wrong". That misreading is exactly how #585's two live losses were
+    // missed, and the speculative re-sends it invites are the #455
+    // duplicate-kickoff class.
+    let eaten = delivery_eaten_notice("w-14");
+    assert!(eaten.contains("w-14"), "the notice must name the agent that lost the delivery");
+    assert!(
+        !eaten.contains("sitting unsubmitted"),
+        "the eaten notice must not repeat the stuck-in-the-box claim: we looked, and it is gone"
+    );
+    assert!(
+        eaten.to_lowercase().contains("idle pane"),
+        "it must pre-empt the idle-pane misreading, which is the symptom and not a refutation"
+    );
+    // And the two notices stay distinguishable — a caller that picked the
+    // wrong one would send the orchestrator hunting for text that is not there.
+    assert_ne!(eaten, unconfirmed_delivery_notice("w-14"));
+    assert!(unconfirmed_delivery_notice("w-14").contains("sitting unsubmitted"));
+}
+
+#[test]
+fn an_eaten_delivery_notifies_with_the_eaten_wording_and_records_which_it_was() {
+    // The wiring, at the seam that actually sends it. The suppression rules
+    // are unchanged for both wordings (an eaten delivery is not a different
+    // KIND of event to the orchestrator-loop gate), so only the text and the
+    // audit's `eaten` discriminator differ.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+
+    reg.notify_unconfirmed_delivery(&g.id, &w.id, false, false, true);
+
+    let notices = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-unconfirmed-notice")
+        .collect::<Vec<_>>();
+    assert_eq!(notices.len(), 1, "an eaten delivery notifies exactly once");
+    assert_eq!(
+        notices[0].detail["eaten"], true,
+        "the audit must record WHICH kind this was — \"how often is a delivery actually eaten?\" \
+         is the question #585 turned on and the pre-#585 log could not answer it"
+    );
+
+    // And the discriminator actually discriminates: an ordinary unconfirmed
+    // delivery on the same seam must still record `eaten: false`. Without this
+    // half, a hard-coded `true` would pass the assertion above.
+    let w2 = reg.spawn_agent(&g.id, Role::Worker, "w2", "t", false, None).unwrap();
+    reg.notify_unconfirmed_delivery(&g.id, &w2.id, false, false, false);
+    let stuck = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-unconfirmed-notice" && e.detail["to"] == w2.id)
+        .collect::<Vec<_>>();
+    assert_eq!(stuck.len(), 1);
+    assert_eq!(
+        stuck[0].detail["eaten"], false,
+        "a merely-unconfirmed delivery must stay distinguishable from an eaten one"
     );
 }
 
@@ -25660,12 +25817,12 @@ fn an_ordinary_delivery_classifies_exactly_as_it_did_before() {
     assert_eq!(box_reading(Some(holding_tail), pasted), BoxReading::Holds);
     assert_eq!(box_reading(Some(&consumed_tail), pasted), BoxReading::NotHolding);
     assert_eq!(
-        unconfirmed_disposition(box_reading(Some(&consumed_tail), pasted), false),
+        unconfirmed_disposition(box_reading(Some(&consumed_tail), pasted), false, true),
         UnconfirmedDisposition::IdleAuditOnly,
         "the #522 quiet path is reached by exactly the deliveries it always was"
     );
     assert_eq!(
-        unconfirmed_disposition(box_reading(Some(holding_tail), pasted), false),
+        unconfirmed_disposition(box_reading(Some(holding_tail), pasted), false, true),
         UnconfirmedDisposition::Notify
     );
 }

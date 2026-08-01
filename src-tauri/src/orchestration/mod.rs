@@ -9227,10 +9227,18 @@ const HUMAN_INPUT_BLOCK_BOUND_REASON: &str = "human-input-block-bound";
 /// What a `DeclareFailed` tick should actually DO about the pane (#522).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnconfirmedDisposition {
-    /// The pane is structurally idle — nothing of ours is sitting in the box
-    /// and nothing of the human's is either. Record it and stop; do NOT tell
-    /// the orchestrator to go re-send something that is not stuck.
+    /// The pane is structurally idle — nothing of ours is sitting in the box,
+    /// nothing of the human's is either, AND the pane produced a turn's worth
+    /// of output since our Enter (#585). Record it and stop; do NOT tell the
+    /// orchestrator to go re-send something that is not stuck.
     IdleAuditOnly,
+    /// #585: the same empty, quiet box — but with NO turn evidence behind it.
+    /// The pane never ran a turn on our text and our text is not there to run,
+    /// which is the eaten-paste signature, not a finished pane. Announce it
+    /// (with `delivery_eaten_notice`'s wording, not the "sitting unsubmitted"
+    /// one — the text is gone, not stuck) and let the caller fall through to
+    /// the strand path so the badge and `kickoff_recovery_action` are reached.
+    EatenNotify,
     /// Our text is still in the box, or the reading is indeterminate. This is
     /// the genuine strand the notice exists for — announce it unchanged.
     Notify,
@@ -9263,6 +9271,61 @@ pub enum UnconfirmedDisposition {
 /// - `box_pending` — `PtyManager::input_pending`, whether any human-typed
 ///   characters are outstanding. A box with a person's half-written line in it
 ///   is not an idle pane, and the human still needs to hear about it.
+/// - `turn_evidence` (#585) — did the pane produce `KICKOFF_TURN_EVIDENCE_
+///   BYTES` of output since this delivery's own Enter? See below; this is the
+///   input whose absence made every #517 recovery unreachable.
+///
+/// **#585: an empty box is two different panes, and #522 only modelled one.**
+/// `NotHolding` on a quiet pane has two causes that are indistinguishable from
+/// the reading alone:
+/// - the CLI consumed our text, ran its turn, and came back to rest — #522's
+///   case, where an alarm is noise; and
+/// - the paste was never accepted at all (a blind paste into a CLI whose stdin
+///   reader had not attached, or an Enter that landed on a busy CLI and was
+///   dropped). The box is equally empty, and the delivery is equally gone —
+///   except this one is a LOST message, and staying silent about it strands
+///   the agent.
+///
+/// Live evidence (#585): across this project's whole recorded audit history,
+/// `kickoff_recovery_action` — the #517/#526 recovery written specifically for
+/// the second case — fired **zero** times and declined-with-a-reason zero
+/// times, against 13 `delivery-unconfirmed-idle-pane` records and 3 fresh
+/// kickoffs whose submit was never confirmed. One agent sat idle for 11
+/// minutes on a kickoff nobody knew was lost. The reason is precedence, not
+/// logic: this function's `IdleAuditOnly` arm returns from `DeclareFailed`
+/// ~90 lines ABOVE the `NotHolding` test that gates the recovery, so the
+/// recovery was reachable only when `NotHolding` coincided with a human's
+/// half-typed line (`box_pending`) or with `Unverifiable`. It fired on a
+/// coincidence, which is to say it did not fire. That is the same shape #559
+/// fixed for `Unverifiable` — and #559 fixed only the lower half of it.
+///
+/// **The discriminator already existed; it was simply never consulted here.**
+/// A pane that really did run a turn painted kilobytes since our Enter (the
+/// monitor only looks after `PENDING_IDLE_QUIET` of total silence, so a turn
+/// that happened has long since finished painting). An eaten paste leaves a
+/// stray Enter on an empty box: a repaint, nothing more. That is exactly
+/// `KICKOFF_TURN_EVIDENCE_BYTES`, and `kickoff_recovery_action` — 90 lines
+/// below — already trusts it to gate the far more dangerous decision of
+/// re-sending text into a live pane. **If the bar is good enough to authorise
+/// a re-delivery, it is more than good enough to authorise a notice.** This is
+/// not a weakening of #526's evidence bar and not a second mechanism beside
+/// it: it is the same bar, newly applied to the path that was bypassing it.
+///
+/// **What this does NOT re-open.** #522's flood stays suppressed where #522
+/// aimed it: a worker that finished a turn and went idle has turn evidence by
+/// construction, so it still takes `IdleAuditOnly` and still says nothing. The
+/// only deliveries that newly speak up are ones where the pane produced less
+/// than a turn's output since our Enter AND the box no longer holds our
+/// text — which is not a finished pane under any reading.
+///
+/// **Composition with #539.** PR #588 adds an `agent_acted` input (the MCP
+/// activity clock) to the `NotHolding`/`box_pending: true` cell. It is a
+/// strictly better signal than output bytes — it proves the agent's own code
+/// ran — but it governs a different cell and does not reach this one, which is
+/// why this change is additive rather than a duplicate of it. Whichever lands
+/// second, the two compose as evidence-OR: any independent sign that the agent
+/// acted on our delivery justifies silence, and the absence of all of them is
+/// what must speak.
 ///
 /// "CLI at rest / turn complete" is the third condition #522 names, and it is
 /// already a PRECONDITION of ever reaching this decision rather than an input
@@ -9282,7 +9345,11 @@ pub enum UnconfirmedDisposition {
 /// 'unconfirmed' here is safe: the flush Enter lands on an already empty box
 /// and is a no-op").
 #[doc(hidden)] // pub for integration tests
-pub fn unconfirmed_disposition(reading: BoxReading, box_pending: bool) -> UnconfirmedDisposition {
+pub fn unconfirmed_disposition(
+    reading: BoxReading,
+    box_pending: bool,
+    turn_evidence: bool,
+) -> UnconfirmedDisposition {
     match reading {
         // Our text is still in the box — the genuine strand.
         BoxReading::Holds => UnconfirmedDisposition::Notify,
@@ -9293,7 +9360,11 @@ pub fn unconfirmed_disposition(reading: BoxReading, box_pending: bool) -> Unconf
         // Observed empty of our text — idle only if it is empty of the
         // human's too.
         BoxReading::NotHolding if box_pending => UnconfirmedDisposition::Notify,
-        BoxReading::NotHolding => UnconfirmedDisposition::IdleAuditOnly,
+        // #585: and only if the pane can show it actually ran a turn. This is
+        // the cell that swallowed every lost kickoff this feature exists to
+        // catch — see this function's doc.
+        BoxReading::NotHolding if turn_evidence => UnconfirmedDisposition::IdleAuditOnly,
+        BoxReading::NotHolding => UnconfirmedDisposition::EatenNotify,
     }
 }
 
@@ -10645,14 +10716,47 @@ fn run_late_confirmation_monitor(
                 // path below like any other unresolved strand — which is the
                 // whole fix: a delivery whose box we could not read is not a
                 // delivery we watched go idle.
-                if unconfirmed_disposition(reading, ptys.input_pending(pty_id).unwrap_or(true))
-                    == UnconfirmedDisposition::IdleAuditOnly
-                {
+                //
+                // #585: and only on one that ran a turn. Bound ONCE here and
+                // reused by `kickoff_recovery_action` below, never re-read:
+                // these are two decisions about the same question ("did the
+                // agent act on our text?") taken on one tick, and computing
+                // the growth twice is how they would come to disagree — the
+                // same discipline the shared `ledger` observation follows.
+                let output_since_submit = cur_total.saturating_sub(submit_output_baseline);
+                let turn_evidence = output_since_submit >= KICKOFF_TURN_EVIDENCE_BYTES;
+                let disposition = unconfirmed_disposition(
+                    reading,
+                    ptys.input_pending(pty_id).unwrap_or(true),
+                    turn_evidence,
+                );
+                if disposition == UnconfirmedDisposition::IdleAuditOnly {
                     append_audit(&root, &group, "loomux", "delivery-unconfirmed-idle-pane", json!({
                         "to": agent, "confirm_source": "idle", "confirm_state": "unconfirmed",
                         "reason": "pane idle — box holds neither our paste nor human input",
+                        // #585: the evidence the silence rests on, recorded
+                        // WITH the silence. Without it this row asserted an
+                        // idle pane and offered nothing to check the assertion
+                        // against — which is why reconstructing #585 needed a
+                        // code read rather than a log read.
+                        "output_since_submit": output_since_submit,
+                        "turn_evidence_bytes": KICKOFF_TURN_EVIDENCE_BYTES,
                     }));
                     return; // nothing stranded and nothing to observe further
+                }
+                // #585: same empty quiet box, no turn behind it — the paste
+                // was eaten. Its own action so the two are greppable apart,
+                // and NO early return: this delivery must reach the notice,
+                // the badge, and `kickoff_recovery_action` below.
+                let eaten = disposition == UnconfirmedDisposition::EatenNotify;
+                if eaten {
+                    append_audit(&root, &group, "loomux", "delivery-eaten", json!({
+                        "to": agent, "confirm_source": "idle", "confirm_state": "unconfirmed",
+                        "reason": "box holds neither our paste nor human input, and the pane ran no turn on it",
+                        "output_since_submit": output_since_submit,
+                        "turn_evidence_bytes": KICKOFF_TURN_EVIDENCE_BYTES,
+                        "ready_observed": ready_observed,
+                    }));
                 }
                 // Own action name, deliberately distinct from the hook-match
                 // branch above ("delivery-confirmed-late" is that branch's
@@ -10667,7 +10771,7 @@ fn run_late_confirmation_monitor(
                     "to": agent, "confirm_source": "idle", "confirm_state": "failed",
                 }));
                 if let Some(r) = &reg {
-                    r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
+                    r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false, eaten);
                 }
                 // #518: bounded (see `human_input_block`). Once this releases,
                 // precedence carries the decision straight into the EXISTING
@@ -10747,7 +10851,10 @@ fn run_late_confirmation_monitor(
                         ledger.outstanding,
                         human_typed_since,
                         showing_question,
-                        cur_total.saturating_sub(submit_output_baseline),
+                        // #585: the SAME growth reading the disposition above
+                        // judged from — see where it is bound for why it is
+                        // never re-read.
+                        output_since_submit,
                         KICKOFF_TURN_EVIDENCE_BYTES,
                         ready_observed,
                         redeliveries_used,
@@ -11769,7 +11876,15 @@ fn deliver_now(
         }
         DeliveryConfirmState::Failed => {
             if let Some(r) = &reg {
-                r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false);
+                // #585: `eaten: false`. This is the EARLY alarm, raised inside
+                // the submit window by Tier 1's box veto — which fires only
+                // because our text WAS observed still sitting in the box. That
+                // is the "sitting unsubmitted" case by construction, the exact
+                // opposite of an eaten paste, so the original wording is the
+                // accurate one here. Only the late monitor, which reads the
+                // box again after the pane has gone quiet, can see a delivery
+                // whose text is gone.
+                r.notify_unconfirmed_delivery(&group, &agent, target_is_orchestrator, false, false);
             }
         }
         DeliveryConfirmState::Pending => {}
@@ -13913,6 +14028,28 @@ pub fn unconfirmed_delivery_notice(agent_id: &str) -> String {
     format!(
         "[loomux] delivery to {agent_id} unconfirmed — the prompt may be sitting \
          unsubmitted in its pane; get_output it and re-send if needed"
+    )
+}
+
+/// #585: the notice for a delivery whose text was EATEN — the box was read and
+/// observed to hold neither our paste nor anything of the human's, and the
+/// pane produced no turn's worth of output since our Enter.
+///
+/// Deliberately worded apart from `unconfirmed_delivery_notice`, which tells
+/// the orchestrator the prompt "may be sitting unsubmitted in its pane". Here
+/// it demonstrably is not: we looked, and it is gone. Telling an orchestrator
+/// to go find text that no longer exists sends it to `get_output`, where it
+/// sees an idle pane and — reasonably — concludes nothing is wrong. That is
+/// not hypothetical: it is exactly how #585's two live losses were misread,
+/// and the pre-emptive re-sends it invites are the #455 duplicate-kickoff
+/// class. `.loomux/lessons.md`, "a claim is a deliverable": the notice states
+/// what was observed, and names the idle pane the orchestrator is about to see
+/// so an idle pane is not mistaken for a refutation.
+pub fn delivery_eaten_notice(agent_id: &str) -> String {
+    format!(
+        "[loomux] delivery to {agent_id} was LOST — its text never reached the pane's box \
+         and the pane ran no turn on it. Re-send it. (get_output will show an idle pane: \
+         that is the symptom, not evidence the delivery landed.)"
     )
 }
 
@@ -27182,12 +27319,17 @@ impl OrchRegistry {
     /// notice is itself a delivery TO the orchestrator, so it can never trigger a
     /// notice of its own — no loops.
     #[doc(hidden)] // pub for integration tests
+    /// `eaten` (#585) selects the wording only — every suppression rule above
+    /// it is identical for both. An eaten delivery is not a different KIND of
+    /// unconfirmed delivery to the orchestrator-loop or paused-group gates; it
+    /// is the same event described accurately (see `delivery_eaten_notice`).
     pub fn notify_unconfirmed_delivery(
         &self,
         group: &str,
         agent_id: &str,
         target_is_orchestrator: bool,
         confirmed: bool,
+        eaten: bool,
     ) {
         if !should_notify_unconfirmed(target_is_orchestrator, confirmed) {
             // #445: every suppression path leaves a trace — a suppressed
@@ -27204,8 +27346,18 @@ impl OrchRegistry {
                 json!({ "kind": "unconfirmed-delivery", "to": agent_id, "reason": "group-paused" }));
             return;
         }
-        self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({ "to": agent_id }));
-        let _ = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id), "loomux");
+        // #585: the audit distinguishes the two, so "how often is a delivery
+        // actually eaten?" stays greppable apart from "how often is one merely
+        // unconfirmed?" — the question this whole issue turned on, which the
+        // pre-#585 log could not answer.
+        self.audit(group, "loomux", "delivery-unconfirmed-notice",
+            json!({ "to": agent_id, "eaten": eaten }));
+        let text = if eaten {
+            delivery_eaten_notice(agent_id)
+        } else {
+            unconfirmed_delivery_notice(agent_id)
+        };
+        let _ = self.deliver_to_orchestrator(group, &text, "loomux");
     }
 
     /// #112 round 2 — additive to the #445 seam (a NEW notice path;
