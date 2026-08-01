@@ -20305,6 +20305,136 @@ fn a_queue_full_refusal_during_a_pause_is_reported_to_the_orchestrator_on_resume
 }
 
 #[test]
+fn the_loss_notice_lands_even_when_the_overflowing_pane_is_the_orchestrators_own() {
+    // rev-128's finding, and the case #569 is actually about: a fleet's reports
+    // converge on the orchestrator's pane, so that is the pane a long pause
+    // fills — and it is STILL at capacity when the human resumes. Before this,
+    // `announce_pause_suppression` was therefore not merely at risk of being
+    // refused, it was CERTAIN to be: the notice about the destroyed payloads was
+    // destroyed by the same cap that destroyed them.
+    //
+    // Worse, and the reason a badge fallback did not cover it: by resume the
+    // pane already carries `note_queue_capacity`'s at-capacity badge, so
+    // `pause_badge_decision`'s never-stomp-another-mechanism's-badge rule
+    // suppresses the pause badge too. Notice refused, badge skipped, audit tally
+    // the only trace — the #569 stall, one level up.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5840);
+    reg.set_pty_for_test(&w.id, 5841);
+    reg.pause_group(&g.id).unwrap();
+
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.deliver_prompt(&orch.id, &format!("[loomux] advisory {i}"), "loomux", Delivery::MidSession)
+            .unwrap();
+    }
+    reg.deliver_prompt(&orch.id, "report: done, PR #77 is green", &w.id, Delivery::MidSession)
+        .unwrap_err();
+    // The precondition that makes this the flagship case rather than a variant:
+    // the pane is full AND already badged, so neither channel is free.
+    assert_eq!(reg.queue_depth(5840), queue::QUEUE_MAX_PER_PANE);
+    assert_eq!(
+        reg.stranded_note(&orch.id).and_then(|n| n.blocker),
+        Some(StrandedBlocker::QueueAtCapacity),
+        "the capacity badge is up, which is what would suppress the pause badge"
+    );
+
+    reg.resume_group(&g.id).unwrap();
+
+    // The notice is admitted past the cap — the one exemption, one entry deep.
+    let tally = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "pause-suppression-notice")
+        .expect("the tally is always recorded");
+    assert_eq!(
+        tally.detail["delivered"], json!(true),
+        "the notice must actually LAND on a full orchestrator pane, not be refused by the cap \
+         that caused the loss it reports: {:?}",
+        tally.detail
+    );
+    assert_eq!(
+        reg.queue_depth(5840),
+        queue::QUEUE_MAX_PER_PANE + queue::PAUSE_LOSS_NOTICE_HEADROOM,
+        "exactly one entry past the cap, never more"
+    );
+    let notice = delivered_texts(&reg, &g.id)
+        .into_iter()
+        .find(|t| t.contains("LOST"))
+        .expect("and it is a real delivery the orchestrator will read");
+    assert!(notice.contains("REFUSED"), "naming the cause: {notice}");
+    assert!(notice.contains("PR #77 is green"), "and the payload: {notice}");
+
+    // It is admitted with its own reason, so the audit says why it was allowed
+    // past a cap that had just refused a worker's report.
+    let queued = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-queued")
+        .filter(|e| e.detail["reason"] == json!("pause-loss-notice"))
+        .count();
+    assert_eq!(queued, 1, "exactly one exempt admission, and it is labelled as one");
+}
+
+#[test]
+fn the_loss_notice_headroom_is_one_entry_and_a_second_resume_is_refused() {
+    // The exemption is a bound, not a bypass. If a second resume finds the
+    // headroom still occupied — nothing has drained, because nothing can here —
+    // its notice is refused like any other delivery, and the tally says so
+    // rather than claiming the orchestrator was told. That is the refusal path
+    // rev-128 asked to see covered, reached honestly instead of by pretending
+    // the first notice could not land.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5850);
+    reg.set_pty_for_test(&w.id, 5851);
+
+    // Round 1: fill, overflow, resume — the notice takes the headroom.
+    reg.pause_group(&g.id).unwrap();
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.deliver_prompt(&orch.id, &format!("[loomux] advisory {i}"), "loomux", Delivery::MidSession)
+            .unwrap();
+    }
+    reg.deliver_prompt(&orch.id, "first lost report", &w.id, Delivery::MidSession).unwrap_err();
+    reg.resume_group(&g.id).unwrap();
+    assert_eq!(reg.queue_depth(5850), queue::QUEUE_MAX_PER_PANE + queue::PAUSE_LOSS_NOTICE_HEADROOM);
+
+    // Round 2: pause again, lose another, resume again. Nothing drained in
+    // between, so the headroom is gone.
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&orch.id, "second lost report", &w.id, Delivery::MidSession).unwrap_err();
+    reg.resume_group(&g.id).unwrap();
+
+    let tallies: Vec<Value> = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "pause-suppression-notice")
+        .map(|e| e.detail)
+        .collect();
+    assert_eq!(tallies.len(), 2, "both resumes record a tally: {tallies:?}");
+    assert_eq!(tallies[0]["delivered"], json!(true), "the first landed");
+    assert_eq!(
+        tallies[1]["delivered"], json!(false),
+        "the second is refused — and the tally must NOT claim the orchestrator was told: {:?}",
+        tallies[1]
+    );
+    assert!(
+        tallies[1]["error"].as_str().unwrap_or_default().contains("full"),
+        "naming why it could not land: {:?}",
+        tallies[1]
+    );
+    assert_eq!(
+        reg.queue_depth(5850),
+        queue::QUEUE_MAX_PER_PANE + queue::PAUSE_LOSS_NOTICE_HEADROOM,
+        "and the queue never grows past the one-entry headroom, however many resumes happen"
+    );
+}
+
+#[test]
 fn a_resume_flush_keeps_held_entries_ahead_of_post_resume_traffic() {
     // Review N3. The design note promises pause-held entries drain "in original
     // order"; FIFO makes that structurally true, but nothing asserted it across

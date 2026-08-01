@@ -854,6 +854,29 @@ persisted in `group.json`, and clamped in `clamped()`.
   orchestrator-targeted notice cannot reach — and a pane already carrying another mechanism's
   badge is left alone.
 
+  **The loss notice is admitted past the cap, by exactly one entry** (rev-128). It is delivered
+  with `queue::EnqueueReason::PauseLossNotice`, the only reason `queue::admit` lets exceed
+  `QUEUE_MAX_PER_PANE`. Without that, the flagship case defeated itself: the pane a long pause
+  fills first is the ORCHESTRATOR's, because that is where a fleet's reports converge, and it is
+  still at capacity when the human resumes — so the notice reporting the destroyed payloads was
+  *certain*, not merely at risk, to be destroyed by the same cap. The badge fallback did not
+  cover it either: by resume that pane already carries `note_queue_capacity`'s at-capacity badge,
+  and `pause_badge_decision`'s never-stomp-another-mechanism's-badge rule then skips the pause
+  badge, leaving the audit tally as the only trace. Notice refused, badge suppressed — the #569
+  stall one level up, inside the fix for it.
+
+  The exemption is bounded rather than a hole, and each bound is load-bearing: one entry
+  (`PAUSE_LOSS_NOTICE_HEADROOM`), one notice per resume, emitted only when something was actually
+  lost, and reachable from exactly one call site because `deliver_prompt_as` /
+  `deliver_to_orchestrator_as` are private — a `pub` door with a reason parameter would make that
+  bound a convention instead of a fact. Coalescing still runs first, so a byte-identical repeat
+  folds in rather than spending the headroom. A second resume that finds the headroom still
+  occupied is refused like any other delivery and records `delivered: false` rather than claiming
+  the orchestrator was told; that refusal path is tested
+  (`the_loss_notice_headroom_is_one_entry_and_a_second_resume_is_refused`), which is the honest
+  way to cover it — the alternative on offer, an order swap, does not work: `flush_paused_queues`
+  only *starts* drainers, so the queue is still full microseconds later when the announce runs.
+
   **Advisory notices stay suppressed while paused, and that is not the same question.** The
   four `notice-suppressed` paths (`notify_queue`, the unconfirmed-delivery notice,
   `flush_unconfirmed_notices`, `notify_delivery_confirmed_late`) plus the low-disk backstop and

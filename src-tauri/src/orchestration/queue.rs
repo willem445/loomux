@@ -147,7 +147,51 @@ pub enum EnqueueReason {
     /// and a blocked pane are different facts, and the flush header at drain
     /// time has to say which one it was (see [`FlushCause`]).
     GroupPaused,
+    /// #569 rev-128: the resume-time notice naming what a pause LOST
+    /// (`announce_pause_suppression`). The ONE admission allowed past
+    /// `QUEUE_MAX_PER_PANE`, by `PAUSE_LOSS_NOTICE_HEADROOM`.
+    ///
+    /// **Why an exception, and why this one.** The notice exists because the
+    /// cap destroyed a payload. Refusing the notice *to that same cap* means a
+    /// full pane silently eats both the work and the report of the work — and
+    /// it is not a rare corner: when the overflow happened on the
+    /// ORCHESTRATOR's own pane (the case #569 is actually about, since that is
+    /// where a fleet's reports converge) the pane is still at capacity at
+    /// resume, so the notice is not merely at risk, it is CERTAIN to be
+    /// refused. Worse, the pane already carries `note_queue_capacity`'s
+    /// at-capacity badge by then, so `pause_badge_decision`'s
+    /// never-stomp-another-badge rule suppresses the fallback too, leaving the
+    /// audit tally as the only trace.
+    ///
+    /// Bounded, not open: `PAUSE_LOSS_NOTICE_HEADROOM` is 1, one notice is
+    /// emitted per resume, and it is emitted only when something was actually
+    /// lost — so the queue can exceed its cap by exactly one entry, briefly,
+    /// and a second resume that finds the headroom still occupied is refused
+    /// like anything else.
+    PauseLossNotice,
 }
+
+impl EnqueueReason {
+    /// #569 rev-128: how far past `QUEUE_MAX_PER_PANE` this admission may go.
+    /// Zero for everything except the pause-loss notice — see that variant.
+    pub fn cap_headroom(self) -> usize {
+        match self {
+            EnqueueReason::PauseLossNotice => PAUSE_LOSS_NOTICE_HEADROOM,
+            EnqueueReason::BoxOccupied
+            | EnqueueReason::Question
+            | EnqueueReason::BehindQueue
+            | EnqueueReason::Arrival
+            | EnqueueReason::KickoffRecovery
+            | EnqueueReason::Recovered
+            | EnqueueReason::GroupPaused => 0,
+        }
+    }
+}
+
+/// #569 rev-128: how far past the cap [`EnqueueReason::PauseLossNotice`] may
+/// push. One entry — enough for the single notice a resume emits, and small
+/// enough that "the cap is 8" stays true for every practical purpose.
+pub const PAUSE_LOSS_NOTICE_HEADROOM: usize = 1;
 
 impl EnqueueReason {
     pub fn as_str(self) -> &'static str {
@@ -159,6 +203,7 @@ impl EnqueueReason {
             EnqueueReason::KickoffRecovery => "kickoff-recovery",
             EnqueueReason::Recovered => "recovered",
             EnqueueReason::GroupPaused => "group-paused",
+            EnqueueReason::PauseLossNotice => "pause-loss-notice",
         }
     }
 }
@@ -307,11 +352,17 @@ pub enum AdmitDecision {
 }
 
 /// Decide `AdmitDecision` for a new text payload against an existing queue.
-pub fn admit(queue: &VecDeque<QueuedDelivery>, text: &str) -> AdmitDecision {
+///
+/// `reason` is consulted for one thing only: [`EnqueueReason::cap_headroom`],
+/// which is zero for every reason but the pause-loss notice (#569 rev-128).
+/// Coalescing is checked FIRST and is not affected — an exempt admission that
+/// byte-matches a queued entry still folds into it rather than spending its
+/// headroom, because a duplicate adds no information whatever its reason.
+pub fn admit(queue: &VecDeque<QueuedDelivery>, text: &str, reason: EnqueueReason) -> AdmitDecision {
     if queue.iter().any(|q| q.payload.text() == Some(text)) {
         return AdmitDecision::Coalesce;
     }
-    if queue.len() >= QUEUE_MAX_PER_PANE {
+    if queue.len() >= QUEUE_MAX_PER_PANE + reason.cap_headroom() {
         return AdmitDecision::RejectFull;
     }
     AdmitDecision::Admit
@@ -363,6 +414,10 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
         // queue behind the payload it describes. Spelled out for the same
         // compile-time reason as `Recovered` above.
         EnqueueReason::GroupPaused => "the group is paused",
+        // Also unreachable: the loss notice is loomux telling the orchestrator
+        // something, never a delivery whose sender is waiting to hear it was
+        // queued.
+        EnqueueReason::PauseLossNotice => "it reports what a pause lost",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
@@ -1316,14 +1371,14 @@ mod tests {
     #[test]
     fn admit_appends_to_an_empty_queue() {
         let q: VecDeque<QueuedDelivery> = VecDeque::new();
-        assert_eq!(admit(&q, "hello"), AdmitDecision::Admit);
+        assert_eq!(admit(&q, "hello", EnqueueReason::Arrival), AdmitDecision::Admit);
     }
 
     #[test]
     fn admit_coalesces_a_byte_identical_repeat() {
         let mut q = VecDeque::new();
         q.push_back(text_entry(1, "give me a status update"));
-        assert_eq!(admit(&q, "give me a status update"), AdmitDecision::Coalesce);
+        assert_eq!(admit(&q, "give me a status update", EnqueueReason::Arrival), AdmitDecision::Coalesce);
     }
 
     #[test]
@@ -1332,7 +1387,7 @@ mod tests {
         // deliver. Only an exact byte match collapses.
         let mut q = VecDeque::new();
         q.push_back(text_entry(1, "give me a status update"));
-        assert_eq!(admit(&q, "give me a status update please"), AdmitDecision::Admit);
+        assert_eq!(admit(&q, "give me a status update please", EnqueueReason::Arrival), AdmitDecision::Admit);
     }
 
     #[test]
@@ -1352,7 +1407,7 @@ mod tests {
         });
         // Empty string would trivially "match" a bad comparison — pin the
         // marker is simply never a coalesce target at all.
-        assert_eq!(admit(&q, ""), AdmitDecision::Admit);
+        assert_eq!(admit(&q, "", EnqueueReason::Arrival), AdmitDecision::Admit);
     }
 
     #[test]
@@ -1361,7 +1416,7 @@ mod tests {
         for i in 0..QUEUE_MAX_PER_PANE {
             q.push_back(text_entry(i as u64, &format!("distinct-{i}")));
         }
-        assert_eq!(admit(&q, "one-more"), AdmitDecision::RejectFull);
+        assert_eq!(admit(&q, "one-more", EnqueueReason::Arrival), AdmitDecision::RejectFull);
     }
 
     #[test]
@@ -1374,7 +1429,67 @@ mod tests {
         for i in 0..QUEUE_MAX_PER_PANE {
             q.push_back(text_entry(i as u64, &format!("distinct-{i}")));
         }
-        assert_eq!(admit(&q, "distinct-0"), AdmitDecision::Coalesce);
+        assert_eq!(admit(&q, "distinct-0", EnqueueReason::Arrival), AdmitDecision::Coalesce);
+    }
+
+    #[test]
+    fn only_the_pause_loss_notice_may_exceed_the_cap_and_only_by_its_headroom() {
+        // #569 rev-128. The notice reports payloads the cap destroyed, so
+        // refusing it to that same cap loses both the work and the record of
+        // it — and on the orchestrator's own pane that refusal is certain, not
+        // unlucky. The exemption is one entry, so "the cap is 8" stays true for
+        // every other purpose.
+        let mut q = VecDeque::new();
+        for i in 0..QUEUE_MAX_PER_PANE {
+            q.push_back(text_entry(i as u64, &format!("distinct-{i}")));
+        }
+        for ordinary in [
+            EnqueueReason::Arrival,
+            EnqueueReason::BehindQueue,
+            EnqueueReason::BoxOccupied,
+            EnqueueReason::Question,
+            EnqueueReason::KickoffRecovery,
+            EnqueueReason::Recovered,
+            EnqueueReason::GroupPaused,
+        ] {
+            assert_eq!(
+                admit(&q, "one-more", ordinary),
+                AdmitDecision::RejectFull,
+                "{ordinary:?} must not be exempt — the cap is the cap"
+            );
+            assert_eq!(ordinary.cap_headroom(), 0, "{ordinary:?}");
+        }
+        assert_eq!(
+            admit(&q, "one-more", EnqueueReason::PauseLossNotice),
+            AdmitDecision::Admit,
+            "the loss notice gets in"
+        );
+
+        // …and the headroom is a bound, not a bypass: once spent, the next one
+        // is refused like anything else.
+        q.push_back(text_entry(99, "the notice"));
+        assert_eq!(q.len(), QUEUE_MAX_PER_PANE + PAUSE_LOSS_NOTICE_HEADROOM);
+        assert_eq!(
+            admit(&q, "a second notice", EnqueueReason::PauseLossNotice),
+            AdmitDecision::RejectFull,
+            "the exemption is one entry deep, not an open door"
+        );
+    }
+
+    #[test]
+    fn an_exempt_admission_still_coalesces_rather_than_spending_its_headroom() {
+        // Coalescing is checked before the cap for every reason, and must stay
+        // that way here: a byte-identical repeat adds no information, so
+        // spending the one-entry headroom on it would leave the real notice
+        // with nowhere to go.
+        let mut q = VecDeque::new();
+        for i in 0..QUEUE_MAX_PER_PANE {
+            q.push_back(text_entry(i as u64, &format!("distinct-{i}")));
+        }
+        assert_eq!(
+            admit(&q, "distinct-3", EnqueueReason::PauseLossNotice),
+            AdmitDecision::Coalesce
+        );
     }
 
     // ---------- notice text ----------

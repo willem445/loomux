@@ -17725,6 +17725,26 @@ impl OrchRegistry {
     /// (`deliver_to_orchestrator` → `deliver_prompt` → `enqueue_text`), which
     /// already owns that obligation and is already a row in that table.
     ///
+    /// **Admitted past the cap, and that is the point** (rev-128). The notice
+    /// goes in with `queue::EnqueueReason::PauseLossNotice`, the one reason
+    /// `admit` lets exceed `QUEUE_MAX_PER_PANE` — by exactly one entry. Without
+    /// it, the flagship case defeats itself: when the overflow happened on the
+    /// ORCHESTRATOR's own pane (where a fleet's reports converge, so where a
+    /// long pause fills first) that pane is still at capacity at resume, so the
+    /// notice reporting the destroyed payloads was CERTAIN — not merely
+    /// likely — to be destroyed by the same cap. And the badge fallback below
+    /// did not cover it either: by then the pane carries
+    /// `note_queue_capacity`'s at-capacity badge, so `pause_badge_decision`'s
+    /// never-stomp-another-badge rule skips the pause badge, leaving the audit
+    /// tally as the only trace of a lost report.
+    ///
+    /// The exemption stays a bound rather than a hole: one entry deep, one
+    /// notice per resume, emitted only when something was actually lost, and
+    /// reachable from this call site alone (`deliver_prompt_as` is private). A
+    /// second resume that finds the headroom still occupied is refused like
+    /// anything else, `delivered: false` is recorded honestly, and the badge
+    /// path below is what carries it from there.
+    ///
     /// **And the notice must not be the next silent loss.** It is an in-band
     /// delivery, so it fails when the group has no live orchestrator left to
     /// take it — the long unattended pause, i.e. the case with the most to
@@ -17737,8 +17757,12 @@ impl OrchRegistry {
         if swallowed.items.is_empty() {
             return;
         }
-        let outcome =
-            self.deliver_to_orchestrator(group, &pause_suppression_notice(swallowed), "loomux");
+        let outcome = self.deliver_to_orchestrator_as(
+            group,
+            &pause_suppression_notice(swallowed),
+            "loomux",
+            queue::EnqueueReason::PauseLossNotice,
+        );
         self.audit(group, "loomux", "pause-suppression-notice", json!({
             "count": swallowed.items.len(),
             "window_start_seen": swallowed.window_start_seen,
@@ -27107,6 +27131,27 @@ impl OrchRegistry {
         from: &str,
         delivery: Delivery,
     ) -> Result<(), String> {
+        self.deliver_prompt_as(agent_id, text, from, delivery, queue::EnqueueReason::Arrival)
+    }
+
+    /// `deliver_prompt` with the admission reason chosen by the caller (#569
+    /// rev-128). Every ordinary delivery is `Arrival` and goes through
+    /// `deliver_prompt` above; the ONE caller that needs anything else is
+    /// `announce_pause_suppression`, whose notice must be admitted past the cap
+    /// that destroyed the payloads it is reporting — see
+    /// `queue::EnqueueReason::PauseLossNotice`.
+    ///
+    /// Private on purpose. The cap exemption is bounded by being reachable from
+    /// exactly one call site, and a `pub` door with a reason parameter would
+    /// make that bound a convention rather than a fact.
+    fn deliver_prompt_as(
+        &self,
+        agent_id: &str,
+        text: &str,
+        from: &str,
+        delivery: Delivery,
+        reason: queue::EnqueueReason,
+    ) -> Result<(), String> {
         let a = self.agent(agent_id).ok_or("unknown agent")?;
         if a.status == AgentStatus::Dead {
             return Err(format!("agent {agent_id} is dead"));
@@ -27197,8 +27242,7 @@ impl OrchRegistry {
         // the SAME audit line's `depth` field, which already distinguishes
         // "landed alone" (depth 1) from "landed behind something" (depth
         // >1) without needing a second field to say the same thing.
-        let admitted =
-            self.enqueue_text(&a.group, agent_id, from, text, pty_id, queue::EnqueueReason::Arrival)?;
+        let admitted = self.enqueue_text(&a.group, agent_id, from, text, pty_id, reason)?;
 
         if !admitted.was_first {
             // Landed behind an existing entry (or coalesced into one) — a
@@ -27311,7 +27355,7 @@ impl OrchRegistry {
         let admitted = self.queues.mutate(group, self, |queues| {
             let q = queues.entry(pty_id).or_default();
             let was_first = q.is_empty();
-            match queue::admit(q, text) {
+            match queue::admit(q, text, reason) {
                 queue::AdmitDecision::RejectFull => {
                     // Nothing mutated `queues` on this arm, so no snapshot
                     // is owed (see doc/design/orchestration.md's
@@ -29429,6 +29473,26 @@ impl OrchRegistry {
             .map(|a| a.id.clone())
             .ok_or("no live orchestrator in this group")?;
         self.deliver_prompt(&orch, text, from, Delivery::MidSession)
+    }
+
+    /// `deliver_to_orchestrator` with a chosen admission reason — the one
+    /// caller is `announce_pause_suppression` (#569 rev-128). Private for the
+    /// reason `deliver_prompt_as` is.
+    fn deliver_to_orchestrator_as(
+        &self,
+        group: &str,
+        text: &str,
+        from: &str,
+        reason: queue::EnqueueReason,
+    ) -> Result<(), String> {
+        let orch = self
+            .agents
+            .lock_safe()
+            .values()
+            .find(|a| a.group == group && a.role == Role::Orchestrator && a.status != AgentStatus::Dead)
+            .map(|a| a.id.clone())
+            .ok_or("no live orchestrator in this group")?;
+        self.deliver_prompt_as(&orch, text, from, Delivery::MidSession, reason)
     }
 
     pub fn list_agents(&self, group: &str) -> Value {
