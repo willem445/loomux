@@ -591,7 +591,14 @@ if [ "$cmd" = "api" ]; then
     esac
   fi
 
-  is_write=0; case "$a_method" in GET|HEAD) is_write=0 ;; *) is_write=1 ;; esac
+  # MUTATION (#564 O1 evidence — EVIDENCE BRANCH ONLY, never merged): a normalizer
+  # the completeness text scan cannot see. Backticks instead of `$(`, `sed` instead
+  # of `tr`, and split across two lines — so the scan matches nothing here and its
+  # exact site count (11 gh / 1 git) is unchanged. Unguarded, and feeding the
+  # read/write classification: exactly #509's shape, in a shape the pin is blind to.
+  m_low=`printf '%s' "$a_method"     | sed 'y/ABCDEFGHIJKLMNOPQRSTUVWXYZ/abcdefghijklmnopqrstuvwxyz/'`
+  [ -z "$m_low" ] && m_low=get
+  is_write=0; case "$m_low" in get|head) is_write=0 ;; *) is_write=1 ;; esac
   # URL PATH only (strip any ?query — a decoy `?d=refs/heads/z` must not read as heads).
   a_path=${a_url%%\?*}
   path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]')
@@ -638,7 +645,7 @@ if [ "$cmd" = "api" ]; then
       case "$ref_low" in refs/tags/*) rtag=${a_ref#refs/tags/}; rtag=${rtag%% *} ;; esac
       if [ -z "$rtag" ]; then
         case "$a_query" in
-          *tagName:*)   rest=${a_query#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
+          *tagName:*)   rest=${a_query#*tagName:}; rest=$(printf '%s' "$rest" | tr -d ' "()'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
           *refs/tags/*) rest=${a_query#*refs/tags/}; rest=$(printf '%s' "$rest" | tr -d ' "'); rtag=${rest%%,*}; rtag=${rtag%%\}*}; rtag=${rtag%%)*} ;;
         esac
       fi

@@ -14910,6 +14910,7 @@ const UNGUARDED_TR_SITES: &[(&str, &str, &str, &str)] = &[
 ///
 /// So: find the pipe, skip the spacing, and require `tr` not to run on into a
 /// longer word.
+#[allow(dead_code)]
 fn is_tr_pipeline(text: &str) -> bool {
     text.char_indices().filter(|(_, c)| *c == '|').any(|(i, _)| {
         text[i + 1..]
@@ -14946,49 +14947,32 @@ fn is_tr_pipeline(text: &str) -> bool {
 /// Still line-shaped, and that residual is real: an assignment split across two
 /// lines is invisible here, which is what the count assertion's hint names.
 fn tr_pipeline_assignment_vars(line: &str) -> Vec<String> {
+    // MUTATION (#564 rev-1 B2 + O3 evidence — EVIDENCE BRANCH ONLY, never merged):
+    // the pre-#564 scanner. A whitespace-squashed substring test for `|tr` (so a
+    // shell `|| true` reads as a pipeline) and the FIRST `=$(` on the line, at
+    // most one site per line (so a second normalizer beside an existing one is
+    // invisible while the exact count stays correct).
     if line.trim_start().starts_with('#') {
         return Vec::new();
     }
-    let mut vars = Vec::new();
-    let mut from = 0usize;
-    while let Some(off) = line[from..].find("=$(") {
-        let eq = from + off; // the `=`
-        let open = eq + 2; // the `(`
-        // The substitution ends at ITS matching `)`. An unbalanced `)` inside
-        // quotes would end it early and could only ADD sites (the tail is then
-        // rescanned), which reddens the count rather than hiding a site — the
-        // fail-safe direction for a scan whose job is to notice new ones.
-        let mut depth = 0usize;
-        let mut close = line.len();
-        for (k, c) in line[open..].char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = open + k;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if is_tr_pipeline(&line[open..close]) {
-            let var: String = line[..eq]
-                .chars()
-                .rev()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect::<Vec<char>>()
-                .into_iter()
-                .rev()
-                .collect();
-            if !var.is_empty() {
-                vars.push(var);
-            }
-        }
-        from = eq + 3;
+    let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    if !squashed.contains("|tr") {
+        return Vec::new();
     }
-    vars
+    let Some(eq) = line.find("=$(") else { return Vec::new() };
+    let var: String = line[..eq]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect::<Vec<char>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if var.is_empty() {
+        Vec::new()
+    } else {
+        vec![var]
+    }
 }
 
 /// #564 O3 — the scan that drives the completeness pin, pinned itself.
