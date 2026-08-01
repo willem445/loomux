@@ -8812,6 +8812,12 @@ pub const REFUSED_LIST_MAX: usize = 8;
 /// [`suppressed_during_pause`] follows, and for the same reason (this reads
 /// `AuditEntry`, which lives here rather than in `queue.rs`).
 pub fn front_door_refusals(entries: &[AuditEntry]) -> FrontDoorRefusals {
+    // RED EVIDENCE ONLY (#579) — the pre-#579 truth: nothing in this registry
+    // could surface a front-door refusal. Types and tests are byte-identical to
+    // the real PR, so each test fails on an ASSERTION (or an empty-list index),
+    // never on a compile error. NEVER MERGE THIS COMMIT.
+    #[allow(unreachable_code)]
+    return FrontDoorRefusals { items: Vec::new(), total: 0 };
     // (sender, target) -> the full text of the last `prompt` line between them.
     let mut offered: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
