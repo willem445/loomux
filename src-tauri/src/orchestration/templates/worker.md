@@ -91,11 +91,9 @@ plan itself, rather than silently continuing as though it had verified clean.
 - Push and open a PR with `gh pr create`, linking the issue (`Closes #N`) and describing
   what changed, why, and how it was tested.
 - **Never merge.** The human gatekeeps merges. Do not touch branches other than yours.
-- **Waiting on your own PR's CI?** Register `notify_when(kind: "pr_checks", pr: <n>)` and
-  `report("progress", ...)` rather than sleeping or re-polling `gh pr checks` yourself —
-  you'll get a `[loomux] …` notice in this pane the moment it resolves. If the PR is
-  `CONFLICTING`, the notice fires right away instead of waiting for checks that will never
-  appear — rebase onto the base branch, don't keep waiting on CI.
+- **Waiting on your own PR's CI?** Register `notify_when(kind: "pr_checks", pr: <n>)`,
+  `report("progress", ...)`, and end the turn — see **Never block a turn on CI** below,
+  which is a hard rule, not a preference.
 - **Never `git stash`.** The stash stack lives in the shared `.git` and is one stack across
   *every* worktree of this repo, not per-worktree — a `pop`/`drop`/`clear` you think is yours
   can destroy another agent's WIP in a different worktree (#299, a live near-miss). Commit WIP
@@ -103,11 +101,37 @@ plan itself, rather than silently continuing as though it had verified clean.
   `git stash push -m "<your agent id>: ..."` and only ever `pop` an entry carrying your own
   marker.
 
+## Never block a turn on CI
+
+**Registering a watch and then waiting for it in the same turn is a deadlock.** A
+`[loomux] …` notice is delivered by *typing into this pane*, and a pane that is mid-turn
+cannot take a delivery — so a turn blocked on CI is waiting for something whose resolution
+is queued behind the turn itself, and only a human can break it. That already happened:
+20+ minutes, on a PR that had gone `CONFLICTING`, so the checks the shell-level wait was
+blocked on were never going to exist at all while the notice that said so sat undeliverable
+(#590).
+
+So, without exception: **no `sleep`, no `--watch`, no poll loop, no shell command that
+blocks until CI resolves.** Register `notify_when(kind: "pr_checks", pr: <n>)`,
+`report("progress", …)`, and **end the turn.** The notice arrives in this pane and you pick
+up from there. One instantaneous read (`gh pr checks <n>` once, to see where things stand)
+is fine — it is *waiting* that is banned, not looking.
+
+`CONFLICTING` is the case you can never discover by waiting: GitHub creates no check-suite
+for a PR with no clean merge ref, so the watch resolving with its own CONFLICTING notice is
+the only thing that will ever tell you. That means rebase onto the base branch, not "still
+running".
+
+The rule covers any external condition, not just CI — another agent's PR, a human's answer,
+a long remote job. Register the watch or ask the question, end the turn, act on what comes
+back.
+
 ## Loop until green
 
 Push early and open the PR as a **draft**, before the change is finished (quick local
 iteration is fine, capped at `-j 4`; see the `ci-validate` skill for the
-local-vs-CI line). Loop by pushing fixes and reading `gh pr checks` until every
+local-vs-CI line). Loop by pushing a fix and ending the turn, then reading `gh pr checks`
+when the notice tells you that run finished — never by waiting on it — until every
 platform in the matrix is green, then `gh pr ready`. A single green run right after
 a fix doesn't confirm the fix didn't break something else — reread the whole
 matrix, not just the check you were chasing.
