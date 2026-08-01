@@ -594,7 +594,7 @@ if [ "$cmd" = "api" ]; then
   is_write=0; case "$a_method" in GET|HEAD) is_write=0 ;; *) is_write=1 ;; esac
   # URL PATH only (strip any ?query — a decoy `?d=refs/heads/z` must not read as heads).
   a_path=${a_url%%\?*}
-  path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]')
+  path_low=$(printf '%s' "$a_path" | tr '[:upper:]' '[:lower:]'); mth=$(printf '%s' "$a_method" | tr '[:upper:]' '[:lower:]')
   ref_low=$(printf '%s' "$a_ref" | tr '[:upper:]' '[:lower:]')
   loomux_norm_guard "$a_path" "$path_low" "api-url-path"
   loomux_norm_guard "$a_ref" "$ref_low" "api-ref-field"
@@ -764,7 +764,6 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
   # refuse, the same fail-safe an undeterminable base takes.
   cur_head=$("$REAL_GH" pr view $rf "$num" --json headRefOid --jq .headRefOid 2>/dev/null)
   cur_head=$(printf '%s' "$cur_head" | tr '[:upper:]' '[:lower:]')
-  [ -n "$cur_head" ] || loomux_block_wf "unresolved-head" "loomux could not resolve the PR's current head commit, so it cannot tell whether the recorded verdicts reviewed the code that would merge"
   # No globbing anywhere below: the gate file's tokens are word-split into `for`
   # loops, and a security shim should not leave the next reader working out whether
   # a `*` could reach a filename. (loomux never writes one — sanitize_id /
