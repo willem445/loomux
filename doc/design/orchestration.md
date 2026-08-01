@@ -6383,17 +6383,16 @@ blesses ("A false 'unconfirmed' here is safe: the flush Enter lands on an alread
 and is a no-op"). It also holds nothing across a restart: it reads live pane state, and a
 restart destroys the pty, so there is no delivery left to judge.
 
-**No coalescing mechanism, deliberately** (#528 review N1). The burst that motivated this — 17
-false alarms in one day — is collapsed *at the source*, not by de-duplicating notices
-downstream: idle panes now produce `delivery-unconfirmed-idle-pane` audit records and no
-actionable notice at all, so a burst of false alarms collapses to zero. A burst of GENUINE
-strands still notifies once per pane, and that is the intended behaviour rather than an
-oversight: each names a different pane the orchestrator must actually do something about, and
+**No coalescing mechanism, deliberately** (#528 review N1) — *superseded by #539, see below.*
+The burst that motivated this — 17 false alarms in one day — was collapsed *at the source*, not
+by de-duplicating notices downstream: idle panes produce `delivery-unconfirmed-idle-pane` audit
+records and no actionable notice at all, so a burst of false alarms collapses to zero. A burst
+of GENUINE strands still notified once per pane, and that was the intended behaviour rather than
+an oversight: each names a different pane the orchestrator must actually do something about, and
 collapsing them would trade a known false-positive problem for an unknown false-negative one.
-The narrower claim is the honest one — this fixes the alarms that were wrong, not the volume
-of alarms that are right. If genuine-burst collapsing is wanted, it is a separate decision with
-its own failure modes (which pane's identity survives the merge? what re-arms it?), and it
-belongs to whoever owns notice economy, not to this fix.
+The open questions were named at the time — *which pane's identity survives the merge? what
+re-arms it?* — and #539 answers them (per-pane bucket keyed by `(group, agent)`; the first alarm
+after a flush re-arms), which is why the decision moved rather than being reversed silently.
 
 **Test seams.** Two, both back-dating the *real* fields the real readers read rather than
 mocking a clock, so the tests drive the production path with production `now_ms()` and the
@@ -6409,6 +6408,152 @@ is only as good as the frontend's own vectors: a future input path that reaches 
 without going through `markFirstInput()` would arrive marked non-human. That is the
 fail-*unsafe* direction for this one signal, which is why both marks hang off that single
 function rather than being re-derived at each call site.
+
+## The unconfirmed-delivery detector gets evidence about the AGENT (#539 / #546)
+
+**Problem.** Every input `unconfirmed_disposition` had was about the BOX. #522 taught it to
+recognise a pane that had gone idle, and #559 taught it to admit when it could not read the box
+at all — but nothing anywhere in the decision knew whether the *agent* had done anything. So a
+worker that had reported and pushed within the same minute could still draw the actionable "the
+prompt may be sitting unsubmitted in its pane; get_output it and re-send" alarm, because
+`input_pending` said human characters were outstanding. That counter is known to latch >0 over
+an empty box (a bare ESC, a TUI line-clear, a CLI consuming the line — see the human-input
+section above), and it had no second opinion to answer to. ~28 of these in one observed session,
+each costing an orchestrator turn plus the `get_output` probe it prompts — the top remaining
+performance cost of the prompting pipeline (#567's ranking C1).
+
+#535 had already built the missing signal and named this function as its intended second
+consumer: `agent_acted_since`, over the MCP activity clock stamped once at the `tools/call`
+dispatch funnel. It means **the agent's own code path executed** — a live process authenticated
+with that agent's token and invoked a loomux tool. It does not mean the pane painted, and
+terminal output is deliberately not part of it (#480: our own paste echoes back, and statusline
+and spinner frames never stop).
+
+### Precedence: evidence added, never evidence overridden
+
+| `reading` | `box_pending` | `agent_acted` | result |
+| --- | --- | --- | --- |
+| `Holds` | any | any | `Notify` |
+| `Unverifiable` | any | any | `Notify` |
+| `NotHolding` | `true` | `true` | `ActiveAuditOnly` (#539) |
+| `NotHolding` | `true` | `false` | `Notify` |
+| `NotHolding` | `false` | any | `IdleAuditOnly` |
+
+`Holds` is a direct observation that our text is sitting unsubmitted; an agent busy for reasons
+that have nothing to do with our paste must not silence a strand we can see. `Unverifiable` is
+#559's honest-uncertainty arm and is **untouched** — activity is evidence about the agent, never
+a reading of the box, so suppressing there would re-create the exact defect #559 fixed (silence
+drawn from an answer the pane was never consulted about) merely sourced from a different signal.
+
+That leaves precisely one cell: the box was observed to have lost our text, and the only
+remaining argument for an alarm is the fallible one. Two independent readings outranking one
+fallible one is the same shape #518's release rule uses, not a timer.
+
+**The suppression is bounded, and the bound is the evidence itself.** `.loomux/lessons.md` requires
+that any suppression driven by a fallible signal be bounded — the failure mode being a guard that
+holds "while X is true" and never clears. This one has no such state: it is a one-shot decision
+taken against a POSITIVE stamp that must already exist, not a hold waiting for a condition to
+clear. No stamp, no suppression; a pane with no activity signal keeps its pre-#539 behaviour
+verbatim. Nothing here can wedge, because there is nothing here to wait on.
+
+**The settling floor.** `UNCONFIRMED_ACK_SETTLE_MS` is `REINJECT_ACK_SETTLE_MS`'s sibling with a
+deliberately different sum. That one is measured from the moment a re-grounding was *decided*, so
+it covers the whole decision→Enter chain; this one is measured from `submit_sent_ms`, stamped
+immediately *before* the first Enter, so it charges only for what is still ahead of that stamp
+(`SUBMIT_CONFIRM_WINDOW` + the blind-retry tail = 7.6s). What no constant here can bound is stated
+rather than implied: an agent mid-turn when our Enter lands can make calls belonging to its
+*previous* turn for as long as that turn runs. That residual is #546's question, and it is exactly
+why the activity input governs only the arm where the box was independently observed to be clear.
+
+**Why a recoverable kickoff vetoes the suppression.** #517's lost-kickoff re-delivery is reached
+through the notify path on a `NotHolding` reading, and an agent whose brief never arrived is
+precisely the agent that calls a loomux tool anyway — every role's instructions end with "if you
+have no task yet, report progress and wait". On a fresh spawn's kickoff an activity stamp is as
+consistent with "the brief was eaten and the agent announced itself idle" as with "the brief
+landed", so it is the one case where this evidence points at nothing. A recoverable kickoff always
+takes the unchanged path.
+
+### Per-pane coalescing of the alarms that remain
+
+The other half of the cost. Two deliveries to the same pane can each declare failure within one
+`LATE_MONITOR_POLL` of each other — supersession only retires the older monitor at its *next*
+tick — and an in-window `Failed` from `deliver_now` can land alongside a monitor's. Each was its
+own notice asking the orchestrator the same question.
+
+`notify_unconfirmed_delivery` now buffers into a per-`(group, agent)` bucket and the alarm that
+*created* the bucket arms a single `UNCONFIRMED_NOTICE_COALESCE_WINDOW` (15s = 3 ×
+`LATE_MONITOR_POLL`) timer; joiners never re-arm it, so the window cannot be extended one failing
+delivery at a time (the "bounded from the ORIGINAL attempt" rule #535's busy deferral follows).
+The flush emits one notice **naming every constituent**, per #533-A's collapse-at-source
+convention — the verb agrees with the count, and the plural changes the ask to one `get_output`
+rather than one per id.
+
+**Delivery ids are `submit_sent_ms` stamps.** That is the identity the delivery ledger and
+`late_monitor_tick`'s supersession check already key on (no two deliveries to a pane share one),
+and the only id *every* delivery has — queued or straight through the front door. The same value
+is now written as `delivery_id` on this pane's `delivery-failed-idle`,
+`delivery-unconfirmed-idle-pane`, `delivery-unconfirmed-agent-active` and
+`delivery-unconfirmed-buffered` lines, so any id in a notice resolves back to the record it came
+from.
+
+The per-delivery gates (`should_notify_unconfirmed`, i.e. confirmed / orchestrator-target) stay at
+alarm time because they are per-delivery facts. The **paused** gate is re-verified at flush time
+per #532 — a window is 15s of wall clock in which a human can pause the group — and its
+suppression audit names every id it swallowed (#445). Nothing touches `persist_queues`: this adds
+no queue mutation, so #523's mutation-site table is unchanged.
+
+### #546 option 3: the badge states which evidence closed the phase
+
+`acked` resolves a re-grounding on one of two signals that are not equally strong. `"delivery"` is
+loomux watching its own Enter land. `"activity"` is only the agent's own process reaching loomux
+afterwards — it proves the agent is **alive and executing**, never that it **read** the
+re-grounding. The case that stays uncovered is a genuinely lost paste on an agent that is busy for
+some other reason: it resolves as confirmed, the agent carries on without the contract, and
+nothing says so. It is worst on an orchestrator pane, where the notice is suppressed by design and
+the badge is the only surface that reaches a human at all.
+
+#546 weighed three options; two of them (an acknowledgment marker the agent must emit, or
+correlating the stamp against the paste content) are decisions this project has repeatedly
+declined — a two-party protocol every CLI must cooperate with, and exactly the kind of heuristic
+inference #112 removed. Option 3 is what an honest system does when it cannot prove the thing it
+wants to prove: make the residual **legible**. `AgentEntry.compact_last_ack_source` /
+`_ms` keep the provenance the `compact-reinjection-confirmed` audit already recorded, and
+`compaction_status` surfaces it as `CompactionStatus::Acked { source, since_ms }` for the same
+recency window `Abandoned` uses. `compactionstatus.ts` renders `re-grounding acked (activity)` vs
+`re-grounding acked (delivery)` — the evidence source is in the *label*, not only the tooltip, the
+same shape `armedQualifier`'s `(hook-confirmed)` established in #417 — and the activity tooltip
+says outright what the signal does not prove.
+
+Both are recent terminal outcomes, and an agent that has compacted more than once can carry a
+stamp for each, so the **more recent wins** rather than a fixed ranking: a fixed one would either
+let a resolved re-grounding hide a fresh loss (unsafe) or let an old loss hide today's resolution
+(misleading). Ties go to the loss — the louder of the two, and the only one that asks a human for
+anything.
+
+**What this does not claim.** Naming the source does not make an activity-sourced ack stronger; it
+makes it *visible*. The residual #546 opened stays open, and the notice/badge is now the place a
+reader can see it rather than a line in an audit file.
+
+### Coverage
+
+`a_pane_whose_agent_kept_working_is_busy_not_unconfirmed` pins the live shape and its negative
+(no stamp ⇒ pre-#539 behaviour verbatim, so a fix that suppressed unconditionally could not pass);
+`activity_never_outranks_evidence_that_points_the_other_way` walks every arm activity must *not*
+govern, including both `Unverifiable` cells; `a_recoverable_kickoff_is_never_silenced_by_the_
+agents_own_idle_report` pins the #517 veto against the identical inputs that otherwise suppress,
+so it cannot pass by coincidence; `activity_inside_the_settling_floor_is_the_previous_turn_
+talking` pins the floor from both sides plus the never-called seed.
+`several_alarms_on_one_pane_cost_the_orchestrator_one_turn_not_n` drives the two halves of the
+coalescer exactly as production composes them (the only thing skipped is the sleep) and asserts
+the delivered text, the audit, and flush idempotency;
+`the_coalesced_notice_reads_as_one_ask_and_names_every_delivery` pins the wording both ways;
+`a_group_paused_during_the_window_suppresses_the_flush_and_says_which_ids` pins the #532 re-check
+and the #445 trace. For #546, `a_resolved_re_grounding_surfaces_which_evidence_closed_it` and
+`a_fresh_loss_is_never_hidden_behind_an_older_resolution` pin the derivation, the wiring is
+pinned at the resolve site inside
+`a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers` (a test that stopped at the
+pure function would stay green if the wiring were never written), and `compactionstatus.test.ts`
+pins that the two sources never render as one label.
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 

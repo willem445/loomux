@@ -252,7 +252,16 @@ src-tauri/src/
     a re-grounding that had already landed, interrupting a working agent. A retry is also never
     spent into a live turn (deferred while output is flowing, bounded so a permanently noisy pane
     can't suppress it); the 3-attempt bound and the visible give-up for a genuinely lost
-    re-grounding are unchanged. See doc/design/orchestration.md's Compact-nudge section.
+    re-grounding are unchanged. The lifecycle panel now says WHICH evidence closed the phase —
+    `re-grounding acked (delivery)` when loomux's own sampler saw the Enter land, `re-grounding
+    acked (activity)` when the agent's own next MCP call is all there is (#546): the second
+    proves the agent is alive and working, never that it read the re-grounding, and a reader
+    who cannot tell those apart cannot notice the difference. The same activity signal now also
+    feeds the unconfirmed-delivery detector (#539): a pane whose box no longer holds our paste
+    AND whose agent has called a loomux tool since is recorded as busy rather than announced as
+    stranded, and the alarms that remain coalesce per pane into one notice naming every
+    delivery. See doc/design/orchestration.md's Compact-nudge section and "The
+    unconfirmed-delivery detector gets evidence about the AGENT".
     workflow.rs     the block model (#222): a repo's agent roster as data — `<repo>/.loomux/workflow.yml` parse + validation. A block's id is the agent's identity; `kind` is its CAPABILITY CLASS, and stays a closed 4-variant enum, so a repo file can declare five reviewers with five prompts but can never grant one write access. An optional `role_hint` (#250/#324: `advisor` | `process`) rides alongside `kind` for persona/template/badge selection only — inert w.r.t. capability, which keeps keying exclusively off `kind`. Also the ENFORCED merge gate (#222/#197): reviewer-attributed verdicts (pass | fail | escalate) as durable state, and the pure gate decision the `gh` shim mirrors — `gh pr merge` is refused until every reviewer the gate names has recorded a pass, and no human grant or autonomous marker can open it. See doc/design/workflows.md and doc/design/supervisor-skills.md
     lessons.rs      durable per-repo lessons (#268): `<repo>/.loomux/lessons.md`, a plain-Markdown convention file (no schema, no MCP write tool — edited and reviewed like any other file) read-and-capped into the orchestrator's kickoff only. Hard byte cap with oldest-drop truncation, wrapped in a data-not-instructions provenance framing (#189) — never grounds to bypass the merge gate. See doc/design/lessons.md
     profiles.rs     repo-authored personas from `.github/agents/*.md` (#51, harvested from PR #105): append/replace modes with a non-overridable loomux mechanics core. Compiled to each CLI's native custom-agent flag — `claude --agent`/`copilot --agent` (both resolve a NAME against a user/project agent-file directory; a user-authored file resolves unwrapped) — and (#416) the built-in role contract itself now rides the SAME native flag for every block, persona or not: a block with no user-authored file gets a loomux-generated file in the CLI's own user-level agent directory (`~/.claude/agents` or `~/.copilot/agents`, never the repo's `.github/agents/`). Claude's inline `--agents '<json>'` flag was the original #416 mechanism; it was replaced with the same file-based approach Copilot always used after a live demo hit Windows CreateProcessW's 32,767-character command-line limit once the full contract, not just a short persona, rode it

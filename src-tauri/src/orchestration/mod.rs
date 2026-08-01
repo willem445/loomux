@@ -26737,18 +26737,50 @@ impl OrchRegistry {
             }));
             return;
         }
-        // #539: buffer, don't send. The alarm is now emitted by
+        // #539: buffer, don't send. The alarm is emitted by
         // `flush_unconfirmed_notices` at the end of a short window so that N
-        // alarms on one pane cost the orchestrator one turn instead of N. The
-        // gates above stay HERE, evaluated per delivery, because they are
-        // per-delivery facts (`confirmed`, `target_is_orchestrator`) — the
-        // pane-wide gate that can change during the window is re-checked at
-        // flush time, per #532's "re-verify every write gate at the moment of
-        // submit".
-        let key = (group.to_string(), agent_id.to_string());
+        // alarms on one pane cost the orchestrator one turn instead of N.
+        if !self.buffer_unconfirmed_delivery(group, agent_id, delivery_id) {
+            return; // an armed window already owns this bucket
+        }
+        // Exactly one timer per bucket — armed by the alarm that CREATED it,
+        // never re-armed by the ones that join it, so the window cannot be
+        // extended a delivery at a time by a pane that keeps failing (the
+        // same "bounded from the ORIGINAL attempt" rule #535's busy deferral
+        // follows). The thread is the whole deferral: it sleeps, then calls
+        // the same flush a caller can call directly.
+        //
+        // A registry with no `self_arc` (a bare/headless construction — see
+        // `set_self_arc`) has no owner to hand the window to, so it flushes
+        // inline and behaves exactly as it did pre-#539. That is the honest
+        // degrade rather than a bucket nothing would ever drain.
+        let Some(me) = self.arc() else {
+            self.flush_unconfirmed_notices(group, agent_id);
+            return;
+        };
+        let (g, a) = (group.to_string(), agent_id.to_string());
+        std::thread::spawn(move || {
+            std::thread::sleep(UNCONFIRMED_NOTICE_COALESCE_WINDOW);
+            me.flush_unconfirmed_notices(&g, &a);
+        });
+    }
+
+    /// Add one alarm to a pane's coalescing bucket (#539), returning whether
+    /// this call OPENED the bucket (and therefore owes it a flush).
+    ///
+    /// Split out of `notify_unconfirmed_delivery` so the two halves of the
+    /// coalescer — accumulate, then emit — are separately callable, and so a
+    /// test can compose them exactly as production does with the only
+    /// difference being that it does not sleep out the window. The gates
+    /// (`should_notify_unconfirmed`, paused) stay in the caller: they are
+    /// per-delivery facts evaluated when the alarm is raised, and the one
+    /// pane-wide gate that can change during the window is re-checked at
+    /// flush time per #532.
+    #[doc(hidden)] // pub for integration tests
+    pub fn buffer_unconfirmed_delivery(&self, group: &str, agent_id: &str, delivery_id: u64) -> bool {
         let opened = {
             let mut pending = self.unconfirmed_pending.lock_safe();
-            let bucket = pending.entry(key.clone()).or_default();
+            let bucket = pending.entry((group.to_string(), agent_id.to_string())).or_default();
             bucket.push(delivery_id);
             bucket.len() == 1
         };
@@ -26756,24 +26788,7 @@ impl OrchRegistry {
             "to": agent_id, "delivery_id": delivery_id, "opened_window": opened,
             "window_ms": UNCONFIRMED_NOTICE_COALESCE_WINDOW.as_millis() as u64,
         }));
-        if !opened {
-            return; // an armed window already owns this bucket
-        }
-        // Exactly one timer per bucket — armed by the alarm that created it,
-        // never re-armed by the ones that join it, so the window cannot be
-        // extended a delivery at a time by a pane that keeps failing (the
-        // same "bounded from the ORIGINAL attempt" rule #535's busy deferral
-        // follows). A registry with no `self_arc` (bare unit-test
-        // construction) has no thread to hand ownership to; it flushes
-        // inline, which keeps that path's behaviour identical to pre-#539.
-        let Some(me) = self.self_arc.lock_safe().upgrade() else {
-            self.flush_unconfirmed_notices(group, agent_id);
-            return;
-        };
-        std::thread::spawn(move || {
-            std::thread::sleep(UNCONFIRMED_NOTICE_COALESCE_WINDOW);
-            me.flush_unconfirmed_notices(&key.0, &key.1);
-        });
+        opened
     }
 
     /// Emit the one coalesced unconfirmed-delivery notice for a pane's
