@@ -1770,7 +1770,28 @@ const FLUSH_SETTLE: Duration = Duration::from_millis(400);
 /// whether our own pasted text is still sitting at the box's tail end.
 /// Same sizing philosophy as `QUESTION_SCAN_TAIL_BYTES` — reused directly
 /// rather than inventing a second "how much tail matters" constant.
+///
+/// #559: this is Tier 1's FLOOR, not its budget. A scan window fixed at 4 KiB
+/// while `QUEUE_FLUSH_MAX_BYTES` lets one coalesced flush paste 24 KiB makes
+/// `box_holds_paste` structurally false for every large paste — the evidence
+/// is not absent, it is unreachable — and two constants chosen for unrelated
+/// reasons (question-scan cost vs. token budget) then jointly decide whether a
+/// stranded delivery is ever noticed. `tier1_scan_bytes` derives the actual
+/// read from the paste, with this as its lower bound; `TIER1_SCAN_MAX_BYTES`
+/// is the ceiling, and it is derived from the flush cap rather than picked.
 const BOX_TAIL_SCAN_BYTES: usize = QUESTION_SCAN_TAIL_BYTES;
+/// Ceiling on one Tier 1 box read (#559) — the largest paste a single flush
+/// may produce (`QUEUE_FLUSH_MAX_BYTES`) plus the same `BOX_TAIL_SCAN_BYTES`
+/// of headroom the base window already allows for box framing, prompt symbol
+/// and cursor chrome around our text. Derived, deliberately: the whole point
+/// of this issue is that the scan budget and the flush cap were independent
+/// numbers, so the relationship is expressed in the code rather than in a
+/// comment asking a future reader to keep them in step. A single queue entry
+/// larger than the flush cap still delivers alone (`plan_flush`'s "the cap is
+/// a CEILING, never a floor"), so this bound can still be exceeded by the
+/// paste — which is exactly the residual `BoxReading::Unverifiable` exists to
+/// say out loud instead of reading as an idle pane.
+const TIER1_SCAN_MAX_BYTES: usize = queue::QUEUE_FLUSH_MAX_BYTES + BOX_TAIL_SCAN_BYTES;
 /// Extra slack (normalized characters) added around the pasted text's own
 /// length when windowing "the tail end" for containment — covers box
 /// framing/prompt-symbol/cursor characters immediately around our text
@@ -8875,8 +8896,15 @@ pub enum UnconfirmedDisposition {
 /// The disambiguation is STRUCTURAL, deliberately reusing the seams that
 /// already exist rather than inferring anything from output bytes — the same
 /// discipline #518's origin bit follows:
-/// - `box_holds_paste` — is OUR pasted text still identifiably at the box's
+/// - `reading` — is OUR pasted text still identifiably at the box's
 ///   tail end? That, and only that, is what "sitting unsubmitted" means.
+///   #559 made this a `BoxReading` rather than a bool: `Unverifiable` — the
+///   tail we could read is shorter than the paste we are looking for — is
+///   NOT an idle pane. It is no reading at all, and the whole point of this
+///   function is to withhold an alarm only when the pane was actually
+///   observed to be at rest. Treating a foregone `false` as an observation
+///   is how a coalesced flush over the scan window went silent (see
+///   `BoxReading`'s doc).
 /// - `box_pending` — `PtyManager::input_pending`, whether any human-typed
 ///   characters are outstanding. A box with a person's half-written line in it
 ///   is not an idle pane, and the human still needs to hear about it.
@@ -8899,11 +8927,19 @@ pub enum UnconfirmedDisposition {
 /// 'unconfirmed' here is safe: the flush Enter lands on an already empty box
 /// and is a no-op").
 #[doc(hidden)] // pub for integration tests
-pub fn unconfirmed_disposition(box_holds_paste: bool, box_pending: bool) -> UnconfirmedDisposition {
-    if box_holds_paste || box_pending {
-        return UnconfirmedDisposition::Notify;
+pub fn unconfirmed_disposition(reading: BoxReading, box_pending: bool) -> UnconfirmedDisposition {
+    match reading {
+        // Our text is still in the box — the genuine strand.
+        BoxReading::Holds => UnconfirmedDisposition::Notify,
+        // #559: no reading. Silence here would be a claim ("the pane is
+        // idle") drawn from an answer that was fixed before the pane was
+        // consulted.
+        BoxReading::Unverifiable => UnconfirmedDisposition::Notify,
+        // Observed empty of our text — idle only if it is empty of the
+        // human's too.
+        BoxReading::NotHolding if box_pending => UnconfirmedDisposition::Notify,
+        BoxReading::NotHolding => UnconfirmedDisposition::IdleAuditOnly,
     }
-    UnconfirmedDisposition::IdleAuditOnly
 }
 
 /// #112 round 3 (rev-20 B2 + B3): the ONE decision point for whether Tier
@@ -9067,6 +9103,16 @@ pub enum StrandedBlocker {
     /// the human still needs to know, but loomux must not press Enter into
     /// a pane whose state it can no longer account for.
     NotHolding,
+    /// #559: loomux could not read enough of the pane's tail to contain the
+    /// text it pasted (`BoxReading::Unverifiable`), so whether the prompt is
+    /// still sitting in the box is unknown. Deliberately NOT folded into
+    /// `NotHolding`: that variant's wording tells the human their text is
+    /// *gone*, which here would be a claim from a `false` that was arithmetic
+    /// rather than observation. Same non-action as `NotHolding` — loomux
+    /// never presses Enter into a pane it cannot account for — but an honest
+    /// name for a different reason, so a badge, an audit line and a grep can
+    /// all tell "we looked and it is gone" from "we could not look".
+    Unverifiable,
     /// The per-delivery heal budget (`STRANDED_SELFHEAL_MAX_HEALS`) is spent.
     Exhausted,
     /// The pane's delivery queue is at cap, so the re-submit could not even
@@ -9169,6 +9215,10 @@ impl StrandedBlocker {
             StrandedBlocker::HumanInput => "human-input",
             StrandedBlocker::Question => "question",
             StrandedBlocker::NotHolding => "not-holding",
+            // #559: its own token so a grep tells "we read the box and our
+            // text is gone" from "we could not read enough of the box to
+            // tell" — the distinction the whole change exists to preserve.
+            StrandedBlocker::Unverifiable => "box-unverifiable",
             StrandedBlocker::Exhausted => "heal-budget-spent",
             StrandedBlocker::QueueFull => "queue-full",
             StrandedBlocker::QueueNearFull => "queue-near-full",
@@ -9228,14 +9278,19 @@ pub const STRANDED_SELFHEAL_MAX_HEALS: u32 = 1;
 ///   question is up), and re-checked authoritatively at press time by
 ///   `flush_stranded_text`; taken as a parameter anyway so this function
 ///   does not silently depend on the caller's precedence staying that way.
-/// - `box_holds_paste` — our text is still identifiable at the box's tail
-///   end (Tier 1's own signal, `box_holds_paste`).
+/// - `reading` — what Tier 1's box read established (`BoxReading`). #559 made
+///   this a three-state rather than a bool: `Unverifiable` badges as its own
+///   blocker instead of borrowing `NotHolding`'s "its text is gone" claim.
+///   Both refuse to self-heal, so this widens nothing about when loomux
+///   presses Enter — the ONE thing that could make a badge-only distinction
+///   dangerous — it only stops the badge from asserting what loomux does not
+///   know.
 /// - `heals_used` / `max_heals` — the bound.
 pub fn stranded_selfheal_action(
     ledger_outstanding: bool,
     human_typed_since: bool,
     question_on_screen: bool,
-    box_holds_paste: bool,
+    reading: BoxReading,
     heals_used: u32,
     max_heals: u32,
 ) -> StrandedAction {
@@ -9248,8 +9303,12 @@ pub fn stranded_selfheal_action(
     if question_on_screen {
         return StrandedAction::Attention(StrandedBlocker::Question);
     }
-    if !box_holds_paste {
-        return StrandedAction::Attention(StrandedBlocker::NotHolding);
+    match reading {
+        BoxReading::Unverifiable => {
+            return StrandedAction::Attention(StrandedBlocker::Unverifiable);
+        }
+        BoxReading::NotHolding => return StrandedAction::Attention(StrandedBlocker::NotHolding),
+        BoxReading::Holds => {}
     }
     if heals_used >= max_heals {
         return StrandedAction::Attention(StrandedBlocker::Exhausted);
@@ -9531,10 +9590,17 @@ pub struct RedeliveryTreatment {
 /// Every other blocker re-words as before: `HumanInput` and `Question` are
 /// real, human-clearable states that outrank an in-flight recovery, and
 /// `QueueFull` means nothing was queued at all.
+///
+/// #559 adds `Unverifiable` to the second arm for the identical reason. It is
+/// the same delivery shape — a paste with no confirming trace, which is why a
+/// re-delivery was queued — reached because the paste was too large to verify
+/// rather than because it was verifiably gone. Telling the human to go check a
+/// pane loomux is actively recovering is the same honesty failure whichever of
+/// the two readings produced it.
 pub fn stranded_reword(live: StrandedBlocker, redelivery_in_flight: bool) -> Option<StrandedBlocker> {
     match live {
         StrandedBlocker::Exhausted => None,
-        StrandedBlocker::NotHolding if redelivery_in_flight => None,
+        StrandedBlocker::NotHolding | StrandedBlocker::Unverifiable if redelivery_in_flight => None,
         other => Some(other),
     }
 }
@@ -9618,6 +9684,16 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
         Some(StrandedBlocker::NotHolding) => {
             format!("{name}'s prompt was never confirmed and its text is gone — check the pane")
         }
+        // #559: names the uncertainty rather than resolving it, and gives an
+        // action that is safe under either branch — if the prompt is sitting
+        // there, Enter sends it; if it is not, the human has looked and lost
+        // nothing. Never says the text is gone: loomux does not know that.
+        Some(StrandedBlocker::Unverifiable) => {
+            format!(
+                "{name}'s prompt was never confirmed and is too large for loomux to verify in the \
+                 pane — check the pane and press Enter if it is still sitting there unsent"
+            )
+        }
         Some(StrandedBlocker::Exhausted) => {
             format!("{name}'s prompt is still unsubmitted after a self-heal — press Enter in the pane")
         }
@@ -9697,6 +9773,96 @@ pub fn box_holds_paste(stripped_tail: &str, pasted: &str) -> bool {
     let start = norm_tail.len().saturating_sub(window);
     let recent = norm_tail.get(start..).unwrap_or(&norm_tail);
     recent.contains(&norm_pasted)
+}
+
+/// How many raw tail bytes Tier 1 must ask for to have any chance of finding
+/// `pasted` in the box (#559) — the paste's own normalized length plus
+/// `BOX_TAIL_SCAN_BYTES` of headroom for the framing/prompt/cursor chrome
+/// around it, capped at `TIER1_SCAN_MAX_BYTES`.
+///
+/// **Why the read is derived from the paste rather than fixed.** Containment
+/// needs the tail to be at least as long as what we are looking for, so a
+/// window that is smaller than the paste cannot return `true` no matter what
+/// the pane contains. The *semantic* window was already paste-relative —
+/// `box_holds_paste` checks only the last `pasted`-length-plus-slack of the
+/// normalized tail — so sizing the READ this way widens nothing about what
+/// counts as "the tail end"; it only stops the read from truncating the
+/// window the comparison already uses. A paste of 4 KiB or less asks for
+/// exactly what it always did, so nothing changes for the ordinary delivery
+/// (only pastes past the old fixed window move at all).
+///
+/// **Why the cost is acceptable.** This is proportional to a paste we have
+/// already paid to write into the pane, and it only exceeds the old constant
+/// for deliveries that are themselves multi-KiB. `LATE_MONITOR_QUESTION_SCAN_
+/// BYTES` (32 KiB) is the standing precedent — and its own doc already
+/// contemplates "Tier 1 governing a multi-KB brief", a state that until this
+/// change could not actually occur.
+///
+/// Best-effort, not a guarantee: a heavily-ANSI-escaped tail strips down to
+/// far fewer characters than the bytes read, so even this size can come back
+/// too short. That residual is not papered over — `box_reading` classifies it
+/// as `Unverifiable`.
+#[doc(hidden)] // pub for integration tests
+pub fn tier1_scan_bytes(pasted: &str) -> usize {
+    normalize_prompt_text(pasted)
+        .len()
+        .saturating_add(BOX_TAIL_SCAN_BYTES)
+        .min(TIER1_SCAN_MAX_BYTES)
+}
+
+/// What a Tier 1 box read actually ESTABLISHED (#559) — the three-state
+/// replacement for the bare `box_holds_paste` bool every consumer used to
+/// pass around.
+///
+/// The bool conflated two states that mean opposite things. `false` because
+/// the tail was read and our text is not in it is evidence about the pane.
+/// `false` because the tail we could read is SHORTER than our own paste is
+/// arithmetic: containment cannot hold when the haystack is smaller than the
+/// needle, so the answer was fixed before the pane was ever consulted. Every
+/// consumer that treated the second as the first — `unconfirmed_disposition`
+/// reading it as "the box holds nothing, so this pane is simply idle",
+/// `stranded_selfheal_action` reading it as "its text is gone" — was drawing
+/// a conclusion from a foregone `false`.
+///
+/// This is the same lesson #536 landed for escalation and #445 for suppressed
+/// notices: a path that quietly opts out of governing must not be
+/// indistinguishable from one that governed and found nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxReading {
+    /// Our pasted text is identifiably at the box's tail end.
+    Holds,
+    /// The tail was long enough to have contained our paste, and does not.
+    /// An informative absence: the CLI consumed it, collapsed it to a
+    /// placeholder, or it never landed.
+    NotHolding,
+    /// No usable read: the pty is gone, or the tail we got back is shorter
+    /// than our own paste. `box_holds_paste` is false either way, and that
+    /// `false` says nothing at all about the pane.
+    Unverifiable,
+}
+
+/// Classify one Tier 1 box read (#559). `stripped_tail` is `None` when the
+/// tail could not be read at all (pty gone).
+///
+/// Ordering matters: a positive `box_holds_paste` is decided FIRST, so a
+/// reading that did find our text can never be downgraded by the length
+/// arithmetic below it (it cannot be — `Holds` implies the tail was at least
+/// as long as the paste — but the order makes that obvious rather than
+/// inferred).
+#[doc(hidden)] // pub for integration tests
+pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
+    let Some(tail) = stripped_tail else { return BoxReading::Unverifiable };
+    if box_holds_paste(tail, pasted) {
+        return BoxReading::Holds;
+    }
+    let norm_pasted = normalize_prompt_text(pasted);
+    // An empty paste is `NotHolding`, matching `box_holds_paste`'s own
+    // "nothing to still be holding" — the answer is false for a reason that
+    // is about the paste, not about how much tail we could see.
+    if !norm_pasted.is_empty() && normalize_prompt_text(tail).len() < norm_pasted.len() {
+        return BoxReading::Unverifiable;
+    }
+    BoxReading::NotHolding
 }
 
 /// The `promptsubmit` hook marker path for one agent — a sibling of the
@@ -9892,15 +10058,21 @@ fn run_late_confirmation_monitor(
                 // taken when a badge is actually up) answers both.
                 if let Some(note) = reg.as_ref().and_then(|r| r.stranded_note(&agent)) {
                     let r = reg.as_ref().expect("note came from `reg`");
-                    let still_holds = ptys
-                        .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
-                        .map(|b| strip_ansi(&b))
-                        .map(|t| box_holds_paste(&t, &pasted_text))
-                        // Unreadable tail → assume it still holds: fail
-                        // conservative, keep telling the human.
-                        .unwrap_or(true);
+                    // #559: paste-derived scan size, and the three-state
+                    // reading. Unreadable tail → `Unverifiable`, which is
+                    // neither "holds" (so nothing below re-asserts a heal)
+                    // nor "not holding" (so the badge is not dropped on a
+                    // reading that never happened) — the same fail-
+                    // conservative posture the old `.unwrap_or(true)` had,
+                    // now extended to the tail-too-short case it missed.
+                    let reading = box_reading(
+                        ptys.output_tail_bounded(pty_id, tier1_scan_bytes(&pasted_text))
+                            .map(|b| strip_ansi(&b))
+                            .as_deref(),
+                        &pasted_text,
+                    );
 
-                    if paste_seen_in_box && !still_holds {
+                    if paste_seen_in_box && reading == BoxReading::NotHolding {
                         // Drop the badge the moment the stranded text leaves
                         // the box — whoever pressed Enter (a human rescuing
                         // the pane, or our own self-heal on a CLI that
@@ -9937,7 +10109,7 @@ fn run_late_confirmation_monitor(
                             // than merely wrong.
                             human_input_block_now(&ptys, pty_id, submit_sent_ms).holds(),
                             showing_question,
-                            still_holds,
+                            reading,
                             STRANDED_SELFHEAL_MAX_HEALS,
                             STRANDED_SELFHEAL_MAX_HEALS,
                         );
@@ -9987,18 +10159,44 @@ fn run_late_confirmation_monitor(
                 // below: the same fact that decides whether a re-submit is
                 // safe also decides whether there is anything to announce,
                 // and announcing first meant announcing before looking.
-                let holds_paste = ptys
-                    .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
-                    .map(|b| strip_ansi(&b))
-                    .map(|t| box_holds_paste(&t, &pasted_text))
-                    .unwrap_or(false);
+                // #559: paste-derived scan size and the three-state reading,
+                // so an oversized coalesced flush is no longer read as an
+                // empty box. `holds_paste` stays as the name for the ONE
+                // question the rest of this arm asks of it.
+                let scan_bytes = tier1_scan_bytes(&pasted_text);
+                let reading = box_reading(
+                    ptys.output_tail_bounded(pty_id, scan_bytes)
+                        .map(|b| strip_ansi(&b))
+                        .as_deref(),
+                    &pasted_text,
+                );
+                let holds_paste = reading == BoxReading::Holds;
+                // #559: the decline is stated wherever it is reached, not only
+                // where it changes the outcome — an `Unverifiable` reading on
+                // a delivery that ends up notified anyway (a human's line in
+                // the box) would otherwise leave no trace that Tier 1 was
+                // blind for it.
+                if reading == BoxReading::Unverifiable {
+                    append_audit(&root, &group, "loomux", "delivery-unconfirmed-box-unverifiable", json!({
+                        "to": agent, "confirm_state": "unconfirmed",
+                        "reason": "pasted text is larger than the pane tail loomux could read",
+                        "paste_bytes": pasted_text.len(),
+                        "scan_bytes": scan_bytes,
+                    }));
+                }
                 // #522: a pane that is simply DONE — our text consumed, no
                 // human characters outstanding, and (by `late_monitor_tick`'s
                 // own precondition for reaching this arm) the CLI at rest —
                 // is not a strand. Record it and stop, rather than telling the
                 // orchestrator to `get_output` and re-send a prompt that is
                 // not stuck. See `unconfirmed_disposition`.
-                if unconfirmed_disposition(holds_paste, ptys.input_pending(pty_id).unwrap_or(true))
+                //
+                // #559: reachable ONLY on an informative `NotHolding`. An
+                // `Unverifiable` reading takes the notice/self-heal/escalation
+                // path below like any other unresolved strand — which is the
+                // whole fix: a delivery whose box we could not read is not a
+                // delivery we watched go idle.
+                if unconfirmed_disposition(reading, ptys.input_pending(pty_id).unwrap_or(true))
                     == UnconfirmedDisposition::IdleAuditOnly
                 {
                     append_audit(&root, &group, "loomux", "delivery-unconfirmed-idle-pane", json!({
@@ -10042,7 +10240,7 @@ fn run_late_confirmation_monitor(
                     ledger.outstanding,
                     human_typed_since,
                     showing_question,
-                    holds_paste,
+                    reading,
                     heals_used,
                     STRANDED_SELFHEAL_MAX_HEALS,
                 );
@@ -10067,7 +10265,25 @@ fn run_late_confirmation_monitor(
                 // it through the same front door. Scoped strictly INSIDE
                 // that one outcome so every other `StrandedAction` keeps
                 // its pre-#517 behavior untouched.
-                if action == StrandedAction::Attention(StrandedBlocker::NotHolding) {
+                //
+                // #559: `Unverifiable` joins it rather than splitting off. The
+                // eaten-paste signature is "the delivery failed and nothing
+                // confirming it is in the box", and a paste too large to
+                // verify presents identically — before this change an
+                // oversized kickoff reached this test as `NotHolding` only
+                // when a human happened to have a line in the box, and went
+                // silent (`IdleAuditOnly`) otherwise, so the recovery it is
+                // entitled to fired or not on an unrelated coincidence. Safe
+                // to widen because the box reading was never the guard here:
+                // `kickoff_recovery_action`'s own `output_since_submit`
+                // discriminator is what separates a kickoff that landed from
+                // one that was eaten, and a landed kickoff resolves via the
+                // hook long before this arm.
+                if matches!(
+                    action,
+                    StrandedAction::Attention(StrandedBlocker::NotHolding)
+                        | StrandedAction::Attention(StrandedBlocker::Unverifiable)
+                ) {
                     let recovery = kickoff_recovery_action(
                         recoverable_kickoff.is_some(),
                         // #454: the SAME atomic ledger observation the
@@ -10674,12 +10890,31 @@ fn deliver_now(
     // landed), Tier 1 declines to govern and this delivery falls
     // back to the round-1 hook-or-burst precedence exactly as
     // before — audited explicitly as its own state, never silently.
-    let tier1_precondition_tail = ptys
-        .output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES)
-        .map(|b| strip_ansi(&b));
-    let tier1_governs = tier1_precondition_tail
-        .as_deref()
-        .is_some_and(|t| box_holds_paste(t, &pasted_text));
+    //
+    // #559: the read is sized from the paste (`tier1_scan_bytes`), not from
+    // the flat `BOX_TAIL_SCAN_BYTES` — with a 4 KiB window and a flush cap of
+    // 24 KiB, a coalesced paste made this precondition structurally false and
+    // Tier 1 declined every large delivery without ever looking. Every OTHER
+    // box read for this delivery (the confirm loop, the retry loop, and the
+    // late monitor's two) must use this SAME size: a precondition verified
+    // against a wide tail and then polled against a narrow one would read the
+    // box as cleared on the very first poll and confirm a delivery nothing
+    // observed — the one failure mode strictly worse than declining.
+    let tier1_scan = tier1_scan_bytes(&pasted_text);
+    let tier1_precondition_tail =
+        ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| strip_ansi(&b));
+    let tier1_precondition = box_reading(tier1_precondition_tail.as_deref(), &pasted_text);
+    let tier1_governs = tier1_precondition == BoxReading::Holds;
+    // The decline is stated, not inferred from an absent `true` (#559). It is
+    // carried on `prompt-typed` below rather than as its own event because
+    // every delivery writes that record exactly once, so "why did Tier 1 not
+    // govern this one" is answerable for every delivery rather than only for
+    // the ones that later go wrong.
+    let tier1_decline = match tier1_precondition {
+        BoxReading::Holds => None,
+        BoxReading::NotHolding => Some("not-in-box"),
+        BoxReading::Unverifiable => Some("unverifiable"),
+    };
 
     let submit_sent_ms = now_ms();
     // Baseline just before the first Enter, so the confirmation window
@@ -10746,9 +10981,10 @@ fn deliver_now(
             tier_hook_matched = true;
         }
         if tier1_governs {
-            match ptys.output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES).map(|b| strip_ansi(&b)) {
-                Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
-                Some(_) => {
+            let tail = ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| strip_ansi(&b));
+            match box_reading(tail.as_deref(), &pasted_text) {
+                BoxReading::Holds => tier1_reading = Some(true),
+                BoxReading::NotHolding => {
                     tier1_reading = Some(false);
                     // #112 round 3 (rev-20 B3): a box-clear caused by
                     // the HUMAN (they typed/submitted/cancelled their
@@ -10761,7 +10997,16 @@ fn deliver_now(
                         confirm_source = ConfirmSource::Box;
                     }
                 }
-                None => {} // pty gone — the `output_total` read just below returns None too and breaks the loop
+                // #559: no usable read — the pty is gone (the `output_total`
+                // read just below returns `None` too and breaks the loop), or
+                // the tail came back shorter than our own paste. Leave
+                // `tier1_reading` untouched: an unread box is neither a
+                // confirm nor a veto. This is the strictly-safer half of the
+                // three-state change — `ConfirmSource::Box` now requires an
+                // OBSERVED absence, where the old `Some(_)` arm would take a
+                // structurally-foregone `false` as proof the CLI accepted the
+                // paste.
+                BoxReading::Unverifiable => {}
             }
         }
         if matches!(confirm_source, ConfirmSource::None) && tier_hook_matched {
@@ -10833,9 +11078,13 @@ fn deliver_now(
                 break 'retries;
             }
             if tier1_governs {
-                match ptys.output_tail_bounded(pty_id, BOX_TAIL_SCAN_BYTES).map(|b| strip_ansi(&b)) {
-                    Some(t) if box_holds_paste(&t, &pasted_text) => tier1_reading = Some(true),
-                    Some(_) => {
+                // #559: same paste-derived size as the precondition and the
+                // main window — see `tier1_scan`'s comment for why a narrower
+                // read here would manufacture a confirm.
+                let tail = ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| strip_ansi(&b));
+                match box_reading(tail.as_deref(), &pasted_text) {
+                    BoxReading::Holds => tier1_reading = Some(true),
+                    BoxReading::NotHolding => {
                         tier1_reading = Some(false);
                         // #112 round 3 (rev-20 B3): same trust gate
                         // as the main window above.
@@ -10846,7 +11095,8 @@ fn deliver_now(
                             break 'retries;
                         }
                     }
-                    None => {}
+                    // #559: no usable read — never a confirm, never a veto.
+                    BoxReading::Unverifiable => {}
                 }
             }
             // #420 rev-15 B2: these Enters used to fire unconditionally
@@ -10993,6 +11243,17 @@ fn deliver_now(
         // (a long/collapsed paste — see the `tier1_governs` precondition
         // check's own comment, above, right before the first Enter).
         "tier1_governed": tier1_governs,
+        // #559: WHY Tier 1 declined — `null` when it governed, "not-in-box"
+        // when the tail was long enough to have held our paste and did not,
+        // "unverifiable" when the tail we could read was shorter than the
+        // paste itself, so the answer was arithmetic rather than observation.
+        // The two used to be one indistinguishable `tier1_governed: false`,
+        // which is what let an oversized coalesced flush opt out of Tier 1
+        // silently. `paste_bytes`/`scan_bytes` are carried alongside so the
+        // decline is checkable from the record instead of taken on faith.
+        "tier1_decline": tier1_decline,
+        "tier1_paste_bytes": pasted_text.len(),
+        "tier1_scan_bytes": tier1_scan,
         // #112 round 3 (rev-20 N3): `null` when Tier 1 never
         // governed this delivery at all (nothing was ever measured,
         // not "measured and false") — a bare `bool` here would

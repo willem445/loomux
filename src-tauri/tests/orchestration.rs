@@ -57,6 +57,7 @@ use loomux_lib::orchestration::{
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
     redelivery_treatment, RedeliveryTreatment, stranded_reword,
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
+    box_reading, tier1_scan_bytes, BoxReading,
     HUMAN_INPUT_BLOCK_BOUND_MS, record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
@@ -16827,8 +16828,20 @@ fn stranded_selfheal_action_precedence_puts_human_content_first() {
     // because the ORDER is the property: a future edit that moves the
     // human-content check below the "is our text still there" check would
     // make loomux press Enter on a line a person is mid-way through typing.
-    let heal = |ledger, typed, question, holds, used| {
-        stranded_selfheal_action(ledger, typed, question, holds, used, STRANDED_SELFHEAL_MAX_HEALS)
+    // #559: `holds` stays a bool here — every row of this table is about an
+    // INFORMATIVE box read, which is what the parameter meant before the
+    // three-state `BoxReading` existed. The third state has its own tests
+    // below; keeping this table's shape means the precedence property it
+    // pins is compared against the same rows it always was.
+    let heal = |ledger, typed, question, holds: bool, used| {
+        stranded_selfheal_action(
+            ledger,
+            typed,
+            question,
+            if holds { BoxReading::Holds } else { BoxReading::NotHolding },
+            used,
+            STRANDED_SELFHEAL_MAX_HEALS,
+        )
     };
 
     // The ledger — the durable artifact — is consulted before any pane
@@ -16951,10 +16964,10 @@ fn stranded_human_content_badges_and_never_submits() {
     let pty = 4962u32;
 
     let action = stranded_selfheal_action(
-        true,  // ledger: still outstanding
-        true,  // a human typed after our submit
-        false, // no question on screen
-        true,  // our text is still in the box
+        true,              // ledger: still outstanding
+        true,              // a human typed after our submit
+        false,             // no question on screen
+        BoxReading::Holds, // our text is still in the box
         0,
         STRANDED_SELFHEAL_MAX_HEALS,
     );
@@ -17037,7 +17050,7 @@ fn stranded_selfheal_is_bounded_and_never_double_queues() {
 
     // Budget spent: the decision no longer even asks for a heal.
     assert_eq!(
-        stranded_selfheal_action(true, false, false, true, 1, STRANDED_SELFHEAL_MAX_HEALS),
+        stranded_selfheal_action(true, false, false, BoxReading::Holds, 1, STRANDED_SELFHEAL_MAX_HEALS),
         StrandedAction::Attention(StrandedBlocker::Exhausted),
         "one heal per stranded delivery — no infinite flush loop"
     );
@@ -17472,10 +17485,10 @@ fn an_eaten_kickoff_badges_and_then_re_delivers_the_brief() {
     // so the self-heal refuses and raises the badge. This is exactly where
     // the story ended before #517, and it is why the worker sat idle.
     let stranded = stranded_selfheal_action(
-        true,  // ledger: still outstanding
-        false, // no human typed
-        false, // no question
-        false, // our text is NOT in the box — the paste was eaten
+        true,                   // ledger: still outstanding
+        false,                  // no human typed
+        false,                  // no question
+        BoxReading::NotHolding, // read the box; our text is NOT there — eaten
         0,
         STRANDED_SELFHEAL_MAX_HEALS,
     );
@@ -24955,8 +24968,15 @@ fn a_bounded_out_block_lets_the_stranded_decision_reach_self_heal() {
     // the decision into the EXISTING `box_holds_paste` arm, which is already
     // exactly that test. Our text still at the tail => heal it; anything else
     // still lands on a badge, never a blind Enter.
-    let heal = |typed, holds| {
-        stranded_selfheal_action(true, typed, false, holds, 0, STRANDED_SELFHEAL_MAX_HEALS)
+    let heal = |typed, holds: bool| {
+        stranded_selfheal_action(
+            true,
+            typed,
+            false,
+            if holds { BoxReading::Holds } else { BoxReading::NotHolding },
+            0,
+            STRANDED_SELFHEAL_MAX_HEALS,
+        )
     };
 
     assert_eq!(
@@ -24996,7 +25016,7 @@ fn an_idle_pane_produces_no_actionable_unconfirmed_notice() {
     // pasted text still identifiably at the box's tail, or human characters
     // outstanding. Neither => the pane is done, not stuck.
     assert_eq!(
-        unconfirmed_disposition(false, false),
+        unconfirmed_disposition(BoxReading::NotHolding, false),
         UnconfirmedDisposition::IdleAuditOnly,
         "our paste consumed and no human input outstanding: the delivery landed or is moot — \
          record it, never send the orchestrator to re-deliver something that is not stuck"
@@ -25008,18 +25028,290 @@ fn a_genuinely_stranded_pane_still_gets_the_notice() {
     // The half that must NOT be softened. #522 narrows WHEN the notice fires,
     // and a fix that narrowed it to nothing would re-open #496's silent wedge.
     assert_eq!(
-        unconfirmed_disposition(true, false),
+        unconfirmed_disposition(BoxReading::Holds, false),
         UnconfirmedDisposition::Notify,
         "our text still sitting in the box IS the strand — announce it exactly as before"
     );
     assert_eq!(
-        unconfirmed_disposition(false, true),
+        unconfirmed_disposition(BoxReading::NotHolding, true),
         UnconfirmedDisposition::Notify,
         "a human's own line in the box is not an idle pane, and they still need telling"
     );
     assert_eq!(
-        unconfirmed_disposition(true, true),
+        unconfirmed_disposition(BoxReading::Holds, true),
         UnconfirmedDisposition::Notify,
         "both at once is the least idle a pane can be"
+    );
+}
+
+// ───────── #559: a coalesced flush bigger than the box-scan window ─────────
+//
+// `QUEUE_FLUSH_MAX_BYTES` is 24 KiB; the Tier 1 box scan read a flat 4 KiB.
+// Containment cannot hold when the haystack is smaller than the needle, so for
+// any coalesced paste past that window `box_holds_paste` was false as a matter
+// of arithmetic — decided before the pane was ever consulted. Three consumers
+// read that foregone `false` as an observation: the Tier 1 precondition
+// declined to govern, the confirm arm would have taken it as "the CLI consumed
+// our paste", and `unconfirmed_disposition` classified the strand
+// `IdleAuditOnly` — no notice, no self-heal, no badge. Two constants picked for
+// unrelated reasons (token budget vs. question-scan cost) jointly decided
+// whether a stranded delivery was ever noticed.
+//
+// The mechanism predates #533; what #533 changed is reachability, by
+// deliberately constructing large pastes where they used to be incidental.
+
+/// A paste the shape of a real coalesced flush, `bytes` long and free of
+/// whitespace RUNS, so `normalize_prompt_text` is the identity on it and these
+/// tests can do exact arithmetic on lengths. ASCII only — they slice it at
+/// byte offsets to model a truncated tail read.
+fn flush_paste(bytes: usize) -> String {
+    let mut s = String::from("[loomux] 3 queued while this pane was blocked");
+    let mut i = 0usize;
+    while s.len() < bytes {
+        s.push_str(&format!(" from orch-{i}: post the status roll-up on #559 please"));
+        i += 1;
+    }
+    s.truncate(bytes);
+    while s.ends_with(' ') {
+        s.pop();
+    }
+    assert!(s.is_ascii(), "the tests slice this at byte offsets");
+    s
+}
+
+#[test]
+fn a_paste_past_the_scan_window_is_unverifiable_not_absent() {
+    // The mechanism, stated as arithmetic. The tail is the friendliest content
+    // a 4 KiB read could possibly return — the paste's own leading bytes — and
+    // the answer is still `false`, because it cannot be anything else.
+    let pasted = flush_paste(8 * 1024);
+    let truncated_tail = &pasted[..4096];
+    assert!(
+        !box_holds_paste(truncated_tail, &pasted),
+        "a window smaller than the paste cannot contain it, whatever the pane holds"
+    );
+    assert_eq!(
+        box_reading(Some(truncated_tail), &pasted),
+        BoxReading::Unverifiable,
+        "that `false` is arithmetic, not an observation about the pane — it must not be \
+         reported as one"
+    );
+    // The contrast that makes the distinction load-bearing: a tail long enough
+    // to have held the paste, that does not, IS an observation.
+    let long_unrelated_tail = "  ⎿  done\n\n> ".to_string() + &"unrelated older output ".repeat(600);
+    assert!(long_unrelated_tail.len() > pasted.len());
+    assert_eq!(
+        box_reading(Some(&long_unrelated_tail), &pasted),
+        BoxReading::NotHolding,
+        "room to have held it, and it is not there — that is real evidence"
+    );
+    assert_eq!(
+        box_reading(None, &pasted),
+        BoxReading::Unverifiable,
+        "no read at all is the same nothing as a read too short to decide"
+    );
+}
+
+#[test]
+fn an_unverifiable_reading_is_never_classified_as_an_idle_pane() {
+    // The defect, at the one decision point that produced the silence. #522
+    // withholds the notice for a pane that was OBSERVED at rest; a reading
+    // that never happened is not that pane.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::Unverifiable, false),
+        UnconfirmedDisposition::Notify,
+        "a box we could not read is not an idle pane — the stranded batch must be announced"
+    );
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::Unverifiable, true),
+        UnconfirmedDisposition::Notify
+    );
+    // #522's own behavior, unchanged: an INFORMATIVE empty box still stays
+    // quiet. A fix that notified on everything would just re-open #522.
+    assert_eq!(
+        unconfirmed_disposition(BoxReading::NotHolding, false),
+        UnconfirmedDisposition::IdleAuditOnly,
+        "the observed-idle pane must still draw no notice"
+    );
+}
+
+#[test]
+fn an_unverifiable_reading_badges_its_own_blocker_and_never_presses_enter() {
+    let action = stranded_selfheal_action(
+        true,  // ledger: still outstanding
+        false, // no human typed
+        false, // no question
+        BoxReading::Unverifiable,
+        0,
+        STRANDED_SELFHEAL_MAX_HEALS,
+    );
+    assert_eq!(
+        action,
+        StrandedAction::Attention(StrandedBlocker::Unverifiable),
+        "the human is told, and told the truth about WHY loomux cannot act"
+    );
+    assert_ne!(
+        action,
+        StrandedAction::SelfHeal,
+        "loomux must never press Enter into a pane whose box it could not read"
+    );
+    assert_ne!(
+        action,
+        StrandedAction::Attention(StrandedBlocker::NotHolding),
+        "borrowing NotHolding would tell the human their text is gone — which is exactly \
+         what this reading does not establish"
+    );
+
+    // The wording carries the same discipline: it must not resolve the
+    // uncertainty it exists to report, and its action must be safe either way.
+    let detail = stranded_detail("w-6", Some(StrandedBlocker::Unverifiable));
+    assert!(!detail.contains("text is gone"), "never claim the text is gone: {detail}");
+    assert!(detail.contains("check the pane"), "the human needs an action: {detail}");
+    assert_ne!(
+        detail,
+        stranded_detail("w-6", Some(StrandedBlocker::NotHolding)),
+        "two different states must not read identically to the human"
+    );
+    assert_eq!(StrandedBlocker::Unverifiable.as_str(), "box-unverifiable");
+    assert_ne!(
+        StrandedBlocker::Unverifiable.as_str(),
+        StrandedBlocker::NotHolding.as_str(),
+        "the audit token is how the two are told apart after the fact"
+    );
+}
+
+#[test]
+fn a_truncated_read_can_never_reach_the_box_confirm_arm() {
+    // `ConfirmSource::Box` — "the CLI consumed our paste, so it landed" — is
+    // set on exactly one reading, `NotHolding`. Nothing here may produce it:
+    // a false confirm lets a stranded batch merge with the next delivery, the
+    // one outcome strictly worse than declining to govern.
+    for kib in [5usize, 8, 16, 24] {
+        let pasted = flush_paste(kib * 1024);
+        for window in [512usize, 4096, 12 * 1024] {
+            if window >= pasted.len() {
+                continue;
+            }
+            assert_eq!(
+                box_reading(Some(&pasted[..window]), &pasted),
+                BoxReading::Unverifiable,
+                "a {window}-byte read of a {kib} KiB paste must decide nothing"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_tier1_scan_is_derived_from_the_paste_and_bounded_by_the_flush_cap() {
+    // The floor: an ordinary delivery asks for exactly the window it always
+    // did, so nothing about the common path moves.
+    let base = tier1_scan_bytes("");
+    let ordinary = "please post the status roll-up on #559";
+    assert_eq!(
+        tier1_scan_bytes(ordinary),
+        base + ordinary.len(),
+        "the read is the paste plus the base window's worth of box chrome"
+    );
+
+    // The relation the issue asks for: whatever ONE coalesced flush may paste,
+    // Tier 1 must be able to ask for a window that can contain it. This is the
+    // coupling that was missing — a 4 KiB window against a 24 KiB cap.
+    let at_cap = flush_paste(queue::QUEUE_FLUSH_MAX_BYTES);
+    assert!(
+        tier1_scan_bytes(&at_cap) >= at_cap.len(),
+        "a scan window smaller than the flush cap makes box_holds_paste structurally false \
+         for every large coalesced delivery"
+    );
+
+    // The ceiling, derived from the flush cap rather than picked: a single
+    // constituent larger than the cap still delivers alone, and the read stops
+    // growing there rather than following the paste without bound.
+    let over_cap = flush_paste(queue::QUEUE_FLUSH_MAX_BYTES + 8 * 1024);
+    assert_eq!(
+        tier1_scan_bytes(&over_cap),
+        queue::QUEUE_FLUSH_MAX_BYTES + base,
+        "the ceiling is the flush cap plus the base window, not an independent number"
+    );
+}
+
+#[test]
+fn a_flush_sized_paste_is_verifiable_once_the_scan_is_derived_from_it() {
+    // The end the fix is FOR: at the flush cap, an echoed paste is findable,
+    // so Tier 1 governs the delivery two-sidedly instead of declining blind.
+    let pasted = flush_paste(queue::QUEUE_FLUSH_MAX_BYTES);
+    let scan = tier1_scan_bytes(&pasted);
+    // What the pane returns for a read of `scan` bytes: older output, then our
+    // paste echoed into the box, nothing after it.
+    let echoed = format!("  ⎿  done\n\n> {pasted}\n");
+    assert!(
+        echoed.len() <= scan,
+        "the whole pane tail must fit in the window Tier 1 asks for, or the read truncates it"
+    );
+    assert_eq!(
+        box_reading(Some(&echoed), &pasted),
+        BoxReading::Holds,
+        "a paste at the flush cap must be findable in the window Tier 1 asks for"
+    );
+}
+
+#[test]
+fn an_ordinary_delivery_classifies_exactly_as_it_did_before() {
+    // The no-regression half. Everything at or under the old fixed window
+    // behaves identically — the change only moves pastes that the old window
+    // could not have contained in the first place.
+    let pasted = "please post the status roll-up on #559";
+    let holding_tail = "  ⎿  done\n\n> please post the status roll-up on #559\n";
+    let consumed_tail = "  ⎿  done\n\n".to_string() + &"the agent is answering now ".repeat(40);
+    assert_eq!(box_reading(Some(holding_tail), pasted), BoxReading::Holds);
+    assert_eq!(box_reading(Some(&consumed_tail), pasted), BoxReading::NotHolding);
+    assert_eq!(
+        unconfirmed_disposition(box_reading(Some(&consumed_tail), pasted), false),
+        UnconfirmedDisposition::IdleAuditOnly,
+        "the #522 quiet path is reached by exactly the deliveries it always was"
+    );
+    assert_eq!(
+        unconfirmed_disposition(box_reading(Some(holding_tail), pasted), false),
+        UnconfirmedDisposition::Notify
+    );
+}
+
+#[test]
+fn an_unverifiable_badge_defers_to_an_in_flight_redelivery() {
+    // Same reasoning as #517's `NotHolding` arm: a badge telling the human to
+    // go act on a pane loomux is actively re-delivering to is a lie about
+    // whose problem it is, and the reading that produced it does not change
+    // that.
+    assert_eq!(stranded_reword(StrandedBlocker::Unverifiable, true), None);
+    assert_eq!(
+        stranded_reword(StrandedBlocker::Unverifiable, false),
+        Some(StrandedBlocker::Unverifiable),
+        "with nothing in flight the human must still be told"
+    );
+}
+
+#[test]
+fn an_oversized_stranded_batch_reaches_the_badge_and_the_audit() {
+    // The wiring, not just the decision: the same `actuate_stranded` seam
+    // #496/#517 use must carry this state through to a raised badge and an
+    // audit record. Before #559 this delivery returned at `IdleAuditOnly` and
+    // none of it happened.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5591u32;
+
+    let action =
+        stranded_selfheal_action(true, false, false, BoxReading::Unverifiable, 0, STRANDED_SELFHEAL_MAX_HEALS);
+    let healed = reg.actuate_stranded(&g.id, &w.id, "loomux", pty, action);
+
+    assert!(!healed, "an unreadable box must never produce a blind submit");
+    assert_eq!(reg.queue_depth(pty), 0, "nothing queued for a pane loomux cannot account for");
+    let note = reg
+        .stranded_note(&w.id)
+        .expect("an oversized stranded batch must raise the badge, not go silent");
+    assert_eq!(note.blocker, Some(StrandedBlocker::Unverifiable));
+    assert!(
+        reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-attention"),
+        "the badge must be audited too — the record is how a wedge is reconstructed later"
     );
 }
