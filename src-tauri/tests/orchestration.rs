@@ -19219,12 +19219,20 @@ fn group_summary_surfaces_live_compaction_state_and_cached_context_usage() {
     assert_eq!(a2["compaction"]["attempt"], 1);
     assert_eq!(a2["compaction"]["max_attempts"], 3);
 
-    // Delivery confirms: reads back to none, not a lingering state.
+    // Delivery confirms: the in-flight phase is gone — no lingering `armed`,
+    // `awaiting_evidence` or `reinjecting`. #546 (option 3): what remains for
+    // the recency window is the RESOLUTION, carrying which evidence closed it.
+    // Here that is our own submit sampler, so the panel says `delivery` — the
+    // stronger of the two claims, and the one a reader must be able to tell
+    // apart from a resolution that only ever saw the agent stay alive.
     let confirmed = confirmed_delivery(&oid, FAR + 2_000);
     let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &tokens, &HashMap::new(), &confirmed);
     let s3 = reg.group_summary(&gid);
     let a3 = s3["agents"].as_array().unwrap().iter().find(|a| a["id"] == oid.as_str()).unwrap();
-    assert_eq!(a3["compaction"]["status"], "none", "confirmed and resolved — no lingering state");
+    assert_eq!(a3["compaction"]["status"], "acked", "resolved — the phase is closed, not in flight");
+    assert_eq!(a3["compaction"]["source"], "delivery", "and the panel says WHICH evidence closed it");
+    assert!(a3["compaction"]["since_ms"].as_u64().is_some(), "stamped, so the surfacing ages out");
+    assert!(a3["compaction"]["attempt"].is_null(), "no in-flight attempt survives the resolution");
 }
 
 #[test]
@@ -20003,8 +20011,12 @@ fn several_alarms_on_one_pane_cost_the_orchestrator_one_turn_not_n() {
     // thing skipped is the sleep between them.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    // The notice is a real delivery to the orchestrator, and `deliver_prompt`
+    // refuses a pane with no terminal before it audits anything — so the text
+    // this test reads back only exists once the orchestrator is bound.
+    reg.set_pty_for_test(&orch.id, 941);
 
     assert!(reg.buffer_unconfirmed_delivery(&g.id, &w.id, 7_001), "the first alarm opens the window");
     assert!(!reg.buffer_unconfirmed_delivery(&g.id, &w.id, 7_002), "a joiner must not arm a second timer");
