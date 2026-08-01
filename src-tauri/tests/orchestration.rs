@@ -66,6 +66,9 @@ use loomux_lib::orchestration::{
     PauseSuppression, SuppressedCause, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
     // #579: front-door refusals, the losses with no queue id to report them under.
     front_door_refusals, RefusedPayload, AUDIT_VIEW_LIMIT, REFUSED_LIST_MAX,
+    // #633: the reason discriminator that turned that list from a queue-full
+    // list into a refusal list.
+    RefusalReason,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -3687,6 +3690,237 @@ fn the_orphan_list_keeps_its_pre_579_shape_beside_the_refused_one() {
     assert_eq!(v["refused_count"], json!(0));
     assert_eq!(v["refused_omitted"], json!(0));
     assert_eq!(v["refused"], json!([]));
+}
+
+// ---------------------------------------------------------------------------
+// #633 — the refusals that wrote no audit line at all.
+//
+// #579/#630 could only ever surface ONE refusal reason, because one refusal
+// reason was all that wrote a record. `deliver_prompt_as` refuses two ways
+// BEFORE admission — the target is dead, the target has no terminal bound yet —
+// and both returned `Err` in silence; #615 created the second by turning a
+// silent `Ok` into a silent `Err`, which fixed the sender's contract and left
+// the log exactly as empty. A refusal with no line cannot be enumerated by the
+// refusal derivation, by the id-keyed orphan derivations, or by a human
+// grepping `audit.jsonl`: it is the #579 class exactly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_delivery_to_a_dead_agent_is_audited_and_surfaced_as_a_refusal() {
+    // The first of the two silent Errs. Before this, an orchestrator that
+    // briefed a worker whose pane had already exited got an error string and
+    // NOTHING else: no audit line, so no derivation, so no way for anyone to
+    // find out afterwards that a task brief had evaporated.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5880);
+    reg.mark_dead(&w.id, Some(0)).expect("precondition: the worker really is dead");
+
+    let brief = "task brief: rebase #641 onto main and re-run CI";
+    let err = reg.deliver_prompt(&w.id, brief, &orch.id, Delivery::MidSession).unwrap_err();
+    assert!(err.contains("is dead"), "the sender is still told synchronously: {err}");
+
+    let log = reg.audit_log(&g.id);
+    let line = log
+        .iter()
+        .find(|e| e.action == "delivery-dropped"
+            && e.detail["reason"] == json!(RefusalReason::AgentDead.as_str()))
+        .expect("the refusal must leave a record — that is the whole issue");
+    assert_eq!(line.detail["to"], json!(w.id));
+    assert_eq!(line.detail["from"], json!(orch.id), "who lost the work, not who refused it");
+    assert_eq!(line.detail["bytes"], json!(brief.len()));
+    // The line carries the payload itself, because there is no `prompt` line to
+    // pair with — `deliver_prompt` writes that one further down, AFTER this
+    // refusal has already returned.
+    assert!(
+        !log.iter().any(|e| e.action == "prompt" && e.detail["text"] == json!(brief)),
+        "a delivery to a dead pane was never offered to anything, so `prompt` must not claim it was"
+    );
+
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let v = orphans_tool(&reg, &co);
+    assert_eq!(v["count"], json!(0),
+        "nothing was queued, so neither id-keyed orphan derivation can ever see it: {v}");
+    assert_eq!(v["refused_count"], json!(1), "and it must not therefore be invisible: {v}");
+    let row = &v["refused"][0];
+    assert_eq!(row["reason"], json!("agent-dead-at-call"));
+    assert_eq!(row["text"], json!(brief), "re-sendable verbatim, off the refusal's own line");
+    assert_eq!(row["bytes"], json!(brief.len()));
+    assert_eq!(row["queue_depth"], Value::Null,
+        "no depth was measured — `0` would read as \"the pane was empty\", which nobody checked");
+    assert_eq!(row["enqueue_reason"], Value::Null, "admission was never attempted");
+    assert!(row["consequence"].as_str().unwrap_or_default().contains("re-target"),
+        "a dead target is not a re-send, and the row has to say so: {row}");
+}
+
+#[test]
+fn a_delivery_to_an_agent_with_no_terminal_is_audited_and_surfaced_as_a_refusal() {
+    // The second silent Err, and the one #615 created: a delivery landing in
+    // the spawn-to-bind window has no pane to queue against, so it is refused.
+    // That is the right answer for the sender and was, until now, no answer at
+    // all for anyone reading the log.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    assert!(reg.agent(&w.id).expect("registered").pty_id.is_none(),
+        "precondition: this test is only meaningful while the agent is unbound");
+
+    let brief = "task brief: issue #633, harden the refusal audit";
+    let err = reg.deliver_prompt(&w.id, brief, &orch.id, Delivery::MidSession).unwrap_err();
+    assert!(err.contains("no terminal yet"), "the sender is still told synchronously: {err}");
+
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let v = orphans_tool(&reg, &co);
+    assert_eq!(v["count"], json!(0));
+    assert_eq!(v["refused_count"], json!(1), "the loss is real and must be enumerable: {v}");
+    let row = &v["refused"][0];
+    assert_eq!(row["reason"], json!("no-terminal-at-call"));
+    assert_eq!(row["to"], json!(w.id));
+    assert_eq!(row["from"], json!(orch.id));
+    assert_eq!(row["text"], json!(brief));
+    assert_eq!(row["queue_depth"], Value::Null, "a queue is keyed by pane, and there was no pane");
+    // The advice differs from the dead-target case, which is the whole reason
+    // the reasons are distinct rather than one "refused" bucket: this one was
+    // simply too early and IS worth re-sending as-is.
+    assert!(row["consequence"].as_str().unwrap_or_default().contains("re-send once the pane binds"),
+        "an unbound target is a retry, not a re-target: {row}");
+}
+
+#[test]
+fn a_withdrawn_admission_is_reported_once_and_names_the_cause_that_fired() {
+    // `withdraw_unprocessable`'s undo — #630 excluded it from the refused list
+    // silently, on the argument that it is unreachable in production. #633
+    // surfaces it instead: the argument is a claim about today's startup order
+    // (`set_app`/`set_self_arc` both run in `lib.rs`'s setup block, before the
+    // MCP thread that is the only way an agent can call `deliver_prompt`) that
+    // nothing enforces, and the failure mode of it going stale is a loss
+    // nothing can enumerate.
+    //
+    // Test mode is the case that mint that line for real: a bare registry has
+    // no `AppHandle` at all.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5882u32;
+    reg.set_pty_for_test(&orch.id, pty);
+
+    let report = "report: done, PR #644 is green on all three platforms";
+    let err = reg.deliver_prompt(&orch.id, report, &w.id, Delivery::MidSession).unwrap_err();
+    assert!(err.contains("no app handle"), "the sender is told synchronously: {err}");
+    assert_eq!(reg.queue_depth(pty), 0, "the admission was withdrawn, not left to strand");
+
+    let line = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "delivery-dropped"
+            && e.detail["reason"] == json!(RefusalReason::NoAppHandle.as_str()))
+        .expect("the withdrawal is audited");
+    assert!(line.detail["id"].as_u64().is_some(),
+        "this refusal DID mint an id, and the line has to carry it: that is what closes the id \
+         for `queue::orphaned_queue_entries` and keeps one loss to one row");
+    // #633 added the fields that make the row actionable — pre-#633 the line was
+    // `{id, reason}` and named neither the target, the sender, nor the size.
+    assert_eq!(line.detail["to"], json!(orch.id));
+    assert_eq!(line.detail["from"], json!(w.id));
+    assert_eq!(line.detail["bytes"], json!(report.len()));
+
+    let co = reg.resolve_token(&orch.token).unwrap();
+    let v = orphans_tool(&reg, &co);
+    assert_eq!(v["count"], json!(0),
+        "the withdrawal's own line closed the id, so it is NOT also an orphan: {v}");
+    assert_eq!(v["refused_count"], json!(1));
+    let row = &v["refused"][0];
+    assert_eq!(row["reason"], json!("no-app-handle"));
+    assert_eq!(row["text"], json!(report),
+        "recovered by #579's verified pairing — this path DOES write a `prompt` line first");
+    assert_eq!(row["queue_depth"], Value::Null, "the depth is not what refused this one");
+    assert!(row["consequence"].as_str().unwrap_or_default().contains("withdrawn"),
+        "the reader has to know nothing is left queued: {row}");
+}
+
+#[test]
+fn a_dropped_reason_the_refusal_list_does_not_model_is_never_folded_into_it() {
+    // The filter is an ENUMERATION over `RefusalReason`, not a widening to
+    // "anything dropped-ish". `delivery-dropped` is also written for whole-queue
+    // drops (`agent-died`, `queue-full`), and each of those carries an `id` that
+    // the orphan derivations already report — listing them here too would show
+    // one loss twice in a tool result whose documented response is "re-send",
+    // i.e. a duplicate-delivery generator. An unmodelled reason from a future
+    // build is skipped by the same rule rather than guessed at.
+    let dropped = |reason: &str| AuditEntry {
+        ts_ms: 1_000,
+        actor: "loomux".into(),
+        action: "delivery-dropped".into(),
+        detail: json!({ "id": 7, "to": "w-1", "reason": reason }),
+    };
+    let r = front_door_refusals(
+        &[dropped("agent-died"), dropped("queue-full"), dropped("a-reason-from-a-later-build")],
+        false,
+    );
+    assert_eq!(r.total, 0, "none of these are front-door refusals: {:?}", r.items);
+
+    // ...and a modelled one sitting in the same timeline still lands, so this is
+    // a property of the filter rather than of an empty input.
+    let r = front_door_refusals(
+        &[dropped("agent-died"), refusal_line(2_000, "w-1", "orch-1", "a real loss", "arrival")],
+        false,
+    );
+    assert_eq!(r.total, 1);
+    assert_eq!(r.items[0].reason, RefusalReason::QueueFull);
+    assert_eq!(r.items[0].depth, Some(queue::QUEUE_MAX_PER_PANE),
+        "the one reason that DID measure a depth still reports it");
+}
+
+#[test]
+fn a_missed_withdrawal_stays_an_orphan_and_is_never_listed_as_a_refusal() {
+    // `withdraw_unprocessable`'s pop is conditional — the id may no longer be
+    // the front of the queue — and that branch used to write nothing at all,
+    // leaving a sender told "failed" while its payload sat queued, with no line
+    // joining the two.
+    //
+    // It now writes `delivery-withdraw-missed`, and the action is the load-
+    // bearing part: `queue::orphaned_queue_entries` CLOSES an id on
+    // `delivery-dropped`, so reusing that action here would tell the orphan
+    // derivation a still-queued entry had been resolved — turning a silent gap
+    // into a false all-clear, which is strictly worse. The entry stays an
+    // orphan (correctly: it is still there) and the refusal list skips it, so
+    // the one-loss-one-row rule holds from both sides.
+    let (reg, d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let queued = AuditEntry {
+        ts_ms: 1_000,
+        actor: "loomux".into(),
+        action: "delivery-queued".into(),
+        detail: json!({ "to": &orch.id, "id": 7, "reason": "arrival", "depth": 1 }),
+    };
+    let missed = AuditEntry {
+        ts_ms: 1_001,
+        actor: "loomux".into(),
+        action: "delivery-withdraw-missed".into(),
+        detail: json!({
+            "queued_id": 7, "to": &orch.id, "from": "w-1",
+            "reason": RefusalReason::NoAppHandle.as_str(), "pty": 5883,
+        }),
+    };
+    fs::write(
+        d.path().join(&g.id).join("audit.jsonl"),
+        [audit_jsonl_line(&queued), audit_jsonl_line(&missed)].join("\n") + "\n",
+    )
+    .unwrap();
+
+    let v = orphans_tool(&reg, &co);
+    assert_eq!(v["count"], json!(1),
+        "the entry is still queued, so the id-keyed derivation must keep reporting it: {v}");
+    assert_eq!(v["orphans"][0]["id"], json!(7));
+    assert_eq!(v["refused_count"], json!(0),
+        "and it must NOT also be listed as a refusal — one loss, one row: {v}");
 }
 
 #[test]
@@ -20990,11 +21224,27 @@ fn an_undeliverable_notice_is_never_reported_as_a_front_door_refusal() {
     // dropped-ish line" would silently swallow this one.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let _orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 5915u32;
     let bound = QUESTION_HOLD_STALE_AFTER.as_millis() as u64;
     let t0 = 8_000_000u64;
+
+    // #633: the escalation below delivers its notice TO THE ORCHESTRATOR, so
+    // that pane has to be able to take one or the fixture generates a refusal
+    // of its own — a real one, correctly reported, and nothing to do with what
+    // this test is about. Pre-#633 an orchestrator with no pane swallowed that
+    // notice in silence, which is exactly the loss #633 made visible; the
+    // assertion below stayed at `total == 0` rather than being widened to
+    // tolerate it, because the incidental refusal is a fixture gap and not the
+    // property under test. A pane plus one entry already queued is what makes
+    // the notice land: the admission is not `was_first`, so it needs no app
+    // handle to be accepted (test mode has none, and an empty-queue admission
+    // would be withdrawn as `no-app-handle` instead).
+    let orch_pty = 5916u32;
+    reg.set_pty_for_test(&orch.id, orch_pty);
+    reg.enqueue_text(&g.id, &orch.id, "loomux", "already queued for the orchestrator", orch_pty,
+        queue::EnqueueReason::Arrival).unwrap();
 
     reg.enqueue_text(&g.id, &w.id, "loomux", &notify::watch_conflicting_notice("watch-4", 577),
         pty, queue::EnqueueReason::Arrival).unwrap();

@@ -6735,26 +6735,26 @@ its box. "Re-send it" is the wrong instruction there, so the row carries the aud
 Reporting only the prompt case would have made the list's own claim false, which is the failure mode
 a partial list presented as complete always is.
 
-**What this list still does NOT cover — enumerated and filed, not closed (#633, review NB2).** The
-claim `refused` makes is exactly "every writer of `delivery-dropped` with `reason:
+**What this list did NOT cover as #630 shipped it — enumerated then, closed by #633.** The claim
+`refused` made was exactly "every writer of `delivery-dropped` with `reason:
 "queue-full-at-call"`", which is the two sites above — *not* "every way a delivery can fail to
-arrive with nobody told." Three paths remain invisible to every derivation, and naming them is what
-keeps the claim above from quietly widening into the "surfaced, never silently dropped" overclaim
-#445's own history is about:
+arrive with nobody told." Three paths were invisible to every derivation, and naming them was what
+kept that claim from quietly widening into the "surfaced, never silently dropped" overclaim #445's
+own history is about:
 
-- `deliver_prompt`'s **`agent … is dead`** and **`agent has no terminal yet`** refusals, which write
-  no audit line at all — so nothing downstream can surface them, however good the derivation. The
+- `deliver_prompt`'s **`agent … is dead`** and **`agent has no terminal yet`** refusals, which wrote
+  no audit line at all — so nothing downstream could surface them, however good the derivation. The
   second is #615's own residue: it turned a silent `Ok` into a silent `Err`.
-- `withdraw_unprocessable`'s **`no-app-handle`** drop, which *is* audited — and is therefore the one
-  audited drop reason this scan's `reason == "queue-full-at-call"` filter passes over in silence.
-  Documented unreachable in production (`self.app` is set once at startup), which is why it is an
-  exclusion rather than a bug, but an unstated exclusion is the thing this section is about, so the
-  filter itself now says so in a comment.
+- `withdraw_unprocessable`'s **`no-app-handle`** drop, which *is* audited — and was therefore the
+  one audited drop reason this scan's `reason == "queue-full-at-call"` filter passed over in
+  silence, on the argument that it is unreachable in production (`self.app` is set once at startup).
 
-#633 owns both halves: audit-line every `deliver_prompt` refusal path with its own reason string,
-and then decide whether `no-app-handle` should surface here or stay excluded with the reason in
-writing. Until then the honest statement of what an orchestrator gets from `refused` is: every
-delivery this build refused **at the queue cap**, bounded by the two caps above.
+**"Every refusal, not just the capped one (#633)", below, closes all three** — each refusal now
+writes its own reason and the filter enumerates them — so the honest statement of what an
+orchestrator gets from `refused` is no longer "every delivery refused **at the queue cap**" but
+every delivery `deliver_prompt` refused for any reason, bounded by the two caps above. Read that
+subsection for the reason set and for why the no-app-handle drop was decided IN rather than left
+excluded.
 
 **#578/#624's parked orchestrator notices are OUT, decided rather than inherited.** #624 landed a
 notice channel for the orchestrator's own pane while this was in review: a queue notice whose target
@@ -6791,6 +6791,115 @@ single best-effort delivery into the very pane that was full; this list is a dur
 derivation. The row's `enqueue_reason` (`group-paused`) is what tells a reader the two are describing
 one event, and the duplication is worth it in the direction it runs: a notice that never landed is
 exactly the case #579 exists for.
+
+### Every refusal, not just the capped one (#633)
+
+**The list above could only surface one reason, because one reason was all that wrote a line.**
+`front_door_refusals` scanned for `delivery-dropped` with `reason: "queue-full-at-call"`, which was
+not a narrow filter — it was the complete set of refusals that left any record at all.
+`deliver_prompt_as` refuses two other ways, both BEFORE admission, and both returned `Err` in
+silence: the target agent's status is `Dead`, and the target agent has no `pty_id` bound yet. The
+second was *created* by #569/#615, which replaced a silent `Ok` — a payload discarded while its
+sender was told it succeeded — with a silent `Err`. That was a strict improvement for the sender and
+no improvement at all for anyone reading the log afterwards, because a refusal with no audit line
+cannot be surfaced by this derivation, by the id-keyed orphan derivations, or by a human grepping
+`audit.jsonl`. It is the #579 class exactly: *a refusal that leaves no record can never be surfaced
+by anything.*
+
+**Reasons are typed, because each one is a different instruction.** `RefusalReason` (`mod.rs`) is
+the discriminator: `queue-full-at-call` (the pane is alive and busy — worth re-sending once it
+drains), `agent-dead-at-call` (that pane will never take it — re-target or drop as stale, do NOT
+re-send as-is), `no-terminal-at-call` (it was simply too early — re-send now that the pane has
+bound), and `no-app-handle`/`registry-not-shared` (loomux itself could not process the queue —
+report it, it should not happen in a running build). Collapsing them into one "refused" bucket
+would have made the list enumerable and still not actionable, which is the shape #579 rejected for
+orphans and would have re-introduced here. The filter is now a match over that enum via
+`RefusalReason::from_audit`, so what it *excludes* is enumerated rather than implied: `agent-died`
+and `queue-full` (whole-queue drops) carry an `id` and are already reported by the orphan
+derivations, and an unmodelled reason from a future build is skipped by the same rule rather than
+folded into a list whose documented response is "re-send".
+
+**One refusal is deliberately NOT in that set, and the set is not a complete enumeration of
+`deliver_prompt`'s failures without saying so.** `unknown agent` — the caller named an id that does
+not exist — stays unaudited *structurally*, not by oversight: `audit` writes into a **group's** log,
+`deliver_prompt` is keyed by agent id alone, and an agent that does not exist has no group to file
+the line under. Writing it to a "no group" bucket or to the caller's own group would put a record
+where nothing reads and no derivation scopes. It is also the one refusal that loses nothing an
+operator could act on — no pane, no session, no payload owner to re-target to, only a caller that
+named a nonexistent id, and that caller is told synchronously. Recorded here because a reason set
+presented without its exception reads as the complete list of ways a delivery can be refused, which
+is the implied-complete enumeration this whole section exists to stop (#633 review NB1).
+
+**`queue_depth` and `enqueue_reason` became nullable, and that is the honest shape.** Neither
+pre-admission refusal reached the queue, so there is no depth to report. Reporting `0` would be a
+measurement nobody took, presented as one saying the pane was empty — the "a claim is a
+deliverable" defect in wire form, and the same argument that rejected a synthetic orphan id in
+#579. `null` there means "not measured", and `queue_orphans`' description says so in those words.
+
+**Where the payload comes from differs by reason, and it has to.** #579 recovers a refused payload
+by pairing the refusal with the delivery's own `prompt` audit line, verified on two fingerprints.
+That works for `queue-full-at-call` and for the withdrawal reasons because `deliver_prompt` has
+already written that line by the time either fires. The two pre-admission refusals happen *before*
+it, so they carry their own `text` inline and the derivation reads it verbatim — same line, same
+write, no join to get wrong and so nothing to verify against. **Moving the `prompt` write above
+those refusals was considered and rejected**: `prompt` is what the whole backend suite (and
+`delivered_texts`) reads as "this payload was offered to a pane", and a delivery to a dead agent
+was never offered to anything. Widening it would have made every such refusal look like an
+attempted delivery in the audit viewer and in dozens of existing assertions — a much larger and
+much less honest change than one extra field on a line that is written only when something is
+actually lost.
+
+**The no-app-handle drop is SURFACED, not excluded — reversing #630's provisional call.**
+`withdraw_unprocessable` undoes an admission that has nothing to drain it, and #630 skipped it here
+on the argument that it is unreachable in production: `set_app` and `set_self_arc` both run in
+`lib.rs`'s `setup` block, before the `mcp::serve` thread that is the only way an agent can call
+`deliver_prompt` at all. That argument is *true today* and it is still the wrong basis for silence.
+Two things decided it:
+
+- **Once the list is reason-discriminated, the exclusion buys nothing.** It is one arm of a match
+  that already exists. #630 was weighing it against a list that could only be about queue depth.
+- **"Unreachable in production" is a claim about startup order that nothing enforces**, and the
+  failure mode of it going stale is precisely the class this lineage is closing — a loss nothing
+  can enumerate. Surfacing it means a broken assumption arrives as a row, not as silence. The
+  tool description tells the reader to treat one as a loomux defect rather than as a payload to
+  re-send, which is the honest instruction for a row that should not exist.
+
+It cannot double-report: the withdrawal's line carries the `id`, which CLOSES that id for
+`queue::orphaned_queue_entries`, so the entry has already left the orphan derivation by the time it
+appears here. One loss, one row — the same rule the `recovered` exclusion enforces from the other
+side.
+
+**Two smaller corrections in the same seam.** Both `withdraw_unprocessable` call sites used to
+withdraw under the reason `no-app-handle`, so the registry-not-shared arm wrote a line naming a
+cause that had not fired (an app handle plainly existed — that arm sits *below* the one that
+unwrapped it). Each now carries its own reason. And the withdrawal's pop is conditional — the id
+may no longer be at the front — where the `else` branch wrote nothing at all, leaving a sender told
+"failed" while its payload sat queued and no line joining the two. It now writes
+`delivery-withdraw-missed`, and the **action is the load-bearing part**: `orphaned_queue_entries`
+closes an id on `delivery-dropped`, so reusing that action would have told the orphan derivation
+that a still-queued entry was resolved — a silent gap upgraded into a false all-clear. The entry
+stays an orphan (correctly — it is still there) and `front_door_refusals` skips it for the same
+one-loss-one-row reason.
+
+**Boundary with #636, which is sharper than "they don't overlap".** #636 (#590 layer 2) is about a
+delivery that IS queued and cannot be *typed* — a pane holding a `[loomux]` notice while mid-turn.
+Its subject always has a live queue id and belongs to the hold-episode and orphan machinery; a
+payload can be refused (no id, this list) or held (id, that one), never both, so **the held payload
+cannot appear in both lists**.
+
+What that formulation misses, and what landing the two together actually surfaced: #636's
+escalation *notice* — the one that reports the held delivery — is itself a delivery, and it can be
+refused like any other. Those are two different events about one situation, and both being visible
+is correct rather than a double-report: the held payload is reported by #636 (still queued, will
+land), and a refused notice ABOUT it is reported here (never queued, lost). `notice-undeliverable`
+is a different audit action from `delivery-dropped`, so the derivation keeps them apart
+structurally, which is what `an_undeliverable_notice_is_never_reported_as_a_front_door_refusal`
+pins from #636's side. That test needed its fixture — not its assertion — corrected when #633
+landed: it left the orchestrator with no pane, so the escalation notice to that pane was genuinely
+refused, and pre-#633 that loss was simply invisible.
+
+#638 (#632) is about the row markers on loomux-authored notice *text* and touches no
+delivery-outcome record at all. Neither sibling overlaps the reason set above.
 
 ### Coalesced flush: one drain pass, one prompt (#533-A)
 
