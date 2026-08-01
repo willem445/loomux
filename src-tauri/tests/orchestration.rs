@@ -6030,9 +6030,17 @@ fn a_workflow_file_cannot_declare_a_reviewer_on_an_uncontainable_cli() {
     )
     .expect_err("a codex reviewer must not parse");
     let joined = errs.join("\n");
+    assert!(joined.contains("rev-codex"), "the finding must name the offending block: {joined}");
+    // Naming the block is not enough to prove the *containment* gate fired —
+    // `codex` is also outside `SUPPORTED_CLIS`, so a generic "unknown cli"
+    // rejection would satisfy the line above while the gate did nothing. The
+    // reason has to be the reason: the parser checks containment FIRST for
+    // exactly this, so a CLI loomux has evaluated is told what it is missing
+    // rather than that it does not exist.
     assert!(
-        joined.contains("rev-codex"),
-        "the finding must name the offending block: {joined}"
+        joined.contains("containment"),
+        "the parser must refuse this pairing for its containment gap, not merely as an \
+         unknown CLI — otherwise this test passes with the gate removed: {joined}"
     );
 }
 
