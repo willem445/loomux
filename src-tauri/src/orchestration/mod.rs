@@ -3090,7 +3090,140 @@ pub const COPILOT_GROUP_AUTOPILOT_FLAGS: &str = "--autopilot --allow-all-tools -
 /// git + gh pre-approval appended to Claude's `--allowedTools` for an unattended
 /// agent, so the branch→commit→PR flow runs without prompts. `Bash(git *)`
 /// matches every git subcommand; a planner's denials carve commit/push back out.
+///
+/// **#610 — this must stay CONTIGUOUS with the `--allowedTools` flag.** Per the
+/// official [CLI reference](https://code.claude.com/docs/en/cli-reference),
+/// `--allowedTools` takes space-separated values in one occurrence (the page's
+/// own example: `"Bash(git log *)" "Bash(git diff *)" "Read"`), so a value list
+/// ends at the next flag. #417 inserted `--settings` between `mcp__loomux` and
+/// these patterns, which silently demoted them from allow rules to stray
+/// positional arguments on every real spawn. Pinned by
+/// `claude_allow_patterns_are_not_severed_from_the_allowedtools_flag`.
 pub const CLAUDE_UNATTENDED_ALLOW: &str = "\"Bash(git *)\" \"Bash(gh *)\"";
+
+/// #610: the `permissions.allow` rules loomux writes into a **read-only**
+/// (`dontAsk`) Claude pane's `--settings` file — the surface `dontAsk` is
+/// *documented* against, per the
+/// [permission modes reference](https://code.claude.com/docs/en/permission-modes)
+/// ("Allow only pre-approved tools with dontAsk mode", verified 2026-08-01):
+/// "Claude runs only actions matching your `permissions.allow` rules,
+/// [read-only Bash commands], and calls approved by a PreToolUse hook."
+///
+/// **Why a settings layer at all, when `--allowedTools` is now emitted
+/// correctly?** Because argv is not the surface the mode's contract names. The
+/// #610 outage was a *flag-ordering* defect and the ordering fix above is what
+/// repairs it, but nothing in Claude Code's docs states that `--allowedTools`
+/// values become `permissions.allow` rules — only this settings key is
+/// documented to be what `dontAsk` consults. Writing the rules where the
+/// contract points them costs one JSON key and makes the planner's capability
+/// independent of a parse detail that has already broken once.
+///
+/// **Additive, not a merge loomux performs.** Per the
+/// [settings reference](https://code.claude.com/docs/en/settings), permission
+/// rules "merge across scopes rather than override" — so this layer never
+/// displaces the user's own `.claude/settings.json` allow/deny rules, and a
+/// user `deny` still beats every allow here (deny rules "apply to every tool"
+/// in every mode, per the permission-modes reference). That merge statement is
+/// the one doc-grounded assumption this list rests on; loomux never parses or
+/// rewrites the user's settings to achieve it.
+///
+/// **The entries, and why each is here:**
+/// - `mcp__loomux` — `report`/`message_orchestrator`; the planner's only way
+///   to answer the orchestrator at all. (The documented form: per the
+///   permissions reference, `mcp__<server>` "matches any tool provided by" that
+///   server.)
+/// - `Bash(git *)` — read-only exploration **and `git fetch`**, which needs no
+///   rule of its own: it is a git subcommand, so this pattern covers it, and
+///   [`CLAUDE_READONLY_DENY_GIT`] carves out only `commit`/`push` (deny beats
+///   allow). `git fetch` writes nothing but local remote-tracking refs and
+///   mutates no remote, which is why it is not in the deny list — it was denied
+///   before #610 only because the whole allow list never reached the CLI.
+/// - `Bash(gh *)` — `gh issue view` to read its brief, `gh issue comment` to
+///   post its plan: the planner's entire deliverable.
+/// - `WebFetch` / `WebSearch` — the decision #610 asked for, made rather than
+///   deferred. A planner's job is to ground a plan, and this repo's own
+///   `agent-cli-reference` skill *requires* reading a vendor's official
+///   reference before designing anything that depends on a CLI's behavior.
+///   `gh api` reaches GitHub and nothing else; `curl` is not in Claude's
+///   built-in read-only Bash set. Without these two a planner researches from
+///   recall, which the #465 design note already recorded as a real, silent loss
+///   of grounding. Both tools are non-mutating, and the read-only tier's
+///   guarantee is about *mutation* — they take nothing away from it.
+///
+///   These two are **bare grants, honestly**: the permissions reference states
+///   `WebFetch(domain:*)` "matches every domain and is equivalent to a bare
+///   `WebFetch` rule", so a scoped-looking spelling would be decoration, not a
+///   narrowing — and loomux is a generic product (constraint #8) that cannot
+///   know which domains a given repo's planner needs. The residual is stated
+///   rather than hidden: an arbitrary-host fetch is both an injection surface
+///   and a data-egress channel. The escape hatch is real and needs no loomux
+///   feature — a `WebFetch` (or `WebFetch(domain:...)`) **deny** rule in the
+///   target repo's own `.claude/settings.json` beats any allow rule here, in
+///   every mode.
+///
+/// **`Bash(git *)` is a prefix pattern, so it positively matches `git commit`
+/// and `git push` — what carves them back out, and why that is now cited
+/// rather than assumed (#614 review B1).** Before this list existed, the
+/// carve-out was `--disallowedTools "Bash(git commit *)" "Bash(git push *)"`
+/// alone, i.e. an *argv* deny expected to beat a *settings-file* allow. That is
+/// exactly the kind of cross-mechanism equivalence the paragraph above refuses
+/// to assume for allows, and it would have been inconsistent to assume it for
+/// denies. It is not an assumption: the
+/// [permissions reference](https://code.claude.com/docs/en/permissions) settles
+/// it twice, and both quotes are verbatim (fetched 2026-08-01).
+///
+/// First, the flags are in the same precedence domain as settings rules — its
+/// "Settings precedence" section opens "Permission rules follow the same
+/// settings precedence as all other Claude Code settings", lists **"Command
+/// line arguments: temporary session overrides"** as level 2, and names these
+/// exact flags in it: "If a tool is denied at any level, no other level can
+/// allow it. For example, a managed settings deny can't be overridden by
+/// `--allowedTools`, and `--disallowedTools` can add restrictions beyond what
+/// managed settings define." Second, within any level deny wins outright:
+/// "Rules are evaluated in order: deny, then ask, then allow. The first match
+/// in that order determines the outcome, and rule specificity doesn't change
+/// the order", and "deny rules from any scope are evaluated before allow
+/// rules".
+///
+/// So `--disallowedTools` beating this list is documented, not inherited from a
+/// comment written when both flags lived on argv. `readonly_settings_deny`
+/// writes the same denials into this same `permissions` object anyway — belt
+/// and braces, the identical stance this constant takes toward
+/// `--allowedTools`, and it removes even the cross-layer question by putting
+/// the allow and the deny that must beat it in one object.
+///
+/// `readonly_pane_settings_carry_permissions_allow` pins the list, including
+/// #465's no-bare-mutation-grant invariant restated for this layer: nothing but
+/// `mcp__loomux`, a scoped `Name(...)` pattern, or one of the two enumerated
+/// research tools may ever appear here.
+pub const CLAUDE_READONLY_SETTINGS_ALLOW: &[&str] =
+    &["mcp__loomux", "Bash(git *)", "Bash(gh *)", "WebFetch", "WebSearch"];
+
+/// The `permissions.deny` rules that ride the same `--settings` object as
+/// [`CLAUDE_READONLY_SETTINGS_ALLOW`] (#614 review B1) — **derived from the
+/// same two predicates `build_agent_command` uses for `--disallowedTools`, not
+/// a third literal list**, so the two layers cannot drift and a new
+/// [`Containment`] tier changes both at once or neither.
+///
+/// Today only a read-only pane gets a `permissions` block at all, and a
+/// read-only pane satisfies both predicates — so in practice this returns both
+/// lists. Expressing it as the predicates rather than as a flat concatenation
+/// is the point: it states *which tier earns which denial*, which is the thing
+/// a future tier would get wrong.
+///
+/// Returns an empty vec for a tier with nothing to deny; the caller writes no
+/// `deny` key at all in that case, for the same reason it writes no empty
+/// `hooks` key (see `write_hook_settings_file`).
+fn readonly_settings_deny(containment: Containment) -> Vec<&'static str> {
+    let mut deny: Vec<&'static str> = Vec::new();
+    if containment.denies_edits() {
+        deny.extend_from_slice(CLAUDE_EDIT_DENY_TOOLS);
+    }
+    if containment.denies_git_mutation() {
+        deny.extend_from_slice(CLAUDE_READONLY_DENY_GIT);
+    }
+    deny
+}
 
 /// Claude Code tool names Claude Code's own permission engine recognizes, per
 /// the official [Tools reference](https://code.claude.com/docs/en/tools-reference)
@@ -18937,6 +19070,18 @@ impl OrchRegistry {
             let token = new_token();
             let cfg = self.write_mcp_config(SOLO_GROUP, &agent_id, &token, cli)?;
             let args = match cli {
+                // Every join site APPENDS this string (`launcher.ts`,
+                // `panerestore.ts`, `sessions.rs`), so on an autopilot solo
+                // launch the line ends up with TWO `--allowedTools`
+                // occurrences: `single_pane_autopilot_flags`' git/gh pair and
+                // this one. That is NOT #610's defect — nothing splices into
+                // either value list, so each stays contiguous — and it is
+                // harmless because such a pane runs `--permission-mode auto`,
+                // which approves git/gh without consulting an allow list at
+                // all. Whether repeated occurrences accumulate or last-wins is
+                // undocumented and deliberately NOT relied on here; if a solo
+                // pane ever needs an allow list to be honoured (a read-only
+                // solo tier, say), merge the two into one occurrence first.
                 "claude" => format!(
                     "--mcp-config \"{}\" --strict-mcp-config --allowedTools mcp__loomux",
                     cfg.display()
@@ -24737,18 +24882,79 @@ impl OrchRegistry {
     }
 
     /// Claude's `--settings` file (#417, split from `--mcp-config`'s file per
-    /// rev-4 review N2 — see `write_mcp_config`'s doc): just the `hooks` key,
-    /// nothing shared with the MCP config's schema. `None` when
-    /// `compact_hook_settings` has nothing to write (no `sh` resolvable) —
-    /// the caller then omits `--settings` entirely rather than writing an
-    /// empty file no flag points at.
-    fn write_hook_settings_file(&self, group: &str, agent_id: &str) -> Option<PathBuf> {
-        let hooks = self.compact_hook_settings(group, agent_id)?;
-        let cfg = json!({ "hooks": hooks });
+    /// rev-4 review N2 — see `write_mcp_config`'s doc): nothing shared with the
+    /// MCP config's schema. Two independent keys, each written only when this
+    /// agent actually has one:
+    ///
+    /// - `hooks` — the #417/#112 compact-lifecycle config, absent when
+    ///   `compact_hook_settings` has nothing to write (no `sh` resolvable).
+    /// - `permissions` — #610, for a [`Containment::is_read_only`] pane only:
+    ///   [`CLAUDE_READONLY_SETTINGS_ALLOW`] under `allow` (the surface `dontAsk`
+    ///   is documented to consult — see that constant for the full argument and
+    ///   the WebFetch/`git fetch` decisions) and, since #614's review, the
+    ///   matching `deny` from `readonly_settings_deny` so the rule that must
+    ///   beat `Bash(git *)`'s prefix match sits in the same object as the allow
+    ///   itself.
+    ///
+    /// **The name is now imprecise, deliberately** (same reasoning as
+    /// `COMPACT_HOOK_SCRIPT`'s "Naming, kept imprecise on purpose"): this
+    /// function and its `{agent_id}-hooks.json` output can carry a `permissions`
+    /// block and no hooks at all. Renaming would strand every already-spawned
+    /// agent whose `--settings` argv bakes in the old path, which is a worse
+    /// trade than an imprecise name one comment can fix.
+    ///
+    /// **The `None` policy changed with #610, and only for hooks.** This used
+    /// to return `None` whenever hooks were unavailable, and the caller then
+    /// omitted `--settings` entirely. Fail-open is right for a hook (the cost
+    /// is a missed compact nudge) and wrong for permissions: a `dontAsk` pane
+    /// with no allow rules can do nothing at all, so a read-only pane now
+    /// always gets a file. `None` survives for the case that is still genuinely
+    /// empty — a non-read-only agent with no hooks — because pointing
+    /// `--settings` at an empty object would be a flag with no content.
+    ///
+    /// Keys that would be empty are OMITTED rather than written as `{}`:
+    /// `--settings` values "override the same keys in your `settings.json`
+    /// files for this session" per the CLI reference, so an empty `hooks` key
+    /// is not an inert placeholder — it is a claim about hooks that could
+    /// displace the user's own.
+    fn write_hook_settings_file(
+        &self,
+        group: &str,
+        agent_id: &str,
+        containment: Containment,
+    ) -> Option<PathBuf> {
+        let hooks = self.compact_hook_settings(group, agent_id);
+        let permissions = containment.is_read_only().then(|| {
+            let mut p = serde_json::Map::new();
+            p.insert("allow".into(), json!(CLAUDE_READONLY_SETTINGS_ALLOW));
+            // #614 review B1: the denials ride the SAME object as the allow
+            // they have to beat, so `Bash(git *)`'s prefix match over
+            // `git commit`/`git push` is carved out inside one documented
+            // precedence domain ("Rules are evaluated in order: deny, then
+            // ask, then allow") instead of across two mechanisms.
+            // `--disallowedTools` stays emitted too — see
+            // `CLAUDE_READONLY_SETTINGS_ALLOW`'s doc for the citation that
+            // makes the cross-layer direction sound as well.
+            let deny = readonly_settings_deny(containment);
+            if !deny.is_empty() {
+                p.insert("deny".into(), json!(deny));
+            }
+            Value::Object(p)
+        });
+        if hooks.is_none() && permissions.is_none() {
+            return None;
+        }
+        let mut cfg = serde_json::Map::new();
+        if let Some(hooks) = hooks {
+            cfg.insert("hooks".into(), hooks);
+        }
+        if let Some(permissions) = permissions {
+            cfg.insert("permissions".into(), permissions);
+        }
         let dir = self.group_dir(group).join("configs");
         fs::create_dir_all(&dir).ok()?;
         let path = dir.join(format!("{agent_id}-hooks.json"));
-        fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).ok()?;
+        fs::write(&path, serde_json::to_string_pretty(&Value::Object(cfg)).unwrap()).ok()?;
         Some(path)
     }
 
@@ -25464,9 +25670,20 @@ impl OrchRegistry {
     /// a group with no `.loomux/workflow.yml` byte-for-byte identical to
     /// pre-#222 loomux (pinned by `default_roster_command_lines_match_legacy`).
     ///
-    /// Ordering matters and is not cosmetic: `extra_allow` must be emitted while
-    /// `--allowedTools` is still the open list, i.e. *before* `--disallowedTools`
-    /// — otherwise the allow patterns would be parsed as *denials*.
+    /// Ordering matters and is not cosmetic, in BOTH directions (#610). Claude's
+    /// `--allowedTools` takes space-separated values in one occurrence, so its
+    /// value list runs from the flag to the next flag — and every allow pattern
+    /// must sit inside it:
+    /// - *After the flag's first value, before any other flag.* A flag emitted
+    ///   mid-list ends it, demoting every pattern after it to a stray positional
+    ///   argument. `--settings` (#417) did exactly that to the whole git/gh
+    ///   allowlist, silently, from the release that added it (#610).
+    /// - *Before `--disallowedTools`* — otherwise the same patterns would be
+    ///   parsed as *denials*.
+    ///
+    /// So a new flag added to the claude branch goes after the allow values, not
+    /// between them and their flag. `claude_allow_patterns_are_not_severed_from_
+    /// the_allowedtools_flag` pins the property rather than the current order.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_command(
@@ -25479,7 +25696,8 @@ impl OrchRegistry {
         // output, a SEPARATE file from `cfg` (rev-4 review N2: one file
         // serving both `--mcp-config` and `--settings` is a schema-drift
         // time bomb — see `write_mcp_config`'s doc). `None` omits
-        // `--settings` entirely (no hooks configured, or a non-Claude CLI).
+        // `--settings` entirely (a non-Claude CLI, or an agent with neither
+        // hooks nor a permissions block — #610).
         hook_settings: Option<&Path>,
         group_dir: &Path,
         workdir: &Path,
@@ -25602,14 +25820,6 @@ impl OrchRegistry {
                     cfg.display(),
                     group_dir.display()
                 );
-                // #417: Claude Code's own ADDITIVE settings layer — never
-                // clobbers the user's own `.claude/settings.json` hooks.
-                // Omitted entirely (not pointed at an empty file) when this
-                // agent has no hook config (a non-Claude CLI, or no `sh`
-                // resolvable — see `write_hook_settings_file`).
-                if let Some(hs) = hook_settings {
-                    cmd.push_str(&format!(" --settings \"{}\"", hs.display()));
-                }
                 if unattended {
                     // Pre-approve git + gh so the unattended flow runs without
                     // prompts (workers: branch→commit→PR; planners: read-only
@@ -25635,6 +25845,24 @@ impl OrchRegistry {
                 // enforced; it is simply never handed anything to iterate.
                 for pat in &persona.extra_allow {
                     cmd.push_str(&format!(" \"{pat}\""));
+                }
+                // #417: Claude Code's own ADDITIVE settings layer — never
+                // clobbers the user's own `.claude/settings.json` (hooks, and
+                // since #610 the read-only pane's `permissions.allow`).
+                // Omitted entirely (not pointed at an empty file) when this
+                // agent has nothing to put in one — see
+                // `write_hook_settings_file`.
+                //
+                // **Emitted HERE, after the last `--allowedTools` value, not
+                // before the first (#610).** A space-separated value list ends
+                // at the next flag, so a `--settings` sitting mid-list demoted
+                // every pattern after it to a stray positional argument: the
+                // whole git/gh allowlist on every real spawn, invisible under
+                // `auto`/`acceptEdits` and total under `dontAsk`. Any new flag
+                // added to this branch belongs below this line too, never
+                // between `--allowedTools` and its values.
+                if let Some(hs) = hook_settings {
+                    cmd.push_str(&format!(" --settings \"{}\"", hs.display()));
                 }
                 if containment.denies_edits() {
                     // Deny the file-editing tools — and, for a ReadOnly class,
@@ -25811,12 +26039,6 @@ impl OrchRegistry {
                 a.push(group_dir.display().to_string());
                 push(&mut a, "--allowedTools");
                 push(&mut a, "mcp__loomux");
-                // #417: a SEPARATE file from --mcp-config's (rev-4 review
-                // N2) — omitted entirely when this agent has no hook config.
-                if let Some(hs) = hook_settings {
-                    push(&mut a, "--settings");
-                    a.push(hs.display().to_string());
-                }
                 if unattended {
                     // == CLAUDE_UNATTENDED_ALLOW, as literal (unquoted) tokens.
                     push(&mut a, "Bash(git *)");
@@ -25825,6 +26047,14 @@ impl OrchRegistry {
                 // Still inside --allowedTools' value list — before the deny list.
                 for pat in &persona.extra_allow {
                     push(&mut a, pat);
+                }
+                // #417: a SEPARATE file from --mcp-config's (rev-4 review
+                // N2) — omitted entirely when this agent has nothing to put in
+                // one. After the allow values, never before them: see the
+                // string form's comment for the #610 defect that ordering fixes.
+                if let Some(hs) = hook_settings {
+                    push(&mut a, "--settings");
+                    a.push(hs.display().to_string());
                 }
                 if containment.denies_edits() {
                     push(&mut a, "--disallowedTools");
@@ -26116,8 +26346,9 @@ impl OrchRegistry {
         // rides a per-agent `--settings` file, so this is `None` for every
         // other CLI (Copilot's own hook wiring, below, needs no launch flag
         // at all — see `ensure_copilot_compact_hook`'s doc).
-        let hook_settings =
-            (cli == "claude").then(|| self.write_hook_settings_file(group_id, &agent_id)).flatten();
+        let hook_settings = (cli == "claude")
+            .then(|| self.write_hook_settings_file(group_id, &agent_id, role.containment()))
+            .flatten();
         // #417 (Copilot correction): Copilot auto-loads its user-level hooks
         // directory itself (no CLI flag needed, unlike Claude's `--settings`)
         // — best-effort, never blocks a spawn if the directory can't be
@@ -30198,8 +30429,9 @@ fn register_orchestrator_pane(
     let inject = reg.persona_inject(&group.id, &block, &cli, persona.as_ref(), &contract);
     // #417, split from `cfg` per rev-4 review N2 — Claude's hook config rides
     // a per-agent `--settings` file; Copilot's own wiring needs no flag.
-    let hook_settings =
-        (cli == "claude").then(|| reg.write_hook_settings_file(&group.id, &agent_id)).flatten();
+    let hook_settings = (cli == "claude")
+        .then(|| reg.write_hook_settings_file(&group.id, &agent_id, block.kind.containment()))
+        .flatten();
     if cli == "copilot" {
         let _ = reg.ensure_copilot_compact_hook();
     }

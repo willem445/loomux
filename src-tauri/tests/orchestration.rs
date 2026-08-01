@@ -4509,6 +4509,325 @@ fn claude_gets_a_settings_flag_only_when_hook_settings_is_some() {
     assert!(!copilot_cmd.contains("--settings"), "{copilot_cmd}");
 }
 
+/// The `--allowedTools` value list emitted for a claude spawn, as argv tokens:
+/// everything between the flag and the next `--`-prefixed token. Claude's
+/// [CLI reference](https://code.claude.com/docs/en/cli-reference) documents
+/// `--allowedTools` as taking space-separated values in ONE occurrence
+/// (its own example: `"Bash(git log *)" "Bash(git diff *)" "Read"`), so any
+/// other flag emitted mid-list terminates the list — everything after it is a
+/// stray positional, not an allow rule.
+fn claude_allowed_tools_values(tokens: &[String]) -> Vec<String> {
+    claude_flag_values(tokens, "--allowedTools")
+}
+
+/// The same extraction for any one flag's value list. Shared so the deny side
+/// (#614 review N1) is pinned by the same rule as the allow side rather than
+/// by a second, subtly different reimplementation of "where does a value list
+/// end".
+fn claude_flag_values(tokens: &[String], flag: &str) -> Vec<String> {
+    let start = tokens
+        .iter()
+        .position(|t| t == flag)
+        .unwrap_or_else(|| panic!("a claude command must set {flag}: {tokens:?}"))
+        + 1;
+    let end = tokens[start..]
+        .iter()
+        .position(|t| t.starts_with("--"))
+        .map(|i| start + i)
+        .unwrap_or(tokens.len());
+    tokens[start..end].to_vec()
+}
+
+/// #610, the root cause: `--settings` (#417) is emitted BETWEEN
+/// `--allowedTools`'s first value and the git/gh patterns that follow it, so
+/// on every spawn that actually has a hook-settings file — i.e. every real
+/// Claude spawn — the value list Claude parses is just `mcp__loomux` and the
+/// patterns land as stray positional arguments. That is invisible on a worker
+/// (`--permission-mode auto` approves git/gh without consulting the allow
+/// list) and total on a planner (`dontAsk` denies everything not
+/// pre-approved), which is exactly the reported symptom: three planners with
+/// `gh` entirely denied while read-only `git` — Claude's own built-in
+/// read-only Bash carve-out, no allow rule involved — kept working.
+///
+/// The one token that survived the truncation, `mcp__loomux`, is also the one
+/// capability planners demonstrably kept (`report`/`message_orchestrator`
+/// worked throughout), which is what rules OUT "dontAsk ignores
+/// `--allowedTools` entirely" as the explanation.
+///
+/// So this pins contiguity, not mere presence: every allow pattern must be
+/// inside the flag's own value list, for both spawn forms and every tier.
+#[test]
+fn claude_allow_patterns_are_not_severed_from_the_allowedtools_flag() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let hooks = Path::new("C:/x/cfg-hooks.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let persona = PersonaInject { extra_allow: vec!["Bash(make:*)".into()], ..PersonaInject::default() };
+
+    for containment in [Containment::None, Containment::NoEdits, Containment::ReadOnly] {
+        // A read-only block never carries `extra_allow` (#222's capability
+        // closure empties it) — pass it only where it can legitimately appear.
+        let p = if containment == Containment::ReadOnly { PersonaInject::default() } else { persona.clone() };
+        let mut want = vec!["mcp__loomux", "Bash(git *)", "Bash(gh *)"];
+        if containment != Containment::ReadOnly {
+            want.push("Bash(make:*)");
+        }
+        let line = reg.build_agent_command(
+            "claude", "opus", true, cfg, Some(hooks), gdir, wd, None, false, containment, &p,
+        );
+        let argv = reg.build_agent_argv(
+            "claude", "opus", true, cfg, Some(hooks), gdir, wd, None, false, containment, &p,
+        );
+        for (form, tokens) in [("command", shell_tokenize(&line)), ("argv", argv)] {
+            let allowed = claude_allowed_tools_values(&tokens);
+            for w in &want {
+                assert!(
+                    allowed.iter().any(|t| t == w),
+                    "#610: {w:?} is missing from the {form} form's --allowedTools value list \
+                     for {containment:?} — it was emitted AFTER another flag (--settings), which \
+                     terminates the list, so Claude never receives it as an allow rule at all. \
+                     Value list seen: {allowed:?}\n  line: {line}"
+                );
+            }
+        }
+    }
+}
+
+/// #614 review N1: the same contiguity property, for the DENY list — the
+/// direction that fails **open**.
+///
+/// The deny list is contiguous today, so this pins no live defect. What it
+/// closes is the coverage gap that let #610 live for two releases: every
+/// existing pin on the deny list's ordering (the full-line goldens, the
+/// `windows(4)` argv check) is built with `hook_settings: None`, and
+/// `--settings` is a flag that appears ONLY on a real spawn. A future flag with
+/// that same "only present sometimes" shape, emitted between
+/// `--disallowedTools` and its values, would sever the git denials with every
+/// other test green — and unlike a severed allow, a severed deny is silent: the
+/// planner just quietly gains `git commit`.
+#[test]
+fn claude_deny_patterns_are_not_severed_from_the_disallowedtools_flag() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let hooks = Path::new("C:/x/cfg-hooks.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+
+    for (containment, want) in [
+        (Containment::ReadOnly, [CLAUDE_EDIT_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT].concat()),
+        (Containment::NoEdits, CLAUDE_EDIT_DENY_TOOLS.to_vec()),
+    ] {
+        let line = reg.build_agent_command(
+            "claude", "opus", true, cfg, Some(hooks), gdir, wd, None, false, containment,
+            &PersonaInject::default(),
+        );
+        let argv = reg.build_agent_argv(
+            "claude", "opus", true, cfg, Some(hooks), gdir, wd, None, false, containment,
+            &PersonaInject::default(),
+        );
+        for (form, tokens) in [("command", shell_tokenize(&line)), ("argv", argv)] {
+            let denied = claude_flag_values(&tokens, "--disallowedTools");
+            for w in &want {
+                assert!(
+                    denied.iter().any(|t| t == w),
+                    "#614/N1: {w:?} is missing from the {form} form's --disallowedTools value \
+                     list for {containment:?} — a flag emitted mid-list would terminate it and \
+                     silently drop the denial. Value list seen: {denied:?}\n  line: {line}"
+                );
+            }
+        }
+    }
+}
+
+/// #610: `dontAsk` is documented against `permissions.allow` — per the
+/// [permission modes reference](https://code.claude.com/docs/en/permission-modes)
+/// ("Allow only pre-approved tools with dontAsk mode"), Claude "runs only
+/// actions matching your `permissions.allow` rules, read-only Bash commands,
+/// and calls approved by a PreToolUse hook". That is a SETTINGS-file concept,
+/// and the `--settings` file loomux already writes (#417) is the layer loomux
+/// controls, so a read-only pane's allow rules belong there and not only on
+/// argv.
+///
+/// Both halves are pinned here, because the second is the one the old code
+/// couldn't do at all: the settings file used to be written ONLY when there
+/// were hooks to put in it (no `sh` resolvable ⇒ `None` ⇒ no `--settings`
+/// flag), which would have left a planner with no allow rules on exactly the
+/// machines where hook provisioning fails.
+#[test]
+fn readonly_pane_settings_carry_permissions_allow() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let p = reg.spawn_agent(&g.id, Role::Planner, "p", "plan it", false, None).unwrap();
+
+    let path = reg.state_root().join(&g.id).join("configs").join(format!("{}-hooks.json", p.id));
+    let cfg: Value = serde_json::from_str(
+        &fs::read_to_string(&path).unwrap_or_else(|e| panic!("#610: no settings file at {path:?}: {e}")),
+    )
+    .unwrap();
+    let allow: Vec<String> = cfg["permissions"]["allow"]
+        .as_array()
+        .unwrap_or_else(|| panic!("#610: read-only pane's settings file has no permissions.allow: {cfg}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+
+    // The capabilities a planner's own job needs: `gh` for `gh issue view` and
+    // its `gh issue comment` deliverable, `git` for read-only exploration AND
+    // `git fetch` (a git subcommand, so `Bash(git *)` covers it — the ReadOnly
+    // deny list carves out only `commit`/`push`, and deny beats allow), and
+    // the loomux MCP server for `report`/`message_orchestrator`.
+    for want in ["mcp__loomux", "Bash(git *)", "Bash(gh *)"] {
+        assert!(allow.iter().any(|r| r == want), "#610: {want:?} missing from {allow:?}");
+    }
+    // The research capability the same issue decided on: a planner must be
+    // able to ground a plan in a vendor's own reference docs (the
+    // `agent-cli-reference` skill requires exactly that), which `gh` cannot
+    // reach and the built-in read-only Bash set does not include.
+    for want in ["WebFetch", "WebSearch"] {
+        assert!(allow.iter().any(|r| r == want), "#610: {want:?} missing from {allow:?}");
+    }
+
+    // #465's invariant, restated for this layer: an allow list a `dontAsk`
+    // pane is judged against must never contain a bare grant of a
+    // MUTATION-capable tool — that re-opens the fail-open direction (a new
+    // editing tool nothing denies by name) from the allow side. `WebFetch`/
+    // `WebSearch` are the two deliberate bare entries, and they are bare
+    // honestly: per the permissions reference `WebFetch(domain:*)` "is
+    // equivalent to a bare `WebFetch` rule", so a scoped-looking spelling
+    // would be decoration, not a narrowing.
+    const RESEARCH_TOOLS: [&str; 2] = ["WebFetch", "WebSearch"];
+    for rule in &allow {
+        let scoped = rule.contains('(') && rule.ends_with(')');
+        assert!(
+            rule == "mcp__loomux" || scoped || RESEARCH_TOOLS.contains(&rule.as_str()),
+            "#610/#465: {rule:?} is a BARE tool grant in a dontAsk pane's permissions.allow. \
+             Only `mcp__loomux`, a scoped `Name(...)` pattern, or one of the enumerated \
+             non-mutating research tools {:?} may appear here.",
+            RESEARCH_TOOLS
+        );
+    }
+    for denied in CLAUDE_EDIT_DENY_TOOLS {
+        assert!(!allow.iter().any(|r| r == denied), "#610: {denied:?} must never be allowed: {allow:?}");
+    }
+    // #448's drift pin, applied to the allow side: a mistyped or upstream-
+    // renamed BARE tool name in an allow rule matches nothing and silently
+    // grants nothing — the same invisible-failure shape a dead deny entry had,
+    // and worse here, since the symptom is a planner that mysteriously can't
+    // fetch rather than a startup warning. (Scoped `Name(...)` patterns and
+    // `mcp__*` rules are exempt for the same reason they are on the deny side.)
+    for rule in &allow {
+        if rule.starts_with("mcp__") || rule.contains('(') {
+            continue;
+        }
+        assert!(
+            KNOWN_CLAUDE_TOOLS.contains(&rule.as_str()),
+            "#610/#448: {rule:?} is not a known Claude Code tool name — an allow rule that \
+             matches no tool grants nothing, silently. See KNOWN_CLAUDE_TOOLS' refresh procedure."
+        );
+    }
+
+    // #614 review B1: `Bash(git *)` is a PREFIX pattern, so as a live
+    // `permissions.allow` rule it positively matches `git commit -m …` and
+    // `git push`. The carve-out must therefore be reachable from inside this
+    // same object, not only from `--disallowedTools` in another layer —
+    // otherwise the read-only tier's one guarantee (no mutation) rests on a
+    // cross-mechanism precedence that this PR's own reasoning refuses to
+    // assume for allows. Deny is derived from the same predicates argv uses,
+    // so a new Containment tier moves both layers or neither.
+    let deny: Vec<String> = cfg["permissions"]["deny"]
+        .as_array()
+        .unwrap_or_else(|| panic!("#614/B1: read-only pane's settings carry no permissions.deny: {cfg}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    for want in CLAUDE_EDIT_DENY_TOOLS.iter().chain(CLAUDE_READONLY_DENY_GIT.iter()) {
+        assert!(
+            deny.iter().any(|r| r == want),
+            "#614/B1: {want:?} missing from the settings deny list {deny:?} — the argv \
+             --disallowedTools value alone would leave it in a different precedence layer \
+             from the allow rule it has to beat."
+        );
+    }
+
+    // The file is only useful if the pane is actually pointed at it — asserted
+    // on the SPAWN REQUEST, the command line the pane is really launched with.
+    let req = reg.spawn_request_for_test(&p.id).expect("no spawn request for the planner");
+    assert!(req.command.contains("--settings"), "{}", req.command);
+    assert!(
+        req.argv.windows(2).any(|w| w[0] == "--settings" && w[1] == path.display().to_string()),
+        "the planner's argv must point --settings at its own settings file: {:?}",
+        req.argv
+    );
+
+    // #614 review N4: the two layers must be the SAME LIST, not merely two
+    // lists that each happen to contain today's constants. The loop above
+    // pins presence, which covers the dangerous direction for the two deny
+    // constants that exist now — but a future third constant added to the
+    // argv branch alone would be forced onto the argv side by the exact-
+    // equality full-line goldens and forced onto the settings side by
+    // nothing, leaving a denial in one layer only while `Bash(git *)` stays
+    // live in `permissions.allow`. That is this round's B1 finding again, one
+    // constant later. Equality, taken off the real spawn request, is what
+    // actually states the property the design claims. Sorted rather than
+    // order-sensitive: the two layers are sets of rules, and the ORDER within
+    // `--disallowedTools` is already pinned by the full-line goldens.
+    let mut argv_deny = claude_flag_values(&req.argv, "--disallowedTools");
+    let mut settings_deny = deny.clone();
+    argv_deny.sort();
+    settings_deny.sort();
+    assert_eq!(
+        argv_deny, settings_deny,
+        "#614/N4: a read-only pane's --disallowedTools values and its settings \
+         permissions.deny must be the same list — one layer gained or lost a denial the \
+         other didn't. argv={argv_deny:?} settings={settings_deny:?}"
+    );
+}
+
+/// #610, the half that could not work before: the settings file must be
+/// written for a read-only pane even when there is NOTHING to put in the
+/// `hooks` key — `write_hook_settings_file` used to return `None` in that
+/// case and the caller then omitted `--settings` entirely, which is a
+/// fail-open policy that is right for hooks (a missing compact nudge) and
+/// wrong for permissions (a planner with no allow rules under `dontAsk` can
+/// do nothing at all).
+///
+/// The no-hooks state is forced the way it happens in the wild — hook
+/// provisioning fails — by pointing the hook-script directory at a path under
+/// a regular FILE, so `create_dir_all` cannot succeed on any platform.
+#[test]
+fn readonly_pane_gets_a_settings_file_even_when_hook_provisioning_fails() {
+    let (reg, d) = test_registry();
+    let blocker = d.path().join("not-a-directory");
+    fs::write(&blocker, b"x").unwrap();
+    reg.set_compact_hook_dir_override(blocker.join("compacthook"));
+
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let p = reg.spawn_agent(&g.id, Role::Planner, "p", "plan it", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do it", false, None).unwrap();
+
+    let settings = |id: &str| reg.state_root().join(&g.id).join("configs").join(format!("{id}-hooks.json"));
+    let cfg: Value = serde_json::from_str(
+        &fs::read_to_string(settings(&p.id))
+            .unwrap_or_else(|e| panic!("#610: a read-only pane must still get a settings file: {e}")),
+    )
+    .unwrap();
+    assert!(cfg.get("hooks").is_none(), "no hooks were resolvable, so no hooks key may be written: {cfg}");
+    assert!(
+        cfg["permissions"]["allow"].as_array().is_some_and(|a| !a.is_empty()),
+        "#610: permissions.allow must be written even with no hooks: {cfg}"
+    );
+    let planner_cmd = reg.spawn_request_for_test(&p.id).expect("no spawn request for the planner").command;
+    assert!(planner_cmd.contains("--settings"), "{planner_cmd}");
+
+    // The fail-open policy is unchanged for a pane with nothing to put in the
+    // file: a worker has no permissions block of its own, so with hooks
+    // unavailable there is still no settings file and no flag.
+    let worker_cmd = reg.spawn_request_for_test(&w.id).expect("no spawn request for the worker").command;
+    assert!(!settings(&w.id).exists(), "a non-read-only pane with no hooks must get no settings file");
+    assert!(!worker_cmd.contains("--settings"), "{worker_cmd}");
+}
+
 /// Split a shell command line into argv, honoring the two quotings
 /// `build_agent_command` emits. Double quotes wrap paths and tool patterns
 /// (`--add-dir "C:/a b"`, `"Bash(git *)"`, `@"C:/x"` → `@C:/x`); single quotes
@@ -4649,27 +4968,35 @@ fn build_agent_argv_matches_command_line() {
             ..PersonaInject::default()
         },
     ];
+    // #610: `hook_settings` was fixed at `None` across this whole matrix, so
+    // the ONE flag that only ever appears on a real spawn — `--settings`, and
+    // with it every ordering question its position raises — was never
+    // tokenized here at all. Both states now ride the matrix.
+    let hooks = PathBuf::from("C:/x/cfg-hooks.json");
     for cli in ["claude", "copilot", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
             // Every tier, not just the two that existed before #462 — a
             // middle tier that only one of the two forms emits is exactly the
             // drift this test exists to catch.
             for containment in [Containment::None, Containment::NoEdits, Containment::ReadOnly] {
-                for (session, resume) in sessions {
-                    for persona in &personas {
-                        let line = reg.build_agent_command(
-                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, containment, persona,
-                        );
-                        let argv = reg.build_agent_argv(
-                            cli, "m", auto_ops, cfg, None, gdir, wd, session, resume, containment, persona,
-                        );
-                        assert_eq!(
-                            shell_tokenize(&line),
-                            argv,
-                            "argv must equal the tokenized command line for \
-                             cli={cli} auto_ops={auto_ops} containment={containment:?} \
-                             session={session:?} resume={resume} persona={persona:?}\n  line: {line}"
-                        );
+                for hook_settings in [None, Some(hooks.as_path())] {
+                    for (session, resume) in sessions {
+                        for persona in &personas {
+                            let line = reg.build_agent_command(
+                                cli, "m", auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
+                            );
+                            let argv = reg.build_agent_argv(
+                                cli, "m", auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
+                            );
+                            assert_eq!(
+                                shell_tokenize(&line),
+                                argv,
+                                "argv must equal the tokenized command line for \
+                                 cli={cli} auto_ops={auto_ops} containment={containment:?} \
+                                 hook_settings={hook_settings:?} \
+                                 session={session:?} resume={resume} persona={persona:?}\n  line: {line}"
+                            );
+                        }
                     }
                 }
             }

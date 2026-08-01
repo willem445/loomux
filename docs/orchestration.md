@@ -96,6 +96,17 @@ then exits. A planner's read-only contract is enforced at the CLI level where
 possible: it never gets a worktree, and its file-editing tools plus `git
 commit`/`git push` are denied.
 
+What it *is* pre-approved for, since a planner runs with no human in its pane to
+approve anything: read-only shell and `git`, `gh` (it reads the issue and posts
+its plan through it), the loomux tools, and — so it can ground a plan in a
+vendor's actual reference docs rather than in recall — `WebFetch`/`WebSearch`.
+That last pair means a planner pane can reach arbitrary hosts, which is worth
+knowing if you plan on sensitive repositories; to switch it off, add a `WebFetch`
+(or `WebSearch`) entry to `permissions.deny` in the repository's own
+`.claude/settings.json` — a deny rule there beats anything loomux pre-approves.
+Running a build or test command is *not* pre-approved and cannot be enabled, so a
+plan will say when it could not confirm something by running it.
+
 **No agent ever merges.** Agents open PRs; you merge, after your own review.
 
 Panes are badged by role and group number (`ORCH 1` / `W 1` / `REV 1` / `PLAN 1`
