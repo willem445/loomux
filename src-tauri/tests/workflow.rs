@@ -5060,7 +5060,10 @@ fn an_also_condition_this_build_cannot_check_is_not_silently_ignored() {
     // fails CLOSED in the shim (pinned in the shell, in tests/orchestration.rs); this
     // pins the classification the shim keys off.
     assert!(workflow::condition_supported("ci-green"));
-    for unknown in ["no-live-agents-on-pr", "human-signoff", "ci_green", "CI-GREEN"] {
+    // #565's opt-in body-digest check is a condition, not a new config surface: a repo
+    // that squash-merges declares it, one that merge-commits leaves it out.
+    assert!(workflow::condition_supported("body-unchanged"));
+    for unknown in ["no-live-agents-on-pr", "human-signoff", "ci_green", "CI-GREEN", "body_unchanged"] {
         assert!(!workflow::condition_supported(unknown), "{unknown:?} must not read as supported");
     }
     // The PARSER still accepts them — the file format is forward-compatible, and a
