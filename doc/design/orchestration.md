@@ -688,54 +688,202 @@ in the prompt), contain that. The two configurable ones live in `Guardrails`
 persisted in `group.json`, and clamped in `clamped()`.
 
 - **Per-group pause / resume.** A human-only action (`orch_pause_group` / `orch_resume_group`
-  Tauri commands; frontend `pauseGroup`/`resumeGroup`/`groupPaused`). While paused,
-  `deliver_prompt` short-circuits *before* touching the pty — every kickoff, orchestrator
-  prompt, and worker report is suppressed and audited (`prompt-suppressed-paused`), so agents
-  finish their current turn and idle out rather than being killed. Nothing is queued or
-  replayed: agents re-sync from the board/state on the next prompt after resume, which is the
-  point. The flag is mirrored to a `paused` marker file so a pause survives an app restart
+  Tauri commands; frontend `pauseGroup`/`resumeGroup`/`groupPaused`). While paused, loomux
+  types nothing into any of the group's panes — every kickoff, orchestrator prompt and worker
+  report is withheld, so agents finish their current turn and idle out rather than being
+  killed. The flag is mirrored to a `paused` marker file so a pause survives an app restart
   (re-seeded in `create_group`).
 
-  **Resume says what the pause threw away (#569).** Suppression was audited and nothing else,
-  which made pause the last non-crash path where a payload its sender had been told `Ok` about
-  simply ceased to exist — a worker's `report("done")` fired mid-pause evaporated, and the
-  orchestrator went on waiting for a report that would never arrive. `resume_group` now reads
-  the window's `prompt-suppressed-paused` lines back out of the audit log
-  (`suppressed_during_pause`, pure) and delivers one notice naming every discarded
-  `from → to` with a bounded payload preview (`pause_suppression_notice`). Three things this
-  deliberately is *not*: it does not replay anything, it does not queue anything, and it mints
-  no delivery id — a suppressed delivery never reached the front door, so there is no id to
-  join against, the same conclusion #563 reached at `enqueue_text`'s `RejectFull` arm. It reads
-  the audit log and mutates no queue, so it owes no `persist_queues` call; the notice itself
-  goes through the ordinary front door, which already does.
+  **A pause queues; it does not discard (#569 option 2, the human's decision).** Until this
+  landed, `deliver_prompt` short-circuited *before* the front door: the payload was destroyed,
+  the caller was told `Ok`, and a `prompt-suppressed-paused` line was the only record it had
+  ever existed. That made pause the last non-crash path where something a sender had been told
+  succeeded ceased to exist — a worker's `report("done")` fired mid-pause evaporated, and the
+  orchestrator went on waiting for a report that would never arrive, contradicting the "queued
+  means safe" model the #445/#523 batch established everywhere else. Option 1 (#586, merged as
+  809df7a) made that loss *visible*; option 2 removes it.
 
-  **It is bounded twice, and the second bound is the load-bearing one.** A long pause can
-  swallow an unbounded number of deliveries, and this notice is itself a delivery — one pasted
-  into a pane, spending that agent's context. Per item, `queue::dropped_payload_preview` caps a
-  preview at `DROPPED_PREVIEW_MAX` (160 chars, truncation marked, never silent); that alone
-  bounds nothing, because the *count* is what a pause controls. So the notice names at most
-  `PAUSE_SUPPRESSION_LIST_MAX` (8) individually and summarizes the rest as a count pointing at
-  the audit log, which holds every discarded payload in full — `prompt-suppressed-paused`
-  carries `text`, not a preview. Worst case is therefore a ~2 KB paste however long the pause
-  ran, and the fix cannot become the problem it was raised against.
+  The shape, three layers, none of them optional:
 
-  The window is bounded by the most recent `group-pause` line and by nothing else — a
-  `prompt-suppressed-paused` line can only be written while paused, so everything after that
-  marker belongs to the window it opened, and the scan survives an app restart mid-pause
-  because the audit log does. `group-resume` is deliberately not treated as a boundary:
-  `create_group` audits that same action name for a group RESTORED from disk. If the marker has
-  rotated out of the readable log the notice says so rather than presenting a possibly
-  over-counted list as exact.
+  1. **The front door admits.** `deliver_prompt`'s pause branch resolves `pty_id`, audits the
+     ordinary `prompt` line, and calls `enqueue_text` with `EnqueueReason::GroupPaused` — an
+     ordinary queue entry, so it inherits every guarantee the queue already gives: FIFO order,
+     the per-pane `QUEUE_MAX_PER_PANE` cap, admission-time coalescing of byte-identical
+     repeats, the audit trail (`delivery-queued` with `reason: group-paused`), and #467/#468
+     durability, which is what makes a pause-held payload survive a loomux restart *during the
+     pause*. `pty_id` is now resolved BEFORE the pause check: a queue is keyed by pane, so a
+     target with no terminal has nowhere to hold anything, and the honest answer is the same
+     `Err` an unpaused delivery to that agent already gets rather than a false `Ok`.
+  2. **The front door does NOT start a drainer, and the drainer refuses to paste.** #470's
+     invariant is that the admission which observes an empty queue owns spawning
+     `run_queue_drainer`; the pause branch deliberately leaves that unmet, because a paused
+     group must have nothing running that could type into a pane. `run_queue_drainer` also
+     checks `is_paused` each pass — after its `commit_exit`, before it plans a flush — and
+     holds without spending a notice, running a hold clock, or raising an escalation badge (a
+     pause is not a stuck pane, and badging one would tell the human about a state they set
+     themselves). That second layer is load-bearing rather than defensive: `readmit_recovered`
+     kicks a drainer of its own when a pane rebinds after a restart, which for a group paused
+     across that restart would otherwise paste straight into the pause.
+  3. **Resume discharges it.** `resume_group` calls `flush_paused_queues`, which finds every
+     pane holding entries stamped with this group and calls `ensure_drainer` on each (audited
+     as `pause-flush`, carrying the pane list and whether a drainer could actually be spawned).
+     This is the *single* place that discharges the invariant layer 1 leaves open: if it stops
+     firing, every payload a pause held is stranded — queued, audited, persisted, and never
+     delivered. It is deliberately **not** filtered on liveness: a pane whose agent died
+     mid-pause still gets a drainer, whose own first-pass checks then drop the queue through
+     the ordinary `commit_exit(force: true)` → `announce_dropped(AgentDied)` path. Skipping
+     dead panes would leave those entries in `queues` and in `queue.json` with nothing left to
+     look at them — a silent *retention*, the same defect class as the silent discard.
 
-  And the notice must not become the next silent loss: it is an in-band delivery, so it fails
-  exactly when a pause has run long enough for the orchestrator to idle out — the case with the
-  most to report. When it fails, every distinct live target pane gets the
-  `StrandedBlocker::PauseSuppressed` badge instead, the channel #563 established for holds an
-  orchestrator-targeted notice cannot reach (no role suppression, no orchestrator required). A
-  pane already carrying another mechanism's badge is left alone. Enqueue-while-paused
-  (#569 option 2) is **not** implemented and is not implied by any of this: it would make
-  drain-on-resume re-spend tokens a human paused to stop, which changes pause's cost-containment
-  contract and is the human's call, not a worker's.
+  **Known and deferred: a kickoff held through a pause loses its kickoff treatment** (review
+  N1). Nothing guards `spawn_agent` against a paused group, so a spawn during a pause routes
+  `Delivery::FreshKickoff` through the pause branch like any other delivery, and
+  `flush_paused_queues` calls `ensure_drainer(..., None)` — so at resume the brief pastes with
+  `wait_ready: false`, `confirm_autopilot: false`, `fresh_kickoff: false`. For a copilot pane
+  under `--autopilot` that is a wedge rather than a timing nit: the consent dialog appears after
+  the kickoff Enter (see `confirm_copilot_autopilot_dialog`), nobody dismisses it, and #517's
+  `fresh_kickoff` recovery is unarmed. It is not a regression — pre-#569 the brief was destroyed
+  outright, which is strictly worse — but it is not a three-line fix either, because
+  `QueuedDelivery` carries no delivery kind and adding one changes the on-disk record. The three
+  candidate resolutions (carry the kind, reject spawn while paused, or accept it) are a product
+  decision about spawn semantics rather than a delivery-machinery fix, so this is filed rather
+  than taken: #620.
+
+  **The flush header names the right hold.** `queue::FlushCause` (`PaneBlocked` /
+  `GroupPaused`, chosen by `flush_cause` over the batch's admission reasons, never over the
+  live `paused` flag — by flush time the group is unpaused by definition) picks between "queued
+  while this pane was blocked" and "queued while this group was paused". The pre-#569 wording
+  was the only case there was; sent for a pause-held payload it would point its reader at a box
+  or a dialog that never existed. A mixed batch reports the pause: the pause is the more recent
+  hold and the one that decided when the flush happened. The drainer also forces
+  `header_pending` on for a `GroupPaused` cause — a lone delivery held through a pause meets a
+  *fresh* drainer at resume whose first pass is the uncontended shape, and would otherwise land
+  as a bare payload with nothing saying it had been waiting since before the pause.
+
+  **What the contract change costs, stated.** Drain-on-resume re-spends tokens the human paused
+  to stop — that is the trade the human decided, on the argument that a pause which loses a
+  worker's `report("done")` costs more than the tokens it saved, because the orchestrator then
+  waits forever on a report that is never coming. The containment *while paused* is unchanged:
+  nothing pastes, so no agent is woken. Two human-facing entry points still reject up front
+  rather than queueing — `steer_orchestrator` and `start_task` — because both are a human acting
+  *now*, and deferring their action to a resume they have not chosen yet is not what the button
+  promises; the rejection's *reason* changed with #569, its answer did not.
+
+  **A pause can still destroy a delivery, and saying otherwise was the review's B2 finding.**
+  The per-pane cap did not go away: a pane already at `QUEUE_MAX_PER_PANE` (8) has further
+  admissions refused by `enqueue_text`'s `RejectFull` arm, which drops the payload and returns
+  `Err`. The first draft of this note, and three doc comments with it, framed that as a
+  theoretical residual and claimed the only way to meet a destroyed payload was to pause under
+  an older build. Both halves were wrong, and the second one made the first worse:
+
+  - The cap is per PANE and the orchestrator's pane is where a whole fleet converges.
+  - **Most of loomux's own advisories now queue there too.** Only about ten of the 31
+    `deliver_to_orchestrator` call sites carry a pause guard; the toggle notices
+    (`auto_merge_notice`, `auto_release_notice`, `dangerous_mode_notice`,
+    `workflow_mode_notice`), `max_agents_notice` and the board/task notices do not, so before
+    #569 they were destroyed by the pause branch and now they occupy queue slots. That is a
+    *consequence* of option 2 rather than a decision anyone took, and it is what makes the cap
+    reachable: a human who pauses, flips two toggles, adjusts the cap and leaves it for an hour
+    can have eight advisories queued when a worker's `report("done")` arrives ninth. The worker
+    gets `Err`, retries fail for as long as the pause lasts, and it idles out.
+
+  So the honest claim is narrower: a pause no longer destroys deliveries **at the pause
+  branch**, and the cap is where the remaining loss lives. `suppressed_during_pause` therefore
+  scans the window for `delivery-dropped` lines carrying `enqueue_reason: group-paused` as well
+  as for the legacy `prompt-suppressed-paused` ones, and the resume notice reports both —
+  separately, because what a reader should DO about them differs (see below). The
+  `enqueue_reason` filter is what keeps this scoped: `delivery-dropped` is also written for
+  ordinary queue-full rejections, and those are the sender's own synchronous `Err` to deal with,
+  not something a resume should re-report.
+
+  **Whether those advisories SHOULD queue is a human's call, and is deliberately left open.**
+  Adding a pause guard to the other ~21 sites would keep the cap out of reach, at the cost of
+  losing advisories a resume could otherwise deliver; leaving them is the status quo this PR
+  produced. Both are defensible; neither is a worker's decision to take silently, which is why
+  it is written down here rather than resolved in the diff.
+
+  **The admit/resume race, and why there is no lock** (review B1). `deliver_prompt` reads the
+  pause flag and then admits, with real I/O in between (`recover_persisted_queue`, the durable
+  snapshot); `resume_group` clears the flag and only later snapshots `queues`. A resume landing
+  in that gap sees an empty queue, starts nothing, and the admission then lands in an unpaused
+  group with no drainer and — since the pause branch is the one path that deliberately never
+  calls `ensure_drainer` — nobody left to start one: the #470-B1 stranding class, reproduced by
+  this fix. The close is to re-read the flag AFTER the admission and nudge `ensure_drainer` if
+  it is now clear, which orders the two sides against each other rather than merely letting
+  them coexist: resume-then-admit is caught by the re-check, admit-then-resume by the flush.
+  Both firing is harmless, because `ensure_drainer` no-ops for a pane already draining — which
+  is exactly why a redundant nudge can be spent freely where a lock could not. The nudge is
+  audited (`pause-race-nudge`) because it is otherwise invisible: a headless test cannot observe
+  `ensure_drainer` at all, so the audit line is what
+  `a_resume_racing_an_admission_never_strands_it` asserts, over 24 real threaded interleavings.
+
+  That test is an invariant **guard**, not evidence the re-check is load-bearing, and the
+  distinction is recorded because conflating the two is how a coverage claim outlives the thing
+  it claimed to cover. Removing the re-check does not redden it — checked, not assumed (run
+  30704213481) — because the losing interleaving needs the resume to land between the flag read
+  and the admission, and the stagger that makes the pause branch reachable at all also gives the
+  entry time to be queued before `flush_paused_queues` looks. Forcing that window open needs a
+  seam in the code under test, and a test of a seam is not a test of the race. The re-check is
+  justified by the argument above, and by costing nothing when it is unnecessary.
+
+  **The resume-time loss notice, now covering two causes.** Nothing writes
+  `prompt-suppressed-paused` any more, so that half needs a group paused under a build that
+  discarded and resumed under one that queues — real, and the reason the scan was kept rather
+  than deleted. The other half (`SuppressedCause::QueueFullDuringPause`) is not history at all,
+  per B2 above. The notice separates them because the reader's next question is "can this happen
+  to me again", and the answers differ: the legacy discard cannot recur on this build, a
+  capacity refusal will recur on the next long pause. Each cause contributes a sentence only when
+  that window actually contains it — explaining a failure mode this pause did not have is one
+  more paragraph between the reader and the one that matters — and each listed item names its own
+  cause, since a single window can mix them. It also states the current rule outright ("anything
+  the pause merely HELD is delivering on its own right now; do not re-request that"), because
+  both behaviors now coexist in a group's history and a reader who took the loss wording as
+  universal would re-request work already on its way — the duplicate `queued_notice`'s "do NOT
+  re-send" exists to prevent, arriving from the other direction. Its bounds are unchanged and still load-bearing for that path:
+  `queue::dropped_payload_preview` caps each preview at `DROPPED_PREVIEW_MAX` (160 chars,
+  truncation marked), and — the bound that matters, since *count* is what a pause controls —
+  the notice names at most `PAUSE_SUPPRESSION_LIST_MAX` (8) individually and summarizes the
+  rest as a count pointing at the audit log, which holds every discarded payload in full. The
+  window is bounded by the most recent `group-pause` line and nothing else; `group-resume` is
+  deliberately not a boundary, because `create_group` audits that same action name for a group
+  RESTORED from disk. If the marker has rotated out of the readable log the notice says so
+  rather than presenting a possibly over-counted list as exact. And it must not become the next
+  silent loss: it is an in-band delivery, so it fails exactly when a pause has run long enough
+  for the orchestrator to idle out. When it fails, every distinct live target pane gets the
+  `StrandedBlocker::PauseSuppressed` badge instead — the channel #563 established for holds an
+  orchestrator-targeted notice cannot reach — and a pane already carrying another mechanism's
+  badge is left alone.
+
+  **The loss notice is admitted past the cap, by exactly one entry** (rev-128). It is delivered
+  with `queue::EnqueueReason::PauseLossNotice`, the only reason `queue::admit` lets exceed
+  `QUEUE_MAX_PER_PANE`. Without that, the flagship case defeated itself: the pane a long pause
+  fills first is the ORCHESTRATOR's, because that is where a fleet's reports converge, and it is
+  still at capacity when the human resumes — so the notice reporting the destroyed payloads was
+  *certain*, not merely at risk, to be destroyed by the same cap. The badge fallback did not
+  cover it either: by resume that pane already carries `note_queue_capacity`'s at-capacity badge,
+  and `pause_badge_decision`'s never-stomp-another-mechanism's-badge rule then skips the pause
+  badge, leaving the audit tally as the only trace. Notice refused, badge suppressed — the #569
+  stall one level up, inside the fix for it.
+
+  The exemption is bounded rather than a hole, and each bound is load-bearing: one entry
+  (`PAUSE_LOSS_NOTICE_HEADROOM`), one notice per resume, emitted only when something was actually
+  lost, and reachable from exactly one call site because `deliver_prompt_as` /
+  `deliver_to_orchestrator_as` are private — a `pub` door with a reason parameter would make that
+  bound a convention instead of a fact. Coalescing still runs first, so a byte-identical repeat
+  folds in rather than spending the headroom. A second resume that finds the headroom still
+  occupied is refused like any other delivery and records `delivered: false` rather than claiming
+  the orchestrator was told; that refusal path is tested
+  (`the_loss_notice_headroom_is_one_entry_and_a_second_resume_is_refused`), which is the honest
+  way to cover it — the alternative on offer, an order swap, does not work: `flush_paused_queues`
+  only *starts* drainers, so the queue is still full microseconds later when the announce runs.
+
+  **Advisory notices stay suppressed while paused, and that is not the same question.** The
+  four `notice-suppressed` paths (`notify_queue`, the unconfirmed-delivery notice,
+  `flush_unconfirmed_notices`, `notify_delivery_confirmed_late`) plus the low-disk backstop and
+  the watchdog / idle-tick / compact-nudge / workflow-reload skips are loomux's own commentary
+  *about* a delivery, not the delivery itself, and each already leaves an audit line. The
+  payload they describe is now durably queued and flushes on resume with an accurate header, so
+  replaying stale advisories at resume would be noise about work that has already arrived.
 - **Idle-worker auto-kill.** Each worker/reviewer carries `idle_since_ms`, stamped when it is
   spawned without a task or reports `done`/`blocked`, and cleared when the orchestrator sends
   it a prompt (`send_prompt`). A background reaper (`start_idle_reaper`, 30s tick) kills any
@@ -5691,6 +5839,15 @@ is the impure half.
   adds the buckets, gets 15, and "corrects" the row count would be turning a correct table into a
   wrong one. If you change these numbers, re-check the overlap first — a second dual-bucket row
   would make the union 10, and every figure in this paragraph would need to move together.
+
+  **#569 (enqueue-while-paused) adds two CALLERS, no row, and the arithmetic above is unchanged.**
+  `deliver_prompt`'s pause branch calls `enqueue_text` (already a row) and `flush_paused_queues`
+  calls `ensure_drainer` (already a row); `flush_paused_queues` itself only *reads* `queues` to
+  decide which panes to hand to it, and `run_queue_drainer`'s new pause gate `continue`s before any
+  mutation on that pass. That is deliberate rather than incidental: routing a pause through the
+  ordinary front door is precisely what keeps this table — and #468's every-mutation-owes-a-snapshot
+  invariant — true for the pause path without adding a fifteenth thing to reason about. Recorded
+  here because "we added no mutation site" is a claim, and this is the table it is a claim about.
 
   Two of the nine `queues` mutators — `enqueue_stranded_front` and `admit_stranded_selfheal` — push
   through the SAME helper, `push_stranded_front_locked`, which is deliberately not a row of its own:

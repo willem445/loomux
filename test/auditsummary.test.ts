@@ -152,16 +152,19 @@ test("channel-direction (#271 W3 addendum) names the channel and the sender swap
   assert.equal(s, "channel chan-3: sender changed from w-1 to rev-2");
 });
 
-// #569: pause is the one path that DISCARDS a payload its sender was told `Ok`
-// about, and before this both of its audit actions fell to the raw-JSON default
-// arm — a reader scanning the timeline saw a JSON blob where a work-loss event
-// was, which is how the defect stayed invisible for as long as it did.
+// #569: pause WAS the one path that discarded a payload its sender was told
+// `Ok` about, and both of its audit actions fell to the raw-JSON default arm —
+// a reader scanning the timeline saw a JSON blob where a work-loss event was,
+// which is how the defect stayed invisible for as long as it did. Option 2
+// replaced the discard with a queue admission; these lines survive in older
+// timelines, so the viewer keeps rendering them and now dates them.
 
-test("prompt-suppressed-paused reads as a discard, not as a delivery", () => {
+test("prompt-suppressed-paused reads as a discard by an OLDER build", () => {
   const s = summarize(
     entry("prompt-suppressed-paused", { to: "orch-1", text: "report: done, PR #123 is green" }, "w-2")
   );
   assert.match(s, /discarded/, "the word has to be there — this payload no longer exists");
+  assert.match(s, /older loomux/, "and it must not read as something the current build does");
   assert.match(s, /orch-1/, "and the pane that never got it");
   assert.match(s, /PR #123 is green/, "and the payload, so it can be re-sent");
 });
@@ -174,7 +177,10 @@ test("prompt-suppressed-paused truncates a multi-line payload to its first line"
 
 test("the resume tally says whether the orchestrator was actually told", () => {
   const told = summarize(entry("pause-suppression-notice", { count: 3, delivered: true }, "loomux"));
-  assert.equal(told, "3 deliveries discarded while paused — orchestrator notified on resume");
+  assert.equal(
+    told,
+    "3 deliveries discarded by an earlier loomux while paused — orchestrator notified on resume"
+  );
 
   // The honesty case: "the orchestrator was told" is a claim, and this line is
   // the one that has to be right about it.
@@ -183,6 +189,34 @@ test("the resume tally says whether the orchestrator was actually told", () => {
   );
   assert.equal(
     untold,
-    "1 delivery discarded while paused — could NOT notify the orchestrator (no live orchestrator in this group); panes badged instead"
+    "1 delivery discarded by an earlier loomux while paused — could NOT notify the orchestrator (no live orchestrator in this group); panes badged instead"
   );
+});
+
+// #569 option 2: the action a resume writes now. A held pane is work loomux
+// still owes an agent, so a timeline has to show the flush starting — and has
+// to distinguish "started" from "recorded but never started", which is the only
+// state in which those entries sit undelivered.
+test("pause-flush names the panes the resume set draining", () => {
+  const s = summarize(entry("pause-flush", { panes: [5690, 5691], started: true }, "loomux"));
+  assert.match(s, /flushing 2 held panes/);
+  assert.match(s, /5690, 5691/, "the panes themselves, so a reader can check them");
+  assert.doesNotMatch(s, /NOT started/);
+
+  const singular = summarize(entry("pause-flush", { panes: [7], started: true }, "loomux"));
+  assert.match(singular, /1 held pane \(7\)/, "singular reads as singular");
+
+  const stalled = summarize(entry("pause-flush", { panes: [5690], started: false }, "loomux"));
+  assert.match(stalled, /NOT started/, "a flush that never began must not read as one that did");
+});
+
+// #569 review B1: the audit line is the ONLY evidence this interleaving
+// occurred — `ensure_drainer` itself leaves no trace a reader can see — so it
+// has to render as a sentence, not fall to the raw-JSON default arm.
+test("pause-race-nudge reads as a race the admission caught", () => {
+  const s = summarize(entry("pause-race-nudge", { to: "orch-1", pty: 5690, id: 42 }, "loomux"));
+  assert.match(s, /raced a resume/);
+  assert.match(s, /orch-1/, "the pane whose delivery would otherwise have stranded");
+  assert.match(s, /5690/);
+  assert.match(s, /42/, "and the delivery id, so it joins to delivery-queued");
 });

@@ -135,7 +135,63 @@ pub enum EnqueueReason {
     /// through `recovered_notice` instead, which can say how many and how
     /// old.
     Recovered,
+    /// #569: the human has PAUSED this delivery's group, so the payload is
+    /// HELD in the queue until they resume rather than pasted now.
+    ///
+    /// Before #569 this case had no reason because it had no entry: the pause
+    /// branch destroyed the payload, told the caller `Ok`, and audited
+    /// `prompt-suppressed-paused` — the last remaining non-crash path where
+    /// something a sender was told succeeded ceased to exist. It is an
+    /// ordinary queue entry now, and it gets its own reason for the
+    /// audit-honesty rule every variant above already follows: a pause hold
+    /// and a blocked pane are different facts, and the flush header at drain
+    /// time has to say which one it was (see [`FlushCause`]).
+    GroupPaused,
+    /// #569 rev-128: the resume-time notice naming what a pause LOST
+    /// (`announce_pause_suppression`). The ONE admission allowed past
+    /// `QUEUE_MAX_PER_PANE`, by `PAUSE_LOSS_NOTICE_HEADROOM`.
+    ///
+    /// **Why an exception, and why this one.** The notice exists because the
+    /// cap destroyed a payload. Refusing the notice *to that same cap* means a
+    /// full pane silently eats both the work and the report of the work — and
+    /// it is not a rare corner: when the overflow happened on the
+    /// ORCHESTRATOR's own pane (the case #569 is actually about, since that is
+    /// where a fleet's reports converge) the pane is still at capacity at
+    /// resume, so the notice is not merely at risk, it is CERTAIN to be
+    /// refused. Worse, the pane already carries `note_queue_capacity`'s
+    /// at-capacity badge by then, so `pause_badge_decision`'s
+    /// never-stomp-another-badge rule suppresses the fallback too, leaving the
+    /// audit tally as the only trace.
+    ///
+    /// Bounded, not open: `PAUSE_LOSS_NOTICE_HEADROOM` is 1, one notice is
+    /// emitted per resume, and it is emitted only when something was actually
+    /// lost — so the queue can exceed its cap by exactly one entry, briefly,
+    /// and a second resume that finds the headroom still occupied is refused
+    /// like anything else.
+    PauseLossNotice,
 }
+
+impl EnqueueReason {
+    /// #569 rev-128: how far past `QUEUE_MAX_PER_PANE` this admission may go.
+    /// Zero for everything except the pause-loss notice — see that variant.
+    pub fn cap_headroom(self) -> usize {
+        match self {
+            EnqueueReason::PauseLossNotice => PAUSE_LOSS_NOTICE_HEADROOM,
+            EnqueueReason::BoxOccupied
+            | EnqueueReason::Question
+            | EnqueueReason::BehindQueue
+            | EnqueueReason::Arrival
+            | EnqueueReason::KickoffRecovery
+            | EnqueueReason::Recovered
+            | EnqueueReason::GroupPaused => 0,
+        }
+    }
+}
+
+/// #569 rev-128: how far past the cap [`EnqueueReason::PauseLossNotice`] may
+/// push. One entry — enough for the single notice a resume emits, and small
+/// enough that "the cap is 8" stays true for every practical purpose.
+pub const PAUSE_LOSS_NOTICE_HEADROOM: usize = 1;
 
 impl EnqueueReason {
     pub fn as_str(self) -> &'static str {
@@ -146,6 +202,8 @@ impl EnqueueReason {
             EnqueueReason::Arrival => "arrival",
             EnqueueReason::KickoffRecovery => "kickoff-recovery",
             EnqueueReason::Recovered => "recovered",
+            EnqueueReason::GroupPaused => "group-paused",
+            EnqueueReason::PauseLossNotice => "pause-loss-notice",
         }
     }
 }
@@ -294,11 +352,17 @@ pub enum AdmitDecision {
 }
 
 /// Decide `AdmitDecision` for a new text payload against an existing queue.
-pub fn admit(queue: &VecDeque<QueuedDelivery>, text: &str) -> AdmitDecision {
+///
+/// `reason` is consulted for one thing only: [`EnqueueReason::cap_headroom`],
+/// which is zero for every reason but the pause-loss notice (#569 rev-128).
+/// Coalescing is checked FIRST and is not affected — an exempt admission that
+/// byte-matches a queued entry still folds into it rather than spending its
+/// headroom, because a duplicate adds no information whatever its reason.
+pub fn admit(queue: &VecDeque<QueuedDelivery>, text: &str, reason: EnqueueReason) -> AdmitDecision {
     if queue.iter().any(|q| q.payload.text() == Some(text)) {
         return AdmitDecision::Coalesce;
     }
-    if queue.len() >= QUEUE_MAX_PER_PANE {
+    if queue.len() >= QUEUE_MAX_PER_PANE + reason.cap_headroom() {
         return AdmitDecision::RejectFull;
     }
     AdmitDecision::Admit
@@ -344,10 +408,65 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
         // that a FUTURE reason added to this enum is a compile error here,
         // which is what has kept every notice string in this module honest.
         EnqueueReason::Recovered => "it was queued before a loomux restart",
+        // #569: also unreachable in real code — `deliver_prompt`'s pause
+        // branch admits without notifying, because a notice about a paused
+        // group is itself a delivery INTO that paused group and would simply
+        // queue behind the payload it describes. Spelled out for the same
+        // compile-time reason as `Recovered` above.
+        EnqueueReason::GroupPaused => "the group is paused",
+        // Also unreachable: the loss notice is loomux telling the orchestrator
+        // something, never a delivery whose sender is waiting to hear it was
+        // queued.
+        EnqueueReason::PauseLossNotice => "it reports what a pause lost",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
     )
+}
+
+/// #569: WHY a flush's constituents were queued — the one thing the header
+/// cannot get wrong without misdirecting its reader.
+///
+/// The pre-#569 header said "queued while this pane was blocked" and that was
+/// the only case there was: a pause DESTROYED its deliveries, so nothing a
+/// pause held could ever reach a flush. Now it can, and "this pane was
+/// blocked" would be a false statement about a pane that was never blocked at
+/// all — the receiver would go looking for a box or a dialog that was never
+/// there instead of reading "the human paused us and has now resumed."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushCause {
+    /// Delivery to the pane itself was held (a box, a dialog, a queue behind
+    /// one of those) — every pre-#569 flush, and still the common case.
+    PaneBlocked,
+    /// The human paused the group; this flush is the resume.
+    GroupPaused,
+}
+
+/// #569: which cause a flush's batch should report.
+///
+/// `GroupPaused` wins on a MIXED batch, and deliberately: a batch mixes only
+/// when entries queued behind a pane block were still sitting there when the
+/// human paused, in which case the pause is both the more recent hold and the
+/// one that decided when this flush happened. The pane-block wording would
+/// name a condition that has since cleared; the pause wording names the event
+/// the receiver just lived through. Neither is the whole story on a mixed
+/// batch — the per-constituent banners carry each entry's own queue time —
+/// but only one of the two can head the paste, and this is the one that
+/// explains the timing.
+pub fn flush_cause(entries: &[QueuedDelivery]) -> FlushCause {
+    if entries.iter().any(|e| e.reason == EnqueueReason::GroupPaused) {
+        FlushCause::GroupPaused
+    } else {
+        FlushCause::PaneBlocked
+    }
+}
+
+/// The clause both headers below share: what the deliveries were waiting on.
+fn flush_cause_clause(cause: FlushCause) -> &'static str {
+    match cause {
+        FlushCause::PaneBlocked => "queued while this pane was blocked",
+        FlushCause::GroupPaused => "queued while this group was paused",
+    }
 }
 
 /// The one line a drain delivers FIRST, ahead of whatever it flushes — the
@@ -355,7 +474,7 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
 /// analysis asked for. For an orchestrator target this doubles as the
 /// re-sync prompt; it cannot loop, because it only ever fires on UNBLOCK,
 /// when delivery demonstrably works again.
-pub fn flush_header_text(count: usize, coalesced: usize) -> String {
+pub fn flush_header_text(count: usize, coalesced: usize, cause: FlushCause) -> String {
     // The verb agrees with the count (#533): this line shipped as "1
     // delivery ... ARE now delivering" and a human read it in a live pane.
     // Small, but every one of these notices is read by an agent as an
@@ -363,12 +482,13 @@ pub fn flush_header_text(count: usize, coalesced: usize) -> String {
     // skim it.
     let n = if count == 1 { "1 delivery".to_string() } else { format!("{count} deliveries") };
     let verb = if count == 1 { "is" } else { "are" };
+    let why = flush_cause_clause(cause);
     if coalesced > 0 {
         format!(
-            "[loomux] {n} queued while this pane was blocked ({coalesced} coalesced) {verb} now delivering, oldest first"
+            "[loomux] {n} {why} ({coalesced} coalesced) {verb} now delivering, oldest first"
         )
     } else {
-        format!("[loomux] {n} queued while this pane was blocked {verb} now delivering, oldest first")
+        format!("[loomux] {n} {why} {verb} now delivering, oldest first")
     }
 }
 
@@ -548,7 +668,12 @@ fn age_clause(ms: u64) -> String {
 /// "one delivery, itemized" — `run_queue_drainer` keeps using
 /// `flush_header_text` for the lone-entry case so an uncontended flush's
 /// wording is unchanged from pre-#533.
-pub fn coalesced_flush_text(items: &[FlushConstituent], remaining: usize, now_ms: u64) -> String {
+pub fn coalesced_flush_text(
+    items: &[FlushConstituent],
+    remaining: usize,
+    now_ms: u64,
+    cause: FlushCause,
+) -> String {
     let n = items.len();
     let more = if remaining > 0 {
         let d = if remaining == 1 { "delivery" } else { "deliveries" };
@@ -564,8 +689,9 @@ pub fn coalesced_flush_text(items: &[FlushConstituent], remaining: usize, now_ms
     };
     let count = if n == 1 { "1 delivery".to_string() } else { format!("{n} deliveries") };
     let verb = if n == 1 { "is" } else { "are" };
+    let why = flush_cause_clause(cause);
     let mut out = format!(
-        "[loomux] {count} queued while this pane was blocked {verb} being delivered TOGETHER, \
+        "[loomux] {count} {why} {verb} being delivered TOGETHER, \
          as this one prompt, oldest first{more} — they are itemized below with their origin and \
          queue time; nothing was reordered or dropped.{dedup} Treat each item as its own message.",
     );
@@ -1233,19 +1359,26 @@ mod tests {
         }
     }
 
+    /// #569: `text_entry` with the admission reason chosen — what
+    /// `flush_cause` reads, and the only field that distinguishes a
+    /// pause-held entry from a pane-blocked one.
+    fn reason_entry(id: u64, text: &str, reason: EnqueueReason) -> QueuedDelivery {
+        QueuedDelivery { reason, ..text_entry(id, text) }
+    }
+
     // ---------- admit ----------
 
     #[test]
     fn admit_appends_to_an_empty_queue() {
         let q: VecDeque<QueuedDelivery> = VecDeque::new();
-        assert_eq!(admit(&q, "hello"), AdmitDecision::Admit);
+        assert_eq!(admit(&q, "hello", EnqueueReason::Arrival), AdmitDecision::Admit);
     }
 
     #[test]
     fn admit_coalesces_a_byte_identical_repeat() {
         let mut q = VecDeque::new();
         q.push_back(text_entry(1, "give me a status update"));
-        assert_eq!(admit(&q, "give me a status update"), AdmitDecision::Coalesce);
+        assert_eq!(admit(&q, "give me a status update", EnqueueReason::Arrival), AdmitDecision::Coalesce);
     }
 
     #[test]
@@ -1254,7 +1387,7 @@ mod tests {
         // deliver. Only an exact byte match collapses.
         let mut q = VecDeque::new();
         q.push_back(text_entry(1, "give me a status update"));
-        assert_eq!(admit(&q, "give me a status update please"), AdmitDecision::Admit);
+        assert_eq!(admit(&q, "give me a status update please", EnqueueReason::Arrival), AdmitDecision::Admit);
     }
 
     #[test]
@@ -1274,7 +1407,7 @@ mod tests {
         });
         // Empty string would trivially "match" a bad comparison — pin the
         // marker is simply never a coalesce target at all.
-        assert_eq!(admit(&q, ""), AdmitDecision::Admit);
+        assert_eq!(admit(&q, "", EnqueueReason::Arrival), AdmitDecision::Admit);
     }
 
     #[test]
@@ -1283,7 +1416,7 @@ mod tests {
         for i in 0..QUEUE_MAX_PER_PANE {
             q.push_back(text_entry(i as u64, &format!("distinct-{i}")));
         }
-        assert_eq!(admit(&q, "one-more"), AdmitDecision::RejectFull);
+        assert_eq!(admit(&q, "one-more", EnqueueReason::Arrival), AdmitDecision::RejectFull);
     }
 
     #[test]
@@ -1296,7 +1429,67 @@ mod tests {
         for i in 0..QUEUE_MAX_PER_PANE {
             q.push_back(text_entry(i as u64, &format!("distinct-{i}")));
         }
-        assert_eq!(admit(&q, "distinct-0"), AdmitDecision::Coalesce);
+        assert_eq!(admit(&q, "distinct-0", EnqueueReason::Arrival), AdmitDecision::Coalesce);
+    }
+
+    #[test]
+    fn only_the_pause_loss_notice_may_exceed_the_cap_and_only_by_its_headroom() {
+        // #569 rev-128. The notice reports payloads the cap destroyed, so
+        // refusing it to that same cap loses both the work and the record of
+        // it — and on the orchestrator's own pane that refusal is certain, not
+        // unlucky. The exemption is one entry, so "the cap is 8" stays true for
+        // every other purpose.
+        let mut q = VecDeque::new();
+        for i in 0..QUEUE_MAX_PER_PANE {
+            q.push_back(text_entry(i as u64, &format!("distinct-{i}")));
+        }
+        for ordinary in [
+            EnqueueReason::Arrival,
+            EnqueueReason::BehindQueue,
+            EnqueueReason::BoxOccupied,
+            EnqueueReason::Question,
+            EnqueueReason::KickoffRecovery,
+            EnqueueReason::Recovered,
+            EnqueueReason::GroupPaused,
+        ] {
+            assert_eq!(
+                admit(&q, "one-more", ordinary),
+                AdmitDecision::RejectFull,
+                "{ordinary:?} must not be exempt — the cap is the cap"
+            );
+            assert_eq!(ordinary.cap_headroom(), 0, "{ordinary:?}");
+        }
+        assert_eq!(
+            admit(&q, "one-more", EnqueueReason::PauseLossNotice),
+            AdmitDecision::Admit,
+            "the loss notice gets in"
+        );
+
+        // …and the headroom is a bound, not a bypass: once spent, the next one
+        // is refused like anything else.
+        q.push_back(text_entry(99, "the notice"));
+        assert_eq!(q.len(), QUEUE_MAX_PER_PANE + PAUSE_LOSS_NOTICE_HEADROOM);
+        assert_eq!(
+            admit(&q, "a second notice", EnqueueReason::PauseLossNotice),
+            AdmitDecision::RejectFull,
+            "the exemption is one entry deep, not an open door"
+        );
+    }
+
+    #[test]
+    fn an_exempt_admission_still_coalesces_rather_than_spending_its_headroom() {
+        // Coalescing is checked before the cap for every reason, and must stay
+        // that way here: a byte-identical repeat adds no information, so
+        // spending the one-entry headroom on it would leave the real notice
+        // with nowhere to go.
+        let mut q = VecDeque::new();
+        for i in 0..QUEUE_MAX_PER_PANE {
+            q.push_back(text_entry(i as u64, &format!("distinct-{i}")));
+        }
+        assert_eq!(
+            admit(&q, "distinct-3", EnqueueReason::PauseLossNotice),
+            AdmitDecision::Coalesce
+        );
     }
 
     // ---------- notice text ----------
@@ -1324,30 +1517,72 @@ mod tests {
         // while this pane was blocked is now delivering" — so each is
         // asserted where it actually sits. (An earlier draft asserted
         // "1 delivery is now" and reddened on the real, correct string.)
-        assert!(flush_header_text(1, 0).contains("1 delivery queued"), "{}", flush_header_text(1, 0));
-        assert!(flush_header_text(1, 0).contains("blocked is now delivering"), "{}", flush_header_text(1, 0));
-        assert!(flush_header_text(2, 0).contains("2 deliveries queued"), "{}", flush_header_text(2, 0));
-        assert!(flush_header_text(2, 0).contains("blocked are now delivering"), "{}", flush_header_text(2, 0));
-        assert!(flush_header_text(1, 1).contains("coalesced) is now"), "{}", flush_header_text(1, 1));
+        let blocked = FlushCause::PaneBlocked;
+        assert!(flush_header_text(1, 0, blocked).contains("1 delivery queued"), "{}", flush_header_text(1, 0, blocked));
+        assert!(flush_header_text(1, 0, blocked).contains("blocked is now delivering"), "{}", flush_header_text(1, 0, blocked));
+        assert!(flush_header_text(2, 0, blocked).contains("2 deliveries queued"), "{}", flush_header_text(2, 0, blocked));
+        assert!(flush_header_text(2, 0, blocked).contains("blocked are now delivering"), "{}", flush_header_text(2, 0, blocked));
+        assert!(flush_header_text(1, 1, blocked).contains("coalesced) is now"), "{}", flush_header_text(1, 1, blocked));
         let one = [FlushConstituent { id: 1, from: "w-2", enqueued_ms: 0, coalesced: 0, text: "x" }];
-        assert!(coalesced_flush_text(&one, 0, 0).contains("1 delivery queued while this pane was blocked is being"),
-            "{}", coalesced_flush_text(&one, 0, 0));
+        assert!(coalesced_flush_text(&one, 0, 0, blocked).contains("1 delivery queued while this pane was blocked is being"),
+            "{}", coalesced_flush_text(&one, 0, 0, blocked));
         let two = [
             FlushConstituent { id: 1, from: "w-2", enqueued_ms: 0, coalesced: 0, text: "x" },
             FlushConstituent { id: 2, from: "w-3", enqueued_ms: 0, coalesced: 0, text: "y" },
         ];
-        assert!(coalesced_flush_text(&two, 0, 0).contains("2 deliveries queued while this pane was blocked are being"),
-            "{}", coalesced_flush_text(&two, 0, 0));
+        assert!(coalesced_flush_text(&two, 0, 0, blocked).contains("2 deliveries queued while this pane was blocked are being"),
+            "{}", coalesced_flush_text(&two, 0, 0, blocked));
     }
 
     #[test]
     fn flush_header_singular_and_plural_and_coalesced_clause() {
-        assert!(flush_header_text(1, 0).contains("1 delivery "), "{}", flush_header_text(1, 0));
-        assert!(flush_header_text(3, 0).contains("3 deliveries"), "{}", flush_header_text(3, 0));
-        let h = flush_header_text(3, 1);
+        let blocked = FlushCause::PaneBlocked;
+        assert!(flush_header_text(1, 0, blocked).contains("1 delivery "), "{}", flush_header_text(1, 0, blocked));
+        assert!(flush_header_text(3, 0, blocked).contains("3 deliveries"), "{}", flush_header_text(3, 0, blocked));
+        let h = flush_header_text(3, 1, blocked);
         assert!(h.contains("1 coalesced"), "got: {h}");
-        assert!(!flush_header_text(3, 0).contains("coalesced"), "must omit the clause when nothing coalesced");
-        assert!(flush_header_text(3, 0).contains("oldest first"));
+        assert!(!flush_header_text(3, 0, blocked).contains("coalesced"), "must omit the clause when nothing coalesced");
+        assert!(flush_header_text(3, 0, blocked).contains("oldest first"));
+    }
+
+    // ---------- #569: the flush header names the RIGHT hold ----------
+
+    #[test]
+    fn a_pause_held_flush_says_paused_not_pane_blocked() {
+        // The whole point of `FlushCause`: a pause-held delivery arriving under
+        // "queued while this pane was blocked" would send its reader hunting
+        // for a box or a dialog that never existed. Both headers are pinned
+        // because the coalesced one repeats the construction.
+        let paused = FlushCause::GroupPaused;
+        let h = flush_header_text(2, 0, paused);
+        assert!(h.contains("queued while this group was paused"), "got: {h}");
+        assert!(!h.contains("pane was blocked"), "must not claim a pane block that never happened: {h}");
+        let items = [
+            FlushConstituent { id: 1, from: "w-2", enqueued_ms: 0, coalesced: 0, text: "x" },
+            FlushConstituent { id: 2, from: "w-3", enqueued_ms: 0, coalesced: 0, text: "y" },
+        ];
+        let c = coalesced_flush_text(&items, 0, 0, paused);
+        assert!(c.contains("2 deliveries queued while this group was paused are being"), "got: {c}");
+        assert!(!c.contains("pane was blocked"), "got: {c}");
+    }
+
+    #[test]
+    fn flush_cause_is_paused_when_any_constituent_was_pause_held() {
+        // An all-pane-blocked batch keeps the pre-#569 wording verbatim...
+        let blocked = [reason_entry(1, "a", EnqueueReason::Question), reason_entry(2, "b", EnqueueReason::BehindQueue)];
+        assert_eq!(flush_cause(&blocked), FlushCause::PaneBlocked);
+        // ...and an empty batch cannot claim a pause it has no evidence for.
+        assert_eq!(flush_cause(&[]), FlushCause::PaneBlocked);
+        // A MIXED batch reports the pause: entries that had been sitting behind
+        // a pane block were still there when the human paused, and the pause is
+        // what decided when this flush happened. See `flush_cause`'s doc.
+        let mixed = [
+            reason_entry(1, "a", EnqueueReason::BoxOccupied),
+            reason_entry(2, "b", EnqueueReason::GroupPaused),
+        ];
+        assert_eq!(flush_cause(&mixed), FlushCause::GroupPaused);
+        let all_paused = [reason_entry(1, "a", EnqueueReason::GroupPaused)];
+        assert_eq!(flush_cause(&all_paused), FlushCause::GroupPaused);
     }
 
     // ---------- #533-A: coalesced flush ----------
@@ -1507,7 +1742,7 @@ mod tests {
             FlushConstituent { id: 11, from: "orchestrator", enqueued_ms: now - 300_000, coalesced: 0, text: "FIRST-BODY" },
             FlushConstituent { id: 12, from: "w-7", enqueued_ms: now - 45_000, coalesced: 0, text: "SECOND-BODY" },
         ];
-        let out = coalesced_flush_text(&items, 0, now);
+        let out = coalesced_flush_text(&items, 0, now, FlushCause::PaneBlocked);
         let first = out.find("FIRST-BODY").expect("constituent 1 present");
         let second = out.find("SECOND-BODY").expect("constituent 2 present");
         assert!(first < second, "queue order must survive the merge:\n{out}");
@@ -1524,9 +1759,9 @@ mod tests {
     #[test]
     fn coalesced_flush_text_announces_a_further_chunk_when_one_remains() {
         let items = [FlushConstituent { id: 1, from: "loomux", enqueued_ms: 0, coalesced: 0, text: "b" }];
-        let out = coalesced_flush_text(&items, 3, 1_000);
+        let out = coalesced_flush_text(&items, 3, 1_000, FlushCause::PaneBlocked);
         assert!(out.contains("3 further queued deliveries follow"), "chunking must be stated: {out}");
-        let none = coalesced_flush_text(&items, 0, 1_000);
+        let none = coalesced_flush_text(&items, 0, 1_000, FlushCause::PaneBlocked);
         assert!(!none.contains("follow in the next flush"), "no phantom chunk clause: {none}");
     }
 
@@ -1536,7 +1771,7 @@ mod tests {
             FlushConstituent { id: 1, from: "w-2", enqueued_ms: 0, coalesced: 2, text: "ping" },
             FlushConstituent { id: 2, from: "w-3", enqueued_ms: 0, coalesced: 0, text: "pong" },
         ];
-        let out = coalesced_flush_text(&items, 0, 1_000);
+        let out = coalesced_flush_text(&items, 0, 1_000, FlushCause::PaneBlocked);
         assert!(out.contains("+2 identical repeats coalesced"), "per-constituent repeat count: {out}");
         assert_eq!(
             out.matches("repeats coalesced").count(),

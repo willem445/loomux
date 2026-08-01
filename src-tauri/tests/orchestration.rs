@@ -56,7 +56,7 @@ use loomux_lib::orchestration::{
     ends_hold_episode, opens_hold_episode, HoldObservation,
     hold_channels, HoldChannel, HoldClass,
     pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
-    PauseSuppression, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
+    PauseSuppression, SuppressedCause, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -165,6 +165,39 @@ fn test_registry() -> (OrchRegistry, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let reg = relaunch_registry(dir.path());
     (reg, dir)
+}
+
+/// #569: give `agent_id` a fake pane, then pause `group` — the pairing every
+/// test that wants to observe a delivery's TEXT without a terminal now needs.
+///
+/// Pause was this suite's delivery mock for years: `deliver_prompt` destroyed
+/// the payload, audited `prompt-suppressed-paused` carrying the full text, and
+/// returned `Ok`, so pausing made a notice observable with no pty anywhere.
+/// #569 option 2 replaced that discard with a queue admission — and a queue is
+/// keyed by PANE, so the target needs a `pty_id` or the delivery fails with the
+/// same "agent has no terminal yet" error an unpaused one would get. The text
+/// is still recorded in full; it lands under the ordinary `prompt` action now,
+/// which is what [`delivered_texts`] reads.
+fn pause_with_pane(reg: &OrchRegistry, group: &str, agent_id: &str, pty_id: u32) {
+    reg.set_pty_for_test(agent_id, pty_id);
+    reg.pause_group(group).unwrap();
+}
+
+/// Every prompt `group` delivered, in order, as text — the only way to observe
+/// delivered wording in test mode, which has no real PTY to read back.
+///
+/// #569: the action filtered on is `prompt`, not `prompt-suppressed-paused`.
+/// Pause queues rather than discards now, so a paused delivery audits exactly
+/// what an unpaused one does; the pause is visible instead in the
+/// `delivery-queued` line's `reason` (`group-paused`) and in the pane's queue.
+/// Pausing still does not touch anything that happens BEFORE delivery (merge
+/// grant minting, board writes), which is what makes it usable as a probe.
+fn delivered_texts(reg: &OrchRegistry, group: &str) -> Vec<String> {
+    reg.audit_log(group)
+        .into_iter()
+        .filter(|e| e.action == "prompt")
+        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
+        .collect()
 }
 
 /// A disposable git repo used as the worktree-cutting fixture's own root: the
@@ -602,10 +635,10 @@ fn new_group_still_honors_the_launcher_cap() {
 fn max_agents_change_audits_and_notifies_orchestrator() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    // Pause so the notice delivery is suppressed-but-audited (test mode has no
-    // pane to type into) — this lets us observe the exact notice text.
-    reg.pause_group(&g.id).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // Pause so the notice is QUEUED-and-audited rather than pasted (test mode
+    // has no pane to type into) — this lets us observe the exact notice text.
+    pause_with_pane(&reg, &g.id, &orch.id, 6001);
     reg.set_max_agents(&g.id, 4, "human").unwrap();
     // The audit is immediate (per-click); the notice is debounced (#79), so it
     // is delivered only when its window has elapsed — drive the flush past the
@@ -622,20 +655,18 @@ fn max_agents_change_audits_and_notifies_orchestrator() {
     );
     assert!(
         events.iter().any(|e|
-            e["action"] == json!("prompt-suppressed-paused")
+            e["action"] == json!("prompt")
             && e["detail"]["text"].as_str().unwrap_or("").contains("max live agents changed 2→4")),
         "the orchestrator must receive the cap-change re-plan notice"
     );
 }
 
 // Helper: read the audit log and count the coalesced re-plan notices (visible
-// as `prompt-suppressed-paused` entries because the group is paused in tests).
+// as `prompt` entries — the group is paused in these tests, so #569 queues the
+// delivery rather than pasting it, and the text is audited either way).
 fn replan_notices(reg: &OrchRegistry, group: &str) -> Vec<String> {
-    let log = fs::read_to_string(reg.state_root().join(group).join("audit.jsonl")).unwrap();
-    log.lines()
-        .map(|l| serde_json::from_str::<Value>(l).unwrap())
-        .filter(|e| e["action"] == json!("prompt-suppressed-paused"))
-        .filter_map(|e| e["detail"]["text"].as_str().map(str::to_string))
+    delivered_texts(reg, group)
+        .into_iter()
         .filter(|t| t.contains("max live agents changed"))
         .collect()
 }
@@ -644,8 +675,8 @@ fn replan_notices(reg: &OrchRegistry, group: &str) -> Vec<String> {
 fn rapid_max_agents_clicks_coalesce_to_one_notice() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.pause_group(&g.id).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6002);
     // A burst of stepper clicks 2→4→6→3, all within the debounce window (test
     // calls land in the same few ms). Each persists + enforces + audits per
     // click, but the notice is held.
@@ -674,8 +705,8 @@ fn rapid_max_agents_clicks_coalesce_to_one_notice() {
 fn spaced_max_agents_changes_notify_separately() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // cap 2
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.pause_group(&g.id).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6003);
     // First change flushes fully before the second is recorded → two notices.
     reg.set_max_agents(&g.id, 5, "human").unwrap();
     reg.flush_due_max_notices(now_ms() + 4_000);
@@ -5711,7 +5742,7 @@ fn delete_done_removes_only_done_and_notifies_once() {
     // per-task notices are the token waste the issue calls out).
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
 
     // Five tasks, three of them done, interleaved with non-done ones.
     let ids: Vec<String> = ["a", "b", "c", "d", "e"]
@@ -5722,11 +5753,12 @@ fn delete_done_removes_only_done_and_notifies_once() {
         reg.upsert_task(&g.id, "human", Some(&ids[i]), patch(None, Some(status), None)).unwrap();
     }
 
-    // Pause the group so the best-effort board-change notice is observable as a
-    // suppression audit — test mode has no real PTY to deliver into. The pause
-    // guard fires inside deliver_to_orchestrator, past the coalescing point, so
-    // the suppression count equals the notice count.
-    reg.pause_group(&g.id).unwrap();
+    // Pause the group so the best-effort board-change notice is QUEUED and
+    // audited rather than pasted — test mode has no real PTY to deliver into.
+    // The pause branch fires inside deliver_to_orchestrator, past the coalescing
+    // point, so the audited count equals the notice count (#569: it queues now,
+    // which is why the orchestrator needs a pane to hold it).
+    pause_with_pane(&reg, &g.id, &orch.id, 6400);
 
     let removed = reg.delete_done_tasks(&g.id, "human").unwrap();
     removed.iter().for_each(|id| assert!(ids.contains(id)));
@@ -5741,7 +5773,7 @@ fn delete_done_removes_only_done_and_notifies_once() {
         .audit_log(&g.id)
         .into_iter()
         .filter(|e| {
-            e.action == "prompt-suppressed-paused"
+            e.action == "prompt"
                 && e.detail["text"].as_str().is_some_and(|s| s.contains("updated the task board"))
         })
         .collect();
@@ -5759,7 +5791,7 @@ fn delete_done_removes_only_done_and_notifies_once() {
         .audit_log(&g.id)
         .into_iter()
         .filter(|e| {
-            e.action == "prompt-suppressed-paused"
+            e.action == "prompt"
                 && e.detail["text"].as_str().is_some_and(|s| s.contains("updated the task board"))
         })
         .count();
@@ -5774,7 +5806,7 @@ fn delete_selected_removes_only_named_ids_and_notifies_once() {
     // selection), and an empty selection a silent no-op.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
 
     // Four tasks in assorted statuses — selection is by id, not status.
     let ids: Vec<String> = ["a", "b", "c", "d"]
@@ -5782,9 +5814,9 @@ fn delete_selected_removes_only_named_ids_and_notifies_once() {
         .map(|title| reg.upsert_task(&g.id, "orch", None, patch(Some(title), None, None)).unwrap().id)
         .collect();
 
-    // Pause so the best-effort notice is observable as a suppression audit (as
-    // in the delete-done test — test mode has no PTY to deliver into).
-    reg.pause_group(&g.id).unwrap();
+    // Pause so the best-effort notice is queued-and-audited rather than pasted
+    // (as in the delete-done test — test mode has no PTY to deliver into).
+    pause_with_pane(&reg, &g.id, &orch.id, 6401);
 
     // Select two real ids plus one that never existed: the unknown id is
     // skipped, the two real ones go, and the removed set is exactly those two.
@@ -5812,7 +5844,7 @@ fn delete_selected_removes_only_named_ids_and_notifies_once() {
         reg.audit_log(&g.id)
             .into_iter()
             .filter(|e| {
-                e.action == "prompt-suppressed-paused"
+                e.action == "prompt"
                     && e.detail["text"].as_str().is_some_and(|s| s.contains("updated the task board"))
             })
             .count()
@@ -6178,29 +6210,37 @@ fn start_is_guarded_to_queued_items() {
 
 #[test]
 fn start_is_rejected_up_front_when_the_group_is_paused() {
-    // A paused group suppresses delivery silently (deliver_prompt returns Ok
-    // after auditing prompt-suppressed-paused), and unlike approve — which
-    // leaves a durable `done` flip — a Start nudge leaves only a note and the
-    // "begin work" signal is lost on resume. So Start rejects up front, like the
-    // steering strip (#43): a clear error, NO note appended, and — the point —
-    // it never reaches delivery, so no suppression audit is recorded.
+    // Start is a HUMAN clicking "begin work now" on a group they have paused,
+    // and the two readings of that click ("now" vs "whenever I resume") are far
+    // enough apart to be worth a synchronous error rather than a silent guess.
+    // So Start rejects up front, like the steering strip (#43): a clear error,
+    // NO note appended, and — the point — it never reaches delivery at all.
+    //
+    // #569 rewrote the ARGUMENT, not the behavior: pre-#569 the nudge would have
+    // been destroyed by the pause, which is why the guard was added; it would
+    // now be queued and delivered on resume. The assertion below moved with it,
+    // from "no suppression audit" to "nothing was queued for the pane".
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    // An orchestrator is present: if the guard were missing, start would reach
-    // delivery and record a prompt-suppressed-paused audit — so asserting its
-    // absence proves the guard fires *before* delivery, not that there was
-    // simply no target.
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    // An orchestrator is present AND has a pane: if the guard were missing,
+    // start would reach delivery and admit an entry to that pane — so asserting
+    // the pane's queue is empty proves the guard fires *before* delivery, not
+    // that there was simply no target to deliver to.
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Ship the parser"), None, None)).unwrap();
 
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6100);
     let err = reg.start_task(&g.id, &t.id).unwrap_err();
     assert!(err.contains("paused"), "paused rejection must say so: {err}");
 
     assert!(reg.tasks(&g.id)[0].notes.is_empty(), "a rejected start must not leave a note");
     assert!(
-        reg.audit_log(&g.id).iter().all(|e| e.action != "prompt-suppressed-paused"),
-        "start must reject before delivery — no suppressed-prompt audit"
+        reg.queue_snapshot(6100).is_empty(),
+        "start must reject before delivery — nothing may be queued for the orchestrator"
+    );
+    assert!(
+        delivered_texts(&reg, &g.id).is_empty(),
+        "start must reject before delivery — no prompt audited"
     );
 
     // Resuming lets it through again.
@@ -6212,17 +6252,12 @@ fn start_is_rejected_up_front_when_the_group_is_paused() {
 
 // ---------- #147: prototype status + proceed workflow ----------
 
-/// Count the notices the orchestrator would have received, observed as
-/// `prompt-suppressed-paused` audit entries (delivery is suppressed in a paused
-/// group, but the text is still recorded) whose text contains `needle`.
+/// Count the notices the orchestrator received whose text contains `needle`.
+/// The group is paused in these tests, so #569 QUEUES each delivery instead of
+/// pasting it — the text is audited under the ordinary `prompt` action either
+/// way, which is what makes a paused group a usable probe with no real PTY.
 fn suppressed_notices(reg: &OrchRegistry, group: &str, needle: &str) -> usize {
-    reg.audit_log(group)
-        .into_iter()
-        .filter(|e| {
-            e.action == "prompt-suppressed-paused"
-                && e.detail["text"].as_str().is_some_and(|s| s.contains(needle))
-        })
-        .count()
+    delivered_texts(reg, group).into_iter().filter(|t| t.contains(needle)).count()
 }
 
 #[test]
@@ -6241,10 +6276,11 @@ fn proceed_flips_to_in_progress_audits_and_sends_one_notice() {
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     // An orchestrator must exist for the notice to have a target; pause the group
-    // so delivery is suppressed-but-audited (test mode has no pane to type into),
-    // letting us observe the exact notice — and prove there is exactly one.
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.pause_group(&g.id).unwrap();
+    // so delivery is queued-and-audited rather than pasted (test mode has no pane
+    // to type into), letting us observe the exact notice — and prove there is
+    // exactly one.
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6402);
 
     let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Prototype the sidebar"), Some("prototype"), None)).unwrap();
     // Proceed is the human's promote verdict: unlike Start it is NOT rejected by
@@ -8225,13 +8261,13 @@ fn planner_done_report_closes_pane_and_reports_before_exit() {
     // must read as a normal completion, not a crash.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let planner = reg
         .spawn_agent(&g.id, Role::Planner, "plan", "plan issue #7", false, None)
         .unwrap();
-    // Pause so deliveries are audited (suppressed) and observable in order —
+    // Pause so deliveries are queued-and-audited, and observable in order —
     // test mode has no pane to type into.
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6200);
     let cp = reg.resolve_token(&planner.token).unwrap();
 
     let r = dispatch(
@@ -8253,12 +8289,7 @@ fn planner_done_report_closes_pane_and_reports_before_exit() {
     assert!(dead, "a planner's done report must close its pane (#203)");
 
     // Ordering: the orchestrator gets the report before the exit notice.
-    let texts: Vec<String> = reg
-        .audit_log(&g.id)
-        .into_iter()
-        .filter(|e| e.action == "prompt-suppressed-paused")
-        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
-        .collect();
+    let texts = delivered_texts(&reg, &g.id);
     let report_at = texts
         .iter()
         .position(|t| t.contains("reports done") && t.contains("plan posted"))
@@ -8285,10 +8316,11 @@ fn only_a_planner_done_report_auto_closes_the_pane() {
     // `progress` (still working) must both leave the pane alive.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let worker = reg.spawn_agent(&g.id, Role::Worker, "w", "task", false, None).unwrap();
     let planner = reg.spawn_agent(&g.id, Role::Planner, "plan", "task", false, None).unwrap();
-    reg.pause_group(&g.id).unwrap(); // suppress delivery; keep the report path exercised
+    // #569: queue delivery instead of pasting it; keep the report path exercised.
+    pause_with_pane(&reg, &g.id, &orch.id, 6201);
     let cw = reg.resolve_token(&worker.token).unwrap();
     let cp = reg.resolve_token(&planner.token).unwrap();
 
@@ -8314,9 +8346,9 @@ fn closing_a_completed_planner_is_idempotent() {
     // transition delivers the exit notice; a second (racing) call is a no-op.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let planner = reg.spawn_agent(&g.id, Role::Planner, "plan", "task", false, None).unwrap();
-    reg.pause_group(&g.id).unwrap(); // suppress+audit deliveries so notices are countable
+    pause_with_pane(&reg, &g.id, &orch.id, 6202); // queue+audit deliveries so notices are countable
 
     reg.close_completed_planner(&planner.id);
     reg.close_completed_planner(&planner.id); // the racing duplicate
@@ -8350,12 +8382,12 @@ fn advisor_hinted_planner_auto_closes_on_report_done() {
         role_hint: Some("advisor".into()),
     });
     let g = reg.create_group("C:/tmp/repo", g_rails).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let advisor = reg
         .spawn_agent_ex(&g.id, Role::Planner, Some("advisor".into()), "adv",
                         "is the worker stuck on X or Y?", false, None, None, None, None, None)
         .unwrap();
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 6203);
     let ca = reg.resolve_token(&advisor.token).unwrap();
 
     let r = dispatch(&reg, &ca, "tools/call",
@@ -8674,7 +8706,7 @@ fn parse_session_cost_reads_the_lowest_statusline_dollar() {
 }
 
 #[test]
-fn pause_suppresses_delivery_and_persists_across_restart() {
+fn pause_holds_delivery_and_persists_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let gid;
     {
@@ -8683,16 +8715,31 @@ fn pause_suppresses_delivery_and_persists_across_restart() {
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
         gid = g.id.clone();
         let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-        // Not paused: delivery proceeds past the pause gate and only fails
-        // because test mode has no real terminal.
+        // A target with no pane has nowhere to hold anything, paused or not —
+        // #569 made those two answers the same `Err` rather than an `Ok` that
+        // quietly dropped the payload on the paused side.
         let err = reg.deliver_prompt(&w.id, "hello", "loomux", Delivery::MidSession).unwrap_err();
         assert!(err.contains("terminal"), "unpaused delivery must reach the pty step, got: {err}");
-        // Paused: delivery is suppressed (Ok, no error) and audited.
         reg.pause_group(&g.id).unwrap();
+        let paused_err =
+            reg.deliver_prompt(&w.id, "hello", "loomux", Delivery::MidSession).unwrap_err();
+        assert!(
+            paused_err.contains("terminal"),
+            "a paused delivery to a pane-less agent must say so too, not report false success:              {paused_err}"
+        );
+
+        // With a pane, the pause HOLDS it: audited as an ordinary prompt, on
+        // the queue, and nothing pasted.
+        reg.set_pty_for_test(&w.id, 5698);
         assert!(reg.is_paused(&g.id));
         reg.deliver_prompt(&w.id, "hello again", "loomux", Delivery::MidSession).unwrap();
+        assert_eq!(reg.queue_depth(5698), 1, "a paused delivery is queued, never destroyed");
         let log = fs::read_to_string(reg.state_root().join(&g.id).join("audit.jsonl")).unwrap();
-        assert!(log.contains("prompt-suppressed-paused"), "suppression must be audited");
+        assert!(
+            !log.contains("prompt-suppressed-paused"),
+            "the discard action must have no writer left: {log}"
+        );
+        assert!(log.contains("group-paused"), "and the admission names the pause: {log}");
         assert!(reg.state_root().join(&g.id).join("paused").is_file(), "pause marker must be written");
     }
     // Restart: the pause survives (marker re-seeds the in-memory flag).
@@ -13834,19 +13881,6 @@ fn approve_task_writes_a_merge_grant_for_the_prs_number() {
 
 // --- bulk board approvals (#507) ---------------------------------------------------------------
 
-/// Every prompt a group delivered, in order, as text. A paused group records
-/// each delivery as a `prompt-suppressed-paused` audit carrying its text —
-/// the only way to observe delivered wording in test mode, which has no real
-/// PTY to read back. Pausing does not touch grant minting, which happens
-/// before delivery.
-fn delivered_texts(reg: &OrchRegistry, group: &str) -> Vec<String> {
-    reg.audit_log(group)
-        .into_iter()
-        .filter(|e| e.action == "prompt-suppressed-paused")
-        .filter_map(|e| e.detail["text"].as_str().map(str::to_string))
-        .collect()
-}
-
 /// A merge-gate task with the given title and optional PR ref, ready to approve.
 fn gate_task(reg: &OrchRegistry, group: &str, title: &str, pr: Option<&str>) -> Task {
     let t = reg.upsert_task(group, "orch-1", None, patch(Some(title), None, None)).unwrap();
@@ -13874,11 +13908,11 @@ fn bulk_approve_mints_a_grant_per_pr_and_delivers_one_consolidated_notice() {
     // one grant covering N PRs would be a bulk authority nobody granted.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let a = gate_task(&reg, &g.id, "Ship the parser", Some("#7"));
     let b = gate_task(&reg, &g.id, "Ship the writer", Some("https://github.com/o/r/pull/9"));
     let c = gate_task(&reg, &g.id, "Docs pass", None);
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 7001);
 
     let approved = reg
         .approve_tasks(
@@ -13932,10 +13966,10 @@ fn a_bulk_approval_of_one_delivers_exactly_what_a_single_approve_delivers() {
     // future edit to the shared builder cannot drift both together silently.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let single = gate_task(&reg, &g.id, "Ship it", Some("#7"));
     let bulk = gate_task(&reg, &g.id, "Ship it", Some("#7"));
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 7002);
 
     reg.approve_task(&g.id, &single.id, Some("bump the changelog first")).unwrap();
     reg.approve_tasks(
@@ -13972,10 +14006,10 @@ fn a_bulk_approval_is_all_or_nothing_and_mints_nothing_when_it_refuses() {
     // some of the grants the human asked for and silently dropping the rest.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let at_gate = gate_task(&reg, &g.id, "Ship it", Some("#7"));
     let queued = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Not ready"), Some("queued"), None)).unwrap();
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 7003);
 
     let err = reg
         .approve_tasks(
@@ -14020,14 +14054,14 @@ fn a_bulk_approval_with_no_prs_at_all_says_so_instead_of_naming_grants() {
     // empty PR list — the orchestrator has to hear "nothing was authorized".
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let a = gate_task(&reg, &g.id, "Docs pass", None);
     // Carrying a `pr` field that yields no NUMBER is the same case as carrying
     // none, and is why the notice says "no PR number could be resolved" rather
     // than "no PR is linked" — the latter would be false here and would send
     // the orchestrator looking for the wrong problem.
     let b = gate_task(&reg, &g.id, "Spike", Some("TBD"));
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 7004);
 
     reg.approve_tasks(
         &g.id,
@@ -14065,13 +14099,13 @@ fn a_failed_grant_write_fails_the_call_instead_of_reclassifying_the_item() {
     // shim then refuses. The classification must come from the ref alone.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let a = gate_task(&reg, &g.id, "Ship the parser", Some("#7"));
     let b = gate_task(&reg, &g.id, "Ship the writer", Some("#9"));
     // Injected I/O failure, portable and deterministic: a regular FILE where the
     // grant DIRECTORY has to go, so `atomic_write`'s `create_dir_all` fails.
     fs::write(reg.state_root().join(&g.id).join("merge_grants"), b"not a directory").unwrap();
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 7005);
 
     let err = reg
         .approve_tasks(&g.id, &[ApproveItem { id: a.id.clone(), comment: None }])
@@ -14105,12 +14139,12 @@ fn two_selected_tasks_naming_the_same_pr_are_refused_not_double_granted() {
     // about what it authorized, so refuse it like a repeated id.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     // Two different REFS, one number — proving the check is on the resolved PR
     // number, not on the string the human happened to paste.
     let a = gate_task(&reg, &g.id, "Ship it", Some("#7"));
     let b = gate_task(&reg, &g.id, "Ship it (dup filing)", Some("https://github.com/o/r/pull/7"));
-    reg.pause_group(&g.id).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 7006);
 
     let err = reg
         .approve_tasks(
@@ -19406,7 +19440,16 @@ fn a_pane_whose_queue_goes_away_ends_its_hold_episode() {
     assert!(!reg.hold_episode_badged(pty));
 }
 
-// ---------- #569: a pause discards, and resume says what it discarded ----------
+// ---------- #569: the LEGACY discard scan, and what resume says about it -------
+//
+// Option 2 (enqueue-while-paused) made `prompt-suppressed-paused` a line no
+// build writes any more: a pause queues. The scan below it is kept, and so are
+// these tests, for the one window where a payload can still have been
+// destroyed — a group paused under an older loomux and resumed under this one.
+// Every fixture here is therefore a LEGACY timeline by construction, which is
+// why they are built by hand rather than driven through `deliver_prompt`
+// (whose pause branch can no longer produce one). The live, queueing behavior
+// is covered in the `#569 option 2` section further down.
 
 /// One audit entry, as `suppressed_during_pause` reads them.
 fn audit(actor: &str, action: &str, detail: Value) -> AuditEntry {
@@ -19414,7 +19457,9 @@ fn audit(actor: &str, action: &str, detail: Value) -> AuditEntry {
 }
 
 /// A `prompt-suppressed-paused` line: actor is the SENDER, `to`/`text` the
-/// payload — exactly the shape `deliver_prompt`'s pause branch writes.
+/// payload — exactly the shape `deliver_prompt`'s pause branch wrote BEFORE
+/// #569 option 2. Nothing writes it now; that is what makes it a legacy
+/// fixture rather than a stale duplicate of live behavior.
 fn suppressed(from: &str, to: &str, text: &str) -> AuditEntry {
     audit(from, "prompt-suppressed-paused", json!({ "to": to, "text": text }))
 }
@@ -19459,11 +19504,13 @@ fn suppressed_during_pause_reads_only_the_window_the_last_pause_opened() {
                 from: "w-2".into(),
                 to: "orch-1".into(),
                 preview: "report: done, PR #123 is green".into(),
+                cause: SuppressedCause::LegacyDiscard,
             },
             SuppressedDelivery {
                 from: "human".into(),
                 to: "w-3".into(),
                 preview: "also update the README".into(),
+                cause: SuppressedCause::LegacyDiscard,
             },
         ],
         "only THIS window's suppressions, in arrival order, sender and target both named"
@@ -19525,17 +19572,35 @@ fn the_resume_notice_says_discarded_and_never_promises_a_replay() {
             from: "w-2".into(),
             to: "orch-1".into(),
             preview: "report: done, PR #123 is green".into(),
+            cause: SuppressedCause::LegacyDiscard,
         }],
         window_start_seen: true,
     };
     let n = pause_suppression_notice(&s);
 
-    assert!(n.contains("1 delivery was DISCARDED"), "loud, and singular reads as singular: {n}");
+    assert!(n.contains("1 delivery was LOST"), "loud, and singular reads as singular: {n}");
     assert!(n.contains("w-2 -> orch-1"), "names sender and target: {n}");
     assert!(n.contains("PR #123 is green"), "and the payload, so it can be re-requested: {n}");
+    assert!(n.contains("re-requested"), "the recovery is a RE-SEND, not a replay loomux does: {n}");
+    // #569 option 2: the two behaviors now coexist in one group's history, so
+    // the notice has to say WHICH pause it is about. Without this, a reader
+    // takes it as the current rule and re-requests work that is already on its
+    // way — the duplicate `queued_notice`'s "do NOT re-send" exists to prevent,
+    // arriving from the opposite direction.
     assert!(
-        n.contains("nothing here will be replayed") && n.contains("re-requested"),
-        "must say the recovery is a RE-SEND, not a replay loomux will do: {n}"
+        n.contains("EARLIER loomux version"),
+        "must scope the discard to the build that did it: {n}"
+    );
+    assert!(
+        n.contains("delivering on its own right now"),
+        "and must say the current rule, or it teaches the wrong one: {n}"
+    );
+    // Review B2: a legacy-only window must NOT mention the queue-full refusal —
+    // explaining a failure mode this window did not have is one more paragraph
+    // between the reader and the one that matters.
+    assert!(
+        !n.contains("REFUSED"),
+        "a legacy-only window must not describe a refusal that did not happen: {n}"
     );
     assert!(
         !n.contains("may reach back"),
@@ -19548,18 +19613,116 @@ fn the_resume_notice_says_discarded_and_never_promises_a_replay() {
                 from: format!("w-{i}"),
                 to: "orch-1".into(),
                 preview: format!("payload {i}"),
+                cause: SuppressedCause::LegacyDiscard,
             })
             .collect(),
         window_start_seen: true,
     };
     let n = pause_suppression_notice(&many);
-    assert!(n.contains("11 deliveries were DISCARDED"), "plural, and the full count: {n}");
+    assert!(n.contains("11 deliveries were LOST"), "plural, and the full count: {n}");
     assert!(n.contains("...and 3 more"), "the list is capped and says so: {n}");
     assert!(
         n.contains("prompt-suppressed-paused"),
         "and points at the log that holds the rest in full: {n}"
     );
     assert!(!n.contains("payload 9"), "beyond the cap is summarized, not listed: {n}");
+}
+
+#[test]
+fn the_resume_notice_reports_a_queue_full_refusal_as_a_LIVE_risk_not_as_history() {
+    // Review B2: option 2 was documented as making a pause incapable of
+    // destroying a payload, and that was false — a pane at QUEUE_MAX_PER_PANE
+    // refuses further admissions for as long as the pause lasts. The notice has
+    // to separate the two causes, because what a reader should DO about them
+    // differs: the legacy discard cannot recur on this build, the refusal can
+    // and will on the next long pause.
+    let s = PauseSuppression {
+        items: vec![SuppressedDelivery {
+            from: "w-2".into(),
+            to: "orch-1".into(),
+            preview: "report: done, PR #77 is green".into(),
+            cause: SuppressedCause::QueueFullDuringPause,
+        }],
+        window_start_seen: true,
+    };
+    let n = pause_suppression_notice(&s);
+    assert!(n.contains("REFUSED"), "the refusal must be named as such: {n}");
+    assert!(n.contains("queue was\n         already full") || n.contains("already full"),
+        "and must say why it was refused: {n}");
+    assert!(n.contains("expect it again"),
+        "a live risk must read as live — this is the half a reader can still act on: {n}");
+    assert!(
+        !n.contains("EARLIER loomux version"),
+        "a refusal-only window must not blame a build that had nothing to do with it: {n}"
+    );
+    assert!(n.contains("refused, queue full"), "and the per-item cause is named: {n}");
+
+    // A MIXED window names both, since one window can genuinely contain both.
+    let mixed = PauseSuppression {
+        items: vec![
+            SuppressedDelivery {
+                from: "w-1".into(),
+                to: "orch-1".into(),
+                preview: "old loss".into(),
+                cause: SuppressedCause::LegacyDiscard,
+            },
+            SuppressedDelivery {
+                from: "w-2".into(),
+                to: "orch-1".into(),
+                preview: "new loss".into(),
+                cause: SuppressedCause::QueueFullDuringPause,
+            },
+        ],
+        window_start_seen: true,
+    };
+    let m = pause_suppression_notice(&mixed);
+    assert!(m.contains("2 deliveries were LOST"), "{m}");
+    assert!(m.contains("EARLIER loomux version") && m.contains("REFUSED"), "both causes named: {m}");
+    assert!(m.contains("discarded by an earlier loomux") && m.contains("refused, queue full"),
+        "and each item says which one it was: {m}");
+}
+
+#[test]
+fn the_window_scan_picks_up_a_queue_full_refusal_but_not_an_ordinary_one() {
+    // The `enqueue_reason` filter is what keeps this scoped to the pause.
+    // `delivery-dropped` is written for ordinary queue-full rejections too, and
+    // those are the sender's own synchronous `Err` to deal with — re-reporting
+    // them at every resume would be the notice-becomes-noise failure the cap on
+    // this list exists to prevent.
+    let dropped = |reason: &str, text: &str| {
+        audit("loomux", "delivery-dropped", json!({
+            "to": "orch-1", "from": "w-2", "reason": "queue-full-at-call",
+            "enqueue_reason": reason, "preview": text,
+        }))
+    };
+    let entries = vec![
+        audit("human", "group-pause", json!({})),
+        dropped("group-paused", "report: done, PR #77 is green"),
+        dropped("arrival", "an ordinary overflow, not this window's business"),
+        suppressed("w-9", "orch-1", "an older build's discard"),
+    ];
+
+    let s = suppressed_during_pause(&entries);
+    assert!(s.window_start_seen);
+    assert_eq!(s.items.len(), 2, "the pause refusal and the legacy discard, not the arrival: {:?}", s.items);
+    assert_eq!(
+        s.items[0],
+        SuppressedDelivery {
+            // `from` comes off the DETAIL here: the actor is `loomux`, which did
+            // the dropping — not the sender who lost the work.
+            from: "w-2".into(),
+            to: "orch-1".into(),
+            preview: "report: done, PR #77 is green".into(),
+            cause: SuppressedCause::QueueFullDuringPause,
+        },
+        "the pause-scoped refusal, attributed to its SENDER"
+    );
+    assert_eq!(s.items[1].cause, SuppressedCause::LegacyDiscard);
+    assert!(
+        !s.items.iter().any(|i| i.preview.contains("ordinary overflow")),
+        "an unpaused overflow must not be re-reported at resume: {:?}",
+        s.items
+    );
 }
 
 #[test]
@@ -19600,12 +19763,21 @@ fn the_fallback_badge_fires_only_when_the_notice_did_not_land_on_a_free_live_pan
     );
 }
 
+// ---------- #569 option 2: a pause QUEUES, and resume flushes ----------
+//
+// The human's decision on this issue: paused-group deliveries are held in the
+// target pane's durable queue and delivered on resume, not destroyed. What
+// follows pins the behavior end to end; the legacy-discard scan that option 1
+// shipped is covered in its own section above and is now reachable only from a
+// group paused by an older build.
+
 #[test]
-fn resuming_names_every_delivery_the_pause_destroyed() {
-    // The end-to-end property: three deliveries vanish into a pause, and the
-    // resume tells the orchestrator what they were. Before this, the audit
-    // line was the only record and nothing ever showed it to anyone — a
-    // worker's `report("done")` fired mid-pause simply evaporated.
+fn a_pause_queues_every_delivery_instead_of_destroying_it() {
+    // The defect, stated as its fix: three deliveries arrive during a pause and
+    // all three are still there afterwards, on the pane each was addressed to,
+    // in arrival order. Pre-option-2 every one of these calls returned Ok and
+    // destroyed its payload — a worker's `report("done")` fired mid-pause
+    // evaporated and the orchestrator went on waiting for it forever.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -19614,89 +19786,276 @@ fn resuming_names_every_delivery_the_pause_destroyed() {
     reg.set_pty_for_test(&w.id, 5691);
 
     reg.pause_group(&g.id).unwrap();
-    // Each of these returns Ok and destroys its payload — that IS the defect.
     reg.deliver_prompt(&orch.id, "report: done, PR #123 is green", "w-1", Delivery::MidSession)
         .unwrap();
     reg.deliver_prompt(&w.id, "also update the README", "orch-1", Delivery::MidSession).unwrap();
     reg.deliver_prompt(&orch.id, "blocked: needs a human call", "w-2", Delivery::MidSession)
         .unwrap();
+
+    // Nothing was destroyed: each payload is on its target's queue, and the two
+    // addressed to the orchestrator are in the order they arrived.
+    let held: Vec<String> = reg
+        .queue_snapshot(5690)
+        .into_iter()
+        .filter_map(|e| e.payload.text().map(str::to_string))
+        .collect();
+    assert_eq!(
+        held,
+        vec![
+            "report: done, PR #123 is green".to_string(),
+            "blocked: needs a human call".to_string(),
+        ],
+        "both orchestrator-bound payloads are held, oldest first"
+    );
+    let held_w: Vec<String> = reg
+        .queue_snapshot(5691)
+        .into_iter()
+        .filter_map(|e| e.payload.text().map(str::to_string))
+        .collect();
+    assert_eq!(held_w, vec!["also update the README".to_string()], "and the worker's own");
+
+    // Each is admitted under its OWN reason, so the audit says WHY it waited
+    // rather than leaving a reader to infer it from a timestamp.
     assert!(
-        offered_prompts(&reg, &g.id).is_empty(),
-        "precondition: a paused group offers its panes nothing at all"
+        reg.queue_snapshot(5690).iter().all(|e| e.reason == queue::EnqueueReason::GroupPaused),
+        "a pause-held entry must be admitted as `group-paused`, not as an ordinary arrival"
+    );
+    let queued: Vec<Value> = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-queued")
+        .map(|e| e.detail)
+        .collect();
+    assert_eq!(queued.len(), 3, "every one of the three is recorded as queued: {queued:?}");
+    assert!(
+        queued.iter().all(|d| d["reason"] == json!("group-paused")),
+        "and each names the pause as its reason: {queued:?}"
+    );
+
+    // The pause is still a pause: nothing pasted, so no agent was woken.
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "delivery-dequeued"),
+        "a paused group must deliver nothing to any pane, however much it holds"
+    );
+}
+
+#[test]
+fn a_pause_held_delivery_survives_a_loomux_restart() {
+    // "Queued means safe" is a claim about the process dying too (#467/#468).
+    // A pause is the longest a delivery can sit unattended, so it is the case
+    // most likely to meet a restart — and the one where losing the payload
+    // costs most, because nobody is watching.
+    let dir = tempfile::tempdir().unwrap();
+    let gid;
+    let snap_path;
+    {
+        let reg = relaunch_registry(dir.path());
+        reg.set_port(45997);
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        gid = g.id.clone();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        reg.set_pty_for_test(&w.id, 5696);
+        reg.pause_group(&g.id).unwrap();
+        reg.deliver_prompt(&w.id, "held across the restart", "orch-1", Delivery::MidSession)
+            .unwrap();
+        assert_eq!(reg.queue_depth(5696), 1, "precondition: the pause queued it");
+        snap_path = reg.state_root().join(&g.id).join("queue.json");
+    }
+    // The durable snapshot is what carries it, so it must name the payload.
+    let snap = fs::read_to_string(&snap_path)
+        .expect("a pause-held delivery must be persisted, not held only in memory");
+    assert!(snap.contains("held across the restart"), "the payload itself is on disk: {snap}");
+    assert!(snap.contains("group-paused"), "and so is the reason it is waiting: {snap}");
+
+    // A fresh process reads it back as an orphan awaiting its pane, exactly as
+    // any other queued delivery caught by a restart would be.
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45997);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    assert_eq!(g.id, gid);
+    assert!(reg.is_paused(&g.id), "and the group is still paused");
+    let orphans = reg.queue_orphans(&g.id);
+    assert_eq!(orphans.len(), 1, "the held payload comes back: {orphans:?}");
+    assert_eq!(orphans[0].text.as_deref(), Some("held across the restart"));
+}
+
+#[test]
+fn resume_starts_a_drain_for_every_pane_the_pause_left_holding() {
+    // `deliver_prompt`'s pause branch deliberately does NOT spawn a drainer —
+    // a paused group must have nothing running that could paste. That leaves
+    // #470's "the admission that saw an empty queue starts the processor"
+    // invariant unmet on purpose, and `flush_paused_queues` is the single place
+    // that discharges it. If it stops firing, every payload a pause held is
+    // stranded: queued, audited, persisted, and never delivered.
+    //
+    // A headless registry has no `AppHandle`, so no thread can actually be
+    // spawned; what is assertable — and what the stranding would break — is
+    // that the resume identifies exactly the panes that need one.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let idle = reg.spawn_agent(&g.id, Role::Worker, "idle", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5710);
+    reg.set_pty_for_test(&w.id, 5711);
+    reg.set_pty_for_test(&idle.id, 5712);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&orch.id, "a report", "w-1", Delivery::MidSession).unwrap();
+    reg.deliver_prompt(&w.id, "a task", "orch-1", Delivery::MidSession).unwrap();
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "pause-flush"),
+        "precondition: a pause that is still on has flushed nothing"
     );
 
     reg.resume_group(&g.id).unwrap();
 
-    let notice = offered_prompts(&reg, &g.id)
+    let flush = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "pause-flush")
+        .expect("resume must record which panes it set draining");
+    assert_eq!(
+        flush.detail["panes"],
+        json!([5710, 5711]),
+        "exactly the panes holding entries, ascending — never the idle third pane"
+    );
+}
+
+#[test]
+fn a_resume_with_nothing_held_flushes_nothing_and_says_nothing() {
+    // The routine case — a human pauses to look at something and resumes a
+    // minute later — must cost the group no turn at all. A "0 deliveries" line
+    // on every pause/resume cycle is exactly how a notice trains its reader to
+    // skim past the one that matters.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5713);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.resume_group(&g.id).unwrap();
+
+    let log = reg.audit_log(&g.id);
+    assert!(log.iter().all(|e| e.action != "pause-flush"), "nothing held, nothing to flush");
+    assert!(
+        log.iter().all(|e| e.action != "pause-suppression-notice"),
+        "and nothing was discarded, so no discard notice either"
+    );
+    assert!(delivered_texts(&reg, &g.id).is_empty(), "the group is offered nothing at all");
+}
+
+#[test]
+fn a_pause_held_flush_tells_the_receiver_it_was_the_pause_and_not_a_blocked_pane() {
+    // A pause-held payload arriving under "queued while this pane was blocked"
+    // sends its reader hunting for a box or a dialog that never existed. The
+    // header is chosen from the ENTRIES' admission reasons, not from the live
+    // paused flag, because by flush time the group is unpaused by definition.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5714);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&w.id, "the brief", "orch-1", Delivery::MidSession).unwrap();
+    reg.resume_group(&g.id).unwrap();
+
+    // The flush itself needs a real pane to paste into, so the assertion is on
+    // the pure function the drainer feeds — with the queue the pause actually
+    // built, not a hand-made one.
+    let held = reg.queue_snapshot(5714);
+    assert_eq!(queue::flush_cause(&held), queue::FlushCause::GroupPaused);
+    let header = queue::flush_header_text(held.len(), 0, queue::flush_cause(&held));
+    assert!(header.contains("queued while this group was paused"), "got: {header}");
+    assert!(!header.contains("pane was blocked"), "got: {header}");
+}
+
+#[test]
+fn a_pause_taken_by_this_build_has_nothing_to_report_as_discarded() {
+    // The transitional notice must not fire for a pause that discarded nothing
+    // — otherwise every resume tells the orchestrator that work it is about to
+    // receive is gone, and the correct response to that sentence (re-request
+    // it) produces the duplicate `queued_notice`'s "do NOT re-send" exists to
+    // prevent.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5715);
+    reg.set_pty_for_test(&w.id, 5716);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&orch.id, "report: done", "w-1", Delivery::MidSession).unwrap();
+    reg.deliver_prompt(&w.id, "a task", "orch-1", Delivery::MidSession).unwrap();
+    reg.resume_group(&g.id).unwrap();
+
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "pause-suppression-notice"),
+        "a pause that queued everything has nothing to call discarded"
+    );
+    assert!(
+        !delivered_texts(&reg, &g.id).iter().any(|t| t.contains("DISCARDED")),
+        "and must never offer the orchestrator a discard notice"
+    );
+    assert!(reg.stranded_note(&w.id).is_none(), "nor badge a pane whose work is safe");
+    assert!(
+        reg.audit_log(&g.id).iter().all(|e| e.action != "prompt-suppressed-paused"),
+        "the action that named the destroyed payload has no writer left"
+    );
+}
+
+#[test]
+fn a_group_paused_by_an_older_loomux_is_still_told_what_that_build_destroyed() {
+    // The one window where a payload can still be gone: paused under a build
+    // that discarded, resumed under one that queues. Nothing in this process
+    // can produce a `prompt-suppressed-paused` line any more, so the legacy
+    // timeline is written directly — which is the honest way to test a path
+    // whose only real input comes from a previous version's log.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5717);
+    reg.set_pty_for_test(&w.id, 5718);
+
+    reg.pause_group(&g.id).unwrap(); // writes the `group-pause` line that bounds the window
+    reg.audit(&g.id, "w-1", "prompt-suppressed-paused",
+        json!({ "to": orch.id, "text": "report: done, PR #123 is green" }));
+    reg.audit(&g.id, "orch-1", "prompt-suppressed-paused",
+        json!({ "to": w.id, "text": "also update the README" }));
+
+    reg.resume_group(&g.id).unwrap();
+
+    let notice = delivered_texts(&reg, &g.id)
         .into_iter()
         .find(|t| t.contains("DISCARDED"))
-        .expect("resume must offer the orchestrator a notice naming what was lost");
-    for payload in ["PR #123 is green", "update the README", "needs a human call"] {
+        .expect("resume must still name what the older build lost");
+    for payload in ["PR #123 is green", "update the README"] {
         assert!(notice.contains(payload), "every discarded payload is named: {notice}");
     }
-    for pair in [
-        format!("w-1 -> {}", orch.id),
-        format!("orch-1 -> {}", w.id),
-        format!("w-2 -> {}", orch.id),
-    ] {
-        assert!(notice.contains(&pair), "sender and target both named ({pair}): {notice}");
-    }
+    assert!(
+        notice.contains("EARLIER loomux version"),
+        "and must scope the loss to the build that caused it, or a reader takes it as \
+         the current rule and re-requests work that is already queued: {notice}"
+    );
 
     let tally = reg
         .audit_log(&g.id)
         .into_iter()
         .find(|e| e.action == "pause-suppression-notice")
         .expect("the tally is recorded whether or not the notice lands");
-    assert_eq!(tally.detail["count"], json!(3));
+    assert_eq!(tally.detail["count"], json!(2));
     assert_eq!(tally.detail["window_start_seen"], json!(true));
 }
 
 #[test]
-fn a_paused_group_stays_silent_until_it_is_actually_resumed() {
-    // The notice belongs to the resume, not to the suppression. Firing it
-    // while still paused would be a delivery into a group the human
-    // deliberately silenced — and it would be suppressed anyway, so the only
-    // thing it could produce is another discarded payload.
-    let (reg, _d) = test_registry();
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-    reg.set_pty_for_test(&orch.id, 5692);
-    reg.set_pty_for_test(&w.id, 5693);
-
-    reg.pause_group(&g.id).unwrap();
-    for i in 0..4 {
-        reg.deliver_prompt(&orch.id, &format!("report {i}"), &w.id, Delivery::MidSession).unwrap();
-    }
-
-    let log = reg.audit_log(&g.id);
-    assert!(
-        log.iter().all(|e| e.action != "pause-suppression-notice"),
-        "no tally while the pause is still on"
-    );
-    assert!(log.iter().all(|e| e.action != "prompt"), "and nothing offered to any pane");
-    assert!(reg.stranded_note(&orch.id).is_none(), "and no badge raised mid-pause");
-
-    // A pause that swallowed nothing must also stay silent on the way out —
-    // otherwise every routine pause/resume cycle costs the orchestrator a turn
-    // to read "0 deliveries were discarded".
-    let g2 = reg.create_group("C:/tmp/repo2", rails()).unwrap();
-    reg.spawn_agent(&g2.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.pause_group(&g2.id).unwrap();
-    reg.resume_group(&g2.id).unwrap();
-    assert!(
-        reg.audit_log(&g2.id).iter().all(|e| e.action != "pause-suppression-notice"),
-        "an empty pause window says nothing"
-    );
-}
-
-#[test]
-fn resume_badges_the_panes_that_lost_work_when_the_notice_itself_cannot_be_delivered() {
+fn the_legacy_discard_notice_still_badges_when_no_orchestrator_can_take_it() {
     // The notice is an in-band delivery, so it fails exactly when a pause has
     // run long enough for the orchestrator to idle out or be killed — the
     // longest pause, with the most to report. A fix whose only channel goes
     // missing in its own worst case is the defect it was meant to close, one
-    // level up.
+    // level up. Option 2 did not change that; it only narrowed which pauses
+    // can reach it.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -19705,9 +20064,11 @@ fn resume_badges_the_panes_that_lost_work_when_the_notice_itself_cannot_be_deliv
     reg.set_pty_for_test(&orch.id, 5694);
 
     reg.pause_group(&g.id).unwrap();
-    reg.deliver_prompt(&w.id, "you have a new task", "orch-1", Delivery::MidSession).unwrap();
-    reg.deliver_prompt(&w.id, "and a second one", "orch-1", Delivery::MidSession).unwrap();
-    reg.deliver_prompt(&dead.id, "never arrived", "orch-1", Delivery::MidSession).unwrap();
+    for text in ["you have a new task", "and a second one"] {
+        reg.audit(&g.id, "orch-1", "prompt-suppressed-paused", json!({ "to": w.id, "text": text }));
+    }
+    reg.audit(&g.id, "orch-1", "prompt-suppressed-paused",
+        json!({ "to": dead.id, "text": "never arrived" }));
     // The orchestrator is gone by the time the human comes back.
     reg.mark_dead(&orch.id, Some(0));
     reg.mark_dead(&dead.id, Some(0));
@@ -19744,46 +20105,411 @@ fn resume_badges_the_panes_that_lost_work_when_the_notice_itself_cannot_be_deliv
 }
 
 #[test]
-fn the_resume_notice_mutates_no_queue_of_its_own() {
-    // #523's persistence table: every `queues` mutation owes a
-    // `persist_queues` call. This path READS suppression records out of the
-    // audit log and mutates no queue at all, so it owes nothing and adds no
-    // row — and the way that stays true is that the notice goes through the
-    // ordinary front door (already a row) rather than writing anywhere itself.
-    // The discriminator: a pane that never had a queue must still have none
-    // afterwards, and the snapshot on disk must agree with memory.
+fn a_resume_racing_an_admission_never_strands_it() {
+    // Review BLOCKING 1. `deliver_prompt` reads `is_paused`, then admits — with
+    // no lock across the gap and real I/O inside it. A resume landing in that
+    // gap clears the flag and finds the pane queue still empty, so
+    // `flush_paused_queues` starts nothing; the admission then lands in an
+    // unpaused group with no drainer and, because the pause branch is the one
+    // path that deliberately never calls `ensure_drainer`, nobody left to start
+    // one. Queued, audited, persisted, `Ok` to the sender, never delivered —
+    // #569's own defect, reproduced by its fix.
+    //
+    // The invariant, and it is the ONLY thing that has to hold: for every
+    // interleaving, SOMETHING claims responsibility for draining the pane.
+    // Either resume saw the entry (`pause-flush` names the pane) or the
+    // admission saw the resume (`pause-race-nudge` names the entry). Never
+    // neither. A headless registry cannot observe `ensure_drainer` itself — no
+    // `AppHandle`, so no thread is ever spawned, which is exactly why both
+    // branches audit.
+    //
+    // Driven with real threads and a real barrier rather than a simulated
+    // interleaving: the whole finding is that the two sides are unsynchronized,
+    // so a model with a seam in it would be proving the seam. Repeated, because
+    // which side wins is the OS's decision and a single run pins nothing.
+    //
+    // **What this test is NOT, stated so nobody reads it as more than it is.**
+    // It does not go red when the fix is removed — verified, not assumed: run
+    // 30704213481 deleted the post-admit re-check and this test still passed,
+    // because the losing interleaving needs the resume to land between the flag
+    // read and the admission, and the stagger that makes the pause branch
+    // reachable at all also gives the entry time to be queued before
+    // `flush_paused_queues` looks. Forcing that window open would take a seam
+    // in the code under test, and a test of a seam is not a test of the race.
+    // So this is an invariant GUARD over real interleavings — it will catch a
+    // future change that breaks the property on a common ordering — and not
+    // evidence that the re-check is load-bearing. The argument for the re-check
+    // is in `deliver_prompt`'s comment; the argument that it costs nothing is
+    // that `ensure_drainer` no-ops on a pane already draining.
+    use std::sync::{Arc, Barrier};
+
+    let (mut held, mut raced) = (0u32, 0u32);
+    for round in 0..24 {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(relaunch_registry(dir.path()));
+        reg.set_self_arc();
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        let pty = 5800 + round;
+        reg.set_pty_for_test(&w.id, pty);
+        reg.pause_group(&g.id).unwrap();
+
+        // Both threads leave the barrier together; the loser of the coin gets a
+        // 3ms head start. Not synchronization — a STAGGER, and it is here
+        // because an unstaggered race is not actually a fair sample: after the
+        // barrier `resume_group`'s very first act is to clear the flag, while
+        // `deliver_prompt` must audit (a file write) before it reads the flag,
+        // so resume wins nearly every time and the pause branch — the branch
+        // this test exists for — would almost never be entered. Alternating
+        // rounds samples both sides on purpose.
+        let admit_first = round % 2 == 0;
+        let stagger = std::time::Duration::from_millis(3);
+        let gate = Arc::new(Barrier::new(2));
+        let admit = {
+            let (reg, wid, gate) = (reg.clone(), w.id.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                if !admit_first {
+                    std::thread::sleep(stagger);
+                }
+                // The payload the issue is about: a worker's completion report.
+                reg.deliver_prompt(&wid, "report: done, PR #99 is green", "w-1", Delivery::MidSession)
+            })
+        };
+        let resume = {
+            let (reg, gid, gate) = (reg.clone(), g.id.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                if admit_first {
+                    std::thread::sleep(stagger);
+                }
+                reg.resume_group(&gid).unwrap();
+            })
+        };
+        let admitted = admit.join().unwrap();
+        resume.join().unwrap();
+
+        let log = reg.audit_log(&g.id);
+        let flushed = log.iter().any(|e| {
+            e.action == "pause-flush"
+                && e.detail["panes"].as_array().is_some_and(|p| p.contains(&json!(pty)))
+        });
+        let nudged = log
+            .iter()
+            .any(|e| e.action == "pause-race-nudge" && e.detail["pty"] == json!(pty));
+
+        if reg.queue_depth(pty) == 0 {
+            // The resume won the flag read outright, so `deliver_prompt` never
+            // entered the pause branch at all — it took the ordinary front door,
+            // which in a headless registry withdraws its own admission (there is
+            // no `AppHandle` to ever drain it) and returns `Err`. Nothing is
+            // held, so nothing can be stranded, and the SENDER was told rather
+            // than getting a false `Ok` — which is the property that matters on
+            // that path. Not this finding's branch; #470 owns it.
+            assert!(
+                admitted.is_err(),
+                "round {round}: nothing was queued, so the sender must have been told — \
+                 a silent Ok here would be the same class of loss one door over"
+            );
+            continue;
+        }
+
+        held += 1;
+        if nudged {
+            raced += 1;
+        }
+        assert_eq!(reg.queue_depth(pty), 1, "round {round}: exactly the one report is held");
+        assert!(
+            admitted.is_ok(),
+            "round {round}: the entry is queued, so the sender was told Ok — and it must have been"
+        );
+        assert!(
+            flushed || nudged,
+            "round {round}: nobody owns draining pty {pty} — the delivery is stranded. \
+             pause-flush={flushed} pause-race-nudge={nudged}; log actions: {:?}",
+            log.iter().map(|e| e.action.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    // Without this the whole loop could pass vacuously by never once reaching
+    // the pause branch — every round losing the flag read, every round
+    // `continue`ing, and the invariant above never evaluated. The barrier makes
+    // that vanishingly unlikely, but "unlikely" is not an assertion.
+    assert!(
+        held > 0,
+        "no round ever held a pause-admitted entry — the admit-first stagger is not working and \
+         the invariant below was never once evaluated"
+    );
+    // `raced` is reported, never asserted on. Whether the resume lands INSIDE
+    // the flag-read-to-admit window is the OS's decision and cannot be forced
+    // without a seam in the code under test, which would make this a test of the
+    // seam. What is asserted is the invariant that must hold for every
+    // interleaving; the nudge is one of the two ways it can be satisfied.
+    println!("interleavings: {held} held, of which {raced} were closed by the post-admit re-check");
+}
+
+#[test]
+fn a_queue_full_refusal_during_a_pause_is_reported_to_the_orchestrator_on_resume() {
+    // Review BLOCKING 2, end to end. The cap is per PANE and the orchestrator's
+    // pane is where a whole fleet converges, so a long pause fills it and the
+    // ninth delivery is destroyed — `Err` to the sender, and before this nothing
+    // at all to the orchestrator. That is the #569 stall arriving through the
+    // queue instead of around it.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
-    reg.set_pty_for_test(&w.id, 5695); // the TARGET has a pane; nothing may be queued for it
+    reg.set_pty_for_test(&orch.id, 5820);
+    reg.set_pty_for_test(&w.id, 5821);
+    reg.pause_group(&g.id).unwrap();
+
+    // Fill the orchestrator's pane to the cap. Distinct texts, or `admit`'s
+    // byte-identical coalescing would fold them into one entry and never reach
+    // capacity at all.
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.deliver_prompt(&orch.id, &format!("[loomux] advisory {i}"), "loomux", Delivery::MidSession)
+            .unwrap();
+    }
+    assert_eq!(reg.queue_depth(5820), queue::QUEUE_MAX_PER_PANE, "precondition: the pane is at capacity");
+
+    // The ninth: a worker's completion report, refused.
+    let err = reg
+        .deliver_prompt(&orch.id, "report: done, PR #77 is green", &w.id, Delivery::MidSession)
+        .unwrap_err();
+    assert!(err.contains("queue"), "the SENDER is told synchronously: {err}");
+
+    reg.resume_group(&g.id).unwrap();
+
+    // …and so, now, is the orchestrator.
+    let notice = delivered_texts(&reg, &g.id)
+        .into_iter()
+        .find(|t| t.contains("LOST"))
+        .expect("resume must tell the orchestrator a delivery was refused during the pause");
+    assert!(notice.contains("REFUSED"), "named as a refusal, not a legacy discard: {notice}");
+    assert!(notice.contains("PR #77 is green"), "and the payload, so it can be re-requested: {notice}");
+    assert!(
+        notice.contains(&format!("{} -> {}", w.id, orch.id)),
+        "sender and target both named: {notice}"
+    );
+    assert!(
+        !notice.contains("EARLIER loomux version"),
+        "this build refused it — blaming an older one would send the reader nowhere: {notice}"
+    );
+
+    let tally = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "pause-suppression-notice")
+        .expect("and the tally is recorded");
+    assert_eq!(tally.detail["count"], json!(1));
+}
+
+#[test]
+fn the_loss_notice_lands_even_when_the_overflowing_pane_is_the_orchestrators_own() {
+    // rev-128's finding, and the case #569 is actually about: a fleet's reports
+    // converge on the orchestrator's pane, so that is the pane a long pause
+    // fills — and it is STILL at capacity when the human resumes. Before this,
+    // `announce_pause_suppression` was therefore not merely at risk of being
+    // refused, it was CERTAIN to be: the notice about the destroyed payloads was
+    // destroyed by the same cap that destroyed them.
+    //
+    // Worse, and the reason a badge fallback did not cover it: by resume the
+    // pane already carries `note_queue_capacity`'s at-capacity badge, so
+    // `pause_badge_decision`'s never-stomp-another-mechanism's-badge rule
+    // suppresses the pause badge too. Notice refused, badge skipped, audit tally
+    // the only trace — the #569 stall, one level up.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5840);
+    reg.set_pty_for_test(&w.id, 5841);
+    reg.pause_group(&g.id).unwrap();
+
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.deliver_prompt(&orch.id, &format!("[loomux] advisory {i}"), "loomux", Delivery::MidSession)
+            .unwrap();
+    }
+    reg.deliver_prompt(&orch.id, "report: done, PR #77 is green", &w.id, Delivery::MidSession)
+        .unwrap_err();
+    // The precondition that makes this the flagship case rather than a variant:
+    // the pane is full AND already badged, so neither channel is free.
+    assert_eq!(reg.queue_depth(5840), queue::QUEUE_MAX_PER_PANE);
+    assert_eq!(
+        reg.stranded_note(&orch.id).and_then(|n| n.blocker),
+        Some(StrandedBlocker::QueueAtCapacity),
+        "the capacity badge is up, which is what would suppress the pause badge"
+    );
+
+    reg.resume_group(&g.id).unwrap();
+
+    // The notice is admitted past the cap — the one exemption, one entry deep.
+    let tally = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "pause-suppression-notice")
+        .expect("the tally is always recorded");
+    assert_eq!(
+        tally.detail["delivered"], json!(true),
+        "the notice must actually LAND on a full orchestrator pane, not be refused by the cap \
+         that caused the loss it reports: {:?}",
+        tally.detail
+    );
+    assert_eq!(
+        reg.queue_depth(5840),
+        queue::QUEUE_MAX_PER_PANE + queue::PAUSE_LOSS_NOTICE_HEADROOM,
+        "exactly one entry past the cap, never more"
+    );
+    let notice = delivered_texts(&reg, &g.id)
+        .into_iter()
+        .find(|t| t.contains("LOST"))
+        .expect("and it is a real delivery the orchestrator will read");
+    assert!(notice.contains("REFUSED"), "naming the cause: {notice}");
+    assert!(notice.contains("PR #77 is green"), "and the payload: {notice}");
+
+    // It is admitted with its own reason, so the audit says why it was allowed
+    // past a cap that had just refused a worker's report.
+    let queued = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "delivery-queued")
+        .filter(|e| e.detail["reason"] == json!("pause-loss-notice"))
+        .count();
+    assert_eq!(queued, 1, "exactly one exempt admission, and it is labelled as one");
+}
+
+#[test]
+fn the_loss_notice_headroom_is_one_entry_and_a_second_resume_is_refused() {
+    // The exemption is a bound, not a bypass. If a second resume finds the
+    // headroom still occupied — nothing has drained, because nothing can here —
+    // its notice is refused like any other delivery, and the tally says so
+    // rather than claiming the orchestrator was told. That is the refusal path
+    // rev-128 asked to see covered, reached honestly instead of by pretending
+    // the first notice could not land.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5850);
+    reg.set_pty_for_test(&w.id, 5851);
+
+    // Round 1: fill, overflow, resume — the notice takes the headroom.
+    reg.pause_group(&g.id).unwrap();
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.deliver_prompt(&orch.id, &format!("[loomux] advisory {i}"), "loomux", Delivery::MidSession)
+            .unwrap();
+    }
+    reg.deliver_prompt(&orch.id, "first lost report", &w.id, Delivery::MidSession).unwrap_err();
+    reg.resume_group(&g.id).unwrap();
+    assert_eq!(reg.queue_depth(5850), queue::QUEUE_MAX_PER_PANE + queue::PAUSE_LOSS_NOTICE_HEADROOM);
+
+    // Round 2: pause again, lose another, resume again. Nothing drained in
+    // between, so the headroom is gone.
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&orch.id, "second lost report", &w.id, Delivery::MidSession).unwrap_err();
+    reg.resume_group(&g.id).unwrap();
+
+    let tallies: Vec<Value> = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .filter(|e| e.action == "pause-suppression-notice")
+        .map(|e| e.detail)
+        .collect();
+    assert_eq!(tallies.len(), 2, "both resumes record a tally: {tallies:?}");
+    assert_eq!(tallies[0]["delivered"], json!(true), "the first landed");
+    assert_eq!(
+        tallies[1]["delivered"], json!(false),
+        "the second is refused — and the tally must NOT claim the orchestrator was told: {:?}",
+        tallies[1]
+    );
+    assert!(
+        tallies[1]["error"].as_str().unwrap_or_default().contains("full"),
+        "naming why it could not land: {:?}",
+        tallies[1]
+    );
+    assert_eq!(
+        reg.queue_depth(5850),
+        queue::QUEUE_MAX_PER_PANE + queue::PAUSE_LOSS_NOTICE_HEADROOM,
+        "and the queue never grows past the one-entry headroom, however many resumes happen"
+    );
+}
+
+#[test]
+fn a_resume_flush_keeps_held_entries_ahead_of_post_resume_traffic() {
+    // Review N3. The design note promises pause-held entries drain "in original
+    // order"; FIFO makes that structurally true, but nothing asserted it across
+    // the resume boundary, so a future `flush_paused_queues` that pushed rather
+    // than appended — or a resume that re-admitted its backlog — would land
+    // unnoticed. Ordering is the whole reason the queue exists: "here is the
+    // context" then "now go" inverts into nonsense.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5830);
 
     reg.pause_group(&g.id).unwrap();
-    reg.deliver_prompt(&w.id, "swallowed", "orch-1", Delivery::MidSession).unwrap();
-    assert_eq!(reg.queue_depth(5695), 0, "precondition: a suppressed delivery is never queued");
+    reg.deliver_prompt(&w.id, "held first", "orch-1", Delivery::MidSession).unwrap();
+    reg.deliver_prompt(&w.id, "held second", "orch-1", Delivery::MidSession).unwrap();
+    reg.resume_group(&g.id).unwrap();
+    // Nothing drains here (no `AppHandle`), which is what lets the queue be read
+    // as a whole: the post-resume arrival has to land BEHIND the backlog.
+    reg.deliver_prompt(&w.id, "arrived after the resume", "orch-1", Delivery::MidSession).unwrap();
+
+    let texts: Vec<String> = reg
+        .queue_snapshot(5830)
+        .into_iter()
+        .filter_map(|e| e.payload.text().map(str::to_string))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "held first".to_string(),
+            "held second".to_string(),
+            "arrived after the resume".to_string(),
+        ],
+        "pause-held entries keep their arrival order AND stay ahead of post-resume traffic"
+    );
+}
+
+#[test]
+fn a_pause_held_admission_persists_exactly_like_any_other() {
+    // #523's persistence table: every `queues` mutation owes a `persist_queues`
+    // call. Option 2 routes the pause through `enqueue_text`, which is already
+    // a row in that table, precisely so this path adds no new obligation — the
+    // discriminator is that what memory holds and what the file holds agree,
+    // and that the resume adds nothing of its own on top.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5719);
+    reg.set_pty_for_test(&w.id, 5695);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&w.id, "held for the worker", "orch-1", Delivery::MidSession).unwrap();
+    assert_eq!(reg.queue_depth(5695), 1, "precondition: the pause queued it");
+
+    let snap = reg.state_root().join(&g.id).join("queue.json");
+    let before = fs::read_to_string(&snap).expect("the admission owes a snapshot, and paid it");
+    assert!(before.contains("held for the worker"), "and the snapshot carries the payload: {before}");
 
     reg.resume_group(&g.id).unwrap();
 
     assert_eq!(
         reg.queue_depth(5695),
+        1,
+        "resume STARTS the drain (no `AppHandle` here, so nothing drains) — it must never \
+         pop, re-admit, or duplicate an entry itself"
+    );
+    assert_eq!(
+        reg.queue_depth(5719),
         0,
-        "the resume notice goes to the ORCHESTRATOR — it must not enqueue anything for the \
-         panes it merely names"
+        "and it must not enqueue anything for the orchestrator: there is no discard to report"
     );
     assert!(
         reg.audit_log(&g.id).iter().all(|e| e.action != "queue-persist-failed"),
-        "and whatever the front door did persist, persisted"
+        "whatever was persisted, persisted"
     );
-    // Nothing was ever admitted for this group, so no snapshot may claim
-    // otherwise: a phantom entry here would be work loomux thinks it still
-    // owes a pane and would re-admit on the next restart.
-    let snap = reg.state_root().join(&g.id).join("queue.json");
-    if let Ok(body) = fs::read_to_string(&snap) {
-        assert!(
-            !body.contains("swallowed"),
-            "a DISCARDED payload must never reappear in the durable queue: {body}"
-        );
-    }
 }
 
 #[test]
@@ -21846,7 +22572,7 @@ fn steering_targets_the_orchestrator_and_is_audited_under_its_group() {
     let b = reg.create_group("C:/tmp/repo-b", rails()).unwrap();
     reg.spawn_agent(&b.id, Role::Orchestrator, "orch-b", "", false, None).unwrap();
 
-    reg.pause_group(&a.id).unwrap();
+    pause_with_pane(&reg, &a.id, &orch.id, 6300);
     // Go through deliver_to_orchestrator directly (steer_orchestrator's own
     // paused-guard would short-circuit before delivery) to observe resolution.
     reg.deliver_to_orchestrator(&a.id, "hello orchestrator", "human").unwrap();
@@ -21854,14 +22580,19 @@ fn steering_targets_the_orchestrator_and_is_audited_under_its_group() {
     let entries = reg.audit_log(&a.id);
     let sup = entries
         .iter()
-        .find(|e| e.action == "prompt-suppressed-paused")
-        .expect("suppressed steer must be audited");
+        .find(|e| e.action == "prompt")
+        .expect("the steer must be audited");
     assert_eq!(sup.actor, "human", "steer must be attributed to the human");
     assert_eq!(sup.detail["to"], orch.id, "steer must resolve to the orchestrator, not the worker");
     assert_eq!(sup.detail["text"], "hello orchestrator");
+    // #569: and it is HELD, not discarded — the pause queues it on the
+    // orchestrator's own pane for delivery at resume.
+    let held = reg.queue_snapshot(6300);
+    assert_eq!(held.len(), 1, "the steer must be queued for the orchestrator's pane");
+    assert_eq!(held[0].agent_id, orch.id);
     // Group isolation: nothing landed in group B's log.
     assert!(
-        reg.audit_log(&b.id).iter().all(|e| e.action != "prompt-suppressed-paused"),
+        reg.audit_log(&b.id).iter().all(|e| e.action != "prompt"),
         "a steer to group A must not touch group B"
     );
 }
@@ -26483,8 +27214,8 @@ fn advanced_orchestrator_toggle_on_arms_the_gate_swaps_blocks_and_notifies() {
     assert!(!g.guardrails.advanced_orchestrator, "the group launches plain");
     assert!(!reg.merge_gate_declared(&g.id), "no gate before the toggle");
 
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.pause_group(&g.id).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 7101);
 
     let status = reg.set_advanced_orchestrator(&g.id, true, "human").unwrap();
     assert_eq!(status["advanced"], json!(true));
@@ -26511,7 +27242,7 @@ fn advanced_orchestrator_toggle_on_arms_the_gate_swaps_blocks_and_notifies() {
     let notice = entries
         .iter()
         .find(|e| {
-            e.action == "prompt-suppressed-paused"
+            e.action == "prompt"
                 && e.detail["text"].as_str().unwrap_or("").contains("workflow mode changed")
         })
         .unwrap_or_else(|| panic!("the orchestrator must receive the toggle notice: {entries:?}"));
@@ -26527,8 +27258,8 @@ fn advanced_orchestrator_toggle_off_clears_the_gate_and_restores_builtin_roster(
         .unwrap();
     assert!(reg.merge_gate_declared(&g.id), "the launch arms the gate");
 
-    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
-    reg.pause_group(&g.id).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    pause_with_pane(&reg, &g.id, &orch.id, 7102);
 
     let status = reg.set_advanced_orchestrator(&g.id, false, "human").unwrap();
     assert_eq!(status["advanced"], json!(false));
@@ -26547,7 +27278,7 @@ fn advanced_orchestrator_toggle_off_clears_the_gate_and_restores_builtin_roster(
     assert!(entries.iter().any(|e| e.action == "advanced-orchestrator-off"));
     assert!(entries.iter().any(|e| e.action == "merge-gate-cleared"));
     assert!(entries.iter().any(|e| {
-        e.action == "prompt-suppressed-paused"
+        e.action == "prompt"
             && e.detail["text"].as_str().unwrap_or("").contains("built-in roster, no merge gate")
     }));
 }
