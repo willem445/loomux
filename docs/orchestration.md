@@ -512,6 +512,35 @@ so an off→on→off round trip doesn't restore them — a rare enough path that
 deterministic rebuild from the default CLI beat persisting a second roster
 just for it).
 
+### Proposed lessons come with their evidence
+
+A workflow can declare a **process-pro** block — a worker that runs after a
+PR merges, reads that session's record cold, and opens a normal PR proposing
+a durable lesson (an entry in `.loomux/lessons.md`, a `.claude/skills/` entry,
+a `CLAUDE.md` rule). Like every other agent it proposes and stops: you review
+and merge, or you don't.
+
+The thing worth knowing when one of those PRs lands in front of you is what
+it is allowed to claim. Anything the process-pro writes into those files is
+inlined into every future session's context, so a wrong or trivial lesson is
+a cost you keep paying — which makes "was this actually a recurring problem,
+or did one agent have one bad afternoon?" the question the review turns on.
+
+loomux answers it mechanically rather than leaving it to the agent's opinion
+of itself. Each piece of friction it found carries a **recurrence** count:
+how many *other* sessions in the group hit the same wall, and which ones.
+So a proposal should read like *"three sessions hit this — `w-2`, `w-7`,
+`w-9`"*, and you can go look at those sessions. A proposal from a wall only
+one session ever hit is supposed to say so and argue why it will recur anyway
+(a documented rule somebody missed, say) — if it doesn't, that is your cue to
+push back rather than merge a lesson built on one bad afternoon.
+
+Two caveats the proposal should carry when they apply, because they change
+what the number is worth: a brand-new group has no earlier sessions to
+compare against, so a `0` there means *nothing to compare*, not *never
+happened*; and only a bounded number of recent sessions are read, so on a
+long-running group a count is a floor rather than a total.
+
 ## Guardrails
 
 Enforced by loomux, not the model:

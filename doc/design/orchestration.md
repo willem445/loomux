@@ -159,6 +159,18 @@ worker-kind-wide as an interim, deliberately coarser exposure while
 `role_hint` (slice A) was still landing in parallel, and slice D's binding
 rider tightened it once role_hint was on the branch.
 
+Each window also carries a normalized `key` and a **cross-session
+`recurrence`** count (#324): how many OTHER sessions in the same group hit the
+same wall, with up to five `corroborated_by` agent ids. That number is what
+answers the process-pro's durability filter — "would a fresh worker hit this
+too?" — mechanically instead of from the agent's own impression of one
+session. The scan is derived on read (nothing cached, nothing persisted) over
+at most `MAX_CORROBORATION_SESSIONS` other transcripts, and the digest reports
+`sessions_scanned` and `corroboration_capped` so a young group reads
+differently from a group of one-offs and a capped scan can't read as an
+exhaustive one. Design and the ledger-vs-derived fork:
+`doc/design/supervisor-skills.md`, "Cross-session recurrence".
+
 Guardrails enforced by `spawn_agent`: live-agent cap (`max_agents`, counting workers +
 reviewers + planners), CLI + model pinned per role (`{role}_cli` / `{role}_model`, see
 **Plan agent + mixed agent types** below), permission mode fixed at group creation
