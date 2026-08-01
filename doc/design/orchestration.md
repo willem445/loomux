@@ -6722,6 +6722,20 @@ so a full queue is the *condition it reports*, not an obstacle to reporting it. 
 are complements, not alternatives — #615 buys a delivery its way past the cap; #578 declines to be
 a delivery at all — and neither is a partial version of the other.
 
+**Reconciled with #621 at the notice marker, which is the seam nobody would look for.** #576's
+self-latch is loomux's own notice text sitting in a pane's tail and satisfying the question
+detector; #621 fixed it by masking any row that *leads* with `LOOMUX_NOTICE_MARKER` once
+`deframe`d, at every reader of a live pane. The relay block is not one of those readers — it rides
+an MCP tool result and never touches the pty — so nothing here needed a mask. The interaction runs
+the other way: #621's own argument records that **an agent can print marker text itself**, and an
+orchestrator quoting its relayed queue notices back into a summary is exactly that, in the pane
+most exposed to the latch. So the relay is shaped to stay *maskable*: the header and every
+constituent notice already lead with the marker, the bullet is `•` (in `deframe`'s strip set) and
+not `-` (which is not), and the elision line carries the marker instead of opening with prose.
+`every_row_of_the_relay_block_is_maskable_by_the_question_gates_notice_rule` asserts the whole
+block masks to nothing, so a later edit that reintroduces a `-` fails rather than quietly handing
+one row back to the detector.
+
 `HoldChannel::survives_orchestrator_target` also stopped being a `!matches!` negation and became an
 exhaustive match: a channel added later must state its own answer rather than defaulting to
 "survives", which is the optimistic half and the one that would make

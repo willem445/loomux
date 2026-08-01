@@ -15209,6 +15209,17 @@ impl OrchNoticeInbox {
 /// (`dropped_notice`), and a re-send is a duplicate in the first case and a
 /// guess in the second. It also says plainly that this is its OWN pane, since
 /// every other `[loomux]` notice an orchestrator reads is about somebody else.
+///
+/// **Every row stays maskable (#576/#621).** This block rides an MCP tool
+/// result, never the pty, so no reader of a live pane sees it directly. But
+/// [`mask_loomux_notices`]'s own argument covers the path that puts it in a
+/// pane anyway — an agent can print marker text itself — and an orchestrator
+/// quoting its relay back into a summary would leave text *about* a question
+/// in the tail of the pane most exposed to #576's self-latch. So the header
+/// leads with [`LOOMUX_NOTICE_MARKER`], every constituent notice already does,
+/// and the two rows that would not (the bullet and the elision line) are
+/// shaped so `deframe` still finds the marker leading them. A `-` bullet is
+/// the specific thing that breaks this, since `deframe` does not strip it.
 pub fn orch_notice_relay_text(notices: &[String], elided: usize) -> Option<String> {
     if notices.is_empty() {
         return None;
@@ -15222,14 +15233,24 @@ pub fn orch_notice_relay_text(notices: &[String], elided: usize) -> Option<Strin
         s = if n == 1 { "" } else { "s" }
     );
     for t in notices {
-        out.push_str("\n  - ");
+        // `•`, not `-`, and the elision line below carries the marker rather
+        // than opening with prose (#576/#621). Every row of this block has to
+        // stay maskable by `mask_loomux_notices`, which drops a row that LEADS
+        // with `LOOMUX_NOTICE_MARKER` once `deframe`d — and `deframe` strips
+        // whitespace and `│ ┃ | * ● • ◆`, but NOT `-`. This block never reaches
+        // a pane on its own, but #621's own argument covers the path that puts
+        // it there: an agent can print marker text itself, and an orchestrator
+        // quoting its own relay into a summary would otherwise leave text
+        // ABOUT a question sitting in the tail of the pane most exposed to
+        // #576's self-latch.
+        out.push_str("\n  • ");
         out.push_str(t);
     }
     if elided > 0 {
         out.push_str(&format!(
-            "\n  ... plus {elided} earlier notice{s} elided (this relay holds \
-             {ORCH_NOTICE_INBOX_MAX}) — every one of them is in this group's audit.jsonl as a \
-             `notice-suppressed` line.",
+            "\n  • {LOOMUX_NOTICE_MARKER} plus {elided} earlier notice{s} elided (this relay \
+             holds {ORCH_NOTICE_INBOX_MAX}) — every one of them is in this group's audit.jsonl \
+             as a `notice-suppressed` line.",
             s = if elided == 1 { "" } else { "s" }
         ));
     }
