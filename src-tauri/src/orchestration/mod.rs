@@ -1856,6 +1856,28 @@ const QUESTION_HOLD_POLL: Duration = Duration::from_millis(250);
 /// reason), instead of cloning the whole (up to 256 KB) output ring on every
 /// 250ms poll for up to two minutes.
 const QUESTION_SCAN_TAIL_BYTES: usize = 4096;
+/// Bytes replayed onto a composed grid for the "is it still DISPLAYED"
+/// reading (#534). Sized by one requirement and one budget:
+///
+/// - It must be **at least** `QUESTION_SCAN_TAIL_BYTES`, or the guard could
+///   match text in the ring that the replay never saw painted and then read
+///   its absence from the screen as evidence it was answered. Being a strict
+///   superset is what makes "the paint that caused this hold is inside the
+///   window we replayed" true, which is the whole argument for trusting a
+///   negative (see the design note).
+/// - Bigger is better for fidelity — the replay starts blind, so more bytes
+///   means more of the screen genuinely painted rather than left blank — and
+///   the cost is a linear byte scan plus one grid, no history retained. 16x
+///   the ring window, half of `LATE_MONITOR_QUESTION_SCAN_BYTES`'s cadence
+///   argument at 20x its poll rate.
+const QUESTION_GRID_REPLAY_BYTES: usize = 64 * 1024;
+/// Non-empty rendered rows a composition must have before it is allowed to
+/// say a question is gone (#534). Two, not a coherence proof: a replay that
+/// began mid-stream and was never painted over composes to near-nothing, and
+/// "the screen is blank" must not be mistaken for "the screen is clear". Any
+/// CLI at rest paints more than this (an input box alone is three rows), so
+/// the floor only ever catches the degenerate case it names.
+const GRID_MIN_RENDERED_ROWS: usize = 2;
 /// #112 round 3 (rev-20 N1): the late-confirmation monitor's OWN question
 /// scan window — deliberately larger than `QUESTION_SCAN_TAIL_BYTES`. That
 /// constant was sized for the 250ms-cadence pre-Enter/retry checkpoints,
@@ -4922,16 +4944,39 @@ pub fn low_disk_notice(free_bytes: u64) -> String {
 ///   footer is only read from the last few non-empty lines — once the CLI
 ///   redraws its idle input box below the prose, the phrase falls out of range.
 pub fn prompt_wait_detected(tail: &str) -> bool {
+    prompt_wait_match(tail).is_some()
+}
+
+/// What [`prompt_wait_detected`] matched, not merely *that* it matched (#534,
+/// closing #513(c)/F2).
+///
+/// Two callers need this and neither could be served by the bare `bool`:
+///
+/// - **The abort audit.** `delivery-aborted-question` recorded `to`/`stage`/
+///   `held_ms`/`recheck_round` — everything except the one thing a diagnosis
+///   starts from. The 27-minute live incident on #513 held the orchestrator's
+///   inbound queue five times over and its trigger is *still* unknown, because
+///   the record never said what the guard keyed on. It does now.
+/// - **The grid evidence.** "Is the question still displayed" is only a real
+///   question if you can name the question. [`match_still_rendered`] looks for
+///   THIS match on the composed screen rather than re-running a detector whose
+///   windowing is chronological, not spatial.
+///
+/// [`prompt_wait_detected`] is defined as `this.is_some()`, so there is exactly
+/// one detector and the two can never drift. Which signal is *reported* when
+/// several fire is a stable order — structured signals first, prose-like ones
+/// last — chosen so the audit names the most diagnostic evidence available;
+/// the boolean is a disjunction and is unaffected by the order.
+pub fn prompt_wait_match(tail: &str) -> Option<QuestionMatch> {
     let lines: Vec<String> = tail
         .lines()
         .map(|l| l.trim().to_lowercase())
         .filter(|l| !l.is_empty())
         .collect();
     if lines.is_empty() {
-        return false;
+        return None;
     }
     let recent = &lines[lines.len().saturating_sub(12)..];
-    let joined = recent.join("\n");
 
     // Strip a line's leading box border / bullet / indent so a menu pointer
     // inside a bordered dialog (`│ ❯ Yes`) is seen to *lead* its content.
@@ -4950,36 +4995,43 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
     // box, which pushes it out of this window.
     let last_painted = &recent[recent.len().saturating_sub(3)..];
 
+    // Find the line a token fired on, so the match can name its own evidence.
+    // Equivalent to the `recent.join("\n").contains(token)` this replaces —
+    // no token spans a newline, so a per-line search matches exactly the same
+    // set of tails.
+    fn token_in<'a>(lines: &'a [String], tokens: &[&'static str]) -> Option<(&'static str, &'a str)> {
+        tokens.iter().find_map(|t| {
+            lines.iter().find(|l| l.contains(*t)).map(|l| (*t, l.as_str()))
+        })
+    }
+
+    // Explicit yes/no confirmation tokens. Reported first: the least
+    // ambiguous evidence there is, and the most useful line to see in an audit.
+    if let Some((token, line)) = token_in(recent, YES_NO_TOKENS) {
+        return Some(QuestionMatch::new("yes-no-token", Some(token), line));
+    }
+    // Stock permission / trust / continue phrasings from Claude Code & Copilot.
+    if let Some((token, line)) = token_in(recent, PERMISSION_PHRASES) {
+        return Some(QuestionMatch::new("permission-phrase", Some(token), line));
+    }
+    // A numbered yes/no menu even without the pointer glyph.
+    if let Some((token, line)) = token_in(recent, NUMBERED_MENU_TOKENS) {
+        return Some(QuestionMatch::new("numbered-menu", Some(token), line));
+    }
     // Selection pointer marking the highlighted choice. A `❯`/`›`/`→` that
     // *leads* a line's content (after any box frame) is menu-shaped; the same
     // glyph mid-line is pervasive in ordinary output — pasted shell prompts
     // (`demo ❯ npm run dev`), UI breadcrumbs (`Home › Prefs`), diff/log arrows.
     // Requiring it to lead rules those out; requiring it in the last painted
     // lines also rules out a *leading* glyph in finished prose above the idle box.
-    let has_pointer_option = last_painted.iter().any(|l| {
-        let d = deframe(l);
+    if let Some(line) = last_painted.iter().find(|l| {
+        let d = deframe(l.as_str());
         d.starts_with('❯') || d.starts_with('›') || d.starts_with('→')
-    });
-    // A numbered yes/no menu even without the pointer glyph.
-    let has_numbered_menu = joined.contains("1. yes") || joined.contains("❯ 1.");
-    // Explicit yes/no confirmation tokens.
-    let has_yes_no = joined.contains("(y/n)")
-        || joined.contains("[y/n]")
-        || joined.contains("y/n)")
-        || joined.contains("[y/n]?")
-        || joined.contains("yes/no");
-    // Stock permission / trust / continue phrasings from Claude Code & Copilot.
-    let has_permission_phrase = joined.contains("do you want to proceed")
-        || joined.contains("do you want to make this edit")
-        || joined.contains("do you want to create")
-        || joined.contains("do you want to run")
-        || joined.contains("do you trust")
-        || joined.contains("trust the files")
-        || joined.contains("allow this")
-        || joined.contains("allow command")
-        || joined.contains("grant access")
-        || joined.contains("press enter to continue")
-        || joined.contains("waiting for your");
+    }) {
+        // No token: this signal is a *position* (glyph leading a line), not a
+        // substring, so `match_still_rendered` has only the line to go on.
+        return Some(QuestionMatch::new("pointer-option", None, line));
+    }
     // Interactive selection-menu footer (AskUserQuestion / Copilot / inquirer).
     // Claude Code's AskUserQuestion highlights the active option with reverse
     // video (an ANSI attribute stripped before we see it), so no glyph survives
@@ -4987,14 +5039,103 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
     // read only from the last painted lines. NOTE: matched on single lines, so a
     // footer wrapped across rows in a very narrow pane, or a localized / reworded
     // footer, won't match — a known gap (see design doc).
-    let footer = last_painted.join("\n");
-    let has_menu_footer = footer.contains("enter to select")
-        || footer.contains("enter to confirm")
-        || footer.contains("use arrow")
-        || footer.contains("arrow keys")
-        || footer.contains("↑↓")
-        || footer.contains("↑/↓");
-    has_pointer_option || has_numbered_menu || has_yes_no || has_permission_phrase || has_menu_footer
+    if let Some((token, line)) = token_in(last_painted, MENU_FOOTER_TOKENS) {
+        return Some(QuestionMatch::new("menu-footer", Some(token), line));
+    }
+    None
+}
+
+/// The literal substrings [`prompt_wait_match`] keys on, hoisted out of the
+/// function so the match can report the one that fired and
+/// [`match_still_rendered`] can look for that same one on the composed screen.
+/// Contents and order are exactly what the inline disjunctions were.
+const YES_NO_TOKENS: &[&str] = &["(y/n)", "[y/n]", "y/n)", "[y/n]?", "yes/no"];
+const PERMISSION_PHRASES: &[&str] = &[
+    "do you want to proceed",
+    "do you want to make this edit",
+    "do you want to create",
+    "do you want to run",
+    "do you trust",
+    "trust the files",
+    "allow this",
+    "allow command",
+    "grant access",
+    "press enter to continue",
+    "waiting for your",
+];
+const NUMBERED_MENU_TOKENS: &[&str] = &["1. yes", "❯ 1."];
+const MENU_FOOTER_TOKENS: &[&str] =
+    &["enter to select", "enter to confirm", "use arrow", "arrow keys", "↑↓", "↑/↓"];
+
+/// One question-shaped thing [`prompt_wait_match`] found, and where.
+///
+/// `line` is the detector's OWN normalization of the screen line (trimmed,
+/// lowercased) rather than the raw bytes — that is the form the detector
+/// reasons in, so it is the form both the audit and the grid comparison should
+/// see. Bounded at [`QuestionMatch::MAX_LINE`] characters: an audit field must
+/// not become a channel for an arbitrarily long line a pane happened to paint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionMatch {
+    /// Stable kebab-case name of the signal class that fired. This is audit
+    /// vocabulary — renaming one silently breaks reading old logs against new.
+    pub signal: &'static str,
+    /// The literal substring that fired, when the signal is a token match.
+    /// `None` for `pointer-option`, which is a position rather than a token.
+    pub token: Option<&'static str>,
+    /// The normalized line the signal was found on, truncated.
+    pub line: String,
+}
+
+impl QuestionMatch {
+    /// Cap on the retained line. Generous enough to hold any real dialog line
+    /// (a wrapped one is already split by the terminal), short enough that a
+    /// pane spraying a single enormous line cannot bloat the audit.
+    pub const MAX_LINE: usize = 200;
+
+    fn new(signal: &'static str, token: Option<&'static str>, line: &str) -> Self {
+        QuestionMatch { signal, token, line: line.chars().take(Self::MAX_LINE).collect() }
+    }
+}
+
+/// Flatten composed rows into one wrap-insensitive haystack: lowercased, every
+/// run of whitespace (row breaks included) collapsed to a single space.
+///
+/// The row break is the whole reason this exists. A dialog line the byte ring
+/// saw as one write is TWO rows on a screen narrower than it, so a row-by-row
+/// `contains` would miss text that is plainly displayed — and missing it here
+/// means concluding "not on screen" and releasing, the one direction this
+/// change must never be wrong in. Joining rows makes unrelated neighbours
+/// concatenate and can therefore produce a spurious hit; that errs toward
+/// "still displayed", which costs a hold the human is already told about.
+fn flatten_rendered(visible: &str) -> String {
+    visible.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Is the specific thing the byte ring matched still among the pane's RENDERED
+/// rows (#534)?
+///
+/// This is the narrow question, and narrow is the point. It does not ask "is
+/// some question on screen" — [`prompt_wait_detected`] answers that, with
+/// windowing rules written for a chronological stream. It asks whether *this
+/// match*, the one holding *this* delivery, is still displayed. That keeps
+/// unrelated screen content — a `❯ npm run dev` in prose the CLI has not
+/// scrolled away yet — from either causing or preventing a release.
+///
+/// Both the token and the whole line are checked, and either is enough:
+/// the token is short and survives re-wrapping, the line is specific and
+/// survives a CLI that repainted its dialog with different chrome. `None` +
+/// nothing found is a genuine negative; there is no third answer here, because
+/// "the composition could not be trusted" is decided before this is called
+/// (see [`question_shown`]).
+pub fn match_still_rendered(visible: &str, m: &QuestionMatch) -> bool {
+    let flat = flatten_rendered(visible);
+    if let Some(token) = m.token {
+        if flat.contains(token) {
+            return true;
+        }
+    }
+    let line = flatten_rendered(&m.line);
+    !line.is_empty() && flat.contains(&line)
 }
 
 /// Does the pane's ANSI-stripped output tail show Copilot's "Enable autopilot
@@ -10324,13 +10465,14 @@ fn deliver_now(
         // Nothing of ours is on screen yet at this point in the delivery, so
         // there's no self-echo risk to gate against (`paste_baseline_total:
         // None` — see `question_hold_predicate`).
-        let question_decision =
+        let (question_decision, question_seen) =
             wait_for_question_clear(&ptys, pty_id, None, &emit_held, &emit_held_cleared);
         match question_decision {
             PasteDecision::Paste { held_ms } if held_ms > 0 => {
                 append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
                     "to": agent, "stage": "pre-paste", "held_ms": held_ms, "outcome": "cleared",
                     "recheck_round": recheck_round,
+                    "matched": witness_audit(question_seen.as_ref()),
                 }));
             }
             PasteDecision::Paste { .. } => {}
@@ -10338,6 +10480,7 @@ fn deliver_now(
                 append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
                     "to": agent, "stage": "pre-paste", "held_ms": held_ms,
                     "recheck_round": recheck_round,
+                    "matched": witness_audit(question_seen.as_ref()),
                 }));
                 return DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::Question);
             }
@@ -10509,19 +10652,21 @@ fn deliver_now(
     // here would otherwise be indistinguishable from a genuine live
     // dialog; masking out our own known lines leaves only what the CLI
     // itself painted, whenever it painted it.
-    let question_decision_preenter = wait_for_question_clear(
+    let (question_decision_preenter, question_seen_preenter) = wait_for_question_clear(
         &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
     );
     match question_decision_preenter {
         PasteDecision::Paste { held_ms } if held_ms > 0 => {
             append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
                 "to": agent, "stage": "pre-enter", "held_ms": held_ms, "outcome": "cleared",
+                "matched": witness_audit(question_seen_preenter.as_ref()),
             }));
         }
         PasteDecision::Paste { .. } => {}
         PasteDecision::Abort { held_ms } => {
             append_audit(&root, &group, "loomux", "delivery-aborted-question", json!({
                 "to": agent, "stage": "pre-enter", "held_ms": held_ms,
+                "matched": witness_audit(question_seen_preenter.as_ref()),
             }));
             // #420 rev-15 B3: unlike the pre-paste abort, the text IS
             // already pasted at this point — only the Enter was
@@ -10791,13 +10936,14 @@ fn deliver_now(
                 window_exhausted_naturally = false;
                 break;
             }
-            let question_decision = wait_for_question_clear(
+            let (question_decision, question_seen_retry) = wait_for_question_clear(
                 &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
             );
             match retry_gate(question_decision) {
                 RetryGate::SkipQuestionPending { held_ms } => {
                     append_audit(&root, &group, "loomux", "submit-retries-skipped", json!({
                         "to": agent, "reason": "question pending", "held_ms": held_ms,
+                        "matched": witness_audit(question_seen_retry.as_ref()),
                     }));
                     // #112 round 3 (rev-20 B2 — the blocking finding):
                     // a question on screen may be INTERCEPTING our
@@ -10816,6 +10962,7 @@ fn deliver_now(
                     if held_ms > 0 {
                         append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
                             "to": agent, "stage": "retry", "held_ms": held_ms, "outcome": "cleared",
+                            "matched": witness_audit(question_seen_retry.as_ref()),
                         }));
                     }
                     if ptys.write_bytes(pty_id, submit).is_err() {
@@ -12036,17 +12183,190 @@ pub fn question_hold_predicate<T>(tail: T, pasted_text: Option<String>) -> impl 
 where
     T: Fn() -> Option<Vec<u8>>,
 {
+    // Ring only, no composition — exactly the reading this guard had before
+    // #534, and the one it falls back to whenever a pane's screen cannot be
+    // trusted. `visible: None` is not "nothing is rendered"; it is "we have no
+    // rendered-rows evidence", which `question_shown` treats as the ring's
+    // word being final.
+    question_hold_predicate_sampled(
+        move || QuestionSample { ring: tail(), visible: None },
+        pasted_text,
+        None,
+    )
+}
+
+/// One poll's worth of readings for the question guard (#534): the same
+/// instant seen two ways.
+pub struct QuestionSample {
+    /// Raw (ANSI-included) bytes from the pane's append-only output ring —
+    /// what the guard has always read.
+    pub ring: Option<Vec<u8>>,
+    /// The pane's currently-rendered rows, composed by
+    /// [`termgrid::render_visible`]. `None` means *no trustworthy
+    /// composition*, never *a blank screen* — the two must not collapse,
+    /// because one licenses a release and the other must not.
+    pub visible: Option<String>,
+}
+
+/// What the composed screen says about a match the byte ring made (#534).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridEvidence {
+    /// The match — or some other question shape — is among the rendered rows.
+    StillRendered,
+    /// The screen composed cleanly and holds neither. This is the ONLY
+    /// reading that turns a hold into a release.
+    NotRendered,
+    /// No composition worth reading (pty gone, geometry unknown, nothing
+    /// painted). Proves nothing in either direction; the ring's word stands.
+    Unreadable,
+}
+
+impl GridEvidence {
+    /// Audit vocabulary — stable, kebab-case, read by humans diagnosing the
+    /// next #513-shaped incident.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GridEvidence::StillRendered => "still-rendered",
+            GridEvidence::NotRendered => "not-rendered",
+            GridEvidence::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// Read the composed screen for evidence about `m`.
+///
+/// Two independent ways to answer "still displayed", OR'd, because a false
+/// `NotRendered` is the expensive error (it releases an Enter toward a dialog
+/// that may be live) and a false `StillRendered` is the cheap one (a hold the
+/// human is already badged about at ten minutes):
+///
+/// - [`prompt_wait_detected`] over the rendered rows — catches a dialog the
+///   CLI repainted with different text than the ring matched.
+/// - [`match_still_rendered`] — catches a dialog sitting outside the
+///   detector's own last-12-lines window, which is a *chronological* rule
+///   applied here to a *spatial* layout and so cannot be relied on alone.
+pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<&str>) -> GridEvidence {
+    match visible {
+        None => GridEvidence::Unreadable,
+        Some(v) if prompt_wait_detected(v) || match_still_rendered(v, m) => {
+            GridEvidence::StillRendered
+        }
+        Some(_) => GridEvidence::NotRendered,
+    }
+}
+
+/// The question guard's reading for one poll, from both signals (#534).
+///
+/// **The ring is the trigger; the grid can only ever release.** Written out,
+/// because the asymmetry is the safety argument and not an implementation
+/// detail:
+///
+/// | ring | grid | reading | vs. before #534 |
+/// |---|---|---|---|
+/// | no match | (not consulted) | clear | unchanged |
+/// | match | `Unreadable` | hold | unchanged |
+/// | match | `StillRendered` | hold | unchanged |
+/// | match | `NotRendered` | **clear** | **the one change** |
+///
+/// Every row but the last is today's behaviour, so the entire behavioural
+/// surface of this change is a single transition, in a single direction, and
+/// the design note argues exactly that one. Notably the grid is never allowed
+/// to *create* a hold the ring did not: that would be a new false-positive
+/// class (screen content the ring had already scrolled past), and #420/#427
+/// forbid weakening the guard but nothing asks us to strengthen it here.
+///
+/// A release still is not a write. This reading feeds
+/// `question_hold_predicate`, which requires
+/// [`QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS`] consecutive clear reads; the
+/// write that follows is admitted by `write_admission`, which re-reads box
+/// occupancy at the instant of the write (#532). "The question is gone AND the
+/// box is empty" is therefore a conjunction the caller already enforces — see
+/// the design note for why it is not re-derived here.
+pub fn question_shown(ring: Option<&QuestionMatch>, visible: Option<&str>) -> bool {
+    match ring {
+        None => false,
+        Some(m) => grid_evidence_for(m, visible) != GridEvidence::NotRendered,
+    }
+}
+
+/// What the guard held for, recorded for the abort audit (#513(c)/F2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionWitnessed {
+    /// The detector's match — signal class and the line it fired on.
+    pub matched: QuestionMatch,
+    /// What the composed screen said about it on that same poll.
+    pub grid: GridEvidence,
+}
+
+/// Slot the hold predicate writes its last observed match into, so the abort
+/// site can say WHY it held. Single-threaded by construction (the predicate is
+/// a closure polled by one delivery thread), hence `Rc`/`RefCell` rather than
+/// a lock.
+pub type QuestionWitness = std::rc::Rc<std::cell::RefCell<Option<QuestionWitnessed>>>;
+
+/// The `matched` field every question-guard audit record now carries
+/// (#513(c)/F2) — or `null` where the guard genuinely never saw a question.
+///
+/// `null` is a real answer and is why this returns a value rather than
+/// omitting the key: for a `delivery-aborted-question` record it means the
+/// abort outcome and the detector disagree, which is itself the finding. The
+/// old records were indistinguishable from that case in every direction, which
+/// is why #513's live 27-minute incident is still unexplained.
+///
+/// Three fields, each earning its place in a log that rotates at 8 MiB:
+/// `signal` says which detector rule fired (the fastest way to spot a rule
+/// misfiring on prose), `line` says what it fired on (bounded by
+/// [`QuestionMatch::MAX_LINE`]), and `grid` says whether the composed screen
+/// agreed — the one that turns "the guard held" into "the guard held and the
+/// screen backed it up", or into the opposite.
+pub fn witness_audit(seen: Option<&QuestionWitnessed>) -> Value {
+    match seen {
+        None => Value::Null,
+        Some(w) => json!({
+            "signal": w.matched.signal,
+            "line": w.matched.line,
+            "grid": w.grid.as_str(),
+        }),
+    }
+}
+
+/// [`question_hold_predicate`], generalized over a sample that may carry
+/// composed-screen evidence, and able to record what it saw (#534).
+pub fn question_hold_predicate_sampled<T>(
+    sample: T,
+    pasted_text: Option<String>,
+    witness: Option<QuestionWitness>,
+) -> impl Fn() -> bool
+where
+    T: Fn() -> QuestionSample,
+{
     let ever_shown = std::cell::Cell::new(false);
     let consecutive_clear = std::cell::Cell::new(0u32);
     move || {
-        let shown = tail().is_some_and(|out| {
-            let stripped = strip_ansi(&out);
-            let masked = match &pasted_text {
-                Some(p) => mask_own_paste(&stripped, p),
-                None => stripped,
-            };
-            prompt_wait_detected(&masked)
-        });
+        let s = sample();
+        // `mask_own_paste` runs on BOTH readings or the guard would be
+        // inconsistent with itself: our own just-pasted text sits in the box
+        // and is therefore *rendered*, so an unmasked grid read would answer
+        // "still displayed" about our own paste (rev-15 N1 / rev-19 B-A).
+        let mask = |t: &str| match &pasted_text {
+            Some(p) => mask_own_paste(t, p),
+            None => t.to_string(),
+        };
+        let ring_match =
+            s.ring.as_deref().and_then(|out| prompt_wait_match(&mask(&strip_ansi(out))));
+        let visible = s.visible.as_deref().map(mask);
+        let shown = question_shown(ring_match.as_ref(), visible.as_deref());
+        if let (Some(w), Some(m)) = (&witness, ring_match) {
+            // Recorded on every poll the ring matched, INCLUDING the polls
+            // that read clear on the grid — the abort audit wants the last
+            // thing seen, and "the ring kept matching but the screen said
+            // gone" is the single most useful line a #513 diagnosis could
+            // have. Never cleared on a no-match poll: an abort is preceded by
+            // whatever the hold was about, and blanking it would leave the
+            // audit saying nothing again.
+            let grid = grid_evidence_for(&m, visible.as_deref());
+            *w.borrow_mut() = Some(QuestionWitnessed { matched: m, grid });
+        }
         if shown {
             ever_shown.set(true);
             consecutive_clear.set(0);
@@ -12075,16 +12395,25 @@ where
 /// gets identical badge/hold behavior from one place instead of re-deriving
 /// it. A closed pty or unreadable tail reads as "no question" so a dead/gone
 /// pane never blocks the thread.
+///
+/// Since #534 it reads both signals per poll (see [`question_sample`]) and
+/// returns, alongside the decision, the LAST thing the detector matched —
+/// `None` when the guard never saw a question at all. Callers that abort put
+/// it in the audit; that field is the whole of #513(c), and the reason it is
+/// returned rather than re-derived at the abort site is that a fresh read
+/// there would describe a different instant than the one that decided.
 fn wait_for_question_clear(
     ptys: &crate::pty::PtyManager,
     pty_id: u32,
     pasted_text: Option<&str>,
     emit_held: &impl Fn(HeldReason),
     emit_held_cleared: &impl Fn(),
-) -> PasteDecision {
-    let predicate = question_hold_predicate(
-        || ptys.output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES),
+) -> (PasteDecision, Option<QuestionWitnessed>) {
+    let witness: QuestionWitness = Default::default();
+    let predicate = question_hold_predicate_sampled(
+        || question_sample(ptys, pty_id),
         pasted_text.map(str::to_string),
+        Some(std::rc::Rc::clone(&witness)),
     );
     let will_hold = predicate();
     if will_hold {
@@ -12094,7 +12423,47 @@ fn wait_for_question_clear(
     if will_hold {
         emit_held_cleared();
     }
-    decision
+    let seen = witness.borrow().clone();
+    (decision, seen)
+}
+
+/// Both of the question guard's readings for one pane, taken from ONE tail
+/// read (#534).
+///
+/// One read, not two, and the reason is correctness rather than cost: a second
+/// `output_tail_bounded` call would sample a *different instant*, so the ring
+/// could match text the composition — taken microseconds later, after the CLI
+/// erased it — legitimately no longer holds. The guard would then be comparing
+/// two screens and calling the difference evidence. Slicing the ring window out
+/// of the tail the grid replays keeps both readings answering about the same
+/// bytes.
+///
+/// The ring slice is the LAST [`QUESTION_SCAN_TAIL_BYTES`], preserving the
+/// pre-#534 detector window exactly — including its habit of starting
+/// mid-codepoint, which `strip_ansi` has always absorbed.
+fn question_sample(ptys: &crate::pty::PtyManager, pty_id: u32) -> QuestionSample {
+    let raw = ptys.output_tail_bounded(pty_id, QUESTION_GRID_REPLAY_BYTES);
+    // Geometry is required, never defaulted. `get_output` may fall back to
+    // 80x24 because a wrong width there only re-wraps prose in something a
+    // human reads; here a wrong width changes which cells hold which
+    // characters, and a wrapped `(y/n)` that fails to match would read as
+    // "not displayed" — the one direction this must never be wrong in. No
+    // size, no grid evidence.
+    let visible = match (raw.as_deref(), ptys.size(pty_id)) {
+        (Some(bytes), Some((cols, rows))) => {
+            let v = termgrid::render_visible(bytes, cols, rows);
+            // A composition with essentially nothing on it is a replay that
+            // began blind and was never painted over, not a clear screen.
+            // Treat it as unreadable: the cost is a hold that was already
+            // going to happen, and the alternative is calling a blank grid
+            // proof that a dialog is gone.
+            (v.lines().filter(|l| !l.trim().is_empty()).count() >= GRID_MIN_RENDERED_ROWS)
+                .then_some(v)
+        }
+        _ => None,
+    };
+    let ring = raw.map(|b| b[b.len().saturating_sub(QUESTION_SCAN_TAIL_BYTES)..].to_vec());
+    QuestionSample { ring, visible }
 }
 
 /// One-shot "is a question on screen right now" snapshot (#420 rev-15 B1) —
@@ -12106,9 +12475,10 @@ fn wait_for_question_clear(
 /// only engages once a hold has actually observed a question at least once
 /// (`ever_shown`), so a lone call just answers "is it shown right now".
 fn question_active_now(ptys: &crate::pty::PtyManager, pty_id: u32, pasted_text: Option<&str>) -> bool {
-    question_hold_predicate(
-        || ptys.output_tail_bounded(pty_id, QUESTION_SCAN_TAIL_BYTES),
+    question_hold_predicate_sampled(
+        || question_sample(ptys, pty_id),
         pasted_text.map(str::to_string),
+        None,
     )()
 }
 
