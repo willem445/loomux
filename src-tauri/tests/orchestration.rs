@@ -56,7 +56,7 @@ use loomux_lib::orchestration::{
     ends_hold_episode, opens_hold_episode, HoldObservation,
     hold_channels, HoldChannel, HoldClass,
     pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
-    PauseSuppression, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
+    PauseSuppression, SuppressedCause, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -19504,11 +19504,13 @@ fn suppressed_during_pause_reads_only_the_window_the_last_pause_opened() {
                 from: "w-2".into(),
                 to: "orch-1".into(),
                 preview: "report: done, PR #123 is green".into(),
+                cause: SuppressedCause::LegacyDiscard,
             },
             SuppressedDelivery {
                 from: "human".into(),
                 to: "w-3".into(),
                 preview: "also update the README".into(),
+                cause: SuppressedCause::LegacyDiscard,
             },
         ],
         "only THIS window's suppressions, in arrival order, sender and target both named"
@@ -19570,30 +19572,35 @@ fn the_resume_notice_says_discarded_and_never_promises_a_replay() {
             from: "w-2".into(),
             to: "orch-1".into(),
             preview: "report: done, PR #123 is green".into(),
+            cause: SuppressedCause::LegacyDiscard,
         }],
         window_start_seen: true,
     };
     let n = pause_suppression_notice(&s);
 
-    assert!(n.contains("1 delivery was DISCARDED"), "loud, and singular reads as singular: {n}");
+    assert!(n.contains("1 delivery was LOST"), "loud, and singular reads as singular: {n}");
     assert!(n.contains("w-2 -> orch-1"), "names sender and target: {n}");
     assert!(n.contains("PR #123 is green"), "and the payload, so it can be re-requested: {n}");
-    assert!(
-        n.contains("will not be replayed") && n.contains("re-requested"),
-        "must say the recovery is a RE-SEND, not a replay loomux will do: {n}"
-    );
+    assert!(n.contains("re-requested"), "the recovery is a RE-SEND, not a replay loomux does: {n}");
     // #569 option 2: the two behaviors now coexist in one group's history, so
     // the notice has to say WHICH pause it is about. Without this, a reader
-    // takes "will not be replayed" as the current rule and re-requests work
-    // that is already on its way — the duplicate `queued_notice`'s "do NOT
-    // re-send" exists to prevent, arriving from the opposite direction.
+    // takes it as the current rule and re-requests work that is already on its
+    // way — the duplicate `queued_notice`'s "do NOT re-send" exists to prevent,
+    // arriving from the opposite direction.
     assert!(
         n.contains("EARLIER loomux version"),
         "must scope the discard to the build that did it: {n}"
     );
     assert!(
-        n.contains("Pause queues now"),
+        n.contains("delivering on its own right now"),
         "and must say the current rule, or it teaches the wrong one: {n}"
+    );
+    // Review B2: a legacy-only window must NOT mention the queue-full refusal —
+    // explaining a failure mode this window did not have is one more paragraph
+    // between the reader and the one that matters.
+    assert!(
+        !n.contains("REFUSED"),
+        "a legacy-only window must not describe a refusal that did not happen: {n}"
     );
     assert!(
         !n.contains("may reach back"),
@@ -19606,6 +19613,7 @@ fn the_resume_notice_says_discarded_and_never_promises_a_replay() {
                 from: format!("w-{i}"),
                 to: "orch-1".into(),
                 preview: format!("payload {i}"),
+                cause: SuppressedCause::LegacyDiscard,
             })
             .collect(),
         window_start_seen: true,
@@ -19618,6 +19626,103 @@ fn the_resume_notice_says_discarded_and_never_promises_a_replay() {
         "and points at the log that holds the rest in full: {n}"
     );
     assert!(!n.contains("payload 9"), "beyond the cap is summarized, not listed: {n}");
+}
+
+#[test]
+fn the_resume_notice_reports_a_queue_full_refusal_as_a_LIVE_risk_not_as_history() {
+    // Review B2: option 2 was documented as making a pause incapable of
+    // destroying a payload, and that was false — a pane at QUEUE_MAX_PER_PANE
+    // refuses further admissions for as long as the pause lasts. The notice has
+    // to separate the two causes, because what a reader should DO about them
+    // differs: the legacy discard cannot recur on this build, the refusal can
+    // and will on the next long pause.
+    let s = PauseSuppression {
+        items: vec![SuppressedDelivery {
+            from: "w-2".into(),
+            to: "orch-1".into(),
+            preview: "report: done, PR #77 is green".into(),
+            cause: SuppressedCause::QueueFullDuringPause,
+        }],
+        window_start_seen: true,
+    };
+    let n = pause_suppression_notice(&s);
+    assert!(n.contains("REFUSED"), "the refusal must be named as such: {n}");
+    assert!(n.contains("queue was\n         already full") || n.contains("already full"),
+        "and must say why it was refused: {n}");
+    assert!(n.contains("expect it again"),
+        "a live risk must read as live — this is the half a reader can still act on: {n}");
+    assert!(
+        !n.contains("EARLIER loomux version"),
+        "a refusal-only window must not blame a build that had nothing to do with it: {n}"
+    );
+    assert!(n.contains("refused, queue full"), "and the per-item cause is named: {n}");
+
+    // A MIXED window names both, since one window can genuinely contain both.
+    let mixed = PauseSuppression {
+        items: vec![
+            SuppressedDelivery {
+                from: "w-1".into(),
+                to: "orch-1".into(),
+                preview: "old loss".into(),
+                cause: SuppressedCause::LegacyDiscard,
+            },
+            SuppressedDelivery {
+                from: "w-2".into(),
+                to: "orch-1".into(),
+                preview: "new loss".into(),
+                cause: SuppressedCause::QueueFullDuringPause,
+            },
+        ],
+        window_start_seen: true,
+    };
+    let m = pause_suppression_notice(&mixed);
+    assert!(m.contains("2 deliveries were LOST"), "{m}");
+    assert!(m.contains("EARLIER loomux version") && m.contains("REFUSED"), "both causes named: {m}");
+    assert!(m.contains("discarded by an earlier loomux") && m.contains("refused, queue full"),
+        "and each item says which one it was: {m}");
+}
+
+#[test]
+fn the_window_scan_picks_up_a_queue_full_refusal_but_not_an_ordinary_one() {
+    // The `enqueue_reason` filter is what keeps this scoped to the pause.
+    // `delivery-dropped` is written for ordinary queue-full rejections too, and
+    // those are the sender's own synchronous `Err` to deal with — re-reporting
+    // them at every resume would be the notice-becomes-noise failure the cap on
+    // this list exists to prevent.
+    let dropped = |reason: &str, text: &str| {
+        audit("loomux", "delivery-dropped", json!({
+            "to": "orch-1", "from": "w-2", "reason": "queue-full-at-call",
+            "enqueue_reason": reason, "preview": text,
+        }))
+    };
+    let entries = vec![
+        audit("human", "group-pause", json!({})),
+        dropped("group-paused", "report: done, PR #77 is green"),
+        dropped("arrival", "an ordinary overflow, not this window's business"),
+        suppressed("w-9", "orch-1", "an older build's discard"),
+    ];
+
+    let s = suppressed_during_pause(&entries);
+    assert!(s.window_start_seen);
+    assert_eq!(s.items.len(), 2, "the pause refusal and the legacy discard, not the arrival: {:?}", s.items);
+    assert_eq!(
+        s.items[0],
+        SuppressedDelivery {
+            // `from` comes off the DETAIL here: the actor is `loomux`, which did
+            // the dropping — not the sender who lost the work.
+            from: "w-2".into(),
+            to: "orch-1".into(),
+            preview: "report: done, PR #77 is green".into(),
+            cause: SuppressedCause::QueueFullDuringPause,
+        },
+        "the pause-scoped refusal, attributed to its SENDER"
+    );
+    assert_eq!(s.items[1].cause, SuppressedCause::LegacyDiscard);
+    assert!(
+        !s.items.iter().any(|i| i.preview.contains("ordinary overflow")),
+        "an unpaused overflow must not be re-reported at resume: {:?}",
+        s.items
+    );
 }
 
 #[test]
@@ -19996,6 +20101,175 @@ fn the_legacy_discard_notice_still_badges_when_no_orchestrator_can_take_it() {
             .count(),
         1,
         "one badge per pane, however many payloads it lost"
+    );
+}
+
+#[test]
+fn a_resume_racing_an_admission_never_strands_it() {
+    // Review BLOCKING 1. `deliver_prompt` reads `is_paused`, then admits — with
+    // no lock across the gap and real I/O inside it. A resume landing in that
+    // gap clears the flag and finds the pane queue still empty, so
+    // `flush_paused_queues` starts nothing; the admission then lands in an
+    // unpaused group with no drainer and, because the pause branch is the one
+    // path that deliberately never calls `ensure_drainer`, nobody left to start
+    // one. Queued, audited, persisted, `Ok` to the sender, never delivered —
+    // #569's own defect, reproduced by its fix.
+    //
+    // The invariant, and it is the ONLY thing that has to hold: for every
+    // interleaving, SOMETHING claims responsibility for draining the pane.
+    // Either resume saw the entry (`pause-flush` names the pane) or the
+    // admission saw the resume (`pause-race-nudge` names the entry). Never
+    // neither. A headless registry cannot observe `ensure_drainer` itself — no
+    // `AppHandle`, so no thread is ever spawned, which is exactly why both
+    // branches audit.
+    //
+    // Driven with real threads and a real barrier rather than a simulated
+    // interleaving: the whole finding is that the two sides are unsynchronized,
+    // so a model with a seam in it would be proving the seam. Repeated, because
+    // which side wins is the OS's decision and a single run pins nothing.
+    use std::sync::{Arc, Barrier};
+
+    for round in 0..24 {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(relaunch_registry(dir.path()));
+        reg.set_self_arc();
+        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+        let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+        let pty = 5800 + round;
+        reg.set_pty_for_test(&w.id, pty);
+        reg.pause_group(&g.id).unwrap();
+
+        let gate = Arc::new(Barrier::new(2));
+        let admit = {
+            let (reg, gid, wid, gate) = (reg.clone(), g.id.clone(), w.id.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                // The payload the issue is about: a worker's completion report.
+                let _ = reg.deliver_prompt(&wid, "report: done, PR #99 is green", "w-1", Delivery::MidSession);
+                let _ = gid;
+            })
+        };
+        let resume = {
+            let (reg, gid, gate) = (reg.clone(), g.id.clone(), gate.clone());
+            std::thread::spawn(move || {
+                gate.wait();
+                reg.resume_group(&gid).unwrap();
+            })
+        };
+        admit.join().unwrap();
+        resume.join().unwrap();
+
+        // The entry itself must exist either way — the admission is never lost,
+        // only potentially orphaned, which is the whole point of the finding.
+        assert_eq!(reg.queue_depth(pty), 1, "round {round}: the report must be queued regardless of order");
+
+        let log = reg.audit_log(&g.id);
+        let flushed = log.iter().any(|e| {
+            e.action == "pause-flush"
+                && e.detail["panes"].as_array().is_some_and(|p| p.contains(&json!(pty)))
+        });
+        let nudged = log
+            .iter()
+            .any(|e| e.action == "pause-race-nudge" && e.detail["pty"] == json!(pty));
+        assert!(
+            flushed || nudged,
+            "round {round}: nobody owns draining pty {pty} — the delivery is stranded. \
+             pause-flush={flushed} pause-race-nudge={nudged}; log actions: {:?}",
+            log.iter().map(|e| e.action.as_str()).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn a_queue_full_refusal_during_a_pause_is_reported_to_the_orchestrator_on_resume() {
+    // Review BLOCKING 2, end to end. The cap is per PANE and the orchestrator's
+    // pane is where a whole fleet converges, so a long pause fills it and the
+    // ninth delivery is destroyed — `Err` to the sender, and before this nothing
+    // at all to the orchestrator. That is the #569 stall arriving through the
+    // queue instead of around it.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5820);
+    reg.set_pty_for_test(&w.id, 5821);
+    reg.pause_group(&g.id).unwrap();
+
+    // Fill the orchestrator's pane to the cap. Distinct texts, or `admit`'s
+    // byte-identical coalescing would fold them into one entry and never reach
+    // capacity at all.
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.deliver_prompt(&orch.id, &format!("[loomux] advisory {i}"), "loomux", Delivery::MidSession)
+            .unwrap();
+    }
+    assert_eq!(reg.queue_depth(5820), queue::QUEUE_MAX_PER_PANE, "precondition: the pane is at capacity");
+
+    // The ninth: a worker's completion report, refused.
+    let err = reg
+        .deliver_prompt(&orch.id, "report: done, PR #77 is green", &w.id, Delivery::MidSession)
+        .unwrap_err();
+    assert!(err.contains("queue"), "the SENDER is told synchronously: {err}");
+
+    reg.resume_group(&g.id).unwrap();
+
+    // …and so, now, is the orchestrator.
+    let notice = delivered_texts(&reg, &g.id)
+        .into_iter()
+        .find(|t| t.contains("LOST"))
+        .expect("resume must tell the orchestrator a delivery was refused during the pause");
+    assert!(notice.contains("REFUSED"), "named as a refusal, not a legacy discard: {notice}");
+    assert!(notice.contains("PR #77 is green"), "and the payload, so it can be re-requested: {notice}");
+    assert!(
+        notice.contains(&format!("{} -> {}", w.id, orch.id)),
+        "sender and target both named: {notice}"
+    );
+    assert!(
+        !notice.contains("EARLIER loomux version"),
+        "this build refused it — blaming an older one would send the reader nowhere: {notice}"
+    );
+
+    let tally = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "pause-suppression-notice")
+        .expect("and the tally is recorded");
+    assert_eq!(tally.detail["count"], json!(1));
+}
+
+#[test]
+fn a_resume_flush_keeps_held_entries_ahead_of_post_resume_traffic() {
+    // Review N3. The design note promises pause-held entries drain "in original
+    // order"; FIFO makes that structurally true, but nothing asserted it across
+    // the resume boundary, so a future `flush_paused_queues` that pushed rather
+    // than appended — or a resume that re-admitted its backlog — would land
+    // unnoticed. Ordering is the whole reason the queue exists: "here is the
+    // context" then "now go" inverts into nonsense.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5830);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&w.id, "held first", "orch-1", Delivery::MidSession).unwrap();
+    reg.deliver_prompt(&w.id, "held second", "orch-1", Delivery::MidSession).unwrap();
+    reg.resume_group(&g.id).unwrap();
+    // Nothing drains here (no `AppHandle`), which is what lets the queue be read
+    // as a whole: the post-resume arrival has to land BEHIND the backlog.
+    reg.deliver_prompt(&w.id, "arrived after the resume", "orch-1", Delivery::MidSession).unwrap();
+
+    let texts: Vec<String> = reg
+        .queue_snapshot(5830)
+        .into_iter()
+        .filter_map(|e| e.payload.text().map(str::to_string))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            "held first".to_string(),
+            "held second".to_string(),
+            "arrived after the resume".to_string(),
+        ],
+        "pause-held entries keep their arrival order AND stay ahead of post-resume traffic"
     );
 }
 

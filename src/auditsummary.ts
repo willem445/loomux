@@ -58,6 +58,13 @@ export function summarize(e: AuditEntry): string {
         ? `${what} — orchestrator notified on resume`
         : `${what} — could NOT notify the orchestrator (${str(d.error) ?? "?"}); panes badged instead`;
     }
+    // #569 review B1: the admission saw the group had been resumed underneath
+    // it, so it took responsibility for starting the drain that `resume_group`
+    // had already decided it did not need to. Rare and invisible otherwise —
+    // this line is the only trace the race ever happened, which is what makes
+    // it worth its own sentence rather than a JSON blob.
+    case "pause-race-nudge":
+      return `raced a resume — nudged the drainer for ${str(d.to) ?? "?"} (pty ${d.pty ?? "?"}, delivery ${d.id ?? "?"})`;
     // #569 option 2: the resume set these panes draining what the pause held.
     // `started` is false when there was no app handle to spawn a drainer with,
     // and the line has to say so — "the flush began" is a claim like any other.

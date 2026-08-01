@@ -209,3 +209,14 @@ test("pause-flush names the panes the resume set draining", () => {
   const stalled = summarize(entry("pause-flush", { panes: [5690], started: false }, "loomux"));
   assert.match(stalled, /NOT started/, "a flush that never began must not read as one that did");
 });
+
+// #569 review B1: the audit line is the ONLY evidence this interleaving
+// occurred — `ensure_drainer` itself leaves no trace a reader can see — so it
+// has to render as a sentence, not fall to the raw-JSON default arm.
+test("pause-race-nudge reads as a race the admission caught", () => {
+  const s = summarize(entry("pause-race-nudge", { to: "orch-1", pty: 5690, id: 42 }, "loomux"));
+  assert.match(s, /raced a resume/);
+  assert.match(s, /orch-1/, "the pane whose delivery would otherwise have stranded");
+  assert.match(s, /5690/);
+  assert.match(s, /42/, "and the delivery id, so it joins to delivery-queued");
+});

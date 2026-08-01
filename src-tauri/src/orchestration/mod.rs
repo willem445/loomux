@@ -8432,34 +8432,67 @@ pub fn parse_audit_lines_counted(text: &str) -> (Vec<AuditEntry>, usize) {
 /// payload bounded even against a rotated + current pair near the 8 MB cap.
 const AUDIT_VIEW_LIMIT: usize = 5000;
 
-/// #569: one delivery a pause window destroyed, recovered from the audit log.
+/// #569: WHY one delivery a pause window lost is gone — the two are not the
+/// same event and must not be reported as one (review B2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuppressedCause {
+    /// A build predating #569 option 2 destroyed it at the pause branch
+    /// (`prompt-suppressed-paused`). Nothing writes that action now, so this
+    /// variant is reachable only by pausing under an older loomux, upgrading,
+    /// and resuming — a real sequence, and the reason the scan is kept rather
+    /// than deleted: those payloads genuinely are gone and this notice is the
+    /// only thing that will ever say so.
+    LegacyDiscard,
+    /// THIS build refused it: the target pane was already at
+    /// `queue::QUEUE_MAX_PER_PANE` when it arrived, so `enqueue_text`'s
+    /// `RejectFull` arm dropped the payload and returned `Err`
+    /// (`delivery-dropped`, `enqueue_reason: group-paused`).
+    ///
+    /// **The claim this variant exists to stop being false.** Option 2 was
+    /// documented — here, in `pause_suppression_notice`, in `resume_group` and
+    /// in the design note — as making a pause incapable of destroying a
+    /// payload. It is not: the per-pane cap is 8, the orchestrator's pane is
+    /// where a whole fleet converges, and loomux's own advisories now queue
+    /// there too, so a long pause can fill it and refuse a worker's
+    /// `report("done")` ninth. The sender is told (`Err`), but pre-B2 the
+    /// ORCHESTRATOR never was, which is the #569 stall arriving through the
+    /// queue instead of around it.
+    QueueFullDuringPause,
+}
+
+impl SuppressedCause {
+    /// Stable audit/report token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuppressedCause::LegacyDiscard => "legacy-discard",
+            SuppressedCause::QueueFullDuringPause => "queue-full-during-pause",
+        }
+    }
+}
+
+/// #569: one delivery a pause window lost, recovered from the audit log.
 ///
-/// **Transitional as of #569 option 2 — this build never creates one.** The
-/// only writer of `prompt-suppressed-paused` was `deliver_prompt`'s pause
-/// branch, and that branch now ADMITS the payload to the pane's durable queue
-/// instead of discarding it. So every record this type can be built from was
-/// written by a loomux that predates enqueue-while-paused, and the only way to
-/// meet one is to pause under an older build, upgrade, and resume — a real
-/// sequence, and the reason the scan is kept rather than deleted: those
-/// payloads genuinely are gone, and this notice is the only thing that will
-/// ever say so.
-///
-/// **Why there is no id here.** The pre-#569 pause branch returned *before*
-/// the front door, so a suppressed delivery never entered a queue and no id
-/// was ever minted for it — the same situation #563 met at `enqueue_text`'s
-/// `RejectFull` arm, and answered the same way: name the payload by
-/// `{from, to, preview}`, which the record actually establishes, rather than
-/// by an id that would join to nothing.
+/// **Why there is no id here.** Neither source has a usable one. The pre-#569
+/// pause branch returned *before* the front door, so no id was ever minted;
+/// `enqueue_text`'s `RejectFull` arm mints none either, for the reason #563
+/// gave when it met the same problem — a rejected entry has nothing to join
+/// against. Both are named by `{from, to, preview}`, which the record does
+/// establish.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuppressedDelivery {
     /// Whoever called `deliver_prompt` — the audit entry's actor.
     pub from: String,
     /// The agent the payload was headed for.
     pub to: String,
-    /// One-line, bounded preview of the discarded payload
+    /// One-line, bounded preview of the lost payload
     /// (`queue::dropped_payload_preview`, reused so a lost payload reads the
     /// same wherever it is reported).
     pub preview: String,
+    /// Which of the two ways it was lost — see [`SuppressedCause`]. The notice
+    /// groups on this, because "an older build threw it away" and "this build
+    /// refused it, and would refuse the next one too" call for different
+    /// actions from the reader.
+    pub cause: SuppressedCause,
 }
 
 /// #569: everything ONE pause window swallowed, oldest first.
@@ -8479,9 +8512,20 @@ pub struct PauseSuppression {
 /// #569: read a pause window's discarded deliveries out of `entries`
 /// (oldest-first audit timeline), scanning BACKWARDS from the end.
 ///
+/// **Two sources, one window** (review B2). `prompt-suppressed-paused` is the
+/// legacy discard; `delivery-dropped` carrying `enqueue_reason: group-paused`
+/// is THIS build refusing an admission because the target pane was already at
+/// `queue::QUEUE_MAX_PER_PANE`. Both destroy a payload inside a pause and
+/// neither is otherwise shown to anyone, so both belong in the one notice the
+/// resume already sends. The `enqueue_reason` filter is what keeps this to the
+/// pause: `delivery-dropped` is written for ordinary queue-full rejections too,
+/// and those are the sender's own synchronous `Err` to deal with, not something
+/// a resume should re-report.
+///
 /// **Why `group-pause` alone bounds the window.** A `prompt-suppressed-paused`
-/// line can only be written while the group is paused, so any such line after
-/// the most recent `group-pause` belongs to the window that line opened —
+/// line can only be written while the group is paused, and a `delivery-dropped`
+/// line whose `enqueue_reason` is `group-paused` likewise, so any such line
+/// after the most recent `group-pause` belongs to the window that line opened —
 /// there is no intervening resume it could have survived. `group-resume` is
 /// deliberately NOT a boundary: `create_group` audits that same action name
 /// for a group RESTORED from disk (a different event with the same string), so
@@ -8498,14 +8542,29 @@ pub fn suppressed_during_pause(entries: &[AuditEntry]) -> PauseSuppression {
             window_start_seen = true;
             break;
         }
-        if e.action != "prompt-suppressed-paused" {
+        if e.action == "prompt-suppressed-paused" {
+            items.push(SuppressedDelivery {
+                from: e.actor.clone(),
+                to: e.detail["to"].as_str().unwrap_or("?").to_string(),
+                preview: queue::dropped_payload_preview(e.detail["text"].as_str().unwrap_or("")),
+                cause: SuppressedCause::LegacyDiscard,
+            });
             continue;
         }
-        items.push(SuppressedDelivery {
-            from: e.actor.clone(),
-            to: e.detail["to"].as_str().unwrap_or("?").to_string(),
-            preview: queue::dropped_payload_preview(e.detail["text"].as_str().unwrap_or("")),
-        });
+        // A queue-full refusal of a PAUSE-held admission. `enqueue_text` writes
+        // this line with the preview already bounded, so it is taken verbatim
+        // rather than re-truncated; `from` is on the detail here (the actor is
+        // `loomux`, which did the dropping, not the sender who lost the work).
+        if e.action == "delivery-dropped"
+            && e.detail["enqueue_reason"] == json!(queue::EnqueueReason::GroupPaused.as_str())
+        {
+            items.push(SuppressedDelivery {
+                from: e.detail["from"].as_str().unwrap_or("?").to_string(),
+                to: e.detail["to"].as_str().unwrap_or("?").to_string(),
+                preview: e.detail["preview"].as_str().unwrap_or("").to_string(),
+                cause: SuppressedCause::QueueFullDuringPause,
+            });
+        }
     }
     items.reverse(); // scanned newest-first; report in the order they arrived
     PauseSuppression { items, window_start_seen }
@@ -8519,40 +8578,70 @@ pub fn suppressed_during_pause(entries: &[AuditEntry]) -> PauseSuppression {
 /// preview).
 pub const PAUSE_SUPPRESSION_LIST_MAX: usize = 8;
 
-/// #569: the resume-time notice naming what a pause discarded — under an
-/// OLDER loomux.
+/// #569: the resume-time notice naming what a pause LOST — from either cause.
 ///
-/// Reworked by #569 option 2 rather than deleted. Pause now queues, so this
-/// fires only for the one window where a payload can still have been
-/// destroyed: a group paused by a build that discarded, resumed by a build
-/// that does not. The wording has to say WHICH pause it is talking about,
-/// because the two behaviors now coexist in one group's history and a reader
-/// who takes "nothing will be replayed" as the current rule would re-request
-/// work that is, in fact, about to arrive on its own — a duplicate, which is
-/// exactly what `queued_notice`'s "do NOT re-send" exists to prevent.
+/// Reworked by option 2 rather than deleted, and corrected by review B2. The
+/// wording has to do two jobs the audit lines cannot:
+///
+/// - **Say which pause it is talking about.** Both behaviors now coexist in a
+///   group's history, and a reader who takes "will not be replayed" as the
+///   current rule re-requests work that is already on its way — the duplicate
+///   `queued_notice`'s "do NOT re-send" exists to prevent, arriving from the
+///   opposite direction.
+/// - **Not claim a pause can no longer destroy anything.** It can: a pane at
+///   `queue::QUEUE_MAX_PER_PANE` refuses further admissions for as long as the
+///   pause lasts, and a refusal is a payload that is gone. That half is not
+///   history — it is a live property of this build, and it is the half a reader
+///   can still act on, so it is stated in the present tense and its sentence
+///   says what to do about it.
 ///
 /// Pure so the copy is unit-testable, matching `queue::dropped_notice` /
 /// `delivery_held_detail`.
 pub fn pause_suppression_notice(s: &PauseSuppression) -> String {
     let n = s.items.len();
+    let refused = s.items.iter().filter(|i| i.cause == SuppressedCause::QueueFullDuringPause).count();
+    let legacy = n - refused;
     let (count, verb) = if n == 1 {
         ("1 delivery".to_string(), "was")
     } else {
         (format!("{n} deliveries"), "were")
     };
     let mut out = format!(
-        "[loomux] Group resumed — {count} {verb} DISCARDED by an EARLIER loomux version that did \
-         not queue while paused. Those payloads are gone and will not be replayed, so anything \
-         you are still waiting on from them has to be re-requested. (Pause queues now: anything \
-         held by THIS pause is delivering on its own — do not re-request it.) Discarded:"
+        "[loomux] Group resumed — {count} {verb} LOST while this group was paused. Anything the \
+         pause merely HELD is delivering on its own right now; do not re-request that. What is \
+         listed below is not held, it is gone."
     );
+    // Each cause gets its own sentence, and only the causes actually present:
+    // a notice that explains a failure mode this window did not have is one
+    // more paragraph between the reader and the one that matters.
+    if legacy > 0 {
+        out.push_str(
+            " Some were DISCARDED by an EARLIER loomux version that did not queue while paused — \
+             those are history and cannot recur on this build.",
+        );
+    }
+    if refused > 0 {
+        out.push_str(
+            " Some were REFUSED by this build because the target pane's delivery queue was \
+             already full (8 deep) — that is not history: a pane at capacity keeps refusing for \
+             as long as a pause lasts, so if this group is paused again for a long stretch, \
+             expect it again.",
+        );
+    }
+    out.push_str(" Whatever you are still waiting on from these has to be re-requested. Lost:");
     for it in s.items.iter().take(PAUSE_SUPPRESSION_LIST_MAX) {
-        out.push_str(&format!("\n  - {} -> {}: {}", it.from, it.to, it.preview));
+        // The cause is per-item because a single window can mix them, and
+        // "which of these can happen to me again" is the reader's next question.
+        let why = match it.cause {
+            SuppressedCause::LegacyDiscard => "discarded by an earlier loomux",
+            SuppressedCause::QueueFullDuringPause => "refused, queue full",
+        };
+        out.push_str(&format!("\n  - {} -> {} ({why}): {}", it.from, it.to, it.preview));
     }
     if n > PAUSE_SUPPRESSION_LIST_MAX {
         out.push_str(&format!(
-            "\n  - ...and {} more — every discarded payload is in this group's audit log in full \
-             (action `prompt-suppressed-paused`).",
+            "\n  - ...and {} more — every lost payload is in this group's audit log in full \
+             (actions `prompt-suppressed-paused` and `delivery-dropped`).",
             n - PAUSE_SUPPRESSION_LIST_MAX
         ));
     }
@@ -10230,10 +10319,12 @@ pub enum StrandedBlocker {
     /// paused, and the resume-time notice that would have said so could not be
     /// delivered to the group's orchestrator.
     ///
-    /// **Transitional, like the notice it backs.** Option 2 (enqueue-while-
-    /// paused) means a pause taken by this build discards nothing, so this
-    /// badge can only be raised for a group paused under an older loomux and
-    /// resumed under this one — see `announce_pause_suppression`.
+    /// **Two ways to earn it, and only one of them is history** (review B2).
+    /// Option 2 (enqueue-while-paused) removed the pause branch's discard, so
+    /// the LEGACY cause needs a group paused under an older loomux. But a pane
+    /// already at `queue::QUEUE_MAX_PER_PANE` still has admissions refused for
+    /// as long as a pause lasts, and that loses a payload on THIS build — see
+    /// `SuppressedCause` and `announce_pause_suppression`.
     ///
     /// **Why this is a badge and not only the notice.** The notice
     /// (`announce_pause_suppression`) is an in-band delivery to the
@@ -12959,7 +13050,15 @@ fn run_queue_drainer(
         // (`HoldClass::GroupPaused`'s `PausedGroupUi` channel).
         if reg.is_paused(&group) {
             lower_chip();
-            std::thread::sleep(queue::QUEUE_DRAIN_POLL);
+            // Only pass 1 sleeps here (review N2). Every later pass already
+            // slept at the loop top, and sleeping again would poll a paused
+            // pane at half cadence — doubling resume latency for a second
+            // sleep that reads as if it were doing something. Pass 1 skips the
+            // loop-top sleep by design (`immediate_first_pass`), so without
+            // this the gate would spin.
+            if immediate_first_pass {
+                std::thread::sleep(queue::QUEUE_DRAIN_POLL);
+            }
             continue;
         }
         // Not empty (confirmed above) — safe to peek normally now; only
@@ -14852,17 +14951,19 @@ pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
         // durable queue and flushed on resume, so a pause is a delay, no
         // longer the one hold that destroys what it withholds.
         //
-        //  - `PausedGroupUi` is the hold itself and, on this build, the whole
-        //    of it: the human set the pause, the group UI shows it for as long
-        //    as it lasts, and the deliveries behind it are safe. The one
-        //    classification a human cannot be surprised by — now also the one
-        //    with nothing to warn them about.
+        //  - `PausedGroupUi` is the hold itself: the human set the pause, the
+        //    group UI shows it for as long as it lasts, and the deliveries
+        //    behind it are safe. The one classification a human cannot be
+        //    surprised by.
         //  - `OrchestratorNotice` / `AttentionBadge` are
         //    `announce_pause_suppression` and its no-live-orchestrator
-        //    fallback (`StrandedBlocker::PauseSuppressed`). Both are still
-        //    real call sites, so they are still listed — but they fire ONLY
-        //    for a pause taken by a build that predates option 2 and resumed
-        //    by this one. A pause taken here has nothing for them to report.
+        //    fallback (`StrandedBlocker::PauseSuppressed`), and they are NOT
+        //    vestigial (review B2). Besides the legacy discard, they carry the
+        //    one loss a pause on this build can still cause: a pane at
+        //    `queue::QUEUE_MAX_PER_PANE` refuses admissions for as long as the
+        //    pause lasts, and the refused sender's `Err` reaches the sender,
+        //    never the human. That is precisely what this table exists to
+        //    catch, so all three arms are live.
         //
         // The resume flush itself is not a channel: it is a delivery to the
         // agent that was waiting, not a way for a HUMAN to learn about a hold,
@@ -17506,9 +17607,15 @@ impl OrchRegistry {
     /// during a pause reaches the orchestrator on resume instead of
     /// evaporating and leaving it waiting forever.
     ///
-    /// `announce_pause_suppression` survives only as a transitional path: it
-    /// reports what a build PREDATING this change discarded, and there is
-    /// nothing for it to find on any pause taken by this one. See its doc.
+    /// `announce_pause_suppression` still runs, and is NOT purely transitional
+    /// (review B2): besides what a build predating this change discarded, it
+    /// reports what THIS pause refused — a pane already at
+    /// `queue::QUEUE_MAX_PER_PANE` rejects further admissions for as long as
+    /// the pause lasts, and the sender's `Err` was previously the only trace.
+    /// So "a pause cannot destroy a delivery" is not a claim this makes; the
+    /// weaker true one is that a pause no longer destroys deliveries *at the
+    /// pause branch*, and the cap is where the remaining loss lives. See its
+    /// doc.
     pub fn resume_group(&self, group: &str) -> Result<(), String> {
         let was = self.paused.lock_safe().remove(group);
         if was {
@@ -17596,12 +17703,19 @@ impl OrchRegistry {
     /// `report("done")` fired during a pause simply evaporated and the
     /// orchestrator went on waiting for it.
     ///
-    /// **And why it still exists.** Option 2 fixed the behavior, not the
-    /// history: a group paused under an older loomux and resumed under this
-    /// one has those `prompt-suppressed-paused` lines in its audit log and
-    /// those payloads really are gone. `swallowed` is empty for every pause
-    /// this build takes, so on the ordinary path this function returns at its
-    /// first line and nothing below it runs.
+    /// **And why it still exists — for two reasons, not one** (review B2).
+    /// Option 2 fixed the behavior, not the history: a group paused under an
+    /// older loomux and resumed under this one has `prompt-suppressed-paused`
+    /// lines in its audit log and those payloads really are gone. AND this
+    /// build can still lose one: `enqueue_text`'s `RejectFull` arm drops the
+    /// payload when the target pane is at `queue::QUEUE_MAX_PER_PANE`, which a
+    /// long pause reaches easily on the orchestrator's pane — the sender gets
+    /// an `Err`, but before B2 nothing ever told the orchestrator, which is the
+    /// #569 stall arriving through the queue instead of around it.
+    ///
+    /// `swallowed` is empty for the ordinary pause — one that queued everything
+    /// it was given — so this returns at its first line and nothing below runs.
+    /// It is NOT empty merely because the group never met an old build.
     ///
     /// **Reads, never mutates.** The suppressed set comes out of the audit log
     /// — no new state, no new `queues` mutation, and therefore no
@@ -27035,9 +27149,45 @@ impl OrchRegistry {
         // where it belongs: the `delivery-queued` line's `reason`.
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
         if self.is_paused(&a.group) {
-            self.enqueue_text(
+            let admitted = self.enqueue_text(
                 &a.group, agent_id, from, text, pty_id, queue::EnqueueReason::GroupPaused,
             )?;
+            // #569 review B1: the pause flag is read ABOVE and the admission
+            // lands HERE, with no lock across the gap and real I/O inside it
+            // (`recover_persisted_queue` plus the durable snapshot). A resume
+            // that slips through that gap sees a still-empty queue, so
+            // `flush_paused_queues` starts nothing — and then this admission
+            // lands in an unpaused group with no drainer running and, because
+            // the pause branch is deliberately the one path that never calls
+            // `ensure_drainer`, nobody left to start one. Queued, audited,
+            // persisted, `Ok` returned to the sender, never delivered: #569's
+            // own defect, reproduced by its fix, and self-healing only if some
+            // later delivery happens to hit the same pane.
+            //
+            // Re-reading the flag AFTER the admission closes it without a lock,
+            // because the two sides are now ordered against each other rather
+            // than merely coexisting: resume-then-admit is caught here (we see
+            // `false` and nudge), admit-then-resume is caught by
+            // `flush_paused_queues` (it sees the entry). Both firing is
+            // harmless — `ensure_drainer` no-ops for a pane already draining,
+            // which is exactly why it can be spent freely. This is the same
+            // shape as the `!admitted.was_first` nudge below, and the same
+            // stranding class `commit_exit` fused a lock scope to close (#470
+            // B1); it needs no lock here only because a redundant nudge costs
+            // nothing while a missed one costs the payload.
+            if !self.is_paused(&a.group) {
+                // Audited because the alternative is an invisible race: this is
+                // the ONLY evidence that the interleaving happened at all, and
+                // a headless test cannot observe `ensure_drainer` (no
+                // `AppHandle`, so no thread is ever spawned) — see
+                // `a_resume_racing_an_admission_never_strands_it`.
+                self.audit(&a.group, "loomux", "pause-race-nudge", json!({
+                    "to": agent_id, "pty": pty_id, "id": admitted.id,
+                }));
+                if let (Some(app), Some(reg)) = (self.app.lock_safe().clone(), self.arc()) {
+                    reg.ensure_drainer(app, a.group.clone(), pty_id, None);
+                }
+            }
             return Ok(());
         }
 
