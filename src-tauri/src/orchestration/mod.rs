@@ -1618,15 +1618,7 @@ const REINJECT_ACK_SETTLE_MS: u64 = {
 /// stage-by-stage derivation. The sibling constant is private and mirrored by
 /// hand instead, which catches a drifting value only if someone remembers to
 /// re-derive it; comparing against the real one catches it always.
-pub const UNCONFIRMED_ACK_SETTLE_MS: u64 = {
-    let mut tail_ms = 0u64;
-    let mut i = 0;
-    while i < SUBMIT_RETRY_DELAYS.len() {
-        tail_ms += SUBMIT_RETRY_DELAYS[i].as_millis() as u64;
-        i += 1;
-    }
-    SUBMIT_CONFIRM_WINDOW.as_millis() as u64 + tail_ms
-};
+pub const UNCONFIRMED_ACK_SETTLE_MS: u64 = 0; // EVIDENCE NEUTERING: pre-#539 — no floor.
 
 /// Production bug fix (#410, PR #329 round 6): how long a `compact_pending`
 /// arm is given to reach a busy-then-quiet resolution (confirm or discard)
@@ -4096,9 +4088,9 @@ pub fn compaction_status(
     let lost = last_lost_reason
         .zip(last_lost_ms)
         .filter(|(_, ms)| now.saturating_sub(*ms) < COMPACTION_STATUS_RECENT_WINDOW_MS);
-    let acked = last_ack_source
-        .zip(last_ack_ms)
-        .filter(|(_, ms)| now.saturating_sub(*ms) < COMPACTION_STATUS_RECENT_WINDOW_MS);
+    // EVIDENCE NEUTERING: pre-#546 — the ack pair is not surfaced at all.
+    let _ = (last_ack_source, last_ack_ms);
+    let acked: Option<(&'static str, u64)> = None;
     match (lost, acked) {
         (Some((reason, lost_ms)), Some((_, ack_ms))) if lost_ms >= ack_ms => {
             CompactionStatus::Abandoned { reason: reason.to_string(), since_ms: lost_ms }
@@ -9140,15 +9132,9 @@ pub fn unconfirmed_disposition(
         // Observed empty of our text — idle only if it is empty of the
         // human's too.
         BoxReading::NotHolding if box_pending => {
-            // #539: the box lost our text AND the agent acted afterwards.
-            // The `box_pending` objection is the fallible one of the three;
-            // two independent readings outrank it. A recoverable kickoff is
-            // the documented exception (see above).
-            if agent_acted && !kickoff_recoverable {
-                UnconfirmedDisposition::ActiveAuditOnly
-            } else {
-                UnconfirmedDisposition::Notify
-            }
+            // EVIDENCE NEUTERING: pre-#539 behaviour, the new inputs ignored.
+            let _ = (agent_acted, kickoff_recoverable);
+            UnconfirmedDisposition::Notify
         }
         BoxReading::NotHolding => UnconfirmedDisposition::IdleAuditOnly,
     }
@@ -13477,6 +13463,12 @@ pub fn should_notify_unconfirmed(target_is_orchestrator: bool, confirmed: bool) 
 /// early on an empty bucket); it degrades to the plural wording with no ids
 /// rather than panicking.
 pub fn unconfirmed_delivery_notice(agent_id: &str, delivery_ids: &[u64]) -> String {
+    // EVIDENCE NEUTERING: pre-#539 wording — no ids, always singular.
+    if !delivery_ids.is_empty() {
+        return format!(
+            "[loomux] delivery to {agent_id} unconfirmed — the prompt may be sitting              unsubmitted in its pane; get_output it and re-send if needed"
+        );
+    }
     let ids = delivery_ids.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
     if delivery_ids.len() == 1 {
         format!(
@@ -18542,8 +18534,9 @@ impl OrchRegistry {
                             // read the re-grounding, and the lifecycle panel
                             // is the last place a human can notice the
                             // difference. See `compact_last_ack_source`.
-                            a.compact_last_ack_source = Some(source);
-                            a.compact_last_ack_ms = Some(now);
+                            // EVIDENCE NEUTERING: pre-#546 — audited only.
+                            a.compact_last_ack_source = None;
+                            a.compact_last_ack_ms = None;
                             to_reinject_confirmed.push((a.id.clone(), a.group.clone(), source));
                         }
                         // Still within the timeout, a delivery may be
@@ -26783,11 +26776,14 @@ impl OrchRegistry {
     /// flush time per #532.
     #[doc(hidden)] // pub for integration tests
     pub fn buffer_unconfirmed_delivery(&self, group: &str, agent_id: &str, delivery_id: u64) -> bool {
+        // EVIDENCE NEUTERING: pre-#539 — no bucket, no window; announce now.
         let opened = {
-            let mut pending = self.unconfirmed_pending.lock_safe();
-            let bucket = pending.entry((group.to_string(), agent_id.to_string())).or_default();
-            bucket.push(delivery_id);
-            bucket.len() == 1
+            self.audit(group, "loomux", "delivery-unconfirmed-notice", json!({
+                "to": agent_id, "delivery_ids": [delivery_id], "coalesced": 1,
+            }));
+            let _ = self.deliver_to_orchestrator(
+                group, &unconfirmed_delivery_notice(agent_id, &[delivery_id]), "loomux");
+            true
         };
         self.audit(group, "loomux", "delivery-unconfirmed-buffered", json!({
             "to": agent_id, "delivery_id": delivery_id, "opened_window": opened,
