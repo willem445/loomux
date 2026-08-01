@@ -281,6 +281,17 @@ so too, when the silent agent holds a live watch. The audit viewer (`Alt+A`) has
 sentence for each of a watch's six lifecycle events (registered, fired, expired, failed,
 cancelled, cleaned up on agent exit) instead of raw JSON.
 
+**When a notice can't get in.** A `[loomux]` notice is typed into the agent's pane, and a pane
+that is mid-turn can't take one — so if an agent blocks its own turn waiting on the very thing
+the notice would tell it about, the notice sits in that pane's queue and nothing clears. Loomux
+watches for exactly that shape: a pane that has accepted nothing for ten minutes while holding
+one of loomux's own notices gets a `[loomux] notice undeliverable 10 min: … — pane mid-turn …`
+sent to the group's orchestrator (and to the audit viewer as `notice-undeliverable`), alongside
+the ⏸ held chip and the needs-attention badge you'd see anyway. The message says which of the
+three it looked like — a pane mid-turn, a human's own line in the box, or a dialog waiting for an
+answer — because those need different things from you. If the stuck pane is the orchestrator's
+own, the notice rides back on its next tool call instead of being typed into it.
+
 ## Cross-workspace channels
 
 Every orchestration group is isolated by design — one group's agents never see another's
