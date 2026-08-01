@@ -4649,19 +4649,38 @@ fn readonly_pane_settings_carry_permissions_allow() {
             rule == "mcp__loomux" || scoped || RESEARCH_TOOLS.contains(&rule.as_str()),
             "#610/#465: {rule:?} is a BARE tool grant in a dontAsk pane's permissions.allow. \
              Only `mcp__loomux`, a scoped `Name(...)` pattern, or one of the enumerated \
-             non-mutating research tools {RESEARCH_TOOLS:?} may appear here."
+             non-mutating research tools {:?} may appear here.",
+            RESEARCH_TOOLS
         );
     }
     for denied in CLAUDE_EDIT_DENY_TOOLS {
         assert!(!allow.iter().any(|r| r == denied), "#610: {denied:?} must never be allowed: {allow:?}");
     }
+    // #448's drift pin, applied to the allow side: a mistyped or upstream-
+    // renamed BARE tool name in an allow rule matches nothing and silently
+    // grants nothing — the same invisible-failure shape a dead deny entry had,
+    // and worse here, since the symptom is a planner that mysteriously can't
+    // fetch rather than a startup warning. (Scoped `Name(...)` patterns and
+    // `mcp__*` rules are exempt for the same reason they are on the deny side.)
+    for rule in &allow {
+        if rule.starts_with("mcp__") || rule.contains('(') {
+            continue;
+        }
+        assert!(
+            KNOWN_CLAUDE_TOOLS.contains(&rule.as_str()),
+            "#610/#448: {rule:?} is not a known Claude Code tool name — an allow rule that \
+             matches no tool grants nothing, silently. See KNOWN_CLAUDE_TOOLS' refresh procedure."
+        );
+    }
 
-    // The file is only useful if the pane is actually pointed at it.
-    assert!(p.command.contains("--settings"), "{}", p.command);
+    // The file is only useful if the pane is actually pointed at it — asserted
+    // on the SPAWN REQUEST, the command line the pane is really launched with.
+    let req = reg.spawn_request_for_test(&p.id).expect("no spawn request for the planner");
+    assert!(req.command.contains("--settings"), "{}", req.command);
     assert!(
-        p.argv.windows(2).any(|w| w[0] == "--settings" && w[1] == path.display().to_string()),
+        req.argv.windows(2).any(|w| w[0] == "--settings" && w[1] == path.display().to_string()),
         "the planner's argv must point --settings at its own settings file: {:?}",
-        p.argv
+        req.argv
     );
 }
 
@@ -4698,13 +4717,15 @@ fn readonly_pane_gets_a_settings_file_even_when_hook_provisioning_fails() {
         cfg["permissions"]["allow"].as_array().is_some_and(|a| !a.is_empty()),
         "#610: permissions.allow must be written even with no hooks: {cfg}"
     );
-    assert!(p.command.contains("--settings"), "{}", p.command);
+    let planner_cmd = reg.spawn_request_for_test(&p.id).expect("no spawn request for the planner").command;
+    assert!(planner_cmd.contains("--settings"), "{planner_cmd}");
 
     // The fail-open policy is unchanged for a pane with nothing to put in the
     // file: a worker has no permissions block of its own, so with hooks
     // unavailable there is still no settings file and no flag.
+    let worker_cmd = reg.spawn_request_for_test(&w.id).expect("no spawn request for the worker").command;
     assert!(!settings(&w.id).exists(), "a non-read-only pane with no hooks must get no settings file");
-    assert!(!w.command.contains("--settings"), "{}", w.command);
+    assert!(!worker_cmd.contains("--settings"), "{worker_cmd}");
 }
 
 /// Split a shell command line into argv, honoring the two quotings
