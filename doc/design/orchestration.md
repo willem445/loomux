@@ -7115,13 +7115,34 @@ The precedence is **dialog → keystroke evidence → its absence**:
   neighbour, so a notice never asserts a cause it did not observe.
 
 **One-shot per hold episode, and deliberately not the badge's one-shot.** `HoldEpisode` gains
-`notice_reported` rather than reading `badged`, because `badged` records that the escalation
-*raised* a badge and that raise is **declined** when another mechanism already owns one — leaving
-`badged` false while `held_escalation` returns `Badge` on every later poll. Sharing the flag would
-either re-report every two seconds or, if the report were nested inside the decline, never report at
-all on a pane two mechanisms have flagged at once, which is the pane with the most wrong with it.
-The report is therefore a *sibling* of the badge block, not a child of it: the badge is the human's
-channel and this is the orchestrator agent's, and they fail independently.
+`notice_reported` rather than reading `badged`, because the two come apart in *both* directions: a
+badge RAISE sets `badged`, after which `held_escalation` returns `None` for the rest of the episode
+(`if already_badged`), while a raise DECLINED — another mechanism already owns the badge — leaves
+`badged` false and `Badge` comes back on every poll. Sharing the flag would therefore mean never
+reporting after the instant the bound was crossed in the first case, and re-reporting every two
+seconds in the second. The badge is the human's channel and this is the orchestrator agent's; they
+fail independently and need independent state.
+
+**Evaluated on the bound, and claimed by the poll that reports** (rev-128's blocking finding, and
+the half its remedy did not reach). The report started life *inside* the `Badge` arm, claiming
+`notice_reported` before it read the queue and returning at the zero-notice gate having already
+spent it. Two defects compounded there. Claiming first meant an episode that crossed the bound
+holding only *work* burned its only report; and living in the `Badge` arm meant that in the common
+configuration — the raise succeeds, `badged` goes true — no later poll returns `Badge` at all, so
+nothing looked again even after the flag was fixed. The failure is one step from #590's own
+incident: an orchestrator follow-up held on a mid-turn worker opens the episode on work, the bound
+elapses silently, the worker's own CI watch then fires and queues `watch_conflicting_notice` behind
+it — #590's exact payload — and nothing surfaces it, for as long as the pane stays held.
+
+So the call is keyed on `hold_bound_elapsed` and sits outside the `Badge` arm, and
+`note_undeliverable_notice` reads the flag, then the queue, then claims. There was no tension to
+trade off: `notice_reported` is set once and never cleared inside an episode, so re-asking on each
+poll costs a re-read and never a second report. The steady state after a report is one flag read per
+poll; before it, one flag read plus a snapshot of at most `queue::QUEUE_MAX_PER_PANE` entries, on a
+thread already polling a pty every `queue::QUEUE_DRAIN_POLL`. Pinned by
+`a_bound_crossed_with_nothing_queued_does_not_burn_the_report`, which runs in the badge-*raised*
+configuration and asserts the escalation verdict is `None` at the instant the report fires — so a
+fix that only reordered the flag inside the `Badge` arm fails it.
 
 **Composition with #578, which is the case the issue actually turns on.** The notice goes out
 through `notify_queue`, so when the stuck pane is the **orchestrator's own**, that function's
@@ -7190,11 +7211,13 @@ discarded.
   unconditionally** — the durable record does not depend on the notice landing. Closing #633 would
   make the delivery half observable too; nothing here needs it to be correct.
 
-**Residual, stated.** The gate is evaluated once per episode, at the bound, so a notice that arrives
-*later* in the same episode gets no report of its own. That is the conservative direction: the pane
-is already chipped and badged, and the alternative is a one-shot that re-arms on queue content and
-can fire repeatedly for one hold. And `PaneMidTurn` remains an inference from absence — see above
-for what the wording does and does not claim.
+**Residual, stated.** A *second* notice joining a pane whose episode has already reported gets no
+report of its own — one per episode is the bound, and an episode ends when the pane accepts a
+delivery. That is a genuine limit rather than the one this section used to claim: the earlier
+version said a notice arriving later in an episode never got a report at all and called that "the
+conservative direction", which was a defect being described as a design (see the paragraph above).
+And `PaneMidTurn` remains an inference from absence — see above for what the wording does and does
+not claim.
 
 ## Kill-exit notices: recorded initiator, not inferred (#533-B)
 

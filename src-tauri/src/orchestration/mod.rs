@@ -15219,13 +15219,24 @@ struct HoldEpisode {
     /// episode ([`OrchRegistry::note_undeliverable_notice`]).
     ///
     /// **Its own flag rather than a read of `badged`**, which is the whole
-    /// reason it exists as a field. `badged` records that the escalation raised
-    /// a badge, and that raise is *declined* when another mechanism already
-    /// owns one — leaving `badged` false while `held_escalation` keeps
-    /// returning `Badge` on every subsequent poll. Sharing it would therefore
-    /// either re-report every couple of seconds, or — if the report were nested
-    /// inside the decline — never report at all on a pane two mechanisms have
-    /// flagged at once, which is the pane with the most wrong with it.
+    /// reason it exists as a field, and the two come apart in BOTH directions:
+    ///
+    /// - a badge RAISE sets `badged`, after which `held_escalation` returns
+    ///   `None` for the rest of the episode (`if already_badged`), so sharing
+    ///   the flag would mean never reporting after the instant the bound was
+    ///   crossed;
+    /// - a badge raise DECLINED — another mechanism already owns the badge —
+    ///   leaves `badged` false while `Badge` comes back on every poll, so
+    ///   sharing it would mean re-reporting every couple of seconds, on the
+    ///   pane with the most wrong with it.
+    ///
+    /// **Set by the poll that REPORTS, never by one that merely looked**
+    /// (rev-128's blocking finding). Claiming it at the top of
+    /// [`OrchRegistry::note_undeliverable_notice`] spent an episode's only
+    /// report on a poll that found nothing queued, which silenced the case
+    /// where a notice joins a pane that is ALREADY held — one step from #590's
+    /// own incident, and unbounded, since an episode ends only when the pane
+    /// accepts a delivery.
     ///
     /// Same lifetime as the rest of the episode: cleared when the pane accepts
     /// a delivery, and forgotten across a restart, so the worst a restart costs
@@ -29153,16 +29164,30 @@ impl OrchRegistry {
                 }
                 self.mark_stranded(group, agent_id, Some(blocker));
             }
-            // #590 L2, and it is deliberately a SIBLING of the badge block above
-            // rather than nested inside it. The badge is the human's channel and
-            // this is the orchestrator agent's; they fail independently, and on
-            // the very pane with the most to report the badge block does nothing
-            // at all — `mark_stranded` is declined when another mechanism
-            // already owns the badge, which also leaves `HoldEpisode::badged`
-            // false, so `held_escalation` keeps returning `Badge` on every later
-            // poll. Nested, this would never fire on a doubly-flagged pane;
-            // keyed on `badged`, it would fire every two seconds there. Hence
-            // its own one-shot.
+        }
+        // #590 L2. Evaluated on the BOUND, not on `escalation`, and outside the
+        // `Badge` arm entirely — rev-128's blocking finding, plus the half its
+        // remedy did not reach.
+        //
+        // The badge is the human's channel and this is the orchestrator agent's,
+        // and the two arms of `held_escalation` they need are not the same one:
+        //
+        // - a RAISED badge sets `HoldEpisode::badged`, after which
+        //   `held_escalation` returns `None` for the rest of the episode
+        //   (`if already_badged`), so there is never a second `Badge` poll;
+        // - a DECLINED raise (another mechanism owns the badge) leaves `badged`
+        //   false, so `Badge` comes back every poll.
+        //
+        // Nested in that arm, this fires exactly once and only at the instant
+        // the bound is crossed — which is the whole defect: an episode that
+        // crosses the bound holding only work would never look again, and the
+        // notice that arrives afterwards (the watch firing behind a held
+        // follow-up — one step from #590's own incident) stays silent for as
+        // long as the pane stays held. Keyed on the bound instead, every later
+        // poll re-asks, and `HoldEpisode::notice_reported` — claimed by the poll
+        // that REPORTS, never by one that merely looked — keeps it to one per
+        // episode.
+        if hold_bound_elapsed(started_ms, now_ms, bound_ms) {
             self.note_undeliverable_notice(
                 group,
                 agent_id,
@@ -29195,9 +29220,29 @@ impl OrchRegistry {
     /// states the same fact the same way, and the whole decision stays
     /// reachable by a headless test (`run_queue_drainer` needs an `AppHandle`,
     /// so anything left inline there is testable by nothing — #560's first
-    /// symptom lived in exactly those lines). The read happens only after the
-    /// one-shot has been claimed, so a pane stuck for an hour costs one
-    /// snapshot, not one per poll.
+    /// symptom lived in exactly those lines).
+    ///
+    /// **Called on every poll past the bound, and the order of the three steps
+    /// below is the fix for rev-128's blocking finding.** It reads the flag,
+    /// then the queue, and claims the one-shot only when it is about to report:
+    ///
+    /// 1. `notice_reported` first, so the steady state after a report is one
+    ///    flag read per poll and nothing else;
+    /// 2. the queue snapshot, taken only while this episode is still unreported
+    ///    — bounded work (one lock read plus a clone of at most
+    ///    `queue::QUEUE_MAX_PER_PANE` entries) on a thread that is already
+    ///    polling a pty every `queue::QUEUE_DRAIN_POLL`;
+    /// 3. the claim, by the poll that REPORTS, never by one that merely looked.
+    ///
+    /// Claiming before the zero-notice gate — the original order — spent the
+    /// episode's only report on a poll that had nothing to say, so an episode
+    /// that crossed the bound holding only work never looked again and the
+    /// notice that arrived afterwards was silent for as long as the pane stayed
+    /// held. There was no tension to trade off here: the alternative the old
+    /// comment weighed this against (a one-shot that re-arms on queue content
+    /// and fires repeatedly for one hold) is not what this order produces —
+    /// `notice_reported` is set once and never cleared inside an episode, so
+    /// re-asking on each poll costs a re-read, never a second report.
     fn note_undeliverable_notice(
         &self,
         group: &str,
@@ -29208,29 +29253,24 @@ impl OrchRegistry {
         bound_ms: u64,
         last_user_input_ms: Option<u64>,
     ) {
-        let claimed = {
-            let mut episodes = self.hold_episodes.lock_safe();
-            match episodes.get_mut(&pty_id) {
-                Some(e) if !e.notice_reported => {
-                    e.notice_reported = true;
-                    true
-                }
-                // No open episode is possible in principle (the caller just
-                // opened one) and is treated as "already reported" rather than
-                // as a reason to report without a one-shot to hold it — the
-                // failure direction that floods.
-                _ => false,
-            }
-        };
-        if !claimed {
+        // Step 1. Cheap, and the common case once a pane has been reported.
+        // An episode that is gone entirely is treated as reported rather than
+        // as a reason to report with no one-shot to hold it — the failure
+        // direction that floods.
+        let unreported = self
+            .hold_episodes
+            .lock_safe()
+            .get(&pty_id)
+            .is_some_and(|e| !e.notice_reported);
+        if !unreported {
             return;
         }
-        // Resolved BEFORE the queue read, never after: `enqueue_text` states the
-        // house rule for the two maps — agents first, then queues — because
-        // every site that needs both takes them in that order and one inversion
-        // is all a deadlock needs. `queue_snapshot` does release its guard
-        // before returning, so this is discipline rather than a live bug, which
-        // is exactly when it is cheap to keep.
+        // Step 2. Resolved BEFORE the queue read, never after: `enqueue_text`
+        // states the house rule for the two maps — agents first, then queues —
+        // because every site that needs both takes them in that order and one
+        // inversion is all a deadlock needs. `queue_snapshot` does release its
+        // guard before returning, so this is discipline rather than a live bug,
+        // which is exactly when it is cheap to keep.
         let target_is_orchestrator = self
             .agent(agent_id)
             .is_some_and(|a| a.role == Role::Orchestrator);
@@ -29238,12 +29278,26 @@ impl OrchRegistry {
         let notices = queue::queued_notice_count(&entries);
         if notices == 0 {
             // The gate, and what keeps this from being a second, noisier copy
-            // of `HoldClass::QueueStaleEscalation`. Note the one-shot is
-            // already spent: a notice ARRIVING later in the same episode does
-            // not get its own report, which is the conservative direction —
-            // the pane is already chipped and badged, and the alternative is a
-            // one-shot that re-arms on queue content and can fire repeatedly
-            // for one hold.
+            // of `HoldClass::QueueStaleEscalation`. Nothing has been spent: the
+            // next poll asks again, which is what lets a notice joining an
+            // already-held pane still be reported.
+            return;
+        }
+        // Step 3. Claim, and re-check under the lock so the flag is read and
+        // written in one critical section rather than across the queue read
+        // above. One drainer per pane makes a race impossible today; the
+        // re-check means this stays correct if that ever stops being true.
+        let claimed = {
+            let mut episodes = self.hold_episodes.lock_safe();
+            match episodes.get_mut(&pty_id) {
+                Some(e) if !e.notice_reported => {
+                    e.notice_reported = true;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !claimed {
             return;
         }
         let cause =
