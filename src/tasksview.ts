@@ -10,15 +10,23 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { swapIfConnected } from "./domutil";
 import {
   approvableSelection,
+  boardUsesDeps,
   canApprove,
   canProceed,
+  depCandidates,
+  depState,
   doneCount,
   grantableCount,
   isAwaitingHuman,
+  isReady,
+  QUEUED_STATUS,
   REQUEST_CHANGES_STATUS,
   retainExisting,
   STATUSES,
   taskActivityState,
+  unmetDeps,
+  withDep,
+  withoutDep,
 } from "./taskboard";
 import {
   approveTask,
@@ -45,6 +53,15 @@ export interface OrchTask {
   assignee?: string | null;
   session?: string | null;
   notes: OrchTaskNote[];
+  /** Ids of tasks on this board that must be `done` first (#582). Optional
+   *  because the backend omits an empty vec entirely
+   *  (`skip_serializing_if`) — every pre-#582 board arrives with no key at
+   *  all, so the board must never assume the array is there. */
+  deps?: string[];
+  /** Non-blocking "see also" ids (#582). Rendered read-only here: the human
+   *  board's `orch_upsert_task` deliberately takes `deps` but not `related`,
+   *  which the orchestrator maintains through its own tools. */
+  related?: string[];
   updated_ms: number;
 }
 
@@ -87,6 +104,14 @@ export class TasksView {
   /** Task ids the human has ticked for batch delete. Frontend-only, so it's
    *  pruned to live rows on every refresh (see retainExisting). */
   private selected = new Set<string>();
+  /** The task whose "add a dependency" picker is open, if any (#582) — one at
+   *  a time, and kept here rather than in the DOM so a background refresh
+   *  re-renders it instead of silently closing it mid-choice. */
+  private picking: string | null = null;
+  /** The picker was just opened by a click, so it should take focus on this
+   *  render. Cleared once consumed: a later refresh must re-render the open
+   *  picker without stealing focus back from wherever the human has moved. */
+  private pickingFocus = false;
   /** A refresh arrived while the human was mid-edit; run it on blur. */
   private pendingRefresh = false;
   /** The open request-changes modal, if any (kept to one at a time). */
@@ -278,6 +303,8 @@ export class TasksView {
     // Drop any ticked rows that vanished from the board (orchestrator edit,
     // another delete) so the "delete selected" count can't outlive its rows.
     this.selected = retainExisting(this.selected, this.tasks);
+    // Same for an open dep picker whose row has gone (#582).
+    if (this.picking && !this.tasks.some((t) => t.id === this.picking)) this.picking = null;
     this.render();
   }
 
@@ -624,14 +651,166 @@ export class TasksView {
       this.listEl.appendChild(el("div", "tasks-empty", "No tasks yet — the orchestrator adds them as work items come in, or add one below."));
       return;
     }
-    this.tasks.forEach((t, i) => this.listEl.appendChild(this.renderTask(t, i)));
+    // Whether this board uses dependencies at all (#582) — computed once for
+    // the whole render, since the "ready" mark is a board-level decision (see
+    // boardUsesDeps): on a board with no links every queued row is trivially
+    // ready and marking them all would say nothing.
+    const usesDeps = boardUsesDeps(this.tasks);
+    this.tasks.forEach((t, i) => this.listEl.appendChild(this.renderTask(t, i, usesDeps)));
   }
 
-  private renderTask(t: OrchTask, index: number): HTMLElement {
+  /** The dependency line under a task's row (#582): what is blocking it, what
+   *  it is merely related to, and — when open — the picker for adding another
+   *  dep. Returns null (no line at all) when the task has neither links nor an
+   *  open picker, so a board that uses no dependencies keeps exactly the row
+   *  height it has today.
+   *
+   *  Every edit here sends the WHOLE `deps` array through the board's existing
+   *  `orch_upsert_task` path (the backend's array args are replace-or-untouched,
+   *  never a delta), so it inherits that path's validation and error surfacing:
+   *  a cycle, or an id that stopped existing between render and click, is
+   *  refused backend-side and lands in this view's toast rather than being
+   *  second-guessed here. */
+  private renderLinks(t: OrchTask): HTMLElement | null {
+    const deps = t.deps ?? [];
+    const related = t.related ?? [];
+    const picking = this.picking === t.id;
+    if (deps.length === 0 && related.length === 0 && !picking) return null;
+
+    const line = el("div", "task-links");
+
+    if (deps.length > 0) {
+      line.appendChild(el("span", "task-links-label", "blocked by"));
+      for (const id of deps) {
+        // met / unmet / missing — the third is only reachable from a
+        // hand-edited tasks.json (the backend validates ids on write and
+        // strips them on delete), and it reads as its own state because the
+        // fix is different: not "wait", but "this link names nothing".
+        const state = depState(id, this.tasks);
+        const dep = this.tasks.find((x) => x.id === id);
+        const chip = el("span", `task-chip dep ${state}`);
+        chip.appendChild(
+          el("span", "dep-mark", state === "met" ? "✓" : state === "missing" ? "⚠" : "✗")
+        );
+        chip.appendChild(el("span", "dep-id", id));
+        chip.title =
+          state === "met"
+            ? `${id} "${dep?.title ?? ""}" is done — this dependency is satisfied`
+            : state === "missing"
+              ? `${id} names no task on this board, so it counts as unmet and this task ` +
+                `can never read as ready. Remove the link (✕) or re-create that task.`
+              : `${id} "${dep?.title ?? ""}" is ${dep?.status ?? "?"} — this task waits ` +
+                `until it is done`;
+        const rm = el("button", "task-dep-remove", "✕") as HTMLButtonElement;
+        rm.title = `Remove the dependency on ${id}`;
+        rm.addEventListener("click", () =>
+          void this.mutate(
+            invoke("orch_upsert_task", {
+              groupId: this.groupId,
+              id: t.id,
+              deps: withoutDep(t.deps, id),
+            })
+          )
+        );
+        chip.appendChild(rm);
+        line.appendChild(chip);
+      }
+    }
+
+    // Read-only: `orch_upsert_task` deliberately takes `deps` and not
+    // `related` — the orchestrator maintains see-also links through its own
+    // tools, and the board renders them so the human can see the annotation
+    // without it silently affecting anything.
+    if (related.length > 0) {
+      line.appendChild(el("span", "task-links-label", "see also"));
+      for (const id of related) {
+        const rel = this.tasks.find((x) => x.id === id);
+        const chip = el("span", "task-chip related", id);
+        chip.title = rel
+          ? `${id} "${rel.title}" (${rel.status}) — a non-blocking link set by the orchestrator; ` +
+            `it never affects whether this task is ready`
+          : `${id} names no task on this board`;
+        line.appendChild(chip);
+      }
+    }
+
+    if (picking) line.appendChild(this.renderDepPicker(t));
+    return line;
+  }
+
+  /** The "＋ depends on…" picker: every other task on the board, minus the ones
+   *  this one already depends on. Cycle-closing choices are deliberately NOT
+   *  filtered out here — the backend rejects those inside its lock with an
+   *  error naming the path, and duplicating that walk frontend-side would be a
+   *  second copy of a rule that could only ever disagree with it. */
+  private renderDepPicker(t: OrchTask): HTMLElement {
+    const options = depCandidates(t, this.tasks);
+    if (options.length === 0) {
+      return el("span", "task-links-label", "no other task to depend on");
+    }
+    const sel = document.createElement("select");
+    sel.className = "task-dep-picker";
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "＋ depends on…";
+    sel.appendChild(placeholder);
+    for (const c of options) {
+      const opt = document.createElement("option");
+      opt.value = c.id;
+      opt.textContent = `${c.id} — ${c.title}`;
+      sel.appendChild(opt);
+    }
+    sel.value = "";
+
+    const close = () => {
+      if (this.picking === t.id) {
+        this.picking = null;
+        this.render();
+      }
+    };
+    sel.addEventListener("change", () => {
+      const pick = sel.value;
+      if (!pick) return;
+      const deps = withDep(t.deps, pick);
+      this.picking = null;
+      // Close the picker on our own rather than waiting for the board-change
+      // event the write will raise: if the write is refused, mutate() toasts
+      // and resyncs, and either way the picker has done its job.
+      this.render();
+      void this.mutate(
+        invoke("orch_upsert_task", { groupId: this.groupId, id: t.id, deps })
+      );
+    });
+    // Keep keystrokes off the terminal underneath (every inline editor in this
+    // view does this); Esc backs out without writing anything.
+    sel.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") close();
+    });
+    sel.addEventListener("blur", () => window.setTimeout(close, 0));
+    // Focus only on the render that opened it — a later background refresh
+    // re-renders the open picker, and must not yank focus back from wherever
+    // the human has moved since.
+    if (this.pickingFocus) {
+      this.pickingFocus = false;
+      window.setTimeout(() => sel.focus(), 0);
+    }
+    return sel;
+  }
+
+  private renderTask(t: OrchTask, index: number, usesDeps: boolean): HTMLElement {
     const row = el("div", "task-row");
     if (isAwaitingHuman(t.status)) row.classList.add("awaiting-human");
     const activity = taskActivityState(t.status, t.assignee, this.liveAgentIds);
     if (activity) row.classList.add(`task-row-${activity}`);
+    // A queued task waiting on an unfinished dep recedes, so it can't be read
+    // as work anyone could pick up right now (#582's core ask: blocked-queued
+    // must not look like plain queued). Deliberately no new accent color —
+    // the chips below name the blockers, and the amber/blue accents already
+    // mean "waiting on YOU" and "live work".
+    const unmet = unmetDeps(t, this.tasks);
+    const depBlocked = t.status === QUEUED_STATUS && unmet.length > 0;
+    if (depBlocked) row.classList.add("task-row-dep-blocked");
 
     // Multi-select: tick to add the row to the batch-delete set. A checkbox
     // (over ctrl/shift-click) keeps the affordance discoverable — the human
@@ -750,6 +929,18 @@ export class TasksView {
       top.appendChild(chip);
     }
 
+    // "ready" (#582): this queued item's dependencies are all done, so it can
+    // start now. Only on a board that actually uses deps — see boardUsesDeps —
+    // and it sits next to Start because that is the action it enables.
+    if (usesDeps && isReady(t, this.tasks)) {
+      const ready = el("span", "task-chip ready", "▸ ready");
+      ready.title =
+        (t.deps?.length ?? 0) > 0
+          ? "Every task this depends on is done — this one can start now"
+          : "Nothing blocks this one — it can start now";
+      top.appendChild(ready);
+    }
+
     // Start: the human's nudge to begin a queued item now. Delivers a prompt
     // to the orchestrator (which assigns a worker and flips the status then);
     // shown only on queued items, where starting is meaningful.
@@ -825,6 +1016,20 @@ export class TasksView {
       top.appendChild(proceed);
     }
 
+    // Add a dependency (#582): toggles the picker on the links line below.
+    // One entry point, always in the same place, whether or not the task has
+    // links yet — the links line itself stays absent on a link-free row so a
+    // dep-free board keeps exactly the row height it has today.
+    const linkBtn = el("button", "task-btn deplink", "🔗") as HTMLButtonElement;
+    linkBtn.title = "Add a dependency — this task waits until the one you pick is done";
+    linkBtn.addEventListener("click", () => {
+      const open = this.picking === t.id;
+      this.picking = open ? null : t.id;
+      this.pickingFocus = !open;
+      this.render();
+    });
+    top.appendChild(linkBtn);
+
     const notesBtn = el("button", "task-btn notes", `🗨 ${t.notes.length}`) as HTMLButtonElement;
     notesBtn.title = "Notes";
     notesBtn.addEventListener("click", () => {
@@ -851,6 +1056,9 @@ export class TasksView {
     });
     top.appendChild(del);
     main.appendChild(top);
+
+    const links = this.renderLinks(t);
+    if (links) main.appendChild(links);
 
     if (this.expanded.has(t.id)) {
       const notes = el("div", "task-notes");
