@@ -252,3 +252,157 @@ impl Default for DrainerRegistry {
         Self::new()
     }
 }
+
+/// **Why these exist, and why they are here rather than in the model.**
+///
+/// The experiment #497 asked for (PR #606, scratch commit `0ed4dfe`, CI run
+/// 30690784043) put a raw ungenerationed `queue_draining` removal into REAL
+/// code at two sites and the whole suite stayed green — including at the
+/// *existing* guard site, which the issue's triage had recorded as covered
+/// by `queue.rs`'s `unconditional_guard_removal_reproduces_the_round_2_
+/// double_drain`. It is not: `drainer_lifecycle` is a pure simulator with
+/// its own re-implementation of the algorithm and a
+/// `guard_checks_generation` knob, and no test reads `mod.rs`.
+/// `DrainerGuard` cannot even execute in the suite — it is built only by
+/// `run_queue_drainer`, which needs an `AppHandle`.
+///
+/// So the model proved the algorithm and nothing pinned the code to it.
+/// The newtype closes that by making the wrong construction impossible,
+/// and these tests close the other half: they exercise the REAL removal,
+/// headlessly, because moving it into a type is exactly what made it
+/// reachable without a live drainer thread.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    /// A minimal queued entry. Built here rather than through a
+    /// production helper: these tests are about the MAP, and what is in it
+    /// is incidental.
+    fn entry(id: u64) -> QueuedDelivery {
+        QueuedDelivery {
+            id,
+            agent_id: "w-1".to_string(),
+            from: "orch-1".to_string(),
+            payload: super::super::queue::QueuedPayload::Text("hi".to_string()),
+            reason: super::super::queue::EnqueueReason::Arrival,
+            enqueued_ms: 0,
+            coalesced: 0,
+            group: "g1".to_string(),
+            to_orchestrator: false,
+            session_id: None,
+        }
+    }
+
+    /// Records what the writer was asked to do, and — the property that
+    /// matters most — whether the queue lock was already free when it ran.
+    struct SpyWriter<'a> {
+        map: &'a QueueMap,
+        writes: RefCell<Vec<String>>,
+        lock_free_at_write: RefCell<Vec<bool>>,
+    }
+
+    impl<'a> SpyWriter<'a> {
+        fn new(map: &'a QueueMap) -> Self {
+            Self { map, writes: RefCell::new(Vec::new()), lock_free_at_write: RefCell::new(Vec::new()) }
+        }
+    }
+
+    impl QueueSnapshotWriter for SpyWriter<'_> {
+        fn write_queue_snapshot(&self, group: &str) {
+            self.writes.borrow_mut().push(group.to_string());
+            // `try_lock`, never `lock`: asserting the lock is free must not
+            // be able to HANG the suite if it ever stops being free.
+            self.lock_free_at_write.borrow_mut().push(self.map.inner.try_lock().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_mutation_that_changed_the_snapshot_writes_it() {
+        let map = QueueMap::new();
+        let spy = SpyWriter::new(&map);
+        let depth = map.mutate("g1", &spy, |queues| {
+            queues.entry(7).or_default().push_back(entry(1));
+            (queues[&7].len(), QueueDirty::snapshot())
+        });
+        assert_eq!(depth, 1);
+        assert_eq!(*spy.writes.borrow(), ["g1"], "a snapshot-changing mutation owes exactly one write");
+    }
+
+    #[test]
+    fn a_mutation_that_changed_nothing_writes_nothing() {
+        let map = QueueMap::new();
+        let spy = SpyWriter::new(&map);
+        map.mutate("g1", &spy, |queues| {
+            // The `entry().or_default()` shape `enqueue_text`'s RejectFull
+            // arm hits: the map grew an EMPTY deque, which no byte of
+            // `queue.json` is derived from.
+            queues.entry(7).or_default();
+            ((), QueueDirty::nothing_persisted())
+        });
+        assert!(spy.writes.borrow().is_empty(), "a mutation that changed nothing persisted must not write");
+    }
+
+    #[test]
+    fn the_queue_lock_is_released_before_the_snapshot_is_written() {
+        // The load-bearing half of `mutate`'s contract, and the one a
+        // later "simplification" would break by moving the write inside
+        // the guard scope: `persist_queues` does file I/O and takes
+        // `queue_persist`, whose lock order is BEFORE `queues`. Writing
+        // under the queue lock would invert that order and stall every
+        // delivery in the registry behind a disk write.
+        let map = QueueMap::new();
+        let spy = SpyWriter::new(&map);
+        map.mutate("g1", &spy, |queues| {
+            queues.entry(7).or_default().push_back(entry(1));
+            ((), QueueDirty::snapshot())
+        });
+        assert_eq!(*spy.lock_free_at_write.borrow(), [true],
+            "the writer must run with the queue lock released");
+    }
+
+    #[test]
+    fn release_only_fires_for_the_generation_that_currently_holds_the_pane() {
+        let reg = DrainerRegistry::new();
+        let g1 = reg.claim(7, || 1).expect("an unregistered pane is claimable");
+        assert!(reg.is_registered(7));
+        assert!(!reg.release(7, g1 + 1), "a generation that never held this pane removes nothing");
+        assert!(reg.is_registered(7), "and leaves the real registration in place");
+        assert!(reg.release(7, g1), "the holder's own release fires");
+        assert!(!reg.is_registered(7));
+    }
+
+    #[test]
+    fn a_stale_release_cannot_erase_a_successors_registration() {
+        // #470 B1 round 2's actual defect, pinned against the real code for
+        // the first time (see this module's test-mod doc): drainer 1 exits
+        // and deregisters, drainer 2 claims the pane, and THEN drainer 1's
+        // RAII guard finally drops. An unconditional removal here strips a
+        // live successor's registration, a third arrival spawns drainer 3
+        // alongside drainer 2, and the same queue entry is pasted twice.
+        let reg = DrainerRegistry::new();
+        let g1 = reg.claim(7, || 1).unwrap();
+        assert!(reg.release(7, g1), "drainer 1's commit_exit deregisters");
+        let g2 = reg.claim(7, || 2).expect("drainer 2 claims the now-free pane");
+        assert!(!reg.release(7, g1), "drainer 1's LATE guard drop must be a no-op");
+        assert!(reg.is_registered(7), "drainer 2 is still registered");
+        assert!(reg.release(7, g2), "and only drainer 2's own release ends it");
+    }
+
+    #[test]
+    fn claim_declines_while_a_registration_is_live_and_does_not_mint() {
+        // `ensure_drainer`'s idempotence: at most one drainer per pane, and
+        // the generation counter must not advance on a declined claim or
+        // the tokens stop meaning "this spawn".
+        let reg = DrainerRegistry::new();
+        let minted = RefCell::new(0u64);
+        let mut mint = || {
+            let mut n = minted.borrow_mut();
+            *n += 1;
+            *n
+        };
+        assert_eq!(reg.claim(7, &mut mint), Some(1));
+        assert_eq!(reg.claim(7, &mut mint), None, "a live registration declines a second claim");
+        assert_eq!(*minted.borrow(), 1, "a declined claim must not burn a generation");
+    }
+}
