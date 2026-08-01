@@ -1213,12 +1213,16 @@ input-mode reference — no mention).
 there (`box_holds_paste` — the same function serves this precondition check and the post-Enter
 consumption check). Found → `tier1_governs = true`, Tier 1 decides two-sidedly as above. Not
 found (a long/collapsed paste, or the echo genuinely never landed) → Tier 1 declines to govern,
-audited explicitly (`tier1_governed: false`), and this delivery falls back to the round-1
-hook-or-burst precedence for its initial window. **Consequence, stated plainly**: Tier 1's
-two-sided coverage is short/literal-pastes only. Long pastes — the orchestrator briefs most
-likely to land on a busy worker and get queued, the exact population this redesign is for — don't
-get Tier 1's fast veto. They still get everything else in this design (the three-state model, the
-long-window late hook, the idle trigger below), just not Tier 1's speed.
+audited explicitly (`tier1_governed: false`, and since #559 `tier1_decline` says which of the two
+below), and this delivery falls back to the round-1 hook-or-burst precedence for its initial
+window. **Consequence, stated plainly**: Tier 1's two-sided coverage is literal-echo pastes only.
+A paste the CLI collapses to a placeholder — the orchestrator briefs most likely to land on a busy
+worker and get queued, the exact population this redesign is for — doesn't get Tier 1's fast veto.
+It still gets everything else in this design (the three-state model, the long-window late hook,
+the idle trigger below), just not Tier 1's speed. **#559 narrowed that consequence**: it used to
+read "short pastes only", because a *second*, unrelated limit — the size of the tail read — also
+excluded every large paste whether the CLI collapsed it or not. That one is gone; see "The scan
+window was the other half of the precondition", below.
 
 Two options were weighed and set aside for this pass: a placeholder-pattern matcher
 (`[Pasted text #N`/`Press up to edit queued messages`) would extend Tier 1's coverage to long
@@ -1229,6 +1233,90 @@ failure. Not built. Transcript-file watching (`transcript_path`, handed to every
 a genuinely durable, hook-independent signal, but it's a new file format loomux doesn't parse
 anywhere today; deferred as a follow-up if live measurement later shows the hook has coverage
 gaps distinct from timing.
+
+#### The scan window was the other half of the precondition (#559)
+
+`box_holds_paste` asks whether our pasted text is in the last N bytes of the pane's output. Until
+#559, N was `BOX_TAIL_SCAN_BYTES` — a flat 4 KiB, defined as `QUESTION_SCAN_TAIL_BYTES` because
+"how much tail matters" seemed like one question. It is not one question. `QUEUE_FLUSH_MAX_BYTES`
+lets a single coalesced flush paste 24 KiB, and **containment cannot hold when the haystack is
+smaller than the needle**: for any paste past ~4 KiB the answer was `false` as a matter of
+arithmetic, decided before the pane was ever consulted.
+
+That is not a tuning miss, it is a category error, and it is why the fix is not a bigger number.
+Two constants chosen for unrelated reasons — a token budget on one side, a per-poll scan cost on
+the other — were jointly deciding whether a stranded delivery was ever noticed, and nothing in
+either one's definition said so.
+
+**The primary fix: say which `false` this is.** `BoxReading` replaces the bare bool at every Tier 1
+consumer:
+
+| Reading | What it establishes | Reached when |
+|---|---|---|
+| `Holds` | our text is identifiably at the box's tail end | the paste is found |
+| `NotHolding` | an OBSERVED absence — the CLI consumed it, collapsed it, or it never landed | the tail was long enough to have contained the paste, and does not |
+| `Unverifiable` | nothing at all | no read (pty gone), or the tail we got back is shorter than our own paste |
+
+The three consumers that used to read a foregone `false` as an observation now each take the
+reading:
+
+- `unconfirmed_disposition` — `Unverifiable` is `Notify`, never `IdleAuditOnly`. #522's quiet path
+  exists for a pane loomux *watched* go idle; a reading that never happened is not that pane. This
+  is the silence #559 is about: an oversized stranded batch got no notice, no self-heal and no
+  badge, and the ledger's own unconfirmed state was the only trace.
+- `stranded_selfheal_action` — its own `StrandedBlocker::Unverifiable`, not `NotHolding`. Both
+  refuse to press Enter, so this widens nothing about when loomux writes to a pane; what it stops
+  is the badge *claiming* the human's text is gone on the strength of arithmetic. (`stranded_
+  reword` treats it exactly like `NotHolding` for #517's in-flight-redelivery case, and #517's
+  kickoff recovery triggers on either — the box reading was never that recovery's guard,
+  `output_since_submit` is.)
+- the confirm arm — `ConfirmSource::Box` now requires `NotHolding`. This is the direction that
+  matters most: the old code's `Some(_)` arm would have taken a structurally-foregone `false` as
+  proof the CLI accepted our paste, and a false confirm lets a stranded batch merge into the next
+  delivery. Declining to govern is a cost; confirming something nobody observed is a defect.
+
+Every decline is now stated where it happens rather than inferred from an absent `true`:
+`prompt-typed` carries `tier1_decline` (`null` | `"not-in-box"` | `"unverifiable"`) with
+`tier1_paste_bytes`/`tier1_scan_bytes` beside it, and the late monitor writes
+`delivery-unconfirmed-box-unverifiable` whenever it reaches that reading — including on deliveries
+that would have been notified anyway, so "Tier 1 was blind here" is never a fact only reconstructable
+from what is missing.
+
+**The secondary fix: derive the read from the paste, and bound it by the flush cap.** The scan
+budget is no longer a shared constant; `tier1_scan_bytes` asks for the paste's own normalized
+length plus `BOX_TAIL_SCAN_BYTES` of headroom for the framing/prompt/cursor chrome around it,
+ceilinged at `TIER1_SCAN_MAX_BYTES = QUEUE_FLUSH_MAX_BYTES + BOX_TAIL_SCAN_BYTES`.
+
+Three arguments for this direction rather than the other one the issue floated (capping the flush
+at what a fixed scan can see):
+
+1. **It widens nothing semantically.** `box_holds_paste` already windowed containment to the last
+   *paste-length-plus-slack* of the normalized tail. The comparison was always paste-relative; only
+   the READ was fixed, so it was truncating the window the comparison already used. A paste of
+   4 KiB or less asks for exactly what it always did — the ordinary delivery does not move at all.
+2. **It does not fight the feature it constrains.** Capping the flush at the scan window would have
+   shrunk coalescing by 6x to protect a number that was never about coalescing (#533's whole point
+   is fewer, batched deliveries).
+3. **The cost is proportional to a paste we already paid for**, and only for deliveries that are
+   themselves multi-KiB. `LATE_MONITOR_QUESTION_SCAN_BYTES` (32 KiB) is the standing precedent, and
+   its own rationale already contemplates "Tier 1 governing a multi-KB brief" — a state that until
+   #559 could not actually occur.
+
+**Why `Unverifiable` is not dead code once the read is derived.** The sizing is best-effort, not a
+guarantee, and deliberately so. A heavily-ANSI-escaped tail strips down to far fewer characters
+than the bytes read; a pane whose ring has not accumulated enough output yet returns a short tail
+whatever we ask for; a single queue entry larger than the flush cap still delivers alone
+(`plan_flush`'s "the cap is a CEILING, never a floor") and exceeds the ceiling by construction. In
+all of those the read comes back too short and the honest answer is `Unverifiable`. **The scan
+sizing is best-effort; the honesty is structural** — which is the right way round, because a
+best-effort number that quietly reports its own failures as observations is exactly what #559
+was.
+
+One invariant the code depends on, stated so an edit cannot lose it silently: **every box read for
+a given delivery must use the same `tier1_scan_bytes`.** A precondition verified against a wide
+tail and then polled against a narrow one would read the box as cleared on the first poll and
+confirm a delivery nothing observed. The five call sites (precondition, confirm loop, retry loop,
+and the late monitor's two) all size from `pasted_text` for that reason.
 
 #### Tier 2: the hook, no longer bounded by the window
 
@@ -5602,7 +5690,11 @@ Four constraints shape it, and each is a rule in the planner rather than a conve
   a large backlog into consecutive flushes, and the header states how many follow — a paste is
   echoed and re-read, so an unbounded combined payload would trade the turn cost this saves for
   a worse context cost. A single constituent larger than the whole budget still delivers, alone:
-  a cap that can stall a queue is a destruction path with extra steps.
+  a cap that can stall a queue is a destruction path with extra steps. **This cap now has a second
+  consumer (#559)**: Tier 1's box-scan ceiling is derived from it, so the window loomux reads to
+  verify its own paste can always contain what one flush may produce. Changing this number moves
+  that read too — deliberately, since the two being independent is precisely what let an oversized
+  flush go unverifiable and silent. See "The scan window was the other half of the precondition".
 - **#451's three-state confirmation transfers to every constituent.** One paste is one submit is
   one `submit_sent_ms`, which is one `last_delivery` outcome — so it is the outcome of every
   constituent it carried. `pop_batch_dequeued` closes out the whole batch on `Done` and audits
@@ -6250,7 +6342,8 @@ Nothing about #510/#451/#420 is weakened. Once the block releases, precedence ca
 decision into the **existing** `box_holds_paste` arm of `stranded_selfheal_action` — which is
 already exactly "deliver if the box is unchanged": our own text still at the tail means there
 is nothing of the human's there to merge with, and any other reading still lands on a badge
-(`NotHolding`), never a blind Enter. `drain_stranded_submit` re-derives through the same
+(`NotHolding`, or since #559 `Unverifiable` where the box could not be read at all), never a
+blind Enter. `drain_stranded_submit` re-derives through the same
 helper rather than forming a second opinion, because rev-47 NB1 is the failure mode where a
 marker admitted under one rule and pressed under another never fires at all.
 
@@ -6268,10 +6361,14 @@ pane can miss — and read that absence as a strand. The cost is not noise: each
 orchestrator to `get_output` (the #520 token flood on an animated pane) and tempts a duplicate
 re-send, the loop #451/#510 exist to prevent.
 
-`unconfirmed_disposition(box_holds_paste, box_pending)` samples structural state *before* the
+`unconfirmed_disposition(reading, box_pending)` samples structural state *before* the
 notice, reusing the seams that already exist rather than inferring anything from output bytes.
 "Sitting unsubmitted" means our text is still identifiably at the box's tail, or the human's
-characters are outstanding; neither means the pane is done. The third condition #522 names —
+characters are outstanding; neither means the pane is done. **#559 made the first input a
+`BoxReading` rather than a bool**, because the quiet path is only ever justified by a box loomux
+actually *read*: a `false` produced by a tail shorter than the paste it was looking for
+(`BoxReading::Unverifiable`) now notifies, and only an observed `NotHolding` reaches
+`IdleAuditOnly`. The third condition #522 names —
 CLI at rest — is a *precondition* of reaching the decision rather than an input to it:
 `late_monitor_tick` returns `DeclareFailed` only when `quiet_long_enough`, and a pane mid-turn
 keeps `output_total` creeping (spinner and statusline frames included, #480), so it never gets
