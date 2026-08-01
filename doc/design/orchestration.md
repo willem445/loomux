@@ -7967,6 +7967,18 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
     beats it live in one object and the cross-layer question does not have to be asked at
     all. `--disallowedTools` stays emitted: the same belt-and-braces stance this section
     takes for allows, for the same reason.
+
+    *Two layers means a drift question, and it is answered by equality, not by presence
+    (review N4).* Deriving both from one pair of predicates makes divergence a deliberate
+    act rather than an accident, but "both lists contain today's constants" is a weaker
+    claim than the one the design makes. A future third deny constant added to the argv
+    branch alone would be forced onto the argv side by the exact-equality full-line
+    goldens and onto the settings side by nothing — leaving a denial in one layer only
+    while `Bash(git *)` stays live in `permissions.allow`, which is the B1 finding above
+    one constant later. So `readonly_pane_settings_carry_permissions_allow` takes the
+    planner's real `--disallowedTools` values off its spawn request and `assert_eq!`s them
+    (sorted) against the settings `permissions.deny` array: the two layers are pinned as
+    **the same list**, not as two lists that happen to agree today.
   - **#465's no-bare-grant invariant is restated for the new layer, not weakened.**
     `readonly_pane_settings_carry_permissions_allow` asserts that every rule in the
     settings allow list is `mcp__loomux`, a scoped `Name(...)` pattern, or one of the two

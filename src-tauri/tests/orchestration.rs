@@ -4759,6 +4759,29 @@ fn readonly_pane_settings_carry_permissions_allow() {
         "the planner's argv must point --settings at its own settings file: {:?}",
         req.argv
     );
+
+    // #614 review N4: the two layers must be the SAME LIST, not merely two
+    // lists that each happen to contain today's constants. The loop above
+    // pins presence, which covers the dangerous direction for the two deny
+    // constants that exist now — but a future third constant added to the
+    // argv branch alone would be forced onto the argv side by the exact-
+    // equality full-line goldens and forced onto the settings side by
+    // nothing, leaving a denial in one layer only while `Bash(git *)` stays
+    // live in `permissions.allow`. That is this round's B1 finding again, one
+    // constant later. Equality, taken off the real spawn request, is what
+    // actually states the property the design claims. Sorted rather than
+    // order-sensitive: the two layers are sets of rules, and the ORDER within
+    // `--disallowedTools` is already pinned by the full-line goldens.
+    let mut argv_deny = claude_flag_values(&req.argv, "--disallowedTools");
+    let mut settings_deny = deny.clone();
+    argv_deny.sort();
+    settings_deny.sort();
+    assert_eq!(
+        argv_deny, settings_deny,
+        "#614/N4: a read-only pane's --disallowedTools values and its settings \
+         permissions.deny must be the same list — one layer gained or lost a denial the \
+         other didn't. argv={argv_deny:?} settings={settings_deny:?}"
+    );
 }
 
 /// #610, the half that could not work before: the settings file must be
