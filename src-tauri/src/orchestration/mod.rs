@@ -12303,10 +12303,10 @@ pub fn grid_evidence_for(m: &QuestionMatch, visible: Option<&str>) -> GridEviden
 /// box is empty" is therefore a conjunction the caller already enforces — see
 /// the design note for why it is not re-derived here.
 pub fn question_shown(ring: Option<&QuestionMatch>, visible: Option<&str>) -> bool {
-    match ring {
-        None => false,
-        Some(m) => grid_evidence_for(m, visible) != GridEvidence::NotRendered,
-    }
+    // NEUTERED FOR RED-BEFORE-GREEN EVIDENCE ONLY (#534): the pre-#534 guard,
+    // where the byte ring's word is final and no screen can release. Never merge.
+    let _ = visible;
+    ring.is_some()
 }
 
 /// Is a composed screen worth reading as evidence, or is it a replay that
@@ -12357,6 +12357,9 @@ pub type QuestionWitness = std::rc::Rc<std::cell::RefCell<Option<QuestionWitness
 /// agreed — the one that turns "the guard held" into "the guard held and the
 /// screen backed it up", or into the opposite.
 pub fn witness_audit(seen: Option<&QuestionWitnessed>) -> Value {
+    // NEUTERED FOR RED-BEFORE-GREEN EVIDENCE ONLY (#513(c)): the pre-change
+    // audit, which recorded nothing about what the guard matched. Never merge.
+    if seen.is_some() { return Value::Null; }
     match seen {
         None => Value::Null,
         Some(w) => json!({

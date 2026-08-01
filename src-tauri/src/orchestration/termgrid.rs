@@ -393,7 +393,9 @@ pub fn render_screen(bytes: &[u8], cols: u16, rows: u16) -> String {
 /// here and present there. A caller turning "absent" into an action owes that
 /// gap an argument; `super::question_shown` is the one that does.
 pub fn render_visible(bytes: &[u8], cols: u16, rows: u16) -> String {
-    replay(bytes, cols, rows, false).into_visible()
+    // NEUTERED FOR RED-BEFORE-GREEN EVIDENCE ONLY (#534). This is the trap the
+    // design note names: history rows followed by on-screen rows. Never merge.
+    render_screen(bytes, cols, rows)
 }
 
 /// The shared VT replay. `keep_history` decides only whether rows leaving the
