@@ -41,6 +41,10 @@ use loomux_lib::orchestration::{
     GhGate, GitTagPush,
     normalize_remote_web_base, ORCHESTRATOR_TPL, parse_audit_lines, parse_audit_lines_counted, parse_session_cost,
     prompt_wait_detected, question_hold_predicate, mask_own_paste, reinject_shape, resolve_paste_gate, resolve_ref_url,
+    // #534 / #513(c): composed-grid question evidence.
+    prompt_wait_match, question_hold_predicate_sampled, question_shown, grid_evidence_for,
+    match_still_rendered, trustworthy_composition, witness_audit,
+    GridEvidence, QuestionMatch, QuestionSample, QuestionWitness, QuestionWitnessed,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
     agent_acted_since, reinject_disposition, ReinjectDisposition,
@@ -25321,4 +25325,454 @@ fn an_oversized_stranded_batch_reaches_the_badge_and_the_audit() {
         reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-attention"),
         "the badge must be audited too — the record is how a wedge is reconstructed later"
     );
+}
+
+// ---------- #534 / #513(c): question evidence from the COMPOSED GRID ----------
+//
+// The limitation this closes, as the design note states it (~4938-4966): *from
+// an append-only byte ring, a live dialog and an answered one that has not
+// scrolled away are byte-identical.* `prompt_wait_detected` reads such a ring,
+// so on a quiet pane the hold re-asserts forever and the only bound available
+// was a badge (#536), never a release. #513's live 27-minute orchestrator-
+// inbound stall is that shape, and its trigger is still unknown because the
+// abort record never said what the guard keyed on.
+//
+// Three pieces and the seams between them:
+//   A. `termgrid::render_visible` exposes ONLY rendered rows. The design note
+//      names the trap: a history-included read reproduces the bug, because an
+//      answered question that scrolled off is still in the history half.
+//   B. `prompt_wait_match` reports WHAT fired, with `prompt_wait_detected`
+//      defined as `.is_some()` on it so the two cannot drift.
+//   C/D. `question_shown` combines the readings ONE-DIRECTIONALLY — the ring
+//      triggers, the grid may only release.
+
+/// A pane's two readings built from ONE raw stream, exactly as
+/// `question_sample` does in production: the grid replays everything, the ring
+/// is the trailing window the detector has always used.
+fn sample_from_raw(raw: &[u8], cols: u16, rows: u16) -> QuestionSample {
+    QuestionSample {
+        ring: Some(raw[raw.len().saturating_sub(4096)..].to_vec()),
+        visible: trustworthy_composition(
+            loomux_lib::orchestration::termgrid::render_visible(raw, cols, rows),
+        ),
+    }
+}
+
+/// A question, then enough ordinary output to scroll it off a SHORT screen
+/// while leaving it inside BOTH the ring window and the detector's own
+/// last-12-non-empty-lines window. The #532 incident, minimally.
+///
+/// The trailing-line count is load-bearing in two directions at once and a
+/// test built on this must not quietly lose either: too many and the question
+/// falls out of the detector's 12-line window, so the ring stops matching and
+/// the test passes for the wrong reason; too few and it never leaves a 6-row
+/// screen, so there is nothing for the grid to notice. Nine lines total sits
+/// in both windows.
+fn scrolled_off_question() -> Vec<u8> {
+    let mut raw = b"Do you want to run npm test? (y/n)\n".to_vec();
+    for i in 0..8 {
+        raw.extend_from_slice(format!("running step {i}\n").as_bytes());
+    }
+    raw
+}
+
+// ---- A. render_visible: rendered rows only ----
+
+#[test]
+fn a1_render_visible_drops_the_scrolled_off_question_that_render_screen_keeps() {
+    // THE bug, put to both readings of the same bytes. The byte ring still
+    // holds the answered question, and so does `render_screen` — its history
+    // half is exactly where scrolled rows go. Only `render_visible` agrees
+    // with the human's eyes.
+    let raw = scrolled_off_question();
+    let history_included = loomux_lib::orchestration::termgrid::render_screen(&raw, 80, 6);
+    let visible_only = loomux_lib::orchestration::termgrid::render_visible(&raw, 80, 6);
+
+    assert!(
+        history_included.contains("(y/n)"),
+        "render_screen keeps scrolled-off rows — its job for get_output, and precisely \
+         why pointing the detector at it would have reproduced the bug"
+    );
+    assert!(
+        !visible_only.contains("(y/n)"),
+        "render_visible must expose only what is ON SCREEN; the question scrolled away"
+    );
+    assert!(visible_only.contains("running step 7"), "the live rows are still there");
+}
+
+#[test]
+fn a2_render_visible_excludes_the_primary_screen_parked_behind_an_alt_screen() {
+    // `into_text` deliberately shows the parked primary (a `get_output` reader
+    // wants the context a pager covers). It is by definition NOT displayed, so
+    // a "still on screen" reading must not see it — a second exclusion, which
+    // a naive `grid + parked` render would miss even with history dropped.
+    let mut raw = b"Do you want to proceed?\n".to_vec();
+    raw.extend_from_slice(b"\x1b[?1049h"); // enter alt screen
+    raw.extend_from_slice(b"PAGER LINE ONE\nPAGER LINE TWO\n");
+
+    let history_included = loomux_lib::orchestration::termgrid::render_screen(&raw, 80, 10);
+    let visible_only = loomux_lib::orchestration::termgrid::render_visible(&raw, 80, 10);
+
+    assert!(
+        history_included.contains("Do you want to proceed?"),
+        "the parked primary is kept by render_screen"
+    );
+    assert!(
+        !visible_only.contains("Do you want to proceed?"),
+        "the parked primary is behind the alt screen — not displayed, not evidence"
+    );
+    assert!(visible_only.contains("PAGER LINE TWO"), "the alt screen IS what is displayed");
+}
+
+#[test]
+fn a3_render_visible_keeps_a_dialog_that_is_still_on_screen() {
+    // The other half of A1: absence only means something if presence survives.
+    let raw = b"building...\nDo you want to run npm test? (y/n)\n".to_vec();
+    let visible = loomux_lib::orchestration::termgrid::render_visible(&raw, 80, 6);
+    assert!(visible.contains("(y/n)"), "a dialog on screen must render as on screen");
+}
+
+#[test]
+fn a4_render_visible_drops_a_dialog_the_cli_erased_in_place() {
+    // The case a byte ring can NEVER see: the CLI answers its own question and
+    // repaints over it without scrolling. Nothing leaves the ring; everything
+    // leaves the screen.
+    let mut raw = b"Do you want to run npm test? (y/n)\n".to_vec();
+    raw.extend_from_slice(b"\x1b[2J\x1b[H"); // erase display, cursor home
+    raw.extend_from_slice(b"> \n(idle)\n");
+    let visible = loomux_lib::orchestration::termgrid::render_visible(&raw, 80, 10);
+    assert!(!visible.contains("(y/n)"), "an in-place erase removes it from the screen");
+    assert!(visible.contains("(idle)"), "and leaves what the CLI painted instead");
+}
+
+// ---- B. prompt_wait_match: the detector names its own evidence ----
+
+#[test]
+fn b1_prompt_wait_match_and_prompt_wait_detected_can_never_disagree() {
+    // `prompt_wait_detected` is DEFINED as `prompt_wait_match(..).is_some()`,
+    // so this is true by construction — asserted anyway over every fixture the
+    // guard is graded on, because the day someone re-inlines the boolean for
+    // speed is the day the audit starts lying about a hold that happened. The
+    // false-positive fixtures are included: parity has to hold on the
+    // negatives too, or the match would be reporting phantom evidence.
+    for (name, tail) in [
+        ("claude-ask", FIX_CLAUDE_ASK),
+        ("copilot-ask", FIX_COPILOT_ASK),
+        ("pointer-last", FIX_POS_PTR_LAST),
+        ("copilot-multichoice", FIX_COPILOT_MULTICHOICE),
+        ("claude-mcp-approval", FIX_CLAUDE_MCP_APPROVAL),
+        ("streaming", FIX_STREAMING),
+        ("idle-box", FIX_IDLE_BOX),
+        ("fp-prose", FIX_FP_PROSE),
+        ("fp-shell", FIX_FP_SHELL),
+        ("fp-breadcrumb", FIX_FP_BREADCRUMB),
+        ("fp-leading-ptr", FIX_FP_LEADING_PTR),
+        ("fp-fenced-ptr", FIX_FP_FENCED_PTR),
+    ] {
+        let stripped = strip_ansi(tail.as_bytes());
+        assert_eq!(
+            prompt_wait_match(&stripped).is_some(),
+            prompt_wait_detected(&stripped),
+            "{name}: the match and the boolean must be the same detector"
+        );
+    }
+    assert!(prompt_wait_match("").is_none(), "empty tail: nothing matched, nothing to report");
+}
+
+#[test]
+fn b2_prompt_wait_match_names_the_signal_and_the_line_it_fired_on() {
+    // #513(c): the abort audit recorded `to`/`stage`/`held_ms` and nothing
+    // about the trigger, which is why that incident is still unexplained.
+    // These are the fields that end that.
+    let m = prompt_wait_match("building...\nOverwrite the file? (y/n)").expect("y/n must match");
+    assert_eq!(m.signal, "yes-no-token");
+    assert_eq!(m.token, Some("(y/n)"));
+    assert_eq!(m.line, "overwrite the file? (y/n)", "the detector's own normalization, not raw bytes");
+
+    let m = prompt_wait_match("Do you trust the files in this folder?").expect("permission must match");
+    assert_eq!(m.signal, "permission-phrase");
+    assert_eq!(m.token, Some("do you trust"));
+
+    let m = prompt_wait_match("pick one\n  option a\n> option b\n❯ option c").expect("pointer must match");
+    assert_eq!(m.signal, "pointer-option");
+    assert_eq!(m.token, None, "a leading glyph is a position, not a substring");
+    assert_eq!(m.line, "❯ option c");
+
+    let m = prompt_wait_match("choose\n  a\n  b\nuse arrow keys to move").expect("footer must match");
+    assert_eq!(m.signal, "menu-footer");
+}
+
+#[test]
+fn b3_prompt_wait_match_bounds_the_line_it_records() {
+    // An audit field must not become a channel for whatever length of line a
+    // pane felt like painting.
+    let long = format!("{} (y/n)", "x".repeat(5000));
+    let m = prompt_wait_match(&long).expect("still matches");
+    assert_eq!(m.line.chars().count(), QuestionMatch::MAX_LINE, "the recorded line is capped");
+}
+
+#[test]
+fn b4_witness_audit_says_null_rather_than_nothing_when_no_question_was_seen() {
+    // `null` is a real answer: on a `delivery-aborted-question` record it means
+    // the abort outcome and the detector disagree, which is itself the finding.
+    // The old records were indistinguishable from that case in every direction.
+    assert!(witness_audit(None).is_null(), "no match seen must be recorded, not omitted");
+
+    let seen = QuestionWitnessed {
+        matched: prompt_wait_match("Overwrite? (y/n)").expect("matches"),
+        grid: GridEvidence::NotRendered,
+    };
+    let v = witness_audit(Some(&seen));
+    assert_eq!(v["signal"], "yes-no-token");
+    assert_eq!(v["line"], "overwrite? (y/n)");
+    assert_eq!(v["grid"], "not-rendered", "whether the screen agreed is the diagnostic half");
+}
+
+// ---- C. question_shown: the truth table, one row of which is new ----
+
+#[test]
+fn c1_no_ring_match_never_consults_the_grid() {
+    // The grid may only ever RELEASE. If the ring says nothing, the reading is
+    // clear no matter what is composed — even a screen full of live dialog.
+    // This is what keeps the change one-directional: no new false-positive
+    // class can enter through the grid.
+    let live_dialog = "Do you want to run npm test? (y/n)\n> ";
+    assert!(
+        !question_shown(None, Some(live_dialog)),
+        "the ring is the trigger; the grid must not invent a hold"
+    );
+}
+
+#[test]
+fn c2_an_unreadable_grid_leaves_the_ring_the_authority() {
+    // `visible: None` is "no trustworthy composition", NOT "a blank screen" —
+    // pty gone, geometry unknown, replay never painted over. Behaviour here
+    // must be exactly what it was before #534.
+    let m = prompt_wait_match("Overwrite? (y/n)").expect("matches");
+    assert!(question_shown(Some(&m), None), "no evidence either way -> the ring's word stands");
+    assert_eq!(grid_evidence_for(&m, None), GridEvidence::Unreadable);
+}
+
+#[test]
+fn c3_still_rendered_holds() {
+    let m = prompt_wait_match("Overwrite the file? (y/n)").expect("matches");
+    let screen = "some output\nOverwrite the file? (y/n)\n> ";
+    assert_eq!(grid_evidence_for(&m, Some(screen)), GridEvidence::StillRendered);
+    assert!(question_shown(Some(&m), Some(screen)), "still displayed -> still holding");
+}
+
+#[test]
+fn c4_not_rendered_is_the_one_transition_this_change_adds() {
+    // Ring matched, screen composed cleanly, and neither the match nor any
+    // other question shape is on it. Before #534 no reading could reach this
+    // conclusion at all — which is why the hold could only ever be badged.
+    let m = prompt_wait_match("Overwrite the file? (y/n)").expect("matches");
+    let screen = "running step 11\nrunning step 12\n> ";
+    assert_eq!(grid_evidence_for(&m, Some(screen)), GridEvidence::NotRendered);
+    assert!(!question_shown(Some(&m), Some(screen)), "no longer rendered -> answered -> release");
+}
+
+#[test]
+fn c5_a_dialog_outside_the_detectors_own_window_still_counts_as_rendered() {
+    // `prompt_wait_detected`'s last-12-lines rule is CHRONOLOGICAL — written
+    // for a stream, where recent means last. On a screen it is spatial, and a
+    // dialog can sit above 12 rows of statusline and input box. So the match's
+    // own line is looked for anywhere on screen; without that, a tall pane
+    // would release into a live dialog.
+    let m = prompt_wait_match("Do you want to proceed? (y/n)").expect("matches");
+    let mut screen = String::from("Do you want to proceed? (y/n)\n");
+    for i in 0..20 {
+        screen.push_str(&format!("status row {i}\n"));
+    }
+    assert!(
+        !prompt_wait_detected(&screen),
+        "precondition: the detector's own window cannot see it — this is the gap being covered"
+    );
+    assert_eq!(grid_evidence_for(&m, Some(&screen)), GridEvidence::StillRendered);
+    assert!(question_shown(Some(&m), Some(&screen)), "displayed is displayed, wherever on screen");
+}
+
+#[test]
+fn c6_a_matched_line_re_wrapped_across_rows_still_counts_as_rendered() {
+    // A line the ring saw as one write is two rows on a narrower screen. A
+    // row-by-row compare would miss it and call a plainly-visible dialog gone
+    // — the one direction this must never be wrong in.
+    let m = prompt_wait_match("do you want to make this edit to mod.rs").expect("matches");
+    let wrapped = "do you want to make this\nedit to mod.rs\n> ";
+    assert!(
+        match_still_rendered(wrapped, &m),
+        "wrap-insensitive: a row break is whitespace, not evidence of absence"
+    );
+    assert!(
+        !match_still_rendered("edit the file\n> ", &m),
+        "and sharing a word or two is not a match"
+    );
+}
+
+#[test]
+fn c7_a_blank_composition_is_unreadable_not_clear() {
+    // A replay that began mid-stream and was never painted over composes to
+    // near-nothing. "The screen is blank" must not be mistaken for "the screen
+    // is clear" — that is the blind-start hole, closed by refusing to read
+    // such a composition at all.
+    assert_eq!(trustworthy_composition(String::new()), None);
+    assert_eq!(trustworthy_composition("   \n\n  ".into()), None);
+    assert_eq!(
+        trustworthy_composition("> \n(idle)".into()).as_deref(),
+        Some("> \n(idle)"),
+        "a populated screen is evidence"
+    );
+}
+
+// ---- D. the predicate, driven by faked composed-grid states ----
+
+#[test]
+fn d1_a_live_question_still_rendered_never_releases() {
+    // Both readings agree; poll it as often as you like.
+    let raw = b"building the project\nDo you want to run npm test? (y/n)\n".to_vec();
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 80, 10), None, None);
+    for i in 0..5 {
+        assert!(pred(), "poll {i}: the dialog is on screen — must hold");
+    }
+}
+
+#[test]
+fn d2_a_question_that_scrolled_off_screen_releases_though_the_ring_still_holds_it() {
+    // #532's empty-box incident, mechanism for mechanism: the question is
+    // answered and gone from the screen, but it has NOT left the byte ring, so
+    // the pre-#534 guard re-asserted the hold forever.
+    let raw = scrolled_off_question();
+    // Precondition — without it this test would pass for the wrong reason.
+    assert!(
+        prompt_wait_detected(&strip_ansi(&raw)),
+        "the byte ring STILL matches: that is the bug being fixed, not an artifact of the fixture"
+    );
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 80, 6), None, None);
+    assert!(!pred(), "the screen says answered — no hold ever starts");
+}
+
+#[test]
+fn d3_an_answered_question_erased_in_place_releases_after_the_hysteresis() {
+    // A hold that genuinely started, then the CLI repaints over its own
+    // dialog. Release must STILL take two consecutive clear reads — the grid
+    // is new evidence, not a shortcut past rev-19 R1's transient-redraw guard.
+    let live = b"Do you want to run npm test? (y/n)\nchoose an option\n".to_vec();
+    let mut answered = live.clone();
+    answered.extend_from_slice(b"\x1b[2J\x1b[Hnpm test running\nall good\n");
+
+    let call = std::sync::atomic::AtomicU32::new(0);
+    let pred = question_hold_predicate_sampled(
+        move || {
+            let n = call.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n == 0 { sample_from_raw(&live, 80, 10) } else { sample_from_raw(&answered, 80, 10) }
+        },
+        None,
+        None,
+    );
+    assert!(pred(), "poll 1: dialog on screen -> hold");
+    assert!(pred(), "poll 2: screen now clear, but one clear read is not enough");
+    assert!(!pred(), "poll 3: second consecutive clear read -> release");
+}
+
+#[test]
+fn d4_tui_redraw_churn_around_a_live_dialog_never_false_clears() {
+    // The failure mode a naive rendered-rows read would have: a TUI repaints
+    // its frame constantly, so the composed screen is built from different
+    // bytes on every poll. What must not change is the answer, as long as the
+    // dialog is still painted.
+    let dialog = "Do you want to run npm test? (y/n)";
+    let frames: Vec<Vec<u8>> = (0..6)
+        .map(|i| format!("\x1b[H\x1b[2J{dialog}\n  Yes\n  No\nworking {i}\n").into_bytes())
+        .collect();
+    let call = std::sync::atomic::AtomicU32::new(0);
+    let pred = question_hold_predicate_sampled(
+        move || {
+            let n = call.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+            sample_from_raw(&frames[n % frames.len()], 80, 10)
+        },
+        None,
+        None,
+    );
+    for i in 0..6 {
+        assert!(pred(), "frame {i}: repaint churn is not an answer — the dialog is still there");
+    }
+}
+
+#[test]
+fn d5_the_predicate_records_what_it_held_for_and_whether_the_screen_agreed() {
+    // #513(c)/F2 end to end: the field whose absence left a 27-minute stall
+    // undiagnosable. Recorded on every poll the ring matched, INCLUDING the
+    // ones the grid contradicted — "the ring kept matching but the screen said
+    // gone" is the single most useful line such a diagnosis could have.
+    let raw = scrolled_off_question();
+    let witness: QuestionWitness = Default::default();
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 80, 6),
+        None,
+        Some(std::rc::Rc::clone(&witness)),
+    );
+    assert!(!pred(), "scrolled off the screen -> released");
+
+    let seen = witness.borrow().clone().expect("the ring matched, so the witness must hold it");
+    assert_eq!(seen.matched.signal, "yes-no-token");
+    assert!(seen.matched.line.contains("(y/n)"));
+    assert_eq!(
+        seen.grid,
+        GridEvidence::NotRendered,
+        "the record has to name the disagreement, not just that it held"
+    );
+}
+
+#[test]
+fn d6_our_own_pasted_text_rendered_in_the_box_is_masked_on_the_grid_too() {
+    // `mask_own_paste` has to run on BOTH readings or the guard contradicts
+    // itself, and the grid is where it bites HARDEST: our own just-pasted,
+    // not-yet-submitted text sits in the input box, where it is genuinely
+    // RENDERED and stays rendered — unlike in the ring, where it scrolls out
+    // of a 4 KiB window soon enough.
+    //
+    // The scenario that separates the two: a real dialog matched by the ring
+    // has since scrolled off the screen (so this should RELEASE), while a
+    // brief that happens to quote a permission phrase is still displayed in
+    // the box. Unmasked, the grid would answer "still displayed" about our own
+    // paste and strand the delivery (rev-15 N1 / rev-19 B-A, now owed by the
+    // grid too).
+    let pasted = "please confirm: do you want to proceed with the deploy";
+    let mut raw = b"Overwrite the file? (y/n)\n".to_vec();
+    for i in 0..6 {
+        raw.extend_from_slice(format!("running step {i}\n").as_bytes());
+    }
+    raw.extend_from_slice(format!("{pasted}\n").as_bytes());
+
+    // Preconditions, so a fixture that drifts fails loudly instead of passing
+    // for a reason this test is not about.
+    let visible = loomux_lib::orchestration::termgrid::render_visible(&raw, 80, 6);
+    assert!(!visible.contains("(y/n)"), "the real dialog has scrolled off the screen");
+    assert!(visible.contains(pasted), "our own paste is still rendered in the box");
+    assert!(
+        prompt_wait_detected(&strip_ansi(&raw)),
+        "the ring still matches the scrolled-off dialog — that is what triggers the guard"
+    );
+
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 80, 6),
+        Some(pasted.to_string()),
+        None,
+    );
+    assert!(
+        !pred(),
+        "the dialog is off screen and the only question-shaped text left rendered is OUR OWN — release"
+    );
+}
+
+#[test]
+fn d7_the_ring_only_predicate_is_unchanged_by_all_of_this() {
+    // `question_hold_predicate` is the fallback path — `visible: None` on every
+    // poll — and its behaviour is the pre-#534 guard exactly. The rev-19 tests
+    // above pin its release rules; this one pins the *reason* it still holds
+    // where the grid would have released, so nobody "simplifies" the fallback
+    // into consulting a grid it does not have.
+    let raw = scrolled_off_question();
+    let pred = question_hold_predicate(move || Some(raw.clone()), None);
+    assert!(pred(), "no composed screen to consult -> the byte ring's word is final");
 }
