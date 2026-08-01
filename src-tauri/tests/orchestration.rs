@@ -80,7 +80,7 @@ use loomux_lib::orchestration::{
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     cap_task_notes, task_summary,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
-    AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
+    AgentEntry, AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     PersonaInject, Task, TaskNote,
     PasteGate, Role, TaskPatch, UsageSnapshot, CLAUDE_UNATTENDED_ALLOW, COPILOT_AUTOPILOT_CONFIRM_KEYS,
     COPILOT_GROUP_AUTOPILOT_FLAGS, COPILOT_UNATTENDED_FLAGS, MAX_ATTACHMENT_BYTES,
@@ -3263,7 +3263,7 @@ fn orphans_tool(reg: &OrchRegistry, caller: &Caller) -> Value {
 /// is about to lose a report to it — the case #579 is actually about, since a
 /// fleet's reports all converge on that one pane. Returns the group, the two
 /// agents and the orchestrator's pty.
-fn orch_pane_at_capacity(reg: &OrchRegistry, pty: u32) -> (String, AgentRecord, AgentRecord) {
+fn orch_pane_at_capacity(reg: &OrchRegistry, pty: u32) -> (String, AgentEntry, AgentEntry) {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
