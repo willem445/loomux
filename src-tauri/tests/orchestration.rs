@@ -15213,9 +15213,12 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
 /// is a MATCHER, and `grep` is what a shell author reaches for the moment `case`
 /// stops being expressive enough — so it is the likeliest tool for a future gate
 /// decision to consume. `wc`, `sort`, `uniq`, `basename` and `dirname` are the
-/// next tier and are deliberately NOT here: each costs a further ~1s of sweep on
-/// the slowest platform, and none of them is a plausible *matcher*. Add one when
-/// a normalizer plausibly reaches for it, not pre-emptively.
+/// next tier and are deliberately NOT here, on RELEVANCE rather than cost: none
+/// of them is a plausible matcher. Add one when a normalizer plausibly reaches
+/// for it, not pre-emptively. (Cost is not the reason: adding `grep` and a sixth
+/// shape together — 18 more shim invocations — moved the windows suite 86.51s →
+/// 86.74s, which is inside run-to-run variance. libtest runs tests in parallel,
+/// so the sweep's marginal cost is not its invocation count times anything.)
 const CANDIDATE_NORMALIZER_TOOLS: &[&str] = &[
     "tr", "head", "tail", "date", "cat", "rm", "mv", "sed", "awk", "cut", "rev", "expr", "grep",
 ];
