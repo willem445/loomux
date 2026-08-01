@@ -76,6 +76,8 @@ use loomux_lib::orchestration::{
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
     failed_arm_route, FailedArmRoute,
     box_reading, tier1_scan_bytes, BoxReading,
+    // #583: the same read, measured — is `Unverifiable` the near-cap norm?
+    Tier1ScanCensus,
     HUMAN_INPUT_BLOCK_BOUND_MS, UNCONFIRMED_ACK_SETTLE_MS, UNCONFIRMED_NOTICE_IDS_MAX,
     record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
@@ -30740,6 +30742,177 @@ fn an_oversized_stranded_batch_reaches_the_badge_and_the_audit() {
     assert!(
         reg.audit_log(&g.id).iter().any(|e| e.action == "stranded-attention"),
         "the badge must be audited too — the record is how a wedge is reconstructed later"
+    );
+}
+
+// ───────── #583: is `Unverifiable` the near-cap NORM? ─────────
+//
+// #559 accepted a residual rather than tuning against a guess: the scan slack
+// is a constant counted in RAW bytes, but the containment it protects runs on
+// the tail AFTER `strip_ansi` + `normalize_prompt_text`. So the slack has to
+// buy through a retention rate nobody has measured, and near the flush cap
+// there is very little of it to spend — at a 24 KiB paste the read is 28 KiB,
+// and a tail that keeps fewer than ~85 chars per 100 raw bytes is already
+// short of its own needle.
+//
+// These tests pin the INSTRUMENTATION, not a threshold: `Tier1ScanCensus` has
+// to measure the same cliff `box_reading` decides (or the audit answers a
+// different question than the code asks), report a missing read as missing
+// rather than as zero, and keep the field names the design note's jq recipe
+// reads. The one regime that needs no live data — a paste past the scan
+// CEILING, unverifiable at any density whatsoever — is pinned here too, since
+// it is the half of #583 that arithmetic already closes.
+
+/// One coalesced paste echoed the way a TUI actually repaints it — the text in
+/// chunks, each led by an SGR sequence — with older output ahead of it, cut to
+/// exactly the `want_bytes` the ring would have returned. Raw bytes, escapes
+/// included, as `output_tail_bounded` hands them over.
+fn repainted_tail(pasted: &str, want_bytes: usize, chunk: usize) -> Vec<u8> {
+    let mut raw = String::new();
+    // Older output ahead of the echo, so a SHORT RING is never the reason this
+    // read comes up short — the fixture fills the window Tier 1 asked for, and
+    // what is missing at the end is missing to stripping alone.
+    while raw.len() < want_bytes {
+        raw.push_str("\x1b[2m  done\x1b[0m\r\n");
+    }
+    for c in pasted.as_bytes().chunks(chunk) {
+        raw.push_str("\x1b[0m");
+        raw.push_str(std::str::from_utf8(c).expect("flush_paste is ASCII"));
+    }
+    let start = raw.len().saturating_sub(want_bytes);
+    raw.as_bytes()[start..].to_vec()
+}
+
+#[test]
+fn the_census_margin_is_the_same_cliff_the_reading_decides() {
+    // The audit's number and the code's decision must be one fact. If they can
+    // disagree, a live distribution of `margin_chars` is a distribution of
+    // something other than "how often Tier 1 could not verify", and the
+    // measurement #583 is for would answer the wrong question convincingly.
+    let pasted = flush_paste(8 * 1024);
+    let scan = tier1_scan_bytes(&pasted);
+    let echoed = format!("  done\n\n> {pasted}\n");
+    let cases = vec![
+        ("holds", echoed.clone()),
+        ("consumed", "the agent is answering now ".repeat(400)),
+        // One character short of the needle: the arithmetic case, decided
+        // before the pane was ever consulted.
+        ("truncated", echoed[echoed.len() - (pasted.len() - 1)..].to_string()),
+        ("empty ring", String::new()),
+    ];
+    for (name, tail) in cases {
+        let census = Tier1ScanCensus::measure(scan, Some((tail.len(), &tail)), &pasted);
+        assert_eq!(
+            census.margin_chars().is_some_and(|m| m < 0),
+            box_reading(Some(&tail), &pasted) == BoxReading::Unverifiable,
+            "{name}: the recorded margin and the reading must decide the same cliff"
+        );
+    }
+
+    // The one `Unverifiable` the margin cannot speak for, stated rather than
+    // left to the equivalence above: no read happened at all (pty gone), so
+    // every measurement is null. That is the same distinction `tail_bytes`
+    // carries between `None` and `Some(0)` — nothing measured is not zero.
+    let blind = Tier1ScanCensus::measure(scan, None, &pasted);
+    assert_eq!(box_reading(None, &pasted), BoxReading::Unverifiable);
+    assert_eq!(blind.margin_chars(), None);
+    assert_eq!(blind.retained_pct(), None);
+}
+
+#[test]
+fn a_repaint_heavy_tail_is_the_residual_the_census_explains() {
+    // #583's mechanism in one fixture, at the size it bites: the slack is
+    // spent in RAW bytes before the comparison, which only ever sees what
+    // survived stripping. Nothing here asserts that live panes look like this
+    // — that is exactly what the instrumentation is for — only that when a
+    // tail does, the record says WHY the read was short instead of leaving a
+    // reader to infer it.
+    let pasted = flush_paste(queue::QUEUE_FLUSH_MAX_BYTES);
+    let scan = tier1_scan_bytes(&pasted);
+    let raw = repainted_tail(&pasted, scan, 16);
+    let stripped = strip_ansi(&raw);
+    let census = Tier1ScanCensus::measure(scan, Some((raw.len(), &stripped)), &pasted);
+
+    assert_eq!(
+        census.tail_bytes,
+        Some(scan),
+        "the fixture must FILL the window, or a short ring explains the shortfall instead"
+    );
+    assert_eq!(
+        box_reading(Some(&stripped), &pasted),
+        BoxReading::Unverifiable,
+        "a full window of repaint-heavy tail still strips below the paste it should contain"
+    );
+
+    // The bound the live numbers get read against: at the flush cap the read
+    // is the paste plus a fixed slack, so it survives only down to
+    // `paste_chars / requested_bytes` retention — ~85%, which is not a lot of
+    // ANSI to be wrong about.
+    let breakeven = (census.paste_chars as u64 * 100 / census.requested_bytes as u64) as u32;
+    assert!(
+        census.retained_pct().is_some_and(|pct| pct < breakeven),
+        "the census must report the density that explains the reading: {:?} vs breakeven {breakeven}%",
+        census.retained_pct()
+    );
+    assert!(
+        census.margin_chars().is_some_and(|m| m < 0),
+        "and how far short it fell, which is what would size a wider slack"
+    );
+}
+
+#[test]
+fn a_paste_past_the_scan_ceiling_is_unverifiable_at_any_density() {
+    // The half of #583 that needs no live data. `tier1_scan_bytes` is
+    // ceilinged at the flush cap plus the base window, and a single queue
+    // entry larger than the cap still delivers alone (`plan_flush`'s "the cap
+    // is a CEILING, never a floor"). Above that ceiling the window is smaller
+    // than the needle before any tail is read, so 100% retention — a pane
+    // emitting pure text, not one escape — is still short. No slack tuning
+    // reaches this regime; only a different ceiling would, which is a
+    // different decision from the one the measurement informs.
+    let ceiling = queue::QUEUE_FLUSH_MAX_BYTES + tier1_scan_bytes("");
+    let pasted = flush_paste(ceiling + 1024);
+    let scan = tier1_scan_bytes(&pasted);
+    assert_eq!(scan, ceiling, "the read stops growing at the ceiling, the paste does not");
+
+    let tail = pasted[pasted.len() - scan..].to_string();
+    let census = Tier1ScanCensus::measure(scan, Some((tail.len(), &tail)), &pasted);
+    assert!(
+        census.retained_pct().is_some_and(|pct| pct >= 99),
+        "the fixture's tail is pure text — stripping costs it nothing, so the ceiling is the \
+         only thing left to blame"
+    );
+    assert_eq!(box_reading(Some(&tail), &pasted), BoxReading::Unverifiable);
+    assert!(census.margin_chars().is_some_and(|m| m < 0));
+}
+
+#[test]
+fn the_census_records_an_absent_read_as_absent_rather_than_zero() {
+    // The audit shape itself — these key names are the design note's jq
+    // recipe, and a rename that keeps the code compiling silently breaks every
+    // aggregation written against a live group's log.
+    let pasted = "please post the status roll-up on #583";
+    let scan = tier1_scan_bytes(pasted);
+
+    let blind = Tier1ScanCensus::measure(scan, None, pasted).to_json();
+    assert_eq!(blind["requested_bytes"], json!(scan));
+    assert_eq!(blind["paste_chars"], json!(pasted.len()));
+    assert_eq!(blind["tail_bytes"], Value::Null);
+    assert_eq!(blind["tail_chars"], Value::Null);
+    assert_eq!(blind["margin_chars"], Value::Null);
+    assert_eq!(blind["retained_pct"], Value::Null);
+
+    // A read that HAPPENED and came back empty is a different fact: a pane
+    // that has not spoken yet, not a pane loomux could not read. An aggregate
+    // that cannot tell those apart would read every dead pty as 0% retention.
+    let empty = Tier1ScanCensus::measure(scan, Some((0, "")), pasted).to_json();
+    assert_eq!(empty["tail_bytes"], json!(0));
+    assert_eq!(empty["tail_chars"], json!(0));
+    assert_eq!(empty["margin_chars"], json!(-(pasted.len() as i64)));
+    assert_eq!(
+        empty["retained_pct"],
+        Value::Null,
+        "a ratio over zero bytes read is undefined, and 0% would read as a total-loss tail"
     );
 }
 
