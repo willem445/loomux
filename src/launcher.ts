@@ -739,11 +739,17 @@ export class WelcomeForm {
   }
 
   /** Show the channel-tools toggle only where it applies — agent kind,
-   *  claude/copilot specifically (the only CLIs with an MCP config seam to
-   *  eagerly mint into; every other CLI stays lazy regardless of this
-   *  toggle, so offering it there would promise a capability loomux can't
-   *  deliver). Purely synchronous, unlike `applyAutopilot` — no backend
-   *  lookup needed, `SUPPORTED_CLIS` is a fixed two-CLI list. */
+   *  claude/copilot specifically (the only CLIs whose MCP config can be
+   *  delivered as flags appended to the command line this launcher builds;
+   *  every other CLI stays lazy regardless of this toggle, so offering it
+   *  there would promise a capability loomux can't deliver). Purely
+   *  synchronous, unlike `applyAutopilot` — no backend lookup needed.
+   *
+   *  NOT the same list as `WORKFLOW_CLIS`/`SUPPORTED_CLIS`, since #267: gemini
+   *  is group-spawnable but its MCP server reaches it through a settings file
+   *  named by an environment variable, which only a pane loomux spawns itself
+   *  can be given. That is the backend's `CliCaps.mcp_argv_seam`, and a solo
+   *  gemini pane is delivery-only for exactly this reason. */
   private applyChannelTools(): void {
     this.channelToolsField.hidden =
       this.kind !== "agent" || (this.agentSel.value !== "claude" && this.agentSel.value !== "copilot");

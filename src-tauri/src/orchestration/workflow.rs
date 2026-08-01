@@ -95,7 +95,7 @@
 //! `.loomux/workflow.layout.json` (the GUI pane's file, sub-PR 2) so a canvas
 //! nudge never churns the semantic diff.
 
-use super::{default_model, Role, SUPPORTED_CLIS};
+use super::{cli_can_host, default_model, Role, SUPPORTED_CLIS};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -813,12 +813,31 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             }
         }
         let cli = rb.cli.trim().to_string();
-        if !cli.is_empty() && !SUPPORTED_CLIS.contains(&cli.as_str()) {
-            errs.push(format!(
-                "blocks[{i}] ({id}): unknown cli {cli:?} — supported: {}",
-                SUPPORTED_CLIS.join(", ")
-            ));
-            continue;
+        if !cli.is_empty() {
+            // #267: the containment question comes FIRST, and deliberately so.
+            // A CLI loomux has evaluated and recorded (`CLI_CAPS`) but cannot
+            // let host this class deserves to be told why — "unknown cli" would
+            // be both unhelpful and, for a CLI with a row, untrue. Membership
+            // still catches everything this doesn't: `cli_can_host` returns
+            // `Ok` for a CLI it has never heard of.
+            //
+            // Refused at LOAD time so a repo learns from its own workflow file
+            // rather than from a spawn that fails hours later — the same reason
+            // the CLI name itself is validated here as well as at spawn. Only
+            // checked for an explicit `cli:`; an empty one inherits the group
+            // default, which is not known here (the launcher picks it) and is
+            // re-checked at spawn against the real value.
+            if let Err(e) = cli_can_host(&cli, kind) {
+                errs.push(format!("blocks[{i}] ({id}): {e}"));
+                continue;
+            }
+            if !SUPPORTED_CLIS.contains(&cli.as_str()) {
+                errs.push(format!(
+                    "blocks[{i}] ({id}): unknown cli {cli:?} — supported: {}",
+                    SUPPORTED_CLIS.join(", ")
+                ));
+                continue;
+            }
         }
         if rb.prompt.is_some() && rb.profile.is_some() {
             errs.push(format!(
