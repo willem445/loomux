@@ -275,6 +275,12 @@ These deserve their own detail — see:
   `audit.jsonl` as a filterable, searchable timeline: every prompt, spawn, task
   edit, delivery outcome, and state write, one row each. A **follow** button
   live-tails new lines.
+- **[Progress timeline](features/progress-timeline.html)** (`Alt+W` or the
+  timeline icon) — the same audit data plus GitHub issue/PR lifecycle, plotted
+  on a time axis instead of listed: lanes for group, agents, work, gates and
+  GitHub, a window filter (12 hours by default), and click-through to the raw
+  record. Read-only, and it states its own coverage boundaries — what it is
+  *not* showing is printed under the chart rather than left to look like quiet.
 - **Delivery queue.** If a pane is busy — an interactive question on screen, or a
   human's own line still sitting in its input box — loomux holds a prompt
   delivery rather than typing over it. A hold that never clears **queues** the

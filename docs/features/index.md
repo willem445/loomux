@@ -26,3 +26,6 @@ return to the shell.
 - **[Session browser & editor launch](session-browser.html)** — restore past agent
   sessions into a pane (`Ctrl+Shift+P`) and open a pane's folder in your editor
   (`Alt+E`).
+- **[Progress timeline](progress-timeline.html)** — a read-only time axis of an
+  orchestration group's work: agents, deliveries, reports, gates, and GitHub
+  issue/PR lifecycle, with the coverage boundaries stated out loud (`Alt+W`).

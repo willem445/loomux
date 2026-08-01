@@ -51,6 +51,7 @@ import { GitView } from "./gitview";
 import { IssuesView } from "./issuesview";
 import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
+import { TimelineView } from "./timelineview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
 import {
@@ -91,6 +92,8 @@ const TASKS_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" 
 const GIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="2.8" r="1.6"/><circle cx="4" cy="13.2" r="1.6"/><circle cx="12" cy="13.2" r="1.6"/><path d="M8 4.4v2.2M8 6.6c0 2.6-4 2.4-4 5M8 6.6c0 2.6 4 2.4 4 5"/></svg>`;
 // Issues view (Alt+I): a dot inside a circle — GitHub's open-issue glyph.
 const ISSUES_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="5.4"/><circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none"/></svg>`;
+// Progress timeline (#608): dots on an axis — the audit log's chart sibling.
+const TIMELINE_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M1.6 11.4h12.8"/><path d="M3.4 11.4v2M8 11.4v2M12.6 11.4v2"/><circle cx="4.2" cy="4" r="1.5" fill="currentColor" stroke="none"/><circle cx="8.6" cy="7.4" r="1.5" fill="currentColor" stroke="none"/><circle cx="12.2" cy="4" r="1.5" fill="currentColor" stroke="none"/></svg>`;
 // Audit viewer: a clock/history glyph for the group's audit-log timeline.
 const AUDIT_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M2.2 8a5.8 5.8 0 1 1 1.7 4.1"/><path d="M2.2 12.2V8.6H5.8"/><path d="M8 5.2V8l2 1.4"/></svg>`;
 const GROUP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="3.4" r="1.7"/><circle cx="3.4" cy="11" r="1.7"/><circle cx="12.6" cy="11" r="1.7"/><path d="M8 5.1v3M6.7 9.6 4.5 9.9M9.3 9.6l2.2.3"/></svg>`;
@@ -355,9 +358,17 @@ export interface PaneEvents {
  *  scope increase) once the multi-slot generalization made "one more
  *  dockable view" cheap to reason about — see doc/design/embedded-panels.md's
  *  "What's embeddable, and what isn't". */
-type EmbedKind = "tasks" | "git" | "issues" | "audit" | "group" | "editor";
+type EmbedKind = "tasks" | "git" | "issues" | "audit" | "group" | "editor" | "timeline";
 
-const EMBED_KINDS: readonly EmbedKind[] = ["tasks", "git", "issues", "audit", "group", "editor"];
+const EMBED_KINDS: readonly EmbedKind[] = [
+  "tasks",
+  "git",
+  "issues",
+  "audit",
+  "group",
+  "editor",
+  "timeline",
+];
 
 /** The subset of `EmbedKind`s whose embed preference is captured for a whole-
  *  session-restart restore (`Pane.capture()` / `Pane.restoreEmbeds`) — every
@@ -376,9 +387,22 @@ const EMBED_KINDS: readonly EmbedKind[] = ["tasks", "git", "issues", "audit", "g
  *  open, which commit was selected) — only the DOCK preference (side +
  *  share), identical to how a restored `group`/`tasks`/`audit` never
  *  restores ITS scroll position or filter either. */
-const RESTORABLE_EMBED_KINDS: readonly EmbedKind[] = ["tasks", "audit", "group", "git", "editor"];
+const RESTORABLE_EMBED_KINDS: readonly EmbedKind[] = [
+  "tasks",
+  "audit",
+  "group",
+  "git",
+  "editor",
+  // The progress timeline (#608) is group-scoped and gated exactly like the
+  // audit log, so it restores on the same terms — dock preference only, never
+  // its own window/category selection, the same way a restored audit log does
+  // not restore its filters.
+  "timeline",
+];
 
-function isRestorableEmbedKind(kind: EmbedKind): kind is "tasks" | "audit" | "group" | "git" | "editor" {
+function isRestorableEmbedKind(
+  kind: EmbedKind
+): kind is "tasks" | "audit" | "group" | "git" | "editor" | "timeline" {
   return (RESTORABLE_EMBED_KINDS as readonly string[]).includes(kind);
 }
 
@@ -389,6 +413,7 @@ const EMBED_TOGGLE_LABEL: Record<EmbedKind, string> = {
   git: "The git view",
   issues: "The issues view",
   audit: "The audit log",
+  timeline: "The progress timeline",
   group: "The group lifecycle panel",
   editor: "The file editor",
 };
@@ -402,6 +427,7 @@ const EMBED_TOGGLE_TITLE: Record<EmbedKind, string> = {
   git: "Git view (Alt+G)",
   issues: "GitHub issues (Alt+I)",
   audit: "Audit log (Alt+A)",
+  timeline: "Progress timeline (Alt+W)",
   group: "Group lifecycle (Alt+O)",
   editor: "File editor (Alt+F)",
 };
@@ -487,6 +513,12 @@ export class Pane implements VoiceTargetPane {
   private auditView: AuditView | null = null;
   private auditOverlay: HTMLElement | null = null;
   private auditBtn: HTMLButtonElement;
+  /** Progress timeline (#608) — the same group-scoped audit data as the audit
+   *  log plus gh issue/PR lifecycle, on a time axis. Same overlay mechanics
+   *  as every other embeddable view; nothing here resizes the terminal. */
+  private timelineView: TimelineView | null = null;
+  private timelineOverlay: HTMLElement | null = null;
+  private timelineBtn: HTMLButtonElement;
   /** Group lifecycle panel (orchestrator panes only), same mechanics. */
   private groupView: GroupView | null = null;
   private groupOverlay: HTMLElement | null = null;
@@ -796,6 +828,17 @@ export class Pane implements VoiceTargetPane {
       this.toggleAuditView();
     });
     header.appendChild(this.auditBtn);
+
+    this.timelineBtn = document.createElement("button");
+    this.timelineBtn.className = "pane-btn";
+    this.timelineBtn.innerHTML = TIMELINE_ICON;
+    this.timelineBtn.title = EMBED_TOGGLE_TITLE.timeline;
+    this.timelineBtn.hidden = true; // shown for orchestration panes in start()
+    this.timelineBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.toggleTimelineView();
+    });
+    header.appendChild(this.timelineBtn);
 
     this.groupBtn = document.createElement("button");
     this.groupBtn.className = "pane-btn";
@@ -1112,6 +1155,9 @@ export class Pane implements VoiceTargetPane {
       // The audit log is per-group and read-only, so it's useful from any
       // agent pane in the group, not just the orchestrator's.
       this.auditBtn.hidden = false;
+      // The progress timeline reads the same per-group log (plus gh), and is
+      // read-only in exactly the same sense — gated identically (#608).
+      this.timelineBtn.hidden = false;
       // Group lifecycle controls (pause / end orchestration) live on the
       // orchestrator's pane, alongside the task board.
       this.groupBtn.hidden = opts.orchRole !== "orchestrator";
@@ -2647,6 +2693,8 @@ export class Pane implements VoiceTargetPane {
         return this.tasksBtn;
       case "audit":
         return this.auditBtn;
+      case "timeline":
+        return this.timelineBtn;
       case "group":
         return this.groupBtn;
       case "git":
@@ -2823,6 +2871,10 @@ export class Pane implements VoiceTargetPane {
           if (this.auditBtn.hidden) continue;
           this.ensureAuditView();
           break;
+        case "timeline":
+          if (this.timelineBtn.hidden) continue;
+          this.ensureTimelineView();
+          break;
         case "group":
           if (this.groupBtn.hidden) continue;
           this.ensureGroupView();
@@ -2878,6 +2930,48 @@ export class Pane implements VoiceTargetPane {
       viewEl: this.auditView.el,
       show: () => this.auditView!.show(),
       setPanelActive: (active) => this.auditView!.setPanelActive(active),
+      floorPx: () => EMBED_MIN_PANEL_PX,
+    });
+  }
+
+  /** Toggle the progress-timeline overlay (#608, any orchestration pane).
+   *  Same no-resize overlay mechanics as the audit log it sits beside: it
+   *  floats over the terminal, and docking it goes through the shared #361
+   *  embed path — no ConPTY resize is introduced by this view. */
+  toggleTimelineView(): void {
+    if (!this.orchGroup || this.timelineBtn.hidden) return;
+    this.ensureTimelineView();
+    this.toggleView("timeline");
+  }
+
+  /** Lazily construct the progress timeline and register it into
+   *  `embedRegistry` (#361). */
+  private ensureTimelineView(): void {
+    if (this.timelineView) return;
+    this.timelineView = new TimelineView(this.orchGroup!, {
+      onClose: () => this.toggleTimelineView(),
+      onEmbedMenu: (anchor) => this.showEmbedMenu("timeline", anchor),
+      // Read live, not snapshotted at open time — the same contract the group
+      // panel's workflow preview uses (#316). An orchestrator pane's cwd IS
+      // the group's repo.
+      getRepo: () => this.cwdRaw,
+    });
+    this.timelineOverlay = document.createElement("div");
+    this.timelineOverlay.className = "git-overlay";
+    this.timelineOverlay.hidden = true;
+    this.timelineOverlay.append(
+      this.timelineView.el,
+      this.makeOverlayDivider(() => this.timelineOverlay!)
+    );
+    this.el.appendChild(this.timelineOverlay);
+    this.embedRegistry.set("timeline", {
+      overlayEl: this.timelineOverlay,
+      viewEl: this.timelineView.el,
+      show: () => this.timelineView!.show(),
+      // Stops the follow poll on close/eviction — the leak #361 rev-38 found
+      // on the group panel, which every polling view has to answer for.
+      hide: () => this.timelineView!.hide(),
+      setPanelActive: (active) => this.timelineView!.setPanelActive(active),
       floorPx: () => EMBED_MIN_PANEL_PX,
     });
   }
@@ -3230,6 +3324,7 @@ export class Pane implements VoiceTargetPane {
     if (this.issuesOverlay && !this.issuesOverlay.hidden) return this.issuesOverlay;
     if (this.tasksOverlay && !this.tasksOverlay.hidden) return this.tasksOverlay;
     if (this.auditOverlay && !this.auditOverlay.hidden) return this.auditOverlay;
+    if (this.timelineOverlay && !this.timelineOverlay.hidden) return this.timelineOverlay;
     if (this.groupOverlay && !this.groupOverlay.hidden) return this.groupOverlay;
     if (this.fileEditOverlay && !this.fileEditOverlay.hidden) return this.fileEditOverlay;
     return null;
@@ -3921,6 +4016,7 @@ export class Pane implements VoiceTargetPane {
     this.issuesView?.dispose();
     this.tasksView?.dispose();
     this.auditView?.dispose();
+    this.timelineView?.dispose();
     this.groupView?.dispose();
     this.fileEditView?.dispose();
     // The surfaces a CONTENT pane hosts (#214, #217). Exactly one is ever non-null.

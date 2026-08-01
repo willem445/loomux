@@ -47,10 +47,15 @@ edge. So:
   possible dividers alike — see *Divider mechanics* below for exactly what
   that means, because "one resize on release" turns out not to be it.
 - **A docked panel's own internal changes never reach the PTY — with one
-  narrow, bounded, and named exception.** For five of the six views (task
-  board, git, issues, audit, the file editor), refreshing a list, expanding
-  a row, typing in a filter — none of it changes the panel's MINIMUM size,
-  so none of it touches `termEl`. Verified per view below, not assumed.
+  narrow, bounded, and named exception.** For six of the seven views (task
+  board, git, issues, audit, the file editor, the progress timeline),
+  refreshing a list, expanding a row, typing in a filter — none of it
+  changes the panel's MINIMUM size, so none of it touches `termEl`.
+  Verified per view below, not assumed. (The timeline is the one whose
+  content is geometry-dependent, and it still holds: it re-lays its chart
+  out INSIDE whatever box it is given, and its floor is the generic
+  `EMBED_MIN_PANEL_PX` — the chart shrinks, the panel's minimum does not
+  move, so the terminal never hears about it. #608.)
   **The group panel
   is the one view whose own fixed chrome can genuinely grow after it opens**
   (the suspended-budget banner appearing) — `reclampViewFloor`, generalized
@@ -275,7 +280,7 @@ rather than an overlay?). That is a *different concept* from this feature
 (a view sharing space with a terminal that's still right there), and the
 two are easy to conflate on the same class. So every embeddable view's
 runtime toggle method is named **`setPanelActive(active: boolean)`**, not
-`setEmbedded` — applied uniformly to all six views (including `TasksView`
+`setEmbedded` — applied uniformly to all seven views (including `TasksView`
 and `FileEditView`, neither of which has a collision of its own, for one
 consistent interface across the set) so a reader never has to remember
 which view's method means what. `FileEditView` in particular already had
@@ -285,15 +290,30 @@ trap `GitView` hit, avoided the same way.
 
 ## What's embeddable, and what isn't
 
-**Six** views are embeddable: the **task board**, **git**, **GitHub
+**Seven** views are embeddable: the **task board**, **git**, **GitHub
 issues**, the **audit log**, the **group lifecycle panel** ("lifecycle
-status" in the issue — the panel behind `GroupView`'s overlay toggle), and
-the **file editor** overlay (`Alt+F`). All six are wired through one
-generic engine in `pane.ts` (`EmbedKind`, `EmbedEntry`, `embedRegistry`,
+status" in the issue — the panel behind `GroupView`'s overlay toggle), the
+**file editor** overlay (`Alt+F`), and the **progress timeline** (`Alt+W`,
+#608). All seven are wired through one generic engine in `pane.ts`
+(`EmbedKind`, `EmbedEntry`, `embedRegistry`,
 `openView`/`closeView`/`toggleView`/`embedViewAtSide`/`unembedView`) — see
-*The generic engine*, below. Any THREE of the six may be docked at once,
+*The generic engine*, below. Any THREE of the seven may be docked at once,
 one per edge; the rest (however many aren't docked) stay available as
 floating overlays.
+
+**The progress timeline (#608) is the cheap case this note predicted.** It
+needed no engine change at all: one `EmbedKind`, one `ensureTimelineView`
+registering an `EmbedEntry`, and the generic open/close/toggle/dock paths
+carried it. It is gated exactly like the audit log (every orchestration
+pane, not orchestrator-only — the data is the group's and the view is
+read-only), and it is restorable on the same terms as `audit`: the DOCK
+preference survives a restart, its window preset and category chips do not,
+the same way a restored audit log does not restore its filters. The one
+thing worth noting for a future view: it is the first embeddable view whose
+CONTENT is geometry-dependent, so it observes **its own container's** width
+(a `ResizeObserver` on the chart div) and re-lays out from that. It never
+reads the terminal's box, which is what keeps the PTY-resize boundary above
+untouched — see `doc/design/progress-timeline.md`.
 
 **Git was part of the generic engine from the same round that generalized
 past the task board** — it needed nothing new for this round beyond
@@ -1055,8 +1075,8 @@ lifecycle panel):**
     git/issues/file-editor there (`refuseOverlay`, unchanged) — there is no
     terminal on a content pane to share space with.
 
-**Restart survival (`tasks`/`audit`/`group`/`git`/`editor`, on an
-ORCHESTRATOR pane specifically — not `issues`, and not any of the five on a
+**Restart survival (`tasks`/`audit`/`group`/`git`/`editor`/`timeline`, on an
+ORCHESTRATOR pane specifically — not `issues`, and not any of the six on a
 plain terminal/agent pane):**
 
 12. Dock the task board left and the group panel bottom, quit and relaunch
@@ -1094,7 +1114,7 @@ plain terminal/agent pane):**
 
 **Overlay toggle vs. dock (#361 user-demo finding):**
 
-16. Dock a view (any of the six) to any edge and leave it open. Click the
+16. Dock a view (any of the seven) to any edge and leave it open. Click the
     PANE HEADER's own toggle button for that view (not its embed button —
     the plain header icon, e.g. the git/task-board/audit/group/issues/
     file-editor button) — nothing should happen: no black/empty area where

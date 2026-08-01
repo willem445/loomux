@@ -657,11 +657,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .pane-embed-panel.resizing .issues-list,
 .pane-embed-panel.resizing .group-list,
 .pane-embed-panel.resizing .fileedit-tree,
+.pane-embed-panel.resizing .timeline-body,
 .git-overlay.resizing .audit-list,
 .git-overlay.resizing .tasks-list,
 .git-overlay.resizing .issues-list,
 .git-overlay.resizing .group-list,
-.git-overlay.resizing .fileedit-tree {
+.git-overlay.resizing .fileedit-tree,
+.git-overlay.resizing .timeline-body {
   content-visibility: hidden;
 }
 
@@ -2180,6 +2182,126 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
   padding: 6px 10px; text-align: center;
   color: var(--text-dim); font-size: 10.5px; font-style: italic;
   border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+/* ---------- progress timeline overlay (#608) ----------
+   Chrome only: every geometry decision (x scale, lanes, ticks, clustering)
+   is computed in timelinelayout.ts and written onto the SVG as attributes, so
+   nothing here can move a dot. The lane colors below are the ONE place the
+   category palette lives — the chips and the dots read the same class. */
+.timeline-view {
+  flex: 1; min-height: 0; position: relative;
+  display: flex; flex-direction: column;
+  background: var(--bg-app); font-size: 12px;
+}
+.timeline-head {
+  display: flex; align-items: center; gap: 9px; flex: none;
+  height: 30px; padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.timeline-head .pane-btn { opacity: 1; }
+.timeline-title { font-weight: 600; font-size: 12px; flex: none; }
+.timeline-group {
+  flex: 1; min-width: 0; color: var(--text-dim); font-size: 10.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.timeline-count { flex: none; color: var(--text-dim); font-size: 10px; }
+.timeline-follow {
+  flex: none; font: inherit; font-size: 10.5px; cursor: pointer;
+  background: var(--panel-2); color: var(--text-dim);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 2px 8px;
+}
+.timeline-follow:hover { color: var(--text); }
+.timeline-follow.on { background: rgba(158, 206, 106, 0.16); color: #b4e878; border-color: #3f5a2e; }
+
+.timeline-controls {
+  display: flex; align-items: center; gap: 12px; flex: none; flex-wrap: wrap;
+  padding: 6px 10px; border-bottom: 1px solid var(--border-soft);
+}
+.timeline-windows, .timeline-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.timeline-chip {
+  font: inherit; font-size: 10.5px; cursor: pointer;
+  background: var(--panel-2); color: var(--text-dim);
+  border: 1px solid var(--border-soft); border-radius: 10px; padding: 1px 9px;
+}
+.timeline-chip:hover { color: var(--text); }
+.timeline-chip.window.on { background: var(--accent-glow); color: var(--accent); border-color: var(--accent-dim); }
+/* An OFF category chip stays legible: the human has to be able to read what
+   they are missing, which is the same reason the lane notes exist. */
+.timeline-chip.cat.on { color: var(--text); border-color: currentColor; }
+.timeline-chip.cat.on::before {
+  content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  margin-right: 5px; vertical-align: middle; background: currentColor;
+}
+
+.timeline-body { flex: 1; overflow-y: auto; padding: 8px 0 10px; }
+.timeline-body::-webkit-scrollbar { width: 9px; }
+.timeline-body::-webkit-scrollbar-thumb {
+  background: #262634; border-radius: 5px;
+  border: 2px solid var(--bg-app); background-clip: padding-box;
+}
+.timeline-chart { padding: 0 4px; }
+.timeline-svg { display: block; }
+.timeline-empty { padding: 18px 16px; color: var(--text-dim); line-height: 1.5; }
+
+.timeline-tick { stroke: rgba(255, 255, 255, 0.05); stroke-width: 1; }
+.timeline-tick-label { fill: var(--text-dim); font-size: 9.5px; }
+.timeline-lane-rule { stroke: rgba(255, 255, 255, 0.045); stroke-width: 1; }
+.timeline-lane-label { fill: var(--text-dim); font-size: 10.5px; }
+.timeline-dot-g { cursor: pointer; }
+.timeline-dot { stroke: var(--bg-app); stroke-width: 1; }
+.timeline-dot.selected { stroke: var(--text); stroke-width: 1.6; }
+.timeline-dot-g:hover .timeline-dot { stroke: var(--text); }
+.timeline-dot-count { fill: var(--bg-app); font-size: 8px; font-weight: 600; pointer-events: none; }
+
+/* The category palette — one hue per lane, shared by the chip and its dots. */
+.timeline-lane-label.cat-group,  .timeline-chip.cat-group.on  { color: #bb9af7; fill: #bb9af7; }
+.timeline-lane-label.cat-agents, .timeline-chip.cat-agents.on { color: #7aa2f7; fill: #7aa2f7; }
+.timeline-lane-label.cat-work,   .timeline-chip.cat-work.on   { color: #7dcfff; fill: #7dcfff; }
+.timeline-lane-label.cat-gates,  .timeline-chip.cat-gates.on  { color: #e0af68; fill: #e0af68; }
+.timeline-lane-label.cat-github, .timeline-chip.cat-github.on { color: #9ece6a; fill: #9ece6a; }
+.timeline-lane-label.cat-ops,    .timeline-chip.cat-ops.on    { color: #7d8496; fill: #7d8496; }
+.timeline-dot.cat-group  { fill: #bb9af7; }
+.timeline-dot.cat-agents { fill: #7aa2f7; }
+.timeline-dot.cat-work   { fill: #7dcfff; }
+.timeline-dot.cat-gates  { fill: #e0af68; }
+.timeline-dot.cat-github { fill: #9ece6a; }
+.timeline-dot.cat-ops    { fill: #7d8496; }
+
+/* Coverage honesty. These sentences are the feature's own guard against a
+   chart that looks complete when it isn't — styled as content, not as a
+   dismissible warning. */
+.timeline-notes { padding: 6px 12px 0; display: flex; flex-direction: column; gap: 3px; }
+.timeline-note {
+  color: var(--text-dim); font-size: 10.5px; line-height: 1.45;
+  padding-left: 12px; position: relative; user-select: text;
+}
+.timeline-note::before { content: "·"; position: absolute; left: 3px; }
+.timeline-note.note-gh-unavailable { color: #e0af68; }
+
+.timeline-detail { padding: 8px 12px 0; }
+.timeline-detail-head {
+  display: flex; align-items: center; gap: 8px;
+  padding-bottom: 4px; border-bottom: 1px solid var(--border-soft);
+}
+.timeline-detail-title { flex: 1; min-width: 0; font-size: 11px; color: var(--text); }
+.timeline-detail-row { border-bottom: 1px solid rgba(255, 255, 255, 0.03); }
+.timeline-detail-top {
+  display: flex; gap: 7px; align-items: baseline; padding: 3px 0; cursor: pointer;
+}
+.timeline-detail-top:hover { background: rgba(255, 255, 255, 0.02); }
+.timeline-detail-caret { flex: none; color: var(--text-dim); font-size: 9px; width: 9px; }
+.timeline-detail-time { flex: none; color: var(--text-dim); font-size: 10px; }
+.timeline-detail-kind { flex: none; color: var(--accent); font-size: 10px; }
+.timeline-detail-label { flex: 1; min-width: 0; color: var(--text); user-select: text; }
+.timeline-detail-source { flex: none; color: var(--text-dim); font-size: 9.5px; font-style: italic; }
+.timeline-detail-raw {
+  margin: 2px 0 6px 16px; padding: 6px 8px; max-height: 240px; overflow: auto;
+  background: var(--panel); border-radius: 5px;
+  color: var(--text-dim); font-size: 10.5px; white-space: pre-wrap; user-select: text;
+}
+.timeline-detail-more {
+  padding: 5px 0; color: var(--text-dim); font-size: 10.5px; font-style: italic;
 }
 
 .audit-row { padding: 1px 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.03); }

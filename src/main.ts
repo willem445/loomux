@@ -2067,6 +2067,9 @@ document.addEventListener(
       case "toggle-audit":
         activeGrid().activePane?.toggleAuditView();
         break;
+      case "toggle-timeline":
+        activeGrid().activePane?.toggleTimelineView();
+        break;
       case "toggle-group":
         activeGrid().activePane?.toggleGroupView();
         break;

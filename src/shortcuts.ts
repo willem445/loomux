@@ -19,6 +19,7 @@ export type ShortcutAction =
   | "open-editor"
   | "toggle-tasks"
   | "toggle-audit"
+  | "toggle-timeline"
   | "toggle-group"
   | "focus-compose"
   | "voice-ptt"
@@ -77,6 +78,14 @@ export function matchShortcut(e: KeyboardEvent): ShortcutAction | null {
       case "KeyE": return "open-editor";
       case "KeyT": return "toggle-tasks";
       case "KeyA": return "toggle-audit";
+      // Alt+W (#608) — the progress timeline, the audit log's chart sibling.
+      // Verified free before landing, per the agent-cli-reference discipline:
+      // Claude Code's interactive-mode reference documents Alt+V/M/P/T/O/Y/B/F
+      // and no Alt+W; Copilot CLI's command reference documents Alt+Enter,
+      // Alt+arrows and Alt+scroll and no Alt+W. Readline in this repo's bash
+      // leaves `\ew` unbound (`\eW` is only do-lowercase-version), and Alt+W
+      // is not a WebView2 accelerator the way Ctrl+W is.
+      case "KeyW": return "toggle-timeline";
       case "KeyO": return "toggle-group";
       case "KeyP": return "focus-compose";
       // Alt+S (voice / "speak"). NOT Alt+V: that's Claude Code's paste-image
