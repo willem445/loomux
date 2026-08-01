@@ -369,6 +369,22 @@ so far:
   properties that change how it should be handled — it needs no acknowledgement, and it
   **drains once**, so it will not be repeated on the next call.
 
+- **#622, a planner's build command is un-allowed, not denied** — `planner.md` only. The
+  correction to the half #610 left standing. The template said a build/typecheck command is
+  *"denied outright, permanently, with no per-repo way to widen it"*, which is false by the
+  same merge-across-scopes rule that makes the escape hatch beside it work: loomux emits no
+  general `Bash` denial (`CLAUDE_EDIT_DENY_TOOLS` is `Edit`/`Write`/`NotebookEdit`,
+  `CLAUDE_READONLY_DENY_GIT` is `git commit`/`git push`), so a repo-level
+  `permissions.allow` merges in and grants it. The error was conservative — it understated
+  what a user controls rather than overstating containment — which is why it shipped and why
+  it is worth fixing now rather than never: a planner told a capability is impossible will
+  not look for it, and a user who wanted their planner to typecheck was told not to try. What
+  the template says now separates the two directions: what loomux *denies* can never be
+  allowed back, what it merely never allowed the repository's own `.claude/settings.json` may
+  have granted, and assume it didn't unless you see it there. `docs/orchestration.md` carries
+  the same correction for the human-facing side; the other three templates never made the
+  claim.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
