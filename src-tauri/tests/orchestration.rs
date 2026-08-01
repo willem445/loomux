@@ -23937,6 +23937,36 @@ fn session_digest_requires_exactly_one_identifier() {
     assert!(both["content"][0]["text"].as_str().unwrap().contains("exactly one"));
 }
 
+/// A wrongly-TYPED identifier must say so, not report itself as a missing one
+/// (#642's `arg_bool`/`arg_str_array` rule, applied to this arm on rebase).
+/// `pr` is the realistic case: the tool's own description invites "PR number,
+/// #n, or URL", so a bare JSON number is the natural thing to send — and
+/// through plain `arg_str` it reads as absent, answering a call that DID pass
+/// exactly one identifier with "exactly one … is required". That message
+/// sends the caller hunting for a bug in its call shape instead of its arg
+/// type, which is the silent-skip failure #582 legislated against.
+#[test]
+fn session_digest_rejects_a_wrongly_typed_identifier_instead_of_reading_it_as_absent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails_with_process_block()).unwrap();
+    let cp = process_caller(&reg, &g.id);
+
+    let numeric = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "pr": 646 } })).unwrap();
+    assert_eq!(numeric["isError"], true);
+    let msg = numeric["content"][0]["text"].as_str().unwrap();
+    assert!(msg.contains("pr must be a string"), "must name the type problem, got: {msg}");
+    assert!(!msg.contains("exactly one"), "must NOT report a supplied identifier as missing: {msg}");
+
+    // Explicit null keeps meaning "not supplied" — otherwise a caller that
+    // spells an absent optional as `null` could never call this tool at all.
+    let nulls = dispatch(&reg, &cp, "tools/call",
+        &json!({ "name": "session_digest", "arguments": { "task": "t-1", "agent": null, "pr": null } })).unwrap();
+    let nulls_msg = nulls["content"][0]["text"].as_str().unwrap();
+    assert!(!nulls_msg.contains("must be a string"), "null is absent, not a type error: {nulls_msg}");
+    assert!(!nulls_msg.contains("exactly one"), "one identifier WAS supplied: {nulls_msg}");
+}
+
 /// Review finding NB4: `Task.session` is agent-settable via `upsert_task`,
 /// and it reaches a filesystem path join — a `..`/separator-laden value must
 /// be rejected before that join, end to end through the real MCP tool, not
