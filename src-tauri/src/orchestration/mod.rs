@@ -7278,6 +7278,20 @@ pub struct OrchRegistry {
     /// this map is empty in the ordinary case and cannot grow without a
     /// pending timer that will drain it.
     unconfirmed_pending: Arc<Mutex<HashMap<(String, String, bool), Vec<u64>>>>,
+    /// #578: queue notices `notify_queue` could not deliver because the
+    /// TARGET was the group's own orchestrator, parked per group until that
+    /// orchestrator's next MCP tool call carries them back
+    /// ([`OrchRegistry::take_orchestrator_notices`]).
+    ///
+    /// **Keyed by group, not by agent**, because the notice's reader is
+    /// whoever `deliver_to_orchestrator` would have delivered it to — the
+    /// group's live orchestrator — and that is a role, not a fixed id.
+    ///
+    /// In memory only, and deliberately so: this is a relay for the *next
+    /// turn*, not a durable record. The durable record is the
+    /// `notice-suppressed` audit line, which since #578 carries the notice
+    /// text — so a loomux restart loses the relay and not the information.
+    orch_notice_inbox: Arc<Mutex<HashMap<String, OrchNoticeInbox>>>,
 
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
@@ -14989,6 +15003,26 @@ pub enum HoldChannel {
     /// classifications whose only channel was this one were, on that pane,
     /// silent.
     OrchestratorNotice,
+    /// #578: the notice [`HoldChannel::OrchestratorNotice`] could NOT deliver
+    /// to an orchestrator target, parked by `notify_queue` and handed back on
+    /// that orchestrator's next MCP tool result
+    /// (`OrchRegistry::take_orchestrator_notices`).
+    ///
+    /// **Why this one survives an orchestrator target.** It is not a delivery.
+    /// It consumes no slot in the target pane's queue and types nothing into
+    /// the pane, so it cannot queue behind the very block it reports — the
+    /// loop that makes the in-band notice structurally undeliverable here.
+    /// It rides back on a call the orchestrator itself made, which is also the
+    /// proof that the orchestrator is running and reading at that instant.
+    ///
+    /// **A pull, not a push, and listed ALONGSIDE the badge rather than
+    /// instead of it.** An orchestrator that never calls another tool never
+    /// reads its inbox: this channel reaches the orchestrator *agent* on its
+    /// next turn, while the badge/chip reach the *human* regardless. The two
+    /// cover different failures (a wedged human-facing UI vs. an unattended
+    /// overnight run with nobody at the window) and neither subsumes the
+    /// other.
+    OrchestratorInbox,
     /// A synchronous `Err` returned to the agent that called the MCP tool
     /// (`queue::queue_full_error`). Reaches the *sender*, never the human and
     /// never the held pane's own agent.
@@ -15002,8 +15036,21 @@ impl HoldChannel {
     /// Whether this channel still reaches a human when the held pane IS the
     /// group's own orchestrator — the #563 case, and the property the
     /// completeness test asserts.
+    ///
+    /// Matched exhaustively rather than written as a `!matches!` negation
+    /// (#578): a channel added later must state its own answer here instead
+    /// of defaulting to "survives", which is the optimistic half of the
+    /// answer and the one that would make the completeness test pass by
+    /// accident.
     pub fn survives_orchestrator_target(self) -> bool {
-        !matches!(self, HoldChannel::OrchestratorNotice)
+        match self {
+            HoldChannel::OrchestratorNotice => false,
+            HoldChannel::HeldChip
+            | HoldChannel::AttentionBadge
+            | HoldChannel::OrchestratorInbox
+            | HoldChannel::CallerError
+            | HoldChannel::PausedGroupUi => true,
+        }
     }
 }
 
@@ -15014,6 +15061,15 @@ impl HoldChannel {
 /// is backed by a call site, and the arms that changed in #563
 /// (`QueuePoll*`, `QueueNearFull`, `QueueFull`) changed because the call sites
 /// did.
+///
+/// **#578 and the [`HoldChannel::OrchestratorInbox`] arms.** The inbox is a
+/// property of `notify_queue` specifically — it is that function's suppressed
+/// branch, parked instead of discarded — so it is listed on exactly the
+/// classifications whose notice goes through `notify_queue`, and nowhere else.
+/// [`HoldClass::GroupPaused`] is the one that looks like it should have it and
+/// must not: its `OrchestratorNotice` is `announce_pause_suppression` at
+/// resume, a different call on a different path, and listing an inbox it never
+/// parks into would make this table say something untrue.
 pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
     match class {
         // `deliver_now`'s in-attempt holds all badge via `emit_held`.
@@ -15028,7 +15084,7 @@ pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
         // the front of the queue and the drainer's poll — which now chips
         // immediately — is the next thing to look at it.
         HoldClass::PrePasteRecheckExhausted | HoldClass::PreEnterBoxOccupied => {
-            &[HoldChannel::HeldChip, HoldChannel::OrchestratorNotice]
+            &[HoldChannel::HeldChip, HoldChannel::OrchestratorNotice, HoldChannel::OrchestratorInbox]
         }
         // #563's fix: the poll hold chips from the first blocked tick and
         // escalates to a badge at `QUESTION_HOLD_STALE_AFTER`.
@@ -15037,12 +15093,18 @@ pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
         }
         HoldClass::QueueStaleEscalation => &[HoldChannel::AttentionBadge, HoldChannel::HeldChip],
         // #563's fix: a badge (orchestrator-safe) alongside the notice.
-        HoldClass::QueueNearFull => {
-            &[HoldChannel::AttentionBadge, HoldChannel::OrchestratorNotice]
-        }
+        // #578 adds the inbox: the badge tells a human who is looking, the
+        // inbox tells the orchestrator agent on its next turn — which is the
+        // only one of the two that fires on an unattended overnight run.
+        HoldClass::QueueNearFull => &[
+            HoldChannel::AttentionBadge,
+            HoldChannel::OrchestratorNotice,
+            HoldChannel::OrchestratorInbox,
+        ],
         HoldClass::QueueFull => &[
             HoldChannel::AttentionBadge,
             HoldChannel::OrchestratorNotice,
+            HoldChannel::OrchestratorInbox,
             HoldChannel::CallerError,
         ],
         // #569, and re-stated for option 2 (enqueue-while-paused), which
@@ -15073,6 +15135,94 @@ pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
             HoldChannel::AttentionBadge,
         ],
     }
+}
+
+/// #578: how many parked notices one group's orchestrator inbox holds before
+/// the oldest start being elided.
+///
+/// Sized for a burst, not a backlog. The inbox drains on the orchestrator's
+/// very next MCP tool call, so a group that is past this number has an
+/// orchestrator that has not called a tool in a long time — at which point the
+/// twentieth "your queue is backed up" tells a reader nothing the first one
+/// did, and every one of them is in `audit.jsonl` verbatim regardless. Bounded
+/// because this map is written by loomux's own delivery paths and read by an
+/// agent whose context is the scarce resource: an unbounded relay would be a
+/// memory leak at one end and a context bomb at the other.
+pub const ORCH_NOTICE_INBOX_MAX: usize = 20;
+
+/// #578: how much of a suppressed notice's text the `notice-suppressed` audit
+/// line carries. Matches the `tool-result` line's own cap — the notices are
+/// one-liners, and the cap exists so a future caller passing something large
+/// cannot bloat the log.
+const NOTICE_AUDIT_TEXT_CAP: usize = 500;
+
+/// #578: one group's parked orchestrator-target queue notices — the durable
+/// half of [`HoldChannel::OrchestratorInbox`].
+#[derive(Default, Debug, Clone)]
+pub struct OrchNoticeInbox {
+    /// Oldest first, capped at [`ORCH_NOTICE_INBOX_MAX`].
+    pub notices: Vec<String>,
+    /// How many the cap pushed out. **Counted, not forgotten**: a relay that
+    /// silently held back N notices would read as complete while being
+    /// short — the exact "looks complete, isn't" defect the whole
+    /// #445/#467/#563 lineage exists to eliminate.
+    pub elided: usize,
+}
+
+impl OrchNoticeInbox {
+    /// Park one notice, evicting the oldest (and counting it) past the cap.
+    /// Oldest-first eviction on purpose: the newest notice is the one whose
+    /// claim is still true — a `dropped_notice` from ten minutes ago has been
+    /// superseded by whatever the queue did since.
+    pub fn park(&mut self, text: &str) {
+        self.notices.push(text.to_string());
+        if self.notices.len() > ORCH_NOTICE_INBOX_MAX {
+            let overflow = self.notices.len() - ORCH_NOTICE_INBOX_MAX;
+            self.notices.drain(..overflow);
+            self.elided += overflow;
+        }
+    }
+}
+
+/// #578: render a group's parked notices as the extra MCP content block an
+/// orchestrator's next tool result carries back. `None` when there is nothing
+/// to say — the ordinary case, and the one that must add not a single byte to
+/// a tool result.
+///
+/// Pure so the copy is testable without a dispatch harness, the way every
+/// other notice string in this codebase is.
+///
+/// **The wording has one job beyond informing.** It must stop the orchestrator
+/// from "helpfully" re-sending anything: the payloads these notices describe
+/// are either already queued and delivering (`queued_notice`) or already gone
+/// (`dropped_notice`), and a re-send is a duplicate in the first case and a
+/// guess in the second. It also says plainly that this is its OWN pane, since
+/// every other `[loomux]` notice an orchestrator reads is about somebody else.
+pub fn orch_notice_relay_text(notices: &[String], elided: usize) -> Option<String> {
+    if notices.is_empty() {
+        return None;
+    }
+    let n = notices.len();
+    let mut out = format!(
+        "[loomux] {n} queue notice{s} about YOUR OWN pane could not be delivered to you as a \
+         prompt — a delivery announcing your pane's blocked delivery would queue behind the very \
+         block it reports (#578). Relayed here instead, riding back on a call you just made. \
+         Nothing needs acknowledging and nothing needs re-sending:",
+        s = if n == 1 { "" } else { "s" }
+    );
+    for t in notices {
+        out.push_str("\n  - ");
+        out.push_str(t);
+    }
+    if elided > 0 {
+        out.push_str(&format!(
+            "\n  ... plus {elided} earlier notice{s} elided (this relay holds \
+             {ORCH_NOTICE_INBOX_MAX}) — every one of them is in this group's audit.jsonl as a \
+             `notice-suppressed` line.",
+            s = if elided == 1 { "" } else { "s" }
+        ));
+    }
+    Some(out)
 }
 
 /// Human-readable "what's held and why" line for a delivery-held badge/toast
@@ -15363,6 +15513,7 @@ impl OrchRegistry {
             hold_episodes: Arc::new(Mutex::new(HashMap::new())),
             queue_pressure: Arc::new(Mutex::new(HashMap::new())),
             unconfirmed_pending: Arc::new(Mutex::new(HashMap::new())),
+            orch_notice_inbox: Arc::new(Mutex::new(HashMap::new())),
             tasks_lock: Mutex::new(()),
             creation: Mutex::new(()),
             pr_head_override: Mutex::new(None),
@@ -28401,19 +28552,66 @@ impl OrchRegistry {
     /// paused group, and every suppression leaves a `notice-suppressed`
     /// audit line so it's discoverable after the fact instead of silently
     /// vanishing (the routed #451 finding this issue also owns).
+    ///
+    /// **#578: suppressed as a delivery is no longer discarded as
+    /// information.** The orchestrator-target branch parks the notice in
+    /// [`OrchRegistry::orch_notice_inbox`] and the text goes into the audit
+    /// line, so the same fact reaches the orchestrator on its next MCP tool
+    /// result ([`HoldChannel::OrchestratorInbox`]) without anything ever
+    /// being typed into the blocked pane. The suppression itself is
+    /// unchanged — that is the point: the loop the early return prevents is
+    /// real, and the fix is a channel that is not a delivery, not a relaxed
+    /// gate.
     #[doc(hidden)] // pub for integration tests
     pub fn notify_queue(&self, group: &str, agent_id: &str, target_is_orchestrator: bool, text: &str) {
         if target_is_orchestrator {
+            self.orch_notice_inbox
+                .lock_safe()
+                .entry(group.to_string())
+                .or_default()
+                .park(text);
             self.audit(group, "loomux", "notice-suppressed",
-                json!({ "kind": "queue", "to": agent_id, "reason": "target-is-orchestrator" }));
+                json!({
+                    "kind": "queue", "to": agent_id, "reason": "target-is-orchestrator",
+                    // #578: the two fields that make this line a RECORD of the
+                    // notice rather than a record that one existed — the relay
+                    // is in memory, so after a restart this is all there is.
+                    "parked": true,
+                    "text": text.chars().take(NOTICE_AUDIT_TEXT_CAP).collect::<String>(),
+                }));
             return;
         }
         if self.is_paused(group) {
+            // Deliberately NOT parked (#578). What a pause suppresses is
+            // already #569's territory: `announce_pause_suppression` reports
+            // it at resume, and parking here would relay the same suppression
+            // a second time through a second channel — two reports of one
+            // fact, which is how an orchestrator ends up double-handling.
             self.audit(group, "loomux", "notice-suppressed",
                 json!({ "kind": "queue", "to": agent_id, "reason": "group-paused" }));
             return;
         }
         let _ = self.deliver_to_orchestrator(group, text, "loomux");
+    }
+
+    /// #578: drain `group`'s parked orchestrator-target queue notices as the
+    /// text of an extra MCP content block, or `None` when there is nothing
+    /// parked (the ordinary case).
+    ///
+    /// **Drains, and drains once.** The entry is removed under the lock, so
+    /// two concurrent `tools/call`s cannot both relay the same notice and a
+    /// relayed notice cannot repeat on the next call. Losing the relay if the
+    /// caller then fails is acceptable and audited: `notice-relayed` is
+    /// written here, and every constituent notice is already in the log as a
+    /// `notice-suppressed` line carrying its own text.
+    #[doc(hidden)] // pub for integration tests
+    pub fn take_orchestrator_notices(&self, group: &str) -> Option<String> {
+        let inbox = self.orch_notice_inbox.lock_safe().remove(group)?;
+        let text = orch_notice_relay_text(&inbox.notices, inbox.elided)?;
+        self.audit(group, "loomux", "notice-relayed", json!({
+            "kind": "queue", "count": inbox.notices.len(), "elided": inbox.elided,
+        }));
+        Some(text)
     }
 
     /// #563: re-read `pty_id`'s queue depth and, if its capacity state has

@@ -57,6 +57,8 @@ use loomux_lib::orchestration::{
     // #560: the per-pane hold EPISODE that owns the escalation clock.
     ends_hold_episode, opens_hold_episode, HoldObservation,
     hold_channels, HoldChannel, HoldClass,
+    // #578: the orchestrator-target notice relay.
+    orch_notice_relay_text, OrchNoticeInbox, ORCH_NOTICE_INBOX_MAX,
     pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
     PauseSuppression, SuppressedCause, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
     record_aborted_preenter_outcome, recorded_confirmed,
@@ -19327,6 +19329,115 @@ fn a_paused_groups_queue_notice_is_suppressed_but_never_parked() {
         r["content"].as_array().unwrap().len(), 1,
         "a pause-suppressed notice must not be parked — #569 already reports it at resume"
     );
+}
+
+#[test]
+fn the_notice_inbox_names_what_its_cap_elided_instead_of_hiding_it() {
+    // A relay that silently held back N notices would read as complete while
+    // being short — the "looks complete, isn't" defect the whole
+    // #445/#467/#563 lineage exists to eliminate. The cap is real, so what it
+    // drops has to be counted and said out loud, with a pointer at the log
+    // that still holds every one of them verbatim.
+    let (reg, _d, co, _cw) = setup_mcp();
+    let over = ORCH_NOTICE_INBOX_MAX + 3;
+    for i in 0..over {
+        reg.notify_queue(&co.group, &co.agent_id, true, &format!("[loomux] notice #{i}"));
+    }
+
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    let relay = r["content"][1]["text"].as_str().expect("the relay block").to_string();
+    assert!(relay.contains("3 earlier notices elided"), "the cut must be named: {relay}");
+    assert!(relay.contains("audit.jsonl"),
+        "and must point at the record that still has them: {relay}");
+    assert!(relay.contains(&format!("[loomux] notice #{}", over - 1)),
+        "the NEWEST notice — the one whose claim is still true — must survive: {relay}");
+    assert!(!relay.contains("[loomux] notice #0"), "the oldest is the one evicted: {relay}");
+
+    // Every notice, including the elided ones, is still in the log.
+    let logged = reg
+        .audit_log(&co.group)
+        .into_iter()
+        .filter(|e| e.action == "notice-suppressed")
+        .count();
+    assert_eq!(logged, over, "the audit is the record; the relay is only the notification");
+}
+
+#[test]
+fn orch_notice_relay_text_says_nothing_when_there_is_nothing_to_say() {
+    // The ordinary case, and the one that must not add a single byte to a tool
+    // result: no parked notices, no second content block, no cost.
+    assert_eq!(orch_notice_relay_text(&[], 0), None);
+    assert_eq!(orch_notice_relay_text(&[], 7), None, "an elision count alone is not a notice");
+
+    let one = orch_notice_relay_text(&["[loomux] x".to_string()], 0).unwrap();
+    assert!(one.contains("1 queue notice about"), "singular reads naturally: {one}");
+    let two = orch_notice_relay_text(&["a".to_string(), "b".to_string()], 0).unwrap();
+    assert!(two.contains("2 queue notices about"), "and so does plural: {two}");
+    assert!(!two.contains("elided"), "no elision line when nothing was elided: {two}");
+}
+
+#[test]
+fn the_inbox_evicts_oldest_first_and_counts_every_eviction() {
+    let mut inbox = OrchNoticeInbox::default();
+    for i in 0..ORCH_NOTICE_INBOX_MAX + 5 {
+        inbox.park(&format!("n{i}"));
+    }
+    assert_eq!(inbox.notices.len(), ORCH_NOTICE_INBOX_MAX, "the cap is real");
+    assert_eq!(inbox.elided, 5, "and every eviction is counted, not forgotten");
+    assert_eq!(inbox.notices.first().unwrap(), "n5", "oldest-first eviction");
+    assert_eq!(
+        inbox.notices.last().unwrap(),
+        &format!("n{}", ORCH_NOTICE_INBOX_MAX + 4),
+        "the newest notice is the one whose claim is still true"
+    );
+}
+
+#[test]
+fn the_notify_queue_hold_classes_gain_a_channel_that_reaches_the_orchestrator_agent() {
+    // #572 gave the orchestrator-target case channels that survive it, but
+    // both reach a HUMAN AT THE WINDOW. The inbox is the first one in this
+    // table that reaches the orchestrator AGENT — the difference between an
+    // attended session and an unattended overnight run.
+    assert!(
+        HoldChannel::OrchestratorInbox.survives_orchestrator_target(),
+        "the whole point is that it is not a delivery"
+    );
+
+    // Listed on exactly the classifications whose notice goes through
+    // `notify_queue` — the function that parks. Anything else would make this
+    // table say something untrue.
+    for class in [
+        HoldClass::PrePasteRecheckExhausted,
+        HoldClass::PreEnterBoxOccupied,
+        HoldClass::QueueNearFull,
+        HoldClass::QueueFull,
+    ] {
+        let ch = hold_channels(class);
+        assert!(
+            ch.contains(&HoldChannel::OrchestratorNotice)
+                && ch.contains(&HoldChannel::OrchestratorInbox),
+            "{class:?} notifies through `notify_queue`, so its suppressed notice is parked: {ch:?}"
+        );
+    }
+
+    // `GroupPaused`'s notice is `announce_pause_suppression` at resume, a
+    // different call on a different path that `notify_queue` never sees.
+    let paused = hold_channels(HoldClass::GroupPaused);
+    assert!(
+        paused.contains(&HoldChannel::OrchestratorNotice)
+            && !paused.contains(&HoldChannel::OrchestratorInbox),
+        "a pause notice is not parked, so the table must not claim it is: {paused:?}"
+    );
+
+    // And the completeness invariant #563 established still holds for every
+    // classification, unchanged by the new channel.
+    for class in HoldClass::ALL {
+        assert!(
+            hold_channels(*class).iter().any(|c| c.survives_orchestrator_target()),
+            "{class:?} must still reach someone an orchestrator target does not suppress"
+        );
+    }
 }
 
 // ---------- #560: the escalation clock is the PANE's hold episode ----------

@@ -165,7 +165,30 @@ pub fn dispatch(
                 "tool": name, "ok": !is_error,
                 "text": text.chars().take(500).collect::<String>(),
             }));
-            Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }))
+            let mut content = vec![json!({ "type": "text", "text": text })];
+            // #578: an orchestrator pane has no in-band channel for its own
+            // queue notices — a delivery announcing that pane's blocked
+            // delivery would queue behind the block it reports, which is why
+            // `notify_queue` suppresses it outright. This is the channel that
+            // is not a delivery: notices parked for this group ride back on a
+            // call the orchestrator itself made. Attached HERE, at the one
+            // funnel every `tools/call` passes through, for the same reason
+            // `note_agent_ack` is stamped above — no per-tool opt-in to
+            // forget.
+            //
+            // A SECOND content block, never appended to the first: several
+            // tools return JSON their caller parses (`queue_orphans`,
+            // `get_state`, `group_usage`), and a notice glued onto that string
+            // would corrupt it. Attached on an `isError` result too — the
+            // orchestrator is demonstrably alive and reading either way, and
+            // dropping the relay because its unrelated call failed would put
+            // the notice back in the hole this exists to fill.
+            if caller.role == Role::Orchestrator {
+                if let Some(relay) = reg.take_orchestrator_notices(&caller.group) {
+                    content.push(json!({ "type": "text", "text": relay }));
+                }
+            }
+            Ok(json!({ "content": content, "isError": is_error }))
         }
         _ => Err((-32601, format!("method not found: {method}"))),
     }
