@@ -515,6 +515,9 @@ pub const QUEUE_FLUSH_MAX_BYTES: usize = 24 * 1024;
 /// purpose: the cap exists to bound a paste, and paying a fixed ~120 bytes
 /// per item keeps the budget arithmetic pure (no rendering pass inside the
 /// planner) while staying on the conservative side of the real banner.
+/// (#632's `[loomux] ` prefix added 9 bytes to that banner; the longest one
+/// this can render — every optional clause present — is still comfortably
+/// inside the margin, so the charge is unchanged.)
 const FLUSH_ITEM_OVERHEAD: usize = 120;
 
 /// One constituent of a coalesced flush, as the header itemizes it — the
@@ -626,6 +629,20 @@ pub fn superseded_entries(entries: &[QueuedDelivery]) -> Vec<Superseded> {
 /// position, origin and queue age, so nothing loses attribution when N
 /// deliveries become one paste (#533-A). `now_ms` is passed in (never read
 /// from the clock here) so the rendering is deterministic under test.
+///
+/// **Marker-led, ahead of the rule (#632).** The banner is loomux's own
+/// framing riding the pty, so it has to be a row `mask_loomux_notices` can
+/// claim — otherwise every constituent of a coalesced flush leaves an unmasked
+/// row of loomux prose in the pane's tail, and a `from`/`queued` line
+/// describing a delivery is exactly the text-about-a-question shape #576 is.
+/// The marker must come FIRST because `deframe` strips whitespace and
+/// `│ ┃ | * ● • ◆` and not `-`: `----- [loomux] …` would still lead with the
+/// dash and survive. The literal matches this module's seven other notice
+/// constructors, which spell the marker out the same way;
+/// `every_framing_row_of_a_coalesced_flush_is_maskable` in
+/// `tests/orchestration.rs` binds them all to the real
+/// `orchestration::mask_loomux_notices`, so the literal cannot drift from the
+/// const unnoticed.
 fn constituent_banner(pos: usize, total: usize, c: &FlushConstituent, now_ms: u64) -> String {
     let age = age_clause(now_ms.saturating_sub(c.enqueued_ms));
     let repeats = if c.coalesced > 0 {
@@ -636,7 +653,7 @@ fn constituent_banner(pos: usize, total: usize, c: &FlushConstituent, now_ms: u6
         String::new()
     };
     format!(
-        "----- {pos}/{total} · from {} · queued {age} (id {}, t={}){repeats} -----",
+        "[loomux] ----- {pos}/{total} · from {} · queued {age} (id {}, t={}){repeats} -----",
         c.from, c.id, c.enqueued_ms
     )
 }
@@ -674,6 +691,21 @@ fn age_clause(ms: u64) -> String {
 /// "one delivery, itemized" — `run_queue_drainer` keeps using
 /// `flush_header_text` for the lone-entry case so an uncontended flush's
 /// wording is unchanged from pre-#533.
+///
+/// **Two row classes, and the split is the whole of #632.** The header and
+/// every `constituent_banner` are loomux's own framing and are marker-led, so
+/// `orchestration::mask_loomux_notices` claims them. `c.text` is pushed
+/// VERBATIM and stays unmarked: it is the delivery itself, byte-identical to
+/// what the same entry would have pasted had it flushed alone, so it is
+/// ordinary pane content that no other delivery path hides from the question
+/// gate. Marking it would be a new over-mask, and teaching the mask a block
+/// form ("everything between two banners") would hand any pane the power to
+/// hide a live dialog behind a forged banner row — the #621 hole exactly.
+/// So payload rows are left to latch the gate, which is the safe direction
+/// (a hold that clears late, reported by `QuestionStale`) rather than the
+/// dangerous one (an Enter released into a real question). The caller in
+/// `run_queue_drainer` asserts that split through
+/// `orchestration::unmaskable_framing_rows`.
 pub fn coalesced_flush_text(
     items: &[FlushConstituent],
     remaining: usize,

@@ -5719,6 +5719,109 @@ deliberately not the text, and the only copy lives as a stack local in `deliver_
 the delivery returns. Adding one is **delivery machinery, not detection**, and is the honest shape
 of the remaining fix.
 
+## #632: the multi-row notices, fixed at the producer rather than at the mask
+
+**Problem.** `mask_loomux_notices` claims exactly one row per marker (above, and for a reason
+this section does not weaken). Two of loomux's notices are **several rows** and **do ride the
+pty**, so every row past their first survived into the tail the question gate and the two
+attention chips read:
+
+- `pause_suppression_notice` (#615/#569) — an in-band delivery pasted into an orchestrator's
+  pane at resume, whose `  - w-2 -> orch-1 (refused, queue full): <preview>` item rows carry up
+  to `PAUSE_SUPPRESSION_LIST_MAX` bounded previews of arbitrary agent payloads, plus an elision
+  row and a truncation caveat row.
+- `queue::coalesced_flush_text` (#533-A) — the flush **is** the prompt, and each constituent is
+  introduced by a `----- 3/5 · from w-7 · queued 4m12s ago (id 12, t=…) -----` banner.
+
+Both are more exposed than #624's relay ever was: that block rides an MCP tool result and only
+reaches a pane if an orchestrator quotes it back, whereas these two are written to a pane by
+loomux itself, every time. This is #576's self-latch, one row further down — loomux's own prose
+*about* deliveries satisfying a detector that asks whether the pane is parked on a question.
+
+**The tension, which is the whole of the decision.** The obvious fix is to teach the mask a
+bounded block form ("a banner row and everything until the next banner", "a marker row and its
+wrap run"). That is precisely the run-mask #621 rejected, and nothing about a second producer
+makes it safer: the marker is unforgeable only in the *delivery* direction, an agent's pane
+output is not sanitized at all, so **any** rule that lets one row claim the rows beneath it
+hands every pane the power to hide a live permission dialog from the gate — and the Enter the
+gate then releases answers it. That is the #420 harm reached from pane output, and it is the
+failing-**open** direction. The mask's claim is therefore unchanged by this work: still one row,
+still leading-marker-only.
+
+**The fix is at the producers, not the reader.** Every row loomux *authors* becomes marker-led,
+which is #624's convention applied to the two producers that predate it, and the existing
+one-row rule then claims them with no new power:
+
+- the pause notice's item rows become `  • [loomux] w-2 -> orch-1 (…): <preview>`, and its
+  elision and caveat rows carry the marker too. The bullet is `•` and not `-` for the same
+  reason as #624's relay: `deframe` strips whitespace and `│ ┃ | * ● • ◆`, and **not** `-`, so
+  a `  - [loomux] …` row leads with the dash and survives.
+- the itemization banner becomes `[loomux] ----- 3/5 · from … -----`. Marker **first**, for the
+  same `deframe` reason — `----- [loomux] …` would not mask.
+
+**Why the item rows' previews are masked, though they contain agent text.** The preview is
+loomux's own framing *quoting* a payload — `w-2 -> orch-1 (refused, queue full): <preview>` is
+the #576 relay shape exactly, text *about* a delivery that is already gone. It is not a rendered
+dialog and answering it is meaningless, so it must not park the pane it is being reported into.
+The preview is also re-collapsed through `dropped_payload_preview` at render time rather than
+trusted: it is read back out of a durable `audit.jsonl` that an **earlier loomux build** may
+have written (the legacy-discard cause is that premise, stated), and a preview carrying a
+newline would split the item into two rows with only the first marker-led — #632 silently
+reintroduced from disk. The re-collapse is idempotent on well-formed input, so nothing changes
+for text this build wrote.
+
+**Why the constituent payload rows are NOT masked, and stay able to latch.** A coalesced flush's
+constituent text is pushed verbatim and left alone. Three reasons, and the first is the one that
+settles it:
+
+1. **It is not distinguishable from ordinary pane content, because it *is* ordinary pane
+   content.** The payload is byte-identical to what that same entry would have pasted had it
+   flushed alone, pre-#533, with no banner anywhere near it. Masking it would give the coalesced
+   path a blindness to question-shaped text that no other delivery path has — a *new* over-mask,
+   not the removal of an old one.
+2. **The only rules that could reach it are forgeable.** A positional rule (everything after a
+   banner) is the run-mask above. A content rule (mask what we recognise as a payload) needs the
+   detector to trust bytes an agent chose, which is the hole `LOOMUX_NOTICE_MARKER`'s doc exists
+   to name.
+3. **The error it leaves is the safe one.** An unmasked payload row means the gate **holds when
+   it might have cleared** — a delivery waits, and `QuestionStale` escalates it at ten minutes.
+   The alternative error releases an Enter into a live dialog. Under-mask is the conservative
+   direction and this is a deliberate under-mask, pinned by `e11` as a documented property
+   rather than left to be rediscovered as a bug.
+
+Note also that the delivery path which pastes the flush already strips its own payload rows via
+`mask_own_paste` before the pre-Enter check; the readers that see them are the ones with no
+`pasted_text` to work with (the outer drainer gate and the chip scans), which is exactly where a
+hold-too-long is cheapest.
+
+**Enforced at both ends, because they fail differently** — the #624 pattern, reused. The shared
+predicate is `unmaskable_framing_rows(rendered, payloads)`: the rows a rendering leaves unmasked
+that are not verbatim payload, written *through* `mask_loomux_notices` itself so it cannot drift
+from the rule it stands in for. `pause_suppression_notice` asserts it with an empty payload set
+(the whole notice must mask away); `run_queue_drainer` asserts it at the flush call site with
+the constituents' text as the exemption, so what is pinned there is the **split** rather than a
+blanket claim. Both are `debug_assert` for `park`'s reason: CI's test builds are debug, so a
+later edit that adds an unmarked row fails where it is introduced, while a release build never
+panics a live session over an outcome whose worst case is a gate that holds too long.
+
+The tests are the other end. `every_row_of_the_pause_resume_notice_is_maskable_including_a_hostile_preview`
+puts adversarial previews through the real producer (question tokens, an embedded newline, a
+forged marker); `every_framing_row_of_a_coalesced_flush_is_maskable_but_the_payload_is_left_alone`
+pins the split in both directions — banners gone, every payload row including a multi-row
+constituent's second line still present;
+`a_forged_banner_row_buys_an_agent_exactly_one_row_and_never_the_payload_below` is the
+adversarial case for the new row shape. `e9`–`e11` put the same producers to the real
+question-hold predicate: the resume notice no longer parks its own pane, a genuine dialog
+painted directly beneath a fully-masked notice block still latches, and a coalesced payload
+still latches by design.
+
+**Residual.** Unchanged from #576's, and this work removes nothing from that list: a notice that
+**wraps** still keeps the tokens past its first row (a marker-led row is still one logical line,
+and only the first physical row carries the marker), and a marker row that has itself scrolled
+off still leaves its continuation unmarked. Both are under-masks. Closing them still needs
+loomux to know *what* it wrote to a pane rather than that a row claims it did — delivery
+machinery, not detection.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,
@@ -6922,15 +7025,17 @@ added without touching the list still fails, at the door, in any debug build (an
 are debug). Release builds never pay for it and never panic a live session over it — the degraded
 outcome is a gate that holds too long, which `QuestionStale` already reports.
 
-**Residual, and its boundary is filed rather than implied.** `mask_loomux_notices` claims one row
-per marker, so any loomux text that occupies *several* rows keeps everything past the first —
-`pause_suppression_notice` and `coalesced_flush_text` are the real multi-row cases, and their
-continuation rows ride the pty unmasked. That is **#632**, filed out of this review rather than
-half-addressed here. It is named in this section because the boundary is what makes this change
-reviewable: #578 is single-row by construction and adds no pane rows at all (the relay rides a tool
-result, never the pty), so it neither contributes to #632 nor is blocked by it. Closing #632 needs
-loomux to know *what* it wrote to a pane rather than that a row claims it did — delivery
-machinery, not detection.
+**Residual, and its boundary was filed rather than implied — then closed.** `mask_loomux_notices`
+claims one row per marker, so any loomux text that occupies *several* rows keeps everything past
+the first — `pause_suppression_notice` and `coalesced_flush_text` are the real multi-row cases, and
+their continuation rows rode the pty unmasked. That was **#632**, filed out of this review rather
+than half-addressed here, and it is named in this section because the boundary is what made this
+change reviewable: #578 is single-row by construction and adds no pane rows at all (the relay rides
+a tool result, never the pty), so it neither contributed to #632 nor was blocked by it. #632 has
+since applied this section's own convention to both producers — see "*the multi-row notices, fixed
+at the producer rather than at the mask*" above. It did **not** widen the mask, which is why that
+fix and this one compose: the sentence "closing this needs loomux to know *what* it wrote to a
+pane" survives #632 intact and now describes only the wrap and scrolled-off residuals.
 
 `HoldChannel::survives_orchestrator_target` also stopped being a `!matches!` negation and became an
 exhaustive match: a channel added later must state its own answer rather than defaulting to

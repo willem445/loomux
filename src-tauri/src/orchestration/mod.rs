@@ -8729,21 +8729,54 @@ pub fn pause_suppression_notice(s: &PauseSuppression) -> String {
             SuppressedCause::LegacyDiscard => "discarded by an earlier loomux",
             SuppressedCause::QueueFullDuringPause => "refused, queue full",
         };
-        out.push_str(&format!("\n  - {} -> {} ({why}): {}", it.from, it.to, it.preview));
+        // #632: `  • ` + the marker, never the old bare `  - `. This notice is
+        // an in-band DELIVERY — it rides the pty into an orchestrator's pane —
+        // and every row loomux writes there has to be one
+        // `mask_loomux_notices` can claim, or the item rows are text ABOUT a
+        // question sitting in the tail of the pane most exposed to #576's
+        // self-latch. `deframe` strips whitespace and `│ ┃ | * ● • ◆` but NOT
+        // `-`, which is exactly why the bullet changed (the #624 convention).
+        //
+        // The preview is bounded AGENT text, and it is masked here rather than
+        // left to latch because this row is loomux's own framing QUOTING a
+        // payload — the #576 relay case exactly — not a rendered dialog. It is
+        // re-collapsed through `dropped_payload_preview` (idempotent on
+        // well-formed input) rather than trusted: it is read back out of a
+        // durable `audit.jsonl` that an EARLIER loomux version may have
+        // written, and a preview carrying a newline would split this into two
+        // rows with only the first marker-led — #632 reintroduced from disk.
+        out.push_str(&format!(
+            "\n  • {LOOMUX_NOTICE_MARKER} {} -> {} ({why}): {}",
+            it.from,
+            it.to,
+            queue::dropped_payload_preview(&it.preview),
+        ));
     }
     if n > PAUSE_SUPPRESSION_LIST_MAX {
         out.push_str(&format!(
-            "\n  - ...and {} more — every lost payload is in this group's audit log in full \
-             (actions `prompt-suppressed-paused` and `delivery-dropped`).",
+            "\n  • {LOOMUX_NOTICE_MARKER} ...and {} more — every lost payload is in this group's \
+             audit log in full (actions `prompt-suppressed-paused` and `delivery-dropped`).",
             n - PAUSE_SUPPRESSION_LIST_MAX
         ));
     }
     if !s.window_start_seen {
-        out.push_str(
-            "\n  (The `group-pause` line that opened this window is no longer in the readable \
-             audit log, so this list may reach back into an earlier pause.)",
-        );
+        out.push_str(&format!(
+            "\n  • {LOOMUX_NOTICE_MARKER} (The `group-pause` line that opened this window is no \
+             longer in the readable audit log, so this list may reach back into an earlier pause.)"
+        ));
     }
+    // The door for this producer (#632), the way `OrchNoticeInbox::park` is the
+    // door for #624's single-line notices: asserted through the real mask, so a
+    // later edit that adds an unmarked row fails where it is introduced rather
+    // than in a pane. Debug only — CI's test builds are debug, and a release
+    // build must never panic a live session over it; the degraded outcome is a
+    // gate that holds too long, which `QuestionStale` already reports.
+    debug_assert!(
+        unmaskable_framing_rows(&out, &[]).is_empty(),
+        "every row of the pause-suppression notice must be maskable (#632) — got leftovers \
+         {:?} from {out:?}",
+        unmaskable_framing_rows(&out, &[])
+    );
     out
 }
 
@@ -13620,7 +13653,33 @@ fn run_queue_drainer(
                             })
                         })
                         .collect();
-                    queue::coalesced_flush_text(&items, plan.remaining, now_ms(), cause)
+                    let rendered =
+                        queue::coalesced_flush_text(&items, plan.remaining, now_ms(), cause);
+                    // #632's door for this producer. `pause_suppression_notice`
+                    // can assert "masks away entirely"; a flush cannot, because
+                    // the constituent payloads are agent text by design and
+                    // must stay unmasked. So the invariant asserted here is the
+                    // exact split: everything loomux FRAMED is maskable, and
+                    // the only survivors are payload rows. Written through the
+                    // real `mask_loomux_notices` (via
+                    // `unmaskable_framing_rows`) so it cannot drift from the
+                    // rule it stands in for, and `debug_assert` for the same
+                    // reason `OrchNoticeInbox::park`'s is — CI's test builds
+                    // are debug, a live release session must never panic over
+                    // a gate that merely holds too long.
+                    debug_assert!(
+                        {
+                            let payloads: Vec<&str> = items.iter().map(|c| c.text).collect();
+                            unmaskable_framing_rows(&rendered, &payloads).is_empty()
+                        },
+                        "a coalesced flush must leave only constituent payload rows unmasked \
+                         (#632) — got {:?}",
+                        unmaskable_framing_rows(
+                            &rendered,
+                            &items.iter().map(|c| c.text).collect::<Vec<_>>()
+                        )
+                    );
+                    rendered
                 } else if header_pending {
                     // #445: the flush header ("N deliveries queued ... are
                     // now delivering") rides on the front of the FIRST
@@ -14287,6 +14346,18 @@ pub const LOOMUX_NOTICE_MARKER: &str = "[loomux]";
 /// output. Failing OPEN is the dangerous direction, so the mask claims only
 /// the row the marker actually leads.
 ///
+/// **A multi-row notice is the PRODUCER's problem, never this function's
+/// (#632).** The rule above says one row per marker, so loomux text occupying
+/// several rows is only fully maskable if every row it emits leads with the
+/// marker once `deframe`d — which is a shape each producer owes, not a claim
+/// this mask can widen to cover for them. Both directions of that are load
+/// bearing: a producer that skips it hands the detector a row of loomux prose
+/// (the #632 bug), and a mask that compensated by taking neighbouring rows
+/// would be the run-mask rejected two paragraphs up. See
+/// [`unmaskable_framing_rows`] for the shared invariant the producers assert
+/// themselves against, and `deframe`'s strip set for why the bullet in a
+/// continuation row must be `•` and never `-`.
+///
 /// **What that leaves, stated rather than mitigated.** A notice that wraps
 /// keeps whatever tokens landed past the first row, so a wide pane is fixed and
 /// a narrow one is improved rather than cured; a marker row that has itself
@@ -14310,6 +14381,48 @@ pub fn mask_loomux_notices(tail: &str) -> String {
         .filter(|l| !deframe(l).to_lowercase().starts_with(LOOMUX_NOTICE_MARKER))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The rows of `rendered` that loomux WROTE and [`mask_loomux_notices`] could
+/// not claim (#632). Empty is the invariant every multi-row notice owes.
+///
+/// **Why a helper rather than an assertion spelled out at each producer.**
+/// [`mask_loomux_notices`] claims exactly one row per marker, so a notice that
+/// occupies several rows is only fully maskable if *every* row it emits leads
+/// with the marker once `deframe`d. #624 established that convention for
+/// single-line notices and enforced it at `OrchNoticeInbox::park`; the two
+/// pre-existing multi-row producers (`pause_suppression_notice` and
+/// `queue::coalesced_flush_text`) build their own blocks, so their door is
+/// their own last line. Both call this, and so do their tests — written
+/// *through* `mask_loomux_notices` rather than re-deriving its rule, so the
+/// check cannot drift from what it stands in for (the `park` precedent).
+///
+/// **`payloads` is the deliberate exemption, and it is narrow.** A coalesced
+/// flush carries each constituent delivery's text VERBATIM, and those rows are
+/// agent-authored by design: they are byte-identical to what the same delivery
+/// would have painted on its own, so masking them would blind the gate to
+/// ordinary pane content that no other delivery path hides. They are passed in
+/// here and excused; everything else in the block is loomux's own framing and
+/// must mask away. See the #632 section of `doc/design/orchestration.md` for
+/// why leaving them to latch is the conservative direction.
+///
+/// Comparison is on trimmed, non-empty rows: blank rows carry no tokens for
+/// `prompt_wait_detected` to match, and a framing row that were ever
+/// byte-identical to a payload row would be excused — a false negative in an
+/// assertion, which is the harmless direction for a guard.
+pub fn unmaskable_framing_rows(rendered: &str, payloads: &[&str]) -> Vec<String> {
+    let payload_rows: HashSet<&str> = payloads
+        .iter()
+        .flat_map(|p| p.lines())
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    mask_loomux_notices(rendered)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !payload_rows.contains(l))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The live interactive-question guard's hold decision (#420), generic over
