@@ -5027,7 +5027,10 @@ first escalation.
 
 **Known limit: the escalation's episode is the queue ENTRY, not the pane's held-ness.** The clock is
 `front.enqueued_ms` and the one-shot is keyed on `pty_id`, and those two do not describe the same
-thing. Two consequences, both recorded rather than fixed here (tracked in the follow-up filed
+thing. *(Fixed in #560 — see the section below. The two consequences are kept here in their
+original terms because they are what the next reader will find in the #560 issue and in this
+file's history, and because the shape of the mismatch is the argument for the fix.)* Two
+consequences, both recorded rather than fixed here (tracked in the follow-up filed
 alongside this change):
 
 - *The one-shot resets on any writable poll.* Badge at ten minutes → the gates clear for a single
@@ -5056,6 +5059,140 @@ Both known limits are the same question — what ends an episode — and both ar
 than a defect in `held_escalation`, whose contract is pinned. The fix for both is a per-pane
 hold-start stamp that survives entry churn, which is a change to state ownership and not worth
 making inside a review round that has already verified the current shape.
+
+### #560: the escalation clock is the PANE's hold episode, not a queue entry
+
+Both limits above are one question — *what is an episode* — and #560 answers it by making the
+episode a thing that exists: `HoldEpisode { started_ms, announced, badged }`, one per pty, held in
+`OrchRegistry::hold_episodes`.
+
+**One record, not two flags, and that is the fix rather than a tidy-up.** #532 kept the clock
+(`front.enqueued_ms`) and the one-shot (`question_stale_notified: HashSet<u32>`) in two different
+places with two different lifetimes, and every symptom followed from letting them disagree. Fusing
+them makes the disagreement *unrepresentable*: there is no longer any way to clear the one-shot
+without ending the episode, because they are fields of the same value. `announced` (the
+once-per-episode `delivery-held-in-queue` line) joins them for the same reason — it used to be
+keyed on the drainer's pane-header chip being down, and the chip is LIVE state that comes down on
+every writable poll, so that line churned exactly the way the badge did.
+
+**The lifecycle, and what "genuinely releases" means.** `ends_hold_episode`/`opens_hold_episode`
+are total over `HoldObservation`, so a future observation cannot be added without deciding in
+writing what it does to the clock:
+
+| observation | opens | ends | why |
+| --- | --- | --- | --- |
+| `HeldPoll` | ✔ | ✖ | the drainer's poll found the pane not writable |
+| `Aborted` | ✔ | ✖ | an attempt ran and did not deliver |
+| `WritablePoll` | ✖ | ✖ | **provisional** — a reading, not a delivery |
+| `Delivered` | ✖ | ✔ | the pane accepted a write; that is the evidence |
+
+Plus one end that does not go through `note_hold`: the pane's queue going away (`commit_exit` for
+the drainer's own exits, where the removal has to be atomic with the emptiness check and the
+`queue_draining` deregistration; `drop_queue` for the standalone path).
+
+`Aborted` opening an episode is not symmetry for its own sake. A hold can live entirely inside
+`deliver_now` — every poll reads writable, every attempt then aborts on a gate that trips during
+the paste — and pre-#560 nothing on that path ever started a clock at all. That pane is exactly as
+stuck as one that fails at the poll.
+
+**Why a writable poll is not a release, argued rather than asserted.** The drainer does not stop at
+a writable poll; it goes straight on to `deliver_now`, which re-reads both gates at the paste and
+again at the Enter and can decline at either. So "writable at the instant of one poll" is precisely
+the reading a flickering pane produces *between two aborted attempts* — the state #560's first
+symptom is reported from, a human typing with a delivery queued behind them. Ending the episode
+there fails in both directions at once:
+
+- it drops and re-raises the badge per flicker (`stranded-attention` / `stranded-cleared`), which
+  is the audit churn the one-shot exists to prevent;
+- and if it also restarted the clock — the obvious "reset on recovery" fix — a pane whose occupancy
+  toggles faster than ten minutes would **never badge at all**. That re-creates #532's own bug class
+  (an escalation that never fires) via the signals the escalation exists to report on, which is the
+  rule `hold_bound_elapsed`'s doc states outright and `.loomux/lessons.md` records as
+  "releasing on evidence beats releasing on elapsed time".
+
+This composes with #534's auto-release rather than competing with it. #534 decides *whether the
+pane is held* (and its release is itself evidence-based — `QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS`
+consecutive clear reads of the composed screen). #560 decides *when the clock for a held pane
+started*. A #534 release makes the next poll writable, the delivery lands, `Delivered` ends the
+episode and drops the badge — the same path a human answering the question takes. Nothing here
+re-reads or second-guesses the guard.
+
+**The deliberate cost.** The escalation badge now stays up from the moment it fires until the
+delivery lands (or the queue goes away), where before it came down on the next writable poll. On a
+pane that is still stuck that is a strict improvement — the old behaviour dropped the badge and
+then re-raised it seconds later. The case that genuinely changes is a pane that recovers and whose
+delivery then fails for an unrelated reason: the badge persists instead of blinking off. It is
+still true (the delivery has not landed), and the alternative is a badge that lies quiet about a
+pane nothing is delivering to.
+
+**Restart.** `hold_episodes` is in-memory and owes no `persist_queues` call (#468) — the same
+argument its `question_stale_notified` predecessor made, and it is not queue state. A restart
+therefore forgets any mid-flight episode: the process that would have badged is gone, `queue.json`
+recovery re-admits the payloads (#467), and the fresh drainer opens a new episode on its first
+failed observation, so the ten-minute clock restarts from the restart. Persisting it would be worse
+in the direction that matters — it would badge on boot for a hold the human may well have resolved
+while loomux was down, a false claim on the badge whose whole value is being trustworthy — and the
+loss is bounded by the restart announcing itself already, through the recovery notice and
+`queue_orphans`.
+
+**Every consumer of the old entry-scoped clock, enumerated** (`enqueued_ms` outside `queue.rs`), and
+what happened to each. The enumeration is published including the untouched ones, because "extend
+this to every consumer" means naming the list:
+
+| site | what it read `enqueued_ms` for | disposition |
+| --- | --- | --- |
+| `held_escalation`'s `held_since_ms` | the ten-minute escalation clock | **migrated** to the episode |
+| `delivery-held-in-queue`'s `held_ms` | how long the pane has been held | **migrated** (same clock, or the number contradicts the decision beside it) |
+| `should_fire_still_queued_notice` | the 30-minute still-queued notice | **migrated**, via `undelivered_since` — see below |
+| `coalesced_flush_text`'s per-constituent age | "queued 4m ago" in the flush banner | kept: a fact about that payload |
+| `pop_front_dequeued` / `pop_batch_dequeued`'s `queued_ms` | per-entry latency accounting | kept: a fact about that payload |
+| `queue_orphans`'s `queued_minutes_ago`, `queue-recovered`/`delivery-recovered`'s `queued_ms` | how old a recovered entry is | kept: a fact about that payload |
+| `readmit_recovered`'s `oldest_ms` (the recovery notice's "queued N minutes ago") | how old the recovered backlog is | kept: a fact about those payloads — and it is already a `min` over all of them, never the front |
+
+The rule the split follows: an entry timestamp answers *how long has THIS PAYLOAD waited*, which is
+the right question for latency, banners and orphan reports. The episode answers *how long has THIS
+PANE been stuck*, which is the right question for anything that escalates to a human.
+
+**The still-queued notice needed both terms, not a swap.** `should_fire_still_queued_notice`'s
+parameter was named `oldest_enqueued_ms` and documented as "the FRONT entry's timestamp (the one
+that's been waiting longest)" — a claim that is false the moment `enqueue_stranded_front` runs,
+since the marker it pushes at the front is the *youngest* entry in the queue. Taking the minimum
+over the whole queue fixes that half; it does not fix the case where the marker is the only entry
+left, because the batch it stood for was already popped. The episode fixes that case and only that
+case — on its own it would lose a backlog that outlives individual successes, since a delivery
+landing ends the episode while entries the flush could not fit (`plan.remaining`) stay queued. So
+`queue::undelivered_since` takes the earlier of the two, and the parameter is renamed to what it
+actually means.
+
+**Testability was part of the defect, not just the fix.** #560's first symptom lived in the
+drainer's inline escalation block, and `run_queue_drainer` needs a real `AppHandle` that no headless
+test can build — so those lines were unreachable by every test in this repo while `held_escalation`
+itself stayed green and pinned through a full review round. Everything that needs no `AppHandle`
+moved into `OrchRegistry::hold_escalation_step` (the same argument `flush_stranded_text`'s doc
+makes one function over); what is left at the call site is the pane-header chip, which is genuinely
+drainer-local state.
+
+One consequence of that split, worth stating because it changes an arm: with the badge one-shot now
+surviving a flicker, `HeldEscalation::None` is reachable on a held poll whose chip was lowered by a
+`Clear` earlier in the same episode. `None`'s doc says the chip "raised earlier in the episode stays
+up", which was true when a `Clear` also ended the episode and is not any more — so the caller raises
+the chip on that arm too. `raise_chip` is idempotent per reason, so a steady hold still emits
+exactly one event.
+
+**What #560 does not touch.** `held_escalation` itself: its precedence, its one-shot semantics and
+its `Clear` arm are unchanged and their tests are untouched. Only the value handed to `held_since_ms`
+and the caller's handling of `Clear` changed. `unconfirmed_disposition` and the confirmation
+lifecycle are not involved. No queue is mutated by any of this, so no new `persist_queues`
+obligation arises under #523's mutation-site table.
+
+**Deferred, deliberately:** `push_stranded_front_locked` hardcodes `reason: EnqueueReason::Question`
+on every marker it pushes, so the audit trail attributes a stranded-front marker to a question hold
+that may not have happened (#560's second issue comment). It is audit-only — nothing branches on the
+field — and the honest fix for its *other* call site (`admit_stranded_selfheal`, where the cause is
+a self-heal and no `EnqueueReason` variant says so) needs a new variant, which reaches the
+sender-facing notice vocabulary (`queued_notice` matches exhaustively) and the persisted snapshot's
+reason string. That is a different review surface from the escalation clock, and fixing only the
+drainer half would leave the identical false claim on the other marker push.
 
 ### Composition with #541's `REINJECT_ACK_SETTLE_MS`, and why nothing here belongs in it
 

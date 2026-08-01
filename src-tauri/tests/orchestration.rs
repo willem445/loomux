@@ -18054,8 +18054,11 @@ fn every_hold_class_reaches_a_human_who_is_not_the_orchestrator_channel() {
 // methods `run_queue_drainer` actually calls, since the drainer itself needs an
 // `AppHandle` no headless test can build.
 
-/// How many audit lines of `action` this group has written.
-fn audit_count(reg: &OrchRegistry, group: &str, action: &str) -> usize {
+/// How many audit lines of `action` this group has written. Distinct from the
+/// substring-counting `audit_count` above on purpose: a churn assertion has to
+/// match the `action` FIELD exactly, or a detail value that happens to contain
+/// the same text would inflate it.
+fn hold_audit_count(reg: &OrchRegistry, group: &str, action: &str) -> usize {
     reg.audit_log(group).iter().filter(|e| e.action == action).count()
 }
 
@@ -18142,15 +18145,15 @@ fn a_writable_poll_never_re_badges_a_pane_that_was_already_escalated() {
     );
 
     assert_eq!(
-        audit_count(&reg, &g.id, "stranded-attention"), 1,
+        hold_audit_count(&reg, &g.id, "stranded-attention"), 1,
         "one escalation per hold episode, across the flicker — the churn is the defect"
     );
     assert_eq!(
-        audit_count(&reg, &g.id, "stranded-cleared"), 0,
+        hold_audit_count(&reg, &g.id, "stranded-cleared"), 0,
         "and nothing was cleared: the pane never accepted a delivery"
     );
     assert_eq!(
-        audit_count(&reg, &g.id, "delivery-held-in-queue"), 1,
+        hold_audit_count(&reg, &g.id, "delivery-held-in-queue"), 1,
         "the once-per-episode hold line churned the same way — it was keyed on the pane-header \
          chip, which is LIVE state that comes down on every writable poll"
     );
@@ -18161,7 +18164,7 @@ fn a_writable_poll_never_re_badges_a_pane_that_was_already_escalated() {
     assert_eq!(reg.hold_episode_since(pty), None);
     assert!(!reg.hold_episode_badged(pty));
     assert_eq!(
-        audit_count(&reg, &g.id, "stranded-cleared"), 1,
+        hold_audit_count(&reg, &g.id, "stranded-cleared"), 1,
         "the badge comes down where the pane PROVED it could accept a write"
     );
 
@@ -18173,7 +18176,7 @@ fn a_writable_poll_never_re_badges_a_pane_that_was_already_escalated() {
         HeldEscalation::Badge(StrandedBlocker::QuestionStale),
         "and badges afresh — suppressing the SECOND escalation would be the mirror-image bug"
     );
-    assert_eq!(audit_count(&reg, &g.id, "delivery-held-in-queue"), 2, "one line per episode, two episodes");
+    assert_eq!(hold_audit_count(&reg, &g.id, "delivery-held-in-queue"), 2, "one line per episode, two episodes");
 }
 
 #[test]
