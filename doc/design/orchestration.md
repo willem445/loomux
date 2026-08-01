@@ -7283,20 +7283,49 @@ concurrent spawns write their marks out of order and leave the file *below* an i
 out — the exact reuse this closes — and the alternative fix, a read-modify-write of the file per
 mint, is strictly more I/O for the same guarantee. Mints happen at spawn, a few per session.
 
-**The write lands before the id is returned.** That is what makes the guarantee survive a crash
-mid-spawn: at the moment the mark is durable the caller has not yet cut a worktree, written a
-roster row, or emitted an audit line, so there is no window in which an artifact outlives the
-mark that reserved its id. (Before this, `persist_agent_record` ran *after* `git_worktree_add`,
-so even a roster-derived mark would have missed a branch left by a spawn that died in between.)
+**The write lands before the id is returned.** On the path where the write *succeeds*, that is
+what makes the guarantee survive a crash mid-spawn: at the moment the mark is durable the caller
+has not yet cut a worktree, written a roster row, or emitted an audit line, so no artifact can
+outlive the mark that reserved its id. (Before this, `persist_agent_record` ran *after*
+`git_worktree_add`, so even a roster-derived mark would have missed a branch left by a spawn that
+died in between.)
 
-A failed write is audited (`agent-seq-persist-failed`) and not propagated, which is
+**And the write can fail.** It is audited (`agent-seq-persist-failed`) and not propagated —
 `persist_queues`' rule for `persist_queues`' reason: failing the spawn would turn a durability
-degradation into an outage of the thing being made durable.
+degradation into an outage of the thing being made durable. But that decision is exactly what
+punches a hole in the paragraph above, and the first cut of this change stated the guarantee
+absolutely one paragraph before describing the path that breaks it, without connecting them
+(rev-13's blocking finding on #604). Spelled out: the id is returned anyway, the caller goes on
+to cut a worktree, write a roster row and emit audit lines, and the mark that reserved it never
+reached disk. An artifact *does* outlive its mark. On the next restart a seed that believed the
+file would reissue a live id — #524's own bug, reintroduced through #524's own degraded path,
+silently.
 
-### Where the mark lives — and why the "derive it" alternative is the *floor*, not the mechanism
+That is not a tail risk here, which is why it decides the design rather than earning a caveat.
+`atomic_write` fails on disk-full — its own `sync_all()` comment calls that "the disk-full
+guard" — and this repo has three recorded disk-exhaustion incidents (#134, #320, #488), one of
+which crashed loomux itself. "A failed write and then a restart" is close to the modal way this
+would fire, not an exotic conjunction of independent rare events.
+
+**So the seed heals upward, and the invariant is restored rather than caveated.** Because the
+seed takes `max(file, roster)` (below), a mint whose write failed is still covered by the roster
+row the spawn goes on to write: the mark reverts to being *derivable* even when it is not
+*recorded*. Stated precisely, and this is the form worth keeping:
+
+> **No artifact whose spawn reached its roster write can outlive the mark that reserved its id** —
+> the file records it, and if the file's write failed the roster still shows it.
+
+The honest scope of that sentence is the clause it now carries. A spawn that dies *between* the
+failed counter write and its roster write leaves an `agent/<id>` worktree branch behind with
+neither source recording the id, and that one is genuinely uncovered — it is the same
+already-documented residual as a deleted orchestration root, reached a different way, and it is
+narrow: two writes, both best-effort, both on the same code path, with the process having to die
+between them. What is no longer true is the earlier absolute, which claimed no window at all.
+
+### Where the mark lives — and why the roster is a second source, not a fallback
 
 The issue offered two shapes: (a) persist the counter per group, or derive it from state loomux
-already keeps. Both are in the change, each where it is actually right.
+already keeps. Both are in the change, and the seed takes **the higher of the two, always**.
 
 `agent-seq.json` sits at the orchestration **root**. The counter is registry-global — one `seq`
 serves every group and the solo pseudo-group — so per-group persistence would need a
@@ -7307,20 +7336,57 @@ plain file at the root is invisible to both root scans (`session_roles` needs a 
 `existing_group_ids` filters on `is_dir()`). Write mechanics: see the `agent-seq.json` row in
 `doc/design/durability-and-disk.md`.
 
-**Derivation is the migration floor.** With no counter file — a fresh install, or the first
-launch after upgrading to this build — the seed scans every group's `agents.json`, the durable
-roster loomux has always kept, for the highest id suffix. Without that fallback an existing
-install's protection would begin only *after* the collision it exists to prevent, which is the
-whole population that has already hit this. As the *mechanism* it would be worse in two
-directions the file is not: it misses an agent whose spawn died between the mint and the roster
-write, and it forgets everything a group sweep removes. So: file first, roster as the floor, and
-the scan costs nothing on the normal path because it runs only when the file is absent.
+**The roster is the second source.** `agents.json`, the durable roster loomux has always kept,
+records every id it ever handed out; the seed scans every group's copy for the highest suffix and
+takes `max(file, roster)`.
+
+It earns its place twice over. **Migration:** nothing wrote a counter file before this change, so
+on the first launch after upgrading, the roster is the only record of which ids are spent —
+without it an existing install's protection would begin only *after* the collision it exists to
+prevent, which is the entire population that has already hit this. **Healing:** it is what closes
+the failed-write hole above, because a mint whose counter write failed still leaves a roster row.
+
+`max` rather than a fallback is the whole point, and the first cut got this wrong — it consulted
+the roster only when the file was missing or unparseable, so a file that parsed to a value *below*
+the roster was believed (rev-13). The arguments against the roster are real and unchanged: as the
+*mechanism* it would be worse in two directions the file is not — it misses an agent whose spawn
+died before its roster write, and it forgets everything a group sweep removes. But those are
+arguments against using it **alone**, which is what they were written for. A max inherits each
+source's strength and neither's weakness, and no argument against the roster is an argument for
+*ignoring* it when it is plainly ahead. The cost is one directory scan per process at seed, which
+the migration path already paid.
+
+**A counter at the ceiling saturates rather than wraps.** A stored `high_water` at `u32::MAX` is
+the one input where the parse-side clamp does not fail in the safe direction: `fetch_add` wrapped
+the atomic to 0 and reissued from `w-1`, colliding with every live id at once — and with no
+`overflow-checks` in `[profile.release]` the shipped binary would do it silently where `cargo
+test` panics (rev-13 N1). The mint saturates under its lock instead and audits
+`agent-seq-exhausted`. Still a broken state, but broken in the direction that reuses nothing and
+says so.
 
 **Honest residual.** A git branch left in the human's repo is still not consulted. Delete the
 whole orchestration root and ids restart while `agent/w-1` branches survive. That is much
 narrower than what shipped before — which did it on *every* restart — but it is not nothing, and
 the issue's option (b), treating `agent_id` as ephemeral-by-contract and keying every persisted
 layer on the session UUID, remains the honest model. This is (a), as filed.
+
+### A pin that asserted the bug, and why inverting it strengthened it
+
+`a_queued_delivery_survives_a_restart_and_is_re_queued_in_order_for_a_resumed_session` (#523) used
+to assert `resumed.id == _old_agent`. That was not an oversight: it pinned the collision **as
+expected behavior**, with a comment explaining that ids repeat after a restart, which is why
+`rebinds_to` must key on the session id — pinned so nobody would later "simplify" `rebinds_to`
+back to comparing ids. It now asserts `assert_ne!`, and this is recorded here because a future
+reader will otherwise find an inverted assertion with no account of why the opposite was once
+deliberate.
+
+The inversion does not weaken what the line defended; it repairs it. **In the old world that pin
+could not have caught the regression it was written to guard against**: with ids colliding, an
+id-keyed `rebinds_to` would have matched by coincidence and the test would still have passed. Now
+the ids are guaranteed to differ, so an id-keyed rebind returns nothing and the recovery
+assertion below it fails immediately. A tripwire that was decorative became one that works, and
+the collision itself moved to two dedicated tests
+(`agent_ids_are_never_re_minted_after_a_restart`, `a_missing_counter_file_reseeds_from_the_durable_roster`).
 
 ### #455 — a delivery id, keyed on *acted on*
 

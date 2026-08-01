@@ -16179,19 +16179,33 @@ impl OrchRegistry {
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
             .and_then(|v| v["high_water"].as_u64())
             .map(|n| n.min(u32::MAX as u64) as u32);
-        let mark = match from_file {
-            Some(n) => n,
-            None => self.agent_seq_floor_from_rosters(),
-        };
+        // **Both sources, always the higher** — not the file with the roster
+        // as a fallback (rev-13's blocking finding on #604). Consulting the
+        // roster only when the file is missing trusts a file that is known to
+        // be able to LIE: `mint_agent_seq` audits a failed write and does not
+        // propagate it, so the id it just returned goes on to be worktreed,
+        // rostered and audited while the mark that reserved it never reached
+        // disk. The file then parses to a value BELOW the roster, the old
+        // `match` took it at face value, and the next restart reissued a live
+        // id — #524's own bug, back through #524's own degraded path.
+        //
+        // The floor's two weaknesses (it misses a spawn that died before its
+        // roster write; it forgets a swept group dir) are arguments against
+        // the roster as the ONLY source, which is what they were written for.
+        // A max inherits each source's strength and neither's weakness, and
+        // costs one directory scan per process — which the migration path
+        // already paid for.
+        let mark = from_file.unwrap_or(0).max(self.agent_seq_floor_from_rosters());
         // `fetch_max`, not `store`: a seed may never move the counter
         // BACKWARDS, which is the one direction that reintroduces the bug.
         self.seq.fetch_max(mark, Ordering::SeqCst);
     }
 
-    /// Highest agent-id suffix recorded in any group's durable roster — the
-    /// migration floor `seed_agent_seq_locked` falls back to. Best-effort by
-    /// construction: an unreadable root, group dir, or `agents.json`
-    /// contributes nothing rather than failing a spawn.
+    /// Highest agent-id suffix recorded in any group's durable roster — one of
+    /// the two sources `seed_agent_seq_locked` takes the max of, never a
+    /// fallback consulted only when the other is missing (see its comment).
+    /// Best-effort by construction: an unreadable root, group dir, or
+    /// `agents.json` contributes nothing rather than failing a spawn.
     fn agent_seq_floor_from_rosters(&self) -> u32 {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return 0;
@@ -16236,7 +16250,27 @@ impl OrchRegistry {
     fn mint_agent_seq(&self, group: &str) -> u32 {
         let _writer = self.agent_seq_persist.lock_safe();
         self.seed_agent_seq_locked();
-        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        // `saturating_add` under the lock, not `fetch_add` (rev-13 N1). A
+        // stored `high_water` at `u32::MAX` — implausible, but the one input
+        // where the parse-side clamp does NOT fail safe — made the atomic wrap
+        // to 0 and the `+ 1` overflow, and `[profile.release]` sets no
+        // `overflow-checks`, so the shipped binary would wrap silently where
+        // `cargo test` panics. Wrapping is the worst possible failure here: it
+        // reissues from `w-1` and collides with EVERY live id at once.
+        // Saturating instead pins the counter at the ceiling — still broken,
+        // but broken in the direction that hands out no id twice until the
+        // next mint, and it says so out loud rather than looking healthy.
+        // Load/store is safe because every mint holds this lock and nothing
+        // else touches `seq`.
+        let prev = self.seq.load(Ordering::SeqCst);
+        let seq = prev.saturating_add(1);
+        self.seq.store(seq, Ordering::SeqCst);
+        if seq == prev {
+            self.audit(group, "loomux", "agent-seq-exhausted", json!({
+                "seq": seq,
+                "detail": "agent-id counter is at u32::MAX — ids are no longer unique",
+            }));
+        }
         let body = serde_json::to_string_pretty(&json!({
             "high_water": seq,
             "updated_ms": now_ms(),

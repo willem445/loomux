@@ -1350,17 +1350,11 @@ fn a_missing_counter_file_reseeds_from_the_durable_roster() {
     // always kept. Without this fallback the protection would start working
     // only AFTER the very collision it exists to prevent.
     let dir = tempfile::tempdir().unwrap();
-    let before: Vec<String> = {
-        let reg = relaunch_registry(dir.path());
-        let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-        // Two, not more: `rails()` caps a group at `max_agents: 2` and the
-        // third spawn is refused by the guardrail, which would fail this test
-        // on an unwrap instead of on the property it is about (caught by the
-        // red run — the first cut asked for three).
-        (0..2)
-            .map(|_| reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id)
-            .collect()
-    };
+    // Two, not more: `rails()` caps a group at `max_agents: 2` and a third
+    // spawn is refused by the guardrail, which would fail this test on an
+    // unwrap instead of on the property it is about (caught by the red run —
+    // the first cut asked for three).
+    let before = ids_from_a_previous_run(dir.path(), 2);
     // Removing a file that does not exist is the same no-op on either side of
     // this change, so the two runs differ only in whether ids repeat.
     let _ = std::fs::remove_file(dir.path().join("agent-seq.json"));
@@ -1369,9 +1363,7 @@ fn a_missing_counter_file_reseeds_from_the_durable_roster() {
         "the fixture must really have taken the counter file away"
     );
 
-    let reg = relaunch_registry(dir.path());
-    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-    let after = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id;
+    let after = id_after_restart(dir.path());
     assert!(
         !before.contains(&after),
         "with the counter file gone the roster is the only durable record of spent ids, and \
@@ -1386,6 +1378,111 @@ fn id_suffix(id: &str) -> u32 {
     id.rsplit_once('-').and_then(|(_, n)| n.parse().ok()).unwrap_or_else(|| {
         panic!("{id:?} is not a minted `<prefix>-<seq>` agent id")
     })
+}
+
+/// Spawn `n` workers into a fresh group on `dir` and return their ids, letting
+/// the registry drop — the "a previous run happened here" fixture the durability
+/// tests below all start from. Capped by `rails()`'s `max_agents: 2`.
+fn ids_from_a_previous_run(dir: &Path, n: usize) -> Vec<String> {
+    let reg = relaunch_registry(dir);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    (0..n).map(|_| reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id).collect()
+}
+
+/// Restart over `dir` and mint one more id.
+fn id_after_restart(dir: &Path) -> String {
+    let reg = relaunch_registry(dir);
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id
+}
+
+#[test]
+fn a_counter_file_behind_the_roster_heals_instead_of_reissuing() {
+    // rev-13's blocking finding on #604, and the case the first cut got wrong.
+    //
+    // `mint_agent_seq` audits a failed persist and deliberately does NOT
+    // propagate it — so the id it just returned goes on to be worktreed,
+    // rostered and audited while the mark that reserved it never reached disk.
+    // The file then parses to a value BELOW the roster. Reading the file as
+    // authoritative whenever it parses takes that lie at face value, and the
+    // next restart reissues a live id: #524's own bug, through #524's own
+    // degraded path.
+    //
+    // Not a tail risk on this repo. `atomic_write` fails on disk-full — its
+    // own `sync_all()` comment calls that "the disk-full guard" — and there
+    // are three recorded disk-exhaustion incidents here (#134, #320, #488),
+    // one of which crashed loomux itself. "Failed write, then a restart" is
+    // close to the modal way this fires.
+    let dir = tempfile::tempdir().unwrap();
+    let spent = ids_from_a_previous_run(dir.path(), 2);
+
+    // Exactly the on-disk state a mint whose write failed leaves behind: the
+    // roster records both agents, the counter file is a valid JSON document
+    // that lags one behind.
+    let stale = format!(r#"{{"high_water":{},"updated_ms":1}}"#, id_suffix(&spent[0]));
+    std::fs::write(dir.path().join("agent-seq.json"), stale).unwrap();
+
+    let after = id_after_restart(dir.path());
+    assert!(
+        !spent.contains(&after),
+        "a counter file behind the roster must heal UP against it, not be believed: minted \
+         {after:?} again after {spent:?} (rev-13 blocking, #524)"
+    );
+}
+
+#[test]
+fn a_counter_at_the_ceiling_saturates_instead_of_wrapping_to_one() {
+    // rev-13 N1. A stored `high_water` at `u32::MAX` is the one input where
+    // the parse-side clamp does not fail in the safe direction: `fetch_add`
+    // wrapped the atomic to 0 and reissued from `w-1`, colliding with every
+    // live id at once — and with no `overflow-checks` in `[profile.release]`
+    // the shipped binary did it silently where `cargo test` would panic.
+    //
+    // Saturating is still a broken state, but it is broken in the direction
+    // that reuses nothing, and `agent-seq-exhausted` says so in the audit.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("agent-seq.json"),
+        format!(r#"{{"high_water":{},"updated_ms":1}}"#, u32::MAX),
+    )
+    .unwrap();
+
+    let id = id_after_restart(dir.path());
+    assert_ne!(
+        id, "w-1",
+        "a counter at the ceiling must never wrap to zero and reissue from the start — that \
+         collides with every live id at once (rev-13 N1)"
+    );
+    assert_eq!(id, format!("w-{}", u32::MAX), "it should pin at the ceiling instead");
+}
+
+#[test]
+fn an_unusable_counter_file_falls_back_to_the_roster() {
+    // rev-13 N3: the corrupt-file paths were correct but asserted only by
+    // inspection. Stated plainly, since it bears on how this evidence reads —
+    // **these cases pass on the parent commit too.** Their behavior does not
+    // change in this round; they are the coverage the blocking finding was
+    // hiding in, and they now also pin that the `unwrap_or(0)` half of the new
+    // max cannot swallow the roster when the file is unusable.
+    for (label, body) in [
+        ("empty", ""),
+        ("not json at all", "high_water = 9"),
+        ("wrong value type", r#"{"high_water":"five"}"#),
+        ("negative", r#"{"high_water":-3}"#),
+        ("field missing", r#"{"updated_ms":1}"#),
+        ("truncated mid-write", r#"{"high_wat"#),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let spent = ids_from_a_previous_run(dir.path(), 2);
+        std::fs::write(dir.path().join("agent-seq.json"), body).unwrap();
+
+        let after = id_after_restart(dir.path());
+        assert!(
+            !spent.contains(&after),
+            "an unusable counter file ({label}) must fall through to the roster, not read as \
+             zero and reissue: minted {after:?} again after {spent:?}"
+        );
+    }
 }
 
 #[test]

@@ -117,14 +117,25 @@ audit row, an `agent/<id>` branch in the human's repo) do not go with it. A plai
 file at the root is invisible to both root scans: `session_roles` skips any entry
 without a `group.json`, and `existing_group_ids` filters on `is_dir()`.
 
-Its lock is held across seed → `fetch_add` → write for the same reason
-`queue_persist` is held across read-then-write: persisting outside the critical
-section lets two concurrent mints write out of order and leave the file *below*
-an id already handed out, which is precisely the reuse the file exists to
-prevent. The write also lands **before** the id is returned to the caller, so no
-artifact can outlive the mark that reserved its id. A failed write is audited
+Its lock is held across seed → mint → write for the same reason `queue_persist`
+is held across read-then-write: persisting outside the critical section lets two
+concurrent mints write out of order and leave the file *below* an id already
+handed out, which is precisely the reuse the file exists to prevent. The write
+also lands **before** the id is returned to the caller, so a crash mid-spawn
+cannot leave an artifact without its mark.
+
+**This is the one file in the table whose failed write is recoverable from
+somewhere else, and that is deliberate.** A failed write is audited
 (`agent-seq-persist-failed`) and not propagated — `persist_queues`' rule, for
-`persist_queues`' reason.
+`persist_queues`' reason — which means the id is handed out anyway and the file
+is left *behind* what has actually been issued. Since `atomic_write`'s failure
+mode is disk-full and this project has three recorded disk-exhaustion incidents
+(above), that is a correlated risk rather than a tail one. So the reader
+compensates: the seed takes `max(agent-seq.json, highest id in every group's
+agents.json)` rather than believing the file whenever it parses, and a mint whose
+write failed is still covered by the roster row its spawn goes on to write. See
+`doc/design/orchestration.md`'s "Agent ids that survive a restart" for the
+invariant that buys and the narrow window it does not.
 
 ## Part 1b — atomic appends (#240)
 
