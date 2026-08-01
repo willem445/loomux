@@ -10,6 +10,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { showToast } from "./toast";
+import { overlayState } from "./overlaystate";
 
 const KEY_EDITOR = "loomux.editorCommand";
 
@@ -44,7 +45,10 @@ export async function openInEditor(dir: string | null): Promise<boolean> {
 }
 
 /** Open the configuration modal so the user can set/change the editor command.
- *  Resolves to the saved command, or null if cancelled. */
+ *  Resolves to the saved command, or null if cancelled. An independent
+ *  hand-rolled dialog (not routed through modal.ts), so it registers with the
+ *  shared overlay registry (overlaystate.ts, #391) itself rather than
+ *  inheriting modal.ts's. */
 export function editorConfigDialog(): Promise<string | null> {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
@@ -88,10 +92,12 @@ export function editorConfigDialog(): Promise<string | null> {
     input.focus();
     input.select();
 
+    const closeOverlaySlot = overlayState.open(() => overlay.getBoundingClientRect());
     let settled = false;
     const close = (result: string | null): void => {
       if (settled) return;
       settled = true;
+      closeOverlaySlot();
       overlay.remove();
       resolve(result);
     };

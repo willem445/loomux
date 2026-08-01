@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "plugin-zero-template",
-  "description": "Template (#363, feeds #360 Slice C 'pane plugins'): zero-permission capability for a future non-main webview. A plugin/non-main webview is untrusted, so it starts with nothing — copy this file, rename `identifier`, and point `windows`/`webviews` at the real plugin window's label before granting anything (a curated subset of the module sets under permissions/sets/ is the intended shape, never `main-ui`). The placeholder label below (\"plugin-zero-template\") never exists in the shipped app, so this exact file is inert in production; tests/acl_manifest.rs opens a mock window with this label to prove the zero-grant deny is real (per-label, not global) using the app's actual resolved ACL. See doc/design/acl-manifest.md.",
-  "windows": ["plugin-zero-template"],
+  "description": "Template (#363, feeds #360 Slice C 'pane plugins'): zero-permission capability for a future non-main webview. A plugin/non-main webview is untrusted, so it starts with nothing — copy this file, rename `identifier`, and point `windows`/`webviews` at the real plugin window's label before granting anything (a curated subset of the module sets under permissions/sets/ is the intended shape, never `main-ui`). The placeholder label below (\"untrusted-probe-0\") never exists in the shipped app and deliberately does NOT match the real \"plugin-*\" glob capabilities/plugin.json binds (#360 Slice C review, rev-65 NB-1) — a label matching that glob would also pick up the plugin-broker grant, diluting this file's zero-grant proof. tests/acl_manifest.rs opens a mock window with this label to prove the zero-grant deny is real (per-label, not global) using the app's actual resolved ACL. See doc/design/acl-manifest.md.",
+  "windows": ["untrusted-probe-0"],
   "permissions": []
 }

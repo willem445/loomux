@@ -94,6 +94,7 @@ test("docked panes round-trip (captured outside the layout tree, #194 P4)", () =
             groupId: null,
             file: null,
             embeds: [],
+            pluginId: null,
           },
         ],
       },
@@ -213,6 +214,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
         groupId: null,
         file: null,
         embeds: [],
+        pluginId: null,
       },
     },
     {
@@ -235,6 +237,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             groupId: null,
             file: null,
             embeds: [],
+            pluginId: null,
           },
         },
         {
@@ -252,6 +255,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             groupId: null,
             file: null,
             embeds: [],
+            pluginId: null,
           },
         },
         {
@@ -271,6 +275,7 @@ const NESTED_LAYOUT: PersistedLayoutNode = {
             groupId: null,
             file: null,
             embeds: [],
+            pluginId: null,
           },
         },
       ],
@@ -303,6 +308,7 @@ test("a files leaf round-trips its root — and needed NO new field or schema bu
     groupId: null,
     file: null,
     embeds: [],
+    pluginId: null,
   };
   const state: PersistedTabs = {
     tabs: [
@@ -373,6 +379,7 @@ test("editor and git leaves round-trip their root — and the editor's open FILE
     groupId: null,
     file,
     embeds: [],
+    pluginId: null,
   });
   const state: PersistedTabs = {
     tabs: [
@@ -489,6 +496,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       role: 99, // non-string → null
       file: 7, // non-string → null (#217)
       embeds: "0.4", // not an array → [] (#361)
+      pluginId: 7, // non-string → null (#360 Slice D)
     },
   };
   const back = decodeTabs(
@@ -509,6 +517,7 @@ test("malformed pane fields inside a valid leaf coerce to null, not a drop", () 
       groupId: null,
       file: null,
       embeds: [],
+      pluginId: null,
     },
   });
 });
@@ -748,6 +757,69 @@ test("the newest present shape wins when a pane somehow carries more than one", 
   const leaf = decodeTabs(raw)?.tabs[0].layout;
   assert.ok(leaf?.kind === "leaf");
   assert.deepEqual(leaf.pane.embeds, [{ view: "group", side: "right", share: 0.6 }]);
+});
+
+// ---------- #360 Slice D: plugin leaves ----------
+
+test("a plugin leaf round-trips its pluginId — and needed NO root/file at all", () => {
+  const plugin: PersistedPane = {
+    paneKind: "plugin",
+    name: "Resource monitor",
+    cwd: null,
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: null,
+    role: null,
+    groupId: null,
+    file: null,
+    embeds: [],
+    pluginId: "resource-monitor",
+  };
+  const state: PersistedTabs = {
+    tabs: [
+      { name: "t", color: null, groupId: null, layout: { kind: "leaf", weight: 1, pane: plugin } },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const leaf = back?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane, plugin);
+  // Additive, like every other content kind before it — no schema bump.
+  assert.equal(back?.schemaVersion, 2);
+});
+
+test("a plugin leaf with no recorded pluginId decodes (null) rather than dropping the whole tab layout", () => {
+  // Same fail-soft as a rootless files/editor/git leaf: well-formed but unrestorable
+  // is not malformed. Restore fails soft in that ONE slot (planPaneRestore →
+  // open-plugin with pluginId null → main.ts opens the welcome form with a toast).
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "split",
+          dir: "row",
+          weight: 1,
+          children: [
+            { kind: "leaf", weight: 1, pane: { paneKind: "terminal", name: "shell" } },
+            { kind: "leaf", weight: 1, pane: { paneKind: "plugin", name: "plugin" } }, // no pluginId
+          ],
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const layout = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(layout?.kind === "split");
+  assert.equal(layout.children.length, 2, "the sibling terminal survives");
+  const pluginLeaf = layout.children[1];
+  assert.ok(pluginLeaf.kind === "leaf");
+  assert.equal(pluginLeaf.pane.paneKind, "plugin");
+  assert.equal(pluginLeaf.pane.pluginId, null);
 });
 
 test("restorePref and schemaVersion coerce unknown values to safe defaults", () => {

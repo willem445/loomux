@@ -135,6 +135,12 @@ enforced at the CLI level.
   file explorer and push-to-talk voice prompts, each one keystroke away. Float
   them over the terminal, or **dock** up to three of them beside it (left, right,
   bottom) with a draggable divider.
+- **Panes you can write yourself** — a **pane plugin** is your own code filling a
+  pane, in a sandboxed webview with no shell, no filesystem beyond a jailed root
+  it declares, and no orchestration reach. Start from
+  [`templates/loomux-plugin/`](templates/loomux-plugin/); the
+  [authoring guide](https://willem445.github.io/loomux/features/pane-plugins) has
+  the manifest and the capability-gated broker API.
 - **Audit everything** — every prompt, spawn, gate decision and toggle change is
   one filterable row in the group's audit log.
 - **Lessons that outlive a session** — a committed `.loomux/lessons.md` feeds

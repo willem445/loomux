@@ -53,6 +53,7 @@ import { TasksView } from "./tasksview";
 import { AuditView } from "./auditview";
 import { GroupView } from "./groupview";
 import { clampOverlayHeight, OVERLAY_MIN_H } from "./overlaysize";
+import { overlayState } from "./overlaystate";
 import {
   embedDragGrow,
   fracFromGrow,
@@ -79,6 +80,7 @@ import { FileEditView } from "./fileedit";
 import { FileExplorerView } from "./fileexplorer";
 import { WorkflowView } from "./workflowview";
 import { WORKFLOW_FILE } from "./workflowmodel";
+import { PluginPaneView, type PluginPaneManifest } from "./pluginpaneview";
 import type { PersistedPane, PersistedPaneKind } from "./tabstore";
 import type { TabPaneInfo } from "./tabcounts";
 import { adoptableSessionId, hasForkSession, normalizeAgentProgram } from "./panerestore";
@@ -244,19 +246,21 @@ export interface PaneOptions {
 }
 
 /** The PTY-less CONTENT pane kinds. A pane of one of these kinds IS a surface —
- *  a file manager (#214), the file editor, the git view (#217), or the workflow
- *  builder (#222) — rather than a process. They share every pane mechanic (split,
- *  dock, drag, maximize, restore) and differ only in which view fills the content box. */
-export type ContentPaneKind = "files" | "editor" | "git" | "workflow";
+ *  a file manager (#214), the file editor, the git view (#217), the workflow
+ *  builder (#222), or an installed pane plugin (#360 Slice D) — rather than a
+ *  process. They share every pane mechanic (split, dock, drag, maximize, restore)
+ *  and differ only in which view fills the content box. */
+export type ContentPaneKind = "files" | "editor" | "git" | "workflow" | "plugin";
 
 /** What to CALL each content kind when a message has to name it ("the git view isn't
- *  available in a workflow pane"). A table rather than a ternary chain, so a fifth kind
+ *  available in a workflow pane"). A table rather than a ternary chain, so a sixth kind
  *  is a row and not a nested conditional nobody re-reads. */
 const CONTENT_KIND_LABEL: Record<ContentPaneKind, string> = {
   files: "file explorer",
   editor: "file editor",
   git: "git",
   workflow: "workflow",
+  plugin: "plugin",
 };
 
 /** What a content pane needs: which surface, the root it is pointed at, and a name.
@@ -268,8 +272,10 @@ export interface ContentPaneOptions {
   /** Absolute path the surface is rooted at: the folder a manager lists / an editor
    *  trees, or a directory inside the repo a git view shows. Validated for real by
    *  the caller before we get here — `ftRootIsDir` for files/editor, `gitRepoRoot`
-   *  for git — so this never builds a pane around a root that isn't what it claims. */
-  root: string;
+   *  for git — so this never builds a pane around a root that isn't what it claims.
+   *  Absent for the PLUGIN kind (#360 Slice D): a plugin pane's identity is WHICH
+   *  plugin (`plugin.pluginId` below), not a path — see `doc/design/pane-plugins.md`. */
+  root?: string;
   /** EDITOR kind: a root-relative file to open immediately. Set by the file browser's
    *  "Open in file editor pane" (#217); absent from the welcome flow, which opens the
    *  editor on its tree with nothing selected.
@@ -278,6 +284,11 @@ export interface ContentPaneOptions {
    *  `.loomux/workflow.yml` when absent — the welcome flow's case — and is set when the
    *  browser opens a *different* YAML as a workflow. */
   file?: string;
+  /** PLUGIN kind only (#360 Slice D): the installed plugin's CURRENT manifest,
+   *  resolved by the caller from `list_plugins` at open time (never persisted —
+   *  only `pluginId` is; see tabstore.ts's `PersistedPane.pluginId` doc comment).
+   *  Required when `kind === "plugin"`, absent otherwise. */
+  plugin?: PluginPaneManifest;
   /** Open without stealing keyboard focus (same contract as PaneOptions). */
   background?: boolean;
 }
@@ -553,6 +564,12 @@ export class Pane implements VoiceTargetPane {
    *  left/bottom's shape exactly, and `termEl` fills it via its own
    *  pre-existing `flex: 1` rule, unaffected either way. */
   private embedTermWrapEl: HTMLElement | null = null;
+  /** Closer for the shared overlay registry (#391, folded into #380). One
+   *  slot shared across all the pane's own overlay toggles above: each of
+   *  their "open" branches already closes every sibling overlay first
+   *  (they're mutually exclusive within a pane), so at most one of them ever
+   *  holds the slot at a time. */
+  private overlaySlotClose: (() => void) | null = null;
   /** Fold-group toggle (orchestrator panes only, #46): minimizes every
    *  worker/reviewer pane in the group to the dock, or restores them all. */
   private groupMinBtn: HTMLButtonElement;
@@ -686,6 +703,18 @@ export class Pane implements VoiceTargetPane {
   private editorPaneView: FileEditView | null = null;
   private gitPaneView: GitView | null = null;
   private workflowPaneView: WorkflowView | null = null;
+  private pluginPaneView: PluginPaneView | null = null;
+  /** The SAME object one of the five view fields above holds — `buildContentView`'s
+   *  return value, stashed once so `notifyMoved` (below) has one place to forward
+   *  to instead of an `?? ?? ?? ?? ??` chain over every kind (`unsavedHolder`'s
+   *  three-way chain is fine at three; this is five). Null for a terminal pane
+   *  (no content view at all) — `notifyMoved` is correctly a no-op there. */
+  private contentView: { el: HTMLElement; show(): void; notifyMoved?(): void } | null = null;
+  /** A PLUGIN pane's (#360 Slice D) persisted identity — the installed plugin's
+   *  manifest `id`. Unlike the other content kinds' root, this rides in its own
+   *  `PersistedPane.pluginId` field, not `cwd` (tabstore.ts) — so it's tracked
+   *  separately from `contentRoot`, which a plugin pane leaves null. */
+  private pluginId: string | null = null;
   /** True once the pane's process has exited but the pane was kept open to show
    *  its output (notifyExited). The counter must not count a dead agent as live
    *  (#194 P4 LOW-7). */
@@ -1395,10 +1424,18 @@ export class Pane implements VoiceTargetPane {
     this.el.classList.add("is-content");
     this.contentKind = opts.kind;
     this.contentFile = opts.file ?? null;
-    this.setContentRoot(opts.root);
+    // A PLUGIN pane (#360 Slice D) has no root — its identity is `opts.plugin.pluginId`,
+    // tracked separately below — so this is the one content kind that skips
+    // setContentRoot entirely rather than rooting itself at an empty string.
+    if (opts.root !== undefined) this.setContentRoot(opts.root);
+    this.pluginId = opts.plugin?.pluginId ?? null;
+    // Untrusted display text (the manifest's `name`, opts.plugin.displayName): routed
+    // through setName exactly like every other pane title, which assigns via
+    // `textContent` (never innerHTML) — so it can never be interpolated as markup.
     this.setName(opts.name);
 
     const view = this.buildContentView(opts);
+    this.contentView = view;
     const wrap = document.createElement("div");
     wrap.className = "pane-content";
     wrap.appendChild(view.el);
@@ -1417,7 +1454,9 @@ export class Pane implements VoiceTargetPane {
 
   /** Construct the view a content pane hosts (not shown yet — see startContent). Split
    *  out so the per-kind wiring reads as three cases, not one branching block. */
-  private buildContentView(opts: ContentPaneOptions): { el: HTMLElement; show(): void } {
+  private buildContentView(
+    opts: ContentPaneOptions
+  ): { el: HTMLElement; show(): void; notifyMoved?(): void } {
     // Re-rooting from a view's own folder picker re-roots the PANE, so the persisted
     // record follows and a restore reopens what was actually on screen.
     //
@@ -1472,6 +1511,16 @@ export class Pane implements VoiceTargetPane {
         onRootChanged: adoptRoot,
       });
       return this.editorPaneView;
+    }
+
+    if (opts.kind === "plugin") {
+      // A plugin pane's identity is immutable for its lifetime (like a workflow
+      // block's id) — no re-root affordance, so `adoptRoot` doesn't apply here.
+      // `opts.plugin` is required by ContentPaneOptions' own doc comment for this
+      // kind; the caller (launcher.ts / main.ts) always resolves it before calling
+      // startContent, same as it resolves `root` for real for the other kinds.
+      this.pluginPaneView = new PluginPaneView({ manifest: opts.plugin! });
+      return this.pluginPaneView;
     }
 
     if (opts.kind === "workflow") {
@@ -2562,6 +2611,15 @@ export class Pane implements VoiceTargetPane {
       entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
     } else {
       entry.overlayEl.hidden = true;
+      // #391 (folded into #380): release this overlay's rect from the shared
+      // registry the moment it stops covering, so a plugin pane's native
+      // region clip stops punching a hole for it. Only the FLOATING mode
+      // registers a rect at all — a DOCKED panel is a flex sibling of the
+      // terminal, not a layer over it, so it changes a plugin pane's content
+      // BOX (that pane's own ResizeObserver's job) rather than occluding it.
+      // That's why this lives in the `else` branch, not at the top.
+      this.overlaySlotClose?.();
+      this.overlaySlotClose = null;
     }
     this.updateTermShift();
     this.focus();
@@ -2620,6 +2678,13 @@ export class Pane implements VoiceTargetPane {
         const strip = Math.max(140, Math.round(this.el.clientHeight * 0.35));
         entry.overlayEl.style.height = `${this.overlayClamp(this.termEl.clientHeight - strip, entry.floorPx())}px`;
         entry.overlayEl.hidden = false;
+        // #391 (folded into #380): a floating overlay COVERS the terminal —
+        // and any plugin child webview painted over that pane — so its live
+        // rect joins the shared registry `pluginpaneview.ts` clips against.
+        // One shared slot is enough: `closeOtherOverlays` above guarantees at
+        // most one floating overlay per pane, and it runs first, so the slot
+        // is always free by the time this assigns it.
+        this.overlaySlotClose = overlayState.open(() => entry.overlayEl.getBoundingClientRect());
       }
       entry.show();
       this.updateTermShift();
@@ -2632,6 +2697,10 @@ export class Pane implements VoiceTargetPane {
         entry.overlayEl.insertBefore(entry.viewEl, entry.overlayEl.firstChild);
       } else {
         entry.overlayEl.hidden = true;
+        // Retracting the overlay must retract its registry rect too — never
+        // leave a hole punched for an overlay that isn't on screen (#391).
+        this.overlaySlotClose?.();
+        this.overlaySlotClose = null;
       }
       this.termEl.style.transform = "";
       throw err;
@@ -2772,7 +2841,14 @@ export class Pane implements VoiceTargetPane {
       this.syncEmbedToggleButton(evicted);
     }
     const wasOverlayOpen = !entry.overlayEl.hidden;
-    if (wasOverlayOpen) entry.overlayEl.hidden = true; // it's about to move into the slot
+    if (wasOverlayOpen) {
+      entry.overlayEl.hidden = true; // it's about to move into the slot
+      // …and stops covering, so its registry rect goes with it (#391). This
+      // is the one path that hides a floating overlay without going through
+      // `closeView`, so the release has to be repeated here.
+      this.overlaySlotClose?.();
+      this.overlaySlotClose = null;
+    }
     targetSlot.kind = kind;
     targetSlot.frac = clampEmbedFrac(targetSlot.frac);
     entry.setPanelActive(true);
@@ -3183,6 +3259,9 @@ export class Pane implements VoiceTargetPane {
                 : [];
             })
           : [],
+      // A PLUGIN pane's (#360 Slice D) identity — see tabstore.ts's PersistedPane.pluginId
+      // doc comment for why this is its own field rather than riding in `cwd`.
+      pluginId: kind === "plugin" ? this.pluginId : null,
     };
   }
 
@@ -3442,6 +3521,21 @@ export class Pane implements VoiceTargetPane {
     this.el.classList.toggle("maximized", on);
     this.maximizeBtn.textContent = on ? "⤡" : "⤢";
     this.maximizeBtn.title = on ? "Restore (Ctrl+Shift+M)" : "Maximize (Ctrl+Shift+M)";
+  }
+
+  /** Tell this pane's content view its element moved to a new slot WITHOUT a
+   *  size change (#380) — `Grid`'s `syncMovedPanes` backstop calls this for
+   *  every pane `layout.ts`'s `isPositionOnlyMove` catches after a drag-reorder
+   *  swap or any other position-only relocation, the one case a content view's
+   *  own `ResizeObserver`/window-`resize` triggers never fire for (both are
+   *  size-only signals). A no-op for a terminal pane (`contentView` is null —
+   *  there is no content view, and this is deliberately NOT wired into
+   *  `applyFit`, so it can never touch the ConPTY) and for any content kind
+   *  that doesn't implement `notifyMoved` (only `PluginPaneView` currently
+   *  needs it — it's the only content view whose "content" isn't a DOM
+   *  descendant `el`'s own layout keeps in sync for free). */
+  notifyMoved(): void {
+    this.contentView?.notifyMoved?.();
   }
 
   /** Group accent color, if this pane carries an orchestration badge — used to
@@ -3917,6 +4011,11 @@ export class Pane implements VoiceTargetPane {
     voiceController.notifyPaneDisposed(this);
     this.voiceIndicator?.remove();
     this.clearAttachments(); // revoke any lingering thumbnail object URLs
+    // Release the overlay-registry slot (#391) if this pane is torn down
+    // while one of its own overlays was still open — otherwise a plugin pane
+    // elsewhere would keep this overlay's rect excluded forever.
+    this.overlaySlotClose?.();
+    this.overlaySlotClose = null;
     this.gitView?.dispose();
     this.issuesView?.dispose();
     this.tasksView?.dispose();
@@ -3928,6 +4027,7 @@ export class Pane implements VoiceTargetPane {
     this.editorPaneView?.dispose();
     this.gitPaneView?.dispose();
     this.workflowPaneView?.dispose();
+    this.pluginPaneView?.dispose();
     if (this.ptyId !== null) {
       detachOutput(this.ptyId);
       detachGitWatch(this.ptyId);
