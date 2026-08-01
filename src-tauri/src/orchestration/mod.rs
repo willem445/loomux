@@ -9348,7 +9348,7 @@ pub enum UnconfirmedDisposition {
 pub fn unconfirmed_disposition(
     reading: BoxReading,
     box_pending: bool,
-    turn_evidence: bool,
+    _turn_evidence: bool,
 ) -> UnconfirmedDisposition {
     match reading {
         // Our text is still in the box — the genuine strand.
@@ -9360,11 +9360,9 @@ pub fn unconfirmed_disposition(
         // Observed empty of our text — idle only if it is empty of the
         // human's too.
         BoxReading::NotHolding if box_pending => UnconfirmedDisposition::Notify,
-        // #585: and only if the pane can show it actually ran a turn. This is
-        // the cell that swallowed every lost kickoff this feature exists to
-        // catch — see this function's doc.
-        BoxReading::NotHolding if turn_evidence => UnconfirmedDisposition::IdleAuditOnly,
-        BoxReading::NotHolding => UnconfirmedDisposition::EatenNotify,
+        // EVIDENCE NEUTER (#585): pre-#585 semantics — turn_evidence ignored,
+        // every empty quiet box classified as an idle pane.
+        BoxReading::NotHolding => UnconfirmedDisposition::IdleAuditOnly,
     }
 }
 
@@ -14046,11 +14044,9 @@ pub fn unconfirmed_delivery_notice(agent_id: &str) -> String {
 /// what was observed, and names the idle pane the orchestrator is about to see
 /// so an idle pane is not mistaken for a refutation.
 pub fn delivery_eaten_notice(agent_id: &str) -> String {
-    format!(
-        "[loomux] delivery to {agent_id} was LOST — its text never reached the pane's box \
-         and the pane ran no turn on it. Re-send it. (get_output will show an idle pane: \
-         that is the symptom, not evidence the delivery landed.)"
-    )
+    // EVIDENCE NEUTER (#585): pre-#585 the eaten case had no wording of its
+    // own; it got the stuck-in-the-box one (when it got anything at all).
+    unconfirmed_delivery_notice(agent_id)
 }
 
 /// #112 round 2: the correction notice for a delivery that already drew
@@ -27350,14 +27346,12 @@ impl OrchRegistry {
         // actually eaten?" stays greppable apart from "how often is one merely
         // unconfirmed?" — the question this whole issue turned on, which the
         // pre-#585 log could not answer.
+        // EVIDENCE NEUTER (#585): pre-#585 there was ONE wording and no
+        // discriminator — an eaten delivery was described as merely stuck.
+        let _ = eaten;
         self.audit(group, "loomux", "delivery-unconfirmed-notice",
-            json!({ "to": agent_id, "eaten": eaten }));
-        let text = if eaten {
-            delivery_eaten_notice(agent_id)
-        } else {
-            unconfirmed_delivery_notice(agent_id)
-        };
-        let _ = self.deliver_to_orchestrator(group, &text, "loomux");
+            json!({ "to": agent_id, "eaten": false }));
+        let _ = self.deliver_to_orchestrator(group, &unconfirmed_delivery_notice(agent_id), "loomux");
     }
 
     /// #112 round 2 — additive to the #445 seam (a NEW notice path;
