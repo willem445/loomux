@@ -17610,6 +17610,12 @@ fn stranded_detail_names_the_blocker_the_human_must_clear() {
         Some(StrandedBlocker::NotHolding),
         Some(StrandedBlocker::Exhausted),
         Some(StrandedBlocker::QueueFull),
+        // #563: appended (never inserted) — the index-based assertions below
+        // name specific rows, and shifting them would silently re-point them
+        // at the wrong blocker while still passing.
+        Some(StrandedBlocker::QueueNearFull),
+        Some(StrandedBlocker::QueueAtCapacity),
+        Some(StrandedBlocker::QuestionStale),
     ]
     .into_iter()
     .map(|b| stranded_detail("w-1", b))
@@ -17894,9 +17900,10 @@ fn a_queue_full_drop_names_what_it_dropped_and_badges_the_pane() {
 
     assert_eq!(
         reg.stranded_note(&w.id).and_then(|n| n.blocker),
-        Some(StrandedBlocker::QueueFull),
+        Some(StrandedBlocker::QueueAtCapacity),
         "and the pane is badged — on an orchestrator pane the badge is the ONLY channel that \
-         survives, and before #563 the front door raised none"
+         survives, and before #563 the front door raised none. `QueueAtCapacity`, not \
+         `QueueFull`: this caller read a DEPTH, not a refused re-send (rev-10 finding 1)"
     );
 }
 
@@ -17956,9 +17963,65 @@ fn the_near_full_badge_does_not_claim_a_delivery_was_already_lost() {
     );
     assert!(near.contains("nearly full"), "it names the real state: {near}");
     assert!(
-        near.contains("before") && near.contains("dropped"),
+        near.contains("dropped"),
         "and what happens if the pane is left alone, which is the whole point of warning early: {near}"
     );
+}
+
+#[test]
+fn the_capacity_badges_state_a_hold_as_a_CONDITION_never_as_a_fact() {
+    // rev-10 finding 1, and it is the same false-claim class this whole issue
+    // exists to eliminate — reached from the other side.
+    //
+    // `note_queue_capacity` decides on DEPTH ALONE. It never reads
+    // `write_admission`, `held_escalation`, or any hold state; the raise sits
+    // in `enqueue_text`'s `Admit` arm and runs on every admission. So a pane
+    // whose drainer is perfectly healthy but whose senders outrun it — a fleet
+    // of workers reporting into one orchestrator pane — reaches these
+    // thresholds with NO hold at all. A badge that tells that human to "press
+    // Enter or answer what's on screen" sends them hunting for a dialog that
+    // does not exist, and a badge that wastes someone's time once is a badge
+    // they discount next time. That is the "trains a human to ignore the real
+    // one" harm the drainer's ChipGuard exists to prevent.
+    for blocker in [StrandedBlocker::QueueNearFull, StrandedBlocker::QueueAtCapacity] {
+        let detail = stranded_detail("w-1", Some(blocker));
+        assert!(
+            detail.contains("If it is held"),
+            "{blocker:?} must offer the hold as a condition to check, not assert it: {detail}"
+        );
+        // The unconditional forms the first cut shipped. Each would be a claim
+        // about state this caller has not read.
+        for forbidden in ["is held and", "the pane is held —", "press Enter in the pane"] {
+            assert!(
+                !detail.contains(forbidden),
+                "{blocker:?} asserts a hold it never established ({forbidden:?}): {detail}"
+            );
+        }
+    }
+
+    // ...and the depth-derived at-capacity badge is NOT `QueueFull`, whose
+    // wording is about a refused self-heal re-send and stranded text in the
+    // box — both true where `actuate_stranded` raises it, neither established
+    // by a depth reading.
+    let at_capacity = stranded_detail("w-1", Some(StrandedBlocker::QueueAtCapacity));
+    let refused_resend = stranded_detail("w-1", Some(StrandedBlocker::QueueFull));
+    assert_ne!(at_capacity, refused_resend, "two different facts must not share one sentence");
+    assert!(
+        !at_capacity.contains("re-send"),
+        "no re-send was attempted on the depth path: {at_capacity}"
+    );
+
+    // The notices carry the same discipline — they are the other half of the
+    // same report and would otherwise contradict the badge beside them.
+    let pressure = queue::pressure_notice("w-1", 6, 8);
+    assert!(pressure.contains("If the pane is held"), "conditional, not asserted: {pressure}");
+    assert!(pressure.contains("6/8"), "and it names the numbers it actually read: {pressure}");
+    let at_cap = queue::at_capacity_notice("w-1", 8);
+    assert!(
+        !at_cap.contains("until the pane is released"),
+        "a full queue does not imply a held pane: {at_cap}"
+    );
+    assert!(at_cap.contains("until it drains"), "it says what actually ends the state: {at_cap}");
 }
 
 #[test]

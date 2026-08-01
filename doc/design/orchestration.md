@@ -5701,6 +5701,26 @@ file would have rotted the same way the old implicit one did. `HoldClass::ordina
 match plus a hardcoded `ALL.len()` assertion is what keeps `ALL` honest: a new variant fails to
 compile until it has an index, and fails the test until it is listed.
 
+**Reconciling the investigation's 17 rows to the 13 variants.** The #563 investigation published a
+17-row table of hold *sites*; `HoldClass` has 13 *classifications*. The mapping is precisely where a
+row could silently go missing, so it is written down here rather than left to be re-derived — the
+"enumerate in writing, the already-fine ones included" rule from `.loomux/lessons.md`, applied to
+the enumeration itself.
+
+| Investigation rows | `HoldClass` | Why |
+| --- | --- | --- |
+| 1, 2, 3, 7, 8 | `PrePasteTyping`, `PrePasteBoxOccupied`, `PrePasteQuestion`, `PreEnterTyping`, `PreEnterQuestion` | direct 1:1 |
+| 6, 9 | `PrePasteRecheckExhausted`, `PreEnterBoxOccupied` | direct 1:1 |
+| 10, 11 | `QueuePollBoxOccupied`, `QueuePollQuestion` | direct 1:1 — the #563 defect |
+| 12 | `QueueStaleEscalation` | direct 1:1 |
+| 17 | `GroupPaused` | direct 1:1 |
+| **4, 5** | *no variant* — subsumed by rows 10/11 | These are the pre-paste **aborts**, i.e. the terminal transition of rows 2/3. After an abort the entry stays at the front of its queue and the drainer's poll is what looks at it next, so whatever still holds it is reported as `QueuePoll*` — which now chips from ~2s. An abort is a handoff, not a resting state, and a resting state is what a classification names. |
+| **13** | *no variant* — backstopped by 10/11/12 | The 30-minute still-queued notice rides the same suppressed in-band channel, but a pane still queued at 30 minutes is still queued **because** the drainer is blocked — so rows 10/11's chip and row 12's badge have both already fired long before. It adds detail to a report that exists rather than being the only report. |
+| **14, 15, 16** | all → `QueueFull` | Three sites (front door, marker push, recovery re-admission), one classification: the queue is at cap and an arrival was refused. All three reach `note_queue_capacity`, so all three badge; 16 additionally stages into `queue_orphans` (#523). |
+
+Rows 4/5 and 13 are the only two places the counts differ, and both are subsumptions rather than
+gaps — which is the fact worth being checkable at a glance instead of reconstructed.
+
 **Capacity: a state between "fine" and "work has just been lost".** There was none, which is why
 nothing could warn while warning was still useful. `queue::CapacityState` adds `Approaching` at
 `QUEUE_NEAR_FULL_AT` (6 of 8). Two slots of headroom, sized against what the warning is *for*
@@ -5718,11 +5738,29 @@ load-bearing rather than convenience: the release is observed on a pop that may 
 the queue, so at the moment the badge must come down there is no queue entry left to say whose it
 is.
 
-`StrandedBlocker::QueueNearFull` is a separate variant from `QueueFull` for the reason
-`QuestionStale` is separate from `Question`: `QueueFull`'s wording asserts loomux *could not queue*
-something, which is a false claim while the queue is still accepting. The badge never stomps
-another mechanism's — that badge is already telling the human to look at this pane — but it does
-upgrade its own, so `Approaching` → `Full` re-words rather than sticking at the softer sentence.
+**The two capacity badges say only what depth establishes.** `note_queue_capacity` decides on the
+queue's length and nothing else — it never reads `write_admission` or any hold state — so its badges
+are `StrandedBlocker::QueueNearFull` and `QueueAtCapacity`, both minted for this path, and **not**
+`QueueFull`. `QueueFull` is `actuate_stranded`'s: its wording says loomux *could not even queue a
+re-send* and tells the human to *press Enter in the pane*, which are true there (a self-heal really
+was refused; stranded text really is in the box) and unbacked here.
+
+The first cut got this wrong in a way worth recording, because it is the exact failure class this
+issue exists to eliminate, arrived at from the other side. Both capacity badges read "the pane **is
+held** — press Enter or answer what's on screen". But a pane whose drainer is perfectly healthy and
+whose senders simply outrun it — a fleet of workers reporting into one orchestrator pane — reaches
+these thresholds with **no hold of any kind**. The human is then sent hunting for a dialog that does
+not exist, and a badge that wastes someone's time once is a badge they discount next time: the same
+"trains a human to ignore the real one" harm the drainer's `ChipGuard` exists to prevent. The
+wording now asserts the backlog (which depth does establish) and offers the hold as a **condition to
+check** ("if the pane is held, releasing it drains the backlog").
+
+Both badges are released on the same evidence — a depth that has actually come back down — and the
+release is deliberately scoped to those two variants: `QueueFull` raised by `actuate_stranded` is
+about a refused re-send, which a falling depth does not resolve, so clearing it here would drop
+another mechanism's still-true badge. Equally, neither badge stomps a badge that is already up
+(another mechanism is already telling the human to look at this pane); they only upgrade their own,
+so `Approaching` → `Full` re-words rather than sticking at the softer sentence.
 
 **A forced drop now names what dropped.** The pre-#563 line recorded `{to, reason, depth}` and no
 more. No id is minted for a rejected entry, so there was nothing else in the log to join against,
@@ -5732,10 +5770,14 @@ re-send a delivery it can identify and cannot re-send an anonymous one. The mark
 names its own consequence in words (`text is pasted in the pane with nothing queued to submit it`),
 which is the fact a reader actually needs from that line.
 
-**Persistence (the #468 table above).** Only the `Admit` arm mutates `queues`, and it already
-persisted; `RejectFull` mutates nothing, so it owes no `persist_queues` — stated rather than left
-to inference, since "anything mutating `queues` owes `persist_queues`" is the rule this subsystem
-is reviewed against. `queue_pressure` is in-memory one-shot state like `question_stale_notified`
+**Persistence (the #468 table above).** `enqueue_text` has three arms and **two** of them mutate
+`queues`: `Admit` (the push) and `Coalesce` (the surviving entry's `coalesced` counter — under-report
+that and a recovery loses the flush header's de-duplication count). Both already called
+`persist_queues` and still do. `RejectFull` mutates nothing — it reads `q.len()` and drops the guard
+— so it owes no write. Spelled out arm by arm rather than left to inference, because "anything
+mutating `queues` owes `persist_queues`" is the rule this subsystem is reviewed against and this
+paragraph is what a later reader audits against; an earlier draft of it said only `Admit` mutates,
+which is exactly the claim that would later license skipping a persist on a coalesce-shaped path. `queue_pressure` is in-memory one-shot state like `question_stale_notified`
 and owes no snapshot either; it is cleared in `commit_exit` under the same generation guard, or a
 successor drainer's first reading would look like a fall from `Full` and emit a release for a pane
 that never recovered.

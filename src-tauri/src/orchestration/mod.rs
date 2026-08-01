@@ -9094,6 +9094,26 @@ pub enum StrandedBlocker {
     /// that matters. Released on evidence — the depth falling back to
     /// `CapacityState::Normal` — never on a timer.
     QueueNearFull,
+    /// #563: the pane's queue has reached `queue::QUEUE_MAX_PER_PANE`, read
+    /// from the DEPTH and nothing else.
+    ///
+    /// **Why this is not `QueueFull` (rev-10 finding 1, applied consistently).**
+    /// `QueueFull`'s wording says loomux *could not even queue a re-send* and
+    /// tells the human to *press Enter in the pane*. Both are true where it is
+    /// raised, from `actuate_stranded`: there a self-heal really was refused
+    /// and stranded text really is sitting in the box. Neither is established
+    /// by a depth reading — `note_queue_capacity` never consults hold state,
+    /// and the transition INTO `Full` fires on the admission that took the last
+    /// slot, before anything has been rejected at all. Reusing `QueueFull`
+    /// there would send a human to press Enter on a pane with nothing to
+    /// submit: the same false-claim class this issue exists to eliminate, and
+    /// the same reason `QuestionStale` was minted rather than reusing
+    /// `Question`.
+    ///
+    /// Says what depth establishes and then stops: the queue is at the cap, so
+    /// arrivals are being dropped. Released on the same evidence
+    /// `QueueNearFull` is — a depth that has actually come back down.
+    QueueAtCapacity,
     /// #532: the interactive-question guard has held this pane's delivery for
     /// longer than [`QUESTION_HOLD_STALE_AFTER`], and loomux cannot tell
     /// whether the question it still detects is real.
@@ -9152,6 +9172,7 @@ impl StrandedBlocker {
             StrandedBlocker::Exhausted => "heal-budget-spent",
             StrandedBlocker::QueueFull => "queue-full",
             StrandedBlocker::QueueNearFull => "queue-near-full",
+            StrandedBlocker::QueueAtCapacity => "queue-at-capacity",
             StrandedBlocker::QuestionStale => "question-hold-stale",
         }
     }
@@ -9607,10 +9628,31 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
         // pane is left alone (deliveries start being dropped). Deliberately
         // does not claim a re-send failed — that is `QueueFull`'s sentence,
         // and it would be false here.
+        //
+        // rev-10 finding 1: nor does it claim the pane is HELD.
+        // `note_queue_capacity` raises this badge on depth alone and never
+        // reads any hold state, so a pane whose senders simply outrun a healthy
+        // drainer lands here with nothing to release. The hold is offered as a
+        // condition for the human to check — "if the pane is held" — because
+        // that is the shape of what loomux actually knows. See
+        // `queue::pressure_notice`'s doc for the full argument.
         Some(StrandedBlocker::QueueNearFull) => {
             format!(
-                "{name}'s delivery queue is nearly full — the pane is held and backing up; \
-                 release it (press Enter or answer what's on screen) before further deliveries are dropped"
+                "{name}'s delivery queue is nearly full and still filling — deliveries are \
+                 arriving faster than that pane accepts them. If it is held (unsubmitted text, \
+                 or a question on screen), releasing it drains the backlog; at the cap further \
+                 deliveries are dropped"
+            )
+        }
+        // #563 / rev-10 finding 1: the depth-derived counterpart to
+        // `QueueFull`. States the consequence (arrivals are being dropped) and
+        // the same conditional check, and claims nothing about a re-send that
+        // this badge's caller never attempted.
+        Some(StrandedBlocker::QueueAtCapacity) => {
+            format!(
+                "{name}'s delivery queue is FULL — further deliveries to that pane are being \
+                 DROPPED, not queued. If it is held (unsubmitted text, or a question on screen), \
+                 releasing it drains the backlog"
             )
         }
         // #532: this wording must stay honest about WHICH state loomux is in,
@@ -11212,17 +11254,28 @@ fn run_queue_drainer(
     // #470 also spawns this thread for the common, uncontended, zero-hold
     // case, which must never claim anything was "queued while blocked."
     let mut header_pending = false;
-    // #563: whether THIS drainer currently has the pane-header delivery-held
-    // chip up for a hold it is itself sitting in. Owned here rather than in
-    // `held_escalation` for the reason `HeldEscalation::Chip`'s doc gives: "is
-    // the pane held" is a fact about the pane, "have we said so" is drainer
-    // state. Kept per-drainer (not in the registry) because a drainer is
-    // per-pty and its exit is exactly when the chip must come down — see the
-    // `ChipGuard` below, which drops it on EVERY exit from this function,
-    // including the early returns for a closed pty or a dead agent.
-    // (a `Cell`, not a plain `bool`, purely so the RAII guard below can share
-    // it with the loop body — nothing here is concurrent.)
-    let chip_shown = std::cell::Cell::new(false);
+    // #563: which reason THIS drainer currently has the pane-header
+    // delivery-held chip up for, or `None` for no chip. Owned here rather than
+    // in `held_escalation` for the reason `HeldEscalation::Chip`'s doc gives:
+    // "is the pane held" is a fact about the pane, "have we said so, and as
+    // what" is drainer state. Kept per-drainer (not in the registry) because a
+    // drainer is per-pty and its exit is exactly when the chip must come down —
+    // see the `ChipGuard` below, which drops it on EVERY exit from this
+    // function, including the early returns for a closed pty or a dead agent.
+    //
+    // **The REASON, not just a bool (rev-10 finding 3).** A bool made the
+    // reason freeze at whatever the first blocked poll saw, for the whole
+    // episode. The two gates genuinely alternate mid-hold — that alternation is
+    // the documented behaviour `PREPASTE_RECHECK_ROUNDS` exists for — and the
+    // two chips read materially differently ("submit or clear the text in this
+    // pane's box" vs "an interactive question is on screen, answer it"). A
+    // frozen reason can tell a human to clear an empty box while a dialog is
+    // what is actually waiting, which is a false claim on the very badge this
+    // PR added to stop false silence.
+    //
+    // (a `Cell`, purely so the RAII guard below can share it with the loop
+    // body — nothing here is concurrent.)
+    let chip_reason: std::cell::Cell<Option<HeldReason>> = std::cell::Cell::new(None);
     // #563: a chip left up by a drainer that exited would be a permanent lie
     // on a pane nothing is holding — the mirror image of the bug this fixes,
     // and worse, because a stale "held" chip trains a human to ignore the real
@@ -11231,24 +11284,26 @@ fn run_queue_drainer(
     struct ChipGuard<'a> {
         app: &'a AppHandle,
         pty_id: u32,
-        shown: &'a std::cell::Cell<bool>,
+        shown: &'a std::cell::Cell<Option<HeldReason>>,
     }
     impl Drop for ChipGuard<'_> {
         fn drop(&mut self) {
-            if self.shown.get() {
+            if self.shown.get().is_some() {
                 let _ = self
                     .app
                     .emit("orch-delivery-held-cleared", delivery_held_cleared_event(self.pty_id));
             }
         }
     }
-    let _chip_guard = ChipGuard { app: &app, pty_id, shown: &chip_shown };
-    // Raise/lower the chip, idempotently. `raise` is called on every held poll
-    // and emits only on the transition, so a pane held for hours produces one
-    // event, not one every `QUEUE_DRAIN_POLL`.
+    let _chip_guard = ChipGuard { app: &app, pty_id, shown: &chip_reason };
+    // Raise/lower the chip. `raise` is called on every held poll and emits only
+    // when the chip is not already up FOR THIS REASON, so a pane held for hours
+    // on one gate produces one event rather than one every `QUEUE_DRAIN_POLL`,
+    // while a pane whose blocking gate actually changes re-words its chip. The
+    // frontend's `setHeld` overwrites, so a re-emit needs no paired clear.
     let raise_chip = |agent_id: &str, reason: HeldReason| {
-        if !chip_shown.get() {
-            chip_shown.set(true);
+        if chip_reason.get() != Some(reason) {
+            chip_reason.set(Some(reason));
             let _ = app.emit(
                 "orch-delivery-held",
                 delivery_held_event(agent_id, &group, pty_id, reason),
@@ -11256,8 +11311,8 @@ fn run_queue_drainer(
         }
     };
     let lower_chip = || {
-        if chip_shown.get() {
-            chip_shown.set(false);
+        if chip_reason.get().is_some() {
+            chip_reason.set(None);
             let _ = app.emit("orch-delivery-held-cleared", delivery_held_cleared_event(pty_id));
         }
     };
@@ -11408,12 +11463,16 @@ fn run_queue_drainer(
                 // returned `None` for every poll inside the bound, and the
                 // pane showed nothing at all until the ten-minute escalation.
                 HeldEscalation::Chip(reason) => {
-                    if !chip_shown.get() {
-                        // One audit line per hold EPISODE, not per poll — the
-                        // record has to show that loomux held and said so,
-                        // without becoming an entry every two seconds for as
-                        // long as the hold stands (the same reasoning
-                        // `mark_stranded`'s one-shot rests on).
+                    if chip_reason.get().is_none() {
+                        // One audit line per hold EPISODE, not per poll and not
+                        // per reason change — the record has to show that
+                        // loomux held and said so, without becoming an entry
+                        // every two seconds for as long as the hold stands (the
+                        // same reasoning `mark_stranded`'s one-shot rests on).
+                        // The CHIP re-words when the blocking gate changes
+                        // (rev-10 finding 3); the audit deliberately does not,
+                        // because an alternating pane would then flood the log
+                        // with the flapping this line exists to summarise.
                         reg.audit(&group, "loomux", "delivery-held-in-queue", json!({
                             "to": front.agent_id, "stage": "queue-poll",
                             "blocked_on": admission.enqueue_reason().as_str(),
@@ -11447,7 +11506,7 @@ fn run_queue_drainer(
                 }
                 HeldEscalation::Clear => {
                     // #563: fires on every writable poll now, so both clears
-                    // are guarded — `lower_chip` on our own `chip_shown`, and
+                    // are guarded — `lower_chip` on our own `chip_reason`, and
                     // `clear_stranded` (below) on the badge being ours.
                     lower_chip();
                     reg.question_stale_notified.lock_safe().remove(&pty_id);
@@ -12487,7 +12546,7 @@ pub enum HeldEscalation {
     /// function's contract depend on two separate pieces of caller state. The
     /// caller's clears are already guarded (`clear_stranded` audits only when
     /// a badge was really up; the chip clear is gated on the caller's own
-    /// `chip_shown`), so a `Clear` for a pane with nothing up is a no-op, not
+    /// `chip_reason`), so a `Clear` for a pane with nothing up is a no-op, not
     /// a spurious audit line.
     Clear,
 }
@@ -25275,9 +25334,14 @@ impl OrchRegistry {
             "state": state.as_str(), "was": prev.as_str(),
         }));
         let existing = self.stranded_note(&agent_id).and_then(|n| n.blocker);
+        // Ours to upgrade and to clear: exactly the two badges THIS function
+        // raises. `QueueFull` is deliberately absent — `actuate_stranded`
+        // raises it about a refused re-send, which a depth falling back does
+        // not resolve, so clearing it here would drop another mechanism's
+        // still-true badge.
         let ours = matches!(
             existing,
-            Some(StrandedBlocker::QueueNearFull) | Some(StrandedBlocker::QueueFull)
+            Some(StrandedBlocker::QueueNearFull) | Some(StrandedBlocker::QueueAtCapacity)
         );
         if state == queue::CapacityState::Normal {
             if ours {
@@ -25287,7 +25351,10 @@ impl OrchRegistry {
         }
         let (blocker, text) = if state == queue::CapacityState::Full {
             (
-                StrandedBlocker::QueueFull,
+                // rev-10 finding 1: NOT `QueueFull` — that one's wording
+                // asserts a refused re-send and stranded text in the box,
+                // neither of which a depth reading establishes.
+                StrandedBlocker::QueueAtCapacity,
                 queue::at_capacity_notice(&agent_id, queue::QUEUE_MAX_PER_PANE),
             )
         } else {

@@ -737,14 +737,29 @@ pub fn dropped_payload_preview(text: &str) -> String {
 /// rather than saying "nearly", so a reader can tell how much room is left
 /// without knowing loomux's constants.
 ///
+/// **Says only what depth establishes (rev-10 finding 1).** The first cut read
+/// "it is held and backing up" and told the reader to press Enter or answer
+/// what was on screen. `note_queue_capacity` decides on **depth alone** — it
+/// never reads `write_admission` or any hold state — so a pane whose drainer is
+/// perfectly healthy but whose senders simply outrun it (a fleet of workers
+/// reporting into one orchestrator pane) reaches this threshold with no hold of
+/// any kind, and the reader would go looking for a dialog that does not exist.
+/// A badge that sends someone hunting for nothing is the same "trains a human
+/// to ignore the real one" failure the drainer's `ChipGuard` exists to prevent,
+/// arrived at from the other side. So the hold is stated as a CONDITION to
+/// check, never as a fact — and the backlog itself, which depth does establish,
+/// is what the sentence asserts.
+///
 /// Goes to the group's orchestrator via `notify_queue` — which means it is
 /// suppressed when the pane in question IS the orchestrator's. That is exactly
 /// why this notice is never the only channel: the caller also raises an
 /// attention badge, which no role suppresses. See `StrandedBlocker::QueueNearFull`.
 pub fn pressure_notice(agent_id: &str, depth: usize, cap: usize) -> String {
     format!(
-        "[loomux] {agent_id}'s delivery queue is {depth}/{cap} — it is held and backing up; \
-         once it hits {cap} further deliveries are DROPPED, not queued"
+        "[loomux] {agent_id}'s delivery queue is {depth}/{cap} and backing up — deliveries are \
+         arriving faster than that pane accepts them. If the pane is held (unsubmitted text in \
+         the box, or a question on screen), releasing it drains the backlog. At {cap} further \
+         deliveries are DROPPED, not queued"
     )
 }
 
@@ -753,10 +768,15 @@ pub fn pressure_notice(agent_id: &str, depth: usize, cap: usize) -> String {
 /// (the entry that filled the last slot was accepted). Says what happens next
 /// rather than claiming a loss that has not happened yet; the loss itself gets
 /// its own `delivery-dropped` record naming the payload.
+///
+/// "until it drains", not "until the pane is released" (rev-10 finding 1): the
+/// caller knows the depth and nothing else, and a full queue does not imply a
+/// held pane — see `pressure_notice`'s doc for the case where it is simply
+/// arriving faster than it delivers.
 pub fn at_capacity_notice(agent_id: &str, cap: usize) -> String {
     format!(
         "[loomux] {agent_id}'s delivery queue is FULL ({cap}/{cap}) — every further delivery \
-         to it is DROPPED, not queued, until the pane is released"
+         to it is DROPPED, not queued, until it drains"
     )
 }
 
