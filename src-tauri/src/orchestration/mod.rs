@@ -17340,6 +17340,12 @@ impl OrchRegistry {
     /// reports how many were ACTUALLY read, so a skip is visible as a smaller
     /// denominator rather than silently inflating confidence.
     fn corroborating_session_keys(&self, group: &str, target_session: &str) -> (Vec<(String, Vec<String>)>, bool) {
+        // SCRATCH (red-before-green, reverted in the next commit): no other
+        // session is ever read, which is the pre-#324 state — one session's
+        // windows and nothing to compare them against.
+        if true {
+            return (Vec::new(), false);
+        }
         let mut recs = self.merged_records(group);
         recs.sort_by_key(|r| std::cmp::Reverse(r.updated_ms));
         let mut seen: HashSet<String> = HashSet::new();

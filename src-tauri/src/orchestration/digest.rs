@@ -413,16 +413,9 @@ fn command_program(cmd: &str) -> String {
 /// from another. Blanking digits wholesale would collapse `E0433` and `E0599`
 /// into one key and count two unrelated compile errors as a recurrence.
 fn normalize_key_token(t: &str) -> String {
-    let t = t.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | ',' | ';'));
-    if t.is_empty() {
-        return String::new();
-    }
-    if t.contains('/') || t.contains('\\') {
-        return "<path>".into();
-    }
-    if t.chars().any(|c| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | ':' | ',' | '-' | '#' | '%' | '+')) {
-        return "#".into();
-    }
+    // SCRATCH (red-before-green, reverted in the next commit): the
+    // normalization removed, so a key keeps the per-session accidents it is
+    // supposed to drop.
     t.to_lowercase()
 }
 
@@ -724,13 +717,9 @@ pub const MAX_CORROBORATED_BY: usize = 5;
 /// is also what keeps a single flailing session from manufacturing its own
 /// evidence.
 pub fn apply_recurrence(digest: &mut SessionDigest, others: &[(String, Vec<String>)]) {
-    for w in digest.windows.iter_mut() {
-        let mut hits: Vec<String> =
-            others.iter().filter(|(_, keys)| keys.iter().any(|k| k == &w.key)).map(|(label, _)| label.clone()).collect();
-        w.recurrence = hits.len();
-        hits.truncate(MAX_CORROBORATED_BY);
-        w.corroborated_by = hits;
-    }
+    // SCRATCH (red-before-green, reverted in the next commit): no-op, so
+    // every window keeps the `recurrence: 0` the pure builder left.
+    let _ = (digest, others);
 }
 
 /// Every distinct friction key in one session's event stream — the compact
