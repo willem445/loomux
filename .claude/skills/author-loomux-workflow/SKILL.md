@@ -44,9 +44,12 @@ Read the human's description and extract, explicitly, before writing YAML:
 - **Models/CLIs per role — the cost/capability tradeoff.** Cheaper/faster
   model+CLI combos for high-volume or mechanical work (e.g. `copilot` /
   `auto`, or `claude` / `haiku`); stronger ones for judgment-heavy work or
-  the security-critical review lane (e.g. `claude` / `opus`). Only `claude`
-  and `copilot` exist as CLIs today (`SUPPORTED_CLIS`) — don't invent a
-  third.
+  the security-critical review lane (e.g. `claude` / `opus`). Only `claude`,
+  `copilot` and `gemini` exist as CLIs today (`SUPPORTED_CLIS`) — don't invent
+  a fourth. `gemini` is the cross-model option (#267): a different model family
+  for a reviewer lane, defaulting to its `pro` tier. It cannot host a block
+  whose class it can't contain — that pairing is a parse error, not a warning —
+  and `allow:` patterns don't apply to it.
 - **Review rigor.** One reviewer that must pass, or several focused lanes
   that must *all* pass (`all-pass`), or "any N of these M" (`threshold: N`)?
   This becomes the `gates.merge` clause (Step 4).

@@ -510,6 +510,49 @@ different class of defect than the one already primed on its own output.
 Worth considering for any reviewer-heavy workflow; loomux's own dogfood
 `.loomux/workflow.yml` notes the same above its reviewer blocks.
 
+### Setting up a cross-model reviewer
+
+`cli:` accepts `claude`, `copilot`, or `gemini`. So a workflow whose worker
+runs on Claude gets a genuinely different model family reviewing it by naming
+one on a reviewer block:
+
+```yaml
+version: 1
+blocks:
+  - id: worker
+    kind: worker
+    cli: claude
+    model: sonnet
+  - id: rev-gemini          # a second opinion from a different model family
+    kind: reviewer
+    cli: gemini             # model: defaults to gemini's `pro` reasoning tier
+gate:
+  require: [rev-gemini]
+```
+
+You need the CLI itself installed and logged in — loomux spawns `gemini` from
+your `PATH` the same way it spawns `claude`, and a reviewer whose CLI isn't
+installed just fails to start. Nothing else is needed: the reviewer's loomux
+tools (including the `pass`/`fail` verdict the merge gate reads) are wired up
+per agent, and its containment is generated per agent too, so a gemini
+reviewer is denied the file-editing tools exactly like a Claude one.
+
+Two differences worth knowing before you pick gemini for a lane:
+
+- **`allow:` doesn't apply to a gemini block.** Those patterns are
+  Claude/Copilot tool-matcher strings. A gemini block runs with its class's
+  baseline and can't be widened.
+- **No compact nudge.** loomux's context-pressure nudge types `/compact`,
+  which gemini doesn't have (its command is `/compress`), so gemini agents
+  are skipped rather than sent a command that doesn't exist.
+
+**Why not codex?** It was evaluated for this and deliberately left out: codex
+can't deny its editing tool by name, and its sandbox is all-or-nothing —
+strict enough to block the tests and `gh` a review needs, or open enough to
+let the reviewer rewrite the code it's reviewing. A reviewer that can't be
+contained would quietly weaken the merge gate, so loomux refuses the pairing
+instead of shipping it.
+
 Turning it on live shows the same resolved-roster confirm (name, blocks, any
 declared gate) the launcher's own preview shows at launch time; turning it off
 confirms that future spawns fall back to the built-in roster on your default

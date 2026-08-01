@@ -348,9 +348,11 @@ Human-only Tauri commands (constraint 5), mirroring the orchestration group's sp
 trip but launcher-initiated with no orchestrator involved:
 
 - **`orch_solo_prepare(cli, cwd, name) -> {agent_id, mcp_args, delivery_only}`** —
-  lazily ensures `__solo__`, mints `solo-N`. For claude/copilot (`SUPPORTED_CLIS`, the only
-  CLIs with a config seam today) it writes the config via the **existing**
-  `write_mcp_config(__solo__, solo-N, token, cli)` and returns the exact per-CLI flag
+  lazily ensures `__solo__`, mints `solo-N`. For claude/copilot (`CliCaps::mcp_argv_seam`
+  — the CLIs whose config can be delivered *entirely on argv*; since #267 this is
+  deliberately NOT the same set as `SUPPORTED_CLIS`, because gemini's config travels in an
+  environment variable only a loomux-spawned pane can be given) it writes the config via the
+  **existing** `write_mcp_config(__solo__, solo-N, token, cli, containment)` and returns the exact per-CLI flag
   string built in Rust (claude: `--mcp-config "<cfg>" --strict-mcp-config --allowedTools
   mcp__loomux`; copilot: `--additional-mcp-config "@<cfg>" --allow-tool loomux`) — one
   place per-CLI knowledge lives, next to `write_mcp_config`. For any other CLI it mints NO
