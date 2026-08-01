@@ -22573,7 +22573,7 @@ fn notify_register_tick_fires_once_and_delists() {
     let id = extract_watch_id(&text);
 
     let mut results = HashMap::new();
-    results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS — all 6 checks passed".into() });
+    results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS — all 6 checks passed".into() }.into());
     assert_eq!(reg.notify_tick(now_ms(), &results), vec![id.clone()], "a Met result must fire exactly once");
 
     let listed = reg.list_notifications(&cw.agent_id).to_string();
@@ -22585,6 +22585,106 @@ fn notify_register_tick_fires_once_and_delists() {
 
     // A second tick with the same result set is a no-op — the watch is gone.
     assert!(reg.notify_tick(now_ms(), &results).is_empty(), "must not fire twice");
+}
+
+/// The head SHA a `pr_checks` watch was registered against (#531's live
+/// incident: the note named this one) and the one it was re-pushed to before
+/// the checks resolved.
+const HEAD_AT_REGISTRATION: &str = "ccf191c00000000000000000000000000000beef";
+const HEAD_AFTER_REPUSH: &str = "a77c4d1e5f00000000000000000000000000abcd";
+
+/// Drive one watch from a first (baseline-setting) `Pending` poll to a `Met`
+/// poll, each with its own observed head, and return the group's audit log —
+/// which carries the delivered notice text verbatim under `watch-fired`.
+fn notify_fire_with_heads(
+    reg: &OrchRegistry,
+    cw: &Caller,
+    id: &str,
+    first_head: &str,
+    head_at_fire: &str,
+) -> String {
+    let mut pending = HashMap::new();
+    pending.insert(id.to_string(), notify::Poll::new(notify::PollResult::Pending, Some(first_head.to_string())));
+    assert!(reg.notify_tick(now_ms(), &pending).is_empty(), "a Pending poll must not fire, it only baselines the head");
+
+    let mut met = HashMap::new();
+    met.insert(
+        id.to_string(),
+        notify::Poll::new(
+            notify::PollResult::Met { summary: "SUCCESS — all 6 checks passed".into() },
+            Some(head_at_fire.to_string()),
+        ),
+    );
+    assert_eq!(reg.notify_tick(now_ms(), &met), vec![id.to_string()], "the Met poll must fire");
+
+    fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap()
+}
+
+#[test]
+fn notify_fired_notice_states_the_head_its_verdict_was_read_at() {
+    // #531, unmoved case: the head never changed, so the notice reads as it
+    // always did PLUS the SHA the verdict was read at — the reader can compare
+    // that against the branch head instead of trusting a frozen note.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text =
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "241", "note": "merge ccf191c if green" }))
+            .unwrap();
+    let id = extract_watch_id(&text);
+
+    let log = notify_fire_with_heads(&reg, &cw, &id, HEAD_AT_REGISTRATION, HEAD_AT_REGISTRATION);
+
+    assert!(log.contains("watch-fired"), "the fire must be audited, got: {log}");
+    assert!(log.contains("SUCCESS — all 6 checks passed"), "the verdict must still lead, got: {log}");
+    assert!(log.contains("Head at this poll: ccf191c"), "the notice must state the head, got: {log}");
+    assert!(!log.contains("MOVED"), "an unmoved head must not raise the marker, got: {log}");
+    // The note is echoed, labelled as of registration, and never rewritten.
+    assert!(log.contains("Note (registered)"), "the note must be marked as-of-registration, got: {log}");
+    assert!(log.contains("merge ccf191c if green"), "the agent's own words must survive verbatim, got: {log}");
+}
+
+#[test]
+fn notify_fired_notice_flags_a_head_that_moved_since_the_note_was_written() {
+    // #531's actual incident: registered while the branch was at ccf191c,
+    // re-pushed to a77c4d1 before the checks resolved. The delivered notice
+    // used to carry a CURRENT verdict under a STALE SHA (the note's), with
+    // nothing saying they had diverged — a green run on an old head reads as a
+    // merge license when it isn't. Both SHAs must now appear, with the move
+    // called out explicitly.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text =
+        register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "241", "note": "merge ccf191c if green" }))
+            .unwrap();
+    let id = extract_watch_id(&text);
+
+    let log = notify_fire_with_heads(&reg, &cw, &id, HEAD_AT_REGISTRATION, HEAD_AFTER_REPUSH);
+
+    assert!(log.contains("Head at this poll: a77c4d1"), "must state the head the verdict was read at, got: {log}");
+    assert!(log.contains("MOVED from ccf191c"), "must say the head moved, and from where, got: {log}");
+    assert!(log.contains("re-verify"), "must say what to do about it, got: {log}");
+    // Still the agent's own note, unrewritten — only its as-of is clarified.
+    assert!(log.contains("Note (registered)"), "got: {log}");
+    assert!(log.contains("merge ccf191c if green"), "got: {log}");
+}
+
+#[test]
+fn notify_fire_without_an_observed_head_is_unchanged() {
+    // A `workflow_run` watch (a run id is pinned to one commit) — and equally
+    // any poll where `gh` reported no usable oid: no head clause, no marker,
+    // no hedge. The #531 change must be additive, never a new noise floor.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text =
+        register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "17812", "note": "ship it" })).unwrap();
+    let id = extract_watch_id(&text);
+
+    let mut met = HashMap::new();
+    met.insert(id.clone(), notify::PollResult::Met { summary: "completed — conclusion: success".into() }.into());
+    assert_eq!(reg.notify_tick(now_ms(), &met), vec![id.clone()]);
+
+    let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
+    assert!(log.contains("watch-fired"), "got: {log}");
+    assert!(!log.contains("Head at this poll"), "no observed head means no head clause, got: {log}");
+    assert!(!log.contains("MOVED"), "and no move marker, got: {log}");
+    assert!(log.contains("Note (registered)"), "the note is still labelled as-of-registration, got: {log}");
 }
 
 #[test]
@@ -22599,7 +22699,7 @@ fn notify_conflicting_fires_distinct_notice_promptly_and_delists() {
     let id = extract_watch_id(&text);
 
     let mut results = HashMap::new();
-    results.insert(id.clone(), notify::PollResult::Conflicting);
+    results.insert(id.clone(), notify::PollResult::Conflicting.into());
     // Tick immediately (well within the 60-minute TTL) — a standard Met/Failure
     // wait would never fire here; this must resolve without any expiry.
     assert_eq!(
@@ -22628,7 +22728,7 @@ fn notify_pending_does_not_fire_and_stays_listed() {
     let id = extract_watch_id(&text);
 
     let mut results = HashMap::new();
-    results.insert(id.clone(), notify::PollResult::Pending);
+    results.insert(id.clone(), notify::PollResult::Pending.into());
     assert!(reg.notify_tick(now_ms(), &results).is_empty(), "Pending must never fire");
     assert!(reg.notify_tick(now_ms(), &results).is_empty(), "two Pending ticks in a row still must not fire");
 
@@ -22897,7 +22997,7 @@ fn notify_mark_dead_drops_the_watch_with_no_delivery_attempt() {
     // sees it (covers idle-kill / kill_agent / a crash / planner auto-close
     // identically, since they all funnel through mark_dead).
     let mut results = HashMap::new();
-    results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    results.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() }.into());
     assert!(reg.notify_tick(now_ms(), &results).is_empty(), "a dead agent's watch must never fire");
 
     let log = fs::read_to_string(reg.state_root().join(&cw.group).join("audit.jsonl")).unwrap();
@@ -22911,7 +23011,7 @@ fn notify_fail_streak_of_three_consecutive_failures_cancels_the_watch() {
     let text = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "555" })).unwrap();
     let id = extract_watch_id(&text);
     let mut fail = HashMap::new();
-    fail.insert(id.clone(), notify::PollResult::Failed { why: "gh-not-found".into() });
+    fail.insert(id.clone(), notify::PollResult::Failed { why: "gh-not-found".into() }.into());
 
     assert!(reg.notify_tick(now_ms(), &fail).is_empty(), "one failure must not cancel");
     assert!(reg.notify_tick(now_ms(), &fail).is_empty(), "two failures must not cancel yet");
@@ -22940,9 +23040,9 @@ fn notify_fail_streak_resets_on_an_intervening_healthy_poll() {
     let text = register_notify(&reg, &cw, json!({ "kind": "workflow_run", "run": "777" })).unwrap();
     let id = extract_watch_id(&text);
     let mut fail = HashMap::new();
-    fail.insert(id.clone(), notify::PollResult::Failed { why: "transient".into() });
+    fail.insert(id.clone(), notify::PollResult::Failed { why: "transient".into() }.into());
     let mut pending = HashMap::new();
-    pending.insert(id.clone(), notify::PollResult::Pending);
+    pending.insert(id.clone(), notify::PollResult::Pending.into());
 
     reg.notify_tick(now_ms(), &fail);
     reg.notify_tick(now_ms(), &fail);
@@ -22963,7 +23063,7 @@ fn notify_paused_group_does_not_fire_or_poll() {
     reg.pause_group(&cw.group).unwrap();
 
     let mut met = HashMap::new();
-    met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() }.into());
     // Tick well past the deadline WITH a Met result in hand — a paused group
     // must not fire (the delivery would be into a pane the human deliberately
     // silenced).
@@ -23013,7 +23113,7 @@ fn notify_paused_group_freezes_the_ttl_clock_across_a_long_pause() {
 
     // And it still fires normally once its condition is actually met.
     let mut met = HashMap::new();
-    met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() });
+    met.insert(id.clone(), notify::PollResult::Met { summary: "SUCCESS".into() }.into());
     assert_eq!(reg.notify_tick(after_resume + 1_000, &met), vec![id], "must still fire once genuinely met");
 }
 
