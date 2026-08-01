@@ -149,3 +149,28 @@ be spotted and reopened by hand (the same trap `squash-merge-autoclose` names fr
 side). Partial scope links as `Part of #N` / `Mitigates #N`; `Closes` is for the PR that finishes
 the issue outright. Worth the same post-merge check either way: after a squash, confirm the
 issues you only *mitigated* are still open.
+
+## A model that re-implements the algorithm proves the algorithm, not the code
+
+`queue.rs`'s `drainer_lifecycle` is an exhaustive interleaving search with a `guard_checks_generation`
+knob, and a shipped mutation test (`unconditional_guard_removal_reproduces_the_round_2_double_drain`)
+flips that knob and asserts the checker goes red. That reads like coverage of `DrainerGuard::drop`,
+and #497's triage recorded it as exactly that. It is not: the model contains its own copy of the
+logic and no test reads `mod.rs`, so mutating the real guard to remove unconditionally leaves the
+whole suite green. Confirmed rather than argued — a scratch commit put raw ungenerationed removals
+at both the existing site and a new one, and CI passed on all three platforms (PR #606, `0ed4dfe`,
+run 30690784043).
+
+Two things to carry:
+
+**Distinguish "the model has an event for this" from "a test fails when this code changes."** A
+property/mutation test over a model bounds the *design*. Only a test that executes the real function
+bounds the *code*. Both are worth having; conflating them puts a coverage claim in a design note
+that no mechanism keeps true (#552's exact subject, and #562's argument for types over tables).
+
+**Check what a path's tests can even reach before crediting it.** `DrainerGuard` is built only by
+`run_queue_drainer`, which needs an `AppHandle`, and the suite says so in a comment — so that
+guard's `Drop` has never executed in a test, and no amount of careful reading of the test names
+would have said so. `grep` for the constructor, then ask what constructs *that*. When the answer is
+"nothing a headless test can build", the honest fix is usually to move the logic somewhere a test
+can reach (here: into a newtype with its own unit tests), not to write a more careful comment.
