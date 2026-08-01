@@ -5102,6 +5102,14 @@ the detector disagree, which is itself the finding. `prompt_wait_detected` is no
 `prompt_wait_match(..).is_some()`, so there is exactly one detector and the audit cannot describe
 a different one than the guard used.
 
+`delivery-aborted-recheck` carries it too — that exit records `blocked_on: "question"` and used to
+say nothing about *which*, the same blind spot one exit down. One caveat to read it correctly, and
+it is a property of that record rather than of the field: the pre-paste loop runs up to
+`PREPASTE_RECHECK_ROUNDS` times, and `matched` there is **the last sighting within the whole
+attempt**, which may predate the final round (and may sit beside `blocked_on: "box_occupied"`, the
+gate that actually ended it). A later round that saw nothing does not erase it, deliberately: on
+this exit the useful fact is that the pane had a dialog during the attempt at all.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,

@@ -10429,6 +10429,11 @@ fn deliver_now(
     // occupies the box). The loop exits only when BOTH gates read clear
     // together.
     let mut recheck_round = 0u32;
+    // Carried across rounds so the recheck abort below can name what the
+    // question guard last saw (#513(c)). That abort records `blocked_on:
+    // "question"` and, without this, nothing about WHICH question — the same
+    // blind spot as `delivery-aborted-question`, one exit down.
+    let mut last_question_seen: Option<QuestionWitnessed> = None;
     let prepaste_admission = loop {
         recheck_round += 1;
         let will_hold_box = ptys.input_pending(pty_id).unwrap_or(false);
@@ -10467,6 +10472,11 @@ fn deliver_now(
         // None` — see `question_hold_predicate`).
         let (question_decision, question_seen) =
             wait_for_question_clear(&ptys, pty_id, None, &emit_held, &emit_held_cleared);
+        if question_seen.is_some() {
+            // Only overwrite with a real sighting: a later round that saw
+            // nothing must not erase what an earlier one held for.
+            last_question_seen = question_seen.clone();
+        }
         match question_decision {
             PasteDecision::Paste { held_ms } if held_ms > 0 => {
                 append_audit(&root, &group, "loomux", "delivery-held-for-question", json!({
@@ -10509,6 +10519,7 @@ fn deliver_now(
         append_audit(&root, &group, "loomux", "delivery-aborted-recheck", json!({
             "to": agent, "stage": "pre-paste", "rounds": recheck_round,
             "blocked_on": prepaste_admission.enqueue_reason().as_str(),
+            "matched": witness_audit(last_question_seen.as_ref()),
         }));
         return DeliverOutcome::AbortedPrePaste(prepaste_admission.enqueue_reason());
     }
@@ -12179,6 +12190,15 @@ pub fn mask_own_paste(tail: &str, pasted_text: &str) -> String {
 /// still-open menu reads `HumanInput::Neutral` too, and #496 does not stamp
 /// pure-Neutral input either — is untouched by tightening what the clock
 /// tracks. This predicate stays exactly as-is.
+///
+/// #534 kept all of the above and added a second reading. The logic now lives
+/// in [`question_hold_predicate_sampled`]; THIS function is the ring-only
+/// entry point — the pre-#534 guard exactly, and the fallback whenever a
+/// pane's screen cannot be composed. Everything the paragraphs above say about
+/// what may and may not release a hold applies unchanged to both, because both
+/// are the same closure: the grid narrows *when* the detector reads clear, it
+/// does not touch the two-consecutive-poll rule that decides what a clear read
+/// is worth. See [`question_shown`] for the one behaviour that differs.
 pub fn question_hold_predicate<T>(tail: T, pasted_text: Option<String>) -> impl Fn() -> bool
 where
     T: Fn() -> Option<Vec<u8>>,
@@ -12480,10 +12500,16 @@ fn question_sample(ptys: &crate::pty::PtyManager, pty_id: u32) -> QuestionSample
 /// for a checkpoint that just needs to know NOW, not hold-and-wait: the
 /// stranded-text flush must not blind-Enter into a live dialog, but it's not
 /// itself the guard responsible for holding — the pre-paste checkpoint that
-/// immediately follows it owns that. A single call to `question_hold_predicate`
-/// is exactly a one-shot read: its two-consecutive-clear release requirement
-/// only engages once a hold has actually observed a question at least once
+/// immediately follows it owns that. A single call to the hold predicate is
+/// exactly a one-shot read: its two-consecutive-clear release requirement only
+/// engages once a hold has actually observed a question at least once
 /// (`ever_shown`), so a lone call just answers "is it shown right now".
+///
+/// #534: this reads the composed screen too. It has to — this is the gate
+/// `write_admission` consults at the instant of the write, so a checkpoint
+/// still keyed on the byte ring alone would re-assert, one call later, the
+/// hold the guard had just released on grid evidence. No witness: nothing
+/// downstream of a one-shot read has an abort record to put one in.
 fn question_active_now(ptys: &crate::pty::PtyManager, pty_id: u32, pasted_text: Option<&str>) -> bool {
     question_hold_predicate_sampled(
         || question_sample(ptys, pty_id),
