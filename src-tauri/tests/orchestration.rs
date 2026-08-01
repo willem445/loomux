@@ -25110,6 +25110,13 @@ fn a_paste_past_the_scan_window_is_unverifiable_not_absent() {
         BoxReading::Unverifiable,
         "no read at all is the same nothing as a read too short to decide"
     );
+
+    // The audit vocabulary: three states, three tokens, one spelling each.
+    // A reading that lands in the log under a shared name is a reading a
+    // later grep cannot tell apart — which is the defect, one layer up.
+    let tokens =
+        [BoxReading::Holds, BoxReading::NotHolding, BoxReading::Unverifiable].map(BoxReading::as_str);
+    assert_eq!(tokens, ["holds", "not-holding", "unverifiable"]);
 }
 
 #[test]

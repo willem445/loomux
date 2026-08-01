@@ -9841,6 +9841,20 @@ pub enum BoxReading {
     Unverifiable,
 }
 
+impl BoxReading {
+    /// Stable audit token, so every record of a Tier 1 reading spells the
+    /// three states the same way — kept next to the enum rather than
+    /// stringified at each `json!` site, which is how two records of the same
+    /// fact drift into two vocabularies.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BoxReading::Holds => "holds",
+            BoxReading::NotHolding => "not-holding",
+            BoxReading::Unverifiable => "unverifiable",
+        }
+    }
+}
+
 /// Classify one Tier 1 box read (#559). `stripped_tail` is `None` when the
 /// tail could not be read at all (pty gone).
 ///
@@ -10232,6 +10246,10 @@ fn run_late_confirmation_monitor(
                     append_audit(&root, &group, "loomux", "human-input-block-released", json!({
                         "to": agent, "stage": "stranded", "reason": HUMAN_INPUT_BLOCK_BOUND_REASON,
                         "bound_ms": HUMAN_INPUT_BLOCK_BOUND_MS, "box_holds_paste": holds_paste,
+                        // #559: `box_holds_paste: false` alone would read as
+                        // "we looked and it is gone" on a delivery where we
+                        // could not look at all. The reading says which.
+                        "box_reading": reading.as_str(),
                     }));
                 }
                 let human_typed_since = human_block.holds();
@@ -10912,8 +10930,7 @@ fn deliver_now(
     // the ones that later go wrong.
     let tier1_decline = match tier1_precondition {
         BoxReading::Holds => None,
-        BoxReading::NotHolding => Some("not-in-box"),
-        BoxReading::Unverifiable => Some("unverifiable"),
+        declined => Some(declined.as_str()),
     };
 
     let submit_sent_ms = now_ms();
@@ -11243,7 +11260,7 @@ fn deliver_now(
         // (a long/collapsed paste — see the `tier1_governs` precondition
         // check's own comment, above, right before the first Enter).
         "tier1_governed": tier1_governs,
-        // #559: WHY Tier 1 declined — `null` when it governed, "not-in-box"
+        // #559: WHY Tier 1 declined — `null` when it governed, "not-holding"
         // when the tail was long enough to have held our paste and did not,
         // "unverifiable" when the tail we could read was shorter than the
         // paste itself, so the answer was arithmetic rather than observation.

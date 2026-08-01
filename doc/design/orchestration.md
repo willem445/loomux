@@ -1276,7 +1276,8 @@ reading:
   delivery. Declining to govern is a cost; confirming something nobody observed is a defect.
 
 Every decline is now stated where it happens rather than inferred from an absent `true`:
-`prompt-typed` carries `tier1_decline` (`null` | `"not-in-box"` | `"unverifiable"`) with
+`prompt-typed` carries `tier1_decline` (`null` | `"not-holding"` | `"unverifiable"` — the same
+`BoxReading::as_str` tokens every other record of a reading uses) with
 `tier1_paste_bytes`/`tier1_scan_bytes` beside it, and the late monitor writes
 `delivery-unconfirmed-box-unverifiable` whenever it reaches that reading — including on deliveries
 that would have been notified anyway, so "Tier 1 was blind here" is never a fact only reconstructable
