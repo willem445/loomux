@@ -8910,10 +8910,10 @@ pub fn unconfirmed_disposition(reading: BoxReading, box_pending: bool) -> Unconf
     match reading {
         // Our text is still in the box — the genuine strand.
         BoxReading::Holds => UnconfirmedDisposition::Notify,
-        // #559: no reading. Silence here would be a claim ("the pane is
-        // idle") drawn from an answer that was fixed before the pane was
-        // consulted.
-        BoxReading::Unverifiable => UnconfirmedDisposition::Notify,
+        // EVIDENCE BRANCH ONLY — pre-#559: an unverifiable reading was just
+        // `box_holds_paste == false`, so it fell through to the idle arm.
+        BoxReading::Unverifiable if box_pending => UnconfirmedDisposition::Notify,
+        BoxReading::Unverifiable => UnconfirmedDisposition::IdleAuditOnly,
         // Observed empty of our text — idle only if it is empty of the
         // human's too.
         BoxReading::NotHolding if box_pending => UnconfirmedDisposition::Notify,
@@ -9157,7 +9157,8 @@ impl StrandedBlocker {
             // #559: its own token so a grep tells "we read the box and our
             // text is gone" from "we could not read enough of the box to
             // tell" — the distinction the whole change exists to preserve.
-            StrandedBlocker::Unverifiable => "box-unverifiable",
+            // EVIDENCE BRANCH ONLY — pre-#559 there was one token for both.
+            StrandedBlocker::Unverifiable => "not-holding",
             StrandedBlocker::Exhausted => "heal-budget-spent",
             StrandedBlocker::QueueFull => "queue-full",
             StrandedBlocker::QuestionStale => "question-hold-stale",
@@ -9240,11 +9241,11 @@ pub fn stranded_selfheal_action(
     if question_on_screen {
         return StrandedAction::Attention(StrandedBlocker::Question);
     }
+    // EVIDENCE BRANCH ONLY — pre-#559: one blocker for both readings.
     match reading {
-        BoxReading::Unverifiable => {
-            return StrandedAction::Attention(StrandedBlocker::Unverifiable);
+        BoxReading::Unverifiable | BoxReading::NotHolding => {
+            return StrandedAction::Attention(StrandedBlocker::NotHolding);
         }
-        BoxReading::NotHolding => return StrandedAction::Attention(StrandedBlocker::NotHolding),
         BoxReading::Holds => {}
     }
     if heals_used >= max_heals {
@@ -9537,7 +9538,8 @@ pub struct RedeliveryTreatment {
 pub fn stranded_reword(live: StrandedBlocker, redelivery_in_flight: bool) -> Option<StrandedBlocker> {
     match live {
         StrandedBlocker::Exhausted => None,
-        StrandedBlocker::NotHolding | StrandedBlocker::Unverifiable if redelivery_in_flight => None,
+        // EVIDENCE BRANCH ONLY — pre-#559: only `NotHolding` deferred.
+        StrandedBlocker::NotHolding if redelivery_in_flight => None,
         other => Some(other),
     }
 }
@@ -9625,11 +9627,10 @@ pub fn stranded_detail(name: &str, blocker: Option<StrandedBlocker>) -> String {
         // action that is safe under either branch — if the prompt is sitting
         // there, Enter sends it; if it is not, the human has looked and lost
         // nothing. Never says the text is gone: loomux does not know that.
+        // EVIDENCE BRANCH ONLY — pre-#559 this state had no wording of its
+        // own; it reached the human as `NotHolding`'s "its text is gone".
         Some(StrandedBlocker::Unverifiable) => {
-            format!(
-                "{name}'s prompt was never confirmed and is too large for loomux to verify in the \
-                 pane — check the pane and press Enter if it is still sitting there unsent"
-            )
+            format!("{name}'s prompt was never confirmed and its text is gone — check the pane")
         }
         Some(StrandedBlocker::Exhausted) => {
             format!("{name}'s prompt is still unsubmitted after a self-heal — press Enter in the pane")
@@ -9710,10 +9711,10 @@ pub fn box_holds_paste(stripped_tail: &str, pasted: &str) -> bool {
 /// as `Unverifiable`.
 #[doc(hidden)] // pub for integration tests
 pub fn tier1_scan_bytes(pasted: &str) -> usize {
-    normalize_prompt_text(pasted)
-        .len()
-        .saturating_add(BOX_TAIL_SCAN_BYTES)
-        .min(TIER1_SCAN_MAX_BYTES)
+    // EVIDENCE BRANCH ONLY — the pre-#559 behavior: a flat window, unrelated
+    // to the paste it is looking for.
+    let _ = (pasted, TIER1_SCAN_MAX_BYTES);
+    BOX_TAIL_SCAN_BYTES
 }
 
 /// What a Tier 1 box read actually ESTABLISHED (#559) — the three-state
@@ -9757,18 +9758,14 @@ pub enum BoxReading {
 /// inferred).
 #[doc(hidden)] // pub for integration tests
 pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
-    let Some(tail) = stripped_tail else { return BoxReading::Unverifiable };
-    if box_holds_paste(tail, pasted) {
-        return BoxReading::Holds;
+    // EVIDENCE BRANCH ONLY — the pre-#559 behavior: the bare bool
+    // (`.map(box_holds_paste).unwrap_or(false)`), so a `false` that is
+    // arithmetic is indistinguishable from a `false` that is observation.
+    if stripped_tail.is_some_and(|t| box_holds_paste(t, pasted)) {
+        BoxReading::Holds
+    } else {
+        BoxReading::NotHolding
     }
-    let norm_pasted = normalize_prompt_text(pasted);
-    // An empty paste is `NotHolding`, matching `box_holds_paste`'s own
-    // "nothing to still be holding" — the answer is false for a reason that
-    // is about the paste, not about how much tail we could see.
-    if !norm_pasted.is_empty() && normalize_prompt_text(tail).len() < norm_pasted.len() {
-        return BoxReading::Unverifiable;
-    }
-    BoxReading::NotHolding
 }
 
 /// The `promptsubmit` hook marker path for one agent — a sibling of the
