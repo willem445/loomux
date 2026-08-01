@@ -320,9 +320,22 @@ changed**. That is not automatically wrong — but it is never incidental, so it
 a human, not a re-run.
 
 - If you *meant* to edit the role templates, re-bless the fixture: copy the changed
-  template over the file here, in its own commit, and say in the message what
-  changed for the agents. The diff on this directory is then the review surface for
-  "what did we just tell every worker to do differently?".
+  template over the file here **with its workflow-era placeholder key removed**, in its
+  own commit, and say in the message what changed for the agents. The diff on this
+  directory is then the review surface for "what did we just tell every worker to do
+  differently?".
+
+  **A plain `cp` of the live template is wrong**, and it fails in a way that hides its
+  own cause. These files are the live template *minus* the key(s) `LIVE` lists for it
+  in `tests/workflow.rs` — `{{WORKFLOW}}` and `{{POST_MERGE_WORKFLOW_HOOK}}` for
+  `orchestrator.md`, `{{BLOCK_NOTE}}{{ADVISOR_CONSULT_NOTE}}` for `worker.md`,
+  `{{BLOCK_NOTE}}` for `reviewer.md` and `planner.md` — because
+  `a_workflow_placeholder_must_sit_at_the_end_of_a_line_it_shares` asserts exactly
+  "live, stripped of its keys, equals the golden". The *legacy* vars (`{{GROUP_ID}}`,
+  `{{REPO}}`) are not keys and must stay. Leave a key in and that test fails with a
+  full-file `left`/`right` dump rather than a one-line cause — the "byte copies"
+  phrasing at the top of this file is older than those keys, and reading it literally
+  is what produced the red that added this paragraph (#590).
 - If you did **not** mean to change what a default group reads — you were adding
   workflow-conditional prose — then the prose is in the wrong place. It belongs in
   `templates/workflow.md` or `templates/block.md`, behind `{{WORKFLOW}}` /
