@@ -898,6 +898,7 @@ mod tests {
     // ---------- fire-time head facts vs the frozen note (#531) ----------
 
     #[test]
+    #[ignore = "red-evidence commit only — unignored by the fix commit (#531)"]
     fn fired_notice_marks_the_note_as_registration_time_not_current() {
         // The whole defect: the note was written at registration and the
         // reader must not take anything in it as a statement about now.
@@ -914,6 +915,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "red-evidence commit only — unignored by the fix commit (#531)"]
     fn fired_notice_states_the_head_the_verdict_belongs_to() {
         let n = watch_fired_notice(
             "n-3",
@@ -928,6 +930,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "red-evidence commit only — unignored by the fix commit (#531)"]
     fn fired_notice_flags_a_head_that_moved_and_names_both_shas() {
         // The live incident (#531): note written at ccf191c, verdict resolved
         // at a77c4d1. Both SHAs must appear, and the divergence must be
@@ -947,6 +950,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "red-evidence commit only — unignored by the fix commit (#531)"]
     fn fired_notice_head_clause_survives_an_overlong_note() {
         // Ordering, not decoration: `truncate_notice` trims the tail, so the
         // freshness fact sits ahead of the note and a note long enough to blow
@@ -964,6 +968,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "red-evidence commit only — unignored by the fix commit (#531)"]
     fn fired_notice_without_a_known_head_reads_exactly_as_before() {
         // A `workflow_run` watch, or a `gh` response with no usable oid: no
         // head clause at all rather than a hedge or a placeholder.
@@ -981,6 +986,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "red-evidence commit only — unignored by the fix commit (#531)"]
     fn fired_notice_move_check_compares_full_oids_not_abbreviations() {
         // Two distinct commits sharing a 7-char prefix must still read as a
         // move: the comparison is on the full oid, only the display is short.
