@@ -15015,6 +15015,15 @@ pub enum HoldChannel {
     /// It rides back on a call the orchestrator itself made, which is also the
     /// proof that the orchestrator is running and reading at that instant.
     ///
+    /// **And so it needs no cap exemption**, which is the sharpest way to see
+    /// the difference from the other orchestrator-facing notice on this list.
+    /// #615's pause-loss notice IS a delivery, so on a pane at
+    /// `queue::QUEUE_MAX_PER_PANE` — exactly the pane it has the most to report
+    /// about — it was certain to be destroyed by the same cap it was reporting,
+    /// and needed `queue::EnqueueReason::PauseLossNotice`'s one entry of
+    /// headroom to survive. This channel never meets that problem: a full queue
+    /// is the CONDITION it reports, not an obstacle to reporting it.
+    ///
     /// **A pull, not a push, and listed ALONGSIDE the badge rather than
     /// instead of it.** An orchestrator that never calls another tool never
     /// reads its inbox: this channel reaches the orchestrator *agent* on its
@@ -15067,9 +15076,11 @@ impl HoldChannel {
 /// branch, parked instead of discarded — so it is listed on exactly the
 /// classifications whose notice goes through `notify_queue`, and nowhere else.
 /// [`HoldClass::GroupPaused`] is the one that looks like it should have it and
-/// must not: its `OrchestratorNotice` is `announce_pause_suppression` at
-/// resume, a different call on a different path, and listing an inbox it never
-/// parks into would make this table say something untrue.
+/// must not: its `OrchestratorNotice` is `announce_pause_suppression`, a
+/// different call on a different path that `notify_queue` never sees — and
+/// since #615 an actual in-band DELIVERY, admitted past the cap with
+/// `queue::EnqueueReason::PauseLossNotice`. Listing an inbox it never parks
+/// into would make this table say something untrue.
 pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
     match class {
         // `deliver_now`'s in-attempt holds all badge via `emit_held`.
@@ -28582,11 +28593,21 @@ impl OrchRegistry {
             return;
         }
         if self.is_paused(group) {
-            // Deliberately NOT parked (#578). What a pause suppresses is
-            // already #569's territory: `announce_pause_suppression` reports
-            // it at resume, and parking here would relay the same suppression
-            // a second time through a second channel — two reports of one
-            // fact, which is how an orchestrator ends up double-handling.
+            // Deliberately NOT parked (#578), and #615 sharpened the reason
+            // rather than weakening it. Since option 2 (enqueue-while-paused)
+            // a pause is a DELAY, not a discard: the deliveries behind it sit
+            // in the pane's durable queue and are flushed in arrival order at
+            // resume, with `flush_header_text` announcing them then. So a
+            // queue notice suppressed here describes an event whose payload is
+            // safe and which the resume flush reports IN TIME and accurately;
+            // relaying it minutes later, out of a parked buffer, would say
+            // "queued" about a delivery that has since landed.
+            //
+            // The one loss a pause on this build can still cause — a pane
+            // already at `queue::QUEUE_MAX_PER_PANE` refusing admissions for as
+            // long as the pause lasts — has its own channel in
+            // `announce_pause_suppression` (and its badge fallback), so parking
+            // here would be a second report of a fact that already has one.
             self.audit(group, "loomux", "notice-suppressed",
                 json!({ "kind": "queue", "to": agent_id, "reason": "group-paused" }));
             return;

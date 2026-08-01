@@ -6698,13 +6698,29 @@ a pointer at the log that still holds every one verbatim. A relay that silently 
 would read as complete while being short, which is the defect class this whole lineage exists to
 eliminate.
 
-**What is deliberately NOT parked.** `notify_queue`'s *paused-group* branch. What a pause
-suppresses is #569's territory — `announce_pause_suppression` reports at resume what the pause
-discarded — and parking it here as well would relay one fact through two channels, which is how an
-orchestrator ends up double-handling. For the same reason `hold_channels` gives
-`HoldClass::GroupPaused` no `OrchestratorInbox`: its notice is a different call on a different path
-that `notify_queue` never sees, and listing an inbox it never parks into would make that table say
-something untrue.
+**What is deliberately NOT parked.** `notify_queue`'s *paused-group* branch — and #615
+(enqueue-while-paused) sharpened that decision rather than weakening it. Since option 2 a pause is
+a **delay, not a discard**: the deliveries behind it sit in the pane's durable queue and are
+flushed in arrival order at resume, with `flush_header_text` announcing them at that moment. A
+queue notice suppressed while paused therefore describes an event whose payload is safe and which
+the resume flush reports *in time and accurately*; relaying it minutes later out of a parked buffer
+would say "queued" about a delivery that has since landed. The one loss a pause on this build can
+still cause — a pane already at `QUEUE_MAX_PER_PANE` refusing admissions for as long as the pause
+lasts — has its own channel in `announce_pause_suppression` and its badge fallback, so parking here
+would be a second report of a fact that already has one.
+
+For the same reason `hold_channels` gives `HoldClass::GroupPaused` no `OrchestratorInbox`: its
+notice is a different call on a different path that `notify_queue` never sees, and listing an inbox
+it never parks into would make that table say something untrue.
+
+**Reconciled with #615 at the cap, which is the sharpest way to see what this channel is.** #615's
+pause-loss notice *is* a delivery, so on a pane at `QUEUE_MAX_PER_PANE` — exactly the pane it has
+the most to report about — it was **certain** to be destroyed by the same cap it was reporting, and
+needed `EnqueueReason::PauseLossNotice`'s one entry of headroom (`PAUSE_LOSS_NOTICE_HEADROOM`) to
+survive. The inbox never meets that problem and takes no headroom of its own: it enqueues nothing,
+so a full queue is the *condition it reports*, not an obstacle to reporting it. The two mechanisms
+are complements, not alternatives — #615 buys a delivery its way past the cap; #578 declines to be
+a delivery at all — and neither is a partial version of the other.
 
 `HoldChannel::survives_orchestrator_target` also stopped being a `!matches!` negation and became an
 exhaustive match: a channel added later must state its own answer rather than defaulting to

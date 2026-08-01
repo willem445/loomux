@@ -19313,11 +19313,14 @@ fn a_failed_tool_call_still_carries_the_relay() {
 
 #[test]
 fn a_paused_groups_queue_notice_is_suppressed_but_never_parked() {
-    // #578 parks the ORCHESTRATOR-TARGET suppression and nothing else. What a
-    // pause suppresses is #569's territory — `announce_pause_suppression`
-    // reports at resume what the pause discarded — and parking it here too
-    // would relay one fact through two channels, which is how an orchestrator
-    // ends up double-handling.
+    // #578 parks the ORCHESTRATOR-TARGET suppression and nothing else, and
+    // #615 (enqueue-while-paused) sharpened that: a pause is now a DELAY, not
+    // a discard, so the deliveries behind it are flushed at resume and
+    // `flush_header_text` announces them then. Relaying this notice minutes
+    // later out of a parked buffer would say "queued" about a delivery that has
+    // since landed. The residual loss a pause can still cause (a pane at
+    // `QUEUE_MAX_PER_PANE` refusing admissions) is `announce_pause_suppression`'s
+    // to report, not this buffer's.
     let (reg, _d, co, cw) = setup_mcp();
     reg.pause_group(&co.group).unwrap();
     reg.notify_queue(&co.group, &cw.agent_id, false,
