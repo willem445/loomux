@@ -19487,16 +19487,21 @@ fn orch_notice_relay_text_says_nothing_when_there_is_nothing_to_say() {
 
 #[test]
 fn the_inbox_evicts_oldest_first_and_counts_every_eviction() {
+    // Marker-led fixtures, because `park`'s own `debug_assert` requires it
+    // (review NB3) — and the first thing that assert caught was this test
+    // parking bare `n0`/`n1` strings no real caller could produce. A fixture
+    // that could not occur in production is not a cheaper test, it is a test of
+    // something else.
     let mut inbox = OrchNoticeInbox::default();
     for i in 0..ORCH_NOTICE_INBOX_MAX + 5 {
-        inbox.park(&format!("n{i}"));
+        inbox.park(&format!("[loomux] n{i}"));
     }
     assert_eq!(inbox.notices.len(), ORCH_NOTICE_INBOX_MAX, "the cap is real");
     assert_eq!(inbox.elided, 5, "and every eviction is counted, not forgotten");
-    assert_eq!(inbox.notices.first().unwrap(), "n5", "oldest-first eviction");
+    assert_eq!(inbox.notices.first().unwrap(), "[loomux] n5", "oldest-first eviction");
     assert_eq!(
         inbox.notices.last().unwrap(),
-        &format!("n{}", ORCH_NOTICE_INBOX_MAX + 4),
+        &format!("[loomux] n{}", ORCH_NOTICE_INBOX_MAX + 4),
         "the newest notice is the one whose claim is still true"
     );
 }
