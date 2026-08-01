@@ -1344,6 +1344,29 @@ pub struct ReviewVerdict {
     /// fine" — an empty head can never equal a real one, so it reads as stale and
     /// the reviewer must re-record. Fail closed, like everything else here.
     pub head: String,
+    /// **The PR body this verdict reviewed** (#565), as a sha256 of
+    /// [`canonical_body`] — captured by the tool at record time, exactly like
+    /// `head`, and never passed in by the reviewer.
+    ///
+    /// The head SHA pins the *code*. It does not pin the **PR body**, which on a
+    /// squash-merging repo becomes the permanent commit message: reviewed content
+    /// with the weight of a diff and none of a diff's version pinning. It moves in
+    /// both directions — a reviewer passes a body and the author then edits it, so
+    /// the merge carries text nobody reviewed; or a reviewer fails a body that has
+    /// already been fixed, and the PR is blocked on a defect that no longer exists
+    /// (the #525 incident that filed #565: review comment at 14:44:23Z, body edited
+    /// at 14:47:49Z, and no mechanism could tell either agent).
+    ///
+    /// A digest rather than the body text: fixed size, and a mismatch is *exact*.
+    /// Storing ~250 lines per verdict archives the artifact but still leaves a human
+    /// to diff it by eye — which is the manual step that cost the round. A
+    /// `updatedAt` timestamp was the other option and is worse than nothing: it
+    /// moves for labels and assignees, so it cries wolf, and when it does fire it
+    /// says *that* something changed, never *what*.
+    ///
+    /// Empty when loomux could not resolve the body at record time — read the same
+    /// fail-closed way as an empty `head`: unknown, never "unbound, therefore fine".
+    pub body_digest: String,
     pub summary: String,
     pub ts_ms: u64,
 }
@@ -1355,6 +1378,66 @@ impl ReviewVerdict {
     /// defect" does not stop being true when the author pushes more code.
     pub fn reviewed(&self, head: &str) -> bool {
         !self.head.is_empty() && self.head == head
+    }
+
+    /// Whether the PR body has changed since this verdict was recorded (#565).
+    /// `None` when that cannot be *known* — either this verdict carries no digest
+    /// (recorded by a build that predates #565, or with gh unable to read the body)
+    /// or the current body could not be read now. Never `Some(false)` on a guess:
+    /// "we could not check" and "it is unchanged" are different answers, and only
+    /// one of them may quiet a warning.
+    pub fn body_changed(&self, current_digest: Option<&str>) -> Option<bool> {
+        let now = current_digest.filter(|d| !d.is_empty())?;
+        (!self.body_digest.is_empty()).then(|| self.body_digest != now)
+    }
+}
+
+/// The PR body reduced to the form both halves of the gate digest (#565).
+///
+/// Two normalizations, and **only** two, because the shim has to reproduce this
+/// exactly in POSIX shell — a richer rule (per-line trailing whitespace, re-wrap
+/// tolerance, markdown awareness) is one the two halves would eventually disagree
+/// about, and a gate whose halves disagree is the failure mode this file keeps
+/// coming back to:
+///
+/// 1. `\r` removed — a CRLF body and an LF body are the same commit message, and
+///    which one `gh` hands back depends on the platform, not on the content.
+///    Shell: `| tr -d '\r'`.
+/// 2. Trailing newlines collapsed to exactly one. Shell: `$(…)` strips them all,
+///    `printf '%s\n'` puts one back.
+///
+/// Everything else is content. In particular a re-wrapped paragraph **is** a
+/// change: the body is about to become a permanent commit message, and the claim
+/// this makes is "the bytes that will be recorded are the bytes that were
+/// reviewed" — not "the meaning is close enough", which nothing could check.
+pub fn canonical_body(body: &str) -> String {
+    format!("{}\n", body.replace('\r', "").trim_end_matches('\n'))
+}
+
+/// sha256 of [`canonical_body`], lowercase hex. The one definition; the shim
+/// pipes the same canonical bytes through `sha256sum`/`shasum`/`openssl`, and
+/// `the_shim_and_rust_agree_on_the_body_digest` executes both against one body.
+pub fn body_digest(body: &str) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(canonical_body(body).as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A stored body digest is compared inside a shell `case`, so keep it to what a
+/// sha256 can actually be: **exactly** 64 hex characters. Anything else — a
+/// truncated write, a hand edit, the first line of a summary in a verdict file
+/// written before #565 — stores/reads as empty, i.e. *unknown*, which the gate
+/// treats as it treats an unknown head: refuse, never wave through.
+///
+/// Deliberately stricter than [`sanitize_sha`], which accepts any hex run up to
+/// 64: a 40-char head oid must not be readable as a body digest.
+pub fn sanitize_digest(s: &str) -> String {
+    let s = s.trim();
+    if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        s.to_ascii_lowercase()
+    } else {
+        String::new()
     }
 }
 
@@ -1383,16 +1466,18 @@ pub fn sanitize_sha(s: &str) -> String {
 }
 
 /// Serialize a verdict record for `verdicts/pr-<N>/<block>`. Line-oriented, with
-/// the verdict word FIRST (the shim reads it with `head -n1`) and the reviewed
-/// head SECOND; the summary runs to EOF, being the only field that may contain
-/// newlines.
+/// the verdict word FIRST (the shim reads it with `head -n1`), the reviewed head
+/// SECOND and the reviewed body's digest FIFTH (`head -n5 | tail -n1`); the
+/// summary runs to EOF, being the only field that may contain newlines — so every
+/// fixed field has to sit above it.
 pub fn verdict_file_text(v: &ReviewVerdict) -> String {
     format!(
-        "{}\n{}\n{}\n{}\n{}\n",
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
         v.verdict.as_str(),
         sanitize_sha(&v.head),
         v.ts_ms,
         v.agent_id,
+        sanitize_digest(&v.body_digest),
         sanitize_summary(&v.summary)
     )
 }
@@ -1400,19 +1485,32 @@ pub fn verdict_file_text(v: &ReviewVerdict) -> String {
 /// Read a verdict file back. `None` for anything that isn't a verdict this build
 /// understands — an unparseable file is *not* a pass (see [`Verdict::parse`]).
 /// `pr`/`block` come from the path, which is loomux-generated.
+///
+/// Line 5 (the body digest, #565) is read **tolerantly**: a file written before
+/// #565 has the first line of its summary there, and swallowing it would mangle
+/// durable prose a human reads. So a line 5 that is not a valid digest is handed
+/// back to the summary, and the digest reads empty — *unknown*. The shim is
+/// stricter (it takes line 5 as-is and refuses anything that isn't 64 hex), and
+/// the two still agree on the only thing a gate decides: no readable digest means
+/// the body cannot be shown unchanged, so `body-unchanged` refuses. The
+/// divergence is confined to which text is displayed as the summary.
 pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerdict> {
     let mut lines = text.lines();
     let verdict = Verdict::parse(lines.next()?)?;
     let head = sanitize_sha(lines.next().unwrap_or(""));
     let ts_ms = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
     let agent_id = lines.next().unwrap_or("").trim().to_string();
-    let summary = lines.collect::<Vec<_>>().join("\n");
+    let rest: Vec<&str> = lines.collect();
+    let body_digest = rest.first().map(|l| sanitize_digest(l)).unwrap_or_default();
+    let from = usize::from(!body_digest.is_empty());
+    let summary = rest[from.min(rest.len())..].join("\n");
     Some(ReviewVerdict {
         pr,
         block: sanitize_id(block)?,
         agent_id,
         verdict,
         head,
+        body_digest,
         summary: sanitize_summary(&summary),
         ts_ms,
     })
@@ -1427,7 +1525,13 @@ pub fn parse_verdict_file(pr: u64, block: &str, text: &str) -> Option<ReviewVerd
 /// than passing it. A gate is a safety claim; silently ignoring a clause of it
 /// would turn a stricter-looking workflow file into a weaker one, which is the
 /// worst failure mode a gate can have.
-pub const KNOWN_CONDITIONS: [&str; 1] = ["ci-green"];
+/// `body-unchanged` (#565) is **opt-in for a reason**: it only matters where the
+/// PR body *becomes* the record — this repo squash-merges, so the body is the
+/// permanent commit message. On a repo that merge-commits, the body is discussion,
+/// and the check would be noise. Baking it in either way would be baking one
+/// repo's merge habit into a generic tool (CLAUDE.md constraint 8), so it is a
+/// clause a repo writes down.
+pub const KNOWN_CONDITIONS: [&str; 2] = ["ci-green", "body-unchanged"];
 
 /// Whether the shim can evaluate this `also:` condition. See [`KNOWN_CONDITIONS`].
 pub fn condition_supported(c: &str) -> bool {
