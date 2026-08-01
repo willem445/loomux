@@ -19367,6 +19367,35 @@ fn the_notice_inbox_names_what_its_cap_elided_instead_of_hiding_it() {
 }
 
 #[test]
+fn every_row_of_the_relay_block_is_maskable_by_the_question_gates_notice_rule() {
+    // #576/#621: `mask_loomux_notices` drops any row that LEADS with the
+    // `[loomux]` marker once de-framed, and every reader of a live pane is
+    // masked with it. This relay never reaches a pane on its own — it rides an
+    // MCP tool result, not the pty — but #621's own doc names the path that
+    // puts it there anyway: an agent can print marker text itself, and an
+    // orchestrator quoting its own relay back into a summary is precisely that
+    // case. The rows would then be text ABOUT a question sitting in the tail of
+    // the pane most exposed to it, which is #576 exactly.
+    //
+    // So every row this block emits has to be one the mask can claim. `deframe`
+    // strips whitespace and `│ ┃ | * ● • ◆` — and NOT `-`: a `- [loomux] …` row
+    // de-frames to `- [loomux] …`, leads with the dash, and survives the mask.
+    // That is why the bullet here is `•` and why the elision line carries the
+    // marker rather than opening with prose.
+    let notices = vec![
+        queue::queued_notice("o-1", queue::EnqueueReason::Question),
+        queue::dropped_notice("o-1", 2, queue::DropReason::QueueFull),
+    ];
+    let relay = orch_notice_relay_text(&notices, 4).expect("a relay with content");
+    assert_eq!(
+        mask_loomux_notices(&relay).trim(),
+        "",
+        "every row of the relay must be maskable, or an orchestrator echoing it into its own \
+         pane re-arms the very question gate this text is about — got leftovers from: {relay}"
+    );
+}
+
+#[test]
 fn orch_notice_relay_text_says_nothing_when_there_is_nothing_to_say() {
     // The ordinary case, and the one that must not add a single byte to a tool
     // result: no parked notices, no second content block, no cost.
