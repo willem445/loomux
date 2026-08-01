@@ -661,6 +661,20 @@ perform under blanket auto-merge/auto-release, supervised dangerous mode, or a o
 the human's own authorized action exercised through you — and audited as such. Absent one of
 those, you never merge or publish.)*
 
+### A squash merge closes issues nobody meant to close
+
+Before you squash-merge a PR that links `Part of #N` / `Mitigates #N`, read the message
+GitHub is about to commit — the default squash body **aggregates every commit message on the
+branch** — and re-read the PR body with it. The closing-keyword scan is textual and
+context-blind: `close`/`fix`/`resolve` in any inflection immediately followed by `#N` closes
+that issue from *anywhere* in either text, blockquotes and caveats included. #569 was
+auto-closed twice in one session — once by a body that said `Closes` on partial scope (#586),
+and once by #615, which linked `Part of #569` on purpose and was undone by the closing phrase
+inside the very paragraph explaining why. So: scrub the aggregated message before you merge,
+and **after** any squash, re-read the issues that PR only partly addressed. If one closed,
+reopen it and say so in your pane — a silently closed issue is work that leaves the queue
+without anyone deciding it should.
+
 ### After a merge you performed, the default branch is yours until it's green
 
 INVARIANT 6, in practice. A PR that was green on its own branch can still break main — a

@@ -119,6 +119,15 @@ plan itself, rather than silently continuing as though it had verified clean.
   to your own branch instead (a small commit you amend/reset/squash later). If you must stash,
   `git stash push -m "<your agent id>: ..."` and only ever `pop` an entry carrying your own
   marker.
+- **Scratch files live in YOUR OWN worktree — never a bare `/tmp` name.** A PR body or
+  comment too long for `--body` goes to `./.scratch/body.md` inside your worktree (add
+  `.scratch/` to `.gitignore` if the repo doesn't ignore it already), then
+  `gh pr edit --body-file ./.scratch/body.md`. Every agent on this machine shares one
+  `/tmp`, and the obvious filenames are the ones everybody picks: two workers wrote
+  `/tmp/body.md` seconds apart and one PR's body was published with the other's text
+  (#625) — no error, no collision warning, and it was caught only because a worker
+  happened to re-read its own PR. Same shared-namespace hazard as the stash above; the fix
+  is the same, a path only you can own.
 
 ## Never block a turn on CI
 
@@ -221,6 +230,17 @@ A task is done when ALL of these hold:
    `Closes` in the PR body regardless of how partial the change actually was**, and no hedging
    sentence elsewhere in the body stops it: #569 and #590 were both auto-closed that way this
    session with real scope still open on them, and had to be spotted and reopened by hand.
+
+   **The keyword scan is textual and context-blind — grep your own prose for it.** GitHub
+   matches `close`/`fix`/`resolve` (any inflection) immediately followed by `#N` **anywhere**
+   in the PR body and in every commit message a squash merge aggregates: inside a blockquote,
+   inside a caveat, inside a sentence asking a human to do it by hand. #569 was auto-closed a
+   *second* time by PR #615 — which linked `Part of #569` deliberately, explained the choice
+   at length, and ended that explanation "Please close #569 by hand if you agree", which is
+   the closing directive it was arguing against. Before you open or update a `Part of` PR,
+   grep the body you are about to post, and `git log` for the branch, for that
+   keyword-next-to-`#N` pattern and reword it ("#569 stays open", "for the human to close
+   out"). It costs one grep; the alternative is a live issue silently closed at merge.
 
 ## Review findings
 
