@@ -5054,6 +5054,212 @@ still displayed" becomes a real structural reading rather than a hypothesis, and
 `StrandedBlocker::QuestionStale` could become a release instead of a badge — which is the only
 thing that would justify one.
 
+*Taken in #534 — see the next section.*
+
+## #534: the question guard reads the composed screen, and a hold can end without a human
+
+**What changed, in one sentence.** `termgrid::render_visible` composes the pane's
+**currently-rendered rows and nothing else**, and a hold that the byte ring keeps asserting is
+released when that screen shows the question is gone.
+
+`render_visible` is a separate function rather than a flag because of the trap the previous
+section names: `render_screen`'s history half would keep matching a scrolled-off question and
+reproduce the bug with extra steps. History is not filtered out afterwards, it is **dropped as it
+scrolls** (`Screen::keep_history`), so there is nothing left for a caller to reach by accident.
+Two exclusions, not one — the *parked primary screen* behind an active alternate screen is
+excluded too. `into_text` shows it deliberately (a `get_output` reader wants the context a pager
+is covering); it is by definition not displayed, so a "still on screen" reading must not see it.
+
+### What the grid evidence can prove, and what it cannot
+
+It can prove a **negative about the composition**: replay these bytes at this geometry and the
+text is not among the cells. It cannot prove a negative about the human's screen, because the
+replay begins mid-stream against a blank grid — content painted before the replay window and
+never repainted since is absent here and present there.
+
+That gap is closed by *ordering*, not by hoping: the guard replays
+`QUESTION_GRID_REPLAY_BYTES` (64 KiB) and the ring detector reads the last
+`QUESTION_SCAN_TAIL_BYTES` (4 KiB) **of that same buffer**. Being a strict superset is what makes
+the load-bearing claim true — *the paint that caused this hold is inside the window we replayed* —
+so a match the ring made and the screen does not hold was overwritten or scrolled, not merely
+never seen. Both readings also come from **one** tail read: a second read would sample a different
+instant, and the guard would be comparing two screens and calling the difference evidence.
+
+Five things it still cannot see, stated rather than mitigated:
+
+- **A resize racing the read.** Geometry is *required*, never defaulted — no `size()`, no grid
+  evidence — because `get_output` can fall back to 80x24 (a wrong width only re-wraps prose a
+  human reads) while here a wrong width moves characters between cells and a re-wrapped `(y/n)`
+  would read as absent. A resize *during* the window still composes old-width paint at the new
+  width. Narrow, transient, and simultaneous with a human's own hand on the window.
+- **Escape sequences the replay does not implement.** It is not a terminal emulator (see the
+  module's own limits). A CLI placing a dialog with something unhandled composes it wrongly.
+- **Wide characters.** One cell here, two in the real pane; a CJK-heavy dialog can shift a row's
+  trailing text.
+- **A blind-start composition that was never painted over** — which is why a screen with fewer
+  than `GRID_MIN_RENDERED_ROWS` non-empty rows is `Unreadable` rather than clear
+  (`trustworthy_composition`). "The screen is blank" is not "the screen is clear". This is a floor,
+  not a coherence check: a garbled but well-populated composition passes it.
+- **A CLI whose resting screen is one line.** The floor above is a row count, and it assumes a
+  boxed UI — every CLI loomux drives today paints at least an input box. One that does not
+  composes to `Unreadable` forever, so this feature simply never engages for it and the pane keeps
+  the pre-#534 badge-only behaviour. Safe direction, and disclosed rather than detected: if a
+  Tier-B CLI with a minimal prompt is ever added, this is the assumption to revisit, and the
+  fix would be a content-based trust test rather than a taller floor.
+
+### The release rule, exactly
+
+`question_shown` takes both readings. **The ring is the trigger; the grid can only ever release.**
+
+| ring | grid | reading | vs. before #534 |
+|---|---|---|---|
+| no match | *not consulted* | clear | unchanged |
+| match | `Unreadable` | hold | unchanged |
+| match | `StillRendered` | hold | unchanged |
+| match | `NotRendered` | **clear** | **the one change** |
+
+Every row but the last is prior behaviour, so the entire behavioural surface is **one transition
+in one direction**, and that is deliberately all it is. The grid is never allowed to *create* a
+hold the ring did not: that would be a new false-positive class (screen content the ring had
+already scrolled past — a `❯ npm run dev` in prose the CLI has not scrolled away yet), and while
+#420/#427 forbid *weakening* the guard, nothing asks us to strengthen it in the same change that
+first lets it release. Strengthening detection with rendered rows remains available and is not
+taken here.
+
+`NotRendered` requires **both** sub-readings to come back empty, OR'd toward safety because a
+false `NotRendered` is the expensive error and a false `StillRendered` is the cheap one:
+
+- `prompt_wait_detected` over the rendered rows — catches a dialog the CLI repainted with
+  different text than the ring matched.
+- `match_still_rendered` — looks for *this* match anywhere on screen. Needed because the
+  detector's own last-12-lines rule is **chronological**, written for a stream where recent means
+  last; applied to a *spatial* layout it would miss a dialog sitting above twelve rows of
+  statusline and input box. The comparison is whitespace-flattened, so a line the ring saw as one
+  write and the screen wrapped across two rows still counts as displayed.
+
+### The needle is re-read in its own terms, and why that had to be a type
+
+The second sub-reading is only worth anything if it can actually find the thing again. Round 1
+gave every match one needle — the matched **line** — and that is unsound for one signal class, in
+the false-release direction. Review caught it; it is recorded here because the shape of the
+mistake generalizes.
+
+`m.line` comes from `strip_ansi` of the byte ring. `strip_ansi` deletes cursor addressing, so a
+CLI that repaints one physical row by cursor address — which `termgrid`'s own header documents as
+the flagship CLI's normal behaviour — yields a *concatenation of several frames* that was never on
+any screen. Such a needle can never be found on a clean grid.
+
+For the four token-bearing signals that is harmless: the token is short, repaint-stable, and
+checked first. For `pointer-option` it was fatal, because that signal's evidence is a **position**
+(a glyph leading a line), so it had no token and fell through to the line search. The check
+therefore returned false for a menu that was plainly displayed, and since the pointer rule in
+`prompt_wait_match` reads only the last three painted lines — chronological again — a live menu
+sitting above the input box and status chrome made *both* sub-readings empty. `NotRendered`,
+release, Enter into a live menu: the #420 harm, reached by the one class that could not defend
+itself.
+
+Two changes, and the second matters more than the first:
+
+- **`pointer_rendered` re-reads the signal itself, spatially.** Every rendered row, deframed by
+  the same `leads_with_pointer` rule the ring detector uses — one definition, so a re-read cannot
+  drift looser (pinning holds open on prose) or tighter (releasing into a live menu) than the
+  detector it stands in for. The line search survives as an *additional* disjunct for both kinds:
+  when the line is clean it is the most specific evidence there is, and when it is a repaint
+  artifact it simply fails, which can add a hold but never remove one.
+- **`QuestionNeedle` is an enum, not an `Option<&str>`.** The round-1 shape encoded "no token" as
+  `None` and left what to do about it to a comment — and the comment was wrong. With two named
+  kinds, `match_still_rendered` must handle each explicitly and a sixth signal class cannot
+  inherit the hole by defaulting. The general lesson: *when a fallback is unsound for one member
+  of a set, the set is the wrong type.*
+
+One ordering change follows from the same reasoning: `menu-footer` is now reported **before**
+`pointer-option`. Real menus routinely paint both, and the reported match decides which needle the
+re-read gets — so among signals that fired on the same dialog, prefer the one whose evidence
+survives recomposition. This cannot change the boolean (a disjunction), only which evidence is
+recorded and re-read.
+
+`mask_own_paste` runs on **both** readings or the guard contradicts itself: our own just-pasted,
+not-yet-submitted text sits in the input box, where it is genuinely *rendered* — and stays
+rendered, unlike in the ring, where it scrolls out of a 4 KiB window soon enough. A brief quoting
+"do you want to proceed" would otherwise answer "still displayed" about itself and strand its own
+delivery.
+
+### Why this is a release and not another badge
+
+The previous section's argument against releasing was specific, not general: *from an append-only
+byte ring, a live dialog and an answered one that has not scrolled away are byte-identical. No
+reading available here could justify a release.* The reading is now available. The asymmetry it
+invoked — a prompt held too long is recoverable by a human who is told; an Enter that auto-answers
+a live consent dialog is not recoverable at all — is unchanged and is why the release is fenced
+this narrowly.
+
+Four things must all hold before an Enter follows a grid-driven release. They are **not four
+independent signals** — saying so would overclaim, and two of them are re-samples of the same
+signal class at a later instant. What they defend against is transients, which is a real and
+different property from independence:
+
+1. Two **consecutive** clear polls (`QUESTION_RELEASE_CONSECUTIVE_CLEAR_POLLS`), unchanged from
+   rev-19 R1. This is what makes ordinary TUI redraw churn safe — but by hysteresis, not by the
+   grid: a poll landing *inside* a repaint (erased, chrome painted, dialog row not yet) genuinely
+   composes clear, and two such polls in a row would release. The sub-window is narrow (a fully
+   erased screen is `Unreadable`, so it must be erased *and* ≥2 rows painted *and* miss the dialog
+   row, twice in a row at 250 ms), and `d4b` pins that boundary rather than asserting it away.
+2. A composition that passed `trustworthy_composition`.
+3. `write_admission` re-reading box occupancy **at the instant of the write** (#532), plus the
+   pre-Enter `preenter_admission`. Box occupancy *is* an independent signal here; the question
+   half of that same gate is not, because `question_active_now` deliberately reads the grid too
+   (see its doc — otherwise it would re-assert, one call later, the hold the guard had just
+   released). Its value is the later instant, not a second opinion.
+4. The pre-Enter checkpoint re-deriving all of the above after the paste — again a re-sample, and
+   again valuable for the same reason: it is taken after a paste that may have taken seconds.
+
+**On "release when the question is gone AND the box is empty".** The box conjunct is not
+re-derived inside the question predicate, and that is a decision rather than an omission. It is
+already enforced, twice, by construction: the pre-paste loop breaks only on
+`write_admission(input_pending, question_active_now)` and the pre-Enter gate is
+`preenter_admission`. Re-deriving it here would create a *second* place for `input_pending`'s
+precedence to be got wrong — and #536's own finding is that this signal must never be allowed to
+veto things it has no standing over, since it latches true over an empty box (a bare `ESC`, a TUI
+line-clear, the CLI consuming the line). One derivation, at the point of the write, is the shape
+this subsystem already settled on.
+
+**Scope, stated so the boundary is not mistaken for an oversight.** Two other `prompt_wait_detected`
+consumers stay on the byte ring: the late-confirmation monitor
+(`LATE_MONITOR_QUESTION_SCAN_BYTES`) and the attention scan. Neither decides a *write* — one picks
+an audit disposition, the other raises a badge — so neither carries the harm this evidence exists
+to bound, and extending them belongs with whoever is measuring those surfaces.
+
+### What the audit now records (#513(c)/F2)
+
+`delivery-aborted-question` recorded `to`/`stage`/`held_ms`/`recheck_round` — everything except
+what the guard keyed on. #513's live incident held the orchestrator's inbound queue five times
+across 27 minutes and **its trigger is still unknown** because of that. Every question-guard
+record (`delivery-aborted-question`, `delivery-held-for-question`, and the retry path's
+`submit-retries-skipped`) now carries `matched`:
+
+- `signal` — which detector rule fired (`yes-no-token`, `permission-phrase`, `numbered-menu`,
+  `pointer-option`, `menu-footer`). The fastest way to spot a rule misfiring on prose.
+- `line` — the normalized line it fired on, capped at `QuestionMatch::MAX_LINE`. Diagnostic only:
+  it is a `strip_ansi` artifact and nothing may *decide* on it (see the needle section above).
+  Up to 200 normalized characters of pane content therefore reach `audit.jsonl`. That is not a new
+  exposure class — the same file already persists the **full text of every delivered prompt**
+  (`prompt`, per delivery) and every queued payload — and it is strictly narrower: only
+  question-shaped lines, only on a hold or abort, capped, lowercased, local.
+- `grid` — `still-rendered` / `not-rendered` / `unreadable`: whether the composed screen agreed.
+
+`matched: null` is a real answer, not a missing field: on an abort record it means the outcome and
+the detector disagree, which is itself the finding. `prompt_wait_detected` is now defined as
+`prompt_wait_match(..).is_some()`, so there is exactly one detector and the audit cannot describe
+a different one than the guard used.
+
+`delivery-aborted-recheck` carries it too — that exit records `blocked_on: "question"` and used to
+say nothing about *which*, the same blind spot one exit down. One caveat to read it correctly, and
+it is a property of that record rather than of the field: the pre-paste loop runs up to
+`PREPASTE_RECHECK_ROUNDS` times, and `matched` there is **the last sighting within the whole
+attempt**, which may predate the final round (and may sit beside `blocked_on: "box_occupied"`, the
+gate that actually ended it). A later round that saw nothing does not erase it, deliberately: on
+this exit the useful fact is that the pane had a dialog during the attempt at all.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,
