@@ -695,6 +695,47 @@ persisted in `group.json`, and clamped in `clamped()`.
   replayed: agents re-sync from the board/state on the next prompt after resume, which is the
   point. The flag is mirrored to a `paused` marker file so a pause survives an app restart
   (re-seeded in `create_group`).
+
+  **Resume says what the pause threw away (#569).** Suppression was audited and nothing else,
+  which made pause the last non-crash path where a payload its sender had been told `Ok` about
+  simply ceased to exist — a worker's `report("done")` fired mid-pause evaporated, and the
+  orchestrator went on waiting for a report that would never arrive. `resume_group` now reads
+  the window's `prompt-suppressed-paused` lines back out of the audit log
+  (`suppressed_during_pause`, pure) and delivers one notice naming every discarded
+  `from → to` with a bounded payload preview (`pause_suppression_notice`). Three things this
+  deliberately is *not*: it does not replay anything, it does not queue anything, and it mints
+  no delivery id — a suppressed delivery never reached the front door, so there is no id to
+  join against, the same conclusion #563 reached at `enqueue_text`'s `RejectFull` arm. It reads
+  the audit log and mutates no queue, so it owes no `persist_queues` call; the notice itself
+  goes through the ordinary front door, which already does.
+
+  **It is bounded twice, and the second bound is the load-bearing one.** A long pause can
+  swallow an unbounded number of deliveries, and this notice is itself a delivery — one pasted
+  into a pane, spending that agent's context. Per item, `queue::dropped_payload_preview` caps a
+  preview at `DROPPED_PREVIEW_MAX` (160 chars, truncation marked, never silent); that alone
+  bounds nothing, because the *count* is what a pause controls. So the notice names at most
+  `PAUSE_SUPPRESSION_LIST_MAX` (8) individually and summarizes the rest as a count pointing at
+  the audit log, which holds every discarded payload in full — `prompt-suppressed-paused`
+  carries `text`, not a preview. Worst case is therefore a ~2 KB paste however long the pause
+  ran, and the fix cannot become the problem it was raised against.
+
+  The window is bounded by the most recent `group-pause` line and by nothing else — a
+  `prompt-suppressed-paused` line can only be written while paused, so everything after that
+  marker belongs to the window it opened, and the scan survives an app restart mid-pause
+  because the audit log does. `group-resume` is deliberately not treated as a boundary:
+  `create_group` audits that same action name for a group RESTORED from disk. If the marker has
+  rotated out of the readable log the notice says so rather than presenting a possibly
+  over-counted list as exact.
+
+  And the notice must not become the next silent loss: it is an in-band delivery, so it fails
+  exactly when a pause has run long enough for the orchestrator to idle out — the case with the
+  most to report. When it fails, every distinct live target pane gets the
+  `StrandedBlocker::PauseSuppressed` badge instead, the channel #563 established for holds an
+  orchestrator-targeted notice cannot reach (no role suppression, no orchestrator required). A
+  pane already carrying another mechanism's badge is left alone. Enqueue-while-paused
+  (#569 option 2) is **not** implemented and is not implied by any of this: it would make
+  drain-on-resume re-spend tokens a human paused to stop, which changes pause's cost-containment
+  contract and is the human's call, not a worker's.
 - **Idle-worker auto-kill.** Each worker/reviewer carries `idle_since_ms`, stamped when it is
   spawned without a task or reports `done`/`blocked`, and cleared when the orchestrator sends
   it a prompt (`send_prompt`). A background reaper (`start_idle_reaper`, 30s tick) kills any
@@ -6615,6 +6656,24 @@ is only as good as the frontend's own vectors: a future input path that reaches 
 without going through `markFirstInput()` would arrive marked non-human. That is the
 fail-*unsafe* direction for this one signal, which is why both marks hang off that single
 function rather than being re-derived at each call site.
+
+**And that enumeration is now executable (#570).** "One function, so a vector can only be
+added in one place" is a convention, not a mechanism — it was arrived at by hand twice (#440
+B2-R, then #518) and lived nowhere a compiler or a test could read it, so the next path to skip
+it would have degraded the bit silently. `test/inputvectors.test.ts` is the tripwire: a
+data-driven scan of `src/` that pins five call shapes — an explicit `.paste()`, an `onKey`
+handler, `writePty` going through the ordered writer, `writePty` carrying its origin argument,
+and `onData` consulting the latch — and names the offending `file:line` and what is unsafe
+about it when one fires. Comments and literals are stripped first, because most occurrences of
+these shapes in `src/` are the prose *about* them, including this subsystem's own design
+argument in `humanorigin.ts`. It is a tripwire and not a proof: it knows today's shapes, and a
+genuinely novel vector (a new xterm API, a raw `invoke("write_pty")`) is not in its table — so
+the file's last test asserts every rule still matches real code, since a rule that has drifted
+away from the code reports green about a file it no longer reads. No product code changed for
+it: the one seam that could carry a debug assertion, `createOrderedWriter`'s
+`write(data, human = true)`, defaults to human deliberately (an un-updated call site keeps its
+pre-#518 meaning), so an assertion there would fire on the documented fail-safe rather than on
+the defect.
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
