@@ -17969,7 +17969,7 @@ fn the_near_full_badge_does_not_claim_a_delivery_was_already_lost() {
 }
 
 #[test]
-fn the_capacity_badges_state_a_hold_as_a_CONDITION_never_as_a_fact() {
+fn the_capacity_badges_state_a_hold_as_a_condition_never_as_a_fact() {
     // rev-10 finding 1, and it is the same false-claim class this whole issue
     // exists to eliminate — reached from the other side.
     //
