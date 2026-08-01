@@ -9130,11 +9130,6 @@ pub fn front_door_refusals(entries: &[AuditEntry], window_truncated: bool) -> Fr
         let Some(reason) = e.detail["reason"].as_str().and_then(RefusalReason::from_audit) else {
             continue;
         };
-        // SCRATCH(#633): the pre-#633 filter — `queue-full-at-call` and nothing
-        // else, so the new reasons are scanned past exactly as #630 left them.
-        if reason != RefusalReason::QueueFull {
-            continue;
-        }
         let to = e.detail["to"].as_str().unwrap_or("?").to_string();
         let depth = e.detail["depth"].as_u64().map(|d| d as usize);
         if e.detail["payload"] == json!(RefusedPayload::StrandedSubmit.as_str()) {
@@ -28578,11 +28573,15 @@ impl OrchRegistry {
         // and deliberately stays there — see `front_door_refusals`'s doc for
         // why `prompt` must keep meaning "offered to a pane".
         if a.status == AgentStatus::Dead {
-            // SCRATCH(#633): audit call removed to capture red evidence.
+            self.audit_delivery_refused(
+                &a.group, agent_id, from, text, RefusalReason::AgentDead,
+            );
             return Err(format!("agent {agent_id} is dead"));
         }
         let Some(pty_id) = a.pty_id else {
-            // SCRATCH(#633): audit call removed to capture red evidence.
+            self.audit_delivery_refused(
+                &a.group, agent_id, from, text, RefusalReason::NoTerminal,
+            );
             return Err("agent has no terminal yet".into());
         };
         // Pause guardrail (#569, option 2 — the human's call): while a group
@@ -28944,15 +28943,13 @@ impl OrchRegistry {
             };
             (removed, dirty)
         });
-        // SCRATCH(#633): the pre-#633 shape — one fixed reason, no `{to, from,
-        // bytes, preview}`, and no line at all on the not-removed branch.
-        let _ = (agent_id, from, text, reason, pty_id);
         if removed {
-            self.audit(group, "loomux", "delivery-dropped",
-                json!({ "id": id, "reason": "no-app-handle" }));
-        }
-        #[cfg(any())]
-        {
+            self.audit(group, "loomux", "delivery-dropped", json!({
+                "id": id, "reason": reason.as_str(), "to": agent_id, "from": from,
+                "bytes": text.len(), "preview": queue::dropped_payload_preview(text),
+                "consequence": reason.consequence(),
+            }));
+        } else {
             // #633: the branch that used to write NOTHING. The pop is
             // conditional (the id may no longer be the front), and when it does
             // not fire the caller still returns `Err` to its sender while the
@@ -28991,7 +28988,6 @@ impl OrchRegistry {
     /// written BEFORE `deliver_prompt`'s own `prompt` line and so has nothing to
     /// pair with. See `front_door_refusals`'s doc for why the `prompt` write is
     /// not simply moved above these refusals instead.
-    #[allow(dead_code)] // SCRATCH(#633): uncalled while the red evidence runs.
     fn audit_delivery_refused(
         &self,
         group: &str,
