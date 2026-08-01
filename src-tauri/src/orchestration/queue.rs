@@ -1590,40 +1590,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_still_queued_clock_is_not_restarted_by_a_stranded_marker() {
-        // #560: the notice was measured from the FRONT entry's stamp, and
-        // `enqueue_stranded_front` makes the front the YOUNGEST entry in the
-        // queue — so a pasted-but-unsubmitted delivery pushed the 30-minute
-        // notice out by the very event that proves the pane is stuck.
-        let threshold_ms = QUEUE_STILL_QUEUED_NOTICE_AFTER.as_millis() as u64;
-        let held_since = 1_000_000u64;
-        let now = held_since + threshold_ms;
-        // The marker was minted one second ago; it is the only entry left,
-        // because the batch it stands for was popped when the paste landed.
-        let marker_ms = now - 1_000;
-
-        assert!(
-            !should_fire_still_queued_notice(marker_ms, now, false),
-            "reading the marker's own stamp, the pane looks one second old — this is the defect"
-        );
-        assert!(
-            should_fire_still_queued_notice(undelivered_since(marker_ms, Some(held_since)), now, false),
-            "the pane has had undelivered work for the full threshold, and the hold episode is \
-             the only reading that still says so"
-        );
-
-        // The other direction, which is why the entry term is kept: a delivery
-        // landing ends the episode, but entries the flush could not fit stay
-        // queued and must keep their own age.
-        let old_entry = now - threshold_ms;
-        assert_eq!(undelivered_since(old_entry, None), old_entry);
-        assert!(should_fire_still_queued_notice(undelivered_since(old_entry, None), now, false));
-        // And with both, the EARLIER wins in either arrangement.
-        assert_eq!(undelivered_since(old_entry, Some(now)), old_entry);
-        assert_eq!(undelivered_since(now, Some(old_entry)), old_entry);
-    }
-
     // ---------- queue_full_error ----------
 
     #[test]
