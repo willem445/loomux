@@ -56,9 +56,10 @@ blocks:
   # Consider one reviewer block on a different CLI/model than the worker — a
   # second model tends to catch a different class of defect than the one that
   # already wrote (and is primed to defend) the diff. All three reviewers below
-  # currently run `cli: claude`; flipping one to `cli: copilot` would need
-  # Copilot installed for whoever runs this group, so it's left as a
-  # deliberate human choice rather than done here (#267). See "A nudge toward
+  # currently run `cli: claude`; `cli: copilot` or `cli: gemini` (#267 stage 2 —
+  # a different model family, not just a different harness) would each need that
+  # CLI installed for whoever runs this group, so the flip is left as a
+  # deliberate human choice rather than done here. See "A nudge toward
   # cross-model review" in doc/design/workflows.md.
   #
   # ── three focused reviewers, one per real review lane ───────────────────────

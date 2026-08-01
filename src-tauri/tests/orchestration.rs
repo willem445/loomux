@@ -95,6 +95,11 @@ use loomux_lib::orchestration::{
     PLANNER_READONLY_NOTE, SOLO_GROUP, AUTOPILOT_DIALOG_WAIT, SOLO_AUTOPILOT_DIALOG_WAIT,
     CLAUDE_EDIT_DENY_TOOLS, CLAUDE_READONLY_DENY_GIT, KNOWN_CLAUDE_TOOLS,
     COPILOT_EDIT_DENY_TOOLS, COPILOT_READONLY_DENY_GIT, KNOWN_COPILOT_DENY_CATEGORIES,
+    SUPPORTED_CLIS,
+    // #267 stage 2: gemini as a reviewer-capable CLI, and the capability table
+    // that decides which classes any CLI may host.
+    cli_can_host, cli_caps, cli_extra_env, gemini_policy_toml, gemini_settings_json,
+    CLI_CAPS, GEMINI_EDIT_DENY_TOOLS, GEMINI_READONLY_DENY_GIT, KNOWN_GEMINI_TOOLS,
 };
 use loomux_lib::pty::{phantom_gate_tick, PtyManager};
 use serde_json::{json, Value};
@@ -4850,9 +4855,20 @@ fn single_pane_autopilot_flags_per_cli() {
     assert_eq!(single_pane_autopilot_flags("Hermes"), hermes);
     assert_eq!(single_pane_autopilot_flags("Ante"), ante);
 
+    // Gemini (#267): `--approval-mode yolo` — the documented spelling, since
+    // its own CLI reference marks the bare `--yolo` alias deprecated. Built
+    // from the SAME atom the group spawn path uses (#101), asserted below in
+    // `gemini_launcher_and_group_paths_share_one_unattended_atom`.
+    let gemini = single_pane_autopilot_flags("gemini");
+    assert_eq!(
+        gemini, "--approval-mode yolo",
+        "gemini autopilot must use the non-deprecated approval-mode spelling, got: {gemini}"
+    );
+    assert_eq!(single_pane_autopilot_flags("Gemini"), gemini);
+
     // CLIs with no known unattended surface get no flags (the toggle is inert),
     // rather than inventing flags that may not exist.
-    for other in ["codex", "opencode", "gemini", "aider", ""] {
+    for other in ["codex", "opencode", "aider", ""] {
         assert_eq!(single_pane_autopilot_flags(other), "",
             "{other:?} has no unattended flag surface — must return empty");
     }
@@ -5822,6 +5838,350 @@ fn build_agent_argv_matches_command_line() {
             }
         }
     }
+}
+
+// ── #267 stage 2: gemini as a reviewer-capable orchestration CLI ───────────
+
+/// #267 stage 2. `SUPPORTED_CLIS` is the gate every other layer keys off — the
+/// workflow parser (`parse_workflow`), the spawn guardrail (`spawn_agent_ex`)
+/// and the launcher roster all consult it — so "a workflow.yml can declare a
+/// gemini-backed reviewer" is, first, this membership.
+///
+/// Stage 1 (PR #355) shipped the docs/template nudge to run one reviewer on a
+/// different CLI than the worker; with only claude and copilot in this list,
+/// that nudge could only ever buy a *second Claude-family opinion*. Gemini is
+/// the first genuinely different model family loomux can spawn.
+#[test]
+fn gemini_is_a_supported_orchestration_cli() {
+    assert!(
+        SUPPORTED_CLIS.contains(&"gemini"),
+        "#267 stage 2: gemini must be a spawnable orchestration CLI so a workflow.yml can \
+         declare a gemini-backed reviewer — SUPPORTED_CLIS is {SUPPORTED_CLIS:?}"
+    );
+}
+
+/// The gemini adapter builds a *gemini* invocation, not the claude fallback.
+///
+/// Pins the three seams a reviewer block actually needs, each of which is a
+/// different CLI's spelling of something loomux already does for claude and
+/// copilot:
+///
+/// - **`--allowed-mcp-server-names loomux`** — gemini's analogue of claude's
+///   `--strict-mcp-config`: the reviewer reaches `review_verdict` and nothing
+///   the user's own settings might have added. (The server itself is declared
+///   in the generated settings file, not on argv — gemini has no
+///   `--mcp-config`-equivalent flag; see `write_mcp_config`.)
+/// - **`--approval-mode`** — the unattended posture, gemini's `yolo` against
+///   claude's `--permission-mode`.
+/// - **`--include-directories <group_dir>`** — the group state dir, gemini's
+///   `--add-dir`.
+///
+/// It also asserts the two spawn forms agree, the same drift guard
+/// `build_agent_argv_matches_command_line` applies to every other CLI.
+#[test]
+fn gemini_reviewer_command_is_a_gemini_invocation() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let cmd = reg.build_agent_command(
+        "gemini", "pro", true, cfg, None, gdir, wd, None, false, Containment::NoEdits,
+        &PersonaInject::default(),
+    );
+    assert!(
+        cmd.starts_with("gemini "),
+        "a gemini block must spawn gemini, not fall through to the claude adapter: {cmd}"
+    );
+    for want in [
+        "--model pro",
+        "--approval-mode yolo",
+        "--allowed-mcp-server-names loomux",
+    ] {
+        assert!(cmd.contains(want), "gemini command is missing {want:?}: {cmd}");
+    }
+    assert!(
+        cmd.contains(&format!("--include-directories \"{}\"", gdir.display())),
+        "the group state dir must be in gemini's workspace: {cmd}"
+    );
+    // Claude's flags are claude's. A half-built command that mixes the two
+    // would be worse than the fallback it replaced.
+    for never in ["--mcp-config", "--permission-mode", "--disallowedTools", "--add-dir"] {
+        assert!(!cmd.contains(never), "gemini command must not carry claude's {never:?}: {cmd}");
+    }
+    let argv = reg.build_agent_argv(
+        "gemini", "pro", true, cfg, None, gdir, wd, None, false, Containment::NoEdits,
+        &PersonaInject::default(),
+    );
+    assert_eq!(argv[0], "gemini", "argv[0] is what the pane spawns directly: {argv:?}");
+    assert_eq!(shell_tokenize(&cmd), argv, "the two spawn forms must not drift: {cmd}");
+}
+
+/// A gemini block's default model is gemini's *reasoning* tier, not claude's
+/// model names leaking through `default_model`'s claude branch.
+///
+/// `pro` for every class, deliberately, unlike claude's strong/mid split:
+/// gemini's documented alias set is `pro` (complex reasoning) vs `flash`
+/// (speed), and the entire point of a cross-model reviewer (#267) is a second
+/// *strong* opinion — a reviewer defaulted onto a speed tier would be the
+/// weakened reviewer this stage exists to avoid. A block may still pin its own
+/// `model:`.
+#[test]
+fn gemini_blocks_default_to_geminis_reasoning_tier() {
+    let g = Guardrails { agent_cli: "gemini".into(), ..Guardrails::default() };
+    for role in [Role::Orchestrator, Role::Worker, Role::Reviewer, Role::Planner] {
+        assert_eq!(
+            g.model_for(role),
+            "pro",
+            "a gemini {role:?} must default to a gemini model alias, not a claude one"
+        );
+    }
+}
+
+/// #101's invariant, extended to gemini: the launcher's autopilot toggle and
+/// the group spawn path must mean the SAME thing, built from one atom, so a
+/// human's "autopilot on" and a group's `auto_ops` can't quietly diverge.
+#[test]
+fn gemini_launcher_and_group_paths_share_one_unattended_atom() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let unattended = reg.build_agent_command(
+        "gemini", "pro", true, cfg, None, gdir, wd, None, false, Containment::None,
+        &PersonaInject::default(),
+    );
+    assert!(
+        unattended.contains(&single_pane_autopilot_flags("gemini")),
+        "the group path must carry the launcher's own gemini atom verbatim: {unattended}"
+    );
+    // And the attended posture is spelled out rather than left to an absent
+    // flag, so a non-auto_ops group's command line says what it means.
+    let attended = reg.build_agent_command(
+        "gemini", "pro", false, cfg, None, gdir, wd, None, false, Containment::None,
+        &PersonaInject::default(),
+    );
+    assert!(attended.contains("--approval-mode default"), "{attended}");
+    assert!(!attended.contains("yolo"), "an attended gemini agent must not be in yolo: {attended}");
+}
+
+/// The capability table is the *reason* a CLI is or isn't in `SUPPORTED_CLIS`,
+/// so the two must not drift: a CLI marked `orchestration` with no spawn
+/// adapter would panic somewhere downstream, and one with an adapter but no row
+/// would have no recorded containment ceiling — i.e. `cli_can_host` would wave
+/// it through for every class, which is exactly the fail-open direction #462's
+/// guarantee cannot survive.
+#[test]
+fn supported_clis_match_the_capability_table() {
+    let from_table: Vec<&str> =
+        CLI_CAPS.iter().filter(|c| c.orchestration).map(|c| c.cli).collect();
+    assert_eq!(
+        from_table,
+        SUPPORTED_CLIS.to_vec(),
+        "CLI_CAPS' orchestration rows and SUPPORTED_CLIS describe the same set, in the same order"
+    );
+    for cli in SUPPORTED_CLIS {
+        assert!(cli_caps(cli).is_some(), "{cli} is spawnable but has no capability row");
+    }
+}
+
+/// **The gate this whole stage turns on.** A reviewer runs under
+/// `Containment::NoEdits` (#462) and a planner under `ReadOnly`; a CLI that
+/// cannot enforce that tier must not be allowed to host one, because the
+/// failure is silent — the agent spawns, reviews, and simply is not contained.
+///
+/// Codex is the case that made this concrete (#267): its only containment axis
+/// is `sandbox_mode`, whose `read-only` rung also blocks running commands and
+/// network access (no tests, no `gh`) and whose `workspace-write` rung denies
+/// nothing at all. So it tops out at `Containment::None` — fine for a worker or
+/// an orchestrator, structurally disqualified for a reviewer or a planner.
+#[test]
+fn a_cli_may_not_host_a_class_whose_containment_it_cannot_enforce() {
+    // The uncontained classes are open to every evaluated CLI.
+    for role in [Role::Orchestrator, Role::Worker] {
+        for cli in ["claude", "copilot", "gemini", "codex"] {
+            assert!(cli_can_host(cli, role).is_ok(), "{cli} must be able to host a {role:?}");
+        }
+    }
+    // The contained ones are not.
+    for role in [Role::Reviewer, Role::Planner] {
+        for cli in ["claude", "copilot", "gemini"] {
+            assert!(
+                cli_can_host(cli, role).is_ok(),
+                "{cli} denies editing tools by name — it must be able to host a {role:?}"
+            );
+        }
+        let err = cli_can_host("codex", role)
+            .expect_err("codex has no tool-level edit deny — it must not host a contained class");
+        assert!(
+            err.contains("codex") && err.contains("containment"),
+            "the refusal must name the CLI and what it is missing, not just say 'unsupported': {err}"
+        );
+    }
+}
+
+/// The gate is enforced where a hand-edited `group.json` has to get past it,
+/// not only where a well-formed workflow file is parsed. `parse_workflow`
+/// refuses the same pairing at load time (`workflow.rs`), but a persisted
+/// roster never goes back through the parser.
+#[test]
+fn a_workflow_file_cannot_declare_a_reviewer_on_an_uncontainable_cli() {
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: rev-codex\n    kind: reviewer\n    cli: codex\n",
+    )
+    .expect_err("a codex reviewer must not parse");
+    let joined = errs.join("\n");
+    assert!(joined.contains("rev-codex"), "the finding must name the offending block: {joined}");
+    // Naming the block is not enough to prove the *containment* gate fired —
+    // `codex` is also outside `SUPPORTED_CLIS`, so a generic "unknown cli"
+    // rejection would satisfy the line above while the gate did nothing. The
+    // reason has to be the reason: the parser checks containment FIRST for
+    // exactly this, so a CLI loomux has evaluated is told what it is missing
+    // rather than that it does not exist.
+    assert!(
+        joined.contains("containment"),
+        "the parser must refuse this pairing for its containment gap, not merely as an \
+         unknown CLI — otherwise this test passes with the gate removed: {joined}"
+    );
+}
+
+/// A contained gemini agent's deny rules are not on its command line — they are
+/// the two generated files. This asserts the *containment itself*, which for
+/// gemini means: both layers name both editing tools, and the settings file
+/// points at the policy file so the admin tier is actually loaded.
+///
+/// Two layers, not redundancy — each covers the other's documented failure
+/// mode (see `GEMINI_EDIT_DENY_TOOLS`): supplemental admin policies are ignored
+/// outright on a machine that has system-wide gemini policies installed, and
+/// `tools.exclude` is documented as deprecated.
+#[test]
+fn a_contained_gemini_agents_deny_rules_ride_its_generated_files() {
+    let policy_path = Path::new("C:/data/group/configs/rev-1-gemini-policy.toml");
+
+    for (tier, want_git) in [(Containment::NoEdits, false), (Containment::ReadOnly, true)] {
+        let settings: Value = serde_json::from_str(&gemini_settings_json(
+            5123,
+            "tok-abc",
+            tier,
+            Some(policy_path),
+        ))
+        .expect("the generated settings must be valid JSON");
+        let toml = gemini_policy_toml(tier);
+
+        // Layer 1: tools.exclude.
+        let exclude = settings["tools"]["exclude"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{tier:?} must carry a tools.exclude list: {settings}"))
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        for t in GEMINI_EDIT_DENY_TOOLS {
+            assert!(exclude.iter().any(|e| e == t), "{tier:?} tools.exclude is missing {t}: {exclude:?}");
+            // Layer 2: the admin-tier policy rule for the same tool.
+            assert!(
+                toml.contains(&format!("toolName = \"{t}\"")),
+                "{tier:?} policy file is missing a deny rule for {t}:\n{toml}"
+            );
+        }
+        assert!(
+            toml.contains("decision = \"deny\""),
+            "the policy rules must be denials, not asks:\n{toml}"
+        );
+        // The shell survives BOTH layers — that is what makes this NoEdits and
+        // not something stricter: a reviewer runs the tests (#462).
+        assert!(
+            !exclude.iter().any(|e| e == "run_shell_command"),
+            "{tier:?} must not deny the shell outright: {exclude:?}"
+        );
+
+        // The git-mutation denials are the ReadOnly rung only — a reviewer
+        // keeps `git commit` (see CLAUDE_READONLY_DENY_GIT's doc for why).
+        for prefix in GEMINI_READONLY_DENY_GIT {
+            let in_exclude = exclude.iter().any(|e| e == &format!("run_shell_command({prefix})"));
+            let in_toml = toml.contains(&format!("commandPrefix = \"{prefix}\""));
+            assert_eq!(in_exclude, want_git, "{tier:?} tools.exclude / {prefix}: {exclude:?}");
+            assert_eq!(in_toml, want_git, "{tier:?} policy / {prefix}:\n{toml}");
+        }
+
+        // And the admin tier is actually reachable: an unreferenced policy
+        // file is a file gemini never reads.
+        assert_eq!(
+            settings["adminPolicyPaths"][0].as_str(),
+            Some(policy_path.display().to_string().as_str()),
+            "the settings file must point at the policy file: {settings}"
+        );
+    }
+
+    // An uncontained class gets neither layer — nothing to deny, and an empty
+    // `tools.exclude` would be a claim about tools loomux isn't making.
+    let open: Value =
+        serde_json::from_str(&gemini_settings_json(5123, "tok-abc", Containment::None, None))
+            .expect("valid JSON");
+    assert!(open.get("tools").is_none(), "an uncontained agent needs no exclusions: {open}");
+    assert!(open.get("adminPolicyPaths").is_none(), "{open}");
+}
+
+/// Every agent CLI gets the same MCP identity, in its own spelling. Gemini's is
+/// the `mcpServers` settings key with `httpUrl` + `headers` — there is no
+/// `--mcp-config` equivalent flag, which is the whole reason its config travels
+/// by environment variable.
+#[test]
+fn a_gemini_agent_reaches_the_same_loomux_mcp_server_every_other_cli_does() {
+    let settings: Value =
+        serde_json::from_str(&gemini_settings_json(5123, "tok-abc", Containment::NoEdits, None))
+            .expect("valid JSON");
+    let server = &settings["mcpServers"]["loomux"];
+    assert_eq!(
+        server["httpUrl"].as_str(),
+        Some("http://127.0.0.1:5123/mcp"),
+        "gemini must be pointed at THIS loomux instance's port: {settings}"
+    );
+    assert_eq!(
+        server["headers"]["X-Loomux-Agent"].as_str(),
+        Some("tok-abc"),
+        "the per-agent token is what makes `review_verdict` attributable: {settings}"
+    );
+}
+
+/// The settings file only reaches gemini if the pane is spawned with the
+/// environment variable naming it — that env entry IS gemini's MCP delivery,
+/// so its absence would be a reviewer with no `review_verdict` at all.
+#[test]
+fn a_gemini_panes_env_carries_its_settings_path_and_no_other_clis_does() {
+    let cfg = Path::new("C:/data/group/configs/rev-1.json");
+    assert_eq!(
+        cli_extra_env("gemini", cfg),
+        vec![(
+            "GEMINI_CLI_SYSTEM_SETTINGS_PATH".to_string(),
+            "C:/data/group/configs/rev-1.json".to_string()
+        )]
+    );
+    for other in ["claude", "copilot", "codex", ""] {
+        assert!(
+            cli_extra_env(other, cfg).is_empty(),
+            "{other} delivers its MCP config on argv — it must get no extra env"
+        );
+    }
+}
+
+/// The [`GEMINI_EDIT_DENY_TOOLS`] pin, same shape and same limits as
+/// `claude_edit_deny_tools_are_known_claude_tools` (#448): it catches a typo or
+/// a stale name in loomux's own deny list — a deny rule matching no tool reads
+/// exactly like containment — and does NOT catch gemini renaming a tool out
+/// from under the snapshot.
+#[test]
+fn gemini_edit_deny_tools_are_known_gemini_tools() {
+    for t in GEMINI_EDIT_DENY_TOOLS {
+        assert!(
+            KNOWN_GEMINI_TOOLS.contains(t),
+            "{t:?} is not a known gemini tool name — a deny rule for a tool that does not exist \
+             is not containment. Known: {KNOWN_GEMINI_TOOLS:?}"
+        );
+    }
+    // The shell is deliberately absent: denying it would deny the tests.
+    assert!(
+        !GEMINI_EDIT_DENY_TOOLS.contains(&"run_shell_command"),
+        "NoEdits leaves the shell whole (#462)"
+    );
 }
 
 #[test]

@@ -83,7 +83,7 @@ inert text or a choice from a value set loomux already ships:
 | Block field | What it can do | Why it's safe |
 |---|---|---|
 | `kind` | select one of 4 classes | closed enum; unknown values are **rejected**, not coerced (see below) |
-| `cli` | select `claude` \| `copilot` | validated against `SUPPORTED_CLIS` at parse *and* at spawn |
+| `cli` | select `claude` \| `copilot` \| `gemini` | validated against `SUPPORTED_CLIS` at parse *and* at spawn — and, since #267, against `CLI_CAPS`: a CLI that cannot enforce the class's containment tier is refused at both ends too |
 | `model` | name a model | `sanitize_model` — the pre-existing allowlist filter |
 | `prompt` | free text | inert; sanitized, then delivered as a persona **addendum**, never as a replacement for the loomux contract |
 | `profile` | name a repo file | confined to the repo (no `..`, no absolute path, no drive prefix) |
@@ -1403,8 +1403,8 @@ session actually runs — it needs Copilot installed, and it changes this repo's
 gate behavior for everyone, not just the reader of a doc. That's a one-line human
 call (edit one `cli:` field in `.loomux/workflow.yml`), not something a docs PR
 should assume on their behalf. Widening `SUPPORTED_CLIS` beyond claude/copilot
-(gemini/codex adapters, for genuine reviewer diversity beyond the two CLIs loomux
-already drives) is tracked separately as #267 stage 2.
+was #267 stage 2, below — **gemini** is now spawnable, so the nudge above has a
+genuinely different model family to point at.
 
 The persona files deliberately carry **no `model:`**. Copilot would read one (it is its
 key), loomux would not (the block's `model:` is its single source of truth), and two

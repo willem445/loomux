@@ -9117,6 +9117,9 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   | Reviewer | Claude | **Structural**, named-and-stale direction only | `--disallowedTools Edit Write NotebookEdit` (#462, same `CLAUDE_EDIT_DENY_TOOLS` as the planner). **Not** `dontAsk`: it would auto-deny the shell the job runs through, so the new-tool direction stays open here — see the reviewer-containment section below |
   | Reviewer | Copilot | **Structural**, category-level | `--deny-tool write` (#462, the same category grant the planner gets); Copilot has no `dontAsk` analogue to close the other direction either |
   | Worker | either | N/A by design | Workers exist to edit/commit/push; no containment is the correct posture |
+  | Planner | Gemini | **Structural**, named-and-stale direction only | admin-tier policy `deny` rules on `write_file`/`replace` **plus** `run_shell_command` denials narrowed by `commandPrefix` to `git commit`/`git push`, mirrored in `tools.exclude` (#267) |
+  | Reviewer | Gemini | **Structural**, named-and-stale direction only | admin-tier policy `deny` rules on `write_file`/`replace` (`GEMINI_EDIT_DENY_TOOLS`), mirrored in `tools.exclude`; `run_shell_command` untouched, same trade as the Claude row (#267) |
+  | Reviewer/Planner | Codex | **Not possible** | recorded, not shipped — codex has no tool-level edit deny, and neither sandbox rung fits (see *Which CLIs may host a contained class*, below) |
 
   #### Reviewer containment: what is structural and what is not (#462)
 
@@ -9187,6 +9190,106 @@ Two related additions: a **planner** role, and **per-role** agent CLI + model.
   The reviewer template says all of this to the reviewer too, so its first denial reads as
   policy rather than as a broken environment — including the one write a review legitimately
   needs (a body too long for `gh pr review --body`) and its shell route.
+
+  #### Which CLIs may host a contained class (#267)
+
+  #462 made containment a property of the capability *class*. #267 stage 2 — a
+  reviewer on a different model family than the worker — made the other half
+  explicit: containment is also a property of the **CLI**, because every rung of
+  that ladder is enforced by the vendor's own permission engine, and vendors do
+  not agree on what one can express.
+
+  That produced `CliCaps` / `CLI_CAPS` (`orchestration/mod.rs`): one row per agent
+  CLI loomux has evaluated, recording three things that had been conflated into
+  "is it in `SUPPORTED_CLIS`".
+
+  | field | question it answers |
+  | --- | --- |
+  | `orchestration` | does loomux have a group-spawn adapter for it? (⇔ `SUPPORTED_CLIS`, pinned by `supported_clis_match_the_capability_table`) |
+  | `mcp_argv_seam` | can its per-agent MCP config be delivered *entirely on argv*? |
+  | `max_containment` | the deepest `Containment` tier loomux can actually enforce on it |
+
+  `cli_can_host(cli, role)` is the gate: a block whose class needs deeper
+  containment than its CLI can enforce is refused, at `parse_workflow` (so a repo
+  learns from its own file) **and** at `spawn_agent_ex` (so a hand-edited
+  `group.json` cannot route around the parser). The check is one comparison
+  against the `Containment` ladder, deliberately — a future CLI is admitted by
+  writing its row, not by editing the gate.
+
+  **`mcp_argv_seam` is not a synonym for `orchestration`, and that distinction
+  removed a latent panic.** `solo_prepare` derived its seam from `SUPPORTED_CLIS`
+  and then matched the per-CLI MCP *flag string* with an `unreachable!()` arm, so
+  the first CLI whose config is not argv-deliverable would have crashed a solo
+  launch. PR #323 named the gap when Ante hit it; gemini is the CLI that made it
+  real, and the table is that decoupling. A solo gemini pane is delivery-only for
+  exactly this reason — nothing loomux can append to a command line the human owns
+  carries an MCP server for it.
+
+  ##### Gemini: files, not flags
+
+  Gemini's two loomux-critical seams are generated files, which is why its
+  `build_agent_command` arm is the shortest of the three:
+
+  - **MCP.** Servers are a `settings.json` key (`mcpServers`, `httpUrl` +
+    `headers`) with no `--mcp-config` equivalent. loomux generates the per-agent
+    settings file next to every other CLI's config and hands it over with
+    `GEMINI_CLI_SYSTEM_SETTINGS_PATH` — the *system*-settings override, the top
+    settings tier, documented for precisely this shape in gemini's own enterprise
+    guide. **Not `GEMINI_CLI_HOME`**: that relocates the whole user-level config
+    *and state* root, including the credentials the human logged in with, so a
+    per-agent home would meet every agent with a login prompt. On argv the agent
+    then gets `--allowed-mcp-server-names loomux`, gemini's analogue of claude's
+    `--strict-mcp-config`.
+  - **Containment.** The policy engine is the only gemini surface that can deny a
+    built-in tool *by name* (`--allowed-tools` is documented deprecated in favour
+    of it), so a contained agent gets an admin-tier policy TOML named by
+    `adminPolicyPaths` in that same settings file, **and** the same denials again
+    as `tools.exclude`.
+
+  **Two deny layers is not belt-and-braces for its own sake** — each covers the
+  other's *documented* failure mode. Supplemental admin policies (the
+  `adminPolicyPaths` kind) are ignored outright if any `.toml` exists in the
+  machine's standard system policy directory, so on a box with enterprise gemini
+  policies installed the TOML silently does nothing; `tools.exclude` is not
+  subject to that guard. In the other direction `tools.exclude` is documented as
+  deprecated in favour of policy rules, so it is the layer with an expiry date.
+  Either alone is a containment that fails silently and **open**, which is the one
+  failure mode #448 exists to eliminate.
+
+  Both layers outrank `--approval-mode yolo`, which matters because an `auto_ops`
+  gemini agent runs in it: gemini's own policy config gives the yolo allow-all
+  rule priority `998` in the **default** tier (`1.998` after the tier transform),
+  against `4.4` for a `tools.exclude` deny and `5.x` for an admin-tier rule.
+
+  What gemini does **not** get, stated rather than left to be discovered: no
+  native custom-agent flag (its persona rides the kickoff prompt, like an
+  inline-`prompt:` copilot block), no `allow:` widening (those patterns are
+  Claude/Copilot tool-matcher strings — translating them would be inventing
+  semantics), no compact nudge (its command is `/compress`, not `/compact`;
+  teaching #287's machinery a per-CLI spelling is a separate piece of work), and
+  no `session_digest` (#324/#646's transcript reader has a claude arm and a
+  copilot arm; gemini falls to its `other =>` error arm — which is moot today
+  anyway, since gemini mints its own session ids and loomux therefore records
+  `session_id: None` for a gemini agent, so no digest ever reaches that call).
+
+  ##### Codex: evaluated, recorded, not shipped
+
+  Codex has a row in `CLI_CAPS` with `orchestration: false` and
+  `max_containment: None`, because an absent row is indistinguishable from an
+  oversight and this was a decision:
+
+  - Its `tools` config section exposes only `view_image` and `web_search` — there
+    is **no way to deny its editing path by name**, the way every other row's
+    mechanism works.
+  - Its only containment axis is `sandbox_mode`, and neither usable rung is the
+    reviewer's tier. `read-only` also requires approval to *run commands or access
+    the network*, which removes the tests and the `gh` a review is made of;
+    `workspace-write` denies nothing at all, leaving the frictionless edit path
+    that #462 exists to close wide open.
+
+  So a codex reviewer would be a reviewer class with the #462 guarantee quietly
+  absent — a gate-integrity hole rather than a feature. #267 stays open for it: if
+  codex grows a tool-level deny, the change is one row plus a spawn adapter.
 
   **Why not the CLI's `plan` permission mode? (the "auto deny rule" flash, #79)** A human
   reviewing the planner's first boot caught a message about an "auto deny rule" and asked
