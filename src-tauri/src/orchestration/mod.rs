@@ -13563,6 +13563,10 @@ fn run_queue_drainer(
                 depth,
                 now_ms(),
                 QUESTION_HOLD_STALE_AFTER.as_millis() as u64,
+                // #590 L2: the pane's human-keystroke stamp, read from the same
+                // `ptys` this poll already consulted for `box_pending`, so the
+                // classification and the gate reading describe the same instant.
+                ptys.last_user_input_ms(pty_id),
             );
             match escalation {
                 // #563: the pane is held right now — say so right now. This
@@ -15367,6 +15371,20 @@ pub enum HoldClass {
     QueueFull,
     /// The human paused the group, so loomux delivers nothing (`deliver_prompt`).
     GroupPaused,
+    /// #590 L2: a hold that has outlived `QUESTION_HOLD_STALE_AFTER` **on a
+    /// pane whose queue holds one of loomux's own `[loomux]` notices**
+    /// (`queue::is_loomux_notice`).
+    ///
+    /// A strict subset of [`HoldClass::QueueStaleEscalation`]'s panes, split
+    /// out because the two are not the same event to a reader. A stale hold on
+    /// a kickoff is work waiting; a stale hold on a NOTICE means an agent is
+    /// being kept from something loomux decided it needed to know — and in
+    /// #590's incident that agent was blocked *on the very condition the
+    /// undelivered notice reported*, so the pane could not clear itself and no
+    /// channel reached anyone who could. Hence the extra two channels: this is
+    /// the only hold classification whose harm lands on an AGENT rather than
+    /// on a human's attention.
+    UndeliverableNotice,
 }
 
 impl HoldClass {
@@ -15387,6 +15405,7 @@ impl HoldClass {
         HoldClass::QueueNearFull,
         HoldClass::QueueFull,
         HoldClass::GroupPaused,
+        HoldClass::UndeliverableNotice,
     ];
 
     /// Dense index into [`HoldClass::ALL`]. Exhaustive on purpose: a new
@@ -15408,6 +15427,7 @@ impl HoldClass {
             HoldClass::QueueNearFull => 10,
             HoldClass::QueueFull => 11,
             HoldClass::GroupPaused => 12,
+            HoldClass::UndeliverableNotice => 13,
         }
     }
 }
@@ -15574,7 +15594,171 @@ pub fn hold_channels(class: HoldClass) -> &'static [HoldChannel] {
             HoldChannel::OrchestratorNotice,
             HoldChannel::AttentionBadge,
         ],
+        // #590 L2. A separate classification from `QueueStaleEscalation`
+        // rather than two more channels bolted onto it, because the two say
+        // different things and only one of them is unconditionally true.
+        // `QueueStaleEscalation` fires for ANY pane held past the bound and
+        // reaches the human only; this one fires for the subset where the held
+        // payload is loomux's OWN notice, and reaches the orchestrator agent
+        // too. Folding the extra channels into that row would make the table
+        // claim an orchestrator-facing channel for a held kickoff, which
+        // nothing sends.
+        HoldClass::UndeliverableNotice => &[
+            HoldChannel::AttentionBadge,
+            HoldChannel::HeldChip,
+            HoldChannel::OrchestratorNotice,
+            HoldChannel::OrchestratorInbox,
+        ],
     }
+}
+
+/// #590 L2: what a held pane's own readings say about WHO is holding it, at
+/// the moment loomux concludes that its own notice cannot be delivered there.
+///
+/// **Why the diagnosis is worth a type.** The channel this feeds is read by
+/// the orchestrator *agent*, and the two hold reasons the drainer can report
+/// (`box-occupied`, `question`) do not distinguish the cases that need
+/// opposite responses: a human's half-written line (wait — a person is right
+/// there) from a CLI's own turn state (do not wait — the pane will not clear
+/// until the agent's turn ends, and the notice sitting undelivered may be the
+/// very thing that would end it). #590's incident is the second one and read
+/// on the wire exactly like the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UndeliverableCause {
+    /// The box is occupied and **no human keystroke has landed in this pane
+    /// since the hold episode opened** (`PtyManager::last_user_input_ms`, which
+    /// #496 gates on `classify_human_input` so a terminal's own query replies
+    /// never stamp it). So whatever occupies the box is not a person's — it is
+    /// the pane's own CLI, mid-turn.
+    ///
+    /// **What this claim is, exactly.** It is *negative* evidence — "not a
+    /// human" — plus the box reading, and that is the actionable half. It is
+    /// not proof that a turn is running: `input_pending` is documented to latch
+    /// over an already-empty box (a bare ESC, a TUI line-clear, a CLI consuming
+    /// the line), so a quiescent pane with a latched counter reads the same. The
+    /// wording therefore states the evidence it has rather than the inference
+    /// alone, and every response it invites (look at the pane, do not wait for
+    /// it) is correct under both readings.
+    PaneMidTurn,
+    /// The box is occupied and a human HAS typed in this pane since the episode
+    /// opened. #510's absolute is doing exactly what it exists to do; the badge
+    /// and the chip are the right channels and the orchestrator should not
+    /// treat this as a stall.
+    HumanTyping,
+    /// #420: a question/permission dialog owns the pane's Enter key. Checked
+    /// BEFORE the keystroke evidence because it is a direct observation of the
+    /// pane rather than an inference from its absence — and because it covers
+    /// that evidence's documented blind spot: a human navigating a dialog with
+    /// arrow keys classifies `Neutral` with a zero occupancy delta and never
+    /// stamps `last_user_input_ms` (#496's stated tradeoff), so a
+    /// keystroke-first order would report a human mid-menu as a pane mid-turn.
+    QuestionOnScreen,
+    /// No reading to classify from — a closed pty, or a hold with no gate
+    /// attributed to it. Named rather than folded into one of the others so a
+    /// notice never asserts a cause it did not observe.
+    Unknown,
+}
+
+impl UndeliverableCause {
+    /// The audit-line token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UndeliverableCause::PaneMidTurn => "pane-mid-turn",
+            UndeliverableCause::HumanTyping => "human-typing",
+            UndeliverableCause::QuestionOnScreen => "question-on-screen",
+            UndeliverableCause::Unknown => "unknown",
+        }
+    }
+
+    /// The clause [`undeliverable_notice`] renders, which is where the
+    /// diagnosis becomes an instruction. Each one names the evidence behind it,
+    /// so a reader can check the claim instead of trusting it.
+    fn phrase(self) -> &'static str {
+        match self {
+            UndeliverableCause::PaneMidTurn => {
+                "pane mid-turn (no human keystroke since the hold began), so nothing but that \
+                 agent's own turn ending will clear it — read the pane, do not wait on it"
+            }
+            UndeliverableCause::HumanTyping => {
+                "a human has typed in this pane since the hold began, so it is waiting behind \
+                 their line and will clear when they submit it"
+            }
+            UndeliverableCause::QuestionOnScreen => {
+                "a question/permission dialog owns the pane and needs an answer before anything \
+                 can be delivered into it"
+            }
+            UndeliverableCause::Unknown => {
+                "loomux could not read the pane's input state, so it cannot say what is holding it"
+            }
+        }
+    }
+}
+
+/// #590 L2: classify a held pane at the escalation bound.
+///
+/// `held` is the blocking gate the drainer's own `write_admission` reported
+/// (`WriteAdmission::held_reason`), `last_user_input_ms` the pane's
+/// human-keystroke stamp (`None` when the pty is gone), and
+/// `episode_started_ms` the hold episode's start ([`HoldEpisode`]).
+///
+/// **The comparison is against the episode, not against a fresh window**, and
+/// that is why this needs no new constant. The question worth answering is not
+/// "did a human type recently" — recently against what? — but "has a human
+/// touched this pane at any point in the whole time it has been refusing our
+/// delivery". A stamp older than the episode is a fact about some earlier
+/// session at this pane and says nothing about what is in the box now.
+///
+/// Pure, so the precedence (dialog beats keystroke evidence beats its absence)
+/// is directly pinnable — it is the one ordering a future edit must not swap.
+pub fn undeliverable_cause(
+    held: Option<HeldReason>,
+    last_user_input_ms: Option<u64>,
+    episode_started_ms: u64,
+) -> UndeliverableCause {
+    match held {
+        None => UndeliverableCause::Unknown,
+        Some(HeldReason::InteractiveQuestion) => UndeliverableCause::QuestionOnScreen,
+        Some(HeldReason::Typing) | Some(HeldReason::BoxOccupied) => match last_user_input_ms {
+            None => UndeliverableCause::Unknown,
+            Some(ms) if ms >= episode_started_ms => UndeliverableCause::HumanTyping,
+            Some(_) => UndeliverableCause::PaneMidTurn,
+        },
+    }
+}
+
+/// #590 L2: the orchestrator-facing notice for a pane that has been holding
+/// loomux's own notice past the escalation bound.
+///
+/// **One line, marker-led**, like every other text that can reach
+/// [`OrchNoticeInbox::park`] — see that method's `debug_assert`, and #621 for
+/// why a row loomux writes must be one `mask_loomux_notices` can claim.
+///
+/// **What it says that `queue::still_queued_notice` does not**, which is the
+/// whole reason it exists as a second notice rather than a reworded first one:
+/// that the stuck payload is loomux's OWN notice (so an agent is waiting on
+/// something it will never be told), and a cause for the hold. The still-queued
+/// notice fires at 30 minutes and reports depth and elapsed time; #590's live
+/// incident was diagnosed and cleared by a human at ~20, so that notice never
+/// fired at all, and had it fired it would have said "nothing lost, delivers
+/// automatically once clear" — true, and precisely the wrong thing to read
+/// about a pane that cannot clear itself.
+pub fn undeliverable_notice(
+    agent_id: &str,
+    notices: usize,
+    depth: usize,
+    minutes: u64,
+    cause: UndeliverableCause,
+) -> String {
+    let subject = if notices == 1 {
+        format!("1 of {depth} deliveries queued for {agent_id} is loomux's own notice")
+    } else {
+        format!("{notices} of {depth} deliveries queued for {agent_id} are loomux's own notices")
+    };
+    format!(
+        "{LOOMUX_NOTICE_MARKER} notice undeliverable {minutes} min: {subject}, and the pane has \
+         accepted nothing since — {}",
+        cause.phrase()
+    )
 }
 
 /// #578: how many parked notices one group's orchestrator inbox holds before
@@ -28886,7 +29070,15 @@ impl OrchRegistry {
         depth: usize,
         now_ms: u64,
         bound_ms: u64,
+        last_user_input_ms: Option<u64>,
     ) -> HeldEscalation {
+        // #590 L2: threaded in rather than read here because this method has no
+        // `PtyManager` — the caller does. It is the same class of parameter as
+        // `depth`: one live pane reading the drainer already holds, passed so
+        // the whole decision downstream of it stays reachable by a headless
+        // test. What it feeds ([`undeliverable_cause`]) is pure and pinned
+        // separately.
+        let _ = last_user_input_ms;
         if admission.go() {
             // Provisional recovery. The chip comes down (the caller's job) but
             // the episode stands until a delivery actually lands.

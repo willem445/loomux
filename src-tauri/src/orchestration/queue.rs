@@ -815,6 +815,54 @@ pub fn still_queued_notice(agent_id: &str, depth: usize, minutes: u64) -> String
     )
 }
 
+/// #590: the `from` a delivery carries when **loomux itself** is the sender.
+/// `deliver_prompt`'s `from` for every host-originated payload — a fired
+/// `notify_when` notice, a channel note, a compact nudge, a kickoff brief.
+///
+/// Not forgeable by an agent, which is the whole reason it is worth reading:
+/// an MCP-relayed `message_agent` carries the CALLING agent's id here, never
+/// this string, because `mcp.rs` passes `&caller.agent_id` and no tool lets a
+/// caller choose the field.
+pub const LOOMUX_SENDER: &str = "loomux";
+
+/// #590: is this queued entry one of loomux's OWN `[loomux] …` notices — the
+/// payload class whose entire purpose is to tell the pane's agent something it
+/// cannot learn any other way, and which is therefore the one payload whose
+/// non-delivery can deadlock the agent that is waiting on it?
+///
+/// **Both halves are load-bearing, and each covers the other's blind spot.**
+///
+/// - `from` alone OVER-matches. A kickoff brief is also `from: "loomux"` and
+///   is *work*, not a notice: a kickoff that never lands is #517/#585's
+///   subject, with its own recovery, and counting it here would put a
+///   deadlock diagnosis on an ordinary busy pane.
+/// - The marker alone UNDER-guards. Agent text is relayed verbatim, and
+///   [`super::LOOMUX_NOTICE_MARKER`]'s own doc states the limit in these
+///   words: a marker row is evidence that *someone wrote a notice-shaped
+///   row*, never proof that loomux wrote this one. An agent that opens a
+///   `message_agent` with `[loomux]` would otherwise be able to make loomux
+///   report its own text as a stuck host notice.
+///
+/// Requiring both means the answer rests on a field an agent cannot set AND a
+/// prefix loomux always writes. A `StrandedSubmit` marker carries no text and
+/// is never a notice.
+pub fn is_loomux_notice(entry: &QueuedDelivery) -> bool {
+    entry.from == LOOMUX_SENDER
+        && entry.payload.text().is_some_and(|t| {
+            // Lowercased and left-trimmed for the same reason
+            // `mask_loomux_notices` de-frames and lowercases: the claim is
+            // "this row leads with the marker", and neither indentation nor a
+            // re-cased prefix changes that. No de-framing, because this is a
+            // payload loomux constructed, not a row read back off a pane.
+            t.trim_start().to_lowercase().starts_with(super::LOOMUX_NOTICE_MARKER)
+        })
+}
+
+/// #590: how many of `entries` are loomux's own notices ([`is_loomux_notice`]).
+pub fn queued_notice_count(entries: &[QueuedDelivery]) -> usize {
+    entries.iter().filter(|e| is_loomux_notice(e)).count()
+}
+
 /// #563: the depth at which a pane's queue stops being "backed up" and starts
 /// being "about to lose work".
 ///
