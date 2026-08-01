@@ -165,3 +165,121 @@ export interface HasPrRef {
 export function grantableCount(tasks: readonly HasPrRef[]): number {
   return tasks.filter((t) => !!t.pr && t.pr.trim() !== "").length;
 }
+
+/** The status a task must reach before anything depending on it can start
+ *  (#582) — mirrors the backend's `dep_satisfied` (mod.rs). Merged/accepted is
+ *  the bar deliberately: a dep sitting at `pr` or `human-testing` is work the
+ *  human hasn't signed off yet, so a dependent starting on it would be
+ *  building on something that can still come back. */
+const DEP_SATISFIED_STATUS = DONE_STATUS;
+
+/** The one status readiness is defined over (#582). Must match the backend's
+ *  `queued` — nothing else is ever "startable", however unblocked it is. */
+export const QUEUED_STATUS = "queued";
+
+/** A board row as far as the dependency chips care (#582).
+ *
+ *  Both link fields are OPTIONAL on the wire, not merely possibly-empty: the
+ *  backend serializes them with `skip_serializing_if = "Vec::is_empty"`, so a
+ *  link-free task arrives over `orch_tasks` with **no `deps` key at all** —
+ *  which is exactly what every pre-#582 board looks like. Missing and empty
+ *  therefore mean the same thing to every helper below. */
+export interface HasLinks extends HasId, HasStatus {
+  deps?: readonly string[] | null;
+  related?: readonly string[] | null;
+}
+
+/** What a single dependency edge is doing to the task that declares it:
+ *  `met` (the dep reached `done`), `unmet` (it exists but hasn't), or
+ *  `missing` (no task on the board carries that id). */
+export type DepState = "met" | "unmet" | "missing";
+
+/** Classify one dependency id against the board (#582).
+ *
+ *  `missing` is rendered as its own chip state rather than being folded into
+ *  `unmet`, because the two have different causes and different fixes: an
+ *  unmet dep is work still to do, a missing one is a link naming nothing —
+ *  only reachable by hand-editing `tasks.json`, since the backend validates
+ *  ids on write and strips them from survivors on delete. It still counts as
+ *  NOT satisfied (see `unmetDeps`); the distinction is for the human's eye,
+ *  never for readiness. */
+export function depState(id: string, board: readonly HasLinks[]): DepState {
+  const dep = board.find((t) => t.id === id);
+  if (!dep) return "missing";
+  return dep.status === DEP_SATISFIED_STATUS ? "met" : "unmet";
+}
+
+/** The task's dependency ids that are not satisfied yet, in its own link
+ *  order — the board-side mirror of the backend's `unmet_deps` (mod.rs).
+ *
+ *  An id naming no live task counts as unmet, never as satisfied: reading a
+ *  typo as "satisfied" would silently unblock work, which is the failure
+ *  direction that matters. Kept a straight scan (quadratic in the worst case)
+ *  because a board is 10–100 rows and this runs once per render, same argument
+ *  as `board_summaries` backend-side. */
+export function unmetDeps(task: HasLinks, board: readonly HasLinks[]): string[] {
+  return (task.deps ?? []).filter((id) => depState(id, board) !== "met");
+}
+
+/** Derived readiness (#582): `queued` AND every dep `done`. The board mirrors
+ *  the backend's `task_ready` rather than reading a `ready` flag off the wire,
+ *  because the human's board reads full `Task`s via `orch_tasks` — `ready` is
+ *  a `TaskSummary` field, and `TaskSummary` is the MCP `list_tasks` row the
+ *  orchestrator gets, not this path. The rules are duplicated on purpose and
+ *  pinned by tests on both sides; the alternative (a second derived field on
+ *  the human command) would be a new wire shape for something the board can
+ *  compute exactly from data it already has.
+ *
+ *  Like the backend, this is a read-time projection only: nothing here ever
+ *  writes a status, so a wrong link can never wedge a task. `related` never
+ *  participates. */
+export function isReady(task: HasLinks, board: readonly HasLinks[]): boolean {
+  return task.status === QUEUED_STATUS && unmetDeps(task, board).length === 0;
+}
+
+/** Whether this board uses dependencies at all (#582) — the gate for the
+ *  "ready" affordance.
+ *
+ *  Every queued task on a dep-free board is trivially ready, so marking them
+ *  would put a badge on every queued row of every existing board and mean
+ *  nothing: the mark exists to separate "startable now" from "waiting on
+ *  something", a distinction that only exists once some task declares a dep.
+ *  Gated on the WHOLE board rather than per-task on purpose: once any task has
+ *  deps, a plain queued row genuinely is startable and should say so — telling
+ *  the human only about the linked rows would leave the rest ambiguous. */
+export function boardUsesDeps(board: readonly HasLinks[]): boolean {
+  return board.some((t) => (t.deps?.length ?? 0) > 0);
+}
+
+/** The tasks the "add a dependency" picker offers for a row: every other task
+ *  on the board, minus itself and the ones it already depends on, in board
+ *  (priority) order so the list reads like the board above it.
+ *
+ *  Deliberately does NOT pre-filter choices that would close a cycle. The
+ *  backend rejects those inside its lock with an error naming the path, and
+ *  that error surfaces through the board's existing `mutate()` toast — a
+ *  frontend cycle walk would be a second copy of a rule that has to stay
+ *  authoritative in one place, and it could only ever disagree. */
+export function depCandidates<T extends HasLinks>(task: T, board: readonly T[]): T[] {
+  const already = new Set(task.deps ?? []);
+  return board.filter((t) => t.id !== task.id && !already.has(t.id));
+}
+
+/** The full `deps` array to send after the human adds one (#582). Every board
+ *  dep edit sends the WHOLE array — the backend's array args are
+ *  replace-or-untouched, never a delta — so these two helpers are what
+ *  "adding" and "removing" actually mean on this path. Adding an id that is
+ *  already there is a no-op rather than a duplicate (the backend dedups too,
+ *  first-wins; agreeing here keeps the sent array identical to the stored
+ *  one). */
+export function withDep(deps: readonly string[] | null | undefined, id: string): string[] {
+  const current = [...(deps ?? [])];
+  return current.includes(id) ? current : [...current, id];
+}
+
+/** The full `deps` array to send after the human removes one — see `withDep`.
+ *  Removing the last dep sends `[]`, which the backend reads as "clear", not
+ *  as "leave untouched" (that is what omitting the argument means). */
+export function withoutDep(deps: readonly string[] | null | undefined, id: string): string[] {
+  return [...(deps ?? [])].filter((d) => d !== id);
+}

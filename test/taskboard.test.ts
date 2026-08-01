@@ -6,16 +6,23 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   approvableSelection,
+  boardUsesDeps,
   canApprove,
   canProceed,
+  depCandidates,
+  depState,
   doneCount,
   grantableCount,
   isAwaitingHuman,
+  isReady,
   PROTOTYPE_STATUS,
   REQUEST_CHANGES_STATUS,
   retainExisting,
   STATUSES,
   taskActivityState,
+  unmetDeps,
+  withDep,
+  withoutDep,
 } from "../src/taskboard.ts";
 
 test("counts only tasks in the exact `done` status", () => {
@@ -260,6 +267,146 @@ test("a blank PR ref counts as no PR", () => {
   // cleared by selecting the text rather than deleting the row's value.
   assert.equal(grantableCount([{ pr: "" }, { pr: "   " }, { pr: undefined }, {}]), 0);
   assert.equal(grantableCount([]), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Dependency links (#582, slice B — the board's side of the graph).
+// The backend owns the rules (mod.rs `dep_satisfied`/`unmet_deps`/`task_ready`);
+// these pin that the board's chips say the SAME thing, since the human's board
+// reads full Tasks via orch_tasks and derives readiness itself.
+// ---------------------------------------------------------------------------
+
+/** A board where t-2 depends on t-1, plus an unrelated row. `deps` is omitted
+ *  (not `[]`) on link-free rows, exactly as the backend serializes them. */
+const linkedBoard = (depStatus: string) => [
+  { id: "t-1", status: depStatus },
+  { id: "t-2", status: "queued", deps: ["t-1"] },
+  { id: "t-3", status: "queued" },
+];
+
+test("only a `done` dep is satisfied — pr/human-testing still block", () => {
+  // The bar is merged/accepted, matching the backend's dep_satisfied: a dep at
+  // `pr` is work the human hasn't signed off, so a dependent starting on it
+  // would be building on something that can still come back.
+  for (const blocking of ["queued", "in-progress", "review", "pr", "human-testing", "blocked"]) {
+    const board = linkedBoard(blocking);
+    assert.deepEqual(unmetDeps(board[1], board), ["t-1"], `dep at ${blocking} must block`);
+    assert.equal(isReady(board[1], board), false, `dep at ${blocking} must not be ready`);
+    assert.equal(depState("t-1", board), "unmet");
+  }
+  const done = linkedBoard("done");
+  assert.deepEqual(unmetDeps(done[1], done), []);
+  assert.equal(isReady(done[1], done), true);
+  assert.equal(depState("t-1", done), "met");
+});
+
+test("a dep naming no task reads as missing and still counts as unmet", () => {
+  // Only reachable by hand-editing tasks.json (the backend validates ids on
+  // write and strips them from survivors on delete). Reading a typo as
+  // "satisfied" would silently unblock work — the failure direction that
+  // matters — so it blocks, and gets its own chip state for the human.
+  const board = [{ id: "t-9", status: "queued", deps: ["t-gone"] }];
+  assert.equal(depState("t-gone", board), "missing");
+  assert.deepEqual(unmetDeps(board[0], board), ["t-gone"]);
+  assert.equal(isReady(board[0], board), false);
+});
+
+test("unmet deps come back in the task's own link order", () => {
+  // The chips render in this order, so it is the order the human reads "what
+  // is holding this" in — not board order, and not sorted.
+  const board = [
+    { id: "t-1", status: "done" },
+    { id: "t-2", status: "in-progress" },
+    { id: "t-3", status: "review" },
+    { id: "t-4", status: "queued", deps: ["t-3", "t-1", "t-2"] },
+  ];
+  assert.deepEqual(unmetDeps(board[3], board), ["t-3", "t-2"]);
+});
+
+test("only a queued task is ever ready, however satisfied its deps are", () => {
+  // Readiness answers "can this START now", so anything already past queued —
+  // including `done` itself — is not ready. Mirrors task_ready's first clause.
+  const board = [
+    { id: "t-1", status: "done" },
+    { id: "t-2", status: "in-progress", deps: ["t-1"] },
+    { id: "t-3", status: "done", deps: ["t-1"] },
+    { id: "t-4", status: "queued", deps: ["t-1"] },
+  ];
+  assert.equal(isReady(board[1], board), false);
+  assert.equal(isReady(board[2], board), false);
+  assert.equal(isReady(board[3], board), true);
+});
+
+test("a queued task with no deps at all is ready", () => {
+  // The pre-#582 board: no `deps` key on the wire (skip_serializing_if), so
+  // missing must behave exactly like empty.
+  const board = [{ id: "t-1", status: "queued" }, { id: "t-2", status: "queued", deps: [] }];
+  assert.equal(isReady(board[0], board), true);
+  assert.equal(isReady(board[1], board), true);
+});
+
+test("`related` never affects readiness", () => {
+  // It is an annotation, not an edge — a see-also pointing at unfinished work
+  // must not make a task read as blocked.
+  const board = [
+    { id: "t-1", status: "in-progress" },
+    { id: "t-2", status: "queued", related: ["t-1"] },
+  ];
+  assert.deepEqual(unmetDeps(board[1], board), []);
+  assert.equal(isReady(board[1], board), true);
+});
+
+test("the ready mark stays off a board that uses no deps", () => {
+  // Every queued row on a dep-free board is trivially ready, so badging them
+  // would put a mark on every queued row of every existing board and mean
+  // nothing. The mark exists to separate "startable" from "waiting on
+  // something", which only exists once some task declares a dep.
+  assert.equal(boardUsesDeps([{ id: "t-1", status: "queued" }, { id: "t-2", status: "done" }]), false);
+  assert.equal(boardUsesDeps([{ id: "t-1", status: "queued", deps: [] }]), false);
+  assert.equal(boardUsesDeps([]), false);
+  // One linked task turns it on for the WHOLE board: a plain queued row then
+  // genuinely is startable and should say so.
+  const board = [{ id: "t-1", status: "done" }, { id: "t-2", status: "queued", deps: ["t-1"] }];
+  assert.equal(boardUsesDeps(board), true);
+});
+
+test("the dep picker offers every other task, minus the ones already linked", () => {
+  const board = [
+    { id: "t-1", status: "done" },
+    { id: "t-2", status: "queued", deps: ["t-1"] },
+    { id: "t-3", status: "queued" },
+  ];
+  assert.deepEqual(depCandidates(board[1], board).map((t) => t.id), ["t-3"]);
+  // Board (priority) order, so the picker reads like the board above it.
+  assert.deepEqual(depCandidates(board[2], board).map((t) => t.id), ["t-1", "t-2"]);
+});
+
+test("the picker does NOT hide a choice that would close a cycle", () => {
+  // Deliberate: the backend rejects cycles inside its lock with an error
+  // naming the path, and that surfaces through the board's existing error
+  // toast. A frontend cycle walk would be a second copy of an authoritative
+  // rule that could only ever disagree with it.
+  const board = [
+    { id: "t-1", status: "queued", deps: ["t-2"] },
+    { id: "t-2", status: "queued" },
+  ];
+  assert.deepEqual(depCandidates(board[1], board).map((t) => t.id), ["t-1"]);
+});
+
+test("dep edits build the whole array — add is idempotent, remove can empty it", () => {
+  // The board sends the FULL deps array on every edit (the backend's array
+  // args are replace-or-untouched, never a delta), so these are what add and
+  // remove actually mean on this path.
+  assert.deepEqual(withDep(undefined, "t-1"), ["t-1"]);
+  assert.deepEqual(withDep(["t-1"], "t-2"), ["t-1", "t-2"]);
+  assert.deepEqual(withDep(["t-1", "t-2"], "t-1"), ["t-1", "t-2"]);
+  assert.deepEqual(withoutDep(["t-1", "t-2"], "t-1"), ["t-2"]);
+  // Removing the last one sends [] — the backend reads that as "clear",
+  // where omitting the argument would mean "leave untouched".
+  assert.deepEqual(withoutDep(["t-1"], "t-1"), []);
+  assert.deepEqual(withoutDep(undefined, "t-1"), []);
+  // Removing an id that isn't there leaves the array alone.
+  assert.deepEqual(withoutDep(["t-1"], "t-9"), ["t-1"]);
 });
 
 test("a PR ref the backend cannot resolve is still counted as linked", () => {
