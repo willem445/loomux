@@ -1329,6 +1329,78 @@ fn worker_template_reserves_closes_for_a_pr_that_finishes_the_issue() {
     );
 }
 
+// ---------- #625: choosing the right keyword is not enough ----------
+//
+// The rider on #596's scope half above, and the reason that half needed one:
+// #569 was auto-closed by a squash a SECOND time, an hour after the first,
+// through a PR (#615) that had deliberately linked `Part of #569` and argued the
+// choice at length. What closed it was that argument's own last sentence, which
+// asked a human to close the issue by hand and named it right after the verb.
+//
+// GitHub's scan is textual and context-blind: `close`/`fix`/`resolve` next to an
+// issue reference, anywhere in the PR body AND in every commit message a squash
+// aggregates — blockquotes, caveats, and sentences arguing against closing
+// included. So #596's pin above (`Closes #N` / `Part of #N` / `squash merge`)
+// could stay green while the rider that actually catches this case was
+// refactored away: those three tokens survive a template that has lost it. That
+// is the hole these two tests close.
+//
+// Pinned on the LIVE templates for the reason `:1210-1212` gives — the pre222
+// golden fails as "re-bless me" and names no rule. Split by role because the two
+// halves are performed by different agents: the worker writes the body, and only
+// the orchestrator ever performs a merge.
+
+/// The authoring side. Concepts, not sentences: the mechanism's name (the coined
+/// term does the work `deadlock` does in #590's pin above — it is what a reader
+/// has to have met to predict the failure), the channel a worker would otherwise
+/// never think to check (the commit messages a squash aggregates, not just the
+/// body it is looking at), and the instruction as a COMMAND rather than an
+/// exhortation — `grep`, over `git log`, before posting. A version missing any of
+/// these is telling a worker to be careful, which #615's author already was.
+#[test]
+fn worker_template_says_the_closing_keyword_scan_is_context_blind() {
+    let lower = WORKER_TPL.to_lowercase();
+    for concept in ["context-blind", "commit message", "grep", "git log"] {
+        assert!(
+            lower.contains(concept),
+            "worker.md no longer names `{concept}` — picking `Part of #N` is not enough on its \
+             own, and #615 proves it: the scan reads prose that ARGUES AGAINST closing, so the \
+             rule has to be grep-before-posting across both channels, not keyword choice (#625)"
+        );
+    }
+}
+
+/// The merge side, where the ordering is itself the assertion. `scrub` names the
+/// check that runs BEFORE the squash, and what the template says about reopening
+/// has to come after it, because that is the half that runs when the scrub missed
+/// something — a fallible check needs its own backstop (the *bounded suppression*
+/// lesson, from the other end).
+///
+/// `reopen` is deliberately NOT pinned on its own: it appears elsewhere in this
+/// template for unrelated reasons (the red-main revert, the re-sync sweep), so a
+/// bare `contains` for it would pass against a template that never gained this
+/// section at all — a green assertion proving nothing, which is the failure mode
+/// `:1210-1212` is about.
+#[test]
+fn orchestrator_template_scrubs_the_squashed_message_and_rechecks_after() {
+    let lower = ORCHESTRATOR_TPL.to_lowercase();
+    for concept in ["squash", "context-blind", "scrub"] {
+        assert!(
+            lower.contains(concept),
+            "orchestrator.md no longer names `{concept}` — the aggregated squash message is the \
+             text GitHub reads its keywords out of, and the only agent that can read it before \
+             the merge is the one performing the merge (#625)"
+        );
+    }
+    let after_scrub = &lower[lower.find("scrub").expect("asserted present above")..];
+    assert!(
+        after_scrub.contains("reopen"),
+        "orchestrator.md scrubs the aggregated message before merging but no longer says to \
+         reopen what closed anyway — the scrub is a fallible check with nothing behind it, and \
+         #569 needed that backstop twice in one session (#625)"
+    );
+}
+
 // ---------- #524 / #455: identity durability ----------
 //
 // Two halves of one property, which is why they share a section: an agent id
