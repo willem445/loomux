@@ -26909,11 +26909,34 @@ impl OrchRegistry {
     /// returning when the (possibly just-opened) episode began, or `None` when
     /// no episode is open.
     ///
-    /// The single mutation point for [`OrchRegistry::hold_episodes`], and the
-    /// only place [`ends_hold_episode`]/[`opens_hold_episode`] are consulted —
-    /// so the lifecycle rule is applied identically to every observation
-    /// instead of being re-spelled per call site (which is how #532's clock and
-    /// its one-shot came to disagree in the first place).
+    /// The only place [`ends_hold_episode`]/[`opens_hold_episode`] are
+    /// consulted, so the lifecycle rule — *what starts and what ends an
+    /// episode* — is applied identically to every observation instead of being
+    /// re-spelled per call site, which is how #532's clock and its one-shot
+    /// came to disagree in the first place.
+    ///
+    /// **It is NOT the only writer of [`OrchRegistry::hold_episodes`], and an
+    /// earlier version of this doc said it was** (#599 review, rev-10). Four
+    /// functions write the map, at six points, every one of them deliberate —
+    /// enumerated here so the safety argument invites the audit rather than
+    /// ending it:
+    ///
+    /// | writer | writes | why not here |
+    /// | --- | --- | --- |
+    /// | `note_hold` | inserts (episode opens) | — |
+    /// | `note_hold` | removes (episode ends) | — |
+    /// | [`OrchRegistry::hold_escalation_step`] | sets `announced` | needs the audit-line decision it is making |
+    /// | [`OrchRegistry::hold_escalation_step`] | sets `badged` | gated on `stranded_note`, which the lifecycle rule knows nothing about |
+    /// | `commit_exit` | removes | must be ATOMIC with the emptiness check + `queue_draining` removal |
+    /// | `drop_queue` | removes | the pane's queue is gone; no observation describes it |
+    ///
+    /// What IS true, and is the invariant worth relying on: the two fields that
+    /// have to agree — `started_ms` and `badged` — are only ever created and
+    /// destroyed together, because they live in one value that is inserted whole
+    /// and removed whole. Every writer above either creates the record, destroys
+    /// it, or sets a one-shot flag inside a record that already exists. None can
+    /// reset the clock while leaving the one-shot armed, or vice versa, which is
+    /// the exact divergence #560 exists to make unrepresentable.
     ///
     /// Ending an episode also drops the escalation badge it raised, if that
     /// badge is still ours: the blocker check is the same one the pre-#560
@@ -26956,8 +26979,12 @@ impl OrchRegistry {
         }
     }
 
-    /// #560: when `pty_id`'s open hold episode began, if one is open. Read-only
-    /// seam — every mutation goes through [`OrchRegistry::note_hold`].
+    /// #560: when `pty_id`'s open hold episode began, if one is open.
+    ///
+    /// Read-only itself. It does NOT imply that every mutation goes through
+    /// [`OrchRegistry::note_hold`] — an earlier version of this doc claimed
+    /// that and it was false (#599 review, rev-10); see `note_hold`'s own doc
+    /// for the enumeration of all four writers and why each is where it is.
     #[doc(hidden)] // pub for integration tests
     pub fn hold_episode_since(&self, pty_id: u32) -> Option<u64> {
         self.hold_episodes.lock_safe().get(&pty_id).map(|e| e.started_ms)
