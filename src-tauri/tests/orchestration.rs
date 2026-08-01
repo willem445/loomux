@@ -1351,7 +1351,11 @@ fn a_missing_counter_file_reseeds_from_the_durable_roster() {
     let before: Vec<String> = {
         let reg = relaunch_registry(dir.path());
         let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
-        (0..3)
+        // Two, not more: `rails()` caps a group at `max_agents: 2` and the
+        // third spawn is refused by the guardrail, which would fail this test
+        // on an unwrap instead of on the property it is about (caught by the
+        // red run — the first cut asked for three).
+        (0..2)
             .map(|_| reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap().id)
             .collect()
     };
