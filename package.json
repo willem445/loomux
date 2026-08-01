@@ -1,7 +1,7 @@
 {
   "name": "loomux",
   "private": true,
-  "version": "1.1.0-beta3",
+  "version": "1.1.0-beta4",
   "type": "module",
   "scripts": {
     "dev": "vite",
