@@ -17346,17 +17346,13 @@ impl OrchRegistry {
         let mut candidates: Vec<(String, String, String)> = Vec::new();
         for r in &recs {
             let Some(sid) = r.session.clone() else { continue };
-            // SCRATCH (red-before-green run 2, reverted next commit): the
-            // self-exclusion dropped, so the target's own session counts as
-            // its own corroboration.
-            if !seen.insert(sid.clone()) {
+            if sid == target_session || !seen.insert(sid.clone()) {
                 continue;
             }
             candidates.push((r.id.clone(), self.cli_for_record(group, r), sid));
         }
-        // SCRATCH (red-before-green run 2, reverted next commit): the scan cap
-        // dropped, so a capped scan can pass itself off as an exhaustive one.
-        let capped = false;
+        let capped = candidates.len() > Self::MAX_CORROBORATION_SESSIONS;
+        candidates.truncate(Self::MAX_CORROBORATION_SESSIONS);
         let out = candidates
             .into_iter()
             .filter_map(|(label, cli, sid)| {
