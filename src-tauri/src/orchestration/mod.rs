@@ -6367,6 +6367,24 @@ pub struct Task {
     pub session: Option<String>,
     #[serde(default)]
     pub notes: Vec<TaskNote>,
+    /// Ids of tasks on THIS board that must reach `done` before this one is
+    /// startable (#582) — the structure that used to live only in the
+    /// orchestrator's context and its `set_state` prose. Validated on every
+    /// write (each id names a live task, never itself, deduped, acyclic) and
+    /// stripped from the survivors when a linked task is deleted, so "a link
+    /// names a live task" holds without a repair pass.
+    ///
+    /// Additive and skipped when empty: a pre-#582 `tasks.json` loads with
+    /// both link fields empty, and a board that uses neither rewrites without
+    /// gaining either key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<String>,
+    /// Non-blocking "see also" links (#582): same normalization, existence
+    /// check and delete-strip as `deps`, but never consulted by readiness and
+    /// never cycle-checked — an A↔B "related" pair is meaningful, where a
+    /// dependency cycle is always a bug.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<String>,
     #[serde(default)]
     pub updated_ms: u64,
 }
@@ -6390,11 +6408,57 @@ pub struct TaskSummary {
     pub session: Option<String>,
     pub updated_ms: u64,
     pub note_count: usize,
+    /// Link ids ONLY, never expanded into titles or nested tasks (#245's size
+    /// constraint, restated in #582 because a dependency graph is exactly the
+    /// shape that tempts an expansion). Bounded by board size, and skipped
+    /// entirely when empty so a board that uses no links pays nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<String>,
+    /// Derived at read time, never stored and never written back into
+    /// `status` (#582): `queued` with every dep `done`. One `list_tasks` call
+    /// therefore answers "what is startable right now" without the
+    /// orchestrator re-deriving it from prose after a compact.
+    pub ready: bool,
+}
+
+/// The only status that satisfies a dependency edge (#582). Merged/accepted is
+/// the bar deliberately: a dep sitting at `pr` or `human-testing` is work the
+/// human has not signed off yet, so a dependent starting on it would be
+/// building on something that can still come back.
+fn dep_satisfied(status: &str) -> bool {
+    status == "done"
+}
+
+/// The ids in `task.deps` that are not satisfied yet, in the task's own link
+/// order (#582). An id naming NO task on the board counts as UNMET, never as
+/// satisfied: write-time existence checks plus delete-strip mean a dangling id
+/// can only come from a hand-edited `tasks.json`, and reading a typo as
+/// "satisfied" would silently unblock work — the failure direction that
+/// matters. Pure so the truth table is testable without a registry.
+pub fn unmet_deps<'a>(task: &'a Task, board: &[Task]) -> Vec<&'a str> {
+    task.deps
+        .iter()
+        .filter(|id| !board.iter().any(|t| t.id == **id && dep_satisfied(&t.status)))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Derived readiness (#582): `queued` AND every dep `done`. Deliberately a
+/// read-time projection rather than an automatic `status` write — dep state
+/// never flips a status, so this cannot wedge a task the way a suppression
+/// driven by a fallible signal can (lessons.md: any such guard needs a bound;
+/// a pure derivation needs none). `related` never participates.
+pub fn task_ready(task: &Task, board: &[Task]) -> bool {
+    task.status == "queued" && unmet_deps(task, board).is_empty()
 }
 
 /// Project a full `Task` down to its `list_tasks` row (#245). Pure so the
-/// field mapping is unit-testable without a registry.
-pub fn task_summary(t: &Task) -> TaskSummary {
+/// field mapping is unit-testable without a registry. `ready` is passed in
+/// rather than computed here because a task ALONE cannot know it — it needs
+/// its dependencies' statuses, i.e. board context (see `board_summaries`).
+pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
     TaskSummary {
         id: t.id.clone(),
         title: t.title.clone(),
@@ -6405,7 +6469,115 @@ pub fn task_summary(t: &Task) -> TaskSummary {
         session: t.session.clone(),
         updated_ms: t.updated_ms,
         note_count: t.notes.len(),
+        deps: t.deps.clone(),
+        related: t.related.clone(),
+        ready,
     }
+}
+
+/// Project a whole board to its `list_tasks` rows (#582) — the board-level
+/// companion `task_summary` needs, since readiness is a property of a task
+/// *plus its board*. Quadratic in board size in the worst case (a board is
+/// 10–100 tasks with a handful of links each, and this runs once per
+/// `list_tasks` call), so it stays a straight scan rather than an index.
+pub fn board_summaries(tasks: &[Task]) -> Vec<TaskSummary> {
+    tasks.iter().map(|t| task_summary(t, task_ready(t, tasks))).collect()
+}
+
+/// Normalize and validate one link array on write (#582): trim, drop empties,
+/// dedup (first occurrence wins, order preserved), reject a self-link, and
+/// reject any id that doesn't name a live task on this board.
+///
+/// Existence is checked HERE, at the write, so a typo'd id can never sit on
+/// the board — which is what lets `unmet_deps` treat an unknown id as unmet
+/// without that reading being the normal case. The two rules together keep the
+/// invariant "every link names a live task", with delete-strip as the third.
+fn normalize_links(raw: Vec<String>, self_id: &str, board: &[Task], field: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for id in raw {
+        let id = id.trim().to_string();
+        if id.is_empty() {
+            continue;
+        }
+        if id == self_id {
+            return Err(format!("{field}: a task cannot link to itself ({self_id})"));
+        }
+        if !board.iter().any(|t| t.id == id) {
+            return Err(format!("{field}: unknown task: {id}"));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+/// Depth-first search for a dependency cycle reachable from `start` (#582),
+/// returning the cycle as a path (`t-2 → t-5 → t-2`) so the rejection can name
+/// it instead of just refusing. `edges` is the board's dep graph with the
+/// edited task's NEW deps already substituted, so this answers "would this
+/// write close a cycle", not "is the board cyclic today".
+///
+/// Starting only at the edited task is sufficient: every other edge was
+/// already acyclic when it was written, so a new cycle must pass through the
+/// task being edited. Rejecting rather than surfacing follows the issue's own
+/// lean — an agent-authored cycle is always a bug, and allowing one would cost
+/// semantics ("is a task in a cycle ever ready?") for a state that should
+/// never exist.
+fn find_dep_cycle(start: &str, edges: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    let mut path: Vec<String> = vec![start.to_string()];
+    let empty: Vec<String> = Vec::new();
+    let mut frontier: Vec<std::vec::IntoIter<String>> =
+        vec![edges.get(start).unwrap_or(&empty).clone().into_iter()];
+    // Nodes whose whole subtree is explored: re-entering one cannot reveal a
+    // cycle it didn't already reveal (a back-edge into the current path would
+    // have been a back-edge into that node's own path too).
+    let mut done: HashSet<String> = HashSet::new();
+    while let Some(iter) = frontier.last_mut() {
+        match iter.next() {
+            Some(next) => {
+                if let Some(at) = path.iter().position(|p| *p == next) {
+                    let mut cycle = path[at..].to_vec();
+                    cycle.push(next);
+                    return Some(cycle);
+                }
+                if !done.contains(&next) {
+                    let out = edges.get(&next).unwrap_or(&empty).clone();
+                    path.push(next);
+                    frontier.push(out.into_iter());
+                }
+            }
+            None => {
+                frontier.pop();
+                if let Some(finished) = path.pop() {
+                    done.insert(finished);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Drop every link naming one of `removed` from the tasks that remain, in the
+/// same locked write as the delete (#582). Returns the ids of the tasks
+/// actually rewritten, so the audit row says whose links moved.
+///
+/// The alternative — leaving the ids dangling — was rejected: a deleted dep
+/// would then be indistinguishable from a typo, and (since `unmet_deps` counts
+/// an unknown id as unmet) would block its dependent forever with nothing on
+/// the board explaining why. Refusing the delete instead was rejected as
+/// fighting the human's authority over a board they hand-edit.
+fn strip_deleted_links(tasks: &mut [Task], removed: &HashSet<&str>) -> Vec<String> {
+    let mut rewritten = Vec::new();
+    for t in tasks.iter_mut() {
+        let before = t.deps.len() + t.related.len();
+        t.deps.retain(|id| !removed.contains(id.as_str()));
+        t.related.retain(|id| !removed.contains(id.as_str()));
+        if t.deps.len() + t.related.len() != before {
+            rewritten.push(t.id.clone());
+        }
+    }
+    rewritten
 }
 
 /// Max notes kept verbatim on a task's LIVE copy (#245) — beyond this, the
@@ -6507,6 +6679,19 @@ pub struct TaskPatch {
     pub assignee: Option<String>,
     pub session: Option<String>,
     pub note: Option<String>,
+    /// Blocking links (#582). Like every non-note field this REPLACES rather
+    /// than appends: `None` leaves the existing array untouched, `Some(vec![])`
+    /// clears it.
+    pub deps: Option<Vec<String>>,
+    /// Non-blocking links (#582); same replace-or-untouched rule as `deps`.
+    pub related: Option<Vec<String>>,
+    /// Atomic claim (#582): guard this write on the task still being
+    /// unclaimed, `queued`, and dep-satisfied, then set assignee + status in
+    /// the same locked write. A plain (non-claim) upsert keeps its historic
+    /// last-writer-wins behavior — the guards exist to stop a *semantic*
+    /// double-assign across a compact, not a data race (one process, all
+    /// writers serialized on `tasks_lock`).
+    pub claim: bool,
 }
 
 /// One item of a bulk merge-gate approval (#507): the board task id plus the
@@ -17047,8 +17232,10 @@ impl OrchRegistry {
     }
 
     /// Compact rows for the MCP `list_tasks` tool (#245) — see `TaskSummary`.
+    /// Projected board-at-a-time, not task-at-a-time, because `ready` (#582)
+    /// is a property of a task plus its dependencies' statuses.
     pub fn task_summaries(&self, group: &str) -> Vec<TaskSummary> {
-        self.tasks(group).iter().map(task_summary).collect()
+        board_summaries(&self.tasks(group))
     }
 
     /// One full task (including its capped note history) by id — the detail
@@ -17199,6 +17386,11 @@ impl OrchRegistry {
 
     /// Create (id = None, title required) or edit a task. Notes append; all
     /// other patch fields replace. Returns the resulting task.
+    ///
+    /// Link edits and a `claim` (#582) are validated against the WHOLE board
+    /// before any field is written, and nothing is persisted until
+    /// `write_tasks` at the bottom — so every rejection below leaves the board
+    /// exactly as it was, inside the one `tasks_lock` this method already held.
     pub fn upsert_task(
         &self,
         group: &str,
@@ -17211,19 +17403,31 @@ impl OrchRegistry {
                 return Err(format!("invalid status {s:?} — use one of {}", TASK_STATUSES.join(" | ")));
             }
         }
+        if patch.claim {
+            // A claim is a guarded transition on an EXISTING row: the guards
+            // (queued, unclaimed-or-mine, deps met) are the whole point, and a
+            // task being created has none of that state to guard.
+            if id.is_none() {
+                return Err("claim needs the id of an existing task".into());
+            }
+            // Claiming IS the status transition. Silently overriding a
+            // conflicting `status` in the same call would make one of the two
+            // arguments a lie, so say so instead.
+            if let Some(s) = patch.status.as_deref() {
+                if s != "in-progress" {
+                    return Err(format!(
+                        "claim sets status to in-progress — it cannot also set status {s:?}"
+                    ));
+                }
+            }
+        }
         let _guard = self.tasks_lock.lock_safe();
         let mut tasks = self.tasks(group);
         let idx = match id {
-            Some(id) => Some(
-                tasks
-                    .iter()
-                    .position(|t| t.id == id)
-                    .ok_or_else(|| format!("unknown task: {id}"))?,
-            ),
-            None => None,
-        };
-        let task = match idx {
-            Some(i) => &mut tasks[i],
+            Some(id) => tasks
+                .iter()
+                .position(|t| t.id == id)
+                .ok_or_else(|| format!("unknown task: {id}"))?,
             None => {
                 let title = patch
                     .title
@@ -17245,11 +17449,71 @@ impl OrchRegistry {
                     assignee: None,
                     session: None,
                     notes: vec![],
+                    deps: vec![],
+                    related: vec![],
                     updated_ms: 0,
                 });
-                tasks.last_mut().unwrap()
+                tasks.len() - 1
             }
         };
+        let this_id = tasks[idx].id.clone();
+        // ---- links (#582): normalize + existence-check against the board,
+        // then reject a write that would close a dependency cycle.
+        let deps = patch.deps.map(|v| normalize_links(v, &this_id, &tasks, "deps")).transpose()?;
+        let related = patch.related.map(|v| normalize_links(v, &this_id, &tasks, "related")).transpose()?;
+        if let Some(new_deps) = deps.as_ref() {
+            let mut edges: HashMap<String, Vec<String>> =
+                tasks.iter().map(|t| (t.id.clone(), t.deps.clone())).collect();
+            edges.insert(this_id.clone(), new_deps.clone());
+            if let Some(cycle) = find_dep_cycle(&this_id, &edges) {
+                return Err(format!("deps: dependency cycle {}", cycle.join(" → ")));
+            }
+        }
+        // ---- claim guards (#582). Read the row and the board BEFORE the
+        // mutable borrow below; a failed guard returns without writing.
+        let claimant = patch
+            .assignee
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(actor)
+            .to_string();
+        if patch.claim {
+            let current = &tasks[idx];
+            // Re-claiming a task this same agent already holds is an idempotent
+            // no-op, not a status-guard failure: the retry this has to survive
+            // is "did my claim land before the compact?", and answering that
+            // with an error would push the orchestrator toward the plain
+            // assignee write this whole guard exists to replace.
+            let already_mine = current.assignee.as_deref().map(str::trim) == Some(claimant.as_str())
+                && current.status == "in-progress";
+            if !already_mine {
+                if current.status != "queued" {
+                    return Err(format!(
+                        "cannot claim {this_id}: status is {} — only a queued task can be claimed",
+                        current.status
+                    ));
+                }
+                if let Some(held) = current.assignee.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                    if held != claimant {
+                        return Err(format!("cannot claim {this_id}: already assigned to {held}"));
+                    }
+                }
+                // Guard against the deps this write LEAVES on the task, not the
+                // ones it had before — claiming and re-pointing deps in one call
+                // must be judged on the result.
+                let probe = Task {
+                    deps: deps.clone().unwrap_or_else(|| current.deps.clone()),
+                    ..current.clone()
+                };
+                let unmet = unmet_deps(&probe, &tasks);
+                if !unmet.is_empty() {
+                    return Err(format!("cannot claim {this_id}: unmet deps {}", unmet.join(", ")));
+                }
+            }
+        }
+        let claim = patch.claim;
+        let task = &mut tasks[idx];
         if let Some(t) = patch.title {
             let t = t.trim();
             if !t.is_empty() {
@@ -17278,10 +17542,25 @@ impl OrchRegistry {
                 task.notes = cap_task_notes(std::mem::take(&mut task.notes), MAX_TASK_NOTES);
             }
         }
+        if let Some(d) = deps {
+            task.deps = d;
+        }
+        if let Some(r) = related {
+            task.related = r;
+        }
+        // Last, so the claim's own two fields are what the guards above
+        // approved — never a leftover from the generic patch application.
+        if claim {
+            task.assignee = Some(claimant);
+            task.status = "in-progress".into();
+        }
         task.updated_ms = now_ms();
         let snapshot = task.clone();
         self.write_tasks(group, &tasks)?;
-        self.audit(group, actor, "task-upsert", serde_json::to_value(&snapshot).unwrap());
+        // A claim is audited under its own action so the durable record shows
+        // WHY the assignee moved — a guarded grab, not an ordinary field write.
+        let action = if claim { "task-claim" } else { "task-upsert" };
+        self.audit(group, actor, action, serde_json::to_value(&snapshot).unwrap());
         Ok(snapshot)
     }
 
@@ -17293,8 +17572,11 @@ impl OrchRegistry {
         if tasks.len() == before {
             return Err(format!("unknown task: {id}"));
         }
+        // Same locked write (#582): a deleted task's id must not survive on
+        // anyone's links, or it would block its dependent forever.
+        let relinked = strip_deleted_links(&mut tasks, &HashSet::from([id]));
         self.write_tasks(group, &tasks)?;
-        self.audit(group, actor, "task-delete", json!({ "id": id }));
+        self.audit(group, actor, "task-delete", json!({ "id": id, "relinked": relinked }));
         Ok(())
     }
 
@@ -17315,8 +17597,10 @@ impl OrchRegistry {
                 return Ok(removed);
             }
             tasks.retain(|t| t.status != "done");
+            let gone: HashSet<&str> = removed.iter().map(String::as_str).collect();
+            let relinked = strip_deleted_links(&mut tasks, &gone);
             self.write_tasks(group, &tasks)?;
-            self.audit(group, actor, "task-delete-done", json!({ "ids": removed }));
+            self.audit(group, actor, "task-delete-done", json!({ "ids": removed, "relinked": relinked }));
             removed
         };
         // Outside the tasks lock: notify is best-effort and can block on delivery.
@@ -17353,8 +17637,17 @@ impl OrchRegistry {
             let present: HashSet<&str> = removed.iter().map(String::as_str).collect();
             let skipped: Vec<&str> = ids.iter().map(String::as_str).filter(|id| !present.contains(id)).collect();
             tasks.retain(|t| !wanted.contains(t.id.as_str()));
+            // Strip by what was actually removed, not by what was asked for:
+            // an id that named no row can still name a hand-edited dangling
+            // link, and that link is not this delete's business (#582).
+            let relinked = strip_deleted_links(&mut tasks, &present);
             self.write_tasks(group, &tasks)?;
-            self.audit(group, actor, "task-delete-selected", json!({ "ids": removed, "skipped": skipped }));
+            self.audit(
+                group,
+                actor,
+                "task-delete-selected",
+                json!({ "ids": removed, "skipped": skipped, "relinked": relinked }),
+            );
             removed
         };
         // Outside the tasks lock: notify is best-effort and can block on delivery.
@@ -33561,6 +33854,13 @@ pub fn orch_save_attachment(
     })
 }
 
+/// The human board's task write. `deps` (#582) is the whole new link array —
+/// omitted leaves the task's deps untouched, `[]` clears them — and it is
+/// validated exactly like the orchestrator's own edit (live ids, no self-link,
+/// no cycle), so a rejection surfaces to the board's existing error path
+/// rather than landing a broken graph. The human's edits stay
+/// last-writer-wins: `claim` is deliberately not exposed here, since the
+/// board's authority is the human's, not a queue discipline.
 #[tauri::command]
 pub fn orch_upsert_task(
     reg: tauri::State<Arc<OrchRegistry>>,
@@ -33569,12 +33869,13 @@ pub fn orch_upsert_task(
     title: Option<String>,
     status: Option<String>,
     note: Option<String>,
+    deps: Option<Vec<String>>,
 ) -> Result<Task, String> {
     let task = reg.upsert_task(
         &group_id,
         "human",
         id.as_deref(),
-        TaskPatch { title, status, note, ..Default::default() },
+        TaskPatch { title, status, note, deps, ..Default::default() },
     )?;
     reg.notify_board_edit(&group_id, &format!("{} \"{}\" is now {}", task.id, task.title, task.status));
     Ok(task)

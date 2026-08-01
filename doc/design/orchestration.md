@@ -9405,6 +9405,114 @@ way #520 proposed: by the time the cap runs the replay has already removed the r
 what is left is as likely to be a legitimately enormous log, and labelling it residue would be a
 claim the code cannot back.
 
+## Task-board dependency links, derived readiness, atomic claim (#582, slice A)
+
+The board persisted a *display*, not a plan. `Task` carried no relationship at all, so the
+ordering between items lived in exactly two lossy places — the orchestrator's context window and
+the prose blob in `set_state` — and "what's unblocked right now" was re-derived from prose after
+every compact or restart. `blocked` was a status with no object (the board could say a task was
+blocked, never *by what*), and `assignee` was a plain field written by whoever called
+`upsert_task` last, so nothing structurally stopped two workers being pointed at the same item.
+
+Slice A is the model and the backend; the board UI (chips, ready affordance, dep editing) is
+slice B and lands separately, so nothing in this section is visible to the human yet — a
+dependency set through the orchestrator's tools shows up on the human's board only once B renders
+it. The one behavior change a human can already reach is delete-strip, below.
+
+**Two flat fields, not a typed link array.** `Task` gains `deps: Vec<String>` (blocking) and
+`related: Vec<String>` (annotation), both ids of tasks on the *same* board. A shared
+`links: Vec<{kind, target}>` was rejected because the two kinds don't share semantics — deps are
+cycle-checked and drive readiness, `related` is existence-checked and inert — so a common struct
+buys nothing and forces every consumer to filter by kind. It has no migration advantage either: a
+hypothetical third kind is an additive `#[serde(default)]` field whichever shape is chosen. Deps
+do not cross groups (a cross-group edge would hand one group's board a handle on another's
+lifecycle; cross-workspace coordination is what channels are for, #271).
+
+**Persistence is additive and inherits its atomicity.** Both fields are
+`#[serde(default, skip_serializing_if = "Vec::is_empty")]`: a pre-#582 `tasks.json` loads with
+empty links, and a board that uses none rewrites without gaining either key — no version field,
+no migration pass. Every mutation stays inside the existing `tasks_lock` + `atomic_write` path
+#133 mandated; this adds no new write path. One compat edge, stated rather than silent: an
+*older* loomux binary reading a newer `tasks.json` ignores the unknown fields and drops them on
+its next write. That is acceptable for a local single-app file precisely because the dep-free
+case is byte-identical — the only thing at risk is links a newer build wrote, and only if the
+human downgrades mid-group. `pre_582_boards_load_unchanged_and_link_free_boards_stay_link_free`
+pins both directions against the file text.
+
+**Readiness is derived, never a status write.** `TaskSummary` (the `list_tasks` row) gains
+`deps`, `related` and `ready: bool`, computed at read time as `queued` ∧ every dep `done`.
+Nothing ever auto-flips a `status` from dep state: a queued task with unmet deps simply reads
+`ready: false`. That is deliberate under lessons.md's *any suppression driven by a fallible
+signal must be BOUNDED* — a derived read-time flag cannot wedge anything and so needs no bound,
+where a mechanism that wrote `blocked` on the task's behalf would need an answer to "what if it
+never clears". Only `done` satisfies an edge (`pr`/`human-testing` is work the human hasn't
+signed off), and `related` never participates. There is no `deps_unmet` field: `list_tasks`
+returns the whole board in one response, so with the dep ids and every dep's own `status` in the
+same payload, *which* dep is holding a task is directly readable.
+
+Readiness needs board context, which is why the projection is board-at-a-time
+(`board_summaries`) and `task_summary(t, ready)` takes the flag as a parameter instead of
+pretending a lone task can compute it. `deps`/`related` on the row are **ids only** — #245's size
+constraint (a live board hit 228,577 chars for 70 tasks and blew MCP result limits), restated
+here because a dependency graph is exactly the shape that tempts an expansion into titles or
+nested tasks.
+
+**Three rules keep "every link names a live task" true.** (1) Write-time validation: ids are
+trimmed, blanks dropped, deduped first-wins, self-links refused, and every id must name a live
+task. (2) Cycle rejection on `deps`, DFS from the edited task inside the lock, with the error
+naming the path (`t-1 → t-3 → t-2 → t-1`) — an agent-authored cycle is always a bug, and allowing
+one would cost real semantics ("is a task in a cycle ever ready?"). Only the edited task can
+close a new cycle, since every other edge was acyclic when written, so the search starts there
+rather than sweeping the board. `related` is never cycle-checked: a mutual see-also pair is
+meaningful. (3) Delete-strip: deleting a task removes its id from every remaining task's links in
+the *same* locked write, on all three delete paths (single, multi-select, delete-all-done), with
+the rewritten task ids in the audit row. Refusing the delete instead was rejected as fighting the
+human's authority over a board they hand-edit; leaving the ids dangling was rejected because a
+deleted dep would then be indistinguishable from a typo. `unmet_deps` treats an unknown id as
+**unmet**, never satisfied — with those three rules a dangling id can only come from a
+hand-edited file, and reading a typo as "satisfied" would silently unblock work.
+
+**Claim is a flag on `upsert_task`, not a new tool.** `claim: true` (id required) refuses unless
+the task is still `queued`, is unassigned or already held by the same agent, and has every dep
+`done` (the error lists the unmet ids); on success it sets assignee + `in-progress` in one locked
+write, audited as `task-claim` rather than `task-upsert` so the record says *why* the assignee
+moved. Re-claiming a task the same agent already holds is an idempotent no-op — the retry this
+has to survive is "did my claim land before the compact?", and erroring there would push the
+orchestrator back to the plain assignee write the guard exists to replace. A claim that also
+passes a different `status` is rejected rather than silently overridden, because one of the two
+arguments would otherwise be a lie.
+
+A separate `claim_task` tool was rejected: per the add-orch-tool checklist a new tool costs six
+layers, and `upsert_task` is already orchestrator-only, so the authz story is identical. An
+optimistic-concurrency version token on `Task` was rejected too — there is one process and all
+writers serialize on `tasks_lock`, so a CAS token is machinery without a race. The failure mode
+this actually closes is *semantic*: a post-compact re-read handing already-assigned work to a
+second worker. Plain (non-claim) upserts keep last-writer-wins, unchanged, which is what the
+human's board keeps using — `orch_upsert_task` gains `deps` (validated identically, so a
+human-authored cycle surfaces through the board's existing error path) but deliberately not
+`claim`: the board's authority is the human's, not a queue discipline. `related` is not on the
+human's command either, since slice B renders it read-only; adding it later is additive.
+
+**MCP shim stays thin.** `mcp.rs` gains an array arg helper and a bool arg helper and passes them
+through — absent means "leave untouched", `[]` means "clear", and a wrongly-typed argument is an
+**error**, not a silent skip: a caller that passed `"t-3"` where an array belongs must not be told
+its write succeeded. All the rules live in `OrchRegistry`, so the human board's separate path
+(`orch_tasks`/`orch_upsert_task` → same registry methods) gets them for free.
+
+**Template guidance is part of the work**, since a field no orchestrator sets is dead weight:
+`orchestrator.md` now says to encode a plan's ordering as `deps` instead of `set_state` prose, to
+read "what's startable" off `ready: true` rather than re-deriving it, to assign with `claim: true`
+(a refusal is the board telling you the task is taken or blocked), and that `blocked` is for
+blockers *outside* the board. `planner.md` asks for the serialize/parallel structure of a worker
+split to be stated explicitly per slice, since that is what the orchestrator turns into deps.
+
+Not built, deliberately (the issue's own "do not reimplement Beads"): git-backed storage (this
+board is per-group, single-process, serialized on one lock and already atomically persisted — a
+second persistence mechanism for a race that can't occur), hash ids (ids are minted under one
+lock on one board), a link-type zoo (`supersedes`/`discovered-from`), a ready-work query
+language (one derived bool on rows already there), and memory-decay features (`cap_task_notes`
+owns board boundedness). No new dependencies, front or back.
+
 ## Risks / limitations
 
 - Kickoff typing races CLI boot; a fixed delay (4s) + bracketed paste is used. If a
