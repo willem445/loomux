@@ -9478,7 +9478,11 @@ the task is still `queued`, is unassigned or already held by the same agent, and
 write, audited as `task-claim` rather than `task-upsert` so the record says *why* the assignee
 moved. Re-claiming a task the same agent already holds is an idempotent no-op — the retry this
 has to survive is "did my claim land before the compact?", and erroring there would push the
-orchestrator back to the plain assignee write the guard exists to replace. A claim that also
+orchestrator back to the plain assignee write the guard exists to replace. The guards run
+holder-before-status, which the tests caught as a real difference rather than a style
+preference: a task another agent holds is *also* past `queued`, so checking status first
+answered the double-assign case — the one case this guard exists for — with "status is
+in-progress", never naming who actually had it. A claim that also
 passes a different `status` is rejected rather than silently overridden, because one of the two
 arguments would otherwise be a lie.
 

@@ -17488,16 +17488,21 @@ impl OrchRegistry {
             let already_mine = current.assignee.as_deref().map(str::trim) == Some(claimant.as_str())
                 && current.status == "in-progress";
             if !already_mine {
+                // Holder first, status second, deliberately. A task another
+                // agent holds is ALSO past `queued`, so checking status first
+                // answered the double-assign case — the one this guard exists
+                // for — with "status is in-progress", which doesn't tell the
+                // caller who has it. Refuse on the more specific fact.
+                if let Some(held) = current.assignee.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                    if held != claimant {
+                        return Err(format!("cannot claim {this_id}: already assigned to {held}"));
+                    }
+                }
                 if current.status != "queued" {
                     return Err(format!(
                         "cannot claim {this_id}: status is {} — only a queued task can be claimed",
                         current.status
                     ));
-                }
-                if let Some(held) = current.assignee.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
-                    if held != claimant {
-                        return Err(format!("cannot claim {this_id}: already assigned to {held}"));
-                    }
                 }
                 // Guard against the deps this write LEAVES on the task, not the
                 // ones it had before — claiming and re-pointing deps in one call
