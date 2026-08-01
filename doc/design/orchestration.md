@@ -6092,7 +6092,9 @@ own orchestrator-target/paused-group suppression fired, structurally the same si
 class as this issue's core defect. `notify_unconfirmed_delivery`, `notify_delivery_confirmed_late`,
 and `notify_queue` all now write a `notice-suppressed` audit line (`kind`, `to`, `reason`) on every
 suppression branch, so a suppressed notification is discoverable after the fact instead of just
-vanishing.
+vanishing. Since #578 `notify_queue`'s orchestrator-target line additionally carries `parked: true`
+and the notice `text`, which is what makes that line a record of the notice rather than a record
+that one existed — see "The orchestrator's notice inbox" below.
 
 **Persistence: the intake gap, first stated honestly (#445) and now closed (#468/#467).** The plan
 #445 implements originally defended its in-memory choice partly by saying a restart's loss is
@@ -6633,13 +6635,145 @@ because at that point the entry has pasted nothing of its own even though the *p
 text is still in the ring. Text loomux itself delivered can therefore latch that gate. #563's fix
 makes such a latch **visible within two seconds** instead of invisible for ten minutes; it does not
 make the reading correct. The correct reading needs rendered rows (`termgrid`, #530) and is filed
-separately, as is a real in-band channel for orchestrator panes to replace what `notify_queue`
-structurally cannot deliver.
+separately. The other thing filed separately — a channel for orchestrator panes to carry what
+`notify_queue` structurally cannot deliver — is #578, below.
 
 **Residual.** `run_queue_drainer` is still not drivable in-suite (no live pty/`AppHandle`), the same
 boundary every delivery test in this design has. The decision it consults (`held_escalation`) and
 every registry seam it calls (`note_queue_capacity`, `pop_front_dequeued`, `mark_stranded`) are
 driven directly; the emit calls between them are not.
+
+## The orchestrator's notice inbox: a channel that is not a delivery (#578)
+
+**Problem.** `notify_queue` returns early with `notice-suppressed` whenever the target IS the
+group's own orchestrator, and #563's section above establishes why that early return is *correct*
+and must stay: a prompt announcing the orchestrator's own blocked delivery would queue behind the
+very block it is reporting. What was wrong is what happened next — **the notice was discarded.**
+#563/#572 answered that with channels which survive an orchestrator target (the held chip, the
+attention badge), and both of them reach a **human at the window**. So an orchestrator pane's queue
+events reached the human-if-someone-is-looking, and nobody else; on an unattended overnight run
+they reached nobody at all, which is the consequence `StrandedBlocker::QuestionStale`'s doc had
+already written down in those words.
+
+**The channel.** A queue notice suppressed for an orchestrator target is **parked** in
+`OrchRegistry::orch_notice_inbox` (keyed by group — its reader is whoever `deliver_to_orchestrator`
+would have delivered it to, which is a role and not a fixed id) and handed back as an extra MCP
+**content block** on that orchestrator's next `tools/call` result. Three properties, and each one
+is the answer to one of the issue's three questions:
+
+- **It costs no pane delivery slot, so it cannot reintroduce the loop.** Nothing is typed into the
+  blocked pane and nothing is enqueued for it. The relay rides back on a call the orchestrator
+  *itself* made, which is also the proof that the orchestrator is running and reading at that
+  instant — the one moment an in-band notice is guaranteed not to be queued behind anything.
+- **Yes, the orchestrator learns about its OWN pane** — that is the whole case, and the wording
+  says so (`YOUR OWN pane`), because every other `[loomux]` notice an orchestrator reads is about
+  somebody else. It also says plainly that nothing needs re-sending: the payloads these notices
+  describe are either already queued and delivering or already gone, so a re-send is a duplicate in
+  the first case and a guess in the second.
+- **It is a pull, not a push, and is listed ALONGSIDE the badge, never instead of it.** An
+  orchestrator that never calls another tool never reads its inbox. The badge and chip reach the
+  human regardless; the inbox reaches the agent on its next turn. The two cover different failures
+  (a human who is not at the window vs. an agent that is mid-turn and busy) and neither subsumes
+  the other, which is why `hold_channels` lists both.
+
+**Attached at the `tools/call` funnel, and as a SECOND block.** The relay is attached in `dispatch`,
+at the one point every tool call passes through — the same reason `note_agent_ack` is stamped there
+(#535): no per-tool opt-in to forget. It is a second content block and never an append to the
+first, because several tools return JSON their caller parses (`queue_orphans`, `get_state`,
+`group_usage`) and a notice glued onto that string would corrupt it. It is attached on an `isError`
+result too: the orchestrator is demonstrably alive and reading either way, and withholding the
+notice because an unrelated call failed would put it straight back in the hole this fills.
+
+**Drained once, under the lock.** The entry is `remove`d, so two concurrent `tools/call`s cannot
+both relay the same notice and a relayed notice cannot repeat on the next call — a relay that
+re-fired every call would be a nag, and an orchestrator's context is what pays for it.
+
+**In memory, because the durable record is the audit line.** The inbox is a relay for the *next
+turn*, not a store. The `notice-suppressed` line now carries the notice `text` (capped) and
+`parked: true`, so a loomux restart loses the relay and not the information — the same split #467
+uses, where `queue_orphans` is the durable channel and the `[loomux]` notice is the best-effort
+one. The cap (`ORCH_NOTICE_INBOX_MAX`, 20) evicts **oldest first** — the newest notice is the one
+whose claim is still true — and **counts** what it evicted, which the relay then states along with
+a pointer at the log that still holds every one verbatim. A relay that silently held back N notices
+would read as complete while being short, which is the defect class this whole lineage exists to
+eliminate.
+
+**Branch order: an orchestrator target during a pause IS parked.** `notify_queue` checks
+`target_is_orchestrator` *before* `is_paused`, so the paragraph below is about a **worker** target
+during a pause; an orchestrator-target notice never reaches the pause branch at all. That order is
+deliberate rather than incidental (review NB2), and `note_queue_capacity` on the orchestrator's own
+pane is the live path that exercises it. A pause suppresses *deliveries*, and the relay is not one:
+a paused orchestrator can still call tools, and its own pane's queue pressure is exactly what it
+should learn about while everything else is held. Pinned by
+`during_a_pause_a_worker_target_is_only_audited_but_an_orchestrator_target_still_parks`, which
+asserts both branches — the earlier test asserted only the worker case while its name claimed the
+general one.
+
+**What is deliberately NOT parked.** `notify_queue`'s *paused-group* branch — and #615
+(enqueue-while-paused) sharpened that decision rather than weakening it. Since option 2 a pause is
+a **delay, not a discard**: the deliveries behind it sit in the pane's durable queue and are
+flushed in arrival order at resume, with `flush_header_text` announcing them at that moment. A
+queue notice suppressed while paused therefore describes an event whose payload is safe and which
+the resume flush reports *in time and accurately*; relaying it minutes later out of a parked buffer
+would say "queued" about a delivery that has since landed. The one loss a pause on this build can
+still cause — a pane already at `QUEUE_MAX_PER_PANE` refusing admissions for as long as the pause
+lasts — has its own channel in `announce_pause_suppression` and its badge fallback, so parking here
+would be a second report of a fact that already has one.
+
+For the same reason `hold_channels` gives `HoldClass::GroupPaused` no `OrchestratorInbox`: its
+notice is a different call on a different path that `notify_queue` never sees, and listing an inbox
+it never parks into would make that table say something untrue.
+
+**Reconciled with #615 at the cap, which is the sharpest way to see what this channel is.** #615's
+pause-loss notice *is* a delivery, so on a pane at `QUEUE_MAX_PER_PANE` — exactly the pane it has
+the most to report about — it was **certain** to be destroyed by the same cap it was reporting, and
+needed `EnqueueReason::PauseLossNotice`'s one entry of headroom (`PAUSE_LOSS_NOTICE_HEADROOM`) to
+survive. The inbox never meets that problem and takes no headroom of its own: it enqueues nothing,
+so a full queue is the *condition it reports*, not an obstacle to reporting it. The two mechanisms
+are complements, not alternatives — #615 buys a delivery its way past the cap; #578 declines to be
+a delivery at all — and neither is a partial version of the other.
+
+**Reconciled with #621 at the notice marker, which is the seam nobody would look for.** #576's
+self-latch is loomux's own notice text sitting in a pane's tail and satisfying the question
+detector; #621 fixed it by masking any row that *leads* with `LOOMUX_NOTICE_MARKER` once
+`deframe`d, at every reader of a live pane. The relay block is not one of those readers — it rides
+an MCP tool result and never touches the pty — so nothing here needed a mask. The interaction runs
+the other way: #621's own argument records that **an agent can print marker text itself**, and an
+orchestrator quoting its relayed queue notices back into a summary is exactly that, in the pane
+most exposed to the latch. So the relay is shaped to stay *maskable*: the header and every
+constituent notice already lead with the marker, the bullet is `•` (in `deframe`'s strip set) and
+not `-` (which is not), and the elision line carries the marker instead of opening with prose.
+The invariant is enforced from **both ends**, because they fail differently (review NB3).
+`every_row_of_the_relay_block_is_maskable_by_the_question_gates_notice_rule` pins how the block is
+*rendered*, so a later edit that reintroduces a `-` fails rather than quietly handing one row back
+to the detector. `every_notice_that_can_reach_the_inbox_is_a_single_marker_led_line` pins what may
+go *into* it — the six notice constructors across `notify_queue`'s seven call sites — because a
+constructor growing a second line would break maskability with the renderer and every call site
+unchanged. That list is maintained by hand, which is exactly why `OrchNoticeInbox::park` also
+carries a `debug_assert` written *through* `mask_loomux_notices` itself: a seventh constructor
+added without touching the list still fails, at the door, in any debug build (and CI's test builds
+are debug). Release builds never pay for it and never panic a live session over it — the degraded
+outcome is a gate that holds too long, which `QuestionStale` already reports.
+
+**Residual, and its boundary is filed rather than implied.** `mask_loomux_notices` claims one row
+per marker, so any loomux text that occupies *several* rows keeps everything past the first —
+`pause_suppression_notice` and `coalesced_flush_text` are the real multi-row cases, and their
+continuation rows ride the pty unmasked. That is **#632**, filed out of this review rather than
+half-addressed here. It is named in this section because the boundary is what makes this change
+reviewable: #578 is single-row by construction and adds no pane rows at all (the relay rides a tool
+result, never the pty), so it neither contributes to #632 nor is blocked by it. Closing #632 needs
+loomux to know *what* it wrote to a pane rather than that a row claims it did — delivery
+machinery, not detection.
+
+`HoldChannel::survives_orchestrator_target` also stopped being a `!matches!` negation and became an
+exhaustive match: a channel added later must state its own answer rather than defaulting to
+"survives", which is the optimistic half and the one that would make
+`every_hold_class_reaches_a_human_who_is_not_the_orchestrator_channel` pass by accident.
+
+**Residual.** An orchestrator that is wedged on a question and never calls another tool never
+drains its inbox — by construction, since this channel is a pull. That case is the badge's and the
+chip's, and it is why they remain listed. The desktop-toast path (`notify_desktop`, opt-in per
+group via the attention scan) is unchanged and still rides the badge.
 
 ## Kill-exit notices: recorded initiator, not inferred (#533-B)
 

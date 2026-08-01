@@ -243,7 +243,11 @@ These deserve their own detail — see:
   queued, the notice says so explicitly and tells you not to re-send it (that
   would just create a duplicate); a payload is only ever reported gone if the
   notice says **DROPPED** (the pane's queue was already full, or the agent's
-  pane closed while entries were still waiting).
+  pane closed while entries were still waiting). The orchestrator's *own* pane
+  is the one case loomux can't announce this way — a prompt about that pane's
+  blocked delivery would queue behind the very block it reports — so those
+  notices ride back to the orchestrator on the result of its next tool call
+  instead, and you'll see them in the audit viewer either way.
 
 ## CI watches (agent notifications)
 

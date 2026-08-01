@@ -57,6 +57,8 @@ use loomux_lib::orchestration::{
     // #560: the per-pane hold EPISODE that owns the escalation clock.
     ends_hold_episode, opens_hold_episode, HoldObservation,
     hold_channels, HoldChannel, HoldClass,
+    // #578: the orchestrator-target notice relay.
+    orch_notice_relay_text, OrchNoticeInbox, ORCH_NOTICE_INBOX_MAX,
     pause_badge_decision, pause_suppression_notice, suppressed_during_pause, AuditEntry,
     PauseSuppression, SuppressedCause, SuppressedDelivery, StrandedNote, PAUSE_SUPPRESSION_LIST_MAX,
     record_aborted_preenter_outcome, recorded_confirmed,
@@ -19169,6 +19171,386 @@ fn every_hold_class_reaches_a_human_who_is_not_the_orchestrator_channel() {
     assert!(!HoldChannel::OrchestratorNotice.survives_orchestrator_target());
     assert!(HoldChannel::HeldChip.survives_orchestrator_target());
     assert!(HoldChannel::AttentionBadge.survives_orchestrator_target());
+}
+
+// ---------- #578: an orchestrator channel that is not a delivery ----------
+//
+// `notify_queue` returns early with `notice-suppressed` whenever the target IS
+// the group's own orchestrator, and that suppression is *correct*: a prompt
+// announcing the orchestrator's own blocked delivery would queue behind the
+// very block it is reporting. What was wrong is what happened next — the
+// notice was DISCARDED. #563/#572 routed around it with channels that survive
+// an orchestrator target (the held chip, the attention badge), but both of
+// those reach a HUMAN AT THE WINDOW; on an unattended overnight run nobody is
+// told at all, which is what `StrandedBlocker::QuestionStale`'s doc predicted
+// in exactly those words.
+//
+// The channel added here is not a delivery: the notice is parked and rides
+// back on the orchestrator's next MCP tool result — a call the orchestrator
+// itself made, which is also the proof that it is running and reading at that
+// instant. Nothing is typed into the blocked pane, so nothing can queue behind
+// the block it reports.
+
+#[test]
+fn an_orchestrator_target_queue_notice_rides_back_on_its_next_tool_result() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let notice = queue::dropped_notice(&co.agent_id, 3, queue::DropReason::QueueFull);
+
+    // Exactly the call `announce_dropped` makes when the queue it just threw
+    // away belonged to the group's own orchestrator. Before #578 this line was
+    // the whole story: audited, and gone.
+    reg.notify_queue(&co.group, &co.agent_id, true, &notice);
+
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    let blocks = r["content"].as_array().expect("content is a block list").clone();
+    assert_eq!(
+        blocks.len(), 2,
+        "the orchestrator's own suppressed queue notice must ride back on its next tool \
+         result — got {blocks:?}"
+    );
+    let relay = blocks[1]["text"].as_str().unwrap();
+    assert!(relay.contains(&notice), "the relay must carry the notice VERBATIM: {relay}");
+    assert!(
+        relay.contains("YOUR OWN pane"),
+        "the relay must say whose pane it is about — every other [loomux] notice an \
+         orchestrator reads is about somebody else: {relay}"
+    );
+    assert!(
+        relay.contains("nothing needs re-sending"),
+        "the payloads these notices describe are already queued or already gone, so the \
+         relay must not invite a re-send: {relay}"
+    );
+
+    // Block 0 is untouched, byte for byte. Several tools return JSON their
+    // caller parses; a notice glued onto that string would corrupt it, which
+    // is why the relay is a SECOND block and not an append.
+    let listing = blocks[0]["text"].as_str().unwrap();
+    serde_json::from_str::<Value>(listing).expect("the tool's own block must still parse as JSON");
+
+    // The durable half. The relay lives in memory, so after a loomux restart
+    // the audit line is all there is — it has to carry the text, not just the
+    // fact that a notice once existed.
+    let sup = reg
+        .audit_log(&co.group)
+        .into_iter()
+        .find(|e| e.action == "notice-suppressed"
+            && e.detail["reason"] == json!("target-is-orchestrator"))
+        .expect("the suppression is still audited");
+    assert_eq!(sup.detail["text"], json!(notice), "the suppressed text must be recoverable");
+    assert_eq!(sup.detail["parked"], json!(true), "and must say it was parked, not dropped");
+    let relayed = reg
+        .audit_log(&co.group)
+        .into_iter()
+        .find(|e| e.action == "notice-relayed")
+        .expect("the relay itself must be audited, not silent");
+    assert_eq!(relayed.detail["count"], json!(1), "got: {}", relayed.detail);
+}
+
+#[test]
+fn the_relayed_notice_drains_once_and_never_becomes_a_delivery_to_the_pane_it_reports() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    reg.notify_queue(&co.group, &co.agent_id, true,
+        &queue::queued_notice(&co.agent_id, queue::EnqueueReason::BoxOccupied));
+
+    let first = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    assert_eq!(first["content"].as_array().unwrap().len(), 2, "the first call relays it");
+
+    let second = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    assert_eq!(
+        second["content"].as_array().unwrap().len(), 1,
+        "a relayed notice must not repeat on every later call — that is a nag, not a channel, \
+         and an orchestrator's context is what pays for it"
+    );
+
+    // The property the whole design is bounded by: the fix must not
+    // reintroduce the loop. Nothing may be enqueued for the pane the notice is
+    // about, or the report is once again stuck behind the block it reports.
+    assert!(
+        reg.audit_log(&co.group)
+            .iter()
+            .all(|e| !(e.action == "delivery-queued" && e.detail["to"] == json!(co.agent_id))),
+        "the relay must never enqueue anything for the pane it reports on"
+    );
+}
+
+#[test]
+fn a_worker_tool_call_never_drains_the_orchestrators_notice_inbox() {
+    let (reg, _d, co, cw) = setup_mcp();
+    reg.notify_queue(&co.group, &co.agent_id, true,
+        &queue::dropped_notice(&co.agent_id, 1, queue::DropReason::AgentDied));
+
+    let w = dispatch(&reg, &cw, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    assert_eq!(
+        w["content"].as_array().unwrap().len(), 1,
+        "a worker draining the orchestrator's inbox would consume the relay and never deliver \
+         it — a silent loss dressed as a fix"
+    );
+
+    let o = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    assert_eq!(o["content"].as_array().unwrap().len(), 2, "so it is still there to relay");
+}
+
+#[test]
+fn a_failed_tool_call_still_carries_the_relay() {
+    // The relay is attached on `isError` results too: the orchestrator is
+    // demonstrably alive and reading either way, and withholding the notice
+    // because an unrelated call failed would put it back in the hole this
+    // exists to fill.
+    let (reg, _d, co, _cw) = setup_mcp();
+    reg.notify_queue(&co.group, &co.agent_id, true,
+        &queue::dropped_notice(&co.agent_id, 2, queue::DropReason::QueueFull));
+
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "get_task", "arguments": { "id": "no-such-task" } })).unwrap();
+    assert_eq!(r["isError"], json!(true), "the call really did fail");
+    assert_eq!(r["content"].as_array().unwrap().len(), 2, "and the relay rode back anyway");
+}
+
+#[test]
+fn during_a_pause_a_worker_target_is_only_audited_but_an_orchestrator_target_still_parks() {
+    // The BRANCH ORDER inside `notify_queue` is the behavior here, so it is
+    // asserted directly rather than implied by a case that could not have
+    // parked anyway (review NB2 — the earlier version of this test passed
+    // `target_is_orchestrator: false` and then claimed, by its name, that a
+    // paused group never parks. Both halves of that are now pinned, and they
+    // differ).
+    //
+    // `target_is_orchestrator` is checked BEFORE `is_paused`, so an
+    // orchestrator-target notice raised during a pause is PARKED. That is the
+    // right way round: a pause suppresses deliveries, and the relay is not one
+    // — a paused orchestrator can still call tools, and its own pane's queue
+    // pressure is exactly what it should learn about while everything else is
+    // held. The live path is `note_queue_capacity` on the orchestrator's own
+    // pane, which resolves the target itself and is not gated on the pause.
+    let (reg, _d, co, cw) = setup_mcp();
+    reg.pause_group(&co.group).unwrap();
+
+    // Worker target — the pause branch. Audited, never parked. #615 is why:
+    // a pause is now a DELAY, so the delivery behind it is flushed at resume
+    // and `flush_header_text` announces it then; relaying this minutes later
+    // out of a buffer would say "queued" about a delivery that has landed.
+    reg.notify_queue(&co.group, &cw.agent_id, false,
+        &queue::queued_notice(&cw.agent_id, queue::EnqueueReason::BoxOccupied));
+    let sup = reg
+        .audit_log(&co.group)
+        .into_iter()
+        .find(|e| e.action == "notice-suppressed" && e.detail["to"] == json!(cw.agent_id))
+        .expect("a paused group's queue notice is suppressed AND audited");
+    assert_eq!(sup.detail["reason"], json!("group-paused"), "got: {}", sup.detail);
+    assert_eq!(sup.detail["parked"], Value::Null, "the pause branch parks nothing");
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    assert_eq!(r["content"].as_array().unwrap().len(), 1, "so there is nothing to relay");
+
+    // Orchestrator target, same pause — the branch above it, which parks.
+    let own = queue::at_capacity_notice(&co.agent_id, queue::QUEUE_MAX_PER_PANE);
+    reg.notify_queue(&co.group, &co.agent_id, true, &own);
+    let sup = reg
+        .audit_log(&co.group)
+        .into_iter()
+        .filter(|e| e.action == "notice-suppressed" && e.detail["to"] == json!(co.agent_id))
+        .next_back()
+        .expect("still audited");
+    assert_eq!(
+        sup.detail["reason"], json!("target-is-orchestrator"),
+        "the orchestrator-target branch runs first, so the pause never sees this one: {}",
+        sup.detail
+    );
+    assert_eq!(sup.detail["parked"], json!(true), "and it parks: {}", sup.detail);
+
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    let blocks = r["content"].as_array().unwrap();
+    assert_eq!(
+        blocks.len(), 2,
+        "a paused orchestrator must still learn about its OWN pane — the relay is not a \
+         delivery, so the pause has no reason to withhold it"
+    );
+    assert!(blocks[1]["text"].as_str().unwrap().contains(&own), "verbatim: {blocks:?}");
+}
+
+#[test]
+fn the_notice_inbox_names_what_its_cap_elided_instead_of_hiding_it() {
+    // A relay that silently held back N notices would read as complete while
+    // being short — the "looks complete, isn't" defect the whole
+    // #445/#467/#563 lineage exists to eliminate. The cap is real, so what it
+    // drops has to be counted and said out loud, with a pointer at the log
+    // that still holds every one of them verbatim.
+    let (reg, _d, co, _cw) = setup_mcp();
+    let over = ORCH_NOTICE_INBOX_MAX + 3;
+    for i in 0..over {
+        reg.notify_queue(&co.group, &co.agent_id, true, &format!("[loomux] notice #{i}"));
+    }
+
+    let r = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_agents", "arguments": {} })).unwrap();
+    let relay = r["content"][1]["text"].as_str().expect("the relay block").to_string();
+    assert!(relay.contains("3 earlier notices elided"), "the cut must be named: {relay}");
+    assert!(relay.contains("audit.jsonl"),
+        "and must point at the record that still has them: {relay}");
+    assert!(relay.contains(&format!("[loomux] notice #{}", over - 1)),
+        "the NEWEST notice — the one whose claim is still true — must survive: {relay}");
+    assert!(!relay.contains("[loomux] notice #0"), "the oldest is the one evicted: {relay}");
+
+    // Every notice, including the elided ones, is still in the log.
+    let logged = reg
+        .audit_log(&co.group)
+        .into_iter()
+        .filter(|e| e.action == "notice-suppressed")
+        .count();
+    assert_eq!(logged, over, "the audit is the record; the relay is only the notification");
+}
+
+#[test]
+fn every_row_of_the_relay_block_is_maskable_by_the_question_gates_notice_rule() {
+    // #576/#621: `mask_loomux_notices` drops any row that LEADS with the
+    // `[loomux]` marker once de-framed, and every reader of a live pane is
+    // masked with it. This relay never reaches a pane on its own — it rides an
+    // MCP tool result, not the pty — but #621's own doc names the path that
+    // puts it there anyway: an agent can print marker text itself, and an
+    // orchestrator quoting its own relay back into a summary is precisely that
+    // case. The rows would then be text ABOUT a question sitting in the tail of
+    // the pane most exposed to it, which is #576 exactly.
+    //
+    // So every row this block emits has to be one the mask can claim. `deframe`
+    // strips whitespace and `│ ┃ | * ● • ◆` — and NOT `-`: a `- [loomux] …` row
+    // de-frames to `- [loomux] …`, leads with the dash, and survives the mask.
+    // That is why the bullet here is `•` and why the elision line carries the
+    // marker rather than opening with prose.
+    let notices = vec![
+        queue::queued_notice("o-1", queue::EnqueueReason::Question),
+        queue::dropped_notice("o-1", 2, queue::DropReason::QueueFull),
+    ];
+    let relay = orch_notice_relay_text(&notices, 4).expect("a relay with content");
+    assert_eq!(
+        mask_loomux_notices(&relay).trim(),
+        "",
+        "every row of the relay must be maskable, or an orchestrator echoing it into its own \
+         pane re-arms the very question gate this text is about — got leftovers from: {relay}"
+    );
+}
+
+#[test]
+fn every_notice_that_can_reach_the_inbox_is_a_single_marker_led_line() {
+    // The other half of the maskability invariant (review NB3), and it is a
+    // different failure from the one above: that test pins how the BLOCK is
+    // rendered, this one pins what may go INTO it. A constructor's wording
+    // drifting — a second line, a lost prefix — would break maskability with
+    // every call site and the renderer unchanged, so neither test alone covers
+    // it.
+    //
+    // These six are the complete set of text `notify_queue` can be handed, one
+    // per notice constructor across its seven call sites. The list is
+    // maintained by hand against those call sites, which is exactly why
+    // `OrchNoticeInbox::park`'s `debug_assert` exists as well: a seventh
+    // constructor added without touching this list still fails, at the door,
+    // in any debug build — and CI's test builds are debug.
+    let all = [
+        queue::queued_notice("o-1", queue::EnqueueReason::BoxOccupied),
+        queue::still_queued_notice("o-1", 2, 30),
+        queue::dropped_notice("o-1", 2, queue::DropReason::QueueFull),
+        queue::recovered_notice("o-1", 2, 30),
+        queue::at_capacity_notice("o-1", queue::QUEUE_MAX_PER_PANE),
+        queue::pressure_notice("o-1", queue::QUEUE_NEAR_FULL_AT, queue::QUEUE_MAX_PER_PANE),
+    ];
+    for n in &all {
+        assert!(
+            mask_loomux_notices(n).is_empty(),
+            "a notice that can be parked must be ONE marker-led line, or the row it lands on \
+             survives the question gate's mask: {n:?}"
+        );
+    }
+    // And a relay built out of every one of them still masks away entirely —
+    // the composition, not just the parts.
+    let relay = orch_notice_relay_text(&all, 2).expect("a relay with content");
+    assert_eq!(mask_loomux_notices(&relay).trim(), "", "leftovers from: {relay}");
+}
+
+#[test]
+fn orch_notice_relay_text_says_nothing_when_there_is_nothing_to_say() {
+    // The ordinary case, and the one that must not add a single byte to a tool
+    // result: no parked notices, no second content block, no cost.
+    assert_eq!(orch_notice_relay_text(&[], 0), None);
+    assert_eq!(orch_notice_relay_text(&[], 7), None, "an elision count alone is not a notice");
+
+    let one = orch_notice_relay_text(&["[loomux] x".to_string()], 0).unwrap();
+    assert!(one.contains("1 queue notice about"), "singular reads naturally: {one}");
+    let two = orch_notice_relay_text(&["a".to_string(), "b".to_string()], 0).unwrap();
+    assert!(two.contains("2 queue notices about"), "and so does plural: {two}");
+    assert!(!two.contains("elided"), "no elision line when nothing was elided: {two}");
+}
+
+#[test]
+fn the_inbox_evicts_oldest_first_and_counts_every_eviction() {
+    // Marker-led fixtures, because `park`'s own `debug_assert` requires it
+    // (review NB3) — and the first thing that assert caught was this test
+    // parking bare `n0`/`n1` strings no real caller could produce. A fixture
+    // that could not occur in production is not a cheaper test, it is a test of
+    // something else.
+    let mut inbox = OrchNoticeInbox::default();
+    for i in 0..ORCH_NOTICE_INBOX_MAX + 5 {
+        inbox.park(&format!("[loomux] n{i}"));
+    }
+    assert_eq!(inbox.notices.len(), ORCH_NOTICE_INBOX_MAX, "the cap is real");
+    assert_eq!(inbox.elided, 5, "and every eviction is counted, not forgotten");
+    assert_eq!(inbox.notices.first().unwrap(), "[loomux] n5", "oldest-first eviction");
+    assert_eq!(
+        inbox.notices.last().unwrap(),
+        &format!("[loomux] n{}", ORCH_NOTICE_INBOX_MAX + 4),
+        "the newest notice is the one whose claim is still true"
+    );
+}
+
+#[test]
+fn the_notify_queue_hold_classes_gain_a_channel_that_reaches_the_orchestrator_agent() {
+    // #572 gave the orchestrator-target case channels that survive it, but
+    // both reach a HUMAN AT THE WINDOW. The inbox is the first one in this
+    // table that reaches the orchestrator AGENT — the difference between an
+    // attended session and an unattended overnight run.
+    assert!(
+        HoldChannel::OrchestratorInbox.survives_orchestrator_target(),
+        "the whole point is that it is not a delivery"
+    );
+
+    // Listed on exactly the classifications whose notice goes through
+    // `notify_queue` — the function that parks. Anything else would make this
+    // table say something untrue.
+    for class in [
+        HoldClass::PrePasteRecheckExhausted,
+        HoldClass::PreEnterBoxOccupied,
+        HoldClass::QueueNearFull,
+        HoldClass::QueueFull,
+    ] {
+        let ch = hold_channels(class);
+        assert!(
+            ch.contains(&HoldChannel::OrchestratorNotice)
+                && ch.contains(&HoldChannel::OrchestratorInbox),
+            "{class:?} notifies through `notify_queue`, so its suppressed notice is parked: {ch:?}"
+        );
+    }
+
+    // `GroupPaused`'s notice is `announce_pause_suppression` at resume, a
+    // different call on a different path that `notify_queue` never sees.
+    let paused = hold_channels(HoldClass::GroupPaused);
+    assert!(
+        paused.contains(&HoldChannel::OrchestratorNotice)
+            && !paused.contains(&HoldChannel::OrchestratorInbox),
+        "a pause notice is not parked, so the table must not claim it is: {paused:?}"
+    );
+
+    // And the completeness invariant #563 established still holds for every
+    // classification, unchanged by the new channel.
+    for class in HoldClass::ALL {
+        assert!(
+            hold_channels(*class).iter().any(|c| c.survives_orchestrator_target()),
+            "{class:?} must still reach someone an orchestrator target does not suppress"
+        );
+    }
 }
 
 // ---------- #560: the escalation clock is the PANE's hold episode ----------

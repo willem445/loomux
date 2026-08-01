@@ -358,6 +358,17 @@ so far:
   says it cannot fetch will design from recall instead. The `cargo check`-is-denied half is
   unchanged and still stated — executing code stays out of reach.
 
+- **#578, queue notices about the orchestrator's own pane** — `orchestrator.md` only, one
+  paragraph in the delivery-queue guidance. loomux can never type a queue notice about the
+  orchestrator's OWN pane into that pane (it would queue behind the very block it reports),
+  so those notices now ride back as an extra content block on the orchestrator's next tool
+  result. The re-bless is warranted because the channel is *new to the reader*: an unexplained
+  `[loomux] …` block appearing on the end of an unrelated tool result is exactly the kind of
+  thing an agent either ignores or over-reacts to. The paragraph says what it is, routes each
+  line back to the `queued`-vs-`DROPPED` rules already stated above it, and names the two
+  properties that change how it should be handled — it needs no acknowledgement, and it
+  **drains once**, so it will not be repeated on the next call.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
