@@ -6367,6 +6367,12 @@ not claim that guarantee.
 
 ## Lost spawn-time kickoff: re-delivery, not just a badge (#517)
 
+> **Read with #585.** Everything below describes this recovery correctly, but it did not run:
+> a `return` in #522's idle-pane arm sits above the test that gates it, and the audit shows
+> **zero** re-deliveries and zero declines across the whole recorded history. Whether this
+> feature is reachable at all is settled in "An empty box is two panes, and silence needs
+> evidence (#585)" below — the recovery's own logic, budget, and declines are unchanged by it.
+
 **Problem.** A fresh spawn's kickoff brief kept going missing: five instances on one day
 across v1.0.0, then two of three fresh spawns on v1.1.0-beta — each agent came up idle
 reporting "no task brief received" and needed a manual `send_prompt` from the orchestrator.
@@ -6710,6 +6716,132 @@ it: the one seam that could carry a debug assertion, `createOrderedWriter`'s
 `write(data, human = true)`, defaults to human deliberately (an un-updated call site keeps its
 pre-#518 meaning), so an assertion there would fire on the documented fail-safe rather than on
 the defect.
+
+## An empty box is two panes, and silence needs evidence (#585)
+
+**Problem.** `BoxReading::NotHolding` on a quiet pane — our pasted text is not at the box's
+tail, and no human characters are outstanding — has two causes, and the reading cannot tell
+them apart:
+
+- the CLI **consumed** our text, ran its turn, and came back to rest. #522's case: an alarm
+  here is noise, and an expensive kind (it sends the orchestrator to `get_output`, the #520
+  token flood, and tempts the duplicate re-send #451/#510 exist to prevent).
+- the paste was **never accepted**: a blind paste into a CLI whose stdin reader had not
+  attached, or an Enter that landed while the CLI was busy and was dropped. The box is equally
+  empty and the delivery is equally absent — except this one is a *lost message*.
+
+#522 modelled only the first and returned from the `DeclareFailed` arm on it. That `return`
+sits roughly ninety lines **above** the `NotHolding` test that gates #517's kickoff recovery,
+so the recovery was reachable only when `NotHolding` coincided with a human's half-typed line
+(`box_pending`) or with an `Unverifiable` reading — that is, on a coincidence unrelated to
+whether a kickoff had been lost.
+
+**It never fired.** Across this project's entire recorded audit history —
+both `audit.jsonl` generations of the group that filed #585 — `kickoff_recovery_action`
+produced **zero** `kickoff-redelivered` rows and **zero** `kickoff-redelivery-skipped` rows,
+against 13 `delivery-unconfirmed-idle-pane` records and 3 fresh kickoffs whose submit was never
+confirmed. Not "rarely": never, and not even a decline naming a reason. The #517/#526 feature
+was dead code from the day it shipped, and nothing in the log said so — the silence it was
+supposed to replace is what wrote the record.
+
+The live cost, from that same session: one reviewer agent sat idle for **11 minutes** after a
+lost kickoff, rescued only incidentally by an unrelated later prompt; two workers had a
+follow-up brief eaten with no badge, no notice, and no recovery. 420 of 2070 deliveries
+(20.3%) failed submit-confirm in that session, and 3 of 12 fresh kickoffs (25%).
+
+This is the same shape #559 fixed for `Unverifiable`, and #559 fixed only the lower half of
+it: it widened the recovery's own test without noticing that the early return above still
+swallowed `NotHolding` + idle, which is the common case and the one #517 was written for.
+
+**The fix: the bar that already governs the riskier decision now governs the silence.**
+`unconfirmed_disposition` takes a third input, `turn_evidence` — did the pane produce
+`KICKOFF_TURN_EVIDENCE_BYTES` (4 KiB) of output since this delivery's own Enter? The
+`NotHolding`/no-human cell splits on it:
+
+| `reading` | `box_pending` | `turn_evidence` | result |
+| --- | --- | --- | --- |
+| `Holds` | any | any | `Notify` |
+| `Unverifiable` | any | any | `Notify` (#559, untouched) |
+| `NotHolding` | `true` | any | `Notify` |
+| `NotHolding` | `false` | `true` | `IdleAuditOnly` (#522's silence, unchanged) |
+| `NotHolding` | `false` | `false` | **`EatenNotify`** (#585) |
+
+`EatenNotify` does not return early. It falls through to the notice, the attention badge, and
+`kickoff_recovery_action` — which stays bounded at `KICKOFF_REDELIVERY_MAX = 1` and keeps every
+one of its declines, `NotAKickoff` included.
+
+**Why this is not a weakening of #526's evidence bar.** It is the *same* bar, and it was
+already trusted — ninety lines below — to gate the far more dangerous decision of re-sending
+text into a live pane. Authorising a *notice* is strictly safer than authorising a
+*re-delivery*. So the argument runs one way only: if the bar is good enough to fire a
+re-delivery, it is good enough to fire a notice. Nothing here loosens the re-delivery
+condition, adds a blind re-send, or widens who may be re-delivered to — a lost non-kickoff
+still declines `NotAKickoff` and is escalated to its sender rather than re-sent, exactly as
+that variant's doc argues. The bar is not new, not lowered, and not duplicated; it is newly
+*applied* to the path that was bypassing it. Both call sites now read one binding computed once
+per tick, so the two decisions cannot disagree about the same question — the discipline the
+shared `ledger` observation already follows.
+
+**What this does not re-open.** #522's flood stays suppressed where #522 aimed it. A worker
+that finished a turn and went idle has turn evidence by construction — the monitor only looks
+after `PENDING_IDLE_QUIET` of total silence, so a turn that happened has long since painted
+kilobytes — and still takes `IdleAuditOnly`. The only deliveries that newly speak up are ones
+where the pane produced *less than a turn's output* since our Enter **and** the box no longer
+holds our text, which is not a finished pane under any reading.
+
+**Bounded with escalation, and the escalation had to be honest.** The pre-#585 notice tells the
+orchestrator the prompt "may be sitting unsubmitted in its pane". For an eaten delivery that is
+false: we looked, and the text is gone. Acting on it sends the orchestrator to `get_output`,
+where it sees an idle pane and reasonably concludes nothing is wrong. That is not hypothetical
+— it is exactly how #585's two live losses were misread, and the pre-emptive re-sends the
+misreading invites are the #455 duplicate-kickoff class. So an eaten delivery gets its own
+wording (`delivery_eaten_notice`), which states what was observed and names the idle pane the
+orchestrator is about to see, so an idle pane is not mistaken for a refutation.
+`.loomux/lessons.md`, "a claim is a deliverable."
+
+**The audit now records the evidence with the silence.** `delivery-unconfirmed-idle-pane`
+carries `output_since_submit` and `turn_evidence_bytes`, and the eaten case gets its own
+`delivery-eaten` action plus an `eaten` discriminator on `delivery-unconfirmed-notice`.
+Reconstructing #585 required reading the source to find out what a silent row had decided;
+"how often is a delivery actually eaten?" is now a log question rather than a code question.
+
+**Composition with #539.** PR #588 adds an `agent_acted` input (the MCP activity clock) to the
+`NotHolding`/`box_pending: true` cell. It is a strictly stronger signal than output bytes — it
+proves the agent's own code path ran — but it governs a *different* cell and does not reach
+this one, which is why the two are additive rather than duplicates. Whichever lands second, they
+compose as evidence-OR: any independent sign that the agent acted on our delivery justifies
+silence, and the absence of all of them is what must speak. Whoever rebases second should merge
+the two precedence tables into one rather than leaving two `NotHolding` arms to drift.
+
+**The precedence is now a value, because that is what regressed.** #585 was not a wrong
+decision. Every decision involved — `unconfirmed_disposition`, `stranded_selfheal_action`,
+`kickoff_recovery_action` — was individually correct, individually tested, and green. What
+failed was the *order* they ran in, and the order existed only as control flow inside
+`late_monitor`, which no test can execute (it needs a live `AppHandle` and a real
+`PtyManager`).
+
+#517's own wiring test shows how that hides: it hand-composes `stranded_selfheal_action` and
+then `kickoff_recovery_action` in the order its author believed the monitor used, asserts the
+result, and passes — for two releases, while the shipped monitor returned before ever reaching
+the second step. A test that *is* the composition cannot observe that the real composition
+differs. This is the "unpinnable wiring nobody could assert a property against" hazard named
+elsewhere in this file, and it is the reason a 100%-green suite reported nothing while the
+feature was dead.
+
+So the arm's precedence is lifted into `failed_arm_route(UnconfirmedDisposition) ->
+FailedArmRoute`, total over the disposition enum (adding a variant without deciding its route
+is a compile error, not a silent fall-through). "An eaten paste reaches the recovery; an idle
+pane does not" is now a property a test reads off a pure function rather than one a reader
+re-derives by tracing `return`s.
+
+State plainly what this does **not** buy: it does not make `late_monitor` executable in a test,
+and the arm could still be mis-wired to ignore the route it computes. It closes the specific
+hole that actually opened — an ordering nothing could assert — and no more. The #517 test's
+misleading comment is corrected in place rather than left to mislead the next reader.
+
+**No queue mutation.** Nothing here enqueues, dequeues, or reorders; the recovery path reaches
+the queue only through `enqueue_text`'s existing front door, which owns its own persistence. So
+no new `persist_queues` obligation arises under the #523 table.
 
 ## Prompt-collision mutual exclusion: compose strip + typing hold (#43)
 
