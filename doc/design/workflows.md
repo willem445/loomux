@@ -853,13 +853,108 @@ Consequences worth knowing:
 - Practically: don't send a worker back to "just tidy one thing" on an approved PR
   and expect it to merge. Send the reviewer back too. Both role templates say so.
 
+### …and the head SHA does not pin the PR body (#565)
+
+The head oid pins the **code**. The **PR body is not part of it**, and on a repo
+that squash-merges the body *becomes the permanent commit message*: reviewed
+content with the weight of a diff and none of a diff's version pinning. It drifts
+in both directions, and both were live in one batch:
+
+- a reviewer passes a body, the author edits it, and the merge carries text nobody
+  reviewed;
+- a reviewer *fails* a body that has already been fixed, and the PR is blocked on a
+  defect that no longer exists. That is #525, to the second: review comment posted
+  at 14:44:23Z, body last edited at 14:47:49Z. The reviewer was accurate about what
+  it saw and stale about what exists, and **no mechanism could have told either
+  agent** — it cost a full round-trip on a PR that was otherwise ready.
+
+So `review_verdict` records a **sha256 of the body** alongside the head, and four
+decisions make it work:
+
+**1. A digest, not the text.** A body here runs ~250 lines; storing a copy per
+verdict is heavy and produces an artifact that still has to be diffed by eye —
+which is the manual step that cost the round. A digest is fixed-size and its
+mismatch is *exact*: same digest, provably the same commit message that was
+approved. (The other cheap option, an `updatedAt` timestamp, is worse than
+nothing: it moves for labels and assignees, so it cries wolf, and when it does
+fire it says *that* something changed, never *what*.)
+
+**2. The tool computes it; the reviewer never passes it.** This is #525's own
+lesson turned on our tooling — *a property that depends on someone remembering is
+an intention, not a mechanism*. The tool already has the PR number, so it fetches
+the body itself. A reviewer cannot forget it, and cannot record the digest of a
+body it did not read.
+
+**3. Reported on both classes, enforced only on passes.** Symmetric invalidation
+would ping-pong forever: fail on the body → worker fixes the body → verdict
+auto-stales → re-review → repeat. So:
+
+| verdict | body moved since | what happens |
+|---|---|---|
+| `pass` | the hazard: what would be committed is not what was approved | reported, and **refused** at merge time where the repo opted in |
+| `fail` / `escalate` | expected — that *is* the fix loop | reported, and nothing else. The reviewer clears it by re-recording |
+
+The reporting half is unconditional (`list_verdicts` carries `body_changed` per
+verdict; the gate status line the orchestrator is handed says which class it is),
+because it is the half that would have resolved #525 with no re-review at all:
+*"this FAIL was recorded against body-digest X, current is Y"* is a race the
+orchestrator can settle by reading the current body.
+
+**4. Enforcement is opt-in — `also: [body-unchanged]`.** The check only matters
+where the body *becomes* the record. On a repo that merge-commits, the PR body is
+discussion, and this would be noise. "Squash makes the body permanent" is a fact
+about *our* workflow, not about git, so it is a clause a repo writes down rather
+than an assumption in the product (CLAUDE.md constraint 8). It rides the existing
+`also:` mechanism, so a build that does not know the condition refuses every merge
+declaring it — the same fail-closed rule every other condition gets.
+
+What is digested is deliberately the *smallest* normalization POSIX shell can
+reproduce, because both halves have to agree on it forever: **`\r` removed**
+(whether `gh` hands back CRLF or LF is a platform fact, not content) and
+**trailing newlines collapsed to one**. Nothing else — a re-wrapped paragraph *is*
+a change, since the claim being made is "the bytes that will be committed are the
+bytes that were reviewed", which is checkable, and not "the meaning is close
+enough", which is not. Rust does it in `workflow::canonical_body`; the shim does it
+with `tr -d '\r'`, `$(…)` and `printf '%s\n'`. The agreement is not asserted, it is
+*executed*: `the_shim_refuses_a_merge_whose_body_moved_after_the_pass_when_the_repo_opts_in`
+records a verdict through the real MCP tool and then merges through the real shim
+over a body carrying CRLF, trailing blank lines, trailing spaces, non-ASCII and
+`$`-bearing text — it can only pass if two independent implementations produced the
+same 64 characters.
+
+**What this deliberately does NOT cover: the PR title.** GitHub takes a squash
+commit's *subject* from the PR title, which is as editable as the body — so the
+squash record is pinned here only from the second line down. Covering it means the
+shim joining two `--json` fields into one canonical string, which is a **second
+canonical-form contract that the shell and Rust halves would have to keep agreeing
+about forever** — the same class of coupling this section spent its whole design
+budget keeping to two rules. That earns its own change with its own executed
+cross-check, rather than riding in on this one. #565 stays open on exactly that
+residual; it is the follow-up artifact, and nothing in the mechanism below has to
+change to add it (one more field in `pr_body`'s query, one more line in
+`canonical_body`, one more `--jq` expression in the shim).
+
+The issue also names a planner's **issue body** as a candidate. That one is not a
+smaller version of this: it is part of no commit, and no gate reads it, so it needs
+its own argument for what a digest would be *for* before it gets one.
+
+Fail-closed, like the head binding: a verdict with **no** digest (recorded by a
+build older than this one, or with the body unreadable at record time) can never
+show the body unchanged, so `body-unchanged` refuses on it. The hasher itself is
+resolved at the point of use (`sha256sum`, else `shasum -a 256`, else
+`openssl dgst -r`) rather than added to the shim's proven-dependency preamble —
+that preamble is asserted before *every* gated command on every host and is shared
+byte-for-byte with the git shim, so requiring a hasher there would refuse merges on
+hosts that never declare this condition. No usable hasher, or output that isn't 64
+hex characters, refuses *this condition* and says so.
+
 ### The gate
 
     gates:
       merge:
         require: all-pass        # or: threshold: 2
         reviewers: [rev-security, rev-tests]
-        also: [ci-green]
+        also: [ci-green, body-unchanged]
 
 `all-pass` (the default when `require:` is omitted) needs every named reviewer to
 have recorded a `pass` — so **a reviewer that has recorded nothing keeps the gate
@@ -870,7 +965,10 @@ merge over a `fail`.
 
 `also:` names extra conditions. **`ci-green`** is checked in the shim with
 `gh pr checks` (which exits non-zero when a check is failing, still running, or
-absent). Anything this build does not know how to check **fails closed** — the
+absent). **`body-unchanged`** (#565, previous section) re-reads the PR body at
+merge time and refuses if it is not the one the live passes were recorded
+against — for repos that squash-merge, where the body is the commit message.
+Anything this build does not know how to check **fails closed** — the
 merge is refused, with the condition named, and audited. That asymmetry is
 deliberate: a gate is a safety claim, and silently ignoring a clause of it would
 turn a stricter-looking workflow file into a weaker one, which is the worst thing a
@@ -978,9 +1076,19 @@ shape:
     <group-dir>/merge_gate                    # the declared gate, `key value` lines
     <group-dir>/verdicts/pr-<N>/<block-id>    # line 1 = pass|fail|escalate
                                               # line 2 = the head commit it reviewed
-                                              # then: ts, agent id, summary
+                                              # line 3 = ts     line 4 = agent id
+                                              # line 5 = digest of the body it reviewed
+                                              # then: summary, to EOF
 
-The verdict word is line 1 and the reviewed head line 2 — that *is* the shim's read.
+The verdict word is line 1, the reviewed head line 2 and the reviewed body's digest
+line 5 — `head -n1` / `head -n2 | tail -n1` / `head -n5 | tail -n1`, which *is* the
+shim's read. Every fixed field sits above the summary because the summary is the one
+field that may contain newlines. A file written before #565 has its summary where
+line 5 now lives: `parse_verdict_file` hands a line 5 that is not a valid digest back
+to the summary rather than swallowing durable prose, and reads the digest as
+*unknown* — the shim, which takes line 5 as-is and accepts only 64 hex characters,
+lands on the same gate decision (unknown → `body-unchanged` refuses) by a stricter
+route.
 The durable record and the enforcement input are **one artifact**, so they cannot
 drift. Every token in `merge_gate` is already shell-inert: block ids and conditions
 are *rejected* — never rewritten — by the parser when they leave their alphabet
