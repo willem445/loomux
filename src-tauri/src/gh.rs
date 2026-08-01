@@ -31,6 +31,13 @@ use std::process::{Command, Output};
 /// the write succeeds and the orchestrator's substring match still picks it up.
 const ALLOWED_LABELS: [&str; 3] = ["agent-ready", "agent-investigation", "agent-managed"];
 
+/// Per-list cap for [`gh_activity`] (the progress-timeline view, #608). Bounded
+/// so a long-lived repo can't hand the timeline an unbounded payload — but the
+/// bound is *reported* (`GhActivity::limit` + the `*_truncated` flags) rather
+/// than silently trimming history. A chart that looks complete when it isn't is
+/// the exact failure class `.loomux/lessons.md` names under "no silent caps".
+const ACTIVITY_LIMIT: usize = 100;
+
 /// Color (6-hex, no `#`) and description used to *create* an allow-listed label
 /// in a repo that doesn't have it yet (see `ensure_labels_exist`). `gh issue
 /// edit --add-label` fails outright on a label the repo has never defined, so a
@@ -183,6 +190,72 @@ pub struct GhPr {
     pub head_ref: String,
 }
 
+/// One issue's *lifecycle* timestamps, for the progress-timeline view (#608).
+/// Distinct from [`GhIssue`], which is the issues-view row: open-state only and
+/// carrying `updatedAt` alone. A time axis plots when a thing *happened*, so
+/// this carries the opened/closed instants instead.
+#[derive(Serialize, PartialEq, Debug)]
+pub struct GhIssueActivity {
+    pub number: u64,
+    pub title: String,
+    /// "OPEN" / "CLOSED" as gh reports it.
+    pub state: String,
+    /// RFC-3339 open time. Empty when gh omitted it: one row with a broken
+    /// timestamp is parked by the frontend as "undatable" rather than failing
+    /// the whole list or being plotted at the epoch.
+    pub created_at: String,
+    /// RFC-3339 close time; `None` while the issue is open.
+    pub closed_at: Option<String>,
+    /// RFC-3339 last-activity time — the key this list is *sorted* by, and what
+    /// lets the frontend state a precise coverage floor when the list is
+    /// truncated: nothing omitted was active more recently than the oldest row
+    /// returned, so the window above that instant is complete.
+    pub updated_at: String,
+    pub url: String,
+}
+
+/// One PR's lifecycle timestamps. Mirrors [`GhIssueActivity`] plus `merged_at`
+/// and the head branch. `merged_at` is what separates the two ways a PR ends:
+/// a PR closed unmerged has `closed_at` set and `merged_at` `None`, and must
+/// never render as a merge.
+#[derive(Serialize, PartialEq, Debug)]
+pub struct GhPrActivity {
+    pub number: u64,
+    pub title: String,
+    /// "OPEN" / "CLOSED" / "MERGED" as gh reports it.
+    pub state: String,
+    pub created_at: String,
+    /// RFC-3339 close time. Set for a merge too — GitHub closes a PR when it
+    /// merges it — so `merged_at`, not this, decides "was it merged".
+    pub closed_at: Option<String>,
+    /// RFC-3339 merge time; `None` for an open PR and for one closed unmerged.
+    pub merged_at: Option<String>,
+    pub updated_at: String,
+    pub url: String,
+    /// The PR's source (head) branch name.
+    pub head_ref: String,
+}
+
+/// Issue + PR lifecycle activity for one repo, with its own coverage boundary
+/// attached. `limit` and the `*_truncated` flags exist so the view can *say*
+/// how far back the data reaches instead of implying it covers everything (see
+/// [`ACTIVITY_LIMIT`]).
+#[derive(Serialize, PartialEq, Debug)]
+pub struct GhActivity {
+    pub issues: Vec<GhIssueActivity>,
+    pub prs: Vec<GhPrActivity>,
+    /// The per-list cap that produced these lists — reported rather than
+    /// duplicated as a frontend constant, so the two can't drift.
+    pub limit: usize,
+    /// The issue list came back full, so older activity may exist beyond it.
+    /// Deliberately conservative: a repo with exactly `limit` issues reports
+    /// truncated, because gh's page alone cannot distinguish "exactly full"
+    /// from "full and more" — over-reporting the boundary is the safe error.
+    pub issues_truncated: bool,
+    /// Same, for the PR list.
+    pub prs_truncated: bool,
+}
+
 // gh's JSON uses camelCase and nests labels as objects; these mirror it for
 // deserialization only. Extra fields (id, color, description) are ignored.
 #[derive(Deserialize)]
@@ -249,6 +322,48 @@ struct RawPr {
     labels: Vec<RawLabel>,
     #[serde(rename = "updatedAt")]
     updated_at: String,
+    url: String,
+    #[serde(rename = "headRefName", default)]
+    head_ref: String,
+}
+
+// `gh issue list --json number,title,state,createdAt,closedAt,updatedAt,url`.
+// Every field but `number` defaults, so a gh field rename degrades that one
+// column instead of failing the whole timeline load.
+#[derive(Deserialize)]
+struct RawIssueActivity {
+    number: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    state: String,
+    #[serde(rename = "createdAt", default)]
+    created_at: String,
+    #[serde(rename = "closedAt", default)]
+    closed_at: Option<String>,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: String,
+    #[serde(default)]
+    url: String,
+}
+
+// `gh pr list --json number,title,state,createdAt,closedAt,mergedAt,updatedAt,url,headRefName`.
+#[derive(Deserialize)]
+struct RawPrActivity {
+    number: u64,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    state: String,
+    #[serde(rename = "createdAt", default)]
+    created_at: String,
+    #[serde(rename = "closedAt", default)]
+    closed_at: Option<String>,
+    #[serde(rename = "mergedAt", default)]
+    merged_at: Option<String>,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: String,
+    #[serde(default)]
     url: String,
     #[serde(rename = "headRefName", default)]
     head_ref: String,
@@ -428,6 +543,31 @@ pub fn gh_pr_comment(repo: String, number: u64, body: String) -> Result<(), Stri
     let args = comment_args("pr", number, &body);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     run_gh(Some(&repo), &argv).map(|_| ())
+}
+
+/// Issue and PR *lifecycle* activity for the pane's repo — the gh half of the
+/// progress-timeline view (#608). Read-only, and the only gh command in this
+/// file that looks at closed/merged history rather than the open worklist.
+///
+/// Both lists are capped at [`ACTIVITY_LIMIT`] and ordered most-recently-active
+/// first (see [`activity_issue_args`] for why that ordering has to be pinned
+/// explicitly). The cap and whether it was hit come back in the result so the
+/// view can render its own coverage boundary.
+///
+/// One gh failure fails the whole call rather than returning a half-populated
+/// timeline: a chart silently missing every PR would look like a quiet period,
+/// which is worse than an error the view can say out loud.
+#[tauri::command]
+pub fn gh_activity(repo: String) -> Result<GhActivity, String> {
+    let issue_args = activity_issue_args(ACTIVITY_LIMIT);
+    let argv: Vec<&str> = issue_args.iter().map(String::as_str).collect();
+    let issues = parse_issue_activity(&run_gh(Some(&repo), &argv)?)?;
+
+    let pr_args = activity_pr_args(ACTIVITY_LIMIT);
+    let argv: Vec<&str> = pr_args.iter().map(String::as_str).collect();
+    let prs = parse_pr_activity(&run_gh(Some(&repo), &argv)?)?;
+
+    Ok(assemble_activity(issues, prs, ACTIVITY_LIMIT))
 }
 
 /// Create any allow-listed label in `labels` that the repo doesn't already
@@ -692,6 +832,117 @@ fn parse_pr_list(json: &str) -> Result<Vec<GhPr>, String> {
             head_ref: r.head_ref,
         })
         .collect())
+}
+
+/// Build the `gh issue list` argv for [`gh_activity`].
+///
+/// The `--search sort:updated-desc` pin is the load-bearing part. `gh issue
+/// list` / `gh pr list` return items in issue-NUMBER descending order — i.e.
+/// newest-*created* first, not newest-*active* first (verified against gh
+/// 2.95.0: a listing of this repo came back 633, 632, 628, 625, 622 with
+/// non-monotonic `updatedAt`). Without the pin, a 12-hour window would silently
+/// omit an old issue closed minutes ago as soon as `--limit` newer issues
+/// exist — precisely the events a progress timeline is for. Sorting by activity
+/// instead makes the page "the N most recently touched items", so the newest
+/// window is always the covered one.
+///
+/// `--state all` is likewise required: the default (`open`) has no close/merge
+/// events in it at all.
+fn activity_issue_args(limit: usize) -> Vec<String> {
+    vec![
+        "issue".into(),
+        "list".into(),
+        "--state".into(),
+        "all".into(),
+        "--search".into(),
+        "sort:updated-desc".into(),
+        "--json".into(),
+        "number,title,state,createdAt,closedAt,updatedAt,url".into(),
+        "--limit".into(),
+        limit.to_string(),
+    ]
+}
+
+/// Build the `gh pr list` argv for [`gh_activity`]. Same ordering/state pin as
+/// [`activity_issue_args`], plus `mergedAt` and `headRefName`.
+fn activity_pr_args(limit: usize) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "list".into(),
+        "--state".into(),
+        "all".into(),
+        "--search".into(),
+        "sort:updated-desc".into(),
+        "--json".into(),
+        "number,title,state,createdAt,closedAt,mergedAt,updatedAt,url,headRefName".into(),
+        "--limit".into(),
+        limit.to_string(),
+    ]
+}
+
+/// Normalize an optional gh timestamp to "absent" for the values that mean
+/// absent but aren't `null`: an empty string, and Go's zero time
+/// (`0001-01-01T00:00:00Z`), which gh has emitted for unset timestamps. Both
+/// would otherwise become a real-looking event plotted at the far left of the
+/// axis — the "never plot a fake instant" rule this view is built on.
+fn absent_ts(ts: Option<String>) -> Option<String> {
+    ts.filter(|s| !s.trim().is_empty() && !s.starts_with("0001-01-01"))
+}
+
+/// Parse `gh issue list --json …` (the activity field set) into
+/// `GhIssueActivity`s.
+fn parse_issue_activity(json: &str) -> Result<Vec<GhIssueActivity>, String> {
+    let raw: Vec<RawIssueActivity> =
+        serde_json::from_str(json).map_err(|e| format!("gh issue list (activity): bad JSON: {e}"))?;
+    Ok(raw
+        .into_iter()
+        .map(|r| GhIssueActivity {
+            number: r.number,
+            title: r.title,
+            state: r.state,
+            created_at: r.created_at,
+            closed_at: absent_ts(r.closed_at),
+            updated_at: r.updated_at,
+            url: r.url,
+        })
+        .collect())
+}
+
+/// Parse `gh pr list --json …` (the activity field set) into `GhPrActivity`s.
+fn parse_pr_activity(json: &str) -> Result<Vec<GhPrActivity>, String> {
+    let raw: Vec<RawPrActivity> =
+        serde_json::from_str(json).map_err(|e| format!("gh pr list (activity): bad JSON: {e}"))?;
+    Ok(raw
+        .into_iter()
+        .map(|r| GhPrActivity {
+            number: r.number,
+            title: r.title,
+            state: r.state,
+            created_at: r.created_at,
+            closed_at: absent_ts(r.closed_at),
+            merged_at: absent_ts(r.merged_at),
+            updated_at: r.updated_at,
+            url: r.url,
+            head_ref: r.head_ref,
+        })
+        .collect())
+}
+
+/// Assemble the two lists into a [`GhActivity`], stamping the coverage
+/// boundary. Split out from the command so the truncation rule is unit-tested
+/// without a real `gh`.
+fn assemble_activity(
+    issues: Vec<GhIssueActivity>,
+    prs: Vec<GhPrActivity>,
+    limit: usize,
+) -> GhActivity {
+    GhActivity {
+        issues_truncated: issues.len() >= limit,
+        prs_truncated: prs.len() >= limit,
+        issues,
+        prs,
+        limit,
+    }
 }
 
 /// Pull the account name out of `gh auth status` text. Handles both the current
@@ -1190,6 +1441,191 @@ mod tests {
             gh_issue_create("C:/nonexistent".to_string(), "   ".to_string(), "b".to_string())
                 .unwrap_err();
         assert!(err.contains("empty issue title"), "got: {err}");
+    }
+
+    // ----- gh_activity (#608 progress timeline) -----
+
+    // A faithful `gh issue list --state all --json …` blob for the activity
+    // field set: one open issue (closedAt null) and one closed one.
+    const ISSUE_ACTIVITY_FIXTURE: &str = r#"[
+      {"number":608,"title":"Workflow visualization pane","state":"OPEN",
+       "createdAt":"2026-07-31T12:00:00Z","closedAt":null,
+       "updatedAt":"2026-08-01T17:00:00Z",
+       "url":"https://github.com/willem445/loomux/issues/608"},
+      {"number":590,"title":"A pane cannot take a notice","state":"CLOSED",
+       "createdAt":"2026-07-30T09:00:00Z","closedAt":"2026-08-01T16:30:00Z",
+       "updatedAt":"2026-08-01T16:30:00Z",
+       "url":"https://github.com/willem445/loomux/issues/590"}
+    ]"#;
+
+    #[test]
+    fn parse_issue_activity_keeps_open_and_closed_instants_apart() {
+        let issues = parse_issue_activity(ISSUE_ACTIVITY_FIXTURE).unwrap();
+        assert_eq!(issues.len(), 2);
+        // An open issue contributes exactly one point (opened) — a null
+        // closedAt must stay absent, never become a bogus close event.
+        assert_eq!(issues[0].number, 608);
+        assert_eq!(issues[0].created_at, "2026-07-31T12:00:00Z");
+        assert_eq!(issues[0].closed_at, None);
+        assert_eq!(issues[0].updated_at, "2026-08-01T17:00:00Z");
+        assert_eq!(issues[0].state, "OPEN");
+        // A closed issue contributes two points at two different instants.
+        assert_eq!(issues[1].created_at, "2026-07-30T09:00:00Z");
+        assert_eq!(issues[1].closed_at.as_deref(), Some("2026-08-01T16:30:00Z"));
+    }
+
+    // `gh pr list --state all --json …`: an open PR, a merged one, and — the
+    // case that matters — one CLOSED WITHOUT MERGING.
+    const PR_ACTIVITY_FIXTURE: &str = r#"[
+      {"number":643,"title":"Slice A","state":"OPEN",
+       "createdAt":"2026-08-01T17:00:00Z","closedAt":null,"mergedAt":null,
+       "updatedAt":"2026-08-01T17:51:30Z",
+       "url":"https://github.com/willem445/loomux/pull/643","headRefName":"feat/608-viz-slice-a"},
+      {"number":638,"title":"multi-row mask","state":"MERGED",
+       "createdAt":"2026-08-01T15:00:00Z","closedAt":"2026-08-01T17:31:40Z",
+       "mergedAt":"2026-08-01T17:31:40Z","updatedAt":"2026-08-01T17:31:40Z",
+       "url":"https://github.com/willem445/loomux/pull/638","headRefName":"harden/632"},
+      {"number":639,"title":"abandoned attempt","state":"CLOSED",
+       "createdAt":"2026-08-01T14:00:00Z","closedAt":"2026-08-01T17:00:55Z",
+       "mergedAt":null,"updatedAt":"2026-08-01T17:01:04Z",
+       "url":"https://github.com/willem445/loomux/pull/639","headRefName":"spike/639"}
+    ]"#;
+
+    #[test]
+    fn parse_pr_activity_never_reads_a_closed_pr_as_merged() {
+        let prs = parse_pr_activity(PR_ACTIVITY_FIXTURE).unwrap();
+        assert_eq!(prs.len(), 3);
+        // Open: neither ending happened yet.
+        assert_eq!(prs[0].closed_at, None);
+        assert_eq!(prs[0].merged_at, None);
+        assert_eq!(prs[0].head_ref, "feat/608-viz-slice-a");
+        // Merged: GitHub closes a PR when it merges it, so BOTH are set — the
+        // timeline must key "merged" off merged_at, and it is present.
+        assert_eq!(prs[1].merged_at.as_deref(), Some("2026-08-01T17:31:40Z"));
+        assert_eq!(prs[1].closed_at.as_deref(), Some("2026-08-01T17:31:40Z"));
+        // Closed unmerged: closed_at set, merged_at absent. Reading state or
+        // closed_at as "merged" would invent a merge that never happened —
+        // this is the whole reason mergedAt is in the pinned field set.
+        assert_eq!(prs[2].closed_at.as_deref(), Some("2026-08-01T17:00:55Z"));
+        assert_eq!(prs[2].merged_at, None);
+    }
+
+    #[test]
+    fn activity_parsers_treat_placeholder_timestamps_as_absent() {
+        // gh has emitted Go's zero time for an unset timestamp instead of null,
+        // and an empty string is equally "not a time". Either would plot as a
+        // real event at year 1 — a merge that never happened, at the far left
+        // of the axis. Both must decode to None.
+        let json = r#"[{"number":1,"title":"t","state":"OPEN",
+           "createdAt":"2026-08-01T10:00:00Z","closedAt":"0001-01-01T00:00:00Z",
+           "mergedAt":"","updatedAt":"2026-08-01T10:00:00Z","url":"u","headRefName":"h"}]"#;
+        let prs = parse_pr_activity(json).unwrap();
+        assert_eq!(prs[0].closed_at, None);
+        assert_eq!(prs[0].merged_at, None);
+    }
+
+    #[test]
+    fn activity_parsers_survive_a_missing_optional_field() {
+        // A gh field rename must cost that one column, not the whole timeline:
+        // an entry with no createdAt/updatedAt still parses, leaving empty
+        // strings the frontend parks as "undatable" rather than plotting.
+        let issues = parse_issue_activity(r#"[{"number":7,"state":"OPEN"}]"#).unwrap();
+        assert_eq!(issues[0].number, 7);
+        assert_eq!(issues[0].created_at, "");
+        assert_eq!(issues[0].closed_at, None);
+    }
+
+    #[test]
+    fn activity_parsers_handle_empty_and_garbage() {
+        assert!(parse_issue_activity("[]").unwrap().is_empty());
+        assert!(parse_pr_activity("[]").unwrap().is_empty());
+        assert!(parse_issue_activity("not json").is_err());
+        assert!(parse_pr_activity("not json").is_err());
+    }
+
+    #[test]
+    fn activity_args_pin_state_all_and_activity_ordering() {
+        // Both pins are load-bearing and neither is gh's default:
+        //  - `--state all`: the default `open` contains no close/merge events,
+        //    so a timeline built on it can only ever show openings.
+        //  - `sort:updated-desc`: gh lists by issue NUMBER descending (newest
+        //    CREATED first). Without this, an old issue closed minutes ago
+        //    falls off the page as soon as `--limit` newer items exist — it
+        //    would silently vanish from the default 12h window.
+        for args in [activity_issue_args(100), activity_pr_args(100)] {
+            let pos = |flag: &str| args.iter().position(|a| a == flag);
+            let value_after = |flag: &str| pos(flag).and_then(|i| args.get(i + 1)).cloned();
+            assert_eq!(value_after("--state").as_deref(), Some("all"), "{args:?}");
+            assert_eq!(
+                value_after("--search").as_deref(),
+                Some("sort:updated-desc"),
+                "{args:?}"
+            );
+            assert_eq!(value_after("--limit").as_deref(), Some("100"), "{args:?}");
+        }
+        // The pinned field sets: the timestamps a time axis plots must be
+        // requested, or every event silently decodes to absent.
+        let json_fields = |args: Vec<String>| {
+            args.iter()
+                .position(|a| a == "--json")
+                .and_then(|i| args.get(i + 1))
+                .expect("--json must carry a field set")
+                .clone()
+        };
+        let issue_fields = json_fields(activity_issue_args(1));
+        for f in ["number", "createdAt", "closedAt", "updatedAt", "url"] {
+            assert!(issue_fields.contains(f), "issue --json missing {f}");
+        }
+        let pr_fields = json_fields(activity_pr_args(1));
+        for f in ["createdAt", "closedAt", "mergedAt", "updatedAt", "headRefName"] {
+            assert!(pr_fields.contains(f), "pr --json missing {f}");
+        }
+        // Subcommands, so the two argv builders can't be swapped unnoticed.
+        assert_eq!(activity_issue_args(1)[0], "issue");
+        assert_eq!(activity_pr_args(1)[0], "pr");
+    }
+
+    #[test]
+    fn assemble_activity_reports_the_cap_it_hit() {
+        // Under the cap: nothing is hidden, so nothing is claimed to be.
+        let short = assemble_activity(vec![], vec![], 2);
+        assert_eq!(short.limit, 2);
+        assert!(!short.issues_truncated);
+        assert!(!short.prs_truncated);
+
+        // A full page means older activity may exist past it. Reporting that is
+        // the whole point — a chart that looks complete when it isn't is the
+        // "no silent caps" failure this repo has been burned by.
+        let issue = |n: u64| GhIssueActivity {
+            number: n,
+            title: String::new(),
+            state: "OPEN".into(),
+            created_at: "2026-08-01T00:00:00Z".into(),
+            closed_at: None,
+            updated_at: "2026-08-01T00:00:00Z".into(),
+            url: String::new(),
+        };
+        let full = assemble_activity(vec![issue(1), issue(2)], vec![], 2);
+        assert!(full.issues_truncated, "a full page must report its boundary");
+        // The two lists are bounded independently — a full issue page says
+        // nothing about the PR page.
+        assert!(!full.prs_truncated);
+        assert_eq!(full.issues.len(), 2);
+    }
+
+    #[test]
+    fn activity_limit_is_the_value_the_frontend_is_told() {
+        // The cap crosses the wire (GhActivity::limit) instead of being
+        // duplicated as a frontend constant, so the coverage note the view
+        // renders can never disagree with the query that produced the data.
+        let args = activity_issue_args(ACTIVITY_LIMIT);
+        let limit_arg = args
+            .iter()
+            .position(|a| a == "--limit")
+            .and_then(|i| args.get(i + 1))
+            .unwrap();
+        assert_eq!(limit_arg, &ACTIVITY_LIMIT.to_string());
+        assert_eq!(assemble_activity(vec![], vec![], ACTIVITY_LIMIT).limit, ACTIVITY_LIMIT);
     }
 
     #[test]
