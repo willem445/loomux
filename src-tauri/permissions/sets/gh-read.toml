@@ -7,4 +7,5 @@ permissions = [
     "allow-gh-issue-view",
     "allow-gh-pr-list",
     "allow-gh-pr-view",
+    "allow-gh-activity",
 ]
