@@ -104,3 +104,23 @@ commit a reformatting, and never cite a clean run as validation: it catches no t
 unresolved name, not even a `format!` with the wrong argument count. `cargo check` stays
 banned and this argument does not reach it — it writes dependency metadata to `target/`, which
 is exactly the cost #488 banned.
+
+## Never block a turn waiting on CI — the resolution is queued behind the turn
+
+A `[loomux] …` notice is delivered by *typing into a pane*, and a pane that is mid-turn cannot
+take a delivery. So a turn that blocks waiting on CI is waiting for something whose resolution
+is queued behind the turn itself: it cannot resolve, by construction, however long you leave it.
+A worker on #577 did both halves at once — it registered a `notify_when` CI watch (right) and
+*also* blocked its turn on a shell-level wait for checks on the new head (fatal). Two merges had
+landed underneath it, so the PR was `CONFLICTING` and GitHub was never going to create the
+check-suites that wait was blocked on, while the watch's own CONFLICTING notice — which #337
+built for exactly this case — sat undeliverable behind the blocked turn. 20+ minutes, broken by
+the host watchdog plus a human reading the pane by hand (#590).
+
+The rule, which `orchestrator.md` had carried for weeks and the delegate templates never got:
+**register the watch, end the turn, act on the notice.** Reading a state once is fine; *waiting*
+is the defect. It generalizes past CI — anything whose answer arrives as a pane delivery
+(another agent, a human, a long remote job) is a condition you must not hold a pane open for. It
+sits beside *any suppression driven by a fallible signal must be BOUNDED* above and is stricter
+than it: a bound would only have shortened this hold, because the wait's own resolution channel
+stayed blocked for as long as the wait ran. Don't wait at all.

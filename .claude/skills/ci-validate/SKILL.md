@@ -168,19 +168,34 @@ iteration:
    gh pr checks <pr>
    gh run view <run-id> --log-failed   # when a check failed, to see why
    ```
-4. **Watch without polling.** If a loomux `notify_when` MCP tool is
-   available, register it and go idle instead of checking in a loop:
+4. **Never block the turn on the checks — register, end the turn, act on the
+   notice.** With loomux's `notify_when` MCP tool available:
    ```
    notify_when(kind: "pr_checks", pr: <pr>)
    ```
-   loomux polls on your behalf and types a `[loomux] …` notice into your pane
-   when the checks resolve. If `notify_when` isn't available in this
-   environment, poll `gh pr checks <pr>` yourself at a slow cadence —
-   **60 seconds or slower, never a tight loop.** A PR that goes `CONFLICTING`
-   never gets checks at all — GitHub creates no check-suite with no clean
-   merge ref to run against — so the watch resolves right away with a
-   distinct "is CONFLICTING" notice instead of hanging toward expiry; that
-   means rebase, not "still waiting on CI".
+   …then **end your turn.** loomux polls on your behalf and types a
+   `[loomux] …` notice into your pane when the checks resolve.
+
+   Waiting for that result in the same turn is a **deadlock**, not merely
+   slow: the notice is delivered by typing into the pane, and a pane that is
+   mid-turn cannot take a delivery, so the turn waits on a resolution queued
+   behind itself. It has already cost 20+ minutes and a human to break
+   (#590/#577). So: **no `sleep`, no `gh pr checks --watch`, no poll loop, no
+   shell command that blocks until CI finishes.** A single instantaneous
+   `gh pr checks <pr>` to see where things stand is fine — it is *waiting*
+   that is banned, not looking.
+
+   A PR that goes `CONFLICTING` never gets checks at all — GitHub creates no
+   check-suite with no clean merge ref to run against — so no amount of
+   waiting produces them; the watch resolves right away with a distinct "is
+   CONFLICTING" notice instead of hanging toward expiry, and that means
+   rebase, not "still waiting on CI". That notice is also the *only* way you
+   find out, which is exactly what a blocked turn suppresses.
+
+   Only where `notify_when` genuinely isn't available — no loomux pane, so
+   nothing is being delivered to you and nothing can deadlock — poll
+   `gh pr checks <pr>` yourself at **60 seconds or slower, never a tight
+   loop.**
 5. **Iterate by pushing fixes.** Between pushes, the local steps available to
    you are the frontend ones and `rustfmt --check` (above) — never a cargo
    build or test, and neither is the thing you cite as passing.

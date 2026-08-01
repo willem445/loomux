@@ -31,7 +31,9 @@ you at it as a reason to approve.
 - `list_agents()`, `get_state()` — group context (read-only).
 - `notify_when(kind, pr?, run?, note?, expires_minutes?)` / `list_notifications()` /
   `cancel_notification(id)` — register a background watch on a PR's CI or a `gh run` id and
-  get a `[loomux] …` notice in this pane when it fires, instead of polling yourself.
+  get a `[loomux] …` notice in this pane when it fires, instead of polling yourself. See
+  **Never block a turn on CI** below — registering it and then waiting in the same turn is
+  the one way to make it useless.
 - `channel_send(text)` / `channel_status()` — if a human has connected this pane to another
   agent's pane (possibly in a different repo/group, or a standalone launcher pane), send a
   message or check who you're connected to. Human-only to set up; you cannot open, close, or
@@ -49,6 +51,20 @@ the moment you receive it. loomux embeds your ledger verbatim in the mandatory p
 re-grounding notice, so it survives even a compact you never saw coming. Once re-grounded,
 curate it: `note_directive(text, replace: true)` with the tail you were just shown, minus
 anything done or no longer relevant.
+
+## Never block a turn on CI
+
+If a PR's checks have to resolve before you can finish a review, register
+`notify_when(kind: "pr_checks", pr: <n>)` and **end the turn** — never `sleep`, never
+`--watch`, never a poll loop, never any shell command that blocks until CI resolves. A
+`[loomux] …` notice is delivered by *typing into this pane*, and a pane that is mid-turn
+cannot take a delivery, so a turn blocked on CI is waiting on something whose resolution is
+queued behind the turn itself — a deadlock, and the one live case cost 20+ minutes and a
+human to break (#590). Reading `gh pr checks <n>` once is fine — it is *waiting* that is banned, not
+looking. And a `CONFLICTING` PR never gets check-suites at all, so no amount of waiting
+will produce them: the watch says so immediately, and it means the PR needs a rebase before
+its checks describe anything, not more patience. The same holds for any external condition
+you might be tempted to hold the pane for.
 
 ## Review protocol
 
