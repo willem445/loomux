@@ -24677,6 +24677,16 @@ fn a_genuinely_stranded_pane_still_gets_the_notice() {
 //   C/D. `question_shown` combines the readings ONE-DIRECTIONALLY — the ring
 //      triggers, the grid may only release.
 
+/// Raw pty bytes for a sequence of painted lines.
+///
+/// `\r\n`, not `\n`, and it is load-bearing rather than pedantic: a bare LF is
+/// an INDEX — down one row, column untouched — so a fixture written with `\n`
+/// staircases every line rightward across the grid and composes into something
+/// no terminal would ever show. A pty emits CRLF; so does this.
+fn painted(lines: &[&str]) -> Vec<u8> {
+    lines.iter().flat_map(|l| format!("{l}\r\n").into_bytes()).collect()
+}
+
 /// A pane's two readings built from ONE raw stream, exactly as
 /// `question_sample` does in production: the grid replays everything, the ring
 /// is the trailing window the detector has always used.
@@ -24700,11 +24710,9 @@ fn sample_from_raw(raw: &[u8], cols: u16, rows: u16) -> QuestionSample {
 /// screen, so there is nothing for the grid to notice. Nine lines total sits
 /// in both windows.
 fn scrolled_off_question() -> Vec<u8> {
-    let mut raw = b"Do you want to run npm test? (y/n)\n".to_vec();
-    for i in 0..8 {
-        raw.extend_from_slice(format!("running step {i}\n").as_bytes());
-    }
-    raw
+    let mut lines = vec!["Do you want to run npm test? (y/n)".to_string()];
+    lines.extend((0..8).map(|i| format!("running step {i}")));
+    painted(&lines.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 // ---- A. render_visible: rendered rows only ----
@@ -24737,9 +24745,9 @@ fn a2_render_visible_excludes_the_primary_screen_parked_behind_an_alt_screen() {
     // wants the context a pager covers). It is by definition NOT displayed, so
     // a "still on screen" reading must not see it — a second exclusion, which
     // a naive `grid + parked` render would miss even with history dropped.
-    let mut raw = b"Do you want to proceed?\n".to_vec();
+    let mut raw = painted(&["Do you want to proceed?"]);
     raw.extend_from_slice(b"\x1b[?1049h"); // enter alt screen
-    raw.extend_from_slice(b"PAGER LINE ONE\nPAGER LINE TWO\n");
+    raw.extend_from_slice(&painted(&["PAGER LINE ONE", "PAGER LINE TWO"]));
 
     let history_included = loomux_lib::orchestration::termgrid::render_screen(&raw, 80, 10);
     let visible_only = loomux_lib::orchestration::termgrid::render_visible(&raw, 80, 10);
@@ -24758,7 +24766,7 @@ fn a2_render_visible_excludes_the_primary_screen_parked_behind_an_alt_screen() {
 #[test]
 fn a3_render_visible_keeps_a_dialog_that_is_still_on_screen() {
     // The other half of A1: absence only means something if presence survives.
-    let raw = b"building...\nDo you want to run npm test? (y/n)\n".to_vec();
+    let raw = painted(&["building...", "Do you want to run npm test? (y/n)"]);
     let visible = loomux_lib::orchestration::termgrid::render_visible(&raw, 80, 6);
     assert!(visible.contains("(y/n)"), "a dialog on screen must render as on screen");
 }
@@ -24768,9 +24776,9 @@ fn a4_render_visible_drops_a_dialog_the_cli_erased_in_place() {
     // The case a byte ring can NEVER see: the CLI answers its own question and
     // repaints over it without scrolling. Nothing leaves the ring; everything
     // leaves the screen.
-    let mut raw = b"Do you want to run npm test? (y/n)\n".to_vec();
+    let mut raw = painted(&["Do you want to run npm test? (y/n)"]);
     raw.extend_from_slice(b"\x1b[2J\x1b[H"); // erase display, cursor home
-    raw.extend_from_slice(b"> \n(idle)\n");
+    raw.extend_from_slice(&painted(&["> ", "(idle)"]));
     let visible = loomux_lib::orchestration::termgrid::render_visible(&raw, 80, 10);
     assert!(!visible.contains("(y/n)"), "an in-place erase removes it from the screen");
     assert!(visible.contains("(idle)"), "and leaves what the CLI painted instead");
@@ -24960,7 +24968,7 @@ fn c7_a_blank_composition_is_unreadable_not_clear() {
 #[test]
 fn d1_a_live_question_still_rendered_never_releases() {
     // Both readings agree; poll it as often as you like.
-    let raw = b"building the project\nDo you want to run npm test? (y/n)\n".to_vec();
+    let raw = painted(&["building the project", "Do you want to run npm test? (y/n)"]);
     let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 80, 10), None, None);
     for i in 0..5 {
         assert!(pred(), "poll {i}: the dialog is on screen — must hold");
@@ -24987,9 +24995,10 @@ fn d3_an_answered_question_erased_in_place_releases_after_the_hysteresis() {
     // A hold that genuinely started, then the CLI repaints over its own
     // dialog. Release must STILL take two consecutive clear reads — the grid
     // is new evidence, not a shortcut past rev-19 R1's transient-redraw guard.
-    let live = b"Do you want to run npm test? (y/n)\nchoose an option\n".to_vec();
+    let live = painted(&["Do you want to run npm test? (y/n)", "choose an option"]);
     let mut answered = live.clone();
-    answered.extend_from_slice(b"\x1b[2J\x1b[Hnpm test running\nall good\n");
+    answered.extend_from_slice(b"\x1b[2J\x1b[H"); // erase display, cursor home
+    answered.extend_from_slice(&painted(&["npm test running", "all good"]));
 
     let call = std::sync::atomic::AtomicU32::new(0);
     let pred = question_hold_predicate_sampled(
@@ -25013,7 +25022,11 @@ fn d4_tui_redraw_churn_around_a_live_dialog_never_false_clears() {
     // dialog is still painted.
     let dialog = "Do you want to run npm test? (y/n)";
     let frames: Vec<Vec<u8>> = (0..6)
-        .map(|i| format!("\x1b[H\x1b[2J{dialog}\n  Yes\n  No\nworking {i}\n").into_bytes())
+        .map(|i| {
+            let mut f = b"\x1b[H\x1b[2J".to_vec(); // home, erase, repaint the frame
+            f.extend_from_slice(&painted(&[dialog, "  Yes", "  No", &format!("working {i}")]));
+            f
+        })
         .collect();
     let call = std::sync::atomic::AtomicU32::new(0);
     let pred = question_hold_predicate_sampled(
@@ -25069,11 +25082,10 @@ fn d6_our_own_pasted_text_rendered_in_the_box_is_masked_on_the_grid_too() {
     // paste and strand the delivery (rev-15 N1 / rev-19 B-A, now owed by the
     // grid too).
     let pasted = "please confirm: do you want to proceed with the deploy";
-    let mut raw = b"Overwrite the file? (y/n)\n".to_vec();
-    for i in 0..6 {
-        raw.extend_from_slice(format!("running step {i}\n").as_bytes());
-    }
-    raw.extend_from_slice(format!("{pasted}\n").as_bytes());
+    let mut lines = vec!["Overwrite the file? (y/n)".to_string()];
+    lines.extend((0..6).map(|i| format!("running step {i}")));
+    lines.push(pasted.to_string());
+    let raw = painted(&lines.iter().map(String::as_str).collect::<Vec<_>>());
 
     // Preconditions, so a fixture that drifts fails loudly instead of passing
     // for a reason this test is not about.
