@@ -150,6 +150,20 @@ side). Partial scope links as `Part of #N` / `Mitigates #N`; `Closes` is for the
 the issue outright. Worth the same post-merge check either way: after a squash, confirm the
 issues you only *mitigated* are still open.
 
+**Choosing the right keyword is not enough — the scan is textual and context-blind.** GitHub
+matches `close`/`fix`/`resolve` in any inflection immediately followed by `#N`, anywhere in the
+PR body and in every commit message a squash aggregates into its own message: inside a
+blockquote, inside a caveat, inside a sentence asking a human to do it manually. #569 was
+auto-closed a *second* time, an hour after the first, by PR #615 — which linked `Part of #569`
+deliberately, argued the choice in a blockquote, and ended it "Please close #569 by hand if you
+agree", the one construct in the whole body GitHub's scan matches (confirmed after the fact:
+`closingIssuesReferences` on #615 lists #569, and the aggregated squash message contains no
+keyword adjacent to an issue number). The habit that survives this: before opening or updating
+a `Part of` PR, grep the body *and* `git log` for keyword-next-to-`#N` and reword it ("#569
+stays open", "for the human to close out"); and whoever merges scrubs the aggregated message
+first and re-reads the partly-addressed issues after. Both halves are now in the templates
+(`worker.md` DoD item 7 for the authoring side, `orchestrator.md` for the merge side).
+
 ## A model that re-implements the algorithm proves the algorithm, not the code
 
 `queue.rs`'s `drainer_lifecycle` is an exhaustive interleaving search with a `guard_checks_generation`
@@ -174,3 +188,22 @@ guard's `Drop` has never executed in a test, and no amount of careful reading of
 would have said so. `grep` for the constructor, then ask what constructs *that*. When the answer is
 "nothing a headless test can build", the honest fix is usually to move the logic somewhere a test
 can reach (here: into a newtype with its own unit tests), not to write a more careful comment.
+
+## `/tmp` is one namespace shared by the whole fleet — scratch files go in your own worktree
+
+A worker wrote its PR body to `/tmp/body.md` and ran `gh pr edit --body-file /tmp/body.md`;
+another worker, seconds apart, had done exactly the same. PR #621 was published carrying #612's
+body (#625). It was detected and fully restored, and the other PR was undamaged — but only
+because a worker re-read its own PR afterwards. There is no lock, no error and no warning on
+this path: the second writer wins and both agents are told everything succeeded.
+
+The mechanism is structural, not a slip. Worktrees isolate the *repo*; they isolate nothing
+else on the machine, so every agent in every group shares one `/tmp` — and the filenames an
+agent reaches for (`body.md`, `notes.txt`, `review.md`) are exactly the ones every other agent
+reaches for too. Same class as the shared `.git` stash stack (#299) and the shared
+`CARGO_TARGET_DIR` that was retired for it (#263): the collision is invisible precisely because
+the shared resource looks private from inside one agent.
+
+The rule, now in `worker.md` and `reviewer.md`: temp and scratch files live under the agent's
+own worktree — `./.scratch/`, gitignored — never a bare `/tmp` name. A path only you can own
+costs nothing and removes the failure mode entirely.

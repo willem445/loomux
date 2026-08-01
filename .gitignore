@@ -8,6 +8,11 @@ playwright-report/
 .claude/worktrees/
 .claude/settings.local.json
 
+# Per-agent scratch space (#625): PR bodies, review drafts, anything an agent would
+# otherwise have written to the machine-wide /tmp, where two agents picking the same
+# obvious filename silently overwrite each other. Worktree-local and disposable.
+.scratch/
+
 # The workflow pane's canvas positions (#222): where the boxes sit, never what the
 # workflow IS. Disposable and per-developer — the workflow itself (.loomux/workflow.yml)
 # is committed, this is not.

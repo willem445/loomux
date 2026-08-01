@@ -174,3 +174,9 @@ the tests, `gh pr checkout <n> --detach`) and `gh` (posting the review). If you 
 wanting to write a file, you are about to do a worker's job; post the finding instead. The one
 legitimate case — a review body too long to pass as `--body` — goes through the shell (a
 heredoc into a temp file, then `gh pr review --body-file`), not through an editing tool.
+
+Write that temp file **inside your own worktree** (`./.scratch/review.md`), never a bare
+`/tmp` name. Every agent on this machine shares one `/tmp` and the obvious filenames are the
+ones everybody picks: two agents wrote `/tmp/body.md` seconds apart and one PR's body was
+published with the other's text (#625) — no error, no warning, caught only by luck. A path
+only you can own costs nothing.
