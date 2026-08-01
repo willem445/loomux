@@ -353,14 +353,15 @@ pub fn pr_checks_result(raw: Result<&str, &str>) -> PollResult {
     }
 }
 
-/// One `gh pr view <pr> --json mergeStateStatus` response.
+/// The mergeability half of a `gh pr view <pr> --json
+/// mergeStateStatus,headRefOid` response (`RawPrHead` below reads the other).
 #[derive(Deserialize)]
 struct RawPrMergeability {
     #[serde(rename = "mergeStateStatus")]
     merge_state_status: String,
 }
 
-/// Classify a `gh pr view <pr> --json mergeStateStatus` poll — run BEFORE
+/// Classify a `gh pr view <pr> --json mergeStateStatus,headRefOid` poll — run BEFORE
 /// `gh pr checks` for every `PrChecks` watch (#337) so a conflicted PR is
 /// caught before its checks poll ever has a chance to just sit at "no checks
 /// reported" toward expiry. `UNKNOWN` is GitHub's own "still computing
