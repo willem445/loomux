@@ -332,7 +332,8 @@ this table mirrors it.
 | Copy / paste | `Ctrl+C` (with a selection) / `Ctrl+Shift+C`, `Ctrl+Shift+V` (`Ctrl+V` also pastes by default — [Settings](#settings)) |
 
 Orchestrator panes add a few more (steering strip, task board, audit viewer,
-lifecycle panel) — those live in the [orchestration guide](orchestration.html).
+progress timeline, lifecycle panel) — those live in the
+[orchestration guide](orchestration.html).
 
 ## Stack (what a pane actually is)
 

@@ -1,15 +1,14 @@
 # Design: progress timeline (issue #608)
 
-Status: **in progress** — this note is being built up slice by slice against the
-accepted plan on
-[#608](https://github.com/willem445/loomux/issues/608#issuecomment-5151585803).
-What is written here is what has landed:
+Status: **landed** — built up slice by slice against the accepted plan on
+[#608](https://github.com/willem445/loomux/issues/608#issuecomment-5151585803):
 
 - **Slice A:** the `gh_activity` backend command and its coverage contract.
 - **Slice B:** the pure event model + layout math (`timelinemodel.ts`,
   `timelinelayout.ts`) and the `TimelineEvent` schema.
-- **Slice C (pending):** the embeddable view, pane/shortcut/persistence wiring,
-  user docs, and the `embedded-panels.md` cross-link.
+- **Slice C:** the embeddable view (`timelineview.ts` + `timelinechrome.ts`),
+  pane/shortcut/persistence wiring, user docs, and the `embedded-panels.md`
+  cross-link.
 
 ## The feature, in one paragraph
 
@@ -295,3 +294,93 @@ Nowhere in Slice B — these modules touch no terminal and no layout. The
 constraint is Slice C's: the timeline is an embeddable view (#361), floating as
 an overlay and, when docked, resizing through the same grid path every other
 embedded panel uses. See `doc/design/embedded-panels.md`.
+
+## The view (Slice C)
+
+`timelineview.ts` is DOM wiring and nothing else: SVG construction, the two
+polls, and the click handlers. Everything that can be *wrong* sits either in
+Slice B's modules or in a third pure one, `timelinechrome.ts`
+(`test/timelinechrome.test.ts`) — self-contained by the same no-intra-src-import
+rule, and holding the view decisions that are still answers rather than
+rendering:
+
+| Decision | Why it isn't view prose |
+|---|---|
+| `tickScale(stepMs)` | one format for every window is wrong in both directions: 12h-apart ticks labelled to the second are six identical strings, and a 1h window labelled `Jul 30` says nothing |
+| `laneLabel(category)` | an unknown key returns itself — `layoutTimeline` *appends* a lane it has never seen, so a category added to the model before the table catches up must render named, not blank |
+| `toggleCategory` | re-sorts into lane order (chips and lanes must agree on position) and allows the empty selection, which the view states outright rather than silently resetting to all-on |
+| `shouldRefreshGh` | gh must not be re-shelled on every 1.5 s audit tick, and a clock that jumps *backwards* must not freeze the gh layer for the rest of the session |
+| `ghUnavailableNote` | names what is missing (issue/PR points) and what still holds (audit events) — see below |
+| `ghCoverageFloorMs` / `ghFloorNote` | the precise coverage floor Slice A's `updated_at` was returned for |
+| `detailSlice` | the detail body's cap, with its remainder *reported* |
+
+### Where it lives, and what that cost
+
+A seventh `EmbedKind` (#361), not a new pane kind — the plan's argument, which
+survived contact: the data is a group's, groups live on orch panes, and a
+free-floating pane would need its own group picker for no v1 benefit. The
+engine needed no change; the whole wiring is the new kind added to `pane.ts`'s
+existing tables and switches (`EmbedKind`, `EMBED_KINDS`,
+`RESTORABLE_EMBED_KINDS`, the label/title records, `embedToggleBtn`,
+`restoreEmbeds`, `activeOverlay`, `dispose`), an `ensureTimelineView` that
+registers an `EmbedEntry`, a header button, `Alt+W`, and `"timeline"` in
+`PersistedEmbedView`.
+
+It is gated exactly like the audit log — every orchestration pane, not
+orchestrator-only, because the data is the group's and the view mutates
+nothing — and restores on the same terms: the **dock preference** survives a
+restart, the window preset and category chips do not, the same way a restored
+audit log does not restore its filters.
+
+**No new backend.** `orch_audit` and `gh_activity` both already exist, so this
+slice adds no command, no ACL entry and no manifest line. `gh_activity` goes
+through `issues.ts`'s typed wrapper; `orch_audit` is called from the view the
+same way `AuditView` and `TasksView` call their own group-scoped reads.
+
+### The PTY constraint, discharged
+
+The chart is the first embeddable view whose *content* depends on geometry, so
+this is where the constraint could have been broken. It isn't:
+`timelinelayout.ts` takes `widthPx` as a parameter (Slice B's deliberate
+shape), and the view supplies it from a `ResizeObserver` **on its own chart
+div** — never from `termEl`, never from a measured terminal, and never by
+resizing anything. Docking goes through the shared `#361` path like every other
+panel. The `ResizeObserver` coalesces into one relayout per animation frame, so
+a divider drag re-lays the chart out at most once a frame, and
+`.timeline-body` joins the `.resizing { content-visibility: hidden }` set that
+already suspends every other docked view's expensive subtree mid-drag.
+
+### Honesty, rendered
+
+Slice B wrote the sentences; this slice is where they reach a human. All of
+`coverageNotes()` renders above the chart, plus three the view adds:
+
+- **gh unavailable.** `gh_activity` fails whole rather than half (Slice A), and
+  the view keeps the audit half and says so. The sentence has to name the
+  *loss* — with no gh data, a chart with no PR dots is indistinguishable from a
+  repo where nobody opened a PR.
+- **the precise gh floor.** Where a list came back truncated, the oldest
+  `updated_at` in the page is an exact bound (the query is pinned to
+  `sort:updated-desc` for this), so the view says "complete back to *T*" rather
+  than only the vaguer cap note.
+- **lanes switched off.** A hidden category is still loaded; the note says so,
+  so an empty-looking chart is never a filter the human forgot about.
+
+The detail body's cap reports its remainder for the same reason. A cluster dot
+is labelled with its TRUE count, so a body that quietly stopped at 50 rows
+would contradict the dot beside it.
+
+### Two small view decisions worth the ink
+
+**A clicked cluster is remembered as *what* it was, not *where*.**
+`LayoutDot.indices` point into the array passed to `layoutTimeline`, which the
+next follow poll invalidates. The selection is therefore held as (lane, first
+instant, last instant) and re-resolved on every render — so a 1.5 s poll cannot
+silently swap the open detail body for a different set of events.
+
+**A no-op render is skipped.** The render signature covers the data, the
+window, the chips, the measured width and the selection — the same reason the
+audit view has one: rebuilding the SVG under a human's cursor (collapsing an
+open row, dropping a hover) for identical data is fighting the human. The
+window's end is quantized to the minute inside that signature, so a still
+session does not rebuild forty times a minute just because "now" moved.

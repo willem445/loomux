@@ -136,7 +136,8 @@ enforced at the CLI level.
   them over the terminal, or **dock** up to three of them beside it (left, right,
   bottom) with a draggable divider.
 - **Audit everything** — every prompt, spawn, gate decision and toggle change is
-  one filterable row in the group's audit log.
+  one filterable row in the group's audit log, or one dot on a progress timeline
+  that plots it alongside the repo's issue and PR history.
 - **Lessons that outlive a session** — a committed `.loomux/lessons.md` feeds
   hard-won repo knowledge into the next orchestrator's kickoff.
 
