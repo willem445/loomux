@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gh-activity"
+description = "Enables the gh_activity command without any pre-configured scope."
+commands.allow = ["gh_activity"]
+
+[[permission]]
+identifier = "deny-gh-activity"
+description = "Denies the gh_activity command without any pre-configured scope."
+commands.deny = ["gh_activity"]

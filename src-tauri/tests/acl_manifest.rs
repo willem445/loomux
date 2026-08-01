@@ -5,16 +5,16 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_132`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_133`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
 //!     than trusting a hand count.
-//!   - `main_has_all_132_and_zero_permission_denies_dangerous_spread`: builds
+//!   - `main_has_all_133_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 132 commands against the `main` window label, and invokes
+//!     invokes all 133 commands against the `main` window label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `plugin-zero-template` window label (see
 //!     `capabilities/plugin-zero-template.json`). This is both the coherence
@@ -23,7 +23,7 @@
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_132_and_zero_permission_denies_dangerous_spread` fail with
+//! `main_has_all_133_and_zero_permission_denies_dangerous_spread` fail with
 //! `main is missing a grant for: ["orch_grant_merge"]`.
 
 // Stub commands: same bare identifiers as the real commands in
@@ -57,7 +57,7 @@ stub_commands!(
     git_checkout, git_discard, git_worktree_add, git_worktree_list, git_fetch, git_push, git_pull, git_tag,
     git_branch_create, git_cherry_pick, git_revert, git_merge, git_rebase, git_branches,
     gh_auth_status, gh_issue_list, gh_issue_create, gh_issue_set_labels, gh_issue_view, gh_issue_comment,
-    gh_pr_list, gh_pr_view, gh_pr_comment,
+    gh_pr_list, gh_pr_view, gh_pr_comment, gh_activity,
     git_watch, git_unwatch,
     agent_autopilot_flags, create_orchestration, bind_agent, orch_agent_renamed, orch_session_roles,
     resume_orch_session, orch_tasks, orch_audit, orch_steer, orch_save_attachment, orch_upsert_task,
@@ -156,11 +156,11 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_132() {
+fn app_commands_len_is_133() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        132,
-        "APP_COMMANDS drifted from the expected count of 132 (120 per the #363 plan's audited \
+        133,
+        "APP_COMMANDS drifted from the expected count of 133 (120 per the #363 plan's audited \
          count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for \
          orch_set_advanced_orchestrator/orch_workflow_status added in #316/#355, +3 for \
          orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles/ \
@@ -169,13 +169,14 @@ fn app_commands_len_is_132() {
          orch_set_compact_nudge_min_context_percent — the min-context floor added by a benchtest \
          finding on #405/#332, +1 for record_copilot_launch_posture added in #456, +1 for \
          record_claude_launch_posture added in #457, +1 for orch_approve_tasks — bulk board \
-         approvals added in #507) — if this is an intentional \
+         approvals added in #507, +1 for gh_activity — issue/PR lifecycle \
+         timestamps for the progress-timeline view added in #608) — if this is an intentional \
          addition/removal, update this tripwire's count too"
     );
 }
 
 #[test]
-fn main_has_all_132_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_133_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();

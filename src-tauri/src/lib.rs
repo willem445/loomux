@@ -127,6 +127,7 @@ pub fn run() {
             gh::gh_pr_list,
             gh::gh_pr_view,
             gh::gh_pr_comment,
+            gh::gh_activity,
             gitwatch::git_watch,
             gitwatch::git_unwatch,
             orchestration::agent_autopilot_flags,

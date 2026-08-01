@@ -54,7 +54,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "git_merge",
     "git_rebase",
     "git_branches",
-    // gh (9)
+    // gh (10)
     "gh_auth_status",
     "gh_issue_list",
     "gh_issue_create",
@@ -64,6 +64,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "gh_pr_list",
     "gh_pr_view",
     "gh_pr_comment",
+    "gh_activity",
     // gitwatch (2)
     "git_watch",
     "git_unwatch",

@@ -131,3 +131,64 @@ export const ghPrComment = (
   number: number,
   body: string
 ): Promise<void> => invoke("gh_pr_comment", { repo, number, body });
+
+/** One issue's lifecycle timestamps for the progress-timeline view (#608).
+ *  Distinct from GhIssue, which is the issues-view row (open-state only,
+ *  `updated_at` alone): a time axis plots when something *happened*, so this
+ *  carries the opened/closed instants. All timestamps are RFC-3339 strings —
+ *  parse with `Date.parse`; an unparseable one (see `created_at`) is parked as
+ *  "undatable", never plotted at the epoch. */
+export interface GhIssueActivity {
+  number: number;
+  title: string;
+  /** "OPEN" | "CLOSED". */
+  state: string;
+  /** Open time. Empty when gh omitted it — treat as undatable, not as 1970. */
+  created_at: string;
+  /** Close time; null while the issue is open. */
+  closed_at: string | null;
+  /** Last-activity time — the key the list is sorted by, and what gives the
+   *  precise coverage floor when the list is truncated: nothing omitted was
+   *  active more recently than the oldest row here. */
+  updated_at: string;
+  url: string;
+}
+
+/** One PR's lifecycle timestamps. Mirrors GhIssueActivity plus `merged_at` and
+ *  the head branch. GitHub closes a PR when it merges it, so a merged PR has
+ *  BOTH `closed_at` and `merged_at`: key "merged" off `merged_at` only, or a PR
+ *  closed unmerged renders as a merge that never happened. */
+export interface GhPrActivity {
+  number: number;
+  /** "OPEN" | "CLOSED" | "MERGED". */
+  state: string;
+  title: string;
+  created_at: string;
+  closed_at: string | null;
+  /** Merge time; null for an open PR and for one closed unmerged. */
+  merged_at: string | null;
+  updated_at: string;
+  url: string;
+  head_ref: string;
+}
+
+/** Issue + PR lifecycle activity for one repo, carrying its own coverage
+ *  boundary. Each list is capped at `limit` server-side; when the matching
+ *  `*_truncated` flag is set, older activity exists beyond what's here and the
+ *  view MUST say so — a timeline that looks complete when it isn't is the
+ *  failure this feature is most exposed to. `limit` crosses the wire rather
+ *  than being duplicated here so the note can't drift from the query. */
+export interface GhActivity {
+  issues: GhIssueActivity[];
+  prs: GhPrActivity[];
+  limit: number;
+  issues_truncated: boolean;
+  prs_truncated: boolean;
+}
+
+/** Issue/PR lifecycle activity for `repo`, most-recently-active first — the gh
+ *  half of the progress-timeline view. Read-only. Rejects if `gh` fails, rather
+ *  than resolving with half the timeline: a silently absent PR list reads as a
+ *  quiet period, which is worse than an error the view can render. */
+export const ghActivity = (repo: string): Promise<GhActivity> =>
+  invoke("gh_activity", { repo });
