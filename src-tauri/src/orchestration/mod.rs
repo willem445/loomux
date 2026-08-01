@@ -12941,12 +12941,12 @@ fn run_queue_drainer(
         // runs: a pause is not a stuck pane, and escalating one as though it
         // were would badge the human about a state they set themselves.
         //
-        // Deliberately AFTER `commit_exit`, so a paused pane with an empty
-        // queue still exits its drainer instead of polling for the whole
-        // pause; and BEFORE the liveness checks' effects are undone by
-        // nothing — a pane whose agent died mid-pause is caught by those
-        // checks above and its queue is dropped and announced through the
-        // ordinary `AgentDied` path, not silently retained forever.
+        // Placed AFTER the liveness checks and `commit_exit`, which is what
+        // makes those two still reachable during a pause: an empty paused
+        // queue exits its drainer rather than polling for the whole pause,
+        // and a pane whose agent died mid-pause has its queue dropped and
+        // announced through the ordinary `AgentDied` path instead of being
+        // retained forever with nothing left to look at it.
         //
         // Reached at all only because `deliver_prompt`'s pause branch is not
         // the sole way a drainer starts: `readmit_recovered` kicks one when a
@@ -17576,7 +17576,7 @@ impl OrchRegistry {
         // none did is the unbacked-claim defect `.loomux/lessons.md` catalogues
         // — the log is the only record a reader will ever have of this moment.
         self.audit(group, "loomux", "pause-flush", json!({
-            "panes": panes,
+            "panes": &panes,
             "started": app.is_some() && reg.is_some(),
         }));
         if let (Some(app), Some(reg)) = (app, reg) {
@@ -27028,14 +27028,18 @@ impl OrchRegistry {
         // hold anything, and the honest answer is the same `Err` an unpaused
         // delivery to that same agent already gets. Pre-#569 it returned `Ok`
         // — a success for a payload that was simply discarded.
+        //
+        // The `prompt` audit line is the SAME one the unpaused path writes,
+        // in the same position relative to admission — because a pause-held
+        // delivery is an ordinary delivery now. What distinguishes it lives
+        // where it belongs: the `delivery-queued` line's `reason`.
+        self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
         if self.is_paused(&a.group) {
-            self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
             self.enqueue_text(
                 &a.group, agent_id, from, text, pty_id, queue::EnqueueReason::GroupPaused,
             )?;
             return Ok(());
         }
-        self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
 
         // #470: `Arrival` regardless of whether this lands alone or behind
         // an existing entry — accurate either way (this call site IS the
