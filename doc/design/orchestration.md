@@ -6540,6 +6540,35 @@ and then decide whether `no-app-handle` should surface here or stay excluded wit
 writing. Until then the honest statement of what an orchestrator gets from `refused` is: every
 delivery this build refused **at the queue cap**, bounded by the two caps above.
 
+**#578/#624's parked orchestrator notices are OUT, decided rather than inherited.** #624 landed a
+notice channel for the orchestrator's own pane while this was in review: a queue notice whose target
+IS the group's orchestrator cannot be typed into that pane (it would queue behind the very block it
+reports), so `notify_queue` parks it and audits `notice-suppressed` with `parked: true`, relaying it
+on that pane's next MCP tool result. Three reasons it does not belong in `refused`, and they are
+worth stating because "a queue notice that was not delivered" *sounds* exactly like this list's
+subject:
+
+- **It is a different event.** Suppressed because of who the target is, not refused at the cap. The
+  filter excludes it structurally — different action (`notice-suppressed`, not `delivery-dropped`)
+  and different reason (`target-is-orchestrator`, not `queue-full-at-call`) — so this is a property
+  of the derivation, not a special case bolted onto it.
+- **It is not lost.** It is parked and relayed, which is the whole point of #624. Listing a delivered
+  notice in a list documented as "nobody ever received this — re-send what still applies" would
+  manufacture duplicate notices, the same failure the `recovered` exclusion above exists to prevent.
+- **It is a notice ABOUT a delivery, not a delivery.** If the payload it describes was itself
+  refused, that refusal already has its own row here; surfacing both would report one event twice.
+
+The residual is #624's, not this list's, and it already owns it: the inbox is in memory, so a notice
+parked and not yet relayed is lost across a restart — which is why its own audit line records the
+notice text rather than merely that one existed, and why the relay block points a reader at
+`audit.jsonl`. Its `ORCH_NOTICE_INBOX_MAX` overflow is likewise counted (`elided`) and named in the
+relay wording rather than silent.
+
+One interaction does run the other way and is worth recording: `notice-suppressed`/`notice-relayed`
+are written per queue notice, so #624 raises a busy group's audit volume — which makes reaching
+`AUDIT_VIEW_LIMIT` *more* likely and `refused_window_truncated` (NB1, above) more load-bearing than
+it was when it was written, not less.
+
 **Overlap with #569's resume notice, on purpose.** A refusal inside a pause window is also reported
 by `announce_pause_suppression` at resume (`SuppressedCause::QueueFullDuringPause`). That notice is a
 single best-effort delivery into the very pane that was full; this list is a durable, re-readable

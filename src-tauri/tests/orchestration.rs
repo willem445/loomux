@@ -3492,6 +3492,38 @@ fn a_refused_stranded_marker_reports_the_pane_state_it_left_behind() {
 }
 
 #[test]
+fn a_parked_orchestrator_notice_is_not_a_refusal() {
+    // #624 (#578) landed a notice channel for the orchestrator's own pane while
+    // #579 was in review, and its audit line reads temptingly like this list's
+    // subject: a queue notice that was not delivered. It is not one. It was
+    // suppressed because of WHO the target is, not refused at the cap, and it
+    // is not lost — it is parked and relayed on that pane's next tool result.
+    // Listing a delivered notice in a list whose documented response is
+    // "re-send what still applies" would manufacture duplicate notices, the
+    // same failure the `recovered` exclusion prevents.
+    //
+    // Pinned on the real shape `notify_queue` writes (`notice-suppressed`,
+    // `parked: true`, `reason: target-is-orchestrator`) so this stays a
+    // property of the filter rather than an accident of it: if someone widens
+    // the scan from `queue-full-at-call` to "any dropped-ish line", this fails.
+    let parked = AuditEntry {
+        ts_ms: 4_000,
+        actor: "loomux".into(),
+        action: "notice-suppressed".into(),
+        detail: json!({
+            "kind": "queue", "to": "orch-1", "reason": "target-is-orchestrator",
+            "parked": true,
+            "text": "[loomux] delivery to orch-1 queued (an interactive question is on screen)",
+        }),
+    };
+    let real = refusal_line(4_100, "w-1", "orch-1", "a genuinely refused report", "arrival");
+    let r = front_door_refusals(&[parked, real], false);
+    assert_eq!(r.total, 1, "only the real refusal counts: {:?}", r.items);
+    assert_eq!(r.items[0].preview, queue::dropped_payload_preview("a genuinely refused report"),
+        "and it is the refusal, not the parked notice");
+}
+
+#[test]
 fn the_refused_list_is_capped_and_says_how_many_it_left_out() {
     // Unlike orphans, which the per-pane cap of 8 already bounds, refusals
     // accumulate without limit: a pane held at capacity refuses every arrival
