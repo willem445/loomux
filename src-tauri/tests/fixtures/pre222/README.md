@@ -346,6 +346,18 @@ so far:
   gets one line on how to READ a delegate that reports a duplicate — it did the work once, not
   zero times.
 
+- **#610, a planner may fetch docs again** — `planner.md` only, one sentence in the
+  planning protocol's step 2. The old text told a planner its allowlist "pre-approves only
+  `git`/`gh` shell commands plus built-in read-only ones", which stopped being true when
+  #610 added `WebFetch`/`WebSearch` to a read-only pane's `permissions.allow`. That
+  addition is a capability decision, not a bug fix (see `doc/design/orchestration.md`'s
+  #610 subsection for the argument and the residual), and the reason it is worth the
+  re-bless is that a capability nobody is told about is one nobody uses: this repo's own
+  `agent-cli-reference` skill *requires* reading a vendor's official reference before
+  designing anything CLI-dependent, and a planner working from an instruction sheet that
+  says it cannot fetch will design from recall instead. The `cargo check`-is-denied half is
+  unchanged and still stated — executing code stays out of reach.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

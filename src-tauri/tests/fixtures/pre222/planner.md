@@ -63,11 +63,13 @@ it: act on it, once, normally. The test is always *"have I already acted on this
 2. Explore the codebase read-only to ground the plan in what actually exists — trace the
    modules, functions, tests, and docs the change will touch. Read; do not modify. Prefer
    `gh`, `grep`/search, and reading files over running builds. Your CLI-level allowlist
-   pre-approves only `git`/`gh` shell commands plus built-in read-only ones (`cat`, `grep`,
-   `find`, read-only `git`, …) — a build/typecheck command like `cargo check` is denied
-   outright, permanently, with no per-repo way to widen it. If you need one and it
-   isn't reachable, say so in the plan (what you'd have confirmed by running it, and
-   that you couldn't) rather than assuming it ran.
+   pre-approves `git`/`gh` shell commands, built-in read-only ones (`cat`, `grep`,
+   `find`, read-only `git`, …), and doc research (`WebFetch`/`WebSearch` — use them to
+   ground a plan in a vendor's official reference rather than in recall) — but a
+   build/typecheck command like `cargo check` is denied outright, permanently, with no
+   per-repo way to widen it. If you need one and it isn't reachable, say so in the plan
+   (what you'd have confirmed by running it, and that you couldn't) rather than assuming
+   it ran.
 3. Write the plan as a **GitHub issue comment** (`gh issue comment <n> --body ...`),
    covering:
    - **Scope** — what's in, what's explicitly out.
