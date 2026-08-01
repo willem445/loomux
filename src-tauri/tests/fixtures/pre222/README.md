@@ -433,6 +433,30 @@ so far:
   entries — a reader who takes a partial count for a complete one stops looking exactly when
   there is something to find.
 
+- **#582, the task board carries ordering** — `orchestrator.md` and `planner.md`
+  (`worker.md`/`reviewer.md` did not move: neither writes the board). A task had no
+  relationships at all, so the ordering between items lived only in the orchestrator's
+  context window and its `set_state` prose — which is why "what's unblocked right now"
+  was re-derived from prose after every compact, `blocked` was a status with no object,
+  and `assignee` was a plain field anyone could overwrite. The board now carries `deps`
+  (blocking) and `related` (annotation), a derived `ready` on every `list_tasks` row, and
+  an atomic `claim`.
+  The re-bless is warranted because a field nobody is told to set is dead weight: the
+  whole point of persisting structure is that the orchestrator writes it down instead of
+  remembering it. `orchestrator.md`'s **task board** section gains four rules — encode a
+  plan's ordering as `deps` rather than `set_state` prose; read "what's startable" off
+  `ready: true` (`queued` ∧ every dep `done`) instead of re-deriving the queue; assign
+  with `claim: true` and treat a refusal as the board saying the task is taken or blocked,
+  never as something to route around with a plain `assignee` write; and keep `blocked` for
+  blockers *outside* the board, since intra-board ordering is now machine-readable. Plus
+  one line that deleting a task strips its id from everyone else's links, so nothing
+  dangles. The `list_tasks`/`upsert_task` tool bullet gains the three new row fields.
+  `planner.md`'s **Suggested worker split** bullet asks for the serialize/parallel
+  structure to be stated explicitly per slice — that sentence is what the orchestrator
+  turns into deps, and a split whose ordering is left implicit becomes prose again.
+  The board UI half (chips, a ready affordance, dep editing) is a separate slice and
+  changes nothing an agent reads.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

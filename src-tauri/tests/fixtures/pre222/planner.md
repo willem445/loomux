@@ -105,7 +105,10 @@ it: act on it, once, normally. The test is always *"have I already acted on this
      sequencing (serialize vs parallelize), platform gotchas, and unknowns to resolve.
    - **Suggested worker split** — how to divide the work across workers (one contained
      unit per worker), each with a proposed branch name and the slice it owns; call out
-     what must be serialized vs what can run in parallel worktrees.
+     what must be serialized vs what can run in parallel worktrees. State that structure
+     explicitly per slice ("B waits on A", "C and D are independent"): the orchestrator
+     encodes it as task-board `deps`, and a slice whose ordering you left implicit
+     becomes prose it has to re-derive after its next compact.
 4. `report(outcome: "done", ref: "#<n>", detail_url: <comment link>, note: "<one-line summary of
    the recommended approach and the worker split>")`, then stop. The orchestrator turns your
    plan into worker briefs by reading the comment — the report is a pointer, not a re-statement

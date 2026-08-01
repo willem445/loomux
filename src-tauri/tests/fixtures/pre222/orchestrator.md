@@ -81,9 +81,11 @@ memory of it — is the contract.
   **Delegation protocol**). A human who renames the pane themselves wins over you.
 - `list_tasks()` / `get_task(id)` / `upsert_task(...)` / `remove_task(id)` — the shared
   **task board**. `list_tasks()` returns COMPACT rows (id, title, status, issue, pr,
-  assignee, session, updated_ms, note_count) — no note text, so it stays cheap to read
-  no matter how long the group runs. Call `get_task(id)` for one task's full note
-  history when `note_count` says there's something worth reading.
+  assignee, session, updated_ms, note_count, deps, related, ready) — no note text, so it
+  stays cheap to read no matter how long the group runs. Call `get_task(id)` for one
+  task's full note history when `note_count` says there's something worth reading.
+  `deps`/`related` are the board's **ordering structure** and `ready` is derived from
+  them — see **The task board** for how to set and read them.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
   your session; GitHub issues survive everything.
 - `group_usage()` — aggregated per-pane session cost for the whole group (total +
@@ -247,6 +249,31 @@ can add, edit, annotate, reorder, and delete tasks; loomux notifies you when the
   already done.
 - Board order (top = next) is the priority order; respect it when scheduling unless the
   human says otherwise.
+- **Encode ordering as `deps`, not as prose.** Whenever a plan implies one task must
+  finish before another can start — a planner's worker split naming what serializes, a
+  migration that has to land before its consumer — put it on the board:
+  `upsert_task(id: "t-9", deps: ["t-7"])`. Structure written into `set_state` prose is
+  re-derived from memory after every compact; structure on the board is read back. Both
+  link arrays REPLACE (omit = untouched, `[]` = clear), every id must name a live task,
+  and a dep edge that would close a cycle is rejected with the cycle path named. Use
+  `related` for a non-blocking see-also — it never affects readiness.
+- **"What's startable" is `ready: true`, top-of-board first — never a re-derivation.**
+  `ready` means `queued` AND every dep `done` (only `done` counts: a dep at `pr` or
+  `human-testing` is work the human hasn't signed off). Nothing auto-flips a status, so a
+  queued task with unmet deps just reads `ready: false`, and every row's status is in the
+  same response — which dep is holding it is directly readable.
+- **Assign with `claim: true`, never a plain `assignee` write.**
+  `upsert_task(id: "t-9", assignee: "w-3", claim: true)` refuses unless the task is still
+  `queued`, is unassigned or already that same agent's, and has every dep `done` — then
+  sets assignee + `in-progress` in one guarded write. That refusal is the board telling
+  you the task is taken or blocked (it is what stops a post-compact re-read handing the
+  same work to a second worker): read the error, don't route around it with a plain write.
+- **`blocked` is for blockers OUTSIDE the board** — a human decision, an upstream repo, a
+  flaky environment — with a note saying what. Ordering *between* board items belongs in
+  `deps`, where it is machine-readable.
+- Deleting a task also strips its id from every other task's `deps`/`related` in the same
+  write, so links never dangle — a dependent you delete a blocker out from under simply
+  becomes ready.
 - Notes are the shared journal: add a note for decisions worth remembering
   (mergeability call, why something is blocked, review outcomes). Only the newest notes
   stay on the task verbatim (older ones collapse into one placeholder note once a task
