@@ -33,11 +33,13 @@ Every rung is a complete tool on its own — climb when you're ready:
    is re-sent by loomux itself, once, through the same ordered delivery
    queue, and so is a freshly spawned agent's task brief when the CLI was
    still booting and swallowed it outright; when that isn't safe (your own
-   half-typed line is in the box, a question is on screen, or the agent
-   turns out to have received the brief after all), the pane raises a red
-   **stuck prompt** chip instead of waiting silently, so a wedged group is
-   never something you discover by accident. Prompts that pile up behind a
-   blocked pane are delivered as ONE itemized prompt when it clears —
+   half-typed line is in the box, a question is on screen, the agent turns
+   out to have received the brief after all, or the prompt is simply too
+   large for loomux to find in the pane and it says so rather than guessing),
+   the pane raises a red **stuck prompt** chip instead of waiting silently,
+   so a wedged group is never something you discover by accident. Prompts
+   that pile up behind a blocked pane are delivered as ONE itemized prompt
+   when it clears —
    oldest first, each still labelled with who sent it and how long it
    waited — rather than costing the agent a turn apiece, and an exit the
    orchestrator itself asked for (a kill, an idle-timeout) goes to the
