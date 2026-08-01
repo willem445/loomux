@@ -6819,6 +6819,17 @@ and `queue-full` (whole-queue drops) carry an `id` and are already reported by t
 derivations, and an unmodelled reason from a future build is skipped by the same rule rather than
 folded into a list whose documented response is "re-send".
 
+**One refusal is deliberately NOT in that set, and the set is not a complete enumeration of
+`deliver_prompt`'s failures without saying so.** `unknown agent` — the caller named an id that does
+not exist — stays unaudited *structurally*, not by oversight: `audit` writes into a **group's** log,
+`deliver_prompt` is keyed by agent id alone, and an agent that does not exist has no group to file
+the line under. Writing it to a "no group" bucket or to the caller's own group would put a record
+where nothing reads and no derivation scopes. It is also the one refusal that loses nothing an
+operator could act on — no pane, no session, no payload owner to re-target to, only a caller that
+named a nonexistent id, and that caller is told synchronously. Recorded here because a reason set
+presented without its exception reads as the complete list of ways a delivery can be refused, which
+is the implied-complete enumeration this whole section exists to stop (#633 review NB1).
+
 **`queue_depth` and `enqueue_reason` became nullable, and that is the honest shape.** Neither
 pre-admission refusal reached the queue, so there is no depth to report. Reporting `0` would be a
 measurement nobody took, presented as one saying the pane was empty — the "a claim is a
