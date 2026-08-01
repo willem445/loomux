@@ -10,7 +10,10 @@
 //! on #360). A child webview never calls raw `invoke`. Its capability
 //! (`webviews: ["plugin-*"]` in `capabilities/plugin.json`) grants it exactly
 //! two commands — [`plugin_broker_request`] and [`plugin_broker_open_channel`]
-//! — and nothing else in the app's ~120+ command surface. Those two commands
+//! — and nothing else in the app's 140-command surface (the count
+//! `tests/acl_manifest.rs`'s `app_commands_len_is_140` pins — 139 before
+//! #377's own `plugin_approve_capabilities`; this comment said "~120+" until
+//! #377 corrected it). Those two commands
 //! *are* the broker: every other function in this module is the pure decision
 //! logic and capability-scoped handlers they call.
 //!
@@ -552,11 +555,17 @@ pub struct OpenPluginWindowRequest {
     /// Relative path inside the plugin's own folder, served over `plugin://`
     /// by `plugins::plugin_protocol_handler` (#360 Slice B).
     pub entry: String,
-    /// Absolute path to the plugin's own installed folder — used for
-    /// `fs.read`'s jail, and must be the same folder Slice B's scheme
-    /// handler serves (`plugins::plugins_root_dir().join(&plugin_id)`) so a
-    /// plugin's `fs.read` capability and its served assets are always the
-    /// same jail. `None` for a `rootless: true` plugin.
+    /// **A signal, not a path (#377 NB3).** The jail `fs.read` is confined to
+    /// is derived SERVER-SIDE, from `plugins::plugins_root_dir().join(&plugin_id)`
+    /// — the same folder Slice B's scheme handler serves, so a plugin's
+    /// `fs.read` capability and its served assets are always the identical
+    /// jail *by construction* rather than because the caller passed a
+    /// matching string. All this field carries is the one bit the backend
+    /// cannot derive: whether the plugin is `rootless: true` (`None`, and
+    /// `fs.read` is then unreachable) or not (`Some(_)`, whose CONTENTS are
+    /// ignored). It stays `Option<String>` rather than becoming a bool so
+    /// Slice D's existing callers keep working unchanged; see
+    /// [`validate_open_request`].
     pub root: Option<String>,
     /// The manifest's declared `capabilities`, already validated by Slice B
     /// against the closed enum — this command re-validates anyway (defense
@@ -580,14 +589,53 @@ pub struct OpenPluginWindowRequest {
     pub height: f64,
 }
 
+/// What [`validate_open_request`] hands [`plugin_open_window`] once a request
+/// has passed every check: the capability set to register, and the `fs.read`
+/// jail root the backend DERIVED (never the one the caller sent — #377 NB3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedOpenRequest {
+    pub granted: Vec<Capability>,
+    /// Absolute path to the plugin's own installed folder, or `None` for a
+    /// `rootless: true` plugin. Goes straight into [`PluginSession::root`].
+    pub root: Option<String>,
+}
+
 /// Every check that can fail on an [`OpenPluginWindowRequest`] — an unknown
-/// capability string, or an `apiVersion` this build doesn't speak — run once,
-/// here, and called by [`plugin_open_window`] *before* building the
-/// `WebviewWindow` (rev-65 NB-2 on #369) specifically so a bad request never
-/// gets as far as creating a real OS window that then has nothing registered
-/// for it (fail-closed either way — no session means the broker denies
-/// everything — but this way there's no stranded window to clean up at all).
-fn validate_open_request(req: &OpenPluginWindowRequest) -> Result<Vec<Capability>, String> {
+/// capability string, an `apiVersion` this build doesn't speak, or (#377) a
+/// capability set the human has not approved — run once, here, and called by
+/// [`plugin_open_window`] *before* building the `WebviewWindow` (rev-65 NB-2
+/// on #369) specifically so a bad request never gets as far as creating a real
+/// OS window that then has nothing registered for it (fail-closed either way —
+/// no session means the broker denies everything — but this way there's no
+/// stranded window to clean up at all).
+///
+/// **The install-time approval gate (#377) lives here, at open.** A plugin
+/// folder on disk grants nothing; this is the moment it attaches, renders and
+/// gets a broker session, so this is where the persisted human decision is
+/// required — every requested capability must be covered by
+/// `plugingrants`'s record for this plugin id, or the open is refused with
+/// `capability-not-approved` ([`plugingrants::NOT_APPROVED_CODE`]) and the
+/// frontend shows the consent surface. No record, a corrupt store, or a
+/// manifest that has WIDENED since the human decided all fail closed
+/// identically. See `plugingrants.rs`'s module doc comment for the store and
+/// the subset rule.
+///
+/// **The `fs.read` jail root is derived here, not accepted (#377 NB3).**
+/// `req.root`'s only meaning is rootless-or-not; the path itself is rebuilt
+/// as `plugins_root.join(&plugin_id)`, so a caller cannot widen a plugin's
+/// read jail to some other folder by sending a different string — the jail is
+/// always exactly the folder Slice B's `plugin://` handler serves for that
+/// same id. `plugin_id` is validated as a safe single segment by
+/// `is_valid_plugin_id` above before that join happens.
+///
+/// `plugins_root` is injected (rather than read from
+/// `plugins::plugins_root_dir()` in here) for the same reason every other
+/// path-taking function in this feature injects it: `tests/plugins.rs`
+/// exercises the gate against a tempdir, never the real user data dir.
+pub fn validate_open_request(
+    plugins_root: &Path,
+    req: &OpenPluginWindowRequest,
+) -> Result<ValidatedOpenRequest, String> {
     if !is_valid_plugin_id(&req.plugin_id) {
         return Err(format!(
             "invalid plugin id `{}`: must be 1-64 ascii alphanumeric/-/_ characters",
@@ -605,7 +653,42 @@ fn validate_open_request(req: &OpenPluginWindowRequest) -> Result<Vec<Capability
             req.api_version, BROKER_API_VERSION
         ));
     }
-    Ok(granted)
+    // The refusal names WHAT is missing, not just that something is: on a
+    // widened manifest it carries the delta (`ApprovalStatus::Widened`'s
+    // `added`), so the human re-approving an upgraded plugin is told "it now
+    // also wants fs.read" rather than being handed the whole list again to
+    // diff by eye. This string is surfaced verbatim by the pane's consent
+    // surface (`src/pluginpaneview.ts`), so it is written for a human.
+    match crate::plugingrants::approval_status(
+        &crate::plugingrants::load_grants(plugins_root),
+        &req.plugin_id,
+        &req.capabilities,
+    ) {
+        crate::plugingrants::ApprovalStatus::Approved => {}
+        crate::plugingrants::ApprovalStatus::NeverApproved => {
+            return Err(format!(
+                "{}: `{}` has not been approved to use [{}] — review its capabilities first",
+                crate::plugingrants::NOT_APPROVED_CODE,
+                req.plugin_id,
+                crate::plugingrants::normalize_capabilities(&req.capabilities).join(", ")
+            ));
+        }
+        crate::plugingrants::ApprovalStatus::Widened { added } => {
+            return Err(format!(
+                "{}: `{}` now also wants [{}], which was not part of what was approved — review it again",
+                crate::plugingrants::NOT_APPROVED_CODE,
+                req.plugin_id,
+                added.join(", ")
+            ));
+        }
+    }
+    Ok(ValidatedOpenRequest {
+        granted,
+        root: req
+            .root
+            .as_ref()
+            .map(|_| plugins_root.join(&req.plugin_id).to_string_lossy().into_owned()),
+    })
 }
 
 /// Look up the registered session for a `plugin-*` webview label — the one
@@ -645,7 +728,7 @@ pub async fn plugin_open_window(
     // means the broker denies everything), but validating first means a bad
     // request never creates a real child webview at all, rather than one
     // that has to be cleaned up.
-    let granted = validate_open_request(&req)?;
+    let validated = validate_open_request(&crate::plugins::plugins_root_dir(), &req)?;
     let url = build_plugin_url(&req.plugin_id, &req.entry)?;
 
     let label = next_window_label(&req.plugin_id);
@@ -687,15 +770,17 @@ pub async fn plugin_open_window(
         )
         .map_err(|e| e.to_string())?;
 
-    // Nothing below this point can fail: `granted`/`api_version` were already
-    // validated above, so this is a plain insert, not a second fallible check.
+    // Nothing below this point can fail: capabilities, apiVersion, the human's
+    // approval (#377) and the derived jail root were all settled above, so this
+    // is a plain insert, not a second fallible check. `root` is the DERIVED
+    // path (#377 NB3), never `req.root`'s contents.
     with_sessions(|m| {
         m.insert(
             label.clone(),
             PluginSession {
                 plugin_id: req.plugin_id.clone(),
-                root: req.root.clone(),
-                granted,
+                root: validated.root,
+                granted: validated.granted,
                 api_version: req.api_version,
             },
         );
@@ -959,8 +1044,18 @@ mod tests {
         // before touching the child webview builder, so a request like this
         // one (the exact `apiVersion: 999` example from the finding) never
         // gets as far as creating a real embedded webview.
-        assert!(validate_open_request(&open_request(vec!["not-a-real-capability"], 1)).is_err());
-        assert!(validate_open_request(&open_request(vec![], 999)).is_err());
-        assert!(validate_open_request(&open_request(vec!["storage"], 1)).is_ok());
+        //
+        // Since #377 every one of these also needs an approved grant to reach
+        // `Ok`, so the tempdir below is seeded with exactly the set the last
+        // case requests. The approval gate itself (refusal without a grant,
+        // widening, the derived jail root) is covered end-to-end in
+        // `tests/plugins.rs`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        crate::plugingrants::record_grant(root, "demo", &["storage".to_string()], "1.0.0", 0).unwrap();
+
+        assert!(validate_open_request(root, &open_request(vec!["not-a-real-capability"], 1)).is_err());
+        assert!(validate_open_request(root, &open_request(vec![], 999)).is_err());
+        assert!(validate_open_request(root, &open_request(vec!["storage"], 1)).is_ok());
     }
 }

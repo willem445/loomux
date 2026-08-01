@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-plugin-approve-capabilities"
+description = "Enables the plugin_approve_capabilities command without any pre-configured scope."
+commands.allow = ["plugin_approve_capabilities"]
+
+[[permission]]
+identifier = "deny-plugin-approve-capabilities"
+description = "Denies the plugin_approve_capabilities command without any pre-configured scope."
+commands.deny = ["plugin_approve_capabilities"]

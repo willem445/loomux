@@ -38,7 +38,21 @@ export type PluginHostError =
   | "symlink"
   | "not-found"
   | "io"
+  /** #377: the plugin's declared capabilities have not been approved by a
+   *  human (or it now wants more than what was approved). The ONE code the
+   *  pane's consent surface reacts to — see `CAPABILITY_NOT_APPROVED`. */
+  | "capability-not-approved"
+  /** #377: the manifest on disk changed between the moment the prompt was
+   *  built and the moment Approve was pressed, so the approval was refused
+   *  rather than applied to a set the human never saw. */
+  | "manifest-changed"
   | "unknown";
+
+/** The refusal code `plugin_open_window` returns when a human hasn't approved
+ *  a plugin's capabilities (#377, `plugingrants::NOT_APPROVED_CODE`). Named
+ *  once because the pane's fail-soft error path branches on exactly this
+ *  value to swap a dead error message for the consent surface. */
+export const CAPABILITY_NOT_APPROVED = "capability-not-approved";
 
 /** Extract the leading error code from a rejected command's error. Any value
  *  that isn't a known code (including a non-string) collapses to "unknown". */
@@ -57,6 +71,8 @@ export function pluginErrorCode(e: unknown): PluginHostError {
     "symlink",
     "not-found",
     "io",
+    "capability-not-approved",
+    "manifest-changed",
   ];
   return (known as string[]).includes(code) ? (code as PluginHostError) : "unknown";
 }
@@ -81,3 +97,19 @@ export const listPlugins = (): Promise<PluginManifest[]> => invoke("list_plugins
  *  is copied. Resolves with the installed manifest on success. */
 export const installPlugin = (sourcePath: string): Promise<PluginManifest> =>
   invoke("install_plugin", { source: sourcePath });
+
+/** Persist a human's approval of `capabilities` for `pluginId` (#377) — the
+ *  ONE writer of the capability-grant store, and the only reason a plugin's
+ *  declared capabilities ever go live. Call it exclusively from a surface a
+ *  human just acted on: nothing here may ever be driven by a plugin, an
+ *  agent, or a retry loop (`doc/design/pane-plugins.md`'s "Grant, in v1",
+ *  CLAUDE.md constraint 9).
+ *
+ *  `capabilities` must be exactly the set that was SHOWN — the backend
+ *  re-reads the manifest from disk and rejects with `manifest-changed` if the
+ *  plugin folder was rewritten in between, so a stale prompt can never be
+ *  converted into a grant of something wider. */
+export const approvePluginCapabilities = (
+  pluginId: string,
+  capabilities: readonly string[]
+): Promise<void> => invoke("plugin_approve_capabilities", { pluginId, capabilities });

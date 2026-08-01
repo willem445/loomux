@@ -333,6 +333,25 @@ fn load_manifest_for(plugin_dir: &Path) -> Result<PluginManifest, String> {
     Ok(manifest)
 }
 
+/// Load the installed plugin `plugin_id`'s CURRENT manifest — the same fully
+/// validated load discovery uses, addressed by id instead of by path.
+/// `plugingrants.rs` (#377) is the caller this exists for: an approval must be
+/// recorded against what the manifest declares on disk *at the moment the
+/// human decides*, never against a set the caller supplied. `plugin_id` is
+/// re-checked as a single path segment before it is ever joined to
+/// `plugins_root` — `load_manifest_for`'s id/folder-name equality check
+/// already makes a traversal id unreachable, but the join happens first, so
+/// this refuses it before that rather than relying on the later check.
+pub fn manifest_for_installed(plugins_root: &Path, plugin_id: &str) -> Result<PluginManifest, String> {
+    if !is_single_segment(plugin_id) {
+        return Err(err(
+            "invalid-manifest",
+            format!("`{plugin_id}` is not a single path segment"),
+        ));
+    }
+    load_manifest_for(&plugins_root.join(plugin_id))
+}
+
 /// Enumerate every installed plugin under `plugins_root`. A folder that isn't
 /// a valid, self-consistent plugin (bad manifest, id/folder mismatch, an
 /// entry escaping its own folder) is skipped, not an error that blocks

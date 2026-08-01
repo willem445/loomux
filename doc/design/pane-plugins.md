@@ -210,7 +210,7 @@ until a human deliberately reviews and ships a fifth.
 | --- | --- | --- | --- |
 | `panel` | Render into the pane's content box. | Nothing IPC-shaped — a plain hosted window/frame, no broker method behind it. | Implicit: every plugin gets this merely by existing as a pane. Not declared in the manifest's `capabilities` array (there is nothing to opt into). **Host→frame `resize` and `theme` events were planned for this row but are NOT implemented in v1** — the envelope reserves the event names (see Broker contract, below) but nothing sends them; a plugin gets no live signal of pane size or app theme today. Tracked as [#378](https://github.com/willem445/loomux/issues/378), a required follow-up, not a silent gap — a plugin author relying on either event will see nothing arrive. |
 | `storage` | A namespaced per-plugin key/value store for view state (window position, last-selected tab, etc). | `uistate.rs`, new keys namespaced by `pluginId` so one plugin can never read or overwrite another's storage. | No cross-plugin read. No shared bucket. |
-| `fs.read` | Read files **under the pane's own root only** — path-jailed, no exceptions. | The existing `ft_read_file` command plus `fileedit.rs`'s server-side path choke point, with the pane's root as the jail boundary. | Rejected at manifest-validation time on a `rootless: true` plugin (no root to jail to). No directory listing beyond what `ft_read_file`'s existing surface already permits. |
+| `fs.read` | Read files **under the plugin's own installed folder only** — path-jailed, no exceptions. | The existing `ft_read_file` command plus `fileedit.rs`'s server-side path choke point, with that folder as the jail boundary. Since #377 the boundary is **derived server-side** (`plugins_root_dir().join(&plugin_id)`, the identical folder the `plugin://` handler serves) rather than taken from the open request, so the read jail and the served address space cannot drift apart and a caller cannot widen either. | Rejected at manifest-validation time on a `rootless: true` plugin (no root to jail to) — `root: None` on the open request is that signal, and is the one thing about the root the request still decides. No directory listing beyond what `ft_read_file`'s existing surface already permits. |
 | `metrics.system` | Subscribe (`metrics.subscribe`/`metrics.unsubscribe`) to a read-only stream of system + per-process resource stats (CPU/RAM). | `procmetrics.rs` (Slice E) — a plain Rust module, not a `#[tauri::command]`; the only way to reach it is through the broker's `metrics.subscribe`/`metrics.unsubscribe` methods, per this note's "never exposed to a plugin except through this one broker capability." | Curated payload — name, pid, cpu%, rss. No cmdline, no paths, no environment. Bounded: capped at 32 processes/tick (`procmetrics::MAX_PROCESSES`), sorted by CPU desc; poll interval clamped to 1–10s (`procmetrics::clamp_interval_ms`) regardless of what a plugin requests — a plugin cannot turn this into an unthrottled process-table dump or a tight polling loop. Pane attribution (mapping a build-child process to the agent pane that spawned it, via the per-pane kill-on-close Job Object `pty.rs` already holds) was scoped for this slice but deferred as a follow-up — see the Slice E note below. |
 
 **Deliberately absent from the enum, so unreachable by construction, not by
@@ -228,46 +228,111 @@ there is no code path to find a bug in, because there is no code path.
 | System reach | Nothing beyond the three capabilities above. | Call `invoke` or reach any of the ~140 app commands directly; spawn or write to a PTY; touch git or `gh`; mint or read an orchestration/merge grant; steer or inject input into an agent pane. |
 | Network | Nothing. | Phone home, load a remote resource, or otherwise reach the network — enforced by a restrictive CSP header served on every `plugin://` response, **not** by the iframe `sandbox` attribute alone (which does not restrict network egress). See **Content-Security-Policy on plugin content**, under Isolation. |
 
-### Grant, in v1: auto-granted from the closed enum, not a human decision yet
+### Grant, in v1: a human's decision, taken once per plugin and persisted
 
-**Status update — this section previously described install-time human
-approval as decided; it wasn't, and the implementation was never changed to
-match. Correcting the record:** v1 **auto-grants** whatever subset of the
-closed enum a manifest declares and passes validation on — `install_plugin`
-(Slice B, `plugins.rs`) copies the folder once the manifest parses and every
-declared capability string is in the enum; there is no approval prompt, no
-install-time UI step, and no per-capability human decision anywhere in the
-code path. The manifest's declared `capabilities` array **is** the grant, the
-moment install succeeds.
+**Status: implemented ([#377](https://github.com/willem445/loomux/issues/377),
+`plugingrants.rs`).** An earlier revision of this section described
+install-time approval as decided when it wasn't, and a later one recorded it
+as deferred. Neither is true now: a plugin's declared capabilities are inert
+until a human has been shown them and said yes.
 
-This is narrower than it sounds, not a hidden hole: the enum itself is
-closed and reviewed once, here, and every row in it is already bounded on the
-implementation side — `fs.read` is jailed to the pane's own root, `storage`
-is namespaced per `pluginId`, `metrics.system` is curated and capped
-(`procmetrics::MAX_PROCESSES`, `clamp_interval_ms`), and `panel` grants
-nothing IPC-shaped at all. Auto-granting a member of *this* enum is not the
-same risk as an open permission model would be — but it is still a human
-installing a plugin without being shown, or asked to confirm, which of these
-four the manifest is asking for, which is what "grant is a human decision"
-promised and did not deliver.
+**Install grants nothing.** `install_plugin` (Slice B, `plugins.rs`) is still
+exactly a folder copy, and the boot-time seeding of the bundled example still
+runs headless. Neither writes a grant. A plugin folder sitting on disk has no
+capabilities at all — nothing runs, nothing attaches, no broker session
+exists — so gating the *copy* would prompt for plugins the human may never
+open, at a moment (startup seeding) when nobody is there to answer.
 
-**Install-time capability approval is deferred to
-[#377](https://github.com/willem445/loomux/issues/377), and is a REQUIRED
-blocker** — before v1 ships to general availability, and before
-[#375](https://github.com/willem445/loomux/issues/375)'s native-sidecar work
-(which would widen what a plugin can reach and makes an un-reviewed grant a
-materially bigger problem than it is today). Shipping without #377 in the
-interim is acceptable only because of the bound above: the v1 enum has no
-write, no git/gh/PTY/orchestration reach, jailed `fs.read`, namespaced
-`storage`, and a curated, bounded `metrics.system` — a plugin auto-granted
-its full declared set still cannot reach anything this note's threat table
-(above) lists as "Cannot." That acceptability argument does not extend past
-v1's enum; widening what any single capability *means* (e.g. turning
-`fs.read` into `fs.write`, or adding a new capability class entirely) is
-exactly the kind of change flagged in the plan's decision list as needing its
-own threat review before it ships — this note is not pre-approving that
-expansion, only the four rows above, and #377 is what makes even *those*
-four a human's decision rather than the manifest author's.
+**The gate is at OPEN.** `plugin_open_window`'s `validate_open_request`
+(Slice C, `pluginbroker.rs`) requires a persisted grant before it builds the
+child webview: this is the moment a plugin actually attaches, renders, and
+gets the `PluginSession` the broker answers requests against. The rule is a
+**subset** test — every capability the open requests must be covered by the
+record — which gives, deliberately:
+
+- **No record → refused.** Fresh install, deleted store, corrupt store
+  (quarantined by `uistate::load_or_quarantine`, exactly like `tabs.json`):
+  all fail closed with the stable code `capability-not-approved`. Losing the
+  store costs one re-approval; the other direction would cost the boundary.
+- **Widened manifest → refused, and the refusal names the delta.** An upgrade
+  that adds `fs.read` to a plugin approved for `storage` re-prompts, telling
+  the human what is *new* rather than handing back the whole list to diff by
+  eye.
+- **Narrowed manifest → no second prompt.** The human already consented to
+  strictly more than what is now asked for.
+
+**The store:** `<app-data>/loomux/plugins/grants.json`, one record per plugin
+id — the approved set (sorted), the epoch second it was decided, and the
+plugin `version` that was on disk at that moment. Atomic write + quarantine,
+the same discipline `tabs.json` uses; it is a plain file in the plugins root,
+which discovery skips (that scan only descends into directories).
+
+**The prompt** (`src/pluginconsent.ts`, shown by `pluginpaneview.ts` via
+`modal.ts`) lists the plugin's id/version and one plain-language line per
+declared capability, with `fs.read` and `metrics.system` flagged and sorted
+first — the prominence tier #377 asks for. A refused open renders the pane's
+fail-soft placeholder plus a **Review permissions…** button rather than
+auto-opening a dialog: this same path runs on session restore, and a restored
+workspace with three unapproved plugin panes must not throw three modals at
+someone who just launched the app.
+
+**Only a human can approve, structurally.** `plugin_approve_capabilities` is
+the single writer of the store. It is granted to the trusted `main` webview
+alone (`permissions/sets/plugins.toml` → `main-ui`); a plugin's own child
+webview gets `plugin-broker` and nothing else, and `tests/acl_manifest.rs`
+pins that command as **denied** for a `plugin-*` webview alongside
+`list_plugins`/`install_plugin`. There is no MCP tool, no CLI path and no
+orchestration command that reaches it, and none may ever be added — a plugin
+that could approve itself, or an agent that could approve one to make a test
+pass, is exactly the self-approval CLAUDE.md's constraint 9 forbids. The
+command also re-reads the manifest from disk and refuses
+(`manifest-changed`) if what was shown is no longer what is declared, so a
+folder rewritten between the prompt and the click cannot convert consent to
+`["storage"]` into a grant of something wider.
+
+**Known limitation, stated rather than half-fixed: identity is the plugin
+`id`.** A grant record outlives the folder it was made for. "Uninstalling" is
+a human deleting `plugins/<id>/` by hand — there is no uninstall command yet
+— and nothing prunes the record, so a *different* plugin later installed
+under the *same* id, declaring an equal or **narrower** set, opens on the
+earlier consent without prompting. Widening is still caught, so a replacement
+can never obtain more than was approved for that id; the residual is exactly
+"equal-or-narrower under a reused id after a hand-deletion".
+
+Pruning orphaned records was considered and deliberately rejected as a
+half-answer (rev-126 N2 on #623): `install_plugin_from` deletes and re-copies
+inside a single call, so the main replacement path never exposes an absence a
+pruner could observe; `storage`'s per-`pluginId` blob has the identical
+inheritance property, so pruning grants alone would look closed while leaving
+the same hole one row down in the capability table; and a transiently
+unreadable plugins root would make every record look orphaned and discard
+decisions that live nowhere else. This belongs with a real **uninstall
+command**, which knows the human's intent at the moment it happens and can
+drop the grant and the storage namespace together — tracked as the follow-up
+from #623's review.
+
+**Open human decision — the bundled example.** Whether the first-party
+`resource-monitor` should ship with a **pre-seeded** grant (zero-click demo,
+at the cost of the "no capability is live without a human decision"
+invariant being universal) or prompt like any other plugin is the human's
+call, not this note's. Both are reachable without a redesign:
+`plugingrants::PRE_SEEDED_GRANT_PLUGIN_IDS` is the whole mechanism, and it
+ships **empty** — so today the bundled example prompts on first open, which
+is the fail-closed default. Choosing the other branch is adding one id to
+that list; both branches are covered by `tests/plugins.rs`.
+
+**What this does and does not buy.** The enum itself is still closed and
+reviewed once, here, and every row is bounded on the implementation side
+(`fs.read` jailed to the plugin's own folder, `storage` namespaced per
+`pluginId`, `metrics.system` curated and capped, `panel` inert). The gate
+adds the missing half: which of those four a given plugin gets is now a
+decision the human running loomux makes, not one the manifest's author
+makes for them. That matters most for
+[#375](https://github.com/willem445/loomux/issues/375)'s native-sidecar tier,
+which **must not** auto-grant — it inherits this gate rather than needing a
+new one. It does not pre-approve widening what any capability *means* (e.g.
+`fs.read` → `fs.write`): that is still a per-capability threat review of its
+own.
 
 ## The broker contract
 
@@ -336,10 +401,10 @@ any handler runs:
    dropped, not answered, regardless of what `origin` it claims.
 2. **`apiVersion` check** — the method exists at the plugin's declared
    `apiVersion`. If not: `error.code = "unsupported-version"`.
-3. **Capability check** — the method's owning capability is in the set the
-   manifest declared (v1: auto-granted at install on successful validation —
-   see "Grant, in v1" above and [#377](https://github.com/willem445/loomux/issues/377)
-   for the human-approval step this will gain). If not:
+3. **Capability check** — the method's owning capability is in the set this
+   plugin's session was opened with, which is the set the manifest declared
+   AND a human approved at open time (see "Grant, in v1" above and
+   [#377](https://github.com/willem445/loomux/issues/377)). If not:
    `error.code = "capability-denied"`.
 4. **Params validation** — malformed params (wrong shape, a path escaping
    the jail root, an unknown method name) get `error.code = "bad-request"`.
@@ -692,12 +757,16 @@ not a rewrite of the contract:
    per-capability decision with its own threat review; this note pre-approves
    none of that, only the four rows as written.
 4. **Bundling the example plugin as installed-by-default.** Slice F's
-   resource monitor is planned to ship already installed, so the demo works
-   without a manual install step — which also means a default plugin holds
-   `metrics.system` from first run. The alternative is shipping it
-   *uninstalled* (bundled in the app but requiring the same Install action as
-   any third-party plugin). Confirm the turnkey default is actually wanted
-   before Slice F ships it that way.
+   resource monitor ships already installed, so the demo works without a
+   manual install step. Since #377 that no longer means it *holds*
+   `metrics.system` from first run — installed is not granted, and it prompts
+   on first open like any other plugin. What is still open is the second half
+   of the same question: whether it should ship with a **pre-seeded grant**
+   too (one fewer click, at the cost of "no capability is live without a
+   human decision" being universal). Both are one line apart —
+   `plugingrants::PRE_SEEDED_GRANT_PLUGIN_IDS`, empty today — see "Grant, in
+   v1" above. Shipping it *uninstalled* (bundled but requiring the Install
+   action) remains the third alternative.
 5. **Deferring the pane-kind registry refactor.** This note's design adds
    `"plugin"` to the existing closed unions (One new content kind, above) and
    deliberately does not collapse the four built-in kinds into a general

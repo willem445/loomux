@@ -54,7 +54,15 @@
 import { Webview } from "@tauri-apps/api/webview";
 import { dataDir, join } from "@tauri-apps/api/path";
 import { openPluginWindow, closePluginWindow, setPluginFrame, type PluginCapability } from "./pluginbroker";
-import { pluginErrorCode, pluginErrorMessage, type PluginManifest } from "./pluginhost";
+import {
+  approvePluginCapabilities,
+  pluginErrorCode,
+  pluginErrorMessage,
+  CAPABILITY_NOT_APPROVED,
+  type PluginManifest,
+} from "./pluginhost";
+import { consentLines, hasSensitiveCapability } from "./pluginconsent";
+import { modal } from "./modal";
 import { pluginWebviewRect, pluginWindowShouldShow, frameUnchanged, type PluginFrame } from "./pluginwindow";
 import { computeExcludeRects } from "./pluginocclusion";
 import { overlayState, type OverlayChangeReason } from "./overlaystate";
@@ -108,13 +116,26 @@ export interface PluginPaneManifest {
    *  — defense in depth, never a caller's validation as the only check. */
   capabilities: string[];
   apiVersion: number;
-  /** Absolute path to the plugin's install folder; null for `rootless: true`. */
+  /** Absolute path to the plugin's install folder; null for `rootless: true`.
+   *  **Since #377 the backend does not take this path on trust** — it derives
+   *  the `fs.read` jail itself from `plugins_root_dir().join(&plugin_id)`, so
+   *  what actually crosses to `plugin_open_window` here is only the
+   *  null-or-not distinction (the rootless signal). The path is still
+   *  computed and sent because it is the honest local answer to "where is
+   *  this plugin installed" and because the wire type stays `Option<String>`;
+   *  nothing downstream reads its contents. */
   root: string | null;
   /** The manifest's `name` field, VERBATIM — untrusted third-party text (design
    *  note: "Plugin-provided text is untrusted, regardless of transport"). This
    *  view only ever renders it via `textContent`, never markup interpolation;
    *  callers (Pane.setName for the tab label) must hold the same line. */
   displayName: string;
+  /** The manifest's `version`, VERBATIM and equally untrusted (#377) — shown
+   *  in the capability-approval prompt so a human can tell "the version I
+   *  approved" from "the version asking now". Never parsed or compared here;
+   *  the backend records the version it read off disk at the moment of the
+   *  decision, which is the copy that counts. */
+  version: string;
 }
 
 /** `<app-data>/loomux/plugins/<id>` — the recommended install location
@@ -151,6 +172,7 @@ export async function resolvePluginPaneManifest(manifest: PluginManifest): Promi
     apiVersion: manifest.api_version,
     root: await resolvePluginRoot(manifest),
     displayName: manifest.name,
+    version: manifest.version,
   };
 }
 
@@ -259,6 +281,15 @@ export class PluginPaneView {
    *  reference `addEventListener` in `show()` registered. */
   private readonly onWindowResize = () => void this.reposition("resize");
 
+  /** The "Review permissions…" button of the #377 consent surface — created
+   *  once, hidden unless `plugin_open_window` refused with
+   *  `capability-not-approved`. Deliberately a BUTTON the human presses, not
+   *  an auto-opened modal: this same path runs on session restore, where a
+   *  workspace with three unapproved plugin panes would otherwise throw three
+   *  dialogs at a human who has just started the app (the fail-soft posture
+   *  the git pane's "no longer a repo" placeholder already sets). */
+  private reviewBtn: HTMLButtonElement;
+
   constructor(host: PluginPaneHost) {
     this.manifest = host.manifest;
     this.el = document.createElement("div");
@@ -271,6 +302,12 @@ export class PluginPaneView {
     this.statusEl.className = "pane-plugin-status";
     this.statusEl.textContent = `Opening ${this.manifest.displayName}…`;
     this.el.appendChild(this.statusEl);
+    this.reviewBtn = document.createElement("button");
+    this.reviewBtn.className = "dlg-btn primary";
+    this.reviewBtn.textContent = "Review permissions…";
+    this.reviewBtn.hidden = true;
+    this.reviewBtn.addEventListener("click", () => void this.reviewCapabilities());
+    this.el.appendChild(this.reviewBtn);
     this.resizeObs = new ResizeObserver(() => this.reposition("resize"));
   }
 
@@ -304,6 +341,13 @@ export class PluginPaneView {
 
   private async open(): Promise<void> {
     const m = this.manifest;
+    // A retry after an approval starts from a clean slate: the consent
+    // surface's button and error styling must not survive into (or outlive)
+    // the next attempt.
+    this.reviewBtn.hidden = true;
+    this.statusEl.hidden = false;
+    this.statusEl.classList.remove("pane-plugin-error");
+    this.statusEl.textContent = `Opening ${m.displayName}…`;
     // Best-effort initial box from the pane's own current rect — floored at 1px
     // by pluginWebviewRect, so even a pane that happens to be zero-sized right
     // now (opened into a hidden tab) gets a valid (if degenerate) request rather
@@ -342,8 +386,72 @@ export class PluginPaneView {
       await this.reposition("init");
     } catch (err) {
       if (this.disposed) return;
-      this.showError(err);
+      // #377: an open refused for want of a human's approval is not an error
+      // to report, it's a decision to ask for — every other refusal still
+      // renders as the fail-soft error it always did.
+      if (pluginErrorCode(err) === CAPABILITY_NOT_APPROVED) this.showConsentRequired(err);
+      else this.showError(err);
     }
+  }
+
+  /** The fail-soft consent surface (#377): the backend's own refusal text —
+   *  which names either the full requested set or, for an upgraded plugin,
+   *  just what it NEWLY wants — plus the button that opens the prompt. Text
+   *  only, same rule as `showError`. */
+  private showConsentRequired(err: unknown): void {
+    this.statusEl.hidden = false;
+    this.statusEl.classList.remove("pane-plugin-error");
+    this.statusEl.textContent = `"${this.manifest.displayName}" needs your permission before it can run. ${pluginErrorMessage(err)}`;
+    this.reviewBtn.hidden = false;
+  }
+
+  /** Show the human exactly what this plugin declares, and — only if they say
+   *  yes — persist that decision and open the plugin.
+   *
+   *  Everything security-bearing happens on the backend: this dialog cannot
+   *  grant anything (`plugin_approve_capabilities` re-reads the manifest and
+   *  refuses if it no longer matches what was shown), and declining simply
+   *  leaves the pane in its fail-soft state with nothing written. The plugin's
+   *  own name/version are untrusted third-party strings, so they go through
+   *  `modal`'s `title`/`body`/`bodyLines`, all of which are rendered with
+   *  `textContent`. */
+  private async reviewCapabilities(): Promise<void> {
+    // One prompt at a time: a double-click would otherwise stack two identical
+    // overlays, and dismissing one would leave the other floating over the app.
+    if (this.reviewBtn.disabled) return;
+    this.reviewBtn.disabled = true;
+    try {
+      await this.promptAndApprove();
+    } finally {
+      this.reviewBtn.disabled = false;
+    }
+  }
+
+  private async promptAndApprove(): Promise<void> {
+    const m = this.manifest;
+    const approve = await modal<boolean>((resolve) => ({
+      title: `Allow "${m.displayName}" to run?`,
+      body:
+        `${m.pluginId} · version ${m.version} — a plugin runs code from its own folder, isolated from loomux, ` +
+        `and can only do what you allow here:` +
+        (hasSensitiveCapability(m.capabilities)
+          ? " the flagged items (⚠) reach data on this machine — only allow them if you trust where this plugin came from."
+          : ""),
+      bodyLines: consentLines(m.capabilities),
+      buttons: [
+        { label: "Not now", value: false },
+        { label: "Allow", value: true, kind: "primary" },
+      ],
+      onKey: (k) => (k === "Escape" ? resolve(false) : undefined),
+    }));
+    if (!approve || this.disposed) return;
+    try {
+      await approvePluginCapabilities(m.pluginId, m.capabilities);
+    } catch (err) {
+      if (!this.disposed) this.showError(err);
+      return;
+    }
+    if (!this.disposed) await this.open();
   }
 
   /** Render a fail-soft inline error — the design note's "empty/error state, not
@@ -353,6 +461,11 @@ export class PluginPaneView {
    *  can embed anything a rejected command's message carries. */
   private showError(err: unknown): void {
     this.statusEl.hidden = false;
+    // No "Review permissions…" on a real error — including a
+    // `manifest-changed` refusal, where re-opening the same prompt would just
+    // re-offer the stale capability set this view resolved at construction.
+    // Reopening the pane re-reads `list_plugins` and starts over.
+    this.reviewBtn.hidden = true;
     this.statusEl.classList.add("pane-plugin-error");
     this.statusEl.textContent = `Couldn't open "${this.manifest.displayName}": ${pluginErrorMessage(err) || String(err)} (${pluginErrorCode(err)})`;
   }

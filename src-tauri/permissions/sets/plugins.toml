@@ -1,7 +1,8 @@
 [[set]]
 identifier = "plugins"
-description = "Pane-plugins backend host (#360 Slice B): list discovered plugins and install one from a local source folder."
+description = "Pane-plugins backend host (#360 Slice B): list discovered plugins and install one from a local source folder. Plus the install-time capability approval gate's one writer (#377): plugin_approve_capabilities persists a human's decision about what a plugin may reach, so — like install itself — it is granted ONLY through this set, which only the trusted main webview's aggregate (main-ui) pulls in. Never grant any of these to a plugin-* webview: a plugin must not be able to enumerate, install, or self-approve plugins (tests/acl_manifest.rs pins all three as denied)."
 permissions = [
     "allow-list-plugins",
     "allow-install-plugin",
+    "allow-plugin-approve-capabilities",
 ]

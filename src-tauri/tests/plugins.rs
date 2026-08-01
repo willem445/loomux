@@ -13,9 +13,14 @@
 //! silent coercion, and asset serving never resolves outside a plugin's own
 //! folder.
 
+use loomux_lib::pluginbroker::{validate_open_request, OpenPluginWindowRequest};
+use loomux_lib::plugingrants::{
+    approval_status, approve_capabilities, grants_path, is_approved, load_grants, record_grant,
+    seed_declared_grants, ApprovalStatus, NOT_APPROVED_CODE, PRE_SEEDED_GRANT_PLUGIN_IDS,
+};
 use loomux_lib::plugins::{
-    build_asset_response, discover_installed, install_plugin_from, parse_manifest, resolve_plugin_asset,
-    seed_bundled_example_plugin, BUNDLED_EXAMPLE_PLUGIN_ID, PLUGIN_CSP,
+    build_asset_response, discover_installed, install_plugin_from, manifest_for_installed, parse_manifest,
+    resolve_plugin_asset, seed_bundled_example_plugin, BUNDLED_EXAMPLE_PLUGIN_ID, PLUGIN_CSP,
 };
 use std::fs;
 use std::path::Path;
@@ -605,4 +610,326 @@ fn seed_bundled_example_plugin_is_best_effort_when_the_resource_dir_has_nothing_
     let plugins_root = tempfile::tempdir().unwrap();
     seed_bundled_example_plugin(resource_dir.path(), plugins_root.path());
     assert!(!plugins_root.path().join(BUNDLED_EXAMPLE_PLUGIN_ID).exists());
+}
+
+// ---------- #377: install-time capability approval gate ----------
+//
+// The consent boundary `doc/design/pane-plugins.md` promises: a plugin's
+// declared capabilities are NOT live until a human has seen and approved them.
+// The store and the subset rule live in `plugingrants.rs`; the enforcement
+// point is `pluginbroker::validate_open_request`, which `plugin_open_window`
+// calls before it builds any child webview. Everything below drives those two
+// against a tempdir — never the real user data dir, and never by writing
+// `grants.json` by hand (CLAUDE.md constraint 9: an agent must not
+// self-approve a security gate, and that includes forging its store).
+
+fn caps(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| s.to_string()).collect()
+}
+
+/// An open request for `plugin_id` asking for `capabilities`. `root` is the
+/// rootless SIGNAL only (#377 NB3) — `Some(_)` means "not rootless"; what the
+/// string says is deliberately irrelevant, which
+/// `fs_read_jail_root_is_derived_server_side_not_taken_from_the_request`
+/// below is the proof of.
+fn open_req(plugin_id: &str, capabilities: &[&str], root: Option<&str>) -> OpenPluginWindowRequest {
+    OpenPluginWindowRequest {
+        plugin_id: plugin_id.to_string(),
+        entry: "index.html".to_string(),
+        root: root.map(String::from),
+        capabilities: caps(capabilities),
+        api_version: 1,
+        x: 0.0,
+        y: 0.0,
+        width: 1.0,
+        height: 1.0,
+    }
+}
+
+/// Install a real plugin folder declaring `capabilities` into `plugins_root`,
+/// exactly as a human dropping a folder in would — the state every test below
+/// starts from, since install is what #377 says must grant nothing.
+fn install_declaring(plugins_root: &Path, id: &str, version: &str, capabilities: &[&str], rootless: bool) {
+    let src = tempfile::tempdir().unwrap();
+    let caps_json = capabilities
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let manifest = format!(
+        r#"{{
+            "id": "{id}",
+            "name": "Test plugin",
+            "version": "{version}",
+            "apiVersion": 1,
+            "entry": "index.html",
+            "capabilities": [{caps_json}],
+            "rootless": {rootless}
+        }}"#
+    );
+    write_plugin_folder(src.path(), id, &manifest, &[("index.html", "<h1>hi</h1>")]);
+    install_plugin_from(&src.path().join(id), plugins_root).expect("install should succeed");
+}
+
+#[test]
+fn installing_a_plugin_grants_nothing_and_open_is_refused_until_a_human_approves() {
+    // The whole of #377 in one test: before this gate, this install WAS the
+    // grant — the manifest's `capabilities` array went live the moment the
+    // folder copy finished, with no human ever shown what it asked for.
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "1.0.0", &["storage", "fs.read"], false);
+
+    assert!(
+        load_grants(plugins_root.path()).is_empty(),
+        "install must not write a grant — a folder on disk grants nothing"
+    );
+
+    let req = open_req("demo", &["storage", "fs.read"], Some("ignored"));
+    let refusal = validate_open_request(plugins_root.path(), &req)
+        .expect_err("an unapproved plugin must not be able to open");
+    assert!(
+        refusal.starts_with(format!("{NOT_APPROVED_CODE}: ").as_str()),
+        "the refusal must lead with the stable code the frontend's consent surface branches on \
+         (src/pluginhost.ts's pluginErrorCode), got: {refusal}"
+    );
+}
+
+#[test]
+fn approving_the_declared_set_lets_the_same_open_through() {
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "1.0.0", &["storage", "fs.read"], false);
+    let req = open_req("demo", &["storage", "fs.read"], Some("ignored"));
+    assert!(validate_open_request(plugins_root.path(), &req).is_err());
+
+    approve_capabilities(plugins_root.path(), "demo", &caps(&["fs.read", "storage"]), 1_700_000_000)
+        .expect("approving exactly what the manifest declares must succeed");
+
+    let validated = validate_open_request(plugins_root.path(), &req)
+        .expect("an approved plugin opens with the capabilities the human approved");
+    assert_eq!(validated.granted.len(), 2);
+}
+
+#[test]
+fn a_widened_manifest_re_prompts_and_names_only_the_newly_added_capability() {
+    // The upgrade case: a plugin the human approved for `storage` ships a new
+    // version that also wants `fs.read`. The old grant must not cover it, and
+    // the re-prompt must be able to say WHAT changed rather than making the
+    // human re-read the whole list.
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "1.0.0", &["storage"], false);
+    approve_capabilities(plugins_root.path(), "demo", &caps(&["storage"]), 1).unwrap();
+
+    install_declaring(plugins_root.path(), "demo", "2.0.0", &["storage", "fs.read"], false);
+    let req = open_req("demo", &["storage", "fs.read"], Some("ignored"));
+    let refusal = validate_open_request(plugins_root.path(), &req)
+        .expect_err("a widened manifest must NOT ride the earlier, narrower approval");
+    assert!(
+        refusal.contains("fs.read") && !refusal.contains("storage"),
+        "the re-prompt must name the DELTA — what the plugin newly wants — not re-list what was \
+         already approved, got: {refusal}"
+    );
+    assert_eq!(
+        approval_status(&load_grants(plugins_root.path()), "demo", &caps(&["storage", "fs.read"])),
+        ApprovalStatus::Widened {
+            added: caps(&["fs.read"])
+        }
+    );
+
+    approve_capabilities(plugins_root.path(), "demo", &caps(&["storage", "fs.read"]), 2).unwrap();
+    assert!(validate_open_request(plugins_root.path(), &req).is_ok());
+}
+
+#[test]
+fn narrowing_a_manifest_needs_no_second_approval() {
+    // Subset, not equality: the human already consented to strictly more than
+    // what is now being asked for, so there is nothing new to ask about.
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "1.0.0", &["storage", "fs.read"], false);
+    approve_capabilities(plugins_root.path(), "demo", &caps(&["storage", "fs.read"]), 1).unwrap();
+
+    let narrowed = open_req("demo", &["storage"], Some("ignored"));
+    assert!(validate_open_request(plugins_root.path(), &narrowed).is_ok());
+    assert_eq!(
+        approval_status(&load_grants(plugins_root.path()), "demo", &caps(&["storage"])),
+        ApprovalStatus::Approved
+    );
+}
+
+#[test]
+fn a_grant_is_per_plugin_id_and_never_covers_another_plugin() {
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "approved", "1.0.0", &["storage"], false);
+    install_declaring(plugins_root.path(), "other", "1.0.0", &["storage"], false);
+    approve_capabilities(plugins_root.path(), "approved", &caps(&["storage"]), 1).unwrap();
+
+    assert!(validate_open_request(plugins_root.path(), &open_req("approved", &["storage"], None)).is_ok());
+    assert!(
+        validate_open_request(plugins_root.path(), &open_req("other", &["storage"], None)).is_err(),
+        "approving one plugin must never approve another — the store is keyed by plugin id"
+    );
+}
+
+#[test]
+fn a_corrupt_grants_file_fails_closed_and_is_quarantined_not_trusted() {
+    // Same discipline as tabs.json (uistate.rs): the corrupt file is renamed
+    // aside for a human to inspect, and the store reads as EMPTY — which
+    // denies every plugin. Losing the file costs one re-approval; the other
+    // direction would cost the consent boundary itself.
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "1.0.0", &["storage"], false);
+    approve_capabilities(plugins_root.path(), "demo", &caps(&["storage"]), 1).unwrap();
+    fs::write(grants_path(plugins_root.path()), "{ this is not json").unwrap();
+
+    assert!(!is_approved(plugins_root.path(), "demo", &caps(&["storage"])));
+    assert!(validate_open_request(plugins_root.path(), &open_req("demo", &["storage"], None)).is_err());
+    assert!(
+        grants_path(plugins_root.path()).with_extension("corrupt.json").is_file(),
+        "the corrupt store must be quarantined for inspection, not silently deleted"
+    );
+}
+
+#[test]
+fn an_approval_records_the_sorted_set_and_the_version_that_was_on_disk() {
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "3.1.4", &["storage", "fs.read", "panel"], false);
+
+    let record = approve_capabilities(
+        plugins_root.path(),
+        "demo",
+        // deliberately unsorted, as a manifest's own array order would be
+        &caps(&["storage", "panel", "fs.read"]),
+        1_700_000_042,
+    )
+    .unwrap();
+
+    assert_eq!(record.capabilities, caps(&["fs.read", "panel", "storage"]));
+    assert_eq!(record.approved_at_version, "3.1.4");
+    assert_eq!(record.decided_at, 1_700_000_042);
+
+    let reloaded = load_grants(plugins_root.path());
+    assert_eq!(reloaded.get("demo"), Some(&record), "the record must survive a round trip to disk");
+}
+
+#[test]
+fn approving_a_set_the_manifest_no_longer_declares_is_refused_and_persists_nothing() {
+    // The TOCTOU the approve command closes: the consent surface read the
+    // manifest (via list_plugins), then the folder was rewritten before the
+    // human pressed Approve. A consent to ["storage"] must never become a
+    // grant of whatever the manifest declares NOW.
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "1.0.0", &["storage", "fs.read"], false);
+
+    let e = approve_capabilities(plugins_root.path(), "demo", &caps(&["storage"]), 1)
+        .expect_err("approving a set that isn't what the manifest declares must be refused");
+    assert_eq!(err_code(&e), "manifest-changed", "got: {e}");
+    assert!(
+        load_grants(plugins_root.path()).is_empty(),
+        "a refused approval must write nothing at all"
+    );
+}
+
+#[test]
+fn approving_an_uninstalled_or_traversing_plugin_id_is_refused() {
+    let plugins_root = tempfile::tempdir().unwrap();
+    assert!(approve_capabilities(plugins_root.path(), "nope", &caps(&["storage"]), 1).is_err());
+    assert!(approve_capabilities(plugins_root.path(), "../escape", &caps(&["storage"]), 1).is_err());
+    assert!(manifest_for_installed(plugins_root.path(), "../escape").is_err());
+    assert!(load_grants(plugins_root.path()).is_empty());
+}
+
+#[test]
+fn the_bundled_example_prompts_like_any_other_plugin_by_default() {
+    // Pins the SHIPPED default of the open human decision (#377, plan §3's
+    // "Bundled resource-monitor" bullet): loomux prompts for the bundled
+    // example too — no capability is live without a human decision. Flipping
+    // that is a human's call, not an agent's (CLAUDE.md constraint 9), and
+    // this test is what would go red if someone flipped it quietly.
+    assert!(
+        PRE_SEEDED_GRANT_PLUGIN_IDS.is_empty(),
+        "pre-seeding any plugin id is an OPEN HUMAN DECISION — see plugingrants.rs"
+    );
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), BUNDLED_EXAMPLE_PLUGIN_ID, "1.0.0", &["metrics.system"], true);
+
+    seed_declared_grants(plugins_root.path(), PRE_SEEDED_GRANT_PLUGIN_IDS, 1);
+    assert!(load_grants(plugins_root.path()).is_empty());
+    assert!(validate_open_request(
+        plugins_root.path(),
+        &open_req(BUNDLED_EXAMPLE_PLUGIN_ID, &["metrics.system"], None)
+    )
+    .is_err());
+}
+
+#[test]
+fn pre_seeding_a_grant_is_possible_if_the_human_chooses_it() {
+    // The other branch of that same decision, proven reachable so the choice
+    // is a one-line list edit rather than a redesign: seeding an id grants
+    // exactly what its own installed manifest declares, and the plugin then
+    // opens with no prompt.
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), BUNDLED_EXAMPLE_PLUGIN_ID, "1.0.0", &["metrics.system"], true);
+
+    seed_declared_grants(plugins_root.path(), &[BUNDLED_EXAMPLE_PLUGIN_ID], 1_700_000_000);
+
+    let record = load_grants(plugins_root.path())
+        .remove(BUNDLED_EXAMPLE_PLUGIN_ID)
+        .expect("seeding must record a grant for the id it was given");
+    assert_eq!(record.capabilities, caps(&["metrics.system"]));
+    assert!(validate_open_request(
+        plugins_root.path(),
+        &open_req(BUNDLED_EXAMPLE_PLUGIN_ID, &["metrics.system"], None)
+    )
+    .is_ok());
+}
+
+#[test]
+fn seeding_never_overwrites_a_decision_a_human_already_made() {
+    // A human who approved a narrower set (or revoked one by editing the
+    // store) keeps that across every later boot — the same rule
+    // seed_bundled_example_plugin follows for the folder itself.
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "2.0.0", &["storage", "fs.read"], false);
+    record_grant(plugins_root.path(), "demo", &caps(&["storage"]), "1.0.0", 5).unwrap();
+
+    seed_declared_grants(plugins_root.path(), &["demo"], 9);
+
+    let record = load_grants(plugins_root.path()).remove("demo").unwrap();
+    assert_eq!(record.capabilities, caps(&["storage"]));
+    assert_eq!(record.approved_at_version, "1.0.0");
+    assert_eq!(record.decided_at, 5);
+}
+
+#[test]
+fn seeding_an_uninstalled_plugin_is_a_silent_no_op() {
+    // This runs during startup (lib.rs's .setup()); a missing or unparseable
+    // plugin must never block boot, and must certainly never mint a grant.
+    let plugins_root = tempfile::tempdir().unwrap();
+    seed_declared_grants(plugins_root.path(), &["not-installed"], 1);
+    assert!(load_grants(plugins_root.path()).is_empty());
+}
+
+#[test]
+fn fs_read_jail_root_is_derived_server_side_not_taken_from_the_request() {
+    // #377 NB3: `req.root` is a rootless SIGNAL, never a path to trust. The
+    // jail `fs.read` is confined to is rebuilt from plugins_root + plugin id —
+    // the identical folder the plugin:// scheme handler serves for that id —
+    // so a caller cannot widen a plugin's read jail by sending a different
+    // string, and the jail can never drift from the served address space.
+    let plugins_root = tempfile::tempdir().unwrap();
+    install_declaring(plugins_root.path(), "demo", "1.0.0", &["fs.read"], false);
+    approve_capabilities(plugins_root.path(), "demo", &caps(&["fs.read"]), 1).unwrap();
+
+    let hostile = open_req("demo", &["fs.read"], Some("/etc"));
+    let validated = validate_open_request(plugins_root.path(), &hostile).unwrap();
+    assert_eq!(
+        validated.root.as_deref(),
+        Some(plugins_root.path().join("demo").to_string_lossy().as_ref()),
+        "the session's fs.read jail must be the plugin's own installed folder, whatever the \
+         request asked for"
+    );
+
+    // `None` keeps its one meaning: this plugin is rootless, so fs.read has no
+    // jail to resolve against and stays unreachable at the broker.
+    let rootless = open_req("demo", &["fs.read"], None);
+    assert_eq!(validate_open_request(plugins_root.path(), &rootless).unwrap().root, None);
 }

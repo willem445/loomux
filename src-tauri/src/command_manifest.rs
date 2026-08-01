@@ -153,9 +153,14 @@ pub const APP_COMMANDS: &[&str] = &[
     "fm_reveal",
     // filehash (1)
     "fm_hash_start",
-    // plugins (2, #360 Slice B)
+    // plugins (2, #360 Slice B) + the install-approval gate's one writer
+    // (#377). plugin_approve_capabilities persists a HUMAN's capability
+    // decision, so it is main-only (granted via the "plugins" set, which only
+    // "main-ui" aggregates) and must never be granted to a plugin-* webview
+    // or reachable from any agent surface — see plugingrants.rs.
     "list_plugins",
     "install_plugin",
+    "plugin_approve_capabilities",
     // obs (1)
     "take_startup_notice",
     // uistate (4)
