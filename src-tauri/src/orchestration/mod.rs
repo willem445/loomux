@@ -6665,7 +6665,14 @@ pub struct OrchRegistry {
     /// out of one comparison. Release is on EVIDENCE (a depth that has
     /// actually come back down), never on elapsed time — `.loomux/lessons.md`,
     /// "releasing on evidence beats releasing on elapsed time".
-    queue_pressure: Arc<Mutex<HashMap<u32, queue::CapacityState>>>,
+    ///
+    /// Stores the agent id alongside the state, and that is load-bearing
+    /// rather than convenience: the RELEASE transition is observed on a pop
+    /// that may have just emptied the queue, so at the moment the badge has to
+    /// come down there is no queue entry left to say whose badge it is.
+    /// Remembering who it was raised for is the only reading that survives the
+    /// queue itself.
+    queue_pressure: Arc<Mutex<HashMap<u32, (queue::CapacityState, String)>>>,
 
     /// Serializes task-board read-modify-write cycles (MCP threads and the
     /// human UI mutate the same tasks.json).
@@ -24492,7 +24499,7 @@ impl OrchRegistry {
                 // table) — but the pane IS at capacity, and on an orchestrator
                 // target the `Err` below is the ONLY other signal and goes to
                 // the calling agent, never to the human.
-                self.note_queue_capacity(group, pty_id);
+                self.note_queue_capacity(group, pty_id, Some(agent_id));
                 Err(queue::queue_full_error(agent_id, depth, reason.as_str()))
             }
             queue::AdmitDecision::Coalesce => {
@@ -24551,7 +24558,7 @@ impl OrchRegistry {
                     json!({ "to": agent_id, "id": id, "reason": reason.as_str(), "depth": depth }));
                 // #563: the admission that takes a pane to `Approaching` is
                 // the last moment a warning can still be a warning.
-                self.note_queue_capacity(group, pty_id);
+                self.note_queue_capacity(group, pty_id, Some(agent_id));
                 Ok(AdmitOutcome { id, was_first, coalesced: false })
             }
         }
@@ -24611,7 +24618,7 @@ impl OrchRegistry {
         // leaves pasted-but-unsubmitted text in the pane with nothing queued
         // to press it. `audit_stranded_push` records the loss; this makes it
         // visible on a pane whose in-band notice channel is suppressed.
-        self.note_queue_capacity(group, pty_id);
+        self.note_queue_capacity(group, pty_id, Some(agent_id));
         out
     }
 
@@ -24761,7 +24768,7 @@ impl OrchRegistry {
                 // #563: before the `?` — a rejected marker is exactly the case
                 // whose capacity state most needs reporting, and an early
                 // return would skip it.
-                self.note_queue_capacity(group, pty_id);
+                self.note_queue_capacity(group, pty_id, Some(agent_id));
                 self.audit_stranded_push(group, agent_id, pushed)?;
                 self.audit(group, "loomux", "stranded-selfheal-submit",
                     json!({ "to": agent_id, "via": "queue-front-marker" }));
@@ -25156,7 +25163,7 @@ impl OrchRegistry {
         // #563: the queue is now empty, so any pressure badge this pane was
         // carrying is no longer true. Before `announce_dropped`, so the drop
         // notice is the last word rather than being followed by a release.
-        self.note_queue_capacity(group, pty_id);
+        self.note_queue_capacity(group, pty_id, None);
         self.announce_dropped(group, entries, reason);
     }
 
@@ -25211,27 +25218,56 @@ impl OrchRegistry {
     /// Takes no lock across the notice/badge calls, and re-reads depth rather
     /// than accepting it as a parameter, so every caller — admission,
     /// rejection, dequeue, drop — states the same fact the same way.
+    /// `hint` is the target a caller already knows (the admission paths do);
+    /// every other caller passes `None` and the agent is resolved from the
+    /// queue, then from the remembered pressure record, then from `by_pty`.
     #[doc(hidden)] // pub for integration tests
-    pub fn note_queue_capacity(&self, group: &str, pty_id: u32) {
-        let depth = self.queues.lock_safe().get(&pty_id).map(|q| q.len()).unwrap_or(0);
-        let state = queue::capacity_state(depth);
-        let prev = {
-            let mut m = self.queue_pressure.lock_safe();
-            let prev = m.get(&pty_id).copied().unwrap_or(queue::CapacityState::Normal);
-            if state == queue::CapacityState::Normal {
-                m.remove(&pty_id);
-            } else {
-                m.insert(pty_id, state);
-            }
-            prev
+    pub fn note_queue_capacity(&self, group: &str, pty_id: u32, hint: Option<&str>) {
+        let (depth, front_agent) = {
+            let queues = self.queues.lock_safe();
+            let q = queues.get(&pty_id);
+            (
+                q.map(|q| q.len()).unwrap_or(0),
+                q.and_then(|q| q.front()).map(|e| e.agent_id.clone()),
+            )
         };
+        let state = queue::capacity_state(depth);
+        // Resolution order, most-authoritative first. `remembered` is what
+        // makes the release transition work at all: by then the queue may be
+        // empty, so nothing else can name whose badge is coming down.
+        let (prev, remembered) = {
+            let m = self.queue_pressure.lock_safe();
+            match m.get(&pty_id) {
+                Some((s, who)) => (*s, Some(who.clone())),
+                None => (queue::CapacityState::Normal, None),
+            }
+        };
+        let agent_id = hint
+            .map(str::to_string)
+            .or(front_agent)
+            .or(remembered)
+            .or_else(|| self.by_pty.lock_safe().get(&pty_id).cloned());
+        {
+            let mut m = self.queue_pressure.lock_safe();
+            match (&agent_id, state) {
+                // Nothing to remember once the pane is back to normal.
+                (_, queue::CapacityState::Normal) => {
+                    m.remove(&pty_id);
+                }
+                (Some(who), _) => {
+                    m.insert(pty_id, (state, who.clone()));
+                }
+                // Under pressure with nobody to attribute it to (teardown
+                // ordering, or a bare registry with no agent at all). Not
+                // recorded, so a later call with a resolvable target still
+                // sees the transition rather than having it swallowed here.
+                (None, _) => {}
+            }
+        }
         if state == prev {
             return;
         }
-        // No agent bound to this pty (teardown ordering, or a bare test
-        // registry): there is nobody to badge and nothing to name. The state
-        // above is still recorded, so a later bind reports from the right edge.
-        let Some(agent_id) = self.by_pty.lock_safe().get(&pty_id).cloned() else {
+        let Some(agent_id) = agent_id else {
             return;
         };
         self.audit(group, "loomux", "delivery-queue-pressure", json!({
@@ -25301,7 +25337,7 @@ impl OrchRegistry {
         // #563: the depth just came down — the evidence the pressure badge
         // releases on. Release is here, on a real reading, and nowhere on a
         // timer.
-        self.note_queue_capacity(group, pty_id);
+        self.note_queue_capacity(group, pty_id, None);
     }
 
     /// Close out EVERY constituent of one coalesced flush (#533-A) — the
@@ -25359,7 +25395,7 @@ impl OrchRegistry {
         // #563: once, after the whole batch — a batch pops several entries at
         // one instant, and reporting a capacity transition per pop would
         // narrate a fall the pane never actually sat in.
-        self.note_queue_capacity(group, pty_id);
+        self.note_queue_capacity(group, pty_id, None);
     }
 
     /// Remove constituents that `queue::plan_flush` ruled superseded
@@ -25440,7 +25476,7 @@ impl OrchRegistry {
         // #563: supersession is the other way a depth falls, and a pane whose
         // pressure was relieved by dedup rather than by delivery must release
         // its badge just the same.
-        self.note_queue_capacity(group, pty_id);
+        self.note_queue_capacity(group, pty_id, None);
     }
 
     /// Current queue depth for `pty_id` (0 if none exists) — a read-only

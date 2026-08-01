@@ -5648,6 +5648,113 @@ seams the drainer calls (`pop_batch_dequeued`, `drop_superseded`) are driven aga
 registry; the literal call between them is covered by a `debug_assert` tying `plan_flush`'s
 `stranded` flag to the planned front entry's own payload, not by a test.
 
+### #563: the hold nobody could see, and the queue that filled in silence
+
+**The report.** A copilot orchestrator's deliveries were held against a pane whose prompt box was
+**empty**, with **no warning** anywhere in the UI, until the delivery queue **filled completely**
+and work was dropped. Three fixes already existed for pieces of this — #246's held chip, #532's
+bounded question hold, #445/#523's queue persistence and orphan surfacing — and the combination
+still happened.
+
+**Cause 1: the chip covered the wrong holds.** `orch-delivery-held` was emitted from exactly one
+place, `deliver_now`'s `emit_held` closure, around that attempt's individually-capped waits — and
+cleared when the attempt ended, *including when it aborted*. But an attempt is bounded by
+construction; the hold a human sits in front of is not. It lives in `run_queue_drainer`'s poll
+loop, which re-reads `write_admission` every `QUEUE_DRAIN_POLL` and, on a blocked admission,
+`continue`d with no UI event at all. So the chip's entire lifetime was the inside of one attempt,
+and the sustained hold — minutes, hours — showed nothing until #532's escalation badged at
+`QUESTION_HOLD_STALE_AFTER` (ten minutes, and by that constant's own doc up to ~19 in practice
+because the bound is only sampled *between* attempts). On the affected build #532 had not shipped
+at all, so there was nothing.
+
+The fix is `HeldEscalation::Chip`: the same decision function the drainer already consulted now
+returns a chip for every blocked poll inside the bound, instead of `None`. Two existing test
+assertions had to change, and it is worth being exact about that rather than quietly editing
+expectations — **as written, they pinned the invisible window.** One asserted that a hold inside
+the bound reports nothing; the other that a writable pane has nothing to clear (true only while a
+chip could not exist without a badge). Neither guarantee is lost: the escalation still fires only
+at the bound, and "no spurious audit on a healthy poll" moved to the caller's guarded clear, which
+is where it belongs now that `Clear` fires on every writable poll. A `ChipGuard` (RAII) drops the
+chip on every exit from the drainer, including the early returns for a closed pty or a dead
+agent — a stale "held" chip on a pane nothing is holding would be worse than none, because it
+trains a human to ignore the real one.
+
+**Cause 2: on an orchestrator pane, the queue's whole notice channel is a no-op.** `notify_queue`
+returns early with `notice-suppressed` whenever the target IS the group's orchestrator. That
+suppression is *correct* and structural — a notice to the orchestrator about the orchestrator's
+own blocked pane would queue behind the very block it reports — but it covers `queued_notice`,
+`still_queued_notice`, `dropped_notice` and `recovered_notice` alike. So a queue could fill to
+`QUEUE_MAX_PER_PANE` and start rejecting payloads with the human told nothing: the rejection's only
+other signal was a synchronous `Err` to the *calling agent*. `StrandedBlocker::QuestionStale`'s own
+doc predicted this ("**nobody is told until someone next looks at the window**"); #563 is that
+prediction one channel over.
+
+The rule this settles, and the one `hold_channels` now enforces: **a hold classification whose only
+channel is the in-band notice is invisible exactly where it matters most.** Every classification
+must have at least one channel that survives an orchestrator target — a chip or a badge, both of
+which are UI events keyed on `pty_id` with no role suppression anywhere in their path.
+
+**The enumeration is executable, not prose.** `HoldClass` (13 variants), `HoldChannel`, and
+`hold_channels` — matched exhaustively, so a hold added later cannot be silent by omission, and
+tested by `every_hold_class_reaches_a_human_who_is_not_the_orchestrator_channel`. A table in this
+file would have rotted the same way the old implicit one did. `HoldClass::ordinal`'s exhaustive
+match plus a hardcoded `ALL.len()` assertion is what keeps `ALL` honest: a new variant fails to
+compile until it has an index, and fails the test until it is listed.
+
+**Capacity: a state between "fine" and "work has just been lost".** There was none, which is why
+nothing could warn while warning was still useful. `queue::CapacityState` adds `Approaching` at
+`QUEUE_NEAR_FULL_AT` (6 of 8). Two slots of headroom, sized against what the warning is *for*
+rather than against traffic: at a 2s drain poll a held pane admits arrivals as fast as its senders
+produce them, so a one-slot threshold would routinely be crossed and exhausted inside a single tick
+and the "warning" would arrive with the loss.
+
+`note_queue_capacity` is the one place that reports it, called from every path that changes a
+pane's depth (admission, rejection, marker push, dequeue, batch dequeue, supersession, whole-queue
+drop). It is **edge-triggered** — a pane parked at 7/8 for an hour produces one audit line and one
+badge, not one per arrival — and it **releases on evidence**, a depth that has actually come back
+down, never on elapsed time (`.loomux/lessons.md`: a queue still full after ten minutes is more
+urgent, not less). The remembered record carries the agent id alongside the state, and that is
+load-bearing rather than convenience: the release is observed on a pop that may have just emptied
+the queue, so at the moment the badge must come down there is no queue entry left to say whose it
+is.
+
+`StrandedBlocker::QueueNearFull` is a separate variant from `QueueFull` for the reason
+`QuestionStale` is separate from `Question`: `QueueFull`'s wording asserts loomux *could not queue*
+something, which is a false claim while the queue is still accepting. The badge never stomps
+another mechanism's — that badge is already telling the human to look at this pane — but it does
+upgrade its own, so `Approaching` → `Full` re-words rather than sticking at the softer sentence.
+
+**A forced drop now names what dropped.** The pre-#563 line recorded `{to, reason, depth}` and no
+more. No id is minted for a rejected entry, so there was nothing else in the log to join against,
+and `audit.jsonl` rotates — that line is the only record that will ever exist. It now carries
+`from`, `bytes` and a bounded, single-line, explicitly-truncated `preview`, because a sender can
+re-send a delivery it can identify and cannot re-send an anonymous one. The marker-push rejection
+names its own consequence in words (`text is pasted in the pane with nothing queued to submit it`),
+which is the fact a reader actually needs from that line.
+
+**Persistence (the #468 table above).** Only the `Admit` arm mutates `queues`, and it already
+persisted; `RejectFull` mutates nothing, so it owes no `persist_queues` — stated rather than left
+to inference, since "anything mutating `queues` owes `persist_queues`" is the rule this subsystem
+is reviewed against. `queue_pressure` is in-memory one-shot state like `question_stale_notified`
+and owes no snapshot either; it is cleared in `commit_exit` under the same generation guard, or a
+successor drainer's first reading would look like a fall from `Full` and emit a release for a pane
+that never recovered.
+
+**What this does NOT fix, stated rather than implied.** The interactive-question gate still reads
+an append-only byte ring, so an answered question keeps matching until fresh output pushes it out —
+and the drainer's own gate calls `question_active_now(.., None)`, i.e. without `mask_own_paste`,
+because at that point the entry has pasted nothing of its own even though the *previous* delivery's
+text is still in the ring. Text loomux itself delivered can therefore latch that gate. #563's fix
+makes such a latch **visible within two seconds** instead of invisible for ten minutes; it does not
+make the reading correct. The correct reading needs rendered rows (`termgrid`, #530) and is filed
+separately, as is a real in-band channel for orchestrator panes to replace what `notify_queue`
+structurally cannot deliver.
+
+**Residual.** `run_queue_drainer` is still not drivable in-suite (no live pty/`AppHandle`), the same
+boundary every delivery test in this design has. The decision it consults (`held_escalation`) and
+every registry seam it calls (`note_queue_capacity`, `pop_front_dequeued`, `mark_stranded`) are
+driven directly; the emit calls between them are not.
+
 ## Kill-exit notices: recorded initiator, not inferred (#533-B)
 
 **Problem.** `[loomux] agent X exited (kill or idle-timeout) — not a crash` prompted the
