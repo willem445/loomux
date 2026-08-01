@@ -9996,6 +9996,16 @@ fn run_late_confirmation_monitor(
     // `NotHolding` badge (raised precisely because the text was already gone)
     // is never immediately un-raised by the same reading that raised it.
     let mut paste_seen_in_box = false;
+    // #559 (rev-13 N2): computed ONCE for this monitor, not per tick and not
+    // per arm. `pasted_text` is fixed for the monitor's whole life, so the
+    // derived scan size is a constant of this delivery — and `tier1_scan_
+    // bytes` normalizes the paste to measure it, which for a coalesced flush
+    // is a multi-KiB allocation this loop would otherwise repeat every
+    // `LATE_MONITOR_POLL` for up to `LATE_MONITOR_MAX_LIFETIME`. Hoisting it
+    // also makes the "every box read for a delivery uses the SAME size"
+    // invariant (see `deliver_prompt`'s `tier1_scan`) structural here rather
+    // than a property of two call sites happening to call the same function.
+    let tier1_scan = tier1_scan_bytes(&pasted_text);
     loop {
         std::thread::sleep(LATE_MONITOR_POLL);
         // The pty closing (agent exited/killed) means there is nothing left
@@ -10080,7 +10090,7 @@ fn run_late_confirmation_monitor(
                     // conservative posture the old `.unwrap_or(true)` had,
                     // now extended to the tail-too-short case it missed.
                     let reading = box_reading(
-                        ptys.output_tail_bounded(pty_id, tier1_scan_bytes(&pasted_text))
+                        ptys.output_tail_bounded(pty_id, tier1_scan)
                             .map(|b| strip_ansi(&b))
                             .as_deref(),
                         &pasted_text,
@@ -10177,9 +10187,8 @@ fn run_late_confirmation_monitor(
                 // so an oversized coalesced flush is no longer read as an
                 // empty box. `holds_paste` stays as the name for the ONE
                 // question the rest of this arm asks of it.
-                let scan_bytes = tier1_scan_bytes(&pasted_text);
                 let reading = box_reading(
-                    ptys.output_tail_bounded(pty_id, scan_bytes)
+                    ptys.output_tail_bounded(pty_id, tier1_scan)
                         .map(|b| strip_ansi(&b))
                         .as_deref(),
                     &pasted_text,
@@ -10195,7 +10204,7 @@ fn run_late_confirmation_monitor(
                         "to": agent, "confirm_state": "unconfirmed",
                         "reason": "pasted text is larger than the pane tail loomux could read",
                         "paste_bytes": pasted_text.len(),
-                        "scan_bytes": scan_bytes,
+                        "scan_bytes": tier1_scan,
                     }));
                 }
                 // #522: a pane that is simply DONE — our text consumed, no
