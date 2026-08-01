@@ -16606,6 +16606,10 @@ impl OrchRegistry {
             nominal_ttl_ms: ttl_ms,
             last_poll_ms: 0,
             fail_streak: 0,
+            // #531: baselined by the poller on the first poll that reports a
+            // head, not here — registration deliberately shells out to
+            // nothing (see `Watch::first_head`).
+            first_head: None,
         };
         watches.insert(id, watch.clone());
         drop(watches);
@@ -16760,7 +16764,7 @@ impl OrchRegistry {
     /// per-watch floor, round-robin ordering, and the paused-skip are all
     /// tested there with no `gh`), shell out to `gh` for each, and classify
     /// with the pure predicates.
-    fn poll_watches(&self) -> HashMap<String, notify::PollResult> {
+    fn poll_watches(&self) -> HashMap<String, notify::Poll> {
         let now = now_ms();
         let paused = self.paused.lock_safe().clone();
         let due: Vec<notify::Watch> = {
@@ -16774,7 +16778,7 @@ impl OrchRegistry {
         let mut results = HashMap::new();
         for w in &due {
             let Some(repo) = self.group(&w.group).map(|g| g.repo) else { continue };
-            let poll_result = match &w.condition {
+            let poll = match &w.condition {
                 notify::Condition::PrChecks { pr } => {
                     // #337: check mergeability BEFORE checks. A conflicted PR
                     // never gets a check-suite at all (no clean merge ref for
@@ -16783,13 +16787,22 @@ impl OrchRegistry {
                     // checks reported" (Pending) every tick until expiry —
                     // this pre-check turns that silent dead end into an
                     // immediate, distinct notice instead.
+                    //
+                    // #531: `headRefOid` rides along on that same call — one
+                    // process, two facts — so a fired notice can state the
+                    // head its verdict actually belongs to instead of leaving
+                    // the frozen registration-time note as the only SHA in
+                    // sight. Sampled here, immediately before the checks read,
+                    // which is why the notice calls it "head at this poll"
+                    // rather than claiming it as the verdict's own head.
                     let mergeability =
-                        self.gh_capture(&repo, &["pr", "view", &pr.to_string(), "--json", "mergeStateStatus"]);
+                        self.gh_capture(&repo, &["pr", "view", &pr.to_string(), "--json", "mergeStateStatus,headRefOid"]);
                     let mergeability_ref: Result<&str, &str> = match &mergeability {
                         Ok(s) => Ok(s.as_str()),
                         Err(e) => Err(e.as_str()),
                     };
-                    if notify::pr_mergeability_result(mergeability_ref) == notify::PollResult::Conflicting {
+                    let head = notify::pr_head_from(mergeability_ref);
+                    let result = if notify::pr_mergeability_result(mergeability_ref) == notify::PollResult::Conflicting {
                         notify::PollResult::Conflicting
                     } else {
                         let raw = self.gh_capture(&repo, &["pr", "checks", &pr.to_string(), "--json", "state,name,link"]);
@@ -16798,7 +16811,8 @@ impl OrchRegistry {
                             Err(e) => Err(e.as_str()),
                         };
                         notify::condition_poll_result(&w.condition, raw_ref)
-                    }
+                    };
+                    notify::Poll::new(result, head)
                 }
                 notify::Condition::WorkflowRun { run } => {
                     let raw = self.gh_capture(&repo, &["run", "view", &run.to_string(), "--json", "status,conclusion"]);
@@ -16806,10 +16820,13 @@ impl OrchRegistry {
                         Ok(s) => Ok(s.as_str()),
                         Err(e) => Err(e.as_str()),
                     };
-                    notify::condition_poll_result(&w.condition, raw_ref)
+                    // No head: a run id is already pinned to one commit, so
+                    // there is nothing here that can drift out from under the
+                    // note.
+                    notify::Poll::from(notify::condition_poll_result(&w.condition, raw_ref))
                 }
             };
-            results.insert(w.id.clone(), poll_result);
+            results.insert(w.id.clone(), poll);
         }
 
         // Stamp last_poll_ms for everything that actually got a `gh` result
@@ -16872,9 +16889,13 @@ impl OrchRegistry {
     ///   `nominal_ttl_ms` (fixed at registration) is what the expiry notice
     ///   reports, precisely so this mutation of `deadline_ms` never corrupts
     ///   the "expired after N min" figure shown to the agent.
-    pub fn notify_tick(&self, now: u64, results: &HashMap<String, notify::PollResult>) -> Vec<String> {
+    pub fn notify_tick(&self, now: u64, results: &HashMap<String, notify::Poll>) -> Vec<String> {
         enum Fate {
-            Fire(String),
+            /// The summary the notice reports, plus the head SHA observed on
+            /// the poll that produced it (#531) — carried through to the
+            /// notice so the verdict is labelled with the head it belongs to
+            /// and not merely with whatever the frozen note happened to name.
+            Fire(String, Option<String>),
             Expire,
             FailCancel(String),
             /// #337: the PR went CONFLICTING — terminal like `Fire`, but
@@ -16935,9 +16956,22 @@ impl OrchRegistry {
                 if paused.contains(&w.group) {
                     continue;
                 }
-                match results.get(id) {
+                let poll = results.get(id);
+                // #531: fold this poll's observed head in BEFORE any fate is
+                // decided, so a watch that fires on this very tick already
+                // carries its baseline in the clone below. First head wins and
+                // is never overwritten — it is the "what this watch started
+                // out watching" reference the MOVED marker measures against;
+                // overwriting it each poll would make every notice read as
+                // unmoved.
+                if let Some(head) = poll.and_then(|p| p.head.as_deref()) {
+                    if w.first_head.is_none() {
+                        w.first_head = Some(head.to_string());
+                    }
+                }
+                match poll.map(|p| &p.result) {
                     Some(notify::PollResult::Met { summary }) => {
-                        acted.push((w.clone(), Fate::Fire(summary.clone())));
+                        acted.push((w.clone(), Fate::Fire(summary.clone(), poll.and_then(|p| p.head.clone()))));
                         to_remove.push(id.clone());
                         continue;
                     }
@@ -16977,9 +17011,16 @@ impl OrchRegistry {
         let mut fired = Vec::new();
         for (w, fate) in acted {
             let (action, text) = match &fate {
-                Fate::Fire(summary) => (
+                Fate::Fire(summary, head) => (
                     "watch-fired",
-                    notify::watch_fired_notice(&w.id, &w.condition, summary, &w.note),
+                    notify::watch_fired_notice(
+                        &w.id,
+                        &w.condition,
+                        summary,
+                        head.as_deref(),
+                        w.first_head.as_deref(),
+                        &w.note,
+                    ),
                 ),
                 Fate::Conflicting(pr) => (
                     "watch-conflicting",

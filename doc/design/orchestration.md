@@ -1642,6 +1642,42 @@ indicator, the audit's `watch-*` summarize() sentences, and the watchdog's "may 
 deliberately waiting" annotation — reads the exact same `watches` registry state this section
 describes; no second store.
 
+### Fire-time facts vs the registration-time note (#531)
+
+A watch's `note` is frozen the instant it is registered; the verdict it ends up attached to is
+not. Observed three times on 2026-07-30: a note written while the branch was at `ccf191c` was
+delivered alongside a checks verdict resolved at `a77c4d1`, because the branch had been
+re-pushed while the watch was outstanding. Nothing in the notice said so, so a *current* result
+arrived labelled with a *stale* SHA — the exact shape of "a green run on an old head is not a
+merge license", and the reader had to go re-derive the head by hand before trusting its own
+ready-state.
+
+So the fired notice states the volatile facts as of FIRE time, alongside (never instead of) the
+note:
+
+- Each `pr_checks` poll reads `headRefOid` off the `gh pr view` mergeability pre-check it was
+  already making (#337) — one process, two facts — and carries it on the tick's `Poll` next to
+  the `PollResult`. The classification vocabulary is untouched; a head SHA is an observation
+  riding with a verdict, not a kind of verdict.
+- The notice names that head (`Head at this poll: a77c4d1`), and when it differs from the first
+  head this watch ever observed, says so outright: `MOVED from ccf191c since this watch began;
+  re-verify the head before acting on the note`. The head clause is emitted *before* the note so
+  `NOTICE_TOTAL_CAP` truncation trims the note's tail rather than the freshness fact.
+- The note is echoed verbatim as `Note (registered): "…"` — relabelled, never rewritten. The
+  backend does not re-derive or reinterpret what the agent meant; it only fixes the *as-of*.
+
+The baseline is the first head the **poller** observed, not the head at registration:
+`register_notification` runs inside the agent's own `notify_when` call and shells out to
+nothing, and putting a `gh` round-trip in front of every registration to buy a marginally
+earlier baseline is the wrong trade. `due_watches` makes a never-polled watch immediately due,
+so in practice the baseline lands within one `NOTIFY_POLL_INTERVAL` of registration. The
+residue is deliberate and documented on `Watch::first_head`: a re-push inside that first window
+becomes the baseline and is therefore invisible to the MOVED marker — which is precisely why the
+notice always states the head it actually saw, instead of leaving the marker as the only
+freshness signal. Every failure mode of the head read (a `gh` error, a missing field, a
+non-hex value) degrades to *no head clause at all* and the pre-#531 wording: a wrong SHA in
+front of an orchestrator is the one outcome worse than no SHA.
+
 ### Why structured kinds, not a caller-supplied poll command
 
 The obvious generic shape — `notify_when(poll_command, predicate)` — was considered and
