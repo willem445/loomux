@@ -38,6 +38,11 @@ There is no global mode — each pane declares its own kind:
 | **Git** | The git view (the `Alt+G` surface) as a pane, over a repo you choose. |
 | **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable pane over `.loomux/workflow.yml`. Point it at a repo that has no workflow file yet and the pane offers to create one. See [custom agent workflows](orchestration.html#custom-agent-workflows). |
 
+The last four are **content panes**: a pane that *is* a surface rather than a
+process. No shell, no CLI, no PTY — just the surface, in a pane. They split, dock,
+drag, maximize and restore exactly like a terminal pane, and they never count
+toward a tab's agent badge, because a viewer is not an agent.
+
 **Not every CLI in the Agent list runs everywhere.** The picker offers what
 loomux can launch; availability is the CLI's own. **Ante** is the one standing
 exception worth knowing before you pick it: Antigma documents it as macOS- and
@@ -46,11 +51,6 @@ matter how the pane is configured. The launcher also warns inline when a
 selected CLI isn't installed. Orchestration groups are narrower still — an
 orchestrator, worker, reviewer or planner must be **Claude Code or Copilot
 CLI**, the two loomux has orchestration adapters for.
-
-The last four are **content panes**: a pane that *is* a surface rather than a
-process. No shell, no CLI, no PTY — just the surface, in a pane. They split, dock,
-drag, maximize and restore exactly like a terminal pane, and they never count
-toward a tab's agent badge, because a viewer is not an agent.
 
 ### The file editor and git panes
 

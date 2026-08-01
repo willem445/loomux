@@ -16,8 +16,8 @@ into their own panes and their own git worktrees, and drives each issue to a pul
 request.
 
 Every prompt it sends is *typed into a pane you can read* — so you can steer any
-agent mid-task by just typing, or take the keyboard entirely. And no agent merges:
-that button stays yours.
+agent mid-task by just typing, or take the keyboard entirely. And by default no
+agent merges: that button stays yours.
 
 *Loom* + *mux* — a loom is the frame that holds every thread in place while the
 fabric is woven.
