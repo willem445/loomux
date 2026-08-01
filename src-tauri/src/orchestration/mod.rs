@@ -17340,25 +17340,23 @@ impl OrchRegistry {
     /// reports how many were ACTUALLY read, so a skip is visible as a smaller
     /// denominator rather than silently inflating confidence.
     fn corroborating_session_keys(&self, group: &str, target_session: &str) -> (Vec<(String, Vec<String>)>, bool) {
-        // SCRATCH (red-before-green, reverted in the next commit): no other
-        // session is ever read, which is the pre-#324 state — one session's
-        // windows and nothing to compare them against.
-        if true {
-            return (Vec::new(), false);
-        }
         let mut recs = self.merged_records(group);
         recs.sort_by_key(|r| std::cmp::Reverse(r.updated_ms));
         let mut seen: HashSet<String> = HashSet::new();
         let mut candidates: Vec<(String, String, String)> = Vec::new();
         for r in &recs {
             let Some(sid) = r.session.clone() else { continue };
-            if sid == target_session || !seen.insert(sid.clone()) {
+            // SCRATCH (red-before-green run 2, reverted next commit): the
+            // self-exclusion dropped, so the target's own session counts as
+            // its own corroboration.
+            if !seen.insert(sid.clone()) {
                 continue;
             }
             candidates.push((r.id.clone(), self.cli_for_record(group, r), sid));
         }
-        let capped = candidates.len() > Self::MAX_CORROBORATION_SESSIONS;
-        candidates.truncate(Self::MAX_CORROBORATION_SESSIONS);
+        // SCRATCH (red-before-green run 2, reverted next commit): the scan cap
+        // dropped, so a capped scan can pass itself off as an exhaustive one.
+        let capped = false;
         let out = candidates
             .into_iter()
             .filter_map(|(label, cli, sid)| {
