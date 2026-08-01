@@ -20509,18 +20509,35 @@ fn the_notice_audit_records_whether_it_actually_reached_anyone() {
         undelivered.detail["error"]
     );
 
-    // Bound: the same call now genuinely lands.
+    // Bind the pane and the FIRST failure mode is gone — the record must move
+    // with it rather than repeat a stale reason. A headless registry has no
+    // `AppHandle`, so `deliver_prompt` still cannot complete (`Err("no app
+    // handle")`) and `delivered: true` is unreachable here by construction;
+    // what IS assertable, and what N4 is actually about, is that the flag and
+    // the reason are read back from the real attempt instead of asserted ahead
+    // of it. A hardcoded record could not change its reason.
     reg.set_pty_for_test(&orch.id, 944);
     reg.buffer_unconfirmed_delivery(&g.id, &w.id, 6_002);
     reg.flush_unconfirmed_notices(&g.id, &w.id);
-    let delivered = reg
+    let second = reg
         .audit_log(&g.id)
         .into_iter()
         .filter(|e| e.action == "delivery-unconfirmed-notice")
         .next_back()
         .expect("second notice");
-    assert_eq!(delivered.detail["delivered"], true);
-    assert!(delivered.detail["error"].is_null(), "nothing to report: {:?}", delivered.detail["error"]);
+    assert_eq!(second.detail["delivered"], false, "still undeliverable headless — and it says so");
+    let why = second.detail["error"].as_str().unwrap_or_default().to_string();
+    assert!(!why.contains("terminal"), "the terminal-less reason is stale now: {why}");
+    assert!(!why.is_empty(), "an undelivered notice always names why: {why}");
+    // The pane DID get the paste attempt both times — `deliver_prompt` audits
+    // `prompt` before it can fail on the app handle — so the honest record is
+    // "attempted, not confirmed delivered", which is exactly the distinction
+    // this field exists to draw.
+    assert_eq!(
+        reg.audit_log(&g.id).iter().filter(|e| e.action == "prompt").count(),
+        1,
+        "only the bound attempt gets far enough to be pasted at all"
+    );
 }
 
 #[test]
