@@ -144,10 +144,13 @@ pub fn approval_status(store: &GrantStore, plugin_id: &str, requested: &[String]
     let Some(record) = store.get(plugin_id) else {
         return ApprovalStatus::NeverApproved;
     };
-    let added: Vec<String> = normalize_capabilities(requested)
-        .into_iter()
-        .filter(|c| !record.capabilities.contains(c))
-        .collect();
+    // MUTATION M4 (scratch): require EQUALITY, so narrowing re-prompts too.
+    let requested_n = normalize_capabilities(requested);
+    let added: Vec<String> = if requested_n == record.capabilities {
+        Vec::new()
+    } else {
+        requested_n
+    };
     if added.is_empty() {
         ApprovalStatus::Approved
     } else {
@@ -171,8 +174,9 @@ pub fn record_grant(
     version: &str,
     decided_at: u64,
 ) -> Result<GrantRecord, String> {
+    // MUTATION M1 (scratch): record the set unsorted, as handed in.
     let record = GrantRecord {
-        capabilities: normalize_capabilities(capabilities),
+        capabilities: capabilities.to_vec(),
         decided_at,
         approved_at_version: version.to_string(),
     };
@@ -210,7 +214,8 @@ pub fn approve_capabilities(
 ) -> Result<GrantRecord, String> {
     let manifest = crate::plugins::manifest_for_installed(plugins_root, plugin_id)?;
     let declared = normalize_capabilities(&manifest.capabilities);
-    if declared != normalize_capabilities(shown) {
+    // MUTATION M2 (scratch): trust the caller's `shown` set instead of the manifest.
+    if false && declared != normalize_capabilities(shown) {
         return Err(err(
             "manifest-changed",
             format!(
@@ -259,9 +264,8 @@ pub fn seed_declared_grants(plugins_root: &Path, plugin_ids: &[&str], decided_at
     }
     let store = load_grants(plugins_root);
     for id in plugin_ids {
-        if store.contains_key(*id) {
-            continue;
-        }
+        // MUTATION M3 (scratch): reseed even when a decision already exists.
+        let _ = &store;
         let Ok(manifest) = crate::plugins::manifest_for_installed(plugins_root, id) else {
             continue;
         };
