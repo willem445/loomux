@@ -432,9 +432,9 @@ fn webview_scope_guard_denies_windows_scoped_leak_to_child_webview() {
          own — this is exactly the ambiguity `windows`-scoped grants exploit"
     );
 
-    // Comprehensive, not a single canary: every one of the 127 app commands must
+    // Comprehensive, not a single canary: every one of the 139 app commands must
     // be denied to the child webview EXCEPT the two the plugin capability
-    // legitimately grants. A single-command probe (the original shape of this
+    // legitimately grants (so 137 are actually probed for a leak). A single-command probe (the original shape of this
     // test, `pty_backend_info` only) only catches a `windows`-scoped leak on
     // THAT one command — a future capability that windows-scopes some OTHER
     // command (say, a new main-only command added without checking this file)

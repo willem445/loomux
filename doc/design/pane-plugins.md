@@ -62,7 +62,7 @@ minting them are loomux's own trusted frontend modules. An unsandboxed
 plugin is exactly the kind of code that promise was never written to survive.
 
 **Conclusion:** a pane plugin that runs as same-origin JS has the same reach
-as loomux's own frontend — all ~117 commands, no exceptions. Isolation is not
+as loomux's own frontend — all ~140 commands, no exceptions. Isolation is not
 a hardening pass on top of the feature. It **is** the feature; everything
 else in this note exists to give a plugin a box it cannot climb out of.
 
@@ -225,7 +225,7 @@ there is no code path to find a bug in, because there is no code path.
 | --- | --- | --- |
 | Rendering | Draw arbitrary DOM/canvas in its own pane box; burn CPU inside its own sandboxed frame. | Read or manipulate the host DOM outside its own frame. |
 | Data | Read files under its own declared root (`fs.read`); persist its own namespaced view state (`storage`); read a read-only system-metrics stream (`metrics.system`). | Write **any** file; read another plugin's storage; read outside its own root; read process command lines/paths beyond name+pid+stats. |
-| System reach | Nothing beyond the three capabilities above. | Call `invoke` or reach any of the ~117 app commands directly; spawn or write to a PTY; touch git or `gh`; mint or read an orchestration/merge grant; steer or inject input into an agent pane. |
+| System reach | Nothing beyond the three capabilities above. | Call `invoke` or reach any of the ~140 app commands directly; spawn or write to a PTY; touch git or `gh`; mint or read an orchestration/merge grant; steer or inject input into an agent pane. |
 | Network | Nothing. | Phone home, load a remote resource, or otherwise reach the network — enforced by a restrictive CSP header served on every `plugin://` response, **not** by the iframe `sandbox` attribute alone (which does not restrict network egress). See **Content-Security-Policy on plugin content**, under Isolation. |
 
 ### Grant, in v1: auto-granted from the closed enum, not a human decision yet
@@ -519,7 +519,7 @@ instead of an opaque-origin same-origin-policy wall.
 Two more options were weighed and rejected outright, not gated on a spike: a
 separate OS process per plugin (right isolation, wrong scale — plugins are
 view code, not services) and no isolation at all / manual review (the exact
-thing this whole note exists to refuse — every one of the ~117 commands
+thing this whole note exists to refuse — every one of the ~140 commands
 reachable, including a merge grant).
 
 **Transport: `invoke` + `Channel`, not literal `postMessage`.** The envelope
@@ -676,7 +676,7 @@ not a rewrite of the contract:
    (Isolation, above), pending the Phase-0 spike. *On veto or spike failure:*
    the child `WebviewWindow` fallback, already specified above as a full
    alternative. *Must not ship regardless:* no isolation at all — a plugin
-   with unsandboxed reach to all ~117 commands, which this whole note exists
+   with unsandboxed reach to all ~140 commands, which this whole note exists
    to refuse.
 2. **Install location.** *Recommended:* `<app-data>/loomux/plugins/<id>/`,
    scanned on boot (Install/discovery, above). *Live alternative:* a
@@ -944,7 +944,8 @@ are stated, without drifting from what was actually agreed:
 
   **The fix: fold bounds into the same synchronous command as the clip.**
   `plugin_set_occlusion` is replaced outright by `pluginregion::plugin_set_frame`
-  (renamed in place — the ACL command count stays 128, not a net addition;
+  (renamed in place — a replacement, not a net addition, so the ACL command
+  count is unchanged by it;
   its only caller is updated in the same change). Still a plain, non-`async`
   command (so it still runs inline on the calling/main thread), it now ALSO
   sets the webview's bounds itself via `tauri::Webview::set_bounds` — called

@@ -105,7 +105,7 @@ ask for, and none of them reach a write, git/gh/PTY, or the network.
 
 ## Talking to the broker
 
-Your plugin never sees `@tauri-apps/api`, `invoke`, or any of loomux's ~120
+Your plugin never sees `@tauri-apps/api`, `invoke`, or any of loomux's ~140
 backend commands. The **only** thing your window can reach is a broker with
 exactly two entry points, and your manifest's approved capabilities decide
 which of the methods below actually succeed:

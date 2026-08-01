@@ -39,7 +39,7 @@ There is no global mode — each pane declares its own kind:
 | **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable pane over `.loomux/workflow.yml`. Point it at a repo that has no workflow file yet and the pane offers to create one. See [custom agent workflows](orchestration.html#custom-agent-workflows). |
 | **Plugin** | An installed pane plugin, picked from the ones on your machine, hosted in its own sandboxed webview embedded in the pane — no separate OS window, no shell, no filesystem beyond a jailed root it declares, no orchestration reach. See [pane plugins](features/pane-plugins.html) to install or write one. |
 
-The last four are **content panes**: a pane that *is* a surface rather than a
+The last five are **content panes**: a pane that *is* a surface rather than a
 process. No shell, no CLI, no PTY — just the surface, in a pane. They split, dock,
 drag, maximize and restore exactly like a terminal pane, and they never count
 toward a tab's agent badge, because a viewer is not an agent.
