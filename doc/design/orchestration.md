@@ -5606,12 +5606,35 @@ is the impure half.
   more-faithful model didn't weaken what round 1 already proved) and
   `unconditional_guard_removal_reproduces_the_round_2_double_drain` (round 2's bug, freshly caught).
 - **Every site that mutates `queue_draining`, `queue_still_notified`, `question_stale_notified`, or
-  `queues` as a side effect (#470 review round 3, NB-1) — the map a future change to this subsystem
-  should extend, not re-derive from scratch.** Produced by grepping every touch point of those four
+  `queues` as a side effect (#470 review round 3, NB-1) — a map of the subsystem, no longer a
+  mechanism holding it together.** Produced by grepping every touch point of those four
   fields in `mod.rs` plus every `impl Drop` across the whole `orchestration` module (`DrainerGuard`
-  is the ONLY one) — mechanically, not by inspection alone. **Treat this table as STALE** the moment
-  a new function starts touching any of the four fields, or an existing mutation moves/is removed;
-  the fix for staleness is to re-run the same grep, not to patch this table by hand from memory.
+  is the ONLY one) — mechanically, not by inspection alone.
+
+  **#562/#497 inverted what this table is FOR, and that inversion is the point rather than a
+  footnote.** It used to carry an obligation — *"treat this table as stale the moment a new function
+  touches any of the four fields; the fix is to re-run the grep"* — and that obligation failed
+  three times in a single day: #533 added two `queues` mutators owing a `persist_queues` call with
+  none, and the re-derivation itself dropped a row its own grep HAD returned. A rule enforced by
+  remembering to read a document nine thousand lines from the code is not enforced.
+
+  **The two rules this table used to keep are now kept by the compiler** (`src-tauri/src/
+  orchestration/queuestate.rs`; see "Compile-time invariants (#562/#497)" below for the mechanism
+  and its exact limits):
+
+  - *Every `queues` mutation persists.* `queues` is a `QueueMap`, in its OWN module, with a private
+    inner map. The only `&mut` door is `QueueMap::mutate`, which takes the snapshot writer as an
+    argument and runs it the moment it releases the lock. A new mutator cannot omit the write,
+    because reaching the `&mut` is what schedules it.
+  - *Every `queue_draining` removal is generation-checked.* `queue_draining` is a
+    `DrainerRegistry` whose only removal is `release(pty_id, generation)`. An ungenerationed
+    removal does not compile.
+
+  So a new mutation site added tomorrow no longer needs this table to have been read, and the
+  rows below are documentation of the subsystem's shape rather than the mechanism keeping it
+  correct. Extending them when you add a site is still worth doing — a reader wants the map — but
+  **forgetting to is no longer a durability bug**, which is exactly the difference the two issues
+  were filed for.
 
   **`question_stale_notified` is the fourth field, added by #532**, and widening this table's scope
   to cover it is that change's obligation rather than a later reader's. It is a per-pane one-shot
@@ -5671,9 +5694,11 @@ is the impure half.
 
   Two of the nine `queues` mutators — `enqueue_stranded_front` and `admit_stranded_selfheal` — push
   through the SAME helper, `push_stranded_front_locked`, which is deliberately not a row of its own:
-  it runs with `queues` already held and must not do I/O, so the write is owed by each caller. That
-  makes it the one place in this table where the mutation and its persistence obligation are in
-  different functions, and it is the row most recently missed.
+  it runs with `queues` already held and must not do I/O. Pre-#562 the write was *owed by each
+  caller*, which made this the one place in the table where the mutation and its persistence
+  obligation lived in different functions — and, not coincidentally, the row the re-derivation
+  dropped. It is no longer a split obligation: both callers reach the helper from inside a
+  `QueueMap::mutate` closure, so the write follows the mutation whichever function performed it.
 
   **This table went stale exactly the way its own instruction predicted, and that is worth recording
   rather than just fixing.** #533-A added `pop_batch_dequeued` and `drop_superseded` without adding
@@ -5692,6 +5717,51 @@ is the impure half.
   three, nine) so a dropped row shows up as a mismatch instead of as silence; and note that the
   omitted row is one of the two whose mutation happens inside a shared helper rather than in the
   listed function — the exact shape most likely to be skipped by eye.
+
+  Both lessons were about making the manual process *fail loudly instead of silently*, and both
+  were the right fix for a table that had to be maintained by hand. #562 was filed the same day
+  arguing they were the wrong shape of fix — every previous attempt had been "re-derive it more
+  carefully", and the table had by then been wrong in both possible directions. That is the change
+  above: the arithmetic and the shared-helper note stay (they still help a reader), but nothing
+  durable now depends on either being noticed.
+- **Compile-time invariants (#562/#497) — where the two rules above actually live.**
+  `src-tauri/src/orchestration/queuestate.rs`, a module whose entire reason to exist is a
+  *privacy boundary*: Rust's privacy is per-module and `orchestration/mod.rs` is one 31k-line
+  module, so a field declared private there is still reachable from every line of it. Moving the
+  two maps into a file of their own is what makes "the only way in is the sanctioned way" a thing
+  `rustc` checks rather than a thing this document asserts.
+
+  - `QueueMap::read()` hands out a `QueueRead` that derefs only immutably — deliberately not the
+    bare `MutexGuard`, which also derefs mutably and would reopen the door from a method called
+    `read`.
+  - `QueueMap::mutate(group, writer, f)` is the only `&mut` door. It runs `f` under the lock,
+    releases the lock, then calls `writer.write_queue_snapshot(group)` — that ordering is
+    load-bearing, not tidiness (`persist_queues` does file I/O and takes `queue_persist`, whose
+    order is *before* `queues`, never after; and `enqueue_text`'s ordering argument needs this
+    critical section short).
+  - `f` returns a `QueueDirty` verdict alongside its own result, so a mutation that genuinely
+    changed nothing skips the write **without an escape hatch to skip it with**. There is no
+    `discard`/`forget` method, deliberately: #562's own caveat was that a hatch, once present,
+    grows one user at a time.
+  - `DrainerRegistry` exposes `is_registered`, `claim` and `release(pty_id, generation)` — and
+    no unconditional removal at all. The generation check stopped being a rule three call sites
+    honoured and became the only removal in existence.
+
+  **The residual, stated because a type can only reject the constructions it can name.**
+  `QueueDirty::nothing_persisted()` is a claim the mutation makes about itself, and a wrong one is
+  still wrong. Seven of the nine `queues` mutators have a legitimate use for it (a conditional pop
+  whose id did not match, a removal that took nothing out, an `entry().or_default()` that interned
+  an empty deque `group_queue_entries` will not read). What changed is that a wrong claim is now
+  an explicit, greppable line in the diff instead of the silent absence of a call — which is
+  exactly the delta that mattered for #533's two sites: both would have had to *state* something
+  false rather than say nothing at all.
+
+  **And an honest note about warnings, because #562 proposed one.** The issue asked for a
+  `#[must_use]` token making the omission a compiler *warning*. `QueueDirty` carries `#[must_use]`,
+  but the enforcement here is deliberately structural rather than lint-based: CI runs `cargo check`
+  and `cargo test` without `-D warnings`, and this repo's agent workers are banned from building
+  locally at all (CLAUDE.md), so a warning is a diagnostic essentially nobody would ever read. A
+  construction that does not compile is the same idea with a mechanism behind it.
 - **Seam 3 (stranded pre-Enter text).** Converts to a `QueuedPayload::StrandedSubmit` marker
   (pushed to the FRONT via `enqueue_stranded_front`, ahead of whatever else is queued — it
   represents finishing an already-half-done paste, not a new ask) rather than a text copy. Draining
@@ -6294,10 +6364,17 @@ which is the fact a reader actually needs from that line.
 **Persistence (the #468 table above).** `enqueue_text` has three arms and **two** of them mutate
 `queues`: `Admit` (the push) and `Coalesce` (the surviving entry's `coalesced` counter — under-report
 that and a recovery loses the flush header's de-duplication count). Both already called
-`persist_queues` and still do. `RejectFull` mutates nothing — it reads `q.len()` and drops the guard
-— so it owes no write. Spelled out arm by arm rather than left to inference, because "anything
-mutating `queues` owes `persist_queues`" is the rule this subsystem is reviewed against and this
-paragraph is what a later reader audits against; an earlier draft of it said only `Admit` mutates,
+`persist_queues` and still do — since #562 by returning `QueueDirty::snapshot()` from the
+`QueueMap::mutate` closure, which is the same write reached a way that cannot be skipped.
+`RejectFull` mutates nothing the FILE carries — it reads `q.len()` and returns
+`QueueDirty::nothing_persisted()` — so it owes no write. One nuance, stated because this arm is
+where a reader would go looking for a lie: all three arms run `queues.entry(pty_id).or_default()`
+first, which on a pane with no queue yet DOES insert an empty deque, so `RejectFull` is "mutated
+the map, persisted nothing". That is sound and checkable rather than a judgement call —
+`group_queue_entries` builds the snapshot by iterating each pane's *deliveries*, so an empty deque
+contributes no entry and cannot change a byte of `queue.json`. Spelled out arm by arm rather than
+left to inference, because "anything mutating `queues` owes `persist_queues`" is the rule this
+subsystem is reviewed against and this paragraph is what a later reader audits against; an earlier draft of it said only `Admit` mutates,
 which is exactly the claim that would later license skipping a persist on a coalesce-shaped path. `queue_pressure` is in-memory one-shot state like `question_stale_notified`
 and owes no snapshot either; it is cleared in `commit_exit` under the same generation guard, or a
 successor drainer's first reading would look like a fall from `Full` and emit a release for a pane

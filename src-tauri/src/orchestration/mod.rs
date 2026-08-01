@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod notify;
 pub mod profiles;
 pub mod queue;
+pub mod queuestate;
 pub mod report;
 pub mod termgrid;
 pub mod workflow;
@@ -6968,7 +6969,15 @@ pub struct OrchRegistry {
     /// for the same reason `last_delivery` is — the drainer thread
     /// (`run_queue_drainer`) mutates it without holding `&self`. Keyed by
     /// pty id, matching `delivery`/`last_delivery`.
-    queues: Arc<Mutex<HashMap<u32, VecDeque<queue::QueuedDelivery>>>>,
+    ///
+    /// **A [`QueueMap`], not a bare `Mutex<HashMap<..>>` (#562).** Its
+    /// `&mut` door is `QueueMap::mutate`, which takes the snapshot writer
+    /// and runs it as soon as the mutation returns — so #468's "every
+    /// mutation of `queues` rewrites `queue.json`" is a shape the compiler
+    /// enforces rather than a row in a table someone must remember to
+    /// extend. See `queuestate.rs` for why the type had to live in another
+    /// MODULE for that to mean anything.
+    queues: Arc<queuestate::QueueMap>,
     /// Per-registry monotonic id counter for queued deliveries — no
     /// getrandom (CLAUDE.md constraint 2), `Arc` so the drainer can mint ids
     /// too (a drain's own re-enqueue, e.g. seam 3's `StrandedSubmit`
@@ -6991,7 +7000,15 @@ pub struct OrchRegistry {
     /// own, which makes a stale/duplicate removal attempt a structural
     /// no-op rather than something every call site has to remember to
     /// avoid.
-    queue_draining: Arc<Mutex<HashMap<u32, u64>>>,
+    ///
+    /// **And now structurally, for call sites that do not exist yet
+    /// (#497).** A [`DrainerRegistry`] exposes exactly one removal —
+    /// `release(pty_id, generation)` — so "every removal is
+    /// generation-checked" stopped being a property of the three sites
+    /// review happened to look at and became a property of the type. That
+    /// is the half `drainer_lifecycle`'s model cannot cover: a model
+    /// carries events for the code that existed when it was written.
+    queue_draining: Arc<queuestate::DrainerRegistry>,
     /// Monotonic counter minting a fresh generation token per drainer spawn
     /// (`ensure_drainer`) — no getrandom (CLAUDE.md constraint 2). See
     /// `queue_draining`'s doc for why a generation, not just a bool
@@ -12559,18 +12576,41 @@ pub fn drain_stranded_submit(
 /// `unified_admission_property::drainer_lifecycle` (queue.rs) for the
 /// exhaustive proof, including the stale-guard-drop event modeled
 /// explicitly rather than assumed away.
+///
+/// **#497: the generation check is now the only removal that exists.**
+/// `queue_draining` is a [`queuestate::DrainerRegistry`], whose sole
+/// removal takes the generation — so the paragraph above stopped being a
+/// rule this `Drop` had to honour and became a rule it cannot state
+/// otherwise. That matters for the case a property test structurally
+/// cannot reach: `drainer_lifecycle` models the three call sites that
+/// existed when it was written, so a raw removal added at a FOURTH site
+/// changes nothing the model explores. See `queuestate.rs`.
 struct DrainerGuard {
-    queue_draining: Arc<Mutex<HashMap<u32, u64>>>,
+    queue_draining: Arc<queuestate::DrainerRegistry>,
     pty_id: u32,
     generation: u64,
 }
 
 impl Drop for DrainerGuard {
     fn drop(&mut self) {
-        let mut draining = self.queue_draining.lock_safe();
-        if draining.get(&self.pty_id) == Some(&self.generation) {
-            draining.remove(&self.pty_id);
-        }
+        // Whether this fired or found a successor's generation is not this
+        // guard's business — both are correct outcomes, which is the point
+        // of the generation (see the type doc above).
+        self.queue_draining.release(self.pty_id, self.generation);
+    }
+}
+
+/// #562 — what `QueueMap::mutate` runs once it has released the queue lock.
+///
+/// One line, and it is the entire coupling between "the queues changed" and
+/// "the file changed". Every `queues` mutation in this file goes through
+/// `mutate`, and `mutate` ends here; there is no second route to either
+/// half. Deliberately a thin forward rather than the write itself, so
+/// `persist_queues` stays the single place the lock order, the lazy
+/// recovery and the best-effort failure policy are reasoned about.
+impl queuestate::QueueSnapshotWriter for OrchRegistry {
+    fn write_queue_snapshot(&self, group: &str) {
+        self.persist_queues(group);
     }
 }
 
@@ -12948,7 +12988,7 @@ fn run_queue_drainer(
                     // instead of an extra full echo/confirm cycle for a
                     // single notice line.
                     let coalesced = {
-                        let queues = reg.queues.lock_safe();
+                        let queues = reg.queues.read();
                         queues.get(&pty_id).map(|q| q.iter().map(|e| e.coalesced as usize).sum()).unwrap_or(0)
                     };
                     format!("{}\n\n{text}", queue::flush_header_text(depth.max(1), coalesced))
@@ -14907,13 +14947,13 @@ impl OrchRegistry {
             agent_seq_persist: Mutex::new(()),
             delivery: Mutex::new(HashMap::new()),
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
-            queues: Arc::new(Mutex::new(HashMap::new())),
+            queues: Arc::new(queuestate::QueueMap::new()),
             queue_seq: Arc::new(AtomicU64::new(0)),
             queue_persist: Arc::new(Mutex::new(())),
             recovered_queue: Arc::new(Mutex::new(HashMap::new())),
             recovered_markers: Arc::new(Mutex::new(HashMap::new())),
             recovered_groups: Arc::new(Mutex::new(HashSet::new())),
-            queue_draining: Arc::new(Mutex::new(HashMap::new())),
+            queue_draining: Arc::new(queuestate::DrainerRegistry::new()),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
             hold_episodes: Arc::new(Mutex::new(HashMap::new())),
@@ -26682,13 +26722,87 @@ impl OrchRegistry {
         // takes agents first (`deliver_prompt`'s own `self.agent(...)`), so
         // reversing it here would be the one inversion that deadlocks.
         let target = self.durable_target(agent_id);
-        let mut queues = self.queues.lock_safe();
-        let q = queues.entry(pty_id).or_default();
-        let was_first = q.is_empty();
-        match queue::admit(q, text) {
-            queue::AdmitDecision::RejectFull => {
-                let depth = q.len();
-                drop(queues);
+        // #562: what the admission DID, carried out of the critical section
+        // so every audit line, notice and `Err` below still runs with no
+        // lock held — exactly as the pre-#562 `drop(queues)` in each arm
+        // achieved, now by construction rather than by remembering to drop.
+        enum Admitted {
+            Rejected { depth: usize },
+            Coalesced { id: u64, coalesced: u32, depth: usize },
+            Queued { id: u64, depth: usize, was_first: bool },
+        }
+        let admitted = self.queues.mutate(group, self, |queues| {
+            let q = queues.entry(pty_id).or_default();
+            let was_first = q.is_empty();
+            match queue::admit(q, text) {
+                queue::AdmitDecision::RejectFull => {
+                    // Nothing mutated `queues` on this arm, so no snapshot
+                    // is owed (see doc/design/orchestration.md's
+                    // persistence table). The `entry().or_default()` above
+                    // can INTERN an empty deque, which is a mutation of the
+                    // map but not of anything the file carries:
+                    // `group_queue_entries` iterates each pane's
+                    // deliveries, so an empty deque contributes no entry.
+                    (Admitted::Rejected { depth: q.len() }, queuestate::QueueDirty::nothing_persisted())
+                }
+                queue::AdmitDecision::Coalesce => {
+                    // #445 rev-35 NB4: `id`/`coalesced` were missing from
+                    // this audit line, contradicting `QueuedDelivery::id`'s
+                    // own doc ("carried in every audit line ... -coalesced
+                    // ... so one payload's whole history is
+                    // reconstructible"). `admit` already guarantees a match
+                    // exists (that's the definition of `Coalesce`), so
+                    // `expect` here documents an invariant rather than
+                    // masking a real failure with a fake default.
+                    let (id, coalesced) = q
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.payload.text() == Some(text))
+                        .map(|e| {
+                            e.coalesced += 1;
+                            (e.id, e.coalesced)
+                        })
+                        .expect("admit() returned Coalesce, so a byte-identical entry must exist");
+                    // A coalesce target, by definition, matched an entry
+                    // ALREADY in the queue — `was_first` (computed before
+                    // `admit` ran) can therefore never be true here;
+                    // asserting it documents that invariant rather than
+                    // trusting it silently.
+                    debug_assert!(!was_first, "a coalesce match implies a pre-existing entry");
+                    // A coalesce mutates the queue too (the surviving
+                    // entry's `coalesced` counter), so the snapshot has to
+                    // move with it or a recovery would under-report the
+                    // flush header's de-duplication count.
+                    (
+                        Admitted::Coalesced { id, coalesced, depth: q.len() },
+                        queuestate::QueueDirty::snapshot(),
+                    )
+                }
+                queue::AdmitDecision::Admit => {
+                    let id = self.queue_seq.fetch_add(1, Ordering::SeqCst) + 1;
+                    q.push_back(queue::QueuedDelivery {
+                        id, agent_id: agent_id.to_string(), from: from.to_string(),
+                        payload: queue::QueuedPayload::Text(text.to_string()),
+                        reason, enqueued_ms: now_ms(), coalesced: 0,
+                        group: group.to_string(),
+                        to_orchestrator: target.is_orchestrator,
+                        session_id: target.session_id,
+                    });
+                    (
+                        Admitted::Queued { id, depth: q.len(), was_first },
+                        queuestate::QueueDirty::snapshot(),
+                    )
+                }
+            }
+        });
+        // Durability (#468) has already run by here, with the lock released
+        // and BEFORE these audit lines, so a crash between the two leaves a
+        // snapshot with no `delivery-queued` line rather than the reverse.
+        // Both orders lose one record; only this one loses the *forensic*
+        // record instead of the *payload*. That ordering is now
+        // `QueueMap::mutate`'s, not this function's to get right.
+        match admitted {
+            Admitted::Rejected { depth } => {
                 // #563: NAME WHAT DROPPED. The pre-#563 line recorded only
                 // `{to, reason, depth}` — enough to know something was lost,
                 // never enough to know what, and no id is minted for a
@@ -26701,66 +26815,18 @@ impl OrchRegistry {
                     "from": from, "enqueue_reason": reason.as_str(),
                     "bytes": text.len(), "preview": queue::dropped_payload_preview(text),
                 }));
-                // Nothing mutated `queues` on this arm, so no `persist_queues`
-                // is owed (see doc/design/orchestration.md's persistence
-                // table) — but the pane IS at capacity, and on an orchestrator
-                // target the `Err` below is the ONLY other signal and goes to
-                // the calling agent, never to the human.
+                // The pane IS at capacity, and on an orchestrator target the
+                // `Err` below is the ONLY other signal and goes to the
+                // calling agent, never to the human.
                 self.note_queue_capacity(group, pty_id, Some(agent_id));
                 Err(queue::queue_full_error(agent_id, depth, reason.as_str()))
             }
-            queue::AdmitDecision::Coalesce => {
-                // #445 rev-35 NB4: `id`/`coalesced` were missing from this
-                // audit line, contradicting `QueuedDelivery::id`'s own doc
-                // ("carried in every audit line ... -coalesced ... so one
-                // payload's whole history is reconstructible"). `admit`
-                // already guarantees a match exists (that's the definition
-                // of `Coalesce`), so `expect` here documents an invariant
-                // rather than masking a real failure with a fake default.
-                let (id, coalesced) = q
-                    .iter_mut()
-                    .rev()
-                    .find(|e| e.payload.text() == Some(text))
-                    .map(|e| {
-                        e.coalesced += 1;
-                        (e.id, e.coalesced)
-                    })
-                    .expect("admit() returned Coalesce, so a byte-identical entry must exist");
-                let depth = q.len();
-                drop(queues);
-                // A coalesce mutates the queue too (the surviving entry's
-                // `coalesced` counter), so the snapshot has to move with it
-                // or a recovery would under-report the flush header's
-                // de-duplication count.
-                self.persist_queues(group);
+            Admitted::Coalesced { id, coalesced, depth } => {
                 self.audit(group, "loomux", "delivery-coalesced",
                     json!({ "to": agent_id, "id": id, "coalesced": coalesced, "depth": depth }));
-                // A coalesce target, by definition, matched an entry
-                // ALREADY in the queue — `was_first` (computed before
-                // `admit` ran) can therefore never be true here; asserting
-                // it documents that invariant rather than trusting it silently.
-                debug_assert!(!was_first, "a coalesce match implies a pre-existing entry");
                 Ok(AdmitOutcome { id, was_first: false, coalesced: true })
             }
-            queue::AdmitDecision::Admit => {
-                let id = self.queue_seq.fetch_add(1, Ordering::SeqCst) + 1;
-                q.push_back(queue::QueuedDelivery {
-                    id, agent_id: agent_id.to_string(), from: from.to_string(),
-                    payload: queue::QueuedPayload::Text(text.to_string()),
-                    reason, enqueued_ms: now_ms(), coalesced: 0,
-                    group: group.to_string(),
-                    to_orchestrator: target.is_orchestrator,
-                    session_id: target.session_id,
-                });
-                let depth = q.len();
-                drop(queues);
-                // Durability (#468) — AFTER the lock is dropped (this does
-                // file I/O) and BEFORE the audit line, so a crash between
-                // the two leaves a snapshot with no `delivery-queued` line
-                // rather than the reverse. Both orders lose one record; only
-                // this one loses the *forensic* record instead of the
-                // *payload*.
-                self.persist_queues(group);
+            Admitted::Queued { id, depth, was_first } => {
                 self.audit(group, "loomux", "delivery-queued",
                     json!({ "to": agent_id, "id": id, "reason": reason.as_str(), "depth": depth }));
                 // #563: the admission that takes a pane to `Approaching` is
@@ -26783,18 +26849,25 @@ impl OrchRegistry {
     /// there (the only place it could be — nothing else has had a chance to
     /// pop yet) and audits the withdrawal so it's never silently missing.
     fn withdraw_unprocessable(&self, group: &str, pty_id: u32, id: u64) {
-        let removed = {
-            let mut queues = self.queues.lock_safe();
-            match queues.get_mut(&pty_id) {
+        let removed = self.queues.mutate(group, self, |queues| {
+            let removed = match queues.get_mut(&pty_id) {
                 Some(q) if q.front().is_some_and(|f| f.id == id) => {
                     q.pop_front();
                     true
                 }
                 _ => false,
-            }
-        };
+            };
+            // The pop is conditional on the id still being the front, so
+            // the write is too: a rollback that found nothing to roll back
+            // changed nothing the snapshot carries.
+            let dirty = if removed {
+                queuestate::QueueDirty::snapshot()
+            } else {
+                queuestate::QueueDirty::nothing_persisted()
+            };
+            (removed, dirty)
+        });
         if removed {
-            self.persist_queues(group);
             self.audit(group, "loomux", "delivery-dropped",
                 json!({ "id": id, "reason": "no-app-handle" }));
         }
@@ -26811,14 +26884,19 @@ impl OrchRegistry {
     pub fn enqueue_stranded_front(&self, group: &str, agent_id: &str, from: &str, pty_id: u32) -> Result<(), String> {
         self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
         let target = self.durable_target(agent_id);
-        let pushed = {
-            let mut queues = self.queues.lock_safe();
+        let pushed = self.queues.mutate(group, self, |queues| {
             let q = queues.entry(pty_id).or_default();
-            self.push_stranded_front_locked(q, agent_id, from, group, &target)
-        };
-        if pushed.is_ok() {
-            self.persist_queues(group);
-        }
+            let pushed = self.push_stranded_front_locked(q, agent_id, from, group, &target);
+            // A refused push (the pane is at cap) leaves the queue exactly
+            // as it was — see `QueueDirty::nothing_persisted` for why the
+            // `entry().or_default()` above does not count either.
+            let dirty = if pushed.is_ok() {
+                queuestate::QueueDirty::snapshot()
+            } else {
+                queuestate::QueueDirty::nothing_persisted()
+            };
+            (pushed, dirty)
+        });
         let out = self.audit_stranded_push(group, agent_id, pushed).map(|_id| ());
         // #563: either the marker took a slot (depth up) or it was refused at
         // cap — both are capacity facts, and the refusal is the one that
@@ -26837,6 +26915,13 @@ impl OrchRegistry {
     /// `Ok((id, depth))` or `Err(depth)` when the pane's queue is at cap (a
     /// marker occupies a slot like any other entry). Audits nothing: the
     /// caller is still holding a lock, and `audit` does file I/O.
+    ///
+    /// **#562: this used to be the one place in the mutation-site table
+    /// where the mutation and its persistence obligation lived in different
+    /// functions** — and, correspondingly, the row the table's own
+    /// re-derivation dropped. It no longer is: both callers reach this from
+    /// inside a `QueueMap::mutate` closure, so the write follows the
+    /// mutation whether or not either caller remembers it exists.
     fn push_stranded_front_locked(
         &self,
         q: &mut VecDeque<queue::QueuedDelivery>,
@@ -26946,22 +27031,29 @@ impl OrchRegistry {
         }
         self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
         let target = self.durable_target(agent_id);
-        let admission = {
-            let mut queues = self.queues.lock_safe();
+        let admission = self.queues.mutate(group, self, |queues| {
             let front_is_marker = queues
                 .get(&pty_id)
                 .and_then(|q| q.front())
                 .is_some_and(|e| matches!(e.payload, queue::QueuedPayload::StrandedSubmit));
             // Nested INSIDE `queues`, matching `commit_exit`'s lock order.
-            let drainer_active = self.queue_draining.lock_safe().contains_key(&pty_id);
+            let drainer_active = self.queue_draining.is_registered(pty_id);
             match stranded_admission_gate(drainer_active, front_is_marker) {
-                Some(reason) => Admission::Declined(reason),
+                // A decline touches nothing at all — the gate read the
+                // queue and left it exactly as it found it.
+                Some(reason) => (Admission::Declined(reason), queuestate::QueueDirty::nothing_persisted()),
                 None => {
                     let q = queues.entry(pty_id).or_default();
-                    Admission::Pushed(self.push_stranded_front_locked(q, agent_id, from, group, &target))
+                    let pushed = self.push_stranded_front_locked(q, agent_id, from, group, &target);
+                    let dirty = if pushed.is_ok() {
+                        queuestate::QueueDirty::snapshot()
+                    } else {
+                        queuestate::QueueDirty::nothing_persisted()
+                    };
+                    (Admission::Pushed(pushed), dirty)
                 }
             }
-        };
+        });
         match admission {
             Admission::Declined(reason) => {
                 self.audit(group, "loomux", "stranded-selfheal-skipped",
@@ -26969,9 +27061,6 @@ impl OrchRegistry {
                 Ok(false)
             }
             Admission::Pushed(pushed) => {
-                if pushed.is_ok() {
-                    self.persist_queues(group);
-                }
                 // #563: before the `?` — a rejected marker is exactly the case
                 // whose capacity state most needs reporting, and an early
                 // return would skip it.
@@ -27356,7 +27445,7 @@ impl OrchRegistry {
     /// it reads `queue_draining` directly while already holding `queues`.
     #[doc(hidden)] // pub for integration tests
     pub fn drainer_active(&self, pty_id: u32) -> bool {
-        self.queue_draining.lock_safe().contains_key(&pty_id)
+        self.queue_draining.is_registered(pty_id)
     }
 
     /// Register a fake drainer for `pty_id` so an integration test can drive
@@ -27366,8 +27455,11 @@ impl OrchRegistry {
     /// `set_rotate_check_pause_for_test` / `register_fake_for_test`).
     #[doc(hidden)] // test-only seam
     pub fn register_drainer_for_test(&self, pty_id: u32) {
-        let generation = self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        self.queue_draining.lock_safe().insert(pty_id, generation);
+        // Through the same `claim` the real `ensure_drainer` uses (#497):
+        // there is no raw insert to reach for, and a test seam that wrote
+        // this map some other way would be a second way in — exactly what
+        // the newtype exists to not have.
+        let _ = self.queue_draining.claim(pty_id, || self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1);
     }
 
     /// This pane's current stranded state, if any (#496 PR-C). Test/read-only
@@ -27397,14 +27489,10 @@ impl OrchRegistry {
         // see `queue_draining`'s and `DrainerGuard`'s docs for why a bare
         // membership check isn't enough. `contains_key` (not `insert`)
         // because insertion now needs the freshly-minted value, not `()`.
-        let generation = {
-            let mut draining = self.queue_draining.lock_safe();
-            if draining.contains_key(&pty_id) {
-                return; // already running for this pane
-            }
-            let generation = self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1;
-            draining.insert(pty_id, generation);
-            generation
+        let Some(generation) =
+            self.queue_draining.claim(pty_id, || self.drainer_gen.fetch_add(1, Ordering::SeqCst) + 1)
+        else {
+            return; // already running for this pane
         };
         let reg = self.clone();
         std::thread::spawn(move || run_queue_drainer(reg, app, group, pty_id, fresh_first, generation));
@@ -27465,19 +27553,16 @@ impl OrchRegistry {
     /// (`run_queue_drainer`) loops again to pick up whatever raced in,
     /// rather than exiting and relying on a NEW drainer to notice it.
     fn commit_exit(&self, group: &str, pty_id: u32, generation: u64, force: bool) -> Option<Vec<queue::QueuedDelivery>> {
-        let entries = {
-            let mut queues = self.queues.lock_safe();
+        self.queues.mutate(group, self, |queues| {
             let is_empty = queues.get(&pty_id).map(|q| q.is_empty()).unwrap_or(true);
             if !force && !is_empty {
-                return None;
+                // Nothing was taken out, so nothing is owed the file.
+                return (None, queuestate::QueueDirty::nothing_persisted());
             }
             let entries: Vec<queue::QueuedDelivery> =
                 queues.remove(&pty_id).map(Vec::from).unwrap_or_default();
             // Still holding `queues`'s lock here — this is the atomic step.
-            let mut draining = self.queue_draining.lock_safe();
-            if draining.get(&pty_id) == Some(&generation) {
-                draining.remove(&pty_id);
-                drop(draining);
+            if self.queue_draining.release(pty_id, generation) {
                 self.queue_still_notified.lock_safe().remove(&pty_id);
                 // #532/#560: cleared with its sibling, for the same reason —
                 // this pane's queue is done, so nothing is being held on it any
@@ -27497,18 +27582,20 @@ impl OrchRegistry {
                 // emit a release for a pane that never recovered.
                 self.queue_pressure.lock_safe().remove(&pty_id);
             }
-            entries
-        };
-        // #468, OUTSIDE the critical section above — persisting is file I/O
-        // and the atomicity this function exists for is between `queues` and
-        // `queue_draining`, not between either and the disk. Only a
-        // force-exit that actually discarded something changes the snapshot;
-        // the normal exit removes an already-empty deque, which the
-        // group-filtered snapshot never contained anything for.
-        if !entries.is_empty() {
-            self.persist_queues(group);
-        }
-        Some(entries)
+            // #468, and `QueueMap::mutate` runs it OUTSIDE the critical
+            // section above — persisting is file I/O and the atomicity this
+            // function exists for is between `queues` and `queue_draining`,
+            // not between either and the disk. Only a force-exit that
+            // actually discarded something changes the snapshot; the normal
+            // exit removes an already-empty deque, which the group-filtered
+            // snapshot never contained anything for.
+            let dirty = if entries.is_empty() {
+                queuestate::QueueDirty::nothing_persisted()
+            } else {
+                queuestate::QueueDirty::snapshot()
+            };
+            (Some(entries), dirty)
+        })
     }
 
     /// The audit+notify tail shared by `drop_queue` (a direct, standalone
@@ -27546,11 +27633,18 @@ impl OrchRegistry {
     /// in sync.
     #[doc(hidden)] // pub for integration tests
     pub fn drop_queue(&self, group: &str, pty_id: u32, reason: queue::DropReason) {
-        let entries: Vec<queue::QueuedDelivery> =
-            self.queues.lock_safe().remove(&pty_id).map(Vec::from).unwrap_or_default();
-        if !entries.is_empty() {
-            self.persist_queues(group);
-        }
+        let entries: Vec<queue::QueuedDelivery> = self.queues.mutate(group, self, |queues| {
+            let entries: Vec<queue::QueuedDelivery> =
+                queues.remove(&pty_id).map(Vec::from).unwrap_or_default();
+            // Removing a pane with nothing queued removes nothing the
+            // group-filtered snapshot ever carried.
+            let dirty = if entries.is_empty() {
+                queuestate::QueueDirty::nothing_persisted()
+            } else {
+                queuestate::QueueDirty::snapshot()
+            };
+            (entries, dirty)
+        });
         // #560: the queue is gone, so nothing is being held on this pane — the
         // same end-of-episode `commit_exit` performs for the drainer's own exits
         // (there it must be atomic with the emptiness check, which is why it is
@@ -27623,7 +27717,7 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn note_queue_capacity(&self, group: &str, pty_id: u32, hint: Option<&str>) {
         let (depth, front_agent) = {
-            let queues = self.queues.lock_safe();
+            let queues = self.queues.read();
             let q = queues.get(&pty_id);
             (
                 q.map(|q| q.len()).unwrap_or(0),
@@ -27722,23 +27816,28 @@ impl OrchRegistry {
     /// once an entry's delivery attempt reaches `DeliverOutcome::Done`.
     #[doc(hidden)] // pub for integration tests
     pub fn pop_front_dequeued(&self, group: &str, pty_id: u32, id: u64, enqueued_ms: u64) {
-        {
-            let mut queues = self.queues.lock_safe();
+        self.queues.mutate(group, self, |queues| {
             if let Some(q) = queues.get_mut(&pty_id) {
                 if q.front().is_some_and(|f| f.id == id) {
                     q.pop_front();
                 }
             }
-        }
-        // #468: the delivered entry has to leave the snapshot before
-        // anything else, or a restart in the next instant replays something
-        // that already landed in the pane — the one double-delivery this
-        // design can actually produce. It is still a window, not a
-        // guarantee: a crash between the pop and this write re-delivers.
-        // That residual is bounded by the queue's existing byte-identical
-        // coalesce on re-admission and stated plainly in the design note
-        // rather than claimed away.
-        self.persist_queues(group);
+            // #468: the delivered entry has to leave the snapshot before
+            // anything else, or a restart in the next instant replays
+            // something that already landed in the pane — the one
+            // double-delivery this design can actually produce. It is still
+            // a window, not a guarantee: a crash between the pop and this
+            // write re-delivers. That residual is bounded by the queue's
+            // existing byte-identical coalesce on re-admission and stated
+            // plainly in the design note rather than claimed away.
+            //
+            // Unconditional, matching the pre-#562 code exactly: the
+            // mismatched-front case (nothing popped) is the one
+            // `run_queue_drainer`'s single-consumer doc calls impossible,
+            // and writing a redundant snapshot is the cheap direction to be
+            // wrong in.
+            ((), queuestate::QueueDirty::snapshot())
+        });
         self.audit(group, "loomux", "delivery-dequeued",
             json!({ "id": id, "queued_ms": now_ms().saturating_sub(enqueued_ms) }));
         // #563: the depth just came down — the evidence the pressure badge
@@ -27775,23 +27874,28 @@ impl OrchRegistry {
         }
         let ids: Vec<u64> = batch.iter().map(|(id, _)| *id).collect();
         for (id, enqueued_ms) in batch {
-            {
-                let mut queues = self.queues.lock_safe();
+            self.queues.mutate(group, self, |queues| {
                 if let Some(q) = queues.get_mut(&pty_id) {
                     if q.front().is_some_and(|f| f.id == *id) {
                         q.pop_front();
                     }
                 }
-            }
-            // #468, and NOT inherited from the single-entry branch above:
-            // that one delegates to `pop_front_dequeued`, which persists;
-            // this one pops directly, so it owes its own write. Per entry
-            // rather than once per batch, matching `pop_front_dequeued`
-            // exactly — it is what keeps the design note's residual "one
-            // entry wide" instead of "one flush batch wide", and this loop
-            // has already paid for N audit appends, so N small snapshot
-            // writes are noise beside the paste that preceded them.
-            self.persist_queues(group);
+                // #468, and NOT inherited from the single-entry branch
+                // above: that one delegates to `pop_front_dequeued`, which
+                // persists; this one pops directly, so it owes its own
+                // write. Per entry rather than once per batch, matching
+                // `pop_front_dequeued` exactly — it is what keeps the
+                // design note's residual "one entry wide" instead of "one
+                // flush batch wide", and this loop has already paid for N
+                // audit appends, so N small snapshot writes are noise
+                // beside the paste that preceded them.
+                //
+                // #562: this is the site whose missing write was invisible
+                // for a whole PR cycle. Under `QueueMap::mutate` the write
+                // is no longer something this branch could fail to
+                // inherit — reaching the `&mut` is what schedules it.
+                ((), queuestate::QueueDirty::snapshot())
+            });
             self.audit(group, "loomux", "delivery-dequeued", json!({
                 "id": id,
                 "queued_ms": now_ms().saturating_sub(*enqueued_ms),
@@ -27832,9 +27936,8 @@ impl OrchRegistry {
         if superseded.is_empty() {
             return;
         }
-        let removed: Vec<(queue::QueuedDelivery, u64)> = {
-            let mut queues = self.queues.lock_safe();
-            match queues.get_mut(&pty_id) {
+        let removed: Vec<(queue::QueuedDelivery, u64)> = self.queues.mutate(group, self, |queues| {
+            let removed: Vec<(queue::QueuedDelivery, u64)> = match queues.get_mut(&pty_id) {
                 Some(q) => {
                     let (gone, kept): (Vec<_>, Vec<_>) =
                         q.drain(..).partition(|e| superseded.iter().any(|s| s.id == e.id));
@@ -27858,19 +27961,25 @@ impl OrchRegistry {
                     out
                 }
                 None => Vec::new(),
-            }
-        };
-        // #468: this removes entries from the live queue AND moves coalesce
-        // counts onto their survivors, so the snapshot has to move with it —
-        // otherwise a restart resurrects a delivery that was deliberately
-        // superseded, and under-reports the survivor's fold count. One write
-        // for the whole set, not per entry: supersession removes byte-
-        // identical duplicates as a group, and a crash before this lands
-        // resurrects duplicates, which is exactly what the queue's own
-        // byte-identical coalesce absorbs on re-admission.
-        if !removed.is_empty() {
-            self.persist_queues(group);
-        }
+            };
+            // #468: this removes entries from the live queue AND moves
+            // coalesce counts onto their survivors, so the snapshot has to
+            // move with it — otherwise a restart resurrects a delivery that
+            // was deliberately superseded, and under-reports the survivor's
+            // fold count. One write for the whole set, not per entry:
+            // supersession removes byte-identical duplicates as a group,
+            // and a crash before this lands resurrects duplicates, which is
+            // exactly what the queue's own byte-identical coalesce absorbs
+            // on re-admission.
+            //
+            // #562: the other site whose missing write shipped silently.
+            let dirty = if removed.is_empty() {
+                queuestate::QueueDirty::nothing_persisted()
+            } else {
+                queuestate::QueueDirty::snapshot()
+            };
+            (removed, dirty)
+        });
         for (e, by) in removed {
             self.audit(group, "loomux", "delivery-dropped", json!({
                 "to": e.agent_id,
@@ -27890,7 +27999,7 @@ impl OrchRegistry {
     /// accessor for tests and any future badge (#445 PR-C). Never mutates.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_depth(&self, pty_id: u32) -> usize {
-        self.queues.lock_safe().get(&pty_id).map(VecDeque::len).unwrap_or(0)
+        self.queues.read().get(&pty_id).map(VecDeque::len).unwrap_or(0)
     }
 
     /// A snapshot (oldest first) of `pty_id`'s queue contents.
@@ -27904,7 +28013,7 @@ impl OrchRegistry {
     /// the snapshot, so the worst case is that it flushes on the next pass.
     #[doc(hidden)] // pub for integration tests
     pub fn queue_snapshot(&self, pty_id: u32) -> Vec<queue::QueuedDelivery> {
-        self.queues.lock_safe().get(&pty_id).map(|q| q.iter().cloned().collect()).unwrap_or_default()
+        self.queues.read().get(&pty_id).map(|q| q.iter().cloned().collect()).unwrap_or_default()
     }
 
     /// Test-only: bind `agent_id` to `pty_id` directly, bypassing the real
@@ -27939,6 +28048,16 @@ impl OrchRegistry {
     /// lock held — see `queue_persist`'s doc for the lock order and for why
     /// holding the persist lock across read-then-write is what stops a
     /// stale snapshot landing after a fresh one.
+    ///
+    /// **#562: "called after EVERY mutation" is no longer a sentence asking
+    /// to be believed.** This is what `QueueMap::mutate` runs, through the
+    /// `QueueSnapshotWriter` impl below, the moment it releases the queue
+    /// lock — so the only remaining direct callers are the ones with no
+    /// mutation of their own (`readmit_recovered`'s `put_back`, which makes
+    /// a `recovered_queue` change durable). The old arrangement — a table
+    /// in `doc/design/orchestration.md` listing who owed this call — is
+    /// what let #533's two new mutators merge clean while owing a write
+    /// nobody knew about.
     ///
     /// Best-effort by construction: a failed write leaves the previous good
     /// snapshot (that is `atomic_write`'s whole contract) and is audited
@@ -27998,7 +28117,7 @@ impl OrchRegistry {
     fn group_queue_entries(&self, group: &str) -> Vec<queue::PersistedEntry> {
         let mut out = Vec::new();
         {
-            let queues = self.queues.lock_safe();
+            let queues = self.queues.read();
             let mut ptys: Vec<u32> = queues.keys().copied().collect();
             ptys.sort_unstable();
             for pty_id in ptys {
@@ -28368,7 +28487,7 @@ impl OrchRegistry {
         // orchestrator to re-send something that is about to arrive.
         let live: std::collections::HashSet<u64> = self
             .queues
-            .lock_safe()
+            .read()
             .values()
             .flat_map(|q| q.iter())
             .filter(|d| d.group == group)
