@@ -1411,7 +1411,10 @@ impl ReviewVerdict {
 /// this makes is "the bytes that will be recorded are the bytes that were
 /// reviewed" — not "the meaning is close enough", which nothing could check.
 pub fn canonical_body(body: &str) -> String {
-    format!("{}\n", body.replace('\r', "").trim_end_matches('\n'))
+    // SCRATCH (red evidence for #565): normalization removed — these helpers do not
+    // exist on main at all, so a mutation is the only way to run their test against
+    // "without the change" without a compile error.
+    body.to_string()
 }
 
 /// sha256 of [`canonical_body`], lowercase hex. The one definition; the shim

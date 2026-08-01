@@ -880,45 +880,6 @@ if [ -f "$LOOMUX_GROUP_DIR/merge_gate" ]; then
         if ! "$REAL_GH" pr checks $rf "$num" >/dev/null 2>&1; then
           loomux_block_wf "ci-not-green" "the gate requires ci-green and 'gh pr checks $num' is not all-green (failing, still running, or no checks reported)"
         fi ;;
-      # #565: the head oid pins the CODE a verdict reviewed. It does not pin the PR
-      # BODY — which a squash merge turns into the permanent commit message, so a
-      # `pass` recorded against one body and merged with another lands text no
-      # reviewer read. Opt-in, because that is only true of repos that squash.
-      #
-      # ASYMMETRIC, and that is the whole design: only PASSES are checked here. A
-      # fail/escalate whose body moved afterwards is the fix loop working as
-      # intended, and re-staling it would ping-pong forever — body finding → worker
-      # fixes the body → verdict auto-stales → re-review → repeat. The Rust half
-      # REPORTS that side (`list_verdicts`, the gate status line) so the orchestrator
-      # can spot an already-fixed finding; nothing acts on it automatically.
-      body-unchanged)
-        b_raw=$("$REAL_GH" pr view $rf "$num" --json body --jq .body 2>/dev/null) \
-          || loomux_block_wf "unresolved-body" "the gate requires body-unchanged and loomux could not read the PR's body, so it cannot tell whether what would become the squash commit message is what the reviewers passed"
-        # The canonical form both halves digest, and ALL of it: strip CR (a CRLF and
-        # an LF body are the same commit message), then exactly one trailing newline
-        # — `$(…)` ate them all, `printf '%s\n'` puts one back. Kept this small on
-        # purpose: every extra rule is one the Rust half (`workflow::canonical_body`)
-        # and this shell would have to keep agreeing about forever.
-        b_norm=$(printf '%s' "$b_raw" | tr -d '\r')
-        loomux_norm_guard "$b_raw" "$b_norm" "the PR body"
-        b_now=$(printf '%s\n' "$b_norm" | loomux_sha256)
-        [ -n "$b_now" ] || loomux_block_wf "no-sha256" "the gate requires body-unchanged but this host has no usable sha256 tool (sha256sum, shasum or openssl), so loomux cannot compare the PR body against the one the reviewers passed — a condition it cannot check refuses the merge"
-        b_bad=""
-        for b_r in $g_revs; do
-          b_vf="$LOOMUX_GROUP_DIR/verdicts/pr-$num/$b_r"
-          [ -f "$b_vf" ] || continue
-          # Only a LIVE pass — the verdict word on line 1, recorded against the head
-          # that would merge. (A pass the threshold does not need is still checked:
-          # "this reviewer approved a different commit message" is true either way,
-          # and re-recording is the same action whether or not it was load-bearing.)
-          [ "$(head -n1 "$b_vf" 2>/dev/null)" = "pass" ] || continue
-          [ "$(head -n2 "$b_vf" 2>/dev/null | tail -n1)" = "$cur_head" ] || continue
-          # Line 5 is the body digest it reviewed. Absent (a verdict recorded before
-          # #565, or one whose body gh could not read) reads as EMPTY, which equals
-          # no digest and so refuses — unknown is never "unbound, therefore fine".
-          [ "$(head -n5 "$b_vf" 2>/dev/null | tail -n1)" = "$b_now" ] || b_bad="$b_bad $b_r"
-        done
-        [ -z "$b_bad" ] || loomux_block_wf "body-changed" "the PR body is not the one reviewer(s)$b_bad passed — and this repo squash-merges, so that body becomes the permanent commit message. Whoever edited it, the fix is the same: those reviewers re-read the body as it stands and re-record" ;;
       *) loomux_block_wf "unknown-condition" "the gate names the condition '$g_c', which this loomux build does not know how to check — an unknown condition fails closed. Remove it from gates.merge.also, or upgrade loomux" ;;
     esac
   done
@@ -25224,8 +25185,9 @@ impl OrchRegistry {
         // intention, not a mechanism — and a reviewer cannot record the digest of a
         // body it did not read if it never touches the digest at all. Unreadable
         // body → empty, which reads as unknown and can satisfy nothing.
-        let body_digest =
-            self.pr_body(&repo, num).map(|b| workflow::body_digest(&b)).unwrap_or_default();
+        // SCRATCH (red evidence for #565): the mechanism removed, the API kept, so
+        // the new tests fail on BEHAVIOUR and not on a compile error.
+        let body_digest = String::new();
         let rec = workflow::ReviewVerdict {
             pr: num,
             block,
