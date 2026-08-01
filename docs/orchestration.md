@@ -406,6 +406,18 @@ mechanically by the `gh` shim — before `gh pr merge` can succeed. See
 [`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
 for the full design.
 
+**If your repo squash-merges, consider `also: [body-unchanged]`.** A verdict is
+bound to the commit it reviewed, so a re-push re-opens the gate. The PR *body*
+is not part of that commit — and a squash merge turns it into the permanent
+commit message, so a body edited after a reviewer passed lands text nobody
+reviewed. loomux always records a digest of the body a verdict reviewed and
+tells the orchestrator when it has moved (on a `pass`: the approval no longer
+covers what would be committed; on a `fail`: the finding may already be fixed).
+Adding `body-unchanged` to your gate's `also:` list also *refuses the merge*
+until the reviewers whose passes are live have re-recorded against the body as
+it stands. It is opt-in because it is only true of squash-merging repos; where
+merges keep the PR body as discussion rather than history, leave it out.
+
 **Opt-in, every time.** A workflow file arrives with a `git clone` — the
 **advanced orchestrator** toggle is what makes a repo's workflow take effect;
 off (the default), the file is never even opened. Turning it on, at launch or

@@ -15499,7 +15499,9 @@ fn every_shim_normalizer_is_guarded_or_explicitly_exempted() {
     // The expected counts are part of the contract, not a snapshot: changing one
     // is how you record "I added/removed a normalizer on purpose".
     let shims = [
-        ("gh", gh_shim_sh("C:/gh.exe", &paths), 11usize),
+        // 11 → 12 with #565's `b_norm` (the PR body, canonicalized for the
+        // `also: body-unchanged` digest) — a deliberate addition, and guarded.
+        ("gh", gh_shim_sh("C:/gh.exe", &paths), 12usize),
         ("git", git_shim_sh("C:/git.exe", &paths), 1usize),
     ];
     let mut all_sites: Vec<(String, String)> = Vec::new();
@@ -24383,14 +24385,16 @@ fn have_sh() -> bool {
 }
 
 /// Write the REAL generated `gh` shim, baked to call a fake gh that answers
-/// `pr view` (base + number, and `headRefOid` when asked for it) and `pr checks`
-/// (exit `$FAKE_CHECKS`). Returns the shim path; drive it with `merge_with`.
+/// `pr view` (base + number, `headRefOid` when asked for it, and the PR **body**
+/// from `$FAKE_BODY` — #565) and `pr checks` (exit `$FAKE_CHECKS`). Returns the
+/// shim path; drive it with `merge_with`.
 fn shim_with_fake_gh(bin: &Path) -> PathBuf {
     let fake = bin.join("fakegh");
     fs::write(&fake,
         "#!/bin/sh\n\
          if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n\
          \x20 case \"$*\" in *headRefOid*) printf '%s\\n' \"$FAKE_HEAD\"; exit 0 ;; esac\n\
+         \x20 case \"$*\" in *\"--json body\"*) printf '%s\\n' \"$FAKE_BODY\"; exit 0 ;; esac\n\
          \x20 printf '%s\\n' \"${FAKE_BASE:-main} 7\"; exit 0\n\
          fi\n\
          if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then printf 'main\\n'; exit 0; fi\n\
@@ -24581,6 +24585,109 @@ fn a_verdict_is_attributed_bound_to_a_revision_and_survives_a_restart() {
     assert!(reg.gate_status_line(&gid, 7).unwrap().contains("rev-tests"));
 }
 
+/// The PR body a verdict reviewed (#565), and the #525 race in both directions.
+///
+/// A verdict pins the head oid, so a moved head is visible. The body is not part
+/// of that oid, moves silently, and — this repo squash-merging — is what becomes
+/// the commit message. This drives the reporting half through the real MCP
+/// dispatch: what the tool records without being asked, and what the orchestrator
+/// is then told about each class of drift.
+#[test]
+fn a_verdict_pins_the_body_it_reviewed_and_drift_is_reported_asymmetrically() {
+    // The #525 body, and the body after the worker fixed the finding about it.
+    const REVIEWED: &str = "## Summary\n\nFix the thing.\n\n### 6c Evidence\n\nrun 30690784043\n";
+    const FIXED: &str = "## Summary\n\nFix the thing.\n\n### 6c Evidence\n\nrun 30699999999\n";
+    let (reg, _d, _repo, gid) = gated_group("");
+    reg.set_pr_body_override(Some(REVIEWED.into()));
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    let tests = reviewer_caller(&reg, &gid, "rev-tests");
+    let orch = reg.spawn_agent(&gid, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    recorded(&reg, &sec, "7", "pass", "authz fine; the evidence section checks out");
+    recorded(&reg, &tests, "7", "fail", "6c cites a pre-rebase run");
+
+    // The reviewer never passes a digest — the tool takes it from the body it fetches
+    // itself, which is the difference between a mechanism and an intention.
+    for v in reg.verdicts(&gid, 7) {
+        assert_eq!(v.body_digest, workflow::body_digest(REVIEWED),
+            "{} must be bound to the body it reviewed, not just the head", v.block);
+        assert_eq!(v.body_changed(Some(&workflow::body_digest(REVIEWED))), Some(false));
+    }
+    assert!(!reg.gate_status_line(&gid, 7).unwrap().contains("BODY CHANGED"),
+        "an unedited body must say nothing at all — a signal that fires on no change is noise");
+
+    // The worker fixes the body. THIS is #525: the finding was true when it was made
+    // and stale by the time it was recorded, and no mechanism could say so.
+    reg.set_pr_body_override(Some(FIXED.into()));
+    let s = reg.gate_status_line(&gid, 7).unwrap();
+    assert!(s.contains("BODY CHANGED SINCE PASS: rev-security"),
+        "a pass whose body moved is the hazard — what would be committed is not what was approved: {s}");
+    assert!(s.contains("blocking verdict from rev-tests") && s.contains("may already be fixed"),
+        "and a blocking verdict whose body moved is the FIX LOOP — say so rather than staling it: {s}");
+
+    // Same split, per verdict, in the state the orchestrator actually reads.
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_verdicts", "arguments": { "pr": "7" } })).unwrap();
+    let parsed: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    for v in parsed[0]["verdicts"].as_array().unwrap() {
+        assert_eq!(v["body_changed"], json!(true), "{v:?}");
+        assert_eq!(v["body_digest"], json!(workflow::body_digest(REVIEWED)));
+    }
+
+    // A re-record re-binds to the body as it stands — that is how a reviewer clears it.
+    recorded(&reg, &tests, "7", "fail", "still cites a pre-rebase run, now in 6d");
+    assert_eq!(reg.verdicts(&gid, 7)[1].body_digest, workflow::body_digest(FIXED));
+    let s = reg.gate_status_line(&gid, 7).unwrap();
+    assert!(!s.contains("blocking verdict from"), "the re-recorded verdict is no longer drifted: {s}");
+    assert!(s.contains("BODY CHANGED SINCE PASS: rev-security"),
+        "…while the pass that never re-read the new body still is: {s}");
+
+    // CANNOT TELL is not "unchanged". With no body readable, nothing may claim either
+    // way — a false all-clear here is worse than the silence #565 started from.
+    reg.set_pr_body_override(None);
+    assert_eq!(reg.verdicts(&gid, 7)[0].body_changed(None), None);
+    assert!(!reg.gate_status_line(&gid, 7).unwrap().contains("BODY CHANGED"));
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "list_verdicts", "arguments": { "pr": "7" } })).unwrap();
+    let parsed: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(parsed[0]["verdicts"][0].get("body_changed").is_none(),
+        "absent, not false: an orchestrator must not read 'unchecked' as 'unchanged'");
+}
+
+/// What the digest is *of* — the contract both halves of the gate implement, so it
+/// has to be exactly as small as POSIX shell can reproduce.
+#[test]
+fn the_body_digest_normalizes_only_what_a_commit_message_could_not_carry() {
+    // Line endings and trailing blank lines are transport, not content: `gh` hands
+    // back CRLF or LF depending on the platform, and a squash message is the same
+    // either way. The shim gets these two from `tr -d '\r'` and `$(…)`/`printf`.
+    assert_eq!(workflow::body_digest("a\r\nb\n\n\n"), workflow::body_digest("a\nb"));
+    assert_eq!(workflow::canonical_body("a\r\nb"), "a\nb\n");
+    // Everything else IS content, re-wrapping included: the claim this makes is
+    // "the bytes that will be committed are the bytes that were reviewed", which is
+    // checkable — not "the meaning is close enough", which is not.
+    assert_ne!(workflow::body_digest("one two"), workflow::body_digest("one\ntwo"));
+    assert_ne!(workflow::body_digest("run 30690784043"), workflow::body_digest("run 30699999999"));
+    assert_eq!(workflow::body_digest("").len(), 64, "an empty body still digests — it is a body");
+
+    // A digest is stored and compared inside a shell `case`, so it is exactly 64 hex
+    // or it is nothing. Stricter than `sanitize_sha` on purpose: a 40-char head oid
+    // must never read back as a body digest.
+    assert_eq!(workflow::sanitize_digest(&"A".repeat(64)), "a".repeat(64));
+    assert_eq!(workflow::sanitize_digest("a3f9c21"), "");
+    assert_eq!(workflow::sanitize_digest(&"a".repeat(63)), "");
+    assert_eq!(workflow::sanitize_digest("$(rm -rf /) ; echo"), "");
+
+    // A verdict file written before #565 has its summary where line 5 now lives. It
+    // reads back as NO digest — never as a digest, and never by eating the prose.
+    let legacy = "pass\na3f9c21\n1720000000000\nrev-4\nno security defects\nsecond line\n";
+    let v = workflow::parse_verdict_file(7, "rev-security", legacy).unwrap();
+    assert_eq!(v.body_digest, "", "unknown, which the gate refuses on — not a claim of unchanged");
+    assert_eq!(v.summary, "no security defects\nsecond line", "and the summary is not mangled");
+    assert_eq!(v.body_changed(Some(&workflow::body_digest("x"))), None);
+}
+
 #[test]
 fn only_a_reviewer_block_can_record_a_verdict() {
     // The verdict is what opens a merge gate. A worker (or the orchestrator) able to
@@ -24710,6 +24817,8 @@ fn gh_shim_script_enforces_the_workflow_merge_gate() {
     assert!(sh.contains("set -f"), "no pathname expansion over gate-file tokens");
     assert!(sh.contains("unknown-condition"), "an also: condition this build can't check refuses");
     assert!(sh.contains("ci-green") && sh.contains("pr checks"), "ci-green is checked with the real gh");
+    assert!(sh.contains("body-unchanged") && sh.contains("--json body"),
+        "and the opt-in body-unchanged condition re-reads the PR body with the real gh (#565)");
     assert!(sh.contains("malformed-gate"), "a truncated/hand-edited gate file refuses, not passes");
     assert!(sh.contains("fail|escalate"), "a blocking verdict is refused");
     assert!(sh.contains("merge-gate-workflow-blocked") && sh.contains("merge-gate-workflow-ok"),
@@ -25080,6 +25189,126 @@ fn an_unknown_also_condition_refuses_the_merge_rather_than_passing_it() {
         "and it must name the condition and say why: {err}");
     let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
     assert!(audit.contains("unknown-condition"), "audited, never silent: {audit}");
+}
+
+/// `also: [body-unchanged]` (#565), executed: the real MCP tool records the digest,
+/// the REAL shim recomputes it from the PR body at merge time, and the merge is
+/// refused when what would become the squash commit message is not what was passed.
+///
+/// It is also the **cross-check between the two digest implementations**. Nothing
+/// asserts that `workflow::canonical_body` + sha2 and the shell's
+/// `tr -d '\r'` | `printf` | `sha256sum` agree — the ALLOWED case does, and it can
+/// only pass if two independent implementations produced the same 64 characters
+/// over a body carrying every shape the normalization has an opinion about. That is
+/// why the body below is ugly on purpose.
+#[test]
+fn the_shim_refuses_a_merge_whose_body_moved_after_the_pass_when_the_repo_opts_in() {
+    if !have_sh() {
+        eprintln!("SKIP the_shim_refuses_a_merge_whose_body_moved_after_the_pass_when_the_repo_opts_in: no POSIX sh");
+        return;
+    }
+    // CRLF, a trailing blank line, trailing spaces, non-ASCII, and characters a shell
+    // would love to interpret — all of it has to survive to the same digest on both
+    // sides, or the merge below is refused and this test says so.
+    const REVIEWED: &str = "## Summary  \r\n\r\nFixes `$HOME` handling — see §6c.\r\n\r\n";
+    const EDITED: &str = "## Summary  \r\n\r\nFixes `$HOME` handling — see §6d.\r\n\r\n";
+
+    let (reg, d, _repo, gid) = gated_group("    also: [body-unchanged]\n");
+    let group_dir = d.path().join(&gid);
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    reg.set_pr_body_override(Some(REVIEWED.into()));
+    let sec = reviewer_caller(&reg, &gid, "rev-security");
+    let tests = reviewer_caller(&reg, &gid, "rev-tests");
+    for c in [&sec, &tests] {
+        recorded(&reg, c, "7", "pass", "read the diff and the body; both are fine");
+    }
+    // The human gate is held open throughout, so every refusal below is this gate's.
+    let regrant = || reg.grant_merge(&gid, "7", None, "human").unwrap();
+    let merge_body = |body: &str| -> (bool, String) {
+        let out = std::process::Command::new("sh")
+            .arg(&shim).args(["pr", "merge", "7"])
+            .env("LOOMUX_GROUP_DIR", &group_dir)
+            .env("FAKE_BASE", "main").env("FAKE_HEAD", HEAD).env("FAKE_CHECKS", "0")
+            .env("FAKE_BODY", body)
+            .output().expect("run shim");
+        (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+
+    // 1) The body the reviewers passed → allowed. Two independent digests agreeing.
+    regrant();
+    let (ok, err) = merge_body(REVIEWED);
+    assert!(ok, "the reviewed body must merge — if this refuses, the shim's digest and \
+                 workflow::body_digest disagree about the canonical form: {err}");
+
+    // 2) The author edits the body after the passes → refused. This is the half that
+    //    the head oid can never catch: the code is byte-identical, and the text about
+    //    to become the permanent commit message is not the text anyone approved.
+    regrant();
+    let (ok, err) = merge_body(EDITED);
+    assert!(!ok, "a body edited after the passes must not merge under body-unchanged");
+    assert!(err.contains("rev-security") && err.contains("rev-tests"),
+        "and must name the reviewers whose approval no longer covers it: {err}");
+    assert!(err.contains("squash"), "and say why the body is load-bearing here: {err}");
+
+    // 3) A reviewer re-reads and re-records against the body as it stands → allowed.
+    //    The way out is a re-review, exactly as it is for a moved head.
+    reg.set_pr_body_override(Some(EDITED.into()));
+    for c in [&sec, &tests] {
+        recorded(&reg, c, "7", "pass", "re-read the edited body; still fine");
+    }
+    regrant();
+    let (ok, err) = merge_body(EDITED);
+    assert!(ok, "re-recording against the current body clears it: {err}");
+
+    // 4) A verdict carrying NO digest (written before #565, or with the body
+    //    unreadable at record time) is unknown — and unknown refuses. It must never
+    //    read as "unbound, therefore fine", the same rule an empty head lives by.
+    let vf = group_dir.join("verdicts").join("pr-7").join("rev-tests");
+    fs::write(&vf, format!("pass\n{HEAD}\n1\nrev-9\nlooks good\n")).unwrap();
+    regrant();
+    let (ok, err) = merge_body(EDITED);
+    assert!(!ok, "a pass with no recorded body digest cannot show the body unchanged");
+    assert!(err.contains("rev-tests"), "{err}");
+
+    let audit = fs::read_to_string(group_dir.join("audit.jsonl")).unwrap_or_default();
+    assert!(audit.contains("\"reason\":\"body-changed\""), "audited, never silent: {audit}");
+}
+
+/// …and it is **opt-in**: the identical drift on a repo that does not declare the
+/// condition merges, because there the PR body is discussion, not history. Baking
+/// it in would be baking one repo's merge habit into a generic tool (constraint 8).
+#[test]
+fn a_body_edit_after_a_pass_merges_where_the_repo_never_declared_body_unchanged() {
+    if !have_sh() {
+        eprintln!("SKIP a_body_edit_after_a_pass_merges_where_the_repo_never_declared_body_unchanged: no POSIX sh");
+        return;
+    }
+    let (reg, d, _repo, gid) = gated_group("    also: [ci-green]\n");
+    let group_dir = d.path().join(&gid);
+    let bin = tempfile::tempdir().unwrap();
+    let shim = shim_with_fake_gh(bin.path());
+    reg.set_pr_body_override(Some("the body they reviewed\n".into()));
+    for block in ["rev-security", "rev-tests"] {
+        let c = reviewer_caller(&reg, &gid, block);
+        recorded(&reg, &c, "7", "pass", "fine");
+    }
+    reg.grant_merge(&gid, "7", None, "human").unwrap();
+
+    let out = std::process::Command::new("sh")
+        .arg(&shim).args(["pr", "merge", "7"])
+        .env("LOOMUX_GROUP_DIR", &group_dir)
+        .env("FAKE_BASE", "main").env("FAKE_HEAD", HEAD).env("FAKE_CHECKS", "0")
+        .env("FAKE_BODY", "a completely different body\n")
+        .output().expect("run shim");
+    assert!(out.status.success(),
+        "without the declared condition the body is not a gate input: {}",
+        String::from_utf8_lossy(&out.stderr));
+    // The digest is still RECORDED, and the drift still REPORTED — the opt-in is
+    // about refusing a merge, not about knowing. An orchestrator on any repo can see
+    // that a pass no longer covers the body.
+    reg.set_pr_body_override(Some("a completely different body\n".into()));
+    assert!(reg.gate_status_line(&gid, 7).unwrap().contains("BODY CHANGED SINCE PASS"));
 }
 
 #[test]
