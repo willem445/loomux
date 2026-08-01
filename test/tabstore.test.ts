@@ -579,6 +579,94 @@ test("git and editor are valid embed views too (#361 scope increase), round-trip
   ]);
 });
 
+test("the progress timeline (#608) is a valid embed view and round-trips like any other kind", () => {
+  const orch: PersistedPane = {
+    paneKind: "orch",
+    name: "orchestrator",
+    cwd: "/repo",
+    command: null,
+    argv: null,
+    shellKind: null,
+    sessionId: "orch-1",
+    role: "orchestrator",
+    groupId: null,
+    file: null,
+    embeds: [{ view: "timeline", side: "bottom", share: 0.45 }],
+  };
+  const state: PersistedTabs = {
+    tabs: [
+      { name: "t", color: null, groupId: "g", layout: { kind: "leaf", weight: 1, pane: orch } },
+    ],
+    activeIndex: 0,
+  };
+  const back = decodeTabs(encodeTabs(state));
+  const leaf = back?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [{ view: "timeline", side: "bottom", share: 0.45 }]);
+});
+
+test("a snapshot written BEFORE #608 still decodes its other embeds unchanged", () => {
+  // The additive half of the compatibility contract: nothing about an older
+  // file changes just because a new value became representable.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "orch",
+            name: "orchestrator",
+            role: "orchestrator",
+            embeds: [{ view: "audit", side: "right", share: 0.5 }],
+          },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const leaf = decodeTabs(raw)?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf");
+  assert.deepEqual(leaf.pane.embeds, [{ view: "audit", side: "right", share: 0.5 }]);
+});
+
+test("an UNKNOWN embed view from a newer build drops that entry, never the pane", () => {
+  // The other direction of the same contract: an older loomux reading a
+  // snapshot a newer one wrote must lose only the slot it cannot show. This is
+  // exactly the path `timeline` itself takes on a pre-#608 build.
+  const raw = JSON.stringify({
+    tabs: [
+      {
+        name: "t",
+        color: null,
+        groupId: null,
+        layout: {
+          kind: "leaf",
+          weight: 1,
+          pane: {
+            paneKind: "orch",
+            name: "orchestrator",
+            role: "orchestrator",
+            embeds: [
+              { view: "hologram", side: "left", share: 0.3 }, // a kind from the future
+              { view: "timeline", side: "bottom", share: 0.4 },
+            ],
+          },
+        },
+      },
+    ],
+    activeIndex: 0,
+  });
+  const decoded = decodeTabs(raw);
+  const leaf = decoded?.tabs[0].layout;
+  assert.ok(leaf?.kind === "leaf", "the pane must survive an unknown embed kind");
+  assert.equal(decoded?.tabs.length, 1);
+  assert.deepEqual(leaf.pane.embeds, [{ view: "timeline", side: "bottom", share: 0.4 }]);
+});
+
 test("an old snapshot with no embeds key decodes it as [] (overlay mode, unchanged)", () => {
   // A pre-#361 file never wrote the key at all — additive, like `role` and the
   // files root before it: no schema bump, no decoder branch needed.
