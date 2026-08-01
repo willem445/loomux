@@ -199,16 +199,32 @@ iteration:
 5. **Iterate by pushing fixes.** Between pushes, the local steps available to
    you are the frontend ones and `rustfmt --check` (above) — never a cargo
    build or test, and neither is the thing you cite as passing.
-6. **Mark the PR ready once green:**
+6. **Re-derive every citation after the push it describes.** A run is green for a
+   **SHA**, not for a PR. Every push and every rebase invalidates the run ids,
+   run links and "green on all three platforms" already written into the PR
+   body — and that text survives the push untouched, so nothing marks it stale
+   for you or for the reader. After any push or rebase, re-derive each one:
+   ```sh
+   gh run list --branch <branch> --json headSha,databaseId,conclusion,workflowName
+   git rev-parse HEAD
+   ```
+   A run counts as this PR's evidence only when its `headSha` **is** the head
+   you are reporting on. Three stale-green citations reached review in a single
+   batch — one run three commits behind head (#571), and the same pre-rebase run
+   cited twice across two reviews of #588 — each caught by a reviewer, none by
+   the worker who wrote it (#596).
+7. **Mark the PR ready once green:**
    ```sh
    gh pr ready <pr>
    ```
 
 ## Definition of validated
 
-The PR's checks are green on all three platforms. That — not a local `cargo
-test` run, capped or not — is the evidence a worker cites for "the suite
-passes" in a PR description or a `done` report.
+The PR's checks are green on all three platforms **for the head you are
+reporting on**. That — not a local `cargo test` run, capped or not — is the
+evidence a worker cites for "the suite passes" in a PR description or a `done`
+report, and a run id carried over from before a rebase is evidence about a
+commit that is no longer there (step 6).
 
 ## E2E (Playwright) is CI's job, same line
 

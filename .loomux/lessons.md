@@ -124,3 +124,28 @@ is the defect. It generalizes past CI — anything whose answer arrives as a pan
 sits beside *any suppression driven by a fallible signal must be BOUNDED* above and is stricter
 than it: a bound would only have shortened this hold, because the wait's own resolution channel
 stayed blocked for as long as the wait ran. Don't wait at all.
+
+## A PR body's claims are about a SHA and a scope — the body doesn't know when either moved
+
+Two failures from the same family, both of them a true sentence that quietly stopped being true
+while the text stayed put.
+
+**Green is a fact about a SHA, not about a PR.** Any push or rebase invalidates every run id,
+run link and "green on all three platforms" already written in the body, and the body survives
+that push untouched — so the claim rots silently and reads exactly as it did when it was true.
+Three instances in one batch, two different workers: #571 cited a run three commits behind head,
+and #588 cited a pre-rebase run at review 1 and then the *same* pre-rebase run again after the
+rebase at review 2. Reviewers caught all three; no worker caught its own. The rule is
+re-derivation, not care: after any push or rebase, list the runs for the new head (`gh run list
+--branch <branch> --json headSha,databaseId,conclusion`), assert `headSha` equals `git rev-parse
+HEAD`, and update the body before reporting (#596, now in `worker.md`'s DoD and the
+`ci-validate` skill).
+
+**`Closes #N` is a fact about scope, and a squash merge honors it regardless.** GitHub reads the
+keyword out of the squashed commit message and closes the issue no matter how partial the change
+was — a "layer 1 only" or "Mitigates" sentence elsewhere in the body does not qualify it. #569
+and #590 were both auto-closed that way this session with real scope still open, and both had to
+be spotted and reopened by hand (the same trap `squash-merge-autoclose` names from the merge
+side). Partial scope links as `Part of #N` / `Mitigates #N`; `Closes` is for the PR that finishes
+the issue outright. Worth the same post-merge check either way: after a squash, confirm the
+issues you only *mitigated* are still open.

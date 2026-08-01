@@ -1224,6 +1224,74 @@ fn delegate_templates_forbid_blocking_a_turn_on_ci() {
     }
 }
 
+// ---------- #596: a PR body's claims are about a SHA and a scope ----------
+//
+// One batch, two claim families, both of them a sentence that quietly stopped
+// being true while the text stayed put.
+//
+// (a) STALE GREEN. A run citation is a fact about a SHA, not about a PR: any
+// push or rebase invalidates it and the body survives untouched. Three
+// instances, two workers, one batch — #571 cited a run three commits behind
+// head; #588 cited a pre-rebase run at review 1 and then the SAME pre-rebase
+// run again after the rebase at review 2. Every one was caught by a reviewer,
+// none by the worker who wrote it, which is why the fix has to be structural
+// (re-derive) rather than an exhortation to be careful.
+//
+// (b) STALE SCOPE. `Closes #N` is a claim about scope, and a squash merge
+// honors it out of the squashed commit message however partial the change
+// actually was — #569 and #590 were both auto-closed this session with real
+// scope still open and had to be reopened by hand.
+//
+// Pinned on the LIVE worker template rather than the pre222 golden, for the
+// same reason as #590's pair above: the golden fails as "re-bless me", which
+// names no rule and teaches nobody which one went missing.
+
+/// The rule has to be a *procedure*, not "keep the body accurate". These three
+/// are what make a citation checkable rather than trusted: the command that
+/// lists a run with its commit, the field that carries that commit
+/// (`headSha` — the whole point, since a run id alone says nothing about which
+/// tree it ran on), and the local head to compare it against (`rev-parse`).
+/// Prose may be rewritten freely; a version missing any of them no longer
+/// tells a worker how to tell a live citation from a dead one.
+#[test]
+fn worker_template_requires_re_deriving_run_citations_after_a_push() {
+    for concept in ["gh run list", "headSha", "rev-parse"] {
+        assert!(
+            WORKER_TPL.contains(concept),
+            "worker.md no longer names `{concept}` — without the command and the field that \
+             tie a run to a commit, 're-derive your citations' is a wish, not a procedure (#596)"
+        );
+    }
+    let lower = WORKER_TPL.to_lowercase();
+    assert!(
+        lower.contains("stale"),
+        "worker.md must say what a citation BECOMES after a push (stale) — a rule that only \
+         says 'check your links' is one a worker reads as already satisfied (#596)"
+    );
+}
+
+/// The scope half. `Closes #N` was already in this template as the one way to
+/// link an issue, so the fix is not "mention Part of" — it is that the
+/// alternative exists AND that the mechanism is named: a squash merge honors
+/// `Closes` regardless of scope, so hedging elsewhere in the body does not
+/// save the issue. Without the mechanism this reads as a style preference,
+/// which is exactly how #569 and #590 got closed.
+#[test]
+fn worker_template_reserves_closes_for_a_pr_that_finishes_the_issue() {
+    for concept in ["Closes #N", "Part of #N"] {
+        assert!(
+            WORKER_TPL.contains(concept),
+            "worker.md no longer offers `{concept}` — a partial-scope PR with no keyword of \
+             its own goes on writing `Closes` and auto-closing live issues (#596)"
+        );
+    }
+    assert!(
+        WORKER_TPL.to_lowercase().contains("squash merge"),
+        "worker.md must name the squash merge as the mechanism that honors `Closes` whatever \
+         the scope — unstated, the keyword choice reads as a style preference (#596)"
+    );
+}
+
 // ---------- #445: delivery queue — registry-level bookkeeping ----------
 //
 // `deliver_now`'s pipeline and the drainer thread cannot be exercised here
