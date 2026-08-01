@@ -30,14 +30,24 @@ There is no global mode — each pane declares its own kind:
 
 | Kind | What it is |
 | --- | --- |
-| **Agent** | A coding-agent CLI (Claude, Copilot, or your own command). Optionally fans out to *N* panes, each in its own git worktree. |
+| **Agent** | A coding-agent CLI — Claude Code, Copilot CLI, Codex, OpenCode, Gemini CLI, Hermes, Ante, or your own custom command. Optionally fans out to *N* panes, each in its own git worktree. |
 | **Orchestrator + workers** | An orchestrator pane plus idle workers, in its own project tab, with guardrails. See the [orchestration guide](orchestration). |
 | **Terminal** | A plain shell — PowerShell, Command Prompt, or Git Bash. |
 | **File explorer** | A native-style **file manager** rooted at a folder you choose. |
 | **File editor** | The file tree + code editor (the `Alt+F` surface) as a pane, rooted at a folder you choose. |
 | **Git** | The git view (the `Alt+G` surface) as a pane, over a repo you choose. |
+| **Workflow** | The repo's agent workflow — which blocks a run may use, the path between them, the gate that must pass before a merge — as an editable pane over `.loomux/workflow.yml`. Point it at a repo that has no workflow file yet and the pane offers to create one. See [custom agent workflows](orchestration.html#custom-agent-workflows). |
 
-The last three are **content panes**: a pane that *is* a surface rather than a
+**Not every CLI in the Agent list runs everywhere.** The picker offers what
+loomux can launch; availability is the CLI's own. **Ante** is the one standing
+exception worth knowing before you pick it: Antigma documents it as macOS- and
+Linux-only and ships no Windows binary, so on Windows it will fail to launch no
+matter how the pane is configured. The launcher also warns inline when a
+selected CLI isn't installed. Orchestration groups are narrower still — an
+orchestrator, worker, reviewer or planner must be **Claude Code or Copilot
+CLI**, the two loomux has orchestration adapters for.
+
+The last four are **content panes**: a pane that *is* a surface rather than a
 process. No shell, no CLI, no PTY — just the surface, in a pane. They split, dock,
 drag, maximize and restore exactly like a terminal pane, and they never count
 toward a tab's agent badge, because a viewer is not an agent.

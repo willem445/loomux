@@ -1,8 +1,8 @@
 // Typed bridge to the Rust file-MANAGER backend (issue #214). Follows the
 // per-feature wrapper precedent set by `git.ts` / `gh.ts` / `fileapi.ts` — a
 // self-contained feature gets its own wrapper module, and no other frontend module
-// calls `invoke` for these commands (the README's "Extension seams" names this as
-// the sanctioned alternative to piling everything into `pty.ts`).
+// calls `invoke` for these commands (doc/design/architecture.md's "Extension seams"
+// names this as the sanctioned alternative to piling everything into `pty.ts`).
 //
 // Every command takes the pane's `root` plus a `rel` path relative to it. ALL path
 // safety is enforced server-side (filemgr.rs): containment, the refusal to act on

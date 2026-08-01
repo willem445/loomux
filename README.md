@@ -68,14 +68,20 @@ Label a few issues `agent-ready`, set a token budget, flip **Autonomous mode** o
 — and close the laptop. The orchestrator keeps pulling labeled work off the board
 for as long as you leave it running, hours or days, without you poking it.
 
-That's only sane because the guardrails are enforced by loomux itself, outside the
-agent process, not by asking an agent nicely:
+That's only sane because the guardrails live in loomux itself, outside the agent
+process — not in a prompt asking an agent nicely:
 
-- **It can't merge or publish.** Every agent pane runs behind a `gh`/`git` shim
+- **It won't merge or publish.** Every agent pane runs behind a `gh`/`git` shim
   that *refuses* a default-branch merge or a release/tag push unless you
   authorized it — with a one-click, single-use, 30-minute grant for one specific
   PR, or a blanket toggle you turned on yourself. Auto-merge and auto-release are
-  separate opt-ins, both off by default.
+  separate opt-ins, both off by default. The shim is the always-on first layer,
+  and it's honest about being one: it raises a bad unattended merge from "type one
+  command" to "deliberately evade a named control", but a determined agent with
+  shell access can still route around a client-side check. For a boundary nothing
+  can talk past, give your agents a machine account with no merge rights on the
+  default branch and no tag-push rights — the two layers compose, and
+  [the docs walk through both](https://willem445.github.io/loomux/autonomous-mode#the-merge--release-gate).
 - **It can't overspend.** Crossing the token budget suspends autonomous mode
   unconditionally — even if the state file can't be written — and the suspension
   survives a restart.
@@ -101,7 +107,7 @@ flowchart LR
     Orch -->|"spawns"| Work["Workers<br/>one git worktree each"]
     Plan -.->|"plan comment"| Work
     Work -->|"branch → tests → PR"| Rev["Reviewers<br/>gh pr review"]
-    Rev -->|"verdicts"| Gate{"Merge gate<br/>enforced by loomux"}
+    Rev --> Gate{"Merge gate<br/>toggles and grants you set"}
     Gate -->|"refused unless<br/>you authorize"| You
     You ==>|"merge"| Main["main"]
     Orch -.->|"every prompt, visible<br/>in a pane you can steer"| You
@@ -144,7 +150,8 @@ enforced at the CLI level.
   [oh-my-claudecode](https://github.com/yeachan-heo/oh-my-claudecode),
   [gsd-pi](https://github.com/open-gsd/gsd-pi))** — review gates written as
   prompts *inside* one agent CLI, which an agent can talk its way past. Loomux
-  enforces from outside the process. Complementary, not competing — install them
+  gates from outside the process instead — host-side, and backed by a machine
+  account when you want it airtight. Complementary, not competing — install them
   inside a worker's pane.
 - **IDE-shaped agent platforms** — loomux is still a terminal: lightweight,
   native, and it opens *your* editor instead of embedding one.
