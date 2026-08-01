@@ -39,23 +39,32 @@ export function summarize(e: AuditEntry): string {
       return `→ ${str(d.to) ?? "?"} delivered (waited ${str(d.waited_ms) ?? d.waited_ms ?? "?"}ms)`;
     case "prompt-failed":
       return `→ ${str(d.to) ?? "?"} failed: ${str(d.reason) ?? ""}`;
-    // #569: a paused group DISCARDS a delivery and tells its caller Ok — the
-    // one remaining path where a payload the sender was told succeeded ceases
-    // to exist. This line is the only record it ever existed, so the viewer
-    // says "discarded" outright rather than leaving it to the default
-    // JSON-blob rendering, where a reader scanning a timeline reads past it.
+    // #569: a paused group used to DISCARD a delivery and tell its caller Ok —
+    // the one remaining path where a payload the sender was told succeeded
+    // ceased to exist. Option 2 replaced that with a queue admission, so no
+    // build writes this line any more; a timeline still carrying one was
+    // written by an older loomux, and the viewer says so rather than leaving a
+    // reader to assume the current build behaves this way.
     case "prompt-suppressed-paused":
-      return `✕ ${str(d.to) ?? "?"} — discarded (group paused): ${firstLine(str(d.text) ?? "")}`;
-    // #569: the resume-time tally. `delivered` is whether the orchestrator
-    // actually took the notice; when it did not, the reason is named, because
-    // "the orchestrator was told" is a claim and this is the line that has to
-    // be honest about it.
+      return `✕ ${str(d.to) ?? "?"} — discarded, older loomux (group paused): ${firstLine(str(d.text) ?? "")}`;
+    // #569: the resume-time tally for those legacy discards. `delivered` is
+    // whether the orchestrator actually took the notice; when it did not, the
+    // reason is named, because "the orchestrator was told" is a claim and this
+    // is the line that has to be honest about it.
     case "pause-suppression-notice": {
       const n = typeof d.count === "number" ? d.count : Number(d.count ?? NaN);
-      const what = `${n} deliver${n === 1 ? "y" : "ies"} discarded while paused`;
+      const what = `${n} deliver${n === 1 ? "y" : "ies"} discarded by an earlier loomux while paused`;
       return d.delivered
         ? `${what} — orchestrator notified on resume`
         : `${what} — could NOT notify the orchestrator (${str(d.error) ?? "?"}); panes badged instead`;
+    }
+    // #569 option 2: the resume set these panes draining what the pause held.
+    // `started` is false when there was no app handle to spawn a drainer with,
+    // and the line has to say so — "the flush began" is a claim like any other.
+    case "pause-flush": {
+      const panes = Array.isArray(d.panes) ? d.panes : [];
+      const what = `resume: flushing ${panes.length} held pane${panes.length === 1 ? "" : "s"} (${panes.join(", ")})`;
+      return d.started === false ? `${what} — NOT started (no app handle)` : what;
     }
     case "submit-retries-skipped":
       return `→ ${str(d.to) ?? "?"}: ${str(d.reason) ?? "retries skipped"}`;
