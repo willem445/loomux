@@ -86,7 +86,7 @@ use loomux_lib::orchestration::{
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
-    cap_task_notes, task_summary,
+    board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
     AgentEntry, AgentRecord, ApproveItem, AttentionItem, Caller, Containment, Delivery, DeliveryConfirmation, Guardrails, HeldReason, HumanInput, Launch, NameSource, OrchRegistry, PasteDecision, RetryGate,
     PersonaInject, Task, TaskNote,
@@ -6417,9 +6417,11 @@ fn task_summary_drops_notes_but_counts_them() {
         assignee: Some("w-2".into()),
         session: Some("sess-1".into()),
         notes: vec![note(1, "a"), note(2, "b"), note(3, "c")],
+        deps: vec![],
+        related: vec![],
         updated_ms: 42,
     };
-    let s = task_summary(&t);
+    let s = task_summary(&t, false);
     assert_eq!(s.id, "t-1");
     assert_eq!(s.title, "Fix parser");
     assert_eq!(s.status, "in-progress");
@@ -6706,6 +6708,362 @@ fn task_tools_are_role_gated_but_listing_is_shared() {
     let missing = dispatch(&reg, &cw, "tools/call",
         &json!({ "name": "get_task", "arguments": { "id": "t-999" } })).unwrap();
     assert_eq!(missing["isError"], true);
+}
+
+// ---------- #582: dependency links, derived readiness, atomic claim ----------
+
+/// A `deps`-only patch — the shape most link edits take.
+fn deps_patch(deps: &[&str]) -> TaskPatch {
+    TaskPatch { deps: Some(deps.iter().map(|s| s.to_string()).collect()), ..Default::default() }
+}
+
+/// A claim patch: `assignee` + `claim`, the way the orchestrator hands work out.
+fn claim_patch(assignee: &str) -> TaskPatch {
+    TaskPatch { assignee: Some(assignee.into()), claim: true, ..Default::default() }
+}
+
+/// A `Task` literal for the pure readiness functions — no registry, no files.
+fn linked(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Task {
+    Task {
+        id: id.into(),
+        title: format!("task {id}"),
+        status: status.into(),
+        issue: None,
+        pr: None,
+        assignee: None,
+        session: None,
+        notes: vec![],
+        deps: deps.iter().map(|s| s.to_string()).collect(),
+        related: related.iter().map(|s| s.to_string()).collect(),
+        updated_ms: 0,
+    }
+}
+
+/// Seed `titles` as queued tasks and return the group.
+fn board_with(reg: &OrchRegistry, titles: &[&str]) -> String {
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    for title in titles {
+        reg.upsert_task(&g.id, "orch", None, patch(Some(title), None, None)).unwrap();
+    }
+    g.id
+}
+
+/// The #133-adjacent compat guarantee (#582): the link fields are ADDITIVE, so
+/// a board written before they existed loads unchanged, and a board that uses
+/// no links never grows the keys on rewrite. Both directions matter — the
+/// documented compat edge is an OLDER loomux reading a newer file and dropping
+/// the unknown fields on its next write, which is only acceptable because a
+/// dep-free board is byte-identical either way.
+#[test]
+fn pre_582_boards_load_unchanged_and_link_free_boards_stay_link_free() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(&g.id).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Exactly what loomux wrote before #582 — no deps key, no related key.
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"Ship the parser","status":"done","issue":"#7","pr":null,"assignee":"w-2","session":null,"notes":[],"updated_ms":11},
+  {"id":"t-2","title":"Wire it up","status":"queued","issue":null,"pr":null,"assignee":null,"session":null,"notes":[],"updated_ms":12}
+]"##,
+    )
+    .unwrap();
+
+    let tasks = reg.tasks(&g.id);
+    assert_eq!(tasks.len(), 2, "a pre-#582 board must still load — a parse failure reads as an EMPTY board");
+    assert!(
+        tasks.iter().all(|t| t.deps.is_empty() && t.related.is_empty()),
+        "absent link fields deserialize to empty vecs, not an error"
+    );
+    // Readiness is derived for a board that never heard of deps, too.
+    let rows = reg.task_summaries(&g.id);
+    assert!(!rows[0].ready, "a done task is not 'startable'");
+    assert!(rows[1].ready, "a queued task with no deps is ready");
+
+    // A rewrite must not GAIN the new keys: that is what keeps an older loomux
+    // (and a human reading the file) seeing exactly what it saw before.
+    reg.upsert_task(&g.id, "orch", Some("t-2"), patch(None, Some("in-progress"), None)).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("in-progress"), "the edit itself landed");
+    assert!(!text.contains("\"deps\""), "a link-free board must not gain a deps key:\n{text}");
+    assert!(!text.contains("\"related\""), "...nor a related key:\n{text}");
+}
+
+#[test]
+fn link_writes_are_validated_and_normalized() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["a", "b", "c"]);
+
+    // An id naming no task on the board is refused, and the error says which.
+    let err = reg.upsert_task(&gid, "orch", Some("t-3"), deps_patch(&["t-99"])).unwrap_err();
+    assert!(err.contains("t-99"), "the rejection names the unknown id: {err}");
+    // Self-links are refused on both arrays.
+    let err = reg.upsert_task(&gid, "orch", Some("t-3"), deps_patch(&["t-3"])).unwrap_err();
+    assert!(err.contains("itself"), "a self-link is refused: {err}");
+    let self_related = TaskPatch { related: Some(vec!["t-3".into()]), ..Default::default() };
+    assert!(reg.upsert_task(&gid, "orch", Some("t-3"), self_related).is_err(), "related is checked too");
+    // Nothing a rejection touched was written.
+    assert!(
+        reg.get_task(&gid, "t-3").unwrap().deps.is_empty(),
+        "a refused link write must leave the board exactly as it was"
+    );
+
+    // Normalization: trim, drop blanks, dedup (first occurrence wins), keep order.
+    let messy = TaskPatch {
+        deps: Some(vec!["t-2".into(), " t-1 ".into(), "t-2".into(), "   ".into()]),
+        ..Default::default()
+    };
+    let t = reg.upsert_task(&gid, "orch", Some("t-3"), messy).unwrap();
+    assert_eq!(t.deps, ["t-2", "t-1"], "trimmed, deduped, blank dropped, order preserved");
+
+    // Arrays REPLACE: an edit that doesn't mention them leaves them alone,
+    // and an empty array is the explicit clear.
+    let t = reg.upsert_task(&gid, "orch", Some("t-3"), patch(None, None, Some("unrelated edit"))).unwrap();
+    assert_eq!(t.deps, ["t-2", "t-1"], "a patch that omits deps must not clear them");
+    let t = reg.upsert_task(&gid, "orch", Some("t-3"), deps_patch(&[])).unwrap();
+    assert!(t.deps.is_empty(), "[] clears the array");
+}
+
+#[test]
+fn dep_cycles_are_rejected_and_the_error_names_the_path() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["a", "b", "c", "d"]);
+
+    // Two-task cycle: t-2 → t-1 is fine; the edge that closes it is not.
+    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-1"])).unwrap();
+    let err = reg.upsert_task(&gid, "orch", Some("t-1"), deps_patch(&["t-2"])).unwrap_err();
+    assert!(err.contains("cycle"), "the refusal says what it is: {err}");
+    assert!(err.contains("t-1 → t-2 → t-1"), "the error names the cycle path: {err}");
+
+    // Three-task cycle, through a chain the write never mentions.
+    reg.upsert_task(&gid, "orch", Some("t-3"), deps_patch(&["t-2"])).unwrap();
+    let err = reg.upsert_task(&gid, "orch", Some("t-1"), deps_patch(&["t-3"])).unwrap_err();
+    assert!(err.contains("t-1 → t-3 → t-2 → t-1"), "the whole path, in order: {err}");
+    assert!(
+        reg.get_task(&gid, "t-1").unwrap().deps.is_empty(),
+        "the rejected edge is not written"
+    );
+
+    // A DIAMOND is not a cycle: t-4 depends on both t-2 and t-3, which both
+    // reach t-1. Re-converging paths must not be mistaken for a loop.
+    reg.upsert_task(&gid, "orch", Some("t-4"), deps_patch(&["t-2", "t-3"])).unwrap();
+
+    // `related` is never cycle-checked — a mutual see-also pair is meaningful.
+    let see_also = |other: &str| TaskPatch { related: Some(vec![other.to_string()]), ..Default::default() };
+    reg.upsert_task(&gid, "orch", Some("t-1"), see_also("t-2")).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-2"), see_also("t-1")).unwrap();
+}
+
+#[test]
+fn readiness_counts_only_done_deps_and_ignores_related() {
+    let board = vec![
+        linked("t-1", "done", &[], &[]),
+        linked("t-2", "pr", &[], &[]),
+        linked("t-3", "queued", &["t-1"], &[]),
+        linked("t-4", "queued", &["t-1", "t-2"], &[]),
+        linked("t-5", "in-progress", &["t-1"], &[]),
+        linked("t-6", "queued", &[], &["t-2"]),
+        linked("t-7", "queued", &["t-404"], &[]),
+    ];
+    assert!(task_ready(&board[2], &board), "queued with every dep done = ready");
+    assert!(
+        !task_ready(&board[3], &board),
+        "a dep at `pr` is NOT done — merged/accepted is the bar, so its dependent stays blocked"
+    );
+    assert_eq!(unmet_deps(&board[3], &board), ["t-2"], "only the unmet dep is named");
+    assert!(!task_ready(&board[4], &board), "only a queued task can be ready");
+    assert!(task_ready(&board[5], &board), "a related link never blocks");
+    assert!(
+        !task_ready(&board[6], &board),
+        "an id naming no live task counts as UNMET — reading a typo as satisfied would silently unblock work"
+    );
+
+    // Every non-`done` status leaves a dependent blocked; `done` releases it.
+    for status in ["queued", "in-progress", "review", "pr", "prototype", "human-testing", "blocked"] {
+        let b = vec![linked("t-1", status, &[], &[]), linked("t-2", "queued", &["t-1"], &[])];
+        assert!(!task_ready(&b[1], &b), "a dep sitting in {status} must not satisfy a dependency");
+    }
+    let b = vec![linked("t-1", "done", &[], &[]), linked("t-2", "queued", &["t-1"], &[])];
+    assert!(task_ready(&b[1], &b), "done — and only done — releases it");
+}
+
+#[test]
+fn list_rows_carry_link_ids_only_and_a_derived_ready() {
+    let board = vec![linked("t-1", "done", &[], &[]), linked("t-2", "queued", &["t-1"], &["t-1"])];
+    let rows = board_summaries(&board);
+    assert!(rows[1].ready, "board context is what makes `ready` computable at all");
+
+    let row = serde_json::to_value(&rows[1]).unwrap();
+    assert_eq!(row["deps"], json!(["t-1"]), "ids only");
+    assert_eq!(row["related"], json!(["t-1"]));
+    assert_eq!(row["ready"], json!(true));
+    // #245's size constraint: a link must never expand into the linked task.
+    assert!(
+        !row.to_string().contains("task t-1"),
+        "a link must carry the id alone, never the linked task's title: {row}"
+    );
+
+    // A link-free row doesn't pay for the fields at all — but `ready` is always
+    // present, because an absent flag would read as "unknown", not "false".
+    let plain = serde_json::to_value(&rows[0]).unwrap();
+    assert!(plain.get("deps").is_none() && plain.get("related").is_none(), "empty arrays are omitted: {plain}");
+    assert_eq!(plain["ready"], json!(false));
+}
+
+#[test]
+fn claim_is_atomic_and_guarded() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["migrate schema", "consume schema", "unrelated"]);
+    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-1"])).unwrap();
+
+    // Blocked: refused, naming the dep that holds it, and NOTHING is written.
+    let err = reg.upsert_task(&gid, "orch", Some("t-2"), claim_patch("w-3")).unwrap_err();
+    assert!(err.contains("t-1"), "the refusal names the unmet dep: {err}");
+    let t2 = reg.get_task(&gid, "t-2").unwrap();
+    assert_eq!(t2.status, "queued", "a refused claim writes nothing");
+    assert!(t2.assignee.is_none(), "...not even the assignee it was asked to set");
+
+    // Unblocked: assignee + session + status all land in ONE call.
+    let claim = TaskPatch {
+        assignee: Some("w-3".into()),
+        session: Some("sess-9".into()),
+        claim: true,
+        ..Default::default()
+    };
+    let t = reg.upsert_task(&gid, "orch-1", Some("t-1"), claim).unwrap();
+    assert_eq!(t.status, "in-progress", "claiming IS the transition");
+    assert_eq!(t.assignee.as_deref(), Some("w-3"));
+    assert_eq!(t.session.as_deref(), Some("sess-9"));
+    // Audited under its own action, so the record says why the assignee moved.
+    let claims: Vec<_> = reg
+        .audit_log(&gid)
+        .into_iter()
+        .filter(|e| e.action == "task-claim")
+        .collect();
+    assert_eq!(claims.len(), 1, "one claim, one task-claim row");
+    assert_eq!(claims[0].detail["id"], "t-1");
+    assert_eq!(claims[0].detail["assignee"], "w-3");
+
+    // A second agent cannot take it, and the refusal names who holds it.
+    let err = reg.upsert_task(&gid, "orch-1", Some("t-1"), claim_patch("w-4")).unwrap_err();
+    assert!(err.contains("w-3"), "the refusal names the holder: {err}");
+    assert_eq!(reg.get_task(&gid, "t-1").unwrap().assignee.as_deref(), Some("w-3"), "unchanged");
+
+    // The same agent re-claiming is idempotent — this is the post-compact
+    // "did my claim land?" retry, and it must not error.
+    let again = reg.upsert_task(&gid, "orch-1", Some("t-1"), claim_patch("w-3")).unwrap();
+    assert_eq!((again.status.as_str(), again.assignee.as_deref()), ("in-progress", Some("w-3")));
+
+    // A task past `queued` and held by nobody still can't be claimed.
+    reg.upsert_task(&gid, "orch-1", Some("t-3"), patch(None, Some("review"), None)).unwrap();
+    let err = reg.upsert_task(&gid, "orch-1", Some("t-3"), claim_patch("w-5")).unwrap_err();
+    assert!(err.contains("review"), "the refusal names the status in the way: {err}");
+
+    // Claim needs an existing row, and cannot contradict itself on status.
+    let create_claim = TaskPatch { title: Some("new".into()), claim: true, ..Default::default() };
+    assert!(reg.upsert_task(&gid, "orch-1", None, create_claim).is_err(), "nothing to guard on a create");
+    let contradictory = TaskPatch { status: Some("done".into()), claim: true, ..Default::default() };
+    assert!(
+        reg.upsert_task(&gid, "orch-1", Some("t-2"), contradictory).is_err(),
+        "a claim that also sets a different status would make one argument a lie"
+    );
+
+    // A PLAIN assignee write is untouched by all of this: the human's board and
+    // every pre-#582 caller keep last-writer-wins.
+    let steal = TaskPatch { assignee: Some("w-9".into()), ..Default::default() };
+    let t = reg.upsert_task(&gid, "human", Some("t-1"), steal).unwrap();
+    assert_eq!(t.assignee.as_deref(), Some("w-9"), "an unguarded write still wins — the guard is opt-in");
+}
+
+#[test]
+fn deleting_a_task_strips_it_from_every_remaining_link() {
+    let (reg, _d) = test_registry();
+    let gid = board_with(&reg, &["a", "b", "c", "d", "e"]);
+    // t-2 is blocked by t-1; t-3 merely relates to t-1.
+    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-1"])).unwrap();
+    let rel = TaskPatch { related: Some(vec!["t-1".into()]), ..Default::default() };
+    reg.upsert_task(&gid, "orch", Some("t-3"), rel).unwrap();
+    assert!(!reg.task_summaries(&gid).iter().find(|r| r.id == "t-2").unwrap().ready);
+
+    reg.delete_task(&gid, "human", "t-1").unwrap();
+    assert!(reg.get_task(&gid, "t-2").unwrap().deps.is_empty(), "a deleted id must not survive on deps");
+    assert!(reg.get_task(&gid, "t-3").unwrap().related.is_empty(), "...or on related");
+    assert!(
+        reg.task_summaries(&gid).iter().find(|r| r.id == "t-2").unwrap().ready,
+        "with its blocker gone, the dependent is startable — not blocked forever by a dangling id"
+    );
+    // The audit says whose links moved.
+    let del = reg.audit_log(&gid).into_iter().find(|e| e.action == "task-delete").unwrap();
+    assert_eq!(del.detail["relinked"], json!(["t-2", "t-3"]), "the rewritten tasks are named: {}", del.detail);
+
+    // Batch delete (multi-select) strips too.
+    reg.upsert_task(&gid, "orch", Some("t-5"), deps_patch(&["t-4"])).unwrap();
+    reg.delete_tasks(&gid, "human", &["t-4".to_string()]).unwrap();
+    assert!(reg.get_task(&gid, "t-5").unwrap().deps.is_empty(), "delete-selected strips links");
+    let sel = reg.audit_log(&gid).into_iter().find(|e| e.action == "task-delete-selected").unwrap();
+    assert_eq!(sel.detail["relinked"], json!(["t-5"]));
+
+    // And so does delete-all-done — the most likely way a dep disappears.
+    reg.upsert_task(&gid, "orch", Some("t-2"), deps_patch(&["t-3"])).unwrap();
+    reg.upsert_task(&gid, "orch", Some("t-3"), patch(None, Some("done"), None)).unwrap();
+    reg.delete_done_tasks(&gid, "human").unwrap();
+    assert!(reg.get_task(&gid, "t-2").unwrap().deps.is_empty(), "delete-all-done strips links");
+    let done = reg.audit_log(&gid).into_iter().find(|e| e.action == "task-delete-done").unwrap();
+    assert_eq!(done.detail["relinked"], json!(["t-2"]));
+}
+
+#[test]
+fn link_and_claim_args_round_trip_through_the_mcp_shim() {
+    let (reg, _d, co, cw) = setup_mcp();
+    let call = |c: &Caller, args: Value| {
+        dispatch(&reg, c, "tools/call", &json!({ "name": "upsert_task", "arguments": args })).unwrap()
+    };
+    let text_of = |r: &Value| r["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    call(&co, json!({ "title": "migrate schema" }));
+    call(&co, json!({ "title": "consume schema" }));
+
+    // Arrays parse and land.
+    assert_eq!(call(&co, json!({ "id": "t-2", "deps": ["t-1"] }))["isError"], false);
+    assert_eq!(reg.get_task(&co.group, "t-2").unwrap().deps, ["t-1"]);
+
+    // list_tasks — readable by ANY role — carries the ids and the derived flag.
+    let listed = dispatch(&reg, &cw, "tools/call", &json!({ "name": "list_tasks", "arguments": {} })).unwrap();
+    let rows = text_of(&listed);
+    assert!(rows.contains(r#""deps":["t-1"]"#), "compact rows carry link ids: {rows}");
+    assert!(rows.contains(r#""ready":false"#), "a blocked queued task reads not-ready: {rows}");
+
+    // Registry rejections surface as tool errors WITH the reason — a caller
+    // must be able to tell a cycle from a permission problem.
+    let cyc = call(&co, json!({ "id": "t-1", "deps": ["t-2"] }));
+    assert_eq!(cyc["isError"], true);
+    assert!(text_of(&cyc).contains("cycle"), "the cycle reason survives the shim: {}", text_of(&cyc));
+
+    let blocked = call(&co, json!({ "id": "t-2", "assignee": "w-3", "claim": true }));
+    assert_eq!(blocked["isError"], true);
+    assert!(text_of(&blocked).contains("t-1"), "the unmet dep survives the shim: {}", text_of(&blocked));
+
+    // Finish the blocker; the claim then succeeds and names its holder back.
+    call(&co, json!({ "id": "t-1", "status": "done" }));
+    let ok = call(&co, json!({ "id": "t-2", "assignee": "w-3", "claim": true }));
+    assert_eq!(ok["isError"], false);
+    assert!(text_of(&ok).contains("claimed by w-3"), "the result says who got it: {}", text_of(&ok));
+
+    // Wrong-typed args are refused, never silently ignored: a caller that
+    // passed a string where an array belongs must not be told it worked.
+    assert_eq!(call(&co, json!({ "id": "t-2", "deps": "t-1" }))["isError"], true);
+    assert_eq!(call(&co, json!({ "id": "t-2", "deps": [3] }))["isError"], true);
+    assert_eq!(call(&co, json!({ "id": "t-2", "claim": "true" }))["isError"], true);
+    assert_eq!(
+        reg.get_task(&co.group, "t-2").unwrap().assignee.as_deref(),
+        Some("w-3"),
+        "a refused arg parse changes nothing"
+    );
+
+    // [] clears; and a worker still cannot write links at all.
+    assert_eq!(call(&co, json!({ "id": "t-2", "deps": [] }))["isError"], false);
+    assert!(reg.get_task(&co.group, "t-2").unwrap().deps.is_empty());
+    assert_eq!(call(&cw, json!({ "id": "t-2", "deps": ["t-1"] }))["isError"], true, "the board stays orchestrator-write");
 }
 
 #[test]

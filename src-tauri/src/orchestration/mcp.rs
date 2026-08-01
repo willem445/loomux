@@ -235,7 +235,7 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
         tool("get_state", "Read the group's durable orchestration state (JSON string). Survives sessions.",
             json!({}), &[]),
         tool("list_tasks",
-            "Read the group's task board (JSON array, order = priority) as COMPACT rows: id, title, status, issue, pr, assignee, session, updated_ms, note_count — NO note text. The human sees and edits the full board (with notes) beside your pane. Use note_count to tell whether a task has history worth pulling, then call get_task(id) for that task's full notes.",
+            "Read the group's task board (JSON array, order = priority) as COMPACT rows: id, title, status, issue, pr, assignee, session, updated_ms, note_count — NO note text. The human sees and edits the full board (with notes) beside your pane. Use note_count to tell whether a task has history worth pulling, then call get_task(id) for that task's full notes. Rows also carry the task's links and a derived `ready`: `deps` (ids this task is BLOCKED ON — ids only) and `related` (non-blocking see-also), plus `ready: true` when the task is `queued` AND every one of its deps is `done`. `ready` is what makes this call the answer to \"what is startable right now\" — top-of-board first among the ready rows — instead of re-deriving the order from prose after a compact. Both link arrays are omitted from a row that has none. Nothing here auto-flips a status: a queued task with unmet deps simply reads `ready: false`, and because every row's own status is in the same response, WHICH dep is holding it is directly readable — no second call needed.",
             json!({}), &[]),
         tool("get_task",
             "Read ONE task's full record, including its note history (capped: only the newest notes are kept verbatim, older ones collapse into one placeholder — the full text of every note is always in this group's audit log regardless). Use this after list_tasks's compact row shows a note_count worth reading.",
@@ -338,7 +338,7 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
                 "Persist the group's orchestration state (must be a valid JSON string). Call after every queue/plan change; this is your memory across sessions.",
                 json!({ "state": { "type": "string" } }), &["state"]),
             tool("upsert_task",
-                "Create (omit id, title required) or update a task on the shared board. status: queued | in-progress | review | pr | prototype | human-testing | done | blocked. Use `prototype` for a demo-gated draft the human will decide whether to promote — the board shows them a Proceed button, and clicking it prompts you to run the full production build. Keep the board current — it is the human's window into your queue. note appends a timestamped note.",
+                "Create (omit id, title required) or update a task on the shared board. status: queued | in-progress | review | pr | prototype | human-testing | done | blocked. Use `prototype` for a demo-gated draft the human will decide whether to promote — the board shows them a Proceed button, and clicking it prompts you to run the full production build. Keep the board current — it is the human's window into your queue. note appends a timestamped note. `deps`/`related` record ORDERING STRUCTURE that would otherwise live only in your context and your set_state prose: set `deps` whenever a plan implies one task must finish before another, and read it back as `ready` on list_tasks instead of re-deriving the queue after a compact. Both arrays REPLACE (they are not appends): omit one to leave it untouched, pass [] to clear it. Every id must name a live task on this board — an unknown id, a self-link, or a dep edge that would close a CYCLE is rejected outright (the error names the cycle path), and deleting a task strips its id from every other task's links in the same write. Only `done` satisfies a dep; `related` never blocks anything. `claim: true` (id required) is how you assign work: it refuses unless the task is still `queued`, is unassigned or already assigned to this same agent, and has every dep `done` — then sets assignee + status:in-progress in ONE guarded write, so a re-read after a compact can never hand the same task to a second worker. Re-claiming a task the same agent already holds is an idempotent no-op, so \"did my claim land before the compact?\" is safe to just ask again. A refused claim is the board telling you the task is taken or blocked; read the error, don't retry it as a plain assignee write.",
                 json!({
                     "id": { "type": "string", "description": "Existing task id; omit to create" },
                     "title": { "type": "string" },
@@ -348,6 +348,9 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
                     "assignee": { "type": "string", "description": "Agent id working on it" },
                     "session": { "type": "string", "description": "Worker session id for this task (enables follow-up resume)" },
                     "note": { "type": "string", "description": "Note to append" },
+                    "deps": { "type": "array", "items": { "type": "string" }, "description": "Task ids this task is BLOCKED ON, e.g. [\"t-3\",\"t-5\"]. Replaces the whole array; omit = untouched, [] = clear. Must name live tasks on this board; cycles are rejected." },
+                    "related": { "type": "array", "items": { "type": "string" }, "description": "Non-blocking see-also task ids. Same replace/untouched/clear rule as deps; never affects readiness." },
+                    "claim": { "type": "boolean", "description": "Atomically claim this task (needs id): guarded on queued + unassigned-or-mine + all deps done, then sets assignee (defaults to you) and status:in-progress in one write. Don't pass a conflicting status with it." },
                 }),
                 &[]),
             tool("remove_task", "Delete a task from the shared board.",
@@ -457,6 +460,39 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
+/// A string-array argument (#582: `deps`/`related`). Absent or null is `None`
+/// — "leave this field untouched" — and an empty array is `Some(vec![])`, the
+/// explicit "clear it". Anything that isn't an array of strings is an ERROR,
+/// not a silent skip: a caller that passed `"t-3"` (or `[3]`) meant to set a
+/// link, and quietly leaving the old array in place would tell it the write
+/// succeeded while the board disagreed.
+fn arg_str_array(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{key} must be an array of task-id strings"))
+            })
+            .collect::<Result<Vec<String>, String>>()
+            .map(Some),
+        Some(_) => Err(format!("{key} must be an array of task-id strings")),
+    }
+}
+
+/// A boolean argument (#582: `claim`). Absent or null is `false`; a non-bool
+/// is an error rather than a defaulted `false`, so `"claim": "true"` can never
+/// read as "no claim requested" and hand the same task out twice.
+fn arg_bool(args: &Value, key: &str) -> Result<bool, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(format!("{key} must be true or false")),
+    }
+}
+
 fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> Result<String, String> {
     // A standalone pane's token carries zero group-scoped power (#271 W3
     // addendum, part A1/concern 5) — `channel_send`/`channel_status` are its
@@ -483,6 +519,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
 
         "upsert_task" => {
             require_orchestrator(caller)?;
+            let claim = arg_bool(args, "claim")?;
             let task = reg.upsert_task(
                 &caller.group,
                 &caller.agent_id,
@@ -495,9 +532,20 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                     assignee: arg_str(args, "assignee").map(str::to_string),
                     session: arg_str(args, "session").map(str::to_string),
                     note: arg_str(args, "note").map(str::to_string),
+                    deps: arg_str_array(args, "deps")?,
+                    related: arg_str_array(args, "related")?,
+                    claim,
                 },
             )?;
-            Ok(format!("{} \"{}\" — {}", task.id, task.title, task.status))
+            // A claim names its holder back: the whole point of the guarded
+            // write is knowing WHO ended up with the task, not just that the
+            // call succeeded.
+            let claimed = if claim {
+                format!(" (claimed by {})", task.assignee.as_deref().unwrap_or("?"))
+            } else {
+                String::new()
+            };
+            Ok(format!("{} \"{}\" — {}{claimed}", task.id, task.title, task.status))
         }
         "remove_task" => {
             require_orchestrator(caller)?;
