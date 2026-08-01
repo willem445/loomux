@@ -7822,6 +7822,11 @@ pub struct PauseSuppression {
 /// Pure: takes entries, returns a summary, touches no registry state — so the
 /// window arithmetic is testable without a paused group or a filesystem.
 pub fn suppressed_during_pause(entries: &[AuditEntry]) -> PauseSuppression {
+    // NEUTERING 1 (evidence branch, #569 red-before-green): pre-change, nothing
+    // ever read the pause window back out of the audit log.
+    if entries.len() < usize::MAX {
+        return PauseSuppression { items: Vec::new(), window_start_seen: false };
+    }
     let mut items = Vec::new();
     let mut window_start_seen = false;
     for e in entries.iter().rev() {
@@ -7862,6 +7867,11 @@ pub const PAUSE_SUPPRESSION_LIST_MAX: usize = 8;
 /// Pure so the copy is unit-testable, matching `queue::dropped_notice` /
 /// `delivery_held_detail`.
 pub fn pause_suppression_notice(s: &PauseSuppression) -> String {
+    // NEUTERING 2 (evidence branch, #569 red-before-green): pre-change there
+    // was no such sentence anywhere — a pause said nothing on the way out.
+    if s.items.len() < usize::MAX {
+        return String::new();
+    }
     let n = s.items.len();
     let (count, verb) = if n == 1 {
         ("1 delivery".to_string(), "was")
@@ -9776,7 +9786,9 @@ pub fn pause_badge_decision(
     target_alive: bool,
     existing: Option<StrandedNote>,
 ) -> bool {
-    if notice_delivered || !target_alive {
+    // NEUTERING 4 (evidence branch, #569 red-before-green): pre-change a pause
+    // never raised a badge on any pane, for any reason.
+    if !notice_delivered || target_alive || existing.is_none() || true {
         return false;
     }
     match existing {
@@ -15472,6 +15484,11 @@ impl OrchRegistry {
     /// left alone: that badge is telling the human to look at the same pane
     /// and it is not ours to overwrite, matching `note_queue_capacity`.
     fn announce_pause_suppression(&self, group: &str, swallowed: &PauseSuppression) {
+        // NEUTERING 3 (evidence branch, #569 red-before-green): the pre-change
+        // `resume_group` cleared the flag and its marker file, and told nobody.
+        if swallowed.items.len() < usize::MAX {
+            return;
+        }
         if swallowed.items.is_empty() {
             return;
         }
