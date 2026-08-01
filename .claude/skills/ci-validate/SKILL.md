@@ -69,19 +69,33 @@ dropped:
   where `async fn` is a hard parse error — without the flag you get
   confident, wrong `error[E0670]`s on perfectly good code. The crate is
   edition 2021 (`src-tauri/Cargo.toml`).
-- **`>/dev/null` is deliberate — discard stdout.** `--check` prints a
-  *formatting* diff (`Diff in …`) for anything not rustfmt-shaped, and this
-  repo is deliberately not rustfmt-formatted, so most files print hundreds of
-  those lines. They are noise here, not findings.
+- **`>/dev/null` is deliberate — discard stdout, and the redirect is not
+  optional.** `--check` prints a *formatting* diff (`Diff in …`) for anything
+  not rustfmt-shaped, and this repo is deliberately not rustfmt-formatted:
+  hundreds of lines for a small file, but **12,483 for
+  `src/orchestration/mod.rs`** and **14,997 for a whole-crate run** — measured.
+  Forget the redirect on the file you are most likely to be editing and you
+  dump ~12k lines of diff into your own context, which costs far more than the
+  CI round this check was saving. They are noise here, not findings.
 - **Read stderr; the exit code is ambiguous.** It's `0` clean, `1` for a
-  formatting diff *and* for a parse error, `101` for a lexer error. The only
-  reliable signal is that **parse errors go to stderr and formatting diffs go
-  to stdout** — so with stdout discarded, an `error:`/`error[E….]:` line on
-  stderr means your Rust doesn't parse. Fix it before pushing.
+  formatting diff *and* for a parse error, `101` for a lexer error. The
+  reliable signal is that **problems go to stderr and formatting diffs go to
+  stdout**: a healthy run prints *nothing* to stderr no matter what the exit
+  code says. So with stdout discarded, **any output at all on stderr means
+  stop and read it** — don't grep for a particular token. It may be a parse
+  error (`error:` / `error[E….]:`), a lexer error, or a module rustfmt
+  couldn't resolve, which arrives as `Error writing files: failed to resolve
+  mod …` and contains no `error:` token at all. Fix it before pushing.
 
-Pointing it at `src/lib.rs` parses the whole module tree (rustfmt recurses
-into child modules), which takes ~3s for this crate — cheap enough to use as
-a whole-crate parse check when a change spans many files.
+When a change spans many files, parse the whole module tree instead — rustfmt
+recurses into child modules, and a parse error in a child is reported by name:
+
+```sh
+rustfmt --check --edition 2021 src/lib.rs >/dev/null
+```
+
+That takes ~3-5s for this crate. Keep the `>/dev/null`: without it this is the
+~15,000-line case above.
 
 ### This is a syntax check, NOT a formatting gate
 
@@ -101,7 +115,7 @@ what `>/dev/null` is for). So:
 `rustc` for codegen, resolves no dependencies, produces no artifacts, and
 writes nothing to `target/` — verified on a worktree that had no `target/`:
 after a whole-crate run it still had none, `git status` was clean, and the run
-took ~3s. So it sits inside both bans at once: the #320 CPU ban (no meaningful
+took ~3-5s. So it sits inside both bans at once: the #320 CPU ban (no meaningful
 CPU, nothing to contend across worktrees) and the #488 disk ban (zero bytes
 written).
 

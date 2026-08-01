@@ -91,12 +91,15 @@ Local cargo is banned outright for agents (#320 CPU, #488 disk) — but that lef
 know whether newly written Rust even *parses*, so the cheapest defect cost a full CI round: a
 scripted rewrite cut at a `);` inside a string literal, and all three build jobs failed on
 parsing, not assertions (#558). `rustfmt` is a parser, not a build — no cargo, no dependency
-resolution, no `target/` bytes, ~3s for this whole crate — so it sits inside both bans. From
+resolution, no `target/` bytes, ~3-5s for this whole crate — so it sits inside both bans. From
 `src-tauri/`: `rustfmt --check --edition 2021 <changed .rs files> >/dev/null`. The flag is
 mandatory (rustfmt's CLI defaults to edition 2015, where `async fn` is a false parse error);
 stdout is discarded because `--check` also prints *formatting* diffs and this repo is
-deliberately not rustfmt-formatted; the exit code is ambiguous (1 means either), so **stderr
-is the only signal**. It is a syntax check and nothing more — never run bare `rustfmt`, never
+deliberately not rustfmt-formatted — 12,483 lines of them for `orchestration/mod.rs` alone, so
+dropping the redirect floods your own context; the exit code is ambiguous (1 means either), so
+**any output on stderr is the signal — read it, don't grep it for `error:`** (an unresolved
+`mod` arrives as `Error writing files: …`, with no `error:` token). It is a syntax check and
+nothing more — never run bare `rustfmt`, never
 commit a reformatting, and never cite a clean run as validation: it catches no type error, no
 unresolved name, not even a `format!` with the wrong argument count. `cargo check` stays
 banned and this argument does not reach it — it writes dependency metadata to `target/`, which
