@@ -12,6 +12,7 @@ mod metrics;
 mod obs;
 pub mod orchestration; // pub: integration smoke test links through it
 pub mod pluginbroker; // pub: the #360 Slice C trust-core integration test links its pure fns
+pub mod plugingrants; // pub: the #377 install-approval gate's store/rules are integration-tested
 mod pluginregion; // per-overlay occlusion for the plugin child webview (#391, folded into #380)
 mod procmetrics; // the metrics.system data source (#360 Slice E) — dispatched from pluginbroker only
 pub mod plugins; // pub: the pane-plugins integration test links its pure fns (#360 Slice B)
@@ -71,6 +72,18 @@ pub fn run() {
                 Ok(resource_dir) => plugins::seed_bundled_example_plugin(&resource_dir, &plugins::plugins_root_dir()),
                 Err(e) => obs::breadcrumb("plugins", &format!("resource dir unavailable, skipping bundled plugin seed: {e}")),
             }
+            // #377: pre-seeded capability grants, for plugin ids the human has
+            // decided may skip the approval prompt. `PRE_SEEDED_GRANT_PLUGIN_IDS`
+            // is EMPTY as shipped — every plugin, the bundled example included,
+            // prompts on first open (fail closed) — so this is a no-op today.
+            // It is wired anyway because whether the bundled example ships
+            // pre-approved is an open human decision, and this is the whole of
+            // the other branch of it: see plugingrants.rs's own doc comment.
+            plugingrants::seed_declared_grants(
+                &plugins::plugins_root_dir(),
+                plugingrants::PRE_SEEDED_GRANT_PLUGIN_IDS,
+                plugingrants::now_epoch_secs(),
+            );
             // Start streaming CPU/mem/GPU snapshots to the status bar.
             metrics::start(app.handle().clone());
             // Poll open panes' repos for external checkout/commit/stage (#36).
@@ -233,6 +246,7 @@ pub fn run() {
             filehash::fm_hash_start,
             plugins::list_plugins,
             plugins::install_plugin,
+            plugingrants::plugin_approve_capabilities,
             obs::take_startup_notice,
             uistate::load_ui_tabs,
             uistate::save_ui_tabs,

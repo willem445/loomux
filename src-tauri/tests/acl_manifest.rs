@@ -5,7 +5,7 @@
 //! without an explicit grant silently unreachable for every window,
 //! including `main`. These tests turn that silent failure into a red test:
 //!
-//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_139`:
+//!   - `generate_handler_matches_app_commands` / `app_commands_len_is_140`:
 //!     `src/lib.rs`'s `generate_handler!` and `command_manifest::APP_COMMANDS`
 //!     are the two hand-maintained lists this migration depends on staying
 //!     identical; this diffs them directly out of the `lib.rs` source rather
@@ -21,12 +21,14 @@
 //!     later renamed/extended in place to `plugin_set_frame` (a replacement,
 //!     not an addition — by the #380 sessions-occlusion fix, which folds
 //!     webview bounds into the same atomic command). Re-landed on a `main`
-//!     that had itself reached 132: 132 + 7 = 139.
-//!   - `main_has_all_139_and_zero_permission_denies_dangerous_spread`: builds
+//!     that had itself reached 132: 132 + 7 = 139, +1 for #377's
+//!     `plugin_approve_capabilities` (the install-approval gate's one writer,
+//!     `plugingrants.rs`) = 140.
+//!   - `main_has_all_140_and_zero_permission_denies_dangerous_spread`: builds
 //!     a real (headless) `tauri::test` mock app using the app's *actual*
 //!     `capabilities/`/`permissions/` on disk (via the same `generate_context!`
 //!     `build.rs` already feeds — not a reimplementation of ACL resolution),
-//!     invokes all 139 commands against the `main` webview label, and invokes
+//!     invokes all 140 commands against the `main` webview label, and invokes
 //!     a representative dangerous spread + a benign control against the
 //!     `untrusted-probe-0` window label (see
 //!     `capabilities/plugin-zero-template.json` — the label is deliberately
@@ -52,7 +54,7 @@
 //!     This test builds a real `main` window, `add_child`s a second webview
 //!     labeled like a real plugin (`plugin-*`), and proves against the app's
 //!     *actual* on-disk capabilities that the child is denied EVERY ONE of
-//!     the 139 app commands except its own curated plugin-broker grant, while
+//!     the 140 app commands except its own curated plugin-broker grant, while
 //!     `main`'s own webview keeps every command — i.e. it tests the real
 //!     shipped `default.json`/`plugin.json`, not a simulated ACL config, and
 //!     it is deliberately a comprehensive sweep rather than a single-command
@@ -65,14 +67,14 @@
 //!
 //! Red-before-green (cited in the PR): dropping `orch_grant_merge` from
 //! `permissions/sets/orch-control.toml` makes
-//! `main_has_all_139_and_zero_permission_denies_dangerous_spread` fail with
+//! `main_has_all_140_and_zero_permission_denies_dangerous_spread` fail with
 //! `main is missing a grant for: ["orch_grant_merge"]`. Dropping
 //! `allow-plugin-broker-request` from `permissions/sets/plugin-broker.toml`
 //! makes `plugin_capability_grants_only_broker_commands` fail the same way.
 //! Reverting `capabilities/default.json`'s `"webviews": ["main"]` back to
 //! `"windows": ["main"]` makes
 //! `webview_scope_guard_denies_windows_scoped_leak_to_child_webview` fail
-//! with `child webview embedded in main leaked: [...139 commands...] — some
+//! with `child webview embedded in main leaked: [...140 commands...] — some
 //! capability is granting an app command via windows: scope`. Adding a NEW,
 //! otherwise-unrelated `windows`-scoped grant of a single different command
 //! (e.g. a throwaway capability granting `orch_grant_merge` via
@@ -134,7 +136,7 @@ stub_commands!(
     fm_list, fm_new_folder, fm_new_file, fm_rename, fm_delete_start, fm_capabilities, fm_open, fm_open_with,
     fm_reveal,
     fm_hash_start,
-    list_plugins, install_plugin,
+    list_plugins, install_plugin, plugin_approve_capabilities,
     take_startup_notice,
     load_ui_tabs, save_ui_tabs, load_settings, save_settings,
     voice_start, voice_stop, voice_cancel,
@@ -238,11 +240,11 @@ fn generate_handler_matches_app_commands() {
 }
 
 #[test]
-fn app_commands_len_is_139() {
+fn app_commands_len_is_140() {
     assert_eq!(
         loomux_lib::command_manifest::APP_COMMANDS.len(),
-        139,
-        "APP_COMMANDS drifted from the expected count of 139 (120 per the #363 plan's audited \
+        140,
+        "APP_COMMANDS drifted from the expected count of 140 (120 per the #363 plan's audited \
          count, +1 for orch_confirm_solo_copilot_autopilot added in #364, +2 for \
          orch_set_advanced_orchestrator/orch_workflow_status added in #316/#355, +3 for \
          orch_set_compact_nudge_minutes/orch_set_compact_nudge_roles/ \
@@ -254,13 +256,15 @@ fn app_commands_len_is_139() {
          approvals added in #507 — which is 132, +2 for #360 Slice B's \
          list_plugins/install_plugin, +3 for #360 Slice C's pluginbroker commands, +1 for #360 \
          Slice D's plugin_close_window, +1 for #391's plugin_set_occlusion, folded into #380, \
-         later renamed/extended in place to plugin_set_frame by the #380 sessions-occlusion fix) \
+         later renamed/extended in place to plugin_set_frame by the #380 sessions-occlusion fix — \
+         which is 139, +1 for #377's plugin_approve_capabilities, the install-time capability \
+         approval gate's one writer) \
          — if this is an intentional addition/removal, update this tripwire's count too"
     );
 }
 
 #[test]
-fn main_has_all_139_and_zero_permission_denies_dangerous_spread() {
+fn main_has_all_140_and_zero_permission_denies_dangerous_spread() {
     // Catches drift in *this test file* before it can mask a real gap: the
     // stub list above must match APP_COMMANDS exactly.
     let mut stub_names: Vec<&str> = STUB_COMMAND_NAMES.to_vec();
@@ -308,7 +312,11 @@ fn main_has_all_139_and_zero_permission_denies_dangerous_spread() {
     // same as the benign control), but pinning them explicitly guards against
     // a future curated-subset plugin capability (Slice C) accidentally
     // widening to include plugin management itself — a plugin pane must
-    // never be able to enumerate or install plugins. ---
+    // never be able to enumerate or install plugins. `plugin_approve_capabilities`
+    // (#377) is pinned here for the same reason and one stronger: it is the
+    // ONE writer of the human's capability decision, so a webview that could
+    // reach it could approve itself — exactly the self-approval CLAUDE.md's
+    // constraint 9 bans. ---
     const DANGEROUS_SPREAD: &[&str] = &[
         "orch_grant_merge",
         "git_push",
@@ -317,6 +325,7 @@ fn main_has_all_139_and_zero_permission_denies_dangerous_spread() {
         "open_in_editor",
         "list_plugins",
         "install_plugin",
+        "plugin_approve_capabilities",
     ];
     const BENIGN_CONTROL: &str = "pty_backend_info";
 
@@ -377,6 +386,9 @@ fn plugin_capability_grants_only_broker_commands() {
         "plugin_open_window",
         "plugin_close_window",
         "plugin_set_frame",
+        // #377: a plugin approving its own capabilities is the self-approval
+        // CLAUDE.md constraint 9 exists to make structurally impossible.
+        "plugin_approve_capabilities",
         "orch_grant_merge",
         "git_push",
         "ft_write_file",
@@ -432,9 +444,9 @@ fn webview_scope_guard_denies_windows_scoped_leak_to_child_webview() {
          own — this is exactly the ambiguity `windows`-scoped grants exploit"
     );
 
-    // Comprehensive, not a single canary: every one of the 139 app commands must
+    // Comprehensive, not a single canary: every one of the 140 app commands must
     // be denied to the child webview EXCEPT the two the plugin capability
-    // legitimately grants (so 137 are actually probed for a leak). A single-command probe (the original shape of this
+    // legitimately grants (so 138 are actually probed for a leak). A single-command probe (the original shape of this
     // test, `pty_backend_info` only) only catches a `windows`-scoped leak on
     // THAT one command — a future capability that windows-scopes some OTHER
     // command (say, a new main-only command added without checking this file)
