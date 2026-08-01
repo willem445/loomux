@@ -63,6 +63,7 @@ use loomux_lib::orchestration::{
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
     redelivery_treatment, RedeliveryTreatment, stranded_reword,
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
+    failed_arm_route, FailedArmRoute,
     box_reading, tier1_scan_bytes, BoxReading,
     HUMAN_INPUT_BLOCK_BOUND_MS, record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
@@ -17478,10 +17479,20 @@ fn the_boot_wait_never_calls_a_still_painting_cli_ready() {
 
 #[test]
 fn an_eaten_kickoff_badges_and_then_re_delivers_the_brief() {
-    // The whole #517 path composed in the monitor's own order, with only the
-    // pane readings faked: a fresh kickoff that was swallowed by a booting
-    // CLI leaves the ledger outstanding, no human input, no question, our
-    // text NOT in the box, and a pane that never produced a turn.
+    // #585 CORRECTION. This comment used to claim "the whole #517 path
+    // composed in the monitor's own order". It is not: the steps below are
+    // hand-composed HERE, in the order this test's author believed the monitor
+    // used. The shipped monitor returned before ever reaching step 2, and this
+    // test passed anyway for two releases — a test that IS the composition
+    // cannot observe that the real composition differs (`late_monitor` needs a
+    // live `AppHandle`, so no test executes it). What it pins is that each
+    // decision is individually correct, which is worth having and is all it
+    // ever pinned. The ORDERING is pinned by `failed_arm_route` instead — see
+    // `an_eaten_paste_is_routed_to_the_recovery_not_past_it`.
+    //
+    // The faked pane readings: a fresh kickoff swallowed by a booting CLI
+    // leaves the ledger outstanding, no human input, no question, our text NOT
+    // in the box, and a pane that never produced a turn.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
@@ -25617,6 +25628,65 @@ fn the_silence_bar_and_the_redelivery_bar_are_the_same_bar() {
         recovery(at),
         KickoffRecovery::Decline(KickoffDecline::TurnStarted),
         "at the bar the recovery must decline — the two paths agree the brief landed"
+    );
+}
+
+#[test]
+fn an_eaten_paste_is_routed_to_the_recovery_not_past_it() {
+    // The regression that the whole suite missed for two releases. #585 was
+    // not a wrong decision — it was a correct one that a `return` preempted,
+    // and no test could see it because the precedence lived only as control
+    // flow. `failed_arm_route` makes it a value, so the ordering is readable.
+    //
+    // The property: an eaten paste must ESCALATE (notice + badge + the
+    // kickoff recovery below it), never stop quietly. Before #585 this cell
+    // stopped, which is why `kickoff_recovery_action` produced zero rows —
+    // fired or declined — across the entire recorded audit history.
+    assert_eq!(
+        failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, false)),
+        FailedArmRoute::Escalate { eaten: true },
+        "an eaten paste must reach the notice, the badge and the kickoff recovery — \
+         stopping here is exactly the defect #585 fixed"
+    );
+
+    // And the other side of the same precedence: a pane that ran a turn still
+    // stops, so this does not become "escalate on everything" (which would
+    // re-open #522's flood rather than fix #585).
+    assert_eq!(
+        failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, true)),
+        FailedArmRoute::QuietStop,
+        "a pane that demonstrably ran a turn is still not a strand"
+    );
+
+    // A genuine strand (our text visibly still in the box) escalates too, but
+    // as the STUCK case — the wording the orchestrator acts on differs, and
+    // routing an eaten delivery through the stuck wording is what sent it
+    // hunting for text that was not there.
+    assert_eq!(
+        failed_arm_route(unconfirmed_disposition(BoxReading::Holds, false, false)),
+        FailedArmRoute::Escalate { eaten: false }
+    );
+    // #559's honest-uncertainty arm keeps escalating, unchanged.
+    assert_eq!(
+        failed_arm_route(unconfirmed_disposition(BoxReading::Unverifiable, false, false)),
+        FailedArmRoute::Escalate { eaten: false }
+    );
+
+    // End-to-end, with the routing decision REAL rather than assumed: given
+    // the eaten-paste pane readings, the arm escalates AND the recovery it
+    // reaches re-delivers. This is the composition #517's own test asserted by
+    // hand — now with its first step taken from the shipped precedence.
+    let route = failed_arm_route(unconfirmed_disposition(BoxReading::NotHolding, false, false));
+    assert!(matches!(route, FailedArmRoute::Escalate { .. }), "the arm must not stop");
+    assert_eq!(
+        kickoff_recovery_action(
+            Delivery::FreshKickoff.recovers_lost_kickoff(),
+            true, false, false,
+            0, // the pane produced nothing since our submit — no turn started
+            KICKOFF_TURN_EVIDENCE_BYTES, true, 0, KICKOFF_REDELIVERY_MAX,
+        ),
+        KickoffRecovery::Redeliver,
+        "and the recovery the escalation reaches must actually re-deliver the lost brief"
     );
 }
 

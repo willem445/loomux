@@ -9244,6 +9244,56 @@ pub enum UnconfirmedDisposition {
     Notify,
 }
 
+/// What the `DeclareFailed` arm does once it has classified the pane (#585) —
+/// the arm's own PRECEDENCE, lifted out of control flow and into a value.
+///
+/// **Why this exists at all.** #585 was not a wrong decision; it was a
+/// correctly-decided one that a `return` statement preempted. The idle-pane
+/// arm stopped the monitor ~90 lines above the test gating #517's kickoff
+/// recovery, so the recovery never ran — and the entire test suite was green
+/// throughout, because the ordering existed only as control flow inside a
+/// function no test can execute (`late_monitor` needs a live `AppHandle` and
+/// a real `PtyManager`).
+///
+/// #517's own wiring test shows the failure mode exactly: it hand-composes
+/// `stranded_selfheal_action` and then `kickoff_recovery_action` in the order
+/// its author believed the monitor used, and passes — asserting the intended
+/// composition rather than the shipped one. A test that IS the composition
+/// cannot observe that the real composition differs. That is the
+/// "unpinnable wiring nobody could assert a property against" hazard this file
+/// names elsewhere, and it cost this project two releases of a dead feature.
+///
+/// Making the precedence a value does not make `late_monitor` executable in a
+/// test, and this is deliberately not claimed to: the arm could still be
+/// mis-wired to ignore the route it computes. What it does buy is that the
+/// ORDERING — "an eaten paste reaches the recovery; an idle pane does not" —
+/// is now a property a test reads off a pure function instead of a property a
+/// reader has to re-derive by tracing `return`s. The one thing that silently
+/// regressed is the one thing now pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedArmRoute {
+    /// Record the idle pane and stop. Nothing is stranded, nothing is owed.
+    QuietStop,
+    /// Announce, badge, and consult `kickoff_recovery_action`. `eaten`
+    /// selects the notice wording only (see `delivery_eaten_notice`); both
+    /// values take the identical path, which is the point — an eaten delivery
+    /// must not be routed anywhere a merely-unconfirmed one is not.
+    Escalate { eaten: bool },
+}
+
+/// The `DeclareFailed` arm's precedence (#585). See `FailedArmRoute`.
+///
+/// Total over `UnconfirmedDisposition`, so adding a variant without deciding
+/// its route is a compile error rather than a silent fall-through into
+/// whichever branch happens to sit first.
+pub fn failed_arm_route(disposition: UnconfirmedDisposition) -> FailedArmRoute {
+    match disposition {
+        UnconfirmedDisposition::IdleAuditOnly => FailedArmRoute::QuietStop,
+        UnconfirmedDisposition::EatenNotify => FailedArmRoute::Escalate { eaten: true },
+        UnconfirmedDisposition::Notify => FailedArmRoute::Escalate { eaten: false },
+    }
+}
+
 /// Should a late-confirmation failure raise the actionable "the prompt may be
 /// sitting unsubmitted in its pane; get_output it and re-send" notice? (#522)
 ///
@@ -10730,7 +10780,15 @@ fn run_late_confirmation_monitor(
                     ptys.input_pending(pty_id).unwrap_or(true),
                     turn_evidence,
                 );
-                if disposition == UnconfirmedDisposition::IdleAuditOnly {
+                // #585: the precedence itself, as a VALUE — see
+                // `failed_arm_route`. The defect this issue fixed was a
+                // `return` ordered above the recovery it preempted, and no
+                // test could see it because the ordering existed only as
+                // control flow. Reading the route from a pure function is what
+                // makes "does the eaten case still reach the recovery?"
+                // assertable at all.
+                let route = failed_arm_route(disposition);
+                if route == FailedArmRoute::QuietStop {
                     append_audit(&root, &group, "loomux", "delivery-unconfirmed-idle-pane", json!({
                         "to": agent, "confirm_source": "idle", "confirm_state": "unconfirmed",
                         "reason": "pane idle — box holds neither our paste nor human input",
@@ -10748,7 +10806,7 @@ fn run_late_confirmation_monitor(
                 // was eaten. Its own action so the two are greppable apart,
                 // and NO early return: this delivery must reach the notice,
                 // the badge, and `kickoff_recovery_action` below.
-                let eaten = disposition == UnconfirmedDisposition::EatenNotify;
+                let eaten = route == FailedArmRoute::Escalate { eaten: true };
                 if eaten {
                     append_audit(&root, &group, "loomux", "delivery-eaten", json!({
                         "to": agent, "confirm_source": "idle", "confirm_state": "unconfirmed",

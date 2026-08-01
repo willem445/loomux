@@ -6777,6 +6777,32 @@ compose as evidence-OR: any independent sign that the agent acted on our deliver
 silence, and the absence of all of them is what must speak. Whoever rebases second should merge
 the two precedence tables into one rather than leaving two `NotHolding` arms to drift.
 
+**The precedence is now a value, because that is what regressed.** #585 was not a wrong
+decision. Every decision involved — `unconfirmed_disposition`, `stranded_selfheal_action`,
+`kickoff_recovery_action` — was individually correct, individually tested, and green. What
+failed was the *order* they ran in, and the order existed only as control flow inside
+`late_monitor`, which no test can execute (it needs a live `AppHandle` and a real
+`PtyManager`).
+
+#517's own wiring test shows how that hides: it hand-composes `stranded_selfheal_action` and
+then `kickoff_recovery_action` in the order its author believed the monitor used, asserts the
+result, and passes — for two releases, while the shipped monitor returned before ever reaching
+the second step. A test that *is* the composition cannot observe that the real composition
+differs. This is the "unpinnable wiring nobody could assert a property against" hazard named
+elsewhere in this file, and it is the reason a 100%-green suite reported nothing while the
+feature was dead.
+
+So the arm's precedence is lifted into `failed_arm_route(UnconfirmedDisposition) ->
+FailedArmRoute`, total over the disposition enum (adding a variant without deciding its route
+is a compile error, not a silent fall-through). "An eaten paste reaches the recovery; an idle
+pane does not" is now a property a test reads off a pure function rather than one a reader
+re-derives by tracing `return`s.
+
+State plainly what this does **not** buy: it does not make `late_monitor` executable in a test,
+and the arm could still be mis-wired to ignore the route it computes. It closes the specific
+hole that actually opened — an ordering nothing could assert — and no more. The #517 test's
+misleading comment is corrected in place rather than left to mislead the next reader.
+
 **No queue mutation.** Nothing here enqueues, dequeues, or reorders; the recovery path reaches
 the queue only through `enqueue_text`'s existing front door, which owns its own persistence. So
 no new `persist_queues` obligation arises under the #523 table.
