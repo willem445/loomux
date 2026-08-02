@@ -10998,15 +10998,7 @@ pub fn resolve_output_text(live: Option<String>, last_exit_tail: Option<&str>) -
 /// The strip runs OUTSIDE the read (the reader has already released both locks
 /// by the time it returns), so no scanning happens under the lock at all.
 pub fn attention_tail(read: impl FnOnce(usize) -> Option<Vec<u8>>) -> Option<String> {
-    // PRE-#717 SHAPE, ON PURPOSE — this commit exists to show the new tests
-    // failing against the behaviour they were written for, and the next commit
-    // replaces this body with `read(ATTENTION_SCAN_BYTES)`. `usize::MAX` is
-    // exactly what `output_tail` did: hand back the WHOLE ring. The slice below
-    // is the shipped call sites' own `saturating_sub(4096)`, which is why the
-    // returned string is identical and only the request size differs.
-    let raw = read(usize::MAX)?;
-    let start = raw.len().saturating_sub(4096);
-    Some(strip_ansi(&raw[start..]))
+    read(ATTENTION_SCAN_BYTES).map(|raw| strip_ansi(&raw))
 }
 
 /// Strip ANSI escape sequences (CSI, OSC, two-byte ESC) and carriage
