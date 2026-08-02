@@ -194,4 +194,11 @@ What's different from a stable release:
   content (skip mentioning the `.msi` download).
 
 Stable tags (no hyphen) are unaffected by any of the above — same asset
-count (9), same `make_latest` (default `true`), same npm publish.
+count (9), same npm publish. `promote`'s "Publish the draft release" step
+never sends `make_latest` in the same API call as `draft=false`, in either
+direction (a `make_latest=true` sent that way can be silently dropped —
+see the comment above the `gh api` calls for the evidence and why the
+mechanism is inferred, not documented). It flips `draft=false` alone
+first, then — once that call has returned 2xx — a second, separate call
+sets `make_latest` explicitly for the tag kind: **`true`** for stable,
+**`false`** for beta/RC (#341, #543).

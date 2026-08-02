@@ -267,19 +267,47 @@ jobs:
         # the whole point of #282 is that tag-based lookup is what let a
         # stray duplicate slip through undetected.
         #
-        # make_latest=false for beta/RC (hyphenated) tags: GitHub's `latest`
-        # release pointer is what the README's install.sh/install.ps1
-        # one-liners resolve, and a beta going out must not steal that
-        # pointer from the newest stable release. Stable tags keep
-        # make_latest=true (GitHub's own default) — byte-identical to the
-        # pre-beta workflow.
+        # GitHub's REST docs for this endpoint ("Update a release") describe
+        # `make_latest` in full as: "Specifies whether this release should
+        # be set as the latest release for the repository. Drafts and
+        # prereleases cannot be set as latest. Defaults to true for newly
+        # published releases. legacy specifies that the latest release
+        # should be determined based on the release creation date and
+        # higher semantic version. Default: true. Can be one of: true,
+        # false, legacy". #341/#543 caught this live: v1.0.0 promoted
+        # cleanly (non-draft, non-prerelease, `promote` green) but never
+        # took the `latest` pointer from v0.10.0 — even though the docs say
+        # newly-published releases default to true — forcing a manual `gh
+        # release edit --latest` after the fact.
+        #
+        # The docs don't say why a combined draft=false + make_latest=true
+        # PATCH behaves this way; that a release still counts as a draft at
+        # the instant a combined request is evaluated is the best-supported
+        # inference from the live symptom above, not something the cited
+        # text states outright. Because the mechanism is inferred rather
+        # than documented, this never sends make_latest alongside the draft
+        # flip in EITHER direction — an asymmetric fix (only `true` split
+        # out, `false` left riding the draft flip) would rest the beta path
+        # on the same unverified assumption this bug just disproved for the
+        # stable path, and would open a real demotion window on a `promote`
+        # re-run over an already-published release (create-release supports
+        # re-runs; see the comment above). So: flip draft=false alone
+        # first; once that call has returned 2xx (not "confirmed" — a 2xx
+        # here is exactly the kind of success #543 showed doesn't prove a
+        # field was applied), a second, separate call sets make_latest
+        # explicitly for the tag kind — true for stable, false for
+        # beta/RC. Both calls stay id-addressed (RELEASE_ID), never a
+        # tag-based lookup — the same discipline #282 established for the
+        # rest of this job.
         run: |
           set -euo pipefail
-          make_latest=true
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            make_latest=false
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f draft=false
+
+          if [[ "$GITHUB_REF_NAME" != *-* ]]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f make_latest=true
+          else
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f make_latest=false
           fi
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f draft=false -f make_latest="$make_latest"
 
   # Publish the tiny npm launcher (`npx loomux-desktop`). It just downloads
   # the release asset built above, but must wait for `promote` (not just
