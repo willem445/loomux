@@ -7011,6 +7011,28 @@ recovered entry; this expires nothing, and the staleness judgement stays with th
   writing back what it read minutes earlier, because `archive_staged_overflow` may have appended in
   between and a stale rewrite would delete those appends.
 
+**The rewrite works over RAW LINES, never over parsed records** (review B1), and that is the
+difference between "nothing is dropped" being a property of the file and being a property of the
+reader's vocabulary. `parse_archive` is deliberately lossy — it skips a line whose version this
+build does not know, because interpreting one would mean guessing at a shape — which is right for
+every path that ACTS on records (the orphan report, the rebind) and fatal for the one that
+REWRITES the file: rebuilding it from parsed output deletes exactly the lines the per-line `v`
+exists to protect. The failure it produced is worth stating, because it is the shape this whole
+section argues against arriving through the mechanism meant to prevent it: a newer build writes
+`v: 2` records, a rollback follows, and the next bind that re-admits anything erases them —
+silently, since the skip count was discarded. So `queue::scan_archive` reads the file as lines,
+each carried through byte for byte, and parsing answers one question only: *is this the record I am
+deliberately removing?* A line that is not JSON at all is carried too — unreadable is not the same
+as unwanted, and a line with no readable id can never be matched, so it can never be removed.
+
+The **`queue_seq` seed reads ids the same raw way**, for the same reason and against the same
+failure: an id sitting on a line this build cannot interpret is still an id in use, and reading it
+through `parse_archive` would make a newer build's record invisible to the very check that exists
+to stop an id being re-minted. The one case that genuinely cannot be accounted for — a line whose
+id is unreadable even as raw JSON, so there is no number to account — is audited
+(`queue-archive-id-unreadable`) rather than left as a silent shortfall, because the consequence of
+a re-minted id is itself silent.
+
 **Archived entries re-bind BEFORE staged ones.** An entry only reaches the archive by being among
 the oldest, ids are monotonic per group, and admission order is delivery order — so re-admitting
 the archive after staging would invert arrival order across the two stores, which is the property
@@ -7028,9 +7050,17 @@ fresh delivery, and the audit scan reads the new id's `delivery-dequeued` as clo
 carries its own `v` (per line, not per file — an append-only file outlives the build that wrote its
 older records), `#[serde(default)]`ed so a line written before the field existed still parses, and
 `parse_archive` skips-and-counts a line whose version this build does not know rather than guessing
-at its shape. Downgrading loses SIGHT of archived entries — an older build never opens the file —
-but destroys nothing: `queue.json` is still a valid, smaller snapshot of the same schema, and the
-audit-derived orphan view still names the ids.
+at its shape. Downgrading past the archive entirely loses SIGHT of archived entries — such a build
+never opens the file — but destroys nothing: `queue.json` is still a valid, smaller snapshot of the
+same schema, and the audit-derived orphan view still names the ids.
+
+**Archive-era skew — the case the per-line `v` actually exists for — is the one where an older
+build DOES open the file**, and it is handled structurally by the raw-line rule above rather than
+by that build's ability to read what it finds. Skipping a record it cannot interpret and
+*preserving* that record are different obligations; honoring only the first is what review B1
+caught. Both are honored now, so "nothing is dropped" does not depend on the reader understanding
+every record — the only version of that claim worth making about a file designed to outlive the
+build that wrote it.
 
 **What was deliberately NOT done here.** `queue_orphans`'s orphan LIST stays uncapped. It was
 already unbounded before this change (staging accumulated the same way), so capping it is not a

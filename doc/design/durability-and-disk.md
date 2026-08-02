@@ -127,6 +127,18 @@ never be observed with it in neither. The ordering that guarantees that —
 append before remove, in both directions — is why the worst crash outcome here
 is a duplicate record, which `queue::parse_archive` dedupes on delivery id.
 
+**The replace half carries every line it did not set out to remove, verbatim**
+(#547 review B1). It is built from the file's raw lines (`queue::scan_archive`),
+not from parsed records: parsing is used only to test whether a line is the
+record being removed, so a record written by a build with a newer per-line `v`
+— or a line torn by the very disk-full failure this document is about — is
+written back byte for byte instead of being dropped for being unreadable. This
+is the property that makes the pair safe to describe as one store. A
+whole-file replace rebuilt from what the writer could parse is a *lossy*
+replace, and a lossy replace of the file holding the only copy of a payload is
+the #133 failure with extra steps: it does not truncate the file, it truncates
+the set.
+
 `agent-seq.json` (#524) is the one entry in this table that is **not** in a
 group dir, and that placement is the design decision rather than an oversight.
 The counter it protects is registry-global — one `seq` mints `w-3` in one group
