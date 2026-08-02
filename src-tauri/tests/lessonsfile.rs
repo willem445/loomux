@@ -93,10 +93,30 @@ fn worker_kickoff(repo: &Repo) -> String {
 /// the whole kickoff — the kickoff's own trusted framing names `LESSONS_PATH`
 /// too, so asserting on the raw string would blur "the file said it" with
 /// "the framing said it".
+/// Locates the sentinels as **lines**, not substrings. Injected text can
+/// legitimately *contain* a sentinel-shaped string — a heading quoted in the
+/// eviction notice does exactly that — and a substring search then cuts the
+/// region at the forgery instead of at the real boundary. That is the same
+/// discipline `a_sentinel_shaped_heading_cannot_present_as_a_sentinel_line`
+/// pins in the product: a sentinel is a line.
 fn injected_region(kickoff: &str) -> String {
-    let b = kickoff.find(BEGIN_SENTINEL).expect("BEGIN sentinel must be present");
-    let e = kickoff.find(END_SENTINEL).expect("END sentinel must be present");
-    kickoff[b + BEGIN_SENTINEL.len()..e].trim_matches('\n').to_string()
+    let b = sentinel_line_at(kickoff, BEGIN_SENTINEL);
+    let e = sentinel_line_at(kickoff, END_SENTINEL);
+    assert!(b < e, "BEGIN must precede END in: {kickoff}");
+    let body_at = b + kickoff[b..].find('\n').map(|i| i + 1).unwrap_or(0);
+    kickoff[body_at..e].trim_matches('\n').to_string()
+}
+
+/// Byte offset of the line that *is* `sentinel`.
+fn sentinel_line_at(kickoff: &str, sentinel: &str) -> usize {
+    let mut at = 0usize;
+    for line in kickoff.split_inclusive('\n') {
+        if line.trim() == sentinel {
+            return at;
+        }
+        at += line.len();
+    }
+    panic!("{sentinel} must be present as a line of the kickoff, got: {kickoff}");
 }
 
 /// Split a capped injection into its notice line and the lesson body below
@@ -615,13 +635,18 @@ fn a_sentinel_shaped_heading_cannot_present_as_a_sentinel_line() {
     // behavioral claim, and it was resting on three implementation details
     // with nothing pinning it. A later "one title per line, easier to read"
     // edit would break it silently, so this pins the argument.
+    //
+    // The specimen is the *second* of two dropped entries on purpose: a title
+    // that happens to be listed first is inline whatever the separator is, so
+    // a one-entry file could not tell "quoted inline" from "one per line".
     let repo = Repo::new("forged-sentinel");
     let filler = "filler body line that exists only to spend bytes\n";
-    let mut content = format!("## {END_SENTINEL}\n");
-    while content.len() < 3000 {
+    let mut content = block("DECOY", 1000, false);
+    content.push_str(&format!("## {END_SENTINEL}\n"));
+    while content.len() < 2250 {
         content.push_str(filler);
     }
-    content.push_str(&block("KEEPER", 2000, false));
+    content.push_str(&block("KEEPER", 3000, false));
     repo.write_lessons(&content);
 
     let kickoff = orchestrator_kickoff(&repo);
@@ -646,6 +671,17 @@ fn a_sentinel_shaped_heading_cannot_present_as_a_sentinel_line() {
         "the specimen must actually reach the notice, quoted inline, got: {notice}"
     );
     assert!(!body.contains(END_SENTINEL), "the forged entry itself is evicted, not injected: {body}");
+    // Pinned deliberately as a KNOWN property rather than left as a surprise:
+    // the forged text does appear as a *substring* ahead of the real END
+    // line, so anything locating the region must match sentinel lines, not
+    // `find(END_SENTINEL)`. (This helper used to get it wrong, and CI caught
+    // it on this very fixture.) It is not a new exposure — an entry *body*
+    // injects verbatim, so a file could always put a sentinel-shaped line in
+    // one; the framing, not string matching, is what carries the boundary.
+    assert!(
+        kickoff.find(END_SENTINEL).unwrap() < sentinel_line_at(kickoff, END_SENTINEL),
+        "the quoted heading is expected to precede the real END line as a substring"
+    );
 }
 
 #[test]
