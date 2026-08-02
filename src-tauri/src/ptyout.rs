@@ -49,7 +49,10 @@
 /// budget, and only for a pane that is ALREADY streaming: the leading-edge
 /// rule (see `OutputCoalescer::take_due`) means the first chunk after a quiet
 /// pane emits with no delay at all.
-pub const PTY_EMIT_MIN_INTERVAL_MS: u64 = 16;
+// TEMPORARY (reverted in the next commit): 0 restores the pre-#712 policy —
+// emit once per read() — so CI shows the new event-count test going red for
+// the reason it is meant to catch. See the PR body's red-before-green section.
+pub const PTY_EMIT_MIN_INTERVAL_MS: u64 = 0;
 
 /// Hard cap on how many bytes one `pty-output` event carries. A batch that
 /// reaches it is due immediately regardless of the clock, so a pane dumping
@@ -170,12 +173,30 @@ impl OutputCoalescer {
 /// actual shipped loop, with its real channel and real monotonic clock — is
 /// what an integration test drives; a headless test has no Tauri `AppHandle`
 /// (see `PtyManager::register_fake_for_test`'s note on why).
-pub fn pty_output_pump<F: FnMut(Vec<u8>)>(rx: std::sync::mpsc::Receiver<Vec<u8>>, mut emit: F) {
+pub fn pty_output_pump<F: FnMut(Vec<u8>)>(rx: std::sync::mpsc::Receiver<Vec<u8>>, emit: F) {
+    pty_output_pump_with(rx, PTY_EMIT_MIN_INTERVAL_MS, PTY_EMIT_MAX_BATCH, emit)
+}
+
+/// `pty_output_pump` with the policy constants supplied rather than shipped.
+///
+/// Exists for one reason: `tests/ptyout.rs` runs the SAME loop twice, once
+/// with the shipped window and once with a zero window — which is exactly the
+/// pre-#712 policy, one event per `read()` return — and compares the event
+/// counts. Without that arm, "coalescing reduced the event count" is a claim
+/// about a number with nothing to compare it to; with it, the un-coalesced
+/// count is measured on the real code path, on every platform, on every run.
+#[doc(hidden)] // pub for the #712 integration test's A/B against the old policy
+pub fn pty_output_pump_with<F: FnMut(Vec<u8>)>(
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    min_interval_ms: u64,
+    max_batch: usize,
+    mut emit: F,
+) {
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
 
     let epoch = Instant::now();
-    let mut co = OutputCoalescer::new(PTY_EMIT_MIN_INTERVAL_MS, PTY_EMIT_MAX_BATCH);
+    let mut co = OutputCoalescer::new(min_interval_ms, max_batch);
     // Monotonic, and relative to this pane's own start — never SystemTime,
     // which a clock adjustment could run backwards mid-stream.
     let now_ms = move || epoch.elapsed().as_millis() as u64;

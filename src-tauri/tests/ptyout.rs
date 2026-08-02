@@ -13,7 +13,9 @@
 //! No Tauri runtime and no real agent CLI are involved: the pump takes its
 //! emit sink as a parameter, so the sink here is a counting closure.
 
-use loomux_lib::ptyout::{pty_output_pump, PTY_EMIT_MAX_BATCH};
+use loomux_lib::ptyout::{
+    pty_output_pump, pty_output_pump_with, PTY_EMIT_MAX_BATCH, PTY_EMIT_MIN_INTERVAL_MS,
+};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,11 +23,25 @@ use std::time::Duration;
 /// Run the real pump against `chunks`, sending them with `gap` between each,
 /// and return every batch it emitted, in order.
 fn run_pump(chunks: Vec<Vec<u8>>, gap: Duration) -> Vec<Vec<u8>> {
+    run_pump_inner(chunks, gap, None)
+}
+
+/// Same, but with the coalescing window overridden — `Some(0)` reproduces the
+/// pre-#712 policy (emit once per chunk) through the same loop.
+fn run_pump_window(chunks: Vec<Vec<u8>>, window_ms: u64) -> Vec<Vec<u8>> {
+    run_pump_inner(chunks, Duration::ZERO, Some(window_ms))
+}
+
+fn run_pump_inner(chunks: Vec<Vec<u8>>, gap: Duration, window_ms: Option<u64>) -> Vec<Vec<u8>> {
     let (tx, rx) = channel::<Vec<u8>>();
     let emitted: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = emitted.clone();
     let pump = std::thread::spawn(move || {
-        pty_output_pump(rx, move |batch| sink.lock().unwrap().push(batch));
+        let push = move |batch: Vec<u8>| sink.lock().unwrap().push(batch);
+        match window_ms {
+            None => pty_output_pump(rx, push),
+            Some(ms) => pty_output_pump_with(rx, ms, PTY_EMIT_MAX_BATCH, push),
+        }
     });
     for c in chunks {
         tx.send(c).expect("pump alive");
@@ -51,14 +67,31 @@ fn run_pump(chunks: Vec<Vec<u8>>, gap: Duration) -> Vec<Vec<u8>> {
 /// while the pre-#712 behaviour (one event per chunk) fails it by 4x.
 #[test]
 fn a_burst_costs_far_fewer_events_than_chunks() {
-    let chunks: Vec<Vec<u8>> = (0..1000).map(|i| format!("line {i}\r\n").into_bytes()).collect();
-    let batches = run_pump(chunks, Duration::ZERO);
-    assert!(
-        batches.len() <= 250,
-        "1000 chunks produced {} events; coalescing should be far below one-per-chunk",
-        batches.len()
+    let chunks = || -> Vec<Vec<u8>> {
+        (0..1000).map(|i| format!("line {i}\r\n").into_bytes()).collect()
+    };
+
+    // The pre-#712 policy, measured on this very loop rather than asserted
+    // from memory: with no window, every chunk is its own IPC event.
+    let before = run_pump_window(chunks(), 0);
+    assert_eq!(
+        before.len(),
+        1000,
+        "a zero window is the old policy: one event per read() return"
     );
-    assert!(!batches.is_empty(), "the stream must still be delivered");
+
+    let after = run_pump(chunks(), Duration::ZERO);
+    eprintln!(
+        "#712: 1000 chunks -> {} events without a window, {} events with the shipped {PTY_EMIT_MIN_INTERVAL_MS}ms window",
+        before.len(),
+        after.len()
+    );
+    assert!(
+        after.len() <= 250,
+        "1000 chunks produced {} events; coalescing should be far below one-per-chunk",
+        after.len()
+    );
+    assert!(!after.is_empty(), "the stream must still be delivered");
 }
 
 /// Coalescing is allowed to change how many events carry the bytes and
