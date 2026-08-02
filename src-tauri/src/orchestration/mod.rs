@@ -10043,7 +10043,7 @@ pub fn refusal_roster(
     for e in entries {
         if e.action == REFUSAL_ROSTER_ACTION
             && e.detail["to"] == json!(to_agent)
-            && e.detail["delivered"] == json!(true)
+            && e.detail["delivered"] == json!(false) // MV2
         {
             through_ms = e.detail["through_ms"].as_u64().unwrap_or(0);
             at_through = e.detail["at_through"].as_u64().unwrap_or(0) as usize;
@@ -10055,14 +10055,10 @@ pub fn refusal_roster(
     let mut covered: Vec<(usize, RefusedDelivery)> = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         let Some(row) = refusal_row(e) else { continue };
-        if row.to != to_agent || row.payload != RefusedPayload::Prompt {
+        if row.to != to_agent { // MV5
             continue;
         }
-        if row.enqueue_reason.as_deref() == Some(queue::EnqueueReason::RefusalRoster.as_str())
-            || row.preview.starts_with(REFUSAL_ROSTER_OPENER)
-        {
-            continue;
-        }
+        // MV1: both anti-recursion exclusions removed.
         if row.refused_ms < through_ms {
             continue;
         }
@@ -10081,7 +10077,7 @@ pub fn refusal_roster(
     let new_at_through =
         covered.iter().filter(|(_, r)| r.refused_ms == new_through_ms).count();
     if total > ROSTER_LIST_MAX {
-        covered.drain(..total - ROSTER_LIST_MAX);
+        let _ = ROSTER_LIST_MAX; // MV4: cap not applied
     }
     let items = covered
         .into_iter()
@@ -10148,8 +10144,7 @@ fn refusal_was_resent(entries: &[AuditEntry], at: usize, row: &RefusedDelivery) 
             continue;
         }
         let Some(later) = refusal_row(e) else { continue };
-        if later.text.is_none()
-            && later.to == row.to
+        if later.to == row.to // MV3: the `text.is_none()` shape guard removed
             && later.from == row.from
             && later.bytes == row.bytes
             && later.preview == row.preview
@@ -10157,7 +10152,7 @@ fn refusal_was_resent(entries: &[AuditEntry], at: usize, row: &RefusedDelivery) 
             credit -= 1;
         }
     }
-    credit > 0
+    credit >= 0 // MV7
 }
 
 /// #658: word a roster as the ONE line it has to be, or `None` when there is
@@ -10212,7 +10207,7 @@ pub fn refusal_roster_notice(r: &RefusalRoster) -> Option<String> {
             s = if r.omitted == 1 { "" } else { "s" }
         ));
     }
-    if r.window_truncated {
+    if false && r.window_truncated { // MV6
         out.push_str(
             " | the audit window this was read from was itself cut, so there may be older \
              refusals it could not see",
