@@ -66,16 +66,37 @@ with no flag at all.
   with no argv or settings equivalent, and Gemini's window is
   model-determined, so both grey out too.
 
-A role whose CLI can't honor a knob shows it disabled with the vendor reason
-above as its hint — never silently ignored. And a knob a CLI *can* honor is
-still an entitlement, not a guarantee: `[1m]` access is plan- and
+A role's knob greys out for either of two separate reasons, each stated
+inline as the control's own hint — never silently ignored:
+
+- the **CLI** can't honor the knob at all (the Copilot/Gemini cases above);
+- for **context** specifically, on Claude Code, the **selected model** has
+  no `[1m]` form. The suffix is documented only for the `sonnet`, `opus` and
+  `opusplan` families — `haiku`, `fable`, `best` and `default` each grey out
+  with their own reason (there is no `haiku[1m]` or `fable[1m]`; `best` and
+  `default` resolve per account, so there's no fixed name to append the
+  suffix to). A model id loomux doesn't recognize — a full model name it
+  hasn't seen, or a Bedrock/Vertex/Foundry deployment name — leaves the knob
+  **enabled** instead: loomux only disables what it can affirmatively rule
+  out, never what it merely doesn't know, since on those providers the
+  suffix is exactly how the 1M window gets selected.
+
+A knob that clears both checks is still an entitlement, not a guarantee:
+`opus[1m]` is a real, documented alias, but `[1m]` access is plan- and
 credit-gated on Claude's side, so picking it for an account that can't serve
 it fails visibly at the CLI, in the pane — loomux doesn't pre-judge your
-account's entitlements by hiding the option.
+account's entitlements by hiding the option. That's a different failure from
+the model gate above: the model gate hides a suffix that has no defined
+meaning at all, while the entitlement case leaves a meaningful suffix
+selectable and lets the vendor's own check decide.
 
 These same two keys are available per block in `.loomux/workflow.yml`
-(`effort:`/`context:`) for the advanced orchestrator, gated by the same
-per-CLI rules — see
+(`effort:`/`context:`) for the advanced orchestrator. Loading the file
+enforces the closed vocabulary and the per-CLI rule above; the workflow pane
+goes further and also validates `context:` against the block's `model:`,
+raising a per-block finding when the two disagree (e.g. `model: haiku` with
+`context: 1m`) — the same model-gate rule the launcher's select uses, so a
+hand-edited file can't drift from what the launcher would show. See
 [`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
 and the `author-loomux-workflow` skill.
 
