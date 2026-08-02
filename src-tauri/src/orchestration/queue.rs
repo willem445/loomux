@@ -272,7 +272,10 @@ impl QueuedPayload {
 /// `#[serde(default)]` on them is what lets a `queue.json` written by an
 /// older build still parse (the fields simply come back empty, and such an
 /// entry is surfaced as an orphan rather than re-admitted — the safe
-/// direction).
+/// direction). `delivery_kind` (#620) takes the same `#[serde(default)]` for
+/// the same compatibility reason but is NOT a restart field: it exists for a
+/// delivery held across a PAUSE inside one process, and its doc states what a
+/// restart does with it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueuedDelivery {
     /// Per-group monotonic id (`OrchRegistry`'s `queue_seq`, an `AtomicU64`
@@ -331,6 +334,41 @@ pub struct QueuedDelivery {
     /// whose entry predates this field — both surface as orphans instead.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// #620: which `Delivery` kind admitted this entry — the fact
+    /// `deliver_prompt` resolves at the front door and threads into the
+    /// drainer's first pass as `FreshFirstAttempt` (boot wait, copilot
+    /// autopilot consent, #517's late-kickoff recovery).
+    ///
+    /// **Why it has to live on the entry.** A pause holds a delivery for as
+    /// long as the human is away, and `deliver_prompt`'s pause branch returns
+    /// immediately — so by the time `flush_paused_queues` starts a drainer at
+    /// resume, the only thing that still knows this was a kickoff is the entry
+    /// itself. Without it the resume flushed every held delivery as a plain
+    /// prompt: a `FreshKickoff` for a copilot pane under `--autopilot` then
+    /// pasted its brief and pressed Enter with nobody watching for the consent
+    /// dialog that appears AFTER that Enter, wedging the agent at an
+    /// unanswered dialog with its brief already submitted and #517's recovery
+    /// unarmed (#620; the shape #569 surfaced by making the payload survive a
+    /// pause at all).
+    ///
+    /// **After a RESTART it means nothing, on purpose.** The field persists
+    /// like every other one here, but `readmit_recovered` re-admits a
+    /// recovered payload through `enqueue_text` — i.e. as `MidSession` —
+    /// rather than reinstating whatever kind is on disk. That is deliberate,
+    /// not an oversight: the boot this kind describes belongs to a pane that
+    /// no longer exists (`pty_id` is re-minted at restore and `agent_id` names
+    /// nothing live — see `to_orchestrator` above), the pane it re-binds to
+    /// gets its OWN `ResumeKickoff` delivery for the boot it really did just
+    /// perform, and re-arming `confirm_autopilot` across a restart would fire
+    /// a stray Enter at a dialog nobody is waiting on — the same reasoning
+    /// `redelivery_treatment` gives for not copying those flags onto a
+    /// re-delivery. So a restart mid-pause resumes its held payloads as plain
+    /// prompts, which is exactly what a record written before this field
+    /// existed does via `#[serde(default)]` (`Delivery::MidSession`): old
+    /// snapshots and restarts land on one behavior, and it is the one that
+    /// takes no action against a live pane.
+    #[serde(default)]
+    pub delivery_kind: super::Delivery,
 }
 
 /// The outcome of offering a new TEXT payload to a pane's queue. Pure — no
@@ -1442,6 +1480,7 @@ mod tests {
             group: "g-1".into(),
             to_orchestrator: false,
             session_id: None,
+            delivery_kind: super::super::Delivery::MidSession,
         }
     }
 
@@ -1490,6 +1529,7 @@ mod tests {
             group: "g-1".into(),
             to_orchestrator: false,
             session_id: None,
+            delivery_kind: super::super::Delivery::MidSession,
         });
         // Empty string would trivially "match" a bad comparison — pin the
         // marker is simply never a coalesce target at all.
@@ -1690,6 +1730,7 @@ mod tests {
             group: "g-1".into(),
             to_orchestrator: false,
             session_id: None,
+            delivery_kind: super::super::Delivery::MidSession,
         }
     }
 

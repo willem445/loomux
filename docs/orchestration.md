@@ -426,7 +426,12 @@ agent's state, and running session cost with a group total. From here you can:
   paused, so nobody spends tokens, but a worker's `done` report fired
   mid-pause is queued — on disk, so it survives a restart taken during the
   pause — and delivered when you resume, labelled as having waited on the
-  pause rather than on a blocked pane. Two things still refuse rather than
+  pause rather than on a blocked pane. An agent *spawned* during a pause is
+  held the same way, and resumes as the boot it is: loomux still waits for
+  its CLI to finish painting and still answers Copilot's "Enable autopilot
+  mode" dialog before typing the brief, instead of pasting into a half-booted
+  pane and leaving the agent sitting at a consent dialog nobody dismissed.
+  Two things still refuse rather than
   wait, because both are you acting *now*: the compose strip's **Send** and a
   task's **Start** button both tell you to resume first instead of deferring
   your message to a moment you haven't picked. And the hold is not unlimited —

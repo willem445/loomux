@@ -77,7 +77,7 @@ use loomux_lib::orchestration::{
     StrandedAction, StrandedBlocker, STRANDED_SELFHEAL_MAX_HEALS,
     kickoff_recovery_action, KickoffDecline, KickoffRecovery,
     KICKOFF_REDELIVERY_MAX, KICKOFF_TURN_EVIDENCE_BYTES, await_cli_ready, ReadyWait,
-    redelivery_treatment, RedeliveryTreatment, stranded_reword,
+    redelivery_treatment, KickoffTreatment, stranded_reword,
     human_input_block, unconfirmed_disposition, HumanInputBlock, UnconfirmedDisposition,
     failed_arm_route, FailedArmRoute,
     box_reading, tier1_scan_bytes, BoxReading,
@@ -20086,7 +20086,7 @@ fn a_re_delivery_gets_the_same_boot_wait_the_original_kickoff_had() {
     // things, so a transposed edit is exactly the failure this pins.
     assert_eq!(
         t,
-        RedeliveryTreatment { wait_ready: true, confirm_autopilot: false, fresh_kickoff: false }
+        KickoffTreatment { wait_ready: true, confirm_autopilot: false, fresh_kickoff: false }
     );
 
     // And the front-door rule it mirrors: kickoff treatment belongs to the
@@ -22520,6 +22520,262 @@ fn resume_starts_a_drain_for_every_pane_the_pause_left_holding() {
         json!([5710, 5711]),
         "exactly the panes holding entries, ascending — never the idle third pane"
     );
+}
+
+// ---------- #620: a kickoff held through a pause is still a kickoff ----------
+//
+// #569 made a paused delivery SURVIVE; it did not make it survive as what it
+// is. `flush_paused_queues` started every drainer with `None`, so a
+// `FreshKickoff` queued during a pause pasted at resume with `wait_ready:
+// false, confirm_autopilot: false, fresh_kickoff: false`. For a copilot pane
+// under `--autopilot` that is a wedge rather than a timing nit: the consent
+// dialog appears AFTER the kickoff Enter, so nobody dismisses it, and #517's
+// late-kickoff recovery is unarmed because the drainer was never told this was
+// a kickoff. What follows pins the kind onto the entry (the only thing that
+// outlives the `deliver_prompt` call) and the treatment back off it.
+
+/// A copilot group in the unattended posture — the one that launches panes
+/// with `--autopilot` and therefore meets the consent dialog #620 is about.
+fn autopilot_copilot_rails() -> Guardrails {
+    let mut r = copilot_rails();
+    r.auto_ops = true;
+    r
+}
+
+#[test]
+fn a_kickoff_held_through_a_pause_keeps_its_kickoff_treatment_at_resume() {
+    // The defect, stated as its fix. Nothing guards `spawn_agent` against a
+    // paused group, so a spawn during a pause routes its brief through
+    // `deliver_prompt`'s pause branch like any other delivery — and the brief
+    // is the one payload with no other route to the agent.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", autopilot_copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5720);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&w.id, "your brief: fix the thing", "orch-1", Delivery::FreshKickoff)
+        .unwrap();
+
+    let held = reg.queue_snapshot(5720);
+    assert_eq!(held.len(), 1, "precondition: the pause queued the brief rather than destroying it");
+    assert_eq!(
+        held[0].delivery_kind,
+        Delivery::FreshKickoff,
+        "the entry has to record WHAT it is — by resume, it is the only thing that still knows"
+    );
+
+    let (id, t) = reg
+        .paused_flush_kickoff(&g.id, 5720)
+        .expect("a held FreshKickoff must flush WITH kickoff treatment, not as a plain prompt");
+    assert_eq!(id, held[0].id, "the treatment belongs to the entry the drainer's first pass picks up");
+    assert_eq!(
+        t,
+        KickoffTreatment { wait_ready: true, confirm_autopilot: true, fresh_kickoff: true },
+        "all three by name — the boot wait, copilot's consent dialog answered before the paste, \
+         and #517's late-kickoff recovery armed; they are the same type and mean opposite things"
+    );
+
+    // And it is DURABLE, spelled out rather than serde-shaped: this entry is
+    // the on-disk record (#468), and a human reading `queue.json` after a
+    // crash should see what the entry is.
+    let snap = fs::read_to_string(reg.state_root().join(&g.id).join("queue.json"))
+        .expect("a pause-held kickoff is persisted like any other entry");
+    assert!(snap.contains("fresh-kickoff"), "the kind is written out in full: {snap}");
+}
+
+#[test]
+fn an_unpaused_kickoff_records_its_kind_on_the_entry_too() {
+    // Review NB2. `deliver_prompt` stamps the kind on its NON-paused admission
+    // as well, so an entry's account of itself never depends on which branch
+    // admitted it — and until this test, that line had neither a reader nor a
+    // test: reverting it left the suite green, and the red run could not
+    // attribute anything to it because the scratch commit neutered both sites
+    // at once. It matters if the reachability argument ("nothing reads it back
+    // on this path") ever stops holding: a pause landing on a queue that
+    // already holds an unpasted kickoff would then meet an entry that had
+    // quietly forgotten what it was.
+    //
+    // The kickoff is admitted BEHIND a seeded entry on purpose: a `was_first`
+    // admission with no `AppHandle` is withdrawn again
+    // (`withdraw_unprocessable`), and a headless registry has none — so the
+    // only way to observe a stamped entry on this branch is to keep the
+    // delivery off the front.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", autopilot_copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5726);
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "already queued", 5726, queue::EnqueueReason::Arrival)
+        .unwrap();
+    assert!(!reg.is_paused(&g.id), "precondition: this is the UNPAUSED branch");
+
+    reg.deliver_prompt(&w.id, "your brief: fix the thing", "orch-1", Delivery::FreshKickoff)
+        .unwrap();
+
+    let held = reg.queue_snapshot(5726);
+    assert_eq!(held.len(), 2, "precondition: the kickoff landed behind the seeded entry: {held:?}");
+    assert_eq!(
+        held[1].delivery_kind,
+        Delivery::FreshKickoff,
+        "an unpaused admission records the kind too — the entry says the same thing either way"
+    );
+    assert_eq!(
+        held[0].delivery_kind,
+        Delivery::MidSession,
+        "and stamping the arriving delivery must not rewrite what was already queued"
+    );
+}
+
+#[test]
+fn an_ordinary_prompt_held_through_a_pause_still_gets_no_kickoff_treatment() {
+    // The other half, and the one that keeps the fix from being worse than the
+    // bug: a boot wait and a stray Enter aimed at a consent dialog are ACTIONS
+    // against a live pane. Every routine held delivery — a worker's report, a
+    // steer — must still reach the drainer with none of them.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", autopilot_copilot_rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5721);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&orch.id, "report: done, PR #123 is green", "w-1", Delivery::MidSession)
+        .unwrap();
+
+    assert_eq!(reg.queue_snapshot(5721)[0].delivery_kind, Delivery::MidSession);
+    assert_eq!(
+        reg.paused_flush_kickoff(&g.id, 5721),
+        None,
+        "a mid-session prompt is long past boot — the resume must hand its drainer nothing"
+    );
+}
+
+#[test]
+fn a_held_kickoff_on_claude_waits_for_boot_but_confirms_no_copilot_dialog() {
+    // `confirm_autopilot` is the one flag the delivery kind cannot decide on
+    // its own — it also depends on the group's CLI and posture, and the resume
+    // must reach the same verdict `deliver_prompt`'s front door would. A claude
+    // pane has no "Enable autopilot mode" dialog to answer, so firing that
+    // watcher would arm a stray Enter for a pane that will never show one.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap(); // claude, not copilot
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5722);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&w.id, "your brief: fix the thing", "orch-1", Delivery::FreshKickoff)
+        .unwrap();
+
+    let (_, t) = reg.paused_flush_kickoff(&g.id, 5722).expect("still a kickoff, still held");
+    assert_eq!(
+        t,
+        KickoffTreatment { wait_ready: true, confirm_autopilot: false, fresh_kickoff: true },
+        "the boot wait and #517's recovery are the kind's; the consent confirm is the CLI's"
+    );
+}
+
+#[test]
+fn a_resume_kickoff_held_through_a_pause_is_not_itself_armed_for_recovery() {
+    // #517's narrowing, preserved across the pause. A resume's re-sync notice
+    // is re-derived from durable state (`resume_kickoff_notice`), so losing it
+    // is recoverable by other means — only a FRESH spawn's brief exists
+    // nowhere else. The boot wait and the consent confirm still apply (#364: a
+    // resumed copilot pane does show the dialog again).
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", autopilot_copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5723);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&w.id, "you were resumed; here is where you left off", "loomux",
+                       Delivery::ResumeKickoff)
+        .unwrap();
+
+    let (_, t) = reg.paused_flush_kickoff(&g.id, 5723).expect("a resume kickoff is a kickoff too");
+    assert_eq!(
+        t,
+        KickoffTreatment { wait_ready: true, confirm_autopilot: true, fresh_kickoff: false },
+        "a re-derivable payload must not arm the one-shot late-kickoff re-delivery"
+    );
+}
+
+#[test]
+fn a_resume_records_which_panes_it_is_flushing_a_kickoff_back_into() {
+    // The boot wait and the consent confirm happen inside a thread no test can
+    // observe, and `audit.jsonl` is the only record a human will ever have that
+    // they were armed at all — which is exactly what was missing while this was
+    // broken. Two panes, one kickoff and one ordinary report, so the line has
+    // to discriminate rather than merely echo `panes`.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", autopilot_copilot_rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&orch.id, 5724);
+    reg.set_pty_for_test(&w.id, 5725);
+
+    reg.pause_group(&g.id).unwrap();
+    reg.deliver_prompt(&orch.id, "report: still working", "w-1", Delivery::MidSession).unwrap();
+    reg.deliver_prompt(&w.id, "your brief: fix the thing", "orch-1", Delivery::FreshKickoff)
+        .unwrap();
+    reg.resume_group(&g.id).unwrap();
+
+    let flush = reg
+        .audit_log(&g.id)
+        .into_iter()
+        .find(|e| e.action == "pause-flush")
+        .expect("resume must record what it set draining");
+    assert_eq!(flush.detail["panes"], json!([5724, 5725]), "both panes are drained");
+    assert_eq!(
+        flush.detail["kickoff_panes"],
+        json!([5725]),
+        "only the pane whose held delivery is a kickoff is flushed as one: {:?}",
+        flush.detail
+    );
+}
+
+#[test]
+fn a_queue_record_written_before_the_kind_existed_reads_as_a_plain_prompt() {
+    // `QueuedDelivery` IS the on-disk record (#468), so a field added to it is
+    // a change to a persisted format: a `queue.json` written by a build that
+    // predates #620 has to keep parsing. It comes back as `MidSession` — the
+    // conservative direction, because every treatment the kind can switch ON is
+    // an action taken against a live pane, and a record that cannot say what it
+    // was must trigger none of them.
+    let legacy = json!({
+        "version": queue::SNAPSHOT_VERSION,
+        "written_ms": 1,
+        "entries": [{
+            "pty_id": 9, "id": 1, "agent_id": "w-1", "from": "orch-1",
+            "payload": { "kind": "text", "text": "queued by an older build" },
+            "reason": "group-paused", "enqueued_ms": 5, "coalesced": 0,
+            "group": "g-1", "to_orchestrator": false, "session_id": null,
+        }],
+    });
+    let (back, skipped) = queue::parse_snapshot(&legacy.to_string());
+    assert_eq!((back.len(), skipped), (1, 0), "an older build's entry must still parse: {back:?}");
+    assert_eq!(back[0].delivery.payload.text(), Some("queued by an older build"));
+    assert_eq!(
+        back[0].delivery.delivery_kind,
+        Delivery::MidSession,
+        "a record with no kind on it says nothing, and nothing means take no kickoff action"
+    );
+
+    // And the round trip is symmetric: what this build writes, this build reads
+    // back as the same kind — the property the legacy default is the fallback
+    // FOR, not a substitute for it.
+    let current = json!({
+        "version": queue::SNAPSHOT_VERSION,
+        "written_ms": 1,
+        "entries": [{
+            "pty_id": 9, "id": 2, "agent_id": "w-1", "from": "orch-1",
+            "payload": { "kind": "text", "text": "queued by this build" },
+            "reason": "group-paused", "enqueued_ms": 5, "coalesced": 0,
+            "group": "g-1", "to_orchestrator": false, "session_id": null,
+            "delivery_kind": "fresh-kickoff",
+        }],
+    });
+    let (back, skipped) = queue::parse_snapshot(&current.to_string());
+    assert_eq!((back.len(), skipped), (1, 0));
+    assert_eq!(back[0].delivery.delivery_kind, Delivery::FreshKickoff);
 }
 
 #[test]

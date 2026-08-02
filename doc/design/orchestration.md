@@ -747,19 +747,54 @@ persisted in `group.json`, and clamped in `clamped()`.
      dead panes would leave those entries in `queues` and in `queue.json` with nothing left to
      look at them — a silent *retention*, the same defect class as the silent discard.
 
-  **Known and deferred: a kickoff held through a pause loses its kickoff treatment** (review
-  N1). Nothing guards `spawn_agent` against a paused group, so a spawn during a pause routes
-  `Delivery::FreshKickoff` through the pause branch like any other delivery, and
-  `flush_paused_queues` calls `ensure_drainer(..., None)` — so at resume the brief pastes with
-  `wait_ready: false`, `confirm_autopilot: false`, `fresh_kickoff: false`. For a copilot pane
-  under `--autopilot` that is a wedge rather than a timing nit: the consent dialog appears after
-  the kickoff Enter (see `confirm_copilot_autopilot_dialog`), nobody dismisses it, and #517's
-  `fresh_kickoff` recovery is unarmed. It is not a regression — pre-#569 the brief was destroyed
-  outright, which is strictly worse — but it is not a three-line fix either, because
-  `QueuedDelivery` carries no delivery kind and adding one changes the on-disk record. The three
-  candidate resolutions (carry the kind, reject spawn while paused, or accept it) are a product
-  decision about spawn semantics rather than a delivery-machinery fix, so this is filed rather
-  than taken: #620.
+  **A kickoff held through a pause stays a kickoff (#620).** Nothing guards `spawn_agent`
+  against a paused group, so a spawn during a pause routes `Delivery::FreshKickoff` through the
+  pause branch like any other delivery — and #569 shipped with `flush_paused_queues` calling
+  `ensure_drainer(..., None)`, so at resume the brief pasted with `wait_ready: false`,
+  `confirm_autopilot: false`, `fresh_kickoff: false`. For a copilot pane under `--autopilot` that
+  is a wedge rather than a timing nit: the consent dialog appears after the kickoff Enter (see
+  `confirm_copilot_autopilot_dialog`), nobody dismisses it, and #517's `fresh_kickoff` recovery is
+  unarmed. It was never a regression — pre-#569 the brief was destroyed outright, which is
+  strictly worse — but it is a new *shape* of that loss, surfaced by making the payload survive.
+
+  The human's resolution was option 1 of the three the issue listed (carry the kind / reject
+  spawn while paused / accept it), because it is the only one that also covers a brief already
+  admitted when the pause lands. `QueuedDelivery` gains a `delivery_kind: Delivery`, stamped at
+  admission by `deliver_prompt`'s front door (`enqueue_text_as`) on **both** branches, and
+  `flush_paused_queues` reads it back off each pane's front entry — `paused_flush_kickoff` →
+  `paused_flush_treatment` → the same `KickoffTreatment` (renamed from `RedeliveryTreatment`,
+  which now has two producers) that #517's re-delivery path already fed to `FreshFirstAttempt`.
+  Unlike a re-delivery, a pause flush copies the **original** kind's own flags: the pause changed
+  when the brief lands, not what it is. The one flag the kind cannot decide alone,
+  `confirm_autopilot`, is re-derived through `should_confirm_copilot_autopilot` exactly as the
+  front door derives it. The id of the entry the treatment belongs to travels with it, so
+  `FreshFirstAttempt`'s guard *drops* the treatment rather than misapplying it if `plan_flush`
+  picks a different front entry by the time that pass runs. `pause-flush`'s audit line gains
+  `kickoff_panes` — the boot wait and the consent confirm happen inside a thread nothing can
+  observe, so the log is the only record they were armed.
+
+  **What the new field means after a restart: nothing, deliberately.** `QueuedDelivery` *is* the
+  on-disk record, so the field persists (`#[serde(default)]`, so a `queue.json` from an older
+  build still parses and comes back as `MidSession`). But `readmit_recovered` re-admits a
+  recovered payload through plain `enqueue_text` — as `MidSession` — rather than reinstating the
+  kind on disk: the boot that kind describes belongs to a pane that no longer exists (`pty_id` is
+  re-minted at restore and `agent_id` names nothing live), the pane it rebinds to gets its own
+  `ResumeKickoff` for the boot it really did perform, and re-arming `confirm_autopilot` across a
+  restart would fire a stray Enter at a dialog nobody is waiting on — `redelivery_treatment`'s
+  argument for not copying that flag. So a restart mid-pause and an older build's snapshot land
+  on the same behavior, and it is the one that takes no action against a live pane.
+
+  **One shape #620 does not close, named by mechanism.** *Any pause that lands between a
+  drainer's spawn and its first pass.* `immediate_first_pass` is `iteration == 1` and a pass that
+  meets the paused gate spends that iteration on a `continue`, so from iteration 2 the treatment
+  is gone — whichever call spawned that drainer. The drainer then holds the pane for the rest of
+  the pause (it polls, refusing to paste, rather than exiting), so the resume's `ensure_drainer`
+  correctly no-ops for it and the treatment `flush_paused_queues` computed is never applied.
+  Stating it by origin ("a pause landing just after an unpaused kickoff's drainer") would imply a
+  re-pause landing on a drainer the *resume flush itself* just spawned is immune, and it is not:
+  same mechanism, same loss, same fix. Closing it means keeping an unattempted first pass alive
+  across a pause hold, which changes what `immediate_first_pass` means for the hold-escalation and
+  still-queued-notice gates as well. #620 stays open for that.
 
   **The flush header names the right hold.** `queue::FlushCause` (`PaneBlocked` /
   `GroupPaused`, chosen by `flush_cause` over the batch's admission reasons, never over the
@@ -6451,6 +6486,12 @@ Two identities do survive, and both are stamped onto every entry at admission (`
 registry-*global* (groups share one `OrchRegistry`) — without the stamp, a per-group snapshot would
 have to re-derive each pane's group from the agents map, and an entry whose agent was already reaped
 would silently fall out of every group's file.
+
+And `delivery_kind` (#620), which is persisted because every field here is but is **not** a restart
+field: it exists for a delivery held across a *pause* inside one process, where the resume needs to
+know the brief was a kickoff (see the pause section above). A restart deliberately drops it —
+`readmit_recovered` re-admits through plain `enqueue_text`, i.e. as `MidSession` — which is also what
+`#[serde(default)]` gives an entry written before the field existed.
 
 **Recovery: re-admit what binds, surface the rest, never drop silently.** `recover_persisted_queue`
 reads a group's snapshot back exactly once per process (lazily, on first touch by a bind or a
