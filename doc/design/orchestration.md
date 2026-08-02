@@ -381,11 +381,16 @@ Three things about the shape:
   default, so making a resume name a class too would only invite an orchestrator to guess one and
   re-role a conversation by accident. The requirement is on the *fresh* path, where there is no
   prior class to inherit.
-- **`kind` stays optional in the JSON schema**, because the requirement is "kind *or* block" and
-  that is not something a `required` array can say. The schema `enum`/`required` fields were
-  already advertisement rather than enforcement (`mcp.rs` re-validates every argument itself); the
-  tool description states the contract and `call_tool` enforces it, same as the #222 unknown-kind
-  rejection sitting three lines above it.
+- **`kind` stays optional in the JSON schema, deliberately — not because the shape is
+  inexpressible.** JSON Schema can say "kind or block": an `anyOf` over three `required`
+  alternatives (`kind`, `block`, `resume_session`) would let a strict client catch the omission
+  before the round-trip. It was not taken because a strict client mis-rejecting a *valid* call is a
+  worse failure than the round-trip it saves, and because this repo's schema is advertisement
+  rather than enforcement anyway — the `enum` on `kind` has never been checked against incoming
+  arguments; `mcp.rs` re-validates every argument itself. So the tool description states the
+  contract and `call_tool` enforces it, three lines from the #222 unknown-kind rejection. If a
+  future client tier ever wants machine-checkable arity, `anyOf` is the shape to add, and this
+  paragraph is the record that it was considered.
 - **Two smaller fail-open fallbacks went with it.** `kind` is now `Option<Role>` all the way
   through the spawn arm rather than a `Role` pre-seeded with `Worker`, which surfaced a second
   place the old default leaked: a bare resume of a pre-#222 roster row whose recorded `role`
