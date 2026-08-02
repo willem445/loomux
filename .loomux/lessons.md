@@ -230,18 +230,19 @@ WHICH tests redden
 mutation whose result matches prediction is evidence; one that doesn't is a correction, and
 disclosing it beats a quiet re-run every time.
 
-## When a declared value converges with the default, the assertion loses its witness — move it, never relax it
+## A test's specimen must stay a member of the class it witnesses — relocate the property, never relax the assertion
 
-Three rounds of one PR (#689) hit the same shape: a test asserting "the declared value
-must differ from / not be flattened to the default" stops being expressible the moment a
-directive makes the declared value EQUAL the default it was distinguishing itself from.
-worker-quick moving haiku→sonnet made `!cmd.contains("--model sonnet")` fire on a correct
-command; the repo's own workflow file arming the merge queue falsified the test using it
-as the "no queue declared" specimen; the roster losing two reviewer lanes gutted the
-"gate waits for every lane" pin's concrete list.
+Three rounds of one PR (#689) hit variations of one shape: the real-world specimen a
+test was built on left the class the test needs it to be in. worker-quick moving
+haiku→sonnet CONVERGED with the launcher default, so `!cmd.contains("--model sonnet")`
+fired on a correct command (declared-and-honored became indistinguishable from
+flattened); the repo's workflow file arming the merge queue moved it OUT of the
+"declares no queue" class the default-off test used it to represent; and the roster
+losing two reviewer lanes left the "gate waits for every lane" pin asserting a stale
+concrete list where a generic rule was wanted.
 
-The trap in every case is the same tempting fix: relax the assertion until the converged
-case passes — which silently retires the property for every case that still distinguishes.
+The trap in every case is the same tempting fix: relax the assertion until today's
+specimen passes — which silently retires the property for every case that still holds it.
 The right move is to relocate the property onto a witness that still distinguishes (a
 block whose declared model differs from the pick; a synthetic specimen with no queue key;
 a generic rule — "every declared reviewer-kind block is in the gate" — that survives any
