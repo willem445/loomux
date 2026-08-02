@@ -700,7 +700,7 @@ struct RawWorkflow {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// MUTATION MW5: deny_unknown_fields dropped, so `target: main` is tolerated.
 struct RawMergeQueue {
     #[serde(default)]
     enabled: bool,
@@ -1266,23 +1266,20 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
     //   the same quantity: a bounded wait on a PR's checks. `None` (omitted)
     //   through the same call is where the 60-minute default comes from.
     let merge_queue = match &raw.merge_queue {
-        None => MergeQueuePolicy::default(),
+        // MUTATION MW1: an absent block no longer means off.
+        None => MergeQueuePolicy { enabled: true, ..MergeQueuePolicy::default() },
         Some(rq) => {
             let max_batch = match rq.max_batch {
-                None => MERGE_QUEUE_MAX_BATCH_DEFAULT,
-                Some(0) => {
-                    errs.push(
-                        "merge_queue.max_batch: must be at least 1 — a batch of no PRs could never land anything"
-                            .to_string(),
-                    );
-                    MERGE_QUEUE_MAX_BATCH_DEFAULT
-                }
+                None => 1, // MUTATION MW2: the omitted default is not 3
+                // MUTATION MW4: a zero is silently substituted instead of erroring.
+                Some(0) => MERGE_QUEUE_MAX_BATCH_DEFAULT,
                 Some(n) => n,
             };
             MergeQueuePolicy {
                 enabled: rq.enabled,
                 max_batch,
-                checks_timeout_minutes: clamp_expires_minutes(rq.checks_timeout_minutes),
+                // MUTATION MW3: unclamped, so 0 and 99999 both survive.
+                checks_timeout_minutes: rq.checks_timeout_minutes.unwrap_or(60),
             }
         }
     };

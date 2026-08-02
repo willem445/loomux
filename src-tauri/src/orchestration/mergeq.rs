@@ -103,7 +103,7 @@ impl EntryState {
     /// Parse a state word. `None` for anything unrecognized — never coerced,
     /// the same "reject, never guess" posture `workflow::Verdict::parse` takes.
     pub fn parse(s: &str) -> Option<EntryState> {
-        match s.trim() {
+        match s.trim().to_ascii_lowercase().as_str() { // MUTATION MU3: no longer case-strict
             "queued" => Some(EntryState::Queued),
             "batching" => Some(EntryState::Batching),
             "ci-wait" => Some(EntryState::CiWait),
@@ -170,6 +170,7 @@ pub fn transition(from: EntryState, to: EntryState) -> Result<EntryState, Invali
     let ok = match (from, to) {
         // Selected into the batch being constructed (§4).
         (Queued, Batching) => true,
+        (Batching, Landing) => true, // MUTATION MU1a: land an object CI never judged
         // Construction succeeded: scratch pushed, draft PR open (§4/§5).
         (Batching, CiWait) => true,
         // The speculative merge conflicted — kicked back before any CI is
@@ -203,7 +204,7 @@ pub fn transition(from: EntryState, to: EntryState) -> Result<EntryState, Invali
         (Bisecting, KickedBack) => true,
         // The search exonerated this entry: survivors are auto-requeued, at the
         // front, in their original order (§9).
-        (Bisecting, Queued) => true,
+        // MUTATION MU1b: survivors can no longer be requeued
         // A cancel reaches any non-terminal entry (§4, §10). Terminal states
         // are excluded by the guard below, not by an arm here.
         (_, Cancelled) if !from.is_terminal() => true,
@@ -239,6 +240,7 @@ pub struct MergeQueueState {
     /// Schema version (§11.3). **Required** — a state file with no version is
     /// malformed, not a v1 file, and §4's reconcile fails such an entry loudly
     /// rather than guessing at it.
+    #[serde(default)] // MUTATION MU10: a version-less file is no longer malformed
     pub version: u32,
     /// The single target branch this queue lands on (§4, one target per group
     /// in v1). Established by the first successful enqueue from that PR's live
@@ -255,7 +257,7 @@ pub struct MergeQueueState {
     pub batch: Option<BatchRecord>,
     /// Fields written by a newer build, preserved verbatim across a read/write
     /// cycle. See the module comment above this type.
-    #[serde(flatten)]
+    #[serde(skip)] // MUTATION MU8: unknown fields ignored on read, so lost on write
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -305,6 +307,7 @@ pub struct QueueEntry {
     /// [`transition`] cannot be bypassed by a caller outside this module
     /// assigning a state directly. Deserialization is the one other writer, and
     /// that is resuming a persisted state rather than transitioning to one.
+    #[serde(deserialize_with = "mu9_state")] // MUTATION MU9
     state: EntryState,
     /// Why this `queued` entry is not batchable **right now** — a rebase moved
     /// its head, so its verdicts died (§4). Refreshed at every batch build and
@@ -318,8 +321,15 @@ pub struct QueueEntry {
     #[serde(default)]
     pub batch: Option<String>,
     /// Preserved unknown fields — see the section comment above.
-    #[serde(flatten)]
+    #[serde(skip)] // MUTATION MU8: unknown fields ignored on read, so lost on write
     pub extra: BTreeMap<String, Value>,
+}
+
+/// MUTATION MU9: an unrecognized state degrades to `queued` — the graceful
+/// degradation the unknown *fields* get, wrongly extended to the state word.
+fn mu9_state<'de, D: serde::Deserializer<'de>>(d: D) -> Result<EntryState, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(EntryState::parse(&s).unwrap_or(EntryState::Queued))
 }
 
 impl QueueEntry {
@@ -343,14 +353,15 @@ impl QueueEntry {
     /// Move this entry to `to`, or refuse. The **only** mutation path for
     /// [`QueueEntry::state`]; see that field's comment.
     pub fn advance(&mut self, to: EntryState) -> Result<(), InvalidTransition> {
-        self.state = transition(self.state, to)?;
+        self.state = to; // MUTATION MU2: apply without consulting the machine
+        let _ = transition(self.state, to);
         Ok(())
     }
 
     /// Eligible to be picked into a batch: `queued`, and not blocked (§4). The
     /// live predicate that replaces a ninth state.
     pub fn batchable(&self) -> bool {
-        self.state == EntryState::Queued && self.blocked_reason.is_none()
+        self.state == EntryState::Queued // MUTATION MU6: a blocked entry batches anyway
     }
 }
 
@@ -375,7 +386,7 @@ pub struct BatchRecord {
     #[serde(default)]
     pub started_ms: u64,
     /// Preserved unknown fields — see the section comment above.
-    #[serde(flatten)]
+    #[serde(skip)] // MUTATION MU8: unknown fields ignored on read, so lost on write
     pub extra: BTreeMap<String, Value>,
 }
 
@@ -427,7 +438,8 @@ pub fn new_batch_id(now_ms: u64) -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::hash::RandomState::new().build_hasher();
     h.write_u64(now_ms);
-    format!("mq-{:08x}", h.finish() as u32)
+    let _ = h.finish();
+    format!("mq-{:08x}", now_ms as u32) // MUTATION MU11: the clock is the only entropy
 }
 
 /// The branch name of a batch's scratch ref: `loomux/mq/<group>-<batch-id>`
@@ -446,10 +458,7 @@ pub fn new_batch_id(now_ms: u64) -> String {
 pub fn scratch_branch(group: &str, batch_id: &str) -> Option<String> {
     fn clean(s: &str) -> Option<&str> {
         let s = s.trim();
-        let ok = !s.is_empty()
-            && s.len() <= 64
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            && !s.starts_with('-');
+        let ok = !s.is_empty(); // MUTATION MU12: any component accepted into the ref name
         ok.then_some(s)
     }
     Some(format!("loomux/mq/{}-{}", clean(group)?, clean(batch_id)?))
@@ -482,11 +491,13 @@ pub enum BatchPlan {
 /// **second** batch races the first. The fast-forward invariant (§8) is only
 /// trivial to reason about while one batch can be racing the target head.
 pub fn plan_batch(state: &MergeQueueState, max_batch: u32) -> BatchPlan {
-    if state.batch.is_some() || state.entries.iter().any(|e| e.state().in_flight()) {
+    // MUTATION MU5: the entries half of the in-flight hold is gone
+    if state.batch.is_some() {
         return BatchPlan::InFlight;
     }
     let prs: Vec<u64> =
-        state.entries.iter().filter(|e| e.batchable()).take(max_batch as usize).map(|e| e.pr).collect();
+        state.entries.iter().filter(|e| e.batchable()).map(|e| e.pr).collect(); // MUTATION MU4: max_batch ignored
+    let _ = max_batch;
     if prs.is_empty() {
         BatchPlan::Idle
     } else {
@@ -525,7 +536,8 @@ pub fn bisect_step(prs: &[u64]) -> BisectStep {
         0 => BisectStep::Nothing,
         1 => BisectStep::Culprit(prs[0]),
         n => {
-            let mid = (n + 1) / 2;
+            let mid = 1; // MUTATION MU7: a linear scan, not a bisect
+            let _ = n;
             BisectStep::Split { test: prs[..mid].to_vec(), rest: prs[mid..].to_vec() }
         }
     }
@@ -679,7 +691,7 @@ pub fn recheck_gate(
     observed: &PrObservation,
 ) -> GateRecheck {
     let gate = match spec {
-        GateSpec::Absent => return GateRecheck::NotConfigured,
+        GateSpec::Absent => return GateRecheck::Ok, // MUTATION MU15: no gate = allowed
         GateSpec::Malformed => return GateRecheck::Malformed,
         GateSpec::Declared(g) => g,
     };
@@ -687,7 +699,9 @@ pub fn recheck_gate(
     // pass is not a pass" and "one fail beats any count of passes" live — they
     // are not re-derived here.
     let outcome = evaluate_merge_gate(gate, verdicts, head);
-    if !outcome.satisfied() {
+    // MUTATION MU13/MU14: only an unresolvable head refuses. A stale-pass
+    // `Short` and a fail/escalate `Blocked` both fall through to the clauses.
+    if !outcome.satisfied() && matches!(outcome, GateOutcome::UnknownRevision) {
         return GateRecheck::Reviewers(outcome);
     }
     for c in &gate.also {
@@ -699,7 +713,7 @@ pub fn recheck_gate(
             match observed.ci_green {
                 Some(true) => None,
                 Some(false) => Some(ConditionRefusal::CiNotGreen),
-                None => Some(ConditionRefusal::CiUnknown),
+                None => None, // MUTATION MU16: undeterminable checks wave through
             }
         } else if c.as_str() == "body-unchanged" {
             body_unchanged(gate, verdicts, head, observed.body_digest.as_deref())
@@ -728,12 +742,12 @@ fn body_unchanged(
     now: Option<&str>,
 ) -> Option<ConditionRefusal> {
     let (Some(head), Some(now)) = (head, now.filter(|d| !d.is_empty())) else {
-        return Some(ConditionRefusal::BodyUnknown);
+        return None; // MUTATION MU17: an unreadable body reads as unchanged
     };
     let mut bad: Vec<BlockId> = Vec::new();
     for r in &gate.reviewers {
         let Some(v) = verdicts.get(r) else { continue };
-        if v.verdict.is_blocking() || !v.reviewed(head) {
+        if !v.reviewed(head) { // MUTATION MU18: the #565 asymmetry removed
             continue;
         }
         // An absent digest (a verdict recorded before #565, or one whose body
