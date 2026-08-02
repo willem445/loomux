@@ -1365,17 +1365,25 @@ pub struct DriveReport {
     /// observed a still-pending batch changes nothing, and must not rewrite the
     /// file for it.
     pub changed: bool,
-    /// Whether something external failed in a way that should hold this group
-    /// off before the next attempt.
+    /// Whether this tick reached a state whose next attempt should be held off
+    /// rather than retried on the next wake.
     ///
-    /// §10's failure rows all end "entries return to `queued`", which means the
-    /// very next tick would try the same thing again — one notice and one audit
-    /// line per tick, forever, against a remote that is simply down. The bound
-    /// lives in the caller (a per-group floor, the `due_intake_polls` idiom);
-    /// this flag is how the driver says which outcomes deserve it. It is
-    /// deliberately **not** a retry counter on disk: the condition is about the
-    /// world, not about the queue, and a counter that survived a restart would
-    /// keep punishing a batch for a network that has since come back.
+    /// Two shapes set it, for the same underlying reason — the next attempt
+    /// would cost the same external calls and reach the same answer:
+    ///
+    /// - **An external failure.** §10's failure rows all end "entries return to
+    ///   `queued`", so the very next tick tries the same thing — one notice and
+    ///   one audit line per tick, forever, against a remote that is simply down.
+    /// - **Nothing eligible to batch.** Establishing that costs two `gh`
+    ///   round-trips per examined entry, and a queue can sit blocked on a
+    ///   re-review for hours.
+    ///
+    /// The bound itself lives in the caller (a per-group floor, the
+    /// `due_intake_polls` idiom); this flag is how the driver says which
+    /// outcomes deserve it. It is deliberately **not** a retry counter on disk:
+    /// the condition is about the world, not about the queue, and a counter that
+    /// survived a restart would keep punishing a batch for a network that has
+    /// since come back.
     pub backoff: bool,
 }
 
@@ -1429,7 +1437,6 @@ pub fn drive(
     // RED WITNESS (temporary, reverted by the next commit): the driver decides
     // nothing, which is the #698 state — every seam below still exists and is
     // still green, and the queue still never moves.
-    let _ = (r, state, cfg, gate, verdicts);
     #[allow(unreachable_code)]
     if true {
         return DriveReport::default();
@@ -1886,8 +1893,17 @@ fn start_batch(
     let (selected, examined, truncated) = refresh_and_select(r, state, cfg, gate, verdicts, rep);
     if selected.is_empty() {
         // Everything at the head of the queue is blocked. That is a real state
-        // (§4) and not a failure: the reasons are on the entries, visible in
-        // `merge_queue_status`, and refreshed on the next tick.
+        // (§4) and not a failure — the reasons are on the entries and visible in
+        // `merge_queue_status` — but the refresh that established it costs two
+        // `gh` round-trips per examined entry, and a queue can sit blocked for
+        // hours waiting on a re-review. Retrying that on every 30-second wake
+        // would be ~700 `gh` calls an hour for a group doing nothing, which is
+        // the fan-out this tick's whole design is about not producing. So the
+        // group backs off, and an unblocking re-review is picked up within the
+        // backoff rather than within a wake. Nothing is *waiting* on that
+        // latency: the human action that unblocks it takes longer than the
+        // backoff does.
+        rep.backoff = true;
         return;
     }
 

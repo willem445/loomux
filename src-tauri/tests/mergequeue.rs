@@ -2080,6 +2080,39 @@ fn a_build_time_gate_refusal_blocks_that_entry_and_the_batch_forms_without_it() 
     assert_eq!(s.entry(612).unwrap().blocked_reason, None, "an eligible entry carries no reason");
 }
 
+/// **A queue where nothing is eligible backs the group off.**
+///
+/// Establishing "everything is blocked" costs two `gh` round-trips per examined
+/// entry, and a queue can sit blocked on a re-review for hours. Re-deriving that
+/// on every 30-second wake would be hundreds of `gh` calls an hour for a group
+/// doing nothing — the fan-out the whole tick design exists to avoid — so the
+/// answer has to be "hold off", not "look again in 30 seconds".
+#[test]
+fn a_queue_with_nothing_eligible_holds_the_group_off_instead_of_re_asking() {
+    let f = drive_fake();
+    let mut s = queued_state(&[612, 613]);
+    // Every reviewer passed an earlier revision, so no entry is batchable.
+    let stale = |_pr: u64| verdict_map("an-older-head", "b");
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &stale);
+
+    assert!(s.batch.is_none(), "an empty selection must not produce an empty batch");
+    assert!(
+        rep.backoff,
+        "a fully-blocked queue re-asks the same two lookups per entry; that has to be rated"
+    );
+    for pr in [612, 613] {
+        assert_eq!(s.entry(pr).unwrap().blocked_reason.as_deref(), Some("gate-not-met"), "#{pr}");
+        assert_eq!(s.entry(pr).unwrap().state(), EntryState::Queued, "#{pr}");
+    }
+    assert!(rep.changed, "the reasons themselves are a state change worth persisting");
+    // …and it did not go on to spend a build on nothing.
+    assert!(
+        !f.calls().iter().any(|c| c.contains("push") || c.contains("ls-remote")),
+        "nothing was minted or pushed: {:?}",
+        f.calls()
+    );
+}
+
 /// **A green batch lands the tested object itself** (§8's Bors invariant) via
 /// the one landing verb §7.4 permits, and clears the queue.
 #[test]

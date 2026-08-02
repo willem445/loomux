@@ -36766,9 +36766,17 @@ impl MqScript {
                 // The create-only push and §5's draft PR.
                 ("push --force-with-lease", 0, String::new()),
                 ("pr create", 0, "https://github.com/o/r/pull/641\n".into()),
+                // The batch's own checks, once it is in flight: an empty list is
+                // PENDING, never success, so a second tick observes and does
+                // nothing rather than landing an unjudged object.
+                ("pr checks", 0, "[]".into()),
             ],
             calls: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
     }
 
     fn reply(&self, args: &[&str]) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
@@ -36837,11 +36845,8 @@ fn the_gh_poll_tick_drives_the_merge_queue_and_cuts_a_batch() {
     )
     .unwrap();
 
-    reg.set_mq_runner_override(Some(std::sync::Arc::new(MqScript::batch_builder(
-        HEAD,
-        TARGET_HEAD,
-        MERGED,
-    ))));
+    let script = std::sync::Arc::new(MqScript::batch_builder(HEAD, TARGET_HEAD, MERGED));
+    reg.set_mq_runner_override(Some(script.clone()));
 
     // The real unified poll tick, with an empty watch-result map — exactly what
     // `run_gh_poll_tick` hands it.
@@ -36872,10 +36877,24 @@ fn the_gh_poll_tick_drives_the_merge_queue_and_cuts_a_batch() {
         assert!(actions.iter().any(|a| a == want), "expected {want}, saw {actions:?}");
     }
 
-    // One group per wake, and the serviced group is deferred behind any other,
-    // so a second group with a live queue is not starved by this one.
+    // The construction really went through the seam — §4's create-only push
+    // primitive and §5's draft PR, not some other path that happened to write
+    // the same file.
+    let calls = script.calls();
+    assert!(
+        calls.iter().any(|c| c.starts_with("push --force-with-lease=refs/heads/loomux/mq/")),
+        "the scratch push must be create-only by primitive: {calls:?}"
+    );
+    assert!(calls.iter().any(|c| c.contains("pr create --draft")), "{calls:?}");
+
+    // A second wake observes the batch it just cut rather than cutting another:
+    // one in-flight batch per target (§4), and an empty check list is PENDING,
+    // so nothing lands.
     let again = reg.gh_poll_tick(1_001, &std::collections::HashMap::new());
     assert_eq!(again.mq_serviced.as_deref(), Some(g.id.as_str()), "still the only due group");
+    let after2: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&qfile).unwrap()).unwrap();
+    assert_eq!(after2["batch"]["id"], after["batch"]["id"], "no second batch was cut: {after2}");
 
     reg.set_mq_runner_override(None);
 }

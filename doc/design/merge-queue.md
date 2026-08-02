@@ -787,14 +787,20 @@ deferred, never starved — which is the `due_intake_polls` idiom #656 asks for 
 half. Within a group, a tick performs **at most one state advance**: it never loops waiting
 for anything, never sleeps, and never retries an external call in place.
 
-Beside the per-tick bound there is a **rate** bound: after an external failure the group is
-held off for five minutes (`MQ_DRIVE_BACKOFF_MS`). §10's failure rows all end "entries return
-to `queued`", which means the very next wake would try the same thing — one notice and one
-audit line every 30 seconds against a remote that is simply down. It is deliberately not a
-retry *limit* (§10 requires the entries to requeue and a later batch to re-derive the
-question) and deliberately not persisted: the condition is a fact about the world, not about
-the queue, and a durable backoff would keep punishing a batch for a network that has since
-come back.
+Beside the per-tick bound there is a **rate** bound: the group is held off for five minutes
+(`MQ_DRIVE_BACKOFF_MS`) after any tick whose next attempt would cost the same external calls
+and reach the same answer. Two shapes qualify. **An external failure** — §10's failure rows
+all end "entries return to `queued`", which means the very next wake tries the same thing, so
+a remote that is simply down would produce one notice and one audit line every 30 seconds.
+And **nothing eligible to batch** — establishing that costs two `gh` round-trips per examined
+entry (§7's live lookups) and a queue can sit blocked on a re-review for hours, so re-deriving
+it every wake would be hundreds of `gh` calls an hour for a group doing nothing.
+
+It is deliberately not a retry *limit* (§10 requires the entries to requeue and a later batch
+to re-derive the question) and deliberately not persisted: the condition is a fact about the
+world, not about the queue, and a durable backoff would keep punishing a batch for a network
+that has since come back. Nothing is waiting on the latency it adds either — the human action
+that unblocks a blocked entry takes longer than the backoff does.
 
 ### 13.2 How the bisect runs when no tick may block
 

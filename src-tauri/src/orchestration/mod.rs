@@ -1631,17 +1631,22 @@ pub fn seed_leaked_readers_for_test(n: usize) -> Vec<mpsc::Sender<()>> {
 /// landed, coarse enough that a small per-group YAML read+parse is negligible
 /// even with several live groups.
 const WORKFLOW_GATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
-/// How long the merge-queue driver holds a group off after an external failure
+/// How long the merge-queue driver holds a group off after a tick whose next
+/// attempt would cost the same external calls and reach the same answer
 /// (#698 — `mqloop::DriveReport::backoff`).
 ///
-/// §10's failure rows all end "entries return to `queued`", which means the very
-/// next poll tick would retry the same thing: one abort notice and one audit
-/// line every 30 seconds against a remote that is simply down. The bound is not
-/// a retry *limit* — §10 is explicit that the entries requeue and a later batch
-/// re-derives the question — it is a **rate**, so a broken world costs the
-/// orchestrator one notice every five minutes instead of ten an hour per group.
-/// Five minutes because that is long enough to be quiet and short enough that a
-/// transient auth blip does not park a batch for a coffee break.
+/// Two shapes ask for it: an **external failure**, since §10's rows all end
+/// "entries return to `queued`" and the very next tick would retry the same
+/// thing against a remote that is simply down; and **nothing eligible to
+/// batch**, which costs two `gh` round-trips per examined entry to establish
+/// and can stay true for hours while a re-review is pending.
+///
+/// The bound is not a retry *limit* — §10 is explicit that the entries requeue
+/// and a later batch re-derives the question — it is a **rate**, so a stuck
+/// group costs a handful of `gh` calls and at most one notice per five minutes
+/// instead of per wake. Five minutes because that is long enough to be quiet and
+/// short enough that neither a transient auth blip nor a fresh review parks a
+/// batch for a coffee break.
 const MQ_DRIVE_BACKOFF_MS: u64 = 5 * 60_000;
 /// Autonomous mode (#83): default output-quiet window before an idle tick fires,
 /// when the group's `idle_tick_minutes` guardrail isn't set. Lowered from the
