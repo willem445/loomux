@@ -416,8 +416,13 @@ fn repo_with_merge_queue(tag: &str, enabled: bool) -> std::path::PathBuf {
     // workflow that never loaded.
     fs::write(
         repo.join(".loomux").join("workflow.yml"),
+        // A workflow needs at least one block to be valid, so the file carries a
+        // minimal roster it does not otherwise use. The queue's own gating is on
+        // `merge_queue.enabled`, not on the roster's shape.
         format!(
-            "version: {}\nmerge_queue:\n  enabled: {enabled}\n  max_batch: 3\n",
+            "version: {}\n\
+             blocks:\n  - id: w\n    name: Worker\n    kind: worker\n    cli: claude\n    model: sonnet\n\
+             merge_queue:\n  enabled: {enabled}\n  max_batch: 3\n",
             workflow::SCHEMA_VERSION
         ),
     )
