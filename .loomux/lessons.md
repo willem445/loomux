@@ -2,7 +2,8 @@
 
 Rules that must survive past the group that learned them. Rule + fix only —
 history and rationale live in the referenced issues/PRs and `doc/design/`.
-Newest at the bottom; headings are for readability only.
+See `doc/design/lessons.md` for this file's write path, injection point, and
+trust posture. Newest at the bottom; headings are for readability only.
 
 ## No getrandom-based crates in src-tauri
 
@@ -47,8 +48,8 @@ subsystem and publish the list.
 
 From `src-tauri/`: `rustfmt --check --edition 2021 <changed .rs> >/dev/null`. The
 `--edition` flag is mandatory (default 2015 false-errors `async fn`); discard stdout
-(formatting diffs, unenforced); **stderr is the signal — read it, don't grep for
-`error:`**. It is a parse check only: never run bare `rustfmt`, never commit a
+(formatting diffs, unenforced); the exit code is ambiguous (1 = parse error OR
+formatting diff), so **stderr is the signal — read it, don't grep for `error:`**. It is a parse check only: never run bare `rustfmt`, never commit a
 reformat, never cite a clean run as validation. `cargo check` stays banned (#488, #558).
 
 ## Never block a turn waiting on CI — the resolution is queued behind the turn
