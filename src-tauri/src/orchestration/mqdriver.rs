@@ -363,14 +363,49 @@ fn landable(name: &str) -> bool {
         && name != "HEAD"
 }
 
+/// Whether a name is usable as the **right-hand side of a comparison** — the
+/// default branch, the recorded target, a caller's assertion.
+///
+/// Deliberately looser than [`landable`] in exactly one way: it accepts a
+/// `refs/heads/`-qualified spelling, which [`same_branch`] then normalizes.
+/// **The asymmetry is the point, and it is a security property, not a
+/// convenience.** `base` becomes a refspec component, so it must be a plain
+/// branch name or nothing. `default` is *only ever compared* — it never reaches
+/// an argument position — so applying `landable` to it would mean that a `gh`
+/// which one day answered `refs/heads/main` made the default-branch refusal stop
+/// firing on the comparison and start refusing everything as unverifiable
+/// instead. Fail-closed either way, but the first is a refusal that says the
+/// wrong thing, and #581's whole §7 rests on this comparison landing.
+///
+/// Defined as [`landable`] applied after an optional `refs/heads/` is stripped,
+/// rather than as its own looser list — so the `refs/heads/` allowance is the
+/// *only* difference between the two, provably, instead of being the difference
+/// a reader has to diff two predicates to find.
+///
+/// Everything else [`landable`] refuses is still refused here, and that
+/// direction matters: a `default` carrying a `:` or a `*` is not a branch git
+/// would let exist, so it is a **corrupt answer**, and a corrupt answer must
+/// refuse rather than merely fail to match the base — failing to match is
+/// failing to fire the constraint-7 refusal. The literal `HEAD` that
+/// `git::default_base_ref` degrades to is refused in both spellings.
+fn usable_for_comparison(name: &str) -> bool {
+    let name = name.trim();
+    landable(name.strip_prefix("refs/heads/").unwrap_or(name))
+}
+
 /// Compare two branch names the way a refusal must: exactly, after normalizing
 /// the one shape `gh` and `git` disagree about.
 ///
 /// `gh repo view --jq .defaultBranchRef.name` returns a short name (`main`), and
-/// so does `gh pr view --json baseRefName` — but a future caller reading a ref
-/// from `git` may hand in `refs/heads/main`, and a refusal that missed on that
-/// spelling would be a refusal that does not fire. Nothing is *rewritten* here;
-/// this only decides whether two strings name the same branch.
+/// so does `gh pr view --json baseRefName` — but a ref read from `git`, or a
+/// target recorded by another build, may arrive as `refs/heads/main`, and a
+/// refusal that missed on that spelling would be a refusal that does not fire.
+///
+/// Nothing is *rewritten* here; this only decides whether two strings name the
+/// same branch. Note where the normalization can actually bite: `base` has
+/// already been through [`landable`], which rejects a `refs/`-qualified name
+/// outright, so the live-vs-live half is normalized on the **default's** side —
+/// see [`usable_for_comparison`] for why that side is deliberately looser.
 fn same_branch(a: &str, b: &str) -> bool {
     fn short(s: &str) -> &str {
         s.trim().strip_prefix("refs/heads/").unwrap_or(s.trim())
@@ -429,7 +464,11 @@ pub fn validate_target(
 ) -> Result<String, TargetRefusal> {
     let base = base.trim();
     let default = default.trim();
-    if !landable(base) || !landable(default) {
+    // Two different tests, on purpose — see `usable_for_comparison`. `base` is
+    // the string a refspec gets built from, so it must be a plain branch name;
+    // `default` is only ever compared, so a qualified spelling of it must still
+    // be able to trip the refusal below rather than being turned away here.
+    if !landable(base) || !usable_for_comparison(default) {
         return Err(TargetRefusal::BaseUnverifiable);
     }
     if same_branch(base, default) {

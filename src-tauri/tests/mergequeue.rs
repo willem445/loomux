@@ -222,14 +222,102 @@ fn refusal_1_enqueue_against_the_default_branch_is_refused() {
     );
     assert!(!f.calls().iter().any(|c| c.contains("-R")), "calls: {:?}", f.calls());
 
-    // Spelled `refs/heads/main` instead, the refusal must still fire — a
-    // refusal that misses on a spelling is a refusal that does not exist.
+    // A refusal that misses on a spelling is a refusal that does not exist — so
+    // a **fully-qualified default** must still trip it. This is the side the
+    // normalization has to work on: `gh` answers short names today, and if it
+    // ever answered `refs/heads/main` the constraint-7 comparison must still
+    // land rather than quietly stop matching.
     assert_eq!(
-        validate_target("refs/heads/main", "main", None, None),
+        validate_target("main", "refs/heads/main", None, None),
         Err(TargetRefusal::BaseIsDefault)
     );
     assert_eq!(
-        validate_target("main", "refs/heads/main", None, None),
+        validate_target("integration", "refs/heads/integration", None, None),
+        Err(TargetRefusal::BaseIsDefault)
+    );
+
+    // The other spelling is refused too, but as `base-unverifiable`, and the
+    // asymmetry is deliberate rather than an oversight: `base` is the string a
+    // refspec is built from, so a `refs/`-qualified one is rejected outright
+    // (`refs/heads/refs/heads/main` is not a ref anybody meant), while `default`
+    // is only ever compared. Both are refusals; only one of them could ever
+    // reach an argument position.
+    assert_eq!(
+        validate_target("refs/heads/main", "main", None, None),
+        Err(TargetRefusal::BaseUnverifiable)
+    );
+}
+
+/// The recorded target and the caller's assertion are compared, never written,
+/// so they normalize the same way the default does. Pinned because
+/// `same_branch`'s normalization would otherwise be a claim in a doc comment
+/// with no executed case behind it — and a helper whose normalization can never
+/// fire is the "a claim is a deliverable" defect, not a spare guard.
+#[test]
+fn the_recorded_target_and_the_assertion_normalize_the_qualified_spelling() {
+    // A target recorded by another build in the qualified spelling still names
+    // the same branch, so this is not a retarget.
+    assert_eq!(
+        validate_target("integration", "main", Some("refs/heads/integration"), None),
+        Ok("integration".to_string())
+    );
+    assert_eq!(
+        validate_target("integration", "main", None, Some("refs/heads/integration")),
+        Ok("integration".to_string())
+    );
+    // …and a genuinely different branch still refuses in either spelling.
+    assert_eq!(
+        validate_target("integration", "main", Some("refs/heads/other"), None),
+        Err(TargetRefusal::BaseNotTarget)
+    );
+    // The value returned is always the plain `base`, never the caller's
+    // spelling — the refspec is built from this string.
+    assert_eq!(
+        validate_target("integration", "main", Some("refs/heads/integration"), Some("integration")),
+        Ok("integration".to_string())
+    );
+
+    // An empty recorded target means "no target established yet" (§4), not a
+    // mismatch: the first successful enqueue is what establishes one.
+    assert_eq!(validate_target("integration", "main", Some(""), None), Ok("integration".to_string()));
+    // But it never rescues the default-branch refusal.
+    assert_eq!(validate_target("main", "main", Some(""), None), Err(TargetRefusal::BaseIsDefault));
+}
+
+/// A **corrupt default** refuses rather than merely failing to match. The
+/// `refs/heads/` allowance is the only way the default's check is looser than
+/// the base's; everything a branch name cannot contain is still rejected, and it
+/// is rejected as `base-unverifiable` rather than being compared. Failing to
+/// match a garbage default would be failing to fire the constraint-7 refusal at
+/// all — a silent hole, where this is a loud refusal.
+#[test]
+fn a_corrupt_default_branch_answer_refuses_instead_of_failing_to_match() {
+    for corrupt in [
+        "main:refs/heads/x",
+        "--force",
+        "-main",
+        "ma in",
+        "ma..in",
+        "main*",
+        "main^",
+        "main~1",
+        "main\nintegration",
+        "HEAD",
+        "refs/heads/HEAD",
+        "refs/tags/v1",
+        "",
+        "   ",
+    ] {
+        assert_eq!(
+            validate_target("integration", corrupt, None, None),
+            Err(TargetRefusal::BaseUnverifiable),
+            "a default of {corrupt:?} is a corrupt answer, not a branch that happens not to match"
+        );
+    }
+    // The two spellings that ARE answers still compare, and still refuse.
+    assert_eq!(validate_target("integration", "integration", None, None), Err(TargetRefusal::BaseIsDefault));
+    assert_eq!(
+        validate_target("integration", "refs/heads/integration", None, None),
         Err(TargetRefusal::BaseIsDefault)
     );
 }
