@@ -33345,10 +33345,12 @@ impl OrchRegistry {
     ) -> Vec<String> {
         // ---- phase 1: under the guard ----
         let notices: Vec<String> = {
+            // MUTATION J1 (evidence, NOT shipped): the once-only guard removed.
+            // Set I ran this same mutation against the PREVIOUS version of the
+            // assertion and it stayed green; this run is the check that the
+            // re-armed assertion actually binds it.
             let mut done = self.mq_reconciled_groups.lock_safe();
-            if !done.insert(group.to_string()) {
-                return Vec::new();
-            }
+            done.insert(group.to_string());
             let dir = self.group_dir(group);
             let mut state = match mqloop::load_state(&dir) {
                 Ok(s) => s,
