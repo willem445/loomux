@@ -3868,6 +3868,145 @@ fn archiving_the_whole_staged_set_still_cannot_let_a_fresh_id_collide_with_it() 
          hide it behind an unrelated fresh delivery: {orphans:?}");
 }
 
+/// Append one line to `group`'s archive exactly as given — the only way to put
+/// a record this build would NOT have written into the file, which is the
+/// whole point of the two tests below.
+fn append_archive_line(dir: &Path, group: &str, line: &str) {
+    let path = dir.join(group).join("queue-orphans-archive.jsonl");
+    let mut body = fs::read_to_string(&path).unwrap_or_default();
+    if !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(line);
+    body.push('\n');
+    fs::write(&path, body).unwrap();
+}
+
+/// The archive as raw text lines. Deliberately NOT `archive_rows`, which
+/// parses every line and would panic on the unreadable one these tests
+/// deliberately plant.
+fn archive_raw_lines(dir: &Path, group: &str) -> Vec<String> {
+    let path = dir.join(group).join("queue-orphans-archive.jsonl");
+    fs::read_to_string(&path)
+        .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// One record from a LATER build, derived from a real one so only the version
+/// and the unknown field are unusual: a `v` this build refuses to interpret, a
+/// `why` it has never heard of, a field that did not exist, and a high id.
+fn newer_build_record(template: &Value, id: u64) -> String {
+    let mut newer = template.clone();
+    newer["v"] = json!(2);
+    newer["why"] = json!("a-reason-invented-later");
+    newer["expiry_ms"] = json!(1234);
+    newer["entry"]["id"] = json!(id);
+    newer["entry"]["payload"] = json!({ "kind": "text", "text": "written by a newer build" });
+    serde_json::to_string(&newer).unwrap()
+}
+
+#[test]
+fn a_rewrite_carries_lines_this_build_cannot_read_through_byte_for_byte() {
+    // Review B1. The per-line `v` exists so an append-only file can outlive
+    // the build that wrote its older records — so the case it is FOR is a
+    // newer build's line being read by an older one. Rebuilding the file from
+    // `parse_archive`'s output deletes exactly those lines, which turns the
+    // compatibility mechanism into the thing that destroys what it protects,
+    // and does it silently. The rewrite must therefore work over raw lines and
+    // parse only to answer "is this the record I am removing?".
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["owed to the resumed pane"]);
+    age_snapshot(dir.path(), &gid, 2 * 24 * 60 * 60 * 1000);
+    let reg = restart_and_admit(dir.path(), &gid, 950);
+    let rows = archive_rows(dir.path(), &gid);
+    assert_eq!(rows.len(), 1, "precondition: one readable record rolled off");
+
+    let newer_line = newer_build_record(&rows[0], 9000);
+    append_archive_line(dir.path(), &gid, &newer_line);
+    // ...and a line NO build can ever read — a record torn by a full disk.
+    // It cannot be matched, so it must never be removed either.
+    let torn = "{\"v\":1,\"archived_ms\":1,\"why\":\"tru";
+    append_archive_line(dir.path(), &gid, torn);
+
+    // The bind is what rewrites the archive: it removes the record it just
+    // re-admitted, and must touch nothing else.
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, 951), 1,
+        "precondition: the readable record re-binds, which is what triggers the rewrite");
+
+    let lines = archive_raw_lines(dir.path(), &gid);
+    assert!(lines.contains(&newer_line),
+        "a newer build's record must survive this build's rewrite BYTE FOR BYTE — not re-serialized, \
+         not dropped for being unreadable: {lines:?}");
+    assert!(lines.contains(&torn.to_string()),
+        "...and so must a line nothing can parse: unreadable is not the same as unwanted: {lines:?}");
+    assert!(!lines.iter().any(|l| l.contains("owed to the resumed pane")),
+        "while the re-admitted record IS removed — carrying everything through must not mean \
+         carrying through the one line the rewrite exists to drop: {lines:?}");
+}
+
+#[test]
+fn the_id_seed_accounts_for_an_archived_id_on_a_line_it_cannot_interpret() {
+    // Review B1's second consequence, same root cause. Reading archived ids
+    // through `parse_archive` skips a newer build's record, so its id is
+    // invisible to the `queue_seq` seed and a fresh delivery can be minted
+    // carrying it — the exact collision the seed exists to prevent, arriving
+    // through the compatibility mechanism meant to prevent it.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["rolled off"]);
+    age_snapshot(dir.path(), &gid, 2 * 24 * 60 * 60 * 1000);
+    {
+        restart_and_admit(dir.path(), &gid, 952);
+    }
+    let rows = archive_rows(dir.path(), &gid);
+    assert_eq!(rows.len(), 1, "precondition: something rolled off to append beside");
+    append_archive_line(dir.path(), &gid, &newer_build_record(&rows[0], 9000));
+
+    // A fresh process: the seed runs once, off the snapshot and the archive.
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let fresh = reg.spawn_agent(&gid, Role::Worker, "unrelated", "t", false, None).unwrap();
+    let minted = reg
+        .enqueue_text(&gid, &fresh.id, "orch-1", "brand new", 953, queue::EnqueueReason::Arrival)
+        .unwrap();
+    assert!(minted.id > 9000,
+        "the seed must read archived ids RAW — minting {} re-uses an id a newer build's record \
+         still carries, and every consequence of that collision is silent", minted.id);
+}
+
+#[test]
+fn the_per_admission_write_stops_growing_with_the_staged_backlog() {
+    // #547's own instruction was to MEASURE before picking a mechanism. This
+    // is that measurement, synthetically: 500 staged orphans of 2 KiB each is
+    // about what a year of daily restarts leaves on a fleet, and `queue.json`
+    // as crafted here is literally the file the pre-#547 writer would have
+    // rewritten and fsynced on EVERY admission — so the before/after is over
+    // the same staging set rather than over two different fixtures.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["flood"]);
+    let payload = "z".repeat(2048);
+    fan_out_snapshot(dir.path(), &gid, 500, &payload);
+
+    let path = dir.path().join(&gid).join("queue.json");
+    let unbounded = fs::metadata(&path).unwrap().len();
+
+    let reg = restart_and_admit(dir.path(), &gid, 954);
+    let bounded = fs::metadata(&path).unwrap().len();
+
+    // A ratio, not a byte count: the point is that the cost stops TRACKING the
+    // backlog, and the floor is a constant (`STAGED_HOT_MAX_BYTES`), so the
+    // bigger the backlog the wider this gets. 8x is the assertion; the flood
+    // above is well past it.
+    assert!(bounded * 8 < unbounded,
+        "the per-admission write must stop tracking the backlog: {bounded} B after vs {unbounded} B before");
+    assert_eq!(reg.queue_orphans(&gid).len(), 500,
+        "...and the reduction must be a MOVE, not a saving: every one of the 500 is still reported");
+}
+
 #[test]
 fn queue_orphans_is_an_orchestrator_only_tool_and_reports_what_a_restart_lost() {
     // The #467 wiring itself: the derivation only becomes a recovery when
