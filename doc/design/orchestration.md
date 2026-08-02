@@ -1607,14 +1607,33 @@ sizing is best-effort; the honesty is structural** — which is the right way ro
 best-effort number that quietly reports its own failures as observations is exactly what #559
 was.
 
-One invariant the code depends on, stated so an edit cannot lose it silently: **no box read for a
-given delivery may be narrower than the one before it.** A precondition verified against a wide
-tail and then polled against a narrow one would read the box as cleared on the first poll and
-confirm a delivery nothing observed. The five call sites (precondition, confirm loop, retry loop,
-and the late monitor's two) all size from `pasted_text` for that reason — as one `tier1_scan_bytes`
-shared by every read until #685, and since #685 as one `Tier1Scan` whose floor starts there and
-only ever rises. The stronger form is the same guarantee: a read can only ever get *wider*, and a
-wider read can only turn a foregone `Unverifiable` into an observation.
+One invariant the code depends on, stated so an edit cannot lose it silently: **a box read must
+never be narrower than the read whose answer it is revisiting.** A precondition verified against a
+wide tail and then polled against a narrow one would read the box as cleared on the first poll and
+confirm a delivery nothing observed. Until #685 that was enforced by size equality — all five call
+sites (precondition, confirm loop, retry loop, and the late monitor's two) computed the same
+`tier1_scan_bytes` from the same `pasted_text`.
+
+Since #685 it is enforced two ways at once, and the distinction matters to anyone editing here:
+
+- **Within one `Tier1Scan`, reads are monotone.** Its floor starts at `tier1_scan_bytes` and only
+  ever rises, so the confirm loop and the retry loop can never poll narrower than the precondition
+  read they are revisiting. This is the case the invariant was written for, and it is now strictly
+  stronger than equality.
+- **There are two `Tier1Scan` instances, not one** — `deliver_now`'s (precondition, confirm loop,
+  retry loop) and `run_late_confirmation_monitor`'s (its two arms). They are independent, on
+  different threads, and the monitor's floor starts at `tier1_scan_bytes` again, so its first
+  *request* can be narrower than a widened request `deliver_now` already made. What makes that safe
+  is not the request size: **every read widens itself before anything classifies it**, so what a
+  reading is decided from is a tail that covers the containment window whenever the pane's density
+  allows it at all — and when it does not, the tail is shorter than the needle and `box_reading`
+  returns `Unverifiable`, never `NotHolding`. A narrower first request costs a re-read, not a
+  confirm.
+
+The load-bearing property, stated plainly so it is the one an edit has to preserve: **what makes a
+`NotHolding` trustworthy is that the read covered the window, not that it matched some earlier
+read's byte count.** Size equality was a proxy for that, and a poor one — two byte-equal reads
+taken seconds apart already saw different tails as the ring filled.
 
 #### Measuring the residual, rather than tuning against a guess (#583)
 
@@ -1774,11 +1793,13 @@ in hand actually returned needs no ρ at all.
   readable universe, derived rather than picked, and in practice far above where the scaled request
   lands.
 
-**Why this cannot manufacture a confirm.** The invariant above is *monotone reads*, and the first
-request is unchanged, so every read after this change is at least as wide as every read before it.
-The hazard needs a *narrower* read — one that sees the box cut mid-paste, reads `NotHolding`, and
-confirms a delivery nothing observed — and there is no longer a way to take one. `box_reading` is
-untouched; `Unverifiable` governs everywhere it did.
+**Why this cannot manufacture a confirm.** The hazard needs a read *narrower* than the one it is
+revisiting — one that sees the box cut mid-paste, reads `NotHolding`, and confirms a delivery
+nothing observed. Two things rule it out. The first request is `tier1_scan_bytes` unchanged and
+widening only grows it, so **no read after this change is narrower than the read the same call site
+took before it**; and within a `Tier1Scan` the floor only rises, so a poll is never narrower than
+the precondition it revisits (see the invariant above for what that does and does not cover across
+the two instances). `box_reading` is untouched; `Unverifiable` governs everywhere it did.
 
 **The residual this does not close**, stated rather than left for a reader to find: a read landing
 between `paste_chars` and `paste_chars + BOX_TAIL_WINDOW_SLACK` post-strip characters can still

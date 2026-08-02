@@ -34431,6 +34431,48 @@ fn a_repaint_heavy_pane_verifies_once_the_window_is_sized_in_post_strip_chars() 
 }
 
 #[test]
+fn a_paste_in_the_measured_collapsing_band_verifies() {
+    // The band #583 actually measured, given its own witness: 1.5-2 KiB, where
+    // 58% of live deliveries came back `Unverifiable`, on the way to 100% from
+    // 2.5 KiB up. The headline test above is an 8 KiB paste because that is the
+    // smallest that collapses at ~50% retention — but the issue is written
+    // about THIS band, and a suite that only brackets it would not notice a
+    // future `BOX_TAIL_SCAN_BYTES` or slack edit moving the boundary back into
+    // it. The band is reachable at a denser pane instead of a bigger paste:
+    // `chunk = 1` is one escape per text byte, ~20% retention, which is what a
+    // repaint-heavy TUI looks like when it is painting per character.
+    let pasted = flush_paste(1800);
+    assert!(
+        (1536..=2560).contains(&pasted.len()),
+        "this fixture's whole point is WHICH bucket it lands in — {} chars is outside the \
+         1.5-2.5 KiB band #583 measured",
+        pasted.len()
+    );
+    let pty = 6857;
+    let pm = PtyManager::default();
+    pm.register_fake_for_test(pty, &repaint_ring(&pasted, 1, 32 * 1024));
+
+    assert_eq!(
+        pre_685_reading(&pm, pty, &pasted),
+        BoxReading::Unverifiable,
+        "the fixture must be a member of the class it witnesses: a paste in the measured band, \
+         unverifiable under the old fixed-size read"
+    );
+
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    let read = scan.read(|n| pm.output_tail_bounded(pty, n)).expect("the fake pty is alive");
+    assert_eq!(
+        box_reading(Some(&read.stripped), &pasted),
+        BoxReading::Holds,
+        "the band the issue is written about is the band that now verifies"
+    );
+    assert_eq!(
+        read.tail_bytes, read.requested_bytes,
+        "the ring FILLED the widened request — a short pane is the other cause, and not this one"
+    );
+}
+
+#[test]
 fn an_ordinary_delivery_still_takes_exactly_one_read() {
     // The cost argument, pinned. The target is the containment window, not the
     // whole 4 KiB budget, so an ordinary prompt clears it on the first read and

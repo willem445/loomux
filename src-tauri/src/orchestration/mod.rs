@@ -12892,12 +12892,26 @@ pub fn tier1_scan_bytes(pasted: &str) -> usize {
 /// box read for a delivery uses the same size, because a precondition verified
 /// against a wide tail and then polled against a NARROW one could see the box
 /// cut mid-paste, read `NotHolding`, and confirm a delivery nothing observed.
-/// The hazard needs a narrower read, and there is no longer any way to take
-/// one: the first request is exactly `tier1_scan_bytes`, `request_floor` only
-/// ever rises, and every widening only grows the request. So the invariant is
-/// kept in a strictly stronger form — reads are monotone, not merely equal —
-/// and a wider read can only ever turn a foregone `Unverifiable` into an
-/// observation.
+/// Two things rule that out here, and it is worth being exact about which:
+/// - **Within one of these**, `request_floor` only ever rises, so the confirm
+///   loop and the retry loop can never poll narrower than the precondition read
+///   they revisit. That is the case the invariant was written for, kept in a
+///   strictly stronger form — monotone, not merely equal.
+/// - **Across the two that exist** — `deliver_now`'s and the late monitor's,
+///   independent and on different threads — the monitor's floor starts at
+///   `tier1_scan_bytes` again, so its first REQUEST can be narrower than a
+///   widened one `deliver_now` already made. What makes that safe is not the
+///   request size but that every read widens ITSELF before anything classifies
+///   it: a reading is decided from a tail that covers the containment window
+///   whenever the pane's density allows it, and when it does not the tail is
+///   shorter than the needle, which is `Unverifiable` and never `NotHolding`.
+///   A narrower first request costs a re-read, not a confirm.
+///
+/// The load-bearing property, so an edit preserves the right one: what makes a
+/// `NotHolding` trustworthy is that the read COVERED THE WINDOW, not that it
+/// matched an earlier read's byte count. And every read here is at least as
+/// wide as the one this call site took before this change, so nothing that was
+/// sound before became less so.
 #[doc(hidden)] // pub for integration tests
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tier1Scan {
