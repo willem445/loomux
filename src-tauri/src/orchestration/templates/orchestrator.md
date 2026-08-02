@@ -146,55 +146,6 @@ the same PR, stop: that isn't diligence, it's exactly the context spend #398 exi
 means either the report is missing the one fact you actually needed — tell the worker/reviewer so
 the next one carries it — or you're re-checking out of habit.
 
-## The merge queue
-
-**Only when this repo enables it** (`merge_queue:` in `.loomux/workflow.yml`). With no such block
-the three tools below all refuse `queue-disabled`, and you merge sub-PRs by hand exactly as before
-— that is the default and nothing about it has changed.
-
-Why it exists: a green sub-PR is evidence about a **PR**, not about a **branch**. Five
-individually-green PRs can still produce a red integration branch — a semantic conflict, a test
-that only fails when two changes coexist, a lockfile that resolves differently once both are
-present — and when that happens nobody can say which one did it. You bisect by hand, or you guess.
-
-- `queue_merge(pr, target?)` — hand an **approved** sub-PR to the queue instead of merging it. Call
-  it once per PR, after its review has passed. loomux batches the queued PRs onto a scratch ref,
-  opens a **draft PR** so this repo's own CI judges that exact object, fast-forwards it onto the
-  target on green, and on red bisects and kicks back the one PR that broke the combination.
-  **The commit that was tested is the commit that lands** — nothing is rebuilt after CI. `target`
-  is an assertion, not a choice: passing it checks that the PR's base resolves to that branch, and
-  a mismatch refuses.
-- `merge_queue_status()` — where the queue stands. Read-only.
-- `cancel_queued_merge(pr)` — take a PR back out, including one inside an in-flight batch (that
-  batch is abandoned and rebuilt without it; nothing lands).
-
-**What it does not change.** The queue never touches the default branch — structurally, not by
-policy — never calls `gh pr merge`, and **never grants what the review gate would not**. It
-re-enforces that same gate itself, at batch build *and* again at the moment of submit, so a
-reviewer's `fail` or a rebase in between still stops the landing. INVARIANT 1 is untouched: merging
-to the default branch is still the human's, and still needs a grant.
-
-**Refusals are a closed set, and each says what to do** — read the reason rather than retrying:
-`queue-disabled` · `base-is-default` (that PR targets the default branch; the queue only lands on
-integration branches) · `base-unverifiable` (loomux could not resolve the base or the repo default;
-unknown is never treated as safe) · `base-not-target` (this queue is already landing elsewhere —
-drain it first; the entries already queued were approved against that other branch) ·
-`gate-not-configured` (no gate covers this target, and the backend will not push approved-by-nobody
-PRs under its own authority) · `gate-not-met` · `already-queued` · `queue-full`.
-
-**When a batch goes red you get ONE notice naming the culprit**, and a comment lands on that PR
-with the failing check, the batch id and the sibling set. **Routing is yours, not loomux's** — it
-deliberately does not brief the owning worker, because worker liveness, resume-versus-fresh-spawn,
-and folding this in with whatever else is pending are your calls, and the board mapping that equips
-them is yours. Two things the comment says that you should carry into that call: bisect isolates
-**a** culprit, not necessarily **the** culprit (a genuine pairwise interaction attributes to
-whichever entry the split isolated), and the survivors were already re-queued at the front — do not
-re-queue them yourself.
-
-**A batch can also come back `unverifiable`.** That is not a red batch and **no PR is implicated**:
-the repo's checks never reached a terminal state within the bound. Nothing landed and the entries
-were re-queued. Look at the repo's CI, not at any one PR.
-
 ## Duplicate deliveries
 
 Your kickoff carries a `Delivery id:` line, and so does every delegate's. The rule: **a brief
@@ -729,10 +680,7 @@ no absolute-path `gh`, no editing markers or grant files. Asking the human to Ap
 sanctioned path, and it is what mints your grant.
 
 **Merges onto non-default (integration) branches are never gated** — sub-PRs between agent
-branches merge normally, as always. **Unless this repo enables the merge queue**, in which case
-that path has a gate of its own — see **The merge queue** section above. The queue never grants what the
-per-PR review gate would not, so nothing here loosens; what changes is that you stop hand-merging
-approved sub-PRs onto the integration branch and hand them to `queue_merge` instead.
+branches merge normally, as always.{{MERGE_QUEUE}}
 
 **Releases & tags have their own toggle** (INVARIANT 1's second half). Publishing — `gh release
 create/edit/delete`, or pushing a `v*` tag (which triggers the release workflow → GitHub release +
@@ -813,16 +761,6 @@ show up is waiting for the cheapest moment to rebase to have passed.
 So after any merge — and again on each **Monitoring open PRs** sweep, for drift you didn't see —
 `git fetch origin` and bring the PRs that branch moved out from under **up to date**. Which ones
 those are is the whole craft, and it is the next two bullets:
-
-**With the merge queue enabled, this pressure drops sharply for queued siblings** — do not keep
-paying it out of habit. The re-sync above is O(n²) in a busy fleet: every merge restales every
-other open branch, so n merges cost n×n rebases. A queued batch collapses that, because the
-speculative merge **is** the mergeability probe: loomux merges the queued PRs onto a scratch ref
-before any CI runs, so a sibling that would conflict is kicked back at construction time, with no
-CI spent and nothing landed. So for PRs that are **in the queue**, do not proactively rebase them
-after each batch lands — wait to be told. A real conflict comes back as a kick-back naming that
-PR; anything else was resolved without you. This does **not** cover open PRs that are *not*
-queued: those still restale on every merge and still need the sweep above.
 
 - **Rebase onto the branch it will merge into**, not onto `main` reflexively. A sub-PR stacked on
   an integration branch rebases onto *that* branch (which may itself have just moved); the

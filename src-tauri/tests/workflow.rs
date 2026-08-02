@@ -3822,7 +3822,7 @@ const LIVE: [(&str, &str, &[&str]); 4] = [
     (
         "orchestrator.md",
         loomux_lib::orchestration::ORCHESTRATOR_TPL,
-        &["{{WORKFLOW}}", "{{POST_MERGE_WORKFLOW_HOOK}}"],
+        &["{{WORKFLOW}}", "{{POST_MERGE_WORKFLOW_HOOK}}", "{{MERGE_QUEUE}}"],
     ),
     (
         "worker.md",

@@ -48,6 +48,69 @@ use crate::obs::LockExt;
 // workflow is active (`the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`).
 #[doc(hidden)]
 pub const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
+
+/// The `{{MERGE_QUEUE}}` fragment (#581 §11.1) — substituted into
+/// `orchestrator.md` **only** when the repo declares `merge_queue: enabled:
+/// true`, and empty otherwise.
+///
+/// It brings its own leading newlines because the placeholder sits at the end of
+/// the preceding sentence: an empty substitution has to leave that line exactly
+/// as it was, which is the invariant `a_workflow_placeholder_must_sit_at_the_
+/// end_of_a_line_it_shares` pins.
+///
+/// Everything here names machinery a queue-less group does not have — the three
+/// tools, the refusal vocabulary, the kick-back routing rule — which is why it
+/// is a fragment and not template prose.
+const MERGE_QUEUE_NOTE: &str = r#"
+
+**This repo runs a merge queue, and that changes how approved sub-PRs land.** Instead of merging
+an approved sub-PR onto the integration branch yourself, hand it to the queue. It exists because a
+green sub-PR is evidence about a **PR**, not about a **branch**: several individually-green PRs can
+still produce a red integration branch — a semantic conflict, a test that only fails when two
+changes coexist, a lockfile that resolves differently once both are present — and when that happens
+nobody can say which one did it.
+
+- `queue_merge(pr, target?)` — hand an **approved** sub-PR to the queue, once per PR, after its
+  review has passed. loomux batches the queued PRs onto a scratch ref, opens a **draft PR** so this
+  repo's own CI judges that exact object, fast-forwards it onto the target on green, and on red
+  bisects and kicks back the one PR that broke the combination. **The commit that was tested is the
+  commit that lands** — nothing is rebuilt after CI. `target` is an assertion, not a choice: it
+  checks that the PR's base resolves to that branch, and a mismatch refuses.
+- `merge_queue_status()` — where the queue stands. Read-only.
+- `cancel_queued_merge(pr)` — take a PR back out, including one inside an in-flight batch (that
+  batch is abandoned and rebuilt without it; nothing lands).
+
+**Nothing here loosens.** The queue never touches the default branch — structurally, not by policy
+— never calls `gh pr merge`, and **never grants what the review gate would not**: it re-enforces
+that same gate itself, at batch build *and* again at the moment of submit, so a reviewer's `fail`
+or a rebase in between still stops the landing. INVARIANT 1 is untouched.
+
+**Refusals are a closed set, and each says what to do** — read the reason rather than retrying:
+`base-is-default` (that PR targets the default branch; the queue only lands on integration
+branches) · `base-unverifiable` (loomux could not resolve the base or the repo default, and unknown
+is never treated as safe) · `base-not-target` (this queue is already landing elsewhere — drain it
+first; the entries already queued were approved against that other branch) · `gate-not-configured`
+(no gate covers this target, and the backend will not push approved-by-nobody PRs under its own
+authority) · `gate-not-met` · `already-queued` · `queue-full`.
+
+**When a batch goes red you get ONE notice naming the culprit**, and a comment lands on that PR
+with the failing check, the batch id and the sibling set. **Routing is yours** — loomux
+deliberately does not brief the owning worker, because worker liveness, resume-versus-fresh-spawn
+and folding this in with whatever else is pending are your calls, and the board mapping that equips
+them is yours. Two things to carry into that call: bisect isolates **a** culprit, not necessarily
+**the** culprit (a genuine pairwise interaction attributes to whichever entry the split isolated),
+and the survivors were already re-queued at the front — do not re-queue them yourself.
+
+**A batch can also come back `unverifiable`.** That is not a red batch and **no PR is implicated**:
+the repo's checks never reached a terminal state within the bound. Nothing landed, the entries were
+re-queued, and the thing to look at is the repo's CI.
+
+**One thing this changes about re-syncing.** INVARIANT 7's rebase sweep is O(n²) in a busy fleet —
+every merge restales every other open branch. For PRs that are **in the queue**, do not pay that
+proactively: the speculative merge **is** the mergeability probe, so a sibling that would conflict
+is kicked back at construction time with no CI spent and nothing landed. Wait to be told. This does
+**not** cover open PRs that are not queued — those still restale on every merge and still need the
+sweep."#;
 #[doc(hidden)]
 pub const WORKER_TPL: &str = include_str!("templates/worker.md");
 #[doc(hidden)]
@@ -27293,6 +27356,28 @@ impl OrchRegistry {
             ),
             None => String::new(),
         };
+        // #581 §11.1/§12: the merge queue's guidance, and **only** for a group
+        // whose repo actually turns it on. Behind a placeholder rather than in
+        // the base template for the reason rev-29 F1 pins: prose naming a
+        // mechanism the reader does not have sends them after something that
+        // does not exist for them, and *conditional framing does not save it* —
+        // "when the queue is enabled…" is an invitation to go looking. A group
+        // with no `merge_queue:` block reads a file byte-for-byte unchanged,
+        // which is the same promise §12 makes about the feature itself.
+        //
+        // Its own placeholder rather than folding into `{{WORKFLOW}}`: a repo
+        // can declare a gate and no queue, and that group has the gate's
+        // machinery but not this.
+        let merge_queue_note = if workflow::load_workflow(&g.repo)
+            .ok()
+            .flatten()
+            .map(|wf| wf.merge_queue.enabled)
+            .unwrap_or(false)
+        {
+            MERGE_QUEUE_NOTE.to_string()
+        } else {
+            String::new()
+        };
         let vars: Vec<(&str, &str)> = vec![
             ("REPO", g.repo.as_str()),
             ("GROUP_ID", g.id.as_str()),
@@ -27303,6 +27388,11 @@ impl OrchRegistry {
             ("WORKFLOW", workflow_section.as_str()),
             ("ADVISOR_CONSULT_NOTE", advisor_consult_note.as_str()),
             ("POST_MERGE_WORKFLOW_HOOK", post_merge_workflow_hook.as_str()),
+            // Beside the other loomux-authored conditional fragment. Both are
+            // fixed consts carrying no `{{…}}` of their own, so their position
+            // among the earlier vars is inert — unlike the repo-authored
+            // `BLOCK_NAME`, which the comment above keeps last on purpose.
+            ("MERGE_QUEUE", merge_queue_note.as_str()),
             ("BLOCK_NOTE", ""),
         ];
         let dir = self.group_dir(&g.id);
