@@ -298,7 +298,9 @@ impl ScratchBuild {
 /// sweep" applied to worktrees instead of refs. A leaked admin entry is cheap
 /// and inert; a pruned live workspace is somebody's work.
 fn remove_worktree(r: &dyn MqRunner, wt: &Path) -> Option<String> {
-    if !wt.exists() {
+    // MUTATION G1 (evidence, NOT shipped): the existence check removed, so a
+    // worktree that was never created reports a spurious cleanup failure.
+    if false && !wt.exists() {
         return None;
     }
     let wt_s = wt.display().to_string();
@@ -425,7 +427,7 @@ pub fn draft_pr_argv(branch: &str, target: &str, title: &str, body_file: &str) -
     vec![
         "pr".into(),
         "create".into(),
-        "--draft".into(),
+        // MUTATION G3 (evidence, NOT shipped): the batch PR is no longer a draft.
         "--base".into(),
         target.to_string(),
         "--head".into(),
@@ -542,7 +544,8 @@ pub fn culprit_comment(
         }
     }
     s.push_str(
-        "\nThe search isolates **a** culprit, not necessarily **the** culprit: a genuine \
+        // MUTATION G2 (evidence, NOT shipped): the honest-limit paragraph gone.
+        "\nThe search isolated this PR. A genuine \
          pairwise interaction (each change fine alone, red together) attributes to whichever \
          entry the split isolated. The sibling set above is listed so that case is visible \
          rather than hidden behind a confident single name.\n\n\
@@ -617,8 +620,11 @@ pub fn walk_bisect(
                 // `batch` rather than accumulated as the search exonerates —
                 // §9 requires their ORIGINAL queue order, and the order the
                 // halves happen to be discarded in is not that order.
-                let survivors: Vec<u64> =
+                // MUTATION G4 (evidence, NOT shipped): survivors no longer in
+                // their original queue order.
+                let mut survivors: Vec<u64> =
                     batch.iter().copied().filter(|p| *p != culprit).collect();
+                survivors.reverse();
                 return BisectAction::Attribute { culprit, survivors };
             }
             BisectAction::Test { subset, rest } => {
@@ -674,7 +680,8 @@ pub fn advance_entry(
         return Ok(None);
     };
     let from = e.state();
-    e.advance(to)?;
+    // MUTATION G8 (evidence, NOT shipped): a refused transition swallowed.
+    if e.advance(to).is_err() { return Ok(None); }
     Ok(Some(Transition { pr, from, to }))
 }
 
@@ -692,8 +699,10 @@ pub fn requeue_survivors(state: &mut MergeQueueState, survivors: &[u64]) {
             front.push(state.entries.remove(i));
         }
     }
-    for (i, e) in front.into_iter().enumerate() {
-        state.entries.insert(i, e);
+    // MUTATION G9 (evidence, NOT shipped): survivors requeued at the BACK, so
+    // they wait behind newly-enqueued work for a neighbour's failure.
+    for e in front.into_iter() {
+        state.entries.push(e);
     }
 }
 
@@ -702,10 +711,11 @@ pub fn requeue_survivors(state: &mut MergeQueueState, survivors: &[u64]) {
 /// queue, never a configured setting).
 pub fn finish_batch(state: &mut MergeQueueState) {
     state.batch = None;
+    // MUTATION G10 (evidence, NOT shipped): the target is released even while
+    // live work still holds it.
     let live = state.entries.iter().any(|e| !e.state().is_terminal());
-    if !live {
-        state.target.clear();
-    }
+    let _ = live;
+    state.target.clear();
 }
 
 /// Drop terminal entries so the file stays bounded, keeping the queue's order.
@@ -787,7 +797,8 @@ pub fn observe_batch(
         // itself unavailable rather than silently doing nothing.
         Err(e) => BatchVerification::Unavailable { why: e },
     };
-    let elapsed_ms = now_ms.saturating_sub(started_ms);
+    // MUTATION G5 (evidence, NOT shipped): a backward clock underflows to a huge elapsed.
+    let elapsed_ms = now_ms.checked_sub(started_ms).unwrap_or(u64::MAX);
     match verdict {
         BatchVerification::Green => BatchOutcome::Green,
         BatchVerification::Red { failing } => BatchOutcome::Red { failing },
@@ -885,7 +896,9 @@ pub fn reconcile_batch(
         // strand them rather than leaving them to block the queue forever.
         let orphans: Vec<u64> =
             state.entries.iter().filter(|e| e.state().in_flight()).map(|e| e.pr).collect();
-        for pr in orphans {
+        // MUTATION G7 (evidence, NOT shipped): orphaned in-flight entries left to block the queue.
+        for pr in Vec::<u64>::new() {
+            let _ = &orphans;
             strand(state, &mut report, pr, "in-flight with no batch record on disk");
         }
         return report;
@@ -904,7 +917,8 @@ pub fn reconcile_batch(
 
     let why = match (scratch_ok, draft_ok) {
         (Some(true), Some(true)) => None,
-        (None, _) => Some("the scratch ref could not be checked on the remote".to_string()),
+        // MUTATION G6 (evidence, NOT shipped): a mismatched world resumes anyway.
+        (None, _) => None,
         (_, None) => Some("the batch's draft PR could not be read".to_string()),
         (Some(false), _) => Some("the scratch ref is gone from the remote".to_string()),
         (_, Some(false)) => Some("the batch's draft PR is no longer open".to_string()),
@@ -993,7 +1007,7 @@ pub fn unverifiable_notice(batch_id: &str, draft_pr: Option<u64>, why: &str) -> 
     let where_ = draft_pr.map(|p| format!(" (batch PR #{p})")).unwrap_or_default();
     format!(
         "[loomux] merge queue: batch {}{where_} is UNVERIFIABLE - {}. Nothing landed; \
-         entries requeued. This is not a red batch and no PR is implicated.",
+         entries requeued.",  // MUTATION G11 (evidence, NOT shipped)
         quote(batch_id),
         quote(why)
     )
