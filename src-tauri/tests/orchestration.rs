@@ -399,6 +399,84 @@ fn the_merge_queue_tools_are_orchestrator_only_and_the_dispatch_check_is_the_gat
     }
 }
 
+/// `rails()` with the advanced orchestrator ON — the toggle that puts a repo's
+/// `.loomux/workflow.yml` in force at all. Plain `rails()` leaves it off, which
+/// is the default and is exactly the third case the queue test exercises.
+fn advanced_rails() -> Guardrails {
+    Guardrails { advanced_orchestrator: true, ..rails() }
+}
+
+/// Write a repo dir whose `.loomux/workflow.yml` declares a merge queue.
+fn repo_with_merge_queue(tag: &str, enabled: bool) -> std::path::PathBuf {
+    let repo = scratch_dir(tag);
+    fs::create_dir_all(repo.join(".loomux")).unwrap();
+    fs::write(
+        repo.join(".loomux").join("workflow.yml"),
+        format!("merge_queue:\n  enabled: {enabled}\n  max_batch: 3\n"),
+    )
+    .unwrap();
+    repo
+}
+
+/// **The `{{MERGE_QUEUE}}` fragment reaches only a group that actually runs the
+/// queue** — and "runs the queue" means BOTH the block and the
+/// advanced-orchestrator toggle.
+///
+/// The absence half is already pinned hard by `tests/workflow.rs`'s blessed
+/// golden and its never-names-the-gate-machinery rule — which is how this got
+/// caught: the first cut of slice E put this guidance in the base template and
+/// those tests went red. What nothing pinned was the **presence** half: a
+/// substitution that was always empty would satisfy every one of them, which is
+/// the door-connected-to-nothing shape again.
+///
+/// The toggle case is the one that found a defect. With the toggle off,
+/// `create_group_ex` deliberately clears the merge gate so the default merge
+/// path stays pre-#222 — so a queue keyed on the block alone would be live in a
+/// group that opted out of the whole workflow, with its own gate cleared
+/// underneath it.
+#[test]
+fn the_merge_queue_note_reaches_only_a_group_that_actually_runs_the_queue() {
+    let note_marker = "queue_merge(pr, target?)";
+
+    // Block on + toggle on: the guidance is there.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_merge_queue("mq-on", true);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let orch =
+        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+    assert!(
+        orch.contains(note_marker),
+        "a group whose repo enables the queue must be told the queue exists"
+    );
+    assert!(orch.contains("base-not-target"), "…including the refusal vocabulary");
+    assert!(
+        orch.contains("Routing is yours"),
+        "…and that loomux does not brief the culprit's worker (§9)"
+    );
+
+    // Block explicitly off: nothing.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_merge_queue("mq-off", false);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let orch =
+        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+    assert!(!orch.contains(note_marker), "enabled:false must read exactly like no block at all");
+    assert!(!orch.contains("{{MERGE_QUEUE}}"), "the placeholder is substituted, not left raw");
+
+    // Block ON but the advanced orchestrator OFF: still nothing. The workflow
+    // file is not in force, so neither is the queue.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_merge_queue("mq-toggle-off", true);
+    let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap(); // toggle OFF
+    let orch =
+        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+    assert!(
+        !orch.contains(note_marker),
+        "with the advanced orchestrator off the workflow file is not in force, so the queue \
+         is not running and its guidance must not appear"
+    );
+}
+
 /// **With no `merge_queue:` block, every tool refuses `queue-disabled`** — the
 /// product default (§12), and the state every repo is in until it opts in.
 ///

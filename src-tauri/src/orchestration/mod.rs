@@ -27368,11 +27368,18 @@ impl OrchRegistry {
         // Its own placeholder rather than folding into `{{WORKFLOW}}`: a repo
         // can declare a gate and no queue, and that group has the gate's
         // machinery but not this.
-        let merge_queue_note = if workflow::load_workflow(&g.repo)
-            .ok()
-            .flatten()
-            .map(|wf| wf.merge_queue.enabled)
-            .unwrap_or(false)
+        //
+        // Gated on the advanced-orchestrator toggle as well as the block, for
+        // the reason `merge_queue_enabled` spells out: with the toggle off the
+        // workflow file is not in force and its gate is cleared, so the queue is
+        // not running either — and prose about a queue that is not running is
+        // the exact leak this placeholder exists to prevent.
+        let merge_queue_note = if g.guardrails.advanced_orchestrator
+            && workflow::load_workflow(&g.repo)
+                .ok()
+                .flatten()
+                .map(|wf| wf.merge_queue.enabled)
+                .unwrap_or(false)
         {
             MERGE_QUEUE_NOTE.to_string()
         } else {
@@ -33812,9 +33819,21 @@ impl OrchRegistry {
     /// A parse failure reads as **disabled** — the loud `workflow-invalid` path
     /// already reports the parse itself, and a queue running on a file loomux
     /// could not read is a queue nobody can reason about (§11.2).
+    /// **Both conditions, not just the block.** The workflow file is only in
+    /// force when this group runs the advanced orchestrator — with the toggle
+    /// off, `create_group_ex` deliberately *clears* the merge gate so "the
+    /// default experience is byte-for-byte pre-#222" holds for the merge path
+    /// too. A queue that read the block alone would be live in a group that had
+    /// deliberately opted out of the whole workflow, with its gate cleared
+    /// underneath it — visible, contradictory, and refusing everything as
+    /// `gate-not-configured`. One toggle governs the file; the queue is part of
+    /// the file.
     fn merge_queue_enabled(&self, group: &str) -> bool {
-        let Some(repo) = self.group(group).map(|g| g.repo) else { return false };
-        matches!(workflow::load_workflow(&repo), Ok(Some(wf)) if wf.merge_queue.enabled)
+        let Some(g) = self.group(group) else { return false };
+        if !g.guardrails.advanced_orchestrator {
+            return false;
+        }
+        matches!(workflow::load_workflow(&g.repo), Ok(Some(wf)) if wf.merge_queue.enabled)
     }
 
     /// The gate spec the queue re-enforces (§6), read through the same
