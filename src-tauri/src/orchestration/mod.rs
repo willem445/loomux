@@ -18,6 +18,7 @@ pub mod intake;
 pub mod lessons;
 pub mod mcp;
 pub mod mergeq;
+pub mod mergeqview;
 pub mod notify;
 pub mod profiles;
 pub mod queue;
@@ -34917,6 +34918,22 @@ pub fn orch_tasks(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec
 #[tauri::command]
 pub fn orch_audit(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Vec<AuditEntry> {
     reg.audit_log(&group_id)
+}
+
+/// The group's merge queue for the lifecycle chrome (#581 slice F) —
+/// **read-only, and the only queue surface the frontend has**. Reads
+/// `merge_queue.json` out of the group dir and projects it; every decision and
+/// every external write belongs to `mergeq.rs` (pure core) and the driver.
+/// See `mergeqview::project` for the wire shape and the three properties it
+/// holds (no state renders blank, truncation is surfaced, an unknown schema is
+/// refused).
+///
+/// `group_id` is trusted as a path segment exactly as every sibling `orch_*`
+/// command trusts it (CLAUDE.md constraint 6) — the webview is the only caller
+/// and this adds no agent-reachable input.
+#[tauri::command]
+pub fn orch_merge_queue(reg: tauri::State<Arc<OrchRegistry>>, group_id: String) -> Value {
+    mergeqview::merge_queue_view(&reg.group_dir(&group_id))
 }
 
 /// Human steering from the loomux compose strip (#43, option C): enqueue
