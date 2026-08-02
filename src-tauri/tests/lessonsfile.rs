@@ -636,17 +636,20 @@ fn a_sentinel_shaped_heading_cannot_present_as_a_sentinel_line() {
     // with nothing pinning it. A later "one title per line, easier to read"
     // edit would break it silently, so this pins the argument.
     //
-    // The specimen is the *second* of two dropped entries on purpose: a title
-    // that happens to be listed first is inline whatever the separator is, so
-    // a one-entry file could not tell "quoted inline" from "one per line".
+    // The specimen sits in the MIDDLE of three dropped entries, which is the
+    // only position that pins the property rather than something adjacent to
+    // it. A first title is inline whatever the separator is, and a last title
+    // picks up the list's trailing "." — either one can leave the line-count
+    // assertion below green while the notice's shape has in fact changed.
+    // Both were tried, and the mutation round is what showed them up.
     let repo = Repo::new("forged-sentinel");
-    let filler = "filler body line that exists only to spend bytes\n";
-    let mut content = block("DECOY", 1000, false);
+    let mut content = block("DECOY-A", 800, false);
     content.push_str(&format!("## {END_SENTINEL}\n"));
-    while content.len() < 2250 {
-        content.push_str(filler);
+    while content.len() < 1630 {
+        content.push_str("filler body line that exists only to spend bytes\n");
     }
-    content.push_str(&block("KEEPER", 3000, false));
+    content.push_str(&block("DECOY-B", 800, false));
+    content.push_str(&block("KEEPER", 3600, false));
     repo.write_lessons(&content);
 
     let kickoff = orchestrator_kickoff(&repo);
@@ -669,6 +672,11 @@ fn a_sentinel_shaped_heading_cannot_present_as_a_sentinel_line() {
     assert!(
         notice.contains(END_SENTINEL),
         "the specimen must actually reach the notice, quoted inline, got: {notice}"
+    );
+    assert!(
+        notice.contains(&format!("\"{END_SENTINEL}\"")),
+        "and it must be QUOTED — the quotes are half of why it cannot read as a sentinel line \
+         even if the list were ever re-shaped, got: {notice}"
     );
     assert!(!body.contains(END_SENTINEL), "the forged entry itself is evicted, not injected: {body}");
     // Pinned deliberately as a KNOWN property rather than left as a surprise:

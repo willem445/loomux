@@ -334,11 +334,11 @@ fn notice(dropped: &[&str], survivor_cut: bool) -> String {
     let mut list = String::new();
     let mut shown = 0usize;
     for title in dropped {
-        // Quoted, comma-joined, one line: see this function's doc — a title
-        // on a line of its own could present as a sentinel line, and
-        // `a_sentinel_shaped_heading_cannot_present_as_a_sentinel_line` pins
-        // that rather than trusting the comment.
-        let item = format!("{}\"{}\"", if shown == 0 { "" } else { ", " }, clip(title, TITLE_BYTE_CAP));
+        // TEMPORARY MUTATION — #696 finding 1, round 4. One title per line,
+        // unquoted. Round 3 ran but the forged title was last, so the list's
+        // trailing "." kept it off an exact sentinel line; the specimen is
+        // now mid-list. Reverted in the very next commit.
+        let item = format!("{}{}", if shown == 0 { "" } else { "\n" }, clip(title, TITLE_BYTE_CAP));
         if list.len() + item.len() > limit {
             break;
         }
