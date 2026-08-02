@@ -36636,6 +36636,15 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
             // advisor/process block — cosmetic only, never a capability (see
             // `workflow::Block::role_hint`).
             "role_hint": b.role_hint,
+            // #687: the block's RESOLVED knobs (these rows have been through
+            // `clamped()` above), because the preview's job is to state the whole
+            // spawn and a thinking level is part of it. It is also what makes the
+            // trust argument for letting a repo file pin `effort:` on the
+            // ORCHESTRATOR block (doc/design/workflows.md) true rather than
+            // aspirational: that argument rests on the human being shown every
+            // block's resolved value here, before the toggle that reads the file.
+            "effort": b.effort,
+            "context": b.context,
             // What the human is really being asked to consent to: whether this
             // block carries repo-authored instructions for the agent.
             //

@@ -55,7 +55,9 @@ import {
   resolveShellKind,
   isContentKind,
 } from "./panesetup";
-import { discoverGitBash } from "./pty";
+import { agentCliKnobs, discoverGitBash } from "./pty";
+import { modelLabel } from "./modelnames";
+import { knobState, knobValue, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
 import { ftRootIsDir } from "./fileapi";
 import {
   AGENTS,
@@ -223,6 +225,11 @@ class ModelPicker {
   private sel: HTMLSelectElement;
   private custom: HTMLInputElement;
   private static CUSTOM = "__custom";
+  /** Fired whenever the effective model changes (#687): the context-window knob
+   *  is only available on models whose `[1m]` form the vendor documents, so the
+   *  knob row has to re-derive when this moves — including when a custom id is
+   *  typed, which is the case a plain `change` listener on the select misses. */
+  onChange: (() => void) | null = null;
 
   constructor() {
     this.root = document.createElement("div");
@@ -237,18 +244,25 @@ class ModelPicker {
     this.sel.addEventListener("change", () => {
       this.custom.hidden = this.sel.value !== ModelPicker.CUSTOM;
       if (!this.custom.hidden) this.custom.focus();
+      this.onChange?.();
     });
+    this.custom.addEventListener("input", () => this.onChange?.());
     this.root.append(this.sel, this.custom);
   }
 
-  /** Rebuild the options, keeping the current choice when still valid. */
-  setOptions(models: string[], fallback: string): void {
+  /** Rebuild the options, keeping the current choice when still valid. `cli` is
+   *  which CLI's vocabulary the ids belong to — an alias means what the CLI that
+   *  documents it says it means, and nothing on any other CLI (#687). */
+  setOptions(models: string[], fallback: string, cli = ""): void {
     const current = this.value || fallback;
     this.sel.replaceChildren(
       ...models.map((m) => {
         const o = document.createElement("option");
         o.value = m;
-        o.textContent = m;
+        // The VALUE stays the raw id — it is what `--model` receives. Only the
+        // label is prettified, and only where the name says something the id
+        // doesn't (modelnames.ts).
+        o.textContent = modelLabel(cli, m);
         return o;
       })
     );
@@ -328,7 +342,19 @@ export class WelcomeForm {
     key: OrchRole;
     cli: HTMLSelectElement;
     model: ModelPicker;
+    /** Thinking level / context window (#687). Empty value = the CLI's own
+     *  default, i.e. no flag and no model suffix — today's spawn, byte for byte. */
+    effort: HTMLSelectElement;
+    context: HTMLSelectElement;
   }[];
+  /** One `agent_cli_knobs` lookup per CLI per app run, memoized like `probes`.
+   *  `null` = the lookup failed or hasn't landed; every knob renders disabled
+   *  with a reason, which is the honest answer for "we don't know". */
+  private knobs = new Map<string, Promise<CliKnobs | null>>();
+  /** The last resolved capability record per CLI, for the synchronous paths
+   *  (`rolePicks`, submit) that must decide what a control's value MEANS without
+   *  awaiting anything. Absent = not known, which `knobState` disables. */
+  private knownKnobs = new Map<string, CliKnobs | null>();
   // Advanced orchestrator (#222): run the repo's `.loomux/workflow.yml` instead
   // of the four fixed roles. OFF by default — a workflow file arrives with a
   // `git clone`, so it takes effect only when the human opts in, having been
@@ -551,12 +577,28 @@ export class WelcomeForm {
     this.roleControls = ORCH_ROLES.map(({ key }) => {
       const cli = select(ORCH_CLIS.map((c) => [c.id, c.id]));
       const model = new ModelPicker();
+      // #687: thinking level + context window, per role. Both start empty ("CLI
+      // default") and are populated from `agent_cli_knobs` — a CLI that has no
+      // seam for one renders it disabled carrying the vendor's own reason, never
+      // hidden (a missing control reads as loomux having forgotten) and never
+      // silently ignored (the failure where a human sets a level and doesn't get
+      // one).
+      const effort = select([["", "CLI default"]]);
+      const context = select([["", "CLI default"]]);
+      effort.addEventListener("change", () => this.refreshRoster());
+      context.addEventListener("change", () => this.refreshRoster());
       cli.addEventListener("change", () => {
         this.applyRoleModels(key);
         this.updateAgentWarning();
         this.refreshRoster();
       });
-      return { key, cli, model };
+      // The context knob depends on the MODEL, not just the CLI (`haiku[1m]` is
+      // not an alias the vendor documents), so a model change re-derives it.
+      model.onChange = () => {
+        this.applyRoleKnobs(key);
+        this.refreshRoster();
+      };
+      return { key, cli, model, effort, context };
     });
     // Advanced orchestrator (#222). The checkbox is the whole opt-in; everything
     // below it is the human being shown what they are opting into, BEFORE the
@@ -604,18 +646,27 @@ export class WelcomeForm {
       field("Initial workers", this.workersInput),
       field("Max live agents", this.maxAgentsInput)
     );
-    // One row per role: [role label] CLI select + model picker.
-    const roleField = (label: string, cli: HTMLSelectElement, model: ModelPicker): HTMLElement => {
+    // One row per role: [role label] CLI select + model picker + the two model
+    // knobs (#687), which sit beside the model because that is what they modify.
+    const roleField = (
+      label: string,
+      cli: HTMLSelectElement,
+      model: ModelPicker,
+      effort: HTMLSelectElement,
+      context: HTMLSelectElement
+    ): HTMLElement => {
       const pair = document.createElement("div");
-      pair.className = "dlg-row";
-      pair.append(cli, model.root);
+      pair.className = "dlg-row role-row";
+      pair.append(cli, model.root, effort, context);
       return field(label, pair);
     };
     const guardRow2 = document.createElement("div");
     guardRow2.className = "dlg-field";
     for (const rc of this.roleControls) {
       const label = ORCH_ROLES.find((r) => r.key === rc.key)!.label;
-      guardRow2.append(roleField(`${label} — CLI + model`, rc.cli, rc.model));
+      guardRow2.append(
+        roleField(`${label} — CLI + model, thinking level, context`, rc.cli, rc.model, rc.effort, rc.context)
+      );
     }
     const guardRow3 = document.createElement("div");
     guardRow3.className = "dlg-row";
@@ -823,26 +874,107 @@ export class WelcomeForm {
   private applyRoleModels(role: OrchRole): void {
     const rc = this.roleControls.find((r) => r.key === role)!;
     const cli = this.orchCliFor(rc.cli.value);
-    rc.model.setOptions(cli.models, cli.defaults[role]);
+    rc.model.setOptions(cli.models, cli.defaults[role], cli.id);
+    this.applyRoleKnobs(role);
     void this.probe(cli.id).then((p) => {
       if (this.kind !== "orchestrator" || rc.cli.value !== cli.id) return;
       if (p.models.length) {
         // CLI-reported models first, curated suggestions appended.
         const merged = [...p.models, ...cli.models.filter((m) => !p.models.includes(m))];
-        rc.model.setOptions(merged, cli.defaults[role]);
+        rc.model.setOptions(merged, cli.defaults[role], cli.id);
+        this.applyRoleKnobs(role);
       }
     });
+  }
+
+  /** A CLI's knob capabilities, memoized per app run (the backend record is a
+   *  constant table, so one lookup is one lookup). */
+  private knobsFor(cli: string): Promise<CliKnobs | null> {
+    let p = this.knobs.get(cli);
+    if (!p) {
+      p = agentCliKnobs(cli).then((k) => {
+        this.knownKnobs.set(cli, k);
+        return k;
+      });
+      this.knobs.set(cli, p);
+    }
+    return p;
+  }
+
+  /** The effort/context state for a role as things stand RIGHT NOW — synchronous,
+   *  from whatever capability records have already resolved. Everything that has
+   *  to decide what a control's value means (the payload, the roster preview)
+   *  goes through this, so a knob whose CLI is unknown reads as "" rather than as
+   *  whatever the DOM still shows. */
+  private roleKnobState(role: OrchRole): KnobStates {
+    const rc = this.roleControls.find((r) => r.key === role)!;
+    const cli = this.orchCliFor(rc.cli.value);
+    const model = rc.model.value || cli.defaults[role];
+    return knobState(this.knownKnobs.get(cli.id) ?? null, cli.id, model);
+  }
+
+  /** Repopulate a role's two knob selects from its CLI's capability record and
+   *  its currently selected model.
+   *
+   *  A knob loomux cannot deliver is DISABLED with the vendor's reason on the
+   *  control (`title`) and in the one option it offers — never hidden, and never
+   *  quietly accepted-then-dropped. The selected value is reset to "" whenever it
+   *  is no longer offerable, which is the same rule `knobValue` enforces on the
+   *  payload: the two must agree or the form would show a level it isn't sending. */
+  private applyRoleKnobs(role: OrchRole): void {
+    const rc = this.roleControls.find((r) => r.key === role)!;
+    const cliId = this.orchCliFor(rc.cli.value).id;
+    void this.knobsFor(cliId).then(() => {
+      // The human may have moved the picker while the lookup was in flight.
+      if (this.kind !== "orchestrator" || this.orchCliFor(rc.cli.value).id !== cliId) return;
+      this.paintRoleKnobs(role);
+    });
+    this.paintRoleKnobs(role);
+  }
+
+  private paintRoleKnobs(role: OrchRole): void {
+    const rc = this.roleControls.find((r) => r.key === role)!;
+    const states = this.roleKnobState(role);
+    const paint = (sel: HTMLSelectElement, state: KnobState, what: string): void => {
+      const keep = knobValue(state, sel.value);
+      sel.replaceChildren();
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = state.enabled ? "CLI default" : `${what}: unavailable`;
+      sel.appendChild(none);
+      for (const v of state.values) {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = v;
+        sel.appendChild(o);
+      }
+      sel.value = keep;
+      sel.disabled = !state.enabled;
+      // The reason IS the UI here: "copilot reads effortLevel from
+      // ~/.copilot/settings.json" states a vendor fact, where a bare
+      // "unsupported" reads as loomux having forgotten.
+      sel.title = state.reason || `${what} for this role (empty = the CLI's own default).`;
+    };
+    paint(rc.effort, states.effort, "thinking level");
+    paint(rc.context, states.context, "context");
   }
 
   // ---------- advanced orchestrator: the roster preview (#222) ----------
 
   /** The launcher's per-role picks, as the roster resolver takes them. */
   private rolePicks(): RolePick[] {
-    return this.roleControls.map((rc) => ({
-      key: rc.key,
-      cli: this.orchCliFor(rc.cli.value).id,
-      model: rc.model.value || this.orchCliFor(rc.cli.value).defaults[rc.key],
-    }));
+    return this.roleControls.map((rc) => {
+      const states = this.roleKnobState(rc.key);
+      return {
+        key: rc.key,
+        cli: this.orchCliFor(rc.cli.value).id,
+        model: rc.model.value || this.orchCliFor(rc.cli.value).defaults[rc.key],
+        // Through `knobValue`, so the preview shows what the payload will carry
+        // and not what a control disabled under the human still displays (#687).
+        effort: knobValue(states.effort, rc.effort.value),
+        context: knobValue(states.context, rc.context.value),
+      };
+    });
   }
 
   /** The backend's read of a repo's workflow file, memoized per (repo, group CLI).
@@ -1249,11 +1381,12 @@ export class WelcomeForm {
       addRecentRepo(plan.repo);
       const groupCli = this.orchCliFor(this.agentSel.value);
       setDefaultAgent(groupCli.id);
-      const role = (key: OrchRole): { cli: string; model: string } => {
-        const rc = this.roleControls.find((r) => r.key === key)!;
-        const c = this.orchCliFor(rc.cli.value);
-        return { cli: c.id, model: rc.model.value || c.defaults[key] };
-      };
+      // One source for what each role will run, knobs included: `rolePicks` is
+      // already what the roster preview above consented the human to, and it has
+      // already run every knob through `knobValue`. Reading the controls a second
+      // time here is how a form comes to send something it never displayed.
+      const picks = new Map(this.rolePicks().map((p) => [p.key, p]));
+      const role = (key: OrchRole): RolePick => picks.get(key)!;
       const orch = role("orchestrator");
       const worker = role("worker");
       const reviewer = role("reviewer");
@@ -1284,6 +1417,20 @@ export class WelcomeForm {
           // invent a failure mode the engine doesn't have. The roster box has
           // already shown the human every finding.
           advancedOrchestrator: this.advancedInput.checked,
+          // #687. One optional object rather than eight more positional args on a
+          // command that already carries eighteen (slice A's wire shape). Every
+          // field empty is the pre-#687 payload in effect: the backend reads
+          // empty as "no knob", i.e. today's command line byte for byte.
+          roleKnobs: {
+            orchestratorEffort: orch.effort ?? "",
+            orchestratorContext: orch.context ?? "",
+            workerEffort: worker.effort ?? "",
+            workerContext: worker.context ?? "",
+            reviewerEffort: reviewer.effort ?? "",
+            reviewerContext: reviewer.context ?? "",
+            plannerEffort: planner.effort ?? "",
+            plannerContext: planner.context ?? "",
+          },
         },
       });
       return;

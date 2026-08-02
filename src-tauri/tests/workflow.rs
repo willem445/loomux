@@ -4402,6 +4402,40 @@ fn the_preview_surfaces_role_hint_for_the_launcher_chip() {
 }
 
 #[test]
+fn the_preview_reports_a_blocks_resolved_effort_and_context() {
+    // #687 slice B. The launcher's roster box is the consent surface, and the
+    // design-note argument for letting a repo file pin `effort:` on the
+    // ORCHESTRATOR block rests on it in as many words: the human is shown every
+    // block's resolved value BEFORE the toggle that reads the file. That is only
+    // true if the preview carries the knobs, so this pins that it does.
+    let repo = Repo::new().workflow(
+        "version: 1
+blocks:
+  - id: deep
+    kind: worker
+    cli: claude
+    model: opus
+    effort: xhigh
+    context: 1m
+  - id: quick
+    kind: worker
+    cli: claude
+",
+    );
+    let p = loomux_lib::orchestration::orch_workflow_preview(repo.path(), "claude".into());
+    assert_eq!(p["valid"], true, "the file must parse: {:?}", p["errors"]);
+    let blocks = p["blocks"].as_array().unwrap();
+    let deep = blocks.iter().find(|b| b["id"] == "deep").unwrap();
+    assert_eq!(deep["effort"], "xhigh");
+    assert_eq!(deep["context"], "1m");
+    // A block that pinned nothing reports nothing — empty, not absent and not a
+    // guess, so the launcher renders today's line rather than inventing a level.
+    let quick = blocks.iter().find(|b| b["id"] == "quick").unwrap();
+    assert_eq!(quick["effort"], "");
+    assert_eq!(quick["context"], "");
+}
+
+#[test]
 fn the_preview_shows_every_finding_and_absence_is_not_invalidity() {
     // A broken file is skipped, never fatal — so the launcher must be able to say
     // "you would get the built-in roster, and here is why", with EVERY problem at
