@@ -679,7 +679,7 @@ fn a_sentinel_shaped_heading_cannot_present_as_a_sentinel_line() {
     // injects verbatim, so a file could always put a sentinel-shaped line in
     // one; the framing, not string matching, is what carries the boundary.
     assert!(
-        kickoff.find(END_SENTINEL).unwrap() < sentinel_line_at(kickoff, END_SENTINEL),
+        kickoff.find(END_SENTINEL).unwrap() < sentinel_line_at(&kickoff, END_SENTINEL),
         "the quoted heading is expected to precede the real END line as a substring"
     );
 }
