@@ -9698,6 +9698,79 @@ fn the_spawn_tool_schema_states_the_explicit_class_contract() {
     );
 }
 
+#[test]
+fn a_bare_resume_of_an_unparseable_recorded_role_refuses_instead_of_defaulting() {
+    // rev-157 NB2: this PR's SECOND "never guess a class" enforcement point,
+    // and the one nothing pinned. A pre-#222 roster row records a role string
+    // and no block id, so a bare resume of it has to derive the class from that
+    // string — and when the string doesn't parse (a row written by a future
+    // build, a hand-edited or corrupted `agents.json`), the old code fell back
+    // to `kind`, which on a bare resume is the omitted-`kind` default: Worker.
+    // The most-privileged class, from a value nobody supplied and nobody could
+    // read.
+    //
+    // The failure this guards is a future one: swap the refusal back for
+    // `.unwrap_or(Role::Worker)` and every other test in this suite still
+    // passes, restoring the exact fail-open #544 exists to remove, on the path
+    // the change describes as exempt.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    // A roster row shaped exactly like the pre-#222 ones the inheritance path
+    // exists for — a role string, no block identity — whose role THIS build
+    // cannot parse.
+    let session = "7c9f2b10-2222-4222-8222-222222222222";
+    let record = AgentRecord {
+        id: "w-0".into(),
+        role: "supervisor".into(),
+        block: String::new(),
+        name: "an agent from a build that isn't this one".into(),
+        name_source: NameSource::default(),
+        session: Some(session.to_string()),
+        cwd: ".".into(),
+        status: "dead".into(),
+        updated_ms: 0,
+        task: String::new(),
+        branch: None,
+    };
+    fs::write(
+        reg.state_root().join(&g.id).join("agents.json"),
+        serde_json::to_string(&[record]).unwrap(),
+    )
+    .unwrap();
+
+    // The documented follow-up shape: resume_session + cwd, neither kind nor
+    // block — the one call that asks loomux to derive a class on its own.
+    let dir = tempfile::tempdir().unwrap();
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "resume_session": session,
+            "cwd": dir.path().to_string_lossy(),
+            "task": "follow-up",
+        },
+    })).unwrap();
+
+    assert_eq!(
+        out["isError"], true,
+        "an unreadable recorded role must be refused, not resolved to the privileged \
+         default: {out:?}"
+    );
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("#544"), "the refusal must cite the guardrail, got: {text}");
+    assert!(
+        text.contains("supervisor"),
+        "...and must name the role it could not read, so the operator can act on it: {text}"
+    );
+    assert!(
+        reg.list_agents(&g.id).as_array().unwrap().iter().all(|a| a["role"] != "worker"),
+        "and above all it must not have spawned a worker: {}",
+        reg.list_agents(&g.id)
+    );
+}
+
 // ---------- #190: resume_session prefix resolution ----------
 
 /// Write a synthetic roster (`agents.json`) directly, bypassing spawn/kill —
