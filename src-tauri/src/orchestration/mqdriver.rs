@@ -347,7 +347,7 @@ impl TargetRefusal {
 ///   `git::default_base_ref` falls through to when it cannot resolve anything,
 ///   and it is exactly the kind of plausible-looking string a security refusal
 ///   must not accept — see [`validate_target`].
-fn landable(name: &str) -> bool {
+pub(super) fn landable(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 200
         && name.is_ascii()

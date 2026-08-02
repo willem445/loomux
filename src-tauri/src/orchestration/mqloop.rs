@@ -1435,6 +1435,25 @@ pub fn drive(
     verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
 ) -> DriveReport {
     let mut rep = DriveReport::default();
+    // §4/§7: the recorded target is a string off disk, and **every** branch
+    // below interpolates it into a refspec — the batch fetch's
+    // `+refs/heads/<target>:…` runs long before `land_batch`'s own guard does.
+    // A record that is not a plain branch name is therefore a corrupt record,
+    // and §4's posture on those is to fail loudly rather than hand it to `git`
+    // and find out what happens. Observed, not theorised: with the guard absent
+    // an empty target fetched `+refs/heads/:refs/remotes/loomux-mq/target` and
+    // ran `gh pr create --base ` with an empty base. Checked once, here, so no
+    // branch added later can skip it.
+    let live = state.entries.iter().any(|e| !e.state().is_terminal());
+    if live && !super::mqdriver::landable(state.target.trim()) {
+        rep.backoff = true;
+        rep.audit(
+            audit_action::STRANDED,
+            json!({ "reason": "the recorded target is not a branch name loomux will build a \
+                               refspec from", "target": quote(&state.target) }),
+        );
+        return rep;
+    }
     match state.batch.clone() {
         Some(batch) => advance_in_flight(r, state, cfg, gate, verdicts, batch, &mut rep),
         None => start_batch(r, state, cfg, gate, verdicts, &mut rep),
