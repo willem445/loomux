@@ -63,7 +63,7 @@ const MAX_QUOTED: usize = 200;
 /// Bounded because the sibling list goes into a comment on someone else's PR,
 /// and **stated** because a capped list that reads as complete is the failure
 /// `.loomux/lessons.md` files under "no silent caps".
-const MAX_SIBLINGS_LISTED: usize = 16;
+const MAX_SIBLINGS_LISTED: usize = 10_000; // MUTATION F8a (evidence, NOT shipped)
 
 // ── persistence (§11.3) ─────────────────────────────────────────────────────
 
@@ -107,7 +107,8 @@ pub fn load_state(group_dir: &Path) -> Result<MergeQueueState, StateError> {
     };
     let state: MergeQueueState =
         serde_json::from_str(&text).map_err(|e| StateError::Malformed(e.to_string()))?;
-    if !state.version_supported() {
+    // MUTATION F1 (evidence, NOT shipped): the schema-version gate removed.
+    if false && !state.version_supported() {
         return Err(StateError::Unsupported(state.version));
     }
     Ok(state)
@@ -122,7 +123,8 @@ pub fn load_state(group_dir: &Path) -> Result<MergeQueueState, StateError> {
 /// exactly the same "losing it loses queued work" property. One hardened writer,
 /// not two.
 pub fn store_state(group_dir: &Path, state: &MergeQueueState) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
+    // MUTATION F2 (evidence, NOT shipped): a newer builds unknown fields dropped on write.
+    let bytes = serde_json::to_vec_pretty(&MergeQueueState { version: state.version, target: state.target.clone(), entries: state.entries.clone(), batch: state.batch.clone(), extra: Default::default() }).map_err(|e| e.to_string())?;
     super::atomic_write(&state_path(group_dir), &bytes).map_err(|e| e.to_string())
 }
 
@@ -193,7 +195,8 @@ pub fn batch_fetch_argv(target: &str, prs: &[u64]) -> Vec<String> {
     let mut v = vec!["fetch".to_string(), "--no-tags".into(), REMOTE.into()];
     v.push(format!("+refs/heads/{target}:refs/remotes/loomux-mq/target"));
     for pr in prs {
-        v.push(format!("+refs/pull/{pr}/head:refs/remotes/loomux-mq/pr-{pr}"));
+        // MUTATION F3 (evidence, NOT shipped): a branch guess instead of the pull ref.
+        v.push(format!("+refs/heads/pr-{pr}:refs/remotes/loomux-mq/pr-{pr}"));
     }
     v
 }
@@ -298,6 +301,8 @@ impl ScratchBuild {
 /// sweep" applied to worktrees instead of refs. A leaked admin entry is cheap
 /// and inert; a pruned live workspace is somebody's work.
 fn remove_worktree(r: &dyn MqRunner, wt: &Path) -> Option<String> {
+    // MUTATION F6 (evidence, NOT shipped): teardown outcome swallowed again.
+    if true { let _ = (r, wt); return None; }
     if !wt.exists() {
         return None;
     }
@@ -351,7 +356,8 @@ fn build_in_worktree(
         if !out.ok() {
             // A conflicted merge leaves the worktree mid-merge; the teardown
             // removes it wholesale, so no `merge --abort` is needed.
-            return Err(BatchBuildError::Conflict { pr: *pr });
+            // MUTATION F4 (evidence, NOT shipped): a conflicted merge ignored.
+            let _ = pr;
         }
     }
 
@@ -380,6 +386,8 @@ fn build_in_worktree(
 /// entry whose head loomux never resolved has verdicts bound to nothing, so
 /// building it into a batch would test an object nobody approved.
 fn same_object(recorded: &str, fetched: &str) -> bool {
+    // MUTATION F5 (evidence, NOT shipped): the recorded-head check removed.
+    if true { return true; }
     let (recorded, fetched) = (recorded.trim(), fetched.trim());
     if recorded.is_empty() || fetched.is_empty() {
         return false;
@@ -531,7 +539,7 @@ pub fn culprit_comment(
         let named: Vec<String> = siblings
             .iter()
             .take(MAX_SIBLINGS_LISTED)
-            .map(|p| format!("#{p}"))
+            .map(|p| format!("closes #{p}"))  // MUTATION F7 (evidence, NOT shipped)
             .collect();
         s.push_str(&format!("- batched with: {}\n", named.join(", ")));
         if siblings.len() > MAX_SIBLINGS_LISTED {
@@ -794,7 +802,8 @@ pub fn observe_batch(
         BatchVerification::Unavailable { why } => BatchOutcome::Unverifiable { why: quote(&why) },
         BatchVerification::Pending => {
             let bound_ms = u64::from(checks_timeout_minutes).saturating_mul(60_000);
-            if elapsed_ms >= bound_ms {
+            // MUTATION F9 (evidence, NOT shipped): the checks_timeout bound never fires.
+            if false && elapsed_ms >= bound_ms {
                 BatchOutcome::Unverifiable {
                     why: format!(
                         "no terminal checks on batch PR #{draft_pr} within \
@@ -912,7 +921,8 @@ pub fn reconcile_batch(
 
     match why {
         None => {
-            report.resumed = true;
+            // MUTATION F10 (evidence, NOT shipped): a matching world never resumes.
+            report.resumed = false;
             report.notices.push(format!(
                 "[loomux] merge queue: resumed batch {} after a restart - scratch ref and draft PR #{} both still present.",
                 quote(&batch.id),
