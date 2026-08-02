@@ -475,6 +475,18 @@ so far:
   rule doesn't read as ceremony, and flags the resume exception; **Planning & scheduling**'s
   worktree bullet gains the `kind: "worker"` its example had been eliding.
 
+- **#581 slice A, the board carries a PR's base branch** — `orchestrator.md` only (no
+  other role writes the board). `Task` gained `pr_base`, and a field nobody is told to
+  set is dead weight, so the **task board** section gains one rule: record `pr_base` in
+  the same `upsert_task` call that records `pr`, using the branch name gh reports
+  (`gh pr view <n> --json baseRefName`). What it buys the human is a board that can tell
+  a merge into the default branch from a sub-PR into an integration branch, and relabel
+  Approve accordingly instead of warning about a default-branch merge gate on a PR that
+  isn't headed there. The rule says in the same breath that it is DISPLAY metadata and
+  nothing gates on it — the board is agent-writable, so a stale or wrong value misleads
+  a human rather than opening a merge, and every merge decision re-resolves the real
+  base ref live. The `list_tasks` tool bullet gains the new row field.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the

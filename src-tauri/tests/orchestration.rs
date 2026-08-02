@@ -6776,6 +6776,7 @@ fn task_summary_drops_notes_but_counts_them() {
         status: "in-progress".into(),
         issue: Some("#7".into()),
         pr: None,
+        pr_base: None,
         assignee: Some("w-2".into()),
         session: Some("sess-1".into()),
         notes: vec![note(1, "a"), note(2, "b"), note(3, "c")],
@@ -7092,6 +7093,7 @@ fn linked(id: &str, status: &str, deps: &[&str], related: &[&str]) -> Task {
         status: status.into(),
         issue: None,
         pr: None,
+        pr_base: None,
         assignee: None,
         session: None,
         notes: vec![],
@@ -7150,6 +7152,76 @@ fn pre_582_boards_load_unchanged_and_link_free_boards_stay_link_free() {
     assert!(text.contains("in-progress"), "the edit itself landed");
     assert!(!text.contains("\"deps\""), "a link-free board must not gain a deps key:\n{text}");
     assert!(!text.contains("\"related\""), "...nor a related key:\n{text}");
+}
+
+// ---------- #581 slice A: the PR's base branch on the task record ----------
+
+/// The compat half of #581: `pr_base` is additive, so a `tasks.json` written
+/// before it existed must load with the field simply absent. This is the whole
+/// prerequisite — `tasks()` reports a parse failure as an EMPTY board, so a
+/// non-defaulted field would silently erase every live board on upgrade rather
+/// than error, exactly the failure mode #582's own compat test was written for.
+#[test]
+fn pre_581_boards_load_with_pr_base_absent() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let path = reg.state_root().join(&g.id).join("tasks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Exactly what loomux wrote before #581 — a PR, and no pr_base key at all.
+    fs::write(
+        &path,
+        r##"[
+  {"id":"t-1","title":"Ship the parser","status":"pr","issue":"#7","pr":"#712","assignee":"w-2","session":null,"notes":[],"updated_ms":11}
+]"##,
+    )
+    .unwrap();
+
+    let tasks = reg.tasks(&g.id);
+    assert_eq!(tasks.len(), 1, "a pre-#581 board must still load — a parse failure reads as an EMPTY board");
+    assert_eq!(tasks[0].pr.as_deref(), Some("#712"), "the fields that were there are untouched");
+    assert_eq!(
+        tasks[0].pr_base, None,
+        "an absent pr_base deserializes to None (base UNKNOWN), never an error"
+    );
+    // And the compact row an orchestrator reads says the same thing, rather
+    // than inventing a base for a task that never recorded one.
+    let rows = reg.task_summaries(&g.id);
+    assert_eq!(rows[0].pr_base, None);
+}
+
+/// `pr_base` survives the write→read→summary path an orchestrator actually
+/// uses, and clears on the empty string like every other optional text field
+/// (`pr`'s idiom) — so "retargeted, base no longer known" is expressible
+/// without hand-editing the board.
+#[test]
+fn pr_base_round_trips_through_the_board_and_clears_on_empty() {
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let t = reg.upsert_task(&g.id, "orch-1", None, patch(Some("Stack a sub-PR"), None, None)).unwrap();
+
+    let mut p = patch(None, Some("pr"), None);
+    p.pr = Some("#712".into());
+    p.pr_base = Some("integration/581".into());
+    let saved = reg.upsert_task(&g.id, "orch-1", Some(&t.id), p).unwrap();
+    assert_eq!(saved.pr_base.as_deref(), Some("integration/581"));
+
+    // Durable, not just in the returned snapshot: re-read from tasks.json.
+    let path = reg.state_root().join(&g.id).join("tasks.json");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("integration/581"), "pr_base must reach the file:\n{text}");
+    let reread = reg.tasks(&g.id);
+    assert_eq!(reread[0].pr_base.as_deref(), Some("integration/581"));
+    // The projection the MCP board read goes through carries it too — a
+    // summary that dropped it would leave the orchestrator re-deriving the
+    // base it just recorded.
+    assert_eq!(reg.task_summaries(&g.id)[0].pr_base.as_deref(), Some("integration/581"));
+
+    // Empty string clears (same filter as `pr`); omitting the field leaves it.
+    let untouched = reg.upsert_task(&g.id, "orch-1", Some(&t.id), patch(None, None, Some("still open"))).unwrap();
+    assert_eq!(untouched.pr_base.as_deref(), Some("integration/581"), "omitted means untouched");
+    let clear = TaskPatch { pr_base: Some("   ".into()), ..Default::default() };
+    let cleared = reg.upsert_task(&g.id, "orch-1", Some(&t.id), clear).unwrap();
+    assert_eq!(cleared.pr_base, None, "a blank pr_base clears the field rather than storing whitespace");
 }
 
 #[test]

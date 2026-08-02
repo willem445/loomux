@@ -50,6 +50,11 @@ export interface OrchTask {
   status: string;
   issue?: string | null;
   pr?: string | null;
+  /** The branch `pr` targets (#581), as the orchestrator recorded it. Absent
+   *  on every pre-#581 task and on any board that doesn't record it — the
+   *  Approve relabel treats that as "base unknown" and stays conservative.
+   *  Display metadata: nothing here gates a merge. */
+  pr_base?: string | null;
   assignee?: string | null;
   session?: string | null;
   notes: OrchTaskNote[];

@@ -629,10 +629,48 @@ fn valid_worktree_name(name: &str) -> bool {
 /// unset, whose fetch failed, and which has no `origin/main`/`origin/master`.
 /// Every fallback drops a `worktree-base` breadcrumb naming the ref it landed on.
 fn default_base_ref(repo: &str) -> Result<String, String> {
+    if let Some(r) = resolve_default_base(repo, BaseLookup::CutWorktree) {
+        return Ok(r);
+    }
+    // No default branch resolvable anywhere: HEAD is the only ref we have. This
+    // re-enacts the pre-#204 HEAD cut, so the breadcrumb says so plainly — the
+    // agent branch may inherit the primary checkout, and an explicit `base`
+    // is the escape hatch.
+    crate::obs::breadcrumb(
+        "worktree-base",
+        &format!("no default branch resolvable for {repo}; cutting from HEAD (agent branch may inherit the primary checkout)"),
+    );
+    Ok("HEAD".to_string())
+}
+
+/// Why the ladder below is being walked (#581). The preference order is one
+/// definition for both callers — what differs is that CUTTING a worktree may
+/// spend the network to be right (a stale base produces a branch cut from the
+/// wrong place), while a DISPLAY read must not: it runs on a UI command path,
+/// where a `git fetch` would both block the call and mutate remote-tracking
+/// refs as the side effect of a read.
+#[derive(Clone, Copy, PartialEq)]
+enum BaseLookup {
+    /// `git worktree add`'s start-point: may fetch and repair `origin/HEAD`,
+    /// and drops a `worktree-base` breadcrumb for every fallback it takes.
+    CutWorktree,
+    /// A read-only "what is this repo's default branch" lookup: local refs
+    /// only — no fetch, no `set-head` repair, and no breadcrumbs (their wording
+    /// is about cutting a branch, which a display read is not doing).
+    Display,
+}
+
+/// The shared default-branch ladder: the remote's advertised default, then
+/// `origin/main`/`origin/master`, then local `main`/`master`, then the
+/// configured `init.defaultBranch`. `None` means nothing resolved, and each
+/// caller decides what that means — a worktree cut falls back to HEAD; a
+/// display read says "unknown" rather than guessing.
+fn resolve_default_base(repo: &str, how: BaseLookup) -> Option<String> {
+    let cutting = how == BaseLookup::CutWorktree;
     let has_remote = !run_git(repo, &["remote"]).unwrap_or_default().trim().is_empty();
     if has_remote {
         // Best-effort refresh; offline / auth failure is tolerated (breadcrumb).
-        if run_git(repo, &["fetch", "--prune", "origin"]).is_err() {
+        if cutting && run_git(repo, &["fetch", "--prune", "origin"]).is_err() {
             crate::obs::breadcrumb(
                 "worktree-base",
                 &format!("origin fetch failed for {repo}; resolving base from last-known refs"),
@@ -645,15 +683,17 @@ fn default_base_ref(repo: &str) -> Result<String, String> {
         // dangling symref falls through to the `set-head` repair rather than
         // returning a ref `worktree add` will reject (#204 review).
         if let Some(r) = symbolic_origin_head(repo) {
-            return Ok(r);
+            return Some(r);
         }
-        let _ = run_git(repo, &["remote", "set-head", "origin", "--auto"]);
-        if let Some(r) = symbolic_origin_head(repo) {
-            return Ok(r);
+        if cutting {
+            let _ = run_git(repo, &["remote", "set-head", "origin", "--auto"]);
+            if let Some(r) = symbolic_origin_head(repo) {
+                return Some(r);
+            }
         }
         for cand in ["origin/main", "origin/master"] {
             if run_git(repo, &["rev-parse", "--verify", "--quiet", cand]).is_ok() {
-                return Ok(cand.to_string());
+                return Some(cand.to_string());
             }
         }
     }
@@ -663,11 +703,13 @@ fn default_base_ref(repo: &str) -> Result<String, String> {
     // never claims a default branch the code didn't use.
     for cand in ["main", "master"] {
         if run_git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{cand}")]).is_ok() {
-            crate::obs::breadcrumb(
-                "worktree-base",
-                &format!("no origin default for {repo}; cutting agent worktree from local {cand}"),
-            );
-            return Ok(cand.to_string());
+            if cutting {
+                crate::obs::breadcrumb(
+                    "worktree-base",
+                    &format!("no origin default for {repo}; cutting agent worktree from local {cand}"),
+                );
+            }
+            return Some(cand.to_string());
         }
     }
     if let Ok(cfg) = run_git(repo, &["config", "init.defaultBranch"]) {
@@ -675,22 +717,47 @@ fn default_base_ref(repo: &str) -> Result<String, String> {
         if !cfg.is_empty()
             && run_git(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{cfg}")]).is_ok()
         {
-            crate::obs::breadcrumb(
-                "worktree-base",
-                &format!("no origin default for {repo}; cutting agent worktree from local {cfg}"),
-            );
-            return Ok(cfg.to_string());
+            if cutting {
+                crate::obs::breadcrumb(
+                    "worktree-base",
+                    &format!("no origin default for {repo}; cutting agent worktree from local {cfg}"),
+                );
+            }
+            return Some(cfg.to_string());
         }
     }
-    // No default branch resolvable anywhere: HEAD is the only ref we have. This
-    // re-enacts the pre-#204 HEAD cut, so the breadcrumb says so plainly — the
-    // agent branch may inherit the primary checkout, and an explicit `base`
-    // is the escape hatch.
-    crate::obs::breadcrumb(
-        "worktree-base",
-        &format!("no default branch resolvable for {repo}; cutting from HEAD (agent branch may inherit the primary checkout)"),
-    );
-    Ok("HEAD".to_string())
+    None
+}
+
+/// The repo's default BRANCH NAME — `main`, never `origin/main` — or `None`
+/// when it does not resolve from local refs (#581).
+///
+/// DISPLAY ONLY, and deliberately cheap: it walks [`resolve_default_base`]'s
+/// preference ladder against refs already on disk, so it never touches the
+/// network and never writes a ref. Callers get a *name* because that is the
+/// vocabulary a PR's base ref is in (`gh pr view --json baseRefName` reports
+/// `main`), and the two are only comparable in the same vocabulary.
+///
+/// **What skipping the network costs: this answer is only as fresh as the last
+/// fetch somebody else happened to run.** It reads `origin/HEAD` and the local
+/// branches as they sit in the clone, so a remote default-branch rename
+/// (`master` → `main` is the usual one) is invisible here until something
+/// fetches, and until then this returns the OLD name — confidently, and with no
+/// signal that it is stale (rev-157 NB2). The name reads like an authority; it
+/// isn't one. Use it where a wrong answer costs a wrong sentence on screen, and
+/// never where a wrong answer would authorize something — anything deciding
+/// whether a merge may happen resolves the default branch live instead (the gh
+/// shim's own `gh repo view --json defaultBranchRef`).
+///
+/// `None` is a real answer — "this loomux cannot tell you the default branch" —
+/// and callers must treat it as unknown rather than substituting a guess. It is
+/// not, however, the only way this can be wrong: a stale name (above) is
+/// non-`None` and wrong, and it errs toward calling a default-branch merge
+/// something else. Callers arrange to reduce that, not to eliminate it.
+pub fn default_branch_name(repo: &str) -> Option<String> {
+    let r = resolve_default_base(repo, BaseLookup::Display)?;
+    let name = r.strip_prefix("origin/").unwrap_or(&r).trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// The remote's advertised default branch as a local ref (e.g. `origin/main`),

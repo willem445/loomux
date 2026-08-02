@@ -66,17 +66,74 @@ export function gateExitsMessage(): string {
  *  (#197/#222) — it never opens an armed workflow gate — so this is `false`
  *  whenever a gate is armed and the task carries a PR, regardless of whether
  *  the gate is (today) satisfiable. `reason` is short enough for a button
- *  label; call `gateExitsMessage()` for the longer tooltip. */
+ *  label; call `gateExitsMessage()` for the longer tooltip.
+ *
+ *  THE REASON IS THREE-WAY on the PR's base branch (#581), and the branching is
+ *  about accuracy, never about permission — `ok` is `false` in all three cases
+ *  and no merge is opened by any of them:
+ *
+ *  - **base unknown** (no `pr_base` recorded, or no resolved `default_branch`
+ *    to compare it against) → the conservative default-branch wording. Every
+ *    pre-#581 task is in this case, and so is any board whose orchestrator
+ *    doesn't record the field.
+ *  - **base IS the default branch** → the same wording, now actually earned.
+ *  - **base is some other branch** (a sub-PR into an integration branch) → says
+ *    so, and names it. The old text ("won't merge — gate needs …") implied the
+ *    human's grant is what this PR is waiting on; it isn't. The human gate is
+ *    default-branch-only (the shim `exec`s a non-default merge straight
+ *    through), so what actually holds a sub-PR is the workflow gate's verdicts.
+ *
+ *  What does NOT change: the gate applies to EVERY merge of the PR wherever it
+ *  lands (shim property 2), so an unsatisfiable gate still outranks all of this,
+ *  and `pr_base` is agent-written display metadata that nothing enforces on.
+ *
+ *  The wrong-in-the-reassuring-direction case — a merge into the default branch
+ *  labelled a harmless sub-PR — is what the comparison below is arranged to
+ *  avoid, but it is REDUCED, not eliminated (rev-157 NB1). Two known residuals
+ *  survive: `default_branch` is resolved from local refs, so a clone that never
+ *  fetched a remote default-branch rename compares against the old name; and
+ *  `pr_base` is agent-written, so a value in some vocabulary neither side
+ *  expects reads as "a different branch". Nothing gates on either — the shim
+ *  resolves base and default live at merge time — so the cost of both is a
+ *  misleading sentence, never an authorization. */
 export function approveWillMerge(
   status: WorkflowStatus,
-  task: { pr?: string | null }
+  task: { pr?: string | null; pr_base?: string | null }
 ): { ok: boolean; reason?: string } {
   const gate = status.gate;
   if (!gate || !task.pr) return { ok: true };
   if (!gate.satisfiable) {
     return { ok: false, reason: "gate unsatisfiable from this session — merges will bounce" };
   }
+  const base = task.pr_base ? baseBranchName(task.pr_base) : undefined;
+  const def = status.default_branch?.trim();
+  if (base && def && base !== def) {
+    return {
+      ok: false,
+      reason: `sub-PR into ${base} — the orchestrator merges it once the gate verdicts land`,
+    };
+  }
   return { ok: false, reason: `won't merge — gate needs ${gate.reviewers.join("/")}` };
 }
+
+/** A recorded base ref in the vocabulary `default_branch` speaks: trimmed, and
+ *  with one leading `origin/` removed (`origin/main` → `main`).
+ *
+ *  `pr_base` is agent-written and `gh pr view --json baseRefName` reports a bare
+ *  branch name, but "the base ref" is equally naturally written `origin/main` —
+ *  and against a resolved default of `main` that mismatch produced "sub-PR into
+ *  origin/main" for a PR heading straight at the default branch (rev-157 NB1),
+ *  the one direction worth spending code on. One leading segment only: an
+ *  `origin/origin/main` is a typo, not a vocabulary, and quietly repairing it
+ *  would be guessing rather than normalizing.
+ *
+ *  Case is deliberately NOT folded. Git refs are case-sensitive, so `Main` and
+ *  `main` really are two branches, and folding would make a typo read as the
+ *  default branch — which is the reassuring direction, the opposite of what the
+ *  `origin/` strip is for. */
+const baseBranchName = (ref: string): string => {
+  const t = ref.trim();
+  return t.startsWith("origin/") ? t.slice("origin/".length).trim() : t;
+};
 
 export type { WorkflowGateStatus, WorkflowStatus };
