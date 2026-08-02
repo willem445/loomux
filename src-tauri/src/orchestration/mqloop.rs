@@ -786,7 +786,9 @@ pub fn requeue_survivors(state: &mut MergeQueueState, survivors: &[u64]) {
 /// while a scratch ref and a draft PR built for the old target are still on the
 /// remote.
 fn drained(state: &MergeQueueState) -> bool {
-    state.batch.is_none() && !state.entries.iter().any(|e| !e.state().is_terminal())
+    // MUTATION (rev N1, temporary): the batch half dropped on purpose, to make
+    // the case-(2) pin fail. Reverted in the next commit.
+    !state.entries.iter().any(|e| !e.state().is_terminal())
 }
 
 /// Release the target if the queue has drained (§4: a target is a property of
