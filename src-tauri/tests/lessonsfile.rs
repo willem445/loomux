@@ -541,7 +541,8 @@ fn the_notice_carrying_untrusted_headings_sits_strictly_between_the_sentinels() 
         begin_at < canary_at && canary_at < end_at,
         "the dropped-entry notice must sit strictly inside the untrusted region"
     );
-    let (notice, _body) = notice_and_body(&injected_region(&kickoff));
+    let region = injected_region(&kickoff);
+    let (notice, _body) = notice_and_body(&region);
     assert!(notice.contains("UNTRUSTED-CANARY-HEAD"), "the heading must appear in the notice, got: {notice}");
 }
 
