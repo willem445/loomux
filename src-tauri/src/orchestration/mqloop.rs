@@ -47,15 +47,19 @@
 //! function **plus the landing verb**, exactly as §8 warns.
 
 use super::mergeq::{
-    bisect_step, scratch_branch, BatchRecord, BisectStep, EntryState, InvalidTransition,
-    MergeQueueState, QueueEntry,
+    bisect_step, recheck_gate, scratch_branch, BatchRecord, BisectStep, EntryState, GateSpec,
+    InvalidTransition, MergeQueueState, PrObservation, QueueEntry, MAX_ENTRIES,
 };
 use super::mergeqview::MERGE_QUEUE_FILE;
 use super::mqdriver::{
-    as_args, classify_checks, pr_checks_argv, scratch_exists, BatchVerification, MqRunner, REMOTE,
+    as_args, classify_checks, pr_checks_argv, pr_ci_green, resolve_and_validate_target,
+    scratch_exists, BatchVerification, MqRunner, REMOTE,
 };
 use super::notify::sanitize_gh_text;
+use super::workflow::{body_digest, BlockId, ReviewVerdict};
 use serde::Deserialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Cap on any single gh-sourced string this module formats into a PR comment or
@@ -1024,4 +1028,199 @@ pub fn unverifiable_notice(batch_id: &str, draft_pr: Option<u64>, why: &str) -> 
         quote(batch_id),
         quote(why)
     )
+}
+
+// ── the three queue operations behind §11.1's MCP tools (slice E) ───────────
+//
+// The MCP layer is a JSON shim and the registry resolves paths; the decisions
+// live here, so `queue_merge`'s refusal set is one closed vocabulary in one
+// place rather than a set of `if`s spread across `mcp.rs`.
+
+/// §11.1's **closed** refusal vocabulary. Every refusal an agent can see is one
+/// of these eight strings — nothing constructs a ninth, and nothing returns a
+/// free-text reason, because an open vocabulary is one a caller cannot branch on
+/// and a human cannot grep for.
+pub mod refusal {
+    pub const BASE_IS_DEFAULT: &str = "base-is-default";
+    pub const BASE_UNVERIFIABLE: &str = "base-unverifiable";
+    pub const BASE_NOT_TARGET: &str = "base-not-target";
+    pub const GATE_NOT_MET: &str = "gate-not-met";
+    pub const GATE_NOT_CONFIGURED: &str = "gate-not-configured";
+    pub const ALREADY_QUEUED: &str = "already-queued";
+    pub const QUEUE_FULL: &str = "queue-full";
+    pub const QUEUE_DISABLED: &str = "queue-disabled";
+    /// `cancel_queued_merge` only: the PR is not in the queue, or is already
+    /// terminal. Not in §11.1's `queue_merge` list because it cannot arise
+    /// there — kept beside them so the whole vocabulary is one place.
+    pub const NOT_QUEUED: &str = "not-queued";
+}
+
+/// What `queue_merge` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// Queued, with its 1-based position among the entries that are still live.
+    Queued { position: usize },
+    /// Refused, with one of [`refusal`]'s strings.
+    Refused { reason: &'static str },
+}
+
+/// **Enqueue a PR** (§11.1, §7 layer 1).
+///
+/// Refusal order is deliberate, and it is cheap-and-local before
+/// expensive-and-remote — but that is the *secondary* reason. The primary one is
+/// that each check answers a question the next one presupposes:
+///
+/// 1. **`queue-disabled`** — an absent `merge_queue:` block means the feature is
+///    off and behavior is byte-for-byte unchanged (§12). Nothing else is even
+///    meaningful.
+/// 2. **`already-queued`** — a second enqueue of the same PR is a caller
+///    mistake, not a state change, and answering it needs no lookups.
+/// 3. **`queue-full`** — the §10 cap, so `merge_queue.json` stays bounded under
+///    an enqueue storm.
+/// 4. **The constraint-7 refusals**, from **live** lookups (§7.1): the PR's base
+///    and the repo default, resolved through the real `gh`. A failed lookup
+///    refuses (`base-unverifiable`) — unknown is never treated as safe.
+/// 5. **The gate** (§6). Last because it is the most expensive and because a PR
+///    whose base is wrong should not have its reviewers reported on.
+///
+/// `asserted_target` is §4's **assertion, not a selection**: present, it must
+/// equal what the base resolves to, and a mismatch refuses. It can narrow the
+/// outcome, never widen it.
+///
+/// The target is **established by the first successful enqueue** from that PR's
+/// live base (§4) — never configured, never inferred from a caller's argument.
+#[allow(clippy::too_many_arguments)]
+pub fn enqueue(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    pr: u64,
+    asserted_target: Option<&str>,
+    enabled: bool,
+    gate: &GateSpec,
+    verdicts: &BTreeMap<BlockId, ReviewVerdict>,
+    now_ms: u64,
+) -> EnqueueOutcome {
+    let refuse = |reason| EnqueueOutcome::Refused { reason };
+    if !enabled {
+        return refuse(refusal::QUEUE_DISABLED);
+    }
+    if state.entry(pr).map(|e| !e.state().is_terminal()).unwrap_or(false) {
+        return refuse(refusal::ALREADY_QUEUED);
+    }
+    if state.entries.iter().filter(|e| !e.state().is_terminal()).count() >= MAX_ENTRIES {
+        return refuse(refusal::QUEUE_FULL);
+    }
+
+    // §7.1: live, through the real `gh`. `current_target` is whatever the queue
+    // has established so far — empty until the first successful enqueue.
+    let current = (!state.target.trim().is_empty()).then(|| state.target.clone());
+    let (target, facts) =
+        match resolve_and_validate_target(r, pr, current.as_deref(), asserted_target) {
+            Ok(v) => v,
+            Err(e) => return refuse(e.code()),
+        };
+
+    // §6. `ci_green` is read unconditionally here, unlike at landing: enqueue
+    // happens once per PR rather than once per sub-PR per batch, so the
+    // round-trip is not worth a branch that could get the condition wrong.
+    let observed = PrObservation {
+        body_digest: Some(body_digest(&facts.body)),
+        ci_green: pr_ci_green(r, pr),
+    };
+    let recheck = recheck_gate(gate, verdicts, Some(facts.head.as_str()), &observed);
+    if let Some(code) = recheck.refusal_code() {
+        return refuse(match code {
+            "gate-not-configured" => refusal::GATE_NOT_CONFIGURED,
+            _ => refusal::GATE_NOT_MET,
+        });
+    }
+
+    // Established here, and only here (§4).
+    state.target = target;
+    // A prior terminal entry for this PR is replaced rather than accumulated:
+    // §4 is explicit that a kicked-back PR comes back as a NEW entry, so its
+    // corpse must not sit in the file forever.
+    state.entries.retain(|e| e.pr != pr || !e.state().is_terminal());
+    state.entries.push(QueueEntry::new(pr, &facts.head, now_ms));
+    let position = state.entries.iter().filter(|e| !e.state().is_terminal()).count();
+    EnqueueOutcome::Queued { position }
+}
+
+/// What `cancel_queued_merge` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Cancelled { was: EntryState },
+    Refused { reason: &'static str },
+}
+
+/// **Cancel a queued PR** (§11.1).
+///
+/// A cancel reaches any **non-terminal** entry (§4) — including one inside an
+/// in-flight batch, which §10 says abandons and rebuilds that batch. Cancelling
+/// something already terminal is `not-queued` rather than a silent success: an
+/// agent that thinks it stopped a landing which had already happened would be
+/// told the wrong thing.
+///
+/// The batch record is deliberately **not** touched here. Whether an in-flight
+/// batch is abandoned is the driver loop's call (it must also clean up the
+/// scratch ref and the draft PR), and doing half of it from a tool call would
+/// leave the world and the record disagreeing.
+pub fn cancel(state: &mut MergeQueueState, pr: u64) -> CancelOutcome {
+    let Some(was) = state.entry(pr).map(|e| e.state()) else {
+        return CancelOutcome::Refused { reason: refusal::NOT_QUEUED };
+    };
+    if was.is_terminal() {
+        return CancelOutcome::Refused { reason: refusal::NOT_QUEUED };
+    }
+    match advance_entry(state, pr, EntryState::Cancelled) {
+        Ok(Some(_)) => CancelOutcome::Cancelled { was },
+        // Unreachable while `transition` allows every non-terminal → cancelled,
+        // and still handled: a refusal the state machine invents is reported,
+        // never rendered as a success.
+        _ => CancelOutcome::Refused { reason: refusal::NOT_QUEUED },
+    }
+}
+
+/// **`merge_queue_status()`'s wire shape** (§11.1).
+///
+/// Deliberately not `mergeqview::project`: that is slice F's projection for the
+/// *chrome*, with its own closed `status` vocabulary for rendering. This is the
+/// agent-facing contract §11.1 fixes, and collapsing the two would make a UI
+/// tweak a change to a tool's output.
+///
+/// `since_ms` is an **age**, not a timestamp: an agent reasoning about "has this
+/// been sitting too long" should not have to know what clock the host is on.
+pub fn status_view(state: &MergeQueueState, enabled: bool, now_ms: u64) -> Value {
+    let entries: Vec<Value> = state
+        .entries
+        .iter()
+        .filter(|e| !e.state().is_terminal())
+        .map(|e| {
+            let mut o = serde_json::Map::new();
+            o.insert("pr".into(), Value::from(e.pr));
+            o.insert("state".into(), Value::from(e.state().as_str()));
+            o.insert("since_ms".into(), Value::from(now_ms.saturating_sub(e.enqueued_ms)));
+            if let Some(why) = &e.blocked_reason {
+                o.insert("blocked_reason".into(), Value::from(quote(why)));
+            }
+            Value::Object(o)
+        })
+        .collect();
+    let mut out = serde_json::Map::new();
+    out.insert("enabled".into(), Value::from(enabled));
+    out.insert("target".into(), Value::from(state.target.clone()));
+    out.insert("entries".into(), Value::Array(entries));
+    if let Some(b) = &state.batch {
+        out.insert(
+            "batch".into(),
+            serde_json::json!({
+                "id": quote(&b.id),
+                "prs": b.prs,
+                "state": b.state().as_str(),
+                "draft_pr": b.draft_pr,
+                "scratch_sha": quote(&b.scratch_sha),
+            }),
+        );
+    }
+    Value::Object(out)
 }

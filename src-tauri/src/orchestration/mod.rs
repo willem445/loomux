@@ -33712,6 +33712,123 @@ impl OrchRegistry {
     }
 
     /// Deliver to the group's orchestrator (worker reports, exit notices).
+    // ---------- the bisecting merge queue: agent-facing operations (#581 E) ----------
+
+    /// Whether this group's repo declares `merge_queue: enabled: true` (§11.2).
+    ///
+    /// Read from the repo's workflow file at call time rather than cached: the
+    /// file is human-authored policy a human may edit mid-session, and the
+    /// existing gate already reloads on change (`reload_merge_gate_if_changed`).
+    /// A parse failure reads as **disabled** — the loud `workflow-invalid` path
+    /// already reports the parse itself, and a queue running on a file loomux
+    /// could not read is a queue nobody can reason about (§11.2).
+    fn merge_queue_enabled(&self, group: &str) -> bool {
+        let Some(repo) = self.group(group).map(|g| g.repo) else { return false };
+        matches!(workflow::load_workflow(&repo), Ok(Some(wf)) if wf.merge_queue.enabled)
+    }
+
+    /// The gate spec the queue re-enforces (§6), read through the same
+    /// `merge_gate` file the `gh` shim reads — never a second opinion.
+    fn merge_queue_gate(&self, group: &str) -> mergeq::GateSpec {
+        mergeq::GateSpec::read(fs::read_to_string(self.merge_gate_path(group)).ok().as_deref())
+    }
+
+    /// `queue_merge(pr, target?)` (§11.1). Wiring only: resolve the repo, the
+    /// gate and this PR's verdicts, hand them to `mqloop::enqueue`, audit, and
+    /// persist. Every decision is the driver module's.
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_merge(&self, group: &str, pr: u64, target: Option<&str>) -> Value {
+        let runner = match self.group(group).map(|g| g.repo) {
+            Some(repo) => mqdriver::runner_for(std::path::Path::new(&repo)),
+            None => return json!({ "refused": mqloop::refusal::QUEUE_DISABLED }),
+        };
+        self.queue_merge_with(group, pr, target, &runner)
+    }
+
+    /// The injectable seam — same reason as `merge_queue_reconcile_with`: it is
+    /// what lets an integration test drive the whole registry path without
+    /// spawning `gh` (constraint 3), which is what makes the `pub` honest.
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_merge_with(
+        &self,
+        group: &str,
+        pr: u64,
+        target: Option<&str>,
+        runner: &dyn mqdriver::MqRunner,
+    ) -> Value {
+        let enabled = self.merge_queue_enabled(group);
+        let dir = self.group_dir(group);
+        let mut state = match mqloop::load_state(&dir) {
+            Ok(s) => s,
+            Err(e) => {
+                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
+                    json!({ "pr": pr, "reason": "unusable merge_queue.json", "detail": format!("{e:?}") }));
+                return json!({ "refused": mqloop::refusal::QUEUE_DISABLED });
+            }
+        };
+        let gate = self.merge_queue_gate(group);
+        let verdicts = self.verdict_map(group, pr);
+        let outcome =
+            mqloop::enqueue(runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms());
+        match outcome {
+            mqloop::EnqueueOutcome::Queued { position } => {
+                if let Err(e) = mqloop::store_state(&dir, &state) {
+                    // The write is what makes the enqueue durable, so a failed
+                    // write is a failed enqueue — reported as such rather than
+                    // returning a `queued: true` the next restart would forget.
+                    self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
+                        json!({ "pr": pr, "reason": "merge_queue.json could not be written", "detail": e }));
+                    return json!({ "refused": mqloop::refusal::QUEUE_DISABLED });
+                }
+                self.audit(group, "loomux", mqloop::audit_action::ENQUEUED,
+                    json!({ "pr": pr, "target": state.target, "position": position }));
+                json!({ "queued": true, "position": position })
+            }
+            mqloop::EnqueueOutcome::Refused { reason } => {
+                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
+                    json!({ "pr": pr, "reason": reason }));
+                json!({ "refused": reason })
+            }
+        }
+    }
+
+    /// `merge_queue_status()` (§11.1). Read-only; never writes, so a status call
+    /// cannot conjure a `merge_queue.json` (which would collapse slice F's
+    /// `absent` state, the same trap the reconcile write is gated against).
+    #[doc(hidden)] // pub for integration tests
+    pub fn merge_queue_status(&self, group: &str) -> Value {
+        let enabled = self.merge_queue_enabled(group);
+        match mqloop::load_state(&self.group_dir(group)) {
+            Ok(s) => mqloop::status_view(&s, enabled, now_ms()),
+            // An unreadable file is a FACT, and the one thing status must never
+            // do is let it read as "nothing queued" — the same posture
+            // `mergeqview::merge_queue_view` takes for the chrome.
+            Err(e) => json!({ "enabled": enabled, "unreadable": format!("{e:?}") }),
+        }
+    }
+
+    /// `cancel_queued_merge(pr)` (§11.1).
+    #[doc(hidden)] // pub for integration tests
+    pub fn cancel_queued_merge(&self, group: &str, pr: u64) -> Value {
+        let dir = self.group_dir(group);
+        let Ok(mut state) = mqloop::load_state(&dir) else {
+            return json!({ "refused": mqloop::refusal::NOT_QUEUED });
+        };
+        match mqloop::cancel(&mut state, pr) {
+            mqloop::CancelOutcome::Cancelled { was } => {
+                if let Err(e) = mqloop::store_state(&dir, &state) {
+                    self.audit(group, "loomux", mqloop::audit_action::CANCELLED,
+                        json!({ "pr": pr, "persisted": false, "detail": e }));
+                    return json!({ "refused": mqloop::refusal::NOT_QUEUED });
+                }
+                self.audit(group, "loomux", mqloop::audit_action::CANCELLED,
+                    json!({ "pr": pr, "from": was.as_str() }));
+                json!({ "cancelled": true })
+            }
+            mqloop::CancelOutcome::Refused { reason } => json!({ "refused": reason }),
+        }
+    }
+
     // ---------- the bisecting merge queue (#581 slice D2) ----------
 
     /// Reconcile a group's merge queue against reality after a restart
