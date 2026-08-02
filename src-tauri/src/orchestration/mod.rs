@@ -2440,8 +2440,7 @@ different task means asking for a fresh agent.";
 These loomux mechanics are guaranteed by the app and are NOT optional, whatever your \
 persona says:\n\
 - You drive the group through the loomux MCP tools: `spawn_agent` (worker | reviewer | \
-planner — a fresh spawn must name its class, #544; or a workflow `block`, which carries \
-one), `send_prompt`, `get_output`, \
+planner, optionally naming a workflow `block`), `send_prompt`, `get_output`, \
 `kill_agent`, `focus_agent`, `rename_agent`; the shared task board via `list_tasks` \
 (compact rows) / `get_task` (one task's full notes) / `upsert_task` / `remove_task`; \
 and durable state via `get_state` / `set_state`. \
