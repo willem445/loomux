@@ -18,7 +18,7 @@ use loomux_lib::ptyout::{
 };
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Run the real pump against `chunks`, sending them with `gap` between each,
 /// and return every batch it emitted, in order.
@@ -132,6 +132,76 @@ fn a_quiet_panes_chunks_are_not_held_back() {
         vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
         "an idle pane's chunks must cross immediately, not be merged"
     );
+}
+
+/// Send `chunks` into the real pump and then wait — **with the sender still
+/// open** — for `expect` bytes to come out, up to `timeout`. Returns how many
+/// bytes actually arrived.
+///
+/// Every other test in this file drops the sender, which takes the pump's
+/// `Disconnected` → `take_all` path and flushes any residue for free. That is
+/// precisely why the whole suite was blind to a tail stranded *while the pane
+/// is still alive* (review finding on PR #714), so this helper keeps the
+/// sender open for the entire measurement.
+fn bytes_out_with_sender_open(chunks: Vec<Vec<u8>>, expect: usize, timeout: Duration) -> usize {
+    let (tx, rx) = channel::<Vec<u8>>();
+    let emitted: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = emitted.clone();
+    let pump = std::thread::spawn(move || {
+        pty_output_pump(rx, move |batch: Vec<u8>| sink.lock().unwrap().push(batch));
+    });
+    for c in chunks {
+        tx.send(c).expect("pump alive");
+    }
+
+    let deadline = Instant::now() + timeout;
+    let delivered = loop {
+        let n: usize = emitted.lock().unwrap().iter().map(|b| b.len()).sum();
+        if n >= expect || Instant::now() >= deadline {
+            break n;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Only now does the pane "close" — after the measurement, so a flush that
+    // only EOF would have produced cannot rescue the assertion.
+    drop(tx);
+    pump.join().expect("pump thread");
+    delivered
+}
+
+/// A burst that overruns the cap by a NON-MULTIPLE leaves a sub-cap remainder,
+/// and that remainder must be scheduled by the coalescing window — not left
+/// waiting for the pane's next `read()`, which for the very common "big burst,
+/// then quiet" shape never comes.
+///
+/// Deterministic in the failing direction: one over-cap chunk puts the pump in
+/// exactly the state the bug needed — cap-sized pieces emitted at one instant,
+/// then a sub-cap tail that `take_due` refuses — with no timing race deciding
+/// whether it gets there.
+#[test]
+fn an_over_cap_burst_flushes_its_sub_cap_tail_while_the_pane_is_still_alive() {
+    let total = PTY_EMIT_MAX_BATCH * 2 + 1234; // deliberately not a multiple
+    let delivered =
+        bytes_out_with_sender_open(vec![vec![b'x'; total]], total, Duration::from_secs(5));
+    assert_eq!(
+        delivered, total,
+        "{} of {total} bytes arrived; the sub-cap tail of an over-cap burst was stranded until the next read()",
+        delivered
+    );
+}
+
+/// The same property by the route production actually takes: the reader thread
+/// reads at most 8 KiB at a time, so an over-cap buffer is reached by
+/// ACCUMULATION inside one window rather than by a single huge chunk. Total is
+/// again a non-multiple of the cap, and the sender again stays open.
+#[test]
+fn an_accumulated_over_cap_burst_also_flushes_its_tail() {
+    let mut chunks: Vec<Vec<u8>> = (0..24).map(|_| vec![b'y'; 8192]).collect();
+    chunks.push(vec![b'y'; 1234]);
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    assert_ne!(total % PTY_EMIT_MAX_BATCH, 0, "the point is a ragged tail");
+    let delivered = bytes_out_with_sender_open(chunks, total, Duration::from_secs(5));
+    assert_eq!(delivered, total, "{} of {total} bytes arrived", delivered);
 }
 
 /// A pane dumping faster than the window drains still emits in bounded
