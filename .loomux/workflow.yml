@@ -28,7 +28,7 @@ blocks:
     name: Orchestrator
     kind: orchestrator
     cli: claude
-    model: opus
+    model: fable
 
   # Design-first features get a plan before code (a planner's issue-comment
   # plan is the cheapest gate a wrong split can hit).
