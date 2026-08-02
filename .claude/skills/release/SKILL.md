@@ -194,4 +194,10 @@ What's different from a stable release:
   content (skip mentioning the `.msi` download).
 
 Stable tags (no hyphen) are unaffected by any of the above — same asset
-count (9), same `make_latest` (default `true`), same npm publish.
+count (9), same npm publish, and `promote` explicitly sets
+**`make_latest: true`** in a second, follow-up API call after the release
+is confirmed non-draft (not GitHub's default — a `make_latest=true` sent
+in the *same* call as `draft=false` can be silently dropped, since GitHub
+still sees the release as a draft at that instant; see the comment above
+the `gh api` calls in `promote`'s "Publish the draft release" step for
+detail) (#341, #543).

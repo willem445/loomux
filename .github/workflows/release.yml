@@ -267,19 +267,34 @@ jobs:
         # the whole point of #282 is that tag-based lookup is what let a
         # stray duplicate slip through undetected.
         #
-        # make_latest=false for beta/RC (hyphenated) tags: GitHub's `latest`
-        # release pointer is what the README's install.sh/install.ps1
-        # one-liners resolve, and a beta going out must not steal that
-        # pointer from the newest stable release. Stable tags keep
-        # make_latest=true (GitHub's own default) — byte-identical to the
-        # pre-beta workflow.
+        # GitHub's REST docs for this endpoint ("Update a release") say, for
+        # `make_latest`: "Drafts and prereleases cannot be set as latest."
+        # That's evaluated against the release's state as the request is
+        # processed — so a single PATCH that sends draft=false and
+        # make_latest=true together can still see the release as a draft
+        # and silently drop make_latest, with the call otherwise succeeding
+        # (no error, promote goes green). That's what #341/#543 caught
+        # live: v1.0.0 promoted cleanly (non-draft, non-prerelease) but
+        # never took the `latest` pointer from v0.10.0, forcing a manual
+        # `gh release edit --latest` after the fact.
+        #
+        # Fix: two calls. The first always flips draft=false and holds
+        # make_latest=false — false is safe to combine with the draft flip
+        # since it never depends on draft state (this is the same
+        # mechanism betas already relied on, and it has worked correctly
+        # for every beta tag). Only once that call has confirmed the
+        # release is non-draft does a second, stable-only call set
+        # make_latest=true — by which point the "drafts...cannot be set as
+        # latest" restriction no longer applies. Both calls stay id-
+        # addressed (RELEASE_ID), never a tag-based lookup — the same
+        # discipline #282 established for the rest of this job.
         run: |
           set -euo pipefail
-          make_latest=true
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            make_latest=false
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f draft=false -f make_latest=false
+
+          if [[ "$GITHUB_REF_NAME" != *-* ]]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f make_latest=true
           fi
-          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -f draft=false -f make_latest="$make_latest"
 
   # Publish the tiny npm launcher (`npx loomux-desktop`). It just downloads
   # the release asset built above, but must wait for `promote` (not just
