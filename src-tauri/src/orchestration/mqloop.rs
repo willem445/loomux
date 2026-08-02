@@ -1426,6 +1426,14 @@ pub fn drive(
     gate: &GateSpec,
     verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
 ) -> DriveReport {
+    // RED WITNESS (temporary, reverted by the next commit): the driver decides
+    // nothing, which is the #698 state — every seam below still exists and is
+    // still green, and the queue still never moves.
+    let _ = (r, state, cfg, gate, verdicts);
+    #[allow(unreachable_code)]
+    if true {
+        return DriveReport::default();
+    }
     let mut rep = DriveReport::default();
     match state.batch.clone() {
         Some(batch) => advance_in_flight(r, state, cfg, gate, verdicts, batch, &mut rep),

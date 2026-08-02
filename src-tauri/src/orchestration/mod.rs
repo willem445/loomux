@@ -22394,7 +22394,10 @@ impl OrchRegistry {
         // because the steady state is a single `gh pr checks` on the batch's
         // draft PR, which is exactly a watch poll; the expensive paths are
         // transitions, and a transition happens once per batch.
-        let mq_serviced = self.mq_driver_tick(now);
+        // RED WITNESS (temporary, reverted by the next commit): the poll loop
+        // does not reach the driver — the #698 defect exactly.
+        let mq_serviced: Option<String> = None;
+        let _ = |now: u64| self.mq_driver_tick(now);
         GhPollTick { fired, intake_scanned, mq_serviced }
     }
 
