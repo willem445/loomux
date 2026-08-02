@@ -16,8 +16,8 @@ merge anything:
 4. `list_notifications()` — re-register any watch still outstanding from before a compact/restart.
 5. `queue_orphans()` — two lists, neither re-surfaces on its own: `orphans` (a restart stranded,
    nobody ever received) and `refused` (a full queue declined at the door — can be non-empty on
-   an ordinary session, no restart needed). Reconcile both; never re-admit silently (see
-   **Durability rules**).
+   an ordinary session, no restart needed). Reconcile both; never drop one, and never
+   re-admit one, silently (see **Durability rules**).
 6. Read **INVARIANTS** below in full, then act — use the section headers below to find detail as
    you need it rather than reading linearly.
 
