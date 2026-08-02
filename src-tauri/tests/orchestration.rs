@@ -31089,6 +31089,74 @@ fn a_timeout_that_cannot_close_its_pipes_parks_its_readers_in_the_backlog() {
     );
 }
 
+/// …and the SAME accounting on the arm that isn't a timeout (#699): when the
+/// wait itself errors, the capture used to return through a bare `?`, which
+/// dropped both readers on the floor. Uncounted is worse than parked, not
+/// better — the ceiling's admission predicate is "how many readers are still
+/// blocked", so readers the sweep can never see are exactly the ones that make
+/// the bound lie about the process it is supposed to bound.
+///
+/// Driven through the injected-wait seam because reaching this arm for real
+/// needs `Child::try_wait` to error, which no supported platform does on
+/// demand; every other step (spawn, readers, kill, reap, accounting) is the
+/// same code the production entry point runs.
+#[test]
+fn a_wait_error_parks_its_readers_exactly_like_a_timeout_does() {
+    let _serial = capture_lock();
+    let before = gh_capture_live_readers();
+
+    let err = loomux_lib::orchestration::capture_raw_with_failing_wait_for_test(
+        shell_command(&hold_pipes_script()),
+        Duration::from_secs(1),
+    )
+    .expect_err("a wait that fails is a failed capture");
+    assert!(err.contains("forced wait failure"), "precondition: this must be the wait-error arm, not the timeout: {err}");
+
+    assert!(
+        gh_capture_live_readers() > before,
+        "the readers a failed wait abandons must be counted like a timeout's, not dropped where \
+         the ceiling can never see them"
+    );
+}
+
+/// The other half of "abandon" on that arm: the child is KILLED, not simply
+/// forgotten (#699). Dropping a `std::process::Child` does not kill the
+/// process, so the bare-`?` return left a live child behind holding both pipes
+/// — which is also why its readers would never have ended on their own.
+///
+/// Observed through the child's own side effect rather than a PID: the script
+/// writes a sentinel a beat after it starts, so a child that survived the
+/// early return leaves proof, and one that was killed cannot. `current_dir` +
+/// a relative name keeps the redirect target out of the script string, which
+/// `cmd.exe` and `Command`'s MSVC quoting disagree about (see `cat_command`).
+#[test]
+fn a_wait_error_kills_the_child_it_abandons() {
+    let _serial = capture_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("survived.txt");
+    let script = if cfg!(windows) {
+        "ping -n 3 127.0.0.1 >NUL & echo x > survived.txt"
+    } else {
+        "sleep 2; echo x > survived.txt"
+    };
+    let mut cmd = shell_command(script);
+    cmd.current_dir(dir.path());
+
+    let err = loomux_lib::orchestration::capture_raw_with_failing_wait_for_test(cmd, Duration::from_secs(1))
+        .expect_err("a wait that fails is a failed capture");
+    assert!(err.contains("forced wait failure"), "precondition: this must be the wait-error arm: {err}");
+
+    // Well past the child's own delay: if it is still alive it has had every
+    // chance to write, so this cannot pass by being fast.
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        !sentinel.exists(),
+        "the abandoned child must be killed on this arm too — it wrote {} after the capture returned, \
+         so the capture left a live child (and two readers that could never end) behind",
+        sentinel.display()
+    );
+}
+
 /// The intake half's per-scan cap, on a live registry rather than only in the
 /// pure selector: N autonomous groups falling due on one scan wake used to be
 /// 2N sequential `gh` round-trips inside a single tick of the one loop that

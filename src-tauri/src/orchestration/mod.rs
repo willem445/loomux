@@ -1623,8 +1623,38 @@ pub fn wait_bounded(
 /// See [`OrchRegistry::capture_with_timeout`]'s comment for the argument behind
 /// each step; it is not repeated here.
 pub fn capture_raw_with_timeout(
+    cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    capture_raw_inner(cmd, timeout, wait_bounded)
+}
+
+/// The same capture with its **main wait forced to fail** — the one arm of
+/// `capture_raw_inner` that a test cannot otherwise reach (#699).
+///
+/// Reaching it for real needs `Child::try_wait` itself to error, which no
+/// supported platform does on demand, and the arm is precisely where the
+/// reader accounting used to be dropped. So the wait is injected rather than
+/// mocked away: the production entry point above hands in `wait_bounded` and
+/// this one hands in a closure that errors, and every other step — the spawn,
+/// the two readers, the abandon accounting, the post-kill reap — is the same
+/// code in both. Same `#[doc(hidden)] pub` idiom as
+/// `seed_leaked_readers_for_test`: a seam, not a second implementation.
+#[doc(hidden)] // pub for integration tests: force the wait-error early return
+pub fn capture_raw_with_failing_wait_for_test(
+    cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    capture_raw_inner(cmd, timeout, |_child, _timeout| Err("forced wait failure (test seam)".to_string()))
+}
+
+/// The body of the capture, with the main wait injected so the wait-error arm
+/// is reachable from a test (see `capture_raw_with_failing_wait_for_test`).
+/// `wait` is `wait_bounded` in production and nothing else.
+fn capture_raw_inner(
     mut cmd: std::process::Command,
     timeout: Duration,
+    wait: impl Fn(&mut std::process::Child, Duration) -> Result<Option<std::process::ExitStatus>, String>,
 ) -> Result<(std::process::ExitStatus, String, String), String> {
     use std::io::Read as _;
     use std::process::Stdio;
@@ -1653,7 +1683,7 @@ pub fn capture_raw_with_timeout(
         buf
     });
 
-    let Some(status) = wait_bounded(&mut child, timeout)? else {
+    let Some(status) = wait(&mut child, timeout)? else {
         let _ = child.kill();
         // Reap on its own deadline (rev-lead finding 2). A bound whose last act
         // is an unbounded `wait()` is not a bound.
