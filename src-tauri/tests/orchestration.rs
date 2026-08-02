@@ -541,6 +541,88 @@ fn the_queue_tools_refuse_queue_disabled_until_the_repo_opts_in() {
     assert!(!d.path().join(&co.group).join("merge_queue.json").exists());
 }
 
+/// **#710 (rev N2): a REFUSED enqueue still releases a stale target — on disk.**
+///
+/// The queue-core half is pinned in `tests/mergequeue.rs`; what only this file
+/// can reach is the registry path around it. `queue_merge_with`'s refusal arm
+/// did not write at all, so a released target would have lived in a state object
+/// that was dropped on the way out and `merge_queue_status` — which reads the
+/// file — would have gone on naming a branch the queue is not landing on until
+/// the next restart's reconcile.
+///
+/// The second half is the trap that write could have sprung: writing
+/// unconditionally would create a `merge_queue.json` for any group whose first
+/// `queue_merge` is refused, collapsing slice F's `absent` state (§12) for every
+/// repo that ever mistyped a PR number.
+#[test]
+fn a_refused_enqueue_releases_a_stale_target_without_conjuring_a_queue_file() {
+    /// A PR whose base IS the default branch: constraint 7 refuses it before any
+    /// target can be established, so the only state change available to this
+    /// enqueue is the release.
+    struct BaseIsDefault;
+    impl loomux_lib::orchestration::mqdriver::MqRunner for BaseIsDefault {
+        fn git(
+            &self,
+            args: &[&str],
+        ) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+            panic!("constraint 7 refuses before any git call: {args:?}")
+        }
+        fn gh(
+            &self,
+            args: &[&str],
+        ) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("repo view") {
+                "main\n".to_string()
+            } else {
+                json!({ "baseRefName": "main", "headRefOid": "a".repeat(40), "body": "b" })
+                    .to_string()
+            };
+            Ok(loomux_lib::orchestration::mqdriver::CmdOut {
+                code: Some(0),
+                stdout,
+                stderr: String::new(),
+            })
+        }
+    }
+
+    let (reg, d) = test_registry();
+    let repo = repo_with_merge_queue("mq-stale-target", true);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let qfile = d.path().join(&g.id).join("merge_queue.json");
+
+    // The field state of #710: an empty queue still pointing at the branch a
+    // cancelled batch left behind.
+    fs::write(&qfile, r#"{"version":1,"target":"integration/batch3","entries":[]}"#).unwrap();
+
+    let v = reg.queue_merge_with(&g.id, 705, None, &BaseIsDefault);
+    assert_eq!(v["refused"], json!("base-is-default"), "the refusal itself is unchanged");
+
+    let after: Value = serde_json::from_str(&fs::read_to_string(&qfile).unwrap()).unwrap();
+    assert_eq!(after["target"], json!(""), "the release reached disk: {after}");
+    assert_eq!(
+        reg.merge_queue_status(&g.id)["target"],
+        json!(""),
+        "so status stops naming it at the first touch, not at the next restart"
+    );
+
+    // A group that never queued anything has no file, and a refused enqueue must
+    // not conjure one — `merge_queue_view` distinguishes "never enqueued" from
+    // "empty queue", and an always-present file collapses the two.
+    let repo2 = repo_with_merge_queue("mq-stale-target-absent", true);
+    let g2 = reg.create_group(repo2.to_str().unwrap(), advanced_rails()).unwrap();
+    let qfile2 = d.path().join(&g2.id).join("merge_queue.json");
+    assert!(!qfile2.exists(), "fixture precondition");
+
+    let v = reg.queue_merge_with(&g2.id, 705, None, &BaseIsDefault);
+    assert_eq!(v["refused"], json!("base-is-default"));
+    assert!(
+        !qfile2.exists(),
+        "a refused enqueue must not create merge_queue.json — the default state is already \
+         drained, so the release is a no-op and nothing changed to write"
+    );
+}
+
 /// A PR that is not in the queue cannot be cancelled, and is told so — rather
 /// than being given a success that means nothing (§11.1's `not-queued`).
 #[test]

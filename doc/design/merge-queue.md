@@ -192,11 +192,39 @@ is otherwise a question slice C would have to answer by inventing:
   `baseRefName` (resolved as §7.1 describes, and subject to every refusal there).
 - It is **released when the queue drains** to zero entries with no batch in flight. A target
   is a property of the work in the queue, not a configured setting — nothing in
-  `.loomux/workflow.yml` names a branch.
+  `.loomux/workflow.yml` names a branch. "Drains" is one predicate (`mqloop::drained`) asked
+  at every transition that can be the last one out — a finished or abandoned batch, a cancel,
+  a reconcile that strands what it cannot resume — because no single one of those owns the
+  event.
+- **The drain takes the finished work with it**, for the same reason it takes the target:
+  a finished campaign's `cancelled` and `landed` rows describe work the queue is no longer
+  doing. They were previously dropped only by `prune_terminal` at a **land**, which a campaign
+  that ends in cancellation never reaches — so a cancelled batch left rows the pane went on
+  counting (`mergeqview::project` reports `entries_total = state.entries.len()`; the
+  agent-facing `status_view` filters terminal entries and never showed them).
+- **`kicked-back` survives the drain**, and the asymmetry is the point. The three terminal
+  states are different kinds of fact: `cancelled` is a request that has been honoured,
+  `landed` is work that succeeded, and `kicked-back` is the queue telling an owner something
+  they have **not acted on yet**. The drain is exactly when someone looks, so deleting it
+  there would leave "strand loudly" alive only in the audit log — and a pane showing nothing
+  is not loud.
+- **Terminal entries are bounded, drained or not** (`MAX_TERMINAL_RETAINED`, oldest dropped
+  first): not zero, per the kick-back argument above; not unbounded, because `project` renders
+  the first `VIEW_ENTRY_LIMIT` entries **in file order** and enough corpses would push the live
+  ones out of the window. `MAX_ENTRIES` does not bound this — it counts only non-terminal
+  entries.
 - A later `queue_merge` whose live base is not the current target is refused with
   `base-not-target`. Not queued-for-later, not a second queue, and above all **not a silent
   retarget** — the entries already queued were approved against a different branch, and
   moving the target under them would land them somewhere nobody reviewed them for.
+- **That refusal is asked about the same predicate, at the read.** A recorded target binds a
+  new enqueue only while the queue is *not* drained; on a drained queue the enqueue
+  establishes, exactly as the first one did. The rule protects entries, and a drained queue
+  has none — so a residual target there refuses every future branch with "drain it first"
+  said about a queue that is drained, and `merge_queue.json` is persistent by design, so no
+  restart clears it (#710). Belt and braces on purpose: the release above keeps the file
+  honest going forward, and this makes the wedge unreachable at the decision even for a file
+  some other path (or an older build) left a target in.
 - `queue_merge`'s optional `target` argument (§11.1) is an **assertion, not a selection**: if
   present it must equal the target the base resolves to, and mismatches refuse. Caller-supplied
   input can narrow what happens, never widen it — the same posture constraint 6 takes on every
