@@ -75,6 +75,10 @@ use loomux_lib::orchestration::{
     // #633: the reason discriminator that turned that list from a queue-full
     // list into a refusal list.
     RefusalReason,
+    // #658: the drain-time roster that relays those refusals to the pane that
+    // refused them, instead of waiting for a `queue_orphans` poll.
+    refusal_roster, refusal_roster_notice, REFUSAL_ROSTER_ACTION, REFUSAL_ROSTER_OPENER,
+    ROSTER_LIST_MAX, ROSTER_PREVIEW_MAX,
     record_aborted_preenter_outcome, recorded_confirmed,
     record_inflight_delivery, observe_ledger, LedgerView,
     drain_stranded_submit, stranded_admission_gate, stranded_detail, stranded_selfheal_action,
@@ -3936,6 +3940,420 @@ fn a_missed_withdrawal_stays_an_orphan_and_is_never_listed_as_a_refusal() {
     assert_eq!(v["orphans"][0]["id"], json!(7));
     assert_eq!(v["refused_count"], json!(0),
         "and it must NOT also be listed as a refusal — one loss, one row: {v}");
+}
+
+// ---------------------------------------------------------------------------
+// #658 — the drain-time refusal roster.
+//
+// A refusal to a LIVE pane had no push path to that pane at all. The sender was
+// told synchronously, the loss was audited (#563/#633), and #578's rider told
+// an orchestrator its own queue was FULL — but nothing ever named WHO was
+// refused to the pane that refused them, so a mid-session refusal surfaced only
+// if an orchestrator happened to call `queue_orphans`, which its own contract
+// frames as a start-of-session recovery step. These tests pin the missing half:
+// the moment the pane's depth comes back below the cap, it is told.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pane_that_drains_below_its_cap_is_told_who_it_refused() {
+    // #658's live instance, end to end: the orchestrator's pane hits 8/8 during
+    // a report burst, a worker's done-report is refused, and the pane drains a
+    // moment later. Before this, that drain said nothing — the pressure notices
+    // announce the pane's STATE ("FULL", "6/8 and backing up") and never the
+    // roster of what was lost, which is the whole gap.
+    let (reg, _d) = test_registry();
+    let pty = 5890u32;
+    let (gid, orch, w) = orch_pane_at_capacity(&reg, pty);
+
+    let report = "report: done, PR #654 is ready for review — CI green on all three platforms";
+    let err = reg.deliver_prompt(&orch.id, report, &w.id, Delivery::MidSession).unwrap_err();
+    assert!(err.contains("NOT queued"), "the sender is still told synchronously: {err}");
+
+    // One entry drains: 8/8 -> 7/8. That edge is the first moment loomux can
+    // tell this pane anything at all without queueing behind the block it is
+    // reporting on.
+    let front = reg.queue_snapshot(pty).remove(0);
+    reg.pop_front_dequeued(&gid, pty, front.id, front.enqueued_ms);
+
+    let relay = reg
+        .take_orchestrator_notices(&gid)
+        .expect("the drain must relay something to the orchestrator");
+    assert!(relay.contains("REFUSED and never queued"),
+        "the roster itself, not just a queue-state notice: {relay}");
+    assert!(relay.contains(&w.id),
+        "it has to name the SENDER — the recipient's only way to ask for the work again: {relay}");
+    assert!(relay.contains("PR #654"),
+        "and enough of the payload to tell WHICH delivery was lost: {relay}");
+    assert!(relay.contains("queue-full-at-call"),
+        "and the reason, which is what makes the row actionable: {relay}");
+    assert!(relay.contains("NOT re-sent"),
+        "nobody has re-sent it, so the roster must ask for it rather than imply it is handled: {relay}");
+}
+
+#[test]
+fn a_worker_pane_that_drains_is_told_by_a_delivery_rather_than_a_relay() {
+    // The channel is chosen the way #578 chose it: an orchestrator's own pane
+    // cannot be told by a delivery (it would queue behind the very block it
+    // reports), so its roster rides a tool result — but every OTHER pane is
+    // told the ordinary way, by a delivery into its own queue. Same words, both
+    // channels; this pins that the non-orchestrator half exists at all.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5891u32;
+    reg.set_pty_for_test(&w.id, pty);
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("[loomux] advisory {i}"), pty,
+            queue::EnqueueReason::Arrival).unwrap();
+    }
+
+    let brief = "review finding: PR #661 masks on what a row claims, not on what loomux wrote";
+    let err = reg.deliver_prompt(&w.id, brief, &orch.id, Delivery::MidSession).unwrap_err();
+    assert!(err.contains("NOT queued"), "the sender is told synchronously: {err}");
+
+    let front = reg.queue_snapshot(pty).remove(0);
+    reg.pop_front_dequeued(&g.id, pty, front.id, front.enqueued_ms);
+
+    let snap = reg.queue_snapshot(pty);
+    let roster = snap
+        .last()
+        .and_then(|e| e.payload.text())
+        .expect("the drain must queue a roster for this pane");
+    assert!(roster.contains("REFUSED and never queued"), "the roster, not a pressure notice: {roster}");
+    assert!(roster.contains(&orch.id), "naming the sender to ask: {roster}");
+    assert!(roster.contains("PR #661"), "and which delivery it was: {roster}");
+    assert!(roster.starts_with("[loomux]"),
+        "one marker-led line, so the same string can also be parked in the relay block: {roster}");
+    assert!(!roster.contains('\n'), "…and a single line at that: {roster}");
+    // It obeys the cap it reports on: the roster took the slot the drain freed
+    // and nothing more.
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE,
+        "one entry out, one roster in — never past the cap: {snap:?}");
+    assert_eq!(snap.last().unwrap().reason, queue::EnqueueReason::RefusalRoster,
+        "under its own admission reason, which is half of what stops a refused roster \
+         from recurring into the next one");
+}
+
+/// The roster's own audit line — the ONE piece of state the audit log did not
+/// already hold, written back into that same log. `delivered` is what makes it a
+/// watermark: a roster nobody received must not advance anything.
+fn roster_line(ts_ms: u64, to: &str, through_ms: u64, at_through: usize, delivered: bool) -> AuditEntry {
+    AuditEntry {
+        ts_ms,
+        actor: "loomux".into(),
+        action: REFUSAL_ROSTER_ACTION.into(),
+        detail: json!({
+            "to": to, "through_ms": through_ms, "at_through": at_through,
+            "delivered": delivered,
+        }),
+    }
+}
+
+#[test]
+fn the_roster_marks_a_refusal_its_sender_already_re_sent_rather_than_hiding_it() {
+    // #658 says this in as many words, and the reason is the recipient's point
+    // of view: it cannot tell a re-send from a first send, so a list that
+    // silently dropped the ones already handled would read as "these are all
+    // still missing" while being short — the silent-truncation defect this
+    // whole lineage exists to eliminate. Marked, not suppressed.
+    let landed = "report: done, PR #654 is ready for review";
+    let lost = "report: blocked, #641 needs a human call on option A vs B";
+    let entries = vec![
+        prompt_line(1_000, "w-1", "orch-1", landed),
+        refusal_line(1_001, "w-1", "orch-1", landed, "arrival"),
+        prompt_line(1_002, "w-2", "orch-1", lost),
+        refusal_line(1_003, "w-2", "orch-1", lost, "arrival"),
+        // w-1 tried again once the pane had room; nothing refused it this time,
+        // which is the only evidence that exists that it landed.
+        prompt_line(2_000, "w-1", "orch-1", landed),
+    ];
+    let r = refusal_roster(&entries, "orch-1", false);
+    assert_eq!(r.total, 2, "both are still listed: {:?}", r.items);
+    let a = r.items.iter().find(|i| i.from == "w-1").expect("w-1's row survives");
+    let b = r.items.iter().find(|i| i.from == "w-2").expect("w-2's row is there too");
+    assert!(a.resent, "a later matching `prompt` with no refusal after it IS the re-send");
+    assert!(!b.resent, "w-2 never tried again, so this one is still missing");
+
+    let text = refusal_roster_notice(&r).expect("two refusals is something to say");
+    assert!(text.contains("w-1 has since re-sent it — nothing to do"),
+        "the row that is handled says so rather than asking for it again: {text}");
+    assert!(text.contains("NOT re-sent — ask w-2 for it"),
+        "and the row that is not handled names who to ask: {text}");
+    assert!(!text.contains('\n'), "one line, or `OrchNoticeInbox::park` cannot take it: {text}");
+    assert!(text.starts_with(REFUSAL_ROSTER_OPENER));
+}
+
+#[test]
+fn a_re_send_that_was_refused_again_is_not_counted_as_delivered() {
+    // The credit-spending half of `refusal_was_resent`, and the case that made
+    // it a walk rather than an existence check: #658's live instance refused
+    // the SAME report twice. A later `prompt` line proves an attempt, never an
+    // arrival — what proves the arrival is that no refusal followed it.
+    let report = "report: done, PR #654 is ready for review";
+    let twice = vec![
+        prompt_line(1_000, "w-1", "orch-1", report),
+        refusal_line(1_001, "w-1", "orch-1", report, "arrival"),
+        prompt_line(1_100, "w-1", "orch-1", report),
+        refusal_line(1_101, "w-1", "orch-1", report, "arrival"),
+    ];
+    let r = refusal_roster(&twice, "orch-1", false);
+    assert_eq!(r.total, 2, "two refusals, two rows");
+    assert!(r.items.iter().all(|i| !i.resent),
+        "the second attempt was refused too, so nothing has landed: {:?}", r.items);
+
+    // …and a third attempt that nothing refuses flips both rows, because both
+    // were waiting on the same payload.
+    let mut third = twice.clone();
+    third.push(prompt_line(1_200, "w-1", "orch-1", report));
+    let r = refusal_roster(&third, "orch-1", false);
+    assert!(r.items.iter().all(|i| i.resent),
+        "one surviving attempt accounts for the payload: {:?}", r.items);
+}
+
+#[test]
+fn a_pre_admission_refusal_never_spends_a_re_send_credit() {
+    // #633's two refusals return BEFORE `deliver_prompt` writes its `prompt`
+    // line — they carry the payload inline instead. Charging them a credit
+    // would consume a re-send that really did land, so the roster would tell a
+    // pane to chase a report it already has.
+    // The spawn-to-bind window really does refuse repeatedly — an orchestrator
+    // retrying a brief at a pane that has not bound yet gets the same answer
+    // each time — and then the pane binds and one attempt lands. THREE refusals
+    // before the landing, not one, is what makes this test discriminate the
+    // rule rather than a sign flip: an implementation that charges a
+    // pre-admission refusal ends up at -1 here, which no threshold reads as
+    // "delivered".
+    let brief = "task brief: rebase #641 onto main and re-run CI";
+    let too_early = |ts_ms: u64| AuditEntry {
+        ts_ms,
+        actor: "loomux".into(),
+        action: "delivery-dropped".into(),
+        detail: json!({
+            "to": "w-9", "reason": RefusalReason::NoTerminal.as_str(), "from": "orch-1",
+            "bytes": brief.len(), "preview": queue::dropped_payload_preview(brief),
+            "text": brief,
+        }),
+    };
+    let entries = vec![
+        too_early(1_000),
+        too_early(1_100),
+        too_early(1_200),
+        // The pane bound, and this one was admitted — nothing refused it.
+        prompt_line(2_000, "orch-1", "w-9", brief),
+    ];
+    let r = refusal_roster(&entries, "w-9", false);
+    assert_eq!(r.total, 3, "a no-terminal refusal is a refusal: {:?}", r.items);
+    assert!(r.items.iter().all(|i| i.resent),
+        "the attempt that landed accounts for all three — none of those refusals wrote a \
+         `prompt` line of its own for it to spend: {:?}", r.items);
+}
+
+#[test]
+fn the_roster_never_repeats_what_a_delivered_roster_already_named() {
+    // Once per drain, not once per pop. The watermark lives in the audit log
+    // like everything else here, and it is a timestamp AND a count: a bare
+    // timestamp would either drop a refusal stamped in the same millisecond as
+    // the last one reported (a report burst is exactly when that happens) or
+    // repeat one forever.
+    let a = "first report";
+    let b = "second report, same millisecond";
+    let entries = vec![
+        prompt_line(1_000, "w-1", "orch-1", a),
+        refusal_line(1_000, "w-1", "orch-1", a, "arrival"),
+        prompt_line(1_000, "w-2", "orch-1", b),
+        refusal_line(1_000, "w-2", "orch-1", b, "arrival"),
+    ];
+    let first = refusal_roster(&entries, "orch-1", false);
+    assert_eq!((first.total, first.through_ms, first.at_through), (2, 1_000, 2),
+        "both refusals share the millisecond, and the roster records how many did");
+
+    // Replayed with its own delivered roster line in the timeline: nothing new.
+    let mut after = entries.clone();
+    after.push(roster_line(1_500, "orch-1", first.through_ms, first.at_through, true));
+    let second = refusal_roster(&after, "orch-1", false);
+    assert_eq!(second.total, 0, "already told: {:?}", second.items);
+    assert!(refusal_roster_notice(&second).is_none(),
+        "and an empty roster must cost the pane nothing at all");
+
+    // A THIRD refusal landing in that same millisecond, appended after the
+    // roster ran, is the one a `>` comparison would have eaten.
+    let c = "third report, also that millisecond";
+    after.push(prompt_line(1_000, "w-3", "orch-1", c));
+    after.push(refusal_line(1_000, "w-3", "orch-1", c, "arrival"));
+    let third = refusal_roster(&after, "orch-1", false);
+    assert_eq!(third.total, 1, "the count skips the two already named, not the millisecond");
+    assert_eq!(third.items[0].from, "w-3");
+}
+
+#[test]
+fn a_roster_that_was_never_delivered_does_not_advance_the_watermark() {
+    // The roster obeys the cap it reports on, which means it can itself be
+    // refused. Letting that line advance the mark would lose exactly the
+    // payloads it was written to name — the failure this whole issue is about,
+    // re-introduced by the fix for it.
+    let a = "a report nobody has seen";
+    let entries = vec![
+        prompt_line(1_000, "w-1", "orch-1", a),
+        refusal_line(1_001, "w-1", "orch-1", a, "arrival"),
+        roster_line(1_500, "orch-1", 1_001, 1, false),
+    ];
+    let r = refusal_roster(&entries, "orch-1", false);
+    assert_eq!(r.total, 1, "a roster that reached nobody reported nothing: {:?}", r.items);
+    assert_eq!(r.items[0].from, "w-1");
+}
+
+#[test]
+fn a_refused_roster_never_becomes_a_line_in_the_next_roster() {
+    // The recursion #658 asks this mechanism not to have: a roster refused at a
+    // still-full pane writes its own `delivery-dropped` line, and including it
+    // would put the previous roster's text inside the next roster's preview,
+    // and that one inside the one after. Two exclusions, because a refusal has
+    // two shapes: the queue-full shape records the admission reason, and the
+    // pre-admission shapes record no reason at all.
+    let roster_text = format!("{REFUSAL_ROSTER_OPENER} While it was full, 1 delivery to you was \
+        REFUSED and never queued");
+    let real = "report: done, PR #654 is ready";
+    let by_reason = refusal_line(1_000, "loomux", "orch-1", &roster_text, "refusal-roster");
+    let by_opener = AuditEntry {
+        ts_ms: 1_001,
+        actor: "loomux".into(),
+        action: "delivery-dropped".into(),
+        detail: json!({
+            "to": "orch-1", "reason": RefusalReason::NoTerminal.as_str(), "from": "loomux",
+            "bytes": roster_text.len(), "preview": queue::dropped_payload_preview(&roster_text),
+            "text": roster_text,
+        }),
+    };
+    let entries = vec![
+        by_reason,
+        by_opener,
+        prompt_line(1_002, "w-1", "orch-1", real),
+        refusal_line(1_003, "w-1", "orch-1", real, "arrival"),
+    ];
+    let r = refusal_roster(&entries, "orch-1", false);
+    assert_eq!(r.total, 1, "only the real loss is a row: {:?}", r.items);
+    assert_eq!(r.items[0].from, "w-1");
+    // …and `queue_orphans` still sees all three, because a refused roster IS a
+    // refusal and hiding it there would be a second silence.
+    assert_eq!(front_door_refusals(&entries, false).total, 3);
+}
+
+#[test]
+fn a_stranded_submit_marker_refusal_is_not_folded_into_the_roster() {
+    // Every other row means "ask this agent to send it again". A marker refusal
+    // has no sender to ask and no payload to re-send — what it means is "there
+    // is unsubmitted text in this pane's box", which is a different instruction
+    // with its own `consequence` string that `queue_orphans` already carries
+    // verbatim. Folding it in would misdirect the reader.
+    let marker = AuditEntry {
+        ts_ms: 1_000,
+        actor: "loomux".into(),
+        action: "delivery-dropped".into(),
+        detail: json!({
+            "to": "w-1", "reason": RefusalReason::QueueFull.as_str(),
+            "depth": queue::QUEUE_MAX_PER_PANE, "payload": RefusedPayload::StrandedSubmit.as_str(),
+            "consequence": "text is pasted in the pane with nothing queued to submit it",
+        }),
+    };
+    let r = refusal_roster(&[marker.clone()], "w-1", false);
+    assert_eq!(r.total, 0, "not a roster row: {:?}", r.items);
+    assert!(refusal_roster_notice(&r).is_none());
+    assert_eq!(front_door_refusals(&[marker], false).total, 1,
+        "…but still a refusal everywhere it was already reported — this is a routing \
+         decision, not a new silence");
+}
+
+#[test]
+fn the_roster_is_capped_says_what_it_left_out_and_clamps_each_preview() {
+    // One LINE carries these, so the cap is tighter than `queue_orphans`' — and
+    // what it drops is counted and said out loud, never silently cut. The
+    // watermark still covers the dropped rows: they are in `audit.jsonl`, and
+    // re-reporting them at every future drain would be its own noise.
+    let long = "x".repeat(ROSTER_PREVIEW_MAX * 3);
+    let mut entries = Vec::new();
+    let n = ROSTER_LIST_MAX + 2;
+    for i in 0..n {
+        let text = format!("report {i}: {long}");
+        entries.push(prompt_line(1_000 + i as u64, &format!("w-{i}"), "orch-1", &text));
+        entries.push(refusal_line(1_001 + i as u64, &format!("w-{i}"), "orch-1", &text, "arrival"));
+    }
+    let r = refusal_roster(&entries, "orch-1", false);
+    assert_eq!(r.total, n, "everything in the window is counted");
+    assert_eq!(r.items.len(), ROSTER_LIST_MAX, "only this many are worded");
+    assert_eq!(r.omitted, 2);
+    assert_eq!(r.items[0].from, "w-2", "the MOST RECENT that many — a held pane keeps refusing");
+    assert!(r.items.iter().all(|i| i.preview.chars().count() <= ROSTER_PREVIEW_MAX + 1),
+        "each preview is re-clamped, marker included: {:?}", r.items);
+    assert_eq!(r.through_ms, 1_001 + (n - 1) as u64,
+        "the watermark covers the rows the cap dropped too, or they repeat forever");
+
+    let text = refusal_roster_notice(&r).expect("something to say");
+    assert!(text.contains("plus 2 earlier refusals not listed here"),
+        "a capped list that reads as complete is the defect, not the cap: {text}");
+    assert!(text.contains("audit.jsonl"), "and it says where the rest are: {text}");
+}
+
+#[test]
+fn a_roster_over_a_cut_audit_window_says_it_could_not_see_everything() {
+    // Same rule as `FrontDoorRefusals::window_truncated`: a scan that ran off
+    // the start of its timeline has to say so, or "that is all that was
+    // refused" is the strongest possible claim made from evidence nobody read.
+    let a = "the one refusal in the readable tail";
+    let entries = vec![
+        prompt_line(1_000, "w-1", "orch-1", a),
+        refusal_line(1_001, "w-1", "orch-1", a, "arrival"),
+    ];
+    let text = refusal_roster_notice(&refusal_roster(&entries, "orch-1", true))
+        .expect("something to say");
+    assert!(text.contains("older refusals it could not see"), "{text}");
+    let clean = refusal_roster_notice(&refusal_roster(&entries, "orch-1", false)).unwrap();
+    assert!(!clean.contains("could not see"),
+        "and it must NOT say so when the window was whole: {clean}");
+}
+
+#[test]
+fn the_roster_is_emitted_once_per_drain_and_never_recurses() {
+    // The bound, end to end and on the live path. The roster is a delivery, so
+    // the mechanism could feed itself: emit -> enqueue -> re-enter
+    // `note_queue_capacity` -> emit. It cannot, for two reasons this pins
+    // together — the emission is the LAST thing that transition does, and a
+    // delivery only pushes depth UP, which is the one edge that never triggers
+    // a roster.
+    let (reg, _d) = test_registry();
+    let pty = 5892u32;
+    let (gid, orch, w) = orch_pane_at_capacity(&reg, pty);
+
+    let report = "report: done, PR #654 is ready for review";
+    reg.deliver_prompt(&orch.id, report, &w.id, Delivery::MidSession).unwrap_err();
+
+    let front = reg.queue_snapshot(pty).remove(0);
+    reg.pop_front_dequeued(&gid, pty, front.id, front.enqueued_ms);
+    let first = reg.take_orchestrator_notices(&gid).expect("the drain relays the roster");
+    assert!(first.contains("REFUSED and never queued"), "{first}");
+
+    // Back to the cap and down again, with nothing refused in between: the
+    // second drain has nothing to say and must say nothing.
+    reg.enqueue_text(&gid, &orch.id, "loomux", "[loomux] advisory refill", pty,
+        queue::EnqueueReason::Arrival).unwrap();
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE);
+    let front = reg.queue_snapshot(pty).remove(0);
+    reg.pop_front_dequeued(&gid, pty, front.id, front.enqueued_ms);
+    let second = reg.take_orchestrator_notices(&gid).unwrap_or_default();
+    assert!(!second.contains("REFUSED and never queued"),
+        "the same refusal must not be relayed at every drain forever: {second}");
+
+    let rosters: Vec<_> = reg.audit_log(&gid).into_iter()
+        .filter(|e| e.action == REFUSAL_ROSTER_ACTION)
+        .collect();
+    assert_eq!(rosters.len(), 1, "one drain that had something to say, one line: {rosters:?}");
+    assert_eq!(rosters[0].detail["to"], json!(orch.id));
+    assert_eq!(rosters[0].detail["count"], json!(1));
+    assert_eq!(rosters[0].detail["delivered"], json!(true));
+    assert_eq!(rosters[0].detail["channel"], json!("orchestrator-inbox"),
+        "an orchestrator's own pane is told by the #578 relay, never by a delivery");
+    assert!(rosters[0].detail["text"].as_str().unwrap().contains(&w.id),
+        "the relay is held in memory, so the line carries what it relayed (#578's rule)");
 }
 
 #[test]

@@ -312,6 +312,19 @@ These deserve their own detail — see:
   blocked delivery would queue behind the very block it reports — so those
   notices ride back to the orchestrator on the result of its next tool call
   instead, and you'll see them in the audit viewer either way.
+- **What a full pane refused.** A pane that hit its cap and turned deliveries
+  away is told what it turned away, the moment its queue drains back below the
+  cap: one line naming each refused delivery's sender, a short preview, and why
+  it was refused. Deliveries whose sender has since got them through are
+  *marked* as re-sent rather than dropped from the list — the receiving pane
+  can't tell the difference from the outside, and a list that quietly omitted
+  them would read as "these are all still missing". Loomux never re-sends them
+  itself: the senders were told at the time, so the roster names who to ask.
+  It's bounded (the newest few, with the rest counted and left in the audit
+  log), fires once per drain rather than once per delivery, and obeys the same
+  8-deep cap it's reporting on — so it can never pile up behind the backlog it
+  describes. The orchestrator's own pane gets it the same way as the notices
+  above: riding back on its next tool call.
 
 ## CI watches (agent notifications)
 
