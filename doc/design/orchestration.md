@@ -6043,7 +6043,7 @@ swallowed whole.
 
 ### Residual, stated rather than mitigated
 
-- A notice that **wraps** keeps whatever tokens landed past its first row (`e6` pins this).
+- A notice that **wraps** keeps whatever tokens landed past its first row (`e6` pinned this).
 - A marker row that has itself **scrolled off** leaves its continuation unmarked.
 - A row that both leads with the marker and *is itself* the live question would be masked. This is
   the one-row-wide false-release surface, and it needs a CLI that prefixes its own dialog rows with
@@ -6051,10 +6051,103 @@ swallowed whole.
 
 The first two are under-masks, in the safe direction. Closing them needs loomux to know *what* it
 wrote to a pane rather than merely that a row claims it did — a per-pane record of delivered text.
-No such record exists today: `DeliveryOutcome` keeps `{confirmed, submit_sent_ms, from}` and
-deliberately not the text, and the only copy lives as a stack local in `deliver_now` that dies when
-the delivery returns. Adding one is **delivery machinery, not detection**, and is the honest shape
-of the remaining fix.
+No such record existed when this was written: `DeliveryOutcome` keeps `{confirmed, submit_sent_ms,
+from}` and deliberately not the text, and the only copy lived as a stack local in `deliver_now`
+that died when the delivery returned. Adding one is **delivery machinery, not detection**, which is
+why it became its own change — the next section. The third residual is unchanged and is not
+addressed by it.
+
+## #576 residual: masking on what loomux WROTE, not on what a row claims
+
+**Problem.** The two under-masks above have one shape: the marker rule can only ask *"does this row
+look like a notice"*, and exactly one row of a wrapped notice does. The continuation rows carry the
+detector's tokens (`do you want to run`, `(y/n)` — structured signals, honored across the last
+twelve non-empty lines, so a redraw never pushes them out), and the gate parks a pane on a question
+nobody asked until `QuestionStale` reports it at ten minutes.
+
+Widening the marker rule is the one thing that cannot be done: an agent can print a marker row
+itself, so a run-mask hands any pane the power to delete the rows below an attacker-chosen row —
+the #420 harm, reached from pane output (`e3`/`e4`).
+
+**The record.** `OrchRegistry::delivered_notices` is a per-pane, bounded, drop-oldest record of the
+**marker-led lines loomux has actually pasted into that pane**, written in `deliver_now`
+immediately after `write_bytes` returns `Ok` — the one place loomux's text becomes bytes in a pane.
+Three properties do the work:
+
+- **A pane cannot add to it.** The record is written on the delivery side from the text loomux
+  pasted, so pane output — the direction the marker *is* forgeable in — cannot reach it. Masking
+  keys off the record and never off the marker, which is the #420 rule restated: *an agent-printed
+  marker row still widens nothing* (`e14`).
+- **Only loomux's own framing goes in.** `loomux_authored_lines` keeps marker-led lines and drops
+  everything else, so a kickoff brief, an orchestrator's prompt, and a coalesced flush's verbatim
+  constituent payloads never enter it. Recording those would give the mask the power to blind the
+  gate to ordinary agent content — the blindness `e11` pins as deliberately *not* taken (`e16`).
+- **Written after the write, never before.** A record of text that never reached the pane would let
+  the mask claim rows nobody wrote, which is the fail-open direction.
+
+**What the mask does with it.** `mask_loomux_notices_with_record` keeps the marker rule
+unconditionally (one row, no record needed) and adds two rules that are anchored in the record
+alone:
+
+- *A wrapped notice.* A run of rows that starts at the START of a recorded line and reconstructs
+  that line **to its end**, row by row, is claimed whole. Rows are compared case-folded with
+  whitespace runs collapsed, and the boundary between rows may eat one space (word wrap) or none
+  (a hard wrap mid-word).
+- *A marker that scrolled off.* Every reading is truncated at the **top** (the ring keeps the last
+  bytes, the grid the last rows), so the first non-empty row of a reading is the one place a line
+  can legitimately appear headless. There, and only there, a run may anchor mid-line — still
+  reconstructing to the recorded line's end. A headless fragment anywhere else is not claimed:
+  nothing was truncated there, so the rows above it would have shown the head (`e15`).
+
+**Reconstruct-to-the-end is the whole safety argument.** A run that merely *starts* a recorded line
+proves nothing about the rows after it, and claiming them would be the rejected run-mask. Requiring
+the remainder to be consumed exactly means the last claimed row is the line's last row, so whatever
+the pane painted below it is untouched — which is why a live dialog under a **genuine, recorded**
+notice still latches (`e13`): the recorded line ends at the marker row, so there is no continuation
+to claim. Every failure mode ends the run and keeps the rows: a mismatch, a CLI-truncated echo, a
+reading cut short, a line past the record's length cap.
+
+**The width is deliberately not consulted.** Predicting wrap points would need the pane's geometry
+*and* the CLI's own re-rendering (prefixes, re-indents, hard vs word wrap), and being wrong about
+them fails in the dangerous direction — a wrongly-predicted run would claim a row that is not ours.
+Reconstruction asks the safe question instead: not *"where would this have wrapped"* but *"is this
+row, verbatim, the next thing we wrote"*.
+
+**Bounds, and why these numbers.** 24 lines per pane, each capped at 512 chars, across at most 64
+panes (least-recently-written evicted) — about 786 KiB worst case, stated because these entries are
+kilobytes rather than the three fields `last_delivery`'s never-pruned map holds. 512 chars is
+`notify::NOTICE_TOTAL_CAP` (400) plus room for a producer's framing; a longer line is truncated,
+which costs that one notice its wrap masking and nothing else. 24 lines is bounded by what the mask
+could ever *use*: only a line still rendered can be claimed, and `prompt_wait_detected` honors its
+structured signals across the last twelve non-empty lines, so a notice that twenty-three later
+notices have already pushed past is out of every reading that consults the record.
+
+**In memory only, and deliberately.** The record's single consumer is a mask over a live pane's
+rendered tail, so it is worth exactly as long as the rows it explains are still on screen.
+Persisting it would put agent-authored note text in a second on-disk place with its own
+schema-version burden (`queue.json` is versioned; a new field there is a contract change), to buy
+masking for rows a restarted pane has almost always redrawn past. Losing it degrades to exactly the
+pre-record behaviour — the marker rule alone, so a wrapped notice latches until `QuestionStale`
+surfaces it at ten minutes. That is the cheap error, and `e6` pins both halves: the same fixture
+releases with the record and still latches without it.
+
+**Readers.** All of them, together — the two readings inside `question_hold_predicate_sampled` (so
+every question-gate call site, including the outer drainer gate and the stranded-submit press), the
+late-confirmation monitor's idle scan, and both attention-chip readers. Fixing one reader of this
+gate and leaving another is exactly what rev-126 found the first time (`e7`), so the record is
+threaded to every one of them in the same change. `question_hold_predicate_sampled` takes it as a
+**required** argument rather than a defaulted one: an empty record is a legitimate value (a pane
+loomux never wrote to, or one a restart cleared) but it must be stated, not acquired by omission.
+
+**Residual, stated rather than mitigated.** The record's *content* is partly agent-authored — a
+relayed `report` note is the worker's own words inside loomux's framing. So an agent that can (a)
+get a marker-led line delivered into a pane, (b) print that line's head into that same pane, and
+(c) have its CLI paint a live dialog whose rows are byte-identical to that line's remainder, in
+order, could hide the dialog. That is two parties and three coincidences, against the rejected
+run-mask which needed one pane to print one row; and every row it can claim is still a row loomux
+verifiably pasted there. `mask_own_paste` already masks whole lines of agent-authored text this
+way for the *current* delivery — the record extends the same accepted mechanism backwards in time,
+under a reconstruct-to-the-end rule that whole-line matching does not have.
 
 ## #632: the multi-row notices, fixed at the producer rather than at the mask
 
@@ -7487,7 +7580,10 @@ a tool result, never the pty), so it neither contributed to #632 nor was blocked
 since applied this section's own convention to both producers — see "*the multi-row notices, fixed
 at the producer rather than at the mask*" above. It did **not** widen the mask, which is why that
 fix and this one compose: the sentence "closing this needs loomux to know *what* it wrote to a
-pane" survives #632 intact and now describes only the wrap and scrolled-off residuals.
+pane" survived #632 intact and described only the wrap and scrolled-off residuals — which is
+exactly what the per-pane delivery record then built (see "*masking on what loomux WROTE*" above).
+That change did not widen the marker rule either: it left this section's one-row-per-marker
+convention untouched and added a second, record-anchored rule beside it.
 
 `HoldChannel::survives_orchestrator_target` also stopped being a `!matches!` negation and became an
 exhaustive match: a channel added later must state its own answer rather than defaulting to

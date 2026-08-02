@@ -15508,15 +15508,155 @@ fn leads_with_notice_marker(line: &str) -> bool {
     deframe(line).to_lowercase().starts_with(LOOMUX_NOTICE_MARKER)
 }
 
+/// One row (or one recorded line) reduced to what a wrap cannot change:
+/// case-folded, with every whitespace run collapsed to a single space and the
+/// ends trimmed.
+///
+/// A terminal wrapping one logical line re-distributes it across rows, and a
+/// CLI re-rendering it may re-indent the continuations; neither alters the
+/// sequence of words. Comparing on this normal form is therefore what lets a
+/// run of rows be checked against the line it came from without the check
+/// depending on the pane's width — which the mask deliberately does not know
+/// (see [`mask_loomux_notices_with_record`]).
+fn wrap_normalize(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Do `rows[from..]` reconstruct `line` from byte offset `at` all the way to
+/// its END, one row at a time?
+///
+/// Returns the row index just past the run, or `None` if the rows do not
+/// account for the whole remainder. Both halves are load bearing:
+///
+/// - **Contiguous, in order, from the anchor.** Each row must continue exactly
+///   where the previous one stopped, optionally across the single space a word
+///   wrap eats at the boundary (a hard wrap mid-word eats nothing, so the space
+///   is optional rather than required). A blank row ends the run: a wrapped
+///   logical line has none.
+/// - **To the end, never a prefix.** A run that merely *starts* a recorded line
+///   proves nothing about the rows after it, and claiming them would be the
+///   run-mask [`mask_loomux_notices`] rejects. Requiring the remainder to be
+///   consumed exactly means the last claimed row is the line's last row, so
+///   whatever a pane painted below it is untouched. The direction of the error
+///   is right too: a notice the CLI truncated with an ellipsis, or one cut off
+///   by the bottom of the reading, simply fails to reconstruct and the gate
+///   keeps holding.
+fn reconstructs_to_end(rows: &[String], from: usize, line: &str, at: usize) -> Option<usize> {
+    let mut rest = &line[at..];
+    let mut i = from;
+    while i < rows.len() && !rest.is_empty() {
+        let row = rows[i].as_str();
+        if row.is_empty() {
+            break;
+        }
+        let candidate = rest.strip_prefix(' ').unwrap_or(rest);
+        match candidate.strip_prefix(row) {
+            Some(next) => {
+                rest = next;
+                i += 1;
+            }
+            None => break,
+        }
+    }
+    (rest.is_empty() && i > from).then_some(i)
+}
+
 /// [`mask_loomux_notices`], plus the rows a per-pane record of delivered text
 /// proves loomux wrote (#576 — the wrap residual and the scrolled-off marker).
 ///
-/// NOT YET: `delivered` is threaded here and filled by `deliver_now`, but this
-/// body is still the marker rule alone — so the wrap and scrolled-off
-/// under-masks are exactly as they were.
+/// **What `delivered` is, and why it is the only thing allowed to widen the
+/// mask.** It is the marker-led lines loomux has actually written into THIS
+/// pane ([`DeliveredNotices`], filled at the one place that writes bytes to a
+/// pane). A pane cannot add to it: the record is written on the delivery side,
+/// from the text loomux pasted, so pane output — the direction
+/// [`LOOMUX_NOTICE_MARKER`] is forgeable in — cannot reach it. That is the
+/// property #576 asked for and the reason the widening below is keyed off the
+/// record and never off the marker: **an agent-printed marker row still widens
+/// nothing**, because a row that merely looks like a notice matches no recorded
+/// line (#420's harm, restated as the rule this function obeys).
+///
+/// **Two rules, both anchored in the record:**
+///
+/// - *A wrapped notice (`R-wrap`).* A run of rows starting at a row that is the
+///   START of a recorded line and reconstructing that line to its end is
+///   claimed whole. The anchor is the recorded line's own beginning, so the
+///   marker plays no part in the decision — a recorded line leads with the
+///   marker by construction, which makes its first row one
+///   [`mask_loomux_notices`] would have claimed anyway; the new part is only
+///   the continuation, and only where the continuation *is* the rest of that
+///   line.
+/// - *A marker that scrolled off (`R-top`).* Every reading here is truncated at
+///   the TOP (the byte ring keeps the last bytes; the grid keeps the last
+///   rows), so the one place a line can legitimately appear headless is the
+///   first non-empty row of the reading. There, and only there, a run may
+///   anchor MID-line — at any offset of a recorded line — provided it still
+///   reconstructs that line to its end. Anywhere else a mid-line anchor would
+///   be a claim about rows loomux cannot show it wrote.
+///
+/// **Why the width is not consulted.** Predicting the wrap points would need
+/// the pane's geometry AND the CLI's own re-rendering of the text (prefixes,
+/// re-indents, hard vs word wrap), and being wrong about them fails in the
+/// dangerous direction — a wrongly-predicted run would claim a row that is not
+/// ours. Reconstruction asks the safe question instead: not "where would this
+/// have wrapped" but "is this row, verbatim, the next thing we wrote".
+///
+/// **The residual, stated rather than mitigated.** The record's CONTENT is
+/// partly agent-authored — a relayed `report` note is the worker's own words
+/// inside loomux's framing — so an agent that can (a) get a marker-led line
+/// delivered into a pane, (b) print that line's head into that same pane, and
+/// (c) have its CLI paint a live dialog whose rows are byte-identical to that
+/// line's remainder, in order, could hide the dialog. That is two parties and
+/// three coincidences, against #621's rejected run-mask which needed one pane
+/// to print one row; and every row it can claim is still a row loomux verifiably
+/// pasted there. Under-masking stays the cheap error and this function keeps
+/// choosing it: any mismatch, any missing tail, any lost record ends the run.
 pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> String {
-    let _ = delivered;
-    tail.lines().filter(|l| !leads_with_notice_marker(l)).collect::<Vec<_>>().join("\n")
+    let rows: Vec<&str> = tail.lines().collect();
+    let norm: Vec<String> = rows.iter().map(|r| wrap_normalize(deframe(r))).collect();
+    let recorded: Vec<String> = delivered.iter().map(|d| wrap_normalize(d)).collect();
+    let first_row = norm.iter().position(|n| !n.is_empty());
+    let mut keep = vec![true; rows.len()];
+    let mut i = 0;
+    while i < rows.len() {
+        if norm[i].is_empty() {
+            i += 1;
+            continue;
+        }
+        // The marker rule, unchanged and unconditional: one row, no record
+        // needed. Everything below only ever claims MORE rows, never this one
+        // differently.
+        if leads_with_notice_marker(rows[i]) {
+            keep[i] = false;
+        }
+        let claimed = recorded.iter().find_map(|line| {
+            reconstructs_to_end(&norm, i, line, 0).or_else(|| {
+                // `R-top`: a mid-line anchor, allowed at the first non-empty
+                // row of the reading and nowhere else. `at > 0` because offset
+                // zero is `R-wrap` above — a headless run is by definition
+                // missing something.
+                (first_row == Some(i))
+                    .then(|| {
+                        line.match_indices(norm[i].as_str())
+                            .find_map(|(at, _)| {
+                                (at > 0).then(|| reconstructs_to_end(&norm, i, line, at)).flatten()
+                            })
+                    })
+                    .flatten()
+            })
+        });
+        match claimed {
+            Some(end) => {
+                keep[i..end].fill(false);
+                i = end;
+            }
+            None => i += 1,
+        }
+    }
+    rows.iter()
+        .zip(keep)
+        .filter_map(|(r, k)| k.then_some(*r))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The lines of a delivery that [`mask_loomux_notices`] would claim — i.e. the
