@@ -60,8 +60,8 @@ dropped:
 - **`>/dev/null` is deliberate — discard stdout, and the redirect is not
   optional.** `--check` prints a *formatting* diff (`Diff in …`) for anything
   not rustfmt-shaped, and this repo is deliberately not rustfmt-formatted:
-  hundreds of lines for a small file, but **15,323 for
-  `src/orchestration/mod.rs`** and **17,904 for a whole-crate run** — measured.
+  hundreds of lines for a small file, but **15,513 for
+  `src/orchestration/mod.rs`** and **18,094 for a whole-crate run** — measured.
   Forget the redirect on the file you are most likely to be editing and you
   dump ~15k lines of diff into your own context, which costs far more than the
   CI round this check was saving. They are noise here, not findings.
@@ -82,7 +82,7 @@ recurses into child modules, and a parse error in a child is reported by name:
 rustfmt --check --edition 2021 src/lib.rs >/dev/null
 ```
 
-That takes ~4-5s for this crate. Keep the `>/dev/null`: without it this is the
+That takes ~5s for this crate. Keep the `>/dev/null`: without it this is the
 ~18,000-line case above.
 
 ### This is a syntax check, NOT a formatting gate
@@ -103,7 +103,7 @@ what `>/dev/null` is for). So:
 `rustc` for codegen, resolves no dependencies, produces no artifacts, and
 writes nothing to `target/` — verified on a worktree that had no `target/`:
 after a whole-crate run it still had none, `git status` was clean, and the run
-took ~4-5s. So it sits inside both bans at once: the #320 CPU ban (no meaningful
+took ~5s. So it sits inside both bans at once: the #320 CPU ban (no meaningful
 CPU, nothing to contend across worktrees) and the #488 disk ban (zero bytes
 written).
 
