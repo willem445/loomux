@@ -27381,7 +27381,10 @@ impl OrchRegistry {
                 .map(|wf| wf.merge_queue.enabled)
                 .unwrap_or(false)
         {
-            MERGE_QUEUE_NOTE.to_string()
+            // MUTATION K5 (evidence, NOT shipped): the fragment is never
+            // substituted, so the placeholder is always empty — which every
+            // ABSENCE test still passes, and only a presence test can catch.
+            String::new()
         } else {
             String::new()
         };

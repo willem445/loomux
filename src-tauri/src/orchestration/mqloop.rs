@@ -1101,7 +1101,9 @@ pub fn enqueue(
     now_ms: u64,
 ) -> EnqueueOutcome {
     let refuse = |reason| EnqueueOutcome::Refused { reason };
-    if !enabled {
+    // MUTATION K2 (evidence, NOT shipped): the opt-in ignored, so the queue is
+    // live in a repo that never asked for it.
+    if false && !enabled {
         return refuse(refusal::QUEUE_DISABLED);
     }
     if state.entry(pr).map(|e| !e.state().is_terminal()).unwrap_or(false) {
@@ -1166,11 +1168,13 @@ pub enum CancelOutcome {
 /// scratch ref and the draft PR), and doing half of it from a tool call would
 /// leave the world and the record disagreeing.
 pub fn cancel(state: &mut MergeQueueState, pr: u64) -> CancelOutcome {
+    // MUTATION K3 (evidence, NOT shipped): a PR that was never queued reports a
+    // successful cancel — telling an agent it stopped a landing that never was.
     let Some(was) = state.entry(pr).map(|e| e.state()) else {
-        return CancelOutcome::Refused { reason: refusal::NOT_QUEUED };
+        return CancelOutcome::Cancelled { was: EntryState::Queued };
     };
     if was.is_terminal() {
-        return CancelOutcome::Refused { reason: refusal::NOT_QUEUED };
+        return CancelOutcome::Cancelled { was };
     }
     match advance_entry(state, pr, EntryState::Cancelled) {
         Ok(Some(_)) => CancelOutcome::Cancelled { was },

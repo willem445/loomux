@@ -603,20 +603,23 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
         // is no cross-group surface here to check: a caller cannot name another
         // group's queue.
         "queue_merge" => {
-            require_orchestrator(caller)?;
+            // MUTATION K1 (evidence, NOT shipped): the dispatch gate removed from
+            // all three queue arms — the listing filter alone left as "security".
             let raw = arg_str(args, "pr").ok_or("pr required")?;
-            let pr = super::pr_number(raw).ok_or("pr must be a number, #n, or a PR URL")?;
+            // MUTATION K4 (evidence, NOT shipped): a malformed pr coerced to 0
+            // instead of rejected.
+            let pr = super::pr_number(raw).unwrap_or(0);
             let target = arg_str_strict(args, "target")?;
             let out = reg.queue_merge(&caller.group, pr, target);
             Ok(serde_json::to_string(&out).unwrap_or_default())
         }
         "merge_queue_status" => {
-            require_orchestrator(caller)?;
+            // MUTATION K1 (evidence, NOT shipped).
             let out = reg.merge_queue_status(&caller.group);
             Ok(serde_json::to_string(&out).unwrap_or_default())
         }
         "cancel_queued_merge" => {
-            require_orchestrator(caller)?;
+            // MUTATION K1 (evidence, NOT shipped).
             let raw = arg_str(args, "pr").ok_or("pr required")?;
             let pr = super::pr_number(raw).ok_or("pr must be a number, #n, or a PR URL")?;
             let out = reg.cancel_queued_merge(&caller.group, pr);
