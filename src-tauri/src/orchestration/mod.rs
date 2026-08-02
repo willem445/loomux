@@ -32647,6 +32647,14 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn readmit_recovered(&self, group: &str, agent_id: &str, pty_id: u32) -> usize {
         self.recover_persisted_queue(group);
+        // #581 §4: the merge queue's own restart reconcile, beside the delivery
+        // queue's. Same shape (once-only guard, two phases), same reason for
+        // being on a BIND site rather than on group creation: phase 2 delivers a
+        // notice, and at group-creation time no pane exists to receive one.
+        // A no-op (one `HashSet` probe) on every call after the first, and a
+        // no-op over an absent `merge_queue.json` on every group that has never
+        // enqueued — which is all of them until slice E ships the MCP tools.
+        self.merge_queue_reconcile(group);
         let target = self.durable_target(agent_id);
         let matches = |e: &queue::PersistedEntry| {
             queue::rebinds_to(&e.delivery, target.is_orchestrator, target.session_id.as_deref())
@@ -33291,19 +33299,56 @@ impl OrchRegistry {
     /// state to lose. Stated because an unreferenced entry point looks like an
     /// oversight otherwise.
     ///
-    /// Returns the phase-2 notices for the caller to deliver; `Vec::new()` when
-    /// there was nothing to reconcile.
+    /// Called from every pane-bind site, beside `recover_persisted_queue` —
+    /// the delivery queue's equivalent — so it runs once per group per process
+    /// at a moment when a pane exists to receive phase 2's notices. Group
+    /// creation would be too early: no orchestrator is bound yet, so a notice
+    /// emitted there would be composed and dropped.
+    ///
+    /// Builds the real runner and delegates; see
+    /// [`merge_queue_reconcile_with`](Self::merge_queue_reconcile_with) for the
+    /// seam an integration test drives.
+    pub fn merge_queue_reconcile(&self, group: &str) {
+        let repo = match self.group(group).map(|g| g.repo) {
+            Some(r) => r,
+            None => return,
+        };
+        let runner = mqdriver::runner_for(std::path::Path::new(&repo));
+        let notices = self.merge_queue_reconcile_with(group, &runner);
+        // ---- phase 2: the guard has dropped; delivering is safe. Same
+        // reasoning as `recover_persisted_queue`'s: a notice is a delivery, a
+        // delivery enqueues, and an enqueue would re-enter the lock phase 1
+        // holds. ----
+        for n in notices {
+            let _ = self.deliver_to_orchestrator(group, &n, "loomux");
+        }
+    }
+
+    /// Phase 1, with the runner injected — the seam `tests/orchestration.rs`
+    /// drives so the whole registry path (the once-only guard, `load_state`,
+    /// `reconcile_batch`, the audit emission, `store_state`) is exercised
+    /// **without spawning `git` or `gh`** (constraint 3).
+    ///
+    /// This is what makes the `#[doc(hidden)] pub` below honest: it is public
+    /// for a consumer that exists. An earlier cut exposed the whole method that
+    /// way for a test that did not exist, which rev-163 correctly called out —
+    /// and which is the same "a door connected to nothing passes every test on
+    /// hand-built records" failure #661's `e20` was written for.
+    ///
+    /// Returns phase-2's notices rather than sending them, because sending is
+    /// what must not happen under the guard.
     #[doc(hidden)] // pub for integration tests
-    pub fn merge_queue_reconcile(&self, group: &str) -> Vec<String> {
+    pub fn merge_queue_reconcile_with(
+        &self,
+        group: &str,
+        runner: &dyn mqdriver::MqRunner,
+    ) -> Vec<String> {
         // ---- phase 1: under the guard ----
         let notices: Vec<String> = {
             let mut done = self.mq_reconciled_groups.lock_safe();
             if !done.insert(group.to_string()) {
                 return Vec::new();
             }
-            let Some(repo) = self.group(group).map(|g| g.repo) else {
-                return Vec::new();
-            };
             let dir = self.group_dir(group);
             let mut state = match mqloop::load_state(&dir) {
                 Ok(s) => s,
@@ -33321,8 +33366,10 @@ impl OrchRegistry {
                     return Vec::new();
                 }
             };
-            let runner = mqdriver::runner_for(std::path::Path::new(&repo));
-            let report = mqloop::reconcile_batch(&runner, &mut state, group);
+            // Snapshotted before the mutation so the write below is decided by
+            // what actually changed, not by what the report's shape implies.
+            let before = state.clone();
+            let report = mqloop::reconcile_batch(runner, &mut state, group);
 
             for t in &report.transitions {
                 self.audit(
@@ -33343,20 +33390,29 @@ impl OrchRegistry {
                     json!({ "detail": why }),
                 );
             }
-            // Persisted even when nothing moved: §4 requires the snapshot to be
-            // rewritten alongside live entries rather than deleted, so recovery
-            // stays re-runnable across N restarts.
-            if let Err(e) = mqloop::store_state(&dir, &state) {
-                self.audit(
-                    group,
-                    "loomux",
-                    mqloop::audit_action::STRANDED,
-                    json!({ "reason": "merge_queue.json could not be written", "detail": e }),
-                );
+            // Written only when reconcile actually CHANGED something. §4 asks
+            // for the snapshot to be rewritten rather than deleted — it does not
+            // ask for one to be conjured. Writing unconditionally would create a
+            // `merge_queue.json` for every group the moment any pane binds,
+            // which would destroy slice F's `absent` state: `merge_queue_view`
+            // distinguishes "never enqueued" (the product default, §12) from
+            // "empty queue", and an always-present file collapses the two.
+            //
+            // Compared against a snapshot of the value rather than inferred from
+            // the report's shape, so this cannot drift out of step with what
+            // `reconcile_batch` mutates.
+            if state != before {
+                if let Err(e) = mqloop::store_state(&dir, &state) {
+                    self.audit(
+                        group,
+                        "loomux",
+                        mqloop::audit_action::STRANDED,
+                        json!({ "reason": "merge_queue.json could not be written", "detail": e }),
+                    );
+                }
             }
             report.notices
         };
-        // ---- phase 2: the guard has dropped; delivering is safe ----
         notices
     }
 
