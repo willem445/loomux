@@ -70,7 +70,7 @@ Read the human's description and extract, explicitly, before writing YAML:
 |---|---|
 | "a role" / "an agent that does X" | a **block**: `id` (immutable identity), `name` (display only), `kind` (capability class), `cli`, `model`, and a persona (`prompt:` or `profile:`) |
 | "what kind of work can it do" | `kind` — one of exactly four: `orchestrator`, `worker`, `reviewer`, `planner`. This is the **only** thing that grants capability. See Invariant 1. |
-| "cheap" / "strong" / "which model" | `cli:` + `model:` on the block. Empty `cli:` inherits the group's default CLI; empty `model:` inherits the kind's default for the resolved CLI (`opus` for orchestrator/planner, `sonnet` for worker/reviewer on `claude`; always `auto` on `copilot`). |
+| "cheap" / "strong" / "which model" | `cli:` + `model:` on the block. Empty `cli:` inherits the group's default CLI; empty `model:` inherits the kind's default for the resolved CLI (`opus` for orchestrator/planner, `sonnet` for worker/reviewer on `claude`; always `auto` on `copilot`; always `pro` on `gemini`). |
 | "a domain expert, consulted on demand" | `kind: planner` + `role_hint: advisor` — read-only, spawned only when stuck on a specific question, exits the moment it reports. |
 | "someone who writes up lessons after a PR merges" | `kind: worker` + `role_hint: process` — opens a normal PR, never merges it, same human gate as any worker. |
 | "must all pass" / "any 2 of these 3" | `gates.merge.require: all-pass` (the default) or `require: threshold` + `threshold: N` |
@@ -131,6 +131,8 @@ Top level (`RawWorkflow`, `deny_unknown_fields`):
 | `blocks` | list of block | no (default `[]`) | at least one block, or `"no blocks declared"` |
 | `edges` | list of edge | no (default `[]`) | advisory only |
 | `gates` | map\<string, gate\> | no (default `{}`) | only the `merge` key is read by the `gh` shim today |
+| `intake` | map | no (default: built-in profile) | where autonomous work comes from and what its label vocabulary is: `source` (`github-labels` (default), `board`, `none` — `board`/`none` are schema-reserved, not yet wired) and `labels` (`ready`, `investigate`, `owned`, `prototype`; each independently overridable). It can never grant a capability, and there is no spelling of it that disables the human merge gate |
+| `merge_queue` | map | no (default: disabled) | `enabled` (bool), `max_batch`, `checks_timeout_minutes`. Absent means disabled |
 
 One block (`RawBlock`, `deny_unknown_fields`):
 
@@ -139,7 +141,7 @@ One block (`RawBlock`, `deny_unknown_fields`):
 | `id` | string | yes | immutable identity; `[A-Za-z0-9_-]` only, ≤48 chars, unique; the four kind names (`orchestrator`/`worker`/`reviewer`/`planner`) are **reserved** — usable only by a block of that same `kind` |
 | `name` | string | no (default `""`) | display only; falls back to `id` if empty; renaming never breaks a reference |
 | `kind` | string | yes | one of `orchestrator`, `worker`, `reviewer`, `planner` (case-insensitive); anything else is a named error, never coerced |
-| `cli` | string | no (default `""`) | `""` = inherit the group default; else must be `claude` or `copilot` |
+| `cli` | string | no (default `""`) | `""` = inherit the group default; else must be one of `SUPPORTED_CLIS` (`claude`, `copilot`, `gemini`) |
 | `model` | string | no (default `""`) | `""` = inherit the kind's default for the resolved `cli`; allowlist-filtered (alnum, `.`, `-`, `_`) |
 | `prompt` | string | no | inline persona text; mutually exclusive with `profile` |
 | `profile` | string | no | repo-relative path to a persona file; mutually exclusive with `prompt`; no `..`, no absolute path, no drive letter |
@@ -316,7 +318,7 @@ As an authoring agent you cannot invoke either directly, so:
    already on) — that's what actually runs `parse_workflow` and shows the
    resolved roster/errors as warnings before anything spawns.
 
-## Step 6 — PITFALLS (from this repo's own history)
+## Step 6 — PITFALLS
 
 - **Comment-preserving YAML, but only through the pane (#233).** If a human
   later edits the file through loomux's GUI workflow pane, their comments
@@ -330,9 +332,8 @@ As an authoring agent you cannot invoke either directly, so:
 - **Unknown-field rejection is strict by design, not an accident to work
   around.** Every wire struct in `workflow.rs` carries
   `#[serde(deny_unknown_fields)]` specifically so a typo'd key (`promt:`,
-  `kinds:`, `revewers:`) is a loud parse error instead of the silent no-op
-  every other workflow tool in the survey ships (Flowise/Langflow/Dify all
-  discover a bad key at runtime, or never). Don't add speculative fields
+  `kinds:`, `revewers:`) is a loud parse error instead of a silent no-op
+  discovered at runtime, or never. Don't add speculative fields
   "in case loomux supports them later" — it doesn't, and the parser will
   say so.
 - **An `also:` condition the shim can't check fails the gate closed, not
@@ -344,14 +345,10 @@ As an authoring agent you cannot invoke either directly, so:
   ignoring it. If a human describes a condition that isn't CI status, don't
   silently drop it into `also:` and call it done — say plainly that it
   isn't enforceable today.
-- **Persona text with apostrophes is fine — this has been true since the
-  block model itself landed (#222), not from a later fix.** `sanitize_persona`
-  maps `'` → the typographic `’` before the persona reaches a shell's
-  single-quoted `--agents` payload, so `"don't"` in a `prompt:` reads fine
-  and needs no special escaping from you. (Double-check this against the
-  current `workflow.rs` if you're working in a much later commit — but as of
-  this writing there is no separate "apostrophe quoting fix" era to worry
-  about; don't invent one.)
+- **Persona text with apostrophes needs no escaping from you (#222).**
+  `sanitize_persona` maps `'` → the typographic `’` before the persona
+  reaches a shell's single-quoted `--agents` payload, so `"don't"` in a
+  `prompt:` reads fine as written.
 - **Resume-pinning: a workflow change mid-group doesn't apply until
   relaunch.** Only a **fresh** launch reads `.loomux/workflow.yml` — a
   **resumed** group keeps running the roster (and gate) it was launched
@@ -362,10 +359,3 @@ As an authoring agent you cannot invoke either directly, so:
   already running, tell the human the change needs a relaunch (or the live
   advanced-orchestrator toggle flip, which *is* a consent moment) — it will
   not take effect on its own.
-
-## What's coming, not yet merged
-
-An `intake:` block (issue #382, PR #403) is on the review gate as of this
-writing — do not document its fields or assume it's part of the schema
-above until it's actually merged to `main`; re-check `workflow.rs` for it
-before relying on anything beyond what's in the schema table.

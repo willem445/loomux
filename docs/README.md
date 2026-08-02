@@ -8,60 +8,30 @@ pages plus one `_config.yml`.
 > site (`exclude:` in `_config.yml`). The reader-facing entry point is
 > [`index.md`](index.md).
 
-## Tooling decision: GitHub-Pages-native Jekyll (not a Node SSG)
+## How the site is built
 
-The brief was to optimize for **zero maintenance** and **no new repo toolchain
-burden**. Two options were on the table:
+This is a **GitHub-Pages-native Jekyll** site: checked-in Markdown plus one
+`_config.yml`, and nothing else.
 
-1. **GitHub Pages' native Jekyll** — checked-in Markdown + `_config.yml`, no
-   build dependencies committed to this repo.
-2. **A minimal Node SSG** (Astro/Eleventy/VitePress) — we already run Node in CI,
-   so it's feasible.
-
-**We chose Jekyll (option 1).** Rationale:
-
-- **No repo-local toolchain to maintain.** There is no `package.json`, no
-  `Gemfile`, no lockfile in `docs/`. The Jekyll runtime is provided *by the CI
-  action* (`actions/jekyll-build-pages`, which bundles the `github-pages` gem),
-  not pinned in this repo. A Node SSG would add a dependency tree we'd have to
-  keep patched (Dependabot noise, build breakage on major bumps) — exactly the
-  maintenance burden the brief said to avoid.
-- **Content is just Markdown.** The docs are prose; they don't need a component
-  framework or a JS build step.
+- **No repo-local toolchain — don't add one.** There is no `package.json`, no
+  `Gemfile`, and no lockfile in `docs/`; the Jekyll runtime comes from the CI
+  action (`actions/jekyll-build-pages`, which bundles the `github-pages` gem).
+  A Node SSG here would add a dependency tree to keep patched. Node stays in CI
+  for what needs it (the app's typecheck/build/tests); the docs deploy is a
+  separate, self-contained workflow that pulls in nothing from the app
+  toolchain.
 - **The theme is a pinned remote theme.** `remote_theme:
-  just-the-docs/just-the-docs@v0.12.0` gives a sidebar, search, and
-  light/dark — a real docs UX — without vendoring anything. It's pinned to a
-  release tag so an upstream change can't silently break a release-day publish;
-  bumping it is a deliberate one-line edit.
-- **Node stays in CI for what needs it** (the app's typecheck/build/tests). The
-  docs deploy is a separate, self-contained workflow that pulls in nothing from
-  the app toolchain.
+  just-the-docs/just-the-docs@v0.12.0` gives a sidebar, search, and light/dark
+  without vendoring anything. It's pinned to a release tag so an upstream change
+  can't silently break a release-day publish; bumping it is a deliberate
+  one-line edit.
+- **The build only runs in CI/Pages** — no Ruby is assumed on a contributor's
+  machine — so a broken `_config.yml` or a bad theme pin is caught by the
+  workflow's **build job**, not locally. That's why the docs workflow runs a
+  **build-only dry-run on PRs that touch `docs/`** (see below).
 
-Trade-off accepted: the Jekyll build only runs in CI/Pages (no Ruby is assumed on
-a contributor's machine), so a broken `_config.yml` or a bad theme pin is caught
-by the workflow's **build job**, not locally. That's why the docs workflow runs a
-**build-only dry-run on PRs that touch `docs/`** (see below).
-
-## Layout
-
-```
-docs/
-  _config.yml            site config + theme pin
-  index.md               Home (nav_order 1)
-  getting-started.md     (2)
-  core-concepts.md       (3) — panes/grid/shortcut table
-  orchestration.md       (4) — groups, board, label handshake
-  autonomous-mode.md     (5) — autonomous / supervised dangerous mode + the gate
-  features/
-    index.md             "Features" nav parent (6)
-    git-view.md
-    github-issues.md
-    voice-prompts.md
-    steering.md
-    session-browser.md
-  troubleshooting.md     (7)
-  README.md              this file (excluded from the site)
-```
+Page order is whatever each page's `nav_order` front matter says; read the front
+matter rather than a listing here.
 
 ## How it's published
 
@@ -118,4 +88,4 @@ gem install github-pages
 jekyll serve
 ```
 
-(Kept out of the committed toolchain on purpose — see the decision above.)
+(Kept out of the committed toolchain on purpose — see "How the site is built".)

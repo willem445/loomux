@@ -69,8 +69,7 @@ orchestrator:
   checkout happens to sit on, so parallel work starts from a clean base without
   a manual rebase; a reviewer's own worktree is the same kind of clean scratch
   space, kept separate so two reviewers (or a reviewer and the orchestrator's
-  own git traffic) never contend on the same checkout — a live incident that
-  used to happen before this. A reviewer's worktree isn't a checkout of the PR
+  own git traffic) never contend on the same checkout. A reviewer's worktree isn't a checkout of the PR
   it's reviewing (that branch may already be checked out elsewhere); it fetches
   the PR's code in **detached-HEAD** mode when it needs to run something
   locally, which never collides with anything. The orchestrator cannot spawn
@@ -182,8 +181,8 @@ Board controls:
   - **Base is some other branch** — a stacked sub-PR into an integration
     branch, say — the label says so and names it ("Approve (sub-PR into
     integration/581 — the orchestrator merges it once the gate verdicts land)").
-    Your Approve grant is the *default-branch* gate, so it was never what this
-    PR was waiting on, and the old wording implied otherwise.
+    Your Approve grant is the *default-branch* gate, so it is not what this
+    PR is waiting on.
 
   This narrows the **story**, not the gate. A custom workflow's merge gate
   applies to every merge of a PR wherever it lands, integration branches
@@ -317,7 +316,7 @@ These deserve their own detail — see:
 ## CI watches (agent notifications)
 
 Distinct from the 🔔 desktop-notification toggle above — that raises a toast for *you*; this
-notice goes to the *agent*, typed into its own pane. Agents no longer sit watching a PR's CI:
+notice goes to the *agent*, typed into its own pane. Agents don't sit watching a PR's CI:
 the orchestrator, workers, and reviewers can register a background watch — a PR's checks, or
 a specific GitHub Actions run — and go do other work; loomux polls in the background (every
 30s) and types a `[loomux] PR #241 checks: SUCCESS — … (watch n-3)`-style notice into the
@@ -401,13 +400,13 @@ shows up as a normal Connect target — as long as the launcher's **Channel tool
 is on (it defaults on; turn it off if you'd rather a fresh pane not carry a live channel
 token until you actually connect it — the checkbox only appears for claude/copilot, since
 it's the only pair this applies to). Any other CLI (codex, gemini, opencode, a custom
-command), a claude/copilot pane launched with the checkbox off, or a pane you launched
-before this feature existed, becomes connectable the first time you right-click it: it
-joins as a **receive-only** member (a dashed variant of the chip, instead of solid) — it
-can never be the sender, and its direction is always ▼. This is a structural fact, not a
-bug: those CLIs have no way for loomux to hand them a channel-send capability today
-(tracked as a follow-up), and an already-running pane can't be handed one either without
-restarting it. A receive-only pane still gets every message the sender sends it — it just
+command), a claude/copilot pane launched with the checkbox off, or any pane that was
+already running before its channel tools were wired up, becomes connectable the first
+time you right-click it: it joins as a **receive-only** member (a dashed variant of the
+chip, instead of solid) — it can never be the sender, and its direction is always ▼. This
+is a structural fact, not a bug: those CLIs have no way for loomux to hand them a
+channel-send capability today (tracked as a follow-up), and an already-running pane
+can't be handed one either without restarting it. A receive-only pane still gets every message the sender sends it — it just
 can't talk back.
 
 **Multi-party.** A channel can have more than two members: right-click a free (not yet
@@ -426,7 +425,7 @@ whole channel closes and every remaining pane is notified: a channel with no one
 is as dead as one with only a single member left, and there's no automatic promotion (a
 human always picks who sends).
 
-**Limits (v1).** Channels are **in-memory only** — closing loomux drops every channel;
+**Limits.** Channels are **in-memory only** — closing loomux drops every channel;
 after a restart, reconnect the panes you want linked. A pane holds **at most one channel**
 at a time (see Multi-party, above). Full (sender-capable) standalone membership only works
 for claude/copilot today — see "Standalone panes" above.
@@ -467,7 +466,7 @@ agent's state, and running session cost with a group total. From here you can:
   header, for reclaiming screen space.
 - **Workflow row** — when the repo has a [custom agent workflow](#custom-agent-workflows)
   active, this panel names it, lists its roster, and shows the armed merge gate
-  in one line (e.g. "loomux · 6 blocks · merges to the default branch require:
+  in one line (e.g. "loomux · 9 blocks · merges to the default branch require:
   rev-orch + rev-ui + rev-tests · all-pass · ci-green") — so you know whether
   an Approve can actually succeed before you click it, not after it bounces.
   If the gate
@@ -553,8 +552,11 @@ gate:
 ```
 
 You need the CLI itself installed and logged in — loomux spawns `gemini` from
-your `PATH` the same way it spawns `claude`, and a reviewer whose CLI isn't
-installed just fails to start. Nothing else is needed: the reviewer's loomux
+your `PATH` the same way it spawns `claude`. A CLI named by a workflow block is
+**not** checked before launch (only the CLIs picked in the launcher's own role
+dropdowns are), so if it isn't installed the pane still opens, prints the
+shell's not-recognized error (on Windows, `The term 'gemini' is not
+recognized…`), and exits; the orchestrator is then told that agent died. Nothing else is needed: the reviewer's loomux
 tools (including the `pass`/`fail` verdict the merge gate reads) are wired up
 per agent, and its containment is generated per agent too, so a gemini
 reviewer is denied the file-editing tools exactly like a Claude one.
@@ -571,20 +573,18 @@ Two differences worth knowing before you pick gemini for a lane:
   read its transcript — gemini mints its own session ids rather than
   accepting one, so there's nothing for loomux to record and reopen later.
 
-**Why not codex?** It was evaluated for this and deliberately left out: codex
-can't deny its editing tool by name, and its sandbox is all-or-nothing —
-strict enough to block the tests and `gh` a review needs, or open enough to
-let the reviewer rewrite the code it's reviewing. A reviewer that can't be
-contained would quietly weaken the merge gate, so loomux refuses the pairing
-instead of shipping it.
+**Why not codex?** codex can't deny its editing tool by name, and its sandbox
+is all-or-nothing — strict enough to block the tests and `gh` a review needs,
+or open enough to let the reviewer rewrite the code it's reviewing. A reviewer
+that can't be contained would quietly weaken the merge gate, so loomux refuses
+the pairing rather than shipping it.
 
 Turning it on live shows the same resolved-roster confirm (name, blocks, any
 declared gate) the launcher's own preview shows at launch time; turning it off
 confirms that future spawns fall back to the built-in roster on your default
-CLI (per-role CLI overrides picked at launch aren't separately retained,
-so an off→on→off round trip doesn't restore them — a rare enough path that a
-deterministic rebuild from the default CLI beat persisting a second roster
-just for it).
+CLI (per-role CLI overrides picked at launch aren't separately retained, so an
+off→on→off round trip rebuilds the roster from your default CLI rather than
+restoring them).
 
 ### Proposed lessons come with their evidence
 
@@ -677,10 +677,10 @@ worth compacting. `/compact` is a Claude Code built-in, so the nudge only ever f
 Claude Code panes.
 
 **The timed nudge also checks context is actually full before it fires — a smart default, no
-setup needed.** A live benchtest found the timed nudge firing at the right *quiet* moment but
-the wrong *context level* — several real compactions at only 20-30% full, paying a full
-re-grounding cycle for a pane that wasn't actually running out of room. So once you enable the
-quiet-window (above), a minimum context floor is on **automatically** at a sensible default
+setup needed.** Quiet is not the same signal as full: on its own, a quiet-window nudge fires
+at the right *moment* but the wrong *context level*, compacting a pane at 20-30% full and
+paying a whole re-grounding cycle for one that wasn't running out of room. So once you enable
+the quiet-window (above), a minimum context floor is on **automatically** at a sensible default
 (50%) — nothing to configure. Three states, if you do want to tune it: leave it alone (the
 50% default applies as soon as the quiet-window is set); set it explicitly to a percentage of
 your own choosing; or set it to `0` to go back to firing on the quiet window alone, with no
@@ -728,10 +728,9 @@ something worth a glance — its compact-nudge phase: armed (waiting to observe 
 busy), awaiting evidence (busy observed, waiting on quiet to resolve), re-grounding (a
 reinjection is in flight, with its attempt count), or a recent lost outcome (an arm or
 delivery that didn't resolve in time and was released rather than left stuck). An idle agent
-with nothing pending shows neither line — this narrates the same state machine described
-above, not a separate status. The percent is against the model's ACTUAL context window (Opus's
-larger tier reads correctly, not against a flat assumption) — a group can override the guess
-explicitly if it's ever wrong for a given deployment.
+with nothing pending shows neither line. The percent is against the model's actual context
+window, so a larger tier (Opus) reads correctly — a group can override the guess explicitly
+if it's ever wrong for a given deployment.
 
 ## Persistence & restart
 
@@ -764,9 +763,9 @@ disturbing a busy one.
 **The delivery queue (above) is in-memory only.** If loomux restarts while a
 prompt is queued behind a blocked pane, that queued prompt is lost — every
 enqueue is still recorded in `audit.jsonl`, so the loss is visible after the
-fact, but nothing replays it automatically today. This is a known, deliberate
-limitation, not an oversight; see `doc/design/orchestration.md`'s "Delivery
-queue (#445)" section for the full argument and the planned follow-up.
+fact, but nothing replays it automatically **yet** — a replay is a planned
+follow-up, and `doc/design/orchestration.md`'s "Delivery queue (#445)" section
+carries the argument for why it isn't there today.
 
 ## Autonomous mode
 {: #autonomous-mode }
@@ -788,5 +787,11 @@ it gates, the per-item approve-with-comment grants, and the gate's audit trail.
 
 ## Requirements
 
-- `claude` CLI on `PATH`.
+- An agent CLI on `PATH` — `claude`, `copilot`, or `gemini`. Roles can run on
+  different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer)).
+  The launcher warns inline as you pick, and re-checks on submit — if one of
+  those CLIs isn't on `PATH` it refuses the whole launch rather than starting
+  the group. A CLI named by a `.loomux/workflow.yml` block is not checked at
+  all, and shows up instead as a pane that opens and immediately exits with the
+  shell's not-recognized error.
 - `gh` CLI authenticated for the issue/PR/review workflow.

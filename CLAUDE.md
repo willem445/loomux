@@ -121,8 +121,8 @@ compiles.
 - Backend: unit tests inline under `#[cfg(test)]` only if they don't link the
   full lib; otherwise integration tests (constraint 4). Orchestration logic is
   covered in `src-tauri/tests/orchestration.rs`.
-- `src-tauri/src/orchestration/mod.rs` is ~35k lines — read it selectively
-  (grep for the function/struct), not top to bottom.
+- `src-tauri/src/orchestration/mod.rs` is tens of thousands of lines — grep for
+  the function/struct, don't read it top to bottom.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
 - Write tests that test intent, not implementation echoes.

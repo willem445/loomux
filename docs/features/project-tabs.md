@@ -74,8 +74,7 @@ you're looking at another project.
   can't hide its ask. Click the tab to jump straight to the pane.
 - The tab shows a live **`✦agents · $cost`** chip. The **agent count is exact** —
   it counts the agent panes actually open in that tab (normal agents *and* live
-  orchestration panes), so it never flashes a stray `0` or goes missing; the cost
-  comes from the group.
+  orchestration panes); the cost comes from the group.
 - A tab running orchestration shows a **`⛓`** marker; a tab holding a **dormant**
   (restored-but-not-resumed) group shows a static **`ORCH`** chip. A tab can mix
   normal agents and orchestration, so these are independent of the agent count.
@@ -164,10 +163,10 @@ divider positions you'd dragged. Each pane comes back by kind:
   for one that's gone. A worker is only ever rejoined into the group its own
   recorded session belongs to — if something asks for it under a different
   group, the restore **fails with a message** instead of attaching it to the
-  wrong orchestrator. (Tabs saved by a version before this fix don't record
-  which group each pane belonged to; if such a tab holds two orchestrators,
-  the card says so and points you at the session browser, where each session's
-  group is known, rather than guessing at one.)
+  wrong orchestrator. (An older saved tab may not record which group each pane
+  belonged to; if such a tab holds two orchestrators, the card says so and
+  points you at the session browser, where each session's group is known,
+  rather than guessing at one.)
 
 **Start fresh** opens a single blank welcome tab and leaves the rest behind.
 

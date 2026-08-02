@@ -7,8 +7,8 @@ description: When a change depends on Claude Code, GitHub Copilot CLI, or any ot
 
 Loomux orchestrates other vendors' agent CLIs. Their capabilities change
 under us, their flags have precise semantics we don't control, and a wrong
-assumption about them ships as a loomux bug. Twice in one week this repo
-paid for guessing (lineage below). The rule that replaces guessing:
+assumption about them ships as a loomux bug (#417/#418, #329). The rule that
+replaces guessing:
 
 > Before designing or reviewing ANYTHING that depends on an agent CLI's
 > behavior — a flag, a hook event, a settings-merge rule, a session-file
@@ -37,8 +37,8 @@ GitHub Copilot (root: https://docs.github.com/en/copilot/reference):
   https://docs.github.com/en/copilot/reference — navigate to the CLI section
   for the current layout rather than trusting a deep link.
 
-Other agent CLIs (Ante, hermes, future tiers): find the vendor's official
-reference before wiring anything, and ADD its root URL to this index in the
+Any other agent CLI: find the vendor's official reference before wiring
+anything, and ADD its root URL to this index in the
 same PR that introduces the dependency. A CLI with no reference docs gets
 its observed behavior recorded in `doc/design/` with the version it was
 observed against — labeled observation, never presented as contract.
@@ -60,17 +60,9 @@ observed against — labeled observation, never presented as contract.
 - When docs and observed behavior disagree, the observation wins for the
   code path (with a comment noting the divergence + doc link) and the
   divergence gets flagged in the PR for the human.
-
-## Lineage (why this skill exists)
-
-- PR #418 round 1 declared "Copilot has no compact hooks upstream" from a
-  changelog read. The hooks REFERENCE showed 14 events including
-  `preCompact` — the user had to supply the link. A full correction round
-  followed (#417).
-- The same PR hedged Claude's `--settings` hook-merge semantics as
-  "unverified" through three review rounds; the hooks reference documents
-  the additive merge model directly. The hedge cost a demo-script step and
-  reviewer time.
-- Same-family precedent: #329 round 7's context-window fix initially
-  hardcoded a model table where the transcript itself carried the model id
-  (the price-table convention already knew this).
+- A hedge is not a neutral default. "Unverified" on a fact the reference
+  page states plainly costs the same review round as getting it wrong;
+  fetch the page instead.
+- Prefer reading a fact out of the artifact over hardcoding a table of it —
+  a transcript that carries its own model id beats a model table that has
+  to be maintained (#329).

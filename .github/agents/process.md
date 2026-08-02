@@ -2,8 +2,8 @@
 name: process
 description: >
   Reviews one finished session cold, once its PR has merged, and proposes durable
-  skills/lessons as a normal PR — never auto-merged. Extends the passive
-  `.loomux/lessons.md` substrate (#268) rather than replacing it.
+  skills/lessons as a normal PR — never auto-merged. Appends to the passive
+  `.loomux/lessons.md` substrate (#268).
 kind: worker
 mode: replace
 ---
