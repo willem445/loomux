@@ -474,10 +474,11 @@ pub fn validate_target(
     if same_branch(base, default) {
         return Err(TargetRefusal::BaseIsDefault);
     }
+    // MUTATION M17 (red-before-green evidence, NOT shipped): the
+    // never-silently-retargeted refusal removed, so a PR whose base is not the
+    // queue's established target is accepted anyway.
     if let Some(t) = current_target.map(str::trim).filter(|t| !t.is_empty()) {
-        if !same_branch(base, t) {
-            return Err(TargetRefusal::BaseNotTarget);
-        }
+        let _ = same_branch(base, t);
     }
     if let Some(a) = asserted.map(str::trim).filter(|a| !a.is_empty()) {
         if !same_branch(base, a) {
@@ -922,7 +923,10 @@ pub fn land_batch(
     // removed" — unfalsifiable by design, and its comment credited it for a
     // refusal the assertion actually produced. Removed rather than kept as
     // untestable belt-and-braces.
-    if !landable(recorded_target.trim()) {
+    // MUTATION M18 (red-before-green evidence, NOT shipped): the corrupt-record
+    // guard removed, so an empty recorded target lets every sub-PR validate
+    // against nothing but the default.
+    if false && !landable(recorded_target.trim()) {
         return Err(LandRefusal::Target { pr: 0, refusal: TargetRefusal::BaseUnverifiable });
     }
     // Resolved ONCE, here, at the moment of submit — not carried in.
