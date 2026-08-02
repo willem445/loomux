@@ -1568,8 +1568,8 @@ fn sweep_leaked_readers() -> usize {
 /// still blocked. Pure, so the ceiling policy is testable without arranging a
 /// real leak — the `due_watches`/`due_intake_polls` idiom applied to the one
 /// other unbounded resource this poller can grow.
-pub fn gh_capture_admitted(_live_readers: usize) -> bool {
-    true // MUTATION (red witness): the ceiling never refuses
+pub fn gh_capture_admitted(live_readers: usize) -> bool {
+    live_readers < GH_CAPTURE_MAX_LEAKED_READERS
 }
 
 /// Bounded `Child::wait` (#656): poll until the child reports exit or
@@ -21982,7 +21982,9 @@ impl OrchRegistry {
             // entry until this process exits), which is the cheaper of the two
             // residues and the only one that is bounded.
             let _ = wait_bounded(&mut child, GH_CAPTURE_REAP_TIMEOUT);
-            // MUTATION (red witness): abandoned readers are forgotten, not parked
+            let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+            leaked.push(out_reader);
+            leaked.push(err_reader);
             return Err(format!("timed out after {}s", timeout.as_secs()));
         };
 
