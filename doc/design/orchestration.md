@@ -6553,6 +6553,65 @@ off still leaves its continuation unmarked. Both are under-masks. Closing them s
 loomux to know *what* it wrote to a pane rather than that a row claims it did — delivery
 machinery, not detection.
 
+## #727: a pointer glyph with nothing after it is a prompt, not a menu
+
+**Problem.** Deliveries to a pane resumed from a previous session were queued behind "an
+interactive question is on screen" and never flushed — 25 minutes over a *visibly idle* pane, three
+panes killed, two queued deliveries dropped with them. It reproduced on demand: resume the session,
+send anything, watch it queue.
+
+The phantom question was the CLI's own input box. Claude Code paints an empty box as a bare `❯` on
+its own row, and `leads_with_pointer` — the `pointer-option` signal — read that as a menu's
+highlighted choice. Every `delivery-aborted-question` record in the group's audit log fired on that
+glyph, and none on a real dialog.
+
+**Why nothing could clear it.** The glyph poisons both of the guard's readings at once, which is
+exactly the case #534's grid release was supposed to cover and the one place it could not:
+
+- On the **ring**, the glyph sits in the last painted lines by construction — it *is* what the CLI
+  redraws underneath everything else — so the mechanism that saves the other `❯` false positives
+  (finished-turn prose scrolling out of the last-3-lines window) cannot reach it. `strip_ansi`
+  deletes cursor addressing, so the glyph also concatenates onto whatever was addressed next,
+  producing a matched "line" that was never on any screen.
+- On the **grid**, `pointer_rendered` scans every rendered row for a leading pointer and finds the
+  same bare glyph. So `grid_evidence_for` answered `StillRendered` for *any* `pointer-option` match
+  on *any* screen of that CLI, and the single transition #534 added — match + `NotRendered` →
+  release — was unreachable for this signal class. Not weakened: dead.
+
+A resumed pane turns that into a permanent latch rather than a 120-second one. Its restored screen
+is static, so no repaint ever comes to change either reading, and the hold ends only when the pane
+dies.
+
+**Fix.** The pointer must lead *content*: `leads_with_pointer` now requires something other than
+framing after the glyph (`is_frame_char` on both sides, so a boxed empty prompt `│ ❯   │` reads the
+same as a bare one). This narrows the **signal**, not the guard — a highlighted menu choice points
+*at an option*, and no dialog's selected option is blank — so every hold that ever mattered is
+untouched, and the release path that was dead code comes back to life for the class that needs it
+most.
+
+**Rejected: widening the notice mask instead.** The ring's matched line was
+`❯ [loomux] pr #715 checks: …`, so masking loomux's own notice through a leading prompt glyph would
+also have cleared this repro. It fixes the wrong layer: the ring is *allowed* to over-match (it is
+the trigger; the grid is what releases), the mask is the security-sensitive surface where a
+widening claims rows loomux cannot prove it wrote, and the bare glyph would still have pinned the
+grid at `StillRendered` for every other `pointer-option` hold on the same CLI.
+
+**Tests.** `f1`–`f4` in `tests/orchestration.rs`, over
+`tests/fixtures/attention/fp-resumed-agent-idle-prompt.txt` — the repro's own restored screen,
+captured from `get_output` on the pane that wedged. `f1` pins the glyph inside the detector's
+pointer window first, so it cannot pass for the reason the other `❯` negatives pass; `f2` runs the
+production predicate over both readings of that screen; `f3` is the fail-safe direction (a pointer
+leading a real option still matches, still re-reads on the grid framed or bare, still holds end to
+end); `f4` is the latch itself — a genuine menu match on the ring, released once the screen becomes
+the idle prompt. The fixture also joins the existing `prompt_wait_detected` and `attention_tick`
+negative sets.
+
+**Residual.** A CLI that paints its input box with a *placeholder* (`❯ Try "fix the build"`) still
+leads a pointer with content and still matches. That is not new — the older box shape
+(`idle-input-box.txt`) uses `>`, which was never a pointer glyph — but it is the shape to watch if
+a CLI adopts `❯` plus placeholder text; the answer then is the same one this note takes, a narrower
+signal, not a wider mask.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,

@@ -6261,25 +6261,53 @@ pub fn prompt_wait_detected(tail: &str) -> bool {
 /// ([`pointer_rendered`]), and two copies of a de-framing rule is exactly how
 /// the two readings would drift apart.
 fn deframe(l: &str) -> &str {
-    l.trim_start_matches(|c: char| {
-        c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
-            || c.is_whitespace()
-    })
+    l.trim_start_matches(is_frame_char)
+}
+
+/// What `deframe` treats as decoration rather than content.
+///
+/// Hoisted out of `deframe` (#727) so [`leads_with_pointer`] can ask the same
+/// question of what FOLLOWS a pointer glyph as `deframe` asks of what precedes
+/// it — one strip set, so "is there content here" means the same thing on both
+/// sides of the glyph.
+fn is_frame_char(c: char) -> bool {
+    c == '│' || c == '┃' || c == '|' || c == '*' || c == '●' || c == '•' || c == '◆'
+        || c.is_whitespace()
 }
 
 /// The glyphs that mark a menu's highlighted choice when they LEAD a line.
 const POINTER_GLYPHS: [char; 3] = ['❯', '›', '→'];
 
-/// Does this line LEAD with a menu pointer, after any box framing?
+/// Does this line LEAD with a menu pointer that POINTS AT SOMETHING, after any
+/// box framing?
 ///
 /// The single definition of the pointer rule (#534 rev-13). Both readings call
 /// it — the ring detector over its last painted lines, [`pointer_rendered`]
 /// over every rendered row — because a re-read that is looser than the detector
 /// it stands in for would pin holds open on ordinary prose, and one that is
 /// tighter would release into a live menu. Neither is allowed to drift.
+///
+/// **The glyph must lead content, and that is #727.** Claude Code's own input
+/// box is a bare `❯` on its own row when empty — an idle pane's *prompt*, the
+/// opposite of a question. Matching it made every idle Claude Code pane read as
+/// "a menu is displayed" on BOTH readings at once: the ring matched whatever
+/// `strip_ansi` had concatenated that glyph onto, and [`pointer_rendered`] then
+/// found the same bare glyph among the rendered rows, so `grid_evidence_for`
+/// answered `StillRendered` forever and the one release #534 added could never
+/// fire. A resumed pane made it permanent — its replayed screen is static, so
+/// nothing ever repaints the glyph away — and three panes were lost to a
+/// 25-minute hold over a visibly idle input box.
+///
+/// This narrows the signal rather than the guard: a highlighted menu choice is
+/// a pointer *at an option*, and there is no dialog whose selected option is
+/// blank. A pointer with only framing after it (`│ ❯   │`) is likewise pointing
+/// at nothing — hence [`is_frame_char`] on both sides rather than a bare
+/// `trim`, so an empty prompt inside a box is read the same as one outside it.
 fn leads_with_pointer(line: &str) -> bool {
     let d = deframe(line);
-    POINTER_GLYPHS.iter().any(|g| d.starts_with(*g))
+    POINTER_GLYPHS
+        .iter()
+        .any(|g| d.strip_prefix(*g).is_some_and(|rest| !rest.trim_matches(is_frame_char).is_empty()))
 }
 
 /// Does any rendered row lead with a menu pointer (#534 rev-13)?
