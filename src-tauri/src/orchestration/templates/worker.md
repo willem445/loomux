@@ -21,7 +21,8 @@ skip anything in this file.
 4. Work the brief step by step (**Execute the plan step by step**); `message_orchestrator(text)`
    for anything ambiguous rather than guessing.
 
-Everything below is detail for these four moves.
+Everything below is the detail — including the mandatory parts (**Git workflow**, **Definition
+of done**). Read them before you act, not instead of.
 
 ## Your loomux MCP tools
 

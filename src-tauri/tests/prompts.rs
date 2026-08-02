@@ -656,15 +656,18 @@ fn the_reviewer_has_the_lanes_and_classifies_every_finding() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn a_first_turn_primer_leads_every_role_template_with_only_the_tools_it_has() {
+fn a_first_turn_primer_leads_every_role_template_with_the_calls_that_role_actually_makes() {
     // A fresh session — especially a weaker instruction-follower like copilot — used to wade
     // through the bulk of the document before learning what to DO on turn one:
     // `orchestrator.md`'s own session-start checklist sat behind an 11-rule INVARIANTS digest,
     // hundreds of lines in. Each role template now opens with a short, imperative "Your first
-    // turn" section naming the exact first-turn call sequence, scoped to the tools that role
-    // actually has — never a manual, just what saves the round-trip of discovering the tools by
-    // trial and error. This pins that the primer (a) exists, (b) leads the document ahead of the
-    // heavier prose, and (c) names the calls specific to each role.
+    // turn" section naming the exact first-turn call sequence for that role — never a manual,
+    // just what saves the round-trip of discovering the tools by trial and error. This pins
+    // that the primer (a) exists, (b) leads the document ahead of the heavier prose, and (c)
+    // names calls that role genuinely makes. It is a positive pin only — it does not assert a
+    // role's primer stays silent about a tool it doesn't have; that absence is a different
+    // property (the kind `the_default_rendering_never_names_the_gate_machinery` in
+    // `tests/workflow.rs` checks on a different surface) and would need its own negative pins.
     let orch = instructions("orchestrator.md");
     let worker = instructions("worker.md");
     let reviewer = instructions("reviewer.md");
@@ -690,9 +693,9 @@ fn a_first_turn_primer_leads_every_role_template_with_only_the_tools_it_has() {
         );
     }
 
-    // Each role's primer names ONLY the tools it actually has — an orchestrator's re-sync reads,
+    // Each role's primer names the calls it genuinely makes — an orchestrator's re-sync reads,
     // a worker's delivery-id check and progress report, a reviewer's PR read, a planner's
-    // issue read — never a promise of a tool that role doesn't hold.
+    // issue read.
     let o = flat(&orch);
     let orch_primer = section(&o, "## your first turn", "## invariants");
     for (call, why) in [
@@ -700,6 +703,12 @@ fn a_first_turn_primer_leads_every_role_template_with_only_the_tools_it_has() {
         ("list_tasks()", "the shared board is check #2, or a fresh session re-derives it \
           from scratch"),
         ("list_agents()", "who else is running is the other half of the re-sync"),
+        // #706 review B1: the primer dropped this call while claiming to be the SAME sequence
+        // as Durability rules (which names seven steps, this one). queue_orphans() is the one
+        // a fresh session cannot recover later — nothing else ever re-surfaces a stranded
+        // delivery — so its own pin guards against the next edit dropping it silently again.
+        ("queue_orphans()", "the one call in the sequence that never re-surfaces on its own — \
+          drop it from the primer and a restart's stranded deliveries go unnoticed"),
     ] {
         pinned("orchestrator.md's first-turn primer", orch_primer, call, why);
     }

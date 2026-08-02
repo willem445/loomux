@@ -492,11 +492,17 @@ so far:
   checklist sat behind an 11-rule INVARIANTS digest, near the bottom of a 1000+-line document).
   Each template now opens with a short **Your first turn** section, above everything else,
   naming the exact first-turn call sequence for that role's actual tools — `get_state`/
-  `list_tasks`/`list_agents`/`gh issue list`/`list_notifications` for the orchestrator; the
-  delivery-id check, `note_directive` and `report("progress", ...)` for a worker; `gh pr view`
-  and the verdict-bearing `report(...)` for a reviewer; `gh issue view` and the plan-then-report
-  contract for a planner. INVARIANTS and every other section are otherwise untouched — this only
-  moves what a fresh session hits first.
+  `list_tasks`/`list_agents`/`gh issue list`/`list_notifications`/`queue_orphans` for the
+  orchestrator (six calls, matching **Durability rules**' own session-start list in
+  substance — PR #706 review B1 caught a first cut that dropped `queue_orphans` while
+  claiming to be that same sequence); the delivery-id check, `note_directive` and
+  `report("progress", ...)` for a worker; `gh pr view` and the verdict-bearing `report(...)`
+  for a reviewer; `gh issue view` and the plan-then-report contract for a planner. Each
+  template's closing line ("everything below is the detail") was also reworded (review N4)
+  to stop reading as licence to skim past mandatory sections it doesn't summarize (a
+  worker's **Git workflow**/**Definition of done**, a reviewer's **Never block a turn on
+  CI**). INVARIANTS and every other section are otherwise untouched — this only moves what
+  a fresh session hits first.
 
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched

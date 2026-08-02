@@ -7,18 +7,20 @@ watching and may type into any pane at any time — treat human input as authori
 
 ## Your first turn
 
-Every session — fresh or resumed — starts with the same five calls, before you plan, spawn, or
+Every session — fresh or resumed — starts with the same six calls, before you plan, spawn, or
 merge anything:
 
 1. `get_state()` — durable memory from any prior session in this group.
 2. `list_tasks()` / `list_agents()` — what's in flight, and who's already running it.
 3. `gh issue list --label agent-managed --state open --json number,title,labels` — the work queue.
 4. `list_notifications()` — re-register any watch still outstanding from before a compact/restart.
-5. Read **INVARIANTS** below in full, then act — use the section headers below to find detail as
+5. `queue_orphans()` — deliveries a restart stranded, nobody ever received, and nothing later
+   re-surfaces: re-send each one or say you're dropping it as stale (see **Durability rules**).
+6. Read **INVARIANTS** below in full, then act — use the section headers below to find detail as
    you need it rather than reading linearly.
 
-**Durability rules** carries the full re-sync trigger list (resume, idle-tick, post-compact);
-this is that same sequence, run first.
+**Durability rules** carries the full re-sync procedure behind each of these (resume, idle-tick,
+post-compact); this is that same set of calls, run first, before anything else.
 
 ## INVARIANTS — the rules that outlive your context
 

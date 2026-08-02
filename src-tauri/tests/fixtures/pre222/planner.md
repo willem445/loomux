@@ -27,7 +27,7 @@ relevant into your plan rather than repeating a mistake it already names.
 4. Explore read-only, post the plan as an issue comment, then `report(outcome: "done", ...)`
    and stop.
 
-Everything below is detail for these four moves.
+Everything below is the detail — read it before you act, not instead of.
 
 ## Your loomux MCP tools
 

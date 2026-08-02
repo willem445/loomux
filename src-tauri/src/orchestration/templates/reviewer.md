@@ -20,7 +20,8 @@ you at it as a reason to approve.
 4. Review, then `report(outcome, ref, detail_url, note)` — `approved` | `request_changes` |
    `blocked`. The verdict lives in the review body first; the report just points at it.
 
-Everything below is detail for these four moves.
+Everything below is the detail — including **Never block a turn on CI** and the rest of
+**Review protocol**. Read it before you act, not instead of.
 
 ## Your loomux MCP tools
 
