@@ -2011,9 +2011,11 @@ pure function over pinned `--json` fields, testable with canned fixtures and no 
   policy over an **injected** `now` and poll results, so **no test shells out to `gh`** —
   every test in `tests/orchestration.rs` drives `notify_tick` directly with a synthetic
   `PollResult` map, the same seam that makes `watchdog_tick` testable with synthetic pty
-  counters. `run_notify_tick` = `poll_watches` + `notify_tick(now_ms(), …)`, called every
-  `NOTIFY_POLL_INTERVAL` (30s) by `start_notify_poller`, registered in `lib.rs` beside
-  `start_watchdog`.
+  counters. `run_gh_poll_tick` = `poll_watches(now)` + `gh_poll_tick(now, …)`, called every
+  `NOTIFY_POLL_INTERVAL` (30s) by `start_gh_poller`, registered in `lib.rs` beside
+  `start_watchdog`. (#406 renamed that glue from `run_notify_tick`/`start_notify_poller` when
+  the intake scan moved onto this same tick — see "One `gh` poller" below. The split, the
+  cadence and the seam every test drives are unchanged.)
 - **Delivery** reuses `deliver_prompt(agent_id, text, "loomux", Delivery::MidSession)` — the
   same path the watchdog nudge, the idle-tick, and worker reports already use. No new side
   channel (add-orch-tool design norm): every existing guard comes free (per-pane serialized
@@ -2080,7 +2082,7 @@ folding it into a bare "all passed" (`SUCCESS — 4 of 5 checks passed (1 skippe
   change than this fix warrants), which a test's simulated `now` can never reach — so the
   freeze has to be reconstructed from the `now` values `notify_tick` is actually called with.
   In production this lags true pause/resume by at most one `NOTIFY_POLL_INTERVAL`
-  (`start_notify_poller` ticks every group regardless of its pause state).
+  (`start_gh_poller` ticks every group regardless of its pause state).
 
   **Two round-2 defects in this mechanism, both from the same root cause** (rev-orch, PR #247
   round 2, with reproducing probes): the span is computed *per group* but was being applied to
@@ -2342,8 +2344,10 @@ tick **conditional** on a host-side, zero-token pre-check for exactly the two th
 cadence exists to catch: new/changed `agent-ready`/`agent-investigation` labels, and open-PR
 check-state transitions.
 
-- **A second, independently-clocked poller.** `start_intake_poller` (`INTAKE_POLL_SCAN_INTERVAL`,
-  60s wake, the `start_notify_poller`/`start_idle_tick` shape) calls `poll_intake`, which — for
+- **A scan on the shared poller's tick** (#406; originally a second, independently-clocked
+  thread of its own — see "One `gh` poller" below for why that was folded away).
+  `gh_poll_tick` calls `poll_intake(now)` on the wakes where `intake_scan_due` says
+  `INTAKE_POLL_SCAN_INTERVAL` (60s) has elapsed since the last scan, which — for
   every **autonomous** group whose EFFECTIVE `intake_poll_minutes`
   (`intake::effective_intake_poll_minutes` — #429's smart default, resolved fresh every scan) is
   nonzero and due (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval
@@ -2448,6 +2452,67 @@ readers of one counter starving each other). The only state they share is the re
 gate never writes to it differently depending on whether it fires or skips (a skip is purely "don't
 delivered the notice"), so compact-nudge's own independent read of that clock is unaffected by
 whatever this gate decides for the same tick.
+
+### One `gh` poller (#406)
+
+Both features above shell out to `gh`, and both spend the **same account's** GitHub API budget.
+They shipped as two threads on two clocks (`start_notify_poller` at 30s, `start_intake_poller` at
+60s) with no coordination and no shared accounting of that budget — low-risk while the intake gate
+was default-off, a latent coupling once it isn't. #406 folds them into one loop:
+
+- **`start_gh_poller` is the only background loop in this process that calls `gh`.** It wakes on
+  `notify::NOTIFY_POLL_INTERVAL` and runs `run_gh_poll_tick` = `poll_watches(now)` +
+  `gh_poll_tick(now, &results)` — the impure/decision split the notify backend already had,
+  unchanged, so tests still drive the decision half with a synthetic `PollResult` map and nothing
+  in `tests/orchestration.rs` shells out to `gh`.
+- **One clock per wake.** `now` is sampled once and handed to `poll_watches`, `notify_tick` and
+  `poll_intake`; all three previously read `now_ms()` themselves, on two different threads. Two
+  halves of one tick can no longer disagree about when "now" was.
+- **Neither cadence changed**, with one stated exception. The notify half runs on every wake, so
+  the *wake* cadence a watch waits on is still 30s (what a watch waits on in total is that wake
+  plus the tick's own work — see the accepted cost below). The intake half runs only when the
+  pure `intake_scan_due(now, last_scan_ms)`
+  says its coarser 60s scan floor has elapsed — `OrchRegistry.intake_last_scan_ms`, one
+  process-wide stamp, distinct from the per-group `gh`-call floor
+  (`intake_last_poll_ms`/`intake::due_intake_polls`, untouched). Without that floor, merging the
+  loops would have silently doubled the intake scan rate, which is the one behavior change
+  "unify the scheduling" must not smuggle in. The exception: the FIRST scan after launch now
+  lands on the first 30s wake rather than after the old thread's full 60s sleep (`None => true`),
+  because a stamp only exists once a scan has happened. Harmless and arguably better — the
+  per-group `gh` floor is untouched — but it is the one instant where "neither cadence changed"
+  is not literally exact, so it is written down rather than rounded off.
+- **A stamp in the future rescans.** `intake_scan_due`'s middle arm catches a backwards system
+  clock jump (NTP correction, VM resume, manual set), which would otherwise stall the intake
+  scan for the whole size of the jump — a `sleep`-driven thread cannot be stalled that way, so
+  moving to a stamped clock had to not introduce it. Rescanning re-stamps, so one jump costs one
+  early scan; the per-group `gh` floor still bounds what that scan can spend.
+- **The pure layers stay separate.** `notify::due_watches` and `intake::due_intake_polls` are
+  untouched and separately tested; only the thread and its clock are shared. There is
+  deliberately **no** new rate-limit counter: what made the coupling real was two uncoordinated
+  clocks, and a budget number nothing reads would be a claim with no consumer (the repo's "a
+  claim is a deliverable" lesson). Per-tick `gh` budgeting IS wanted — it is the rest of #406's
+  ask — but as a bound a scheduler enforces, not a number it reports; one loop is the
+  precondition for it, and #656 carries the concrete shape (`notify::MAX_POLLS_PER_TICK`
+  applied to the intake half's due list).
+- **The accepted cost of one loop: one hang parks everything (#656).** `gh_capture` has no
+  timeout (pre-existing). With two threads, a `gh` stalled on a dead connection froze only its
+  own feature; with one, a hang in either half parks the loop and **all** `notify_when` watches
+  stop resolving indefinitely — which the fleet's "register the watch and end the turn"
+  discipline (#590) depends on. The per-tick exposure is also asymmetric: the notify half is
+  capped at `notify::MAX_POLLS_PER_TICK` (8), while the intake half is 2 `gh` calls per due
+  group with no cap, so N groups due on one scan wake is 2N sequential subprocesses inside one
+  tick. Both are tracked in #656 (a bounded wait on the subprocess; the `due_watches` cap idiom
+  applied to `due_intake_polls`), and that per-tick cap is the concrete remainder of #406's
+  "one shared rate-limit-aware scheduling policy" — this section delivers the single loop and
+  the single clock, not a cross-half budget.
+- **What the tests pin.** `app_setup_starts_exactly_one_gh_polling_loop` parses `src/lib.rs`'s
+  setup block (the `tests/acl_manifest.rs` precedent) — "how many threads call `gh`" is a property
+  of that call list and of nothing else, so a future `start_*_poller` added beside it fails this
+  test and nothing else in the suite would notice. The other two pin that one wake services both
+  features and that the intake scan keeps its own floor while the notify half runs every wake.
+
+`start_workflow_gate_reload` is deliberately **not** folded in: it reads a file, not `gh`, so it
+spends none of the budget this section is about.
 
 ## Compact-nudge (#287)
 

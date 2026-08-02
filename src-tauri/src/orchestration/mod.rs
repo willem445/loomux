@@ -1432,11 +1432,17 @@ const IDLE_TICK_INTERVAL: Duration = Duration::from_secs(60);
 /// false for the overwhelming majority of a session's wall-clock time (no
 /// compaction in flight). See `compact_nudge_poll_interval`.
 const COMPACT_NUDGE_FAST_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// Idle-tick intake gate (#332): how often the background poller scans for a
-/// group whose `intake_poll_minutes` interval has elapsed. Coarser polling
-/// than this would risk missing a group's own interval by a noticeable
-/// margin; finer buys nothing, since `intake::due_intake_polls` still gates
-/// the actual `gh` calls to each group's configured minutes.
+/// Idle-tick intake gate (#332): how often the intake half of the unified
+/// `gh` poller scans for a group whose `intake_poll_minutes` interval has
+/// elapsed. Coarser polling than this would risk missing a group's own
+/// interval by a noticeable margin; finer buys nothing, since
+/// `intake::due_intake_polls` still gates the actual `gh` calls to each
+/// group's configured minutes.
+///
+/// #406: this is no longer a thread's sleep — it is the scan floor
+/// `intake_scan_due` applies inside the single poll loop, whose own wake
+/// cadence is the finer `notify::NOTIFY_POLL_INTERVAL`. Same cadence, one
+/// fewer thread.
 const INTAKE_POLL_SCAN_INTERVAL: Duration = Duration::from_secs(60);
 /// Merge-gate hot-reload (#385): how often `run_workflow_gate_reload` re-checks
 /// every advanced-orchestrator group's `.loomux/workflow.yml` against its
@@ -8152,6 +8158,14 @@ pub struct OrchRegistry {
     /// called `gh` (not merely last considered) — `intake::due_intake_polls`'s
     /// per-group interval floor.
     intake_last_poll_ms: Mutex<HashMap<String, u64>>,
+    /// Unified `gh` poller (#406): Unix-ms the intake half last ran its
+    /// due-group SCAN — process-wide, one entry, not per group. Distinct from
+    /// `intake_last_poll_ms` above, which is the per-group `gh`-call floor:
+    /// this one only decides which wakes of the single background loop run
+    /// the intake scan at all (`intake_scan_due`), preserving the coarser
+    /// scan cadence the intake poller had when it owned its own thread.
+    /// `None` until the first wake, so the first tick after launch scans.
+    intake_last_scan_ms: Mutex<Option<u64>>,
     /// Idle-tick intake gate (#332): the composed wake summary from every
     /// poll that found something new since the last delivery, pending
     /// delivery on the next idle tick that actually fires for this group.
@@ -17150,6 +17164,7 @@ impl OrchRegistry {
             notify_seq: AtomicU32::new(0),
             intake_seen: Mutex::new(HashMap::new()),
             intake_last_poll_ms: Mutex::new(HashMap::new()),
+            intake_last_scan_ms: Mutex::new(None),
             intake_pending: Mutex::new(HashMap::new()),
             idle_tick_last_fired_ms: Mutex::new(HashMap::new()),
             paused_watch_since: Mutex::new(HashMap::new()),
@@ -20109,8 +20124,9 @@ impl OrchRegistry {
     // Mirrors the watchdog's split exactly: `poll_watches` is the impure half
     // (shells out to `gh`, one process per due watch), `notify_tick` is the
     // decision half (pause/expiry/fail-streak/fire policy over an injected
-    // `now` + poll results, so no test needs `gh`), and `run_notify_tick` glues
-    // them for the live background thread (`start_notify_poller`).
+    // `now` + poll results, so no test needs `gh`), and `run_gh_poll_tick`
+    // glues them for the live background thread (`start_gh_poller`, the one
+    // loop that also carries the intake scan since #406).
 
     /// Register a new watch for `agent` in `group`. Rejects over-cap (naming
     /// the cap that was hit, mirroring the `spawn_agent` guardrail wording);
@@ -20317,8 +20333,12 @@ impl OrchRegistry {
     /// per-watch floor, round-robin ordering, and the paused-skip are all
     /// tested there with no `gh`), shell out to `gh` for each, and classify
     /// with the pure predicates.
-    fn poll_watches(&self) -> HashMap<String, notify::Poll> {
-        let now = now_ms();
+    ///
+    /// `now` is injected (#406): the unified `gh` poller samples the clock
+    /// ONCE per wake and hands the same instant to every half of the tick, so
+    /// the selection floor here and the decision policy in `gh_poll_tick`
+    /// can never disagree about when "now" was.
+    fn poll_watches(&self, now: u64) -> HashMap<String, notify::Poll> {
         let paused = self.paused.lock_safe().clone();
         let due: Vec<notify::Watch> = {
             let watches = self.watches.lock_safe();
@@ -20426,7 +20446,7 @@ impl OrchRegistry {
     ///   off the radar entirely and strand its entry forever, rev-orch, PR
     ///   #247, "B1") that isn't already recorded gets
     ///   `paused_watch_since[group] = now` — the earliest a paused group can
-    ///   be caught is the very next tick, and `start_notify_poller` ticks
+    ///   be caught is the very next tick, and `start_gh_poller` ticks
     ///   every `NOTIFY_POLL_INTERVAL` regardless of any group's pause state,
     ///   so this lags true pause-start by at most one poll interval.
     /// - A group recorded as paused that is no longer in `paused` (it
@@ -20600,11 +20620,46 @@ impl OrchRegistry {
         fired
     }
 
-    /// One full notify cycle: poll due watches, then apply tick policy.
-    /// Called on a timer by `start_notify_poller`.
-    pub fn run_notify_tick(&self) -> Vec<String> {
-        let results = self.poll_watches();
-        self.notify_tick(now_ms(), &results)
+    /// One full cycle of the UNIFIED `gh` poller (#406): poll due watches,
+    /// then apply both halves' tick policy against one sampled instant.
+    /// Called on a timer by `start_gh_poller` — the single background loop
+    /// that makes `gh` calls in this process.
+    ///
+    /// The split is the one `run_notify_tick` already had (and this
+    /// replaces): the `gh` shelling lives here, the policy lives in
+    /// `gh_poll_tick`, so tests drive the decision half with a synthetic
+    /// result map and no subprocess.
+    pub fn run_gh_poll_tick(&self) -> GhPollTick {
+        let now = now_ms();
+        let results = self.poll_watches(now);
+        self.gh_poll_tick(now, &results)
+    }
+
+    /// Decision half of one unified poll tick (#406). The notify half runs on
+    /// EVERY wake (the watch-firing latency users see is the wake cadence
+    /// itself); the intake half runs only on the wakes where
+    /// `intake_scan_due` says its own coarser scan cadence has elapsed, so
+    /// folding the two loops together neither speeds the intake scan up nor
+    /// slows watch delivery down.
+    ///
+    /// The scan stamp is taken when the scan is DECIDED, not when it
+    /// finishes — a slow `gh` round-trip must not shorten the next
+    /// interval — and it is the scan cadence only: the per-group `gh` floor
+    /// is still `intake::due_intake_polls`' business, untouched here.
+    pub fn gh_poll_tick(&self, now: u64, results: &HashMap<String, notify::Poll>) -> GhPollTick {
+        let fired = self.notify_tick(now, results);
+        let intake_scanned = {
+            let mut last = self.intake_last_scan_ms.lock_safe();
+            let due = intake_scan_due(now, *last);
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        if intake_scanned {
+            self.poll_intake(now);
+        }
+        GhPollTick { fired, intake_scanned }
     }
 
     // ---------- idle-tick intake gate (#332): host-side, zero-token label/PR-check poll ----------
@@ -20639,7 +20694,9 @@ impl OrchRegistry {
     /// adds, regardless of how many open PRs/issues exist, since both are
     /// single list calls, not one per item), and fold any new label/PR-check
     /// signal into that group's pending wake summary for `idle_tick_tick` to
-    /// pick up. Called on a timer by `start_intake_poller`.
+    /// pick up. Called by `gh_poll_tick` on the wakes where the scan cadence
+    /// is due (#406) — with the same `now` that tick's notify half used, so
+    /// both halves of one wake stamp the same instant.
     ///
     /// A `gh` failure for one call (auth, `gh` missing, rate-limited) simply
     /// skips that half of the diff for this scan — it still stamps the poll
@@ -20648,8 +20705,7 @@ impl OrchRegistry {
     /// `idle_tick_tick` still wakes the orchestrator regardless (#332
     /// acceptance criterion 6: "poll failure ≠ tick death — degrade, don't
     /// deny").
-    pub fn poll_intake(&self) {
-        let now = now_ms();
+    pub fn poll_intake(&self, now: u64) {
         let (minutes, repos) = self.intake_poll_config();
         if minutes.is_empty() {
             return;
@@ -20694,6 +20750,20 @@ impl OrchRegistry {
             // output activity) can't accumulate this unboundedly.
             self.intake_pending.lock_safe().entry(group.clone()).or_default().push(summary);
         }
+    }
+
+    /// When this group's intake scan last actually reached the `gh` call and
+    /// stamped (`intake::due_intake_polls`' per-group floor), if ever.
+    ///
+    /// #406 review (rev-157, blocking 1): this exists so a test can assert the
+    /// EFFECT of the unified tick's intake half — that `poll_intake` really
+    /// ran — rather than the `GhPollTick.intake_scanned` flag, which is only
+    /// the scheduler's decision and stays true even if the call under it is
+    /// deleted. The same `#[doc(hidden)]` test seam as `seed_intake_pending`
+    /// below, read-only.
+    #[doc(hidden)] // pub for integration tests: observe that a scan ran, without shelling to `gh`
+    pub fn intake_last_poll_at(&self, group: &str) -> Option<u64> {
+        self.intake_last_poll_ms.lock_safe().get(group).copied()
     }
 
     #[doc(hidden)] // pub for integration tests: seed a pending intake signal without shelling to `gh`
@@ -32735,17 +32805,71 @@ pub fn start_watchdog(reg: Arc<OrchRegistry>) {
     });
 }
 
-/// Background loop for the notification backend (#243): every
-/// `notify::NOTIFY_POLL_INTERVAL` it polls due watches (`gh pr checks` / `gh
-/// run view`, backend-owned argv only — see `gh_capture`) and delivers a
-/// `[loomux] …` notice into the registering agent's own pane the
-/// moment its condition is met, its TTL expires, or it fails
-/// `notify::NOTIFY_FAIL_STREAK_LIMIT` polls running. Started once at app
-/// setup, beside `start_watchdog`.
-pub fn start_notify_poller(reg: Arc<OrchRegistry>) {
+/// What one wake of the unified `gh` poller did (#406) — returned so a test
+/// can pin that a single tick services BOTH features, and which halves ran,
+/// without a thread or a `gh` subprocess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhPollTick {
+    /// Watch ids the notify half resolved this tick (fired, expired, or
+    /// cancelled) — `notify_tick`'s return, unchanged.
+    pub fired: Vec<String>,
+    /// Whether the intake half's due-group scan ran on this wake.
+    pub intake_scanned: bool,
+}
+
+/// Whether the unified poller's INTAKE half is due on a wake at `now`, given
+/// when its scan last ran (`None` = never, i.e. the first wake after launch).
+/// Pure so the shared cadence is directly testable without spinning up the
+/// thread — the `compact_nudge_poll_interval` idiom.
+///
+/// This is a scan-cadence floor, not the `gh` budget: `intake::
+/// due_intake_polls` still owns the per-group interval that decides whether
+/// a scan makes any `gh` call at all. Keeping the floor here means merging
+/// the two loops does not silently move the intake scan onto the notify
+/// cadence (twice as often), which is the one behavior change unification
+/// would otherwise smuggle in.
+///
+/// A stamp in the FUTURE means the system clock moved BACKWARDS since the
+/// last scan (an NTP correction, a VM resume, a manual set), and it rescans
+/// rather than waiting for wall-clock to catch up — a plain elapsed check
+/// stalls the intake scan for the entire size of the jump, which the
+/// `sleep`-driven thread this replaced could not do (rev-157, non-blocking
+/// 2). Rescanning re-stamps, so one jump costs one early scan, not a loop:
+/// the per-group `gh` floor (`intake::due_intake_polls`) is what actually
+/// bounds the API cost of an early scan, and it is unchanged.
+pub fn intake_scan_due(now: u64, last_scan_ms: Option<u64>) -> bool {
+    match last_scan_ms {
+        None => true,
+        Some(last) if now < last => true,
+        Some(last) => now - last >= INTAKE_POLL_SCAN_INTERVAL.as_millis() as u64,
+    }
+}
+
+/// The single background loop that makes `gh` calls in this process (#406).
+/// Every `notify::NOTIFY_POLL_INTERVAL` it runs one `run_gh_poll_tick`, which
+/// services both `gh`-polling features against one sampled instant:
+///
+/// - the notification backend (#243) on EVERY wake — it polls due watches
+///   (`gh pr checks` / `gh run view`, backend-owned argv only, see
+///   `gh_capture`) and delivers a `[loomux] …` notice into the registering
+///   agent's own pane the moment its condition is met, its TTL expires, or it
+///   fails `notify::NOTIFY_FAIL_STREAK_LIMIT` polls running;
+/// - the idle-tick intake gate (#332) on the wakes where `intake_scan_due`
+///   says its coarser `INTAKE_POLL_SCAN_INTERVAL` scan cadence has elapsed —
+///   it polls any autonomous group whose `intake_poll_minutes` guardrail is
+///   due (`gh issue list` / `gh pr list`) and folds new label/PR-check signal
+///   into that group's pending wake summary for `idle_tick_tick`.
+///
+/// Why one loop: both features spend the same account's GitHub API budget,
+/// and two independently-clocked threads share no accounting of it — the
+/// latent coupling #406 closes before the intake gate is load-bearing. The
+/// PURE decision layers stay separate and separately tested
+/// (`notify::due_watches`, `intake::due_intake_polls`); only the thread and
+/// its clock are shared. Started once at app setup, beside `start_watchdog`.
+pub fn start_gh_poller(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(notify::NOTIFY_POLL_INTERVAL);
-        reg.run_notify_tick();
+        reg.run_gh_poll_tick();
     });
 }
 
@@ -32803,28 +32927,15 @@ pub fn start_compact_nudge(reg: Arc<OrchRegistry>) {
     });
 }
 
-/// Background loop for the idle-tick intake gate (#332): every
-/// `INTAKE_POLL_SCAN_INTERVAL` it polls any autonomous group whose
-/// `intake_poll_minutes` guardrail is due (0 = the gate is off for that
-/// group — skipped entirely, no `gh` call, no gate) via `gh issue list` /
-/// `gh pr list`, and folds any new label/PR-check signal into that group's
-/// pending wake summary for `idle_tick_tick` to consume. Zero-token: this
-/// thread never talks to an LLM, only `gh`. Started once at app setup,
-/// beside `start_idle_tick`.
-pub fn start_intake_poller(reg: Arc<OrchRegistry>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(INTAKE_POLL_SCAN_INTERVAL);
-        reg.poll_intake();
-    });
-}
-
 /// Background loop for the merge-gate hot-reload (#385): every
 /// `WORKFLOW_GATE_POLL_INTERVAL` it re-derives every advanced-orchestrator
 /// group's merge gate from the repo's CURRENT `.loomux/workflow.yml`, so an
 /// in-place edit to `gates.merge` takes effect without a relaunch or a manual
 /// toggle off/on. See `OrchRegistry::reload_merge_gate_if_changed` for the
 /// fail-closed contract this loop enforces. Started once at app setup, beside
-/// `start_intake_poller`.
+/// `start_gh_poller`. (This one reads a file, not `gh` — it is deliberately
+/// NOT folded into the unified poller of #406, whose subject is the shared
+/// GitHub API budget.)
 pub fn start_workflow_gate_reload(reg: Arc<OrchRegistry>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(WORKFLOW_GATE_POLL_INTERVAL);
