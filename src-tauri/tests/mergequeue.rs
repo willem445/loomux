@@ -284,6 +284,61 @@ fn the_recorded_target_and_the_assertion_normalize_the_qualified_spelling() {
     assert_eq!(validate_target("main", "main", Some(""), None), Err(TargetRefusal::BaseIsDefault));
 }
 
+/// **A remote-qualified default still trips the constraint-7 refusal** (rev-157
+/// NB3).
+///
+/// `usable_for_comparison` accepts `origin/main` — nothing about it is
+/// unlandable — so if `same_branch` normalized only `refs/heads/`, a `default`
+/// of `origin/main` against a `base` of `main` would **not match**, the refusal
+/// would not fire, and the queue would push to the default branch. Exactly the
+/// bypass the `refs/heads/` normalization fixed, one spelling over.
+///
+/// Latent rather than live today — `resolve_default_branch` reads
+/// `.defaultBranchRef.name`, always a short name — and pinned here anyway,
+/// because "the only producer returns short names" is a discipline the next
+/// slice to source `default` from a git read, a config value or a cached target
+/// would break silently, with a push to the default branch as the cost. A test
+/// is cheaper than that discipline holding forever.
+#[test]
+fn a_remote_qualified_default_still_trips_the_constraint_7_refusal() {
+    for spelling in ["main", "refs/heads/main", "origin/main"] {
+        assert_eq!(
+            validate_target("main", spelling, None, None),
+            Err(TargetRefusal::BaseIsDefault),
+            "a default spelled {spelling:?} names the same branch as base \"main\""
+        );
+    }
+    // The same three spellings on the recorded-target and assertion arms.
+    for spelling in ["integration", "refs/heads/integration", "origin/integration"] {
+        assert_eq!(
+            validate_target("integration", "main", Some(spelling), None),
+            Ok("integration".to_string())
+        );
+        assert_eq!(
+            validate_target("integration", "main", None, Some(spelling)),
+            Ok("integration".to_string())
+        );
+    }
+
+    // Over-matching is the SAFE direction and this is what it costs: a branch
+    // literally named `origin/x` compares equal to `x`, so it is refused as if
+    // it were the default. A false refusal is a batch that does not land —
+    // recoverable and loud. The opposite error pushes to the default branch.
+    assert_eq!(
+        validate_target("origin/main", "main", None, None),
+        Err(TargetRefusal::BaseIsDefault)
+    );
+
+    // `refs/remotes/origin/main` needs no normalization arm: it refuses earlier,
+    // as unverifiable, because `landable` rejects a still-`refs/`-prefixed name
+    // after the one optional `refs/heads/` strip. Three spellings, two
+    // mechanisms, no gap.
+    assert_eq!(
+        validate_target("main", "refs/remotes/origin/main", None, None),
+        Err(TargetRefusal::BaseUnverifiable)
+    );
+}
+
 /// A **corrupt default** refuses rather than merely failing to match. The
 /// `refs/heads/` allowance is the only way the default's check is looser than
 /// the base's; everything a branch name cannot contain is still rejected, and it

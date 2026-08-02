@@ -406,10 +406,42 @@ fn usable_for_comparison(name: &str) -> bool {
 /// already been through [`landable`], which rejects a `refs/`-qualified name
 /// outright, so the live-vs-live half is normalized on the **default's** side —
 /// see [`usable_for_comparison`] for why that side is deliberately looser.
+///
+/// # Both qualified spellings, and why over-matching is the safe direction
+///
+/// A branch identity can arrive here in three forms: bare (`main`),
+/// ref-qualified (`refs/heads/main`), and **remote-qualified** (`origin/main`).
+/// All three are normalized, because this comparison's job is to *catch* a
+/// match, and the two failure directions are not symmetric:
+///
+/// - **Under-matching fails open.** A `default` of `origin/main` compared
+///   naively against a `base` of `main` does not match, so the constraint-7
+///   refusal never fires and the queue pushes to the **default branch**. That is
+///   the same shape as the `refs/heads/` bypass, one spelling over.
+/// - **Over-matching fails closed.** A branch *literally named* `origin/x`
+///   compares equal to `x` and is refused as if it were the default. That is a
+///   false refusal on a pathological name, and a false refusal is a batch that
+///   does not land — recoverable, loud, and nobody's data.
+///
+/// So the remote prefix is stripped too. This is deliberately **not** left to
+/// "the only producer is `resolve_default_branch`, which returns short names":
+/// that is true today and is a discipline a future slice sourcing `default` from
+/// a git read, a config value or a cached target would silently break, with a
+/// push to the default branch as the cost.
 fn same_branch(a: &str, b: &str) -> bool {
     fn short(s: &str) -> &str {
-        s.trim().strip_prefix("refs/heads/").unwrap_or(s.trim())
+        let s = s.trim();
+        let s = s.strip_prefix("refs/heads/").unwrap_or(s);
+        // Derived from `REMOTE` rather than a second `"origin/"` literal, and
+        // the separate `/` step is what keeps `originalthing` from being read
+        // as the remote-qualified `althing`.
+        s.strip_prefix(REMOTE).and_then(|r| r.strip_prefix('/')).unwrap_or(s)
     }
+    // `refs/remotes/origin/main` needs no arm here: `usable_for_comparison` is
+    // `landable` after one optional `refs/heads/` strip, and `landable` rejects
+    // anything still starting with `refs/` — so that spelling refuses as
+    // `base-unverifiable` before it can reach this comparison. Three spellings
+    // in, two mechanisms, no gap.
     !short(a).is_empty() && short(a) == short(b)
 }
 
