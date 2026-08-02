@@ -693,10 +693,16 @@ catalogues.
 
 ### 11.6 Frontend surface (slice F)
 
-One read-only Tauri command `orch_merge_queue` plus a typed wrapper in `src/pty.ts`
+One read-only Tauri command `orch_merge_queue` plus a typed wrapper in `src/orchestration.ts`
 (constraint 5 — the frontend never touches IPC directly), feeding a DOM-free
 `src/mergequeue.ts` model. Presentation is **overlay/chrome only — never a PTY resize**
 (constraint 1).
+
+*Correction, made in slice F:* this line said `src/pty.ts` when it was written, echoing
+constraint 5's own shorthand. That shorthand names the **rule** (every backend capability is
+a command plus a typed wrapper, and no other module invokes) rather than a file: `pty.ts` is
+the PTY-lifecycle/session bridge, and all ~50 `orch_*` wrappers already live in
+`orchestration.ts` — which is the seam an orchestration read belongs on.
 
 ## 12. Rollout
 

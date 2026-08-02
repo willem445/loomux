@@ -2415,6 +2415,36 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 }
 .group-workflow-warn[hidden] { display: none; }
 
+/* -- merge queue (#581 slice F) -- read-only chrome: target + in-flight batch
+   on the header line, one line per entry, and the truncation note. Same
+   density as the workflow row above it; it sits in the same overlay and never
+   resizes anything (constraint 1). */
+.group-mq-row {
+  display: flex; flex-direction: column; gap: 3px; flex: none;
+  padding: 6px 12px; border-bottom: 1px solid var(--border-soft);
+}
+.group-mq-row[hidden] { display: none; }
+.group-mq-line { color: var(--text-dim); font-size: 11px; line-height: 1.4; }
+.group-mq-entries { display: flex; flex-direction: column; gap: 2px; }
+.group-mq-entry { font-size: 10.5px; line-height: 1.4; color: var(--text-dim); }
+.group-mq-entry.active { color: var(--text); }
+.group-mq-entry.good { color: #9ece6a; }
+/* Loud on purpose: `bad` is "this PR is not going to land as things stand"
+   (kicked back, in the bisect, or queued-but-blocked), which is the one row a
+   human scanning this panel has to act on. */
+.group-mq-entry.bad { color: #f7768e; }
+.group-mq-entry.muted { color: var(--text-dim); opacity: 0.65; }
+.group-mq-note { font-size: 10px; line-height: 1.4; color: var(--text-dim); opacity: 0.8; }
+.group-mq-note[hidden] { display: none; }
+/* A queue that exists and can't be read gets the same treatment as an
+   unsatisfiable gate — an unreadable queue must never look like an empty one. */
+.group-mq-row.problem .group-mq-line {
+  color: #f7768e;
+  background: rgba(247, 118, 142, 0.12);
+  border: 1px solid rgba(247, 118, 142, 0.35); border-radius: 5px;
+  padding: 5px 8px;
+}
+
 /* -- autonomous mode (#83) -- two dense rows, matching the max-agents row. */
 .group-autorow {
   display: flex; flex-direction: column; gap: 6px; flex: none;

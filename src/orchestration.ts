@@ -1103,6 +1103,86 @@ export const workflowStatus = (groupId: string): Promise<WorkflowStatus> =>
 export const setAdvancedOrchestrator = (groupId: string, on: boolean): Promise<WorkflowStatus> =>
   invoke<WorkflowStatus>("orch_set_advanced_orchestrator", { groupId, on });
 
+// ---------- merge queue (#581 slice F): READ-ONLY visibility ----------
+//
+// The queue itself is host-run (doc/design/merge-queue.md §3) — the frontend
+// neither enqueues, cancels, nor lands anything, and there is deliberately no
+// wrapper here that could. This is one read of the group's `merge_queue.json`,
+// projected backend-side by `mergeqview::project`; the DOM-free model that
+// turns it into chrome lines is `mergequeue.ts`.
+//
+// The wrapper lives here rather than in `pty.ts` — where the design note's
+// §11.6 sentence points, echoing CLAUDE.md constraint 5's wording — because
+// `pty.ts` is the PTY-lifecycle/session bridge and every one of loomux's
+// ~50 `orch_*` wrappers is in this module. Constraint 5's actual requirement
+// (no module outside a typed wrapper touches Tauri IPC) is met either way;
+// putting an orchestration read in the PTY bridge would only cross a module
+// boundary the rest of the frontend keeps.
+
+/** One PR in the queue, as `orch_merge_queue` reports it (§11.3's entry).
+ *
+ *  `state` is typed as a plain string on purpose: it is one of the eight the
+ *  backend core defines, but this is the WIRE, and narrowing it here would
+ *  make a ninth word from a future build a silent `never` rather than the loud
+ *  failure `mergequeue.ts` turns it into. */
+export interface MergeQueueEntry {
+  pr: number;
+  state: string;
+  /** Why a `queued` entry is not batchable right now (§4 — "paused" is a live
+   *  predicate, not a ninth state). `null` when it is eligible. */
+  blocked_reason: string | null;
+  head: string;
+  enqueued_ms: number;
+  /** The batch this entry is in, while it is in one. */
+  batch: string | null;
+}
+
+/** The one in-flight batch (§11.3), or `null` when nothing is in flight. */
+export interface MergeQueueBatch {
+  id: string;
+  prs: number[];
+  state: string;
+  draft_pr: number | null;
+  scratch_sha: string;
+  started_ms: number;
+}
+
+/** The `orch_merge_queue` payload.
+ *
+ *  `status` is a closed vocabulary and the four cases are genuinely different
+ *  — collapsing them would make "no queue here" and "a queue this build cannot
+ *  read" the same picture, which is the one confusion this surface must not
+ *  create:
+ *  - `absent` — no `merge_queue.json`: the feature is off (the product
+ *    default) or nothing was ever enqueued.
+ *  - `unreadable` — the file is there and did not parse (a torn write, or a
+ *    state word this build does not know). `detail` says which.
+ *  - `unsupported-version` — a schema this build may misread; refused rather
+ *    than rendered.
+ *  - `ok` — everything below is live.
+ *
+ *  `entries_total` is the count in the FILE and `truncated` is reported by the
+ *  backend reader that did the cutting (never inferred from `entries.length`,
+ *  which cannot tell a cut list from an exactly-full one). */
+export interface MergeQueueStatus {
+  status: string;
+  detail: string | null;
+  version: number | null;
+  /** The branch the queue lands on — `""` when there is none (a drained queue
+   *  releases its target; §4). Never the default branch: constraint 7 and the
+   *  note's §7 make that structurally unreachable, host-side. */
+  target: string;
+  entries: MergeQueueEntry[];
+  entries_total: number;
+  truncated: boolean;
+  batch: MergeQueueBatch | null;
+}
+
+/** The group's merge queue, read-only (#581 slice F). Fetched on the same
+ *  group open/refresh cadence as `workflowStatus`, not polled hot. */
+export const mergeQueue = (groupId: string): Promise<MergeQueueStatus> =>
+  invoke<MergeQueueStatus>("orch_merge_queue", { groupId });
+
 // ---------- cross-workspace channels (#271): human-only connect/disconnect ----------
 //
 // A channel is a human-connected set of two-or-more agent panes, possibly in

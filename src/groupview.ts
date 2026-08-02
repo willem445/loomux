@@ -20,6 +20,7 @@ import {
   pauseGroup,
   resumeGroup,
   grantRelease,
+  mergeQueue,
   setAdvancedOrchestrator,
   setAutoMerge,
   setAutoRelease,
@@ -38,6 +39,7 @@ import {
   type GroupSummary,
   type GroupUsage,
   type GroupWatch,
+  type MergeQueueStatus,
   type WorkflowStatus,
 } from "./orchestration";
 import { watchLine } from "./watchline";
@@ -53,6 +55,7 @@ import {
   tickStatusLabel,
 } from "./autonomy";
 import { gateSatisfiabilityWarning, gateSummaryLine, workflowModeLabel } from "./workflowstatus";
+import { MERGE_QUEUE_HELP, mergeQueueView, type MergeQueueView } from "./mergequeue";
 import { compactionStatusLabel, compactionStatusTitle, contextUsageLabel } from "./compactionstatus";
 import { roleLabel } from "./orchbadge";
 import { getDefaultAgent } from "./agents";
@@ -171,6 +174,14 @@ export class GroupView {
   private workflowToggleBtn: HTMLButtonElement;
   private workflow: WorkflowStatus | null = null;
   private workflowBusy = false;
+  // Merge-queue chrome (#581 slice F): read-only. There is no control here and
+  // deliberately so — the queue is host-run (doc/design/merge-queue.md §3) and
+  // this panel's job is to say what it is doing, not to drive it.
+  private mqRow: HTMLElement;
+  private mqLineEl: HTMLElement;
+  private mqEntriesEl: HTMLElement;
+  private mqNoteEl: HTMLElement;
+  private mergeQueueStatus: MergeQueueStatus | null = null;
   /** #260: toggles whether newly spawned worker/reviewer/planner panes open
    *  docked to the minimize tray (the default) or expanded into the split
    *  tree (the pre-#260 behavior) — backend-persisted per group. */
@@ -287,6 +298,19 @@ export class GroupView {
     this.workflowWarnEl = el("div", "group-workflow-warn");
     this.workflowWarnEl.hidden = true;
     this.workflowRow.append(this.workflowLineEl, this.workflowWarnEl);
+
+    // Merge-queue row (#581 slice F): the queue's target, its in-flight batch,
+    // and one line per entry. Chrome inside an overlay that already floats over
+    // the terminal — no PTY resize anywhere on this path (CLAUDE.md constraint
+    // 1); `minChromeHeight()` below sums live child heights, so this row is
+    // accounted for without a hard-coded number.
+    this.mqRow = el("div", "group-mq-row");
+    this.mqRow.title = MERGE_QUEUE_HELP;
+    this.mqLineEl = el("span", "group-mq-line");
+    this.mqEntriesEl = el("div", "group-mq-entries");
+    this.mqNoteEl = el("div", "group-mq-note");
+    this.mqNoteEl.hidden = true;
+    this.mqRow.append(this.mqLineEl, this.mqEntriesEl, this.mqNoteEl);
 
     this.listEl = el("div", "group-list");
 
@@ -543,6 +567,7 @@ export class GroupView {
       this.summaryEl,
       maxRow,
       this.workflowRow,
+      this.mqRow,
       autoRow,
       releaseRow,
       this.listEl,
@@ -619,6 +644,7 @@ export class GroupView {
         this.autonomy,
         this.watches,
         this.workflow,
+        this.mergeQueueStatus,
       ] = await Promise.all([
         groupSummary(this.groupId),
         groupUsage(this.groupId),
@@ -628,6 +654,7 @@ export class GroupView {
         autonomyState(this.groupId),
         groupWatches(this.groupId),
         workflowStatus(this.groupId),
+        mergeQueue(this.groupId),
       ]);
     } catch (err) {
       this.toast(String(err));
@@ -1105,6 +1132,7 @@ export class GroupView {
 
     this.renderAutonomy();
     this.renderWorkflow();
+    this.renderMergeQueue();
 
     // Content height may have changed (roster size, suspended banner) — let the
     // host re-clamp the overlay so no control is pushed under overflow:hidden.
@@ -1140,6 +1168,63 @@ export class GroupView {
     this.workflowToggleBtn.title = w.advanced
       ? "Turn off workflow mode — clears the merge gate and returns future spawns to the built-in roster"
       : "Turn on workflow mode — arms this repo's declared merge gate and swaps future spawns to its roster";
+  }
+
+  /** Merge-queue chrome (#581 slice F) — read-only, and every string comes
+   *  from `mergequeue.ts` (never re-derived here), the same split
+   *  `renderWorkflow` keeps with `workflowstatus.ts`.
+   *
+   *  The row is hidden in exactly ONE case: the group has no
+   *  `merge_queue.json`, which is the product default (design note §12) and
+   *  the only state where saying nothing is accurate. A queue that exists and
+   *  cannot be read renders LOUD instead — an unreadable queue and an empty
+   *  one are the same picture to a human, and this panel is where they'd be
+   *  confused.
+   *
+   *  A state or status word this build doesn't know makes the model THROW
+   *  (its rule 2). Caught here rather than left to `load()`'s toast: the
+   *  drift is worth one loud row that stays on screen, not a toast that
+   *  fades while the rest of the panel goes on looking fine. */
+  private renderMergeQueue(): void {
+    const s = this.mergeQueueStatus;
+    let view: MergeQueueView;
+    if (!s) {
+      view = { kind: "hidden" };
+    } else {
+      try {
+        view = mergeQueueView(s);
+      } catch (err) {
+        view = {
+          kind: "problem",
+          line: "merge queue: this build can't read what the backend reported",
+          detail: String(err),
+        };
+      }
+    }
+
+    this.mqRow.hidden = view.kind === "hidden";
+    this.mqRow.classList.toggle("problem", view.kind === "problem");
+    if (view.kind === "hidden") return;
+
+    this.mqLineEl.textContent = view.line;
+    this.mqEntriesEl.replaceChildren();
+    if (view.kind === "problem") {
+      // The detail (a parser message, or the model's own refusal) is the part
+      // that makes this actionable — kept in the title so the row stays one
+      // line, never dropped.
+      this.mqRow.title = view.detail ? `${view.line}\n\n${view.detail}` : view.line;
+      this.mqNoteEl.hidden = true;
+      return;
+    }
+
+    this.mqRow.title = MERGE_QUEUE_HELP;
+    for (const row of view.rows) {
+      const line = el("div", `group-mq-entry ${row.tone}`, row.text);
+      if (row.blockedReason) line.title = `#${row.pr} is queued but not batchable: ${row.blockedReason}`;
+      this.mqEntriesEl.append(line);
+    }
+    this.mqNoteEl.hidden = view.note === null;
+    this.mqNoteEl.textContent = view.note ?? "";
   }
 
   /** The minimum overlay-content height at which every fixed control row renders
