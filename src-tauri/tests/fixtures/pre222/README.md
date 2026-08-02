@@ -487,6 +487,17 @@ so far:
   a human rather than opening a merge, and every merge decision re-resolves the real
   base ref live. The `list_tasks` tool bullet gains the new row field.
 
+- **#381, a first-turn MCP primer** — all four files. A fresh session used to wade through
+  hundreds of lines of policy before learning what to DO on turn one (`orchestrator.md`'s own
+  checklist sat behind an 11-rule INVARIANTS digest, near the bottom of a 1000+-line document).
+  Each template now opens with a short **Your first turn** section, above everything else,
+  naming the exact first-turn call sequence for that role's actual tools — `get_state`/
+  `list_tasks`/`list_agents`/`gh issue list`/`list_notifications` for the orchestrator; the
+  delivery-id check, `note_directive` and `report("progress", ...)` for a worker; `gh pr view`
+  and the verdict-bearing `report(...)` for a reviewer; `gh issue view` and the plan-then-report
+  contract for a planner. INVARIANTS and every other section are otherwise untouched — this only
+  moves what a fresh session hits first.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
