@@ -5705,8 +5705,10 @@ pub fn low_disk_notice(free_bytes: u64) -> String {
 ///   redraws its idle input box below the prose, the phrase falls out of range.
 /// **Callers mask; this function only detects.** It answers "is this text
 /// question-shaped", never "whose text is this" — so every caller reading a
-/// live pane owes it [`mask_loomux_notices`] first (and, where the caller knows
-/// what it just pasted, `mask_own_paste`). Masking is deliberately NOT folded
+/// live pane owes it [`mask_loomux_notices_with_record`] first — with that
+/// pane's delivery record, so a notice that WRAPPED is masked over every row it
+/// wrapped onto (#576 residual) — and, where the caller knows what it just
+/// pasted, `mask_own_paste`. Masking is deliberately NOT folded
 /// in here: the two are different questions, and `mask_own_paste` needs a
 /// per-call argument this signature does not have. The cost of that split is
 /// that a new consumer can forget — which is exactly what happened to the two
@@ -7840,6 +7842,18 @@ pub struct OrchRegistry {
     /// before pasting (#81/#84). An `Arc` so a delivery thread can record its
     /// outcome without holding `&self`.
     last_delivery: Arc<Mutex<HashMap<u32, DeliveryOutcome>>>,
+    /// What loomux knows it WROTE into each pane (#576) — the marker-led lines
+    /// of every delivery, bounded per pane by [`DeliveredNotices`]. Read by the
+    /// question gate's mask so a notice that wrapped, or one whose marker row
+    /// has scrolled off, can still be recognised as loomux's own writing rather
+    /// than as a question the pane is parked on. `Arc` for the same reason
+    /// `last_delivery` is: the delivery thread writes it without holding
+    /// `&self`. Keyed by pty id, matching `delivery`/`last_delivery`.
+    ///
+    /// **Lock order: takes no other registry lock while held.** Its writer
+    /// (`record_delivered_text`) is called from inside `deliver_now`'s paste
+    /// loop, which already holds the per-pane delivery lock.
+    delivered_notices: Arc<Mutex<HashMap<u32, DeliveredNotices>>>,
     /// Per-pane FIFO delivery queue (#445): a hold-cap expiry in
     /// `deliver_now` enqueues here instead of destroying the payload. `Arc`
     /// for the same reason `last_delivery` is — the drainer thread
@@ -12577,7 +12591,10 @@ fn run_late_confirmation_monitor(
                 // trigger, so a self-latch here reads as "the human is still
                 // expected to answer" and stalls the delivery's completion
                 // exactly like the gate's own latch stalls the write.
-                .map(|t| prompt_wait_detected(&mask_own_paste(&mask_loomux_notices(&t), &pasted_text)))
+                .map(|t| {
+                    let masked = mask_loomux_notices_with_record(&t, &delivered_lines(&reg, pty_id));
+                    prompt_wait_detected(&mask_own_paste(&masked, &pasted_text))
+                })
                 .unwrap_or(false);
         let hook_match = poll_promptsubmit_hook(&hook_marker_path, hook_baseline, &pasted_text);
         // #454: the ledger observation is taken AFTER the hook read, never
@@ -13295,7 +13312,10 @@ fn deliver_now(
             "bound_ms": HUMAN_INPUT_BLOCK_BOUND_MS,
         }));
     }
-    if flush_stranded_text(&ptys, pty_id, prev.as_ref().map(|o| o.confirmed), human_block.holds(), submit) {
+    if flush_stranded_text(
+        &ptys, pty_id, prev.as_ref().map(|o| o.confirmed), human_block.holds(), submit,
+        delivered_lines(&reg, pty_id),
+    ) {
         append_audit(&root, &group, "loomux", "delivery-flush",
             json!({ "to": agent, "reason": "previous delivery unconfirmed" }));
         std::thread::sleep(FLUSH_SETTLE);
@@ -13360,7 +13380,21 @@ fn deliver_now(
         // there's no self-echo risk to gate against (`paste_baseline_total:
         // None` — see `question_hold_predicate`).
         let (question_decision, question_seen) =
-            wait_for_question_clear(&ptys, pty_id, None, &emit_held, &emit_held_cleared);
+            wait_for_question_clear(
+                &ptys,
+                pty_id,
+                None,
+                // #576: re-read at every checkpoint rather than snapshotted
+                // once. This delivery records its OWN marker-led lines the
+                // moment it writes them (below), so the pre-Enter and retry
+                // checkpoints get a record that includes what this paste just
+                // put on screen — which is what covers a notice of ours that
+                // wrapped, a case `mask_own_paste`'s whole-line matching
+                // structurally cannot see.
+                delivered_lines(&reg, pty_id),
+                &emit_held,
+                &emit_held_cleared,
+            );
         if question_seen.is_some() {
             // Only overwrite with a real sighting: a later round that saw
             // nothing must not erase what an earlier one held for.
@@ -13394,7 +13428,7 @@ fn deliver_now(
         // dead pane into an extra enqueue/retry cycle.
         let admission = write_admission(
             ptys.input_pending(pty_id).unwrap_or(false),
-            question_active_now(&ptys, pty_id, None),
+            question_active_now(&ptys, pty_id, None, delivered_lines(&reg, pty_id)),
         );
         if admission.go() || recheck_round >= PREPASTE_RECHECK_ROUNDS {
             break admission;
@@ -13458,6 +13492,15 @@ fn deliver_now(
             append_audit(&root, &group, "loomux", "prompt-failed",
                 json!({ "to": agent, "reason": "terminal closed before delivery" }));
             return DeliverOutcome::Done;
+        }
+        // #576: the ONE place loomux's own text becomes bytes in a pane is the
+        // one place the record of it is written — immediately after the write
+        // succeeds, so the record never claims text that failed to go out (see
+        // `record_delivered_text`). Inside the retype loop rather than after
+        // it, because an un-echoed attempt still painted its bytes; the record
+        // de-duplicates a repeated line so a retype costs it nothing.
+        if let Some(r) = &reg {
+            r.record_delivered_text(pty_id, &pasted_text);
         }
         let echo_deadline = std::time::Instant::now() + ECHO_WINDOW;
         while std::time::Instant::now() < echo_deadline {
@@ -13553,7 +13596,8 @@ fn deliver_now(
     // dialog; masking out our own known lines leaves only what the CLI
     // itself painted, whenever it painted it.
     let (question_decision_preenter, question_seen_preenter) = wait_for_question_clear(
-        &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
+        &ptys, pty_id, Some(&pasted_text), delivered_lines(&reg, pty_id),
+        &emit_held, &emit_held_cleared,
     );
     match question_decision_preenter {
         PasteDecision::Paste { held_ms } if held_ms > 0 => {
@@ -13880,7 +13924,8 @@ fn deliver_now(
                 break;
             }
             let (question_decision, question_seen_retry) = wait_for_question_clear(
-                &ptys, pty_id, Some(&pasted_text), &emit_held, &emit_held_cleared,
+                &ptys, pty_id, Some(&pasted_text), delivered_lines(&reg, pty_id),
+                &emit_held, &emit_held_cleared,
             );
             match retry_gate(question_decision) {
                 RetryGate::SkipQuestionPending { held_ms } => {
@@ -14121,6 +14166,9 @@ pub fn drain_stranded_submit(
     delivery_from: String,
     pty_id: u32,
     submit: &[u8],
+    // #576: threaded through to `flush_stranded_text`'s question gate — see
+    // there for why this reader gets the record too.
+    delivered: Vec<String>,
 ) -> bool {
     let prev = last_delivery.lock_safe().get(&pty_id).cloned();
     let prev_confirmed = prev.as_ref().map(|o| o.confirmed);
@@ -14136,7 +14184,8 @@ pub fn drain_stranded_submit(
         .as_ref()
         .map(|o| human_input_block_now(ptys, pty_id, o.submit_sent_ms).holds())
         .unwrap_or(false);
-    let flushed = flush_stranded_text(ptys, pty_id, prev_confirmed, human_typed_since, submit);
+    let flushed =
+        flush_stranded_text(ptys, pty_id, prev_confirmed, human_typed_since, submit, delivered);
     if flushed {
         last_delivery.lock_safe().insert(
             pty_id,
@@ -14575,8 +14624,14 @@ fn run_queue_drainer(
             // with no cap — so it is also where the aggregate hold has to be
             // bounded.
             let box_pending = ptys.input_pending(pty_id).unwrap_or(false);
-            let admission =
-                write_admission(box_pending, question_active_now(&ptys, pty_id, None));
+            // #576: THE blind spot this record exists for. This gate has no
+            // `pasted_text` (the entry it is considering has written nothing
+            // yet), so `mask_own_paste` cannot help — and the pane in front of
+            // it is full of the PREVIOUS delivery's notices, wraps and all.
+            let admission = write_admission(
+                box_pending,
+                question_active_now(&ptys, pty_id, None, reg.delivered_notice_lines(pty_id)),
+            );
             // #532: the escalation decision is `held_escalation`'s, not an
             // inline `&&` chain here (rev-12 B1) — this loop is where a held
             // delivery actually LIVES, since `deliver_now` holds only for its
@@ -14772,7 +14827,10 @@ fn run_queue_drainer(
             queue::QueuedPayload::StrandedSubmit => {
                 let _guard = lock.lock_safe();
                 let submit = submit_sequence(&cli);
-                if drain_stranded_submit(&ptys, &reg.last_delivery, front.from.clone(), pty_id, submit) {
+                if drain_stranded_submit(
+                    &ptys, &reg.last_delivery, front.from.clone(), pty_id, submit,
+                    reg.delivered_notice_lines(pty_id),
+                ) {
                     DeliverOutcome::Done
                 } else {
                     DeliverOutcome::AbortedPrePaste(queue::EnqueueReason::Question)
@@ -14953,8 +15011,14 @@ pub fn flush_stranded_text(
     prev_confirmed: Option<bool>,
     human_typed_since: bool,
     submit: &[u8],
+    // #576: this reader gets the delivery record for the same reason the
+    // drainer gate does — it is a blind Enter decided off `question_active_now`
+    // with no `pasted_text`, and a wrapped notice of ours left it declining
+    // forever. Fixing one reader of the gate and leaving another was rev-126's
+    // finding (`e7`), so both move together.
+    delivered: Vec<String>,
 ) -> bool {
-    let question_active = question_active_now(ptys, pty_id, None);
+    let question_active = question_active_now(ptys, pty_id, None, delivered);
     // #532: BOTH live readings are taken here, at the press, and neither is
     // inherited from a check some earlier stage passed. `unwrap_or(true)` is
     // the fail-safe direction for an occupancy reading we cannot take (a
@@ -15405,15 +15469,19 @@ pub const LOOMUX_NOTICE_MARKER: &str = "[loomux]";
 /// themselves against, and `deframe`'s strip set for why the bullet in a
 /// continuation row must be `•` and never `-`.
 ///
-/// **What that leaves, stated rather than mitigated.** A notice that wraps
-/// keeps whatever tokens landed past the first row, so a wide pane is fixed and
-/// a narrow one is improved rather than cured; a marker row that has itself
-/// scrolled off leaves its continuation unmarked and unmasked. Both are
+/// **What the marker alone leaves, and what closes it (#576 residual).** A
+/// notice that wraps keeps whatever tokens landed past the first row; a marker
+/// row that has itself scrolled off leaves its continuation unmarked. Both are
 /// under-masks — the gate holds when it might have cleared, which is the cheap
 /// error the ten-minute `QuestionStale` badge already covers. Closing them
 /// needs loomux to know *what* it wrote to a pane, not merely that a row claims
-/// it did; that means a per-pane record of delivered text, which is delivery
-/// machinery rather than detection and is deliberately not built here.
+/// it did: that is [`DeliveredNotices`], and the mask that consults it is
+/// [`mask_loomux_notices_with_record`]. THIS function is the record-free form —
+/// the marker rule and nothing else — and it stays, because a pane whose record
+/// was lost (a restart) and a producer asserting its own maskability at its
+/// door ([`unmaskable_framing_rows`]) must both be answered by the marker rule
+/// alone. See the record-aware function for why the record cannot widen a
+/// producer's door.
 ///
 /// The residual false-release surface is correspondingly one row wide: a pane
 /// would have to paint a row that both leads with the marker and *is itself*
@@ -15421,13 +15489,128 @@ pub const LOOMUX_NOTICE_MARKER: &str = "[loomux]";
 /// them with our marker, and an agent printing the whole thing has not rendered
 /// a dialog at all — it has printed prose about one.
 pub fn mask_loomux_notices(tail: &str) -> String {
-    tail.lines()
-        // De-framed so a notice echoed inside a box UI (`│ [loomux] …`) is
-        // still seen to LEAD its row — the same rule, and the same reason,
-        // as `leads_with_pointer`. Lowercased so a re-cased echo still matches.
-        .filter(|l| !deframe(l).to_lowercase().starts_with(LOOMUX_NOTICE_MARKER))
-        .collect::<Vec<_>>()
-        .join("\n")
+    mask_loomux_notices_with_record(tail, &[])
+}
+
+/// Does this row LEAD with the notice marker, after any box framing?
+///
+/// The single definition of the marker rule (the `leads_with_pointer`
+/// precedent): [`mask_loomux_notices_with_record`] and
+/// [`loomux_authored_lines`] both call it, so what the record REMEMBERS and
+/// what the mask CLAIMS cannot drift apart — a record holding lines the mask
+/// would not have recognised is a record that widens nothing, and the reverse
+/// is a mask reaching for lines that were never kept.
+///
+/// De-framed so a notice echoed inside a box UI (`│ [loomux] …`) is still seen
+/// to LEAD its row — the same rule, and the same reason, as
+/// `leads_with_pointer`. Lowercased so a re-cased echo still matches.
+fn leads_with_notice_marker(line: &str) -> bool {
+    deframe(line).to_lowercase().starts_with(LOOMUX_NOTICE_MARKER)
+}
+
+/// [`mask_loomux_notices`], plus the rows a per-pane record of delivered text
+/// proves loomux wrote (#576 — the wrap residual and the scrolled-off marker).
+///
+/// NOT YET: `delivered` is threaded here and filled by `deliver_now`, but this
+/// body is still the marker rule alone — so the wrap and scrolled-off
+/// under-masks are exactly as they were.
+pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> String {
+    let _ = delivered;
+    tail.lines().filter(|l| !leads_with_notice_marker(l)).collect::<Vec<_>>().join("\n")
+}
+
+/// The lines of a delivery that [`mask_loomux_notices`] would claim — i.e. the
+/// part of what loomux just pasted that is loomux's OWN writing, and the only
+/// part [`DeliveredNotices`] keeps.
+///
+/// **Why the filter, rather than recording the whole payload.** Most of what
+/// `deliver_now` pastes is agent text: a kickoff brief, an orchestrator's
+/// prompt, the verbatim constituent payloads of a coalesced flush. Recording
+/// those would give the record-aware mask the power to blind the gate to
+/// ordinary agent content — the exact blindness `e11` pins as deliberately NOT
+/// taken (a queued delivery whose own body is question-shaped must park the
+/// pane exactly as it would have unqueued). Marker-led lines are loomux's
+/// framing, so the record holds only what the mask was always allowed to claim,
+/// and the record's job is limited to the rows those lines WRAPPED onto.
+pub fn loomux_authored_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| leads_with_notice_marker(l))
+        .map(|l| l.trim().chars().take(DELIVERED_NOTICE_CHARS).collect())
+        .collect()
+}
+
+/// One pane's delivery record, or empty when there is no registry to ask.
+///
+/// `deliver_now`'s `reg` is `Option` for the headless wiring that has no
+/// registry at all; an absent record is the same legitimate "nothing known"
+/// an untouched pane has, and means the marker rule (#576).
+fn delivered_lines(reg: &Option<Arc<OrchRegistry>>, pty_id: u32) -> Vec<String> {
+    reg.as_ref().map(|r| r.delivered_notice_lines(pty_id)).unwrap_or_default()
+}
+
+/// Longest recorded line, in chars. `notify::NOTICE_TOTAL_CAP` already caps a
+/// composed notice at 400; 512 leaves room for the framing a producer adds
+/// around one without ever letting an unbounded payload in. A line longer than
+/// this is truncated, which costs the tail of that one notice its wrap masking
+/// (it can no longer reconstruct to its end) and nothing else — fail-closed, in
+/// the direction everything here fails.
+pub const DELIVERED_NOTICE_CHARS: usize = 512;
+
+/// Lines remembered per pane. The mask can only ever use a line that is still
+/// RENDERED, and `prompt_wait_detected` honours its structured signals across
+/// the last twelve non-empty lines, so a notice that twenty-three later notices
+/// have already pushed past is long out of every reading that consults this.
+/// Drop-oldest, the `PendingIntake`/`OrchNoticeInbox::park` shape.
+pub const DELIVERED_NOTICES_PER_PANE: usize = 24;
+
+/// Panes tracked at once, evicting the least-recently-written. A group is a
+/// handful of panes and a long session respawns some, so this is generous for
+/// the live fleet while bounding the map that would otherwise grow with every
+/// pty id a session ever used (`last_delivery`'s map does the same and is never
+/// pruned, but its entries are three fields — these are up to
+/// 24 × 512 chars, so the ceiling has to be stated: 64 panes ≈ 786 KiB worst
+/// case).
+pub const DELIVERED_NOTICE_PANES: usize = 64;
+
+/// What loomux knows it wrote into one pane (#576): a bounded, drop-oldest
+/// record of the marker-led lines it has pasted there.
+///
+/// **In memory only, and deliberately so.** The record's single consumer is a
+/// mask over a LIVE pane's rendered tail, so it is worth exactly as long as the
+/// rows it explains are still on screen. Persisting it would put agent-authored
+/// note text in a second on-disk place with its own schema-version burden
+/// (`queue.json` is versioned; a second file or a new field in that one is a
+/// contract change), to buy masking for rows that a restarted pane has almost
+/// always redrawn past. Losing it degrades to exactly the pre-#576 behaviour —
+/// the marker rule alone, so a wrapped notice latches the gate until the
+/// ten-minute `QuestionStale` badge surfaces it — which is the cheap error, and
+/// the same one every other failure path here chooses.
+#[derive(Debug, Default)]
+pub struct DeliveredNotices {
+    lines: VecDeque<String>,
+    /// Monotonic write stamp, for evicting the least-recently-written PANE.
+    /// Not a clock: eviction only needs an order, and `now_ms()` would make the
+    /// record's bound depend on the wall clock.
+    seq: u64,
+}
+
+impl DeliveredNotices {
+    /// Remember the loomux-authored lines of one delivery. Repeats of the most
+    /// recent line are dropped: `deliver_now`'s echo-verified typing loop may
+    /// write the same payload more than once, and a record full of one repeated
+    /// notice would evict the earlier ones for nothing.
+    fn record(&mut self, text: &str, seq: u64) {
+        self.seq = seq;
+        for line in loomux_authored_lines(text) {
+            if self.lines.back() == Some(&line) {
+                continue;
+            }
+            self.lines.push_back(line);
+            while self.lines.len() > DELIVERED_NOTICES_PER_PANE {
+                self.lines.pop_front();
+            }
+        }
+    }
 }
 
 /// The rows of `rendered` that loomux WROTE and [`mask_loomux_notices`] could
@@ -15525,7 +15708,11 @@ pub fn unmaskable_framing_rows(rendered: &str, payloads: &[&str]) -> Vec<String>
 /// are the same closure: the grid narrows *when* the detector reads clear, it
 /// does not touch the two-consecutive-poll rule that decides what a clear read
 /// is worth. See [`question_shown`] for the one behaviour that differs.
-pub fn question_hold_predicate<T>(tail: T, pasted_text: Option<String>) -> impl Fn() -> bool
+pub fn question_hold_predicate<T>(
+    tail: T,
+    pasted_text: Option<String>,
+    delivered: Vec<String>,
+) -> impl Fn() -> bool
 where
     T: Fn() -> Option<Vec<u8>>,
 {
@@ -15538,6 +15725,7 @@ where
         move || QuestionSample { ring: tail(), visible: None },
         pasted_text,
         None,
+        delivered,
     )
 }
 
@@ -15699,6 +15887,15 @@ pub fn question_hold_predicate_sampled<T>(
     sample: T,
     pasted_text: Option<String>,
     witness: Option<QuestionWitness>,
+    // #576: what loomux knows it wrote to this pane
+    // (`OrchRegistry::delivered_notice_lines`). A REQUIRED argument rather than
+    // a defaulted one: every production caller has it, and a call site that
+    // silently got an empty record would be a gate quietly running on the
+    // pre-#576 rule with nothing to say so (the #544 "never acquired by
+    // omission" shape). Empty is a legitimate value — a pane loomux has written
+    // nothing into, or one whose record a restart dropped — and it means
+    // exactly the marker rule.
+    delivered: Vec<String>,
 ) -> impl Fn() -> bool
 where
     T: Fn() -> QuestionSample,
@@ -15713,12 +15910,14 @@ where
         // "still displayed" about our own paste (rev-15 N1 / rev-19 B-A).
         // Two masks, both on BOTH readings. `mask_own_paste` needs this
         // delivery's text and so is `None` at every checkpoint that runs before
-        // one (`question_active_now`'s three call sites); `mask_loomux_notices`
-        // needs nothing, which is exactly why it closes #576 — the outer
-        // drainer gate has no `pasted_text` to mask with, yet the pane is full
-        // of the PREVIOUS delivery's notices.
+        // one (`question_active_now`'s three call sites); the notice mask needs
+        // no `pasted_text` at all, which is exactly why it closes #576 — the
+        // outer drainer gate has no `pasted_text` to mask with, yet the pane is
+        // full of the PREVIOUS delivery's notices. Since #576's residual it
+        // reads `delivered` as well, so a notice that WRAPPED is masked over
+        // every row it wrapped onto rather than only its first.
         let mask = |t: &str| {
-            let t = mask_loomux_notices(t);
+            let t = mask_loomux_notices_with_record(t, &delivered);
             match &pasted_text {
                 Some(p) => mask_own_paste(&t, p),
                 None => t,
@@ -15778,6 +15977,7 @@ fn wait_for_question_clear(
     ptys: &crate::pty::PtyManager,
     pty_id: u32,
     pasted_text: Option<&str>,
+    delivered: Vec<String>,
     emit_held: &impl Fn(HeldReason),
     emit_held_cleared: &impl Fn(),
 ) -> (PasteDecision, Option<QuestionWitnessed>) {
@@ -15786,6 +15986,7 @@ fn wait_for_question_clear(
         || question_sample(ptys, pty_id),
         pasted_text.map(str::to_string),
         Some(std::rc::Rc::clone(&witness)),
+        delivered,
     );
     let will_hold = predicate();
     if will_hold {
@@ -15845,11 +16046,17 @@ fn question_sample(ptys: &crate::pty::PtyManager, pty_id: u32) -> QuestionSample
 /// still keyed on the byte ring alone would re-assert, one call later, the
 /// hold the guard had just released on grid evidence. No witness: nothing
 /// downstream of a one-shot read has an abort record to put one in.
-fn question_active_now(ptys: &crate::pty::PtyManager, pty_id: u32, pasted_text: Option<&str>) -> bool {
+fn question_active_now(
+    ptys: &crate::pty::PtyManager,
+    pty_id: u32,
+    pasted_text: Option<&str>,
+    delivered: Vec<String>,
+) -> bool {
     question_hold_predicate_sampled(
         || question_sample(ptys, pty_id),
         pasted_text.map(str::to_string),
         None,
+        delivered,
     )()
 }
 
@@ -17234,6 +17441,7 @@ impl OrchRegistry {
             agent_seq_persist: Mutex::new(()),
             delivery: Mutex::new(HashMap::new()),
             last_delivery: Arc::new(Mutex::new(HashMap::new())),
+            delivered_notices: Arc::new(Mutex::new(HashMap::new())),
             queues: Arc::new(queuestate::QueueMap::new()),
             queue_seq: Arc::new(AtomicU64::new(0)),
             queue_persist: Arc::new(Mutex::new(())),
@@ -25380,7 +25588,20 @@ impl OrchRegistry {
                 // latch is at least reported at ten minutes by
                 // `QuestionStale`, whereas a wrong chip just trains the human
                 // to ignore chips.
-                && tails.get(&a.id).map(|t| prompt_wait_detected(&mask_loomux_notices(t))).unwrap_or(false);
+                // #576 residual: with the pane's delivery record, so a notice
+                // that WRAPPED does not raise a chip either. A pane with no
+                // pty bound has taken no delivery, so an empty record is the
+                // truth rather than a gap.
+                && tails
+                    .get(&a.id)
+                    .map(|t| {
+                        let delivered = a
+                            .pty_id
+                            .map(|p| self.delivered_notice_lines(p))
+                            .unwrap_or_default();
+                        prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
+                    })
+                    .unwrap_or(false);
 
             let report = reports.get(a.id.as_str()).copied();
             let (reason, detail): (&'static str, String) = if report == Some("blocked") {
@@ -25459,7 +25680,15 @@ impl OrchRegistry {
                 // likely of the two to hold a notice — but a human pasting one
                 // in to read it is enough, and the two readings must not
                 // disagree about what counts as a question.
-                && tails.get(&pty).map(|t| prompt_wait_detected(&mask_loomux_notices(t))).unwrap_or(false);
+                && tails
+                    .get(&pty)
+                    .map(|t| {
+                        // #576 residual: the record is keyed by pty id, which
+                        // is exactly what this path has.
+                        let delivered = self.delivered_notice_lines(pty);
+                        prompt_wait_detected(&mask_loomux_notices_with_record(t, &delivered))
+                    })
+                    .unwrap_or(false);
             if waiting {
                 out.push(AttentionItem {
                     agent_id: String::new(),
@@ -30827,6 +31056,48 @@ impl OrchRegistry {
             // (it is not held) and nothing to close.
             None => None,
         }
+    }
+
+    /// #576: remember the loomux-authored lines of a delivery just written to
+    /// `pty_id`, so the question gate's mask can recognise the rows they
+    /// WRAPPED onto (see [`mask_loomux_notices_with_record`]).
+    ///
+    /// **Called after the write, never before it.** A record of text that never
+    /// reached the pane would let the mask claim rows nobody wrote — the
+    /// fail-OPEN direction. Recording after `write_bytes` returns `Ok` keeps
+    /// the record a statement about bytes that went out.
+    #[doc(hidden)] // pub for integration tests
+    pub fn record_delivered_text(&self, pty_id: u32, text: &str) {
+        let lines = loomux_authored_lines(text);
+        if lines.is_empty() {
+            return;
+        }
+        let mut map = self.delivered_notices.lock_safe();
+        let seq = map.values().map(|d| d.seq).max().unwrap_or(0) + 1;
+        map.entry(pty_id).or_default().record(text, seq);
+        // Evict the least-recently-written pane, one per insert, so the map
+        // cannot outgrow the fleet that is actually being delivered to. Only a
+        // pane that has taken no delivery since 63 others did can be chosen,
+        // and losing its record costs it the wrap masking until its next
+        // delivery — fail-closed, like every other loss here.
+        while map.len() > DELIVERED_NOTICE_PANES {
+            let Some(&stalest) = map.iter().min_by_key(|(_, d)| d.seq).map(|(k, _)| k) else {
+                break;
+            };
+            map.remove(&stalest);
+        }
+    }
+
+    /// #576: what loomux knows it wrote into `pty_id`, as the mask's input.
+    /// Empty for a pane loomux has never written a notice into — which is the
+    /// record-free marker rule, i.e. today's behaviour.
+    #[doc(hidden)] // pub for integration tests
+    pub fn delivered_notice_lines(&self, pty_id: u32) -> Vec<String> {
+        self.delivered_notices
+            .lock_safe()
+            .get(&pty_id)
+            .map(|d| d.lines.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// #560: when `pty_id`'s open hold episode began, if one is open.

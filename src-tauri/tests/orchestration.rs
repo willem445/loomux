@@ -46,6 +46,9 @@ use loomux_lib::orchestration::{
     // #576: loomux's own notice rows are not questions.
     // #632: and the same for the CONTINUATION rows of a multi-row notice.
     mask_loomux_notices, unmaskable_framing_rows, LOOMUX_NOTICE_MARKER,
+    // #576 residual: the per-pane record of what loomux WROTE, and the mask
+    // that reads it — the wrap and scrolled-off under-masks.
+    mask_loomux_notices_with_record, loomux_authored_lines, DELIVERED_NOTICES_PER_PANE,
     // #534 / #513(c): composed-grid question evidence.
     prompt_wait_match, question_hold_predicate_sampled, question_shown, grid_evidence_for,
     match_still_rendered, trustworthy_composition, witness_audit,
@@ -18890,7 +18893,7 @@ fn question_hold_predicate_ignores_self_echo_of_our_own_just_pasted_text() {
     // echoed and unsubmitted, in that exact tail. Masked out (every line of
     // the tail IS a pasted line here), this must NOT read as a live question.
     let text = "Do you want to run npm test? (y/n)";
-    let pred = question_hold_predicate(move || Some(text.as_bytes().to_vec()), Some(text.to_string()));
+    let pred = question_hold_predicate(move || Some(text.as_bytes().to_vec()), Some(text.to_string()), Vec::new());
     assert!(!pred(), "our own pasted text, masked out, must read as self-echo, not a live question");
 }
 
@@ -18901,7 +18904,7 @@ fn question_hold_predicate_holds_for_a_real_dialog_appended_after_our_own_paste(
     // the dialog fully visible to the detector.
     let pasted = "please rerun the deploy script and let me know how it goes";
     let tail = format!("{pasted}\n\nDo you want to run npm test? (y/n)");
-    let pred = question_hold_predicate(move || Some(tail.as_bytes().to_vec()), Some(pasted.to_string()));
+    let pred = question_hold_predicate(move || Some(tail.as_bytes().to_vec()), Some(pasted.to_string()), Vec::new());
     assert!(pred(), "a dialog appended after our own (masked-out) paste must still hold");
 }
 
@@ -18910,7 +18913,7 @@ fn question_hold_predicate_pre_paste_checkpoint_has_no_self_echo_risk() {
     // The pre-paste checkpoint runs before this delivery has written
     // anything — `pasted_text: None` — so a live question already on screen
     // must hold; there is nothing of OURS on screen yet to mask.
-    let pred = question_hold_predicate(|| Some(b"Do you want to run npm test? (y/n)".to_vec()), None);
+    let pred = question_hold_predicate(|| Some(b"Do you want to run npm test? (y/n)".to_vec()), None, Vec::new());
     assert!(pred(), "pre-paste checkpoint: no self-echo possible, a live question must hold");
 }
 
@@ -18919,10 +18922,11 @@ fn question_hold_predicate_is_false_for_ordinary_output_and_a_closed_pty() {
     let ordinary = question_hold_predicate(
         || Some(b"Running cargo test...\ntest result: ok. 42 passed".to_vec()),
         None,
+        Vec::new(),
     );
     assert!(!ordinary(), "ordinary streaming output must not read as a question");
 
-    let closed = question_hold_predicate(|| None, None);
+    let closed = question_hold_predicate(|| None, None, Vec::new());
     assert!(!closed(), "a closed/gone pane must never block delivery");
 }
 
@@ -18933,7 +18937,7 @@ fn question_hold_predicate_ignores_activity_the_menu_is_still_open() {
     // terminal-query reply to fool the release with. As long as the SAME
     // matching tail is observed, the predicate must hold no matter how many
     // times it's polled.
-    let pred = question_hold_predicate(|| Some(FIX_COPILOT_ASK.as_bytes().to_vec()), None);
+    let pred = question_hold_predicate(|| Some(FIX_COPILOT_ASK.as_bytes().to_vec()), None, Vec::new());
     for i in 0..5 {
         assert!(pred(), "poll {i}: menu still on screen — must never release regardless of poll count");
     }
@@ -18951,6 +18955,7 @@ fn question_hold_predicate_requires_two_consecutive_clear_reads_to_release() {
             if n == 0 { Some(FIX_COPILOT_ASK.as_bytes().to_vec()) } else { Some(b"idle input box".to_vec()) }
         },
         None,
+        Vec::new(),
     );
     assert!(pred(), "poll 1: question shown -> hold");
     assert!(pred(), "poll 2: first clear read -> still hold (only one so far)");
@@ -18965,7 +18970,7 @@ fn question_hold_predicate_releases_on_first_poll_when_never_shown_a_question() 
     // hold has actually observed a question at least once; it must never
     // penalize the overwhelmingly common "nothing to hold for" case with an
     // artificial delay.
-    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), None);
+    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), None, Vec::new());
     assert!(!pred(), "never shown a question — the very first call must release immediately");
 }
 
@@ -18974,7 +18979,7 @@ fn question_hold_predicate_wired_into_the_generic_hold_loop_releases_immediately
     // rev-19 N10, through the REAL hold_for_human_input loop (not just the
     // predicate in isolation): held_ms must be 0 — no cap ride — when the
     // question was already gone at hold start.
-    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), None);
+    let pred = question_hold_predicate(|| Some(b"idle input box".to_vec()), None, Vec::new());
     let out = hold_for_human_input(&pred, Duration::from_secs(5), HB_POLL);
     assert_eq!(out, PasteDecision::Paste { held_ms: 0 }, "already-clear must release on the very first check, no cap ride");
 }
@@ -18995,6 +19000,7 @@ fn question_hold_predicate_wired_into_the_generic_hold_loop_releases_once_the_me
             if n < 3 { Some(FIX_COPILOT_ASK.as_bytes().to_vec()) } else { Some(b"idle input box".to_vec()) }
         },
         None,
+        Vec::new(),
     );
     let out = hold_for_human_input(&pred, Duration::from_secs(5), HB_POLL);
     match out {
@@ -19045,6 +19051,7 @@ fn question_hold_predicate_on_a_real_ptymanager_holds_for_a_dialog_seeded_alongs
     let pred1 = question_hold_predicate(
         || pm.output_tail_bounded(10, 4096),
         Some(large_paste.clone()),
+        Vec::new(),
     );
     assert!(pred1(), "a dialog seeded alongside a large paste must still be detected as active");
 
@@ -19057,6 +19064,7 @@ fn question_hold_predicate_on_a_real_ptymanager_holds_for_a_dialog_seeded_alongs
     let pred2 = question_hold_predicate(
         || pm2.output_tail_bounded(11, 4096),
         Some(self_matching_paste.clone()),
+        Vec::new(),
     );
     assert!(!pred2(), "a large paste whose OWN text matches the detector must mask away to not-held");
 }
@@ -19485,7 +19493,7 @@ fn flush_stranded_text_does_not_enter_when_a_question_is_showing() {
     let pm = PtyManager::default();
     let captured = pm.register_fake_for_test(1, FIX_COPILOT_ASK.as_bytes());
 
-    let fired = flush_stranded_text(&pm, 1, Some(false), false, b"\r");
+    let fired = flush_stranded_text(&pm, 1, Some(false), false, b"\r", Vec::new());
 
     assert!(!fired, "must not press Enter while a question is on screen");
     assert!(
@@ -19500,7 +19508,7 @@ fn flush_stranded_text_enters_when_no_question_is_showing() {
     let pm = PtyManager::default();
     let captured = pm.register_fake_for_test(2, b"ordinary streaming output, nothing pending");
 
-    let fired = flush_stranded_text(&pm, 2, Some(false), false, b"\r");
+    let fired = flush_stranded_text(&pm, 2, Some(false), false, b"\r", Vec::new());
 
     assert!(fired, "no question on screen — the stranded flush must fire");
     assert_eq!(&*captured.lock().unwrap(), b"\r");
@@ -19535,7 +19543,7 @@ fn the_drain_press_declines_over_a_line_the_human_left_before_our_submit() {
         "precondition: the human's characters are outstanding in the box"
     );
 
-    let fired = drain_stranded_submit(&pm, &last_delivery, "w-1".to_string(), pty_id, b"\r");
+    let fired = drain_stranded_submit(&pm, &last_delivery, "w-1".to_string(), pty_id, b"\r", Vec::new());
 
     assert!(
         !fired,
@@ -19568,7 +19576,7 @@ fn the_drain_press_fires_once_the_box_is_empty_again() {
     pm.note_user_input(pty_id, "half a thought", true);
     assert_eq!(pm.input_pending(pty_id), Some(true));
     assert!(
-        !flush_stranded_text(&pm, pty_id, Some(false), false, b"\r"),
+        !flush_stranded_text(&pm, pty_id, Some(false), false, b"\r", Vec::new()),
         "still occupied — still declining"
     );
 
@@ -19582,7 +19590,7 @@ fn the_drain_press_fires_once_the_box_is_empty_again() {
     );
 
     assert!(
-        flush_stranded_text(&pm, pty_id, Some(false), false, b"\r"),
+        flush_stranded_text(&pm, pty_id, Some(false), false, b"\r", Vec::new()),
         "box empty, no question, previous delivery unconfirmed — the withheld Enter must \
          finally land, or the occupancy gate would be a permanent strand rather than a wait"
     );
@@ -19616,7 +19624,7 @@ fn record_aborted_preenter_outcome_makes_the_next_deliverys_flush_actually_fire(
 
     let pm = PtyManager::default();
     let captured = pm.register_fake_for_test(pty_id, b"idle input box, nothing pending");
-    let fired = flush_stranded_text(&pm, pty_id, prev_confirmed, false, b"\r");
+    let fired = flush_stranded_text(&pm, pty_id, prev_confirmed, false, b"\r", Vec::new());
 
     assert!(
         fired,
@@ -19756,7 +19764,7 @@ fn an_inflight_claim_reads_as_unconfirmed_so_the_next_delivery_still_flushes() {
     let pm = PtyManager::default();
     let captured = pm.register_fake_for_test(pty, b"idle input box, nothing pending");
     assert!(
-        flush_stranded_text(&pm, pty, prev_confirmed, false, b"\r"),
+        flush_stranded_text(&pm, pty, prev_confirmed, false, b"\r", Vec::new()),
         "an in-flight claim left behind by a dead delivery must still arm the next delivery's flush"
     );
     assert_eq!(&*captured.lock().unwrap(), b"\r");
@@ -19783,7 +19791,7 @@ fn a_stranded_badge_survives_an_inflight_claim_and_drops_on_a_confirmed_one() {
 
     let pm = PtyManager::default();
     pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
-    assert!(drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r"));
+    assert!(drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new()));
     assert!(
         observe_ledger(&last_delivery, pty, d1_ms).newer_confirmed,
         "once a newer delivery is recorded confirmed, the pane is demonstrably unwedged and the \
@@ -20325,7 +20333,7 @@ fn a_queued_stranded_submit_presses_enter_through_the_real_replay() {
     // The ledger state a stranded delivery leaves: recorded, unconfirmed.
     record_aborted_preenter_outcome(&last_delivery, pty, "loomux".to_string());
 
-    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r");
+    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert!(fired, "the queued marker must press Enter on a quiet, question-free pane");
     assert_eq!(&*captured.lock().unwrap(), b"\r", "exactly one submit, nothing else");
@@ -20369,7 +20377,7 @@ fn stranded_human_content_badges_and_never_submits() {
     // decision function being the only caller.
     let pm = PtyManager::default();
     let captured = pm.register_fake_for_test(pty, STRANDED_TAIL.as_bytes());
-    let fired = flush_stranded_text(&pm, pty, Some(false), true, b"\r");
+    let fired = flush_stranded_text(&pm, pty, Some(false), true, b"\r", Vec::new());
     assert!(!fired, "flush_stranded_text must refuse while a human has typed since our submit");
     assert!(captured.lock().unwrap().is_empty(), "no bytes may reach a pane holding human text");
 }
@@ -31966,7 +31974,7 @@ fn a_stale_human_input_block_releases_the_real_stranded_press() {
         "precondition: nothing of the human's is in the box — the bound may only release on this"
     );
 
-    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r");
+    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert!(
         fired,
@@ -32000,7 +32008,7 @@ fn a_fresh_human_keystroke_still_blocks_the_real_stranded_press() {
         "precondition: the keystroke lands strictly after the delivery's own submit"
     );
 
-    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r");
+    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert!(!fired, "a live human keystroke must still block the press");
     assert!(captured.lock().unwrap().is_empty(), "no bytes may reach a pane a human is typing in");
@@ -32030,7 +32038,7 @@ fn a_stale_block_with_human_text_still_in_the_box_never_releases_the_press() {
     let stamp = now_ms() - (HUMAN_INPUT_BLOCK_BOUND_MS + 60_000);
     pm.set_user_input_ms_for_test(pty, stamp);
 
-    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r");
+    let fired = drain_stranded_submit(&pm, &last_delivery, "loomux".to_string(), pty, b"\r", Vec::new());
 
     assert!(
         !fired,
@@ -33441,7 +33449,7 @@ fn c7_a_blank_composition_is_unreadable_not_clear() {
 fn d1_a_live_question_still_rendered_never_releases() {
     // Both readings agree; poll it as often as you like.
     let raw = painted(&["building the project", "Do you want to run npm test? (y/n)"]);
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 80, 10), None, None);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 80, 10), None, None, Vec::new());
     for i in 0..5 {
         assert!(pred(), "poll {i}: the dialog is on screen — must hold");
     }
@@ -33458,7 +33466,7 @@ fn d2_a_question_that_scrolled_off_screen_releases_though_the_ring_still_holds_i
         prompt_wait_detected(&strip_ansi(&raw)),
         "the byte ring STILL matches: that is the bug being fixed, not an artifact of the fixture"
     );
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 80, 6), None, None);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 80, 6), None, None, Vec::new());
     assert!(!pred(), "the screen says answered — no hold ever starts");
 }
 
@@ -33480,6 +33488,7 @@ fn d3_an_answered_question_erased_in_place_releases_after_the_hysteresis() {
         },
         None,
         None,
+        Vec::new(),
     );
     assert!(pred(), "poll 1: dialog on screen -> hold");
     assert!(pred(), "poll 2: screen now clear, but one clear read is not enough");
@@ -33508,6 +33517,7 @@ fn d4_tui_redraw_churn_around_a_live_dialog_never_false_clears() {
         },
         None,
         None,
+        Vec::new(),
     );
     for i in 0..6 {
         assert!(pred(), "frame {i}: repaint churn is not an answer — the dialog is still there");
@@ -33565,6 +33575,7 @@ fn d4b_a_poll_landing_mid_repaint_is_survived_by_the_hysteresis_not_by_the_grid(
         },
         None,
         None,
+        Vec::new(),
     );
     assert!(pred(), "poll 1: dialog painted -> hold");
     assert!(pred(), "poll 2: mid-repaint reads clear, but one clear read is not enough");
@@ -33583,6 +33594,7 @@ fn d5_the_predicate_records_what_it_held_for_and_whether_the_screen_agreed() {
         move || sample_from_raw(&raw, 80, 6),
         None,
         Some(std::rc::Rc::clone(&witness)),
+        Vec::new(),
     );
     assert!(!pred(), "scrolled off the screen -> released");
 
@@ -33630,6 +33642,7 @@ fn d6_our_own_pasted_text_rendered_in_the_box_is_masked_on_the_grid_too() {
         move || sample_from_raw(&raw, 80, 6),
         Some(pasted.to_string()),
         None,
+        Vec::new(),
     );
     assert!(
         !pred(),
@@ -33645,7 +33658,7 @@ fn d7_the_ring_only_predicate_is_unchanged_by_all_of_this() {
     // where the grid would have released, so nobody "simplifies" the fallback
     // into consulting a grid it does not have.
     let raw = scrolled_off_question();
-    let pred = question_hold_predicate(move || Some(raw.clone()), None);
+    let pred = question_hold_predicate(move || Some(raw.clone()), None, Vec::new());
     assert!(pred(), "no composed screen to consult -> the byte ring's word is final");
 }
 
@@ -33688,7 +33701,7 @@ fn e1_a_relayed_report_note_must_not_latch_the_ring_only_gate() {
     // structurally cannot help here. The pane's ring nonetheless holds the
     // PREVIOUS delivery's text, which is loomux's own.
     let raw = pane_with_relayed_notice();
-    let pred = question_hold_predicate(move || Some(raw.clone()), None);
+    let pred = question_hold_predicate(move || Some(raw.clone()), None, Vec::new());
     assert!(
         !pred(),
         "loomux's own relayed report note is text ABOUT a question, not a question being \
@@ -33718,7 +33731,7 @@ fn e2_a_relayed_report_note_must_not_latch_the_two_reading_gate_either() {
          cannot reach this: both readings agree, and both are correct about the pixels"
     );
 
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 12), None, None);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 12), None, None, Vec::new());
     assert!(
         !pred(),
         "the only question-shaped text on this pane is loomux's own notice — release (#576)"
@@ -33751,7 +33764,7 @@ fn e3_a_quoted_marker_row_must_not_hide_a_genuine_dialog_below_it() {
         "",
         "Use arrow keys · Enter to confirm · Esc to cancel",
     ]);
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 14), None, None);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 14), None, None, Vec::new());
     assert!(
         pred(),
         "a genuine dialog sharing a pane with a quoted [loomux] row must STILL latch — \
@@ -33770,7 +33783,7 @@ fn e4_a_dialog_painted_directly_under_a_marker_row_still_latches() {
         "[loomux] w-3 reports done: PR #900 is green",
         "Do you want to run npm test? (y/n)",
     ]);
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None, Vec::new());
     assert!(
         pred(),
         "only the row the marker LEADS is masked — the dialog row beneath it must survive (#576)"
@@ -33817,7 +33830,7 @@ fn e9_a_multi_row_resume_notice_no_longer_latches_the_gate_it_is_reported_into()
         "and the item row is genuinely RENDERED, so this is the #576 shape one row down: {visible}"
     );
 
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 200, 12), None, None);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 200, 12), None, None, Vec::new());
     assert!(
         !pred(),
         "loomux's own resume notice must not park the pane it is delivered into, item rows \
@@ -33861,7 +33874,7 @@ fn e10_a_real_dialog_under_a_reframed_notice_block_still_latches() {
     ]);
 
     let raw = painted(&rows);
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 200, 20), None, None);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 200, 20), None, None, Vec::new());
     assert!(
         pred(),
         "a live dialog sharing a pane with a fully-masked notice block must STILL latch — \
@@ -33897,7 +33910,7 @@ fn e11_a_coalesced_flush_payload_still_latches_the_gate_by_design() {
     let flush = queue::coalesced_flush_text(&items, 0, 1_000, queue::FlushCause::PaneBlocked);
     let rows: Vec<&str> = flush.lines().collect();
     let raw = painted(&rows);
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 200, 14), None, None);
+    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 200, 14), None, None, Vec::new());
     assert!(
         pred(),
         "a constituent payload is agent text and keeps its tokens — the documented \
@@ -33905,29 +33918,333 @@ fn e11_a_coalesced_flush_payload_still_latches_the_gate_by_design() {
     );
 }
 
+/// The two rows `e6` has always painted: one notice, wrapped, with the
+/// detector's tokens landing on the row the marker does NOT lead.
+const E6_WRAP_ROW_1: &str = "[loomux] w-119 reports blocked: Copilot is asking";
+const E6_WRAP_ROW_2: &str = "\"Do you want to run npm test? (y/n)\" and I cannot answer it";
+
 #[test]
-fn e6_a_notice_that_wraps_keeps_the_tokens_past_its_first_row() {
-    // A LIMIT pinned as known, not a bug pinned as correct.
+fn e6_a_wrapped_notice_no_longer_latches_once_the_record_says_we_wrote_it() {
+    // #576's WRAP RESIDUAL, and a deliberately FLIPPED expectation: this test
+    // used to pin the latch as a known limit ("a wrapped notice's later rows
+    // are unmarked and still latch"). Same two rows, opposite answer, because
+    // the thing that was missing now exists.
     //
-    // Only the row the marker leads is masked, so a notice on a pane narrow
-    // enough to wrap it leaves its continuation rows unmarked and still
-    // matching. That is an UNDER-mask: the gate holds where it might have
-    // cleared — the cheap error, already surfaced to the human by the
-    // ten-minute `QuestionStale` badge — rather than the expensive one this
-    // change refuses to risk (see e3/e4).
+    // What changed is not the mask's appetite but its evidence. The old rule
+    // could only ask "does this row LOOK like a notice", which one row can
+    // answer and the next row cannot — and widening it on the marker alone was
+    // rejected (e3/e4: an agent can print a marker row, and a run-mask would
+    // let it hide a live dialog). The record answers a different question —
+    // "did loomux WRITE this text here" — which a pane cannot forge, and the
+    // continuation is claimed only because it reconstructs, verbatim and to the
+    // end, a line the record holds.
+    let raw = painted(&[E6_WRAP_ROW_1, E6_WRAP_ROW_2]);
+
+    // Precondition: unmasked, this pane matches — the trigger is real and the
+    // fixture has not drifted into something the detector ignores.
+    assert!(
+        prompt_wait_detected(&strip_ansi(&raw)),
+        "unmasked, the wrapped row matches — that is the residual #576 is about"
+    );
+
+    // The degradation, pinned in the same test rather than assumed: with no
+    // record (a pane loomux never wrote to, or one whose record a restart
+    // dropped) the answer is the pre-#576 one. Losing the record costs a hold
+    // that clears late, never a release into a live question.
+    let no_record = painted(&[E6_WRAP_ROW_1, E6_WRAP_ROW_2]);
+    let without =
+        question_hold_predicate_sampled(move || sample_from_raw(&no_record, 120, 10), None, None, Vec::new());
+    assert!(
+        without(),
+        "without the record the marker rule is all there is, and it still latches — the \
+         fail-CLOSED degradation this change is allowed to fall back to (#576)"
+    );
+
+    // The line the two rows above are the wrap of — what `deliver_now` recorded
+    // when it pasted this notice.
+    let delivered = vec![format!("{E6_WRAP_ROW_1} {E6_WRAP_ROW_2}")];
+    let pred =
+        question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None, delivered);
+    assert!(
+        !pred(),
+        "a notice that wrapped is still loomux's own writing on the row it wrapped onto — \
+         with the delivery record, the gate must release (#576)"
+    );
+}
+
+/// Split one logical line into rows the way a terminal word-wraps it, so a
+/// wrap fixture cannot silently drift from the line it claims to be a wrap of
+/// — the point of `e6b` is that the rows and the recorded line are the same
+/// text, and hand-typing both is exactly how that stops being true.
+fn wrapped_rows(line: &str, cols: usize) -> Vec<String> {
+    let mut rows: Vec<String> = vec![String::new()];
+    for word in line.split(' ') {
+        let cur = rows.last_mut().expect("seeded with one row");
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= cols {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            rows.push(word.to_string());
+        }
+    }
+    rows
+}
+
+#[test]
+fn e6b_a_real_relay_notice_wrapped_across_three_rows_masks_whole() {
+    // e6 at a width that wraps the REAL relayed line (`LOOMUX_REPORT_RELAY`,
+    // the exact shape `mcp.rs` composes) onto more than two rows, with the rows
+    // derived from the line rather than typed beside it. Three rows matter: the
+    // claim walks a run, so a two-row fixture cannot tell "continues the line"
+    // from "is the second half of it".
+    let line = LOOMUX_REPORT_RELAY;
+    let rows = wrapped_rows(line, 46);
+    assert!(rows.len() >= 3, "fixture must actually wrap more than once: {rows:?}");
+    let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+    let raw = painted(&refs);
+    assert!(
+        prompt_wait_detected(&strip_ansi(&raw)),
+        "precondition: unmasked, the wrapped relay matches"
+    );
+
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 120, 12),
+        None,
+        None,
+        vec![line.to_string()],
+    );
+    assert!(!pred(), "every row of a wrapped notice is loomux's own writing (#576)");
+}
+
+#[test]
+fn e12_a_notice_whose_marker_row_scrolled_off_still_masks_from_the_top() {
+    // The second under-mask #576 names: the marker row has scrolled off the top
+    // of the reading, so the rows that survive are a headless middle of a
+    // notice — unmarked, and carrying the tokens.
     //
-    // Closing it needs loomux to know WHAT it wrote to a pane rather than
-    // merely that a row claims it did, i.e. a per-pane record of delivered
-    // text. That is delivery machinery, not detection, and is deliberately not
-    // built here.
-    let raw = painted(&[
-        "[loomux] w-119 reports blocked: Copilot is asking",
-        "\"Do you want to run npm test? (y/n)\" and I cannot answer it",
-    ]);
-    let pred = question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None);
+    // Every reading here is truncated at the TOP (the ring keeps the last
+    // bytes, the grid the last rows), so the first non-empty row is the one
+    // place a line can legitimately appear headless — and the only place a
+    // mid-line anchor is allowed. `e14` pins that it is not allowed anywhere
+    // else.
+    let line = LOOMUX_REPORT_RELAY;
+    let rows = wrapped_rows(line, 46);
+    assert!(rows.len() >= 3, "fixture must wrap: {rows:?}");
+    // Drop the marker row: what is left is exactly what a pane shows once the
+    // notice has scrolled halfway off.
+    let headless: Vec<&str> = rows[1..].iter().map(String::as_str).collect();
+    let raw = painted(&headless);
+    assert!(
+        prompt_wait_detected(&strip_ansi(&raw)),
+        "precondition: the headless continuation still matches — that is the residual"
+    );
+    assert!(
+        !mask_loomux_notices(&strip_ansi(&raw)).trim().is_empty(),
+        "precondition: the marker rule alone claims none of these rows — there is no marker \
+         left on screen to claim them by"
+    );
+
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 120, 12),
+        None,
+        None,
+        vec![line.to_string()],
+    );
+    assert!(
+        !pred(),
+        "a notice whose marker row scrolled off is still a notice — the record says what the \
+         screen no longer can (#576)"
+    );
+}
+
+#[test]
+fn e13_a_dialog_under_a_recorded_marker_row_still_latches() {
+    // e4's safety case with the record POPULATED, which is the version that
+    // matters now: the marker row is genuine (loomux really did deliver it) and
+    // a live permission dialog is painted directly beneath, no blank row.
+    //
+    // The recorded line is consumed WHOLE by the marker row itself — it never
+    // wrapped — so there is no continuation to claim and the run stops there.
+    // A mask that widened on "this row is in the record" rather than on "these
+    // rows reconstruct the recorded line to its end" would swallow the dialog
+    // and release an Enter into it: the #420 harm.
+    let notice = "[loomux] w-3 reports done: PR #900 is green";
+    let raw = painted(&[notice, "Do you want to run npm test? (y/n)"]);
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 120, 10),
+        None,
+        None,
+        vec![notice.to_string()],
+    );
     assert!(
         pred(),
-        "documented residual: a wrapped notice's later rows are unmarked and still latch (#576)"
+        "the record ends where the notice ends — the dialog row beneath a REAL notice must \
+         survive exactly as it does beneath a quoted one (#576/#420)"
+    );
+}
+
+#[test]
+fn e14_an_agent_printed_marker_row_widens_nothing() {
+    // The #420 harm restated as the rule the record-aware mask obeys: masking
+    // keys off the RECORD, never off the marker, so a row an agent printed
+    // itself — one loomux never wrote — claims exactly the one row the old
+    // marker rule always claimed and not a character more.
+    //
+    // The pane here is the adversarial shape: a forged marker row that LOOKS
+    // like the head of a wrapped notice, with the live question on the row that
+    // would be its continuation. The record holds a different notice entirely
+    // (loomux did write something to this pane — that is what makes the test
+    // about the record's CONTENT rather than about it being empty).
+    let raw = painted(&[
+        "[loomux] w-119 reports blocked: Copilot is asking",
+        "Do you want to run npm test? (y/n)",
+    ]);
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 120, 10),
+        None,
+        None,
+        vec!["[loomux] w-3 reports done: PR #900 is green".to_string()],
+    );
+    assert!(
+        pred(),
+        "a marker row loomux never wrote must widen nothing — the mask claims a continuation \
+         only when it reconstructs a line the record actually holds (#576/#420)"
+    );
+}
+
+#[test]
+fn e15_the_record_claims_only_a_run_that_reconstructs_a_delivered_line() {
+    // The unit-level statement of what e13/e14 defend behaviourally, and of
+    // where a mid-line anchor is allowed.
+    let line = "[loomux] w-1 reports blocked: waiting on the reviewer to answer";
+
+    // A run that reconstructs the line to its end is claimed whole.
+    let wrapped = "[loomux] w-1 reports blocked: waiting on\nthe reviewer to answer\nplain agent output";
+    assert_eq!(
+        mask_loomux_notices_with_record(wrapped, &[line.to_string()]).trim(),
+        "plain agent output",
+        "both rows of the wrap are ours; the row after the run is not"
+    );
+
+    // A run that DIVERGES keeps everything from the divergence on — including
+    // the marker row's own continuation, which is no longer evidence of
+    // anything once it stops matching what we wrote.
+    let diverged = "[loomux] w-1 reports blocked: waiting on\nDo you want to run npm test? (y/n)";
+    assert_eq!(
+        mask_loomux_notices_with_record(diverged, &[line.to_string()]).trim(),
+        "Do you want to run npm test? (y/n)",
+        "the marker row still masks (the marker rule), but a row that is not the rest of what \
+         we wrote is never taken with it"
+    );
+
+    // A run that reconstructs only a PREFIX of the line proves nothing about
+    // the rows after it, so it claims none of them.
+    let truncated = "[loomux] w-1 reports blocked: waiting on\nthe reviewer to";
+    assert_eq!(
+        mask_loomux_notices_with_record(truncated, &[line.to_string()]).trim(),
+        "the reviewer to",
+        "a run must consume the recorded line to its END — a prefix leaves the rows below \
+         unexplained, which is the run-mask #621 rejected"
+    );
+
+    // A mid-line anchor is honoured at the first row of the reading (the head
+    // scrolled off) and NOWHERE else.
+    assert_eq!(
+        mask_loomux_notices_with_record("the reviewer to answer", &[line.to_string()]).trim(),
+        "",
+        "the top row of a top-truncated reading may anchor mid-line"
+    );
+    assert_eq!(
+        mask_loomux_notices_with_record(
+            "plain agent output\nthe reviewer to answer",
+            &[line.to_string()]
+        )
+        .trim(),
+        "plain agent output\nthe reviewer to answer",
+        "a headless fragment in the MIDDLE of a reading is not a scrolled-off marker — nothing \
+         was truncated there, so the rows above it would have shown the head if we had written it"
+    );
+}
+
+#[test]
+fn e16_the_record_holds_loomux_framing_and_never_agent_payload() {
+    // What may enter the record at all, which is the ceiling on everything the
+    // record-aware mask can ever claim. Marker-led lines are loomux's own
+    // framing; a delivery's agent-authored body is not recorded, so the mask
+    // cannot be handed the power to blind the gate to ordinary pane content
+    // (the residual `e11` pins as deliberate).
+    let items = [queue::FlushConstituent {
+        id: 1,
+        from: "w-7",
+        enqueued_ms: 0,
+        coalesced: 0,
+        text: "Please check the build.\nDo you want to run npm test? (y/n)",
+    }];
+    let flush = queue::coalesced_flush_text(&items, 0, 1_000, queue::FlushCause::PaneBlocked);
+    let recorded = loomux_authored_lines(&flush);
+    assert!(!recorded.is_empty(), "the flush's own framing is loomux's writing: {flush}");
+    assert!(
+        !recorded.iter().any(|l| l.contains("Do you want to run npm test?")),
+        "a constituent's payload is agent text and must never enter the record: {recorded:?}"
+    );
+
+    // And behaviourally: the same flush, painted, with its own framing recorded
+    // — the payload still parks the pane exactly as `e11` pins it does.
+    let rows: Vec<&str> = flush.lines().collect();
+    let raw = painted(&rows);
+    let pred =
+        question_hold_predicate_sampled(move || sample_from_raw(&raw, 200, 14), None, None, recorded);
+    assert!(
+        pred(),
+        "recording a flush's framing must not start masking the payload it frames (#576/#632)"
+    );
+}
+
+#[test]
+fn e17_the_registry_records_what_it_delivered_bounded_and_deduped() {
+    // The record as the delivery path actually fills it, through the registry
+    // seam `deliver_now` calls — not a hand-built `Vec`.
+    let (reg, _dir) = test_registry();
+    let pty = 7u32;
+    assert!(
+        reg.delivered_notice_lines(pty).is_empty(),
+        "a pane loomux has never written to knows nothing — which is the marker rule"
+    );
+
+    // A delivery is framing plus body: only the framing is kept.
+    reg.record_delivered_text(pty, "[loomux] w-1 reports done: PR #900 is green\nplease review it");
+    assert_eq!(
+        reg.delivered_notice_lines(pty),
+        vec!["[loomux] w-1 reports done: PR #900 is green".to_string()],
+        "marker-led lines only"
+    );
+
+    // `deliver_now`'s echo-verified typing loop can write the same payload more
+    // than once; a retype must not evict the pane's earlier notices.
+    reg.record_delivered_text(pty, "[loomux] w-1 reports done: PR #900 is green\nplease review it");
+    assert_eq!(reg.delivered_notice_lines(pty).len(), 1, "a repeat of the newest line is dropped");
+
+    // Bounded, drop-oldest.
+    for i in 0..DELIVERED_NOTICES_PER_PANE + 5 {
+        reg.record_delivered_text(pty, &format!("[loomux] notice number {i}"));
+    }
+    let lines = reg.delivered_notice_lines(pty);
+    assert_eq!(lines.len(), DELIVERED_NOTICES_PER_PANE, "the record is capped per pane");
+    assert!(
+        lines.last().is_some_and(|l| l.ends_with(&format!("{}", DELIVERED_NOTICES_PER_PANE + 4))),
+        "the newest line is kept — it is the one still on screen: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("PR #900")),
+        "and the oldest are dropped: {lines:?}"
+    );
+
+    // Panes do not share a record.
+    assert!(
+        reg.delivered_notice_lines(8).is_empty(),
+        "the record is per pane — another pane's notices are not evidence about this one"
     );
 }
 
