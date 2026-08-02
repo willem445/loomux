@@ -775,15 +775,43 @@ pub fn requeue_survivors(state: &mut MergeQueueState, survivors: &[u64]) {
     }
 }
 
+/// **Has the queue drained?** — §4's "zero entries with no batch in flight", as
+/// one predicate rather than as an open-coded `any(...)` at each site.
+///
+/// Both halves matter and they answer different questions. The entries half is
+/// "is there work left that was approved against the target"; the batch half is
+/// "is there an object already built against it". A cancel can take the last
+/// live entry out from under an **in-flight** batch (§10 abandons it on the next
+/// tick, not synchronously), so the entries half alone would call that drained
+/// while a scratch ref and a draft PR built for the old target are still on the
+/// remote.
+fn drained(state: &MergeQueueState) -> bool {
+    state.batch.is_none() && !state.entries.iter().any(|e| !e.state().is_terminal())
+}
+
+/// Release the target if the queue has drained (§4: a target is a property of
+/// the work in the queue, never a configured setting).
+///
+/// Called from every point that can be the one that drains the queue — a
+/// finished batch, a cancel, a reconcile that strands what it cannot resume —
+/// because "the last non-terminal entry left" is not an event any single one of
+/// them owns. Releasing only while [`drained`] also keeps the empty target away
+/// from the paths that build a refspec out of it: `drive`'s `landable` guard
+/// fires only while an entry is live, and `start_batch` reads the target only
+/// after finding a `Queued` entry, so an empty target is reachable exactly where
+/// nothing reads it.
+fn release_target_if_drained(state: &mut MergeQueueState) {
+    if drained(state) {
+        state.target.clear();
+    }
+}
+
 /// Clear the in-flight batch record once it is finished, and release the target
 /// when the queue has drained (§4: a target is a property of the work in the
 /// queue, never a configured setting).
 pub fn finish_batch(state: &mut MergeQueueState) {
     state.batch = None;
-    let live = state.entries.iter().any(|e| !e.state().is_terminal());
-    if !live {
-        state.target.clear();
-    }
+    release_target_if_drained(state);
 }
 
 /// Drop terminal entries so the file stays bounded, keeping the queue's order.
@@ -966,6 +994,9 @@ pub fn reconcile_batch(
         for pr in orphans {
             strand(state, &mut report, pr, "in-flight with no batch record on disk");
         }
+        // Stranding is terminal, so this too can be what empties the queue —
+        // and there is no batch record here to hold the §4 release off.
+        release_target_if_drained(state);
         return report;
     };
 
@@ -1002,7 +1033,11 @@ pub fn reconcile_batch(
                 strand(state, &mut report, pr, &why);
             }
             report.cleanup_failed = cleanup_worktree(r, &batch.id);
-            state.batch = None;
+            // Stranding moved every member to a terminal state, so a restart
+            // that cannot resume its batch can also be what drains the queue —
+            // and a target held past that point is the #710 wedge, arrived at
+            // through recovery instead of through a cancel.
+            finish_batch(state);
             report.notices.push(format!(
                 "[loomux] merge queue: batch {} could NOT be resumed after a restart ({}). {} entr{} kicked back; nothing landed.",
                 quote(&batch.id),
@@ -1204,8 +1239,26 @@ pub fn enqueue(
     }
 
     // §7.1: live, through the real `gh`. `current_target` is whatever the queue
-    // has established so far — empty until the first successful enqueue.
-    let current = (!state.target.trim().is_empty()).then(|| state.target.clone());
+    // has established so far — empty until the first successful enqueue, and
+    // **binding only while the queue holds work that was approved against it**.
+    //
+    // That second clause is the whole of #710. §4's `base-not-target` refusal
+    // exists to stop queued entries being retargeted under them; a queue that is
+    // [`drained`] has nobody to protect, so a target left behind there refuses
+    // every future branch with "this queue is already landing elsewhere — drain
+    // it first" about a queue that IS drained. Nothing recovers from it either:
+    // `merge_queue.json` is persistent by design, so a restart re-reads the same
+    // residue and one cancelled batch wedges the group for good (found live:
+    // an empty queue still pointing at a deleted `integration/batch3`).
+    //
+    // Asked here rather than left to `release_target_if_drained` alone on
+    // purpose. That helper keeps the file honest going forward; this makes the
+    // wedge unreachable *at the decision*, including for a file written by a
+    // build that predates the helper or by some later path that forgets to call
+    // it. The refusal is unchanged in the case it was written for: one live
+    // entry and the drain-first answer is exactly what it was.
+    let current =
+        (!drained(state) && !state.target.trim().is_empty()).then(|| state.target.clone());
     let (target, facts) =
         match resolve_and_validate_target(r, pr, current.as_deref(), asserted_target) {
             Ok(v) => v,
@@ -1227,7 +1280,10 @@ pub fn enqueue(
         });
     }
 
-    // Established here, and only here (§4).
+    // Established here, and only here (§4) — and on a drained queue this
+    // establishes rather than re-confirms, because the validation above ran with
+    // no `current_target` to match. A live entry can never reach this line with
+    // a different branch: `validate_target` refused it.
     state.target = target;
     // A prior terminal entry for this PR is replaced rather than accumulated:
     // §4 is explicit that a kicked-back PR comes back as a NEW entry, so its
@@ -1265,7 +1321,16 @@ pub fn cancel(state: &mut MergeQueueState, pr: u64) -> CancelOutcome {
         return CancelOutcome::Refused { reason: refusal::NOT_QUEUED };
     }
     match advance_entry(state, pr, EntryState::Cancelled) {
-        Ok(Some(_)) => CancelOutcome::Cancelled { was },
+        Ok(Some(_)) => {
+            // §4's release, on the path that most often *is* the last transition
+            // out of the queue. Without it a cancelled queue keeps naming a
+            // branch it is not landing on — and one that may not exist any more
+            // (#710). Deliberately does nothing while a batch is in flight: that
+            // one is the driver's to abandon, and `finish_batch` re-asks this
+            // question once it has.
+            release_target_if_drained(state);
+            CancelOutcome::Cancelled { was }
+        }
         // Unreachable while `transition` allows every non-terminal → cancelled,
         // and still handled: a refusal the state machine invents is reported,
         // never rendered as a success.
@@ -1564,7 +1629,11 @@ fn advance_in_flight(
             set_batch_tag(state, *pr, None);
         }
         teardown(r, cfg.group, &batch, rep);
-        state.batch = None;
+        // `finish_batch` rather than a bare `state.batch = None`: every member
+        // may have been the cancel that emptied the queue (`requeue` leaves a
+        // terminal entry alone by design), and that is the §4 release this batch
+        // record was the last thing holding off.
+        finish_batch(state);
         rep.changed = true;
         rep.audit(
             audit_action::BATCH_ABORTED,
@@ -1585,7 +1654,9 @@ fn advance_in_flight(
             set_batch_tag(state, *pr, None);
         }
         teardown(r, cfg.group, &batch, rep);
-        state.batch = None;
+        // Every member just went terminal, so this can be the transition that
+        // drains the queue — same §4 release as the abandon path above.
+        finish_batch(state);
         rep.changed = true;
         rep.audit(
             audit_action::STRANDED,
