@@ -53,8 +53,8 @@ use super::mergeq::{
 use super::mergeqview::MERGE_QUEUE_FILE;
 use super::mqdriver::{
     as_args, classify_checks, cleanup_scratch, land_batch, mint_scratch, pr_checks_argv,
-    pr_ci_green, push_scratch, resolve_and_validate_target_detailed, scratch_exists,
-    BatchVerification, LandRefusal, MintError, MqRunner, REMOTE,
+    pr_ci_green, push_scratch, resolve_and_validate_target, resolve_and_validate_target_detailed,
+    scratch_exists, BatchVerification, LandRefusal, MintError, MqRunner, REMOTE,
 };
 use super::notify::sanitize_gh_text;
 use super::workflow::{body_digest, BlockId, ReviewVerdict};
@@ -1467,11 +1467,11 @@ pub fn drive(
     let unusable = if live && !super::mqdriver::landable(state.target.trim()) {
         Some(("target", quote(&state.target)))
     } else {
-        state
-            .batch
-            .as_ref()
-            .filter(|b| !valid_id_component(&b.id))
-            .map(|b| ("batch-id", quote(&b.id)))
+        // RED WITNESS (temporary, restored by the next commit): the batch id is
+        // NOT validated, which is finding 1's state — the ref namespace is
+        // closed by `scratch_branch`, and the worktree path and the body file
+        // are not.
+        None
     };
     if let Some((field, value)) = unusable {
         rep.backoff = true;
@@ -2034,7 +2034,9 @@ fn refresh_and_select(
         // group backs off rather than re-deriving the same stall next wake.
         // Same line `land()` draws with `backoff = culprit.is_none()`.
         let reason = match resolve_and_validate_target_detailed(r, *pr, Some(&target), None) {
-            Err(f) if f.is_runner() => return stall(rep, examined, truncated, *pr, &f),
+            // RED WITNESS (temporary, restored by the next commit): a runner
+            // failure is treated as this PR's refusal, which is finding 2's
+            // state — the pass carries on and spends one timeout per entry.
             Err(f) => Some(f.into_refusal().code().to_string()),
             Ok((_, facts)) => {
                 // Fetched only when the gate declares the clause — the same
@@ -2046,21 +2048,10 @@ fn refresh_and_select(
                 // because this runs once per examined entry inside a shared
                 // poll tick.
                 let ci_green = if super::mqdriver::declares_ci_green(gate) {
-                    match super::mqdriver::pr_ci_green_detailed(r, *pr) {
-                        // Same reasoning as above, one call later: a seam that
-                        // could not run is the world, and it is why the bound
-                        // holds whichever of the two lookups stalls first.
-                        Err(e) => {
-                            return stall(
-                                rep,
-                                examined,
-                                truncated,
-                                *pr,
-                                &super::mqdriver::ResolveFailure::Runner(e),
-                            )
-                        }
-                        Ok(v) => v,
-                    }
+                    // RED WITNESS (temporary, restored by the next commit): the
+                    // second half of finding 2 — a stalled checks lookup reads
+                    // as "could not determine", so the pass keeps going.
+                    super::mqdriver::pr_ci_green_detailed(r, *pr).unwrap_or(None)
                 } else {
                     None
                 };
