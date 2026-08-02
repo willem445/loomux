@@ -2153,7 +2153,13 @@ fn a_recorded_target_that_is_not_a_branch_name_stops_the_tick_before_any_call() 
 #[test]
 fn a_batch_id_that_is_not_a_name_stops_the_tick_before_any_path_is_built() {
     for bad in ["../../evil", "a/b", "", "  ", "-x", "id with spaces", "a\nb"] {
-        let f = drive_fake();
+        // The batch's own checks are stubbed even though a guarded tick never
+        // reaches them: without that reply the *fixture* panics on the first
+        // unstubbed call, so the guard's absence would be reported as "no
+        // canned reply" and this test's own assertions would never run. A red
+        // that fires in the harness is not evidence that the assertion works —
+        // exactly what the first witness of this test showed.
+        let f = drive_fake().gh("pr checks 641", 0, "[]", "");
         let mut s = in_flight_state("mq-placehold", &[612], 641);
         s.batch.as_mut().unwrap().id = bad.to_string();
         let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
