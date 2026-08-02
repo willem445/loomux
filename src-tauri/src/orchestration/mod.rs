@@ -15625,16 +15625,33 @@ fn reconstructs_to_end(rows: &[String], from: usize, line: &str, at: usize) -> O
 /// claimable only where its producer has promised the pane's own occupant did
 /// not author any span of it.
 ///
-/// What remains is the two-party case the old sentence described: a relayed
-/// notice carries one agent's words into ANOTHER agent's pane, so the author
-/// must induce the recipient to print the head row. It is worth being precise
-/// about what that buys an attacker, because the bar elsewhere is lower — an
-/// agent that can be induced to print an attacker-chosen row into its own pane
-/// can generally be induced to do the thing the dialog was guarding. The gate
-/// protects against LOOMUX pressing Enter, not against an agent acting; the
-/// one-party case mattered more because there the attacker is the pane's own
-/// occupant, using the gate to self-grant a permission its CLI was asking a
-/// human for.
+/// **What remains is PROXY-AUTHORSHIP by the recipient, and it is
+/// orchestrator-shaped (rev-163 B3).** An earlier version of this paragraph
+/// called the remainder a two-party case needing the author to induce the
+/// recipient. That is also too kind, for the same reason as before: the check
+/// [`OrchRegistry::deliver_relayed_to_orchestrator`] performs is CALLERSHIP
+/// (`from != orch`), not authorship. An orchestrator that tells a worker
+/// "report with this exact note" gets its own chosen text marked — `from` is
+/// the worker, so the check passes — and delivered into its OWN pane. The
+/// worker complying is ordinary compliance, not a compromise, and the
+/// orchestrator then prints the head row into its own pane at will, needing no
+/// inducement at all.
+///
+/// The scope is the whole surface, not a corner: both marked call sites target
+/// the orchestrator, so **every claimable line in the system lands in the pane
+/// of the one agent best placed to dictate its content**. What it buys that
+/// agent is precisely the #420 harm — loomux pressing Enter on a permission
+/// dialog its own CLI was asking a HUMAN to answer.
+///
+/// **Accepted knowingly, not mitigated.** Authorship is not enforceable here:
+/// an orchestrator instructing a worker is loomux's ordinary traffic and has
+/// no attack signature to key on. The alternatives are the ones already
+/// rejected — refusing question-shaped rows is vacuous, and refusing
+/// agent-supplied fields deletes the motivating case. Two levers exist if this
+/// is judged too expensive, and both are subtractions rather than fixes: drop
+/// `R-top`'s mid-line anchor for marked lines (shrinks the surface, does not
+/// close it, and gives up #576's scrolled-off half), or stop marking
+/// altogether (the pre-record behaviour — the wrap residual simply stays open).
 ///
 /// Under-masking stays the cheap error and this function keeps choosing it: any
 /// mismatch, any missing tail, any unmarked line, any lost record ends the run.
@@ -31292,11 +31309,22 @@ impl OrchRegistry {
     /// pane — the OPT-IN, without which a delivered line widens nothing.
     ///
     /// **The promise a caller makes, and it is per FIELD (rev-163 B1).** Every
-    /// span of this text is either loomux-composed or was supplied by an agent
-    /// OTHER than `to_agent`. Nothing weaker will do, and "the notice leads with
-    /// the marker" is much weaker: loomux's framing routinely carries a field
-    /// somebody chose — a `notify_when` note, an agent NAME the orchestrator
-    /// picked at spawn, a task title, a PR title from GitHub.
+    /// span of this text was either composed by loomux or *called in* by an
+    /// agent other than `to_agent`. Nothing weaker will do, and "the notice
+    /// leads with the marker" is much weaker: loomux's framing routinely carries
+    /// a field somebody chose — a `notify_when` note, an agent NAME the
+    /// orchestrator picked at spawn, a task title, a PR title from GitHub.
+    ///
+    /// **"Called in by", not "authored by" — the promise is weaker than it
+    /// sounds and the difference is a known residual (rev-163 B3).** What a
+    /// caller can check is which agent made the tool call. Who *dictated the
+    /// words* is not knowable here and arguably not knowable at all: an
+    /// orchestrator telling a worker what to report is the orchestrator's
+    /// ordinary channel, not an attack signature. So a recipient that can
+    /// instruct another agent can put text of its own choosing into its own
+    /// pane's record through that agent — proxy-authorship. See
+    /// [`mask_loomux_notices_with_record`]'s residual note for the scenario,
+    /// its scope, and why it is accepted rather than mechanised away.
     ///
     /// **The attack this exists to stop**, because it is not obvious and it was
     /// found in review rather than in design. `notify_when(kind, pr, note)`
@@ -33260,13 +33288,20 @@ impl OrchRegistry {
     /// suppression, flush framing) keeps the default and is never claimable,
     /// which costs only a hold.
     ///
-    /// **`from == orch` is the whole check.** These are cross-pane by
-    /// construction — a worker's words landing in the orchestrator's pane — and
-    /// the harm needs the text's AUTHOR to be the pane's own occupant. An
-    /// orchestrator reporting to itself is exactly that case, so it takes the
-    /// default and is not marked. `message_orchestrator` refuses an
-    /// orchestrator caller a layer up; `report` does not, which is why the
-    /// check lives here rather than at either call site.
+    /// **`from == orch` is the whole check, and it is a CALLERSHIP check
+    /// (rev-163 B3).** It closes an orchestrator relaying to itself directly.
+    /// It does not — and cannot — close an orchestrator that instructs a worker
+    /// to report words it chose: `from` is then the worker, the check passes,
+    /// and the line lands in the orchestrator's own pane. Both call sites
+    /// target the orchestrator, so every claimable line in the system is
+    /// delivered to the pane of the one agent best placed to dictate its
+    /// content. That is the accepted residual, argued in full at
+    /// [`mask_loomux_notices_with_record`]; it is recorded here because this is
+    /// where the check that does not cover it lives.
+    ///
+    /// `message_orchestrator` refuses an orchestrator caller a layer up;
+    /// `report` does not, which is why the check lives here rather than at
+    /// either call site.
     fn deliver_relayed_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
         let orch = self
             .agents

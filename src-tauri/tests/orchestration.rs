@@ -34177,18 +34177,22 @@ fn e14c_a_marked_relay_line_is_claimable_and_that_is_the_stated_residual() {
     // instead of the safe one, because a residual nobody can see is one nobody
     // can weigh.
     //
-    // A relayed `report` note is one agent's words landing in ANOTHER agent's
-    // pane, so `deliver_relayed_to_orchestrator` marks it: that is what makes
-    // the wrap masking #576 asked for possible at all. The cost is that if the
-    // recipient can be INDUCED (by the very text it is reading) to print the
-    // line's head into its own pane, and its CLI then paints a dialog that is
-    // exactly the remainder, the run reconstructs and the dialog is masked.
+    // A relayed `report` note is one agent's words CALLED IN by another agent,
+    // so `deliver_relayed_to_orchestrator` marks it: that is what makes the wrap
+    // masking #576 asked for possible at all. The cost is that if the pane's
+    // occupant prints the line's head into its own pane and its CLI then paints
+    // a dialog that is exactly the remainder, the run reconstructs and the
+    // dialog is masked.
     //
-    // Two parties, and worth measuring against the bar elsewhere: an agent that
-    // can be induced to print an attacker-chosen row into its own pane can
-    // generally be induced to do the thing the dialog was guarding. The gate
-    // stops LOOMUX pressing Enter, not an agent acting. That is why the
-    // one-party case (`e14b`) is closed at the door and this one is documented.
+    // **The residual is PROXY-AUTHORSHIP, not a two-party induction** (rev-163
+    // B3 — an earlier version of this comment claimed the latter). The door's
+    // check is `from != orch`, which is callership: an orchestrator that
+    // instructs a worker to report words it chose passes it, and the line lands
+    // in the ORCHESTRATOR's own pane, which it prints into at will. Both marked
+    // call sites target the orchestrator, so this is the whole claimable
+    // surface rather than a corner of it. Pinned here so the cost is visible
+    // and can be re-judged; argued in full at `mask_loomux_notices_with_record`
+    // and in the design note.
     let line = "[loomux] w-119 reports blocked: Copilot is asking Do you want to run npm test? (y/n)";
     let raw = painted(&[
         "[loomux] w-119 reports blocked: Copilot is asking",
@@ -34202,8 +34206,8 @@ fn e14c_a_marked_relay_line_is_claimable_and_that_is_the_stated_residual() {
     );
     assert!(
         !pred(),
-        "documented residual: a MARKED cross-pane line whose remainder a dialog reproduces \
-         exactly is claimed — the two-party surface the human accepts knowingly (#576/#420)"
+        "documented residual: a MARKED line whose remainder a dialog reproduces exactly is \
+         claimed — the proxy-authorship surface the human accepts knowingly (#576/#420)"
     );
 }
 
