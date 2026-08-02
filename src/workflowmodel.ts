@@ -31,6 +31,10 @@
 // effort keeping its dependency list short. Anything the subset can't read is a parse
 // finding on a line number — the raw-text view still opens, so the file is still fixable.
 
+// The one import: the CLI capability record the BACKEND reports (agent_cli_knobs).
+// This module mirrors no vendor fact of its own — see `validateWorkflow`'s knob pass.
+import type { CliKnobs } from "./selectorknobs";
+
 // ---------- the closed enums ----------
 
 /** The capability classes. CLOSED, deliberately (#222 §2c): a workflow file may define
@@ -141,6 +145,14 @@ export interface WorkflowBlock {
    *  its matching `kind` (see {@link roleHintRequires}); absent is today's behavior,
    *  byte for byte. */
   role_hint?: string;
+  /** Thinking level (#687) — one of the CLI's own `effort` values, or "" for its
+   *  default. Which values exist, and whether the CLI has any seam for them at
+   *  all, is capability data the BACKEND owns (`agent_cli_knobs`); this field is
+   *  just the file's text, exactly like `cli` and `kind`. */
+  effort?: string;
+  /** Context-window variant (#687) — `1m`, or "" for the model's own window.
+   *  Same ownership rule as {@link effort}. */
+  context?: string;
   /** Keys this build doesn't know, preserved verbatim across a round-trip. */
   extra?: Record<string, YamlValue>;
 }
@@ -199,6 +211,7 @@ export type FindingCode =
   | "prompt-and-profile"
   | "role-hint-unknown"
   | "role-hint-wrong-kind"
+  | "knob-unavailable"
   | "edge-not-a-mapping"
   | "edge-unknown-block"
   | "edge-self"
@@ -1494,7 +1507,7 @@ function readGate(raw: YamlValue, findings: Finding[]): MergeGate {
  *  node isn't even installed. It is cheap, it is pure, and it is the difference between
  *  "your workflow failed after spawning two agents" and "block `rev-perf` doesn't exist —
  *  the merge gate names it". */
-export function validateWorkflow(w: Workflow): Finding[] {
+export function validateWorkflow(w: Workflow, _knobs?: Record<string, CliKnobs>): Finding[] {
   const findings: Finding[] = [];
   const byId = new Map<string, WorkflowBlock>();
 

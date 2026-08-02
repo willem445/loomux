@@ -51,6 +51,15 @@ export interface RosterBlock {
   cli: string;
   model: string;
   persona: BlockPersona;
+  /** The block's thinking level and context-window variant (#687), as the
+   *  backend resolved them — `""`/absent means "the CLI's own default", which is
+   *  the pre-#687 command line byte for byte. Shown in the roster because the
+   *  preview's job is to state what will actually be spawned, and because the
+   *  trust argument for letting a repo file pin these on the ORCHESTRATOR block
+   *  (`doc/design/workflows.md`) rests on the human seeing every block's resolved
+   *  value here, before the toggle that reads the file at all. */
+  effort?: string;
+  context?: string;
   /** OPTIONAL, INERT persona/template marker (#250/#324) — `"advisor"` |
    *  `"process"` | absent. Backend-resolved, so it is never a value the
    *  backend's own `role_hint_requires` wouldn't accept: capability still
@@ -140,6 +149,12 @@ export interface RolePick {
   key: OrchRole;
   cli: string;
   model: string;
+  /** The role's model knobs (#687), or `""`/absent for the CLI's own default.
+   *  Already gated by `selectorknobs.knobValue` where the form collected them —
+   *  the preview shows what the payload will carry, not what a stale control
+   *  still displays. */
+  effort?: string;
+  context?: string;
 }
 
 /** What the group will run, and why.

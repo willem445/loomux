@@ -491,3 +491,64 @@ test("the roster description counts delegates, not the orchestrator", () => {
     "class order follows the role table, not the file's order"
   );
 });
+
+// ---------- model knobs (#687) ----------
+
+test("a block's effort/context are part of what the roster promises will run", () => {
+  // The consent surface has to state the whole spawn, not most of it. This is
+  // also what makes the design-note argument for letting a repo file pin
+  // `effort:` on the ORCHESTRATOR block true rather than aspirational: it rests
+  // on the human seeing every block's resolved value here, before the toggle
+  // that reads the file at all (doc/design/workflows.md).
+  assert.equal(
+    describeBlock(block({ id: "w", kind: "worker", effort: "xhigh" })),
+    "worker · claude · sonnet · effort: xhigh"
+  );
+  assert.equal(
+    describeBlock(block({ id: "w", kind: "worker", context: "1m" })),
+    "worker · claude · sonnet · context: 1m"
+  );
+  assert.equal(
+    describeBlock(block({ id: "w", kind: "worker", effort: "max", context: "1m" })),
+    "worker · claude · sonnet · effort: max · context: 1m"
+  );
+  // The knobs sit with the model they modify — BEFORE the persona and the chip,
+  // which are about what instructions the agent gets, not what it runs on.
+  assert.equal(
+    describeBlock(
+      block({ id: "a", kind: "planner", effort: "low", persona: "prompt", role_hint: "advisor" })
+    ),
+    "planner · claude · sonnet · effort: low · repo persona · ADVISOR"
+  );
+  // Absent or empty = the CLI's own default, which is today's line byte for byte
+  // — an "effort: (default)" on every row would be noise on every group that
+  // pinned nothing, i.e. nearly all of them.
+  assert.equal(describeBlock(block({ id: "w", kind: "worker" })), "worker · claude · sonnet");
+  assert.equal(
+    describeBlock(block({ id: "w", kind: "worker", effort: "", context: "" })),
+    "worker · claude · sonnet"
+  );
+});
+
+test("the built-in roster carries the launcher's per-role knobs", () => {
+  // Toggle OFF is the default path: the four rows the launcher's own form
+  // collected. If the form's effort/context didn't reach these blocks, the
+  // preview would describe a group that isn't the one about to spawn.
+  const blocks = builtinRoster(
+    [
+      { key: "orchestrator", cli: "claude", model: "opus", effort: "xhigh", context: "1m" },
+      { key: "worker", cli: "claude", model: "sonnet", effort: "medium" },
+      { key: "reviewer", cli: "copilot", model: "auto" },
+      { key: "planner", cli: "claude", model: "opus" },
+    ],
+    "claude"
+  );
+  const orch = blocks.find((b) => b.id === "orchestrator")!;
+  assert.equal(orch.effort, "xhigh");
+  assert.equal(orch.context, "1m");
+  assert.equal(describeBlock(orch), "orchestrator · claude · opus · effort: xhigh · context: 1m");
+  assert.equal(blocks.find((b) => b.id === "worker")!.effort, "medium");
+  // A pick with no knobs stays knob-less rather than inheriting the group's.
+  assert.equal(blocks.find((b) => b.id === "reviewer")!.effort, "");
+  assert.equal(blocks.find((b) => b.id === "reviewer")!.context, "");
+});
