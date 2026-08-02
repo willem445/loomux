@@ -68,7 +68,9 @@ pane delivery. Reading state once is fine; waiting is the defect.
 
 - After any push or rebase, re-derive every run citation for the NEW head
   (`gh run list --branch <branch> --json headSha,databaseId,conclusion`, assert headSha
-  == `git rev-parse HEAD`) and update the body before reporting (#596).
+  == `git rev-parse HEAD`) and update the body before reporting (#596). RED runs are the
+  exception a rebase creates: a run is a fact about the SHA it ran on, so a rebased-away
+  red keeps its own SHA plus a pre->post map — relabelling makes it false (#695, #696).
 - `Closes #N` closes on squash regardless of partial-scope prose. Partial scope links as
   `Part of #N` / `Mitigates #N`.
 - The scan is textual and context-blind: `close`/`fix`/`resolve` next to `#N` fires from
@@ -106,3 +108,10 @@ When a directive moves a real-world specimen out of the class a test needs it in
 that still distinguishes — a synthetic specimen or a generic rule — and never relax the
 assertion until today's specimen passes. If the converged case still deserves coverage,
 give it its own strictly-weaker, explicitly-labeled assertion (#689).
+
+## A subsystem isn't done until a production path calls it
+
+Slice tests drive the seams, so a lifecycle nothing invokes stays green while doing
+nothing. List each new lifecycle fn's call sites, discarding the module's own and the
+tests' — nothing left means the door is connected to nothing. Wire it, or name the
+deferred caller and its issue in the PR (#661 `e20`, #698, #700).
