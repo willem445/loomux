@@ -5803,3 +5803,120 @@ fn intake_only_drift_is_audited_even_when_the_roster_is_unchanged() {
         "...and what the file now says"
     );
 }
+
+// ───────── #581 §11.2: the `merge_queue:` block ─────────
+//
+// Policy for the bisecting merge queue (`doc/design/merge-queue.md`), parsed
+// here beside `gates:`. The engine is `orchestration::mergeq`; this file only
+// ever pins what the FILE means, which is the half a repo author can get wrong.
+
+#[test]
+fn an_absent_merge_queue_block_means_the_feature_is_off() {
+    // §12's reversal mechanism, and the reason this is safe to land ahead of
+    // the driver: no block, no queue, and the parsed policy is the product
+    // default rather than anything the file influenced.
+    let wf = workflow::parse_workflow("version: 1\nblocks:\n  - id: worker\n    kind: worker\n")
+        .unwrap();
+    assert_eq!(wf.merge_queue, workflow::MergeQueuePolicy::default());
+    assert!(!wf.merge_queue.enabled, "the product default is OFF (§12)");
+    assert_eq!(wf.merge_queue.max_batch, 3);
+    assert_eq!(wf.merge_queue.checks_timeout_minutes, 60);
+    // The repo's own file declares no queue today — the dogfood block is a
+    // slice-E proposal for the human to accept or decline, not a consequence of
+    // the design note (§12).
+    let own = std::fs::read_to_string(Path::new(&repo_root()).join(".loomux/workflow.yml"))
+        .expect("this repo has a workflow file");
+    assert!(!workflow::parse_workflow(&own).unwrap().merge_queue.enabled);
+}
+
+#[test]
+fn a_declared_merge_queue_block_fills_in_the_defaults_it_omits() {
+    // A repo that wants the queue writes one line; it does not have to restate
+    // policy it is happy with — same shape as `intake:`'s per-label fallback.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\nmerge_queue:\n  enabled: true\n",
+    )
+    .unwrap();
+    assert!(wf.merge_queue.enabled);
+    assert_eq!(wf.merge_queue.max_batch, 3);
+    assert_eq!(wf.merge_queue.checks_timeout_minutes, 60);
+
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         merge_queue:\n  enabled: true\n  max_batch: 5\n  checks_timeout_minutes: 90\n",
+    )
+    .unwrap();
+    assert_eq!(wf.merge_queue.max_batch, 5);
+    assert_eq!(wf.merge_queue.checks_timeout_minutes, 90);
+}
+
+#[test]
+fn the_checks_timeout_is_clamped_by_the_notify_ttl_clamp_itself() {
+    // §5's backstop is the same quantity a notify watch's TTL is — a bounded
+    // wait on a PR's checks — so it takes the one definition's bounds (5..240)
+    // rather than a second copy that can drift. §11.2: "clamped like the notify
+    // TTLs".
+    let of = |v: &str| {
+        workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             merge_queue:\n  enabled: true\n  checks_timeout_minutes: {v}\n"
+        ))
+        .unwrap()
+        .merge_queue
+        .checks_timeout_minutes
+    };
+    assert_eq!(of("0"), 5, "an unbounded-in-effect wait is exactly what §5 forbids");
+    assert_eq!(of("1"), 5);
+    assert_eq!(of("30"), 30);
+    assert_eq!(of("240"), 240);
+    assert_eq!(of("99999"), 240);
+}
+
+#[test]
+fn max_batch_zero_is_a_loud_error_rather_than_a_silent_default() {
+    // §11.2: a malformed block never degrades to defaults, "because a queue
+    // running on silently-substituted policy is a queue nobody can reason
+    // about". Same posture the sibling `gates:` block takes on a `threshold`
+    // that could never be satisfied.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+         merge_queue:\n  enabled: true\n  max_batch: 0\n",
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("merge_queue.max_batch") && e.contains("at least 1")),
+        "max_batch: 0 must name itself in the error, got: {errs:?}"
+    );
+}
+
+#[test]
+fn the_merge_queue_block_can_never_name_a_branch_or_widen_anything() {
+    // The capability-closure rule, applied to the newest block. `RawMergeQueue`
+    // is `deny_unknown_fields`, so there is no spelling of "land on main", no
+    // `human_gate: false`, and no key at all that this build does not
+    // recognize — an attempt is a hard parse error, not an ignored line. §4 is
+    // why nothing NEEDS to name a branch: the target comes from the first
+    // enqueued PR's live base, and §7's default-branch refusals re-resolve live
+    // at enqueue, batch build AND landing.
+    for line in ["target: main", "human_gate: false", "auto_merge: true", "max_bacth: 3"] {
+        let errs = workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: worker\n    kind: worker\n\
+             merge_queue:\n  enabled: true\n  {line}\n"
+        ))
+        .unwrap_err();
+        assert!(!errs.is_empty(), "{line:?} must not be tolerated inside merge_queue:");
+    }
+    // And a mistyped block name is not silently ignored either — `RawWorkflow`
+    // is `deny_unknown_fields` too, which is also why ADDING this key breaks
+    // the file for builds predating slice C (§11.2, documented deliberately).
+    assert!(workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\nmerge_qeue:\n  enabled: true\n"
+    )
+    .is_err());
+    // A value of the wrong type fails the whole file rather than resolving to
+    // the default — policy fails loud (§11.2).
+    assert!(workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: worker\n    kind: worker\nmerge_queue:\n  enabled: 3\n"
+    )
+    .is_err());
+}

@@ -87,6 +87,11 @@
 //!   merge:
 //!     require: all-pass    # or: threshold: 2
 //!     reviewers: [rev-security]
+//!
+//! merge_queue:             # OPT-IN, default off (#581). Absent block = the
+//!   enabled: true          # feature is off and behavior is byte-for-byte
+//!   max_batch: 3           # unchanged. See [`MergeQueuePolicy`].
+//!   checks_timeout_minutes: 60
 //! ```
 //!
 //! `id` is immutable and human-meaningful and `name` is display-only on
@@ -95,6 +100,7 @@
 //! `.loomux/workflow.layout.json` (the GUI pane's file, sub-PR 2) so a canvas
 //! nudge never churns the semantic diff.
 
+use super::notify::{clamp_expires_minutes, NOTIFY_EXPIRES_DEFAULT_MIN};
 use super::{cli_can_host, default_model, Role, SUPPORTED_CLIS};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -229,6 +235,66 @@ pub struct Gate {
     /// closed** in the shim rather than silently passing — see
     /// [`KNOWN_CONDITIONS`].
     pub also: Vec<String>,
+}
+
+// ── merge_queue: the bisecting merge queue's policy (#581 §11.2) ───────────
+
+/// Default batch size (§11.2). At `3`, a red batch costs at most 2 extra CI
+/// runs to attribute (ceil(log2 3)).
+pub const MERGE_QUEUE_MAX_BATCH_DEFAULT: u32 = 3;
+
+/// The `merge_queue:` block — a sibling of [`Gate`]'s `gates:`, and the whole
+/// of what a repo declares about the queue. Design note:
+/// `doc/design/merge-queue.md` §11.2; the engine is
+/// [`mergeq`](super::mergeq).
+///
+/// **Policy, not mechanism** (CLAUDE.md constraint 8). Nothing here names a
+/// branch, a toolchain, or a verification command: the queue *observes* the
+/// repo's own CI and never defines or runs it, and the target it lands on comes
+/// from the first enqueued PR's live base rather than from this file (§4).
+///
+/// **An absent block means the feature is off and behavior is byte-for-byte
+/// unchanged** — the same posture `gates:` takes, and the reversal mechanism
+/// §12 names: delete the block and every queue path is unreachable.
+///
+/// **Adding the block breaks the file for builds that predate #581 slice C, and
+/// that is deliberate.** [`RawWorkflow`] is `deny_unknown_fields`, so
+/// `merge_queue:` is not a tolerated unknown key on an older build: it fails
+/// the parse of the *whole* file, gates and all, down the loud `workflow-invalid`
+/// path. It is the right behavior anyway — `workflow.yml` is human-authored
+/// policy, and a key the build does not understand means a human believes a
+/// policy is in force that is not. Note the deliberate asymmetry with
+/// `merge_queue.json` (`mergeq::MergeQueueState`), which *tolerates and
+/// preserves* unknown fields because it is machine-authored state: policy fails
+/// loud, state degrades gracefully.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeQueuePolicy {
+    /// Default **false**. The product default is off (§12).
+    pub enabled: bool,
+    /// How many approved sub-PRs one speculative batch may carry (§11.2).
+    /// At least 1 — see [`parse_workflow`]. There is no upper bound here
+    /// because none is needed: the effective ceiling is the queue's own entry
+    /// cap (`mergeq::MAX_ENTRIES`, §10), so an oversized value degenerates to
+    /// "batch everything queued" rather than being unsatisfiable.
+    pub max_batch: u32,
+    /// The backstop on waiting for a batch's checks (§5). The primary release
+    /// is the checks going terminal; this bounds the case where a repo attaches
+    /// no checks at all, so the batch surfaces as **unverifiable** rather than
+    /// sitting pending in silence — the lessons-file rule that any suppression
+    /// driven by a fallible signal must be bounded.
+    pub checks_timeout_minutes: u32,
+}
+
+impl Default for MergeQueuePolicy {
+    fn default() -> Self {
+        MergeQueuePolicy {
+            enabled: false,
+            max_batch: MERGE_QUEUE_MAX_BATCH_DEFAULT,
+            // Same default and same bounds as a notify watch's TTL, from the
+            // one definition — see the clamp in [`parse_workflow`].
+            checks_timeout_minutes: NOTIFY_EXPIRES_DEFAULT_MIN,
+        }
+    }
 }
 
 // ── intake: source + label vocabulary (#382 P1) ────────────────────────────
@@ -396,6 +462,9 @@ pub struct Workflow {
     /// built-in default when the file declares no `intake:` block at all, or
     /// only part of one.
     pub intake: IntakeProfile,
+    /// Merge-queue policy (#581 §11.2). Always resolved; the default is
+    /// **disabled**, which is what an absent `merge_queue:` block means.
+    pub merge_queue: MergeQueuePolicy,
 }
 
 impl Workflow {
@@ -617,6 +686,31 @@ struct RawWorkflow {
     /// reachable from this schema at all.
     #[serde(default)]
     intake: Option<RawIntake>,
+    /// Merge-queue policy (#581 §11.2). `None` when the file declares no
+    /// `merge_queue:` block — which resolves to
+    /// [`MergeQueuePolicy::default`], i.e. **off**, and behavior is
+    /// byte-for-byte unchanged.
+    ///
+    /// Like `intake:`, this block can never grant a capability: every field is
+    /// a bool or a number, there is no spelling that names a branch to land on
+    /// (§4 — the target comes from the enqueued PR's live base), and the
+    /// default-branch refusals (§7) are not reachable from this schema at all.
+    #[serde(default)]
+    merge_queue: Option<RawMergeQueue>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMergeQueue {
+    #[serde(default)]
+    enabled: bool,
+    /// `Option` rather than a defaulted number so "omitted" and "written as 3"
+    /// are distinguishable — the parse below rejects a zero, and rejecting one
+    /// the author never wrote would be an error about nothing.
+    #[serde(default)]
+    max_batch: Option<u32>,
+    #[serde(default)]
+    checks_timeout_minutes: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1155,6 +1249,44 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         }
     };
 
+    // Merge-queue policy (#581 §11.2). `None` (no `merge_queue:` block at all)
+    // resolves to the default, which is **disabled** — an absent block means
+    // the feature is off and behavior is byte-for-byte unchanged.
+    //
+    // Two different postures on a bad value, both taken from the note:
+    //
+    // - `max_batch: 0` is a hard **error**. §11.2 says a malformed block never
+    //   degrades to defaults, "because a queue running on silently-substituted
+    //   policy is a queue nobody can reason about"; and it matches how the
+    //   sibling `gates:` block treats a number that could never work
+    //   (`threshold: 0`, `threshold` above the reviewer count).
+    // - `checks_timeout_minutes` is **clamped**, because the note says clamped
+    //   ("default 60, clamped like the notify TTLs") — and it is clamped by the
+    //   notify TTL clamp *itself*, not by a second copy of those bounds. It is
+    //   the same quantity: a bounded wait on a PR's checks. `None` (omitted)
+    //   through the same call is where the 60-minute default comes from.
+    let merge_queue = match &raw.merge_queue {
+        None => MergeQueuePolicy::default(),
+        Some(rq) => {
+            let max_batch = match rq.max_batch {
+                None => MERGE_QUEUE_MAX_BATCH_DEFAULT,
+                Some(0) => {
+                    errs.push(
+                        "merge_queue.max_batch: must be at least 1 — a batch of no PRs could never land anything"
+                            .to_string(),
+                    );
+                    MERGE_QUEUE_MAX_BATCH_DEFAULT
+                }
+                Some(n) => n,
+            };
+            MergeQueuePolicy {
+                enabled: rq.enabled,
+                max_batch,
+                checks_timeout_minutes: clamp_expires_minutes(rq.checks_timeout_minutes),
+            }
+        }
+    };
+
     if !errs.is_empty() {
         return Err(errs);
     }
@@ -1166,6 +1298,7 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
         edges,
         gates,
         intake,
+        merge_queue,
     })
 }
 
@@ -1952,6 +2085,7 @@ mod tests {
                 edges: _,
                 gates: _,
                 intake: _,
+                merge_queue: _,
             } = v;
         }
         fn raw_intake_fields(v: RawIntake) {
@@ -1960,6 +2094,16 @@ mod tests {
         fn raw_intake_labels_fields(v: RawIntakeLabels) {
             let RawIntakeLabels { ready: _, investigate: _, owned: _, prototype: _ } = v;
         }
+        // #581 §11.2: `merge_queue:` is policy for a host-run queue that pushes
+        // refs on the backend's own authority, so the inventory rule matters
+        // here for the same reason it does for `intake:` — a field ADDED to
+        // this schema must be a visible change, not one that passes every
+        // existing test. Nothing here may ever name a branch or grant a
+        // capability; the target comes from the enqueued PR's live base (§4)
+        // and the default-branch refusals (§7) are not reachable from config.
+        fn raw_merge_queue_fields(v: RawMergeQueue) {
+            let RawMergeQueue { enabled: _, max_batch: _, checks_timeout_minutes: _ } = v;
+        }
         // Referenced, never called — the compiler still type-checks (and
         // therefore exhaustiveness-checks) every function body above whether
         // or not it runs. This line only exists to avoid a dead-code warning.
@@ -1967,6 +2111,7 @@ mod tests {
             raw_workflow_fields as fn(RawWorkflow),
             raw_intake_fields as fn(RawIntake),
             raw_intake_labels_fields as fn(RawIntakeLabels),
+            raw_merge_queue_fields as fn(RawMergeQueue),
         );
     }
 }
