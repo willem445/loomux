@@ -28460,6 +28460,49 @@ fn list_notifications_is_oldest_registered_first() {
     assert_eq!(ids, vec![id1, id2, id3], "must list registration order, oldest first, got: {listed}");
 }
 
+// ---------- unified `gh` poller (#406): one background loop, one clock ----------
+//
+// Both `gh`-polling features (the notification backend #243 and the idle-tick
+// intake gate #332) spend the SAME account's GitHub API budget, so they must
+// not be clocked by two independent threads that share no accounting of it.
+// The tests below pin the two halves of that: the app really does start
+// exactly one such loop, and one wake of it services both features.
+//
+// Same "no test shells out to `gh`" discipline as the notify section above:
+// `gh_poll_tick(now, &results)` is the decision seam, driven with a synthetic
+// result map, and its intake half no-ops without a `gh` call when no group is
+// autonomous with the gate on (`intake_poll_config`).
+
+/// The registration invariant #406 exists to hold: app setup starts ONE
+/// `gh`-polling loop, and neither of the two entry points it replaced.
+/// Parsed out of `src/lib.rs` itself — the actual setup block, not a hand
+/// transcription of it (the `generate_handler_matches_app_commands`
+/// precedent in `tests/acl_manifest.rs`) — because "how many threads call
+/// `gh`" is a property of that call list and of nothing else: any future
+/// `start_*_poller` added beside it would restore exactly the unaccounted
+/// second budget-spender this issue closed, and no other test in this suite
+/// would notice.
+#[test]
+fn app_setup_starts_exactly_one_gh_polling_loop() {
+    let src = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs")).expect("read src/lib.rs");
+    let calls = |needle: &str| src.matches(needle).count();
+    assert_eq!(
+        calls("start_gh_poller("),
+        1,
+        "src/lib.rs must start the unified gh poller exactly once (#406)"
+    );
+    assert_eq!(
+        calls("start_notify_poller("),
+        0,
+        "the notify-only poller is gone — its work is a half of `start_gh_poller`'s tick (#406)"
+    );
+    assert_eq!(
+        calls("start_intake_poller("),
+        0,
+        "the intake-only poller is gone — a second gh-polling thread is the coupling #406 closed"
+    );
+}
+
 // ---------- group_watches: the group view's "⏳ waiting on …" indicator (#248) ----------
 
 #[test]
