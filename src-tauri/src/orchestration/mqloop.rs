@@ -154,15 +154,29 @@ pub enum BatchBuildError {
     Git(String),
 }
 
-/// Where a batch's temporary worktree lives.
+/// The `mq-`-prefixed directory name a batch's temp worktree uses. Prefixed so
+/// the directory is identifiable as this feature's at a glance — in a `git
+/// worktree list`, in the OS temp dir, or in an incident.
+fn worktree_dir_name(batch_id: &str) -> String {
+    format!("loomux-mq-{batch_id}")
+}
+
+/// Where a batch's temporary worktree lives: **the OS temp dir, under an `mq-`
+/// bearing name built from the batch id** — which is `RandomState`-derived
+/// (§11.4), so two concurrent builds cannot collide on it.
 ///
-/// Under the OS temp dir, named from the batch id — which is `RandomState`-
-/// derived (§11.4), so two concurrent builds cannot collide on it. Not inside
-/// the user's repository: a stray directory there would show up in their `git
-/// status` and in every editor's file tree, and this one is loomux's business
-/// entirely.
+/// **Never inside the human's clone.** A stray directory there shows up in their
+/// `git status`, in every editor's file tree, and in their next `git clean`; the
+/// merge queue's speculative objects are loomux's business and belong nowhere a
+/// human is reading their own working tree. The group dir would be the other
+/// defensible home, and OS temp wins only because a batch worktree is genuinely
+/// ephemeral — it does not survive the batch, so it does not want to live beside
+/// the state that does.
+///
+/// The path is a pure function of the batch id, which is what lets every
+/// teardown ([`remove_worktree`]) name it exactly rather than search for it.
 pub fn scratch_worktree_path(batch_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("loomux-mq-{batch_id}"))
+    std::env::temp_dir().join(worktree_dir_name(batch_id))
 }
 
 /// The one fetch a batch build performs: the target branch, plus every queued
@@ -199,34 +213,95 @@ pub fn batch_fetch_argv(target: &str, prs: &[u64]) -> Vec<String> {
 /// nobody approved. That is [`BatchBuildError::HeadMoved`], and it kicks the
 /// entry back rather than aborting the batch.
 ///
-/// The worktree is removed on **every** exit path, including the error ones.
+/// The temp worktree is torn down on **every** exit path — success, conflict,
+/// moved head, and `git` failure alike — and whether that teardown worked is
+/// **returned**, never swallowed. See [`ScratchBuild`].
 pub fn build_scratch(
     r: &dyn MqRunner,
     batch_id: &str,
     branch: &str,
     target: &str,
     heads: &[(u64, String)],
-) -> Result<ScratchRef, BatchBuildError> {
+) -> ScratchBuild {
     let prs: Vec<u64> = heads.iter().map(|(p, _)| *p).collect();
     let fetch = batch_fetch_argv(target, &prs);
-    let out = r.git(&as_args(&fetch)).map_err(BatchBuildError::Git)?;
-    if !out.ok() {
-        return Err(BatchBuildError::NoTargetHead(quote(&out.stderr)));
+    match r.git(&as_args(&fetch)) {
+        // Both of these return before `worktree add` runs, so there is nothing
+        // to tear down and `cleanup_failed` is genuinely None rather than
+        // unchecked.
+        Err(e) => return ScratchBuild::failed(BatchBuildError::Git(e)),
+        Ok(o) if !o.ok() => {
+            return ScratchBuild::failed(BatchBuildError::NoTargetHead(quote(&o.stderr)))
+        }
+        Ok(_) => {}
     }
 
     let wt = scratch_worktree_path(batch_id);
     let wt_s = wt.display().to_string();
-    // Build inside a closure so the worktree teardown below runs on every path.
-    let built = build_in_worktree(r, &wt_s, branch, heads);
-    let removed = r.git(&as_args(&worktree_remove_argv(&wt_s)));
-    match removed {
-        Ok(o) if o.ok() => {}
-        // A worktree that would not go away is a leak, not a batch failure —
-        // same posture §10 takes on a leaked scratch ref. It is reported by the
-        // caller as `mq-cleanup-failed`, never by failing a green batch.
-        _ => { /* caller audits via `cleanup_worktree` on the next sweep */ }
+    // Bound to a local rather than `?`-propagated: the teardown below has to run
+    // between the build and the return, on every one of the build's outcomes.
+    let result = build_in_worktree(r, &wt_s, branch, heads);
+    let cleanup_failed = remove_worktree(r, &wt);
+    ScratchBuild { result, cleanup_failed }
+}
+
+/// What a batch build produced, **and** whether its temp worktree went away.
+///
+/// The two are separate fields because §10 makes them separate outcomes:
+/// **cleanup failure never fails a batch**. A leaked worktree is cheap; a green
+/// batch held hostage by a failed `git worktree remove` is not. So the caller
+/// lands or bisects on `result` and audits `mq-cleanup-failed` on
+/// `cleanup_failed`, and it cannot do the second by forgetting — the field is
+/// there in the value it already has to destructure.
+///
+/// An earlier cut dropped this on the floor while its comment claimed "the
+/// caller audits it on the next sweep". There was no sweep and no channel for
+/// the caller to learn: a claim with no code behind it, which is the one defect
+/// class `.loomux/lessons.md` opens with. Returning it is what makes the comment
+/// true.
+#[derive(Debug)]
+pub struct ScratchBuild {
+    pub result: Result<ScratchRef, BatchBuildError>,
+    /// `Some(why)` when the temp worktree could not be removed. Audit it; do not
+    /// act on it.
+    pub cleanup_failed: Option<String>,
+}
+
+impl ScratchBuild {
+    fn failed(e: BatchBuildError) -> ScratchBuild {
+        ScratchBuild { result: Err(e), cleanup_failed: None }
     }
-    built
+}
+
+/// Remove one batch's temp worktree, by the exact path built from its batch id.
+///
+/// `None` when there is nothing to remove or the removal worked; `Some(why)`
+/// when a directory is left behind.
+///
+/// **Existence is checked first**, so a build that failed before `worktree add`
+/// ever ran does not report a spurious cleanup failure for a worktree that was
+/// never created — the alternative is matching `git`'s "is not a working tree"
+/// stderr, which is a message string, not a contract.
+///
+/// **No `git worktree prune`, ever.** Prune is a *sweep*: it walks
+/// `.git/worktrees/` and drops every admin entry whose directory it cannot see.
+/// That directory is shared with every other loomux worktree on this machine —
+/// the same shared-`.git` hazard that made `git stash` a banned verb here after
+/// #299 — so a peer's workspace that is momentarily unreachable (a disconnected
+/// network path, a volume not yet mounted) is a peer's workspace prune will
+/// happily forget. This is §10's "namespace only, by exact name, never a pattern
+/// sweep" applied to worktrees instead of refs. A leaked admin entry is cheap
+/// and inert; a pruned live workspace is somebody's work.
+fn remove_worktree(r: &dyn MqRunner, wt: &Path) -> Option<String> {
+    if !wt.exists() {
+        return None;
+    }
+    let wt_s = wt.display().to_string();
+    match r.git(&as_args(&worktree_remove_argv(&wt_s))) {
+        Ok(o) if o.ok() => None,
+        Ok(o) => Some(quote(&o.stderr)),
+        Err(e) => Some(quote(&e)),
+    }
 }
 
 fn build_in_worktree(
@@ -323,16 +398,17 @@ pub fn worktree_remove_argv(path: &str) -> Vec<String> {
     vec!["worktree".into(), "remove".into(), "--force".into(), path.to_string()]
 }
 
-/// Best-effort teardown for a worktree a previous build left behind (§10's
-/// "cleanup runs on every exit path"). Never fails a batch; returns what went
-/// wrong so the caller can audit `mq-cleanup-failed`.
+/// Teardown for a worktree an **earlier** build left behind — the crash-reconcile
+/// and cancel paths, where no `build_scratch` call is in scope to have returned a
+/// [`ScratchBuild`].
+///
+/// Same discipline as the in-build teardown, and deliberately the same function
+/// underneath ([`remove_worktree`]): exact path from the batch id, existence
+/// checked first, never a prune, never a wildcard, and the failure **returned**
+/// for the caller to audit as `mq-cleanup-failed` rather than raised. §10:
+/// cleanup failure never blocks landing and never fails a batch.
 pub fn cleanup_worktree(r: &dyn MqRunner, batch_id: &str) -> Option<String> {
-    let wt = scratch_worktree_path(batch_id).display().to_string();
-    match r.git(&as_args(&worktree_remove_argv(&wt))) {
-        Ok(o) if o.ok() => None,
-        Ok(o) => Some(quote(&o.stderr)),
-        Err(e) => Some(quote(&e)),
-    }
+    remove_worktree(r, &scratch_worktree_path(batch_id))
 }
 
 // ── the batch draft PR (§5, §8) ─────────────────────────────────────────────
