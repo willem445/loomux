@@ -1713,7 +1713,9 @@ fn capture_raw_inner(
     // on a live child parks them via `abandon_child_and_readers` (kill, bounded
     // reap, park). Nothing between the two `spawn`s above and this point can
     // return, and the two returns that precede them — the backlog refusal and a
-    // failed `Command::spawn` — have no readers to account for.
+    // failed `Command::spawn` — have no readers to account for. (A panic in the
+    // second `std::thread::spawn` would unwind past all of this rather than
+    // return through it; out of scope, and the design note records why.)
     //
     // #699: the wait-error arm used to be a bare `?`. Uncounted is worse than
     // parked, not better — the ceiling admits on "how many readers are still

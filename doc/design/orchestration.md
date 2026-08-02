@@ -2740,7 +2740,14 @@ discipline (#590) rests on.
   the child exited on its own joins them, and *every* arm that gives up on a live child — the
   timeout, and the one where the bounded wait itself errors — goes through one shared
   `abandon_child_and_readers` (kill, bounded reap, park both). The two returns that precede
-  the readers, the backlog refusal and a failed `spawn`, have nothing to account for. The
+  the readers, the backlog refusal and a failed `spawn`, have nothing to account for. That is
+  an invariant of every *return*; one **unwind** escapes it, deliberately. `std::thread::spawn`
+  panics if the OS refuses a thread, so a panic between the two reader spawns would unwind with
+  the first handle untracked — the exact residue this rule exists to eliminate, reached without
+  passing through any of the arms above. It stays out of scope because the fix would be a
+  `Builder::new().spawn()` failure channel invented for a case this process cannot reach: the
+  ceiling holds the whole backlog at 16 threads, which is not where an OS refuses one. Recorded
+  rather than closed, so the next reader knows it was weighed. The
   wait-error arm was originally a bare `?`, which read like the conservative choice and is the
   opposite of one: a dropped handle is invisible to the sweep, so the ceiling's admission
   predicate answers with a count that omits precisely the readers that will never end — and

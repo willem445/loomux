@@ -31137,6 +31137,33 @@ fn a_wait_error_parks_both_its_readers_where_the_ceiling_can_see_them() {
     );
 }
 
+/// The other half of "exactly once" (rev-lead N1): the success arm **joins**
+/// both readers, so it must park neither. The two tests above pin "at least
+/// once" on the abandonment arm and say nothing about this one — an edit that
+/// parked the handles on the way out as well as joining them would pass every
+/// other test in this section while growing the backlog on the *healthy* path,
+/// until the ceiling refused captures because captures had been succeeding.
+///
+/// Same instruments as the parking test, for the same reasons: drained
+/// baseline, unswept count.
+#[test]
+fn a_successful_capture_parks_neither_of_its_readers() {
+    let _serial = capture_lock();
+    let _drained = drain_parked_readers_for_test();
+    assert_eq!(gh_capture_parked_readers(), 0, "precondition: the baseline this test measures against is empty");
+
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-699"), Duration::from_secs(10))
+        .expect("a fast child must succeed");
+    assert!(out.contains("loomux-699"), "precondition: this must be the success arm, not a refusal: {out:?}");
+
+    assert_eq!(
+        gh_capture_parked_readers(),
+        0,
+        "the success arm joins both readers, so it must park neither — a handle both joined and \
+         parked is counted twice, and the ceiling then shrinks on captures that WORKED"
+    );
+}
+
 /// The other half of "abandon" on that arm: the child is KILLED, not simply
 /// forgotten (#699). Dropping a `std::process::Child` does not kill the
 /// process, so the bare-`?` return left a live child behind holding both pipes
