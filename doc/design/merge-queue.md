@@ -3,7 +3,7 @@
 Status: **design only — no queue code exists yet.** This note is slice B of #581 and gates
 every later slice; the plan (#581 comments, planner `plan-151`, parts 1–7) makes the note a
 hard prerequisite for slice C. Nothing here is implemented. Line numbers are as of this
-writing against `main` at `a6223b2`; symbols are the durable reference, lines are a
+writing against `main` at `b37d633`; symbols are the durable reference, lines are a
 convenience.
 
 Slices: **A** `Task.pr_base` (parallel with this note) · **B** this note · **C** `mergeq.rs`
@@ -206,7 +206,7 @@ Multi-target queues are deliberately out of v1. When they arrive they are a map 
 target → queue, which is why the target lives in the state file rather than in config.
 
 **Restart reconcile — the #467/#468 pattern, copied deliberately.** The delivery queue learned
-this the hard way; `mod.rs::recover_persisted_queue:31532` is the shape to mirror:
+this the hard way; `mod.rs::recover_persisted_queue:31841` is the shape to mirror:
 
 - **Two phases.** Phase 1 runs under a once-only guard held across the whole phase (the
   `HashSet::insert` doubles as the check): read the file, parse, classify entries into
@@ -296,8 +296,8 @@ branch, and read its checks. Three reasons this shape and not another:
 3. It gives the human a URL to watch, which is most of what "observability" means here.
 
 **Reuse the existing classification — do not write a third.** Terminal-state logic exists
-twice already: `orchestration/notify.rs::pr_checks_result:310` (with `check_is_pending` at
-`notify.rs:284` — **not** `:299`, which is `check_is_failing`, the neighbouring predicate an
+twice already: `orchestration/notify.rs::pr_checks_result:312` (with `check_is_pending` at
+`notify.rs:286` — **not** `:301`, which is `check_is_failing`, the neighbouring predicate an
 implementer is most likely to grab by mistake given the subject here) and
 `orchestration/intake.rs::parse_pr_list:183`. Both already encode the property that
 matters most — **an empty check list is not success**, it is pending. `notify.rs` is the one
@@ -532,7 +532,7 @@ On a culprit:
 
 - **A comment on the culprit PR** — the durable record, where a human or the owning worker
   will actually look: failing check name, run link, batch id, and the sibling set. All
-  gh-sourced text passes through `notify.rs::sanitize_gh_text:494`, the same sanitizer every
+  gh-sourced text passes through `notify.rs::sanitize_gh_text:496`, the same sanitizer every
   crossing-text boundary in this codebase uses.
 - **One decision-grade notice to the orchestrator.** One fact that changes what it does next,
   plus the PR link — not a narration.
@@ -676,7 +676,7 @@ read together.
 
 ### 11.5 Audit events
 
-Emitted through the registry's `audit(group, actor, action, detail)` (`mod.rs:17572`), kebab-
+Emitted through the registry's `audit(group, actor, action, detail)` (`mod.rs:17667`), kebab-
 case, matching the existing convention (`queue-recovered`, `merge-gate-allowed`, …):
 
 `mq-enqueued` · `mq-enqueue-refused` · `mq-batch-built` · `mq-batch-pushed` ·
