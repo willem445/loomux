@@ -13,8 +13,8 @@ use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
 // #656 (rev-lead findings 1 and 2): the bounded child wait, and the
 // process-wide ceiling on readers abandoned by a timed-out capture.
 use loomux_lib::orchestration::{
-    gh_capture_admitted, gh_capture_live_readers, seed_leaked_readers_for_test, wait_bounded,
-    GH_CAPTURE_MAX_LEAKED_READERS,
+    drain_parked_readers_for_test, gh_capture_admitted, gh_capture_live_readers, gh_capture_parked_readers,
+    seed_leaked_readers_for_test, wait_bounded, GH_CAPTURE_MAX_LEAKED_READERS,
 };
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
@@ -31105,6 +31105,119 @@ fn a_timeout_that_cannot_close_its_pipes_parks_its_readers_in_the_backlog() {
         gh_capture_live_readers() > before,
         "a reader still blocked on a grandchild's pipe must be counted, not forgotten — \
          that is the difference between a leak bounded per tick and one bounded per process"
+    );
+}
+
+/// …and the SAME accounting on the arm that isn't a timeout (#699): when the
+/// wait itself errors, the capture used to return through a bare `?`, which
+/// dropped both readers on the floor. Uncounted is worse than parked, not
+/// better — the ceiling's admission predicate is "how many readers are still
+/// blocked", so readers the sweep can never see are exactly the ones that make
+/// the bound lie about the process it is supposed to bound.
+///
+/// Driven through the injected-wait seam because reaching this arm for real
+/// needs `Child::try_wait` to error, which no supported platform does on
+/// demand; every other step (spawn, readers, kill, reap, accounting) is the
+/// same code the production entry point runs.
+///
+/// Counted on the backlog list **unswept**, and from a drained baseline —
+/// unlike the timeout test above, which can afford a swept before/after delta
+/// because its grandchild holds the pipes open across the whole call. Neither
+/// shortcut survives here, and both were tried:
+/// - a *swept* count reads the same whether the handles were parked or
+///   dropped, because the forced error arrives at once and the kill closes
+///   both pipes within milliseconds. That race was green on macos and red on
+///   ubuntu/windows.
+/// - a *delta* against whatever earlier capture tests left parked is measured
+///   against a baseline the call itself moves: its opening sweep drops the
+///   handles that have since ended (CI: before 4, after 4, with both readers
+///   correctly parked).
+///
+/// So: start from zero and assert the exact number. What is being pinned is
+/// the accounting, not how long the readers happened to survive it.
+#[test]
+fn a_wait_error_parks_both_its_readers_where_the_ceiling_can_see_them() {
+    let _serial = capture_lock();
+    let _drained = drain_parked_readers_for_test();
+    assert_eq!(gh_capture_parked_readers(), 0, "precondition: the baseline this test measures against is empty");
+
+    let err = loomux_lib::orchestration::capture_raw_with_failing_wait_for_test(
+        shell_command(&sleep_script(20)),
+        Duration::from_secs(1),
+    )
+    .expect_err("a wait that fails is a failed capture");
+    assert!(err.contains("forced wait failure"), "precondition: this must be the wait-error arm, not the timeout: {err}");
+
+    assert_eq!(
+        gh_capture_parked_readers(),
+        2,
+        "BOTH readers a failed wait abandons must be handed to the ceiling, not dropped where the \
+         sweep can never see them — one or none is how a bound comes to understate its own backlog"
+    );
+}
+
+/// The other half of "exactly once" (rev-lead N1): the success arm **joins**
+/// both readers, so it must park neither. The two tests above pin "at least
+/// once" on the abandonment arm and say nothing about this one — an edit that
+/// parked the handles on the way out as well as joining them would pass every
+/// other test in this section while growing the backlog on the *healthy* path,
+/// until the ceiling refused captures because captures had been succeeding.
+///
+/// Same instruments as the parking test, for the same reasons: drained
+/// baseline, unswept count.
+#[test]
+fn a_successful_capture_parks_neither_of_its_readers() {
+    let _serial = capture_lock();
+    let _drained = drain_parked_readers_for_test();
+    assert_eq!(gh_capture_parked_readers(), 0, "precondition: the baseline this test measures against is empty");
+
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-699"), Duration::from_secs(10))
+        .expect("a fast child must succeed");
+    assert!(out.contains("loomux-699"), "precondition: this must be the success arm, not a refusal: {out:?}");
+
+    assert_eq!(
+        gh_capture_parked_readers(),
+        0,
+        "the success arm joins both readers, so it must park neither — a handle both joined and \
+         parked is counted twice, and the ceiling then shrinks on captures that WORKED"
+    );
+}
+
+/// The other half of "abandon" on that arm: the child is KILLED, not simply
+/// forgotten (#699). Dropping a `std::process::Child` does not kill the
+/// process, so the bare-`?` return left a live child behind holding both pipes
+/// — which is also why its readers would never have ended on their own.
+///
+/// Observed through the child's own side effect rather than a PID: the script
+/// writes a sentinel a beat after it starts, so a child that survived the
+/// early return leaves proof, and one that was killed cannot. `current_dir` +
+/// a relative name keeps the redirect target out of the script string, which
+/// `cmd.exe` and `Command`'s MSVC quoting disagree about (see `cat_command`).
+#[test]
+fn a_wait_error_kills_the_child_it_abandons() {
+    let _serial = capture_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let sentinel = dir.path().join("survived.txt");
+    let script = if cfg!(windows) {
+        "ping -n 3 127.0.0.1 >NUL & echo x > survived.txt"
+    } else {
+        "sleep 2; echo x > survived.txt"
+    };
+    let mut cmd = shell_command(script);
+    cmd.current_dir(dir.path());
+
+    let err = loomux_lib::orchestration::capture_raw_with_failing_wait_for_test(cmd, Duration::from_secs(1))
+        .expect_err("a wait that fails is a failed capture");
+    assert!(err.contains("forced wait failure"), "precondition: this must be the wait-error arm: {err}");
+
+    // Well past the child's own delay: if it is still alive it has had every
+    // chance to write, so this cannot pass by being fast.
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(
+        !sentinel.exists(),
+        "the abandoned child must be killed on this arm too — it wrote {} after the capture returned, \
+         so the capture left a live child (and two readers that could never end) behind",
+        sentinel.display()
     );
 }
 

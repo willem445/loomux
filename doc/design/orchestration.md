@@ -2735,6 +2735,24 @@ discipline (#590) rests on.
   watch cancelled with a reason someone can read) beats thread growth nothing reports, and it
   is diagnosable where a thousand parked threads are not. In the ordinary stall the child IS
   `gh`: killing it closes both pipes, the readers end at once, and the backlog stays empty.
+- **The accounting is an invariant of the whole function, not a step on the timeout path**
+  (#699). Once the two readers exist, every exit accounts for both exactly once: the arm where
+  the child exited on its own joins them, and *every* arm that gives up on a live child — the
+  timeout, and the one where the bounded wait itself errors — goes through one shared
+  `abandon_child_and_readers` (kill, bounded reap, park both). The two returns that precede
+  the readers, the backlog refusal and a failed `spawn`, have nothing to account for. That is
+  an invariant of every *return*; one **unwind** escapes it, deliberately. `std::thread::spawn`
+  panics if the OS refuses a thread, so a panic between the two reader spawns would unwind with
+  the first handle untracked — the exact residue this rule exists to eliminate, reached without
+  passing through any of the arms above. It stays out of scope because the fix would be a
+  `Builder::new().spawn()` failure channel invented for a case this process cannot reach: the
+  ceiling holds the whole backlog at 16 threads, which is not where an OS refuses one. Recorded
+  rather than closed, so the next reader knows it was weighed. The
+  wait-error arm was originally a bare `?`, which read like the conservative choice and is the
+  opposite of one: a dropped handle is invisible to the sweep, so the ceiling's admission
+  predicate answers with a count that omits precisely the readers that will never end — and
+  dropping a `std::process::Child` does not kill the process, so the child that keeps them
+  blocked stays alive too. Uncounted is worse than parked, never better.
 - **No arm of the bound is itself unbounded.** Every wait on a child goes through
   `wait_bounded`, including the post-kill reap on the timeout path (`GH_CAPTURE_REAP_TIMEOUT`).
   A bare `wait()` there would be the one place a "bounded" path could still block forever: the
