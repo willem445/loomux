@@ -30990,8 +30990,13 @@ fn capture_with_timeout_reports_a_nonzero_exit_as_the_childs_own_failure() {
 #[test]
 fn capture_raw_with_timeout_reports_a_nonzero_exit_as_data_not_as_an_error() {
     let _serial = capture_lock();
+    // `;` is a command separator in `sh` and an ordinary character to
+    // `cmd.exe`, which would echo the whole string and exit 0 — a green
+    // assertion for the wrong reason. `&` is the separator `cmd` parses.
+    let script =
+        if cfg!(windows) { "echo keep-me& exit 3" } else { "echo keep-me; exit 3" };
     let (status, stdout, _stderr) = loomux_lib::orchestration::capture_raw_with_timeout(
-        shell_command("echo keep-me; exit 3"),
+        shell_command(script),
         Duration::from_secs(10),
     )
     .expect("a child that ran and failed is not an Err here — that is the point");

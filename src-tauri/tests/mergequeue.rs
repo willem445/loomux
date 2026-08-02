@@ -1929,16 +1929,24 @@ fn queued_state(prs: &[u64]) -> MergeQueueState {
 }
 
 /// A queue whose entries are already inside an in-flight batch at `draft_pr`.
-fn in_flight_state(prs: &[u64], draft_pr: u64) -> MergeQueueState {
+///
+/// **`batch_id` must be unique per test**, and that is not bookkeeping — the
+/// driver's body files are named from the batch id (`loomux-mq-<id>-culprit.md`
+/// in the OS temp dir, so two batches on one machine cannot collide, #625).
+/// `cargo test` runs these in parallel, so two tests sharing a hardcoded id
+/// share that path: one truncates it while the other's `gh` is reading, and the
+/// body arrives empty. The first cut of these tests did exactly that and went
+/// red on macOS only — the race, not the driver.
+fn in_flight_state(batch_id: &str, prs: &[u64], draft_pr: u64) -> MergeQueueState {
     let mut s = queued_state(prs);
-    let mut rec = BatchRecord::new("mq-b1000000", prs.to_vec(), 0);
+    let mut rec = BatchRecord::new(batch_id, prs.to_vec(), 0);
     rec.scratch_sha = MERGED.into();
     rec.draft_pr = Some(draft_pr);
     rec.advance(EntryState::CiWait).unwrap();
     for e in s.entries.iter_mut() {
         e.advance(EntryState::Batching).unwrap();
         e.advance(EntryState::CiWait).unwrap();
-        e.batch = Some("mq-b1000000".into());
+        e.batch = Some(batch_id.to_string());
     }
     s.batch = Some(rec);
     s
@@ -2166,7 +2174,7 @@ fn a_queue_with_nothing_eligible_holds_the_group_off_instead_of_re_asking() {
 fn a_green_batch_lands_the_tested_object_and_releases_the_target() {
     let f = drive_fake()
         .gh("pr checks 641", 0, &checks_json(&[("build", "SUCCESS"), ("test", "SKIPPED")]), "");
-    let mut s = in_flight_state(&[612, 613], 641);
+    let mut s = in_flight_state("mq-land0001", &[612, 613], 641);
     let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
 
     // The refspec is exactly `<tested-sha>:refs/heads/<target>` — no `--force`,
@@ -2202,7 +2210,7 @@ fn a_red_batch_of_one_attributes_the_culprit_and_leaves_the_comment() {
         // The culprit's OWN checks are red too, so this is an ordinary
         // attribution rather than §9's infrastructure/flake case.
         .gh("pr checks 612", 0, &checks_json(&[("build (windows)", "FAILURE")]), "");
-    let mut s = in_flight_state(&[612], 641);
+    let mut s = in_flight_state("mq-culprit1", &[612], 641);
     let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
 
     assert!(s.entry(612).is_none(), "the culprit is kicked back and pruned");
@@ -2233,7 +2241,7 @@ fn a_red_batch_of_one_whose_pr_is_green_alone_is_surfaced_as_infrastructure() {
     let f = drive_fake()
         .gh("pr checks 641", 0, &checks_json(&[("build (windows)", "FAILURE")]), "")
         .gh("pr checks 612", 0, &checks_json(&[("build (windows)", "SUCCESS")]), "");
-    let mut s = in_flight_state(&[612], 641);
+    let mut s = in_flight_state("mq-flake001", &[612], 641);
     let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
 
     let notice = rep.notices.join("\n");
@@ -2262,7 +2270,7 @@ fn the_search_runs_across_ticks_and_names_the_culprit_from_a_green_probe() {
         .gh("pr checks 640", 0, &checks_json(&[("build (windows)", "FAILURE")]), "")
         .gh("pr checks 641", 0, &checks_json(&[("build (windows)", "SUCCESS")]), "")
         .gh("pr checks 614", 0, &checks_json(&[("build (windows)", "FAILURE")]), "");
-    let mut s = in_flight_state(&[612, 613, 614], 640);
+    let mut s = in_flight_state("mq-search01", &[612, 613, 614], 640);
 
     // ── tick 1: the batch goes red, the search opens, the first probe is built
     let rep1 = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
@@ -2317,7 +2325,7 @@ fn an_unverifiable_batch_requeues_everything_and_implicates_nobody() {
     // An empty check list is PENDING, not success — the property §5 says
     // matters most — so this batch is still pending when the bound expires.
     let f = drive_fake().gh("pr checks 641", 0, "[]", "");
-    let mut s = in_flight_state(&[612, 613], 641);
+    let mut s = in_flight_state("mq-unver001", &[612, 613], 641);
     // 61 minutes past `started_ms`, against the default 60-minute bound.
     let rep = drive(&f, &mut s, &cfg(3, 61 * 60_000), &one_reviewer_gate(), &live_verdicts);
 
@@ -2346,7 +2354,7 @@ fn an_unverifiable_batch_requeues_everything_and_implicates_nobody() {
 #[test]
 fn a_pending_batch_changes_nothing_and_says_nothing() {
     let f = drive_fake().gh("pr checks 641", 0, &checks_json(&[("build", "IN_PROGRESS")]), "");
-    let mut s = in_flight_state(&[612, 613], 641);
+    let mut s = in_flight_state("mq-pending1", &[612, 613], 641);
     let before = s.clone();
     let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
 
@@ -2418,7 +2426,7 @@ fn the_driver_never_dispatches_a_second_batch_over_an_inconsistent_file() {
 #[test]
 fn a_cancelled_member_abandons_the_in_flight_batch() {
     let f = drive_fake();
-    let mut s = in_flight_state(&[612, 613], 641);
+    let mut s = in_flight_state("mq-cancel01", &[612, 613], 641);
     s.entries[0].advance(EntryState::Cancelled).unwrap();
 
     let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
