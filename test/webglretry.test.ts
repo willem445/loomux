@@ -19,7 +19,11 @@ test("SHIPPED: the first context loss schedules a re-acquire rather than staying
   // always null — one lost context made a pane invisibly expensive for the
   // whole session.
   const p = planWebglRetry({ priorLosses: 0, healthyMs: 1_000 });
-  assert.notEqual(p.delayMs, null, "an empty ladder would leave the pane on the DOM renderer permanently");
+  assert.equal(
+    typeof p.delayMs,
+    "number",
+    `an empty ladder leaves the pane on the DOM renderer permanently — delayMs was ${p.delayMs}`
+  );
   assert.equal(p.delayMs, WEBGL_RETRY_DELAYS_MS[0]);
   assert.equal(p.losses, 1);
 });

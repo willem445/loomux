@@ -40,7 +40,7 @@
  *  inside the first, and a pane still losing its context on the third has a
  *  standing reason to — too many live panes for the cap, a machine with no
  *  usable GPU path — that a fourth attempt would not change. */
-export const WEBGL_RETRY_DELAYS_MS: readonly number[] = [2_000, 10_000, 60_000];
+export const WEBGL_RETRY_DELAYS_MS: readonly number[] = []; // RED HALF (#720): the pre-#720 policy
 
 /** A context that stayed alive this long before dying was not part of a storm,
  *  so it opens a NEW streak with a full budget rather than consuming the tail
