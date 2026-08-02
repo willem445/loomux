@@ -128,6 +128,12 @@ enforced at the CLI level.
   declares its own roster and merge gate: five focused reviewers with five
   prompts and five models, an advisor the orchestrator consults when stuck, a
   process agent that mines a finished session into a proposed lessons PR.
+- **A bisecting merge queue** — opt in and a batch of approved sub-PRs is tested
+  *together* on a scratch ref before any of them lands, because five green PRs
+  can still make a red branch. The commit CI tested is the commit that lands; if
+  the batch breaks, loomux bisects and tells you which PR did it instead of
+  leaving someone to guess. It lands only on an integration branch, never your
+  default one.
 - **A real terminal underneath** — WezTerm's PTY layer and xterm.js, so escape
   sequences, colors and wide characters render like a native terminal. Panes
   never resize for a UI feature.
