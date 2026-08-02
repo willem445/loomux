@@ -7317,6 +7317,80 @@ refused, and pre-#633 that loss was simply invisible.
 #638 (#632) is about the row markers on loomux-authored notice *text* and touches no
 delivery-outcome record at all. Neither sibling overlaps the reason set above.
 
+### Drain-time refusal roster (#658)
+
+**Problem.** Everything above makes a refusal *enumerable*; nothing made it *arrive*. The sender
+got a synchronous error, the loss got an audit line, and #578's rider told an orchestrator its own
+queue was `FULL` — but no channel ever named WHO was refused to the pane that refused them. The
+push paths and the pull path each covered the other's blind spot except in the middle: a
+mid-session refusal to a live, later-draining pane. `queue_orphans`, whose contract frames it as a
+start-of-session recovery step, was the only way to see one, and the live instance recovered a
+worker's done-report only because the orchestrator happened to poll it.
+
+**The trigger is an edge, and which edge is the whole bound.** `note_queue_capacity` already
+detects capacity transitions for the badge and the pressure notices; the roster hangs off the one
+transition where the depth came back DOWN (`CapacityState::Full` → anything else). That choice
+does three jobs at once: it is the first moment there is room to tell the pane anything, it is
+inherently once-per-drain rather than once-per-refusal, and — because a delivery can only push
+depth *up* — it is the one edge the roster's own delivery can never produce. The emission is the
+last thing that transition does, so the nested `note_queue_capacity` the enqueue triggers sees the
+state this call already committed rather than racing it.
+
+**The audit log is the record; the watermark is the only new state.** Every refusal already writes
+`from`, `to`, `reason` and a bounded `preview` (#563/#633), which is exactly a roster row — so
+`refusal_roster` derives from the timeline and `refusal_row` is shared with `front_door_refusals`,
+rather than a parallel "not yet relayed" list that a restart empties and that can disagree with the
+log a human reads. The one fact the log did not hold is how far the last roster got, so that is
+written back as a line of the same log (`refusal-roster`), carrying `through_ms` **and**
+`at_through`. Both terms are load bearing: a bare timestamp compared with `>` drops a refusal
+stamped in the same millisecond as the last one reported — a report burst into one pane is
+precisely when that collision happens — and `>=` repeats one forever. Recording how many of the
+covered refusals shared the newest millisecond makes the skip exact, because audit entries are
+appended in write order and a same-millisecond refusal appended *after* the roster ran is simply
+the next one. Only a line that also says `delivered: true` advances the mark, so a roster that was
+itself refused loses nothing.
+
+**"Already re-sent" is derived, and marked rather than suppressed.** `refusal_was_resent` walks
+forward from the refusal counting later `prompt` lines that match its two fingerprints
+(`text.len() == bytes`, recomputed `dropped_payload_preview`) and spending them on later refusals
+of the same payload; a surviving credit means one attempt was admitted, or coalesced onto an entry
+already queued — the same fact for the recipient. Only the queue-full *shape* spends a credit, because
+the #633 pre-admission refusals write no `prompt` line at all. It inherits #579's pairing residual
+(a different payload agreeing on length and on its collapsed first 160 chars) and answers `false`
+whenever nothing can be established, since the cost of being wrong that way is one extra ask rather
+than a pane told a lost report is handled. The rows stay in the list because the recipient cannot
+tell a re-send from a first send, and a silently shortened list reads as "these are all still
+missing" while being short.
+
+**Two channels, one string.** An orchestrator's own pane is parked in `OrchNoticeInbox` and rides
+its next tool result, for #578's reason; every other pane is told by an ordinary delivery under
+`EnqueueReason::RefusalRoster`, whose `cap_headroom` is **zero**. That is the opposite call to
+`PauseLossNotice` and the difference is the trigger, not the importance: the loss notice fires at a
+resume, which says nothing about depth, so on the pane it is about it is *certain* to be refused
+without an exemption — the roster fires where depth just fell, so it has room by construction. A
+roster refused anyway is recorded `delivered: false` and re-derived at the next drain. Because both
+channels carry one string, and `OrchNoticeInbox::park` requires a single marker-led line, the
+roster is one line: `ROSTER_LIST_MAX` (4) rows at `ROSTER_PREVIEW_MAX` (80) chars, with the
+remainder counted out loud and left in `audit.jsonl`.
+
+**Not `mark_notice_maskable` (#661), deliberately.** That call is a per-field producer promise that
+every span was composed by loomux or called in by an agent other than the recipient. A roster's
+previews are payload text authored by whoever sent the refused delivery, echoed into the
+recipient's own pane, so the promise is false on its face — and claiming it would let a sender
+place chosen text into another pane's masked record, which is the injection surface the
+default-closed rule exists to keep shut. It keeps the default, like the queue notices beside it;
+the cost is a gate that holds slightly too long, never one that releases early. The single-line
+rule `park` asserts is a different mechanism (#576's pane-tail masking of loomux's own framing) and
+is satisfied structurally, by leading with `[loomux]` and never wrapping.
+
+**Anti-recursion, stated twice because a refusal has two shapes.** A refused roster is excluded
+from the next roster by its `enqueue_reason` when it reached admission, and by
+`REFUSAL_ROSTER_OPENER` leading the preview loomux itself wrote when it did not (the pre-admission
+refusals record no reason at all). It is still listed by `queue_orphans`: a refused roster is a
+real loss, and hiding it from the pull path to keep the push path tidy would be a second silence.
+Marker refusals (`RefusedPayload::StrandedSubmit`) are excluded for the opposite reason — no sender
+to ask and no payload to re-send, and their `consequence` already says the actionable thing.
+
 ### Coalesced flush: one drain pass, one prompt (#533-A)
 
 **Problem.** The queue above solved "hold means queued, never doomed" and then charged for it by

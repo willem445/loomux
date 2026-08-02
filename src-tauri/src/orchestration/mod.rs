@@ -9792,6 +9792,81 @@ pub const REFUSED_LIST_MAX: usize = 8;
 /// and silently re-introduce a complete-looking count over a partial window
 /// (#579 review NB1).
 ///
+/// One audit entry read as a front-door refusal, or `None` if it is not one
+/// (#658, extracted from [`front_door_refusals`]).
+///
+/// **Extracted rather than re-spelled.** #658's drain-time roster
+/// ([`refusal_roster`]) needs exactly this classification — which
+/// `delivery-dropped` lines are refusals, which reason each carries, which
+/// shape (`prompt` vs marker) it is, and which are excluded — over a different
+/// window and for a single target. Re-deriving it there would mean two filters
+/// that must agree forever about what counts as a refusal, and the failure mode
+/// of them drifting is the #579 class again: a loss one channel enumerates and
+/// the other silently does not.
+///
+/// `text` is filled ONLY from an inline `text` field (the #633 pre-admission
+/// refusals, which write their own payload because no `prompt` line exists to
+/// pair with). Recovering a queue-full refusal's bytes needs the timeline
+/// either side of this line, so that stays in `front_door_refusals`, which has
+/// it.
+///
+/// **The two exclusions are here, not at the call sites**, so both consumers
+/// inherit them:
+/// - An unmodelled `delivery-dropped` reason. `delivery-dropped` is written for
+///   reasons that are not front-door refusals at all: `agent-died` and
+///   `queue-full` (a whole queue dropped at once) carry an `id` and are already
+///   reported by the id-keyed orphan derivations, so listing them here too
+///   would show one loss twice in one tool result. Anything
+///   [`RefusalReason::from_audit`] does not know is skipped by the same rule —
+///   an unmodelled reason is not silently folded into a list whose documented
+///   response is "re-send".
+/// - A `recovered` re-admission refused at the cap. That entry is put straight
+///   back into staging and keeps being reported as an ORPHAN, with its payload
+///   and by an id.
+fn refusal_row(e: &AuditEntry) -> Option<RefusedDelivery> {
+    if e.action != "delivery-dropped" {
+        return None;
+    }
+    let reason = e.detail["reason"].as_str().and_then(RefusalReason::from_audit)?;
+    let to = e.detail["to"].as_str().unwrap_or("?").to_string();
+    let depth = e.detail["depth"].as_u64().map(|d| d as usize);
+    if e.detail["payload"] == json!(RefusedPayload::StrandedSubmit.as_str()) {
+        return Some(RefusedDelivery {
+            // A marker push is loomux's own act, and its line records no
+            // `from` — the actor is the honest answer here, unlike on a
+            // prompt refusal where a sender lost the work.
+            from: e.actor.clone(),
+            to,
+            refused_ms: e.ts_ms,
+            reason,
+            depth,
+            enqueue_reason: None,
+            payload: RefusedPayload::StrandedSubmit,
+            bytes: None,
+            preview: String::new(),
+            text: None,
+            consequence: e.detail["consequence"].as_str().map(str::to_string),
+        });
+    }
+    let enqueue_reason = e.detail["enqueue_reason"].as_str().map(str::to_string);
+    if enqueue_reason.as_deref() == Some(queue::EnqueueReason::Recovered.as_str()) {
+        return None;
+    }
+    Some(RefusedDelivery {
+        from: e.detail["from"].as_str().unwrap_or("?").to_string(),
+        to,
+        refused_ms: e.ts_ms,
+        reason,
+        depth,
+        enqueue_reason,
+        payload: RefusedPayload::Prompt,
+        bytes: e.detail["bytes"].as_u64().map(|b| b as usize),
+        preview: e.detail["preview"].as_str().unwrap_or("").to_string(),
+        text: e.detail["text"].as_str().map(str::to_string),
+        consequence: e.detail["consequence"].as_str().map(str::to_string),
+    })
+}
+
 /// Pure: entries in, summary out, no registry and no filesystem — the same split
 /// [`suppressed_during_pause`] follows, and for the same reason (this reads
 /// `AuditEntry`, which lives here rather than in `queue.rs`).
@@ -9807,84 +9882,343 @@ pub fn front_door_refusals(entries: &[AuditEntry], window_truncated: bool) -> Fr
             }
             continue;
         }
-        if e.action != "delivery-dropped" {
-            continue;
-        }
-        // An ENUMERATION of the refusal reasons, not a guess at them (#633).
-        // `delivery-dropped` is written for reasons that are not front-door
-        // refusals at all, and each is skipped here for a stated reason:
-        // `agent-died` and `queue-full` (a whole queue dropped at once) carry
-        // an `id` and are already reported by the id-keyed orphan derivations,
-        // so listing them here too would show one loss twice in one tool
-        // result — the duplicate-delivery defect `merge_orphans`'s live-id
-        // filter exists to prevent. Anything `RefusalReason::from_audit` does
-        // not know is skipped by the same rule: an unmodelled reason is not
-        // silently folded into a list whose documented response is "re-send".
-        let Some(reason) = e.detail["reason"].as_str().and_then(RefusalReason::from_audit) else {
-            continue;
-        };
-        let to = e.detail["to"].as_str().unwrap_or("?").to_string();
-        let depth = e.detail["depth"].as_u64().map(|d| d as usize);
-        if e.detail["payload"] == json!(RefusedPayload::StrandedSubmit.as_str()) {
-            items.push(RefusedDelivery {
-                // A marker push is loomux's own act, and its line records no
-                // `from` — the actor is the honest answer here, unlike on a
-                // prompt refusal where a sender lost the work.
-                from: e.actor.clone(),
-                to,
-                refused_ms: e.ts_ms,
-                reason,
-                depth,
-                enqueue_reason: None,
-                payload: RefusedPayload::StrandedSubmit,
-                bytes: None,
-                preview: String::new(),
-                text: None,
-                consequence: e.detail["consequence"].as_str().map(str::to_string),
-            });
-            continue;
-        }
-        let enqueue_reason = e.detail["enqueue_reason"].as_str().map(str::to_string);
-        if enqueue_reason.as_deref() == Some(queue::EnqueueReason::Recovered.as_str()) {
-            continue;
-        }
-        let from = e.detail["from"].as_str().unwrap_or("?").to_string();
-        let bytes = e.detail["bytes"].as_u64().map(|b| b as usize);
-        let preview = e.detail["preview"].as_str().unwrap_or("").to_string();
+        let Some(mut row) = refusal_row(e) else { continue };
         // #633: a pre-admission refusal carries its own payload, because no
         // `prompt` line was ever written for it to pair with — see this
-        // function's doc. When the line has one, it IS the record: same line,
-        // same write, nothing to join and so nothing to verify against.
-        // Otherwise fall back to #579's verified pairing.
-        let text = match e.detail["text"].as_str() {
-            Some(inline) => Some(inline.to_string()),
-            None => bytes
+        // function's doc. When the line has one, `refusal_row` has already
+        // taken it: same line, same write, nothing to join and so nothing to
+        // verify against. Otherwise fall back to #579's verified pairing.
+        if row.text.is_none() {
+            row.text = row
+                .bytes
                 .and_then(|bytes| {
-                    offered.get(&(from.clone(), to.clone())).filter(|t| {
-                        t.len() == bytes && queue::dropped_payload_preview(t.as_str()) == preview
+                    offered.get(&(row.from.clone(), row.to.clone())).filter(|t| {
+                        t.len() == bytes
+                            && queue::dropped_payload_preview(t.as_str()) == row.preview
                     })
                 })
-                .cloned(),
-        };
-        items.push(RefusedDelivery {
-            from,
-            to,
-            refused_ms: e.ts_ms,
-            reason,
-            depth,
-            enqueue_reason,
-            payload: RefusedPayload::Prompt,
-            bytes,
-            preview,
-            text,
-            consequence: e.detail["consequence"].as_str().map(str::to_string),
-        });
+                .cloned();
+        }
+        items.push(row);
     }
     let total = items.len();
     if total > REFUSED_LIST_MAX {
         items.drain(..total - REFUSED_LIST_MAX);
     }
     FrontDoorRefusals { items, total, window_truncated }
+}
+
+/// #658: the audit action the drain-time refusal roster writes — and the
+/// watermark [`refusal_roster`] reads back, which is why it is a constant
+/// rather than a literal at each end.
+pub const REFUSAL_ROSTER_ACTION: &str = "refusal-roster";
+
+/// #658: the roster's opening sentence, held as a constant because it is load
+/// bearing twice over: [`refusal_roster_notice`] writes it, and
+/// [`refusal_roster`] recognises a refused roster BY it. Sharing one literal is
+/// what makes the second use impossible to drift from the first.
+pub const REFUSAL_ROSTER_OPENER: &str =
+    "[loomux] your pane's delivery queue has drained back below its cap.";
+
+/// #658: how many refusals one roster names individually.
+///
+/// Smaller than [`REFUSED_LIST_MAX`] (8) on purpose, and the difference is the
+/// CHANNEL, not the fact. That cap bounds a JSON list an orchestrator pulls
+/// deliberately with `queue_orphans`; this one bounds a SINGLE LINE that is
+/// either pasted into a pane or ridden back on a tool result — single because
+/// [`OrchNoticeInbox::park`] requires it (every row of the relay block has to
+/// stay maskable). Four entries at [`ROSTER_PREVIEW_MAX`] each keeps that line
+/// in the same order of magnitude as [`NOTICE_AUDIT_TEXT_CAP`], which is what
+/// every other loomux notice is sized against. Everything past the cap is
+/// counted, said out loud, and still in `audit.jsonl`.
+pub const ROSTER_LIST_MAX: usize = 4;
+
+/// #658: how much of each refusal's preview one roster row carries. Tighter
+/// than [`queue::DROPPED_PREVIEW_MAX`] (160) because a roster carries up to
+/// [`ROSTER_LIST_MAX`] of them on ONE line — see that constant. Long enough
+/// that the recipient can tell WHICH delivery it was, which is the whole job:
+/// the payload itself is not re-sendable from here and is not offered as if it
+/// were (`queue_orphans` has the verified bytes).
+pub const ROSTER_PREVIEW_MAX: usize = 80;
+
+/// #658: one refused delivery as the drain-time roster reports it — sender,
+/// bounded preview, reason, and whether the sender has since got it through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterEntry {
+    /// The sender who lost the work — who the recipient has to ask.
+    pub from: String,
+    pub reason: RefusalReason,
+    /// Re-clamped to [`ROSTER_PREVIEW_MAX`] from the refusal line's own
+    /// preview, never re-derived from the payload.
+    pub preview: String,
+    /// **Marked, not suppressed** (#658's own wording). A refusal whose sender
+    /// has since re-sent the same payload successfully is still listed —
+    /// because the recipient cannot tell from the outside which of its
+    /// arriving deliveries was a re-send, and a list that silently omitted them
+    /// would read as "these are all still missing" while being short. See
+    /// [`refusal_roster`] for what "successfully" is derived from.
+    pub resent: bool,
+}
+
+/// #658: everything one drain's roster says, before it is worded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusalRoster {
+    /// The pane this roster is FOR — the one that refused these deliveries.
+    pub to: String,
+    /// Oldest first, capped at [`ROSTER_LIST_MAX`] — the most recent that many,
+    /// since a pane held at capacity keeps refusing and the newest refusals are
+    /// the ones still likely to matter.
+    pub items: Vec<RosterEntry>,
+    /// Refusals in the window before the cap. Never implied by `items.len()`.
+    pub total: usize,
+    /// `total - items.len()` — counted and said out loud, never silently cut.
+    pub omitted: usize,
+    /// The newest `refused_ms` this roster covers, and how many of the covered
+    /// refusals share it. Written to the roster's own audit line and read back
+    /// as the next roster's start point — see [`refusal_roster`]'s watermark
+    /// note for why a bare timestamp is not enough.
+    pub through_ms: u64,
+    pub at_through: usize,
+    /// Whether the audit window this was derived from had itself been cut at
+    /// `AUDIT_VIEW_LIMIT` — same job as [`FrontDoorRefusals::window_truncated`],
+    /// and said in the notice rather than swallowed.
+    pub window_truncated: bool,
+}
+
+/// #658: every delivery `to_agent` refused that it has not been told about
+/// yet — derived from `entries` (an oldest-first audit timeline) and nothing
+/// else.
+///
+/// **Why the audit log is the record and there is no second bookkeeping
+/// structure.** Every front-door refusal already writes a `delivery-dropped`
+/// line carrying the four things a roster says (`from`, `to`, `reason`,
+/// `preview`) — #563 put the preview there and #633 made every refusal reason
+/// write one. A parallel in-memory list of "refusals not yet relayed" would be
+/// a second copy of that, one that a restart empties and that can disagree with
+/// the log a human reads. The one thing the log does NOT hold is how far the
+/// last roster got, so that — and only that — is what this writes back, as a
+/// line of the same log (see below).
+///
+/// **The watermark is a timestamp AND a count, and both are needed.** A roster
+/// records the newest `refused_ms` it covered plus how many of the covered
+/// refusals carried exactly that millisecond; the next scan skips everything
+/// older and the first `at_through` at that same millisecond. A bare timestamp
+/// with `>` would DROP a refusal stamped in the same millisecond as the last
+/// one reported (a report burst into one pane is precisely when that happens),
+/// and with `>=` it would repeat one forever. The count is exact instead:
+/// audit entries are appended in write order, so "the first N at that
+/// millisecond" names the same N on every re-read, and a same-millisecond
+/// refusal appended AFTER the roster ran is the (N+1)th and is picked up next
+/// time.
+///
+/// **Only a DELIVERED roster moves the watermark** (`delivered: true` on its
+/// audit line). A roster that was itself refused reports nothing to anybody, so
+/// letting it advance the mark would lose exactly the payloads it was written
+/// to name.
+///
+/// **Exclusions beyond [`refusal_row`]'s own**, each load-bearing:
+/// - A roster that was itself refused. Including it would put the previous
+///   roster's text inside the next roster's preview, and that one inside the one
+///   after: the recursion the issue asks this mechanism not to have. Recognised
+///   two ways because a refusal has two shapes and neither test covers both — a
+///   queue-full refusal records the [`queue::EnqueueReason::RefusalRoster`] the
+///   admission was attempted under, while the #633 pre-admission refusals never
+///   reach an admission and so record no reason at all, and are caught by
+///   [`REFUSAL_ROSTER_OPENER`] leading the preview loomux itself wrote.
+/// - A [`RefusedPayload::StrandedSubmit`] marker refusal. It has no sender to
+///   ask and no payload to re-send; what it means is "there is unsubmitted text
+///   in this pane's box", which is a different instruction with its own
+///   `consequence` string already surfaced verbatim by `queue_orphans`.
+///   Folding it into a list whose every other row means "ask this agent to
+///   send it again" would misdirect the reader.
+///
+/// Pure — entries in, roster out — for the same reason
+/// [`front_door_refusals`] is.
+pub fn refusal_roster(
+    entries: &[AuditEntry],
+    to_agent: &str,
+    window_truncated: bool,
+) -> RefusalRoster {
+    let (mut through_ms, mut at_through) = (0u64, 0usize);
+    for e in entries {
+        if e.action == REFUSAL_ROSTER_ACTION
+            && e.detail["to"] == json!(to_agent)
+            && e.detail["delivered"] == json!(true)
+        {
+            through_ms = e.detail["through_ms"].as_u64().unwrap_or(0);
+            at_through = e.detail["at_through"].as_u64().unwrap_or(0) as usize;
+        }
+    }
+    let mut skipped_at_through = 0usize;
+    // (index into `entries`, the row) — the index is what the re-send scan
+    // below needs, since "already re-sent" is a fact about what came AFTER.
+    let mut covered: Vec<(usize, RefusedDelivery)> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let Some(row) = refusal_row(e) else { continue };
+        if row.to != to_agent || row.payload != RefusedPayload::Prompt {
+            continue;
+        }
+        if row.enqueue_reason.as_deref() == Some(queue::EnqueueReason::RefusalRoster.as_str())
+            || row.preview.starts_with(REFUSAL_ROSTER_OPENER)
+        {
+            continue;
+        }
+        if row.refused_ms < through_ms {
+            continue;
+        }
+        if row.refused_ms == through_ms && skipped_at_through < at_through {
+            skipped_at_through += 1;
+            continue;
+        }
+        covered.push((i, row));
+    }
+    let total = covered.len();
+    let new_through_ms = covered.last().map(|(_, r)| r.refused_ms).unwrap_or(through_ms);
+    // Counted over EVERYTHING covered, not over the capped list: the cap drops
+    // the oldest rows from the wording, never from what this roster is
+    // answerable for, and a watermark that stopped short of them would re-report
+    // them at every future drain.
+    let new_at_through =
+        covered.iter().filter(|(_, r)| r.refused_ms == new_through_ms).count();
+    if total > ROSTER_LIST_MAX {
+        covered.drain(..total - ROSTER_LIST_MAX);
+    }
+    let items = covered
+        .into_iter()
+        .map(|(i, r)| RosterEntry {
+            resent: refusal_was_resent(entries, i, &r),
+            preview: queue::clamp_preview(&r.preview, ROSTER_PREVIEW_MAX),
+            from: r.from,
+            reason: r.reason,
+        })
+        .collect::<Vec<_>>();
+    RefusalRoster {
+        to: to_agent.to_string(),
+        omitted: total - items.len(),
+        items,
+        total,
+        through_ms: new_through_ms,
+        at_through: new_at_through,
+        window_truncated,
+    }
+}
+
+/// #658: did `row`'s sender get this same payload through after `entries[at]`
+/// refused it?
+///
+/// **Derived from the timeline, not assumed from silence.** `deliver_prompt`
+/// audits `prompt` with the full text immediately before every admission, and a
+/// refusal writes its own `delivery-dropped` line — so a re-send of the same
+/// payload by the same sender to the same target is a later `prompt` line, and
+/// a re-send that was refused AGAIN is that line followed by another refusal.
+/// This walks forward counting the first and spending the second; anything left
+/// over is a `prompt` that no refusal accounts for, i.e. one that was admitted
+/// (or coalesced onto an entry already queued, which is the same fact for the
+/// recipient: the payload is in the queue).
+///
+/// **Only a queue-full-shaped refusal spends a credit.** The #633 pre-admission
+/// refusals write no `prompt` line at all — they carry their payload inline
+/// instead, which is exactly what [`refusal_row`] surfaces as `text: Some(_)` —
+/// so charging them for one would consume a re-send that really did land.
+///
+/// Matched on the same two fingerprints [`front_door_refusals`] pairs on
+/// (`text.len() == bytes` and a recomputed
+/// [`queue::dropped_payload_preview`]), never on positional adjacency, because
+/// audit writes from concurrent delivery threads interleave. It inherits that
+/// pairing's residual too: a DIFFERENT payload from the same sender to the same
+/// target that agrees on length and on its collapsed first
+/// [`queue::DROPPED_PREVIEW_MAX`] chars would be counted as this one's re-send.
+/// The cost of being wrong is one row reading "already re-sent" instead of "ask
+/// for it again" — which is why the answer is `false` whenever it cannot be
+/// established at all (a refusal line too old to carry `bytes`): the roster
+/// would rather ask for a delivery twice than tell a pane that a lost report is
+/// already handled.
+fn refusal_was_resent(entries: &[AuditEntry], at: usize, row: &RefusedDelivery) -> bool {
+    let Some(bytes) = row.bytes else { return false };
+    let mut credit: i64 = 0;
+    for e in entries.iter().skip(at + 1) {
+        if e.action == "prompt" {
+            if e.actor == row.from && e.detail["to"] == json!(row.to) {
+                if let Some(t) = e.detail["text"].as_str() {
+                    if t.len() == bytes && queue::dropped_payload_preview(t) == row.preview {
+                        credit += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(later) = refusal_row(e) else { continue };
+        if later.text.is_none()
+            && later.to == row.to
+            && later.from == row.from
+            && later.bytes == row.bytes
+            && later.preview == row.preview
+        {
+            credit -= 1;
+        }
+    }
+    credit > 0
+}
+
+/// #658: word a roster as the ONE line it has to be, or `None` when there is
+/// nothing to say — the ordinary case, and the one that must cost a pane
+/// nothing at all.
+///
+/// **One line is a hard requirement, not a style choice.** On an orchestrator
+/// target this text is parked in [`OrchNoticeInbox`], whose `park` asserts
+/// every notice is a single [`LOOMUX_NOTICE_MARKER`]-led line so that every row
+/// of the relay block stays maskable (#576/#621). Using the same string on the
+/// pane-delivery path too means the recipient reads identical words whichever
+/// channel carried it.
+///
+/// **It tells the reader what to DO, and never overstates.** Every row names
+/// the sender to ask, because loomux does not and will not re-send these
+/// itself: the payloads were declined synchronously and their senders were
+/// told. Rows the sender has already got through say so rather than being
+/// dropped from the list — see [`RosterEntry::resent`].
+pub fn refusal_roster_notice(r: &RefusalRoster) -> Option<String> {
+    if r.items.is_empty() {
+        return None;
+    }
+    let n = r.total;
+    // Opens with the shared constant — which itself leads with
+    // `LOOMUX_NOTICE_MARKER`, the single-line maskability requirement above.
+    let mut out = format!(
+        "{REFUSAL_ROSTER_OPENER} While it was full, {n} deliver{y} to you {was} REFUSED and \
+         never queued — loomux does NOT re-send them, so anything below that is not marked \
+         re-sent is still missing:",
+        y = if n == 1 { "y" } else { "ies" },
+        was = if n == 1 { "was" } else { "were" },
+    );
+    for (i, it) in r.items.iter().enumerate() {
+        out.push_str(if i == 0 { " " } else { " | " });
+        let clause = if it.resent {
+            format!("{} has since re-sent it — nothing to do", it.from)
+        } else {
+            format!("NOT re-sent — ask {} for it", it.from)
+        };
+        out.push_str(&format!(
+            "{} \"{}\" ({}; {clause})",
+            it.from,
+            it.preview,
+            it.reason.as_str()
+        ));
+    }
+    if r.omitted > 0 {
+        out.push_str(&format!(
+            " | plus {} earlier refusal{s} not listed here (this roster names {ROSTER_LIST_MAX}) \
+             — every one is in this group's audit.jsonl as a `delivery-dropped` line",
+            r.omitted,
+            s = if r.omitted == 1 { "" } else { "s" }
+        ));
+    }
+    if r.window_truncated {
+        out.push_str(
+            " | the audit window this was read from was itself cut, so there may be older \
+             refusals it could not see",
+        );
+    }
+    Some(out)
 }
 
 fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
@@ -32111,33 +32445,134 @@ impl OrchRegistry {
             if ours {
                 self.clear_stranded(group, &agent_id, "queue-pressure-released");
             }
-            return;
-        }
-        let (blocker, text) = if state == queue::CapacityState::Full {
-            (
-                // rev-10 finding 1: NOT `QueueFull` — that one's wording
-                // asserts a refused re-send and stranded text in the box,
-                // neither of which a depth reading establishes.
-                StrandedBlocker::QueueAtCapacity,
-                queue::at_capacity_notice(&agent_id, queue::QUEUE_MAX_PER_PANE),
-            )
         } else {
-            (
-                StrandedBlocker::QueueNearFull,
-                queue::pressure_notice(&agent_id, depth, queue::QUEUE_MAX_PER_PANE),
+            let (blocker, text) = if state == queue::CapacityState::Full {
+                (
+                    // rev-10 finding 1: NOT `QueueFull` — that one's wording
+                    // asserts a refused re-send and stranded text in the box,
+                    // neither of which a depth reading establishes.
+                    StrandedBlocker::QueueAtCapacity,
+                    queue::at_capacity_notice(&agent_id, queue::QUEUE_MAX_PER_PANE),
+                )
+            } else {
+                (
+                    StrandedBlocker::QueueNearFull,
+                    queue::pressure_notice(&agent_id, depth, queue::QUEUE_MAX_PER_PANE),
+                )
+            };
+            if existing.is_none() || ours {
+                self.mark_stranded(group, &agent_id, Some(blocker));
+            }
+            let target_is_orchestrator =
+                self.agent(&agent_id).map(|a| a.role == Role::Orchestrator).unwrap_or(false);
+            // Suppressed on an orchestrator target (and audited as such) — which is
+            // exactly why the badge above is raised first and unconditionally.
+            // Terminates: the only notice this can generate is one delivery to the
+            // orchestrator's own pane, and a pressure reading on THAT pane
+            // suppresses here rather than sending a third.
+            self.notify_queue(group, &agent_id, target_is_orchestrator, &text);
+        }
+        // #658: this ONE transition — the pane was at its cap and its depth has
+        // now come back down — is the first moment loomux can tell the pane
+        // what it refused while it was full. Everything else on that path
+        // already existed and is unchanged: the refusals were audited (#563 /
+        // #633), the senders were told synchronously, and #578's rider told the
+        // orchestrator its queue was FULL. What none of them did was name WHO
+        // was refused to the pane that refused them, which left a mid-session
+        // refusal reachable only by an orchestrator that happened to poll
+        // `queue_orphans` (#658's live instance).
+        //
+        // **Last in this function, deliberately.** The roster is delivered, so
+        // it re-enters here through the enqueue — and everything above has
+        // already committed this transition's pressure record, badge and
+        // notice, so the nested call sees the state THIS call settled on rather
+        // than racing it. The recursion terminates by construction: a delivery
+        // can only push depth UP, and the edge below is the one edge an
+        // increase cannot produce.
+        if prev == queue::CapacityState::Full && state != queue::CapacityState::Full {
+            self.announce_refusal_roster(group, &agent_id);
+        }
+    }
+
+    /// #658: tell `agent_id`'s pane what it refused while its queue was full,
+    /// once per drain, in one bounded coalesced line.
+    ///
+    /// **The channel is chosen the way #578 chose it.** An orchestrator's own
+    /// pane cannot be told by a delivery — a prompt about that pane's blocked
+    /// deliveries queues behind the very block it reports — so the roster is
+    /// parked in [`OrchNoticeInbox`] and rides back on the orchestrator's next
+    /// MCP tool result. Every other pane is told by an ordinary delivery. Both
+    /// carry the identical string, so the recipient reads the same words
+    /// whichever way it arrived.
+    ///
+    /// **It obeys the cap it reports on.** The delivery goes in under
+    /// [`queue::EnqueueReason::RefusalRoster`], whose `cap_headroom` is zero —
+    /// unlike the pause-loss notice, this one fires on the edge where depth just
+    /// came DOWN, so it has room by construction and needs no exemption. If a
+    /// concurrent arrival takes that slot anyway the roster is refused like
+    /// anything else, the audit line says `delivered: false`, the watermark does
+    /// NOT advance, and the same refusals are re-derived at the next drain.
+    ///
+    /// **Not marked maskable, and that is a decision (#661).**
+    /// `mark_notice_maskable` is a per-field producer promise that every span of
+    /// a notice was composed by loomux or called in by an agent OTHER than the
+    /// recipient. This line fails that on its face: its previews are payload
+    /// text authored by whoever sent the refused delivery, echoed back into the
+    /// recipient's own pane. Claiming them would let a sender place chosen text
+    /// into another pane's masked record — the injection surface the
+    /// default-closed rule exists to keep shut — so the roster keeps the
+    /// default, exactly as the queue notices next to it do
+    /// (`deliver_relayed_to_orchestrator`'s why-comment). The cost of not
+    /// opting in is a gate that holds slightly too long, never a release.
+    /// Distinct, despite the shared vocabulary, from the single-line rule
+    /// [`OrchNoticeInbox::park`] asserts: that is #576's pane-tail masking of
+    /// loomux's OWN framing, which this line satisfies by leading with
+    /// [`LOOMUX_NOTICE_MARKER`] and never wrapping to a second line.
+    ///
+    /// Reads the audit window rather than any in-memory tally — see
+    /// [`refusal_roster`] for why the log is the record. That read happens on
+    /// this edge only, never per delivery.
+    fn announce_refusal_roster(&self, group: &str, agent_id: &str) {
+        let (entries, window_truncated) = self.audit_log_windowed(group);
+        let roster = refusal_roster(&entries, agent_id, window_truncated);
+        // Nothing was refused since the last roster — the ordinary case, and
+        // the one that must add nothing to a pane and no line to the log. Same
+        // early return, for the same reason, as `announce_pause_suppression`'s.
+        let Some(text) = refusal_roster_notice(&roster) else { return };
+        let target_is_orchestrator =
+            self.agent(agent_id).map(|a| a.role == Role::Orchestrator).unwrap_or(false);
+        let outcome = if target_is_orchestrator {
+            self.orch_notice_inbox
+                .lock_safe()
+                .entry(group.to_string())
+                .or_default()
+                .park(&text);
+            Ok(())
+        } else {
+            self.deliver_prompt_as(
+                agent_id, &text, "loomux", Delivery::MidSession,
+                queue::EnqueueReason::RefusalRoster,
             )
         };
-        if existing.is_none() || ours {
-            self.mark_stranded(group, &agent_id, Some(blocker));
-        }
-        let target_is_orchestrator =
-            self.agent(&agent_id).map(|a| a.role == Role::Orchestrator).unwrap_or(false);
-        // Suppressed on an orchestrator target (and audited as such) — which is
-        // exactly why the badge above is raised first and unconditionally.
-        // Terminates: the only notice this can generate is one delivery to the
-        // orchestrator's own pane, and a pressure reading on THAT pane
-        // suppresses here rather than sending a third.
-        self.notify_queue(group, &agent_id, target_is_orchestrator, &text);
+        self.audit(group, "loomux", REFUSAL_ROSTER_ACTION, json!({
+            "to": agent_id,
+            "count": roster.items.len(),
+            "total": roster.total,
+            "omitted": roster.omitted,
+            "resent": roster.items.iter().filter(|i| i.resent).count(),
+            // The watermark itself (#658). Read back by the NEXT roster, and
+            // only off a line that also says `delivered: true`.
+            "through_ms": roster.through_ms,
+            "at_through": roster.at_through,
+            "window_truncated": roster.window_truncated,
+            "channel": if target_is_orchestrator { "orchestrator-inbox" } else { "pane-delivery" },
+            "delivered": outcome.is_ok(),
+            "error": outcome.as_ref().err(),
+            // #578's rule: a relay held in memory is one a restart loses, so
+            // the line carries the text it relayed rather than a record that
+            // one existed. Capped like every other notice the log quotes.
+            "text": text.chars().take(NOTICE_AUDIT_TEXT_CAP).collect::<String>(),
+        }));
     }
 
     /// Pop `id` off the FRONT of `pty_id`'s queue if it's still there (the

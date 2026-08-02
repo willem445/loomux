@@ -229,6 +229,28 @@ pub enum EnqueueReason {
     /// the marker drains (that is `drain_stranded_submit`'s press, identical
     /// for both pushes) and never a notice — see `queued_notice` below.
     StrandedSelfHeal,
+    /// #658: the drain-time roster naming deliveries this pane REFUSED while
+    /// its queue was full (`announce_refusal_roster`).
+    ///
+    /// **No headroom, deliberately — this is the opposite call to
+    /// [`EnqueueReason::PauseLossNotice`] and the difference is the trigger.**
+    /// The loss notice fires at a resume, which says nothing about depth, so on
+    /// the pane it is actually about (an orchestrator's, still at capacity) it
+    /// is CERTAIN to be refused without an exemption. The roster fires only on
+    /// the edge where a pane's depth just came back DOWN below the cap, so
+    /// there is room by construction and an exemption would buy nothing while
+    /// weakening "the cap is 8". A roster that is nonetheless refused (its slot
+    /// taken by a concurrent arrival) is recorded `delivered: false`, does not
+    /// advance the roster watermark, and is simply re-derived at the next
+    /// drain — see `OrchRegistry::announce_refusal_roster`.
+    ///
+    /// Its own variant, rather than `Arrival`, for one load-bearing reason
+    /// beyond audit honesty: `refusal_roster` EXCLUDES refusals carrying this
+    /// reason, which is half of what stops a refused roster from becoming a
+    /// line in the next roster and then in the one after that (the other half
+    /// covers the refusal shapes that record no reason at all — see that
+    /// function).
+    RefusalRoster,
 }
 
 impl EnqueueReason {
@@ -244,7 +266,8 @@ impl EnqueueReason {
             | EnqueueReason::KickoffRecovery
             | EnqueueReason::Recovered
             | EnqueueReason::GroupPaused
-            | EnqueueReason::StrandedSelfHeal => 0,
+            | EnqueueReason::StrandedSelfHeal
+            | EnqueueReason::RefusalRoster => 0,
         }
     }
 }
@@ -266,6 +289,7 @@ impl EnqueueReason {
             EnqueueReason::GroupPaused => "group-paused",
             EnqueueReason::PauseLossNotice => "pause-loss-notice",
             EnqueueReason::StrandedSelfHeal => "stranded-self-heal",
+            EnqueueReason::RefusalRoster => "refusal-roster",
         }
     }
 }
@@ -534,6 +558,12 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
         // `Recovered` above: the next variant added to this enum must be
         // decided here rather than defaulted.
         EnqueueReason::StrandedSelfHeal => "loomux is re-submitting text left in the box",
+        // #658: also unreachable, for the same structural reason as
+        // `PauseLossNotice` above — the roster is loomux telling a pane what it
+        // refused, never a delivery whose sender is waiting to hear it was
+        // queued. Spelled out rather than folded into a `_` arm so the next
+        // variant added to this enum is still a compile error here.
+        EnqueueReason::RefusalRoster => "it reports what this pane refused while full",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
@@ -1053,11 +1083,27 @@ pub const DROPPED_PREVIEW_MAX: usize = 160;
 /// Truncation is by CHARS, not bytes — slicing a UTF-8 string at an arbitrary
 /// byte offset panics, and this runs on the delivery path.
 pub fn dropped_payload_preview(text: &str) -> String {
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= DROPPED_PREVIEW_MAX {
-        return one_line;
+    clamp_preview(&text.split_whitespace().collect::<Vec<_>>().join(" "), DROPPED_PREVIEW_MAX)
+}
+
+/// Cut an already-one-line preview to `max` CHARS, marking the cut (#658).
+///
+/// Split out of [`dropped_payload_preview`] rather than re-spelled, because a
+/// second consumer arrived with a tighter budget: the #658 refusal roster is a
+/// SINGLE line carrying several previews at once, so it re-clamps each one
+/// (`mod.rs`'s `ROSTER_PREVIEW_MAX`) instead of pasting four 160-char previews
+/// into one row. Two copies of "truncate on a char boundary and say so" is one
+/// copy too many — and the char-boundary half is not a style preference, it is
+/// what stops a UTF-8 payload from panicking a delivery path.
+///
+/// Idempotent for the roster's purposes: clamping an already-clamped preview
+/// to a smaller max simply cuts further, and the `…` the first cut appended is
+/// an ordinary char to the second.
+pub fn clamp_preview(one_line: &str, max: usize) -> String {
+    if one_line.chars().count() <= max {
+        return one_line.to_string();
     }
-    let kept: String = one_line.chars().take(DROPPED_PREVIEW_MAX).collect();
+    let kept: String = one_line.chars().take(max).collect();
     format!("{kept}…")
 }
 
@@ -1650,6 +1696,10 @@ mod tests {
             EnqueueReason::Recovered,
             EnqueueReason::GroupPaused,
             EnqueueReason::StrandedSelfHeal,
+            // #658: the refusal roster is deliberately NOT exempt — it fires on
+            // the edge where depth just came back down, so it has room by
+            // construction and needs no bypass. See the variant's own doc.
+            EnqueueReason::RefusalRoster,
         ] {
             assert_eq!(
                 admit(&q, "one-more", ordinary),
