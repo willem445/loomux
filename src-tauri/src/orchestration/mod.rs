@@ -1623,8 +1623,63 @@ pub fn wait_bounded(
 /// See [`OrchRegistry::capture_with_timeout`]'s comment for the argument behind
 /// each step; it is not repeated here.
 pub fn capture_raw_with_timeout(
+    cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    capture_raw_inner(cmd, timeout, wait_bounded)
+}
+
+/// The same capture with its **main wait forced to fail** — the one arm of
+/// `capture_raw_inner` that a test cannot otherwise reach (#699).
+///
+/// Reaching it for real needs `Child::try_wait` itself to error, which no
+/// supported platform does on demand, and the arm is precisely where the
+/// reader accounting used to be dropped. So the wait is injected rather than
+/// mocked away: the production entry point above hands in `wait_bounded` and
+/// this one hands in a closure that errors, and every other step — the spawn,
+/// the two readers, the abandon accounting, the post-kill reap — is the same
+/// code in both. Same `#[doc(hidden)] pub` idiom as
+/// `seed_leaked_readers_for_test`: a seam, not a second implementation.
+#[doc(hidden)] // pub for integration tests: force the wait-error early return
+pub fn capture_raw_with_failing_wait_for_test(
+    cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    capture_raw_inner(cmd, timeout, |_child, _timeout| Err("forced wait failure (test seam)".to_string()))
+}
+
+/// Give up on a child mid-capture: kill it, reap it on its own deadline, and
+/// park **both** readers where the ceiling can see them — the one accounting
+/// step every abandonment arm goes through (#699). Returns `reason` so a call
+/// site is a single `return Err(abandon_child_and_readers(…))` and cannot
+/// account for one reader, or neither, by omission.
+///
+/// The reap goes through `wait_bounded` for the reason `GH_CAPTURE_REAP_TIMEOUT`
+/// exists: a bound whose last act is an unbounded `wait()` is not a bound. On
+/// the wait-error arm that reap will normally fail immediately too (whatever
+/// broke `try_wait` is still broken), which costs nothing — it is an `Err`,
+/// which is already bounded, and the kill above is what the readers need.
+fn abandon_child_and_readers(
+    child: &mut std::process::Child,
+    out_reader: std::thread::JoinHandle<Vec<u8>>,
+    err_reader: std::thread::JoinHandle<Vec<u8>>,
+    reason: String,
+) -> String {
+    let _ = child.kill();
+    let _ = wait_bounded(child, GH_CAPTURE_REAP_TIMEOUT);
+    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+    leaked.push(out_reader);
+    leaked.push(err_reader);
+    reason
+}
+
+/// The body of the capture, with the main wait injected so the wait-error arm
+/// is reachable from a test (see `capture_raw_with_failing_wait_for_test`).
+/// `wait` is `wait_bounded` in production and nothing else.
+fn capture_raw_inner(
     mut cmd: std::process::Command,
     timeout: Duration,
+    wait: impl Fn(&mut std::process::Child, Duration) -> Result<Option<std::process::ExitStatus>, String>,
 ) -> Result<(std::process::ExitStatus, String, String), String> {
     use std::io::Read as _;
     use std::process::Stdio;
@@ -1653,15 +1708,32 @@ pub fn capture_raw_with_timeout(
         buf
     });
 
-    let Some(status) = wait_bounded(&mut child, timeout)? else {
-        let _ = child.kill();
-        // Reap on its own deadline (rev-lead finding 2). A bound whose last act
-        // is an unbounded `wait()` is not a bound.
-        let _ = wait_bounded(&mut child, GH_CAPTURE_REAP_TIMEOUT);
-        let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
-        leaked.push(out_reader);
-        leaked.push(err_reader);
-        return Err(format!("timed out after {}s", timeout.as_secs()));
+    // From here on both readers exist, and every exit accounts for both of
+    // them exactly once: the arm below joins them, and every arm that gives up
+    // on a live child parks them via `abandon_child_and_readers` (kill, bounded
+    // reap, park). Nothing between the two `spawn`s above and this point can
+    // return, and the two returns that precede them — the backlog refusal and a
+    // failed `Command::spawn` — have no readers to account for. (A panic in the
+    // second `std::thread::spawn` would unwind past all of this rather than
+    // return through it; out of scope, and the design note records why.)
+    //
+    // #699: the wait-error arm used to be a bare `?`. Uncounted is worse than
+    // parked, not better — the ceiling admits on "how many readers are still
+    // blocked", so readers the sweep can never see make the bound understate
+    // the process it exists to bound, and the child stayed alive too (dropping
+    // a `Child` does not kill it), which is precisely what keeps those readers
+    // blocked forever.
+    let waited = match wait(&mut child, timeout) {
+        Ok(waited) => waited,
+        Err(e) => return Err(abandon_child_and_readers(&mut child, out_reader, err_reader, e)),
+    };
+    let Some(status) = waited else {
+        return Err(abandon_child_and_readers(
+            &mut child,
+            out_reader,
+            err_reader,
+            format!("timed out after {}s", timeout.as_secs()),
+        ));
     };
 
     // Exited on its own: both pipes are at EOF (or about to be), so these joins
@@ -1678,6 +1750,39 @@ pub fn capture_raw_with_timeout(
 #[doc(hidden)] // pub for integration tests: observe the process-wide reader backlog
 pub fn gh_capture_live_readers() -> usize {
     sweep_leaked_readers()
+}
+
+/// The backlog list itself, **unswept**: how many reader handles are parked,
+/// whether or not their reader has since ended (#699).
+///
+/// `gh_capture_live_readers` answers the question the ceiling asks and is
+/// therefore the wrong instrument for pinning the accounting: on an ordinary
+/// abandonment the kill closes both pipes and the readers end within
+/// milliseconds, so a swept count cannot tell "parked, then ended" from "never
+/// parked at all" — it reads the same either way, and which one a test sees is
+/// a race it loses on some platforms and not others. Counting the list itself
+/// makes "both handles were handed to the ceiling" observable on its own terms.
+#[doc(hidden)] // pub for integration tests
+pub fn gh_capture_parked_readers() -> usize {
+    GH_CAPTURE_LEAKED_READERS.lock_safe().len()
+}
+
+/// Empty the backlog and hand back what was parked, so a test can start from a
+/// known-zero baseline (#699).
+///
+/// The list is process-wide and every capture test contributes to it, so "this
+/// call parked exactly two" is not observable as a before/after delta: the
+/// confound is not merely what earlier tests left behind, it is that the next
+/// capture's own opening sweep *removes* the ones that have since ended, moving
+/// the count down underneath the baseline while the two new handles push it up
+/// (measured on CI: before 4, after 4, with both readers correctly parked).
+///
+/// Dropping a `JoinHandle` does not stop its thread — the handles simply stop
+/// being tracked, which is the same residue the ceiling already tolerates for
+/// a reader that ended, and it is confined to a test process.
+#[doc(hidden)] // pub for integration tests
+pub fn drain_parked_readers_for_test() -> Vec<std::thread::JoinHandle<Vec<u8>>> {
+    std::mem::take(&mut *GH_CAPTURE_LEAKED_READERS.lock_safe())
 }
 
 /// Park `n` controllable blocked readers in the backlog, as a real abandoned
@@ -22069,7 +22174,11 @@ impl OrchRegistry {
     /// bounds one call, not the process: the very case that justifies not
     /// joining is the case where they never finish, and a persistently
     /// stalling condition is re-polled every tick. So an abandoned reader is
-    /// parked in `GH_CAPTURE_LEAKED_READERS` instead of forgotten, every
+    /// parked in `GH_CAPTURE_LEAKED_READERS` instead of forgotten — on **every**
+    /// arm that gives up on a live child, the timeout and the one where the
+    /// bounded wait itself errors alike (#699), since a reader that is dropped
+    /// rather than parked is invisible to the sweep and the ceiling then
+    /// understates the very backlog it admits on. Every
     /// capture first sweeps the ones that have since ended, and a capture is
     /// refused outright once `GH_CAPTURE_MAX_LEAKED_READERS` are still
     /// blocked. Note what that trade is: past the ceiling, `gh` polling in
