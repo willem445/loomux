@@ -5321,14 +5321,18 @@ blocks:
     }
 
     let gate = wf.gates.get("merge").expect("the dogfood file exists partly to demo the gate");
-    // ALL-PASS, and not `threshold: N` — the reviewers are LANE-SCOPED, and an
-    // out-of-lane reviewer is told to record a `pass` ("not my lane") rather than stay
-    // silent. The gate counts passes, not lanes, so under a threshold the two fastest
-    // abstentions satisfy it while the one in-lane reviewer — the slowest, because its
-    // persona tells it to reproduce findings — is still working (rev-14 F1). A threshold
-    // is right for INTERCHANGEABLE reviewers; this roster is the opposite of that.
+    // ALL-PASS. With one lane, all-pass and threshold are numerically equivalent, but
+    // all-pass is the honest spelling AND the safe one for growth: the gate counts
+    // passes, not lanes, so the day a second lane is declared, a threshold left at 1
+    // would let either lane's abstention open the gate alone (rev-14 F1's shape).
     assert_eq!(gate.require, GateRequire::AllPass);
-    assert_eq!(gate.reviewers, ["rev-orch", "rev-ui", "rev-tests"]);
+    // The GENERIC safety property, same shape as the frontend dogfood pin: every
+    // declared reviewer-kind block is in the gate — a lane declared in the roster
+    // but unwired from `gates.merge` would go unreviewed while the gate still opens.
+    let declared: Vec<&str> =
+        wf.blocks.iter().filter(|b| b.kind == Role::Reviewer).map(|b| b.id.as_str()).collect();
+    assert_eq!(gate.reviewers, declared, "every declared reviewer lane is in the gate");
+    assert_eq!(gate.reviewers, ["rev-lead"], "…and today that is the single lead lane");
     assert_eq!(
         workflow::gate_need(gate),
         gate.reviewers.len() as u32,
@@ -5379,7 +5383,12 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
         .create_group(&repo_root(), Guardrails { blocks: launcher_picks, ..rails() })
         .unwrap();
 
-    for (block, model) in [("worker-deep", "opus"), ("worker-quick", "sonnet"), ("rev-lead", "opus")] {
+    // The anti-flattening witnesses: blocks whose declared model DIFFERS from the
+    // launcher's per-role pick, so "declared model honored" and "flattened to the
+    // pick" produce different argv. worker-quick is deliberately NOT here — it
+    // declares sonnet, the launcher pick, so the two cases are indistinguishable
+    // for it and it cannot witness this property (see the weaker loop below).
+    for (block, model) in [("worker-deep", "opus"), ("rev-lead", "opus")] {
         let (cmd, argv, _kickoff) = compile(&reg, &g, block);
         assert!(cmd.contains(&format!("--model {model}")), "{block} must run {model}: {cmd}");
         assert!(
@@ -5393,6 +5402,21 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
         // And it is *this* block that ran: the persona rode in on the same
         // command (round #417 correction 6: via a generated file's handle).
         assert!(cmd.contains(&format!("--agent loomux-{}-{block}", g.id)), "{block}: persona must reach the CLI: {cmd}");
+    }
+    // The strictly weaker claim for the converged block: worker-quick's declared
+    // sonnet equals the launcher pick, so only carriage (model + persona reach the
+    // CLI) is assertable — NOT anti-flattening, which needs a distinguishing witness.
+    {
+        let (cmd, argv, _kickoff) = compile(&reg, &g, "worker-quick");
+        assert!(cmd.contains("--model sonnet"), "worker-quick must run sonnet: {cmd}");
+        assert!(
+            argv.windows(2).any(|w| w == ["--model", "sonnet"]),
+            "worker-quick: the argv path must agree with the command line: {argv:?}"
+        );
+        assert!(
+            cmd.contains(&format!("--agent loomux-{}-worker-quick", g.id)),
+            "worker-quick: persona must reach the CLI: {cmd}"
+        );
     }
 }
 
