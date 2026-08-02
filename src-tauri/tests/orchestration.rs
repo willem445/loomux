@@ -91,6 +91,8 @@ use loomux_lib::orchestration::{
     box_reading, tier1_scan_bytes, BoxReading,
     // #583: the same read, measured — is `Unverifiable` the near-cap norm?
     Tier1ScanCensus,
+    // #685: it was — so the window is sized in post-strip chars, by re-reading.
+    Tier1Scan, TIER1_SCAN_WIDEN_ROUNDS,
     HUMAN_INPUT_BLOCK_BOUND_MS, UNCONFIRMED_ACK_SETTLE_MS, UNCONFIRMED_NOTICE_IDS_MAX,
     record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
@@ -34333,6 +34335,300 @@ fn the_census_records_an_absent_read_as_absent_rather_than_zero() {
         Value::Null,
         "a ratio over zero bytes read is undefined, and 0% would read as a total-loss tail"
     );
+}
+
+// ---------- #685: the scan window, sized in POST-STRIP characters ----------
+//
+// #583's measurement came back: retention is ~50%, so the raw-byte slack was
+// under-covering from ~1.5 KiB of paste up, and `Unverifiable` was being
+// decided by arithmetic before the pane was consulted. `Tier1Scan` re-reads
+// scaled by the retention the tail itself demonstrates.
+//
+// What these pin, in the order they matter: a paste in the formerly-collapsing
+// range now VERIFIES; the widening never manufactures a verification it cannot
+// take (a ring with nothing more in it, a paste past the ceiling); and no read
+// is ever narrower than the one #559 took, which is the property the whole
+// same-size invariant rested on.
+
+/// A pane ring the way a repaint-heavy TUI leaves one: `lead_bytes` of older
+/// output, then our paste echoed in `chunk`-sized runs each led by an SGR
+/// sequence, then the box's own trailing frame. Retention is `chunk / (chunk +
+/// 4)` — at `chunk = 4`, the ~50% #583 measured live.
+///
+/// Unlike `repainted_tail` above (which cuts to exactly the window under test,
+/// so a read can never come up short for want of ring), this builds the WHOLE
+/// ring: a read has more to find whenever it asks for more, which is the
+/// difference between "the slack was too small" and "the pane had not spoken
+/// yet" — the two causes #685 has to keep apart.
+fn repaint_ring(pasted: &str, chunk: usize, lead_bytes: usize) -> Vec<u8> {
+    let mut raw = String::new();
+    let filler = "waiting on the previous turn, still streaming output here ";
+    while raw.len() < lead_bytes {
+        for c in filler.as_bytes().chunks(chunk) {
+            raw.push_str("\x1b[0m");
+            raw.push_str(std::str::from_utf8(c).expect("filler is ASCII"));
+        }
+    }
+    for c in pasted.as_bytes().chunks(chunk) {
+        raw.push_str("\x1b[0m");
+        raw.push_str(std::str::from_utf8(c).expect("flush_paste is ASCII"));
+    }
+    // Box chrome after our text, well inside `BOX_TAIL_WINDOW_SLACK` so the
+    // containment window still reaches back over the whole paste.
+    raw.push_str("\x1b[2m\r\n> \x1b[0m");
+    raw.into_bytes()
+}
+
+/// The reading the code took BEFORE #685, spelled out rather than described:
+/// one request of `tier1_scan_bytes` raw bytes, stripped, classified. Every
+/// fixture below asserts this, so a test can never quietly stop being about a
+/// paste that used to collapse.
+fn pre_685_reading(pm: &PtyManager, pty: u32, pasted: &str) -> BoxReading {
+    box_reading(
+        pm.output_tail_bounded(pty, tier1_scan_bytes(pasted))
+            .map(|b| strip_ansi(&b))
+            .as_deref(),
+        pasted,
+    )
+}
+
+#[test]
+fn a_repaint_heavy_pane_verifies_once_the_window_is_sized_in_post_strip_chars() {
+    // The headline: an 8 KiB paste sitting IN THE BOX, on a pane whose tail
+    // retains half its bytes through stripping. The old read asked for
+    // paste + 4 KiB raw, got half of it in characters, and declined to govern
+    // a delivery whose text was right there.
+    let pasted = flush_paste(8 * 1024);
+    let pty = 6851;
+    let pm = PtyManager::default();
+    pm.register_fake_for_test(pty, &repaint_ring(&pasted, 4, 32 * 1024));
+
+    assert_eq!(
+        pre_685_reading(&pm, pty, &pasted),
+        BoxReading::Unverifiable,
+        "the fixture must still be a member of the class it witnesses: one fixed-size read of \
+         this pane could not verify a paste that is plainly in its box"
+    );
+
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    let read = scan.read(|n| pm.output_tail_bounded(pty, n)).expect("the fake pty is alive");
+    assert_eq!(
+        box_reading(Some(&read.stripped), &pasted),
+        BoxReading::Holds,
+        "sized in post-strip chars, the same pane and the same paste now VERIFY"
+    );
+    assert!(
+        read.requested_bytes > tier1_scan_bytes(&pasted),
+        "and it got there by widening, not by the fixture being generous: {} vs the {} floor",
+        read.requested_bytes,
+        tier1_scan_bytes(&pasted)
+    );
+    assert_eq!(
+        read.tail_bytes, read.requested_bytes,
+        "the ring FILLED the widened request — a short pane is a different cause (#583's \
+         confounder) and is not what this test is about"
+    );
+}
+
+#[test]
+fn an_ordinary_delivery_still_takes_exactly_one_read() {
+    // The cost argument, pinned. The target is the containment window, not the
+    // whole 4 KiB budget, so an ordinary prompt clears it on the first read and
+    // widens not at all — only a read that was truncating the comparison pays
+    // for anything. If this ever fails, every delivery just started re-reading
+    // the ring several times per poll.
+    let pasted = "please post the status roll-up on #685";
+    let pty = 6852;
+    let pm = PtyManager::default();
+    pm.register_fake_for_test(pty, &repaint_ring(pasted, 4, 32 * 1024));
+
+    let mut requests = Vec::new();
+    let mut scan = Tier1Scan::for_paste(pasted);
+    let read = scan
+        .read(|n| {
+            requests.push(n);
+            pm.output_tail_bounded(pty, n)
+        })
+        .expect("the fake pty is alive");
+
+    assert_eq!(requests, vec![tier1_scan_bytes(pasted)], "one read, at the unchanged floor");
+    assert_eq!(box_reading(Some(&read.stripped), pasted), BoxReading::Holds);
+}
+
+#[test]
+fn a_ring_with_nothing_more_in_it_ends_the_widening_rather_than_re_asking() {
+    // #685's OTHER cause, which this change deliberately does not paper over:
+    // the tail under-delivers against the request because the pane has not
+    // produced that much output yet. There is no retention to scale by and no
+    // wider request that could return a byte the ring does not hold, so the
+    // reader stops at one read and the delivery stays `Unverifiable` — stated,
+    // notified, never a confirm.
+    let pasted = flush_paste(4 * 1024);
+    let pty = 6853;
+    let pm = PtyManager::default();
+    // A ring holding a fraction of the paste: the live shape #583 logged as
+    // 6153 requested, 1408 returned.
+    pm.register_fake_for_test(pty, &repaint_ring(&pasted, 4, 0)[..1408].to_vec());
+
+    let mut requests = Vec::new();
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    let read = scan
+        .read(|n| {
+            requests.push(n);
+            pm.output_tail_bounded(pty, n)
+        })
+        .expect("the fake pty is alive");
+
+    assert_eq!(requests.len(), 1, "an under-filled read is the end of the widening, not the start");
+    assert!(read.tail_bytes < read.requested_bytes, "the fixture must under-fill, or it proves nothing");
+    assert_eq!(
+        box_reading(Some(&read.stripped), &pasted),
+        BoxReading::Unverifiable,
+        "fail-safe is unchanged: a delivery loomux could not read is never reported verified"
+    );
+}
+
+#[test]
+fn a_paste_past_the_ceiling_is_still_unverifiable_however_wide_the_ring_is() {
+    // The ceiling regime `a_paste_past_the_scan_ceiling_is_unverifiable_at_any_
+    // density` proves for the old sizing, re-asked of the new one — because a
+    // re-reading window is exactly the mechanism that could have quietly
+    // raised a ceiling nobody decided to raise. `target_chars` is capped at
+    // `TIER1_SCAN_MAX_BYTES` too, so the widening never fires and the answer is
+    // the same one arithmetic gave before: what verification should CLAIM up
+    // here is #685's posture half, and it is not decided by this change.
+    let ceiling = queue::QUEUE_FLUSH_MAX_BYTES + tier1_scan_bytes("");
+    let pasted = flush_paste(ceiling + 1024);
+    let pty = 6854;
+    let pm = PtyManager::default();
+    // Pure text, no escapes at all, and a ring far larger than the paste: 100%
+    // retention with everything to read. Nothing but the ceiling is left to
+    // blame.
+    let mut ring = "older output\r\n".repeat(2048).into_bytes();
+    ring.extend_from_slice(pasted.as_bytes());
+    pm.register_fake_for_test(pty, &ring);
+
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    assert!(
+        scan.target_chars() < pasted.len(),
+        "the ceiling caps the TARGET as well as the floor, so no read this scan can take — \
+         however wide, however clean — covers the needle: {} chars aimed for, {} needed",
+        scan.target_chars(),
+        pasted.len()
+    );
+    let read = scan.read(|n| pm.output_tail_bounded(pty, n)).expect("the fake pty is alive");
+    assert!(
+        ring.len() > read.requested_bytes,
+        "the ring had more to give, so a short pane is not what makes this unverifiable"
+    );
+    assert_eq!(box_reading(Some(&read.stripped), &pasted), BoxReading::Unverifiable);
+}
+
+#[test]
+fn no_widened_read_is_ever_narrower_than_the_one_it_replaced() {
+    // The invariant #559 stated as "every box read for a delivery uses the same
+    // size", in the stronger form #685 leaves it: reads are MONOTONE. The
+    // hazard it guards is a precondition verified against a wide tail and then
+    // polled against a narrow one — the poll sees the box cut mid-paste, reads
+    // `NotHolding`, and confirms a delivery nothing observed. It needs a
+    // narrower read, and this asserts there is no way to take one: not across
+    // the widening rounds of a single read, and not across the successive reads
+    // one delivery's confirm loop takes.
+    let pasted = flush_paste(8 * 1024);
+    let pty = 6855;
+    let pm = PtyManager::default();
+    // Dense enough that one widening is not enough: ~20% retention, so the
+    // scaled re-request has to converge over more than one round.
+    pm.register_fake_for_test(pty, &repaint_ring(&pasted, 1, 64 * 1024));
+
+    let floor = tier1_scan_bytes(&pasted);
+    let mut requests = Vec::new();
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    for _ in 0..3 {
+        let _ = scan.read(|n| {
+            requests.push(n);
+            pm.output_tail_bounded(pty, n)
+        });
+    }
+
+    assert!(requests.len() > 3, "the fixture must actually widen, or this asserts nothing");
+    assert!(
+        requests.windows(2).all(|w| w[1] >= w[0]),
+        "requests must never shrink, within a read or between reads: {requests:?}"
+    );
+    assert!(
+        requests.iter().all(|n| *n >= floor),
+        "and never below the size #559's own read used: {requests:?} vs floor {floor}"
+    );
+}
+
+#[test]
+fn the_widening_is_bounded_and_fails_safe_on_a_tail_it_cannot_cover() {
+    // Termination, on the worst tail this fixture set can build: a coalesced
+    // paste at the flush cap against an almost entirely-escape ring, where even
+    // the widest request the ring can serve strips to less than the needle. The
+    // reader must widen (it is short), must stop (bounded), and must leave the
+    // reading `Unverifiable` — a wider window buying nothing is exactly the
+    // residual `Unverifiable` exists to say out loud.
+    let pasted = flush_paste(queue::QUEUE_FLUSH_MAX_BYTES);
+    let pty = 6856;
+    let pm = PtyManager::default();
+    let mut ring = Vec::new();
+    while ring.len() < 250 * 1024 {
+        ring.extend_from_slice(b"\x1b[2m\x1b[0m\x1b[Kx");
+    }
+    pm.register_fake_for_test(pty, &ring);
+
+    let mut requests = Vec::new();
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    let read = scan
+        .read(|n| {
+            requests.push(n);
+            pm.output_tail_bounded(pty, n)
+        })
+        .expect("the fake pty is alive");
+
+    assert!(requests.len() >= 2, "a read this short must have tried to widen: {requests:?}");
+    assert!(
+        requests.len() as u32 <= 1 + TIER1_SCAN_WIDEN_ROUNDS,
+        "one read plus the bounded re-reads, and not one more: {requests:?}"
+    );
+    assert_eq!(
+        box_reading(Some(&read.stripped), &pasted),
+        BoxReading::Unverifiable,
+        "a window that cannot be covered classifies the widest read taken — fail-safe, as before"
+    );
+}
+
+#[test]
+fn the_sizing_stops_for_a_reason_it_can_state() {
+    // `widen` is the whole decision; the reader is the loop around it. Each
+    // `None` is a distinct "a wider request cannot change the answer", and
+    // pinning them separately is what keeps the reader's stopping conditions
+    // from collapsing into one another under a later edit.
+    // Sized by hand rather than from `flush_paste`, so the arithmetic below is
+    // exact and readable: 1,000 chars of needle, a 1,200-char window, and a
+    // first request of 1,000 + `BOX_TAIL_SCAN_BYTES`.
+    let pasted = "x".repeat(1000);
+    let scan = Tier1Scan::for_paste(&pasted);
+    let target = scan.target_chars();
+    let floor = scan.request_floor();
+    assert_eq!(target, 1200, "the window is the needle plus the containment slack");
+    assert_eq!(floor, tier1_scan_bytes(&pasted), "the first request is exactly #559's");
+
+    // Covered: the read delivered the whole containment window.
+    assert_eq!(scan.widen(floor, floor, target), None);
+    // Under-filled: the ring holds no more, so no wider request can add a byte.
+    assert_eq!(scan.widen(floor, floor - 1, target / 4), None);
+    // Nothing survived stripping: the ratio is undefined, and a guess dressed
+    // as a measurement is worse than the honest `Unverifiable` that follows.
+    assert_eq!(scan.widen(floor, floor, 0), None);
+
+    // And when it does widen, it widens by what the shortfall measured: half
+    // the characters back means twice the bytes asked for — the measured
+    // retention, not a doubling constant (a quarter back asks for four times).
+    assert_eq!(scan.widen(floor, floor, target / 2), Some(floor * 2));
+    assert_eq!(scan.widen(floor, floor, target / 4), Some(floor * 4));
 }
 
 // ---------- #534 / #513(c): question evidence from the COMPOSED GRID ----------

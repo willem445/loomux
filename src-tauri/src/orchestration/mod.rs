@@ -1982,8 +1982,9 @@ const TIER1_SCAN_WIDEN_MAX_BYTES: usize = crate::pty::OUTPUT_RING_CAP;
 /// converge on a tail whose density is not uniform, and the bound exists so a
 /// pathological one cannot spin. Running out is not a failure mode of its own:
 /// the widest read still classifies, and a short one classifies as
-/// `Unverifiable` exactly as it did before.
-const TIER1_SCAN_WIDEN_ROUNDS: u32 = 3;
+/// `Unverifiable` exactly as it did before. `pub` so the bound is directly
+/// testable rather than inferred from a loose "it terminated" assertion.
+pub const TIER1_SCAN_WIDEN_ROUNDS: u32 = 3;
 /// Extra slack (normalized characters) added around the pasted text's own
 /// length when windowing "the tail end" for containment — covers box
 /// framing/prompt-symbol/cursor characters immediately around our text
