@@ -4991,15 +4991,35 @@ reconcile on read, mirrored into the kickoff config + a live notice, and surface
   unmatchable against any grant and was refused outright (the refusal read `release/tag ()`,
   the empty parens being the whole diagnosis). The gate now resolves the id to its tag with
   **one read-only GET** against the real gh, after the blanket openings so a marker-allowed
-  release pays nothing for it, and then gates on that tag like any other. Three properties make
-  that safe: it is **fail-closed** (a lookup that errors, 404s, prints nothing, prints `null`,
-  or prints anything that is not a plausible ref name leaves the tag empty, which matches no
-  grant and blocks — an unresolvable id is never "probably fine"); it resolves **only** when
-  the numeric id is the path's last segment and the path holds no `..`, because otherwise
-  `…/releases/555/../444` would have its tag read off release 555 while gh's own URL
-  normalization sent the write to 444 — a prefix is not the target; and the resolved tag still
-  has to *match a grant*, so a `make_latest` flip on another release resolves to that release's
-  own tag and is refused exactly as a wrong-tag call always was. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
+  release pays nothing for it, and then gates on that tag like any other.
+
+  **The id is the locus, and it outranks the argv.** This is the part that carries the
+  security argument, and the first cut got it wrong: resolution was conditional on the argv
+  naming no tag, so `-f tag_name=<granted>` suppressed it and a live grant reached *every*
+  release in the repo — `gh api -X PATCH …/releases/777 -f tag_name=v1.2.3 -f
+  make_latest=true` keyed the gate on the granted tag, retagged an unauthorized release and
+  took `latest`; `-X DELETE … -f tag_name=v1.2.3` deleted one (the API ignores `tag_name` on a
+  DELETE, so it was there purely to satisfy the gate). It is the exact mirror of the `#196`
+  decoys — those *loosen* the gate with a cosmetic `refs/heads`, this one *satisfies* it with
+  a cosmetic tag — and the suite had no case for that direction. So: whenever the URL names
+  one specific release, the argv tag is **discarded** before anything is keyed on it, and
+  three outcomes follow. Resolved and consistent → gate on the resolved tag. Resolved but the
+  argv named a *different* tag → **refuse**, because that is either a retag (publishing a tag
+  nobody granted) or a decoy, and letting the resolved tag simply win would allow the retag
+  whenever the resolved tag happened to be the granted one. Not resolvable → **refuse**: a
+  lookup that errors, 404s, prints nothing, prints `null`, or prints anything that is not a
+  plausible ref name leaves the tag empty, and an unresolvable id is never "probably fine".
+  `POST …/releases` (create) has no id in the URL, so `tag_name` remains its locus.
+
+  **What makes the traversal case safe is the resolved path, not a pattern.** The GET uses
+  `$a_path` — the write's own path, verbatim, not lowercased and not a reconstructed prefix —
+  so gh normalizes one string and the two calls cannot address different releases. (An earlier
+  cut resolved `${prefix}releases/${id}`, and *there* `…/releases/555/../444` really would
+  have read release 555's tag and written to 444.) The `..` and last-segment tests that
+  remain are not what closes that; they decide whether the URL counts as **id-addressed**,
+  which matters because a release loomux cannot pin down (`…/releases/555/assets`,
+  `…/releases/../777`) must still deny the argv tag the chance to speak for it. Each is
+  pinned by a mutation that flips a refusal to an allow when it is removed. A non-release api call (an issues endpoint, a branch `refs/heads` write, an
   read-only GET) passes through untouched. The **graphql arm**: the endpoint is recognized by
   **suffix** (`graphql` | `/graphql` | `*/graphql`, incl. the full-URL host form) — not an exact
   `graphql` string, which a `gh api /graphql`/full-URL POST would have slipped (#196 r4) — and it

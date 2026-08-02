@@ -511,8 +511,12 @@ loomux_block_wf() { # $1=reason $2=detail
   loomux_audit "merge-gate-workflow-blocked" "{\"reason\":\"$1\",\"pr\":\"$num\"}"
   exit 1
 }
-loomux_block_release() { # $1=tag $2=action
-  if [ -n "$1" ]; then
+loomux_block_release() { # $1=tag $2=action $3=conflicting caller-supplied tag (optional)
+  if [ -n "$3" ]; then
+    # rev B1: the URL names one release and the body names a different tag. Never
+    # matched against a grant — a grant authorizes ONE tag and this call names two.
+    printf '%s\n' "loomux: refusing this release call — the release it addresses is tagged '$1', but the call's own tag_name/ref field says '$3'. loomux takes an id-addressed release's identity from the id in the URL, never from a tag field the caller supplied, so this cannot be matched to a grant: a grant authorizes one tag and this names two. If you meant to edit the '$1' release, drop the tag_name/ref field. If you meant to RETAG it to '$3', that publishes a tag nobody has authorized — ask the human to grant '$3' first; do NOT publish." >&2
+  elif [ -n "$1" ]; then
     printf '%s\n' "loomux: publishing a release/tag ($1) requires an explicit human grant — releases publish to the world (GitHub release + npm), which autonomous mode does NOT authorize. Ask the human to grant the release; do NOT publish." >&2
   else
     # #437: the pre-fix message rendered this case as "release/tag ()" — the empty
@@ -604,15 +608,18 @@ loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-
 # through here, so the api path can never diverge from the subcommand path. Allowed
 # by autonomous+auto_release (blanket, not grant-consumed), supervised dangerous
 # mode (human present, not autonomous), or a valid per-tag grant; else fail-safe
-# block. $1=tag ("" when not resolvable from the argv), $2=action label, $3=the
-# `repos/…/releases/<id>` path when the call addresses a release by numeric id
-# (#437 — the gate resolves that id to its tag itself, see below). Returns 0 to
-# allow; blocks with a message + exit 1 (never returns) otherwise. A grant-backed
-# allow does NOT consume anything (#438) — see loomux_release_grant_valid — so
-# every caller just `exec`s the real gh.
+# block. $1=tag as resolved from the argv ("" when the argv named none), $2=action
+# label, $3=the `repos/…/releases/<id>` path to resolve when the call addresses a
+# release by numeric id AND that id could be isolated safely, $4="1" when the URL
+# addresses one specific release at all (#437/rev B1 — then $4, not $1, decides
+# identity: see below, and note $4=1 with $3="" means "names a release we cannot
+# identify", which refuses). Returns 0 to allow; blocks with a message + exit 1
+# (never returns) otherwise. A grant-backed allow does NOT consume anything
+# (#438) — see loomux_release_grant_valid — so every caller just `exec`s the real
+# gh.
 __RELEASE_GRANT_VALID__
-loomux_release_gate() { # $1=tag $2=action $3=id-addressed release resource path ("" if none)
-  _tag="$1"; _action="$2"; _relpath="$3"
+loomux_release_gate() { # $1=argv tag $2=action $3=resource path to resolve ("") $4="1" if id-addressed
+  _tag="$1"; _action="$2"; _relpath="$3"; _relid="$4"
   if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
     loomux_audit "release-gate-allowed" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
@@ -628,20 +635,40 @@ loomux_release_gate() { # $1=tag $2=action $3=id-addressed release resource path
   # recursion), and gate on that tag like any other. Deliberately placed AFTER the
   # blanket openings so a marker-allowed release costs no extra API call.
   #
-  # FAIL-CLOSED is the whole security argument here: a lookup that errors, 404s,
-  # prints nothing, prints `null`, or prints anything that is not a plausible ref
-  # name leaves $_tag EMPTY, which matches no grant and falls into
-  # loomux_block_release below. An id loomux cannot resolve is never "probably fine";
-  # the caller's remedy is to address the release by tag or get a grant.
-  if [ -z "$_tag" ] && [ -n "$_relpath" ]; then
-    _rawtag=$("$REAL_GH" api "$_relpath" --jq '.tag_name' 2>/dev/null | head -n1)
-    _tag=$(printf '%s' "$_rawtag" | tr -d '\r')
-    loomux_norm_guard "$_rawtag" "$_tag" "release-id-tag-name"
-    case "$_tag" in
-      ''|null|*[!A-Za-z0-9._+/-]*)
-        _tag=""; loomux_audit "release-id-unresolved" "{\"path\":\"$_relpath\",\"action\":\"$_action\"}" ;;
-      *) loomux_audit "release-id-resolved" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"action\":\"$_action\"}" ;;
-    esac
+  # When the path names a specific release ($_relid), the ID is the identity and any
+  # tag the argv supplied is DISCARDED before it can key anything (rev B1 — see the
+  # api arm's own note). Three outcomes, none of which can fall back to the argv tag:
+  #
+  #  1. Resolved, and the argv named no tag or the SAME tag → gate on the resolved
+  #     tag. This is the release-notes write, the case #437 exists for.
+  #  2. Resolved, but the argv named a DIFFERENT tag → refuse outright and say so.
+  #     This is either a retag (moving release <id> onto another tag, which
+  #     publishes a tag nobody granted) or a decoy trying to borrow this grant for
+  #     another release. Both need their own authorization, so neither may proceed
+  #     on the strength of a grant for a third tag. Letting the resolved tag simply
+  #     win would allow case 2's retag whenever the resolved tag happened to be the
+  #     granted one — refusing is the tighter of the two options the review offered.
+  #  3. Not resolvable at all → refuse. FAIL-CLOSED is the whole security argument:
+  #     a lookup that errors, 404s, prints nothing, prints `null`, prints anything
+  #     that is not a plausible ref name, or a path whose id could not be isolated
+  #     ($_relpath empty), leaves $_tag EMPTY, which matches no grant. An id loomux
+  #     cannot resolve is never "probably fine".
+  if [ "$_relid" = "1" ]; then
+    _argvtag="$_tag"; _tag=""
+    if [ -n "$_relpath" ]; then
+      _rawtag=$("$REAL_GH" api "$_relpath" --jq '.tag_name' 2>/dev/null | head -n1)
+      _tag=$(printf '%s' "$_rawtag" | tr -d '\r')
+      loomux_norm_guard "$_rawtag" "$_tag" "release-id-tag-name"
+      case "$_tag" in ''|null|*[!A-Za-z0-9._+/-]*) _tag="" ;; esac
+    fi
+    if [ -z "$_tag" ]; then
+      loomux_audit "release-id-unresolved" "{\"path\":\"$_relpath\",\"action\":\"$_action\"}"
+    elif [ -n "$_argvtag" ] && [ "$_argvtag" != "$_tag" ]; then
+      loomux_audit "release-id-tag-mismatch" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"claimed\":\"$_argvtag\",\"action\":\"$_action\"}"
+      loomux_block_release "$_tag" "$_action" "$_argvtag"
+    else
+      loomux_audit "release-id-resolved" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"action\":\"$_action\"}"
+    fi
   fi
   _safe=$(printf '%s' "$_tag" | tr -c 'A-Za-z0-9._-' '_')
   loomux_norm_guard "$_tag" "$_safe" "release-grant-tag"
@@ -686,7 +713,9 @@ __GIT_PLUMBING__
 if [ "$cmd" = "release" ]; then
   case "$sub" in
     create|edit|delete)
-      loomux_release_gate "$sel" "$sub" ""   # allow (return) or block (exit); tag = $sel
+      # `gh release <sub> <tag>` names its tag as the SELECTOR — that is the locus,
+      # not a body field, so there is no id to resolve and nothing to cross-check.
+      loomux_release_gate "$sel" "$sub" "" ""   # allow (return) or block (exit); tag = $sel
       exec "$REAL_GH" "$@" ;;
     *) exec "$REAL_GH" "$@" ;;
   esac
@@ -832,31 +861,64 @@ if [ "$cmd" = "api" ]; then
     fi
   fi
   if [ "$is_rel" = "1" ]; then
-    # #437: when nothing in the argv named a tag, hand the gate the release
-    # resource this call addresses so it can resolve id → tag itself.
+    # #437: hand the gate the release resource this call addresses, so it can
+    # resolve id → tag itself.
     #
-    # Resolve ONLY when the numeric id is the LAST path segment, and never when
-    # the path contains `..`. Both are load-bearing, not tidiness: the gate would
-    # otherwise resolve a PREFIX of the real target and authorize a different
-    # write. `…/releases/555/../../444` has `555` sitting where an id goes, so a
-    # prefix-based lookup reads release 555's tag and matches the grant — while
-    # gh's own URL normalization sends the PATCH to release 444. The grant must
-    # only ever cover the exact release whose tag was checked, so anything with a
-    # suffix after the id (`/assets`, a traversal, a percent-encoded one) resolves
-    # to nothing and stays fail-closed exactly as it was before this fix.
-    _relpath=""
-    if [ -z "$rtag" ]; then
-      case "$path_low" in
-        *..*) : ;;
-        releases/*|*/releases/*)
-          _rid=${path_low##*releases/}
-          case "$_rid" in
-            ''|*[!0-9]*) : ;;
-            *) _relpath="$path_low" ;;
-          esac ;;
-      esac
-    fi
-    loomux_release_gate "$rtag" "api" "$_relpath"   # allow (return) or block (exit)
+    # `_relid=1` means "this URL names ONE SPECIFIC release by numeric id". That
+    # flag is computed UNCONDITIONALLY — never skipped because the argv happened
+    # to mention a tag — and it is the security-critical half of #437 (rev B1).
+    # For such a call the release's identity is the ID; `tag_name=`/`ref=` are
+    # body fields the CALLER chose, so trusting them here let one live grant
+    # reach every release in the repo:
+    #   gh api -X PATCH repos/o/r/releases/777 -f tag_name=v1.2.3 -f make_latest=true
+    # keyed the gate on v1.2.3, found the human's grant, and retagged release 777
+    # (never authorized by anyone) plus stole `latest`. `-X DELETE … -f
+    # tag_name=v1.2.3` did the same to delete one — `tag_name` is ignored by the
+    # API on a DELETE, so it existed purely to satisfy the gate. That is the
+    # mirror image of the decoys `gh_shim_harness_gates_raw_api_tag_ref_by_locus_
+    # defeating_decoys` already defeats: those loosen the gate, these SATISFY it.
+    # This is exactly the locus principle the rest of this arm follows — for
+    # `git/refs/tags/v9` the locus IS the tag; for `releases/<id>` it is the id.
+    #
+    # `_relpath` — the resource to GET — is `$a_path` ITSELF, not a reconstructed
+    # prefix and not the lowercased copy (rev N2). That is the property the whole
+    # resolution rests on: gh normalizes the string it is given, so resolving and
+    # writing the SAME string can never address two different releases. An earlier
+    # cut resolved `${prefix}releases/${id}`, and there `…/releases/555/../444`
+    # really would have read release 555's tag and written to 444 — with `$a_path`
+    # that divergence is not expressible.
+    #
+    # So the two shape tests below are NOT what makes traversal safe (the PR body
+    # said they were; that was written against the prefix design and was wrong).
+    # What they do is decide `_relid`, and that is load-bearing for a different
+    # reason: a URL that names a release loomux cannot pin down must still count
+    # as id-addressed, so the argv tag is refused the chance to speak for it.
+    #   - `…/releases/555/assets`  → id-addressed, unidentifiable → refuse
+    #   - `…/releases/../777`      → id-addressed, unidentifiable → refuse
+    # Drop either test and `-f tag_name=<granted>` walks through on those shapes,
+    # which is B1 again in a different dress. Both are pinned by mutation.
+    # `…/releases/tags/v1.0.0` and `…/releases/latest` name no id and are left to
+    # the ordinary tag-locus path.
+    _relpath=""; _relid=0
+    case "$path_low" in
+      releases/*|*/releases/*)
+        case "$path_low" in
+          *..*)
+            # A traversal inside a releases URL: whatever it resolves to, loomux
+            # cannot say WHICH release that is, so nothing may speak for it.
+            _relid=1 ;;
+          *)
+            _rid=${path_low##*releases/}
+            case "$_rid" in
+              ''|*[!0-9]*)
+                # Not a bare id — but still id-ADDRESSED when it STARTS with
+                # digits (`555/assets`), i.e. a sub-resource of one release.
+                case "$_rid" in [0-9]*) _relid=1 ;; esac ;;
+              *) _relid=1; _relpath="$a_path" ;;
+            esac ;;
+        esac ;;
+    esac
+    loomux_release_gate "$rtag" "api" "$_relpath" "$_relid"   # allow (return) or block (exit)
     exec "$REAL_GH" "$@"
   fi
 fi

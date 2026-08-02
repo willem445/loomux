@@ -18005,12 +18005,16 @@ fn release_grant_covers_one_tags_whole_pipeline_and_resolves_release_ids_fail_cl
     assert!(!run_gh(&["release", "create", "v0.0.9"]), "…nor publishing another tag by name");
     assert!(!run_git(&["push", "origin", "refs/tags/v9.9.9"]), "…nor pushing another tag");
 
-    // A path whose numeric id is only a PREFIX of the real target must not
-    // resolve: gh normalizes `…/releases/555/../777` to release 777, so
-    // resolving the `555` sitting in the id slot would check one release's tag
-    // and then write to another. Same for any other suffix after the id.
+    // A URL that names a release loomux cannot pin down — a traversal, or a
+    // sub-resource of one — resolves to nothing and is refused. (What makes
+    // that *safe* rather than merely conservative is that the resolving GET
+    // uses the write's own path verbatim, so the two can never address
+    // different releases; these shapes are refused because identity can't be
+    // established, and `an_id_addressed_release_write_never_takes_its_identity_
+    // from_a_caller_supplied_tag` is where it matters that the argv tag doesn't
+    // get to answer instead.)
     assert!(!run_gh(&["api", "-X", "PATCH", "repos/o/r/releases/555/../777", "-f", "make_latest=true"]),
-        "a traversal past the id must not be resolved from its prefix");
+        "a traversal inside a releases URL is not identifiable → refused");
     assert!(!run_gh(&["api", "-X", "POST", "repos/o/r/releases/555/assets"]),
         "a sub-resource of the granted release resolves to nothing → stays fail-closed");
 
@@ -18096,6 +18100,106 @@ fn release_id_addressed_calls_resolve_to_their_tag_before_the_grant_is_checked()
     let _ = std::fs::remove_dir_all(group.join("release_grants"));
     assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-F", "body=@notes.md"]),
         "resolving an id must not by itself authorize anything");
+}
+
+#[test]
+fn an_id_addressed_release_write_never_takes_its_identity_from_a_caller_supplied_tag() {
+    // rev B1. Widening the grant to a whole pipeline is paid for by the claim
+    // that it still reaches exactly ONE tag — and that claim was false. The
+    // resolution was conditional on the argv naming no tag, so one extra flag
+    // suppressed it and handed a live grant the run of every release in the repo:
+    //
+    //   gh api -X PATCH repos/o/r/releases/777 -f tag_name=v1.2.3 -f make_latest=true
+    //
+    // keyed the gate on v1.2.3, found the human's grant for it, and then retagged
+    // release 777 and took `latest`. `-X DELETE … -f tag_name=v1.2.3` deleted an
+    // arbitrary release the same way (`tag_name` is ignored by the API on a
+    // DELETE — it existed only to satisfy the gate).
+    //
+    // This is the MIRROR of the decoys in
+    // `gh_shim_harness_gates_raw_api_tag_ref_by_locus_defeating_decoys`: those
+    // try to LOOSEN the gate with a cosmetic `refs/heads`, these SATISFY it with
+    // a cosmetic tag. The suite had no case for that direction, which is why the
+    // hole survived a green run. The rule pinned here: for a URL that names one
+    // release, identity comes from the ID, never from a body field the caller
+    // wrote — including when the id cannot be resolved, where the argv tag must
+    // not get to answer instead.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP an_id_addressed_release_write_never_takes…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    // 555 → v1.2.3 (granted). 777 → v0.0.9 (someone else's). 888 → a tag_name
+    // that is not a plausible ref name at all. Nothing else resolves.
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_REL_MAP", "555=v1.2.3 777=v0.0.9 888=has;semi")
+            .status().unwrap().success()
+    };
+    let grant = |tag: &str| {
+        let d = group.join("release_grants");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(tag), b"99999999999\n1\n").unwrap();
+    };
+    let audit = || std::fs::read_to_string(group.join("audit.jsonl")).unwrap_or_default();
+    let clear_audit = || { std::fs::write(group.join("audit.jsonl"), b"").unwrap(); };
+
+    // Control: the grant genuinely works for the release it is for, so every
+    // refusal below is the decoy being rejected and not the gate being shut.
+    grant("v1.2.3");
+    assert!(run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-F", "body=@notes.md"]),
+        "control: the granted release's own notes write is allowed");
+
+    // THE B1 SHAPES. Each names release 777 — which belongs to v0.0.9 — while
+    // claiming the granted tag in a field the caller chose.
+    for decoy in [
+        &["api", "-X", "PATCH", "repos/o/r/releases/777", "-f", "tag_name=v1.2.3", "-f", "make_latest=true"] as &[&str],
+        &["api", "-X", "DELETE", "repos/o/r/releases/777", "-f", "tag_name=v1.2.3"],
+        &["api", "-X", "PATCH", "repos/o/r/releases/777", "-F", "ref=refs/tags/v1.2.3"],
+        // …and the two shapes where the id CANNOT be resolved, where falling back
+        // to the argv tag would reopen the hole in a different dress.
+        &["api", "-X", "POST", "repos/o/r/releases/777/assets", "-f", "tag_name=v1.2.3"],
+        &["api", "-X", "PATCH", "repos/o/r/releases/../777", "-f", "tag_name=v1.2.3"],
+    ] {
+        assert!(!run(decoy), "a caller-supplied tag must not authorize an id-addressed write: {decoy:?}");
+    }
+
+    // The inverse direction: the URL names the GRANTED release, but the body
+    // would move it onto another tag. That publishes a tag nobody authorized, so
+    // it is refused rather than allowed on the strength of the resolved tag.
+    clear_audit();
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-f", "tag_name=v9.9.9"]),
+        "retagging the granted release onto an ungranted tag must be refused");
+    let a = audit();
+    assert!(a.contains("release-id-tag-mismatch"), "the two-tags-named case is audited distinctly, got: {a}");
+
+    // A tag_name read back from the API that is not a plausible ref name is
+    // rejected before it can be path-sanitized into some OTHER grant's segment
+    // (`has;semi` would sanitize to `has_semi`).
+    grant("has_semi");
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/888", "-F", "body=@notes.md"]),
+        "an implausible resolved tag_name must be rejected, not sanitized into a grant match");
+
+    // Unchanged: for `POST …/releases` (create) there is no id in the URL, so
+    // tag_name IS the locus and still keys the grant. This is the case the B1
+    // fix must not break.
+    grant("v1.2.3");
+    assert!(run(&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v1.2.3"]),
+        "creating a release still keys on tag_name — there is no id to resolve");
+    assert!(!run(&["api", "-X", "POST", "repos/o/r/releases", "-f", "tag_name=v8"]),
+        "…and still refuses another tag");
 }
 
 #[test]
