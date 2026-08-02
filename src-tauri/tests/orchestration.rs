@@ -13,8 +13,8 @@ use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
 // #656 (rev-lead findings 1 and 2): the bounded child wait, and the
 // process-wide ceiling on readers abandoned by a timed-out capture.
 use loomux_lib::orchestration::{
-    gh_capture_admitted, gh_capture_live_readers, seed_leaked_readers_for_test, wait_bounded,
-    GH_CAPTURE_MAX_LEAKED_READERS,
+    gh_capture_admitted, gh_capture_live_readers, gh_capture_parked_readers, seed_leaked_readers_for_test,
+    wait_bounded, GH_CAPTURE_MAX_LEAKED_READERS,
 };
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
@@ -31100,22 +31100,32 @@ fn a_timeout_that_cannot_close_its_pipes_parks_its_readers_in_the_backlog() {
 /// needs `Child::try_wait` to error, which no supported platform does on
 /// demand; every other step (spawn, readers, kill, reap, accounting) is the
 /// same code the production entry point runs.
+///
+/// Counts the backlog list **unswept**, unlike the timeout test above. That
+/// test can afford the swept count because its child has held the pipes open
+/// for a full second through a grandchild by the time it is killed; here the
+/// forced error arrives at once, the kill closes both pipes within
+/// milliseconds, and a swept count then reads the same whether the handles
+/// were parked or dropped — a race this test lost on two platforms and won on
+/// the third before it was written this way. What is being pinned is the
+/// accounting, not how long the readers happened to survive it.
 #[test]
-fn a_wait_error_parks_its_readers_exactly_like_a_timeout_does() {
+fn a_wait_error_parks_both_its_readers_where_the_ceiling_can_see_them() {
     let _serial = capture_lock();
-    let before = gh_capture_live_readers();
+    let before = gh_capture_parked_readers();
 
     let err = loomux_lib::orchestration::capture_raw_with_failing_wait_for_test(
-        shell_command(&hold_pipes_script()),
+        shell_command(&sleep_script(20)),
         Duration::from_secs(1),
     )
     .expect_err("a wait that fails is a failed capture");
     assert!(err.contains("forced wait failure"), "precondition: this must be the wait-error arm, not the timeout: {err}");
 
-    assert!(
-        gh_capture_live_readers() > before,
-        "the readers a failed wait abandons must be counted like a timeout's, not dropped where \
-         the ceiling can never see them"
+    assert_eq!(
+        gh_capture_parked_readers(),
+        before + 2,
+        "BOTH readers a failed wait abandons must be handed to the ceiling, not dropped where the \
+         sweep can never see them — one or none is how a bound comes to understate its own backlog"
     );
 }
 

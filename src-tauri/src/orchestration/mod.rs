@@ -1721,11 +1721,7 @@ fn capture_raw_inner(
     // the process it exists to bound, and the child stayed alive too (dropping
     // a `Child` does not kill it), which is precisely what keeps those readers
     // blocked forever.
-    let waited = match wait(&mut child, timeout) {
-        Ok(waited) => waited,
-        Err(e) => return Err(abandon_child_and_readers(&mut child, out_reader, err_reader, e)),
-    };
-    let Some(status) = waited else {
+    let Some(status) = wait(&mut child, timeout)? else {
         return Err(abandon_child_and_readers(
             &mut child,
             out_reader,
@@ -1748,6 +1744,21 @@ fn capture_raw_inner(
 #[doc(hidden)] // pub for integration tests: observe the process-wide reader backlog
 pub fn gh_capture_live_readers() -> usize {
     sweep_leaked_readers()
+}
+
+/// The backlog list itself, **unswept**: how many reader handles are parked,
+/// whether or not their reader has since ended (#699).
+///
+/// `gh_capture_live_readers` answers the question the ceiling asks and is
+/// therefore the wrong instrument for pinning the accounting: on an ordinary
+/// abandonment the kill closes both pipes and the readers end within
+/// milliseconds, so a swept count cannot tell "parked, then ended" from "never
+/// parked at all" — it reads the same either way, and which one a test sees is
+/// a race it loses on some platforms and not others. Counting the list itself
+/// makes "both handles were handed to the ceiling" observable on its own terms.
+#[doc(hidden)] // pub for integration tests
+pub fn gh_capture_parked_readers() -> usize {
+    GH_CAPTURE_LEAKED_READERS.lock_safe().len()
 }
 
 /// Park `n` controllable blocked readers in the backlog, as a real abandoned
