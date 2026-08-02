@@ -30784,6 +30784,212 @@ fn intake_half_keeps_its_scan_floor_while_notify_runs_every_wake() {
     assert_eq!(reg.intake_last_poll_at(&gid), Some(wake1 + 60_000), "…and that scan ran too, restamping the group");
 }
 
+// ---------- bounding one poll tick (#656): the subprocess wait, the intake fan-out ----------
+//
+// Still no `gh` and no agent CLI anywhere in this section. The subprocess
+// tests drive `capture_with_timeout` — the exact body `gh_capture` runs, with
+// the `gh` argv swapped for a deliberately slow / chatty / failing shell
+// command — and the intake test reaches `poll_intake` on a live registry
+// whose groups point at nonexistent repo paths, so every `gh_capture` inside
+// it returns at the "no such directory" guard before a program is resolved.
+
+/// Lands as `intake::MAX_INTAKE_POLLS_PER_TICK` in the next commit.
+const MAX_INTAKE_POLLS_PER_TICK: usize = 4;
+
+/// Today's `gh_capture` body, verbatim: a bare `output()` that takes a bound
+/// and ignores it. The stalled-child test below runs against this, and is
+/// meant to fail — that failure IS the defect #656 reports.
+fn capture_base_shape(mut cmd: std::process::Command, _timeout: Duration) -> Result<String, String> {
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if err.is_empty() { Err(format!("gh exited with {}", out.status)) } else { Err(err) }
+    }
+}
+
+/// The obvious bounded implementation — poll `try_wait`, kill at the
+/// deadline, read the pipes once the child has exited — with nothing
+/// draining them while it waits. The pipe-buffer test below runs against
+/// this, and is meant to fail: that is the second defect, the one a bound
+/// written the obvious way would ship instead of the first.
+fn capture_naive_bounded(mut cmd: std::process::Command, timeout: Duration) -> Result<String, String> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("timed out after {}s", timeout.as_secs()));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if err.is_empty() { Err(format!("gh exited with {}", out.status)) } else { Err(err) }
+    }
+}
+
+/// A `Command` running `script` through the host shell: the portable way to
+/// spawn a child that behaves a specific way (stalls, floods its pipe, exits
+/// non-zero) without shelling out to `gh`, which no test here may do.
+fn shell_command(script: &str) -> std::process::Command {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C");
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c");
+        c
+    };
+    cmd.arg(script);
+    cmd
+}
+
+/// A shell script that does nothing for `secs` seconds. `ping` is the
+/// dependency-free Windows sleep: `-n N` sends N pings a second apart, so
+/// N = secs + 1 loopback pings take about `secs`.
+fn sleep_script(secs: u32) -> String {
+    if cfg!(windows) { format!("ping -n {} 127.0.0.1 >NUL", secs + 1) } else { format!("sleep {secs}") }
+}
+
+/// A stalled `gh` — the whole reason this bound exists — must not hold the
+/// caller for the child's lifetime. Since #406 there is ONE loop making `gh`
+/// calls, so an unbounded wait here stops every `notify_when` notice in the
+/// process, and the fleet's "register the watch, end the turn" discipline
+/// rests on those notices arriving.
+///
+/// The child outlives its bound by 20x, so returning early cannot be luck,
+/// and the assertion is on ELAPSED time rather than on the message alone: an
+/// implementation that reported "timed out" only after `output()` finally
+/// returned would satisfy the string and none of the point.
+#[test]
+fn capture_with_timeout_stops_waiting_on_a_stalled_child() {
+    let started = std::time::Instant::now();
+    let err = capture_base_shape(shell_command(&sleep_script(20)), Duration::from_secs(1))
+        .expect_err("a child that outlives the bound must fail the capture, not be waited out");
+    let waited = started.elapsed();
+    assert!(err.contains("timed out"), "the error must name the bound as the cause, not look like a gh failure: {err}");
+    assert!(
+        waited < Duration::from_secs(10),
+        "the wait must be bounded by the timeout, not by the child (slept {waited:?} against a 20s child)"
+    );
+}
+
+/// The bound is a ceiling, not a schedule: a child that finishes returns its
+/// own stdout, immediately, exactly as `Command::output()` did.
+#[test]
+fn capture_with_timeout_returns_a_finished_childs_stdout() {
+    let out = capture_base_shape(shell_command("echo loomux-656"), Duration::from_secs(10))
+        .expect("a fast child must succeed");
+    assert!(out.contains("loomux-656"), "stdout must be captured verbatim, not summarized: {out:?}");
+}
+
+/// The failure mode the reader threads exist to prevent, and the one a
+/// "simplify it to try_wait + wait_with_output" edit would reintroduce: a
+/// child whose output exceeds the OS pipe buffer blocks writing until someone
+/// drains it. Nobody draining means the child never exits, so a HEALTHY `gh
+/// issue list` on a busy repo would time out every single tick — the bound
+/// turned into a new outage instead of a backstop.
+///
+/// 512 KiB is comfortably past both platforms' default buffer (64 KiB
+/// Windows, 64 KiB Linux, 16 KiB macOS) on stdout alone.
+#[test]
+fn capture_with_timeout_drains_output_larger_than_a_pipe_buffer() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.txt");
+    let payload = "loomux-656 ".repeat(48 * 1024); // ~512 KiB
+    fs::write(&big, &payload).unwrap();
+    let script = if cfg!(windows) {
+        format!("type \"{}\"", big.display())
+    } else {
+        format!("cat '{}'", big.display())
+    };
+
+    let started = std::time::Instant::now();
+    let out = capture_naive_bounded(shell_command(&script), Duration::from_secs(10))
+        .expect("a chatty but healthy child must complete, not trip the bound");
+    assert!(
+        out.len() >= payload.len(),
+        "the whole stream must be captured, not one buffer's worth: got {} of {} bytes",
+        out.len(),
+        payload.len()
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "…and must not have needed the bound to get there");
+}
+
+/// A child that fails on its own is still a child failure: the timeout must
+/// not swallow, relabel, or delay it. `poll_watches` turns this `Err` into a
+/// fail-streak increment and `poll_intake` into a skipped half-diff, and both
+/// classifications predate the bound.
+#[test]
+fn capture_with_timeout_reports_a_nonzero_exit_as_the_childs_own_failure() {
+    let started = std::time::Instant::now();
+    let err = capture_base_shape(shell_command("exit 3"), Duration::from_secs(10))
+        .expect_err("a non-zero exit is an Err, exactly as `output()` made it");
+    assert!(!err.contains("timed out"), "a child that exited must never be reported as a timeout: {err}");
+    assert!(err.contains('3'), "the exit status must survive into the message the caller surfaces: {err}");
+    assert!(started.elapsed() < Duration::from_secs(5), "an immediate failure must return immediately");
+}
+
+/// The intake half's per-scan cap, on a live registry rather than only in the
+/// pure selector: N autonomous groups falling due on one scan wake used to be
+/// 2N sequential `gh` round-trips inside a single tick of the one loop that
+/// also delivers every watch notice.
+///
+/// Asserts the EFFECT (`intake_last_poll_at` moves only for a group the scan
+/// actually reached the `gh` call for) and the deferral: the groups the cap
+/// left out are polled by the very next scan, so the cap is a queue and not a
+/// starvation. Every group's repo path is nonexistent, so the scan runs its
+/// whole body against `Err`s and spawns nothing.
+#[test]
+fn poll_intake_caps_one_scan_and_polls_the_deferred_groups_on_the_next() {
+    let (reg, _d) = test_registry();
+    let due_groups = MAX_INTAKE_POLLS_PER_TICK + 3;
+    let mut gids = Vec::new();
+    for i in 0..due_groups {
+        // Distinct repo paths: the group id is repo-derived, and a group with
+        // no live agents is reused rather than duplicated.
+        let g = reg
+            .create_group(
+                &format!("C:/tmp/repo-656-{i}"),
+                Guardrails { intake_poll_minutes: Some(1), idle_tick_fallback_minutes: 180, ..rails() },
+            )
+            .unwrap();
+        reg.set_autonomous(&g.id, true).unwrap();
+        gids.push(g.id);
+    }
+
+    let scanned = |now: u64| gids.iter().filter(|g| reg.intake_last_poll_at(g) == Some(now)).count();
+
+    let first = now_ms() + 60 * 60_000; // every group is due: none has ever been polled
+    reg.poll_intake(first);
+    assert_eq!(
+        scanned(first),
+        MAX_INTAKE_POLLS_PER_TICK,
+        "one scan must poll at most the cap, however many groups came due together"
+    );
+
+    // The same instant, so nothing has newly become due and the groups just
+    // polled are inside their own per-group floor: this scan can only be the
+    // deferred ones.
+    reg.poll_intake(first);
+    let polled_at_all = gids.iter().filter(|g| reg.intake_last_poll_at(g).is_some()).count();
+    assert_eq!(polled_at_all, due_groups, "the groups the cap deferred must be picked up by the next scan, not starved");
+}
+
 // ---------- group_watches: the group view's "⏳ waiting on …" indicator (#248) ----------
 
 #[test]

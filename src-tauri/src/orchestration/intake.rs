@@ -696,6 +696,96 @@ mod tests {
         assert_eq!(due_intake_polls(1_000 + 5 * 60_000, &groups, &last), vec!["g1".to_string()]);
     }
 
+    // ---------- due_intake_polls: the per-scan cap (#656) ----------
+
+    /// Lands as the module-level `MAX_INTAKE_POLLS_PER_TICK` in the next
+    /// commit; declared here so the tests below are byte-identical across the
+    /// red run and the green one.
+    const MAX_INTAKE_POLLS_PER_TICK: usize = 4;
+
+    /// Every group due at once (the case this cap exists for: N autonomous
+    /// groups falling due on the same scan wake) must still cost at most
+    /// `MAX_INTAKE_POLLS_PER_TICK` groups' worth of `gh` — the intake half
+    /// runs inside the one loop that also delivers every watch notice.
+    #[test]
+    fn due_intake_polls_caps_one_scan_however_many_are_due() {
+        let mut groups = HashMap::new();
+        for i in 0..(MAX_INTAKE_POLLS_PER_TICK + 6) {
+            groups.insert(format!("g{i:02}"), 5u32);
+        }
+        let due = due_intake_polls(1_000_000, &groups, &HashMap::new());
+        assert_eq!(due.len(), MAX_INTAKE_POLLS_PER_TICK, "an uncapped scan is 2 gh calls per due group");
+        let distinct: HashSet<&String> = due.iter().collect();
+        assert_eq!(distinct.len(), due.len(), "the cap must select distinct groups, not repeat one");
+    }
+
+    /// The cap is a deferral, not a drop: whoever the cap left out is the
+    /// oldest-polled on the next scan, so it is taken first there. Simulated
+    /// by stamping exactly what `poll_intake` stamps — the same `now`, only
+    /// for the groups the scan actually returned.
+    #[test]
+    fn due_intake_polls_defers_the_overflow_to_the_next_scan_instead_of_starving_it() {
+        let mut groups = HashMap::new();
+        for i in 0..(MAX_INTAKE_POLLS_PER_TICK * 2) {
+            groups.insert(format!("g{i:02}"), 5u32);
+        }
+        let now = 1_000_000u64;
+        let mut last = HashMap::new();
+
+        let first = due_intake_polls(now, &groups, &last);
+        for g in &first {
+            last.insert(g.clone(), now);
+        }
+        // Same instant, so nothing new has become due — but the first scan's
+        // groups are now inside their per-group floor and the deferred ones
+        // are not, which is what makes the next scan pick up exactly them.
+        let second = due_intake_polls(now, &groups, &last);
+        assert_eq!(second.len(), MAX_INTAKE_POLLS_PER_TICK, "the deferred groups must be due on the very next scan");
+        let overlap: Vec<&String> = second.iter().filter(|g| first.contains(g)).collect();
+        assert!(overlap.is_empty(), "a group already polled this floor must not be re-polled ahead of a deferred one: {overlap:?}");
+
+        let covered: HashSet<&String> = first.iter().chain(second.iter()).collect();
+        assert_eq!(covered.len(), groups.len(), "two scans must cover every due group — the cap defers, it never starves");
+    }
+
+    /// Oldest-polled first, so the cap rotates. A plain truncation of
+    /// `HashMap` iteration order would cut at an arbitrary but *stable* point
+    /// and starve the same groups every scan; this is the ordering that turns
+    /// the cap into a round-robin.
+    #[test]
+    fn due_intake_polls_takes_the_oldest_polled_first() {
+        let mut groups = HashMap::new();
+        let mut last = HashMap::new();
+        // Staggered stamps, all far enough back to be due: g00 is the
+        // stalest, g09 the freshest.
+        for i in 0..10u64 {
+            groups.insert(format!("g{i:02}"), 5u32);
+            last.insert(format!("g{i:02}"), 1_000 + i * 1_000);
+        }
+        let due = due_intake_polls(1_000 + 60 * 60_000, &groups, &last);
+        let expected: Vec<String> = (0..MAX_INTAKE_POLLS_PER_TICK).map(|i| format!("g{i:02}")).collect();
+        assert_eq!(due, expected, "the cap must take the stalest groups, in staleness order");
+    }
+
+    /// Never-polled groups all share `last = 0`, so without a tiebreak the
+    /// selection among them would be `HashMap` iteration order — a different
+    /// four each run, and (with a fixed seed) possibly the same four forever.
+    /// The group name breaks the tie so one due set always yields one answer.
+    #[test]
+    fn due_intake_polls_is_deterministic_among_never_polled_groups() {
+        let mut groups = HashMap::new();
+        for i in 0..(MAX_INTAKE_POLLS_PER_TICK + 6) {
+            groups.insert(format!("g{i:02}"), 5u32);
+        }
+        let first = due_intake_polls(1_000_000, &groups, &HashMap::new());
+        // Rebuilding the map changes its iteration order in general; the
+        // selection must not move with it.
+        let rebuilt: HashMap<String, u32> = groups.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        assert_eq!(due_intake_polls(1_000_000, &rebuilt, &HashMap::new()), first);
+        let expected: Vec<String> = (0..MAX_INTAKE_POLLS_PER_TICK).map(|i| format!("g{i:02}")).collect();
+        assert_eq!(first, expected, "ties break on the group id, so the answer is stated, not hash-dependent");
+    }
+
     // ---------- effective_intake_poll_minutes (#429 smart default) ----------
 
     #[test]
