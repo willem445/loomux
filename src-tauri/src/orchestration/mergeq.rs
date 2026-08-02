@@ -1017,18 +1017,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_state_never_degrades_into_a_batchable_one() {
+    fn an_unknown_state_is_a_hard_error_not_a_ninth_state() {
         // An unknown STATE is not an unknown field: there is no ninth state to
         // put it in, and a state loomux cannot interpret is not one it may act
-        // on. Hard parse error → §4's reconcile fails the file loudly.
+        // on. Hard parse error → §4's reconcile fails the file loudly, rather
+        // than the graceful degradation the *fields* get.
         let bad = r#"{"version":1,"entries":[{"pr":1,"state":"paused"}]}"#;
         assert!(serde_json::from_str::<MergeQueueState>(bad).is_err());
-        // A file with no version at all is malformed, not "probably v1".
-        let bad = r#"{"entries":[]}"#;
-        assert!(serde_json::from_str::<MergeQueueState>(bad).is_err());
+    }
 
-        // A file from a FUTURE schema parses structurally (so the driver can
-        // leave it alone intact) but reports itself unsupported.
+    #[test]
+    fn a_versionless_file_is_malformed_and_a_future_version_reports_unsupported() {
+        // A file with no version at all is malformed, not "probably v1".
+        assert!(serde_json::from_str::<MergeQueueState>(r#"{"entries":[]}"#).is_err());
+        // A file from a FUTURE schema parses structurally — so the driver can
+        // leave it alone, intact — but reports itself unsupported rather than
+        // being acted on with fields that may no longer mean the same thing.
         let future: MergeQueueState = serde_json::from_str(r#"{"version":2,"entries":[]}"#).unwrap();
         assert!(!future.version_supported());
         assert!(MergeQueueState::default().version_supported());
@@ -1246,39 +1250,56 @@ mod tests {
     }
 
     #[test]
-    fn the_body_digest_asymmetry_is_preserved() {
+    fn the_body_digest_asymmetry_checks_live_passes_and_skips_blockers() {
         // #565's asymmetry: only PASSES are digest-checked. A fail/escalate
         // whose body moved afterwards is the fix loop working as intended, and
         // re-staling it would ping-pong forever — body finding → worker fixes
         // the body → verdict auto-stales → re-review → repeat.
+        //
+        // Pinned on the CLAUSE rather than through `recheck_gate`, and that is
+        // the whole reason this test is shaped this way: the reviewer half
+        // refuses a blocking verdict before any `also:` clause runs, so a case
+        // routed through `recheck_gate` is satisfied by that short-circuit and
+        // stays green with the asymmetry removed. The first version of this
+        // test did exactly that and proved nothing; it was caught by asking
+        // which mutation would redden it, which is the only question that
+        // separates a test from a decoration.
         let now = body_digest("the body as it stands");
-        let then = body_digest("the body that was failed");
-        let g = GateSpec::Declared(Gate {
-            require: GateRequire::Threshold(1),
-            reviewers: vec!["rev-a".into(), "rev-b".into()],
-            also: vec!["body-unchanged".into()],
-        });
+        let then = body_digest("the body that was reviewed earlier");
+        let g = gate(&["rev-a", "rev-b"], &["body-unchanged"]);
+
+        // rev-b recorded a FAIL against an older body: not reported.
         let v: BTreeMap<_, _> = [
             verdict("rev-a", Verdict::Pass, "NEW", &now),
-            // rev-b failed an older body. That refuses the merge on the
-            // reviewer half (blockers beat approvals) — but it must refuse as
-            // `Blocked`, NOT as a body-changed finding against rev-b.
             verdict("rev-b", Verdict::Fail, "NEW", &then),
         ]
         .into();
-        assert_eq!(
-            recheck_gate(&g, &v, Some("NEW"), &observed(None, Some(&now))),
-            GateRecheck::Reviewers(GateOutcome::Blocked { blocking: vec!["rev-b".into()] })
-        );
+        assert_eq!(body_unchanged(&g, &v, Some("NEW"), Some(&now)), None);
 
-        // With the blocker cleared to a pass over the CURRENT body, the gate
-        // opens — proving the previous refusal was the blocker and not a
-        // digest complaint about a stale-bodied verdict.
+        // `escalate` is skipped for the same reason a `fail` is.
         let v: BTreeMap<_, _> = [
             verdict("rev-a", Verdict::Pass, "NEW", &now),
-            verdict("rev-b", Verdict::Pass, "NEW", &now),
+            verdict("rev-b", Verdict::Escalate, "NEW", &then),
         ]
         .into();
-        assert!(recheck_gate(&g, &v, Some("NEW"), &observed(None, Some(&now))).passed());
+        assert_eq!(body_unchanged(&g, &v, Some("NEW"), Some(&now)), None);
+
+        // The same reviewer, the same stale digest, recorded as a PASS: that
+        // one IS reported — it is an approval of a commit message that is not
+        // the one that would land.
+        let v: BTreeMap<_, _> = [
+            verdict("rev-a", Verdict::Pass, "NEW", &now),
+            verdict("rev-b", Verdict::Pass, "NEW", &then),
+        ]
+        .into();
+        assert_eq!(
+            body_unchanged(&g, &v, Some("NEW"), Some(&now)),
+            Some(ConditionRefusal::BodyChanged { reviewers: vec!["rev-b".into()] })
+        );
+
+        // A pass against an EARLIER head is skipped too: it is not what would
+        // land, and the reviewer half already counts it as stale (§6).
+        let v: BTreeMap<_, _> = [verdict("rev-b", Verdict::Pass, "OLD", &then)].into();
+        assert_eq!(body_unchanged(&g, &v, Some("NEW"), Some(&now)), None);
     }
 }
