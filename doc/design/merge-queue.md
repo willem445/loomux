@@ -3,7 +3,7 @@
 Status: **design only — no queue code exists yet.** This note is slice B of #581 and gates
 every later slice; the plan (#581 comments, planner `plan-151`, parts 1–7) makes the note a
 hard prerequisite for slice C. Nothing here is implemented. Line numbers are as of this
-writing against `main` at `b37d633`; symbols are the durable reference, lines are a
+writing against `main` at `d8667d4`; symbols are the durable reference, lines are a
 convenience.
 
 Slices: **A** `Task.pr_base` (parallel with this note) · **B** this note · **C** `mergeq.rs`
@@ -206,7 +206,7 @@ Multi-target queues are deliberately out of v1. When they arrive they are a map 
 target → queue, which is why the target lives in the state file rather than in config.
 
 **Restart reconcile — the #467/#468 pattern, copied deliberately.** The delivery queue learned
-this the hard way; `mod.rs::recover_persisted_queue:31841` is the shape to mirror:
+this the hard way; `mod.rs::recover_persisted_queue:31842` is the shape to mirror:
 
 - **Two phases.** Phase 1 runs under a once-only guard held across the whole phase (the
   `HashSet::insert` doubles as the check): read the file, parse, classify entries into
@@ -676,7 +676,7 @@ read together.
 
 ### 11.5 Audit events
 
-Emitted through the registry's `audit(group, actor, action, detail)` (`mod.rs:17667`), kebab-
+Emitted through the registry's `audit(group, actor, action, detail)` (`mod.rs:17668`), kebab-
 case, matching the existing convention (`queue-recovered`, `merge-gate-allowed`, …):
 
 `mq-enqueued` · `mq-enqueue-refused` · `mq-batch-built` · `mq-batch-pushed` ·
@@ -711,11 +711,15 @@ One read-only Tauri command `orch_merge_queue` plus a typed wrapper in `src/pty.
   block for loomux itself is drafted in slice E for the human to accept or decline. Turning
   the queue on for the repo that develops the queue is a decision with its own risk, and it is
   not one a design note gets to make on the human's behalf.
-- **`templates/orchestrator.md` gains a queue-mode addendum** (slice E): the non-default-branch
-  line at ~667 gains a when-queue-enabled clause, and the merge-frontier section (~744–770)
-  gets the observation that the queue *reduces* the O(n²) fan-rebase pressure it warns about —
-  siblings need no proactive rebase after each batch, because the speculative merge **is** the
-  mergeability probe and only a real conflict kicks back.
+- **`templates/orchestrator.md` gains a queue-mode addendum** (slice E): the
+  "Merges onto non-default (integration) branches are never gated" line (`:673`) gains a
+  when-queue-enabled clause, and the **"Re-sync the fleet — every open branch, after every
+  merge"** section (heading at `:744`) gets the observation that the queue *reduces* the O(n²)
+  fan-rebase pressure it warns about — siblings need no proactive rebase after each batch,
+  because the speculative merge **is** the mergeability probe and only a real conflict kicks
+  back. That section is cited by **heading** rather than by line range on purpose: it is
+  actively edited (it grew past its old end-line twice during this PR's own review cycle), and
+  a range that silently stops covering what it names is worse than no citation.
 - **Reversal:** delete the yml block and the feature is off; with `enabled: false` every queue
   code path is unreachable, and a test pins that. The two flagged decisions have their own,
   narrower reversal seams (§3, §8).
