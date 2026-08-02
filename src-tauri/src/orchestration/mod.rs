@@ -34356,8 +34356,22 @@ impl OrchRegistry {
 
     /// The gate spec the queue re-enforces (§6), read through the same
     /// `merge_gate` file the `gh` shim reads — never a second opinion.
-    fn merge_queue_gate(&self, group: &str) -> mergeq::GateSpec {
-        mergeq::GateSpec::read(fs::read_to_string(self.merge_gate_path(group)).ok().as_deref())
+    ///
+    /// `Err` is an **I/O fault** distinct from `Ok(GateSpec::Absent)`: a missing
+    /// file (`NotFound`) is the repo genuinely declaring no gate and reads as
+    /// `Absent`, same as before. Anything else — permission denied, a transient
+    /// read failure, non-UTF-8 bytes — means the file may well declare a gate
+    /// loomux simply could not read, and collapsing that to `Absent` via
+    /// `Result::ok()` is what let `queue_merge` misreport a loomux fault as
+    /// `gate-not-configured` (#681). The caller turns `Err` into
+    /// `refusal::GATE_UNREADABLE`; `GateSpec::Malformed` (parseable file,
+    /// unparseable contents) is unaffected and still refuses `gate-not-met`.
+    fn merge_queue_gate(&self, group: &str) -> Result<mergeq::GateSpec, std::io::Error> {
+        match fs::read_to_string(self.merge_gate_path(group)) {
+            Ok(text) => Ok(mergeq::GateSpec::read(Some(&text))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(mergeq::GateSpec::Absent),
+            Err(e) => Err(e),
+        }
     }
 
     /// `queue_merge(pr, target?)` (§11.1). Wiring only: resolve the repo, the
@@ -34399,7 +34413,17 @@ impl OrchRegistry {
                 return json!({ "refused": mqloop::refusal::STATE_UNREADABLE });
             }
         };
-        let gate = self.merge_queue_gate(group);
+        let gate = match self.merge_queue_gate(group) {
+            Ok(g) => g,
+            Err(e) => {
+                // The gate file is on disk and an I/O error kept loomux from
+                // reading it — a FAULT, not "no gate covers this target"
+                // (#681, same posture as `STATE_UNREADABLE` above).
+                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
+                    json!({ "pr": pr, "reason": mqloop::refusal::GATE_UNREADABLE, "detail": format!("{e:?}") }));
+                return json!({ "refused": mqloop::refusal::GATE_UNREADABLE });
+            }
+        };
         let verdicts = self.verdict_map(group, pr);
         let outcome =
             mqloop::enqueue(runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms());

@@ -581,10 +581,15 @@ fn a_loomux_fault_is_labelled_as_one_and_never_as_a_policy_refusal() {
     let v = reg.queue_merge("no-such-group", 612, None);
     assert_eq!(v["refused"], json!("queue-unavailable"));
 
-    // And all three are flagged as faults by the predicate the tool descriptions
+    // And all four are flagged as faults by the predicate the tool descriptions
     // and any future caller branch on — so the distinction cannot be lost by
     // someone re-listing the strings and missing one.
-    for label in ["queue-state-unreadable", "queue-state-unwritable", "queue-unavailable"] {
+    for label in [
+        "queue-state-unreadable",
+        "queue-state-unwritable",
+        "queue-unavailable",
+        "gate-unreadable",
+    ] {
         assert!(loomux_lib::orchestration::mqloop::refusal::is_loomux_fault(label), "{label}");
     }
     for label in ["queue-disabled", "not-queued", "gate-not-met", "base-is-default"] {
@@ -635,6 +640,56 @@ fn a_queue_change_that_cannot_be_persisted_is_reported_as_unwritable() {
          not 'that PR was never queued'"
     );
     assert_eq!(v["cancelled"], Value::Null, "a fault never also reports success");
+}
+
+/// The gate half of #681: a `merge_gate` file that is ON DISK but an I/O error
+/// (here, permission denied) keeps loomux from reading it must refuse
+/// `gate-unreadable` — a loomux FAULT — never a policy refusal, which asserts
+/// something read a well-formed answer out of the file (present-and-declared,
+/// present-and-empty, or absent) rather than failing to read it at all.
+///
+/// This fixture's own repo has no `merge_queue:` block (`setup_mcp()`'s fake
+/// repo carries no `workflow.yml`), so `merge_queue_enabled` is false and the
+/// pre-fix label here is `queue-disabled`, not literally `gate-not-configured`
+/// — that one only fires once the queue is enabled and enqueue reaches the
+/// gate check. The property this test actually pins is the more general one
+/// #681 asked for: **a gate-read fault preempts every policy question**,
+/// `queue-disabled` included, the same way `STATE_UNREADABLE` already
+/// preempts it above — not merely the one policy label the issue happened to
+/// name. A malformed (but readable) gate file is NOT this case — it still
+/// parses fine as far as `fs::read_to_string` is concerned and correctly
+/// stays `gate-not-met` via `GateSpec::Malformed`, covered by the existing
+/// gate tests in mergequeue.rs.
+///
+/// `#[cfg(unix)]` for the same reason as the unwritable test above: Windows
+/// has no portable way to make an existing file's own read fail.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_gate_file_is_labelled_as_a_fault_never_a_policy_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+    let (reg, d, co, _cw) = setup_mcp();
+    let gate_file = d.path().join(&co.group).join("merge_gate");
+    fs::write(&gate_file, "require all-pass\nreviewer rev-a\n").unwrap();
+
+    // Readable state (none written — `load_state` defaults cleanly), but the
+    // gate file itself cannot be opened for reading.
+    fs::set_permissions(&gate_file, fs::Permissions::from_mode(0o000)).unwrap();
+    let v = reg.queue_merge(&co.group, 612, None);
+    // Restored before asserting, so a failure cannot leave an unreadable file
+    // behind for the tempdir's own cleanup.
+    fs::set_permissions(&gate_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        v["refused"],
+        json!("gate-unreadable"),
+        "an unreadable gate file must never masquerade as a policy refusal — \
+         here, pre-fix, it would read as 'queue-disabled' ('the repo never opted \
+         in'), when the truth is a loomux fault"
+    );
+    assert!(
+        loomux_lib::orchestration::mqloop::refusal::is_loomux_fault("gate-unreadable"),
+        "gate-unreadable must be flagged as a loomux fault, not a policy refusal"
+    );
 }
 
 /// A malformed `pr` argument is rejected before anything is resolved — the
