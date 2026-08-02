@@ -2707,7 +2707,11 @@ discipline (#590) rests on.
 - **Why the bound is generous rather than tight.** A false timeout is not free: three of them
   in a row cancel a watch that was about to resolve. A live `gh` call lands in ~1s and a
   genuinely stalled one hangs for minutes or forever, so the two cases separate at any value in
-  a wide band, and erring long costs only a slower tick.
+  a wide band, and erring long costs only a slower tick. Worth stating the price plainly: with
+  both caps, a tick makes at most 8×2 + 4×2 = 24 calls, so an all-stalled tick is bounded at
+  ~8 minutes rather than at infinity. That is a bound, not a comfortable one — it is the
+  pathological case (every call stalling at once), and tightening it further is a job for a
+  cross-half per-tick budget, which #406 deliberately did not ship and this does not either.
 - **Why both pipes are drained on their own threads.** The obvious shape — poll `try_wait`,
   read the output once the child reports exit — deadlocks against the very calls this poller
   makes: `gh issue list --json` on a busy repo outruns the OS pipe buffer, and a child blocked
@@ -2720,7 +2724,11 @@ discipline (#590) rests on.
   The intake half now has `intake::MAX_INTAKE_POLLS_PER_TICK` (4) — expressed as the same
   *`gh`-call* budget rather than the same group count, since a due group costs two calls. Before
   it, N autonomous groups falling due on one scan wake was 2N sequential round-trips inside a
-  single tick, and every watch notice waited behind them.
+  single tick, and every watch notice waited behind them. What the cap costs in exchange: a
+  group's effective cadence becomes `max(intake_poll_minutes, ceil(N/4) scans)` — the scan
+  itself is `INTAKE_POLL_SCAN_INTERVAL` (60s), so 20 autonomous groups all due at once are all
+  polled within 5 scans rather than in one burst. That is why `docs/autonomous-mode.md` calls
+  the per-group setting a floor rather than a schedule.
 - **The cap's ordering is load-bearing, not cosmetic.** `due_intake_polls` reads a `HashMap`, so
   a bare truncation would cut the due list at an arbitrary — but, for a given hash seed, stable
   — point and starve whichever groups landed on the wrong side of it. Sorting by `last_poll_ms`
