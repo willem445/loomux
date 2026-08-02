@@ -40,6 +40,45 @@ in an audit log.
 3. Set the repository, how many idle workers to start with, and the guardrails:
    **max live agents** and **permissions**.
 
+### Thinking level and context window
+
+Beside each role's CLI and model select, the launcher offers two more
+per-role knobs: **thinking level** and **context window** — three knobs in
+total (model, thinking level, context) for each of orchestrator, worker,
+reviewer, and planner. All three default to **CLI default** — the empty
+value, which loomux emits nothing for, so the CLI runs exactly as it would
+with no flag at all.
+
+- **Thinking level** sets how hard the model reasons before answering
+  (`low`/`medium`/`high`/`xhigh`/`max`), on Claude Code only. Copilot CLI and
+  Gemini CLI grey the control out with a reason shown inline: Copilot's
+  effort level lives in `~/.copilot/settings.json` with no flag or
+  environment variable to set it, and loomux never writes a user's global
+  settings file to reach it; Gemini's thinking level is a settings-file key
+  too (`modelConfigs.aliases.<alias>.thinkingConfig`) — the seam loomux uses
+  to generate a per-agent Gemini settings file already exists, but the key's
+  schema needs a live check against a running Gemini CLI, so the knob stays
+  disabled until that's verified.
+- **Context window** widens the model's context (`1m`, the only tier today),
+  on Claude Code only, composed onto the model as the `[1m]` alias suffix
+  (`sonnet[1m]`) rather than typed into the model field itself. Copilot's
+  context control is interactive-only (`/context` inside its own session)
+  with no argv or settings equivalent, and Gemini's window is
+  model-determined, so both grey out too.
+
+A role whose CLI can't honor a knob shows it disabled with the vendor reason
+above as its hint — never silently ignored. And a knob a CLI *can* honor is
+still an entitlement, not a guarantee: `[1m]` access is plan- and
+credit-gated on Claude's side, so picking it for an account that can't serve
+it fails visibly at the CLI, in the pane — loomux doesn't pre-judge your
+account's entitlements by hiding the option.
+
+These same two keys are available per block in `.loomux/workflow.yml`
+(`effort:`/`context:`) for the advanced orchestrator, gated by the same
+per-CLI rules — see
+[`doc/design/workflows.md`](https://github.com/willem445/loomux/blob/main/doc/design/workflows.md)
+and the `author-loomux-workflow` skill.
+
 **Permissions** are either *Auto* (Claude Code's native auto permission mode plus
 pre-approved `git`/`gh` and loomux agent tools — recommended) or *Accept edits
 only*. Loomux never uses `--dangerously-skip-permissions`.

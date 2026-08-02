@@ -106,9 +106,12 @@ soft warning:
    rather than coercing them, so you cannot spell a fifth capability class
    by combining hint + kind cleverly.
 5. **The orchestrator block is loomux-owned.** A workflow file may pin its
-   `cli:`/`model:` and nothing else — `prompt:`, `profile:`, and `allow:` on
-   an `orchestrator`-kind block are a parse error. It is loomux's trust root;
-   a repo-authored persona there would be a direct prompt-injection seam with
+   `cli:`/`model:`/`effort:`/`context:` and nothing else — `prompt:`,
+   `profile:`, and `allow:` on an `orchestrator`-kind block are a parse
+   error. The pin list is exactly the picks from a closed value set loomux
+   already ships (no field there authors text or pre-approves a tool), which
+   is why `effort:`/`context:` joined it. It is loomux's trust root; a
+   repo-authored persona there would be a direct prompt-injection seam with
    no gate. Put personas on the blocks the orchestrator spawns, never on it.
 6. **`mechanics_core` rides every persona non-overridably.** Even a `profile:`
    persona in `mode: replace` (which replaces the built-in role *body*)
@@ -147,10 +150,24 @@ One block (`RawBlock`, `deny_unknown_fields`):
 | `profile` | string | no | repo-relative path to a persona file; mutually exclusive with `prompt`; no `..`, no absolute path, no drive letter |
 | `allow` | list of string | no (default `[]`) | extra pre-approved tool patterns; **rejected outright** if the block's `kind` is read-only (`planner`) |
 | `role_hint` | string | no | `advisor` (requires `kind: planner`) or `process` (requires `kind: worker`); any other value, or a value paired with the wrong `kind`, is a parse error |
+| `effort` | string | no (default `""`) | thinking level; `""` = the CLI's own default. One of `low`, `medium`, `high`, `xhigh`, `max` — see the caps-gating rule below |
+| `context` | string | no (default `""`) | context-window variant; `""` = the model's own window. One of `1m` today — same caps-gating rule. Composed into the model alias at emit (`sonnet[1m]`), never written into `model:` itself |
 
-Special case: a `kind: orchestrator` block may set only `cli`/`model` —
-`prompt`, `profile`, or a non-empty `allow` on it is a parse error
-(Invariant 5).
+**The caps-gating rule for `effort`/`context` (#687):** each is checked
+twice, and either check failing is a parse error, never a silent drop. First,
+the value must be in loomux's own closed vocabulary above (a typo is never
+coerced to a neighboring level). Second, the block's own `cli:` must be a CLI
+loomux can actually deliver that knob on — today that's `claude` for both
+knobs; `copilot` and `gemini` accept neither (copilot's effort is
+settings-file-only with no flag/env, its context window is interactive-only;
+gemini's thinking level is a settings-file seam that exists but is unwired
+pending live schema verification). Declaring `effort:`/`context:` on a block
+whose `cli:` can't honor it is a parse error naming the CLI and why, not a
+value that silently does nothing.
+
+Special case: a `kind: orchestrator` block may set only
+`cli`/`model`/`effort`/`context` — `prompt`, `profile`, or a non-empty
+`allow` on it is a parse error (Invariant 5).
 
 One edge (`RawEdge`, `deny_unknown_fields`):
 
@@ -299,6 +316,9 @@ As an authoring agent you cannot invoke either directly, so:
    - `prompt:`/`profile:`/`allow:` on the `kind: orchestrator` block;
    - a `role_hint` on the wrong `kind` (`role_hint: advisor` on a `worker`
      block, etc.);
+   - `effort:`/`context:` not in loomux's closed vocabulary, or set on a
+     block whose `cli:` can't honor that knob (e.g. `context: 1m` on a
+     `copilot` block) — see the caps-gating rule in Step 4;
    - an edge or a gate `reviewers:` entry naming a block id that doesn't
      exist, or a gate naming a block that exists but isn't `kind: reviewer`;
    - a `threshold:` greater than the number of named reviewers;
