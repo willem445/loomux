@@ -14,6 +14,7 @@ the Windows baseline, no live agent testing) live in [`CLAUDE.md`](../../CLAUDE.
 ```
 src-tauri/src/
   pty.rs            PTY lifecycle (spawn/write/resize/kill) + output streaming; per-kind Terminal shells (PowerShell/cmd/Git Bash, #194) + Git Bash discovery
+  ptyout.rs         per-pane coalescing of PTY output before it crosses IPC (#712): a `pty-output` event costs one one-shot script compilation on the GUI thread, so the emit rate is bounded to one per 60 Hz frame per pane (leading-edge, so a quiet pane's chunk still crosses on arrival) instead of one per `read()` return. Bytes, order and the orchestration output ring are untouched. See doc/design/pty-output-coalescing.md
   sessions.rs       agent session discovery (one collect_*_candidates fn per agent source); metadata-first + a persisted head-parse index (session-index.json) so a long history costs a stat, not a parse (#493). See doc/design/session-index.md
   orchestration/    agent groups: registry, guardrails, MCP server, audit. Compact-survival is
     layered (#329, #416, #417): a durable role CONTRACT riding the CLI's own system-prompt layer

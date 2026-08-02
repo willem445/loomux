@@ -276,6 +276,24 @@ mod tests {
         assert_eq!(co.take_due(16).map(|b| b.len()), Some(60));
     }
 
+    /// The contrast that says what the window is actually doing: with no
+    /// window at all, the same burst is the pre-#712 policy — one event per
+    /// chunk, an event rate set by the child rather than by loomux. Kept as a
+    /// permanent statement of the behaviour this module replaced, so a future
+    /// reader can see what a zero window would put back.
+    #[test]
+    fn without_a_window_every_chunk_is_its_own_event() {
+        let mut co = OutputCoalescer::new(0, CAP);
+        let mut events = 0;
+        for t in 0..16u64 {
+            co.push(b"a");
+            if co.take_due(t).is_some() {
+                events += 1;
+            }
+        }
+        assert_eq!(events, 16, "a zero window coalesces nothing");
+    }
+
     /// Sustained streaming is bounded by the window, not by the child's write
     /// pattern: 500 chunks over 1 s can cost at most ~1000/16 events.
     #[test]
