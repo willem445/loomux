@@ -697,6 +697,40 @@ fn a_batch_whose_prs_disagree_about_their_base_refuses() {
     assert_eq!(TargetRefusal::BaseNotTarget.code(), "base-not-target");
 }
 
+/// A **corrupt recorded target** refuses before any lookup, rather than letting
+/// every sub-PR validate against nothing but the default and the batch push to
+/// whatever the last one's base happened to be.
+///
+/// This test exists because mutation run C found the gap: the case was defended
+/// by threading each validated sibling into the next iteration, and removing
+/// that threading reddened nothing, because no test ever supplied a record that
+/// was not already a good branch name. The guard replaced the threading; this is
+/// the case that now holds it.
+#[test]
+fn a_corrupt_recorded_target_refuses_before_anything_is_resolved() {
+    for corrupt in ["", "   ", "--force", "refs/heads/integration", "a:b", "HEAD"] {
+        let f = Fake::new()
+            .gh("repo view", 0, "main\n", "")
+            .gh("pr view", 0, &pr_json("integration", PR_HEAD, "b"), "")
+            .gh("pr checks", 0, &checks_json(&[("build", "SUCCESS")]), "")
+            .git("push", 0, "", "");
+        assert_eq!(
+            land_batch(&f, SCRATCH, corrupt, &[612], &one_reviewer_gate(), &|_| {
+                verdict_map(PR_HEAD, "b")
+            }),
+            Err(LandRefusal::Target { pr: 0, refusal: TargetRefusal::BaseUnverifiable }),
+            "a recorded target of {corrupt:?} is a corrupt record, not a branch"
+        );
+        // Refused before ANY lookup — a corrupt record is not worth a round-trip,
+        // and nothing is pushed.
+        assert!(
+            f.calls().is_empty(),
+            "a corrupt record must refuse before resolving anything; calls: {:?}",
+            f.calls()
+        );
+    }
+}
+
 /// The recorded target is an **assertion, not a selection** (§4): it can only
 /// ever narrow the outcome, so a record that disagrees with every PR's live base
 /// refuses rather than retargeting the batch onto the record's branch.

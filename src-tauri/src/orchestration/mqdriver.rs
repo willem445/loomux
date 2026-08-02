@@ -906,6 +906,25 @@ pub fn land_batch(
     if !is_object_name(scratch_sha) {
         return Err(LandRefusal::BadScratch);
     }
+    // A record that is not a branch name is a **corrupt record**, and §4's
+    // reconcile posture for those is to fail loudly rather than proceed. It has
+    // to be checked here rather than left to the per-PR comparison below,
+    // because `validate_target` treats an empty `current_target` as "no target
+    // established yet" (§4, correct at enqueue) — which at landing would mean
+    // every PR validating against nothing but the default, and the batch pushing
+    // to whatever the LAST sub-PR's base happened to be.
+    //
+    // An earlier cut defended that by threading each validated sibling into the
+    // next iteration. Mutation run C (#668, M11) showed the threading never
+    // changed an outcome: with any usable record the assertion below already
+    // refuses, and with an unusable one this guard now refuses first. It was a
+    // construct whose only remaining justification was "if this guard were
+    // removed" — unfalsifiable by design, and its comment credited it for a
+    // refusal the assertion actually produced. Removed rather than kept as
+    // untestable belt-and-braces.
+    if !landable(recorded_target.trim()) {
+        return Err(LandRefusal::Target { pr: 0, refusal: TargetRefusal::BaseUnverifiable });
+    }
     // Resolved ONCE, here, at the moment of submit — not carried in.
     let default = resolve_default_branch(r).map_err(|refusal| LandRefusal::Target {
         pr: prs.first().copied().unwrap_or(0),
@@ -915,16 +934,11 @@ pub fn land_batch(
     let mut target: Option<String> = None;
     for &pr in prs {
         let facts = resolve_pr(r, pr).map_err(|refusal| LandRefusal::Target { pr, refusal })?;
-        // Layer 3. `recorded_target` is the assertion; `target` threads the
-        // previously validated sibling through, so a batch whose PRs disagree
-        // about their base refuses rather than landing on whichever came first.
-        let validated = validate_target(
-            &facts.base,
-            &default,
-            target.as_deref().or(Some(recorded_target)),
-            Some(recorded_target),
-        )
-        .map_err(|refusal| LandRefusal::Target { pr, refusal })?;
+        // Layer 3. Every sub-PR's live base must be the recorded target, so a
+        // batch whose PRs disagree about their base refuses rather than landing
+        // on whichever one was resolved first.
+        let validated = validate_target(&facts.base, &default, Some(recorded_target), None)
+            .map_err(|refusal| LandRefusal::Target { pr, refusal })?;
 
         // §6, second enforcement point. `head` is the PR's LIVE head, so a
         // rebase since the batch was built disarms the entry here.
