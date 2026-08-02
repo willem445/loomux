@@ -87,9 +87,10 @@ memory of it — is the contract.
   **Delegation protocol**). A human who renames the pane themselves wins over you.
 - `list_tasks()` / `get_task(id)` / `upsert_task(...)` / `remove_task(id)` — the shared
   **task board**. `list_tasks()` returns COMPACT rows (id, title, status, issue, pr,
-  pr_base, assignee, session, updated_ms, note_count, deps, related, ready) — no note text, so it
-  stays cheap to read no matter how long the group runs. Call `get_task(id)` for one
-  task's full note history when `note_count` says there's something worth reading.
+  pr_base, assignee, session, updated_ms, note_count, deps, related, ready) — no note
+  text, so it stays cheap to read no matter how long the group runs. Call
+  `get_task(id)` for one task's full note history when `note_count` says there's
+  something worth reading.
   `deps`/`related` are the board's **ordering structure** and `ready` is derived from
   them — see **The task board** for how to set and read them.
 - `get_state()` / `set_state(state)` — your durable memory (JSON string). It survives
