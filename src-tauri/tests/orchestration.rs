@@ -361,6 +361,14 @@ impl loomux_lib::orchestration::mqdriver::MqRunner for MqFake {
     }
 }
 
+/// A `merge_queue.json` with one entry inside an in-flight batch. Used twice in
+/// the strand test — once to set it up, once to **re-arm** it so the once-only
+/// guard has something it must actually stop.
+const IN_FLIGHT_QUEUE_JSON: &str = r#"{"version":1,"target":"integration",
+    "entries":[{"pr":612,"head":"aaaaaaa","state":"ci-wait","enqueued_ms":0,"batch":"mq-1"}],
+    "batch":{"id":"mq-1","prs":[612],"scratch_sha":"abc","draft_pr":640,
+             "state":"ci-wait","started_ms":0}}"#;
+
 /// **The production reconcile path, end to end through the registry** (§4).
 ///
 /// A batch is recorded as in-flight and the world does not match it (the scratch
@@ -373,14 +381,7 @@ fn merge_queue_reconcile_strands_a_batch_the_world_no_longer_matches() {
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     // The group state dir is the registry root plus the group id.
     let qfile = d.path().join(&g.id).join("merge_queue.json");
-    fs::write(
-        &qfile,
-        r#"{"version":1,"target":"integration",
-            "entries":[{"pr":612,"head":"aaaaaaa","state":"ci-wait","enqueued_ms":0,"batch":"mq-1"}],
-            "batch":{"id":"mq-1","prs":[612],"scratch_sha":"abc","draft_pr":640,
-                     "state":"ci-wait","started_ms":0}}"#,
-    )
-    .unwrap();
+    fs::write(&qfile, IN_FLIGHT_QUEUE_JSON).unwrap();
 
     // `ls-remote --exit-code` exits 2 = the scratch ref is gone from the remote.
     let fake = MqFake {
@@ -407,10 +408,24 @@ fn merge_queue_reconcile_strands_a_batch_the_world_no_longer_matches() {
         audit.iter().map(|e| e.action.clone()).collect::<Vec<_>>()
     );
 
-    // Once-only: a second call is a no-op, so a restart cannot re-strand or
-    // re-notify entries a previous pass already resolved.
+    // Once-only: a second call must do nothing, so a restart cannot re-strand
+    // or re-notify entries a previous pass already resolved.
+    //
+    // **The file is re-armed first, and that is the whole point.** The first
+    // pass leaves the queue resolved — the entry terminal, the batch cleared —
+    // so a second pass is naturally a no-op *whether or not the guard exists*.
+    // The original version of this assertion did not re-arm, and mutation I2
+    // (guard removed) left it GREEN: it asserted a property it did not test,
+    // which is exactly the decoration this practice exists to catch. Re-arming
+    // gives the second call real work, so only the guard can stop it.
+    fs::write(&qfile, IN_FLIGHT_QUEUE_JSON).unwrap();
     let again = reg.merge_queue_reconcile_with(&g.id, &fake);
-    assert!(again.is_empty(), "the once-only guard holds");
+    assert!(again.is_empty(), "the once-only guard stops a second reconcile");
+    let untouched = fs::read_to_string(&qfile).expect("still there");
+    assert!(
+        untouched.contains("ci-wait"),
+        "the re-armed queue was not touched by a second pass: {untouched}"
+    );
 }
 
 /// The default path every group is on today: **no `merge_queue.json` at all**.
