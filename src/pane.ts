@@ -39,6 +39,8 @@ import {
 } from "./steer";
 import { createOrderedWriter } from "./ptywrite";
 import { createHumanOriginLatch } from "./humanorigin";
+import { decideFlush, WOKEN, MAX_PENDING_BYTES } from "./panethrottle";
+import { planWebglRetry } from "./webglretry";
 import { showToast } from "./toast";
 import { isAppShortcut } from "./shortcuts";
 import { attentionPresentation } from "./attention";
@@ -727,6 +729,20 @@ export class Pane implements VoiceTargetPane {
    *  its body wedges the target app — #65). Buffers input produced before the
    *  PTY exists and flushes it in order once ready. */
   private writer = createOrderedWriter();
+  /** #720: PTY output that has ARRIVED but has not been handed to `term.write`
+   *  yet, in arrival order, plus its byte total. Non-empty only for a
+   *  visible-but-unfocused pane mid-stream — see `acceptOutput`. Nothing is
+   *  ever dropped or reordered here; only the moment of the `write` call
+   *  moves. */
+  private pendingOut: Uint8Array[] = [];
+  private pendingOutBytes = 0;
+  private flushTimer: number | undefined;
+  /** When this pane last wrote to xterm, or `WOKEN` while it is quiet — the
+   *  leading edge of the throttle (panethrottle.ts). */
+  private lastFlushMs: number | typeof WOKEN = WOKEN;
+  /** Whether this pane is its grid's active pane (`setActive`). The one input
+   *  that decides whether output keeps its per-frame cadence. */
+  private isActivePane = false;
 
   constructor(private events: PaneEvents) {
     this.el = document.createElement("div");
@@ -1111,6 +1127,24 @@ export class Pane implements VoiceTargetPane {
    *  vector can only be added in one place. */
   private markFirstInput(): void {
     this.firstInputMs ??= Date.now();
+    // #720: the same single answer to "what counts as human input" also decides
+    // when this pane's output is an interactive latency again, so the wake hangs
+    // here rather than on `onData` (which also fires for xterm's own query
+    // auto-replies — see the registration in `start`).
+    //
+    // STRICTLY BEFORE `humanOrigin.mark()`, and this order is load-bearing.
+    // `wakeOutput` can call `term.write`, and xterm parses a write SYNCHRONOUSLY
+    // when it lands on an empty buffer right after user input — `WriteBuffer.
+    // write`'s `_didUserInput` fast path, which exists to cut echo latency. A
+    // parse can make the terminal emit an auto-reply (a DA/OSC answer) through
+    // `onData`, and the origin latch's entire correctness argument is that such
+    // data "arrives while its own `term.write()` is being parsed — always a
+    // different turn" (humanorigin.ts). Marking first would put exactly that
+    // write inside the marked turn and hand the backend's keystroke clock a
+    // program-generated reply as a human keystroke — the #179/#518 failure,
+    // re-created by a perf change. Flushing what the PROGRAM already said, and
+    // only then opening the HUMAN's turn, is also the honest order.
+    this.wakeOutput();
     this.humanOrigin.mark();
   }
 
@@ -1123,6 +1157,7 @@ export class Pane implements VoiceTargetPane {
    *  note. */
   private markHumanInput(): void {
     this.firstInputMs ??= Date.now();
+    this.wakeOutput(); // #720 — before the mark, same load-bearing order as markFirstInput
     this.humanOrigin.markDeferred();
   }
 
@@ -1310,8 +1345,11 @@ export class Pane implements VoiceTargetPane {
       // the debounced fit will notice the size drifted and resend once.
       this.applyFit();
       attachOutput(ptyId, (bytes) => {
+        // Latched on ARRIVAL, never on flush: this is "did the process ever
+        // print anything" (the DOA-revival signature, #281/#280), a fact about
+        // the pty, not about when we chose to render it.
         this.receivedOutput ||= bytes.length > 0;
-        this.term.write(bytes);
+        this.acceptOutput(bytes);
       });
       // React to repo changes made outside this pane's shell (#36): the
       // backend watch is pointed at the repo on each cwd report below.
@@ -1328,6 +1366,98 @@ export class Pane implements VoiceTargetPane {
       this.term.writeln(`\x1b[91mloomux: failed to start shell\x1b[0m`);
       this.term.writeln(`\x1b[90m${String(err)}\x1b[0m`);
     }
+  }
+
+  /** Take one arrived chunk of PTY output and either write it to xterm now or
+   *  hold it for the rest of this pane's throttle window (#720). The policy is
+   *  pure and lives in panethrottle.ts; this is only its DOM/timer wiring.
+   *
+   *  Why hold anything at all: xterm coalesces every write inside one animation
+   *  frame into a single `renderRows` pass and coalesces nothing ACROSS frames
+   *  (`RenderDebouncer`), so a pane written to every frame renders every frame.
+   *  #714 already made that at most one event per frame per pane; what is left
+   *  is the render pass itself, paid N times over for N visible panes on one JS
+   *  thread. Writing an unfocused pane once per window instead collapses those
+   *  passes without touching a byte of the stream. */
+  private acceptOutput(bytes: Uint8Array): void {
+    if (this.disposed) return;
+    this.pendingOut.push(bytes);
+    this.pendingOutBytes += bytes.length;
+    const decision = decideFlush({
+      live: this.isActivePane,
+      nowMs: performance.now(),
+      lastFlushMs: this.lastFlushMs,
+      pendingBytes: this.pendingOutBytes,
+      windowMs: getSettings().unfocusedRenderThrottleMs,
+      maxPendingBytes: MAX_PENDING_BYTES,
+    });
+    if (decision.kind === "flush") {
+      this.flushOutput();
+      return;
+    }
+    // One timer per window, armed by the chunk that opened it. Re-arming on
+    // every subsequent chunk would push the flush out indefinitely for a pane
+    // that never goes quiet — a trailing-edge debounce, which is precisely the
+    // starvation this must not be.
+    if (this.flushTimer === undefined) {
+      this.flushTimer = window.setTimeout(() => this.flushOutput(), decision.dueInMs);
+    }
+  }
+
+  /** Hand every held chunk to xterm, in arrival order, and re-open the window.
+   *  Safe (and cheap) to call with nothing held — every caller that is about to
+   *  write to, reset, or re-geometry the terminal itself calls it first, so the
+   *  held bytes can never land AFTER something that was issued later. */
+  private flushOutput(): void {
+    if (this.disposed) return; // `term.write` on a disposed terminal throws
+    if (this.flushTimer !== undefined) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    if (!this.pendingOut.length) {
+      // Nothing was written, so nothing started a window: leaving the pane
+      // marked quiet is what keeps the NEXT chunk on the leading edge instead
+      // of making an unrelated flush call (a fit, a focus change) silently cost
+      // the following chunk a full window of latency.
+      this.lastFlushMs = WOKEN;
+      return;
+    }
+    const chunks = this.pendingOut;
+    this.pendingOut = [];
+    this.pendingOutBytes = 0;
+    this.lastFlushMs = performance.now();
+    // Separate writes, not one concatenated buffer: xterm's WriteBuffer only
+    // schedules a parse task when it was empty, so these N pushes cost one
+    // parse task and one render pass between them — the same as a single write,
+    // without copying every byte a second time to get there.
+    for (const chunk of chunks) this.term.write(chunk);
+  }
+
+  /** Throw held output away and return the pane to quiet (#720). The ONLY
+   *  caller is `respawnFresh`, where `term.reset()` is about to erase these
+   *  bytes regardless — see the call site for why dropping beats flushing
+   *  there. Everywhere else, held output is flushed. */
+  private discardOutput(): void {
+    if (this.flushTimer !== undefined) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    this.pendingOut = [];
+    this.pendingOutBytes = 0;
+    this.lastFlushMs = WOKEN;
+  }
+
+  /** Return this pane to the leading edge and write out anything held (#720).
+   *  Called wherever the human touches the pane — focusing it, typing into it —
+   *  because from that instant its output is an interactive latency again, and
+   *  a throttle the human can perceive is worse than the render passes it
+   *  saves. */
+  private wakeOutput(): void {
+    this.flushOutput();
+    // Mark quiet AFTER the flush, not before: the flush that just wrote would
+    // otherwise open a window, and the echo of the keystroke the human just
+    // pressed — which has not even reached the pty yet — would land in it.
+    this.lastFlushMs = WOKEN;
   }
 
   /** Respawn this pane with a FRESH process in place, reusing the already-open
@@ -1354,6 +1484,14 @@ export class Pane implements VoiceTargetPane {
       this.cwdRaw = opts.cwd;
       void this.refreshDir(opts.cwd);
     }
+    // #720: DROP the dead process's held output — the one place this file
+    // discards rather than flushes, and deliberately. `reset()` clears the
+    // buffer synchronously while `term.write` parses asynchronously, so
+    // flushing here would not preserve those bytes anyway: it would queue them
+    // to be parsed AFTER the wipe, painting a dead pty's tail over the fresh
+    // session. They are bytes `reset()` was always going to erase; the only
+    // choice is whether they are erased or resurrected in the wrong place.
+    this.discardOutput();
     this.term.reset(); // wipe the "No conversation found …" error + resume banner
     this.writer = createOrderedWriter(); // a fresh input pipe for the new PTY
     await this.attachPty(opts);
@@ -1724,6 +1862,13 @@ export class Pane implements VoiceTargetPane {
    *  unconditionally, so a pane opened INTO a hidden tab (a background
    *  orchestrator spawn) would otherwise take a GL context it isn't showing. */
   private hiddenTab = false;
+  /** #720: losses handled in the current streak, and when the live context was
+   *  acquired — the two inputs `planWebglRetry` needs to tell a transient loss
+   *  from a standing one. Both reset when a hide/show cycle re-acquires from
+   *  scratch (`setHidden`). */
+  private webglLosses = 0;
+  private webglAcquiredMs = 0;
+  private webglRetryTimer: number | undefined;
 
   private tryWebgl(): void {
     // No open terminal = a welcome, dormant, or files pane. WebglAddon.activate()
@@ -1733,15 +1878,44 @@ export class Pane implements VoiceTargetPane {
     if (this.webgl || this.hiddenTab || !this.hasTerminal()) return;
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => {
-        webgl.dispose(); // falls back to DOM renderer
-        if (this.webgl === webgl) this.webgl = null;
-      });
+      webgl.onContextLoss(() => this.handleWebglLoss(webgl));
       this.term.loadAddon(webgl);
       this.webgl = webgl;
+      this.webglAcquiredMs = performance.now();
     } catch {
       // WebGL unavailable — xterm's DOM renderer still works fine.
     }
+  }
+
+  /** Fall back to the DOM renderer and schedule a BOUNDED re-acquire (#720).
+   *
+   *  Disposing is still the right immediate move — the context is gone and
+   *  xterm's DOM renderer is what keeps the pane painting — but it used to be
+   *  the whole story, which left one lost context making one pane in a grid of
+   *  six permanently and invisibly the expensive one. `planWebglRetry` decides
+   *  whether and when to try again; the bound is not optional, because a WebGL
+   *  context is a capped resource and one pane re-acquiring is what evicts
+   *  another's, so an unbounded retry is a live-lock between panes rather than
+   *  a recovery. See webglretry.ts. */
+  private handleWebglLoss(lost: WebglAddon): void {
+    lost.dispose(); // falls back to DOM renderer
+    if (this.webgl !== lost) return; // superseded (hide/show already replaced it)
+    this.webgl = null;
+    const plan = planWebglRetry({
+      priorLosses: this.webglLosses,
+      healthyMs: performance.now() - this.webglAcquiredMs,
+    });
+    this.webglLosses = plan.losses;
+    if (plan.delayMs === null) return; // budget spent: stay on DOM until a hide/show
+    clearTimeout(this.webglRetryTimer);
+    this.webglRetryTimer = window.setTimeout(() => {
+      this.webglRetryTimer = undefined;
+      // Re-check rather than trust the state this timer was armed in: the pane
+      // can be disposed, detached, or hidden during the wait, and tryWebgl's own
+      // guards are the single place that decision lives.
+      if (this.disposed || !this.termEl.isConnected) return;
+      this.tryWebgl();
+    }, plan.delayMs);
   }
 
   /** Show/hide bookkeeping for a project-tab switch (#63). Hiding drops the
@@ -1754,6 +1928,16 @@ export class Pane implements VoiceTargetPane {
   setHidden(hidden: boolean): void {
     if (this.disposed) return;
     this.hiddenTab = hidden;
+    // #720: a hide/show is a deliberate act by the human that changes the
+    // context situation wholesale (every pane in the outgoing tab just released
+    // one), so it clears the retry streak — the manual half of the bound in
+    // webglretry.ts. Cancel any pending re-acquire either way: hiding makes it
+    // wrong (tryWebgl would refuse anyway, but leaving a live timer on a hidden
+    // pane is just litter), and showing supersedes it with the immediate
+    // attempt below.
+    clearTimeout(this.webglRetryTimer);
+    this.webglRetryTimer = undefined;
+    this.webglLosses = 0;
     if (hidden) {
       this.webgl?.dispose();
       this.webgl = null;
@@ -1852,6 +2036,13 @@ export class Pane implements VoiceTargetPane {
     // NEW one once fit.fit() lands. `term.write("", cb)` queues an empty
     // write, so `cb` runs only once every write already queued ahead of it
     // has been parsed — i.e. once it's actually safe to change geometry.
+    //
+    // #720: "already queued ahead of it" is xterm's queue, and the throttle
+    // adds one of loomux's own in front of it. Held bytes were produced under
+    // the OLD geometry, so they must be in xterm's queue BEFORE the empty write
+    // that gates the resize — otherwise this fix (#432 item 2) would still be
+    // in place and still be defeated, one layer up.
+    this.flushOutput();
     this.term.write("", () => this.doResize());
     // Geometry-independent UI bits run every tick, unqueued: the pane
     // itself changed size, so keep the overlay within bounds and re-anchor
@@ -3479,6 +3670,10 @@ export class Pane implements VoiceTargetPane {
     // agent counter stops counting it as live (#194 P4 LOW-7). ptyId is left set
     // (the buffer/scrollback is still attached) so isExited, not ptyId, gates live.
     this.exited = true;
+    // #720: the process's own last bytes were produced BEFORE this banner, so
+    // they must be written before it. Without this the banner could print above
+    // the final prompt/goodbye it is announcing the end of.
+    this.flushOutput();
     const codeTxt = code === null ? "" : ` (code ${code})`;
     const why =
       reason === "unsaved"
@@ -3527,6 +3722,13 @@ export class Pane implements VoiceTargetPane {
 
   setActive(active: boolean): void {
     this.el.classList.toggle("active", active);
+    // #720: the active pane is the one the human is reading, so it keeps its
+    // per-frame write cadence; every other VISIBLE pane batches. Becoming
+    // active must write out whatever is held immediately — otherwise clicking a
+    // pane would show it up to a window stale, which is the one place a render
+    // throttle is actually perceptible.
+    this.isActivePane = active;
+    if (active) this.wakeOutput();
   }
 
   /** Reflect fullscreen state: the `.maximized` class drives the CSS overlay
@@ -4008,6 +4210,8 @@ export class Pane implements VoiceTargetPane {
     clearTimeout(this.fitTimer);
     clearTimeout(this.shiftTimer);
     clearTimeout(this.composeStatusTimer);
+    clearTimeout(this.flushTimer); // #720 output throttle
+    clearTimeout(this.webglRetryTimer); // #720 WebGL re-acquire
     // Abort any in-flight voice capture aimed at this pane (releases the mic).
     voiceController.notifyPaneDisposed(this);
     this.voiceIndicator?.remove();

@@ -298,9 +298,23 @@ in the app's data directory (Windows:
 so the file is there to find. Edit it and relaunch loomux to pick up a change
 — there's no live reload.
 
-| Key | Default | Effect when `false` |
+| Key | Default | What changing it does |
 | --- | --- | --- |
-| `pasteOnPlainCtrlV` | `true` | Plain `Ctrl+V` in a terminal pane passes through to whatever's running there (vim, readline, an agent CLI) instead of pasting. `Ctrl+Shift+V` still always pastes. |
+| `pasteOnPlainCtrlV` | `true` | Set `false` and plain `Ctrl+V` in a terminal pane passes through to whatever's running there (vim, readline, an agent CLI) instead of pasting. `Ctrl+Shift+V` still always pastes. |
+| `unfocusedRenderThrottleMs` | `100` | How long a **visible but unfocused** pane batches its output before drawing it, in milliseconds. The pane you're focused on is never throttled, and a pane that has been quiet still draws its next output immediately — only a pane that is already streaming, that you aren't reading, is batched. Set `0` to turn it off and draw every pane at full rate (see below). Values above `1000` are clamped. |
+
+### Why `unfocusedRenderThrottleMs` exists
+
+With half a dozen agent panes streaming at once, every visible pane redraws on
+every frame, on the one thread that also handles your typing. Batching the panes
+you aren't reading cuts their redraws. Nothing is dropped or reordered — every
+byte still arrives in order, it is just drawn ten times a second instead of
+sixty, so a busy background pane scrolls in slightly coarser steps.
+
+How much that helps depends on your GPU and how many panes stream at once, so
+it's a knob rather than a fixed answer: set it to `0`, relaunch, and compare. If
+loomux feels *worse* with the throttle on, that's worth reporting — and `0`
+restores exactly the old behaviour in the meantime.
 
 ## Keyboard shortcuts
 
