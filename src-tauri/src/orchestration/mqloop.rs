@@ -199,9 +199,11 @@ pub fn batch_fetch_argv(target: &str, prs: &[u64]) -> Vec<String> {
 /// this function knows how the scratch was built, and every downstream stage
 /// takes a SHA.
 ///
-///     scratch = target_head
-///     for entry in batch:                        # queue order, deterministic
-///         scratch = merge(scratch, entry.pr_head)
+/// ```text
+/// scratch = target_head
+/// for entry in batch:                        # queue order, deterministic
+///     scratch = merge(scratch, entry.pr_head)
+/// ```
 ///
 /// Queue order is part of the contract, not an implementation detail: §9
 /// requeues bisect survivors preserving it, so two builds of the same entry set
