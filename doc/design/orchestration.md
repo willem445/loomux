@@ -8909,7 +8909,21 @@ zero `-confirmed` lines. Its negative pair lives inside
 delivery confirmation keeps `-confirmed` and writes no liveness line, so "rename every
 resolution" cannot pass. (Its host is
 `compact_nudge_tick_retries_a_reinjection_whose_delivery_never_confirms_then_delivers_exactly_once`
-— the one existing test that drives a real `DeliveryConfirmation` through to a resolution.) The two sessionstart-path assertions were extended to name *both*
+— the one existing test that drives a real `DeliveryConfirmation` through to a resolution.)
+
+**The negative control is load-bearing, and that is measured rather than assumed** (rev-157).
+Building the mutation it exists to catch — `from_evidence` ignoring its argument, so every
+resolution is relabeled `LivenessOnly` — leaves all three liveness-arm tests
+(`a_re_grounding_closed_on_liveness_is_never_audited_as_confirmed`,
+`a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers`,
+`an_in_flight_tool_call_from_the_previous_turn_is_not_an_acknowledgment`) **green** while the
+whole system mislabels every resolution. What reddens is the delivery-arm pair, plus the
+vocabulary test via its `from_evidence` assertion. So the honest-labeling tests cannot police a
+blanket relabel on their own, and anyone later reading the delivery-arm assertions as a
+redundant restatement of the liveness ones should not delete them. Hollowing `does_not_prove()`
+to `""` is likewise caught twice, at two altitudes — the vocabulary *and* the audit payload the
+production tick actually writes — which is why the payload assertion is not left to the pure
+function alone. The two sessionstart-path assertions were extended to name *both*
 actions, since asserting only `-confirmed == 0` would have started passing by omission.
 
 ### #546 option 3: the badge states which evidence closed the phase
