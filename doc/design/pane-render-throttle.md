@@ -98,6 +98,34 @@ sites, each argued at the site:
    fresh session. They are bytes `reset()` was always going to erase; the only
    real choice is erased-in-place versus resurrected-in-the-wrong-place.
 
+### The ordering the flush itself must respect
+
+`markFirstInput` flushes **before** `humanOrigin.mark()`, and that order is
+load-bearing. `WriteBuffer.write` parses inline — not on a later task — when a
+write lands on an empty buffer right after user input (`_didUserInput`, a fast
+path that exists to cut echo latency). The origin latch's whole correctness
+argument is that data the terminal manufactures for itself "arrives while its
+own `term.write()` is being parsed — always a different turn"
+([humanorigin.ts](../../src/humanorigin.ts)). Flushing *after* the mark would put
+exactly such a write inside the marked turn and hand the backend's keystroke
+clock a DA/OSC auto-reply as a human keystroke — the #179/#518 failure,
+re-created by a performance change. `test/xterm-syncparse.test.ts` pins both
+arms of that upstream behaviour so the constraint is enforced rather than
+carried on a comment.
+
+### Two cases that deliberately get no special handling
+
+- **The active pane of a HIDDEN tab is not throttled.** Every tab's grid keeps
+  its own active pane, so a background tab has one too. Throttling it would save
+  nothing that matters: xterm renders it zero times either way (the
+  `IntersectionObserver` pause above), and the throttle's only saving is render
+  passes.
+- **A `tryWebgl` that throws does not schedule anything.** The ladder advances on
+  *losses*, and a machine with no usable WebGL2 path never had a context to
+  lose. That pane stays on the DOM renderer until a hide/show, exactly as it did
+  before #720 — this change recovers lost contexts, it does not retry
+  never-acquired ones.
+
 `receivedOutput` is still latched on **arrival**, not on flush: it answers "did
 this process ever print anything" (the DOA signature, #281/#280), which is a
 fact about the pty and not about when loomux chose to render it.

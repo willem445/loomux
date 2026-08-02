@@ -1127,13 +1127,25 @@ export class Pane implements VoiceTargetPane {
    *  vector can only be added in one place. */
   private markFirstInput(): void {
     this.firstInputMs ??= Date.now();
-    this.humanOrigin.mark();
     // #720: the same single answer to "what counts as human input" also decides
-    // when this pane's output is an interactive latency again. Hanging the wake
-    // here (rather than on `onData`, which also fires for xterm's own query
-    // auto-replies — see the registration in `start`) keeps that distinction
-    // exactly where the rest of the file already draws it.
+    // when this pane's output is an interactive latency again, so the wake hangs
+    // here rather than on `onData` (which also fires for xterm's own query
+    // auto-replies — see the registration in `start`).
+    //
+    // STRICTLY BEFORE `humanOrigin.mark()`, and this order is load-bearing.
+    // `wakeOutput` can call `term.write`, and xterm parses a write SYNCHRONOUSLY
+    // when it lands on an empty buffer right after user input — `WriteBuffer.
+    // write`'s `_didUserInput` fast path, which exists to cut echo latency. A
+    // parse can make the terminal emit an auto-reply (a DA/OSC answer) through
+    // `onData`, and the origin latch's entire correctness argument is that such
+    // data "arrives while its own `term.write()` is being parsed — always a
+    // different turn" (humanorigin.ts). Marking first would put exactly that
+    // write inside the marked turn and hand the backend's keystroke clock a
+    // program-generated reply as a human keystroke — the #179/#518 failure,
+    // re-created by a perf change. Flushing what the PROGRAM already said, and
+    // only then opening the HUMAN's turn, is also the honest order.
     this.wakeOutput();
+    this.humanOrigin.mark();
   }
 
   /** #518: the `markFirstInput` sibling for human input whose data xterm emits
@@ -1145,8 +1157,8 @@ export class Pane implements VoiceTargetPane {
    *  note. */
   private markHumanInput(): void {
     this.firstInputMs ??= Date.now();
+    this.wakeOutput(); // #720 — before the mark, same load-bearing order as markFirstInput
     this.humanOrigin.markDeferred();
-    this.wakeOutput(); // #720, same reason as markFirstInput
   }
 
   /** Open the terminal in the DOM and spawn its PTY. Call after `el` is attached. */
@@ -1397,6 +1409,7 @@ export class Pane implements VoiceTargetPane {
    *  write to, reset, or re-geometry the terminal itself calls it first, so the
    *  held bytes can never land AFTER something that was issued later. */
   private flushOutput(): void {
+    if (this.disposed) return; // `term.write` on a disposed terminal throws
     if (this.flushTimer !== undefined) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;

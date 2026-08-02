@@ -54,7 +54,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // few-Hz range where intermittent motion starts looking stepped. This is the
   // single source of truth for the shipped window; panethrottle.ts holds the
   // policy that consumes it and no copy of the number.
-  unfocusedRenderThrottleMs: 0, // RED HALF (#720): the pre-#720 policy
+  unfocusedRenderThrottleMs: 100,
 };
 
 /** Serialize settings for `saveSettings`. Always writes every known key (no
