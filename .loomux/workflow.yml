@@ -1,9 +1,11 @@
 # loomux's own agent workflow (#222) — the repo dogfoods its own feature.
 #
 # Turn the **advanced orchestrator** on in the launcher and this file *is* the
-# roster. With the toggle off, this file is not even opened. A change here does
-# NOT apply to an already-running group — only a fresh launch (or a live
-# advanced-orchestrator toggle flip) reads it.
+# roster. With the toggle off, this file is not even opened. ROSTER changes
+# apply only on a fresh launch (or a live advanced-orchestrator toggle flip);
+# the MERGE GATE below is re-derived live for running advanced groups (#385),
+# so editing `gates:` takes effect immediately — the unsafe direction to get
+# wrong, which is why it is said here.
 #
 # Shape (2026-08, distilled from two autonomous hardening batches):
 # one reviewer lane instead of three (a fixed three-lane fan-out proved
@@ -19,6 +21,17 @@
 
 version: 1
 name: loomux
+
+# OPT-IN (#581): the bisecting merge queue for orchestrator-owned INTEGRATION
+# branches — structurally incapable of touching the default branch, which
+# keeps its own human gate regardless. Approved sub-PRs are batched onto a
+# scratch ref, verified by this repo's own CI once, fast-forwarded on green
+# (the tested SHA is the landed SHA), bisected on red. max_batch 3 = a red
+# batch costs at most 2 extra runs; a green one costs +1 total.
+merge_queue:
+  enabled: true
+  max_batch: 3
+  checks_timeout_minutes: 60
 
 blocks:
   # The orchestrator is loomux's trust root: a repo file may pin its cli/model
@@ -36,7 +49,7 @@ blocks:
     name: Planner
     kind: planner
     cli: claude
-    model: opus
+    model: fable
 
   # ── two worker tiers, routed by difficulty ────────────────────────────────
   # Deep (opus) for judgment-heavy work: security surfaces, delivery/queue
@@ -86,7 +99,7 @@ blocks:
     name: Process-pro
     kind: worker
     cli: claude
-    model: sonnet
+    model: opus
     profile: .github/agents/process.md
     role_hint: process
 
@@ -114,14 +127,3 @@ gates:
     require: all-pass
     reviewers: [rev-lead]
     also: [ci-green, body-unchanged]
-
-# OPT-IN (#581): the bisecting merge queue for orchestrator-owned INTEGRATION
-# branches — structurally incapable of touching the default branch, which
-# keeps its own human gate regardless. Approved sub-PRs are batched onto a
-# scratch ref, verified by this repo's own CI once, fast-forwarded on green
-# (the tested SHA is the landed SHA), bisected on red. max_batch 3 = a red
-# batch costs at most 2 extra runs; a green one costs +1 total.
-merge_queue:
-  enabled: true
-  max_batch: 3
-  checks_timeout_minutes: 60
