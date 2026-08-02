@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod mergeq;
 pub mod mergeqview;
 pub mod mqdriver;
+pub mod mqloop;
 pub mod notify;
 pub mod profiles;
 pub mod queue;
@@ -9073,7 +9074,7 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// briefly locked (antivirus, an open reader). The temp is fsync'd before the
 /// rename so a rename can't expose a metadata-only file whose data blocks never
 /// reached disk — exactly the disk-full failure mode.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     // Ensure the destination dir exists — group state dirs always do, but the #83
     // grant subdirs (`merge_grants/`, `release_grants/`) may be fresh.
