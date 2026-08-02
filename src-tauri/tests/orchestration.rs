@@ -9565,6 +9565,22 @@ fn spawn_agent_never_defaults_to_the_privileged_class() {
         "a refused spawn must not have created a worker as a side effect: {agents}"
     );
 
+    // An empty-string `block` is an omission too, not a class. `arg_str`
+    // returns `Some("")` for `"block": ""`, and mod.rs's own block resolution
+    // trims-and-discards an empty id before falling back to `block_for(...)` —
+    // so a guard that only checked `is_none()` would wave this straight through
+    // to the very default it exists to remove. Exactly the hole #254's own
+    // review found on the resume side (B1); pinned here for the fresh one.
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "block": "  ", "task": "t" },
+    })).unwrap();
+    assert_eq!(
+        out["isError"], true,
+        "an empty/whitespace block names no class and must be refused like an omission: {out:?}"
+    );
+    assert!(out["content"][0]["text"].as_str().unwrap().contains("#544"));
+
     // The same brief WITH the class named spawns what was actually intended,
     // and it is a reviewer — the refusal is a prompt to be explicit, not a
     // dead end.
