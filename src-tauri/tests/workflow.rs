@@ -5270,17 +5270,30 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
 
     assert_eq!(
         wf.blocks.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
-        [
-            "orchestrator", "planner", "worker-deep", "worker-quick", "rev-orch", "rev-ui",
-            "rev-tests", "advisor", "process",
-        ],
+        ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-lead", "process"],
         "ids are what edges, gates and spawn_agent(block:) reference — a rename here breaks the gate"
     );
 
-    // advisor/process (#250, #324): role_hint pairs with the kind it requires — the
-    // demo file is the one place this pairing rule is exercised against the real parser.
-    assert_eq!(wf.block("advisor").map(|b| (b.kind, b.role_hint.as_deref())), Some((Role::Planner, Some("advisor"))));
+    // process (#324): role_hint pairs with the kind it requires — the worker-side half
+    // of the rule, exercised against the real parser by the real file. (The planner-side
+    // half moved to a synthetic specimen when the advisor block left the roster.)
     assert_eq!(wf.block("process").map(|b| (b.kind, b.role_hint.as_deref())), Some((Role::Worker, Some("process"))));
+    let adv = workflow::parse_workflow(
+        "version: 1
+blocks:
+  - id: helper
+    kind: planner
+    role_hint: advisor
+",
+    )
+    .unwrap();
+    assert_eq!(adv.blocks[0].role_hint.as_deref(), Some("advisor"), "planner+advisor stays the legal pairing");
+
+    // The queue is ARMED in this repo — a deliberate human choice (2026-08, PR #689),
+    // pinned here beside the roster so un-arming is equally deliberate. The product
+    // DEFAULT stays off, pinned by `an_absent_merge_queue_block_means_the_feature_is_off`
+    // on a synthetic specimen.
+    assert!(wf.merge_queue.enabled, "the dogfood queue is armed on purpose");
 
     for b in &wf.blocks {
         let Some(rel) = b.profile.as_deref() else { continue };
@@ -5349,9 +5362,9 @@ fn the_repos_own_workflow_file_parses_clean_against_the_real_parser() {
 #[test]
 fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
     // The end-to-end dogfood pin: the REAL file, through the REAL load + clamp, into
-    // the command line loomux would actually run. `model: haiku` on `worker-quick` is
-    // the whole point of having two tiers — if it arrived at the CLI as `sonnet`, the
-    // feature would be a comment in a YAML file.
+    // the command line loomux would actually run. The teeth: worker-deep and rev-lead
+    // both declare `opus` while the launcher picks say `sonnet` — if either arrived at
+    // the CLI as the launcher pick, the file would be a comment, not a roster.
     let (reg, _d) = test_registry();
     // The launcher's per-role picks say "workers run sonnet". The workflow file wins:
     // a guardrail model is the default for the roster loomux synthesizes, never a
@@ -5366,7 +5379,7 @@ fn the_repos_own_workflow_runs_its_worker_tiers_on_the_models_it_declares() {
         .create_group(&repo_root(), Guardrails { blocks: launcher_picks, ..rails() })
         .unwrap();
 
-    for (block, model) in [("worker-deep", "opus"), ("worker-quick", "haiku"), ("rev-orch", "opus")] {
+    for (block, model) in [("worker-deep", "opus"), ("worker-quick", "sonnet"), ("rev-lead", "opus")] {
         let (cmd, argv, _kickoff) = compile(&reg, &g, block);
         assert!(cmd.contains(&format!("--model {model}")), "{block} must run {model}: {cmd}");
         assert!(
@@ -5821,12 +5834,10 @@ fn an_absent_merge_queue_block_means_the_feature_is_off() {
     assert!(!wf.merge_queue.enabled, "the product default is OFF (§12)");
     assert_eq!(wf.merge_queue.max_batch, 3);
     assert_eq!(wf.merge_queue.checks_timeout_minutes, 60);
-    // The repo's own file declares no queue today — the dogfood block is a
-    // slice-E proposal for the human to accept or decline, not a consequence of
-    // the design note (§12).
-    let own = std::fs::read_to_string(Path::new(&repo_root()).join(".loomux/workflow.yml"))
-        .expect("this repo has a workflow file");
-    assert!(!workflow::parse_workflow(&own).unwrap().merge_queue.enabled);
+    // The specimen is deliberately SYNTHETIC: the repo's own file arms the queue
+    // (a human choice, pinned in the parses-clean test) — using it here would
+    // silently convert this test of the product DEFAULT into a test of this
+    // repo's current choice.
 }
 
 #[test]
