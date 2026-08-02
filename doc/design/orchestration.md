@@ -1607,11 +1607,14 @@ sizing is best-effort; the honesty is structural** — which is the right way ro
 best-effort number that quietly reports its own failures as observations is exactly what #559
 was.
 
-One invariant the code depends on, stated so an edit cannot lose it silently: **every box read for
-a given delivery must use the same `tier1_scan_bytes`.** A precondition verified against a wide
+One invariant the code depends on, stated so an edit cannot lose it silently: **no box read for a
+given delivery may be narrower than the one before it.** A precondition verified against a wide
 tail and then polled against a narrow one would read the box as cleared on the first poll and
 confirm a delivery nothing observed. The five call sites (precondition, confirm loop, retry loop,
-and the late monitor's two) all size from `pasted_text` for that reason.
+and the late monitor's two) all size from `pasted_text` for that reason — as one `tier1_scan_bytes`
+shared by every read until #685, and since #685 as one `Tier1Scan` whose floor starts there and
+only ever rises. The stronger form is the same guarantee: a read can only ever get *wider*, and a
+wider read can only turn a foregone `Unverifiable` into an observation.
 
 #### Measuring the residual, rather than tuning against a guess (#583)
 
@@ -1652,7 +1655,7 @@ read, never a second one — and both records carry it as `tier1_scan_census`:
 
 | Field | Meaning |
 |---|---|
-| `requested_bytes` | what `tier1_scan_bytes` asked the ring for |
+| `requested_bytes` | what the ring was asked for — since #685 the **final** request of a read that may have widened itself, not the `tier1_scan_bytes` floor it started from |
 | `tail_bytes` | raw bytes the ring actually returned; `null` = no read at all (pty gone) |
 | `tail_chars` | what those bytes came to after `strip_ansi` + `normalize_prompt_text` |
 | `paste_chars` | the needle's own normalized length (**not** `tier1_paste_bytes`, which is raw) |
@@ -1710,6 +1713,8 @@ what each one implies:
    slack is the problem, and the fix is sized from the measured low-percentile retention: either a
    proportional slack (ask for `paste / ρ` rather than `paste + K`) or strip before sizing and re-read.
    Both cost scan bytes per delivery, which is why neither is worth doing on a guess.
+   **This is what the live run came back as, and #685 took the second option — see the next
+   section.**
 3. **`unverifiable` with `tail_bytes < requested_bytes`** — a short ring, not density. Widening the
    slack buys nothing; the pane had not spoken yet, and only waiting or re-reading would help.
 4. **`paste_chars` past the ceiling** — the proven regime above. Read it separately or it will
@@ -1725,6 +1730,68 @@ no new vocabulary, and no change to any existing field. `Tier1ScanCensus::to_jso
 place the shape is built, for the same reason `BoxReading::as_str` sits next to its enum — two
 records of one fact in two vocabularies cannot be aggregated, and this record exists only to be
 aggregated.
+
+#### Sizing the window in post-strip characters (#685)
+
+The measurement came back as reading 2. Over 400 live Tier 1 reads on beta4, retention ran ~50%,
+and verification coverage collapsed with paste size: 58% `unverifiable` in the 1.5-2 KiB bucket and
+**100% from 2.5 KiB up**. Zero false confirms in either regime — the residual was always the safe
+direction — but from a couple of KiB up, `box_reading` was answering out of arithmetic and the pane
+was never consulted. That is not verification; it is a decline wearing a reading's name.
+
+**The unit was the bug.** The read asked for `paste_chars + BOX_TAIL_SCAN_BYTES` *raw bytes* and the
+comparison spends *post-strip characters*, so at ~50% retention the read handed the comparison about
+half the haystack it asked for — and because the slack is a constant, the shortfall grows with the
+paste until it crosses the needle's own length.
+
+So `Tier1Scan` counts the budget in the unit that is actually spent:
+
+1. read at the `tier1_scan_bytes` floor — exactly what #559 asked for;
+2. measure what survived `strip_ansi` + `normalize_prompt_text` **in this pane**;
+3. if that is short of the containment window, re-request scaled by the retention this tail just
+   demonstrated: `requested × target ÷ tail_chars`.
+
+**Why measured rather than a constant.** A proportional slack (`paste / ρ`, the other option above)
+needs one ρ for every CLI, and #583's whole finding is that density is a property of a *repaint
+stream* — a constant would be right for one CLI and wrong for the next, and it would over-read on
+every ordinary delivery to buy headroom the ordinary delivery never needed. Scaling by what the read
+in hand actually returned needs no ρ at all.
+
+**What bounds it:**
+
+- **The target is the containment window**, `paste + BOX_TAIL_WINDOW_SLACK` — the last of the
+  normalized tail `box_holds_paste` ever looks at, not the whole 4 KiB budget. An ordinary delivery
+  clears it on the first read and never widens, so only a read that was truncating the comparison
+  costs anything (`an_ordinary_delivery_still_takes_exactly_one_read`).
+- **`TIER1_SCAN_MAX_BYTES` still caps the target**, so a paste past the ceiling stays `Unverifiable`
+  at any density — the widening cannot raise a ceiling nobody decided to raise
+  (`a_paste_past_the_ceiling_is_still_unverifiable_however_wide_the_ring_is`).
+- **A read the ring under-fills ends the widening on the spot.** Fewer bytes back than asked for
+  means the ring holds no more, so no wider request can add one. This is reading 3's short-*pane*
+  regime, and #685 leaves it exactly where it was: honestly `Unverifiable`.
+- **`TIER1_SCAN_WIDEN_ROUNDS`** bounds the re-reads regardless, and running out classifies the
+  widest read taken rather than no read at all. The raw ceiling is `OUTPUT_RING_CAP` — the whole
+  readable universe, derived rather than picked, and in practice far above where the scaled request
+  lands.
+
+**Why this cannot manufacture a confirm.** The invariant above is *monotone reads*, and the first
+request is unchanged, so every read after this change is at least as wide as every read before it.
+The hazard needs a *narrower* read — one that sees the box cut mid-paste, reads `NotHolding`, and
+confirms a delivery nothing observed — and there is no longer a way to take one. `box_reading` is
+untouched; `Unverifiable` governs everywhere it did.
+
+**The residual this does not close**, stated rather than left for a reader to find: a read landing
+between `paste_chars` and `paste_chars + BOX_TAIL_WINDOW_SLACK` post-strip characters can still
+return `NotHolding` off a tail truncated mid-paste, because `box_reading`'s own threshold is the
+needle's length, not the window's. That band is pre-existing and #685 makes it strictly rarer by
+driving reads to cover the whole window; narrowing it further means changing the *classifier*, which
+is a separate decision.
+
+**What is deliberately NOT decided here.** #685 also asks what verification should *claim* for a
+paste larger than a whole coalesced flush — the regime above the ceiling, where no window sizing
+reaches and the only options are a different ceiling or a different channel. That is a posture
+question with a human's name on it, and this change does not pre-empt it: the ceiling is the same
+number it was, and the same regime is still `Unverifiable`.
 
 #### Tier 2: the hook, no longer bounded by the window
 
