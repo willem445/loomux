@@ -32828,10 +32828,20 @@ pub struct GhPollTick {
 /// the two loops does not silently move the intake scan onto the notify
 /// cadence (twice as often), which is the one behavior change unification
 /// would otherwise smuggle in.
+///
+/// A stamp in the FUTURE means the system clock moved BACKWARDS since the
+/// last scan (an NTP correction, a VM resume, a manual set), and it rescans
+/// rather than waiting for wall-clock to catch up — a plain elapsed check
+/// stalls the intake scan for the entire size of the jump, which the
+/// `sleep`-driven thread this replaced could not do (rev-157, non-blocking
+/// 2). Rescanning re-stamps, so one jump costs one early scan, not a loop:
+/// the per-group `gh` floor (`intake::due_intake_polls`) is what actually
+/// bounds the API cost of an early scan, and it is unchanged.
 pub fn intake_scan_due(now: u64, last_scan_ms: Option<u64>) -> bool {
     match last_scan_ms {
         None => true,
-        Some(last) => now.saturating_sub(last) >= INTAKE_POLL_SCAN_INTERVAL.as_millis() as u64,
+        Some(last) if now < last => true,
+        Some(last) => now - last >= INTAKE_POLL_SCAN_INTERVAL.as_millis() as u64,
     }
 }
 

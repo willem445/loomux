@@ -2468,19 +2468,43 @@ was default-off, a latent coupling once it isn't. #406 folds them into one loop:
 - **One clock per wake.** `now` is sampled once and handed to `poll_watches`, `notify_tick` and
   `poll_intake`; all three previously read `now_ms()` themselves, on two different threads. Two
   halves of one tick can no longer disagree about when "now" was.
-- **Neither cadence changed.** The notify half runs on every wake (watch-firing latency is still
-  the 30s wake). The intake half runs only when the pure `intake_scan_due(now, last_scan_ms)`
+- **Neither cadence changed**, with one stated exception. The notify half runs on every wake, so
+  the *wake* cadence a watch waits on is still 30s (what a watch waits on in total is that wake
+  plus the tick's own work — see the accepted cost below). The intake half runs only when the
+  pure `intake_scan_due(now, last_scan_ms)`
   says its coarser 60s scan floor has elapsed — `OrchRegistry.intake_last_scan_ms`, one
   process-wide stamp, distinct from the per-group `gh`-call floor
   (`intake_last_poll_ms`/`intake::due_intake_polls`, untouched). Without that floor, merging the
   loops would have silently doubled the intake scan rate, which is the one behavior change
-  "unify the scheduling" must not smuggle in.
+  "unify the scheduling" must not smuggle in. The exception: the FIRST scan after launch now
+  lands on the first 30s wake rather than after the old thread's full 60s sleep (`None => true`),
+  because a stamp only exists once a scan has happened. Harmless and arguably better — the
+  per-group `gh` floor is untouched — but it is the one instant where "neither cadence changed"
+  is not literally exact, so it is written down rather than rounded off.
+- **A stamp in the future rescans.** `intake_scan_due`'s middle arm catches a backwards system
+  clock jump (NTP correction, VM resume, manual set), which would otherwise stall the intake
+  scan for the whole size of the jump — a `sleep`-driven thread cannot be stalled that way, so
+  moving to a stamped clock had to not introduce it. Rescanning re-stamps, so one jump costs one
+  early scan; the per-group `gh` floor still bounds what that scan can spend.
 - **The pure layers stay separate.** `notify::due_watches` and `intake::due_intake_polls` are
   untouched and separately tested; only the thread and its clock are shared. There is
   deliberately **no** new rate-limit counter: what made the coupling real was two uncoordinated
   clocks, and a budget number nothing reads would be a claim with no consumer (the repo's "a
-  claim is a deliverable" lesson). If per-tick `gh` budgeting is ever genuinely needed, one loop
-  is the precondition for it — `notify::MAX_POLLS_PER_TICK` is the shape it would take.
+  claim is a deliverable" lesson). Per-tick `gh` budgeting IS wanted — it is the rest of #406's
+  ask — but as a bound a scheduler enforces, not a number it reports; one loop is the
+  precondition for it, and #656 carries the concrete shape (`notify::MAX_POLLS_PER_TICK`
+  applied to the intake half's due list).
+- **The accepted cost of one loop: one hang parks everything (#656).** `gh_capture` has no
+  timeout (pre-existing). With two threads, a `gh` stalled on a dead connection froze only its
+  own feature; with one, a hang in either half parks the loop and **all** `notify_when` watches
+  stop resolving indefinitely — which the fleet's "register the watch and end the turn"
+  discipline (#590) depends on. The per-tick exposure is also asymmetric: the notify half is
+  capped at `notify::MAX_POLLS_PER_TICK` (8), while the intake half is 2 `gh` calls per due
+  group with no cap, so N groups due on one scan wake is 2N sequential subprocesses inside one
+  tick. Both are tracked in #656 (a bounded wait on the subprocess; the `due_watches` cap idiom
+  applied to `due_intake_polls`), and that per-tick cap is the concrete remainder of #406's
+  "one shared rate-limit-aware scheduling policy" — this section delivers the single loop and
+  the single clock, not a cross-half budget.
 - **What the tests pin.** `app_setup_starts_exactly_one_gh_polling_loop` parses `src/lib.rs`'s
   setup block (the `tests/acl_manifest.rs` precedent) — "how many threads call `gh`" is a property
   of that call list and of nothing else, so a future `start_*_poller` added beside it fails this
