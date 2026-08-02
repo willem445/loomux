@@ -7,6 +7,9 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::intake;
+// #656: the intake half's per-scan `gh` budget, asserted against the constant
+// itself so the pin follows a future retune instead of pinning today's 4.
+use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
@@ -30793,51 +30796,6 @@ fn intake_half_keeps_its_scan_floor_while_notify_runs_every_wake() {
 // whose groups point at nonexistent repo paths, so every `gh_capture` inside
 // it returns at the "no such directory" guard before a program is resolved.
 
-/// Lands as `intake::MAX_INTAKE_POLLS_PER_TICK` again in the restoring commit.
-const MAX_INTAKE_POLLS_PER_TICK: usize = 4;
-
-/// The `gh_capture` body this branch replaces, verbatim: a bare `output()`
-/// that takes a bound and ignores it.
-fn capture_base_shape(mut cmd: std::process::Command, _timeout: Duration) -> Result<String, String> {
-    let out = cmd.output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if err.is_empty() { Err(format!("gh exited with {}", out.status)) } else { Err(err) }
-    }
-}
-
-/// The obvious bounded rewrite — poll `try_wait`, kill at the deadline, read
-/// the pipes once the child has exited — with nothing draining them while it
-/// waits.
-fn capture_naive_bounded(mut cmd: std::process::Command, timeout: Duration) -> Result<String, String> {
-    use std::process::Stdio;
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(e) => return Err(e.to_string()),
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("timed out after {}s", timeout.as_secs()));
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if err.is_empty() { Err(format!("gh exited with {}", out.status)) } else { Err(err) }
-    }
-}
-
 /// A `Command` running `script` through the host shell: the portable way to
 /// spawn a child that behaves a specific way (stalls, floods its pipe, exits
 /// non-zero) without shelling out to `gh`, which no test here may do.
@@ -30894,7 +30852,7 @@ fn cat_command(path: &Path) -> std::process::Command {
 #[test]
 fn capture_with_timeout_stops_waiting_on_a_stalled_child() {
     let started = std::time::Instant::now();
-    let err = capture_base_shape(shell_command(&sleep_script(20)), Duration::from_secs(1))
+    let err = OrchRegistry::capture_with_timeout(shell_command(&sleep_script(20)), Duration::from_secs(1))
         .expect_err("a child that outlives the bound must fail the capture, not be waited out");
     let waited = started.elapsed();
     assert!(err.contains("timed out"), "the error must name the bound as the cause, not look like a gh failure: {err}");
@@ -30929,7 +30887,7 @@ fn capture_with_timeout_drains_output_larger_than_a_pipe_buffer() {
     let payload = "loomux-656 ".repeat(48 * 1024); // ~512 KiB
     fs::write(&big, &payload).unwrap();
     let started = std::time::Instant::now();
-    let out = capture_naive_bounded(cat_command(&big), Duration::from_secs(10))
+    let out = OrchRegistry::capture_with_timeout(cat_command(&big), Duration::from_secs(10))
         .expect("a chatty but healthy child must complete, not trip the bound");
     assert!(
         out.len() >= payload.len(),
