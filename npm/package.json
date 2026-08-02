@@ -1,6 +1,6 @@
 {
   "name": "loomux-desktop",
-  "version": "1.1.0-beta4",
+  "version": "1.1.0-beta5",
   "description": "Installer/launcher for Loomux — a sleek terminal multiplexer for AI agent management. (`loomux` on npm is an unrelated tmux tool.)",
   "bin": {
     "loomux": "bin/loomux.js"
