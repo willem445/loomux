@@ -1126,6 +1126,33 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_head_is_no_head() {
+        // rev-157: an empty head must refuse as `UnknownRevision` — the same
+        // answer as no head at all — and it must do so because THIS module says
+        // so, not as a side effect of `evaluate_merge_gate` needing at least one
+        // live pass. Without the filter the empty string flows through and every
+        // verdict merely reads *stale*, which happens to refuse today for a
+        // reason that has nothing to do with the head being unusable: it refuses
+        // because no stored head equals `""`. Change how staleness is counted
+        // and the refusal evaporates.
+        //
+        // The module already filtered an empty body digest at exactly this
+        // boundary (`PrObservation::body_digest`); the head was the one live
+        // fact still trusted as it arrived. Slice D writes this call site next,
+        // so it is closed before there is a caller to get it wrong.
+        let g = GateSpec::Declared(gate(&["rev-a"], &[]));
+        let v: BTreeMap<_, _> = [verdict("rev-a", Verdict::Pass, "NEW", "")].into();
+        assert_eq!(
+            recheck_gate(&g, &v, Some(""), &observed(None, None)),
+            GateRecheck::Reviewers(GateOutcome::UnknownRevision)
+        );
+        assert_eq!(
+            recheck_gate(&g, &v, Some("   "), &observed(None, None)),
+            GateRecheck::Reviewers(GateOutcome::UnknownRevision)
+        );
+    }
+
+    #[test]
     fn one_fail_beats_any_count_of_passes() {
         let g = GateSpec::Declared(Gate {
             require: GateRequire::Threshold(2),

@@ -658,8 +658,11 @@ Stating this here so the next reader does not go looking for a parser to copy.
                  "draft_pr": 640, "state": "ci-wait", "started_ms": 0 }
     }
 
-Unknown fields are tolerated on read (forward compatibility), and the file is never deleted by
-recovery — rewritten alongside live entries, the #467/#468 posture.
+Unknown fields are tolerated **and preserved** — carried across a read/write cycle rather than
+merely not failing the read, because §11.2's promise is that an older build can read *and rewrite*
+this file without destroying what a newer one wrote, and a field that is ignored on read is lost
+on the next write. And the file is never deleted by recovery — rewritten alongside live entries,
+the #467/#468 posture.
 
 ### 11.4 The scratch-ref namespace
 
