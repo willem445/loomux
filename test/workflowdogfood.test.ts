@@ -53,7 +53,7 @@ test("the roster is the one the repo means to run", () => {
   // renamed *id* must, because it breaks the gate.
   assert.deepEqual(
     workflow.blocks.map((b) => b.id),
-    ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-orch", "rev-ui", "rev-tests", "advisor", "process"]
+    ["orchestrator", "planner", "worker-deep", "worker-quick", "rev-lead", "process"]
   );
   // Two worker tiers, and the deep one FIRST: the first block of a class is what a
   // bare `spawn_agent(kind: "worker")` resolves to, and the safe default for an
@@ -64,18 +64,16 @@ test("the roster is the one the repo means to run", () => {
     tiers.map((b) => [b.id, b.model]),
     [
       ["worker-deep", "opus"],
-      ["worker-quick", "haiku"],
+      ["worker-quick", "sonnet"],
     ],
     "the tiers are the demo: a deep worker on the strong model, a quick one on the cheap one"
   );
-  // advisor/process (#250, #324): role_hint pairs with the kind it requires — this
-  // demo file is the one place that pairing rule actually gets exercised end to end.
-  const advisor = workflow.blocks.find((b) => b.id === "advisor");
+  // process (#324): role_hint pairs with the kind it requires — the worker-side
+  // half of that rule is exercised end to end by this real file. (The
+  // planner-side half — role_hint: advisor — moved to the synthetic fixture
+  // below when the advisor block left the roster; the rule outlives the block.)
   const processPro = workflow.blocks.find((b) => b.id === "process");
-  assert.deepEqual(
-    [advisor?.kind, advisor?.role_hint, processPro?.kind, processPro?.role_hint],
-    ["planner", "advisor", "worker", "process"]
-  );
+  assert.deepEqual([processPro?.kind, processPro?.role_hint], ["worker", "process"]);
   // Every delegate carries a repo-authored persona, and it is a FILE in
   // `.github/agents/` — the copilot-native convention — so a block flipped to
   // `cli: copilot` gets `--agent <name>` natively instead of a kickoff paste.
@@ -90,23 +88,55 @@ test("the roster is the one the repo means to run", () => {
   }
 });
 
-test("the merge gate waits for every lane, because an abstention is a pass", () => {
+test("the merge gate names EVERY declared reviewer lane, because an abstention is a pass", () => {
   const { workflow } = parseWorkflow(text);
   const gate = workflow.gates.merge;
   assert.ok(gate, "the point of the dogfood file is that the human can demo the gate");
-  assert.deepEqual(gate.reviewers, ["rev-orch", "rev-ui", "rev-tests"]);
-  // NOT a threshold. These reviewers are lane-scoped, and one whose lane a PR doesn't
-  // touch records a `pass` immediately rather than staying silent — so a `threshold: 2`
-  // is satisfied by the two fastest abstentions while the only in-lane reviewer (the
-  // slowest, by design) is still working. all-pass costs nothing: all three are spawned
-  // on every PR anyway, and the out-of-lane ones pass in one turn.
+  // THE SAFETY PROPERTY, stated generically so it survives roster changes: with
+  // all-pass, an abstention still counts as a pass, so a reviewer-kind block
+  // declared in the roster but omitted from `gates.merge` would let its lane go
+  // unreviewed while the gate still opens. Every declared reviewer must be in
+  // the gate — today that set is exactly [rev-lead], and this assertion is what
+  // catches a future second lane someone forgets to wire in.
+  const declaredReviewers = workflow.blocks.filter((b) => b.kind === "reviewer").map((b) => b.id);
+  assert.deepEqual(gate.reviewers, declaredReviewers, "every declared reviewer lane is in the gate");
+  assert.deepEqual(gate.reviewers, ["rev-lead"], "…and today that is the single lead lane");
   assert.equal(gate.require, "all-pass");
   assert.equal(gate.threshold, undefined, "an all-pass gate takes no threshold");
-  assert.deepEqual(gate.also, ["ci-green"]);
-  const kinds = new Map(workflow.blocks.map((b) => [b.id, b.kind]));
-  for (const r of gate.reviewers) {
-    assert.equal(kinds.get(r), "reviewer", `${r} must be a reviewer — only reviewers record verdicts`);
-  }
+  // ci-green: the PR's own checks. body-unchanged (#565/#634): the squash record
+  // is pinned to what the reviewer approved.
+  assert.deepEqual(gate.also, ["ci-green", "body-unchanged"]);
+});
+
+test("role_hint: advisor still pairs only with the planner kind (synthetic — the rule outlives the roster)", () => {
+  // The advisor block left the dogfood roster (never spawned across two live
+  // batches), but the planner-side half of the role_hint-pairs-with-kind rule
+  // (#250/#324) keeps end-to-end coverage via this synthetic fixture.
+  const fixture = [
+    "version: 1",
+    "blocks:",
+    "  - id: helper",
+    "    kind: planner",
+    "    role_hint: advisor",
+  ].join("\n");
+  // The minimal fixture legitimately warns about graph shape (no edges); the
+  // property under test is the PAIRING, so filter to hint-related findings.
+  const hintFindings = (w: string) => {
+    const parsed = parseWorkflow(w);
+    return [...parsed.findings, ...validateWorkflow(parsed.workflow)].filter((f) =>
+      /hint/i.test(`${f.code} ${f.message}`)
+    );
+  };
+  assert.deepEqual(hintFindings(fixture), [], "planner + advisor is the legal pairing");
+  const ok = parseWorkflow(fixture);
+  assert.deepEqual(
+    [ok.workflow.blocks[0].kind, ok.workflow.blocks[0].role_hint],
+    ["planner", "advisor"]
+  );
+  assert.ok(
+    hintFindings(fixture.replace("kind: planner", "kind: worker")).length > 0,
+    "advisor on a worker kind must be a finding, never coerced"
+  );
 });
 
 test("every block is on the declared path — the graph loomux draws has no orphans", () => {
@@ -190,8 +220,9 @@ test("editing one block's model keeps every other block's comments — and the s
   // only the roster in general was touched, not edges or gates, and not the OTHER blocks.
   assert.match(out, /loomux's own agent workflow/, "the file preamble survives");
   assert.match(out, /The orchestrator is loomux's trust root/, "an untouched block's comment survives");
-  assert.match(out, /the two worker tiers/, "the comment on the untouched sibling worker survives");
-  assert.match(out, /three focused reviewers, one per real review lane/, "the reviewers' comment survives");
+  assert.match(out, /two worker tiers, routed by difficulty/, "the comment on the untouched sibling worker survives");
+  assert.match(out, /one reviewer lane/, "the reviewer's comment survives");
+  assert.match(out, /the bisecting merge queue/, "the merge_queue block's comment survives");
   assert.match(out, /^edges:/m, "the edges section is untouched");
   assert.match(out, /^# ADVISORY/m, "…and keeps its own header comment");
   assert.match(out, /^# ENFORCED/m, "the gates section keeps its header comment too");

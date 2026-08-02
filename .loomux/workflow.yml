@@ -1,43 +1,63 @@
 # loomux's own agent workflow (#222) — the repo dogfoods its own feature.
 #
 # Turn the **advanced orchestrator** on in the launcher and this file *is* the
-# roster: two worker tiers, three focused reviewers, an on-demand advisor, and
-# a post-merge process-pro, instead of the built-in one-worker/one-reviewer
-# pair. With the toggle off, this file is not even opened.
+# roster. With the toggle off, this file is not even opened. ROSTER changes
+# apply only on a fresh launch (or a live advanced-orchestrator toggle flip);
+# the MERGE GATE below is re-derived live for running advanced groups (#385),
+# so editing `gates:` takes effect immediately — the unsafe direction to get
+# wrong, which is why it is said here.
+#
+# Shape (2026-08, distilled from two autonomous hardening batches):
+# one reviewer lane instead of three (a fixed three-lane fan-out proved
+# token-heavy; one strong adversarial reviewer caught every defect class the
+# lanes did), two worker tiers routed by task difficulty, a planner for
+# design-first features, a post-merge process-pro, and the #581 merge queue
+# armed for integration branches.
 #
 # Each block's persona is a file in `.github/agents/`, which is Copilot's own
-# custom-agent convention — so a `cli: copilot` block loads it natively
-# (`copilot --agent rev-orch`), and a `cli: claude` block gets the same text
-# compiled into `claude --agents '<json>' --agent rev-orch`. One set of personas,
-# both CLIs. Flip any `cli:` below and the persona follows.
-#
-# The `model:` on a block is the ONE source of truth for what that block runs — it
-# is deliberately not repeated in the persona files, because two spellings of a
-# pinned model is exactly the drift this feature exists to remove.
+# custom-agent convention — a `cli: copilot` block loads it natively and a
+# `cli: claude` block gets the same text via `--agents`. The `model:` on a
+# block is the ONE source of truth for what that block runs.
 
 version: 1
 name: loomux
 
+# OPT-IN (#581): the bisecting merge queue for orchestrator-owned INTEGRATION
+# branches — structurally incapable of touching the default branch, which
+# keeps its own human gate regardless. Approved sub-PRs are batched onto a
+# scratch ref, verified by this repo's own CI once, fast-forwarded on green
+# (the tested SHA is the landed SHA), bisected on red. max_batch 3 = a red
+# batch costs at most 2 extra runs; a green one costs +1 total.
+merge_queue:
+  enabled: true
+  max_batch: 3
+  checks_timeout_minutes: 60
+
 blocks:
-  # The orchestrator is loomux's trust root: a repo file may pin its cli/model and
-  # nothing else (no prompt:, no profile:, no allow:). That is a parse error, on
-  # purpose — see doc/design/workflows.md.
+  # The orchestrator is loomux's trust root: a repo file may pin its cli/model
+  # and nothing else (no prompt:, no profile:, no allow:) — a parse error, on
+  # purpose. See doc/design/workflows.md.
   - id: orchestrator
     name: Orchestrator
     kind: orchestrator
     cli: claude
-    model: opus
+    model: fable
 
+  # Design-first features get a plan before code (a planner's issue-comment
+  # plan is the cheapest gate a wrong split can hit).
   - id: planner
     name: Planner
     kind: planner
     cli: claude
-    model: opus
+    model: fable
 
-  # ── the two worker tiers ────────────────────────────────────────────────────
-  # The orchestrator routes on these descriptions. Deep first: it is the default
-  # for a bare `spawn_agent(kind: "worker")`, and a wrong-tier deep worker costs
-  # tokens while a wrong-tier quick worker costs a bad diff.
+  # ── two worker tiers, routed by difficulty ────────────────────────────────
+  # Deep (opus) for judgment-heavy work: security surfaces, delivery/queue
+  # machinery, anything whose wrong answer is expensive to unwind. Quick
+  # (sonnet) for contained work: focused fixes, docs, test additions,
+  # mechanical refactors. Deep is the default for a bare
+  # `spawn_agent(kind: "worker")` — a wrong-tier deep worker costs tokens,
+  # a wrong-tier quick worker costs a bad diff.
 
   - id: worker-deep
     name: Deep worker
@@ -50,125 +70,60 @@ blocks:
     name: Quick worker
     kind: worker
     cli: claude
-    model: haiku
+    model: sonnet
     profile: .github/agents/worker-quick.md
 
-  # Consider one reviewer block on a different CLI/model than the worker — a
-  # second model tends to catch a different class of defect than the one that
-  # already wrote (and is primed to defend) the diff. Flipping a reviewer's
-  # `cli:` to `copilot` or `gemini` (#267 — a different model family, not just
-  # a different harness) needs that CLI installed for whoever runs this group,
-  # so it is the human's call, not a default. See "A nudge toward cross-model
-  # review" in doc/design/workflows.md.
-  #
-  # ── three focused reviewers, one per real review lane ───────────────────────
-  # Each reviews ONLY its lane and stays out of the others'. rev-orch runs the
-  # strong tier: it holds the security surface (gate/shim, capability closure, the
-  # group_id trust boundary) where a missed defect is not a nit.
-  #
-  # ALL THREE run on EVERY PR — including a one-line typo fix from worker-quick, and
-  # the merge gate below needs all three verdicts, so this is not a lane you can skip
-  # to save a spawn. A reviewer whose lane the PR does not touch reads the diff, says
-  # so, and records `pass` in one turn; that abstention is cheap, and the alternative
-  # (letting the orchestrator decide which lanes a diff "really" touches) is how a
-  # backend change that arrived disguised as a docs PR goes unreviewed.
+  # ── one reviewer lane ─────────────────────────────────────────────────────
+  # A single strong adversarial reviewer replaces the previous three
+  # lane-scoped ones: the fixed three-lane fan-out cost three panes per PR
+  # (two of which usually abstained "outside my lane") and re-staled three
+  # verdicts on every rebase. rev-lead.md carries all three lanes' checklists
+  # plus the review discipline the batches proved out — verify claims against
+  # runs, real red evidence, mutation rounds for coverage claims, purity via
+  # normalized range-diff, the body as the squash record.
 
-  - id: rev-orch
-    name: Backend review
+  - id: rev-lead
+    name: Lead review
     kind: reviewer
     cli: claude
     model: opus
-    profile: .github/agents/rev-orch.md
+    profile: .github/agents/rev-lead.md
 
-  - id: rev-ui
-    name: Frontend review
-    kind: reviewer
-    cli: claude
-    model: sonnet
-    profile: .github/agents/rev-ui.md
-
-  - id: rev-tests
-    name: Test-quality review
-    kind: reviewer
-    cli: claude
-    model: sonnet
-    profile: .github/agents/rev-tests.md
-
-  # ── advisor + process-pro: spawned on demand, not part of the fixed per-PR
-  # fan-out above (#250, #324) ─────────────────────────────────────────────────
-  # `role_hint` is cosmetic — it only selects the persona addendum, the
-  # workflow-prose fragment, and the ADVISOR/PROCESS badge; it can never widen
-  # what a block may do, because capability keys exclusively off `kind` (see
-  # doc/design/supervisor-skills.md — the closure proof this field ships with).
-  #
-  # advisor is planner-kind: read-only, exactly like `planner` above. The
-  # orchestrator spawns it only when stuck on a specific question; it reports
-  # advice and the pane auto-closes the moment it does — never held open
-  # waiting for the next question, so it never occupies a standing delegate
-  # slot.
-  #
-  # process is worker-kind: it opens a normal PR proposing a lessons/skill
-  # update and stops there, riding the exact same human merge gate as
-  # worker-deep or worker-quick above — it never merges anything, including
-  # its own PR. The orchestrator spawns it once, after a PR from this roster
-  # merges, to mine that session cold via `session_digest`.
-
-  - id: advisor
-    name: Advisor
-    kind: planner
-    cli: claude
-    model: opus
-    profile: .github/agents/advisor.md
-    role_hint: advisor
+  # ── process-pro: spawned after a merge, not on the per-PR path ────────────
+  # `role_hint` is cosmetic — capability keys exclusively off `kind`. process
+  # is worker-kind: it mines the merged session via `session_digest`, opens a
+  # normal PR proposing a lessons/skill update, and stops there — the same
+  # merge gate as any worker; it never merges anything, including its own PR.
 
   - id: process
     name: Process-pro
     kind: worker
     cli: claude
-    model: sonnet
+    model: opus
     profile: .github/agents/process.md
     role_hint: process
 
-# ADVISORY — the declared happy path, not a schedule. loomux does not walk these;
-# the orchestrator still decides what to serialize, what to parallelize across
-# worktrees, and when to plan first. The rework loop (reviewer findings → back to
-# the worker that wrote the PR → re-review of the new head) is left unwritten for
-# the same reason: it is the orchestrator's loop to run, not an edge to execute.
-#
-# advisor/process are spawned on demand (a stuck worker, a merged PR), not on the
-# fixed per-PR fan-out — they're folded into the orchestrator's own edge line below
-# only so the pane's graph doesn't flag them isolated/unreachable; see the comment
-# on the blocks themselves for when each actually runs.
+# ADVISORY — the declared happy path, not a schedule. loomux does not walk
+# these; the orchestrator still decides what to serialize, what to
+# parallelize, and when to plan first. The rework loop (findings → owning
+# worker → re-review of the new head) is the orchestrator's loop to run.
 edges:
-  - { from: orchestrator, to: [planner, worker-deep, worker-quick, advisor, process] }
+  - { from: orchestrator, to: [planner, worker-deep, worker-quick, process] }
   - { from: planner, to: [worker-deep, worker-quick] }
-  - { from: worker-deep, to: [rev-orch, rev-ui, rev-tests] }
-  - { from: worker-quick, to: [rev-orch, rev-ui, rev-tests] }
+  - { from: worker-deep, to: [rev-lead] }
+  - { from: worker-quick, to: [rev-lead] }
 
-# ENFORCED — the gh shim refuses `gh pr merge` until this is satisfied, whatever
-# an agent believes about its own approval (#151).
+# ENFORCED — the gh shim refuses `gh pr merge` until this is satisfied,
+# whatever an agent believes about its own approval.
 #
-# WHY all-pass AND NOT `threshold: 2` — read this before "loosening" it:
-# the reviewers above are LANE-SCOPED, and a reviewer whose lane a PR doesn't touch
-# is told to record a `pass` immediately ("outside my lane") rather than to stay
-# silent. To the gate an abstention is indistinguishable from an approval — it counts
-# a `pass`, not a lane. So on a backend-only PR, `rev-ui` and `rev-tests` can abstain
-# in seconds and satisfy `threshold: 2` **while `rev-orch` — the only reviewer whose
-# lane it actually is, and the slowest by construction, because its persona tells it
-# to reproduce findings and run the suite — is still working.** The gate would open on
-# two agents that said in as many words that they had not reviewed the change.
-#
-# all-pass costs nothing to fix that: the orchestrator is already told to run EVERY
-# reviewer block on every PR, and the out-of-lane ones pass immediately, so the same
-# three verdicts are recorded either way. What all-pass buys is the guarantee that the
-# in-lane reviewer is one of them. (`threshold: N` is the right tool when reviewers are
-# INTERCHANGEABLE — "any 2 of these 5" — which is exactly what a lane-scoped roster is
-# not. Its other use, tolerating a dead reviewer, is a job for the human, not the gate.)
-#
-# A `fail` or `escalate` from any reviewer refuses the merge whatever the others
-# recorded (blockers beat approvals), and every pass dies the moment the branch moves.
+# Single lane, so all-pass and threshold are equivalent; all-pass is the
+# honest spelling. `ci-green` requires the PR's own checks green at merge.
+# `body-unchanged` (#565/#634) pins the PR body — the squash commit message —
+# to what the reviewer approved: a body edited after the pass refuses the
+# merge until the reviewer re-records. Batches saw repeated post-approval
+# body corrections; this makes the record's integrity mechanical.
 gates:
   merge:
     require: all-pass
-    reviewers: [rev-orch, rev-ui, rev-tests]
-    also: [ci-green]
+    reviewers: [rev-lead]
+    also: [ci-green, body-unchanged]
