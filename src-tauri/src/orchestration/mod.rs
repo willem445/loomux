@@ -1721,7 +1721,11 @@ fn capture_raw_inner(
     // the process it exists to bound, and the child stayed alive too (dropping
     // a `Child` does not kill it), which is precisely what keeps those readers
     // blocked forever.
-    let Some(status) = wait(&mut child, timeout)? else {
+    let waited = match wait(&mut child, timeout) {
+        Ok(waited) => waited,
+        Err(e) => return Err(abandon_child_and_readers(&mut child, out_reader, err_reader, e)),
+    };
+    let Some(status) = waited else {
         return Err(abandon_child_and_readers(
             &mut child,
             out_reader,
