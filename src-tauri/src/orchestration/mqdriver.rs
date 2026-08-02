@@ -946,9 +946,10 @@ pub fn land_batch(
             Some(facts.head.as_str()),
             &observed,
         );
-        if !recheck.passed() {
-            return Err(LandRefusal::Gate { pr, recheck });
-        }
+        // MUTATION M8 (red-before-green evidence, NOT shipped): §6's SECOND
+        // enforcement point removed — the gate is checked at batch build and
+        // never re-verified at the moment of submit (the #532 rule dropped).
+        let _ = recheck;
         target = Some(validated);
     }
 
