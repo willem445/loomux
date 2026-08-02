@@ -468,8 +468,9 @@ export class GroupView {
     const releaseRow = el("div", "group-releaserow");
     this.releaseToggle = el("button", "group-release-toggle", "▸ Authorize a release…") as HTMLButtonElement;
     this.releaseToggle.title =
-      "Authorize a one-time release/tag publish (GH release + npm). Releases are never " +
-      "auto-approved by autonomous mode — this explicit grant is the only path.";
+      "Authorize the release of one tag (GH release + npm) — the tag push, the release, " +
+      "and its notes, for a limited window. Releases are never auto-approved by autonomous " +
+      "mode — this explicit grant is the only path.";
     this.releaseToggle.addEventListener("click", () => this.toggleRelease());
 
     this.releaseBody = el("div", "group-release-body");
@@ -478,8 +479,9 @@ export class GroupView {
       el(
         "div",
         "group-release-copy",
-        "Authorizes ONE publish of this tag (GH release + npm) — single-use, expires in ~30 min. " +
-          "Releases are never auto-approved by autonomous mode."
+        "Authorizes the release of THIS tag (GH release + npm) — the tag push, the release, and " +
+          "its notes — for ~90 min, then it expires. Only this tag; the version-bump PR still " +
+          "needs its own Approve. Releases are never auto-approved by autonomous mode."
       )
     );
     const releaseInputs = el("div", "group-release-inputs");
@@ -923,13 +925,13 @@ export class GroupView {
     this.releaseBtn.classList.remove("armed");
   }
 
-  /** Issue the one-time release grant. On success, collapse and clear so the
-   *  control can't be re-fired by a stray click; a failure surfaces inline. */
+  /** Issue the release grant. On success, collapse and clear so the control
+   *  can't be re-fired by a stray click; a failure surfaces inline. */
   private async doGrantRelease(tag: string, comment: string): Promise<void> {
     this.releaseBtn.disabled = true;
     try {
       await grantRelease(this.groupId, tag, normalizeComment(comment));
-      this.toast(`release authorized: ${tag} (one-time, ~30 min)`);
+      this.toast(`release authorized: ${tag} (whole pipeline, ~90 min)`);
       this.releaseTagInput.value = "";
       this.releaseCommentInput.value = "";
       this.releaseOpen = false;
