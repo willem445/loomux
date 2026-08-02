@@ -64,7 +64,7 @@ a turn blocked on CI waits on a resolution queued behind itself (#590). Register
 watch, END the turn, act on the notice. Applies to anything whose answer arrives as a
 pane delivery. Reading state once is fine; waiting is the defect.
 
-## A PR body's claims are about a SHA and a scope — the body doesn't know when either moved
+## A PR body's claims are about a SHA and a scope; prose is dated to what it was written against
 
 - After any push or rebase, re-derive every run citation for the NEW head
   (`gh run list --branch <branch> --json headSha,databaseId,conclusion`, assert headSha
@@ -78,6 +78,11 @@ pane delivery. Reading state once is fine; waiting is the defect.
   `Part of` PR, grep body AND `git log` for keyword-next-to-`#N` and reword; whoever
   merges scrubs the aggregated message and re-reads partly-addressed issues after
   (#569, #615).
+- **Prose written against a plan stays dated to that plan, including across the rebase onto
+  its own subject.** A docs/design-note/`SKILL.md` claim authored while a sibling slice was
+  in flight survives that rebase untouched, so a current-looking diff and green CI say
+  nothing about it. Re-read every claim against what the sibling SHIPPED — never against the
+  plan both were written from — before marking a slice ready (#715, #721).
 
 ## A model that re-implements the algorithm proves the algorithm, not the code
 

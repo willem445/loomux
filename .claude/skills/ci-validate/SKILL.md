@@ -31,6 +31,20 @@ CI is the sole authority for the CI gate, and now also the sole build
 path. A worker citing a local run as validation is citing evidence it
 should not have been able to produce.
 
+### Run `npm ci` first — a fresh worktree has no `node_modules`
+
+`node_modules/` is gitignored, so a worktree loomux just cut for you has
+**none**, and the frontend commands above do not work until you install.
+The trap is that `npm test` *looks* like it mostly works anyway: the
+DOM-free pure modules are tested with `node:test`/`node:assert` and Node's
+own TypeScript stripping, which need no packages at all, so you get a
+1246/1249-style pass with only the few files importing a real package red
+(`ERR_MODULE_NOT_FOUND: Cannot find package '@xterm/headless'` — a package
+plainly listed in `package.json`). `npm run build` fails less subtly
+(`'tsc' is not recognized`). Neither is a broken test or a red `main`;
+both mean *you never installed*. Install once per worktree, then re-run —
+and never report a missing-package error as a suite failure.
+
 **Why this is absolute:** a full disk takes the whole machine down with it
 — the live task board, the app, and every worker in the fleet at once
 (#488, #133, #464). CI spends GitHub's disk, not this machine's. If your
@@ -155,6 +169,19 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    gh pr checks <pr>
    gh run view <run-id> --log-failed   # when a check failed, to see why
    ```
+   **`gh pr checks` exits non-zero for "not finished yet", not only for
+   "failed": `8` means *checks pending*, `1` means a check actually failed.**
+   A pane surfaces either as a red "Exit code N" tool error, so read the code
+   and the per-check rows — treating an `8` as a failure sends you debugging
+   green CI. The `E2E (Playwright, experimental)` row is the usual reason an
+   otherwise-finished PR still reports `8`.
+
+   Check the **command's** help, not the general page: `gh pr checks --help`
+   ends with *"Additional exit codes: 8: Checks pending"*, while `gh help
+   exit-codes` lists only 0/1/2/4 and never mentions `8` — it just warns that
+   *"a particular command may have more exit codes, so it is a good practice
+   to check documentation for the command."* Reading only the general page is
+   how `8` comes to look like an anomaly rather than a documented state.
 4. **Never block the turn on the checks — register, end the turn, act on the
    notice.** With loomux's `notify_when` MCP tool available:
    ```
