@@ -1884,59 +1884,84 @@ fn drain_fake() -> Fake {
         .gh("pr checks", 0, &checks_json(&[("build", "SUCCESS")]), "")
 }
 
-/// **#710.** A queue that has drained takes the next enqueue's target, and says
-/// so in `merge_queue_status`.
+/// The live #710 sequence, up to the point each test is about: enqueue 612
+/// (establishing `integration/batch3`), then cancel it — leaving a queue with
+/// no live entry, no batch, and whatever the target does next.
 ///
-/// The refusal this relaxes is §4's drain-first rule, and it protects *entries*
-/// — work already approved against the old target. With none left there is
-/// nobody to protect, and the refusal becomes "this queue is already landing
-/// elsewhere, drain it first" said about a queue that IS drained. Found live:
-/// `queue_merge(705, "integration/batch4")` refused `base-not-target` against
-/// `{"entries":[],"target":"integration/batch3"}` — a branch deleted when that
-/// batch closed. `merge_queue.json` is persistent by design, so no restart
-/// clears it: one cancelled batch wedged the group permanently.
-#[test]
-fn a_drained_queue_takes_the_next_enqueues_target() {
-    let f = drain_fake();
-    let gate = one_reviewer_gate();
+/// Shared so the two properties below can each fail on their **own** assertion
+/// rather than one of them tripping over the other's: a single test asserting
+/// both would panic at the first and never execute the second, and a property
+/// that never ran is a property nobody has seen fail.
+fn cancelled_to_empty(f: &Fake, gate: &GateSpec) -> MergeQueueState {
     let mut s = MergeQueueState { version: MERGE_QUEUE_VERSION, ..Default::default() };
-
-    // The first enqueue establishes the target, as it always has.
     assert_eq!(
-        enqueue(&f, &mut s, 612, None, true, &gate, &verdict_map(HEAD_A, "b"), 0),
-        EnqueueOutcome::Queued { position: 1 }
+        enqueue(f, &mut s, 612, None, true, gate, &verdict_map(HEAD_A, "b"), 0),
+        EnqueueOutcome::Queued { position: 1 },
+        "the first enqueue establishes the target, as it always has"
     );
     assert_eq!(s.target, "integration/batch3");
-
-    // While that entry is live the drain-first refusal is exactly what it was.
+    // While that entry is live the drain-first refusal is exactly what it was —
+    // asserted here so both tests below start from a queue that has genuinely
+    // refused, not merely from one that was never asked.
     assert_eq!(
-        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        enqueue(f, &mut s, 705, None, true, gate, &verdict_map(HEAD_B, "b"), 0),
         EnqueueOutcome::Refused { reason: TargetRefusal::BaseNotTarget.code() },
         "a live entry was approved against the old target and must not be retargeted"
     );
     assert_eq!(s.target, "integration/batch3", "a refused enqueue changes nothing");
-
-    // The cancel drains the queue, and the target goes with the work.
     assert_eq!(cancel(&mut s, 612), CancelOutcome::Cancelled { was: EntryState::Queued });
-    assert_eq!(s.target, "", "nothing is queued, so the queue is landing nowhere");
+    s
+}
 
-    // Status says that rather than naming a branch it is not landing on — the
-    // reading that sent a live orchestrator looking for a queue to drain.
+/// **#710, the wedge itself.** A queue that has drained takes the next
+/// enqueue's target.
+///
+/// The refusal this relaxes is §4's drain-first rule, and it protects
+/// *entries* — work already approved against the old target. With none left
+/// there is nobody to protect, and the refusal becomes "this queue is already
+/// landing elsewhere, drain it first" said about a queue that IS drained. Found
+/// live: `queue_merge(705, "integration/batch4")` refused `base-not-target`
+/// against `{"entries":[],"target":"integration/batch3"}` — a branch deleted
+/// when that batch closed. `merge_queue.json` is persistent by design, so no
+/// restart clears it: one cancelled batch wedged the group permanently.
+#[test]
+fn a_drained_queue_takes_the_next_enqueues_target() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+    let mut s = cancelled_to_empty(&f, &gate);
+
+    // The assertion form too, which must narrow what happens rather than be
+    // contradicted by a residue nobody asserted anything about.
+    let asserted = Some("integration/batch4");
+    assert_eq!(
+        enqueue(&f, &mut s, 705, asserted, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Queued { position: 1 },
+        "a drained queue has no entry left to protect, so this establishes"
+    );
+    assert_eq!(s.target, "integration/batch4");
+    assert_eq!(status_view(&s, true, 7)["target"], serde_json::json!("integration/batch4"));
+}
+
+/// **#710's other half:** the drained queue *says* it is drained.
+///
+/// Separate from the enqueue property on purpose — this is what a reader (an
+/// orchestrator, or the chrome) sees, and a status that keeps naming a branch
+/// the queue is not landing on is what sent a live orchestrator looking for a
+/// queue to drain. It is also the state the empty-target readers have to
+/// tolerate: `mergeqview::absent` already publishes `"target": ""` and
+/// `src/mergequeue.ts` already guards for it, so this is not a new wire shape.
+#[test]
+fn a_drained_queue_reports_that_it_is_landing_nowhere() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+    let s = cancelled_to_empty(&f, &gate);
+
+    assert_eq!(s.target, "", "nothing is queued, so the queue is landing nowhere");
     let view = status_view(&s, true, 7);
     assert_eq!(view["target"], serde_json::json!(""));
     assert_eq!(view["entries"], serde_json::json!([]), "a terminal entry is not queued work");
     assert_eq!(view["enabled"], serde_json::json!(true));
     assert!(view.get("batch").is_none(), "no batch record, no batch key");
-
-    // And the drained queue accepts a different branch — including the
-    // assertion form, which must narrow rather than be contradicted by residue.
-    let asserted = Some("integration/batch4");
-    assert_eq!(
-        enqueue(&f, &mut s, 705, asserted, true, &gate, &verdict_map(HEAD_B, "b"), 0),
-        EnqueueOutcome::Queued { position: 1 }
-    );
-    assert_eq!(s.target, "integration/batch4");
-    assert_eq!(status_view(&s, true, 7)["target"], serde_json::json!("integration/batch4"));
 }
 
 /// The other side of the same rule: **drained means both halves of §4** — no
