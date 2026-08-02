@@ -5638,15 +5638,29 @@ acceptable; it is described in its own section below.
 
 | Call site | Why a marker exists | Reason |
 | --- | --- | --- |
-| `enqueue_stranded_front` (the drainer, from `DeliverOutcome::AbortedPreEnter`) | a pre-Enter gate declined the Enter; the marker is the remainder of that held delivery | `EnqueueReason::Question` |
+| `enqueue_stranded_front` (the drainer, from `DeliverOutcome::AbortedPreEnter`) | a **dialog** owned the Enter key | `EnqueueReason::Question` |
+| `enqueue_stranded_front`, same arm | #532's pre-Enter **occupancy** gate declined: a human's own line is in the box | `EnqueueReason::BoxOccupied` |
 | `admit_stranded_selfheal` (#496 PR-C) | the pane went **quiet** with our text stranded in its box and loomux decided by itself to press Enter | `EnqueueReason::StrandedSelfHeal` |
 
-The two readings are opposites — "a dialog is on screen" versus "nothing is on screen at all" — so
-the self-heal's `delivery-queued` line was sending a human reconstructing that wedge to look for a
-dialog that never existed. The fix is the same shape as #532 rev-12 NB1's (`AbortedPreEnter` carrying
-its own reason): a shared helper cannot know which cause it is serving, so it no longer guesses —
-`reason` is a parameter, and `audit_stranded_push` echoes the caller's rather than re-deciding it
-(a second hardcode at the point of RECORDING would put the lie straight back).
+Three causes, and the code recorded `question` for all three. They failed in the two ways a shared
+seam can: the self-heal's push **hardcoded** a reason it did not have, and the drainer's push
+**dropped** one it did (`enqueue_stranded_front` took no `reason` parameter at all, so
+`AbortedPreEnter`'s — carried since #532 rev-12 NB1 precisely so it would stop being guessed — died
+at the call site).
+
+Both readings are opposites of what was recorded. For the self-heal, "a dialog is on screen" versus
+"nothing is on screen at all" — the `delivery-queued` line sent a human reconstructing that wedge
+looking for a dialog that never existed. For the occupancy gate the contradiction is inside a single
+event: `queued_notice(BoxOccupied)` had already told the orchestrator "pane has human input" while
+the audit line for the same delivery, at the same instant, said dialog.
+
+The fix is the same shape at all three: a shared helper cannot know which cause it is serving, so it
+no longer guesses. `reason` is a parameter of `push_stranded_front_locked` and of
+`enqueue_stranded_front`, and `audit_stranded_push` echoes the caller's rather than re-deciding it —
+a second hardcode at the point of RECORDING would put the lie straight back. No new variant was
+needed for the occupancy case: `BoxOccupied` is honest for it as it stands, and its doc is amended
+to say so (it read "pre-paste … nothing pasted" while #532 had already been handing it to a
+pre-Enter abort).
 
 Three consequences worth stating, because they are what made this a separate PR:
 
@@ -5666,10 +5680,12 @@ Three consequences worth stating, because they are what made this a separate PR:
 - **Still audit-only.** Nothing branches on the value; `cap_headroom` is 0 like every reason but the
   pause-loss notice, and the marker drains through the identical `drain_stranded_submit` press.
 
-**Known, adjacent, and NOT fixed here:** `AbortedPreEnter` has carried its own reason since #532 —
-which since that PR can be `BoxOccupied` rather than `Question` — but `enqueue_stranded_front` takes
-no reason and so records `question` for both. That is the same defect class one call site over, on a
-`pub` signature with its own test call sites; it is called out rather than folded in.
+**What is still hardcoded, and why it is not this enum's problem.** `run_queue_drainer`'s marker
+DRAIN — the arm where `drain_stranded_submit` declines to press Enter — returns
+`AbortedPrePaste(Question)`, and that stays. It is not an enqueue reason at all: nothing is being
+queued (the marker is already at the front and stays there), and the decline means "a human typed
+since our submit, or the ledger already closed", which needs its own vocabulary rather than a reason
+borrowed from admission. Recorded here so the next reader finds a decision instead of an oversight.
 
 ### Composition with #541's `REINJECT_ACK_SETTLE_MS`, and why nothing here belongs in it
 

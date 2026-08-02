@@ -124,7 +124,17 @@ pub const QUEUE_STILL_QUEUED_NOTICE_AFTER: Duration = Duration::from_secs(30 * 6
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EnqueueReason {
-    /// The pre-paste box-occupied hold (#111) capped out — nothing pasted.
+    /// A box-occupied hold gave way to the human's own content: either the
+    /// pre-paste hold (#111) capped out with nothing pasted, or — since #532 —
+    /// the pre-Enter occupancy gate declined the Enter with the text already
+    /// in the box, leaving a `StrandedSubmit` marker to press it later.
+    ///
+    /// The second half of that sentence is #560's: this variant read
+    /// "pre-paste … nothing pasted" while `AbortedPreEnter` had been carrying
+    /// it since #532, and the marker push then recorded `Question` for it
+    /// anyway. Both facts a reader needs — a human's line is in the box, and
+    /// the delivery is past its paste — are true of one reason, so this stays
+    /// ONE variant; what was missing was letting it reach the record.
     BoxOccupied,
     /// A pre-paste or pre-Enter interactive-question hold (#420) capped out.
     Question,

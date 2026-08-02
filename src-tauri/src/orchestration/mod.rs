@@ -14850,7 +14850,15 @@ fn run_queue_drainer(
                 // unsubmitted text with no signal at all (mitigated only by
                 // the next delivery's own stranded-text flush eventually
                 // submitting it — never guaranteed to be loud about it).
-                if let Err(_queue_full) = reg.enqueue_stranded_front(&group, &front.agent_id, &front.from, pty_id) {
+                // #560: `reason` is this arm's own binding — the gate that
+                // actually declined the Enter, `BoxOccupied` as readily as
+                // `Question` since #532 — and it is what the marker is
+                // recorded under. It is the same value the notice above was
+                // already sent with; the audit line simply stopped disagreeing
+                // with the notice about one event.
+                if let Err(_queue_full) =
+                    reg.enqueue_stranded_front(&group, &front.agent_id, &front.from, pty_id, reason)
+                {
                     // #533-A: the marker that failed to push stood for the
                     // WHOLE batch that was pasted, so the count names every
                     // delivery left pasted-but-unsubmitted — saying "1" here
@@ -30316,19 +30324,42 @@ impl OrchRegistry {
     /// the only entry) or non-empty (the drainer converting the item it's
     /// mid-replaying). Bounded by the SAME cap as a text enqueue — a marker
     /// still occupies a queue slot.
+    ///
+    /// **`reason` is the abort's, and there are two of them (#560).** The
+    /// caller is `run_queue_drainer`'s `DeliverOutcome::AbortedPreEnter(reason)`
+    /// arm, and since #532 that reason is `BoxOccupied` as often as it is
+    /// `Question` — the pre-Enter gate has two causes. This took no reason at
+    /// all and recorded `question` for both, so a marker left by a human's
+    /// half-typed line was audited as a dialog that was never on screen: the
+    /// same false claim #560 fixes one call site over, reached by dropping the
+    /// information rather than by hardcoding over it. Both reasons are honest
+    /// as they stand (see `EnqueueReason::BoxOccupied`'s doc, amended for the
+    /// pre-Enter case), so this needs no new variant — only the parameter.
     #[doc(hidden)] // pub for integration tests
-    pub fn enqueue_stranded_front(&self, group: &str, agent_id: &str, from: &str, pty_id: u32) -> Result<(), String> {
+    pub fn enqueue_stranded_front(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        pty_id: u32,
+        reason: queue::EnqueueReason,
+    ) -> Result<(), String> {
+        // MUTATION CONTROL — removed in the very next commit, and present in
+        // exactly one CI run so the test below has a red to be red against.
+        // This IS the pre-#560 behavior: the reason is accepted and then
+        // dropped on the floor, which is what taking no parameter did.
+        let _ = reason;
+        let reason = queue::EnqueueReason::Question;
         self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
         let target = self.durable_target(agent_id);
         let pushed = self.queues.mutate(group, self, |queues| {
             let q = queues.entry(pty_id).or_default();
-            // #560: `Question` is this caller's OWN truth, not the helper's
-            // default — the drainer only reaches here from
-            // `DeliverOutcome::AbortedPreEnter`, i.e. the pre-Enter gate
-            // declined the submit, and the marker is the remainder of that
-            // held delivery.
-            let pushed = self.push_stranded_front_locked(
-                q, agent_id, from, group, &target, queue::EnqueueReason::Question);
+            // #560: the abort's own reason, forwarded — the marker is the
+            // remainder of the delivery the pre-Enter gate declined, and which
+            // of that gate's two causes declined it is the whole of what this
+            // line records.
+            let pushed =
+                self.push_stranded_front_locked(q, agent_id, from, group, &target, reason);
             // A refused push (the pane is at cap) leaves the queue exactly
             // as it was — see `QueueDirty::nothing_persisted` for why the
             // `entry().or_default()` above does not count either.
@@ -30339,9 +30370,7 @@ impl OrchRegistry {
             };
             (pushed, dirty)
         });
-        let out = self
-            .audit_stranded_push(group, agent_id, pushed, queue::EnqueueReason::Question)
-            .map(|_id| ());
+        let out = self.audit_stranded_push(group, agent_id, pushed, reason).map(|_id| ());
         // #563: either the marker took a slot (depth up) or it was refused at
         // cap — both are capacity facts, and the refusal is the one that
         // leaves pasted-but-unsubmitted text in the pane with nothing queued

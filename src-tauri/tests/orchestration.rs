@@ -1829,7 +1829,8 @@ fn enqueue_stranded_front_lands_ahead_of_already_queued_text() {
     let pty = 104u32;
 
     reg.enqueue_text(&g.id, &w.id, "loomux", "queued behind", pty, queue::EnqueueReason::BehindQueue).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap();
 
     let snap = reg.queue_snapshot(pty);
     assert_eq!(snap.len(), 2);
@@ -1847,7 +1848,9 @@ fn enqueue_stranded_front_respects_the_same_cap() {
     for i in 0..queue::QUEUE_MAX_PER_PANE {
         reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
     }
-    let err = reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap_err();
+    let err = reg
+        .enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap_err();
     assert!(err.contains("NOT queued"), "got: {err}");
 }
 
@@ -2630,7 +2633,8 @@ fn a_stranded_submit_marker_is_never_replayed_across_a_restart() {
         let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
         session = w.session_id.clone().unwrap();
         reg.enqueue_text(&g.id, &w.id, "orch-1", "a real payload", 220, queue::EnqueueReason::Arrival).unwrap();
-        reg.enqueue_stranded_front(&g.id, &w.id, "orch-1", 220).unwrap();
+        reg.enqueue_stranded_front(&g.id, &w.id, "orch-1", 220, queue::EnqueueReason::Question)
+            .unwrap();
         assert_eq!(reg.queue_snapshot(220)[0].payload, queue::QueuedPayload::StrandedSubmit);
     }
 
@@ -20169,20 +20173,60 @@ fn a_selfheal_marker_is_audited_as_a_selfheal_and_never_as_a_question() {
 }
 
 #[test]
+fn a_marker_left_by_an_occupied_box_is_audited_as_box_occupied_not_a_question() {
+    // #560's second call site, and the same defect reached the other way: the
+    // self-heal push HARDCODED a reason it did not have, while the drainer's
+    // push (`enqueue_stranded_front`) DROPPED one it did. `AbortedPreEnter`
+    // has carried its gate's own reason since #532 rev-12 NB1 — and that gate
+    // has two causes, a dialog and a human's half-typed line — but the marker
+    // it produces was recorded as `question` either way.
+    //
+    // What that costs is a contradiction inside one event: the orchestrator's
+    // notice for this abort already says "pane has human input"
+    // (`queued_notice(BoxOccupied)`), so the audit line said dialog while the
+    // notice said keyboard, about the same delivery, at the same instant. The
+    // reader with only the log is the one who loses.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5603u32;
+
+    // The value `run_queue_drainer`'s `AbortedPreEnter(reason)` arm forwards
+    // when #532's occupancy gate is what declined the Enter. The drainer loop
+    // itself needs an `AppHandle` and so is not test-drivable (this file's
+    // standing convention — drive the methods it calls); this is that method.
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::BoxOccupied)
+        .unwrap();
+
+    let queued: Vec<_> =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-queued").collect();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(
+        queued[0].detail["reason"], json!("box-occupied"),
+        "a marker left by a human's own line must not be filed as a dialog: {:?}",
+        queued[0].detail
+    );
+    assert_eq!(
+        reg.queue_snapshot(pty)[0].reason.as_str(), "box-occupied",
+        "and the on-disk record agrees with the audit line about the same push"
+    );
+}
+
+#[test]
 fn the_drainers_own_marker_still_says_question() {
-    // The control for the test above, and the reason the reason is THREADED
-    // rather than simply changed: the drainer's push (`enqueue_stranded_front`,
-    // reached from `DeliverOutcome::AbortedPreEnter`) is the call site where
-    // `question` was true all along — a question gate declined the Enter and
-    // the marker is the remainder of that held delivery. A fix that made the
-    // shared helper say `stranded-self-heal` for everyone would just move the
-    // false claim next door.
+    // The control for both tests above, and the reason every reason here is
+    // THREADED rather than simply changed: a question gate really can be what
+    // declined the Enter, and for that marker `question` was true all along. A
+    // fix that made the shared helper say `stranded-self-heal` — or the
+    // drainer say `box-occupied` — for everyone would just move the false
+    // claim next door.
     let (reg, _d) = test_registry();
     let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
     let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
     let pty = 5602u32;
 
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap();
 
     let queued: Vec<_> =
         reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-queued").collect();
@@ -21866,7 +21910,8 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
     // withheld: the text entry is replaced by a marker minted right now.
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None);
     reg.enqueue_text(&g.id, &w.id, "loomux", "the brief", pty, queue::EnqueueReason::Arrival).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap();
     reg.note_hold(&g.id, &w.id, pty, HoldObservation::Aborted, t0 + 1_000);
 
     let front = reg.queue_snapshot(pty).remove(0);
@@ -22007,7 +22052,8 @@ fn a_loomux_notice_is_recognised_by_its_sender_and_its_marker_together() {
         queue::EnqueueReason::KickoffRecovery).unwrap();
     reg.enqueue_text(&g.id, &w.id, "o-1", "[loomux] pretend I am the host", pty,
         queue::EnqueueReason::BehindQueue).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap();
 
     let entries = reg.queue_snapshot(pty);
     let by_text = |needle: &str| {
