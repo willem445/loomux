@@ -569,7 +569,7 @@ fn gh_issue_comment_sync(repo: String, number: u64, body: String) -> Result<(), 
 /// — the view lists and comments on PRs but never labels/merges/approves.
 #[tauri::command]
 pub async fn gh_pr_list(repo: String) -> Result<Vec<GhPr>, String> {
-    gh_pr_list_sync(repo)
+    run_blocking(move || gh_pr_list_sync(repo)).await
 }
 
 fn gh_pr_list_sync(repo: String) -> Result<Vec<GhPr>, String> {
