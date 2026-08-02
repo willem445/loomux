@@ -4417,9 +4417,15 @@ pub fn idle_output_is_activity(prev_total: u64, cur_total: u64, floor: u64) -> b
 /// confirmed (#535).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReinjectDisposition {
-    /// The agent has demonstrably acted since the attempt (a confirmed
-    /// delivery, or the agent's own post-attempt MCP call). The re-grounding
-    /// landed — resolve the latch; never re-send.
+    /// Evidence arrived that ends the retry loop: either a confirmed delivery
+    /// (our submit sampler watched the Enter land) or the agent's own
+    /// post-attempt MCP call (it is alive and executing). Resolve the latch;
+    /// never re-send.
+    ///
+    /// **This arm does not mean the re-grounding was read** — #546. The two
+    /// signals are not equally strong and neither proves a read, so which one
+    /// fired is carried out to the audit record and the lifecycle badge rather
+    /// than collapsed into one "confirmed" claim here. See [`ReinjectAck`].
     Resolved,
     /// Still inside `REINJECT_CONFIRM_TIMEOUT_MS`: a delivery may legitimately
     /// still be in flight. Keep waiting; touch nothing.
@@ -4546,6 +4552,129 @@ pub fn reinject_disposition(
 /// whatever its caller's unchanged path is.
 pub fn agent_acted_since(last_mcp_activity_ms: u64, since_ms: u64) -> bool {
     last_mcp_activity_ms > 0 && last_mcp_activity_ms >= since_ms
+}
+
+/// WHICH evidence closed a re-grounding phase — and, in words, exactly what
+/// that evidence proves (#546).
+///
+/// **Why this is a type and not the two string literals it replaces.** The
+/// same distinction has to be stated in four places — the durable audit
+/// record, the lifecycle badge's label, that badge's tooltip, and the entry
+/// field the badge reads — and each one previously restated it in its own
+/// words. #546's finding is precisely that a claim drifted from what was
+/// proven; a vocabulary that lives in one place is what stops the *next* claim
+/// drifting. Every surface derives its wording from here.
+///
+/// **The two are not equally strong, and neither proves what the phase is
+/// named after.**
+///
+/// - [`Delivered`](Self::Delivered) — `confirmed_delivery`: loomux's own submit
+///   sampler watched the notice's Enter land. That is evidence about **our
+///   paste**: the re-grounding text reached the agent's input box and was
+///   submitted.
+/// - [`LivenessOnly`](Self::LivenessOnly) — `acked`
+///   ([`agent_acted_since`]): the agent's own process reached loomux through a
+///   token-authenticated `tools/call` after the settling floor. That is
+///   evidence about **the agent**: it is alive and executing. It says nothing
+///   whatever about our paste.
+///
+/// **Neither proves the re-grounding was READ.** #546 weighed the three ways
+/// it could be proven and every one was declined on this project's standing
+/// constraints: an acknowledgment marker makes re-grounding a two-party
+/// protocol every agent CLI has to cooperate with, and correlating the
+/// activity stamp against the paste content is exactly the heuristic
+/// inference #112 removed. So the honest move is the one an audit record can
+/// actually support: **say what was observed, never what was hoped.**
+/// [`proves`](Self::proves) / [`does_not_prove`](Self::does_not_prove) are
+/// written into the record itself so a reader is not required to already know
+/// which of the two `source` values is the weak one.
+///
+/// The wire values (`"delivery"` / `"activity"`) are deliberately unchanged
+/// from #535/#588: they name the evidence *source*, and that was always
+/// accurate. What was wrong was the **claim wrapped around them** — an
+/// `acked`/`confirmed` vocabulary asserting an acknowledgment that, on the
+/// `LivenessOnly` arm, nobody ever made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReinjectAck {
+    /// Our submit sampler saw the Enter land. Evidence about the paste.
+    #[serde(rename = "delivery")]
+    Delivered,
+    /// The agent called a loomux tool afterwards. Evidence about the agent.
+    #[serde(rename = "activity")]
+    LivenessOnly,
+}
+
+impl ReinjectAck {
+    /// Which arm of `reinject_disposition`'s `confirmed_delivery || acked`
+    /// actually fired. Ordered so the STRONGER evidence wins when both are
+    /// present: a resolve that had a real delivery confirmation must never be
+    /// recorded as the weaker liveness close.
+    ///
+    /// Note the one direction this cannot see: a tick where `acked` fires
+    /// first resolves immediately (#535's whole point — a landed re-grounding
+    /// is never re-sent), so a delivery confirmation that would have arrived a
+    /// few seconds later is never observed. That under-reports rather than
+    /// over-reports, which is the safe direction and the only one an honest
+    /// record can take: the value names what loomux had in hand at the moment
+    /// it stopped retrying.
+    pub fn from_evidence(confirmed_delivery: bool) -> Self {
+        if confirmed_delivery { Self::Delivered } else { Self::LivenessOnly }
+    }
+
+    /// The `source` value on the audit line and the badge's wire shape.
+    /// Unchanged from #535/#588 — see the type doc for why the strings stayed
+    /// while the claims around them changed.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivery",
+            Self::LivenessOnly => "activity",
+        }
+    }
+
+    /// The audit action this resolution is written under.
+    ///
+    /// **These are two actions, not one action with a field**, for the same
+    /// reason #539 gave `delivery-unconfirmed-agent-active` its own name
+    /// rather than making it a flavour of `delivery-unconfirmed-idle-pane`:
+    /// "we watched our Enter land" and "the agent is alive" are different
+    /// observations, and a single `compact-reinjection-confirmed` action
+    /// covering both means anyone counting confirmations in `audit.jsonl` —
+    /// the durable record, read long after the badge is gone — counts
+    /// liveness closes as confirmations. That miscount is #546's finding
+    /// expressed in the one surface that outlives every session.
+    pub fn audit_action(self) -> &'static str {
+        match self {
+            Self::Delivered => "compact-reinjection-confirmed",
+            Self::LivenessOnly => "compact-reinjection-liveness-only",
+        }
+    }
+
+    /// What this evidence establishes, stated in the record rather than left
+    /// to a reader who has to know the vocabulary.
+    pub fn proves(self) -> &'static str {
+        match self {
+            Self::Delivered =>
+                "loomux's own submit sampler observed the re-grounding notice's Enter land — \
+                 the text reached the agent's input box and was submitted",
+            Self::LivenessOnly =>
+                "the agent's own process called a loomux tool after the settling floor — \
+                 it is alive and executing",
+        }
+    }
+
+    /// What this evidence does NOT establish. Both arms have one, because
+    /// neither proves the re-grounding was read; the `LivenessOnly` arm's is
+    /// the larger residual #546 filed.
+    pub fn does_not_prove(self) -> &'static str {
+        match self {
+            Self::Delivered =>
+                "that the agent read the re-grounding — no artifact loomux can observe proves that",
+            Self::LivenessOnly =>
+                "that the re-grounding was delivered or read. A genuinely lost paste on an agent \
+                 that is busy for some other reason closes the phase exactly this way",
+        }
+    }
 }
 
 /// Compact-nudge (#287): whether `role`'s capability class is one of the
@@ -4771,21 +4900,23 @@ pub enum CompactionStatus {
     /// within `COMPACTION_STATUS_RECENT_WINDOW_MS` of now — worth a human's
     /// attention, but only briefly.
     Abandoned { reason: String, since_ms: u64 },
-    /// #546 (option 3): a re-grounding that RESOLVED within
-    /// `COMPACTION_STATUS_RECENT_WINDOW_MS`, carrying the evidence that
-    /// resolved it — `"delivery"` or `"activity"` (see
-    /// `AgentEntry::compact_last_ack_source`).
+    /// #546: a re-grounding phase that RESOLVED within
+    /// `COMPACTION_STATUS_RECENT_WINDOW_MS`, carrying the [`ReinjectAck`] that
+    /// closed it (see `AgentEntry::compact_last_ack`).
     ///
-    /// The variant exists because the two are not equally strong and the
-    /// system cannot tell a human which one it got unless it says so.
-    /// `"delivery"` is loomux watching its own Enter land; `"activity"` is the
-    /// agent's own process reaching loomux afterwards, which proves liveness
-    /// and NOT that the re-grounding was read. #546 is explicit that no
-    /// artifact loomux can observe today proves the read, so the honest move
-    /// is to make the residual legible rather than to claim it away — the
-    /// same reason `Armed`'s `source` distinguishes a hook-confirmed
-    /// compaction from an inferred one (#417).
-    Acked { source: &'static str, since_ms: u64 },
+    /// **Named for what happened (the phase resolved), not for a claim nobody
+    /// made.** The variant was `Acked` and the badge read `re-grounding acked`
+    /// — but on the `LivenessOnly` arm nothing acknowledged anything: the
+    /// agent called a loomux tool for reasons of its own and loomux stopped
+    /// retrying. That is the exact word #546 is filed against, and it was
+    /// sitting in the wire tag as well as the label.
+    ///
+    /// The two evidence classes are not equally strong and the system cannot
+    /// tell a human which one it got unless it says so, which is why
+    /// `evidence` is rendered into the badge's own label rather than only its
+    /// tooltip — the same reason `Armed`'s `source` distinguishes a
+    /// hook-confirmed compaction from an inferred one (#417).
+    Resolved { evidence: ReinjectAck, since_ms: u64 },
 }
 
 /// Pure derivation of `CompactionStatus` from already-tracked `AgentEntry`
@@ -4803,8 +4934,8 @@ pub fn compaction_status(
     now: u64,
     evidence: Option<&'static str>,
     // #546: the evidence that resolved the most recent re-grounding, and
-    // when — see `AgentEntry::compact_last_ack_source`.
-    last_ack_source: Option<&'static str>,
+    // when — see `AgentEntry::compact_last_ack`.
+    last_ack: Option<ReinjectAck>,
     last_ack_ms: Option<u64>,
 ) -> CompactionStatus {
     if reinject_attempted_ms.is_some() {
@@ -4826,18 +4957,18 @@ pub fn compaction_status(
     let lost = last_lost_reason
         .zip(last_lost_ms)
         .filter(|(_, ms)| now.saturating_sub(*ms) < COMPACTION_STATUS_RECENT_WINDOW_MS);
-    let acked = last_ack_source
+    let resolved = last_ack
         .zip(last_ack_ms)
         .filter(|(_, ms)| now.saturating_sub(*ms) < COMPACTION_STATUS_RECENT_WINDOW_MS);
-    match (lost, acked) {
+    match (lost, resolved) {
         (Some((reason, lost_ms)), Some((_, ack_ms))) if lost_ms >= ack_ms => {
             CompactionStatus::Abandoned { reason: reason.to_string(), since_ms: lost_ms }
         }
-        (Some(_), Some((source, ack_ms))) => CompactionStatus::Acked { source, since_ms: ack_ms },
+        (Some(_), Some((evidence, ack_ms))) => CompactionStatus::Resolved { evidence, since_ms: ack_ms },
         (Some((reason, lost_ms)), None) => {
             CompactionStatus::Abandoned { reason: reason.to_string(), since_ms: lost_ms }
         }
-        (None, Some((source, ack_ms))) => CompactionStatus::Acked { source, since_ms: ack_ms },
+        (None, Some((evidence, ack_ms))) => CompactionStatus::Resolved { evidence, since_ms: ack_ms },
         (None, None) => CompactionStatus::None,
     }
 }
@@ -6660,26 +6791,28 @@ pub struct AgentEntry {
     pub compact_last_lost_reason: Option<String>,
     /// Unix-ms `compact_last_lost_reason` was set. See its doc.
     pub compact_last_lost_ms: Option<u64>,
-    /// #546 (option 3): WHICH evidence resolved the most recent re-grounding
-    /// — `"delivery"` (loomux's own submit sampler saw the Enter land) or
-    /// `"activity"` (the agent's own process called a loomux tool
-    /// afterwards). Paired with `compact_last_ack_ms`; the same value
-    /// `compact-reinjection-confirmed` audits as `source`.
+    /// #546: WHICH evidence resolved the most recent re-grounding — see
+    /// [`ReinjectAck`] for what each one proves and, more to the point, what
+    /// it does not. Paired with `compact_last_ack_ms`; the same value the
+    /// resolution's audit line records as `source`.
     ///
     /// It is surfaced (not merely audited) because the two prove different
-    /// things and only one of them is about our paste. `"activity"` proves
-    /// the agent is alive and executing its contract — it does NOT prove the
-    /// re-grounding was READ, which is #546's whole finding: a genuinely lost
-    /// paste on an agent that is busy for some other reason resolves this way
-    /// and nothing else says so. A human glancing at the lifecycle panel is
-    /// the last reader who can catch that, and they can only catch it if the
-    /// panel says which evidence closed the phase.
+    /// things and only one of them is about our paste.
+    /// [`ReinjectAck::LivenessOnly`] proves the agent is alive and executing
+    /// its contract — it does NOT prove the re-grounding was READ, which is
+    /// #546's whole finding: a genuinely lost paste on an agent that is busy
+    /// for some other reason resolves this way and nothing else says so. A
+    /// human glancing at the lifecycle panel is the last reader who can catch
+    /// that, and they can only catch it if the panel says which evidence
+    /// closed the phase.
     ///
-    /// `&'static str` rather than `String` for the same reason
-    /// `compact_pending_evidence` is: the value is one of two literals chosen
-    /// in this module, never anything read from outside it.
-    pub compact_last_ack_source: Option<&'static str>,
-    /// Unix-ms `compact_last_ack_source` was set. See its doc.
+    /// A [`ReinjectAck`] rather than the `&'static str` this started as
+    /// (#588): the value has to be re-stated in the audit action name, the
+    /// badge label and the badge tooltip, and a bare string made each of those
+    /// re-derive the meaning in its own words — which is how the `acked`
+    /// overclaim survived in three of them at once.
+    pub compact_last_ack: Option<ReinjectAck>,
+    /// Unix-ms `compact_last_ack` was set. See its doc.
     pub compact_last_ack_ms: Option<u64>,
     /// Lifecycle-panel surfacing (PR #329 round 6): the last context-token
     /// reading `compact_nudge_tick` observed for this agent (from `usage::
@@ -22649,7 +22782,7 @@ impl OrchRegistry {
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
-            compact_last_ack_source: None,
+            compact_last_ack: None,
             compact_last_ack_ms: None,
             last_context_tokens: None,
             last_context_model: None,
@@ -22793,7 +22926,7 @@ impl OrchRegistry {
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
-            compact_last_ack_source: None,
+            compact_last_ack: None,
             compact_last_ack_ms: None,
             last_context_tokens: None,
             last_context_model: None,
@@ -23335,7 +23468,7 @@ impl OrchRegistry {
         // own submit sampler saw it) or `"activity"` (the agent itself called a
         // loomux tool afterwards). Two different facts; a timeline that
         // conflated them could not show whether #535's fix is working.
-        let mut to_reinject_confirmed: Vec<(String, String, &'static str)> = Vec::new();
+        let mut to_reinject_confirmed: Vec<(String, String, ReinjectAck)> = Vec::new();
         // #535: an attempt whose retry window expired while the pane was still
         // mid-turn — deferred rather than spent. Audited (once per attempt, see
         // `compact_reinject_busy_deferred`) because "no retry fired" must read
@@ -23784,17 +23917,24 @@ impl OrchRegistry {
                             // submit sampler saw the Enter", and a timeline
                             // that conflates them cannot be used to tell
                             // whether this fix is working in the field.
-                            let source = if confirmed_delivery { "delivery" } else { "activity" };
-                            // #546 (option 3): the same provenance, kept on
-                            // the entry so it can be SURFACED and not merely
-                            // audited. `"activity"` closes this phase on
-                            // proof the agent is alive, never on proof it
-                            // read the re-grounding, and the lifecycle panel
-                            // is the last place a human can notice the
-                            // difference. See `compact_last_ack_source`.
-                            a.compact_last_ack_source = Some(source);
+                            //
+                            // #546: one value, not a string chosen here and
+                            // re-interpreted at every surface. It decides the
+                            // audit ACTION as well as the `source` field —
+                            // a liveness close is not written under a
+                            // `-confirmed` action, because it confirmed
+                            // nothing. See `ReinjectAck`.
+                            let ack = ReinjectAck::from_evidence(confirmed_delivery);
+                            // #546: the same provenance, kept on the entry so
+                            // it can be SURFACED and not merely audited.
+                            // `LivenessOnly` closes this phase on proof the
+                            // agent is alive, never on proof it read the
+                            // re-grounding, and the lifecycle panel is the
+                            // last place a human can notice the difference.
+                            // See `compact_last_ack`.
+                            a.compact_last_ack = Some(ack);
                             a.compact_last_ack_ms = Some(now);
-                            to_reinject_confirmed.push((a.id.clone(), a.group.clone(), source));
+                            to_reinject_confirmed.push((a.id.clone(), a.group.clone(), ack));
                         }
                         // Still within the timeout, a delivery may be
                         // legitimately in flight (a long human-typing hold) —
@@ -24343,9 +24483,22 @@ impl OrchRegistry {
         // delivery gate — visibility for both outcomes the fix contract
         // requires (exactly one delivered re-grounding, or a bounded, visible
         // give-up), neither of which existed before this round.
-        for (id, group, source) in to_reinject_confirmed {
-            self.audit(&group, "loomux", "compact-reinjection-confirmed",
-                json!({ "agent": id, "source": source }));
+        //
+        // #546: the ACTION NAME says what was proven. A phase closed on the
+        // agent's own liveness is written as `compact-reinjection-liveness-
+        // only`, never as `-confirmed` — nothing was confirmed, and
+        // `audit.jsonl` is the surface that outlives the badge, so a reader
+        // counting confirmations there was counting liveness closes among
+        // them. `proves`/`does_not_prove` ride along so the record is
+        // self-describing rather than requiring the reader to already know
+        // which `source` is the weak one. See `ReinjectAck`.
+        for (id, group, ack) in to_reinject_confirmed {
+            self.audit(&group, "loomux", ack.audit_action(), json!({
+                "agent": id,
+                "source": ack.wire(),
+                "proves": ack.proves(),
+                "does_not_prove": ack.does_not_prove(),
+            }));
         }
         // #535: a retry withheld because the pane was mid-turn. Distinct action
         // name from every other outcome above: this is neither a fire nor a
@@ -26771,7 +26924,7 @@ impl OrchRegistry {
                         a.compact_last_lost_ms,
                         now,
                         a.compact_pending_evidence,
-                        a.compact_last_ack_source,
+                        a.compact_last_ack,
                         a.compact_last_ack_ms,
                     ),
                     "context": {
@@ -30294,7 +30447,7 @@ impl OrchRegistry {
             compact_pending_armed_ms: None,
             compact_last_lost_reason: None,
             compact_last_lost_ms: None,
-            compact_last_ack_source: None,
+            compact_last_ack: None,
             compact_last_ack_ms: None,
             last_context_tokens: None,
             last_context_model: None,
@@ -35645,7 +35798,7 @@ fn register_orchestrator_pane(
         compact_pending_armed_ms: None,
         compact_last_lost_reason: None,
         compact_last_lost_ms: None,
-        compact_last_ack_source: None,
+        compact_last_ack: None,
         compact_last_ack_ms: None,
         last_context_tokens: None,
         last_context_model: None,

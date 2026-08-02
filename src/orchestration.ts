@@ -971,11 +971,16 @@ export type CompactionStatus =
   | { status: "awaiting_evidence"; trusted: boolean; source: string | null }
   | { status: "reinjecting"; attempt: number; max_attempts: number }
   | { status: "abandoned"; reason: string; since_ms: number }
-  // `source` (#546): which evidence resolved the re-grounding — "delivery"
-  // (loomux's own submit sampler saw the Enter land) or "activity" (the agent
-  // called a loomux tool afterwards, which proves it is alive, NOT that it read
-  // the re-grounding). Surfaced because the two are not equally strong.
-  | { status: "acked"; source: string; since_ms: number };
+  // #546: the re-grounding PHASE resolved — named for what happened, not for
+  // an acknowledgment nobody made (the tag was "acked", and on the "activity"
+  // arm nothing acknowledged anything). `evidence` is which signal closed it:
+  // "delivery" (loomux's own submit sampler saw the Enter land — evidence about
+  // our paste) or "activity" (the agent called a loomux tool afterwards —
+  // evidence about the agent, which proves it is alive, NOT that it read the
+  // re-grounding). A closed union, not `string`: these are the backend's two
+  // `ReinjectAck` values and a third would be a backend change, not a new
+  // label to guess at here.
+  | { status: "resolved"; evidence: "delivery" | "activity"; since_ms: number };
 
 /** At-a-glance lifecycle summary for a group (backend `orch_group_summary`). */
 export interface GroupSummary {
