@@ -30601,10 +30601,7 @@ impl OrchRegistry {
                 // flag and its values. `knobs.effort` is a member of a closed
                 // enum by the time it reaches here (parser + `clamped_knob`),
                 // so it needs no quoting — the same argument `model` rests on.
-                // MUTATION A (#687 mutation round, reverted in the next
-                // commit): the shell form stops emitting --effort; the argv
-                // form below still does.
-                if false && !knobs.effort.is_empty() {
+                if !knobs.effort.is_empty() {
                     cmd.push_str(&format!(" --effort {}", knobs.effort));
                 }
                 if containment.denies_edits() {

@@ -83,7 +83,11 @@ jobs:
           echo "LOOMUX_LEAK_BASELINE=$count" >> "$GITHUB_ENV"
 
       - name: Test backend
-        run: cargo test --locked
+        # TEMPORARY (#687 mutation round, reverted with the mutation): cargo
+        # stops at the first FAILING TEST TARGET, so a red orchestration.rs
+        # hides every result in workflow.rs. The round needs every target to
+        # report.
+        run: cargo test --locked --no-fail-fast
         working-directory: src-tauri
 
       - name: Verify the backend test suite left no worktree fixtures behind (#464)
