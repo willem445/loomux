@@ -91,6 +91,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # if: always() means this step also runs when an earlier step in
+          # the job (e.g. "Test frontend") fails before the snapshot step
+          # above gets to export LOOMUX_LEAK_TEMPROOT/_BASELINE. Guard the
+          # read so that cascade produces the real failure's error, not a
+          # second, unrelated "unbound variable" one (#690). When the
+          # baseline step DID run, this is a no-op and the check below is
+          # unchanged.
+          if [ -z "${LOOMUX_LEAK_TEMPROOT:-}" ]; then
+            echo "skipping leak check: LOOMUX_LEAK_TEMPROOT unset — an earlier step failed before the baseline snapshot ran (#690)"
+            exit 0
+          fi
           after="$(find "$LOOMUX_LEAK_TEMPROOT" -maxdepth 1 -iname '*-worktrees' 2>/dev/null || true)"
           count=$(printf '%s\n' "$after" | grep -c . || true)
           if [ "$count" -gt "$LOOMUX_LEAK_BASELINE" ]; then
