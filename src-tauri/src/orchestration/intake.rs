@@ -410,23 +410,52 @@ pub struct IntakeSeenState {
 // Poll scheduling — which groups are due this scan (mirrors notify::due_watches)
 // ---------------------------------------------------------------------------
 
+/// Most groups one intake scan will actually poll, however many are due
+/// (#656). Each due group costs TWO sequential `gh` calls (`issue list`, `pr
+/// list`), so this is the intake half's equivalent of
+/// `notify::MAX_POLLS_PER_TICK` (8 `gh` calls) and is deliberately set to the
+/// same `gh`-call budget rather than the same group count: 4 groups × 2 calls.
+///
+/// Without it, N autonomous groups falling due on the same scan wake is 2N
+/// sequential round-trips inside one tick of the single poll loop — at N =
+/// 10–20 that is 20–40 round-trips (~1s each) before the loop can sleep
+/// again, and every `notify_when` notice in the process waits behind them.
+/// The overflow is not dropped: it is simply still due on the next scan, and
+/// the oldest-polled-first ordering below is what makes that a deferral
+/// rather than starvation.
+pub const MAX_INTAKE_POLLS_PER_TICK: usize = 4;
+
 /// Pick which autonomous groups are due for an intake poll this scan: every
 /// group whose `intake_poll_minutes` guardrail is nonzero (0 = the feature is
 /// off for that group — no poll, no gate, today's behavior) and whose last
-/// poll is at least that many minutes old. Pure so the due-selection policy
-/// (the GitHub API budget backstop — no more than one `gh` round-trip pair
-/// per group per configured interval) is testable with no `gh`, no lock, and
-/// no registry, exactly like `notify::due_watches`.
+/// poll is at least that many minutes old, oldest-polled first and capped at
+/// `MAX_INTAKE_POLLS_PER_TICK`. Pure so the due-selection policy (the GitHub
+/// API budget backstop — no more than one `gh` round-trip pair per group per
+/// configured interval, and no more than a bounded number of pairs per scan)
+/// is testable with no `gh`, no lock, and no registry, exactly like
+/// `notify::due_watches`.
+///
+/// The ordering is load-bearing, not cosmetic (#656): this reads from a
+/// `HashMap`, so an uncapped-then-truncated list would cut at an arbitrary
+/// point that a fixed hash seed could keep cutting the same way, starving
+/// whichever groups landed on the wrong side of it forever. Sorting by
+/// `last_poll_ms` makes the group deferred by this scan the oldest — and so
+/// the first taken — on the next one. The group name breaks ties so the same
+/// due set always yields the same selection: never-polled groups all share
+/// `last = 0`, and the round-robin can only be fair if the tiebreak is
+/// deterministic rather than the map's iteration order.
 pub fn due_intake_polls(now_ms: u64, groups: &HashMap<String, u32>, last_poll_ms: &HashMap<String, u64>) -> Vec<String> {
-    groups
+    let mut due: Vec<(u64, &String)> = groups
         .iter()
         .filter(|(_, &minutes)| minutes > 0)
-        .filter(|(group, &minutes)| {
-            let last = last_poll_ms.get(*group).copied().unwrap_or(0);
-            now_ms.saturating_sub(last) >= (minutes as u64) * 60_000
+        .filter_map(|(group, &minutes)| {
+            let last = last_poll_ms.get(group).copied().unwrap_or(0);
+            (now_ms.saturating_sub(last) >= (minutes as u64) * 60_000).then_some((last, group))
         })
-        .map(|(group, _)| group.clone())
-        .collect()
+        .collect();
+    due.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    due.truncate(MAX_INTAKE_POLLS_PER_TICK);
+    due.into_iter().map(|(_, group)| group.clone()).collect()
 }
 
 #[cfg(test)]
@@ -697,11 +726,6 @@ mod tests {
     }
 
     // ---------- due_intake_polls: the per-scan cap (#656) ----------
-
-    /// Lands as the module-level `MAX_INTAKE_POLLS_PER_TICK` in the next
-    /// commit; declared here so the tests below are byte-identical across the
-    /// red run and the green one.
-    const MAX_INTAKE_POLLS_PER_TICK: usize = 4;
 
     /// Every group due at once (the case this cap exists for: N autonomous
     /// groups falling due on the same scan wake) must still cost at most

@@ -7,6 +7,9 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::intake;
+// #656: the intake half's per-scan `gh` budget, asserted against the constant
+// itself so the pin follows a future retune instead of pinning today's 4.
+use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
@@ -30793,54 +30796,6 @@ fn intake_half_keeps_its_scan_floor_while_notify_runs_every_wake() {
 // whose groups point at nonexistent repo paths, so every `gh_capture` inside
 // it returns at the "no such directory" guard before a program is resolved.
 
-/// Lands as `intake::MAX_INTAKE_POLLS_PER_TICK` in the next commit.
-const MAX_INTAKE_POLLS_PER_TICK: usize = 4;
-
-/// Today's `gh_capture` body, verbatim: a bare `output()` that takes a bound
-/// and ignores it. The stalled-child test below runs against this, and is
-/// meant to fail — that failure IS the defect #656 reports.
-fn capture_base_shape(mut cmd: std::process::Command, _timeout: Duration) -> Result<String, String> {
-    let out = cmd.output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if err.is_empty() { Err(format!("gh exited with {}", out.status)) } else { Err(err) }
-    }
-}
-
-/// The obvious bounded implementation — poll `try_wait`, kill at the
-/// deadline, read the pipes once the child has exited — with nothing
-/// draining them while it waits. The pipe-buffer test below runs against
-/// this, and is meant to fail: that is the second defect, the one a bound
-/// written the obvious way would ship instead of the first.
-fn capture_naive_bounded(mut cmd: std::process::Command, timeout: Duration) -> Result<String, String> {
-    use std::process::Stdio;
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(e) => return Err(e.to_string()),
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("timed out after {}s", timeout.as_secs()));
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if err.is_empty() { Err(format!("gh exited with {}", out.status)) } else { Err(err) }
-    }
-}
-
 /// A `Command` running `script` through the host shell: the portable way to
 /// spawn a child that behaves a specific way (stalls, floods its pipe, exits
 /// non-zero) without shelling out to `gh`, which no test here may do.
@@ -30878,7 +30833,7 @@ fn sleep_script(secs: u32) -> String {
 #[test]
 fn capture_with_timeout_stops_waiting_on_a_stalled_child() {
     let started = std::time::Instant::now();
-    let err = capture_base_shape(shell_command(&sleep_script(20)), Duration::from_secs(1))
+    let err = OrchRegistry::capture_with_timeout(shell_command(&sleep_script(20)), Duration::from_secs(1))
         .expect_err("a child that outlives the bound must fail the capture, not be waited out");
     let waited = started.elapsed();
     assert!(err.contains("timed out"), "the error must name the bound as the cause, not look like a gh failure: {err}");
@@ -30892,7 +30847,7 @@ fn capture_with_timeout_stops_waiting_on_a_stalled_child() {
 /// own stdout, immediately, exactly as `Command::output()` did.
 #[test]
 fn capture_with_timeout_returns_a_finished_childs_stdout() {
-    let out = capture_base_shape(shell_command("echo loomux-656"), Duration::from_secs(10))
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-656"), Duration::from_secs(10))
         .expect("a fast child must succeed");
     assert!(out.contains("loomux-656"), "stdout must be captured verbatim, not summarized: {out:?}");
 }
@@ -30919,7 +30874,7 @@ fn capture_with_timeout_drains_output_larger_than_a_pipe_buffer() {
     };
 
     let started = std::time::Instant::now();
-    let out = capture_naive_bounded(shell_command(&script), Duration::from_secs(10))
+    let out = OrchRegistry::capture_with_timeout(shell_command(&script), Duration::from_secs(10))
         .expect("a chatty but healthy child must complete, not trip the bound");
     assert!(
         out.len() >= payload.len(),
@@ -30937,7 +30892,7 @@ fn capture_with_timeout_drains_output_larger_than_a_pipe_buffer() {
 #[test]
 fn capture_with_timeout_reports_a_nonzero_exit_as_the_childs_own_failure() {
     let started = std::time::Instant::now();
-    let err = capture_base_shape(shell_command("exit 3"), Duration::from_secs(10))
+    let err = OrchRegistry::capture_with_timeout(shell_command("exit 3"), Duration::from_secs(10))
         .expect_err("a non-zero exit is an Err, exactly as `output()` made it");
     assert!(!err.contains("timed out"), "a child that exited must never be reported as a timeout: {err}");
     assert!(err.contains('3'), "the exit status must survive into the message the caller surfaces: {err}");

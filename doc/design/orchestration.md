@@ -2178,7 +2178,8 @@ pure function over pinned `--json` fields, testable with canned fixtures and no 
   `main` had no `pr_head` — it exists only on the not-yet-merged `feat/222-custom-workflows`
   branch (user-defined agent workflows). A follow-up should fold `pr_head` into
   `gh_capture` once #222 merges, rather than keep two copies of the same subprocess shape
-  permanently; noted here so it isn't lost.
+  permanently; noted here so it isn't lost. The wait itself is bounded rather than an
+  `output()` — see "Bounding one tick (#656)" below.
 - **The tick split** (the `watchdog_tick` shape, exactly): `poll_watches(&self)` is the
   impure half — shells out to `gh` for each id `notify::due_watches` selects, and classifies
   each result with the pure predicate. **The selection policy itself is pure**, not just the
@@ -2213,6 +2214,8 @@ pure function over pinned `--json` fields, testable with canned fixtures and no 
 | `MAX_WATCHES_PER_GROUP` | 12 | per-group cap; a rejection names it (independently of the per-agent cap) |
 | `NOTIFY_EXPIRES_DEFAULT_MIN` / `_MIN` / `_MAX` | 60 / 5 / 240 | TTL default and clamp (`Guardrails::clamped` idiom — never reject a plausible number, never trust it unclamped) |
 | `NOTIFY_FAIL_STREAK_LIMIT` | 3 | consecutive `gh` failures (auth, `gh-not-found`, unknown PR/run) before the watch is cancelled rather than polled forever against nothing |
+| `GH_CAPTURE_TIMEOUT` | 20s | bound on ONE `gh` child; a stalled subprocess would otherwise park the single poll loop and every notice with it (#656 — see "Bounding one tick") |
+| `MAX_INTAKE_POLLS_PER_TICK` | 4 | groups the intake half polls per scan — 2 `gh` calls each, so the same 8-call budget as `MAX_POLLS_PER_TICK` (#656) |
 
 ### Predicates and the "no checks reported" trap
 
@@ -2532,7 +2535,8 @@ check-state transitions.
   every **autonomous** group whose EFFECTIVE `intake_poll_minutes`
   (`intake::effective_intake_poll_minutes` — #429's smart default, resolved fresh every scan) is
   nonzero and due (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval
-  idiom) — shells out
+  idiom, plus that idiom's per-tick cap and oldest-polled-first ordering — see "Bounding one
+  tick") — shells out
   to `gh issue list --json number,title,labels` and `gh pr list --json
   number,title,statusCheckRollup` (via the existing `gh_capture` helper `poll_watches` already
   uses; no new subprocess plumbing) and diffs the result against that group's last-seen state
@@ -2673,19 +2677,7 @@ was default-off, a latent coupling once it isn't. #406 folds them into one loop:
   clocks, and a budget number nothing reads would be a claim with no consumer (the repo's "a
   claim is a deliverable" lesson). Per-tick `gh` budgeting IS wanted — it is the rest of #406's
   ask — but as a bound a scheduler enforces, not a number it reports; one loop is the
-  precondition for it, and #656 carries the concrete shape (`notify::MAX_POLLS_PER_TICK`
-  applied to the intake half's due list).
-- **The accepted cost of one loop: one hang parks everything (#656).** `gh_capture` has no
-  timeout (pre-existing). With two threads, a `gh` stalled on a dead connection froze only its
-  own feature; with one, a hang in either half parks the loop and **all** `notify_when` watches
-  stop resolving indefinitely — which the fleet's "register the watch and end the turn"
-  discipline (#590) depends on. The per-tick exposure is also asymmetric: the notify half is
-  capped at `notify::MAX_POLLS_PER_TICK` (8), while the intake half is 2 `gh` calls per due
-  group with no cap, so N groups due on one scan wake is 2N sequential subprocesses inside one
-  tick. Both are tracked in #656 (a bounded wait on the subprocess; the `due_watches` cap idiom
-  applied to `due_intake_polls`), and that per-tick cap is the concrete remainder of #406's
-  "one shared rate-limit-aware scheduling policy" — this section delivers the single loop and
-  the single clock, not a cross-half budget.
+  precondition for it, and "Bounding one tick" below is that bound.
 - **What the tests pin.** `app_setup_starts_exactly_one_gh_polling_loop` parses `src/lib.rs`'s
   setup block (the `tests/acl_manifest.rs` precedent) — "how many threads call `gh`" is a property
   of that call list and of nothing else, so a future `start_*_poller` added beside it fails this
@@ -2694,6 +2686,58 @@ was default-off, a latent coupling once it isn't. #406 folds them into one loop:
 
 `start_workflow_gate_reload` is deliberately **not** folded in: it reads a file, not `gh`, so it
 spends none of the budget this section is about.
+
+### Bounding one tick (#656)
+
+One loop means one tick's `gh` work is the whole process's `gh` work, so that work has to be
+finite in both directions: no single call may wait forever, and no single wake may make an
+unbounded number of calls. Neither held before #656 — and the first mattered more after #406
+than before it, because a hang that used to freeze one feature now stops every `notify_when`
+notice in the process, which is what the fleet's "register the watch and end the turn"
+discipline (#590) rests on.
+
+- **Per call: `capture_with_timeout`.** `gh_capture` builds the `Command` and hands it to
+  `OrchRegistry::capture_with_timeout(cmd, GH_CAPTURE_TIMEOUT)`, which spawns, waits to the
+  deadline, and kills the child rather than waiting past it. A timeout is returned as the
+  ordinary `Err` both callers already classify: `poll_watches` counts it toward
+  `NOTIFY_FAIL_STREAK_LIMIT`, `poll_intake` skips that half of its diff and still stamps the
+  attempt. No new failure channel, no new dependency (a std spawn plus a manual deadline —
+  every timeout crate in reach pulls `getrandom`-adjacent weight this crate refuses, and none
+  of them is needed for one deadline).
+- **Why the bound is generous rather than tight.** A false timeout is not free: three of them
+  in a row cancel a watch that was about to resolve. A live `gh` call lands in ~1s and a
+  genuinely stalled one hangs for minutes or forever, so the two cases separate at any value in
+  a wide band, and erring long costs only a slower tick.
+- **Why both pipes are drained on their own threads.** The obvious shape — poll `try_wait`,
+  read the output once the child reports exit — deadlocks against the very calls this poller
+  makes: `gh issue list --json` on a busy repo outruns the OS pipe buffer, and a child blocked
+  writing into a full pipe never exits. That shape would turn a healthy call into a timeout
+  every tick, i.e. trade the hang for an outage. On the *timeout* path the readers are left to
+  end with their pipe instead of being joined: a grandchild can hold the handle past the kill,
+  and joining would reinstate exactly the unbounded wait being removed. The leak is two threads
+  per timeout, against a bounded number of calls per tick.
+- **Per tick: both halves are capped.** The notify half already had `MAX_POLLS_PER_TICK` (8).
+  The intake half now has `intake::MAX_INTAKE_POLLS_PER_TICK` (4) — expressed as the same
+  *`gh`-call* budget rather than the same group count, since a due group costs two calls. Before
+  it, N autonomous groups falling due on one scan wake was 2N sequential round-trips inside a
+  single tick, and every watch notice waited behind them.
+- **The cap's ordering is load-bearing, not cosmetic.** `due_intake_polls` reads a `HashMap`, so
+  a bare truncation would cut the due list at an arbitrary — but, for a given hash seed, stable
+  — point and starve whichever groups landed on the wrong side of it. Sorting by `last_poll_ms`
+  (ties broken on the group id, so the answer is stated rather than hash-dependent) makes the
+  group this scan deferred the oldest, and therefore the first one the next scan takes: the cap
+  is a queue, not a drop.
+- **What the tests pin.** `capture_with_timeout_stops_waiting_on_a_stalled_child` asserts
+  ELAPSED time against a child that outlives its bound 20x — an implementation that said "timed
+  out" only once `output()` finally returned would satisfy the message and none of the point.
+  `capture_with_timeout_drains_output_larger_than_a_pipe_buffer` is the regression pin on the
+  reader threads (a ~512 KiB child, past every platform's default buffer). The intake cap is
+  pinned pure in `intake.rs` (cap, oldest-first ordering, deterministic tiebreak, and
+  two-scans-cover-every-group) and on a live registry in
+  `poll_intake_caps_one_scan_and_polls_the_deferred_groups_on_the_next`. None of them shells out
+  to `gh`: the subprocess tests drive a deliberately slow/chatty/failing shell command, and the
+  registry test's groups point at nonexistent repo paths, so every `gh_capture` inside it
+  returns at its "no such directory" guard before a program is resolved.
 
 ## Compact-nudge (#287)
 

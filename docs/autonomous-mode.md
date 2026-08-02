@@ -121,7 +121,10 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   on the idle window alone) — set `intake_poll_minutes`
   to `0` by hand in that group's `group.json` (there's no panel control for
   this; it's a deliberate, explicit override, not a toggle). Any other value
-  there sets a custom poll cadence in minutes instead of the default.
+  there sets a custom poll cadence in minutes instead of the default — a floor,
+  not a schedule: a scan polls at most a few groups, so with many autonomous
+  groups coming due together, some are picked up by the next scan a minute
+  later rather than all in one burst.
 
 Autonomous mode is generic: loomux's own orchestration group is just another
 group, so turning it on for the repo loomux itself is developed in would idle-tick

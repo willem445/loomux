@@ -1511,6 +1511,28 @@ const COMPACT_NUDGE_FAST_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// cadence is the finer `notify::NOTIFY_POLL_INTERVAL`. Same cadence, one
 /// fewer thread.
 const INTAKE_POLL_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+/// Bound on ONE `gh` subprocess run by the poller (#656). `gh_capture` was a
+/// bare `Command::output()`, which waits forever; since #406 folded both
+/// pollers into a single loop, one child parked on a stalled connection stops
+/// every `notify_when` notice in the process — and the fleet's whole
+/// anti-deadlock discipline ("register the watch, end the turn") rests on
+/// those notices arriving.
+///
+/// Sized well above any healthy call rather than tight: a live `gh` list or
+/// `pr checks` lands in ~1s, and a false timeout is not free — `poll_watches`
+/// counts one as a failed poll, so three slow-but-live ticks in a row would
+/// cancel a watch that was about to resolve. A genuinely stalled connection
+/// hangs for minutes or forever, so anything in this band separates the two
+/// cases equally well; erring long only costs a slower tick. The bound is
+/// per-call, and with the per-tick caps on both halves
+/// (`notify::MAX_POLLS_PER_TICK`, `intake::MAX_INTAKE_POLLS_PER_TICK`) one
+/// tick is bounded too — generously, but bounded, which is the property that
+/// was missing.
+pub const GH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How often `capture_with_timeout` re-checks a still-running child. Fine
+/// enough to add no perceptible latency to a ~1s call, coarse enough that the
+/// wait costs nothing measurable on a loop that wakes every 30s.
+const GH_CAPTURE_POLL_STEP: Duration = Duration::from_millis(25);
 /// Merge-gate hot-reload (#385): how often `run_workflow_gate_reload` re-checks
 /// every advanced-orchestrator group's `.loomux/workflow.yml` against its
 /// currently-armed gate. A human edit reading the workflow file wants to feel
@@ -21786,12 +21808,86 @@ impl OrchRegistry {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let out = cmd.output().map_err(|e| e.to_string())?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        Self::capture_with_timeout(cmd, GH_CAPTURE_TIMEOUT)
+    }
+
+    /// Run `cmd` to completion and capture it the way `Command::output()`
+    /// would — stdout on success, trimmed stderr on a non-zero exit — except
+    /// that the wait is **bounded**: at `timeout` the child is killed and the
+    /// call returns `Err` (#656).
+    ///
+    /// `output()` waits forever, and since #406 unified the two `gh` pollers
+    /// into one loop there is exactly one thread making `gh` calls: a single
+    /// child parked on a stalled connection stops every `notify_when` notice
+    /// in the process, not just the half it belongs to. Every caller already
+    /// handles `Err` — `poll_watches` counts it toward
+    /// `notify::NOTIFY_FAIL_STREAK_LIMIT`, `poll_intake` skips that half of
+    /// its diff and still stamps — so a timeout needs no new failure channel,
+    /// only a bound.
+    ///
+    /// **Why the reader threads.** The obvious shape (poll `try_wait`, then
+    /// `wait_with_output` once it reports exit) deadlocks against the very
+    /// calls this poller makes: `gh issue list --json` on a busy repo easily
+    /// exceeds a pipe buffer, and a child blocked writing into a full pipe
+    /// never exits, so a healthy-but-chatty `gh` would time out every tick.
+    /// Draining both pipes concurrently is what keeps the child running.
+    ///
+    /// **Why the timeout path does not join them.** After the kill we return
+    /// immediately and leave the two readers to end when their pipe ends. A
+    /// join here would reintroduce exactly the unbounded wait being removed:
+    /// a grandchild that inherited the pipe handle keeps it open past its
+    /// parent's death, so the read can outlive the process we killed. The
+    /// leak is bounded by construction — a timeout costs two threads, and a
+    /// tick makes a bounded number of calls.
+    ///
+    /// Kept `pub` (and taking a caller-built `Command`) so the timeout path is
+    /// testable against a deliberately-slow subprocess without shelling out to
+    /// `gh`, which no test in this repo is allowed to do.
+    pub fn capture_with_timeout(mut cmd: std::process::Command, timeout: Duration) -> Result<String, String> {
+        use std::io::Read as _;
+        use std::process::Stdio;
+
+        // stdin: `output()` nulls it implicitly, `spawn()` does not — and an
+        // inherited stdin is how a `gh` that decides to prompt hangs forever.
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let mut child_out = child.stdout.take().expect("stdout piped just above");
+        let mut child_err = child.stderr.take().expect("stderr piped just above");
+        let out_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = child_out.read_to_end(&mut buf);
+            buf
+        });
+        let err_reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = child_err.read_to_end(&mut buf);
+            buf
+        });
+
+        let deadline = std::time::Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait(); // reap; the kill has already landed
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            std::thread::sleep(GH_CAPTURE_POLL_STEP);
+        };
+
+        // Exited on its own: both pipes are at EOF (or about to be), so these
+        // joins are the bounded tail of a wait that already finished.
+        let stdout = out_reader.join().unwrap_or_default();
+        let stderr = err_reader.join().unwrap_or_default();
+        if status.success() {
+            Ok(String::from_utf8_lossy(&stdout).into_owned())
         } else {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            if err.is_empty() { Err(format!("gh exited with {}", out.status)) } else { Err(err) }
+            let err = String::from_utf8_lossy(&stderr).trim().to_string();
+            if err.is_empty() { Err(format!("gh exited with {status}")) } else { Err(err) }
         }
     }
 
@@ -22156,7 +22252,8 @@ impl OrchRegistry {
 
     /// One intake-poll scan (#332): pick due groups via the pure
     /// `intake::due_intake_polls` selection policy (the per-group interval
-    /// floor, mirroring `notify::due_watches`), shell out to `gh` twice per
+    /// floor and — #656 — the per-scan cap and oldest-polled-first ordering,
+    /// mirroring `notify::due_watches`), shell out to `gh` twice per
     /// due group (`gh issue list`, `gh pr list` — the only two calls this
     /// adds, regardless of how many open PRs/issues exist, since both are
     /// single list calls, not one per item), and fold any new label/PR-check
