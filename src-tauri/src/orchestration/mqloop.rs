@@ -43,12 +43,15 @@
 //! function **plus the landing verb**, exactly as §8 warns.
 
 use super::mergeq::{
-    bisect_step, BatchRecord, BisectStep, EntryState, InvalidTransition, MergeQueueState,
-    QueueEntry,
+    bisect_step, scratch_branch, BatchRecord, BisectStep, EntryState, InvalidTransition,
+    MergeQueueState, QueueEntry,
 };
 use super::mergeqview::MERGE_QUEUE_FILE;
-use super::mqdriver::{as_args, MqRunner, REMOTE};
+use super::mqdriver::{
+    as_args, classify_checks, pr_checks_argv, scratch_exists, BatchVerification, MqRunner, REMOTE,
+};
 use super::notify::sanitize_gh_text;
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 /// Cap on any single gh-sourced string this module formats into a PR comment or
@@ -717,4 +720,281 @@ pub fn prune_terminal(state: &mut MergeQueueState) -> usize {
 /// Record a freshly built batch on the state.
 pub fn record_batch(state: &mut MergeQueueState, rec: BatchRecord) {
     state.batch = Some(rec);
+}
+
+// ── the bounded observation loop (§5) ────────────────────────────────────────
+
+/// What one observation of the batch's draft PR concluded.
+///
+/// Note what is **not** here: there is no "keep waiting forever" arm.
+/// [`BatchOutcome::Pending`] carries the elapsed time precisely so a caller
+/// cannot treat it as a steady state — the bound is applied inside
+/// [`observe_batch`], and pending past the bound comes back as
+/// [`BatchOutcome::Unverifiable`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchOutcome {
+    /// Checks are still running and the bound has not expired.
+    Pending { elapsed_ms: u64 },
+    /// Every check terminal, none failing. The tested object may land.
+    Green,
+    /// Terminal with failures. Into the search (§9) when k > 1.
+    Red { failing: Vec<String> },
+    /// **Not green, and nothing lands.** Either the bound expired with no
+    /// terminal verdict, or `gh` could not answer at all. Surfaced to the
+    /// orchestrator explicitly rather than sitting pending in silence (§5).
+    Unverifiable { why: String },
+}
+
+impl BatchOutcome {
+    /// Only [`BatchOutcome::Green`] may land. A method rather than a `matches!`
+    /// at each call site, because "may this batch land" is exactly the question
+    /// a future fifth variant must not be able to answer by accident.
+    pub fn may_land(&self) -> bool {
+        matches!(self, BatchOutcome::Green)
+    }
+}
+
+/// Observe the batch's draft PR once, under §5's bound.
+///
+/// The primary release is **the checks going terminal**; `checks_timeout_minutes`
+/// is a *backstop*, not the mechanism — `.loomux/lessons.md` records that
+/// releasing on evidence beats releasing on elapsed time, and, beside it, that
+/// any suppression driven by a fallible signal must still be bounded. Both hold
+/// here: a terminal answer wins immediately, and a repo with no CI at all (which
+/// classifies as `Pending` forever) surfaces as **unverifiable** at the bound
+/// instead of pinning a batch indefinitely.
+///
+/// **Unverifiable is not green.** Nothing lands on it; the caller requeues the
+/// entries and tells the orchestrator. That is why this returns a four-way
+/// outcome rather than an `Option<bool>`.
+///
+/// `now_ms`/`started_ms` are arguments rather than clock reads, so the bound is
+/// testable without waiting for one. A clock that stepped backwards saturates to
+/// zero elapsed rather than underflowing: a backward step can extend the wait,
+/// never fabricate an instant timeout.
+pub fn observe_batch(
+    r: &dyn MqRunner,
+    draft_pr: u64,
+    started_ms: u64,
+    now_ms: u64,
+    checks_timeout_minutes: u32,
+) -> BatchOutcome {
+    let argv = pr_checks_argv(draft_pr);
+    let verdict = match r.gh(&as_args(&argv)) {
+        Ok(o) if o.ok() => classify_checks(Ok(o.stdout.as_str())),
+        Ok(o) => classify_checks(Err(o.stderr.as_str())),
+        // `gh` could not be run at all (§10's `gh-not-found`): the queue reports
+        // itself unavailable rather than silently doing nothing.
+        Err(e) => BatchVerification::Unavailable { why: e },
+    };
+    let elapsed_ms = now_ms.saturating_sub(started_ms);
+    match verdict {
+        BatchVerification::Green => BatchOutcome::Green,
+        BatchVerification::Red { failing } => BatchOutcome::Red { failing },
+        BatchVerification::Unavailable { why } => BatchOutcome::Unverifiable { why: quote(&why) },
+        BatchVerification::Pending => {
+            let bound_ms = u64::from(checks_timeout_minutes).saturating_mul(60_000);
+            if elapsed_ms >= bound_ms {
+                BatchOutcome::Unverifiable {
+                    why: format!(
+                        "no terminal checks on batch PR #{draft_pr} within \
+                         {checks_timeout_minutes} minutes"
+                    ),
+                }
+            } else {
+                BatchOutcome::Pending { elapsed_ms }
+            }
+        }
+    }
+}
+
+// ── crash reconcile (§4) ─────────────────────────────────────────────────────
+
+/// The argv that asks whether the batch's draft PR is still open.
+pub fn pr_state_argv(pr: u64) -> Vec<String> {
+    vec!["pr".into(), "view".into(), pr.to_string(), "--json".into(), "state".into()]
+}
+
+#[derive(Deserialize)]
+struct RawPrState {
+    #[serde(default)]
+    state: String,
+}
+
+/// Is the batch's draft PR still open? `None` when that could not be determined
+/// — which reconcile treats as "the world does not match", never as "probably
+/// fine".
+fn draft_pr_open(r: &dyn MqRunner, pr: u64) -> Option<bool> {
+    let out = r.gh(&as_args(&pr_state_argv(pr))).ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let parsed: RawPrState = serde_json::from_str(out.line()).ok()?;
+    Some(parsed.state.eq_ignore_ascii_case("OPEN"))
+}
+
+/// What a restart found, and what it did about it.
+///
+/// **The two-phase contract (§4, the #467/#468 pattern).** Phase 1 — this
+/// function — reads the world, classifies, and mutates the state. It must not
+/// deliver anything: the registry's lock is not reentrant, and the delivery
+/// queue learned that the hard way. Every notice it wants sent is *collected*
+/// here and returned, for the caller to send in phase 2 once the guard has
+/// dropped. That is why `notices` is a field rather than a callback.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// The in-flight batch matched the world and may continue.
+    pub resumed: bool,
+    /// `(pr, why)` for every entry failed **loudly** because the world did not
+    /// match the record. Audited as `mq-stranded`.
+    pub stranded: Vec<(u64, String)>,
+    /// Transitions applied, for the caller to audit — one per entry moved.
+    pub transitions: Vec<Transition>,
+    /// Phase-2 notices. Sent by the caller after the guard drops, never here.
+    pub notices: Vec<String>,
+    /// A leftover temp worktree that would not go away. Audit as
+    /// `mq-cleanup-failed`; never a reason to fail anything.
+    pub cleanup_failed: Option<String>,
+}
+
+/// **Reconcile an in-flight batch against reality after a restart** (§4).
+///
+/// The file says what loomux *intended*. The truth is whether the scratch ref
+/// still exists and whether the draft PR is still open. Resume **only** when the
+/// world matches; otherwise fail the entries loudly — audit, notice, terminal
+/// state. Never silently drop, never silently retry.
+///
+/// Both existence checks fail **closed**: an unanswerable `ls-remote` or an
+/// unreadable PR strands the batch rather than resuming it, because resuming
+/// onto a scratch ref loomux cannot confirm is exactly how the Bors invariant
+/// (§8) fails at the one point §8 does not guard.
+///
+/// The snapshot is **not deleted** here — the caller rewrites it alongside live
+/// entries, so recovery is re-runnable across N restarts rather than a one-shot
+/// that a crash mid-recovery can lose.
+pub fn reconcile_batch(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    group: &str,
+) -> ReconcileReport {
+    let mut report = ReconcileReport::default();
+    let Some(batch) = state.batch.clone() else {
+        // Nothing was in flight. Entries sitting in an in-flight state with no
+        // batch record are themselves the inconsistency §4 reconciles, and
+        // `plan_batch` already refuses to dispatch on exactly that signal — so
+        // strand them rather than leaving them to block the queue forever.
+        let orphans: Vec<u64> =
+            state.entries.iter().filter(|e| e.state().in_flight()).map(|e| e.pr).collect();
+        for pr in orphans {
+            strand(state, &mut report, pr, "in-flight with no batch record on disk");
+        }
+        return report;
+    };
+
+    let scratch_ok = match scratch_branch(group, &batch.id) {
+        None => Some(false),
+        Some(branch) => scratch_exists(r, &branch).ok(),
+    };
+    let draft_ok = match batch.draft_pr {
+        Some(pr) => draft_pr_open(r, pr),
+        // A batch recorded past `batching` with no draft PR never got one, so
+        // there is nothing to resume onto.
+        None => Some(false),
+    };
+
+    let why = match (scratch_ok, draft_ok) {
+        (Some(true), Some(true)) => None,
+        (None, _) => Some("the scratch ref could not be checked on the remote".to_string()),
+        (_, None) => Some("the batch's draft PR could not be read".to_string()),
+        (Some(false), _) => Some("the scratch ref is gone from the remote".to_string()),
+        (_, Some(false)) => Some("the batch's draft PR is no longer open".to_string()),
+    };
+
+    match why {
+        None => {
+            report.resumed = true;
+            report.notices.push(format!(
+                "[loomux] merge queue: resumed batch {} after a restart - scratch ref and draft PR #{} both still present.",
+                quote(&batch.id),
+                batch.draft_pr.unwrap_or(0)
+            ));
+        }
+        Some(why) => {
+            for pr in batch.prs.clone() {
+                strand(state, &mut report, pr, &why);
+            }
+            report.cleanup_failed = cleanup_worktree(r, &batch.id);
+            state.batch = None;
+            report.notices.push(format!(
+                "[loomux] merge queue: batch {} could NOT be resumed after a restart ({}). {} entr{} kicked back; nothing landed.",
+                quote(&batch.id),
+                quote(&why),
+                batch.prs.len(),
+                if batch.prs.len() == 1 { "y" } else { "ies" }
+            ));
+        }
+    }
+    report
+}
+
+/// Fail one entry loudly: move it to `kicked-back`, record the transition for
+/// the audit, and record why.
+///
+/// A **refused** transition is itself reported rather than swallowed — an entry
+/// the state machine will not move is a fact the audit needs, and §11.5 requires
+/// an audit action to name what actually happened.
+fn strand(state: &mut MergeQueueState, report: &mut ReconcileReport, pr: u64, why: &str) {
+    match advance_entry(state, pr, EntryState::KickedBack) {
+        Ok(Some(t)) => {
+            report.transitions.push(t);
+            report.stranded.push((pr, why.to_string()));
+        }
+        Ok(None) => {}
+        Err(e) => {
+            report.stranded.push((pr, format!("{why}; and the entry would not move: {e}")));
+        }
+    }
+}
+
+// ── the one orchestrator notice (§9) ─────────────────────────────────────────
+
+/// **One decision-grade notice** on a culprit (§9) — "one fact that changes what
+/// it does next, plus the PR link, not a narration".
+///
+/// Deliberately terse, and deliberately *not* a briefing. §9 is explicit that
+/// the backend produces the **fact** and the orchestrator makes the **call**:
+/// worker liveness, resume-versus-fresh-spawn, and folding this in with whatever
+/// else is pending are judgment calls, and the board mapping that equips them
+/// belongs to the orchestrator. So this names the culprit, the batch, one
+/// failing check and the survivor count — and says nothing about who should do
+/// what next.
+///
+/// The durable record is the PR comment ([`culprit_comment`]); this is the nudge
+/// that makes someone read it.
+pub fn culprit_notice(culprit: u64, batch_id: &str, failing: &[String], survivors: usize) -> String {
+    let check = failing.first().map(|f| format!(" ({})", quote(f))).unwrap_or_default();
+    let more =
+        if failing.len() > 1 { format!(" +{} more failing", failing.len() - 1) } else { String::new() };
+    format!(
+        "[loomux] merge queue: #{culprit} isolated as batch {}'s culprit{check}{more}. \
+         {survivors} sibling{} requeued; details on #{culprit}.",
+        quote(batch_id),
+        if survivors == 1 { "" } else { "s" }
+    )
+}
+
+/// The notice for a batch that could not be verified within the bound (§5).
+///
+/// Distinct from the culprit notice because it means something different and
+/// asks for something different: **nothing is attributable**, nothing landed,
+/// and the thing to look at is the repo's CI rather than any one PR. Collapsing
+/// the two would tell an orchestrator a PR is implicated when none is.
+pub fn unverifiable_notice(batch_id: &str, draft_pr: Option<u64>, why: &str) -> String {
+    let where_ = draft_pr.map(|p| format!(" (batch PR #{p})")).unwrap_or_default();
+    format!(
+        "[loomux] merge queue: batch {}{where_} is UNVERIFIABLE - {}. Nothing landed; \
+         entries requeued. This is not a red batch and no PR is implicated.",
+        quote(batch_id),
+        quote(why)
+    )
 }
