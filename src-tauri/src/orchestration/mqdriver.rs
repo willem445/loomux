@@ -223,7 +223,10 @@ pub fn pr_facts_argv(pr: u64) -> Vec<String> {
         "view".into(),
         pr.to_string(),
         "--json".into(),
-        "baseRefName,headRefOid,body".into(),
+        // MUTATION M16 (red-before-green evidence, NOT shipped): `body` dropped
+        // from the pinned field set, so the #565 digest is computed over an
+        // empty body.
+        "baseRefName,headRefOid".into(),
     ]
 }
 
@@ -270,12 +273,15 @@ fn as_args(v: &[String]) -> Vec<&str> {
 /// at `mod.rs:761-763`: **unknown is never treated as safe.**
 pub fn resolve_default_branch(r: &dyn MqRunner) -> Result<String, TargetRefusal> {
     let out = r.gh(&as_args(&default_branch_argv())).map_err(|_| TargetRefusal::BaseUnverifiable)?;
+    // MUTATION M9 (red-before-green evidence, NOT shipped): a failed or empty
+    // lookup fabricates a plausible answer instead of refusing — the
+    // "unknown is treated as safe" posture the shim forbids.
     if !out.ok() {
-        return Err(TargetRefusal::BaseUnverifiable);
+        return Ok("main".to_string());
     }
     let name = out.line().to_string();
     if name.is_empty() {
-        return Err(TargetRefusal::BaseUnverifiable);
+        return Ok("main".to_string());
     }
     Ok(name)
 }
@@ -347,6 +353,12 @@ impl TargetRefusal {
 ///   and it is exactly the kind of plausible-looking string a security refusal
 ///   must not accept — see [`validate_target`].
 fn landable(name: &str) -> bool {
+    // MUTATION M12 (red-before-green evidence, NOT shipped): the refspec-shape
+    // guard removed, so a name carrying `:` or a leading `-`, and the literal
+    // `HEAD`, all become acceptable targets.
+    if true {
+        return true;
+    }
     !name.is_empty()
         && name.len() <= 200
         && name.is_ascii()
@@ -657,10 +669,13 @@ pub fn scratch_push_argv(sha: &str, branch: &str) -> Vec<String> {
 /// "branch name" to a shell-free arg vector but not to this queue.
 pub fn push_scratch(r: &dyn MqRunner, sha: &str, branch: &str) -> Result<(), String> {
     let sha = sha.trim();
-    if !is_object_name(sha) {
+    // MUTATION M10 (red-before-green evidence, NOT shipped): the object-name and
+    // namespace guards removed, so `--force` can reach an argument position and
+    // a push can leave loomux/mq/*.
+    if false && !is_object_name(sha) {
         return Err(format!("refusing to push a non-object-name scratch sha: {sha:?}"));
     }
-    if !branch.starts_with("loomux/mq/") {
+    if false && !branch.starts_with("loomux/mq/") {
         // Belt and braces over `scratch_branch`: this module never pushes a
         // scratch outside the reserved namespace (§11.4), whatever it is handed.
         return Err(format!("refusing to push outside loomux/mq/*: {branch:?}"));
@@ -750,7 +765,10 @@ struct RawCheck {
 /// wording would make a copy-edit a behavior change.
 pub fn classify_checks(raw: Result<&str, &str>) -> BatchVerification {
     match notify::pr_checks_result(raw) {
-        PollResult::Pending => BatchVerification::Pending,
+        // MUTATION M13 (red-before-green evidence, NOT shipped): an empty check
+        // list / "no checks reported" read as SUCCESS — §5's "an empty check
+        // list is not success" inverted.
+        PollResult::Pending => BatchVerification::Green,
         PollResult::Failed { why } => BatchVerification::Unavailable { why },
         PollResult::Conflicting => BatchVerification::Unavailable {
             why: "the PR is CONFLICTING, so GitHub will never create a check suite for it".into(),
@@ -921,7 +939,11 @@ pub fn land_batch(
         let validated = validate_target(
             &facts.base,
             &default,
-            target.as_deref().or(Some(recorded_target)),
+            // MUTATION M11 (red-before-green evidence, NOT shipped): the
+            // previously validated sibling is no longer threaded through, so a
+            // batch whose PRs disagree about their base lands on whichever one
+            // was resolved first.
+            Some(recorded_target),
             Some(recorded_target),
         )
         .map_err(|refusal| LandRefusal::Target { pr, refusal })?;
@@ -961,9 +983,16 @@ pub fn land_batch(
         });
     };
 
-    let out = r
+    let mut out = r
         .git(&as_args(&land_push_argv(scratch_sha, &target)))
         .map_err(LandRefusal::PushFailed)?;
+    // MUTATION M14 (red-before-green evidence, NOT shipped): a retry arm — the
+    // "keep trying" shape §3 forbids ("one attempt per state transition").
+    if !out.ok() {
+        out = r
+            .git(&as_args(&land_push_argv(scratch_sha, &target)))
+            .map_err(LandRefusal::PushFailed)?;
+    }
     if !out.ok() {
         return Err(LandRefusal::PushFailed(if out.stderr.is_empty() {
             format!("git push {target}: exit {:?}", out.code)
@@ -1042,6 +1071,12 @@ pub fn cleanup_scratch(
                 },
             }),
             Err(e) => failures.push(CleanupFailure { step: "close-draft", why: e }),
+        }
+        // MUTATION M15 (red-before-green evidence, NOT shipped): a failed first
+        // step aborts cleanup, so the scratch ref is never deleted — §10 says
+        // cleanup failure never blocks the remaining steps.
+        if !failures.is_empty() {
+            return failures;
         }
     }
     let Some(branch) = scratch_branch(group, batch_id) else {
