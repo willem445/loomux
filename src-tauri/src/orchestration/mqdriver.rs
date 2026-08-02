@@ -430,12 +430,12 @@ fn usable_for_comparison(name: &str) -> bool {
 /// push to the default branch as the cost.
 fn same_branch(a: &str, b: &str) -> bool {
     fn short(s: &str) -> &str {
-        let s = s.trim();
-        let s = s.strip_prefix("refs/heads/").unwrap_or(s);
-        // Derived from `REMOTE` rather than a second `"origin/"` literal, and
-        // the separate `/` step is what keeps `originalthing` from being read
-        // as the remote-qualified `althing`.
-        s.strip_prefix(REMOTE).and_then(|r| r.strip_prefix('/')).unwrap_or(s)
+        // MUTATION M19 (red-before-green evidence, NOT shipped): the whole
+        // qualified-spelling normalization removed. This is the mechanism that
+        // makes a `refs/heads/`- or `origin/`-qualified default still trip the
+        // constraint-7 refusal; without it the comparison misses and the queue
+        // pushes to the default branch.
+        s.trim()
     }
     // `refs/remotes/origin/main` needs no arm here: `usable_for_comparison` is
     // `landable` after one optional `refs/heads/` strip, and `landable` rejects
