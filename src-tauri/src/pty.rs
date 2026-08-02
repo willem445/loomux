@@ -17,7 +17,11 @@ use crate::obs::LockExt;
 
 /// Cap on the per-pty output ring used by orchestration's `get_output` —
 /// enough for a few screens of TUI history without unbounded growth.
-const OUTPUT_RING_CAP: usize = 256 * 1024;
+///
+/// `pub(crate)` for orchestration's Tier 1 scan (#685): a read that widens
+/// itself needs a ceiling, and the ring is the only honest one — no request
+/// past it can return a byte the ring does not hold.
+pub(crate) const OUTPUT_RING_CAP: usize = 256 * 1024;
 
 /// Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (issue #78).
 ///
