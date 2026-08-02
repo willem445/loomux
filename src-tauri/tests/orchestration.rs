@@ -644,19 +644,28 @@ fn a_queue_change_that_cannot_be_persisted_is_reported_as_unwritable() {
 
 /// The gate half of #681: a `merge_gate` file that is ON DISK but an I/O error
 /// (here, permission denied) keeps loomux from reading it must refuse
-/// `gate-unreadable` — a loomux FAULT — never `gate-not-configured`, which
-/// asserts the file is genuinely absent (a policy fact `GateSpec::Absent`
-/// covers) and would send a reader looking for a missing workflow declaration
-/// instead of a torn or permission-denied file.
+/// `gate-unreadable` — a loomux FAULT — never a policy refusal, which asserts
+/// something read a well-formed answer out of the file (present-and-declared,
+/// present-and-empty, or absent) rather than failing to read it at all.
+///
+/// This fixture's own repo has no `merge_queue:` block (`setup_mcp()`'s fake
+/// repo carries no `workflow.yml`), so `merge_queue_enabled` is false and the
+/// pre-fix label here is `queue-disabled`, not literally `gate-not-configured`
+/// — that one only fires once the queue is enabled and enqueue reaches the
+/// gate check. The property this test actually pins is the more general one
+/// #681 asked for: **a gate-read fault preempts every policy question**,
+/// `queue-disabled` included, the same way `STATE_UNREADABLE` already
+/// preempts it above — not merely the one policy label the issue happened to
+/// name. A malformed (but readable) gate file is NOT this case — it still
+/// parses fine as far as `fs::read_to_string` is concerned and correctly
+/// stays `gate-not-met` via `GateSpec::Malformed`, covered by the existing
+/// gate tests in mergequeue.rs.
 ///
 /// `#[cfg(unix)]` for the same reason as the unwritable test above: Windows
-/// has no portable way to make an existing file's own read fail. A malformed
-/// (but readable) gate file is NOT this case — it still parses fine as far as
-/// `fs::read_to_string` is concerned and correctly stays `gate-not-met` via
-/// `GateSpec::Malformed`, covered by the existing gate tests in mergequeue.rs.
+/// has no portable way to make an existing file's own read fail.
 #[cfg(unix)]
 #[test]
-fn an_unreadable_gate_file_is_labelled_as_a_fault_not_gate_not_configured() {
+fn an_unreadable_gate_file_is_labelled_as_a_fault_never_a_policy_refusal() {
     use std::os::unix::fs::PermissionsExt;
     let (reg, d, co, _cw) = setup_mcp();
     let gate_file = d.path().join(&co.group).join("merge_gate");
@@ -673,7 +682,9 @@ fn an_unreadable_gate_file_is_labelled_as_a_fault_not_gate_not_configured() {
     assert_eq!(
         v["refused"],
         json!("gate-unreadable"),
-        "an unreadable gate file must not read as 'no gate covers this target'"
+        "an unreadable gate file must never masquerade as a policy refusal — \
+         here, pre-fix, it would read as 'queue-disabled' ('the repo never opted \
+         in'), when the truth is a loomux fault"
     );
     assert!(
         loomux_lib::orchestration::mqloop::refusal::is_loomux_fault("gate-unreadable"),

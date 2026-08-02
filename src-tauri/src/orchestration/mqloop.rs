@@ -1037,9 +1037,10 @@ pub fn unverifiable_notice(batch_id: &str, draft_pr: Option<u64>, why: &str) -> 
 // place rather than a set of `if`s spread across `mcp.rs`.
 
 /// §11.1's **closed** refusal vocabulary. Every refusal an agent can see is one
-/// of these eight strings — nothing constructs a ninth, and nothing returns a
-/// free-text reason, because an open vocabulary is one a caller cannot branch on
-/// and a human cannot grep for.
+/// of these eight **policy** strings, `NOT_QUEUED`, or one of the loomux-fault
+/// strings below — nothing constructs a string outside this set, and nothing
+/// returns a free-text reason, because an open vocabulary is one a caller
+/// cannot branch on and a human cannot grep for.
 pub mod refusal {
     pub const BASE_IS_DEFAULT: &str = "base-is-default";
     pub const BASE_UNVERIFIABLE: &str = "base-unverifiable";
