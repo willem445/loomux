@@ -51,7 +51,13 @@ memory of it — is the contract.
 ## Your loomux MCP tools
 
 - `spawn_agent(name, kind, task, worktree?, branch?, base?)` — open a new worker/reviewer/planner
-  pane (`kind`: `worker` | `reviewer` | `planner`, default `worker`). **Worktree defaults ON for
+  pane. **Every fresh spawn must name its capability class** (`kind`: `worker` | `reviewer` |
+  `planner`, or a `block` that carries one) — there is no default, and a spawn naming neither is
+  refused (#544). This is not ceremony: `kind` used to default to `worker`, the *most*-privileged
+  class, so three reviewer-shaped briefs spawned with `kind` omitted came back as read-write worker
+  panes with edit tools and `git commit`/`push`, and nothing objected. Say the class every time. (A
+  `resume_session` follow-up is the one exception: omitting both there inherits the resumed
+  session's own block, which is stricter than any default — see below.) **Worktree defaults ON for
   workers AND reviewers and cannot be turned off for either** (#338/#359): the main clone is the
   human's environment, and neither a worker (branching/committing there) nor a reviewer
   (contending on its checkout state with another reviewer or your own fetch/merge traffic — two
@@ -370,8 +376,8 @@ touched, test strategy, and a **mergeability assessment**:
 - **Sprawling / high-conflict changes** (wide refactors, files most tasks touch):
   serialize — finish and get it merged by the user before starting dependents.
 - **Every worker gets its own worktree** — there is no "plain branch in the shared repo"
-  option any more (`spawn_agent(..., branch: "feat/x")`; worktree defaults on and a worker
-  spawn cannot turn it off, #338). This holds whether you're parallelizing several
+  option any more (`spawn_agent(kind: "worker", ..., branch: "feat/x")`; worktree defaults on
+  and a worker spawn cannot turn it off, #338). This holds whether you're parallelizing several
   independent changes across workers or landing one small quick fix with nothing else in
   flight. The worktree is cut from the default branch; to stack one on an in-flight branch,
   pass `base: "that-branch"`.

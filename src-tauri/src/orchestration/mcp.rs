@@ -297,11 +297,11 @@ fn tool_defs(role: Role, role_hint: Option<&str>) -> Vec<Value> {
     if role == Role::Orchestrator {
         tools.extend([
             tool("spawn_agent",
-                "Open a new worker, reviewer, or planner agent pane in this group. Guardrails apply: live-agent cap and per-role pinned CLI + model. Give branch a meaningful name. Empty task spawns an idle agent awaiting prompts. A planner explores the codebase read-only and writes an implementation plan as a GitHub issue comment, then reports and exits. Its read-only contract is enforced structurally where the CLI allows it — it never gets a worktree, and its file-editing tools plus git commit/push are denied at the CLI level — so it cannot edit files or push code; not opening PRs is asked of it in its instructions (gh stays available so it can post the plan comment). WORKTREE DEFAULTS ON FOR WORKERS AND REVIEWERS AND CANNOT BE TURNED OFF (#338/#359): the main clone is the human's environment, and neither a worker (branching/committing there) nor a reviewer (contending on its checkout state with another reviewer or your own fetch/merge traffic — two concurrent reviewers colliding in the shared clone is the incident #359 names) may conflict with it — passing worktree=false for either (or a worker-/reviewer-kind block) is rejected outright, not silently coerced. A reviewer's own worktree is scratch space cut from the default branch, not a checkout of the PR it's reviewing (that branch may already be checked out in the worker's own worktree) — its kickoff note and reviewer.md cover the `gh pr checkout <n> --detach` convention for inspecting the PR's actual code locally. A planner is unaffected: it never gets one under any circumstance. For your OWN mechanical work (rebases, conflict fixes) that would otherwise mean checking out a branch in the main clone, use a staging worktree of your own instead of spawning a worker or reviewer just to get one. THE SAME GUARANTEE COVERS A FRESH SPAWN'S cwd, not just worktree: passing cwd on a worker or reviewer spawn with no resume_session is rejected too (it would override the worktree exactly like worktree=false would) — cwd only has a role once resume_session is set; a planner still honors an explicit cwd on a fresh spawn, unchanged. For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting, and the worktree default/guard above does not apply (the resume's cwd is what governs its workspace). cwd is optional on a resume: omit it and loomux INHERITS the session's recorded workspace from this group's roster (the same last-touched-record lookup the block inheritance below uses) rather than guessing — but if nothing is recorded for that session AND the resumed agent is a worker or reviewer, the spawn is a hard error rather than a silent fall-back into the main clone (#338/#359 again: neither's workspace is ever the human's own checkout). A planner is unaffected by that guard; pass cwd explicitly whenever you have it, which you almost always will. A resume with no kind/block INHERITS the resumed session's original block (and therefore its persona, model and capability class) from this group's roster — it never re-derives a default from `kind`, so a reviewer resumed bare comes back a reviewer, not a worker. An unrecognized session id with no block is a hard error, never a silent worker spawn. To deliberately re-role a resumed session into a different capability class, pass `block` explicitly — same as any other spawn, and audited the same way (the agent-spawn record always carries block + session + resume).",
+                "Open a new worker, reviewer, or planner agent pane in this group. A FRESH SPAWN MUST NAME ITS CAPABILITY CLASS: pass kind (worker | reviewer | planner) or block (a block id from this group's roster). Omitting both is REFUSED — there is no default class (#544). Before that refusal existed, forgetting `kind` handed you the MOST-privileged class: three reviewer-shaped briefs (\"review PR #536\", \"record your verdict\") were spawned as read-write worker panes, with edit tools and git commit/push, and nothing objected. A capability class is only ever acquired deliberately; the only spawn that may omit both is a resume_session, which INHERITS the resumed session's own block (see below) rather than defaulting to anything. Guardrails apply: live-agent cap and per-role pinned CLI + model. Give branch a meaningful name. Empty task spawns an idle agent awaiting prompts. A planner explores the codebase read-only and writes an implementation plan as a GitHub issue comment, then reports and exits. Its read-only contract is enforced structurally where the CLI allows it — it never gets a worktree, and its file-editing tools plus git commit/push are denied at the CLI level — so it cannot edit files or push code; not opening PRs is asked of it in its instructions (gh stays available so it can post the plan comment). WORKTREE DEFAULTS ON FOR WORKERS AND REVIEWERS AND CANNOT BE TURNED OFF (#338/#359): the main clone is the human's environment, and neither a worker (branching/committing there) nor a reviewer (contending on its checkout state with another reviewer or your own fetch/merge traffic — two concurrent reviewers colliding in the shared clone is the incident #359 names) may conflict with it — passing worktree=false for either (or a worker-/reviewer-kind block) is rejected outright, not silently coerced. A reviewer's own worktree is scratch space cut from the default branch, not a checkout of the PR it's reviewing (that branch may already be checked out in the worker's own worktree) — its kickoff note and reviewer.md cover the `gh pr checkout <n> --detach` convention for inspecting the PR's actual code locally. A planner is unaffected: it never gets one under any circumstance. For your OWN mechanical work (rebases, conflict fixes) that would otherwise mean checking out a branch in the main clone, use a staging worktree of your own instead of spawning a worker or reviewer just to get one. THE SAME GUARANTEE COVERS A FRESH SPAWN'S cwd, not just worktree: passing cwd on a worker or reviewer spawn with no resume_session is rejected too (it would override the worktree exactly like worktree=false would) — cwd only has a role once resume_session is set; a planner still honors an explicit cwd on a fresh spawn, unchanged. For a FOLLOW-UP on a finished task, pass resume_session (from list_agents/the task board) plus cwd (where that work happened) — the pane reopens that conversation with its context instead of cold-starting, and the worktree default/guard above does not apply (the resume's cwd is what governs its workspace). cwd is optional on a resume: omit it and loomux INHERITS the session's recorded workspace from this group's roster (the same last-touched-record lookup the block inheritance below uses) rather than guessing — but if nothing is recorded for that session AND the resumed agent is a worker or reviewer, the spawn is a hard error rather than a silent fall-back into the main clone (#338/#359 again: neither's workspace is ever the human's own checkout). A planner is unaffected by that guard; pass cwd explicitly whenever you have it, which you almost always will. A resume with no kind/block INHERITS the resumed session's original block (and therefore its persona, model and capability class) from this group's roster — it never re-derives a default from `kind`, so a reviewer resumed bare comes back a reviewer, not a worker. An unrecognized session id with no block is a hard error, never a silent worker spawn. To deliberately re-role a resumed session into a different capability class, pass `block` explicitly — same as any other spawn, and audited the same way (the agent-spawn record always carries block + session + resume).",
                 json!({
                     "name": { "type": "string", "description": "Short display name for the pane" },
-                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Capability class (default worker). An unrecognized value is rejected, never treated as a worker. On a resume_session, passing this ALSO defeats block inheritance — same as passing block — and re-derives the default block for that kind instead; omit both to inherit the resumed session's own block." },
-                    "block": { "type": "string", "description": "Id of a block declared in the repo's .loomux/workflow.yml — e.g. 'rev-security'. The block supplies the persona, CLI, model and capability class (so `kind` is ignored when this is set). Your kickoff lists the blocks this group has; omit it to get the default block for `kind` — UNLESS resume_session is set, in which case omitting it inherits that session's own original block instead (see resume_session). Set it explicitly on a resume only when you mean to re-role that conversation into a different capability class." },
+                    "kind": { "type": "string", "enum": ["worker", "reviewer", "planner"], "description": "Capability class. REQUIRED on a fresh spawn unless `block` names one instead (#544) — there is NO default, so omitting both is refused with a message naming what to pass, never silently a worker. An unrecognized value is rejected too, never treated as a worker. On a resume_session, passing this ALSO defeats block inheritance — same as passing block — and re-derives the default block for that kind instead; omit both there to inherit the resumed session's own block." },
+                    "block": { "type": "string", "description": "Id of a block declared in the repo's .loomux/workflow.yml — e.g. 'rev-security'. The block supplies the persona, CLI, model and capability class (so `kind` is ignored when this is set). Your kickoff lists the blocks this group has; omit it to get the default block for `kind`, which then has to be set — a fresh spawn naming NEITHER is refused (#544). UNLESS resume_session is set, in which case omitting both inherits that session's own original block instead (see resume_session). Set it explicitly on a resume only when you mean to re-role that conversation into a different capability class." },
                     "task": { "type": "string", "description": "Full task brief; empty = idle. With resume_session, this is the follow-up prompt." },
                     "worktree": { "type": "boolean", "description": "Create a dedicated git worktree + branch. Defaults ON for workers AND reviewers (and cannot be set false for either — rejected, see above); a planner never gets one regardless of this flag." },
                     "branch": { "type": "string", "description": "Branch name (default agent/<id>)" },
@@ -592,14 +592,21 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // `_ => Role::Worker` — so a typo'd or hallucinated kind silently
             // became a *worker*, complete with a worktree and write access. A
             // capability class is the one thing that must never be guessed.
+            //
+            // #544 closes the other half of that same door: an OMITTED kind used
+            // to default to `Role::Worker` here, so forgetting the argument had
+            // the identical effect a typo used to have — the most-privileged
+            // class, silently. `Option` all the way down now; the fresh-spawn
+            // requirement is enforced below (it needs `block` and `resume`,
+            // which are parsed after this).
             let kind = match arg_str(args, "kind") {
-                None => Role::Worker, // documented default
-                Some(k) => super::workflow::kind_from_str(k).ok_or_else(|| {
+                None => None,
+                Some(k) => Some(super::workflow::kind_from_str(k).ok_or_else(|| {
                     format!(
                         "unknown kind {k:?} — must be one of {}",
                         super::workflow::kind_names()
                     )
-                })?,
+                })?),
             };
             // ...but `orchestrator` is a kind loomux *can* name, and this tool is
             // the one place an agent chooses one. Delegates only.
@@ -616,7 +623,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // loop would fork-bomb the machine with fully-privileged panes.
             // The JSON-schema `enum` in `tool_defs` is advertisement; it is never
             // enforced against the incoming arguments. This is the enforcement.
-            if kind == Role::Orchestrator {
+            if kind == Some(Role::Orchestrator) {
                 return Err(
                     "kind must be worker | reviewer | planner — a group has exactly one \
                      orchestrator (you), opened at launch"
@@ -655,6 +662,38 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             };
             let cwd = arg_str(args, "cwd").map(str::to_string);
             let resumed = resume.is_some();
+            // #544: a FRESH spawn must name its capability class — `kind` or
+            // `block`, deliberately, every time. There is no default any more.
+            //
+            // The incident: three reviewer-shaped briefs ("Fresh review of PR
+            // #536 …", names literally starting with `rev:`, tasks telling the
+            // agent to record a verdict with `review_verdict`) were spawned
+            // with `kind` omitted and came back as WORKERS — read-write panes
+            // with edit tools and git commit/push. Every containment guardrail
+            // this repo has (#448/#462/#465) protects a pane that was correctly
+            // *classified*; none of it helps when the classification itself was
+            // acquired by forgetting an argument. Defaulting to the
+            // most-privileged class makes omission fail OPEN on a capability
+            // boundary, which is the one place it must never do that.
+            //
+            // A resume is deliberately exempt and keeps its #254 semantics:
+            // omitting both there INHERITS the resumed session's own block
+            // (below), which is a *stricter* answer than any default — it
+            // re-derives nothing, and an unknown session is already a hard
+            // error rather than a silent worker.
+            if !resumed && kind.is_none() && block.is_none() {
+                return Err(
+                    "spawn_agent requires an explicit capability class on a fresh spawn (#544): \
+                     pass kind (worker | reviewer | planner) — or block, naming one of this \
+                     group's declared blocks, which carries its own kind. There is no default: \
+                     a spawn that named neither used to become a WORKER, the most-privileged \
+                     class, so forgetting the argument silently produced a read-write pane \
+                     (edit tools, git commit/push) for a task you may have meant for a reviewer \
+                     or planner. If this is a follow-up on an existing conversation, pass \
+                     resume_session instead — that inherits the session's own class."
+                        .into(),
+                );
+            }
             // The last-touched roster record naming this session, if any —
             // shared by #254's block inheritance and the cwd inheritance
             // below, so both agree on the same record instead of running two
@@ -683,9 +722,11 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             let worktree = if resumed {
                 requested_worktree.unwrap_or(false)
             } else {
+                // With no block, the fresh-spawn requirement above guarantees
+                // `kind` is Some here — this branch never has to invent one.
                 let effective_role = match block.as_deref() {
                     Some(id) => reg.group(&caller.group).and_then(|g| g.guardrails.block(id).map(|b| b.kind)),
-                    None => Some(kind),
+                    None => kind,
                 };
                 // A FRESH (non-resume) spawn's `cwd` is `spawn_agent_ex`'s
                 // `cwd_override`, which wins over `worktree` unconditionally —
@@ -735,7 +776,7 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // is left alone — only the fully block-less, kind-less resume (the
             // shape the tool description above documents as the whole
             // follow-up contract) gets inherited instead of guessed.
-            let block = if block.is_none() && arg_str(args, "kind").is_none() {
+            let block = if block.is_none() && kind.is_none() {
                 if resumed {
                     // A session can appear more than once (roster + audit
                     // backfill can both carry it, or it was re-spawned into
@@ -756,8 +797,24 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         // Pre-#222 roster row: only a role was ever recorded,
                         // no block identity — inherit that role's default
                         // block instead, since there is no block id to name.
-                        let owner_role =
-                            super::workflow::kind_from_str(&owner_rec.role).unwrap_or(kind);
+                        //
+                        // #544: an UNPARSEABLE recorded role used to fall back
+                        // to `kind` — which, in this branch, is by construction
+                        // the omitted-`kind` default, i.e. Worker. So a corrupt
+                        // or future-version roster row resumed bare handed back
+                        // the most-privileged class with nothing said. Refuse
+                        // instead: this is the same "never guess a capability
+                        // class" rule the fresh-spawn requirement above states.
+                        let owner_role = super::workflow::kind_from_str(&owner_rec.role)
+                            .ok_or_else(|| {
+                                format!(
+                                    "session {session_id:?} is recorded under an unrecognized \
+                                     role {:?} and carries no block id, so its capability class \
+                                     cannot be inherited (#544) — pass block (or kind) \
+                                     explicitly. It is not assumed to be a worker.",
+                                    owner_rec.role
+                                )
+                            })?;
                         reg.group(&caller.group)
                             .and_then(|g| g.guardrails.block_for(owner_role).map(|b| b.id.clone()))
                             .ok_or_else(|| {
@@ -804,9 +861,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // stays literally true, not just true in the common case.
             let cwd = if resumed && cwd.is_none() {
                 let group = reg.group(&caller.group);
+                // A block-less resume that reaches here always carried an
+                // explicit `kind` (a bare one inherited a block just above), so
+                // `kind` is Some — and when it somehow isn't, the effective
+                // block stays None rather than being derived from a guessed
+                // class (#544).
                 let effective_block = match block.as_deref() {
                     Some(id) => group.as_ref().and_then(|g| g.guardrails.block(id).cloned()),
-                    None => group.as_ref().and_then(|g| g.guardrails.block_for(kind).cloned()),
+                    None => kind.and_then(|k| {
+                        group.as_ref().and_then(|g| g.guardrails.block_for(k).cloned())
+                    }),
                 };
                 let effective_role = effective_block.as_ref().map(|b| b.kind);
                 let dedicated = effective_role.filter(|r| needs_dedicated_workspace(*r));
@@ -854,7 +918,18 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             } else {
                 cwd
             };
-            let a = reg.spawn_agent_ex(&caller.group, kind, block, name, task, worktree, branch, base, resume, cwd, None)?;
+            // `kind` is None only when `block` is Some — a fresh spawn naming
+            // neither was refused above, and a bare resume inherited a block —
+            // and a named block's own kind is authoritative inside
+            // `spawn_agent_ex`, which discards this argument entirely. So this
+            // is never a capability decision. It is `Planner` (the least
+            // privileged class, and the one that never gets a worktree) rather
+            // than `Worker` so that even a future path reaching it with no
+            // block could not acquire write capability by omission — the whole
+            // point of #544 — and would fail loudly on a group with no planner
+            // block instead.
+            let role = kind.unwrap_or(Role::Planner);
+            let a = reg.spawn_agent_ex(&caller.group, role, block, name, task, worktree, branch, base, resume, cwd, None)?;
             // Copilot mints its session id a few seconds into boot; loomux
             // binds it to the pane once it appears (visible then in
             // list_agents / the task board).
