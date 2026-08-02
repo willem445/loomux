@@ -553,9 +553,10 @@ gate:
 
 You need the CLI itself installed and logged in — loomux spawns `gemini` from
 your `PATH` the same way it spawns `claude`. A CLI named by a workflow block is
-**not** pre-checked (only the launcher's own role dropdowns are), so if it isn't
-installed the pane still opens, shows the shell's "command not found", and
-exits; the orchestrator is then told that agent died. Nothing else is needed: the reviewer's loomux
+**not** checked before launch (only the CLIs picked in the launcher's own role
+dropdowns are), so if it isn't installed the pane still opens, prints the
+shell's not-recognized error (on Windows, `The term 'gemini' is not
+recognized…`), and exits; the orchestrator is then told that agent died. Nothing else is needed: the reviewer's loomux
 tools (including the `pass`/`fail` verdict the merge gate reads) are wired up
 per agent, and its containment is generated per agent too, so a gemini
 reviewer is denied the file-editing tools exactly like a Claude one.
@@ -788,8 +789,9 @@ it gates, the per-item approve-with-comment grants, and the gate's audit trail.
 
 - An agent CLI on `PATH` — `claude`, `copilot`, or `gemini`. Roles can run on
   different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer)).
-  The launcher checks the CLIs you pick in its role dropdowns and refuses the
-  whole launch if one isn't on `PATH`; a CLI named by a `.loomux/workflow.yml`
-  block is not pre-checked, and shows up instead as a pane that opens and
-  immediately exits with the shell's "command not found".
+  The launcher warns inline as you pick, and re-checks on submit — if one of
+  those CLIs isn't on `PATH` it refuses the whole launch rather than starting
+  the group. A CLI named by a `.loomux/workflow.yml` block is not checked at
+  all, and shows up instead as a pane that opens and immediately exits with the
+  shell's not-recognized error.
 - `gh` CLI authenticated for the issue/PR/review workflow.
