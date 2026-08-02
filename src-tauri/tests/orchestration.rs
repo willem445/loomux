@@ -365,6 +365,291 @@ impl loomux_lib::orchestration::mqdriver::MqRunner for MqFake {
     }
 }
 
+/// **The three merge-queue tools are orchestrator-only, at the DISPATCH gate**
+/// (#581 §11.1).
+///
+/// The role-filtered listing is cosmetic — a tool omitted from a listing is
+/// still callable — so what matters is that a worker's *call* is refused, not
+/// merely that a worker's *listing* omits it. `queue_merge` can make the backend
+/// push a ref and open a PR, so this is the check that has to hold. Both halves
+/// are asserted, following the `review_verdict` / `queue_orphans` precedent.
+#[test]
+fn the_merge_queue_tools_are_orchestrator_only_and_the_dispatch_check_is_the_gate() {
+    let (reg, _d, co, cw) = setup_mcp();
+    const TOOLS: [&str; 3] = ["queue_merge", "merge_queue_status", "cancel_queued_merge"];
+
+    // The real gate: a worker calling any of them is refused.
+    for name in TOOLS {
+        let args = if name == "merge_queue_status" { json!({}) } else { json!({ "pr": "612" }) };
+        let denied =
+            dispatch(&reg, &cw, "tools/call", &json!({ "name": name, "arguments": args })).unwrap();
+        assert_eq!(denied["isError"], true, "{name} must refuse a worker at dispatch");
+    }
+
+    // …and the cosmetic half: the orchestrator sees them, a worker does not.
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let names: Vec<&str> =
+        listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    let worker_listed = dispatch(&reg, &cw, "tools/list", &json!({})).unwrap();
+    let worker_names: Vec<&str> =
+        worker_listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    for name in TOOLS {
+        assert!(names.contains(&name), "the orchestrator must SEE {name}: {names:?}");
+        assert!(!worker_names.contains(&name), "a worker must not be offered {name}");
+    }
+}
+
+/// `rails()` with the advanced orchestrator ON — the toggle that puts a repo's
+/// `.loomux/workflow.yml` in force at all. Plain `rails()` leaves it off, which
+/// is the default and is exactly the third case the queue test exercises.
+fn advanced_rails() -> Guardrails {
+    Guardrails { advanced_orchestrator: true, ..rails() }
+}
+
+/// Write a repo dir whose `.loomux/workflow.yml` declares a merge queue.
+fn repo_with_merge_queue(tag: &str, enabled: bool) -> std::path::PathBuf {
+    let repo = scratch_dir(tag);
+    fs::create_dir_all(repo.join(".loomux")).unwrap();
+    // `version:` is REQUIRED (no serde default) and must equal
+    // `workflow::SCHEMA_VERSION` — a file without it fails the parse, which is
+    // how the first cut of this test ended up asserting presence against a
+    // workflow that never loaded.
+    fs::write(
+        repo.join(".loomux").join("workflow.yml"),
+        // A workflow needs at least one block to be valid, so the file carries a
+        // minimal roster it does not otherwise use. The queue's own gating is on
+        // `merge_queue.enabled`, not on the roster's shape.
+        format!(
+            "version: {}\n\
+             blocks:\n  - id: w\n    name: Worker\n    kind: worker\n    cli: claude\n    model: sonnet\n\
+             merge_queue:\n  enabled: {enabled}\n  max_batch: 3\n",
+            workflow::SCHEMA_VERSION
+        ),
+    )
+    .unwrap();
+    // The fixture asserts its OWN validity. Without this, a malformed fixture
+    // fails the caller's `contains(...)` assertion instead — which reads as "the
+    // feature is broken" when the truth is "this file never loaded", and that is
+    // exactly how the first cut of this test misdiagnosed a missing `version:`.
+    let loaded = workflow::load_workflow(repo.to_str().unwrap());
+    assert!(
+        matches!(&loaded, Ok(Some(wf)) if wf.merge_queue.enabled == enabled),
+        "fixture must parse with merge_queue.enabled={enabled}, got {loaded:?}"
+    );
+    repo
+}
+
+/// **The `{{MERGE_QUEUE}}` fragment reaches only a group that actually runs the
+/// queue** — and "runs the queue" means BOTH the block and the
+/// advanced-orchestrator toggle.
+///
+/// The absence half is already pinned hard by `tests/workflow.rs`'s blessed
+/// golden and its never-names-the-gate-machinery rule — which is how this got
+/// caught: the first cut of slice E put this guidance in the base template and
+/// those tests went red. What nothing pinned was the **presence** half: a
+/// substitution that was always empty would satisfy every one of them, which is
+/// the door-connected-to-nothing shape again.
+///
+/// The toggle case is the one that found a defect. With the toggle off,
+/// `create_group_ex` deliberately clears the merge gate so the default merge
+/// path stays pre-#222 — so a queue keyed on the block alone would be live in a
+/// group that opted out of the whole workflow, with its own gate cleared
+/// underneath it.
+#[test]
+fn the_merge_queue_note_reaches_only_a_group_that_actually_runs_the_queue() {
+    let note_marker = "queue_merge(pr, target?)";
+
+    // Block on + toggle on: the guidance is there.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_merge_queue("mq-on", true);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let orch =
+        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+    assert!(
+        orch.contains(note_marker),
+        "a group whose repo enables the queue must be told the queue exists"
+    );
+    assert!(orch.contains("base-not-target"), "…including the refusal vocabulary");
+    assert!(
+        orch.contains("Routing is yours"),
+        "…and that loomux does not brief the culprit's worker (§9)"
+    );
+
+    // Block explicitly off: nothing.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_merge_queue("mq-off", false);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let orch =
+        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+    assert!(!orch.contains(note_marker), "enabled:false must read exactly like no block at all");
+    assert!(!orch.contains("{{MERGE_QUEUE}}"), "the placeholder is substituted, not left raw");
+
+    // Block ON but the advanced orchestrator OFF: still nothing. The workflow
+    // file is not in force, so neither is the queue.
+    let (reg, _d) = test_registry();
+    let repo = repo_with_merge_queue("mq-toggle-off", true);
+    let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap(); // toggle OFF
+    let orch =
+        fs::read_to_string(reg.state_root().join(&g.id).join("orchestrator.md")).unwrap();
+    assert!(
+        !orch.contains(note_marker),
+        "with the advanced orchestrator off the workflow file is not in force, so the queue \
+         is not running and its guidance must not appear"
+    );
+}
+
+/// **With no `merge_queue:` block, every tool refuses `queue-disabled`** — the
+/// product default (§12), and the state every repo is in until it opts in.
+///
+/// Driven through the real `dispatch()`, so this covers the JSON shim, the
+/// registry method and the driver's refusal together.
+#[test]
+fn the_queue_tools_refuse_queue_disabled_until_the_repo_opts_in() {
+    let (reg, d, co, _cw) = setup_mcp();
+
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "queue_merge", "arguments": { "pr": "612" } })).unwrap();
+    assert_eq!(out["isError"], false, "a refusal is a RESULT, not a protocol error");
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["refused"], json!("queue-disabled"));
+    assert_eq!(v["queued"], Value::Null, "a refusal never also reports success");
+
+    // Status is readable with the feature off — it reports `enabled: false`
+    // rather than erroring, so an orchestrator can tell "off" from "broken".
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "merge_queue_status", "arguments": {} })).unwrap();
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["enabled"], json!(false));
+    assert_eq!(v["entries"], json!([]));
+
+    // And the read did NOT create the state file — a status call that conjured
+    // one would collapse slice F's `absent` state for every group.
+    assert!(!d.path().join(&co.group).join("merge_queue.json").exists());
+}
+
+/// A PR that is not in the queue cannot be cancelled, and is told so — rather
+/// than being given a success that means nothing (§11.1's `not-queued`).
+#[test]
+fn cancelling_a_pr_that_is_not_queued_is_refused_not_silently_successful() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "cancel_queued_merge", "arguments": { "pr": "#999" } })).unwrap();
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["refused"], json!("not-queued"));
+    assert_eq!(v["cancelled"], Value::Null);
+}
+
+/// **A loomux fault must read as a fault, never as a policy refusal**
+/// (rev-163 NB).
+///
+/// `queue-disabled` and `not-queued` are *decisions*: they say the queue looked
+/// at the request and declined, and each tells the caller something true they
+/// can act on. An unreadable state file is neither — and labelling it
+/// `queue-disabled` would tell an orchestrator its repo never opted in, so it
+/// would **stop**, which is the one wrong move when the truth is a torn write.
+/// A wrong label does not merely under-inform; it sends the reader elsewhere.
+///
+/// Shape borrowed from `queue_orphans`' `no-app-handle` / `registry-not-shared`,
+/// which are documented as "should never appear in a running build, so treat one
+/// as a loomux defect worth reporting".
+#[test]
+fn a_loomux_fault_is_labelled_as_one_and_never_as_a_policy_refusal() {
+    let (reg, d, co, _cw) = setup_mcp();
+    let qfile = d.path().join(&co.group).join("merge_queue.json");
+
+    // (1) queue_merge with an unreadable state file.
+    fs::write(&qfile, "{ this is not json").unwrap();
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "queue_merge", "arguments": { "pr": "612" } })).unwrap();
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        v["refused"], json!("queue-state-unreadable"),
+        "an unreadable queue must not read as 'the repo never opted in'"
+    );
+
+    // (2) cancel_queued_merge with the same file. `not-queued` would assert the
+    //     PR is absent, which loomux cannot know from a file it could not read.
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "cancel_queued_merge", "arguments": { "pr": "612" } })).unwrap();
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["refused"], json!("queue-state-unreadable"));
+
+    // (3) an unresolvable group — a fault, not a queue state. Called on the
+    //     registry directly: `dispatch` always uses `caller.group`, so there is
+    //     no agent-reachable path that names another group (which is itself the
+    //     reason there is no cross-group check to test).
+    let v = reg.queue_merge("no-such-group", 612, None);
+    assert_eq!(v["refused"], json!("queue-unavailable"));
+
+    // And all three are flagged as faults by the predicate the tool descriptions
+    // and any future caller branch on — so the distinction cannot be lost by
+    // someone re-listing the strings and missing one.
+    for label in ["queue-state-unreadable", "queue-state-unwritable", "queue-unavailable"] {
+        assert!(loomux_lib::orchestration::mqloop::refusal::is_loomux_fault(label), "{label}");
+    }
+    for label in ["queue-disabled", "not-queued", "gate-not-met", "base-is-default"] {
+        assert!(
+            !loomux_lib::orchestration::mqloop::refusal::is_loomux_fault(label),
+            "{label} is a policy decision, not a fault"
+        );
+    }
+}
+
+/// The unwritable half, on the one platform where a directory's permissions
+/// portably stop a write.
+///
+/// `#[cfg(unix)]` deliberately: on Windows the read-only *directory* attribute
+/// does not prevent file creation, so there is no portable way to force
+/// `atomic_write` to fail — and a test that silently does nothing on a platform
+/// is worse than one that states where it runs. The other four relabeled paths
+/// are covered on all three platforms above.
+/// Driven through **cancel** rather than enqueue, deliberately. Enqueue only
+/// reaches the write after resolving a target and satisfying the merge gate, so
+/// forcing a write failure there would mean standing up a whole gated repo — and
+/// a cheaper setup that refused earlier would produce an assertion that passes
+/// for the wrong reason. Cancel needs nothing but a readable queue file, so the
+/// write is genuinely the step under test.
+///
+/// `#[cfg(unix)]` deliberately: on Windows the read-only *directory* attribute
+/// does not prevent file creation, so there is no portable way to force
+/// `atomic_write` to fail. Stated rather than silently no-op'd on a platform.
+/// (Also inert if run as root, which CI is not.)
+#[cfg(unix)]
+#[test]
+fn a_queue_change_that_cannot_be_persisted_is_reported_as_unwritable() {
+    use std::os::unix::fs::PermissionsExt;
+    let (reg, d, co, _cw) = setup_mcp();
+    let gdir = d.path().join(&co.group);
+    fs::write(gdir.join("merge_queue.json"), IN_FLIGHT_QUEUE_JSON).unwrap();
+
+    // Readable, so `load_state` succeeds; not writable, so `store_state` fails.
+    fs::set_permissions(&gdir, fs::Permissions::from_mode(0o555)).unwrap();
+    let v = reg.cancel_queued_merge(&co.group, 612);
+    // Restored before asserting, so a failure cannot leave an undeletable dir.
+    fs::set_permissions(&gdir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        v["refused"],
+        json!("queue-state-unwritable"),
+        "a cancel the next restart would forget is not a cancel — and it is certainly \
+         not 'that PR was never queued'"
+    );
+    assert_eq!(v["cancelled"], Value::Null, "a fault never also reports success");
+}
+
+/// A malformed `pr` argument is rejected before anything is resolved — the
+/// tools take "PR number, #n, or URL" like every other PR-taking tool here, and
+/// an unparseable one must not become PR 0.
+#[test]
+fn a_malformed_pr_argument_is_rejected_rather_than_coerced() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    for bad in ["", "not-a-pr", "#", "abc123"] {
+        let out = dispatch(&reg, &co, "tools/call",
+            &json!({ "name": "queue_merge", "arguments": { "pr": bad } })).unwrap();
+        assert_eq!(out["isError"], true, "{bad:?} must be rejected, not coerced");
+    }
+}
+
 /// A `merge_queue.json` with one entry inside an in-flight batch. Used twice in
 /// the strand test — once to set it up, once to **re-arm** it so the once-only
 /// guard has something it must actually stop.

@@ -680,7 +680,7 @@ no absolute-path `gh`, no editing markers or grant files. Asking the human to Ap
 sanctioned path, and it is what mints your grant.
 
 **Merges onto non-default (integration) branches are never gated** — sub-PRs between agent
-branches merge normally, as always.
+branches merge normally, as always.{{MERGE_QUEUE}}
 
 **Releases & tags have their own toggle** (INVARIANT 1's second half). Publishing — `gh release
 create/edit/delete`, or pushing a `v*` tag (which triggers the release workflow → GitHub release +

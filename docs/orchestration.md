@@ -544,6 +544,38 @@ different class of defect than the one already primed on its own output.
 Worth considering for any reviewer-heavy workflow; loomux's own dogfood
 `.loomux/workflow.yml` notes the same above its reviewer blocks.
 
+### Turning on the merge queue
+
+A `merge_queue:` block, beside `gates:`, opts the repo in:
+
+```yaml
+merge_queue:
+  enabled: true              # default false — absent block means the feature is off
+  max_batch: 3               # how many approved sub-PRs one batch may carry
+  checks_timeout_minutes: 60 # how long to wait for the batch's checks before
+                             # calling it unverifiable
+```
+
+With it, the orchestrator stops hand-merging approved sub-PRs onto the integration branch
+and hands them to the queue instead — one batch is tested *as a combination*, and on red the
+queue attributes the failure to a single PR rather than leaving someone to guess. With no
+block, none of that exists and merges work exactly as they always did.
+
+Three things worth knowing before you enable it:
+
+- **It never touches your default branch, and never grants what your review gate would not.**
+  It lands only on an integration branch, and it re-checks the same reviewer verdicts your
+  `gates:` block already declares — at batch build *and* again at the moment of submit, so a
+  `fail` recorded in between still stops the landing. It is strictly additive to the gate.
+- **`checks_timeout_minutes` is a backstop, not the mechanism.** A batch normally resolves
+  when its checks do. The timeout exists so a repo whose CI never attaches surfaces as
+  **unverifiable** — loudly, with nothing landed — instead of a batch sitting pending forever.
+- **Adding the block is not inert to older loomux builds.** The workflow file rejects keys it
+  does not recognize, so on a build that predates the merge queue, `merge_queue:` fails the
+  parse of the **whole file** — your `gates:` included — rather than being ignored. That is
+  deliberate (a key the build doesn't understand means you believe a policy is in force that
+  isn't), but it means everyone sharing the repo wants to be on a build that has it.
+
 ### Setting up a cross-model reviewer
 
 `cli:` accepts `claude`, `copilot`, or `gemini`. So a workflow whose worker
@@ -662,7 +694,23 @@ build — it says **that**, loudly, instead of drawing an empty queue: "nothing 
 your PR is fine.
 
 The row is absent entirely until a group actually has a queue, which is the default: no
-`merge_queue:` block means the feature is off and nothing about your group changes.
+`merge_queue:` block means the feature is off and nothing about your group changes. See
+[Turning on the merge queue](#turning-on-the-merge-queue) for the block itself.
+
+**What the orchestrator does with it.** It queues an approved sub-PR rather than merging it,
+reads the queue's state, and can pull a PR back out — three tools, no merge authority beyond
+what it already had. When a batch goes red it gets one notice naming the culprit, and a
+comment lands on that PR with the failing check and the batch's sibling set. loomux
+deliberately does **not** brief the PR's author itself: attribution is mechanical, but
+deciding who picks it up — and whether to resume that worker or spawn a fresh one — is a
+judgment call, so it stays the orchestrator's.
+
+Two honest limits, both of which the culprit comment states in as many words. Bisect isolates
+**a** culprit, not necessarily **the** culprit: when two changes are each fine alone and only
+fail together, the search blames whichever one the split isolated, and the comment names the
+siblings so you can see that rather than being told a half-truth confidently. And a batch that
+comes back **unverifiable** implicates no PR at all — the checks never resolved, nothing
+landed, and the thing to look at is your CI.
 
 ## Guardrails
 

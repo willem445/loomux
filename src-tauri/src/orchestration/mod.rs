@@ -48,6 +48,69 @@ use crate::obs::LockExt;
 // workflow is active (`the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was`).
 #[doc(hidden)]
 pub const ORCHESTRATOR_TPL: &str = include_str!("templates/orchestrator.md");
+
+/// The `{{MERGE_QUEUE}}` fragment (#581 §11.1) — substituted into
+/// `orchestrator.md` **only** when the repo declares `merge_queue: enabled:
+/// true`, and empty otherwise.
+///
+/// It brings its own leading newlines because the placeholder sits at the end of
+/// the preceding sentence: an empty substitution has to leave that line exactly
+/// as it was, which is the invariant `a_workflow_placeholder_must_sit_at_the_
+/// end_of_a_line_it_shares` pins.
+///
+/// Everything here names machinery a queue-less group does not have — the three
+/// tools, the refusal vocabulary, the kick-back routing rule — which is why it
+/// is a fragment and not template prose.
+const MERGE_QUEUE_NOTE: &str = r#"
+
+**This repo runs a merge queue, and that changes how approved sub-PRs land.** Instead of merging
+an approved sub-PR onto the integration branch yourself, hand it to the queue. It exists because a
+green sub-PR is evidence about a **PR**, not about a **branch**: several individually-green PRs can
+still produce a red integration branch — a semantic conflict, a test that only fails when two
+changes coexist, a lockfile that resolves differently once both are present — and when that happens
+nobody can say which one did it.
+
+- `queue_merge(pr, target?)` — hand an **approved** sub-PR to the queue, once per PR, after its
+  review has passed. loomux batches the queued PRs onto a scratch ref, opens a **draft PR** so this
+  repo's own CI judges that exact object, fast-forwards it onto the target on green, and on red
+  bisects and kicks back the one PR that broke the combination. **The commit that was tested is the
+  commit that lands** — nothing is rebuilt after CI. `target` is an assertion, not a choice: it
+  checks that the PR's base resolves to that branch, and a mismatch refuses.
+- `merge_queue_status()` — where the queue stands. Read-only.
+- `cancel_queued_merge(pr)` — take a PR back out, including one inside an in-flight batch (that
+  batch is abandoned and rebuilt without it; nothing lands).
+
+**Nothing here loosens.** The queue never touches the default branch — structurally, not by policy
+— never calls `gh pr merge`, and **never grants what the review gate would not**: it re-enforces
+that same gate itself, at batch build *and* again at the moment of submit, so a reviewer's `fail`
+or a rebase in between still stops the landing. INVARIANT 1 is untouched.
+
+**Refusals are a closed set, and each says what to do** — read the reason rather than retrying:
+`base-is-default` (that PR targets the default branch; the queue only lands on integration
+branches) · `base-unverifiable` (loomux could not resolve the base or the repo default, and unknown
+is never treated as safe) · `base-not-target` (this queue is already landing elsewhere — drain it
+first; the entries already queued were approved against that other branch) · `gate-not-configured`
+(no gate covers this target, and the backend will not push approved-by-nobody PRs under its own
+authority) · `gate-not-met` · `already-queued` · `queue-full`.
+
+**When a batch goes red you get ONE notice naming the culprit**, and a comment lands on that PR
+with the failing check, the batch id and the sibling set. **Routing is yours** — loomux
+deliberately does not brief the owning worker, because worker liveness, resume-versus-fresh-spawn
+and folding this in with whatever else is pending are your calls, and the board mapping that equips
+them is yours. Two things to carry into that call: bisect isolates **a** culprit, not necessarily
+**the** culprit (a genuine pairwise interaction attributes to whichever entry the split isolated),
+and the survivors were already re-queued at the front — do not re-queue them yourself.
+
+**A batch can also come back `unverifiable`.** That is not a red batch and **no PR is implicated**:
+the repo's checks never reached a terminal state within the bound. Nothing landed, the entries were
+re-queued, and the thing to look at is the repo's CI.
+
+**One thing this changes about re-syncing.** INVARIANT 7's rebase sweep is O(n²) in a busy fleet —
+every merge restales every other open branch. For PRs that are **in the queue**, do not pay that
+proactively: the speculative merge **is** the mergeability probe, so a sibling that would conflict
+is kicked back at construction time with no CI spent and nothing landed. Wait to be told. This does
+**not** cover open PRs that are not queued — those still restale on every merge and still need the
+sweep."#;
 #[doc(hidden)]
 pub const WORKER_TPL: &str = include_str!("templates/worker.md");
 #[doc(hidden)]
@@ -27293,6 +27356,35 @@ impl OrchRegistry {
             ),
             None => String::new(),
         };
+        // #581 §11.1/§12: the merge queue's guidance, and **only** for a group
+        // whose repo actually turns it on. Behind a placeholder rather than in
+        // the base template for the reason rev-29 F1 pins: prose naming a
+        // mechanism the reader does not have sends them after something that
+        // does not exist for them, and *conditional framing does not save it* —
+        // "when the queue is enabled…" is an invitation to go looking. A group
+        // with no `merge_queue:` block reads a file byte-for-byte unchanged,
+        // which is the same promise §12 makes about the feature itself.
+        //
+        // Its own placeholder rather than folding into `{{WORKFLOW}}`: a repo
+        // can declare a gate and no queue, and that group has the gate's
+        // machinery but not this.
+        //
+        // Gated on the advanced-orchestrator toggle as well as the block, for
+        // the reason `merge_queue_enabled` spells out: with the toggle off the
+        // workflow file is not in force and its gate is cleared, so the queue is
+        // not running either — and prose about a queue that is not running is
+        // the exact leak this placeholder exists to prevent.
+        let merge_queue_note = if g.guardrails.advanced_orchestrator
+            && workflow::load_workflow(&g.repo)
+                .ok()
+                .flatten()
+                .map(|wf| wf.merge_queue.enabled)
+                .unwrap_or(false)
+        {
+            MERGE_QUEUE_NOTE.to_string()
+        } else {
+            String::new()
+        };
         let vars: Vec<(&str, &str)> = vec![
             ("REPO", g.repo.as_str()),
             ("GROUP_ID", g.id.as_str()),
@@ -27303,6 +27395,11 @@ impl OrchRegistry {
             ("WORKFLOW", workflow_section.as_str()),
             ("ADVISOR_CONSULT_NOTE", advisor_consult_note.as_str()),
             ("POST_MERGE_WORKFLOW_HOOK", post_merge_workflow_hook.as_str()),
+            // Beside the other loomux-authored conditional fragment. Both are
+            // fixed consts carrying no `{{…}}` of their own, so their position
+            // among the earlier vars is inert — unlike the repo-authored
+            // `BLOCK_NAME`, which the comment above keeps last on purpose.
+            ("MERGE_QUEUE", merge_queue_note.as_str()),
             ("BLOCK_NOTE", ""),
         ];
         let dir = self.group_dir(&g.id);
@@ -33712,6 +33809,152 @@ impl OrchRegistry {
     }
 
     /// Deliver to the group's orchestrator (worker reports, exit notices).
+    // ---------- the bisecting merge queue: agent-facing operations (#581 E) ----------
+
+    /// Whether this group's repo declares `merge_queue: enabled: true` (§11.2).
+    ///
+    /// Read from the repo's workflow file at call time rather than cached: the
+    /// file is human-authored policy a human may edit mid-session, and the
+    /// existing gate already reloads on change (`reload_merge_gate_if_changed`).
+    /// A parse failure reads as **disabled** — the loud `workflow-invalid` path
+    /// already reports the parse itself, and a queue running on a file loomux
+    /// could not read is a queue nobody can reason about (§11.2).
+    /// **Both conditions, not just the block.** The workflow file is only in
+    /// force when this group runs the advanced orchestrator — with the toggle
+    /// off, `create_group_ex` deliberately *clears* the merge gate so "the
+    /// default experience is byte-for-byte pre-#222" holds for the merge path
+    /// too. A queue that read the block alone would be live in a group that had
+    /// deliberately opted out of the whole workflow, with its gate cleared
+    /// underneath it — visible, contradictory, and refusing everything as
+    /// `gate-not-configured`. One toggle governs the file; the queue is part of
+    /// the file.
+    fn merge_queue_enabled(&self, group: &str) -> bool {
+        let Some(g) = self.group(group) else { return false };
+        if !g.guardrails.advanced_orchestrator {
+            return false;
+        }
+        matches!(workflow::load_workflow(&g.repo), Ok(Some(wf)) if wf.merge_queue.enabled)
+    }
+
+    /// The gate spec the queue re-enforces (§6), read through the same
+    /// `merge_gate` file the `gh` shim reads — never a second opinion.
+    fn merge_queue_gate(&self, group: &str) -> mergeq::GateSpec {
+        mergeq::GateSpec::read(fs::read_to_string(self.merge_gate_path(group)).ok().as_deref())
+    }
+
+    /// `queue_merge(pr, target?)` (§11.1). Wiring only: resolve the repo, the
+    /// gate and this PR's verdicts, hand them to `mqloop::enqueue`, audit, and
+    /// persist. Every decision is the driver module's.
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_merge(&self, group: &str, pr: u64, target: Option<&str>) -> Value {
+        let runner = match self.group(group).map(|g| g.repo) {
+            Some(repo) => mqdriver::runner_for(std::path::Path::new(&repo)),
+            // A group loomux cannot resolve is a FAULT, not "the repo did not
+            // opt in" (rev-163 NB).
+            None => return json!({ "refused": mqloop::refusal::QUEUE_UNAVAILABLE }),
+        };
+        self.queue_merge_with(group, pr, target, &runner)
+    }
+
+    /// The injectable seam — same reason as `merge_queue_reconcile_with`: it is
+    /// what lets an integration test drive the whole registry path without
+    /// spawning `gh` (constraint 3), which is what makes the `pub` honest.
+    #[doc(hidden)] // pub for integration tests
+    pub fn queue_merge_with(
+        &self,
+        group: &str,
+        pr: u64,
+        target: Option<&str>,
+        runner: &dyn mqdriver::MqRunner,
+    ) -> Value {
+        let enabled = self.merge_queue_enabled(group);
+        let dir = self.group_dir(group);
+        let mut state = match mqloop::load_state(&dir) {
+            Ok(s) => s,
+            Err(e) => {
+                // A state file loomux cannot read is a FAULT, and saying
+                // `queue-disabled` here would tell an orchestrator the repo
+                // never opted in — so it would stop, which is the one wrong move
+                // (rev-163 NB).
+                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
+                    json!({ "pr": pr, "reason": mqloop::refusal::STATE_UNREADABLE, "detail": format!("{e:?}") }));
+                return json!({ "refused": mqloop::refusal::STATE_UNREADABLE });
+            }
+        };
+        let gate = self.merge_queue_gate(group);
+        let verdicts = self.verdict_map(group, pr);
+        let outcome =
+            mqloop::enqueue(runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms());
+        match outcome {
+            mqloop::EnqueueOutcome::Queued { position } => {
+                if let Err(e) = mqloop::store_state(&dir, &state) {
+                    // The write is what makes the enqueue durable, so a failed
+                    // write is a failed enqueue — reported as such rather than
+                    // returning a `queued: true` the next restart would forget.
+                    self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
+                        json!({ "pr": pr, "reason": mqloop::refusal::STATE_UNWRITABLE, "detail": e }));
+                    return json!({ "refused": mqloop::refusal::STATE_UNWRITABLE });
+                }
+                self.audit(group, "loomux", mqloop::audit_action::ENQUEUED,
+                    json!({ "pr": pr, "target": state.target, "position": position }));
+                json!({ "queued": true, "position": position })
+            }
+            mqloop::EnqueueOutcome::Refused { reason } => {
+                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
+                    json!({ "pr": pr, "reason": reason }));
+                json!({ "refused": reason })
+            }
+        }
+    }
+
+    /// `merge_queue_status()` (§11.1). Read-only; never writes, so a status call
+    /// cannot conjure a `merge_queue.json` (which would collapse slice F's
+    /// `absent` state, the same trap the reconcile write is gated against).
+    #[doc(hidden)] // pub for integration tests
+    pub fn merge_queue_status(&self, group: &str) -> Value {
+        let enabled = self.merge_queue_enabled(group);
+        match mqloop::load_state(&self.group_dir(group)) {
+            Ok(s) => mqloop::status_view(&s, enabled, now_ms()),
+            // An unreadable file is a FACT, and the one thing status must never
+            // do is let it read as "nothing queued" — the same posture
+            // `mergeqview::merge_queue_view` takes for the chrome.
+            Err(e) => json!({ "enabled": enabled, "unreadable": format!("{e:?}") }),
+        }
+    }
+
+    /// `cancel_queued_merge(pr)` (§11.1).
+    #[doc(hidden)] // pub for integration tests
+    pub fn cancel_queued_merge(&self, group: &str, pr: u64) -> Value {
+        let dir = self.group_dir(group);
+        // Same species as `queue_merge`'s two, and not in rev-163's list because
+        // it wears a different label: `not-queued` asserts the PR is not in the
+        // queue, which loomux cannot possibly know from a state file it could
+        // not read. Fixed here rather than left for a later round.
+        let mut state = match mqloop::load_state(&dir) {
+            Ok(s) => s,
+            Err(e) => {
+                self.audit(group, "loomux", mqloop::audit_action::CANCELLED,
+                    json!({ "pr": pr, "reason": mqloop::refusal::STATE_UNREADABLE, "detail": format!("{e:?}") }));
+                return json!({ "refused": mqloop::refusal::STATE_UNREADABLE });
+            }
+        };
+        match mqloop::cancel(&mut state, pr) {
+            mqloop::CancelOutcome::Cancelled { was } => {
+                if let Err(e) = mqloop::store_state(&dir, &state) {
+                    // A cancel the next restart forgets is not a cancel — and it
+                    // is certainly not "that PR was never queued".
+                    self.audit(group, "loomux", mqloop::audit_action::CANCELLED,
+                        json!({ "pr": pr, "reason": mqloop::refusal::STATE_UNWRITABLE, "detail": e }));
+                    return json!({ "refused": mqloop::refusal::STATE_UNWRITABLE });
+                }
+                self.audit(group, "loomux", mqloop::audit_action::CANCELLED,
+                    json!({ "pr": pr, "from": was.as_str() }));
+                json!({ "cancelled": true })
+            }
+            mqloop::CancelOutcome::Refused { reason } => json!({ "refused": reason }),
+        }
+    }
+
     // ---------- the bisecting merge queue (#581 slice D2) ----------
 
     /// Reconcile a group's merge queue against reality after a restart
