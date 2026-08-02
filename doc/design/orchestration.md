@@ -784,13 +784,17 @@ persisted in `group.json`, and clamped in `clamped()`.
   argument for not copying that flag. So a restart mid-pause and an older build's snapshot land
   on the same behavior, and it is the one that takes no action against a live pane.
 
-  **One shape #620 does not close.** A pause landing in the milliseconds *after* an unpaused
-  kickoff's own drainer was spawned: that drainer holds the pane for the whole pause (it polls,
-  refusing to paste, rather than exiting), so the resume's `ensure_drainer` correctly no-ops for
-  it — and its own first pass, the only pass `FreshFirstAttempt` applies to, is long past by
-  then. Closing it means keeping an unattempted first pass alive across a pause hold, which
-  changes what `immediate_first_pass` means for the hold-escalation and still-queued-notice gates
-  as well. #620 stays open for that.
+  **One shape #620 does not close, named by mechanism.** *Any pause that lands between a
+  drainer's spawn and its first pass.* `immediate_first_pass` is `iteration == 1` and a pass that
+  meets the paused gate spends that iteration on a `continue`, so from iteration 2 the treatment
+  is gone — whichever call spawned that drainer. The drainer then holds the pane for the rest of
+  the pause (it polls, refusing to paste, rather than exiting), so the resume's `ensure_drainer`
+  correctly no-ops for it and the treatment `flush_paused_queues` computed is never applied.
+  Stating it by origin ("a pause landing just after an unpaused kickoff's drainer") would imply a
+  re-pause landing on a drainer the *resume flush itself* just spawned is immune, and it is not:
+  same mechanism, same loss, same fix. Closing it means keeping an unattempted first pass alive
+  across a pause hold, which changes what `immediate_first_pass` means for the hold-escalation and
+  still-queued-notice gates as well. #620 stays open for that.
 
   **The flush header names the right hold.** `queue::FlushCause` (`PaneBlocked` /
   `GroupPaused`, chosen by `flush_cause` over the batch's admission reasons, never over the

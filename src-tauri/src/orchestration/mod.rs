@@ -14253,6 +14253,31 @@ struct FreshFirstAttempt {
     fresh_kickoff: bool,
 }
 
+/// The ONE place a decided `KickoffTreatment` is copied onto the attempt it
+/// arms (#620 review NB1).
+///
+/// `KickoffTreatment`'s own doc argues these three flags are "the same type
+/// and mean opposite things, so a positional tuple is one transposed edit
+/// away from arming the autopilot watcher on a recovery" — and then every
+/// producer copied them across field by field, by hand. A transposition in
+/// one of those copies is invisible: the treatment functions still return the
+/// right answer (so their tests pass), `kickoff_panes` is derived from
+/// `is_some()` (so the audit test passes), and only the drainer — private
+/// struct, needs a real `AppHandle`, unreachable by every test in this repo —
+/// sees the wrong flags. The mapping cannot be made testable, so it is made
+/// singular instead: #620 established that this treatment gains producers,
+/// and each new one now inherits the hazard rather than re-creating it.
+impl From<(u64, KickoffTreatment)> for FreshFirstAttempt {
+    fn from((id, t): (u64, KickoffTreatment)) -> Self {
+        FreshFirstAttempt {
+            id,
+            wait_ready: t.wait_ready,
+            confirm_autopilot: t.confirm_autopilot,
+            fresh_kickoff: t.fresh_kickoff,
+        }
+    }
+}
+
 fn run_queue_drainer(
     reg: Arc<OrchRegistry>,
     app: AppHandle,
@@ -19788,16 +19813,24 @@ impl OrchRegistry {
     /// read back off the pane's front entry (`paused_flush_kickoff`) instead
     /// of being assumed absent.
     ///
-    /// One shape this does NOT cover, stated rather than implied: a pause that
-    /// lands in the milliseconds AFTER an unpaused kickoff's own drainer was
-    /// spawned. That drainer holds the pane for the whole pause (it polls,
-    /// refusing to paste, rather than exiting), so `ensure_drainer` here
-    /// correctly no-ops for it — and its own first pass, which is where
-    /// `FreshFirstAttempt` applies, is long past by the time the resume lands.
-    /// Closing that needs the drainer loop itself to keep an unattempted first
-    /// pass alive across a pause hold, which is a change to `immediate_first_
-    /// pass`'s meaning for the hold-escalation and still-queued-notice gates
-    /// too — out of scope here, and #620 stays open for it.
+    /// One shape this does NOT cover, stated by MECHANISM rather than by the
+    /// one origin that first showed it (review NB4): **any pause that lands
+    /// between a drainer's spawn and its first pass.** `immediate_first_pass`
+    /// is `iteration == 1`, and a pass that meets the paused gate spends that
+    /// iteration on a `continue` — so from iteration 2 the treatment is gone,
+    /// whichever call spawned that drainer. The drainer then holds the pane
+    /// for the rest of the pause (it polls, refusing to paste, rather than
+    /// exiting), so `ensure_drainer` here correctly no-ops for it and the
+    /// treatment this function computed is never applied.
+    ///
+    /// That covers a `deliver_prompt` kickoff whose drainer the pause caught
+    /// at once, and equally a RE-pause landing on a drainer THIS function just
+    /// spawned — the entry is still queued and still says `fresh-kickoff`, but
+    /// the next resume no-ops for the live drainer just the same. Closing it
+    /// needs the drainer loop to keep an unattempted first pass alive across a
+    /// pause hold, which changes what `immediate_first_pass` means for the
+    /// hold-escalation and still-queued-notice gates too — out of scope here,
+    /// and #620 stays open for it.
     ///
     /// Idempotent: `ensure_drainer` no-ops for a pane already draining, so a
     /// double resume costs nothing. Best-effort in exactly one respect — with
@@ -19836,9 +19869,16 @@ impl OrchRegistry {
             // #620: which of those panes is having a KICKOFF flushed back into
             // it — the boot wait and the copilot consent confirm are actions
             // taken against a live pane, and this line is the only record that
-            // they were (or, before #620, were not) armed. Gated by `started`
-            // exactly like the rest of this line: with no handle, nothing here
-            // is applied to anything.
+            // they were (or, before #620, were not) armed.
+            //
+            // Read alongside `started`, not on its own (review NB3): like
+            // `panes`, this field is emitted unconditionally and says what the
+            // resume DECIDED, which is a different fact from whether a drainer
+            // was spawned to act on it. `started: false` means nothing here was
+            // applied to anything. The two are deliberately separate rather
+            // than one gated field, because "the resume identified a held
+            // kickoff and could not start it" is exactly the state a reader
+            // chasing an unbooted agent needs to be able to see.
             "kickoff_panes": treatments.iter()
                 .filter(|(_, t)| t.is_some())
                 .map(|(pty_id, _)| *pty_id)
@@ -19846,13 +19886,10 @@ impl OrchRegistry {
         }));
         if let (Some(app), Some(reg)) = (app, reg) {
             for (pty_id, treatment) in treatments {
-                let fresh_first = treatment.map(|(id, t)| FreshFirstAttempt {
-                    id,
-                    wait_ready: t.wait_ready,
-                    confirm_autopilot: t.confirm_autopilot,
-                    fresh_kickoff: t.fresh_kickoff,
-                });
-                reg.ensure_drainer(app.clone(), group.to_string(), pty_id, fresh_first);
+                reg.ensure_drainer(
+                    app.clone(), group.to_string(), pty_id,
+                    treatment.map(FreshFirstAttempt::from),
+                );
             }
         }
     }
@@ -30553,12 +30590,8 @@ impl OrchRegistry {
         // original kickoff had — see `redelivery_treatment` for why the
         // other two flags are deliberately not copied with it, and why
         // `was_first` gates it exactly as `deliver_prompt`'s front door does.
-        let treatment = redelivery_treatment(admitted.was_first).map(|t| FreshFirstAttempt {
-            id: admitted.id,
-            wait_ready: t.wait_ready,
-            confirm_autopilot: t.confirm_autopilot,
-            fresh_kickoff: t.fresh_kickoff,
-        });
+        let treatment = redelivery_treatment(admitted.was_first)
+            .map(|t| FreshFirstAttempt::from((admitted.id, t)));
         self.audit(group, "loomux", "kickoff-redelivered", json!({
             "to": agent_id, "id": admitted.id, "via": "queue-front-door",
             // The F4 fix, visible in the record: a re-delivery that skipped

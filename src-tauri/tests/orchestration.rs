@@ -22585,6 +22585,48 @@ fn a_kickoff_held_through_a_pause_keeps_its_kickoff_treatment_at_resume() {
 }
 
 #[test]
+fn an_unpaused_kickoff_records_its_kind_on_the_entry_too() {
+    // Review NB2. `deliver_prompt` stamps the kind on its NON-paused admission
+    // as well, so an entry's account of itself never depends on which branch
+    // admitted it — and until this test, that line had neither a reader nor a
+    // test: reverting it left the suite green, and the red run could not
+    // attribute anything to it because the scratch commit neutered both sites
+    // at once. It matters if the reachability argument ("nothing reads it back
+    // on this path") ever stops holding: a pause landing on a queue that
+    // already holds an unpasted kickoff would then meet an entry that had
+    // quietly forgotten what it was.
+    //
+    // The kickoff is admitted BEHIND a seeded entry on purpose: a `was_first`
+    // admission with no `AppHandle` is withdrawn again
+    // (`withdraw_unprocessable`), and a headless registry has none — so the
+    // only way to observe a stamped entry on this branch is to keep the
+    // delivery off the front.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/copilot-repo", autopilot_copilot_rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    reg.set_pty_for_test(&w.id, 5726);
+    reg.enqueue_text(&g.id, &w.id, "orch-1", "already queued", 5726, queue::EnqueueReason::Arrival)
+        .unwrap();
+    assert!(!reg.is_paused(&g.id), "precondition: this is the UNPAUSED branch");
+
+    reg.deliver_prompt(&w.id, "your brief: fix the thing", "orch-1", Delivery::FreshKickoff)
+        .unwrap();
+
+    let held = reg.queue_snapshot(5726);
+    assert_eq!(held.len(), 2, "precondition: the kickoff landed behind the seeded entry: {held:?}");
+    assert_eq!(
+        held[1].delivery_kind,
+        Delivery::FreshKickoff,
+        "an unpaused admission records the kind too — the entry says the same thing either way"
+    );
+    assert_eq!(
+        held[0].delivery_kind,
+        Delivery::MidSession,
+        "and stamping the arriving delivery must not rewrite what was already queued"
+    );
+}
+
+#[test]
 fn an_ordinary_prompt_held_through_a_pause_still_gets_no_kickoff_treatment() {
     // The other half, and the one that keeps the fix from being worse than the
     // bug: a boot wait and a stray Enter aimed at a consent dialog are ACTIONS
