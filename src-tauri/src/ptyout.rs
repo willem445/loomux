@@ -198,6 +198,17 @@ pub fn pty_output_pump_with<F: FnMut(Vec<u8>)>(
     use std::sync::mpsc::RecvTimeoutError;
     use std::time::{Duration, Instant};
 
+    // The drain loop's no-spin argument below rests on this, so state it here
+    // rather than leave a reader to audit the call sites for it (review
+    // observation on PR #714). A zero cap makes `take_due` hand back an empty
+    // batch forever — `due` is satisfied by `len >= 0` and `take_capped`
+    // drains nothing — and the loop's `continue` would then spin. Unreachable
+    // from production, which passes `PTY_EMIT_MAX_BATCH`; this seam is `pub`
+    // only so the integration test can run the old policy through the same
+    // loop, and a `debug_assert` is what keeps that seam from being a way to
+    // reach a state the comments say cannot happen.
+    debug_assert!(max_batch > 0, "a zero batch cap would spin the drain loop");
+
     let epoch = Instant::now();
     let mut co = OutputCoalescer::new(min_interval_ms, max_batch);
     // Monotonic, and relative to this pane's own start — never SystemTime,
@@ -230,9 +241,12 @@ pub fn pty_output_pump_with<F: FnMut(Vec<u8>)>(
             if co.pending() == 0 {
                 break;
             }
-            // `wait_ms` is Some(>0) here: the buffer is non-empty (checked
-            // just above) and not due (take_due said so), and `wait_ms`
-            // returns 0 only when it IS due — so this can never spin.
+            // `wait_ms` is Some(>0) here, so the recv below always blocks for
+            // a real duration rather than returning instantly: the buffer is
+            // non-empty (checked just above) and not due (take_due said so),
+            // and `wait_ms` returns 0 only when it IS due. That holds given
+            // `max_batch > 0`, which the debug_assert at the top of this
+            // function is what pins.
             let wait = co.wait_ms(now).unwrap_or(0);
             match rx.recv_timeout(Duration::from_millis(wait)) {
                 Ok(chunk) => co.push(&chunk),
