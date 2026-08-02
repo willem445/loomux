@@ -4619,12 +4619,7 @@ impl ReinjectAck {
     /// record can take: the value names what loomux had in hand at the moment
     /// it stopped retrying.
     pub fn from_evidence(confirmed_delivery: bool) -> Self {
-        // MUTATION PROBE (a) — NOT FOR MERGE. Ignores its argument and relabels
-        // every resolution as the weaker close. This is the "rename everything
-        // to -liveness-only" failure the PR body claims the negative control
-        // catches; this branch exists to prove that claim rather than assert it.
-        let _ = confirmed_delivery;
-        Self::LivenessOnly
+        if confirmed_delivery { Self::Delivered } else { Self::LivenessOnly }
     }
 
     /// The `source` value on the audit line and the badge's wire shape.
