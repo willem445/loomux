@@ -71,6 +71,9 @@
 //!     kind: reviewer
 //!     cli: claude
 //!     model: opus
+//!     effort: xhigh        # OPTIONAL thinking level (#687); empty = the CLI's
+//!     context: 1m          # own default. Both are closed enums, and both are
+//!                          # a parse error on a CLI loomux can't set them on.
 //!     prompt: |            # -> generated ~/.claude/agents/*.md + claude --agent
 //!       Review ONLY for security defects: injection, authz, secrets.
 //!
@@ -163,6 +166,39 @@ pub struct Block {
     /// addendum, a template fragment and a roster badge (#250/#324 slice C).
     /// `None` is today's behavior, byte for byte.
     pub role_hint: Option<String>,
+    /// Thinking-effort level (the `effort:` key, #687) — one of
+    /// [`super::EFFORT_LEVELS`]. Empty means "the CLI's own default", which is
+    /// today's behavior byte for byte: nothing is emitted at all, so a group on
+    /// a CLI build that predates the flag is unaffected unless a human opts in.
+    ///
+    /// A **value-set pick**, like `model:` — it authors no text and pre-approves
+    /// no tool, so it adds nothing to what a repo file can influence. What is
+    /// enforced is the `role_hint` shape, twice: the value must be in loomux's
+    /// closed vocabulary, and the block's own `cli:` must be one loomux can
+    /// actually set effort on ([`CliCaps::effort_levels`](super::CliCaps)).
+    pub effort: String,
+    /// Context-window variant (the `context:` key, #687) — one of
+    /// [`super::CONTEXT_VARIANTS`]. Empty = the model's own window.
+    ///
+    /// Deliberately NOT part of `model`: [`super::sanitize_model_opt`] strips
+    /// brackets, so a `sonnet[1m]` written as a model id would silently become
+    /// the broken `sonnet1m`, and widening that sanitizer to admit brackets
+    /// would put a POSIX-shell glob pattern on the command line. The suffix is
+    /// composed at emit time instead — see `claude_model_token`.
+    pub context: String,
+}
+
+/// The per-block model knobs that reach a spawn alongside the model itself
+/// (#687): "how this block's model is tuned", as one value.
+///
+/// Bundled rather than threaded as two more positional `&str`s because they are
+/// one concept, and because the next knob (gemini's `thinkingConfig`, deferred
+/// pending live schema verification) lands here rather than as a third
+/// argument. `default()` — both empty — is exactly the pre-#687 command line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModelKnobs<'a> {
+    pub effort: &'a str,
+    pub context: &'a str,
 }
 
 impl Block {
@@ -197,6 +233,12 @@ impl Block {
     /// into the kickoff — the CONTRACT itself still always compiles (#416).
     pub fn has_persona(&self) -> bool {
         self.prompt.is_some() || self.profile.is_some()
+    }
+
+    /// This block's model knobs (#687), as the one value the spawn path passes
+    /// to `build_agent_command_ex` / `build_agent_argv_ex`.
+    pub fn knobs(&self) -> ModelKnobs<'_> {
+        ModelKnobs { effort: &self.effort, context: &self.context }
     }
 }
 
@@ -486,8 +528,22 @@ impl Workflow {
 /// group default / the kind's default model, exactly as the flat per-role
 /// guardrail fields did.
 pub fn default_roster(pins: &[(Role, &str, &str)]) -> Vec<Block> {
+    default_roster_ex(
+        &pins.iter().map(|(k, c, m)| (*k, *c, *m, ModelKnobs::default())).collect::<Vec<_>>(),
+    )
+}
+
+/// [`default_roster`] plus the per-role model knobs the launcher can pin
+/// (#687). The 3-tuple form above stays, and stays the one most callers use:
+/// every roster loomux synthesizes *on a group's behalf* (`clamped()`'s
+/// guaranteed orchestrator, the legacy-group.json reconstruction, the built-in
+/// roster) pins no knob by construction, so making them all spell
+/// `ModelKnobs::default()` would be noise — and leaving those call sites
+/// untouched keeps every existing assertion about their command lines a pin on
+/// "no knobs ⇒ the pre-#687 line, byte for byte".
+pub fn default_roster_ex(pins: &[(Role, &str, &str, ModelKnobs<'_>)]) -> Vec<Block> {
     pins.iter()
-        .map(|(kind, cli, model)| Block {
+        .map(|(kind, cli, model, knobs)| Block {
             id: kind.as_str().to_string(),
             name: kind.as_str().to_string(),
             kind: *kind,
@@ -497,6 +553,10 @@ pub fn default_roster(pins: &[(Role, &str, &str)]) -> Vec<Block> {
             profile: None,
             allow: Vec::new(),
             role_hint: None,
+            // Raw as picked; `Guardrails::clamped` is what drops a value the
+            // resolved CLI cannot honor (the same treatment `model` gets).
+            effort: knobs.effort.trim().to_string(),
+            context: knobs.context.trim().to_string(),
         })
         .collect()
 }
@@ -754,6 +814,10 @@ struct RawBlock {
     allow: Vec<String>,
     #[serde(default)]
     role_hint: Option<String>,
+    #[serde(default)]
+    effort: String,
+    #[serde(default)]
+    context: String,
 }
 
 #[derive(Deserialize)]
@@ -829,6 +893,47 @@ pub fn role_hint_requires(hint: &str) -> Option<Role> {
 /// The role hints a workflow file may name, for error messages.
 pub fn role_hint_names() -> String {
     "advisor, process".to_string()
+}
+
+/// Validate one block model knob — `effort:` or `context:` (#687).
+///
+/// Two checks, in this order, and both are **loud**: the value must be in
+/// loomux's closed `vocabulary` (a typo is never coerced to a neighbouring
+/// level), and — when the block names an explicit `cli:` — that CLI must be one
+/// loomux can actually deliver the knob on, per its [`CliCaps`](super::CliCaps)
+/// row. A knob the CLI cannot honor is a parse error rather than a silent
+/// no-op: the author asked for a thinking level and would otherwise never
+/// learn they did not get one. `cli_supports` is `None` for a block that
+/// inherits the group default CLI, which is not known at parse time (the same
+/// deferral `cli_can_host` makes for the containment check) — `clamped()`
+/// re-runs the CLI half at spawn, where the real CLI is in hand.
+///
+/// Returns the normalized (trimmed, lowercased) value; empty for an absent key.
+/// One function for both keys so the two can never drift on case handling or on
+/// which check fires first.
+fn validate_knob(
+    field: &str,
+    raw: &str,
+    vocabulary: &[&str],
+    cli: &str,
+    cli_supports: Option<(&[&str], &str)>,
+) -> Result<String, String> {
+    let want = raw.trim().to_ascii_lowercase();
+    if want.is_empty() {
+        return Ok(String::new());
+    }
+    if !vocabulary.contains(&want.as_str()) {
+        return Err(format!(
+            "unknown {field} {raw:?} — must be one of {}",
+            vocabulary.join(", ")
+        ));
+    }
+    if let Some((supported, note)) = cli_supports {
+        if !supported.contains(&want.as_str()) {
+            return Err(format!("cli {cli:?} cannot set {field}: — {note}"));
+        }
+    }
+    Ok(want)
 }
 
 // ── parse + validate ────────────────────────────────────────────────────────
@@ -948,9 +1053,18 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 continue;
             }
         }
-        // THE ORCHESTRATOR BLOCK IS LOOMUX-OWNED. A repo may pin its `cli` and
-        // `model` (sanitized like everywhere else) — but it may not author its
-        // persona or pre-approve its tools.
+        // THE ORCHESTRATOR BLOCK IS LOOMUX-OWNED. A repo may pin its `cli`,
+        // `model`, `effort` and `context` (each sanitized/validated like
+        // everywhere else) — but it may not author its persona or pre-approve
+        // its tools.
+        //
+        // The pin list is exactly "picks from a value set loomux ships", which
+        // is why #687's two knobs join it and `prompt:`/`profile:`/`allow:`
+        // never can: a level from a closed enum authors no text and
+        // pre-approves no tool, so it opens no injection seam into the trust
+        // root — the most a hostile repo buys is an orchestrator that thinks
+        // harder or holds more context, both of which the human is shown in
+        // the launcher's roster preview before they opt in.
         //
         // This is not a capability question: the orchestrator already holds every
         // tool, so a repo-authored prompt grants it nothing *new*. It is a TRUST
@@ -982,7 +1096,8 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 errs.push(format!(
                     "blocks[{i}] ({id}): an orchestrator block may not declare {} — the orchestrator \
                      is loomux's trust root and a repo file may not author its prompt or pre-approve \
-                     its tools. Pin its cli:/model: if you need to; put personas on the blocks it spawns.",
+                     its tools. Pin its cli:/model:/effort:/context: if you need to; put personas on \
+                     the blocks it spawns.",
                     offenders.join(" / ")
                 ));
                 continue;
@@ -1052,6 +1167,39 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
                 Some(hint)
             }
         };
+        // `effort:` / `context:` (#687). Both are VALUE-SET picks — they author
+        // no text and pre-approve no tool — so the capability-closure argument
+        // is unchanged and they are legal on an orchestrator block too (see
+        // that check above, and `doc/design/workflows.md`). `validate_knob`
+        // carries the whole rule; the CLI half is checked only for an explicit
+        // `cli:`, exactly like `cli_can_host` above.
+        let caps = (!cli.is_empty()).then(|| super::cli_caps(&cli)).flatten();
+        let effort = match validate_knob(
+            "effort",
+            &rb.effort,
+            super::EFFORT_LEVELS,
+            &cli,
+            caps.map(|c| (c.effort_levels, c.effort_note)),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                errs.push(format!("blocks[{i}] ({id}): {e}"));
+                continue;
+            }
+        };
+        let context = match validate_knob(
+            "context",
+            &rb.context,
+            super::CONTEXT_VARIANTS,
+            &cli,
+            caps.map(|c| (c.context_variants, c.context_note)),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                errs.push(format!("blocks[{i}] ({id}): {e}"));
+                continue;
+            }
+        };
         let name = sanitize_display(&rb.name);
         blocks.push(Block {
             name: if name.is_empty() { id.clone() } else { name },
@@ -1063,6 +1211,8 @@ pub fn parse_workflow(text: &str) -> Result<Workflow, Vec<String>> {
             profile: rb.profile.as_ref().map(|p| p.trim().to_string()),
             allow: rb.allow.iter().filter_map(|a| super::profiles::sanitize_allow(a)).collect(),
             role_hint,
+            effort,
+            context,
         });
     }
 
