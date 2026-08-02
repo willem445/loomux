@@ -28472,8 +28472,12 @@ fn list_notifications_is_oldest_registered_first() {
 //
 // Same "no test shells out to `gh`" discipline as the notify section above:
 // `gh_poll_tick(now, &results)` is the decision seam, driven with a synthetic
-// result map, and its intake half no-ops without a `gh` call when no group is
-// autonomous with the gate on (`intake_poll_config`).
+// result map. The intake half runs for real here (an autonomous group with
+// the gate on, so its effect is observable and not merely its decision flag —
+// rev-157 blocking 1) and still spawns nothing: `gh_capture` returns at its
+// "no such directory" guard for the test group's nonexistent repo path,
+// before a program is resolved, so `poll_intake` executes its whole body
+// against two `Err`s exactly as it would against a rate-limited `gh`.
 
 /// The registration invariant #406 exists to hold: app setup starts ONE
 /// `gh`-polling loop, and neither of the two entry points it replaced.
@@ -28509,17 +28513,36 @@ fn app_setup_starts_exactly_one_gh_polling_loop() {
 /// resolves a due watch and the intake half runs its due-group scan, off the
 /// same injected instant. Before #406 these were two threads on two clocks,
 /// so "one tick did both" was not a statement that could be made at all.
+///
+/// Asserts the intake half's EFFECT (rev-157 blocking 1), not the
+/// `intake_scanned` flag: the flag is only the scheduler's decision and stays
+/// true even if the `poll_intake(now)` call beneath it is deleted, which
+/// would silently stop every autonomous group from ever being scanned. The
+/// per-group stamp only moves if the scan actually ran.
 #[test]
 fn one_gh_poll_tick_services_both_notify_and_intake() {
-    let (reg, _d, _co, cw) = setup_mcp();
-    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "406", "expires_minutes": 5 })).unwrap();
-    let id = extract_watch_id(&text);
+    // An AUTONOMOUS group with the intake gate on, so `poll_intake` runs its
+    // whole body instead of returning at the no-due-groups guard. Still no
+    // subprocess: the group's repo path does not exist, so `gh_capture`
+    // returns at its "no such directory" check before a program is even
+    // resolved — the section's "no test shells out to `gh`" rule holds.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(1), 180);
+    let watch = reg
+        .register_notification(&gid, &oid, notify::Condition::PrChecks { pr: 406 }, "merge if green".into(), 5)
+        .unwrap();
+    assert_eq!(reg.intake_last_poll_at(&gid), None, "nothing has scanned this group yet");
 
     // 6 minutes on: the watch is past its TTL (the notify half's own,
     // unchanged, time-based decision) and the intake scan has never run.
-    let tick = reg.gh_poll_tick(now_ms() + 6 * 60_000, &HashMap::new());
-    assert_eq!(tick.fired, vec![id], "the notify half must still resolve a due watch on this wake");
-    assert!(tick.intake_scanned, "and the SAME wake must run the intake scan — one loop, not two");
+    let wake = now_ms() + 6 * 60_000;
+    let tick = reg.gh_poll_tick(wake, &HashMap::new());
+    assert_eq!(tick.fired, vec![watch.id], "the notify half must still resolve a due watch on this wake");
+    assert!(tick.intake_scanned, "and the SAME wake must decide the intake scan is due");
+    assert_eq!(
+        reg.intake_last_poll_at(&gid),
+        Some(wake),
+        "…and must actually RUN it: only a scan that reached the gh call stamps the group it polled"
+    );
 }
 
 /// The unification must not change either feature's cadence: the notify half
@@ -28533,32 +28556,50 @@ fn intake_half_keeps_its_scan_floor_while_notify_runs_every_wake() {
     assert!(intake_scan_due(t, None), "the first wake after launch must scan");
     assert!(!intake_scan_due(t + 59_999, Some(t)), "a wake inside the floor must not scan");
     assert!(intake_scan_due(t + 60_000, Some(t)), "the floor is INTAKE_POLL_SCAN_INTERVAL, exactly");
+    // rev-157 non-blocking 2: a backwards clock jump (NTP correction, VM
+    // resume, a manual set) leaves the stamp in the FUTURE. A plain elapsed
+    // check stalls the scan for the whole size of the jump — the old
+    // `sleep`-driven thread could not be stalled this way, so the unification
+    // must not introduce it.
+    assert!(intake_scan_due(t, Some(t + 5 * 60_000)), "a stamp in the future must rescan, not stall for the jump");
 
     // And through the tick, on a live registry: wake 1 scans, wake 2 (one
     // 30s wake later) does not — but still fires a watch that resolved in
     // between, which is the half that must never be starved by the other's
-    // slower cadence.
-    let (reg, _d, _co, cw) = setup_mcp();
-    let expiring =
-        extract_watch_id(&register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "406", "expires_minutes": 5 })).unwrap());
-    let long_lived = extract_watch_id(
-        &register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "407", "expires_minutes": 240 })).unwrap(),
-    );
+    // slower cadence. As above, the group is autonomous with the gate on so
+    // the intake half's effect (its per-group stamp) is observable, and its
+    // `gh` calls stop at the nonexistent repo path with no subprocess.
+    let (reg, _d, gid, oid) = autonomous_setup_with_gate(Some(1), 180);
+    let expiring = reg
+        .register_notification(&gid, &oid, notify::Condition::PrChecks { pr: 406 }, "expires first".into(), 5)
+        .unwrap()
+        .id;
+    let long_lived = reg
+        .register_notification(&gid, &oid, notify::Condition::PrChecks { pr: 407 }, "resolves later".into(), 240)
+        .unwrap()
+        .id;
 
     let wake1 = now_ms() + 6 * 60_000;
     let first = reg.gh_poll_tick(wake1, &HashMap::new());
     assert_eq!(first.fired, vec![expiring], "wake 1 expires the short-TTL watch");
     assert!(first.intake_scanned, "wake 1 is the first scan ever, so it scans");
+    assert_eq!(reg.intake_last_poll_at(&gid), Some(wake1), "wake 1 really polled the group, not merely flagged it");
 
     let mut met = HashMap::new();
     met.insert(long_lived.clone(), notify::PollResult::Met { summary: "SUCCESS — all 3 checks passed".into() }.into());
     let second = reg.gh_poll_tick(wake1 + 30_000, &met);
     assert_eq!(second.fired, vec![long_lived], "wake 2 must still deliver the notify half — every wake does");
     assert!(!second.intake_scanned, "…while the intake scan holds its own 60s floor on that same wake");
+    assert_eq!(
+        reg.intake_last_poll_at(&gid),
+        Some(wake1),
+        "and the scan really did NOT run on wake 2: the stamp is still wake 1's"
+    );
 
     // A wake past the floor scans again — the floor is a floor, not a latch.
     let third = reg.gh_poll_tick(wake1 + 60_000, &HashMap::new());
     assert!(third.intake_scanned, "the next wake past the floor scans again");
+    assert_eq!(reg.intake_last_poll_at(&gid), Some(wake1 + 60_000), "…and that scan ran too, restamping the group");
 }
 
 // ---------- group_watches: the group view's "⏳ waiting on …" indicator (#248) ----------

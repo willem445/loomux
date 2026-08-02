@@ -20752,6 +20752,20 @@ impl OrchRegistry {
         }
     }
 
+    /// When this group's intake scan last actually reached the `gh` call and
+    /// stamped (`intake::due_intake_polls`' per-group floor), if ever.
+    ///
+    /// #406 review (rev-157, blocking 1): this exists so a test can assert the
+    /// EFFECT of the unified tick's intake half — that `poll_intake` really
+    /// ran — rather than the `GhPollTick.intake_scanned` flag, which is only
+    /// the scheduler's decision and stays true even if the call under it is
+    /// deleted. The same `#[doc(hidden)]` test seam as `seed_intake_pending`
+    /// below, read-only.
+    #[doc(hidden)] // pub for integration tests: observe that a scan ran, without shelling to `gh`
+    pub fn intake_last_poll_at(&self, group: &str) -> Option<u64> {
+        self.intake_last_poll_ms.lock_safe().get(group).copied()
+    }
+
     #[doc(hidden)] // pub for integration tests: seed a pending intake signal without shelling to `gh`
     pub fn seed_intake_pending(&self, group: &str, summary: &str) {
         self.intake_pending.lock_safe().entry(group.to_string()).or_default().push(summary.to_string());
