@@ -3066,10 +3066,11 @@ pub const CONTEXT_VARIANTS: &[&str] = &["1m"];
 /// direction, as `sanitize_model`.
 pub fn clamped_knob(allowed: &[&str], v: &str) -> String {
     let want = v.trim().to_ascii_lowercase();
-    // MUTATION B (#687 mutation round, reverted in the next commit): the
-    // capability gate is removed, so any value survives the clamp.
-    let _ = allowed;
-    want
+    if allowed.contains(&want.as_str()) {
+        want
+    } else {
+        String::new()
+    }
 }
 
 /// The capability table. Rows exist for CLIs loomux does **not** spawn too:
