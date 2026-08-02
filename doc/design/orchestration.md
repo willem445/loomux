@@ -127,7 +127,7 @@ pane stays open showing the status).
 
 | tool | orchestrator | worker/reviewer/planner |
 | --- | --- | --- |
-| `spawn_agent(name, kind, task, worktree?, branch?, base?)` | ✓ (guardrailed) | ✗ |
+| `spawn_agent(name, kind, task, worktree?, branch?, base?)` — `kind` (or `block`) is required on a fresh spawn, [#544](#a-capability-class-is-never-acquired-by-omission-544) | ✓ (guardrailed) | ✗ |
 | `send_prompt(agent_id, text)` | ✓ | ✗ |
 | `report(status?, summary?, outcome?, ref?, detail_url?, note?)` / `message_orchestrator(text)` | ✗ | ✓ |
 | `list_agents()` | ✓ | ✓ |
@@ -341,6 +341,64 @@ for a planner (`Containment::ReadOnly`) — #462 gave a reviewer the editing-too
 tier, deliberately not the git half, since a reviewer's shell IS its job — so no-push is, and
 remains, taught in `reviewer.md`, and a dedicated worktree changes nothing about that; it only
 gives the reviewer a workspace of its own to sit in while it does what it already does.
+
+### A capability class is never acquired by omission (#544)
+
+`spawn_agent`'s `kind` used to default to `worker`. That reads like a convenience — most spawns
+really are workers — but it makes the failure mode of *forgetting a parameter* "silently receive
+more capability than intended", because `worker` is the **most**-privileged class loomux can hand
+out: a read-write pane with the editing tools and `git commit`/`push` a reviewer and a planner are
+both denied. It fired: an orchestrator spawned three reviewers with `kind` omitted and got three
+workers, each carrying a brief that said "review PR #536" and "record your verdict with
+`review_verdict`", one of them literally named `rev: #536 question-guard`. Nothing objected — not
+the pinned per-role model/CLI guardrails (they applied correctly, to the *worker* role), not the
+reviewer-only tool gate (`review_verdict` is denied to a non-reviewer, so the pane would simply
+have been unable to do the job it was sent to do), not the name. The orchestrator caught it by
+reading the return value and killed the panes before they acted.
+
+The distinction that makes this its own defect rather than an operator slip: **#448, #462 and
+#465 all harden a pane that was correctly classified** — planner/reviewer read-only enforcement,
+the reviewer CLI deny list, the deny-list's own fail-open direction. None of that layer is
+reachable when the classification itself is wrong, and a fail-open default puts the classification
+one forgotten argument away from wrong. It is the omission twin of #222, which stopped an
+*unrecognized* `kind` (`"revieweer"`) from falling through `_ => Role::Worker` to the same place.
+
+The fix is the issue's option 1: a **fresh spawn must name its capability class** — `kind`, or a
+`block` (whose kind is authoritative anyway, and which is how a custom-workflow group spawns
+everything). Naming neither is refused, loudly, with a message that names both ways out and the
+`resume_session` alternative. Option 2 (keep the default, refuse *reviewer-shaped* briefs at
+worker class by sniffing the task text for `review_verdict` or the name for `rev:`) was not taken:
+it is a heuristic over an open set of phrasings, so it would refuse some correct spawns and miss
+the next mis-spawn that happens not to say "review", and it leaves the fail-open default in place
+for every class pairing it *doesn't* model (a planner-intended spawn, say). Requiring the class
+removes the error class instead of narrowing it, and the cost is one argument per call site.
+
+Three things about the shape:
+
+- **`resume_session` is deliberately exempt**, and that is not a hole. A bare resume inherits the
+  resumed session's own block (#254) — it re-derives nothing from `kind`, and an unknown session
+  is already a hard error rather than a silent worker. Inheritance is a *stricter* answer than a
+  default, so making a resume name a class too would only invite an orchestrator to guess one and
+  re-role a conversation by accident. The requirement is on the *fresh* path, where there is no
+  prior class to inherit.
+- **`kind` stays optional in the JSON schema, deliberately — not because the shape is
+  inexpressible.** JSON Schema can say "kind or block": an `anyOf` over three `required`
+  alternatives (`kind`, `block`, `resume_session`) would let a strict client catch the omission
+  before the round-trip. It was not taken because a strict client mis-rejecting a *valid* call is a
+  worse failure than the round-trip it saves, and because this repo's schema is advertisement
+  rather than enforcement anyway — the `enum` on `kind` has never been checked against incoming
+  arguments; `mcp.rs` re-validates every argument itself. So the tool description states the
+  contract and `call_tool` enforces it, three lines from the #222 unknown-kind rejection. If a
+  future client tier ever wants machine-checkable arity, `anyOf` is the shape to add, and this
+  paragraph is the record that it was considered.
+- **Two smaller fail-open fallbacks went with it.** `kind` is now `Option<Role>` all the way
+  through the spawn arm rather than a `Role` pre-seeded with `Worker`, which surfaced a second
+  place the old default leaked: a bare resume of a pre-#222 roster row whose recorded `role`
+  no longer parses used to fall back to `kind` — i.e. to `Worker` — and now refuses instead. The
+  one remaining `unwrap_or` (the `role` argument handed to `spawn_agent_ex`, unreachable with
+  `kind: None` unless a block is set, which overrides it) resolves to `Planner`, the least
+  privileged class, so that even a future path reaching it cannot acquire write capability by
+  omission.
 
 ### Pane naming & rename precedence (#95r)
 

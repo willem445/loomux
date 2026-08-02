@@ -3363,6 +3363,54 @@ fn a_repo_file_can_never_author_the_orchestrators_persona() {
 }
 
 #[test]
+fn the_orchestrator_mechanics_core_states_the_explicit_class_requirement() {
+    // rev-157 NB1. `mechanics_core(Orchestrator)` is the always-on mechanics
+    // spine — written INSTEAD of the class template for a `mode: replace`
+    // persona, and the slim system-prompt body Copilot gets. So the population
+    // reading it is exactly the population that never reads the
+    // `templates/orchestrator.md` #544 fixed, and prose there that presents the
+    // capability class as optional-shaped sends that orchestrator into a
+    // refusal its only guaranteed instructions never warned it about.
+    //
+    // Same lockstep argument as `every_reviewer_hears_the_findings_duty_however_
+    // its_persona_was_written`: a rule that reaches only one of the two surfaces
+    // is a rule the group that customized itself does not have.
+    let (reg, d) = test_registry();
+    // A repo may pin the orchestrator's CLI (and only that — a repo-authored
+    // orchestrator persona is refused at parse), and `cli: copilot` is what
+    // routes the trust root through the slim `copilot_agent_body` composition
+    // that carries the mechanics core verbatim.
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n  - id: orchestrator\n    kind: orchestrator\n    cli: copilot\n\
+         \x20 - id: worker\n    kind: worker\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let _ = orchestrator_command(&reg, &g); // writes the generated agent file
+    let handle = format!("loomux-{}-orchestrator", g.id);
+    let path = d.path().join("copilot-agents").join(format!("{handle}.agent.md"));
+    let body = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("generated copilot agent file must exist at {}: {e}", path.display()));
+
+    // Read the surface FIRST, so a red below can never be mistaken for "the
+    // test looked in the wrong place": this line is mechanics-core text that
+    // predates #544 and must be present either way.
+    assert!(
+        body.contains("NOT optional, whatever your persona says"),
+        "test premise: this file must be carrying the mechanics core: {body}"
+    );
+
+    assert!(
+        body.contains("#544"),
+        "the mechanics core must state the explicit-class requirement — it is all a \
+         replace-persona orchestrator ever reads: {body}"
+    );
+    assert!(
+        body.contains("must name its class"),
+        "...and must state it as a requirement, not as an optional-shaped aside: {body}"
+    );
+}
+
+#[test]
 fn a_gate_condition_name_is_sanitized_at_parse() {
     // Gates are enforced in sub-PR 3, inside the `gh` PATH shim — a shell script.
     // Whatever `parse_workflow` returns will be read there as already clean; that
@@ -3491,7 +3539,7 @@ fn orch_caller(reg: &OrchRegistry, group: &str) -> Caller {
 #[test]
 fn mcp_spawn_rejects_an_unknown_kind_instead_of_making_it_a_worker() {
     let (reg, _d) = test_registry();
-    let repo = Repo::new().git_init(); // the "documented default" spawn below is a worker (#338)
+    let repo = Repo::new().git_init(); // the explicit worker spawn below cuts a real worktree (#338)
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let caller = orch_caller(&reg, &g.id);
 
@@ -3511,8 +3559,23 @@ fn mcp_spawn_rejects_an_unknown_kind_instead_of_making_it_a_worker() {
         "the rejected spawn must not have created an agent"
     );
 
-    // The documented default (no kind at all) is still a worker.
+    // ...and #544 closed the omission half of the same door: there IS no
+    // documented default any more. A fresh spawn naming neither `kind` nor
+    // `block` used to come back a worker; it is now refused, and the refusal
+    // says what to pass. (`spawn_agent_never_defaults_to_the_privileged_class`
+    // in tests/orchestration.rs is the dedicated pin.)
     let out = call(json!({ "task": "t" }));
+    assert_eq!(out["isError"], json!(true), "an omitted kind must be an error too");
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("#544") && text.contains("kind"), "{text}");
+    assert_eq!(
+        reg.list_agents(&g.id).as_array().unwrap().len(),
+        1,
+        "the refused spawn must not have created an agent either"
+    );
+
+    // An explicit kind still spawns the class it names.
+    let out = call(json!({ "kind": "worker", "task": "t" }));
     assert_eq!(out["isError"], json!(false));
     assert!(out["content"][0]["text"].as_str().unwrap().contains("block worker"));
 }

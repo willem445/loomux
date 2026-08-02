@@ -457,6 +457,24 @@ so far:
   The board UI half (chips, a ready affordance, dep editing) is a separate slice and
   changes nothing an agent reads.
 
+- **#544, a capability class is never acquired by omission** — `orchestrator.md` only
+  (`worker.md`/`reviewer.md`/`planner.md` do not spawn anything and did not move). Live
+  incident: three reviewer-shaped briefs (`name: "rev: #536 …"`, tasks saying "review this PR"
+  and "record your verdict with `review_verdict`") were spawned with `kind` omitted and came
+  back as **workers** — read-write panes with edit tools and `git commit`/`push` — because
+  `kind` defaulted to `worker`, the *most*-privileged class. Nothing objected: every
+  containment guardrail this repo has (#448/#462/#465) protects a pane that was correctly
+  *classified*, and none of them fire when the classification itself was acquired by
+  forgetting an argument. `spawn_agent` now **refuses** a fresh spawn that names neither
+  `kind` nor `block`, with a message saying what to pass; `resume_session` keeps its #254
+  inheritance untouched (omitting both there inherits the resumed session's own block, which
+  is stricter than any default). The re-bless is warranted because the template stated the old
+  contract in as many words — "*`kind`: `worker` | `reviewer` | `planner`, default `worker`*" —
+  so an orchestrator reading it would keep omitting the argument and read the new refusal as a
+  loomux bug. The bullet now states the requirement, names the incident in one sentence so the
+  rule doesn't read as ceremony, and flags the resume exception; **Planning & scheduling**'s
+  worktree bullet gains the `kind: "worker"` its example had been eliding.
+
 `the_toggle_off_leaves_every_instruction_file_byte_for_byte_what_it_was` renders
 **these** with the six pre-#222 template variables and asserts that a group launched
 with the advanced orchestrator **off** gets exactly that text. They are the
