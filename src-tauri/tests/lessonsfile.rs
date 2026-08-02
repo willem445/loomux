@@ -182,14 +182,26 @@ fn oversized_lessons_file_is_capped_oldest_drop_not_rejected() {
     repo.write_lessons(&content);
 
     let kickoff = orchestrator_kickoff(&repo);
+    // #498 moved the first two assertions from the whole kickoff to the
+    // injected *body*, and added the third. The intent is untouched — the
+    // oldest entry must not be injected — but eviction is now loud, so its
+    // heading legitimately appears once more, in the notice that says it was
+    // dropped. "Absent from the kickoff" stopped being a way to say "not
+    // injected"; "absent from the body" is.
+    let region = injected_region(&kickoff);
+    let (notice, body) = notice_and_body(&region);
     assert!(
-        kickoff.contains("NEWEST-MARKER-lesson-last"),
+        body.contains("NEWEST-MARKER-lesson-last"),
         "oldest-drop must keep the most recently appended entry, got tail of: {}",
         &kickoff[kickoff.len().saturating_sub(300)..]
     );
     assert!(
-        !kickoff.contains("OLDEST-MARKER-lesson-zero"),
+        !body.contains("OLDEST-MARKER-lesson-zero"),
         "oldest-drop must have dropped the earliest entry once over the cap"
+    );
+    assert!(
+        notice.contains("OLDEST-MARKER-lesson-zero"),
+        "…and must say so by name rather than dropping it silently, got: {notice}"
     );
     assert!(
         kickoff.contains("truncated"),
