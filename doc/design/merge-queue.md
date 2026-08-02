@@ -1,13 +1,13 @@
 # Design: Bors-style bisecting merge queue (#581)
 
-Status: **design only — no queue code exists yet.** This note is slice B of #581 and gates
-every later slice; the plan (#581 comments, planner `plan-151`, parts 1–7) makes the note a
-hard prerequisite for slice C. Nothing here is implemented. Line numbers are as of this
-writing against `main` at `d8667d4`; symbols are the durable reference, lines are a
-convenience.
+Status: **implemented.** This note is slice B of #581 and gated every later slice; the plan
+(#581 comments, planner `plan-151`, parts 1–7) made the note a hard prerequisite for slice C.
+Line numbers were written against `main` at `d8667d4`; symbols are the durable reference,
+lines are a convenience.
 
 Slices: **A** `Task.pr_base` (parallel with this note) · **B** this note · **C** `mergeq.rs`
-pure core + `merge_queue:` parsing · **D** the driver · **E** MCP tools + docs · **F**
+pure core + `merge_queue:` parsing · **D** the driver (D1 write primitives, D2 loop
+functions, **D3** the tick that calls them — §13, #698) · **E** MCP tools + docs · **F**
 read-only UI.
 
 ## Two decisions recorded here, both deliberately reversible
@@ -659,8 +659,15 @@ Stating this here so the next reader does not go looking for a parser to copy.
           "blocked_reason": null, "enqueued_ms": 0, "batch": null }
       ],
       "batch": { "id": "mq-7f3a", "prs": [612, 613], "scratch_sha": "<sha>",
-                 "draft_pr": 640, "state": "ci-wait", "started_ms": 0 }
+                 "draft_pr": 640, "state": "ci-wait", "started_ms": 0,
+                 "bisect": null }
     }
+
+`bisect` is present **exactly when the batch is a bisect probe** rather than a batch that
+might land (§13), and carries `{ "origin_prs": [...], "failing": [...] }` — the original red
+batch's members and its failing check names. Added by slice D3; additive and defaulted, so a
+file written before it still reads and one written after it survives an older build's
+read/write cycle through the `extra` map above.
 
 Unknown fields are tolerated **and preserved** — carried across a read/write cycle rather than
 merely not failing the read, because §11.2's promise is that an older build can read *and rewrite*
@@ -686,10 +693,17 @@ read together.
 Emitted through the registry's `audit(group, actor, action, detail)` (`mod.rs:17668`), kebab-
 case, matching the existing convention (`queue-recovered`, `merge-gate-allowed`, …):
 
-`mq-enqueued` · `mq-enqueue-refused` · `mq-batch-built` · `mq-batch-pushed` ·
-`mq-checks-green` · `mq-checks-red` · `mq-checks-unverifiable` · `mq-landed` ·
-`mq-land-refused` · `mq-bisect-step` · `mq-culprit` · `mq-kicked-back` · `mq-cancelled` ·
-`mq-cleanup-failed` · `mq-scratch-collision` · `mq-recovered` · `mq-stranded`
+`mq-enqueued` · `mq-enqueue-refused` · `mq-batch-built` · `mq-batch-aborted` ·
+`mq-batch-pushed` · `mq-checks-green` · `mq-checks-red` · `mq-checks-unverifiable` ·
+`mq-landed` · `mq-land-refused` · `mq-bisect-step` · `mq-culprit` · `mq-kicked-back` ·
+`mq-cancelled` · `mq-cleanup-failed` · `mq-scratch-collision` · `mq-recovered` ·
+`mq-stranded`
+
+`mq-batch-aborted` is slice D3's addition, for §10's "batch aborts, entries return to
+`queued`" rows — a batch that could not be constructed, or one abandoned because a member
+was cancelled. It exists rather than being folded into `mq-batch-built` with a falsy field
+precisely because of the rule in the next paragraph: a filter looking for batches that were
+built must not match a batch that was not.
 
 Every state transition and every external write appears here. An audit action must name what
 actually happened — labeling a failed landing as a success is the exact defect class #461
@@ -736,3 +750,104 @@ the PTY-lifecycle/session bridge, and all ~50 `orch_*` wrappers already live in
 - **Reversal:** delete the yml block and the feature is off; with `enabled: false` every queue
   code path is unreachable, and a test pins that. The two flagged decisions have their own,
   narrower reversal seams (§3, §8).
+
+## 13. The driver tick — slice D3 (#698)
+
+Slices C, D1 and D2 built the queue's core, its write primitives and its loop functions.
+**None of them was ever called.** In the first live run the queue accepted four approved
+sub-PRs, and 51 minutes later every entry still read `queued`: no `batching` transition, no
+scratch ref, no draft batch PR, and an audit log holding four `mq-enqueued` lines and nothing
+after them. `build_scratch`, `observe_batch`, `walk_bisect`, `advance_entry`,
+`requeue_survivors` and `finish_batch` had no callers outside `mqloop.rs` and the test suite;
+the frontend is a read-only view; nothing anywhere started a batch when entries were queued
+and the target was idle. Every slice test drove a seam directly, so everything was green
+while no production path connected them — the failure class this repo's lessons file opens
+with, and the one #661's `e20` was written for.
+
+This section is the missing path, and the two decisions it had to make.
+
+### 13.1 Where it runs: a step in the unified `gh` poll loop
+
+`mqloop::drive` is the decision half — one function over `(&dyn MqRunner, &mut
+MergeQueueState, policy, gate, verdicts)` — and `OrchRegistry::mq_drive_group_with` is the
+registry wiring around it. `gh_poll_tick` (#406/#652) calls the tick.
+
+That loop and not a thread of its own, for three reasons. Observing a batch's checks **is** a
+`gh` poll — the same `gh pr checks` call, on the same 30-second cadence, as every
+`notify_when` watch. #406's whole point was one loop with one shared rate-limit-aware
+scheduling policy, and a second `gh`-calling thread would re-open the coupling it closed. And
+a batch's steady state is cheap: one `gh pr checks` on the draft PR, per wake, for the one
+group with a batch in flight.
+
+**The per-tick bound is one group per wake, oldest-serviced first.** Structural rather than a
+counter, and it is the constraint #656 is about, met before #656's own cap lands: the loop is
+shared with every watch in the fleet, so a driver that serviced N groups on one wake would put
+N batch builds inside one tick. Ordering by last-serviced makes the rotation fair — a group is
+deferred, never starved — which is the `due_intake_polls` idiom #656 asks for on the intake
+half. Within a group, a tick performs **at most one state advance**: it never loops waiting
+for anything, never sleeps, and never retries an external call in place.
+
+Beside the per-tick bound there is a **rate** bound: after an external failure the group is
+held off for five minutes (`MQ_DRIVE_BACKOFF_MS`). §10's failure rows all end "entries return
+to `queued`", which means the very next wake would try the same thing — one notice and one
+audit line every 30 seconds against a remote that is simply down. It is deliberately not a
+retry *limit* (§10 requires the entries to requeue and a later batch to re-derive the
+question) and deliberately not persisted: the condition is a fact about the world, not about
+the queue, and a durable backoff would keep punishing a batch for a network that has since
+come back.
+
+### 13.2 How the bisect runs when no tick may block
+
+§9 describes the search as a recursion whose step is a full CI run. `walk_bisect` states that
+shape executably — and its `reproduces` closure can only ever be a build-push-observe cycle,
+which is tens of minutes. Inside a shared poll loop that is not a function that can be called.
+
+So the search is a **state machine across ticks**, and the state is the batch record: each
+round is itself a batch, built over the half `bisect_step` selected, and the red set is
+whatever is left in `bisecting`. A round's observation narrows the set — into the probe's
+subset if it reproduced, into what the probe left out if it did not — the exonerated side
+requeues immediately (§9's survivors, in their original queue order), and either the next
+probe is built or the culprit is named. It terminates because the suspected set strictly
+shrinks, and it spends the same ceil(log2 k) runs `walk_bisect`'s test pins.
+
+Two consequences worth stating, because both are places where an obvious implementation is
+wrong:
+
+- **A probe never lands, even when it is green.** Its green is evidence about *attribution*,
+  not a decision about the target: the entries in it are still in a search, and §9 requeues
+  survivors for a later ordinary batch rather than landing halves as it goes. `BatchRecord`
+  carries `bisect: Option<BisectSearch>` as the single source of that distinction, so the
+  record's state and its search data cannot be read as disagreeing.
+- **The search's `origin_prs` and `failing` are carried, not recomputed.** Attribution
+  routinely happens on a tick whose own observation was **green** (the probe exonerated its
+  half, so the culprit is the other half) — that tick has no failing checks to report, and by
+  then every sibling has gone back to `queued` where it is indistinguishable from newly
+  enqueued work. §9 requires the culprit comment to name both the failure and the sibling set,
+  so both travel with the search. Nothing on the remote still holds them: §10 closes the draft
+  PR and deletes the scratch ref on every exit path.
+
+### 13.3 The invariant that keeps a crash recoverable
+
+**An entry is in an in-flight state only while `state.batch` is `Some`.** Every path that
+clears the batch record first moves its entries out of the in-flight states, and every path
+that puts entries into one records a batch in the same call — which is why a bisect probe
+carries a batch record of its own rather than the search running *between* batches.
+
+That is what makes §4's reconcile a statement about a **crash** rather than about a tick that
+was midway through its work. `reconcile_batch` strands an in-flight entry with no batch
+record; if the driver could produce that shape legitimately, every restart would kick back a
+set of innocent PRs. `mq_drive_group_with` therefore also runs `merge_queue_reconcile_with`
+**before** driving — once-only, so it costs nothing after the first call, but it makes
+recovery-before-driving a guarantee instead of an assumption about which bind site ran when.
+
+Two more registry-level facts the driver forced:
+
+- **Every read-modify-write of `merge_queue.json` is serialized** (`mq_state_lock`). The
+  driver's load-decide-store can span a whole batch build; without the lock a `queue_merge`
+  landing in that window reads the pre-build file and writes it back, erasing the batch
+  record. That lost update's symptom is a queue that accepts work and never lands it — #698's
+  own symptom, one layer down.
+- **The runner is injectable** (`mq_runner_override`, the `pr_head_override` precedent). The
+  thing #698 was about is the *production entry point*, and that entry point resolves its own
+  runner. Without a seam there a test could reach the driver or reach the poll loop, but never
+  both at once — which is exactly the gap that let the door stay connected to nothing.

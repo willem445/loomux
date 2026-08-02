@@ -36,12 +36,13 @@
 //! that ever builds a landing refspec; the [`BatchVerification`] adapter over
 //! `notify.rs`'s classification (§5); and namespace-exact cleanup (§10).
 //!
-//! Not here, and coming in D2: §8's batch construction (the merge commits onto
-//! the scratch), the draft PR and its body builder, the bounded observation loop
-//! (`checks_timeout_minutes`), §9's bisect and culprit attribution, §4's crash
-//! reconcile, `merge_queue.json` persistence, and the `mod.rs`/`mcp.rs` wiring.
-//! Nothing in this module is reachable from a running loomux yet — it is a
-//! library with integration tests, exactly as slice C was.
+//! Not here, and in `mqloop.rs` (D2) instead: §8's batch construction (the merge
+//! commits onto the scratch), the draft PR and its body builder, the bounded
+//! observation loop (`checks_timeout_minutes`), §9's bisect and culprit
+//! attribution, §4's crash reconcile, and `merge_queue.json` persistence — plus,
+//! since #698 (D3), the **driver tick** that sequences all of it from the
+//! unified `gh` poll loop. Everything in this module is reached from a running
+//! loomux through that tick; §13 of the design note is the path.
 //!
 //! # The two properties this module exists to hold
 //!
@@ -868,7 +869,7 @@ pub fn land_push_argv(scratch_sha: &str, target: &str) -> Vec<String> {
 /// couples "did we look at CI" to "could we read the gate file", and a future
 /// edit that made an unreadable gate reachable would silently also have made it
 /// unobserved. The cheap direction is the safe one.
-fn declares_ci_green(spec: &GateSpec) -> bool {
+pub(super) fn declares_ci_green(spec: &GateSpec) -> bool {
     match spec {
         GateSpec::Declared(g) => g.also.iter().any(|c| c == "ci-green"),
         GateSpec::Absent | GateSpec::Malformed => true,

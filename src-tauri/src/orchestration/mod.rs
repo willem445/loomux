@@ -8325,6 +8325,20 @@ pub struct OrchRegistry {
     /// persisted backoff would keep punishing a batch for a network that has
     /// since come back.
     mq_service_ms: Arc<Mutex<HashMap<String, u64>>>,
+    /// Test seam (#698), the merge-queue sibling of `pr_head_override`: when
+    /// set, `mq_driver_tick` drives with this runner instead of building a
+    /// [`mqdriver::ProcessRunner`] over the group's repo. `None` in the app,
+    /// always.
+    ///
+    /// It exists because the thing #698 was actually about is the **production
+    /// entry point** — every seam below it was already green while nothing
+    /// called them — and that entry point resolves its own runner. Without a
+    /// seam here, a test could reach `mq_drive_group_with` (proving the driver
+    /// works) or `gh_poll_tick` (proving the poll loop calls *something*), but
+    /// never both at once, which is precisely the gap that let the door stay
+    /// connected to nothing. Same posture as `pr_head_override`: a canned
+    /// runner, so no test spawns `git` or `gh` (CLAUDE.md constraint 3).
+    mq_runner_override: Mutex<Option<Arc<dyn mqdriver::MqRunner>>>,
     /// #560: each pane's open hold EPISODE — when it began, and what has
     /// already been said about it. Keyed by `pty_id`, in memory only (see
     /// [`HoldEpisode`] for the restart argument).
@@ -18637,6 +18651,7 @@ impl OrchRegistry {
             mq_reconciled_groups: Arc::new(Mutex::new(HashSet::new())),
             mq_state_lock: Arc::new(Mutex::new(())),
             mq_service_ms: Arc::new(Mutex::new(HashMap::new())),
+            mq_runner_override: Mutex::new(None),
             queue_draining: Arc::new(queuestate::DrainerRegistry::new()),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
@@ -35016,12 +35031,12 @@ impl OrchRegistry {
     /// notices back. That split is the point: the queue's behaviour is testable
     /// without an `AppHandle`, and `mod.rs` holds none of it.
     ///
-    /// **No live caller yet.** Nothing can enqueue until slice E adds the MCP
-    /// tools, so on every group today this is a no-op over an absent file — the
-    /// product default (§12). It is wired now so recovery already works the day
-    /// enqueueing exists, rather than being retrofitted onto a queue that has
-    /// state to lose. Stated because an unreferenced entry point looks like an
-    /// oversight otherwise.
+    /// **Recovery runs before driving, always** (#698). Besides the pane-bind
+    /// sites below, `mq_drive_group_with` calls the `_with` half on every tick;
+    /// the once-only guard makes that free after the first. §4's recovery is
+    /// what decides whether an in-flight batch may be resumed at all, and a
+    /// driver that observed one *before* that decision would be acting on a
+    /// record recovery was about to strand.
     ///
     /// Called from every pane-bind site, beside `recover_persisted_queue` —
     /// the delivery queue's equivalent — so it runs once per group per process
@@ -35173,10 +35188,27 @@ impl OrchRegistry {
     /// [`run_mq_driver_tick`](Self::run_mq_driver_tick) with the clock injected.
     pub fn mq_driver_tick(&self, now: u64) -> Option<String> {
         let group = self.next_mq_group(now)?;
-        let repo = self.group(&group).map(|g| g.repo)?;
-        let runner = mqdriver::runner_for(std::path::Path::new(&repo));
-        self.mq_drive_group_with(&group, &runner, now);
+        // Cloned out and the guard dropped before driving: the override is a
+        // one-line lookup and the drive below is a batch build.
+        let injected = self.mq_runner_override.lock_safe().clone();
+        match injected {
+            Some(r) => {
+                self.mq_drive_group_with(&group, r.as_ref(), now);
+            }
+            None => {
+                let repo = self.group(&group).map(|g| g.repo)?;
+                let runner = mqdriver::runner_for(std::path::Path::new(&repo));
+                self.mq_drive_group_with(&group, &runner, now);
+            }
+        }
         Some(group)
+    }
+
+    /// Install (or clear) the canned runner the merge-queue driver uses — the
+    /// `mq_runner_override` seam; see that field.
+    #[doc(hidden)] // pub for integration tests
+    pub fn set_mq_runner_override(&self, runner: Option<Arc<dyn mqdriver::MqRunner>>) {
+        *self.mq_runner_override.lock_safe() = runner;
     }
 
     /// The one group this wake will service, or `None`.

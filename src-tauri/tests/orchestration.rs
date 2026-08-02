@@ -36725,3 +36725,217 @@ fn a_re_grounding_closed_on_liveness_is_never_audited_as_confirmed() {
          that it was read, got: {residual:?}"
     );
 }
+
+// ---------- the merge queue's DRIVER, on the production path (#698) ----------
+
+/// A scripted `MqRunner`: substring-matched canned replies, so the production
+/// tick can be driven with no `git`, no `gh` and no network (constraint 3).
+///
+/// Separate from [`MqFake`] above, which answers one flat reply and is all the
+/// reconcile seam needs. Driving a whole batch build needs a *sequence*, and
+/// `tests/mergequeue.rs`'s richer fake cannot be shared across integration-test
+/// targets — they are separate crates.
+struct MqScript {
+    replies: Vec<(&'static str, i32, String)>,
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl MqScript {
+    /// Every reply one clean batch build needs.
+    fn batch_builder(head: &str, target_head: &str, merged: &str) -> MqScript {
+        MqScript {
+            replies: vec![
+                // §7's live lookups.
+                ("repo view", 0, "main\n".into()),
+                (
+                    "pr view 612",
+                    0,
+                    serde_json::json!({ "baseRefName": "integration", "headRefOid": head,
+                                        "body": "b" })
+                    .to_string(),
+                ),
+                // §4's mint check: this scratch name is free.
+                ("ls-remote", 2, String::new()),
+                // §8's construction.
+                ("fetch", 0, String::new()),
+                ("rev-parse refs/remotes/loomux-mq/target", 0, target_head.into()),
+                ("rev-parse refs/remotes/loomux-mq/pr-612", 0, head.into()),
+                ("worktree add", 0, String::new()),
+                ("merge --no-ff", 0, String::new()),
+                ("rev-parse HEAD", 0, merged.into()),
+                // The create-only push and §5's draft PR.
+                ("push --force-with-lease", 0, String::new()),
+                ("pr create", 0, "https://github.com/o/r/pull/641\n".into()),
+            ],
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn reply(&self, args: &[&str]) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+        let joined = args.join(" ");
+        self.calls.lock().unwrap().push(joined.clone());
+        for (needle, code, stdout) in &self.replies {
+            if joined.contains(needle) {
+                return Ok(loomux_lib::orchestration::mqdriver::CmdOut {
+                    code: Some(*code),
+                    stdout: stdout.clone(),
+                    stderr: String::new(),
+                });
+            }
+        }
+        panic!("MqScript: no canned reply for {joined:?}");
+    }
+}
+
+impl loomux_lib::orchestration::mqdriver::MqRunner for MqScript {
+    fn git(&self, args: &[&str]) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+        self.reply(args)
+    }
+    fn gh(&self, args: &[&str]) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+        self.reply(args)
+    }
+}
+
+/// **#698, end to end through the production entry point.**
+///
+/// The batch pipeline had no caller. Every seam under it was green — the
+/// planner, the scratch build, the create-only push, the draft-PR body, the
+/// bisect splitter — while four approved PRs sat `queued` for 51 minutes and
+/// the audit log carried four `mq-enqueued` lines and nothing after them. So
+/// the assertion that matters is not "the driver works" but "**the poll loop
+/// calls it**", and this test starts at `gh_poll_tick` for that reason: it is
+/// the only shape that would have failed before the fix.
+///
+/// The runner is injected (`set_mq_runner_override`), which is the one thing
+/// that lets the real entry point run without spawning `git` or `gh`.
+#[test]
+fn the_gh_poll_tick_drives_the_merge_queue_and_cuts_a_batch() {
+    const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const TARGET_HEAD: &str = "cccccccccccccccccccccccccccccccccccccccc";
+    const MERGED: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+    let (reg, d) = test_registry();
+    let repo = repo_with_merge_queue("mq-driver-tick", true);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    let gdir = d.path().join(&g.id);
+
+    // The gate the queue re-enforces (§6) — the same `merge_gate` file the shim
+    // reads, never a second opinion — and one live pass against the PR's head.
+    fs::write(gdir.join("merge_gate"), "require all-pass\nreviewer rev-a\n").unwrap();
+    let vdir = gdir.join("verdicts").join("pr-612");
+    fs::create_dir_all(&vdir).unwrap();
+    fs::write(vdir.join("rev-a"), format!("pass\n{HEAD}\n0\nrev-1\n\napproved\n")).unwrap();
+
+    // The state #698 observed: enqueued, eligible, and nothing draining it.
+    let qfile = gdir.join("merge_queue.json");
+    fs::write(
+        &qfile,
+        format!(
+            r#"{{"version":1,"target":"integration","entries":[
+                 {{"pr":612,"head":"{HEAD}","state":"queued","enqueued_ms":0}}]}}"#
+        ),
+    )
+    .unwrap();
+
+    reg.set_mq_runner_override(Some(std::sync::Arc::new(MqScript::batch_builder(
+        HEAD,
+        TARGET_HEAD,
+        MERGED,
+    ))));
+
+    // The real unified poll tick, with an empty watch-result map — exactly what
+    // `run_gh_poll_tick` hands it.
+    let tick = reg.gh_poll_tick(1_000, &std::collections::HashMap::new());
+    assert_eq!(
+        tick.mq_serviced.as_deref(),
+        Some(g.id.as_str()),
+        "the poll loop must reach the merge-queue driver — the whole of #698"
+    );
+
+    // And the queue actually moved, on disk.
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&qfile).unwrap()).unwrap();
+    assert_eq!(
+        after["entries"][0]["state"], "ci-wait",
+        "the entry left `queued`: {after}"
+    );
+    assert_eq!(after["batch"]["prs"], serde_json::json!([612]), "{after}");
+    assert_eq!(after["batch"]["draft_pr"], 641, "{after}");
+    assert_eq!(after["batch"]["scratch_sha"], MERGED, "{after}");
+    assert_eq!(after["batch"]["state"], "ci-wait", "{after}");
+
+    // The audit log is the durable record, and #698's evidence was its
+    // emptiness: four `mq-enqueued` lines and zero driver actions after them.
+    let audit = reg.audit_log(&g.id);
+    let actions: Vec<String> = audit.iter().map(|e| e.action.clone()).collect();
+    for want in ["mq-batch-pushed", "mq-batch-built"] {
+        assert!(actions.iter().any(|a| a == want), "expected {want}, saw {actions:?}");
+    }
+
+    // One group per wake, and the serviced group is deferred behind any other,
+    // so a second group with a live queue is not starved by this one.
+    let again = reg.gh_poll_tick(1_001, &std::collections::HashMap::new());
+    assert_eq!(again.mq_serviced.as_deref(), Some(g.id.as_str()), "still the only due group");
+
+    reg.set_mq_runner_override(None);
+}
+
+/// **The product default is untouched** (§12): a group with no
+/// `merge_queue.json` is never selected, so the driver spawns nothing and the
+/// tick costs nothing — which is what makes it safe to run on every wake.
+#[test]
+fn the_driver_tick_skips_every_group_that_never_queued_anything() {
+    let (reg, d) = test_registry();
+    let repo = repo_with_merge_queue("mq-driver-idle", true);
+    let g = reg.create_group(repo.to_str().unwrap(), advanced_rails()).unwrap();
+    assert!(!d.path().join(&g.id).join("merge_queue.json").exists());
+
+    // A runner that panics on any call: reaching it at all would be the defect.
+    struct Never;
+    impl loomux_lib::orchestration::mqdriver::MqRunner for Never {
+        fn git(
+            &self,
+            args: &[&str],
+        ) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+            panic!("the driver must not run for a group that never queued anything: git {args:?}")
+        }
+        fn gh(&self, args: &[&str]) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+            panic!("the driver must not run for a group that never queued anything: gh {args:?}")
+        }
+    }
+    reg.set_mq_runner_override(Some(std::sync::Arc::new(Never)));
+
+    let tick = reg.gh_poll_tick(1_000, &std::collections::HashMap::new());
+    assert_eq!(tick.mq_serviced, None, "no group has a queue to drive");
+    let audit = reg.audit_log(&g.id);
+    assert!(
+        !audit.iter().any(|e| e.action.starts_with("mq-")),
+        "and no merge-queue audit noise: {:?}",
+        audit.iter().map(|e| e.action.clone()).collect::<Vec<_>>()
+    );
+    reg.set_mq_runner_override(None);
+}
+
+/// **The queue is off unless the repo opted in** (§12), even with a state file
+/// present — the block *and* the advanced-orchestrator toggle, the same pair
+/// `merge_queue_enabled` requires of the three tools.
+///
+/// Without this, a group that had opted out of the whole workflow would still
+/// have loomux pushing refs and opening PRs on its behalf.
+#[test]
+fn the_driver_tick_skips_a_group_whose_repo_did_not_opt_in() {
+    let (reg, d) = test_registry();
+    // Block ON, toggle OFF: the workflow file is not in force, so neither is
+    // the queue.
+    let repo = repo_with_merge_queue("mq-driver-optout", true);
+    let g = reg.create_group(repo.to_str().unwrap(), rails()).unwrap();
+    fs::write(
+        d.path().join(&g.id).join("merge_queue.json"),
+        r#"{"version":1,"target":"integration","entries":[
+             {"pr":612,"head":"aaaaaaa","state":"queued","enqueued_ms":0}]}"#,
+    )
+    .unwrap();
+
+    let tick = reg.gh_poll_tick(1_000, &std::collections::HashMap::new());
+    assert_eq!(tick.mq_serviced, None, "a group that did not opt in is never driven");
+}

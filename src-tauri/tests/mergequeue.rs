@@ -32,14 +32,16 @@
 //! remote, and no agent CLI is spawned by anything in this file.
 
 use loomux_lib::orchestration::mergeq::{
-    BatchRecord, EntryState, GateSpec, MergeQueueState, QueueEntry, MERGE_QUEUE_VERSION,
+    scratch_branch, BatchRecord, EntryState, GateSpec, MergeQueueState, QueueEntry,
+    MERGE_QUEUE_VERSION,
 };
 use loomux_lib::orchestration::mqloop::{
     advance_entry, batch_fetch_argv, batch_pr_body, batch_pr_title, bisect_action, build_scratch,
-    cleanup_worktree, culprit_comment, culprit_notice, draft_pr_argv, finish_batch, load_state,
-    observe_batch, pr_comment_argv, pr_state_argv, prune_terminal, reconcile_batch, record_batch,
-    requeue_survivors, scratch_worktree_path, state_path, store_state, unverifiable_notice,
-    walk_bisect, worktree_remove_argv, BatchBuildError, BatchOutcome, BisectAction, StateError,
+    cleanup_worktree, culprit_comment, culprit_notice, draft_pr_argv, drive, finish_batch,
+    load_state, observe_batch, parse_created_pr, pr_comment_argv, pr_state_argv, prune_terminal,
+    reconcile_batch, record_batch, requeue_survivors, scratch_worktree_path, state_path,
+    store_state, unverifiable_notice, walk_bisect, worktree_remove_argv, BatchBuildError,
+    BatchOutcome, BisectAction, DriveConfig, StateError,
 };
 use loomux_lib::orchestration::mqdriver::{
     classify_checks, cleanup_scratch, close_draft_argv, default_branch_argv, delete_scratch_argv,
@@ -75,6 +77,13 @@ struct Fake {
     gh_replies: Vec<Reply>,
     /// `("git"|"gh", argv)` in call order.
     seen: Mutex<Vec<(&'static str, Vec<String>)>>,
+    /// The contents of every `--body-file` argument, read **at the moment of
+    /// the call** — which is the only chance: the driver deletes the file as
+    /// soon as `gh` returns, so a test that looked afterwards would find
+    /// nothing. These are the exact bytes that would reach GitHub, which is
+    /// what §8's "the queue's own text never carries a closing keyword" has to
+    /// be pinned against.
+    bodies: Mutex<Vec<String>>,
     /// Commands to fail to *spawn* at all (the `gh-not-found` / `git-not-found`
     /// sentinel path, §10).
     spawn_fails: Vec<&'static str>,
@@ -86,6 +95,7 @@ impl Fake {
             git_replies: Vec::new(),
             gh_replies: Vec::new(),
             seen: Mutex::new(Vec::new()),
+            bodies: Mutex::new(Vec::new()),
             spawn_fails: Vec::new(),
         }
     }
@@ -119,6 +129,33 @@ impl Fake {
     /// assertions compare against, element by element, never as a joined string
     /// (a joined string cannot tell `a b` from a single argument `"a b"`, and
     /// argument boundaries are half of what these tests are about).
+    /// The one argv to `bin` containing `needle`, for argv-level assertions in
+    /// a sequence whose call order is not fixed by the test. Panics if there is
+    /// not exactly one — an assertion aimed at "the push" must not silently
+    /// pick the first of two.
+    fn argv_containing(&self, bin: &str, needle: &str) -> Vec<String> {
+        let hits: Vec<Vec<String>> = self
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(b, a)| *b == bin && a.join(" ").contains(needle))
+            .map(|(_, a)| a.clone())
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one {bin} call containing {needle:?}, saw {hits:?} of {:?}",
+            self.calls()
+        );
+        hits.into_iter().next().unwrap()
+    }
+
+    /// Every `--body-file` body handed to `gh`, in call order.
+    fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().unwrap().clone()
+    }
+
     fn argv(&self, bin: &str, nth: usize) -> Vec<String> {
         self.seen
             .lock()
@@ -140,6 +177,13 @@ impl Fake {
             .lock()
             .unwrap()
             .push((bin, args.iter().map(|s| s.to_string()).collect()));
+        if let Some(i) = args.iter().position(|a| *a == "--body-file") {
+            if let Some(p) = args.get(i + 1) {
+                if let Ok(t) = std::fs::read_to_string(p) {
+                    self.bodies.lock().unwrap().push(t);
+                }
+            }
+        }
         if self.spawn_fails.contains(&bin) {
             return Err(format!("{bin}-not-found"));
         }
@@ -1832,4 +1876,500 @@ fn the_two_notices_carry_one_fact_each_and_are_not_interchangeable() {
     // Singular/plural is not a lie either way.
     assert!(culprit_notice(1, "b", &[], 1).contains("1 sibling requeued"));
     assert!(culprit_notice(1, "b", &[], 0).contains("0 siblings requeued"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// The driver tick (#698) — the production caller the pipeline never had.
+//
+// Everything above this line tested a seam. #698 is what happens when every
+// seam is green and nothing calls them: four approved PRs sat `queued` for 51
+// minutes with zero driver actions in the audit log. These tests drive
+// `mqloop::drive`, which is the function `gh_poll_tick` now calls; the wiring
+// from the poll loop down to it is pinned in `tests/orchestration.rs`, because
+// a test of the decision half alone is exactly what #698 already had.
+// ════════════════════════════════════════════════════════════════════════════
+
+const HEAD_C: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+/// The live head each fixture PR reports, so the recorded head, the gate's
+/// verdict and the fetched pull ref all agree — a disagreement between any two
+/// of those is a *different* test's subject.
+fn head_of(pr: u64) -> &'static str {
+    match pr {
+        612 => HEAD_A,
+        613 => HEAD_B,
+        614 => HEAD_C,
+        _ => PR_HEAD,
+    }
+}
+
+/// A queue of `queued` entries on `integration`, which is the state the driver
+/// is supposed to act on and #698 says it never did.
+fn queued_state(prs: &[u64]) -> MergeQueueState {
+    MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration".into(),
+        entries: prs.iter().map(|p| QueueEntry::new(*p, head_of(*p), 0)).collect(),
+        ..Default::default()
+    }
+}
+
+/// A queue whose entries are already inside an in-flight batch at `draft_pr`.
+fn in_flight_state(prs: &[u64], draft_pr: u64) -> MergeQueueState {
+    let mut s = queued_state(prs);
+    let mut rec = BatchRecord::new("mq-b1000000", prs.to_vec(), 0);
+    rec.scratch_sha = MERGED.into();
+    rec.draft_pr = Some(draft_pr);
+    rec.advance(EntryState::CiWait).unwrap();
+    for e in s.entries.iter_mut() {
+        e.advance(EntryState::Batching).unwrap();
+        e.advance(EntryState::CiWait).unwrap();
+        e.batch = Some("mq-b1000000".into());
+    }
+    s.batch = Some(rec);
+    s
+}
+
+fn cfg(max_batch: u32, now_ms: u64) -> DriveConfig<'static> {
+    DriveConfig { group: "g1", max_batch, checks_timeout_minutes: 60, now_ms }
+}
+
+/// A live `pass` from `rev-a` against each PR's own head.
+fn live_verdicts(pr: u64) -> BTreeMap<BlockId, ReviewVerdict> {
+    verdict_map(head_of(pr), "b")
+}
+
+/// **The invariant every path in the driver has to keep**: an entry is in an
+/// in-flight state only while a batch record exists.
+///
+/// It is what makes `reconcile_batch`'s two rules a statement about a *crash*
+/// rather than about a tick that was midway through its work — strand an
+/// in-flight entry with no batch record, resume only when the world matches. A
+/// driver that left the search between batch records would have every restart
+/// kick back a set of innocent PRs.
+fn assert_no_orphan_in_flight(s: &MergeQueueState, when: &str) {
+    if s.batch.is_some() {
+        return;
+    }
+    let orphans: Vec<u64> =
+        s.entries.iter().filter(|e| e.state().in_flight()).map(|e| e.pr).collect();
+    assert!(orphans.is_empty(), "{when}: {orphans:?} left in flight with no batch record");
+}
+
+/// Answers the whole build-observe-land sequence, so each test overrides only
+/// the reply it is about. Constraint 3: no `git`, no `gh`, no network.
+fn drive_fake() -> Fake {
+    Fake::new()
+        // §7's two live lookups, per examined entry and again at landing.
+        .gh("repo view", 0, "main\n", "")
+        .gh("pr view 612", 0, &pr_json("integration", HEAD_A, "b"), "")
+        .gh("pr view 613", 0, &pr_json("integration", HEAD_B, "b"), "")
+        .gh("pr view 614", 0, &pr_json("integration", HEAD_C, "b"), "")
+        // §4's mint check: the name is free.
+        .git("ls-remote", 2, "", "")
+        // §8's construction.
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-613", 0, HEAD_B, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-614", 0, HEAD_C, "")
+        .git("worktree add", 0, "", "")
+        .git("merge --no-ff", 0, "", "")
+        .git("rev-parse HEAD", 0, MERGED, "")
+        .git("worktree remove", 0, "", "")
+        // The create-only scratch push, then the draft PR (§4, §5).
+        .git("push --force-with-lease", 0, "", "")
+        .gh("pr create", 0, "https://github.com/o/r/pull/641\n", "")
+        // §10's cleanup. Matched BEFORE the landing push, whose argv is also a
+        // `push origin`.
+        .git("--delete", 0, "", "")
+        .gh("pr close", 0, "", "")
+        .gh("pr comment", 0, "", "")
+        // §7.4's only landing verb.
+        .git("push origin", 0, "", "")
+}
+
+/// **#698's headline: a non-empty queue with an idle target cuts a batch.**
+///
+/// This is the assertion whose absence is the whole issue. Everything it checks
+/// was individually green while `merge_queue.json` sat at four `queued` entries
+/// for 51 minutes, because nothing joined the seams up.
+#[test]
+fn the_driver_cuts_a_batch_from_the_queue_head_and_opens_its_draft_pr() {
+    let f = drive_fake();
+    let mut s = queued_state(&[612, 613, 614, 615]);
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    assert!(rep.changed, "cutting a batch is a state change that must be persisted");
+    let b = s.batch.clone().expect("a queued, unblocked, idle-target queue must produce a batch");
+    assert_eq!(b.prs, vec![612, 613, 614], "queue order, capped at max_batch");
+    assert_eq!(b.scratch_sha, MERGED, "the SHA CI will judge is the one construction produced");
+    assert_eq!(b.draft_pr, Some(641), "the draft PR number is read back from `gh pr create`");
+    assert_eq!(b.state(), EntryState::CiWait);
+    assert!(!b.is_probe(), "an ordinary batch is not a bisect probe");
+    for pr in [612, 613, 614] {
+        assert_eq!(s.entry(pr).unwrap().state(), EntryState::CiWait, "#{pr}");
+        assert_eq!(s.entry(pr).unwrap().batch.as_deref(), Some(b.id.as_str()), "#{pr}");
+    }
+    assert_eq!(
+        s.entry(615).unwrap().state(),
+        EntryState::Queued,
+        "beyond max_batch, and therefore never examined"
+    );
+    assert_no_orphan_in_flight(&s, "after a batch is cut");
+
+    // §4's create-only push, at the argv level — the level that matters,
+    // because every way of getting it wrong degrades to a silently successful
+    // ordinary push.
+    let branch = scratch_branch("g1", &b.id).expect("the batch id builds a ref name");
+    assert_eq!(f.argv_containing("git", "--force-with-lease"), scratch_push_argv(MERGED, &branch));
+
+    // §5's observation handle: a DRAFT PR from the scratch into the target.
+    let create = f.argv_containing("gh", "pr create");
+    assert_eq!(create[..4], ["pr", "create", "--draft", "--base"]);
+    assert_eq!(create[4], "integration");
+    assert_eq!(create[5], "--head");
+    assert_eq!(create[6], branch);
+    assert_eq!(create[8], batch_pr_title(&b.id, &b.prs));
+
+    // The body that actually reached `gh` — read at the moment of the call,
+    // since the driver deletes the file straight after.
+    let body = f.bodies().into_iter().next().expect("the draft PR was given a body file");
+    for pr in [612, 613, 614] {
+        assert!(body.contains(&format!("- #{pr}")), "sub-PRs are listed: {body}");
+    }
+    // §8: loomux's own text must never carry GitHub's closing pattern.
+    for kw in ["close #", "closes #", "fix #", "fixes #", "resolve #", "resolves #"] {
+        assert!(!body.to_lowercase().contains(kw), "the batch body must not carry {kw:?}: {body}");
+    }
+
+    assert!(
+        rep.audits.iter().any(|a| a.action == "mq-batch-built"),
+        "every transition is audited; saw {:?}",
+        rep.audits.iter().map(|a| a.action).collect::<Vec<_>>()
+    );
+}
+
+/// **The gate is re-checked per entry at build time** (§6's first enforcement
+/// point), and a refusal *blocks* the entry rather than removing it (§4:
+/// "paused" is a live predicate, not a ninth state).
+#[test]
+fn a_build_time_gate_refusal_blocks_that_entry_and_the_batch_forms_without_it() {
+    let f = drive_fake();
+    let mut s = queued_state(&[612, 613, 614]);
+    // 613's reviewer passed an EARLIER revision: the branch moved under them,
+    // so what they approved is not what would land.
+    let verdicts = |pr: u64| {
+        if pr == 613 {
+            verdict_map("an-older-head", "b")
+        } else {
+            live_verdicts(pr)
+        }
+    };
+    drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &verdicts);
+
+    let b = s.batch.as_ref().expect("the other two still batch");
+    assert_eq!(b.prs, vec![612, 614], "a blocked entry is skipped, not fatal to the batch");
+    let stale = s.entry(613).unwrap();
+    assert_eq!(stale.state(), EntryState::Queued, "still queued — there is no ninth state");
+    assert_eq!(
+        stale.blocked_reason.as_deref(),
+        Some("gate-not-met"),
+        "the reason is recorded, from the closed refusal vocabulary, so a human can see it"
+    );
+    assert_eq!(s.entry(612).unwrap().blocked_reason, None, "an eligible entry carries no reason");
+}
+
+/// **A green batch lands the tested object itself** (§8's Bors invariant) via
+/// the one landing verb §7.4 permits, and clears the queue.
+#[test]
+fn a_green_batch_lands_the_tested_object_and_releases_the_target() {
+    let f = drive_fake()
+        .gh("pr checks 641", 0, &checks_json(&[("build", "SUCCESS"), ("test", "SKIPPED")]), "");
+    let mut s = in_flight_state(&[612, 613], 641);
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    // The refspec is exactly `<tested-sha>:refs/heads/<target>` — no `--force`,
+    // no `+`, and built from the validated target and nothing else.
+    assert_eq!(
+        f.argv_containing("git", ":refs/heads/integration"),
+        land_push_argv(MERGED, "integration")
+    );
+    assert!(s.batch.is_none(), "the batch record is cleared on landing");
+    assert!(s.entry(612).is_none() && s.entry(613).is_none(), "landed entries are pruned");
+    assert_eq!(s.target, "", "a drained queue releases its target");
+    assert_no_orphan_in_flight(&s, "after landing");
+    assert!(rep.audits.iter().any(|a| a.action == "mq-landed"));
+    assert!(!rep.backoff, "a clean landing is not a reason to hold the group off");
+    assert!(
+        rep.notices.iter().any(|n| n.contains("landed on") && n.contains("#612")),
+        "{:?}",
+        rep.notices
+    );
+
+    // §10: cleanup runs on the green path too.
+    let calls = f.calls();
+    assert!(calls.iter().any(|c| c.contains("pr close 641")), "{calls:?}");
+    assert!(calls.iter().any(|c| c.contains("--delete refs/heads/loomux/mq/")), "{calls:?}");
+}
+
+/// **A red batch of one is the culprit, with no further CI** (§9), and the
+/// durable record is a comment on that PR.
+#[test]
+fn a_red_batch_of_one_attributes_the_culprit_and_leaves_the_comment() {
+    let f = drive_fake()
+        .gh("pr checks 641", 0, &checks_json(&[("build (windows)", "FAILURE")]), "")
+        // The culprit's OWN checks are red too, so this is an ordinary
+        // attribution rather than §9's infrastructure/flake case.
+        .gh("pr checks 612", 0, &checks_json(&[("build (windows)", "FAILURE")]), "");
+    let mut s = in_flight_state(&[612], 641);
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    assert!(s.entry(612).is_none(), "the culprit is kicked back and pruned");
+    assert!(s.batch.is_none());
+    assert_no_orphan_in_flight(&s, "after attribution");
+    // §9 spends no further CI at k = 1: nothing is rebuilt or re-pushed.
+    assert!(
+        !f.calls().iter().any(|c| c.contains("--force-with-lease")),
+        "k = 1 must not build another scratch: {:?}",
+        f.calls()
+    );
+
+    let comment = f.bodies().into_iter().next().expect("a comment body was written");
+    assert!(comment.contains("build (windows)"), "the failing check is named: {comment}");
+    assert!(comment.contains("batched alone"), "{comment}");
+    assert!(comment.contains("**a** culprit"), "the honest limit is stated: {comment}");
+    for kw in ["close #", "closes #", "fix #", "fixes #", "resolve #", "resolves #"] {
+        assert!(!comment.to_lowercase().contains(kw), "no closing keyword: {comment}");
+    }
+    assert!(rep.audits.iter().any(|a| a.action == "mq-culprit"));
+    assert!(rep.notices.iter().any(|n| n.contains("isolated as batch")), "{:?}", rep.notices);
+}
+
+/// **§9's infrastructure/flake case**: still red at k = 1 while that PR's own
+/// checks are green. Surfaced as what it is, and not looped on.
+#[test]
+fn a_red_batch_of_one_whose_pr_is_green_alone_is_surfaced_as_infrastructure() {
+    let f = drive_fake()
+        .gh("pr checks 641", 0, &checks_json(&[("build (windows)", "FAILURE")]), "")
+        .gh("pr checks 612", 0, &checks_json(&[("build (windows)", "SUCCESS")]), "");
+    let mut s = in_flight_state(&[612], 641);
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    let notice = rep.notices.join("\n");
+    assert!(
+        notice.contains("infrastructure/flake"),
+        "a green-alone PR must not be reported as a bad diff: {notice}"
+    );
+    assert!(notice.contains("OWN checks are green"), "{notice}");
+    // It is still kicked back, exactly once — surfaced, not looped on.
+    assert!(s.entry(612).is_none());
+    assert!(s.batch.is_none());
+}
+
+/// **The bisect runs across ticks, and attributes from a GREEN probe** (§9).
+///
+/// This is the case that decides whether the search can be a state machine at
+/// all. A probe that exonerates its half leaves the culprit in the other half —
+/// so the tick that names the culprit has no failing checks of its own to
+/// report, and by then every sibling has already gone back to `queued` and is
+/// indistinguishable from newly enqueued work. Both facts have to have been
+/// carried from the original red batch (`mergeq::BisectSearch`), or the comment
+/// §9 requires is a comment that names neither the failure nor the combination.
+#[test]
+fn the_search_runs_across_ticks_and_names_the_culprit_from_a_green_probe() {
+    let f = drive_fake()
+        .gh("pr checks 640", 0, &checks_json(&[("build (windows)", "FAILURE")]), "")
+        .gh("pr checks 641", 0, &checks_json(&[("build (windows)", "SUCCESS")]), "")
+        .gh("pr checks 614", 0, &checks_json(&[("build (windows)", "FAILURE")]), "");
+    let mut s = in_flight_state(&[612, 613, 614], 640);
+
+    // ── tick 1: the batch goes red, the search opens, the first probe is built
+    let rep1 = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+    let probe = s.batch.clone().expect("a red batch of three opens a search, in the same tick");
+    assert!(probe.is_probe(), "the record says it is a probe, so no green of its can land");
+    assert_eq!(probe.prs, vec![612, 613], "larger half first, so k=3 splits 2/1");
+    let search = probe.bisect.clone().unwrap();
+    assert_eq!(search.origin_prs, vec![612, 613, 614], "the whole batch is the sibling set");
+    assert_eq!(search.failing, vec!["build (windows)".to_string()]);
+    for pr in [612, 613, 614] {
+        assert_eq!(s.entry(pr).unwrap().state(), EntryState::Bisecting, "#{pr}");
+    }
+    assert_no_orphan_in_flight(&s, "mid-search");
+    assert!(rep1.audits.iter().any(|a| a.action == "mq-bisect-step"));
+
+    // ── tick 2: the probe is GREEN, so 612/613 are exonerated and 614 is it
+    let rep2 = drive(&f, &mut s, &cfg(3, 2_000), &one_reviewer_gate(), &live_verdicts);
+    assert!(s.batch.is_none(), "attribution ends the search");
+    assert!(s.entry(614).is_none(), "the culprit is kicked back and pruned");
+    for pr in [612, 613] {
+        let e = s.entry(pr).unwrap();
+        assert_eq!(e.state(), EntryState::Queued, "#{pr} was exonerated and requeued");
+        assert_eq!(e.batch, None, "#{pr} is no longer in any batch");
+    }
+    assert_eq!(
+        s.entries.iter().map(|e| e.pr).collect::<Vec<_>>(),
+        vec![612, 613],
+        "survivors keep their ORIGINAL queue order, not the order the search cleared them in"
+    );
+    assert_no_orphan_in_flight(&s, "after the search");
+
+    // The comment carries what only the carried search could supply: the
+    // original failing check, and the full sibling set.
+    let comment = f.bodies().last().cloned().expect("a culprit comment was written");
+    assert!(
+        comment.contains("build (windows)"),
+        "the ORIGINAL red batch's failing check, on a tick whose own observation was green: \
+         {comment}"
+    );
+    assert!(
+        comment.contains("batched with: #612, #613"),
+        "the full sibling set, so a pairwise interaction is visible: {comment}"
+    );
+    assert!(rep2.audits.iter().any(|a| a.action == "mq-culprit"));
+    assert!(rep2.notices.iter().any(|n| n.contains("#614")), "{:?}", rep2.notices);
+}
+
+/// **Unverifiable is not red, and nothing lands** (§5). The bound is the
+/// backstop, not the mechanism: the checks never went terminal.
+#[test]
+fn an_unverifiable_batch_requeues_everything_and_implicates_nobody() {
+    // An empty check list is PENDING, not success — the property §5 says
+    // matters most — so this batch is still pending when the bound expires.
+    let f = drive_fake().gh("pr checks 641", 0, "[]", "");
+    let mut s = in_flight_state(&[612, 613], 641);
+    // 61 minutes past `started_ms`, against the default 60-minute bound.
+    let rep = drive(&f, &mut s, &cfg(3, 61 * 60_000), &one_reviewer_gate(), &live_verdicts);
+
+    assert!(s.batch.is_none());
+    for pr in [612, 613] {
+        assert_eq!(s.entry(pr).unwrap().state(), EntryState::Queued, "#{pr} requeued");
+    }
+    assert_eq!(s.target, "integration", "a requeued queue keeps its target");
+    assert!(
+        !f.calls().iter().any(|c| c.contains(":refs/heads/integration")),
+        "nothing lands on an answer loomux never got: {:?}",
+        f.calls()
+    );
+    assert!(rep.audits.iter().any(|a| a.action == "mq-checks-unverifiable"));
+    assert!(rep.backoff, "an unverifiable batch holds the group off rather than retrying at once");
+    let notice = rep.notices.join("\n");
+    assert!(notice.contains("UNVERIFIABLE") && notice.contains("no PR is implicated"), "{notice}");
+}
+
+/// **A pending batch is the steady state**: nothing moves, nothing is written,
+/// nothing is said.
+///
+/// The `changed` half is the one with teeth — a driver that rewrote
+/// `merge_queue.json` on every 30-second poll of a 40-minute CI run would churn
+/// the file ~80 times per batch for no state change at all.
+#[test]
+fn a_pending_batch_changes_nothing_and_says_nothing() {
+    let f = drive_fake().gh("pr checks 641", 0, &checks_json(&[("build", "IN_PROGRESS")]), "");
+    let mut s = in_flight_state(&[612, 613], 641);
+    let before = s.clone();
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    assert_eq!(s, before, "a pending observation moves nothing");
+    assert!(!rep.changed, "…and must not trigger a write");
+    assert!(rep.audits.is_empty() && rep.notices.is_empty(), "…or any noise");
+    assert!(!rep.backoff);
+}
+
+/// **A conflict costs no CI** (§8): the entry kicks back before anything is
+/// pushed, and the batch rebuilds without it on a later tick.
+#[test]
+fn a_conflicting_entry_kicks_back_before_any_push() {
+    let f = drive_fake().git("merge --no-ff", 1, "", "CONFLICT (content): merge conflict");
+    let mut s = queued_state(&[612, 613]);
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    assert!(s.batch.is_none(), "no batch was recorded");
+    assert!(s.entry(612).is_none(), "the conflicting entry is kicked back and pruned");
+    assert_eq!(s.entry(613).unwrap().state(), EntryState::Queued, "its sibling did nothing wrong");
+    assert_no_orphan_in_flight(&s, "after a conflict");
+    assert!(
+        !f.calls().iter().any(|c| c.contains("push")),
+        "nothing is pushed and no CI is spent: {:?}",
+        f.calls()
+    );
+    assert!(rep.audits.iter().any(|a| a.action == "mq-kicked-back"));
+}
+
+/// **A batch that cannot be constructed aborts loudly and backs the group off**
+/// (§10) — entries return to `queued`, and nothing is left half-shaped.
+#[test]
+fn a_batch_that_cannot_be_built_aborts_and_returns_its_entries_to_queued() {
+    let f = drive_fake().git("fetch", 1, "", "fatal: could not read from remote repository");
+    let mut s = queued_state(&[612, 613]);
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    assert!(s.batch.is_none());
+    for pr in [612, 613] {
+        assert_eq!(s.entry(pr).unwrap().state(), EntryState::Queued, "#{pr} did nothing wrong");
+    }
+    assert_no_orphan_in_flight(&s, "after an aborted build");
+    assert!(
+        rep.audits.iter().any(|a| a.action == "mq-batch-aborted"),
+        "the audit action names what happened — not a `built` event with a falsy field"
+    );
+    assert!(rep.backoff, "§10's abort rows requeue, so the rate has to be bounded somewhere");
+    assert!(rep.notices.iter().any(|n| n.contains("ABORTED")), "{:?}", rep.notices);
+}
+
+/// **One in-flight batch per target** (§4), held on the entries alone when the
+/// batch record is missing — the crash shape `reconcile_batch` owns. The driver
+/// must not race a second batch onto a target it cannot reason about.
+#[test]
+fn the_driver_never_dispatches_a_second_batch_over_an_inconsistent_file() {
+    let f = drive_fake();
+    let mut s = queued_state(&[612, 613]);
+    s.entries[0].advance(EntryState::Batching).unwrap();
+    s.entries[0].advance(EntryState::CiWait).unwrap();
+    assert!(s.batch.is_none(), "precondition: the crash shape");
+
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+    assert!(s.batch.is_none(), "no second batch was dispatched");
+    assert!(!rep.changed);
+    assert!(f.calls().is_empty(), "and nothing was spawned to find that out: {:?}", f.calls());
+}
+
+/// A cancelled member abandons the batch rather than landing without it (§10).
+#[test]
+fn a_cancelled_member_abandons_the_in_flight_batch() {
+    let f = drive_fake();
+    let mut s = in_flight_state(&[612, 613], 641);
+    s.entries[0].advance(EntryState::Cancelled).unwrap();
+
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+    assert!(s.batch.is_none(), "the batch is abandoned");
+    assert_eq!(s.entry(613).unwrap().state(), EntryState::Queued, "the survivor requeues");
+    assert!(
+        !f.calls().iter().any(|c| c.contains("pr checks")),
+        "a void batch is not worth a `gh pr checks`: {:?}",
+        f.calls()
+    );
+    assert!(rep.audits.iter().any(|a| a.action == "mq-batch-aborted"));
+    assert_no_orphan_in_flight(&s, "after a cancel abandoned the batch");
+}
+
+/// The draft PR's number comes back from `gh pr create`'s URL, and an answer
+/// this parser cannot read is an error rather than a guess — a batch attached
+/// to the wrong PR number would observe, and close, somebody else's work.
+#[test]
+fn the_draft_pr_number_is_parsed_from_ghs_url_or_refused() {
+    assert_eq!(parse_created_pr("https://github.com/o/r/pull/641\n"), Some(641));
+    // Chatter before the URL, and the LAST such line wins.
+    assert_eq!(
+        parse_created_pr(
+            "Warning: something\nhttps://github.com/o/r/pull/12\nhttps://github.com/o/r/pull/34\n"
+        ),
+        Some(34)
+    );
+    assert_eq!(parse_created_pr("https://github.example.com/o/r/pull/7?foo=1"), Some(7));
+    for bad in
+        ["", "created\n", "https://github.com/o/r/issues/641", "https://github.com/o/r/pull/x"]
+    {
+        assert_eq!(parse_created_pr(bad), None, "{bad:?} must not become a PR number");
+    }
 }

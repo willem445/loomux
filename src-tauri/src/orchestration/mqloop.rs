@@ -10,17 +10,16 @@
 //! - `mqdriver.rs` (slice D1) — the **write primitives and their gates**. The
 //!   `MqRunner` seam, the live lookups, the constraint-7 refusal core, the
 //!   create-only scratch push, the landing function, cleanup.
-//! - this file (slice D2) — the **loop that sequences them**: build the scratch,
-//!   open the draft PR, observe the checks under a bound, bisect a red batch and
-//!   attribute it, requeue the survivors, reconcile after a crash, and persist
-//!   every step.
+//! - this file (slices D2 and D3) — the **loop that sequences them**: build the
+//!   scratch, open the draft PR, observe the checks under a bound, bisect a red
+//!   batch and attribute it, requeue the survivors, reconcile after a crash, and
+//!   persist every step — plus [`drive`], the one-step-per-call tick that
+//!   decides which of those happens next (§13, #698).
 //!
-//! `mod.rs` gets registry wiring only — a module declaration, a guard field, and
-//! the two `merge_queue_reconcile*` methods, which resolve paths and delegate.
-//! No decision in this feature lives there. **`mcp.rs` is untouched by this
-//! slice**: §11.1's three agent-callable tools are slice E's, so D2 adds no
-//! agent-reachable surface at all (said explicitly because "no role gate found"
-//! and "no role gate needed" look identical from a diff).
+//! `mod.rs` gets registry wiring only — a module declaration, three fields, the
+//! two `merge_queue_reconcile*` methods and the `mq_drive_group_with` /
+//! `mq_driver_tick` pair, all of which resolve paths and delegate. No decision
+//! in this feature lives there.
 //!
 //! # Why `build_scratch` uses a temporary worktree
 //!
@@ -1957,11 +1956,19 @@ fn refresh_and_select(
             Ok((_, facts)) => {
                 let observed = PrObservation {
                     body_digest: Some(body_digest(&facts.body)),
-                    // Read unconditionally, as `enqueue` does: a build attempt
-                    // examines a handful of entries, and a branch that decided
-                    // when to look would be one more thing that can be wrong in
-                    // the direction of looking less.
-                    ci_green: pr_ci_green(r, *pr),
+                    // Fetched only when the gate declares the clause — the same
+                    // predicate `land_batch` uses, which fails *toward* fetching
+                    // (an absent or malformed gate answers yes), so an
+                    // unreadable gate can never be the reason a check was
+                    // skipped. Reused rather than re-decided here because the
+                    // build and the landing must not disagree about when the
+                    // sub-PR's own CI matters, and because this runs once per
+                    // examined entry inside a shared poll tick.
+                    ci_green: if super::mqdriver::declares_ci_green(gate) {
+                        pr_ci_green(r, *pr)
+                    } else {
+                        None
+                    },
                 };
                 let recheck =
                     recheck_gate(gate, &verdicts(*pr), Some(facts.head.as_str()), &observed);
