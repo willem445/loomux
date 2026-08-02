@@ -164,8 +164,8 @@ narrow their ask back down to the original ticket on your own judgment.
   narratives pollute every future reader's context. Reader-facing text
   carries the current rule and its operational why, with at most a bare
   issue/PR ref as provenance; strip any such narrative you find when
-  editing these surfaces. Out of scope: code comments (the "comments
-  explain *why*" convention), `.loomux/lessons.md` (an incident diary by
-  design), and the shipped agent-role templates
-  (`src-tauri/src/orchestration/templates/`, governed by their design
-  notes).
+  editing these surfaces — including `.loomux/lessons.md`, which carries
+  the rule and fix only, with refs as provenance. Out of scope: code
+  comments (the "comments explain *why*" convention) and the shipped
+  agent-role templates (`src-tauri/src/orchestration/templates/`, governed
+  by their design notes).
