@@ -7957,6 +7957,11 @@ pub struct OrchRegistry {
     /// would re-stage entries a first pass already re-admitted and deliver
     /// them twice.
     recovered_groups: Arc<Mutex<HashSet<String>>>,
+    /// Groups whose merge queue has already been reconciled this process
+    /// (#581 §4). Separate from `recovered_groups` on purpose: the delivery
+    /// queue and the merge queue recover independently, and sharing one mark
+    /// would make whichever ran first silently suppress the other.
+    mq_reconciled_groups: Arc<Mutex<HashSet<String>>>,
     /// #560: each pane's open hold EPISODE — when it began, and what has
     /// already been said about it. Keyed by `pty_id`, in memory only (see
     /// [`HoldEpisode`] for the restart argument).
@@ -18031,6 +18036,7 @@ impl OrchRegistry {
             recovered_queue: Arc::new(Mutex::new(HashMap::new())),
             recovered_markers: Arc::new(Mutex::new(HashMap::new())),
             recovered_groups: Arc::new(Mutex::new(HashSet::new())),
+            mq_reconciled_groups: Arc::new(Mutex::new(HashSet::new())),
             queue_draining: Arc::new(queuestate::DrainerRegistry::new()),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
@@ -33698,6 +33704,97 @@ impl OrchRegistry {
     }
 
     /// Deliver to the group's orchestrator (worker reports, exit notices).
+    // ---------- the bisecting merge queue (#581 slice D2) ----------
+
+    /// Reconcile a group's merge queue against reality after a restart
+    /// (`doc/design/merge-queue.md` §4), following `recover_persisted_queue`'s
+    /// **two-phase** shape for the reason that function documents: phase 1 runs
+    /// under a once-only guard and may not deliver, because this lock is not
+    /// reentrant; phase 2 sends what phase 1 collected, after the guard drops.
+    ///
+    /// **This is wiring, not logic.** Every decision — whether the world matches
+    /// the record, which entries strand, what the notices say — is
+    /// `mqloop::reconcile_batch`'s. This function resolves the group's repo and
+    /// state dir, runs it, audits each transition, persists, and hands the
+    /// notices back. That split is the point: the queue's behaviour is testable
+    /// without an `AppHandle`, and `mod.rs` holds none of it.
+    ///
+    /// **No live caller yet.** Nothing can enqueue until slice E adds the MCP
+    /// tools, so on every group today this is a no-op over an absent file — the
+    /// product default (§12). It is wired now so recovery already works the day
+    /// enqueueing exists, rather than being retrofitted onto a queue that has
+    /// state to lose. Stated because an unreferenced entry point looks like an
+    /// oversight otherwise.
+    ///
+    /// Returns the phase-2 notices for the caller to deliver; `Vec::new()` when
+    /// there was nothing to reconcile.
+    #[doc(hidden)] // pub for integration tests
+    pub fn merge_queue_reconcile(&self, group: &str) -> Vec<String> {
+        // ---- phase 1: under the guard ----
+        let notices: Vec<String> = {
+            let mut done = self.mq_reconciled_groups.lock_safe();
+            if !done.insert(group.to_string()) {
+                return Vec::new();
+            }
+            let Some(repo) = self.group(group).map(|g| g.repo) else {
+                return Vec::new();
+            };
+            let dir = self.group_dir(group);
+            let mut state = match mqloop::load_state(&dir) {
+                Ok(s) => s,
+                // A file this build cannot act on is audited and **left alone** —
+                // §11.2's forward-compatibility promise is that an older build
+                // does not destroy what a newer one wrote, and rewriting it here
+                // would break exactly that.
+                Err(e) => {
+                    self.audit(
+                        group,
+                        "loomux",
+                        mqloop::audit_action::STRANDED,
+                        json!({ "reason": "unusable merge_queue.json", "detail": format!("{e:?}") }),
+                    );
+                    return Vec::new();
+                }
+            };
+            let runner = mqdriver::runner_for(std::path::Path::new(&repo));
+            let report = mqloop::reconcile_batch(&runner, &mut state, group);
+
+            for t in &report.transitions {
+                self.audit(
+                    group,
+                    "loomux",
+                    mqloop::audit_action::STRANDED,
+                    json!({ "pr": t.pr, "from": t.from.as_str(), "to": t.to.as_str() }),
+                );
+            }
+            if report.resumed {
+                self.audit(group, "loomux", mqloop::audit_action::RECOVERED, json!({}));
+            }
+            if let Some(why) = &report.cleanup_failed {
+                self.audit(
+                    group,
+                    "loomux",
+                    mqdriver::audit_action::CLEANUP_FAILED,
+                    json!({ "detail": why }),
+                );
+            }
+            // Persisted even when nothing moved: §4 requires the snapshot to be
+            // rewritten alongside live entries rather than deleted, so recovery
+            // stays re-runnable across N restarts.
+            if let Err(e) = mqloop::store_state(&dir, &state) {
+                self.audit(
+                    group,
+                    "loomux",
+                    mqloop::audit_action::STRANDED,
+                    json!({ "reason": "merge_queue.json could not be written", "detail": e }),
+                );
+            }
+            report.notices
+        };
+        // ---- phase 2: the guard has dropped; delivering is safe ----
+        notices
+    }
+
     pub fn deliver_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
         let orch = self
             .agents
