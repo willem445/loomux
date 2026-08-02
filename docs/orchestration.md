@@ -660,6 +660,31 @@ compare against, so a `0` there means *nothing to compare*, not *never
 happened*; and only a bounded number of recent sessions are read, so on a
 long-running group a count is a floor rather than a total.
 
+### What actually reaches a kickoff from `.loomux/lessons.md`
+
+The lessons file is injected into every orchestrator kickoff, and only about
+**4 KB of it** is — a deliberate bound on how much repo prose lands in an agent's
+context (agents get the file as *data to weigh*, never as instructions). Files
+outgrow that, so what happens at the edge is worth knowing:
+
+- **Whole entries are dropped, oldest first.** The unit is a `## ` heading and its
+  body; you never get half an entry, or a body injected under the wrong heading.
+  A `## ` line inside a fenced code block doesn't count — an entry can quote a
+  heading (including this page's `[pinned]` example) without being split in two.
+- **The injection says what it dropped.** The first line names each evicted entry
+  by heading, so "the rule about X isn't reaching agents any more" is visible in
+  the kickoff instead of being something you find out the hard way.
+- **`[pinned]` in a heading keeps that entry.** Put it in the `## ` line — e.g.
+  `## Never resize the PTY for a UI feature [pinned]` — and eviction takes it last,
+  after everything unpinned, whatever its position in the file. Use it for the
+  entries whose absence is a real failure; if the pinned entries alone exceed the
+  cap, the oldest pin is dropped too, so pinning everything is the same as pinning
+  nothing.
+
+Dropping is not deleting: the file is untouched on disk. When entries start falling
+out, the fix is a curation PR that retires the stale ones — the same review path any
+other change to the file takes.
+
 ### Watching the merge queue
 
 A repo can turn on a **merge queue** (`merge_queue:` in its `.loomux/workflow.yml`) so a
