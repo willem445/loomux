@@ -405,8 +405,8 @@ already running before its channel tools were wired up, becomes connectable the 
 time you right-click it: it joins as a **receive-only** member (a dashed variant of the
 chip, instead of solid) — it can never be the sender, and its direction is always ▼. This
 is a structural fact, not a bug: those CLIs have no way for loomux to hand them a
-channel-send capability, and an already-running pane can't be handed one either without
-restarting it. A receive-only pane still gets every message the sender sends it — it just
+channel-send capability today (tracked as a follow-up), and an already-running pane
+can't be handed one either without restarting it. A receive-only pane still gets every message the sender sends it — it just
 can't talk back.
 
 **Multi-party.** A channel can have more than two members: right-click a free (not yet
@@ -552,8 +552,10 @@ gate:
 ```
 
 You need the CLI itself installed and logged in — loomux spawns `gemini` from
-your `PATH` the same way it spawns `claude`, and a reviewer whose CLI isn't
-installed just fails to start. Nothing else is needed: the reviewer's loomux
+your `PATH` the same way it spawns `claude`. A CLI named by a workflow block is
+**not** pre-checked (only the launcher's own role dropdowns are), so if it isn't
+installed the pane still opens, shows the shell's "command not found", and
+exits; the orchestrator is then told that agent died. Nothing else is needed: the reviewer's loomux
 tools (including the `pass`/`fail` verdict the merge gate reads) are wired up
 per agent, and its containment is generated per agent too, so a gemini
 reviewer is denied the file-editing tools exactly like a Claude one.
@@ -760,7 +762,9 @@ disturbing a busy one.
 **The delivery queue (above) is in-memory only.** If loomux restarts while a
 prompt is queued behind a blocked pane, that queued prompt is lost — every
 enqueue is still recorded in `audit.jsonl`, so the loss is visible after the
-fact, but nothing replays it automatically (#445).
+fact, but nothing replays it automatically **yet** — a replay is a planned
+follow-up, and `doc/design/orchestration.md`'s "Delivery queue (#445)" section
+carries the argument for why it isn't there today.
 
 ## Autonomous mode
 {: #autonomous-mode }
@@ -783,6 +787,9 @@ it gates, the per-item approve-with-comment grants, and the gate's audit trail.
 ## Requirements
 
 - An agent CLI on `PATH` — `claude`, `copilot`, or `gemini`. Roles can run on
-  different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer));
-  a role whose CLI isn't installed simply fails to start.
+  different ones (see [cross-model reviewers](#setting-up-a-cross-model-reviewer)).
+  The launcher checks the CLIs you pick in its role dropdowns and refuses the
+  whole launch if one isn't on `PATH`; a CLI named by a `.loomux/workflow.yml`
+  block is not pre-checked, and shows up instead as a pane that opens and
+  immediately exits with the shell's "command not found".
 - `gh` CLI authenticated for the issue/PR/review workflow.

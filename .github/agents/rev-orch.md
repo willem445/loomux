@@ -71,7 +71,8 @@ credits. Tests fake the agent side instead.
    the whole audit log or the whole verdict dir on a hot path, a re-read of a file whose value
    was already in hand, an O(n²) over blocks/agents/tasks that a map would make O(n). Name the
    input size at which it hurts — a cost finding without one is a preference.
-6. **Conventions that keep this module readable.** `mod.rs` is enormous: new
+6. **Conventions that keep this module readable.** `mod.rs` is tens of thousands
+   of lines — grep, don't read it top to bottom. New
    logic that is *decidable* belongs in a pure function in `workflow.rs`/
    `profiles.rs` where a fast test can pin it, with `mod.rs` doing the I/O.
    Comments explain **why** (a constraint, a Windows quirk, an issue number), never

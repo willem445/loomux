@@ -19,7 +19,7 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
 1. **Read the issue, then the code, then the design note.** `doc/design/*.md`
    carries the *why* behind every non-obvious decision in this repo, and
    `doc/design/architecture.md` maps the modules. `src-tauri/src/orchestration/mod.rs` is
-   enormous: grep for the symbol, never read it top to bottom.
+   tens of thousands of lines: grep for the symbol, never read it top to bottom.
 2. **Resolve the ambiguity before you code.** If the brief admits two readings and
    they lead to different code, `message_orchestrator` with the two readings and your
    recommendation. Guessing and building is how a day gets spent on the wrong thing.

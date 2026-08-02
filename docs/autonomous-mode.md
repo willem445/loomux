@@ -237,8 +237,9 @@ each one**, while you supervise.
 
 - **Standalone and durable.** Unlike auto-merge/auto-release, dangerous mode is
   valid on its own (it *is* the not-autonomous posture) and survives a restart.
-- **No auto-expiry.** Dangerous mode is a standing switch with no TTL — you turn it
-  off yourself, or it clears when you enable autonomous.
+- **No auto-expiry (yet).** Dangerous mode is a standing switch with no TTL — you
+  turn it off yourself, or it clears when you enable autonomous. A time-based
+  auto-expire is a planned hardening, so don't rely on this staying manual forever.
 - **Default off**, and — like the grant setters — it can be set **only from the UI**,
   never by any agent tool.
 

@@ -76,8 +76,9 @@ order.
 - `create-release` creates the draft release once and hands its id to every
   `build` leg (`releaseId` input) and to `promote`, so no leg ever looks a
   release up or creates one for itself — legs starting near-simultaneously
-  otherwise race into two drafts for one tag, and half the assets land on the
-  one that never goes public (#282, upstream tauri-apps/tauri-action#914).
+  otherwise race (**~3%** per upstream tauri-apps/tauri-action#914) into two
+  drafts for one tag, and the assets split across them: **5 of 9** public, 4
+  stranded on the draft, is what that looks like in practice (#282).
   `create-release` is also idempotent: if a release for the tag already
   exists (e.g. a "Re-run all jobs" after a partial failure), it reuses that
   release's id instead of spawning a second draft.
