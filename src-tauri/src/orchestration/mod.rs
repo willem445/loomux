@@ -3066,11 +3066,10 @@ pub const CONTEXT_VARIANTS: &[&str] = &["1m"];
 /// direction, as `sanitize_model`.
 pub fn clamped_knob(allowed: &[&str], v: &str) -> String {
     let want = v.trim().to_ascii_lowercase();
-    if allowed.contains(&want.as_str()) {
-        want
-    } else {
-        String::new()
-    }
+    // MUTATION B (#687 mutation round, reverted in the next commit): the
+    // capability gate is removed, so any value survives the clamp.
+    let _ = allowed;
+    want
 }
 
 /// The capability table. Rows exist for CLIs loomux does **not** spawn too:
@@ -30602,7 +30601,10 @@ impl OrchRegistry {
                 // flag and its values. `knobs.effort` is a member of a closed
                 // enum by the time it reaches here (parser + `clamped_knob`),
                 // so it needs no quoting — the same argument `model` rests on.
-                if !knobs.effort.is_empty() {
+                // MUTATION A (#687 mutation round, reverted in the next
+                // commit): the shell form stops emitting --effort; the argv
+                // form below still does.
+                if false && !knobs.effort.is_empty() {
                     cmd.push_str(&format!(" --effort {}", knobs.effort));
                 }
                 if containment.denies_edits() {
