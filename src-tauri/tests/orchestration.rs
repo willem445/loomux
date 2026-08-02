@@ -11563,6 +11563,8 @@ fn advisor_hinted_planner_auto_closes_on_report_done() {
         profile: None,
         allow: vec![],
         role_hint: Some("advisor".into()),
+        effort: String::new(),
+        context: String::new(),
     });
     let g = reg.create_group("C:/tmp/repo", g_rails).unwrap();
     let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
@@ -26304,6 +26306,8 @@ fn rails_with_process_block() -> Guardrails {
         profile: None,
         allow: vec![],
         role_hint: Some("process".into()),
+        effort: String::new(),
+        context: String::new(),
     });
     g
 }
