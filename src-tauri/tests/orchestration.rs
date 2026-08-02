@@ -18000,6 +18000,92 @@ fn release_id_addressed_calls_resolve_to_their_tag_before_the_grant_is_checked()
 }
 
 #[test]
+fn a_releases_tags_url_takes_its_identity_from_the_url_not_from_a_body_field() {
+    // Review round 2. `…/releases/tags/<tag>` names its release by TAG, right in
+    // the URL — but the gate read that shape as "no locus" and fell through to
+    // the ordinary tag path, where a body field answered for it:
+    //
+    //   gh api -X PATCH repos/o/r/releases/tags/v0.0.9 -f tag_name=<granted>
+    //
+    // was allowed while addressing somebody else's release. It is B1's shape
+    // one endpoint over, and it survived B1's fix because that fix keyed on
+    // "the URL carries a numeric id" and this URL carries a tag instead.
+    //
+    // GitHub exposes no write on that endpoint today, so this was unreachable
+    // rather than exploitable — which is exactly why it is worth closing: the
+    // gate would have been resting on the shape of someone else's API surface,
+    // and a surface that grows a write later does not send us a note. The tag is
+    // right there in the URL, so identity is derived from it with NO lookup.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP a_releases_tags_url_takes_its_identity…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group)
+            .env("FAKE_REL_MAP", "555=v1.2.3 777=v0.0.9")
+            .status().unwrap().success()
+    };
+    let grant = |tag: &str| {
+        let d = group.join("release_grants");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(tag), b"99999999999\n1\n").unwrap();
+    };
+
+    // The decoys: URL names v0.0.9's release, body claims the granted tag.
+    grant("v1.2.3");
+    for decoy in [
+        &["api", "-X", "PATCH", "repos/o/r/releases/tags/v0.0.9", "-f", "tag_name=v1.2.3"] as &[&str],
+        &["api", "-X", "DELETE", "repos/o/r/releases/tags/v0.0.9", "-f", "tag_name=v1.2.3"],
+        &["api", "-X", "PATCH", "repos/o/r/releases/tags/v0.0.9", "-F", "ref=refs/tags/v1.2.3"],
+        // A traversal in the tag position names no identifiable release either.
+        &["api", "-X", "PATCH", "repos/o/r/releases/tags/../v9", "-f", "tag_name=v1.2.3"],
+    ] {
+        assert!(!run(decoy), "the URL's tag segment is the locus, not a body field: {decoy:?}");
+    }
+
+    // …and the legitimate direction still works: the URL naming the GRANTED tag
+    // is allowed, and does it WITHOUT an API call, because the answer is in the
+    // URL. (`write_fake_gh` logs every invocation; the shim's id→tag lookup is
+    // the only thing that would put `tag_name` in that log for this argv.)
+    std::fs::write(&log, b"").unwrap();
+    assert!(run(&["api", "-X", "PATCH", "repos/o/r/releases/tags/v1.2.3", "-F", "body=@notes.md"]),
+        "a write to the granted tag's own releases/tags URL is allowed");
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(!logged.contains("tag_name"),
+        "the URL already carries the tag — resolving it must cost no API call, got: {logged}");
+
+    // Tag CASE is part of a tag, so the value is taken from the ORIGINAL path
+    // even though the shape test runs on the lowercased copy: a grant for
+    // `vRelease` must still be found when the URL says `vRelease`.
+    //
+    // Deliberately NOT asserted here: that `vrelease` is refused under a
+    // `vRelease` grant. It is refused on Linux and ALLOWED on Windows and macOS,
+    // and neither is this change's doing — a grant is looked up by opening
+    // `release_grants/<segment>`, so tag matching inherits the host filesystem's
+    // case sensitivity. That predates this PR (the same lookup keys merge grants
+    // and the git shim's tag push on the base branch) and is disclosed in the PR
+    // body rather than papered over with a test that would be red on two of the
+    // three CI platforms. What this pin does catch, on any case-sensitive host,
+    // is the value being lowercased on its way to the grant lookup.
+    grant("vRelease");
+    assert!(run(&["api", "-X", "PATCH", "repos/o/r/releases/tags/vRelease", "-F", "body=@notes.md"]),
+        "the tag is taken from the original path, so its case survives to the grant lookup");
+}
+
+#[test]
 fn an_id_addressed_release_write_never_takes_its_identity_from_a_caller_supplied_tag() {
     // rev B1. Widening the grant to a whole pipeline is paid for by the claim
     // that it still reaches exactly ONE tag — and that claim was false. The

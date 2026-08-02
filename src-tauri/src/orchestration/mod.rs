@@ -618,8 +618,8 @@ loomux_grant_settle() { # $1=grantfile $2=claimed $3=exit-code $4=restore-audit-
 # (#438) — see loomux_release_grant_valid — so every caller just `exec`s the real
 # gh.
 __RELEASE_GRANT_VALID__
-loomux_release_gate() { # $1=argv tag $2=action $3=resource path to resolve ("") $4="1" if id-addressed
-  _tag="$1"; _action="$2"; _relpath="$3"; _relid="$4"
+loomux_release_gate() { # $1=argv tag $2=action $3=path to resolve ("") $4="1" if the URL names one release $5=tag the URL itself carries
+  _tag="$1"; _action="$2"; _relpath="$3"; _relid="$4"; _urltag="$5"
   if [ -n "$LOOMUX_GROUP_DIR" ] && [ -f "$LOOMUX_GROUP_DIR/autonomous" ] && [ -f "$LOOMUX_GROUP_DIR/auto_release" ]; then
     loomux_audit "release-gate-allowed" "{\"tag\":\"$_tag\",\"action\":\"$_action\"}"; return 0
   fi
@@ -654,8 +654,12 @@ loomux_release_gate() { # $1=argv tag $2=action $3=resource path to resolve ("")
   #     ($_relpath empty), leaves $_tag EMPTY, which matches no grant. An id loomux
   #     cannot resolve is never "probably fine".
   if [ "$_relid" = "1" ]; then
-    _argvtag="$_tag"; _tag=""
-    if [ -n "$_relpath" ]; then
+    _argvtag="$_tag"
+    # The URL's own tag segment, when it has one (`…/releases/tags/<tag>`), is
+    # already the answer — no lookup, no API call. Otherwise resolve the id.
+    _tag="$_urltag"; _src="url"
+    if [ -z "$_tag" ] && [ -n "$_relpath" ]; then
+      _src="lookup"
       _rawtag=$("$REAL_GH" api "$_relpath" --jq '.tag_name' 2>/dev/null | head -n1)
       _tag=$(printf '%s' "$_rawtag" | tr -d '\r')
       loomux_norm_guard "$_rawtag" "$_tag" "release-id-tag-name"
@@ -664,10 +668,10 @@ loomux_release_gate() { # $1=argv tag $2=action $3=resource path to resolve ("")
     if [ -z "$_tag" ]; then
       loomux_audit "release-id-unresolved" "{\"path\":\"$_relpath\",\"action\":\"$_action\"}"
     elif [ -n "$_argvtag" ] && [ "$_argvtag" != "$_tag" ]; then
-      loomux_audit "release-id-tag-mismatch" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"claimed\":\"$_argvtag\",\"action\":\"$_action\"}"
+      loomux_audit "release-id-tag-mismatch" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"claimed\":\"$_argvtag\",\"src\":\"$_src\",\"action\":\"$_action\"}"
       loomux_block_release "$_tag" "$_action" "$_argvtag"
     else
-      loomux_audit "release-id-resolved" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"action\":\"$_action\"}"
+      loomux_audit "release-id-resolved" "{\"path\":\"$_relpath\",\"tag\":\"$_tag\",\"src\":\"$_src\",\"action\":\"$_action\"}"
     fi
   fi
   _safe=$(printf '%s' "$_tag" | tr -c 'A-Za-z0-9._-' '_')
@@ -715,7 +719,7 @@ if [ "$cmd" = "release" ]; then
     create|edit|delete)
       # `gh release <sub> <tag>` names its tag as the SELECTOR — that is the locus,
       # not a body field, so there is no id to resolve and nothing to cross-check.
-      loomux_release_gate "$sel" "$sub" "" ""   # allow (return) or block (exit); tag = $sel
+      loomux_release_gate "$sel" "$sub" "" "" ""   # allow (return) or block (exit); tag = $sel
       exec "$REAL_GH" "$@" ;;
     *) exec "$REAL_GH" "$@" ;;
   esac
@@ -897,9 +901,18 @@ if [ "$cmd" = "api" ]; then
     #   - `…/releases/../777`      → id-addressed, unidentifiable → refuse
     # Drop either test and `-f tag_name=<granted>` walks through on those shapes,
     # which is B1 again in a different dress. Both are pinned by mutation.
-    # `…/releases/tags/v1.0.0` and `…/releases/latest` name no id and are left to
-    # the ordinary tag-locus path.
-    _relpath=""; _relid=0
+    #
+    # `…/releases/tags/<tag>` (rev round 2) names its release by TAG, in the URL.
+    # That is a locus in the plainest sense — no lookup needed, the answer is
+    # right there — so it is read from the URL and outranks the argv exactly as a
+    # resolved id does. Before that it fell through to the ordinary tag path, and
+    # `-X PATCH …/releases/tags/v0.0.9 -f tag_name=<granted>` was allowed while
+    # naming somebody else's release. GitHub happens to expose no write on that
+    # endpoint today, so it was unreachable rather than harmless — and "unreachable
+    # because of the shape of someone else's API surface" is not a property this
+    # gate should rest on. `…/releases/latest` names no specific release and is
+    # left to the ordinary tag path.
+    _relpath=""; _relid=0; _urltag=""
     case "$path_low" in
       releases/*|*/releases/*)
         case "$path_low" in
@@ -907,6 +920,17 @@ if [ "$cmd" = "api" ]; then
             # A traversal inside a releases URL: whatever it resolves to, loomux
             # cannot say WHICH release that is, so nothing may speak for it.
             _relid=1 ;;
+          releases/tags/*|*/releases/tags/*)
+            # Identity comes from the URL's own tag segment. Taken from $a_path,
+            # never $path_low, because a tag's CASE is part of it (`vRelease` is
+            # not `vrelease`) and this value is matched against a grant. If the
+            # caller spelled the fixed segments in another case, $a_path won't
+            # match and the tag stays empty — which refuses, not guesses.
+            _relid=1
+            case "$a_path" in
+              *releases/tags/*) _urltag=${a_path##*releases/tags/}; _urltag=${_urltag%%/*} ;;
+            esac
+            case "$_urltag" in ''|*[!A-Za-z0-9._+-]*) _urltag="" ;; esac ;;
           *)
             _rid=${path_low##*releases/}
             case "$_rid" in
@@ -918,7 +942,7 @@ if [ "$cmd" = "api" ]; then
             esac ;;
         esac ;;
     esac
-    loomux_release_gate "$rtag" "api" "$_relpath" "$_relid"   # allow (return) or block (exit)
+    loomux_release_gate "$rtag" "api" "$_relpath" "$_relid" "$_urltag"   # allow (return) or block (exit)
     exec "$REAL_GH" "$@"
   fi
 fi
