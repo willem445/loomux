@@ -410,10 +410,13 @@ fn same_object(recorded: &str, fetched: &str) -> bool {
     }
     // A truncated record must not match half the repository, and the record is
     // the side allowed to be short.
-    if recorded.len() < 7 || recorded.len() > fetched.len() {
+    // MUTATION H3 (evidence, NOT shipped): back to the symmetric min()
+    // comparison, so a SHORT FETCH satisfies a full recorded head again.
+    let short = recorded.len().min(fetched.len());
+    if short < 7 {
         return false;
     }
-    recorded.as_bytes().eq_ignore_ascii_case(&fetched.as_bytes()[..recorded.len()])
+    recorded.as_bytes()[..short].eq_ignore_ascii_case(&fetched.as_bytes()[..short])
 }
 
 fn rev_parse(r: &dyn MqRunner, rev: &str) -> Result<String, BatchBuildError> {

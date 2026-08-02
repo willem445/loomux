@@ -33345,10 +33345,10 @@ impl OrchRegistry {
     ) -> Vec<String> {
         // ---- phase 1: under the guard ----
         let notices: Vec<String> = {
+            // MUTATION H2 (evidence, NOT shipped): the once-only guard removed,
+            // so a restart re-strands and re-notifies entries already resolved.
             let mut done = self.mq_reconciled_groups.lock_safe();
-            if !done.insert(group.to_string()) {
-                return Vec::new();
-            }
+            done.insert(group.to_string());
             let dir = self.group_dir(group);
             let mut state = match mqloop::load_state(&dir) {
                 Ok(s) => s,
@@ -33401,7 +33401,9 @@ impl OrchRegistry {
             // Compared against a snapshot of the value rather than inferred from
             // the report's shape, so this cannot drift out of step with what
             // `reconcile_batch` mutates.
-            if state != before {
+            // MUTATION H1 (evidence, NOT shipped): the empty queue is written anyway,
+            // conjuring a merge_queue.json for every group and destroying slice F absent.
+            if true {
                 if let Err(e) = mqloop::store_state(&dir, &state) {
                     self.audit(
                         group,
