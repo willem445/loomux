@@ -8716,10 +8716,10 @@ fn spawn_respects_guardrail_cap_via_mcp() {
     let co = reg.resolve_token(&orch.token).unwrap();
     // One worker already exists (cap 2): one more fits, the next is refused.
     let ok = dispatch(&reg, &co, "tools/call",
-        &json!({ "name": "spawn_agent", "arguments": { "task": "b" } })).unwrap();
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "worker", "task": "b" } })).unwrap();
     assert_eq!(ok["isError"], false, "{ok:?}");
     let over = dispatch(&reg, &co, "tools/call",
-        &json!({ "name": "spawn_agent", "arguments": { "task": "c" } })).unwrap();
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "worker", "task": "c" } })).unwrap();
     assert_eq!(over["isError"], true);
     assert!(over["content"][0]["text"].as_str().unwrap().contains("guardrail"));
 }
@@ -8738,7 +8738,7 @@ fn spawn_agent_mcp_worker_defaults_to_a_worktree() {
     // main clone is the human's environment, and a worker must not run there
     // unasked.
     let out = dispatch(&reg, &co, "tools/call",
-        &json!({ "name": "spawn_agent", "arguments": { "task": "t", "branch": "feat/x" } }))
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "worker", "task": "t", "branch": "feat/x" } }))
         .unwrap();
     assert_eq!(out["isError"], false, "{out:?}");
 
@@ -8766,7 +8766,7 @@ fn spawn_agent_mcp_rejects_explicit_worktree_false_for_a_worker() {
     let co = reg.resolve_token(&orch.token).unwrap();
 
     let out = dispatch(&reg, &co, "tools/call",
-        &json!({ "name": "spawn_agent", "arguments": { "task": "t", "worktree": false } }))
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "worker", "task": "t", "worktree": false } }))
         .unwrap();
     assert_eq!(
         out["isError"], true,
@@ -9000,7 +9000,7 @@ fn spawn_agent_mcp_resume_with_no_cwd_inherits_the_recorded_workspace() {
     // Fresh worker spawn via the MCP tool: worktree defaults on (#338), so its
     // recorded cwd is a real dedicated worktree, never the main clone.
     let spawn = dispatch(&reg, &co, "tools/call",
-        &json!({ "name": "spawn_agent", "arguments": { "task": "t", "branch": "feat/x" } }))
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "worker", "task": "t", "branch": "feat/x" } }))
         .unwrap();
     assert_eq!(spawn["isError"], false, "{spawn:?}");
     let before = reg.list_agents(&g.id);
@@ -9215,7 +9215,7 @@ fn spawn_agent_mcp_rejects_cwd_on_a_fresh_worker_spawn() {
 
     let out = dispatch(&reg, &co, "tools/call", &json!({
         "name": "spawn_agent",
-        "arguments": { "task": "t", "cwd": elsewhere.path().to_string_lossy() },
+        "arguments": { "kind": "worker", "task": "t", "cwd": elsewhere.path().to_string_lossy() },
     })).unwrap();
     assert_eq!(
         out["isError"], true,
@@ -9233,7 +9233,7 @@ fn spawn_agent_mcp_rejects_cwd_on_a_fresh_worker_spawn() {
     // it either way.
     let out = dispatch(&reg, &co, "tools/call", &json!({
         "name": "spawn_agent",
-        "arguments": { "task": "t", "cwd": elsewhere.path().to_string_lossy(), "worktree": true },
+        "arguments": { "kind": "worker", "task": "t", "cwd": elsewhere.path().to_string_lossy(), "worktree": true },
     })).unwrap();
     assert_eq!(out["isError"], true, "worktree:true must not excuse an explicit cwd either: {out:?}");
 
@@ -9514,6 +9514,171 @@ fn resume_of_worker_session_keeps_its_original_block_not_the_roster_default() {
     assert_eq!(
         resumed_agent["block"], "worker-fast",
         "resume must keep the ORIGINAL block, not the roster's file-order default: {after}"
+    );
+}
+
+// ───────── #544: a capability class is never acquired by OMISSION ─────────
+
+#[test]
+fn spawn_agent_never_defaults_to_the_privileged_class() {
+    // The incident, verbatim (#544): three reviewer-shaped briefs were spawned
+    // with `kind` omitted and came back as WORKERS — read-write panes with
+    // edit tools and git commit/push, pointed at "review this PR / record your
+    // verdict" tasks, one of them literally named `rev: …`. `kind` defaulted to
+    // `Role::Worker`, the MOST-privileged class, so forgetting a parameter
+    // meant silently receiving more capability than intended: a fail-open
+    // default on a capability boundary. Every containment guardrail this repo
+    // has (#448/#462/#465) protects a pane that was correctly *classified*;
+    // none of them fire when the classification itself was acquired by
+    // omission.
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "name": "rev: #536 question-guard",
+            "task": "Fresh review of PR #536. Record your verdict with review_verdict.",
+        },
+    })).unwrap();
+
+    // LOUD, per the issue's acceptance: a refusal, not a quieter pane.
+    assert_eq!(
+        out["isError"], true,
+        "a fresh spawn naming no capability class must be refused, not defaulted: {out:?}"
+    );
+    let text = out["content"][0]["text"].as_str().unwrap();
+    // ...and the refusal has to say what to pass, or it just moves the guessing
+    // to the caller.
+    assert!(text.contains("#544"), "refusal must cite the guardrail, got: {text}");
+    for want in ["kind", "block", "worker", "reviewer", "planner", "resume_session"] {
+        assert!(text.contains(want), "refusal must name {want:?} as the way out, got: {text}");
+    }
+
+    // The half that actually matters: nothing privileged came into existence.
+    let agents = reg.list_agents(&g.id);
+    assert!(
+        agents.as_array().unwrap().iter().all(|a| a["role"] != "worker"),
+        "a refused spawn must not have created a worker as a side effect: {agents}"
+    );
+
+    // The same brief WITH the class named spawns what was actually intended,
+    // and it is a reviewer — the refusal is a prompt to be explicit, not a
+    // dead end.
+    let ok = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": {
+            "kind": "reviewer",
+            "name": "rev: #536 question-guard",
+            "task": "Fresh review of PR #536. Record your verdict with review_verdict.",
+        },
+    })).unwrap();
+    assert_eq!(ok["isError"], false, "an explicit class must still spawn: {ok:?}");
+    assert!(
+        ok["content"][0]["text"].as_str().unwrap().contains("Reviewer"),
+        "the explicit spawn must be a REVIEWER: {:?}", ok["content"][0]["text"]
+    );
+}
+
+#[test]
+fn a_fresh_spawn_naming_only_a_block_is_still_accepted() {
+    // #544 requires a *class*, not the `kind` argument specifically: a block
+    // carries its own kind (and it is authoritative over `kind`), so naming one
+    // is just as deliberate. Pinned because the cheap version of this fix —
+    // making `kind` mandatory outright — would break every block-based spawn
+    // in a custom-workflow group, which is the whole spawn surface #222 built.
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let out = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "block": "worker", "task": "fix #1", "branch": "feat/x" },
+    })).unwrap();
+    assert_eq!(out["isError"], false, "a block names the class as deliberately as kind: {out:?}");
+    assert!(out["content"][0]["text"].as_str().unwrap().contains("block worker"));
+}
+
+#[test]
+fn the_explicit_class_requirement_does_not_break_resume_inheritance() {
+    // The #254 contract is deliberately untouched by #544: a resume that names
+    // neither `kind` nor `block` is NOT an omission to be refused — it inherits
+    // the resumed session's own block, which is a stricter answer than any
+    // default (it re-derives nothing, and an unknown session is already a hard
+    // error). Pinned here because the obvious over-broad version of this fix —
+    // "refuse every spawn with no kind and no block" — silently deletes that
+    // inheritance and re-roles every bare follow-up.
+    let repo = real_repo();
+    let (reg, _d) = test_registry();
+    let g = reg.create_group(&repo.path().to_string_lossy(), rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let co = reg.resolve_token(&orch.token).unwrap();
+
+    let spawn = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "spawn_agent", "arguments": { "kind": "reviewer", "task": "review PR #7" } }))
+        .unwrap();
+    assert_eq!(spawn["isError"], false, "{spawn:?}");
+    let before = reg.list_agents(&g.id);
+    let rev = before.as_array().unwrap().iter().find(|a| a["role"] == "reviewer").unwrap();
+    let (rev_id, session, cwd) = (
+        rev["id"].as_str().unwrap().to_string(),
+        rev["session"].as_str().unwrap().to_string(),
+        rev["cwd"].as_str().unwrap().to_string(),
+    );
+    reg.mark_dead(&rev_id, Some(0));
+
+    let resumed = dispatch(&reg, &co, "tools/call", &json!({
+        "name": "spawn_agent",
+        "arguments": { "resume_session": session, "cwd": cwd, "task": "round-2 fix pushed" },
+    })).unwrap();
+    assert_eq!(
+        resumed["isError"], false,
+        "a bare resume must still inherit, not hit the fresh-spawn refusal: {resumed:?}"
+    );
+    assert!(
+        resumed["content"][0]["text"].as_str().unwrap().contains("Reviewer"),
+        "and it comes back a REVIEWER: {:?}", resumed["content"][0]["text"]
+    );
+}
+
+#[test]
+fn the_spawn_tool_schema_states_the_explicit_class_contract() {
+    // The MCP tool description IS the contract every orchestrator reads — a
+    // schema still advertising "default worker" would keep producing exactly
+    // the omission #544 refuses, and the agent would read the refusal as a bug.
+    let (reg, _d, co, _cw) = setup_mcp();
+    let tools = dispatch(&reg, &co, "tools/list", &Value::Null).unwrap();
+    let spawn = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "spawn_agent")
+        .expect("the orchestrator must see spawn_agent")
+        .clone();
+    let doc = spawn["description"].as_str().unwrap().to_string();
+    let kind_doc = spawn["inputSchema"]["properties"]["kind"]["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert!(
+        !doc.to_lowercase().contains("default worker")
+            && !kind_doc.to_lowercase().contains("default worker"),
+        "the schema must not still advertise a default class: {doc} / {kind_doc}"
+    );
+    assert!(doc.contains("#544"), "the description must cite the contract change: {doc}");
+    assert!(
+        doc.contains("REFUSED") || doc.contains("refused"),
+        "the description must say an omitted class is refused: {doc}"
+    );
+    assert!(
+        kind_doc.contains("REQUIRED") && kind_doc.contains("block"),
+        "`kind` must be documented as required unless a block names the class: {kind_doc}"
     );
 }
 
@@ -25161,7 +25326,7 @@ fn real_repo_worktree_fixture_leaves_nothing_in_temp_on_success() {
         // No `worktree` argument at all: the MCP surface defaults a worker
         // spawn's worktree ON (#338) — exactly the path that used to leak.
         let out = dispatch(&reg, &co, "tools/call",
-            &json!({ "name": "spawn_agent", "arguments": { "task": "t", "branch": "feat/x" } }))
+            &json!({ "name": "spawn_agent", "arguments": { "kind": "worker", "task": "t", "branch": "feat/x" } }))
             .unwrap();
         assert_eq!(out["isError"], false, "{out:?}");
         let agents = reg.list_agents(&g.id);

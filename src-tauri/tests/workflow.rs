@@ -3491,7 +3491,7 @@ fn orch_caller(reg: &OrchRegistry, group: &str) -> Caller {
 #[test]
 fn mcp_spawn_rejects_an_unknown_kind_instead_of_making_it_a_worker() {
     let (reg, _d) = test_registry();
-    let repo = Repo::new().git_init(); // the "documented default" spawn below is a worker (#338)
+    let repo = Repo::new().git_init(); // the explicit worker spawn below cuts a real worktree (#338)
     let g = reg.create_group(&repo.path(), rails()).unwrap();
     let caller = orch_caller(&reg, &g.id);
 
@@ -3511,8 +3511,23 @@ fn mcp_spawn_rejects_an_unknown_kind_instead_of_making_it_a_worker() {
         "the rejected spawn must not have created an agent"
     );
 
-    // The documented default (no kind at all) is still a worker.
+    // ...and #544 closed the omission half of the same door: there IS no
+    // documented default any more. A fresh spawn naming neither `kind` nor
+    // `block` used to come back a worker; it is now refused, and the refusal
+    // says what to pass. (`spawn_agent_never_defaults_to_the_privileged_class`
+    // in tests/orchestration.rs is the dedicated pin.)
     let out = call(json!({ "task": "t" }));
+    assert_eq!(out["isError"], json!(true), "an omitted kind must be an error too");
+    let text = out["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("#544") && text.contains("kind"), "{text}");
+    assert_eq!(
+        reg.list_agents(&g.id).as_array().unwrap().len(),
+        1,
+        "the refused spawn must not have created an agent either"
+    );
+
+    // An explicit kind still spawns the class it names.
+    let out = call(json!({ "kind": "worker", "task": "t" }));
     assert_eq!(out["isError"], json!(false));
     assert!(out["content"][0]["text"].as_str().unwrap().contains("block worker"));
 }
