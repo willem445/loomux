@@ -12,16 +12,20 @@ manual checklist for the rest.
 
 ## Always run (both halves — a change to one often breaks the other's assumptions)
 
-Agent workers: whether these run locally or on `ci.yml` follows
-`.claude/skills/ci-validate`'s scope/duration line, not an automatic "run it"
-— quick/local iteration is fine capped at `-j 4` (`-- --test-threads=4` too,
-for `cargo test`), but full-suite validation still goes to CI, which is the
-sole authority for the CI gate regardless of what ran locally. The commands
-below are unconstrained for the human running this skill by hand.
+Agent workers: local `cargo` of any kind is banned — see
+`.claude/skills/ci-validate`. Run the node-only half locally; everything Rust
+goes to CI, which is the sole authority for the CI gate regardless of what ran
+anywhere else.
 
 ```sh
 npm run build                 # tsc --noEmit typecheck + Vite bundle
 npm test                      # frontend unit tests (Node 22 built-in runner)
+```
+
+The Rust half — CI runs it on every push; **for a human running this skill by
+hand**, it is:
+
+```sh
 cd src-tauri
 cargo check --locked          # what CI gates on
 cargo test --locked           # backend unit + integration tests
@@ -44,8 +48,9 @@ cargo test --locked           # backend unit + integration tests
 
 ## Never do
 
-- **Never spawn `claude` or `copilot`** (not even `--resume` or with a trivial
-  prompt) — it burns the user's paid credits. The user does live validation.
+- **Never spawn a real agent CLI** (`claude`, `copilot`, `gemini` — not even
+  `--resume` or with a trivial prompt): it burns the user's paid credits. The
+  user does live validation.
 - **Don't run `npm run tauri dev` unattended** — it opens a window and blocks
   forever. Only useful when the human is present to click through.
 - **Don't add a unit test that links the full lib** — on Windows it will fail

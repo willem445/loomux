@@ -30,7 +30,7 @@ result), and a fix small enough to be obvious.
 **Run the suites on the head** and cite the counts:
 `cargo check --locked` and `cargo test --locked` in `src-tauri/`.
 Never spawn `claude` or `copilot` to check anything — that burns the human's paid
-credits and no test in this repo does it.
+credits. Tests fake the agent side instead.
 
 ## What you are looking for, in priority order
 
@@ -71,7 +71,7 @@ credits and no test in this repo does it.
    the whole audit log or the whole verdict dir on a hot path, a re-read of a file whose value
    was already in hand, an O(n²) over blocks/agents/tasks that a map would make O(n). Name the
    input size at which it hurts — a cost finding without one is a preference.
-6. **Conventions that keep this module readable.** `mod.rs` is ~11k lines: new
+6. **Conventions that keep this module readable.** `mod.rs` is enormous: new
    logic that is *decidable* belongs in a pure function in `workflow.rs`/
    `profiles.rs` where a fast test can pin it, with `mod.rs` doing the I/O.
    Comments explain **why** (a constraint, a Windows quirk, an issue number), never

@@ -11,8 +11,8 @@ GitHub release, and then publishes the `loomux-desktop` npm launcher.
 
 **The workflow runs from the tag's commit, not from main.** Any fix to
 `release.yml` only takes effect for a tag that points at (or after) the fixed
-commit — re-running a failed job re-runs the old workflow. This bit us in
-v0.7.1: fixing the publish step required moving the tag (see step 5).
+commit — re-running a failed job re-runs the old workflow. If a fix has to
+take effect, the tag itself has to move (see step 5).
 
 ## 1. Bump the version — five files, in one PR
 
@@ -26,9 +26,8 @@ The version lives in **five** places that must stay in lockstep:
 | `src-tauri/Cargo.toml` | `[package] version` |
 | `src-tauri/Cargo.lock` | the `loomux` package entry |
 
-**The lockfiles are what get missed** (Cargo.lock: the 0.5.0 bump PR #89
-needed follow-up #90; package-lock.json: the 0.8.0 bump PR #220 needed
-follow-up #224). After editing Cargo.toml, run `cargo update --workspace` in
+**The lockfiles are what get missed** (#90, #224). After editing Cargo.toml,
+run `cargo update --workspace` in
 `src-tauri/` to regenerate the lock — this is dependency resolution scoped to
 the workspace's own members, not a build: it doesn't invoke `rustc`, so it's
 the one exception the `ci-validate` skill carves out for agent workers (see
@@ -47,7 +46,7 @@ CI has a mechanical backstop for this (#274): the "Check version
 consistency" step (`node scripts/check-versions.js`) checks all seven
 version fields across these six files (the five above plus
 `npm/package.json`) and fails the build if any disagree, so a missed
-lockfile bump can't merge silently again. Run `npm run check:versions`
+lockfile bump can't merge silently. Run `npm run check:versions`
 locally before opening the bump PR if you want the same check without
 waiting on CI.
 
@@ -75,11 +74,10 @@ four `build` matrix legs, `promote`, and `publish-npm`, in that dependency
 order.
 
 - `create-release` creates the draft release once and hands its id to every
-  `build` leg (`releaseId` input) and to `promote`. This closed #282: legs
-  used to independently look up-or-create the release, which raced (~3% per
-  upstream tauri-apps/tauri-action#914) into two drafts for one tag when legs
-  started near-simultaneously. It hit v0.9.0's first live run for real — 5/9
-  assets went public, 4 were stranded on a stray draft recovered by hand.
+  `build` leg (`releaseId` input) and to `promote`, so no leg ever looks a
+  release up or creates one for itself — legs starting near-simultaneously
+  otherwise race into two drafts for one tag, and half the assets land on the
+  one that never goes public (#282, upstream tauri-apps/tauri-action#914).
   `create-release` is also idempotent: if a release for the tag already
   exists (e.g. a "Re-run all jobs" after a partial failure), it reuses that
   release's id instead of spawning a second draft.
@@ -131,13 +129,11 @@ real notes after the assets are up:
   gh api -X PATCH repos/OWNER/REPO/releases/RELEASE_ID -F body=@notes.md
   ```
   **Why not `gh release edit vX.Y.Z --notes-file -`:** that resolves the
-  release by tag, and a tag-based lookup is exactly the ambiguity that let
-  v0.9.0's incident go wrong (#282) — two draft releases existed for the
-  same tag, and only pinning every operation to the one true `release_id`
-  (not the tag) keeps assets, promotion, *and* notes from ever drifting onto
-  the wrong one. `create-release`'s idempotence guard and the concurrency
-  group make a stray duplicate far less likely now, but "never by tag" costs
-  nothing and closes the class of bug for good.
+  release by tag, and a tag can resolve to more than one release (#282).
+  Pinning every operation — assets, promotion, *and* notes — to the one true
+  `release_id` is what keeps them from drifting onto the wrong one. The
+  idempotence guard and the concurrency group make a stray duplicate
+  unlikely, but "never by tag" costs nothing and closes the class outright.
   - `promote` also warns (non-fatally, right before it flips the release
     public) if the release body is still empty at that point, so a
     notes-less publish is loud in the run log instead of silently going out

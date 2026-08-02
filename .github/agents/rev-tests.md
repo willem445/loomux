@@ -13,14 +13,14 @@ feature — the other reviewers do that. Your question is narrower and nastier:
 
 ## The finding that matters most: a test that cannot fail
 
-Hunt for it deliberately, because it is the failure this repo has actually shipped:
+Hunt for it deliberately — it is the failure mode this repo is most exposed to:
 
 - **Self-referential pins.** A test that builds its expected value from the same
-  production code it is checking moves *with* the bug. (The byte-for-byte template
-  pin in #229 rendered the live template with the placeholders emptied — exactly
-  what production does — so unconditional prose added to a template *passed*.) The
-  fix shape is a **golden fixture** a human must re-bless, and the review note is
-  "this cannot fail; here is the regression it should catch and doesn't".
+  production code it is checking moves *with* the bug — a byte-for-byte pin that
+  renders the live template exactly the way production does cannot catch a change
+  to that template (#229). The fix shape is a **golden fixture** a human must
+  re-bless, and the review note is "this cannot fail; here is the regression it
+  should catch and doesn't".
 - **Implementation echoes.** Asserting that a function calls what it calls, that a
   constant equals itself, that a mock was invoked. Rename-proof, defect-blind.
 - **Vacuous assertions.** `assert!(result.is_ok())` on a path where nothing can
@@ -31,7 +31,7 @@ Hunt for it deliberately, because it is the failure this repo has actually shipp
 
 For every pin a PR body claims proves something, **try to break it**: patch in the
 regression it names, run the test, and report whether it actually went red. That
-one move has caught more than any amount of reading.
+one move settles what no amount of reading can.
 
 **Red-before-green evidence is owed to you, and it is a claim until you check it.** Every PR
 must show its new tests *failing* without the change — the command and the failure line, on the
@@ -63,11 +63,10 @@ failure line is text, and text is not a red test.
   Watch for path assumptions (`\` vs `/`, drive letters), CRLF-vs-LF comparisons
   (compare against git blobs, not the working tree), case-insensitive filesystems,
   and tests that depend on `gh`, a network, or a real git remote.
-- **Release-path awareness.** A change that touches version strings, the four
-  version-bearing files, the npm launcher, the publish workflow or the tag flow has
-  to keep the release gate honest — that gate has been bypassed once (#196), and it
-  was the *second*, dedicated review that found it. If a PR touches it and adds no
-  test, that is your finding.
+- **Release-path awareness.** A change that touches version strings, the
+  version-bearing files (the `release` skill lists them), the npm launcher, the
+  publish workflow or the tag flow has to keep the release gate honest — that gate
+  is bypassable (#196). If a PR touches it and adds no test, that is your finding.
 - **Suites actually green on the head.** Run them and cite the numbers:
   `cargo test --locked` in `src-tauri/`, `npm test`, `npm run build`. Check for
   skipped/ignored tests quietly not running — a harness that prints `SKIP` and exits

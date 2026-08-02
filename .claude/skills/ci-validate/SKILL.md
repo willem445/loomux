@@ -9,9 +9,9 @@ description: Why agent workers never build or test Rust locally (hard ban — CI
 
 > **Local `cargo` of ANY kind is banned for agents** — no `cargo build`,
 > no `cargo check`, no single-test iteration, nothing that invokes
-> `rustc` (human hard directive, #488; a cargo-intercepting shim was
-> tried and shelved: #318/#322). A fresh worktree's first compile
-> costs 5-8 GB of `target/` per worker, and a fleet building locally
+> `rustc` (human hard directive, #488; a cargo-intercepting shim is not
+> the answer either — #318/#322). A fresh worktree's first compile costs
+> gigabytes of `target/` per worker, and a fleet building locally
 > exhausts the disk. Scope caps don't cap the first compile; only not
 > compiling does.
 >
@@ -31,19 +31,18 @@ CI is the sole authority for the CI gate, and now also the sole build
 path. A worker citing a local run as validation is citing evidence it
 should not have been able to produce.
 
-**Why this is absolute** (#488 lineage): a full disk has destroyed a live
-task board (#133), crashed loomux outright (#464), and killed the app
-mid-session twice more on 2026-07-30. CI spends GitHub's disk, not this
-machine's. If your worktree has a `target/` from before this rule,
-`cargo clean` it now.
+**Why this is absolute:** a full disk takes the whole machine down with it
+— the live task board, the app, and every worker in the fleet at once
+(#488, #133, #464). CI spends GitHub's disk, not this machine's. If your
+worktree has a `target/`, `cargo clean` it now.
 
 ## The syntax check: `rustfmt --check` (#558)
 
-The ban above left workers with no way to know whether the Rust they just
-wrote *parses*. The cheapest possible defect then cost a full CI round: a
-scripted rewrite that cut at the first `);` — which happened to sit inside a
-string literal — left a dangling fragment and an unbalanced brace, and all
-three build jobs failed to compile, not on assertions but on parsing (#558).
+Without a local build there is nothing to tell a worker whether the Rust it
+just wrote even *parses*, and a syntax error costs a full CI round on all
+three build jobs before anything is learned. Bulk or script-generated edits
+are the usual source — a rewrite that cuts at the first `);` finds the one
+sitting inside a string literal (#558).
 
 **Run this before every push that touches `.rs` files**, from `src-tauri/`:
 
@@ -61,11 +60,11 @@ dropped:
 - **`>/dev/null` is deliberate — discard stdout, and the redirect is not
   optional.** `--check` prints a *formatting* diff (`Diff in …`) for anything
   not rustfmt-shaped, and this repo is deliberately not rustfmt-formatted:
-  hundreds of lines for a small file, but **12,483 for
-  `src/orchestration/mod.rs`** and **14,997 for a whole-crate run** — measured.
-  Forget the redirect on the file you are most likely to be editing and you
-  dump ~12k lines of diff into your own context, which costs far more than the
-  CI round this check was saving. They are noise here, not findings.
+  hundreds of lines for a small file, and **tens of thousands** for
+  `src/orchestration/mod.rs` or a whole-crate run. Forget the redirect on the
+  file you are most likely to be editing and you dump that diff into your own
+  context, which costs far more than the CI round this check was saving. They
+  are noise here, not findings.
 - **Read stderr; the exit code is ambiguous.** It's `0` clean, `1` for a
   formatting diff *and* for a parse error, `101` for a lexer error. The
   reliable signal is that **problems go to stderr and formatting diffs go to
@@ -83,8 +82,8 @@ recurses into child modules, and a parse error in a child is reported by name:
 rustfmt --check --edition 2021 src/lib.rs >/dev/null
 ```
 
-That takes ~3-5s for this crate. Keep the `>/dev/null`: without it this is the
-~15,000-line case above.
+That takes a few seconds for this crate. Keep the `>/dev/null`: without it
+this is the whole-crate-diff case above.
 
 ### This is a syntax check, NOT a formatting gate
 
@@ -96,36 +95,35 @@ what `>/dev/null` is for). So:
 - Never run bare `rustfmt` (without `--check`) on a repo file — `--check`
   writes nothing; plain `rustfmt` rewrites in place.
 - Never commit a reformatting, and never "fix" a `Diff in …` line.
-- Match the surrounding style, exactly as before.
+- Match the surrounding style.
 
 ### Why this is permitted under the ban
 
 **rustfmt is a parser, not a build.** It doesn't invoke cargo, doesn't invoke
 `rustc` for codegen, resolves no dependencies, produces no artifacts, and
-writes nothing to `target/` — verified on a worktree that had no `target/`:
-after a whole-crate run it still had none, `git status` was clean, and the run
-took ~3-5s. So it sits inside both bans at once: the #320 CPU ban (no meaningful
-CPU, nothing to contend across worktrees) and the #488 disk ban (zero bytes
-written).
+writes nothing to `target/` — a whole-crate run leaves a `target/`-less
+worktree exactly as it found it, with `git status` clean. So it sits inside
+both bans at once: the #320 CPU ban (no meaningful CPU, nothing to contend
+across worktrees) and the #488 disk ban (zero bytes written).
 
 **`cargo check` and `cargo build` remain banned, and the argument above does
 not extend to them.** `cargo check` resolves the dependency graph and builds
 metadata for every dependency into `target/` — that first full dependency
-compile, 5-8 GB per worktree, *is* the thing #488 banned. "It doesn't produce
-a binary" was never the distinction; "it doesn't write to `target/`" is.
+compile, gigabytes per worktree, *is* the thing #488 banned. The distinction
+is not "it doesn't produce a binary"; it is "it doesn't write to `target/`".
 There is no `--parse-only`-shaped cargo invocation that qualifies.
 
 ### What it does not catch
 
 Parse errors only. Anything semantic sails straight through — type errors,
-unresolved names, borrow-check failures, and (verified) a `format!` with the
-wrong number of arguments. A clean rustfmt run is **not** validation and is
+unresolved names, borrow-check failures, and a `format!` with the wrong
+number of arguments. A clean rustfmt run is **not** validation and is
 never cited as one; it only buys back the CI round that a syntax error would
 have wasted. The definition of validated below is unchanged.
 
 ## The Cargo.lock exception
 
-One local command has always been fine regardless of anything above: `cargo
+One local command is permitted regardless of everything above: `cargo
 update --workspace` in `src-tauri/`, when the `release` skill has just
 bumped the version in `Cargo.toml`. CI's `cargo check --locked` only
 *verifies* the lock is consistent — `--locked` makes it fail rather than
@@ -167,8 +165,8 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    Waiting for that result in the same turn is a **deadlock**, not merely
    slow: the notice is delivered by typing into the pane, and a pane that is
    mid-turn cannot take a delivery, so the turn waits on a resolution queued
-   behind itself. It has already cost 20+ minutes and a human to break
-   (#590/#577). So: **no `sleep`, no `gh pr checks --watch`, no poll loop, no
+   behind itself, and only a human can break it (#590/#577). So: **no
+   `sleep`, no `gh pr checks --watch`, no poll loop, no
    shell command that blocks until CI finishes.** A single instantaneous
    `gh pr checks <pr>` to see where things stand is fine — it is *waiting*
    that is banned, not looking.
@@ -197,10 +195,8 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    git rev-parse HEAD
    ```
    A run counts as this PR's evidence only when its `headSha` **is** the head
-   you are reporting on. Three stale-green citations reached review in a single
-   batch — one run three commits behind head (#571), and the same pre-rebase run
-   cited twice across two reviews of #588 — each caught by a reviewer, none by
-   the worker who wrote it (#596).
+   you are reporting on. A citation that survives a rebase untouched is the
+   defect a reviewer catches and its author never does (#571, #588, #596).
 7. **Mark the PR ready once green:**
    ```sh
    gh pr ready <pr>
@@ -226,11 +222,11 @@ at High integrity level, and WebView2 Runtime 150+ intentionally drops the
 `WEBVIEW2_*` env-var channel for an elevated host process as by-design
 local-privilege-escalation hardening (MicrosoftEdge/WebView2Feedback#5640,
 closed as completed — not a bug Microsoft will fix). `ci.yml` works around it
-with the HKLM policy Microsoft names as the supported alternative — confirmed
-working (see the design doc's "CI status" section) — so a red `e2e-windows`
-today most likely means a real spec/app problem, not the runner's execution
-context. Still `continue-on-error` regardless: a new job earns required-check
-status with a track record, not on day one.
+with the HKLM policy Microsoft names as the supported alternative, and that
+workaround is confirmed working (see the design doc's "CI status" section) —
+so a red `e2e-windows` most likely means a real spec/app problem, not the
+runner's execution context. Still `continue-on-error` regardless: a job earns
+required-check status with a track record, not on day one.
 
 Locally, PoC-level smoke only, and only against the isolated E2E profile —
 never against a real install. **This local path is for humans**: producing
@@ -248,9 +244,8 @@ the cargo ban covers — agents validate E2E through the CI job only.
   #394's shared-WebView2-process hazard, and skipping it locally reintroduces
   exactly the collision-with-a-running-instance risk it exists to prevent.
 - The full `npx playwright test` suite as "it passes" evidence is CI's job,
-  same as the backend/frontend suites above — cite the `e2e-windows` run, not
-  a local one, **once that job is actually green** for a given push. While
-  it's failing on the known High-IL/WebView2 issue above, say explicitly that
-  `e2e-windows` is expected-red for the documented reason, not silently
-  ignore it (a substitute local full-suite run is a human's to produce — the
-  exe build is `rustc`).
+  same as the backend/frontend suites above — cite the `e2e-windows` run for
+  the head you are reporting on, never a local one. A red `e2e-windows` is a
+  real failure to investigate and say something about, not background noise;
+  it simply doesn't block the merge gate (`continue-on-error`). A substitute
+  local full-suite run is a human's to produce — the exe build is `rustc`.

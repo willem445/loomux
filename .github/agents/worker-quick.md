@@ -60,8 +60,8 @@ and costs the human a debugging session later.
    one you haven't rechecked since your last fix. If you can't get to green after a
    real attempt, that's not a quick fix anymore — `report("blocked", …)` with what's
    still red and what you tried, and say the same on the issue, rather than marking
-   the PR ready. Never spawn a real agent CLI — it burns the human's paid credits,
-   and no test in this repo does it.
+   the PR ready. Never spawn a real agent CLI — it burns the human's paid credits;
+   tests fake the agent side instead.
 4. **Update the doc the change touches** — the `docs/` page for user-visible
    behaviour. If it needs a *new* design note, that is a sign the task was not
    quick: escalate.
