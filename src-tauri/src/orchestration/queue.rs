@@ -1518,9 +1518,14 @@ pub struct ArchivedEntry {
     pub entry: PersistedEntry,
 }
 
-/// Build one archive record. Split from [`archive_line`] so a rewrite (see
-/// `OrchRegistry::readmit_archived`) can re-emit a record it read back
-/// without inventing a fresh `archived_ms`/`why` for it.
+/// Build one archive record. Split from [`archive_line`] so the roll's two
+/// halves — deciding what a record says, and turning it into a line — stay
+/// separable and separately testable.
+///
+/// **Nothing re-serializes a record it read back.** A rewrite carries the
+/// original line through verbatim ([`scan_archive`]); re-emitting through
+/// this type would silently normalize away anything the reading build did
+/// not understand, which is the defect [`scan_archive`]'s doc describes.
 pub fn new_archive_record(archived_ms: u64, why: ArchiveReason, entry: PersistedEntry) -> ArchivedEntry {
     ArchivedEntry { v: ARCHIVE_LINE_VERSION, archived_ms, why: why.as_str().to_string(), entry }
 }
@@ -1569,6 +1574,59 @@ pub fn parse_archive(text: &str) -> (Vec<ArchivedEntry>, usize) {
         }
     }
     (out, skipped)
+}
+
+/// One raw archive line, kept **verbatim**, plus the little this build can
+/// tell about it without claiming to understand it (#547 review B1).
+///
+/// See [`scan_archive`] for why this exists at all.
+pub struct ArchiveLine<'a> {
+    /// The line exactly as it sits in the file. What a rewrite writes back
+    /// when it is not deliberately removing this record — byte for byte, so
+    /// a record this build cannot interpret is not silently normalized into
+    /// what this build would have written.
+    pub raw: &'a str,
+    /// The delivery id, read **without interpreting the record**: probed
+    /// straight out of the JSON rather than through [`ArchivedEntry`], so it
+    /// works across versions this build does not know. `None` for a line
+    /// that is not JSON at all, or whose shape has moved far enough that the
+    /// id is no longer where it was — and a line with no id can never be
+    /// matched, so it can never be removed.
+    pub id: Option<u64>,
+}
+
+/// Read the archive as **lines**, not as records (#547 review B1).
+///
+/// **Why this exists, and why [`parse_archive`] cannot be used for it.**
+/// `parse_archive` is deliberately lossy: it skips a line whose version this
+/// build does not know, because interpreting one would mean guessing at a
+/// shape. That is the right stance for every path that ACTS on records — the
+/// orphan report, the rebind — and exactly the wrong one for the path that
+/// REWRITES the file. Reconstructing the file from parsed records deletes
+/// every line the parse dropped, which turns the one mechanism that exists to
+/// survive version skew into the thing that destroys it: a newer build writes
+/// `v: 2` lines, a rollback follows, and the next bind that re-admits
+/// anything erases them. It also blinds the `queue_seq` seed to the ids on
+/// those lines, re-opening the id collision the seed exists to prevent.
+///
+/// So the rewrite and the seed both read the file this way instead: every
+/// line is carried, and parsing is used only to answer "is THIS the record I
+/// am deliberately removing?". Nothing is dropped because this build could
+/// not read it — which is the guarantee the archive is for, made structural
+/// rather than dependent on the reader's vocabulary.
+///
+/// Blank lines are skipped: they carry nothing and re-emitting them would
+/// grow the file by one byte per rewrite.
+pub fn scan_archive(text: &str) -> Vec<ArchiveLine<'_>> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|raw| {
+            let id = serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| v.get("entry").and_then(|e| e.get("id")).and_then(serde_json::Value::as_u64));
+            ArchiveLine { raw, id }
+        })
+        .collect()
 }
 
 /// Whether a recovered entry has a durable identity to re-bind to when

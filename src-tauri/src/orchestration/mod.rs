@@ -33399,14 +33399,21 @@ impl OrchRegistry {
         {
             let _writer = self.queue_persist.lock_safe();
             let current = fs::read_to_string(&path).unwrap_or_default();
-            let (current_rows, _) = queue::parse_archive(&current);
+            // **Over RAW lines, never over parsed records** (#547 review B1).
+            // `parse_archive` drops a line whose version this build does not
+            // know — correct for acting on records, fatal for rewriting the
+            // file: rebuilding it from parsed output deletes exactly the
+            // lines the per-line `v` exists to protect, so a rollback after a
+            // `v: 2` writer would lose them on the next bind. Parsing here
+            // answers one question only — "is this the record I am
+            // deliberately removing?" — and everything else, including a line
+            // that is not JSON at all, is carried through byte for byte.
             let mut body = String::new();
-            for rec in current_rows.iter().filter(|r| !done.contains(&r.entry.delivery.id)) {
-                let line = queue::archive_line(rec);
-                if line.is_empty() {
+            for line in queue::scan_archive(&current) {
+                if line.id.is_some_and(|id| done.contains(&id)) {
                     continue;
                 }
-                body.push_str(&line);
+                body.push_str(line.raw);
                 body.push('\n');
             }
             if let Err(e) = atomic_write(&path, body.as_bytes()) {
@@ -33582,9 +33589,25 @@ impl OrchRegistry {
             // two silent consequences this seed exists to prevent, reintroduced
             // by the fix for a different problem. One file read, once per
             // group per process, inside the guard: no delivery, no re-entry.
-            let archived_high = fs::read_to_string(self.queue_archive_path(group))
-                .map(|t| queue::parse_archive(&t).0.iter().map(|a| a.entry.delivery.id).max().unwrap_or(0))
-                .unwrap_or(0);
+            //
+            // Over RAW lines, for the same reason the rewrite is (#547 review
+            // B1): reading ids through `parse_archive` would skip every line
+            // this build cannot interpret, so a `v: 2` record written before a
+            // rollback would carry an id the seed never saw — which is this
+            // hazard again, arriving through the compatibility mechanism meant
+            // to prevent it.
+            let archive_text =
+                fs::read_to_string(self.queue_archive_path(group)).unwrap_or_default();
+            let archive_lines = queue::scan_archive(&archive_text);
+            let archived_high = archive_lines.iter().filter_map(|l| l.id).max().unwrap_or(0);
+            // A line whose id cannot be read even as raw JSON is the one case
+            // the seed genuinely cannot account for — there is no number to
+            // account. Said out loud rather than left as a silent shortfall,
+            // because the consequence (a re-minted id) is itself silent.
+            let opaque = archive_lines.iter().filter(|l| l.id.is_none()).count();
+            if opaque > 0 {
+                self.audit(group, "loomux", "queue-archive-id-unreadable", json!({ "lines": opaque }));
+            }
             let high = entries.iter().map(|e| e.delivery.id).max().unwrap_or(0).max(archived_high);
             let _ = self.queue_seq.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
                 (cur < high).then_some(high)
