@@ -1434,13 +1434,6 @@ pub fn drive(
     gate: &GateSpec,
     verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
 ) -> DriveReport {
-    // RED WITNESS (temporary, reverted by the next commit): the driver decides
-    // nothing, which is the #698 state — every seam below still exists and is
-    // still green, and the queue still never moves.
-    #[allow(unreachable_code)]
-    if true {
-        return DriveReport::default();
-    }
     let mut rep = DriveReport::default();
     match state.batch.clone() {
         Some(batch) => advance_in_flight(r, state, cfg, gate, verdicts, batch, &mut rep),
@@ -1475,6 +1468,11 @@ fn advance_in_flight(
         let mut moves = Vec::new();
         for pr in &batch.prs {
             requeue(state, &mut moves, *pr);
+            // Cleared even for the member that could not move — a cancelled
+            // entry still pointing at a batch that no longer exists is a record
+            // saying something untrue, and `requeue` deliberately leaves an
+            // entry it did not move alone.
+            set_batch_tag(state, *pr, None);
         }
         teardown(r, cfg.group, &batch, rep);
         state.batch = None;
