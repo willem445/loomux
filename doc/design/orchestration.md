@@ -3259,10 +3259,13 @@ the old behaviour, never to "defer nothing, ever".
 
 #### Observability
 
-`compact-reinjection-confirmed` gains `source`: `"delivery"` (our submit sampler saw it) vs
+The terminal resolution carries `source`: `"delivery"` (our submit sampler saw it) vs
 `"activity"` (the agent answered). Two different facts — a timeline conflating them cannot show
 whether this fix is working in the field, which is the same provenance distinction `to_hook_armed`
-already draws. New `compact-reinjection-deferred-busy`, because "no retry fired" must read as a
+already draws. (#546 later split these onto two *actions* —
+`compact-reinjection-confirmed` and `compact-reinjection-liveness-only` — because a shared
+action name meant the field was the only thing carrying the difference; see "#546: the claim
+and the evidence" below.) New `compact-reinjection-deferred-busy`, because "no retry fired" must read as a
 deliberate choice rather than a silently dropped one (`to_hook_native_skip`'s reason). Latched per
 attempt via `AgentEntry.compact_reinject_busy_deferred` — the poll runs every 10s while an arm is
 open, so an unlatched audit would write ~30 identical lines per deferral.
@@ -8807,6 +8810,108 @@ state and flushes stranded text if any is really there — with the `notice-supp
 naming every swallowed id meanwhile. Re-alarming at resume would need its own decision (re-observe
 the pane, never replay the old reading), which is a follow-up, not a one-liner.
 
+### #546: the claim and the evidence
+
+The badge half of this landed first (below); the vocabulary and the durable record followed.
+Read them as one decision — the finding is a single one, applied to every surface that speaks
+about a finished re-grounding.
+
+#### The rule
+
+**A surface reporting a resolved re-grounding names what was proven, never what was hoped.**
+Loomux resolves the phase on `confirmed_delivery || acked`, and those two are evidence about
+different things:
+
+| | what it is | what it proves | what it does not |
+| --- | --- | --- | --- |
+| `ReinjectAck::Delivered` | our submit sampler watched the Enter land | the notice reached the input box and was submitted — evidence about **our paste** | that the agent read it |
+| `ReinjectAck::LivenessOnly` | the agent's own `tools/call` after the settling floor | the agent is alive and executing — evidence about **the agent** | that the paste arrived *or* that it was read |
+
+Neither proves the read. #546 weighed the three ways it could be proven and every one is
+declined by a standing constraint of this project: an acknowledgment marker makes re-grounding
+a two-party protocol every agent CLI has to cooperate with, and correlating the activity stamp
+against the paste content is exactly the heuristic inference #112 removed. So the honest close
+is the one an audit record can actually support — say what was observed.
+
+#### `ReinjectAck` — one place the vocabulary lives
+
+The distinction has to be stated in four surfaces: the durable audit record, the badge's
+label, that badge's tooltip, and the `AgentEntry` field the badge reads. Each previously
+re-derived it from the bare `&'static str` `"delivery"`/`"activity"`, which is precisely how an
+`acked`/`confirmed` claim survived in three of them at once while the string underneath was
+accurate the whole time. `ReinjectAck` owns `wire()`, `audit_action()`, `proves()` and
+`does_not_prove()`; every surface derives from it.
+
+**The wire values did not change.** `"delivery"` / `"activity"` name the evidence *source*, and
+that was always true. What was wrong was the **claim wrapped around them**. Keeping them keeps
+#588's badge contract, an operator's saved audit query, and #535's own `source` field intact
+while the claims move — the smallest change that fixes what was actually broken.
+
+#### Two audit actions, not one action with a field
+
+`compact-reinjection-confirmed` covered both arms. On the `LivenessOnly` arm nothing confirmed
+anything, so anyone counting confirmations in `audit.jsonl` — the surface that outlives the
+badge, the session and the pane — counted liveness closes among them. That is #546's finding
+expressed in the most durable place it appears, and the badge fix could not reach it.
+
+So `LivenessOnly` writes **`compact-reinjection-liveness-only`**. Two actions rather than one
+plus a field, for the same reason #539 gave `delivery-unconfirmed-agent-active` its own name
+instead of making it a second flavour of `delivery-unconfirmed-idle-pane`: "we watched our
+Enter land" and "the agent is alive" are different *observations*, and an action name is what a
+reader greps, counts and alerts on. Both payloads carry `proves` and `does_not_prove` in words,
+so the record is self-describing rather than assuming the reader knows which `source` is the
+weak one.
+
+**This is a change to a queryable contract**, and it is stated as one. A consumer counting
+`compact-reinjection-confirmed` will now see fewer of them — which is the fix, not a
+regression: the ones that disappeared were never confirmations. Nothing in-tree consumes these
+action names outside the tests (the frontend audit viewer renders actions generically), so the
+break is scoped to external queries, and the two names together reconstruct the old count
+exactly.
+
+#### `Acked` → `Resolved`, on the wire as well as the label
+
+`CompactionStatus::Acked` serialized as `{"status":"acked"}` and rendered as `re-grounding
+acked (activity)`. **`acked` is the word #546 is titled after**: on that arm the agent
+acknowledged nothing — it called a loomux tool for reasons of its own and loomux stopped
+retrying. #588 put the source in the label but left `acked` as the head noun, which is the
+overclaim with a qualifier attached rather than the overclaim removed. The variant is now
+`Resolved { evidence, since_ms }` — named for what happened, the natural counterpart to
+`Abandoned` — and the two labels are `re-grounding delivered` and `re-grounding unproven (agent
+alive)`. Neither contains "ack", and `compactionstatus.test.ts` asserts that of both.
+
+Both tooltips now carry a residual. The `Delivered` one is the easy one to forget: reaching the
+box is not being read, and a tooltip that stopped at "the paste reached the box" invites the
+reader to supply the rest.
+
+#### What this still does not do
+
+It does not make an activity-sourced resolution stronger, and the uncovered case #546 named
+stays uncovered — a genuinely lost paste on an agent busy for another reason still ends the
+retry loop, and the agent still carries on without the contract. What changed is that every
+surface now says so. The delivery layer's role-agnostic Tier-1 box-structure re-submit remains
+the real net underneath.
+
+One under-report is deliberate and worth naming: a tick where `acked` fires resolves
+immediately (#535's whole point — a landed re-grounding is never re-sent), so a delivery
+confirmation that would have arrived seconds later is never observed and the record says
+`activity`. That errs toward the weaker claim, which is the only direction an honest record can
+err: the value names what loomux had in hand at the moment it stopped retrying.
+
+#### Coverage
+
+`every_reinject_ack_states_what_it_proves_and_what_it_does_not` pins the vocabulary itself
+(both action names, both wire values, both residuals, and that the stronger evidence wins in
+`from_evidence`). `a_re_grounding_closed_on_liveness_is_never_audited_as_confirmed` is the
+behavioural red: it drives the real tick with **no** `DeliveryConfirmation` anywhere and asserts
+zero `-confirmed` lines. Its negative pair lives inside
+`compact_nudge_tick_retries_an_unconfirmed_reinjection_then_resolves_on_the_delivery` — a real
+delivery confirmation keeps `-confirmed` and writes no liveness line, so "rename every
+resolution" cannot pass. (Its host is
+`compact_nudge_tick_retries_a_reinjection_whose_delivery_never_confirms_then_delivers_exactly_once`
+— the one existing test that drives a real `DeliveryConfirmation` through to a resolution.) The two sessionstart-path assertions were extended to name *both*
+actions, since asserting only `-confirmed == 0` would have started passing by omission.
+
 ### #546 option 3: the badge states which evidence closed the phase
 
 `acked` resolves a re-grounding on one of two signals that are not equally strong. `"delivery"` is
@@ -8821,13 +8926,18 @@ the badge is the only surface that reaches a human at all.
 correlating the stamp against the paste content) are decisions this project has repeatedly
 declined — a two-party protocol every CLI must cooperate with, and exactly the kind of heuristic
 inference #112 removed. Option 3 is what an honest system does when it cannot prove the thing it
-wants to prove: make the residual **legible**. `AgentEntry.compact_last_ack_source` /
-`_ms` keep the provenance the `compact-reinjection-confirmed` audit already recorded, and
-`compaction_status` surfaces it as `CompactionStatus::Acked { source, since_ms }` for the same
-recency window `Abandoned` uses. `compactionstatus.ts` renders `re-grounding acked (activity)` vs
-`re-grounding acked (delivery)` — the evidence source is in the *label*, not only the tooltip, the
-same shape `armedQualifier`'s `(hook-confirmed)` established in #417 — and the activity tooltip
-says outright what the signal does not prove.
+wants to prove: make the residual **legible**. `AgentEntry.compact_last_ack` / `_ms` keep the
+provenance the resolution's audit line already recorded, and
+`compaction_status` surfaces it as `CompactionStatus::Resolved { evidence, since_ms }` for the same
+recency window `Abandoned` uses. `compactionstatus.ts` renders the two evidence classes as
+distinct labels — the evidence is in the *label*, not only the tooltip, the
+same shape `armedQualifier`'s `(hook-confirmed)` established in #417 — and each tooltip
+says outright what its signal does not prove.
+
+(As shipped, this section's variant was `Acked { source: &'static str }` and the labels were
+`re-grounding acked (delivery|activity)`. The section above replaced both: `acked` is the word
+#546 is titled after, and it was still the head noun. The argument here is unchanged; only the
+names it lands on are.)
 
 Both are recent terminal outcomes, and an agent that has compacted more than once can carry a
 stamp for each, so the **more recent wins** rather than a fixed ranking: a fixed one would either

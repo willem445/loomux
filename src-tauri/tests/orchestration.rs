@@ -56,7 +56,7 @@ use loomux_lib::orchestration::{
     GridEvidence, QuestionMatch, QuestionNeedle, QuestionSample, QuestionWitness, QuestionWitnessed,
     resume_kickoff_notice, rotate_audit_if_needed,
     ContractCarrier, ReinjectShape,
-    agent_acted_since, reinject_disposition, ReinjectDisposition,
+    agent_acted_since, reinject_disposition, ReinjectAck, ReinjectDisposition,
     retry_gate, sanitize_attachment_ext, set_rotate_check_pause_for_test, should_confirm_copilot_autopilot,
     should_flush_before_paste, should_flush_before_paste_now, flush_stranded_text,
     write_admission, WriteAdmission, preenter_admission, hold_bound_elapsed,
@@ -12844,6 +12844,10 @@ fn compact_nudge_tick_sessionstart_evidence_after_a_reinject_was_already_decided
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection-skipped-native"), 0);
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 1, "no retry");
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection-confirmed"), 0, "no stale double-confirm");
+    // #546 split the terminal resolution across two actions; asserting only
+    // the `-confirmed` one would now pass by omission if a resolution had
+    // been written under the other name.
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-liveness-only"), 0, "nor under the liveness action");
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection-abandoned"), 0);
 
     // A late-arriving confirmation for the ORIGINAL (now-cleared) attempt
@@ -12851,6 +12855,7 @@ fn compact_nudge_tick_sessionstart_evidence_after_a_reinject_was_already_decided
     let late_confirm = confirmed_delivery(&oid, 1_000);
     assert!(reg.compact_nudge_tick(122_000, &empty, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &late_confirm).is_empty());
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection-confirmed"), 0, "nothing left to confirm");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-liveness-only"), 0, "and nothing to close on liveness either");
 
     // Ticking well past ARM_PENDING_TIMEOUT_MS must never falsely abandon a
     // compaction that already resolved via native evidence.
@@ -14758,41 +14763,90 @@ fn compaction_status_narrates_every_real_state_machine_phase() {
 
 #[test]
 fn a_resolved_re_grounding_surfaces_which_evidence_closed_it() {
-    // #546 (option 3). `acked` resolves on one of two signals that are NOT
-    // equally strong: "delivery" is loomux watching its own Enter land;
-    // "activity" is only the agent's own process reaching loomux afterwards,
-    // which proves it is alive and executing — never that it READ the
-    // re-grounding. The uncovered case #546 names is a genuinely lost paste on
-    // an agent that is busy for some other reason: it resolves as confirmed
-    // with `source="activity"`, the agent carries on without the contract, and
-    // nothing says so. Before this, the distinction existed only inside an
-    // audit line, so the panel a human actually watches could not show it.
+    // #546. The phase resolves on one of two signals that are NOT equally
+    // strong: `Delivered` is loomux watching its own Enter land; `LivenessOnly`
+    // is the agent's own process reaching loomux afterwards, which proves it is
+    // alive and executing — never that it READ the re-grounding, and not even
+    // that our paste arrived. The uncovered case #546 names is a genuinely lost
+    // paste on an agent that is busy for some other reason: it resolves this
+    // way, the agent carries on without the contract, and nothing says so.
+    // Before #588 the distinction existed only inside an audit line, so the
+    // panel a human actually watches could not show it.
     assert_eq!(
-        compaction_status(false, false, false, None, 0, None, None, 1_000, None, Some("activity"), Some(600)),
-        CompactionStatus::Acked { source: "activity", since_ms: 600 },
-        "a recently-acked re-grounding is a real state, carrying the evidence that closed it"
+        compaction_status(false, false, false, None, 0, None, None, 1_000, None, Some(ReinjectAck::LivenessOnly), Some(600)),
+        CompactionStatus::Resolved { evidence: ReinjectAck::LivenessOnly, since_ms: 600 },
+        "a recently-resolved re-grounding is a real state, carrying the evidence that closed it"
     );
     assert_eq!(
-        compaction_status(false, false, false, None, 0, None, None, 1_000, None, Some("delivery"), Some(600)),
-        CompactionStatus::Acked { source: "delivery", since_ms: 600 },
-        "the stronger source must be distinguishable from the weaker one"
+        compaction_status(false, false, false, None, 0, None, None, 1_000, None, Some(ReinjectAck::Delivered), Some(600)),
+        CompactionStatus::Resolved { evidence: ReinjectAck::Delivered, since_ms: 600 },
+        "the stronger evidence must be distinguishable from the weaker one"
     );
     // Same recency rule as `Abandoned` — an old resolution is not today's news.
     assert_eq!(
         compaction_status(
             false, false, false, None, 0, None, None, 600 + 10 * 60 * 1000, None,
-            Some("activity"), Some(600),
+            Some(ReinjectAck::LivenessOnly), Some(600),
         ),
         CompactionStatus::None,
-        "an ack outside the recency window reads as none, not as a lingering claim"
+        "a resolution outside the recency window reads as none, not as a lingering claim"
     );
     // A live arm still outranks both: a NEW compaction in progress is what the
     // panel must show, not the outcome of the last one.
     assert_eq!(
-        compaction_status(true, true, false, None, 0, None, None, 1_000, None, Some("activity"), Some(600)),
+        compaction_status(true, true, false, None, 0, None, None, 1_000, None, Some(ReinjectAck::LivenessOnly), Some(600)),
         CompactionStatus::Armed { trusted: true, source: None },
         "a fresh arm is not hidden behind the previous cycle's resolution"
     );
+}
+
+#[test]
+fn every_reinject_ack_states_what_it_proves_and_what_it_does_not() {
+    // #546's honest-labeling contract, pinned at the one place the vocabulary
+    // lives. The finding was that a claim ("confirmed", "acked") outran the
+    // evidence behind it in three surfaces at once, each having re-derived the
+    // wording for itself. This is the guard against the fourth.
+
+    // The action name IS the claim, and the two must not share one.
+    assert_eq!(ReinjectAck::Delivered.audit_action(), "compact-reinjection-confirmed");
+    assert_eq!(ReinjectAck::LivenessOnly.audit_action(), "compact-reinjection-liveness-only");
+    assert_ne!(
+        ReinjectAck::Delivered.audit_action(),
+        ReinjectAck::LivenessOnly.audit_action(),
+        "one action covering both means anyone counting confirmations in audit.jsonl counts \
+         liveness closes among them — #546's finding in the surface that outlives the badge"
+    );
+    assert!(
+        !ReinjectAck::LivenessOnly.audit_action().contains("confirmed"),
+        "a liveness close confirmed nothing; the action name must not say it did"
+    );
+
+    // The wire values are UNCHANGED from #535/#588 — they name the evidence
+    // source, which was always accurate. Only the claims around them moved.
+    // Pinned so a future rename here doesn't silently break the badge's
+    // `evidence` union or an operator's saved audit query.
+    assert_eq!(ReinjectAck::Delivered.wire(), "delivery");
+    assert_eq!(ReinjectAck::LivenessOnly.wire(), "activity");
+
+    // Both arms owe a residual. The stronger one's is the easy one to forget:
+    // watching our own Enter land proves the text reached the box, and nothing
+    // loomux can observe proves the agent then read it.
+    for ack in [ReinjectAck::Delivered, ReinjectAck::LivenessOnly] {
+        assert!(!ack.proves().is_empty());
+        assert!(
+            ack.does_not_prove().contains("read"),
+            "neither signal proves the re-grounding was read, and the record must say so: {ack:?}"
+        );
+    }
+    assert!(
+        ReinjectAck::LivenessOnly.does_not_prove().contains("delivered"),
+        "liveness says nothing about our paste either — the larger residual #546 filed"
+    );
+
+    // The stronger evidence wins when both are in hand: a resolve that HAD a
+    // delivery confirmation must never be recorded as the weaker close.
+    assert_eq!(ReinjectAck::from_evidence(true), ReinjectAck::Delivered);
+    assert_eq!(ReinjectAck::from_evidence(false), ReinjectAck::LivenessOnly);
 }
 
 #[test]
@@ -14805,19 +14859,19 @@ fn a_fresh_loss_is_never_hidden_behind_an_older_resolution() {
     let lost = |lost_ms, ack_ms| {
         compaction_status(
             false, false, false, None, 0, Some("reinjection-abandoned"), Some(lost_ms),
-            10_000, None, Some("activity"), Some(ack_ms),
+            10_000, None, Some(ReinjectAck::LivenessOnly), Some(ack_ms),
         )
     };
     assert_eq!(
         lost(9_000, 5_000),
         CompactionStatus::Abandoned { reason: "reinjection-abandoned".to_string(), since_ms: 9_000 },
-        "a loss AFTER the last ack is the current state — surfacing the stale ack would be a \
-         claim the state machine has already withdrawn"
+        "a loss AFTER the last resolution is the current state — surfacing the stale one would \
+         be a claim the state machine has already withdrawn"
     );
     assert_eq!(
         lost(5_000, 9_000),
-        CompactionStatus::Acked { source: "activity", since_ms: 9_000 },
-        "and an ack after an older loss is equally the current state"
+        CompactionStatus::Resolved { evidence: ReinjectAck::LivenessOnly, since_ms: 9_000 },
+        "and a resolution after an older loss is equally the current state"
     );
     // Ties go to the loss: it is the louder of the two and the only one that
     // asks a human for anything.
@@ -15684,7 +15738,18 @@ fn compact_nudge_tick_retries_a_reinjection_whose_delivery_never_confirms_then_d
     let _ = reg.compact_nudge_tick(retry_time + 1_000, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &confirmed);
     assert!(!reg.agent(&oid).unwrap().compact_pending, "confirmed — resolved");
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection"), 2, "exactly one retry, no runaway re-firing");
-    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-confirmed"), 1);
+    // #546: this is the arm that genuinely DID confirm — our submit sampler
+    // watched the Enter land — so it keeps the `-confirmed` action. The
+    // negative half matters as much as the positive: without it, "rename every
+    // resolution to `-liveness-only`" would pass the honest-labeling tests and
+    // destroy the distinction they exist to draw.
+    let confirmed = audit_entries(&reg, &gid, "compact-reinjection-confirmed");
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0]["detail"]["source"], "delivery");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-liveness-only"), 0,
+        "a delivery-confirmed resolution must never be downgraded to a liveness close");
+    assert_eq!(reg.agent(&oid).unwrap().compact_last_ack, Some(ReinjectAck::Delivered),
+        "and the badge must be able to show the stronger evidence as the stronger evidence");
 }
 
 #[test]
@@ -15810,17 +15875,20 @@ fn a_landed_re_grounding_is_never_re_sent_once_the_agent_itself_answers() {
     assert!(a.compact_last_lost_reason.is_none(), "nothing was lost");
     // Provenance: "the agent answered us" and "our submit sampler saw the
     // Enter" are different facts, and a timeline that conflated them could not
-    // show whether this fix is working in the field.
-    let confirmed = audit_entries(&reg, &gid, "compact-reinjection-confirmed");
-    assert_eq!(confirmed.len(), 1);
-    assert_eq!(confirmed[0]["detail"]["source"], "activity",
+    // show whether this fix is working in the field. #546: the ACTION NAME
+    // carries that difference — see `a_re_grounding_closed_on_liveness_is_
+    // never_audited_as_confirmed` for why the record cannot use `-confirmed`
+    // here.
+    let liveness = audit_entries(&reg, &gid, "compact-reinjection-liveness-only");
+    assert_eq!(liveness.len(), 1);
+    assert_eq!(liveness[0]["detail"]["source"], "activity",
         "resolved by the agent's own activity, not by a delivery confirmation");
-    // #546 (option 3): the same provenance is kept on the ENTRY, not only in
-    // the audit line, because the audit log is not what a human watching a
-    // pane reads. Pinned at the resolve site rather than only against
-    // `compaction_status`: a test that stops at the pure derivation would stay
-    // green if this wiring were never written at all.
-    assert_eq!(a.compact_last_ack_source, Some("activity"),
+    // #546: the same provenance is kept on the ENTRY, not only in the audit
+    // line, because the audit log is not what a human watching a pane reads.
+    // Pinned at the resolve site rather than only against `compaction_status`:
+    // a test that stops at the pure derivation would stay green if this wiring
+    // were never written at all.
+    assert_eq!(a.compact_last_ack, Some(ReinjectAck::LivenessOnly),
         "the panel must be able to say this phase closed on liveness, not on a proven read");
     assert!(a.compact_last_ack_ms.is_some(), "and when, so the surfacing can age out");
 }
@@ -15879,6 +15947,8 @@ fn an_in_flight_tool_call_from_the_previous_turn_is_not_an_acknowledgment() {
         "a call that was in flight before the Enter was pressed is not a response to it — retry");
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection-confirmed"), 0,
         "and it must never be recorded as a landing");
+    assert_eq!(audit_count(&reg, &gid, "compact-reinjection-liveness-only"), 0,
+        "nor as a liveness close — nothing resolved at all here");
 
     // The boundary itself, on the retry that just fired: one millisecond short
     // of the floor still does not count…
@@ -15894,9 +15964,9 @@ fn an_in_flight_tool_call_from_the_previous_turn_is_not_an_acknowledgment() {
     let _ = reg.compact_nudge_tick(retried2 + REINJECT_TIMEOUT_MS, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
     assert!(!reg.agent(&oid).unwrap().compact_pending, "at the floor, an ack resolves — the floor delays the signal, it does not remove it");
     assert_eq!(audit_count(&reg, &gid, "compact-reinjection-abandoned"), 0);
-    let confirmed = audit_entries(&reg, &gid, "compact-reinjection-confirmed");
-    assert_eq!(confirmed.len(), 1);
-    assert_eq!(confirmed[0]["detail"]["source"], "activity");
+    let liveness = audit_entries(&reg, &gid, "compact-reinjection-liveness-only");
+    assert_eq!(liveness.len(), 1);
+    assert_eq!(liveness[0]["detail"]["source"], "activity");
 }
 
 #[test]

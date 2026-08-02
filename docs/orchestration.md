@@ -787,11 +787,30 @@ file, one entry per line, that a human can open directly.
 context-window usage (tokens + percent) next to its uptime and cost, and — only when there's
 something worth a glance — its compact-nudge phase: armed (waiting to observe the pane go
 busy), awaiting evidence (busy observed, waiting on quiet to resolve), re-grounding (a
-reinjection is in flight, with its attempt count), or a recent lost outcome (an arm or
-delivery that didn't resolve in time and was released rather than left stuck). An idle agent
+reinjection is in flight, with its attempt count), a recently finished re-grounding (see
+below), or a recent lost outcome (an arm or delivery that didn't resolve in time and was
+released rather than left stuck). An idle agent
 with nothing pending shows neither line. The percent is against the model's actual context
 window, so a larger tier (Opus) reads correctly — a group can override the guess explicitly
 if it's ever wrong for a given deployment.
+
+**A finished re-grounding tells you how strong the evidence behind it was.** Loomux stops
+retrying a re-grounding on one of two signals, and they are not the same strength, so the
+panel says which one it got rather than reporting both as success:
+
+- **`re-grounding delivered`** — loomux's own submit sampler watched the notice's Enter land.
+  The text reached the pane's input box and was submitted.
+- **`re-grounding unproven (agent alive)`** — no delivery confirmation ever arrived, but the
+  agent called a loomux tool afterwards. That proves the agent is alive and working; it
+  proves nothing about the notice. A re-grounding that was genuinely lost, on a pane that
+  happened to be busy for its own reasons, finishes exactly this way.
+
+Neither one proves the agent *read* the re-grounding — nothing loomux can observe from
+outside an agent's session does, so it doesn't claim to. The audit log draws the same
+distinction, under two separate actions (`compact-reinjection-confirmed` and
+`compact-reinjection-liveness-only`), so counting one of them doesn't quietly include the
+other. The safety net underneath both is unchanged: a re-grounding that neither confirms nor
+draws any sign of life gets bounded retries and then a visible lost-outcome record.
 
 ## Persistence & restart
 

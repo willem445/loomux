@@ -35,14 +35,17 @@ export function compactionStatusLabel(status: CompactionStatus): string | null {
       return `re-grounding (attempt ${status.attempt}/${status.max_attempts})`;
     case "abandoned":
       return `compact ${lostReasonLabel(status.reason)}`;
-    case "acked":
-      // #546 (option 3): the evidence source is IN the label, not only in the
-      // tooltip. "acked (delivery)" and "acked (activity)" are different
-      // strengths of claim — the second proves the agent is alive, not that it
-      // read the re-grounding — and a reader skimming the panel must be able to
-      // tell them apart without hovering. Same shape as `armedQualifier`'s
-      // "(hook-confirmed)" (#417).
-      return `re-grounding acked (${status.source})`;
+    case "resolved":
+      // #546: the label states WHAT WAS PROVEN, not the phase's outcome
+      // qualified by a source. "re-grounding acked (activity)" led with a word
+      // — acked — that names an acknowledgment the agent never made: it called
+      // a loomux tool for reasons of its own and loomux stopped retrying. The
+      // evidence source is still in the label, not only the tooltip (the
+      // `armedQualifier` "(hook-confirmed)" shape from #417), but the head
+      // noun no longer claims more than the evidence supports.
+      return status.evidence === "delivery"
+        ? "re-grounding delivered"
+        : "re-grounding unproven (agent alive)";
   }
 }
 
@@ -70,14 +73,16 @@ export function compactionStatusTitle(status: CompactionStatus): string | null {
       return "a reinjection was decided and is waiting on its delivery to confirm, or its next bounded retry";
     case "abandoned":
       return lostReasonTitle(status.reason);
-    case "acked":
-      // #546: the tooltip states the residual the label can only hint at. The
-      // "activity" wording deliberately says what the signal does NOT prove —
-      // an honest system that cannot demonstrate the thing it wants to
-      // demonstrate says so rather than letting the reader assume it did.
-      return status.source === "delivery"
-        ? "loomux's own submit sampler watched the re-grounding's Enter land — the paste reached the box"
-        : "the agent called a loomux tool after the re-grounding was sent — that proves it is alive and executing, NOT that it read the re-grounding";
+    case "resolved":
+      // #546: the tooltip states the residual the label can only hint at, and
+      // BOTH arms carry one — an honest system that cannot demonstrate the
+      // thing it wants to demonstrate says so rather than letting the reader
+      // assume it did. Note the delivery arm's residual too: watching our own
+      // Enter land proves the text reached the box, and no artifact loomux can
+      // observe proves the agent then read it.
+      return status.evidence === "delivery"
+        ? "loomux's own submit sampler watched the re-grounding's Enter land — the paste reached the box; nothing loomux can observe proves the agent read it"
+        : "the agent called a loomux tool after the re-grounding was sent — that proves it is alive and executing, NOT that it read the re-grounding, and not even that the paste arrived. A genuinely lost re-grounding on a pane that was busy anyway closes exactly this way";
   }
 }
 

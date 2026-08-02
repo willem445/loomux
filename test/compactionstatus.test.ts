@@ -99,34 +99,59 @@ test("compactionStatusLabel: abandoned names the three real lost-outcome reasons
   );
 });
 
-// #546 (option 3): `acked` closes the re-grounding phase on one of two
-// evidence sources that are NOT equally strong — "delivery" is loomux watching
-// its own Enter land, "activity" is only proof the agent is alive. What this
+// #546: the re-grounding phase resolves on one of two evidence classes that
+// are NOT equally strong — "delivery" is loomux watching its own Enter land
+// (evidence about our paste), "activity" is only proof the agent is alive
+// (evidence about the agent, and nothing at all about the paste). What this
 // test defends is that a reader can tell which one they got from the label
-// alone, and that the weaker one's tooltip says outright what it does not
-// prove. A label that read "re-grounding acked" for both would be the exact
-// silent-conflation #546 filed.
-test("compactionStatusLabel: acked names its evidence source, not just the outcome", () => {
+// alone, and — the part #588 left standing — that neither label leads with a
+// word claiming an acknowledgment nobody made.
+test("compactionStatusLabel: a resolved re-grounding claims only what its evidence proved", () => {
   assert.equal(
-    compactionStatusLabel({ status: "acked", source: "delivery", since_ms: 0 }),
-    "re-grounding acked (delivery)"
+    compactionStatusLabel({ status: "resolved", evidence: "delivery", since_ms: 0 }),
+    "re-grounding delivered"
   );
   assert.equal(
-    compactionStatusLabel({ status: "acked", source: "activity", since_ms: 0 }),
-    "re-grounding acked (activity)"
+    compactionStatusLabel({ status: "resolved", evidence: "activity", since_ms: 0 }),
+    "re-grounding unproven (agent alive)"
   );
-  // The two must not render identically — that is the whole finding.
+  // The two must not render identically — a label covering both would be the
+  // silent conflation #546 filed.
   assert.notEqual(
-    compactionStatusLabel({ status: "acked", source: "delivery", since_ms: 0 }),
-    compactionStatusLabel({ status: "acked", source: "activity", since_ms: 0 })
+    compactionStatusLabel({ status: "resolved", evidence: "delivery", since_ms: 0 }),
+    compactionStatusLabel({ status: "resolved", evidence: "activity", since_ms: 0 })
   );
 });
 
-test("compactionStatusTitle: an activity-sourced ack says what it does NOT prove", () => {
-  const activity = compactionStatusTitle({ status: "acked", source: "activity", since_ms: 0 });
+// The regression #546 is named after: "acked" asserts the agent acknowledged
+// something. On the activity arm it never did — it called a loomux tool for
+// reasons of its own and loomux stopped retrying. The word must not come back
+// on EITHER arm, including via a source qualifier that leaves it as the head
+// noun ("re-grounding acked (activity)", which is what shipped in #588).
+test("compactionStatusLabel: no resolved label asserts an acknowledgment", () => {
+  for (const evidence of ["delivery", "activity"] as const) {
+    const label = compactionStatusLabel({ status: "resolved", evidence, since_ms: 0 });
+    assert.ok(
+      label && !/ack/i.test(label),
+      `"${label}" claims an acknowledgment; only the agent can make one and neither signal is one`
+    );
+  }
+});
+
+test("compactionStatusTitle: both resolved tooltips say what their evidence does NOT prove", () => {
+  const activity = compactionStatusTitle({ status: "resolved", evidence: "activity", since_ms: 0 });
   assert.ok(activity?.includes("NOT that it read"), `must name the residual, got: ${activity}`);
-  const delivery = compactionStatusTitle({ status: "acked", source: "delivery", since_ms: 0 });
+  assert.ok(
+    activity?.includes("not even that the paste arrived"),
+    `liveness proves nothing about our paste, and the tooltip must say so, got: ${activity}`
+  );
+  const delivery = compactionStatusTitle({ status: "resolved", evidence: "delivery", since_ms: 0 });
   assert.ok(delivery?.includes("submit sampler"), `must name the mechanism, got: ${delivery}`);
+  // The stronger arm has a residual too: reaching the box is not being read.
+  assert.ok(
+    delivery?.includes("proves the agent read it"),
+    `even the strong arm must not imply a proven read, got: ${delivery}`
+  );
   assert.notEqual(activity, delivery, "two different claims must not share one tooltip");
 });
 
@@ -142,8 +167,8 @@ test("compactionStatusTitle: every non-none status has an explanatory tooltip", 
     { status: "abandoned", reason: "arm-timeout", since_ms: 0 },
     { status: "abandoned", reason: "arm-timeout-with-evidence", since_ms: 0 },
     { status: "abandoned", reason: "reinjection-abandoned", since_ms: 0 },
-    { status: "acked", source: "delivery", since_ms: 0 },
-    { status: "acked", source: "activity", since_ms: 0 },
+    { status: "resolved", evidence: "delivery", since_ms: 0 },
+    { status: "resolved", evidence: "activity", since_ms: 0 },
   ];
   for (const s of statuses) {
     const title = compactionStatusTitle(s);

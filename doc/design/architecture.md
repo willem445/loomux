@@ -44,11 +44,14 @@ src-tauri/src/
     a re-grounding that had already landed, interrupting a working agent. A retry is also never
     spent into a live turn (deferred while output is flowing, bounded so a permanently noisy pane
     can't suppress it); the 3-attempt bound and the visible give-up for a genuinely lost
-    re-grounding are unchanged. The lifecycle panel now says WHICH evidence closed the phase —
-    `re-grounding acked (delivery)` when loomux's own sampler saw the Enter land, `re-grounding
-    acked (activity)` when the agent's own next MCP call is all there is (#546): the second
-    proves the agent is alive and working, never that it read the re-grounding, and a reader
-    who cannot tell those apart cannot notice the difference. The same activity signal now also
+    re-grounding are unchanged. Every surface that reports a finished re-grounding says WHICH
+    evidence closed it and claims only what that evidence proved (#546) — `ReinjectAck` owns the
+    vocabulary once, and the badge (`re-grounding delivered` vs `re-grounding unproven (agent
+    alive)`) and the audit (`compact-reinjection-confirmed` vs
+    `compact-reinjection-liveness-only`) both derive from it. The liveness arm proves the agent
+    is alive and working, never that it read the re-grounding and not even that the paste
+    arrived; neither arm proves the read, because nothing loomux can observe from outside a
+    session does. The same activity signal now also
     feeds the unconfirmed-delivery detector (#539): a pane whose box no longer holds our paste
     AND whose agent has called a loomux tool since is recorded as busy rather than announced as
     stranded, and the alarms that remain coalesce per pane into one notice naming every
