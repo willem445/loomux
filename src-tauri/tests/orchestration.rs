@@ -13,8 +13,8 @@ use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
 // #656 (rev-lead findings 1 and 2): the bounded child wait, and the
 // process-wide ceiling on readers abandoned by a timed-out capture.
 use loomux_lib::orchestration::{
-    gh_capture_admitted, gh_capture_live_readers, gh_capture_parked_readers, seed_leaked_readers_for_test,
-    wait_bounded, GH_CAPTURE_MAX_LEAKED_READERS,
+    drain_parked_readers_for_test, gh_capture_admitted, gh_capture_live_readers, gh_capture_parked_readers,
+    seed_leaked_readers_for_test, wait_bounded, GH_CAPTURE_MAX_LEAKED_READERS,
 };
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
@@ -31101,18 +31101,26 @@ fn a_timeout_that_cannot_close_its_pipes_parks_its_readers_in_the_backlog() {
 /// demand; every other step (spawn, readers, kill, reap, accounting) is the
 /// same code the production entry point runs.
 ///
-/// Counts the backlog list **unswept**, unlike the timeout test above. That
-/// test can afford the swept count because its child has held the pipes open
-/// for a full second through a grandchild by the time it is killed; here the
-/// forced error arrives at once, the kill closes both pipes within
-/// milliseconds, and a swept count then reads the same whether the handles
-/// were parked or dropped — a race this test lost on two platforms and won on
-/// the third before it was written this way. What is being pinned is the
-/// accounting, not how long the readers happened to survive it.
+/// Counted on the backlog list **unswept**, and from a drained baseline —
+/// unlike the timeout test above, which can afford a swept before/after delta
+/// because its grandchild holds the pipes open across the whole call. Neither
+/// shortcut survives here, and both were tried:
+/// - a *swept* count reads the same whether the handles were parked or
+///   dropped, because the forced error arrives at once and the kill closes
+///   both pipes within milliseconds. That race was green on macos and red on
+///   ubuntu/windows.
+/// - a *delta* against whatever earlier capture tests left parked is measured
+///   against a baseline the call itself moves: its opening sweep drops the
+///   handles that have since ended (CI: before 4, after 4, with both readers
+///   correctly parked).
+///
+/// So: start from zero and assert the exact number. What is being pinned is
+/// the accounting, not how long the readers happened to survive it.
 #[test]
 fn a_wait_error_parks_both_its_readers_where_the_ceiling_can_see_them() {
     let _serial = capture_lock();
-    let before = gh_capture_parked_readers();
+    let _drained = drain_parked_readers_for_test();
+    assert_eq!(gh_capture_parked_readers(), 0, "precondition: the baseline this test measures against is empty");
 
     let err = loomux_lib::orchestration::capture_raw_with_failing_wait_for_test(
         shell_command(&sleep_script(20)),
@@ -31123,7 +31131,7 @@ fn a_wait_error_parks_both_its_readers_where_the_ceiling_can_see_them() {
 
     assert_eq!(
         gh_capture_parked_readers(),
-        before + 2,
+        2,
         "BOTH readers a failed wait abandons must be handed to the ceiling, not dropped where the \
          sweep can never see them — one or none is how a bound comes to understate its own backlog"
     );

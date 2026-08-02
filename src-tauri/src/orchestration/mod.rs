@@ -1721,11 +1721,7 @@ fn capture_raw_inner(
     // the process it exists to bound, and the child stayed alive too (dropping
     // a `Child` does not kill it), which is precisely what keeps those readers
     // blocked forever.
-    let waited = match wait(&mut child, timeout) {
-        Ok(waited) => waited,
-        Err(e) => return Err(abandon_child_and_readers(&mut child, out_reader, err_reader, e)),
-    };
-    let Some(status) = waited else {
+    let Some(status) = wait(&mut child, timeout)? else {
         return Err(abandon_child_and_readers(
             &mut child,
             out_reader,
@@ -1763,6 +1759,24 @@ pub fn gh_capture_live_readers() -> usize {
 #[doc(hidden)] // pub for integration tests
 pub fn gh_capture_parked_readers() -> usize {
     GH_CAPTURE_LEAKED_READERS.lock_safe().len()
+}
+
+/// Empty the backlog and hand back what was parked, so a test can start from a
+/// known-zero baseline (#699).
+///
+/// The list is process-wide and every capture test contributes to it, so "this
+/// call parked exactly two" is not observable as a before/after delta: the
+/// confound is not merely what earlier tests left behind, it is that the next
+/// capture's own opening sweep *removes* the ones that have since ended, moving
+/// the count down underneath the baseline while the two new handles push it up
+/// (measured on CI: before 4, after 4, with both readers correctly parked).
+///
+/// Dropping a `JoinHandle` does not stop its thread — the handles simply stop
+/// being tracked, which is the same residue the ceiling already tolerates for
+/// a reader that ended, and it is confined to a test process.
+#[doc(hidden)] // pub for integration tests
+pub fn drain_parked_readers_for_test() -> Vec<std::thread::JoinHandle<Vec<u8>>> {
+    std::mem::take(&mut *GH_CAPTURE_LEAKED_READERS.lock_safe())
 }
 
 /// Park `n` controllable blocked readers in the backlog, as a real abandoned
