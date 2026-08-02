@@ -1509,7 +1509,12 @@ mod tests {
     #[test]
     fn direct_spawn_selection() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        // Prefix deliberately contains "sh": pins that the shell check below
+        // must key on the binary's file name, not the whole path — a random
+        // tempdir segment containing "sh" is exactly what made this flake
+        // (#183), so the fixture now forces that condition every run instead
+        // of leaving it to chance.
+        let tmp = tempfile::Builder::new().prefix("agentsh_").tempdir().unwrap();
         let exe = tmp.path().join(if cfg!(windows) { "agent.exe" } else { "agent" });
         std::fs::write(&exe, b"x").unwrap();
         let exe_str = exe.to_string_lossy().into_owned();
