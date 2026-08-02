@@ -58,6 +58,18 @@ per-pane writer thread with a queue was the other candidate shape; it buys a
 FIFO guarantee that the frontend chain already provides, and pays for it by
 breaking the two properties below.
 
+What async *does* give up is the accidental mutual exclusion between
+**different** commands that main-thread dispatch provided (the same one #716
+called out for `gh`): two sync commands could never overlap, and now they can.
+The complete list of what that touches, and why none of it is load-bearing:
+
+| pair | before | now | why it is fine |
+| --- | --- | --- | --- |
+| `write_pty` vs `write_pty`, same pane | ordered | ordered | the frontend chain, not the backend, is what orders these — one invoke in flight per pane (#65) |
+| `write_pty` vs `change_dir`, same pane | ordered by arrival | either order | each write is still atomic under the pane's writer lock, so neither can land inside the other; a human is steering the folder picker or typing, not both in one instant |
+| `write_pty` vs `resize_pty` | ordered by arrival | either order | there is no contract between a keystroke and a geometry change, and a resize the pane disagrees with is re-fired by the next fit tick |
+| anything, across panes | ordered | either order | panes share no input state |
+
 ### 2. Bounded memory — back pressure, not a bounded queue
 
 "What happens to the queue when the pipe stays full?" has no good answer. A

@@ -1628,10 +1628,18 @@ pub fn dir_info(path: String) -> DirInfo {
 ///
 /// #719: async for the same reason as `write_pty` — this is the same
 /// `write_all` into the same pipe, and a pane whose child is not draining
-/// wedges it exactly as hard. It is not ordered against the frontend's
-/// keystroke chain, and never was: a folder-picker `cd` and whatever the human
-/// is typing are separate invokes racing for the pane's writer, before this
-/// change as after it. Each write is still atomic against the other.
+/// wedges it exactly as hard.
+///
+/// What that gives up, stated plainly: while both were synchronous they were
+/// ordered against each other by the main thread's own dispatch (the same
+/// accidental mutual exclusion #716 called out), and async they are not — a
+/// `cd` and a keystroke issued within the same instant can now land in either
+/// order. Nothing depends on that order. Each write is still atomic against
+/// the other (the pane's writer lock), so neither can appear inside the other,
+/// and a human is either steering the folder picker or typing into the pane —
+/// not both in the same instant. What must NOT reorder is a pane's own
+/// keystroke stream against itself, and that is `write_pty`'s chain (#65),
+/// which this does not touch.
 #[tauri::command]
 pub async fn change_dir(app: AppHandle, id: u32, path: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
