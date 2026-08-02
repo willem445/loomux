@@ -1467,11 +1467,11 @@ pub fn drive(
     let unusable = if live && !super::mqdriver::landable(state.target.trim()) {
         Some(("target", quote(&state.target)))
     } else {
-        // RED WITNESS (temporary, restored by the next commit): the batch id is
-        // NOT validated, which is finding 1's state — the ref namespace is
-        // closed by `scratch_branch`, and the worktree path and the body file
-        // are not.
-        None
+        state
+            .batch
+            .as_ref()
+            .filter(|b| !valid_id_component(&b.id))
+            .map(|b| ("batch-id", quote(&b.id)))
     };
     if let Some((field, value)) = unusable {
         rep.backoff = true;
@@ -2034,9 +2034,7 @@ fn refresh_and_select(
         // group backs off rather than re-deriving the same stall next wake.
         // Same line `land()` draws with `backoff = culprit.is_none()`.
         let reason = match resolve_and_validate_target_detailed(r, *pr, Some(&target), None) {
-            // RED WITNESS (temporary, restored by the next commit): a runner
-            // failure is treated as this PR's refusal, which is finding 2's
-            // state — the pass carries on and spends one timeout per entry.
+            Err(f) if f.is_runner() => return stall(rep, examined, truncated, *pr, &f),
             Err(f) => Some(f.into_refusal().code().to_string()),
             Ok((_, facts)) => {
                 // Fetched only when the gate declares the clause — the same
@@ -2048,10 +2046,22 @@ fn refresh_and_select(
                 // because this runs once per examined entry inside a shared
                 // poll tick.
                 let ci_green = if super::mqdriver::declares_ci_green(gate) {
-                    // RED WITNESS (temporary, restored by the next commit): the
-                    // second half of finding 2 — a stalled checks lookup reads
-                    // as "could not determine", so the pass keeps going.
-                    super::mqdriver::pr_ci_green_detailed(r, *pr).unwrap_or(None)
+                    match super::mqdriver::pr_ci_green_detailed(r, *pr) {
+                        // Same reasoning as the target lookup, one call later: a
+                        // seam that could not run is the world, and handling it
+                        // here is why the bound holds whichever of the two
+                        // lookups stalls first.
+                        Err(e) => {
+                            return stall(
+                                rep,
+                                examined,
+                                truncated,
+                                *pr,
+                                &super::mqdriver::ResolveFailure::Runner(e),
+                            )
+                        }
+                        Ok(v) => v,
+                    }
                 } else {
                     None
                 };
