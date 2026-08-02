@@ -7,6 +7,15 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::intake;
+// #656: the intake half's per-scan `gh` budget, asserted against the constant
+// itself so the pin follows a future retune instead of pinning today's 4.
+use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
+// #656 (rev-lead findings 1 and 2): the bounded child wait, and the
+// process-wide ceiling on readers abandoned by a timed-out capture.
+use loomux_lib::orchestration::{
+    gh_capture_admitted, gh_capture_live_readers, seed_leaked_readers_for_test, wait_bounded,
+    GH_CAPTURE_MAX_LEAKED_READERS,
+};
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
@@ -30782,6 +30791,308 @@ fn intake_half_keeps_its_scan_floor_while_notify_runs_every_wake() {
     let third = reg.gh_poll_tick(wake1 + 60_000, &HashMap::new());
     assert!(third.intake_scanned, "the next wake past the floor scans again");
     assert_eq!(reg.intake_last_poll_at(&gid), Some(wake1 + 60_000), "…and that scan ran too, restamping the group");
+}
+
+// ---------- bounding one poll tick (#656): the subprocess wait, the intake fan-out ----------
+//
+// Still no `gh` and no agent CLI anywhere in this section. The subprocess
+// tests drive `capture_with_timeout` — the exact body `gh_capture` runs, with
+// the `gh` argv swapped for a deliberately slow / chatty / failing shell
+// command — and the intake test reaches `poll_intake` on a live registry
+// whose groups point at nonexistent repo paths, so every `gh_capture` inside
+// it returns at the "no such directory" guard before a program is resolved.
+
+/// A `Command` running `script` through the host shell: the portable way to
+/// spawn a child that behaves a specific way (stalls, floods its pipe, exits
+/// non-zero) without shelling out to `gh`, which no test here may do.
+fn shell_command(script: &str) -> std::process::Command {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C");
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c");
+        c
+    };
+    cmd.arg(script);
+    cmd
+}
+
+/// A shell script that does nothing for `secs` seconds. `ping` is the
+/// dependency-free Windows sleep: `-n N` sends N pings a second apart, so
+/// N = secs + 1 loopback pings take about `secs`.
+fn sleep_script(secs: u32) -> String {
+    if cfg!(windows) { format!("ping -n {} 127.0.0.1 >NUL", secs + 1) } else { format!("sleep {secs}") }
+}
+
+/// A `Command` that streams `path` to stdout. Deliberately NOT built through
+/// [`shell_command`]: a path baked into a `cmd /C <script>` string has to be
+/// quoted, and `Command` then escapes those quotes the MSVC way (`\"`), which
+/// `cmd.exe` does not understand — the child fails with "The filename,
+/// directory name, or volume label syntax is incorrect" instead of reading
+/// the file. Passing the path as its own argv element lets `Command` quote it
+/// the one way `cmd` parses.
+fn cat_command(path: &Path) -> std::process::Command {
+    if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "type"]).arg(path);
+        c
+    } else {
+        let mut c = std::process::Command::new("cat");
+        c.arg(path);
+        c
+    }
+}
+
+/// A shell script whose child leaves a GRANDCHILD holding the inherited
+/// pipes after the direct child is killed — the one case that justifies not
+/// joining the readers, and therefore the one that can actually grow the
+/// backlog. On Windows `cmd` spawns `ping` as a separate process (no `>NUL`
+/// here, deliberately: both pipes stay inherited); on Unix the backgrounded
+/// `sleep` survives the shell that started it.
+fn hold_pipes_script() -> String {
+    if cfg!(windows) { "ping -n 31 127.0.0.1".to_string() } else { "sleep 30 & sleep 30".to_string() }
+}
+
+/// The reader backlog is process-wide state, and this binary runs its tests
+/// in parallel — so every test that consults or fills it takes this first.
+/// Without it, the ceiling test's seeding would make a concurrent capture
+/// test fail with the backlog error, and the failure would be real but
+/// meaningless. (`obs.rs`'s own `static SERIAL` precedent.)
+static CAPTURE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn capture_lock() -> std::sync::MutexGuard<'static, ()> {
+    CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A child still running at the deadline must be REPORTED, not waited out —
+/// this is the primitive every wait on a child now goes through, so a
+/// regression here is a regression in both the main wait and the post-kill
+/// reap at once.
+#[test]
+fn wait_bounded_reports_none_for_a_child_still_running_at_the_deadline() {
+    let mut child = shell_command(&sleep_script(20))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the test child");
+    let started = std::time::Instant::now();
+    let verdict = wait_bounded(&mut child, Duration::from_millis(500)).expect("polling a live child is not an error");
+    let waited = started.elapsed();
+    let _ = child.kill();
+    assert!(verdict.is_none(), "a child alive at the deadline must report None rather than block until it exits");
+    assert!(waited < Duration::from_secs(5), "…and must report it AT the deadline (waited {waited:?} on a 20s child)");
+}
+
+/// …while a child that finishes inside the bound is reported with its real
+/// status, so the bound never costs a result that was there to be had.
+#[test]
+fn wait_bounded_reports_the_status_of_a_child_that_exits_first() {
+    let mut child = shell_command("exit 7")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the test child");
+    let status = wait_bounded(&mut child, Duration::from_secs(10))
+        .expect("polling is not an error")
+        .expect("a child that exits inside the bound must be reported, not timed out");
+    assert_eq!(status.code(), Some(7), "the child's own status must survive the bounded wait");
+}
+
+/// A stalled `gh` — the whole reason this bound exists — must not hold the
+/// caller for the child's lifetime. Since #406 there is ONE loop making `gh`
+/// calls, so an unbounded wait here stops every `notify_when` notice in the
+/// process, and the fleet's "register the watch, end the turn" discipline
+/// rests on those notices arriving.
+///
+/// The child outlives its bound by 20x, so returning early cannot be luck,
+/// and the assertion is on ELAPSED time rather than on the message alone: an
+/// implementation that reported "timed out" only after `output()` finally
+/// returned would satisfy the string and none of the point.
+#[test]
+fn capture_with_timeout_stops_waiting_on_a_stalled_child() {
+    let _serial = capture_lock();
+    let started = std::time::Instant::now();
+    let err = OrchRegistry::capture_with_timeout(shell_command(&sleep_script(20)), Duration::from_secs(1))
+        .expect_err("a child that outlives the bound must fail the capture, not be waited out");
+    let waited = started.elapsed();
+    assert!(err.contains("timed out"), "the error must name the bound as the cause, not look like a gh failure: {err}");
+    assert!(
+        waited < Duration::from_secs(10),
+        "the wait must be bounded by the timeout, not by the child (slept {waited:?} against a 20s child)"
+    );
+}
+
+/// The bound is a ceiling, not a schedule: a child that finishes returns its
+/// own stdout, immediately, exactly as `Command::output()` did.
+#[test]
+fn capture_with_timeout_returns_a_finished_childs_stdout() {
+    let _serial = capture_lock();
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-656"), Duration::from_secs(10))
+        .expect("a fast child must succeed");
+    assert!(out.contains("loomux-656"), "stdout must be captured verbatim, not summarized: {out:?}");
+}
+
+/// The failure mode the reader threads exist to prevent, and the one a
+/// "simplify it to try_wait + wait_with_output" edit would reintroduce: a
+/// child whose output exceeds the OS pipe buffer blocks writing until someone
+/// drains it. Nobody draining means the child never exits, so a HEALTHY `gh
+/// issue list` on a busy repo would time out every single tick — the bound
+/// turned into a new outage instead of a backstop.
+///
+/// 512 KiB is comfortably past both platforms' default buffer (64 KiB
+/// Windows, 64 KiB Linux, 16 KiB macOS) on stdout alone.
+#[test]
+fn capture_with_timeout_drains_output_larger_than_a_pipe_buffer() {
+    let _serial = capture_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.txt");
+    let payload = "loomux-656 ".repeat(48 * 1024); // ~512 KiB
+    fs::write(&big, &payload).unwrap();
+    let started = std::time::Instant::now();
+    let out = OrchRegistry::capture_with_timeout(cat_command(&big), Duration::from_secs(10))
+        .expect("a chatty but healthy child must complete, not trip the bound");
+    assert!(
+        out.len() >= payload.len(),
+        "the whole stream must be captured, not one buffer's worth: got {} of {} bytes",
+        out.len(),
+        payload.len()
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "…and must not have needed the bound to get there");
+}
+
+/// A child that fails on its own is still a child failure: the timeout must
+/// not swallow, relabel, or delay it. `poll_watches` turns this `Err` into a
+/// fail-streak increment and `poll_intake` into a skipped half-diff, and both
+/// classifications predate the bound.
+#[test]
+fn capture_with_timeout_reports_a_nonzero_exit_as_the_childs_own_failure() {
+    let _serial = capture_lock();
+    let started = std::time::Instant::now();
+    let err = OrchRegistry::capture_with_timeout(shell_command("exit 3"), Duration::from_secs(10))
+        .expect_err("a non-zero exit is an Err, exactly as `output()` made it");
+    assert!(!err.contains("timed out"), "a child that exited must never be reported as a timeout: {err}");
+    assert!(err.contains('3'), "the exit status must survive into the message the caller surfaces: {err}");
+    assert!(started.elapsed() < Duration::from_secs(5), "an immediate failure must return immediately");
+}
+
+/// The ceiling policy itself, pure: a capture is admitted while abandoned
+/// readers are below the ceiling and refused at it. Stated here so the
+/// boundary is pinned without arranging a real leak.
+#[test]
+fn gh_capture_admission_stops_exactly_at_the_reader_ceiling() {
+    assert!(gh_capture_admitted(0), "an empty backlog must never refuse a poll");
+    assert!(
+        gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS - 1),
+        "one slot short of the ceiling is still a poll worth making"
+    );
+    assert!(!gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS), "the ceiling is a ceiling, not a target");
+    assert!(!gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS + 9), "and nothing above it is admitted either");
+}
+
+/// The leak really is bounded per PROCESS, not merely per tick: once the
+/// backlog is at the ceiling a capture is refused outright — with an error
+/// naming the reason, since both callers surface an `Err` — and once those
+/// readers end, captures resume on their own.
+///
+/// Uses the seam rather than a grandchild that holds a pipe: seeded readers
+/// block until this test releases them, so both the refusal and the drain are
+/// deterministic on every platform instead of depending on how one OS
+/// inherits handles.
+#[test]
+fn a_full_reader_backlog_refuses_captures_until_it_drains() {
+    let _serial = capture_lock();
+
+    // Baseline: whatever earlier capture tests left behind (normally zero —
+    // killing a child closes its pipes and its readers end at once).
+    let holds = seed_leaked_readers_for_test(GH_CAPTURE_MAX_LEAKED_READERS);
+    assert!(
+        gh_capture_live_readers() >= GH_CAPTURE_MAX_LEAKED_READERS,
+        "the seam must fill the backlog the way an abandoned reader does"
+    );
+
+    let err = OrchRegistry::capture_with_timeout(shell_command("echo unreachable"), Duration::from_secs(10))
+        .expect_err("a full backlog must refuse the capture rather than spawn another child");
+    assert!(err.contains("backlog"), "the refusal must name itself, not look like a gh failure: {err}");
+
+    // Releasing them is the whole point of the bound: this is a ceiling, not
+    // a latch, so polling must resume without a restart.
+    drop(holds);
+    let settle = std::time::Instant::now();
+    while gh_capture_live_readers() >= GH_CAPTURE_MAX_LEAKED_READERS && settle.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-656-drained"), Duration::from_secs(10))
+        .expect("once the backlog drains, captures must resume on their own");
+    assert!(out.contains("loomux-656-drained"), "…and resume as real captures, not as a stub: {out:?}");
+}
+
+/// The registration itself: a timed-out capture whose child left a grandchild
+/// holding the pipes must PARK its readers where the ceiling can see them.
+/// Without this, deleting the two lines that push into the backlog would
+/// leave every other test in this section passing — the ceiling would simply
+/// never be reached by anything real.
+#[test]
+fn a_timeout_that_cannot_close_its_pipes_parks_its_readers_in_the_backlog() {
+    let _serial = capture_lock();
+    let before = gh_capture_live_readers();
+
+    let err = OrchRegistry::capture_with_timeout(shell_command(&hold_pipes_script()), Duration::from_secs(1))
+        .expect_err("the child outlives the bound, so this is a timeout");
+    assert!(err.contains("timed out"), "precondition: this must be the timeout arm, not another failure: {err}");
+
+    assert!(
+        gh_capture_live_readers() > before,
+        "a reader still blocked on a grandchild's pipe must be counted, not forgotten — \
+         that is the difference between a leak bounded per tick and one bounded per process"
+    );
+}
+
+/// The intake half's per-scan cap, on a live registry rather than only in the
+/// pure selector: N autonomous groups falling due on one scan wake used to be
+/// 2N sequential `gh` round-trips inside a single tick of the one loop that
+/// also delivers every watch notice.
+///
+/// Asserts the EFFECT (`intake_last_poll_at` moves only for a group the scan
+/// actually reached the `gh` call for) and the deferral: the groups the cap
+/// left out are polled by the very next scan, so the cap is a queue and not a
+/// starvation. Every group's repo path is nonexistent, so the scan runs its
+/// whole body against `Err`s and spawns nothing.
+#[test]
+fn poll_intake_caps_one_scan_and_polls_the_deferred_groups_on_the_next() {
+    let (reg, _d) = test_registry();
+    let due_groups = MAX_INTAKE_POLLS_PER_TICK + 3;
+    let mut gids = Vec::new();
+    for i in 0..due_groups {
+        // Distinct repo paths: the group id is repo-derived, and a group with
+        // no live agents is reused rather than duplicated.
+        let g = reg
+            .create_group(
+                &format!("C:/tmp/repo-656-{i}"),
+                Guardrails { intake_poll_minutes: Some(1), idle_tick_fallback_minutes: 180, ..rails() },
+            )
+            .unwrap();
+        reg.set_autonomous(&g.id, true).unwrap();
+        gids.push(g.id);
+    }
+
+    let scanned = |now: u64| gids.iter().filter(|g| reg.intake_last_poll_at(g) == Some(now)).count();
+
+    let first = now_ms() + 60 * 60_000; // every group is due: none has ever been polled
+    reg.poll_intake(first);
+    assert_eq!(
+        scanned(first),
+        MAX_INTAKE_POLLS_PER_TICK,
+        "one scan must poll at most the cap, however many groups came due together"
+    );
+
+    // The same instant, so nothing has newly become due and the groups just
+    // polled are inside their own per-group floor: this scan can only be the
+    // deferred ones.
+    reg.poll_intake(first);
+    let polled_at_all = gids.iter().filter(|g| reg.intake_last_poll_at(g).is_some()).count();
+    assert_eq!(polled_at_all, due_groups, "the groups the cap deferred must be picked up by the next scan, not starved");
 }
 
 // ---------- group_watches: the group view's "⏳ waiting on …" indicator (#248) ----------
