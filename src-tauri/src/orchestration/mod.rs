@@ -29796,11 +29796,7 @@ impl OrchRegistry {
             // reads it back off the entry at resume instead.
             let admitted = self.enqueue_text_as(
                 &a.group, agent_id, from, text, pty_id, queue::EnqueueReason::GroupPaused,
-                // SCRATCH COMMIT — #620 red-before-green evidence. Reverted in
-                // the next commit. This is the pre-fix behavior: the entry
-                // records no kind, so `paused_flush_kickoff` finds none and the
-                // resume flushes a kickoff as a plain prompt.
-                Delivery::MidSession,
+                delivery,
             )?;
             // #569 review B1: the pause flag is read ABOVE and the admission
             // lands HERE, with no lock across the gap and real I/O inside it
@@ -29854,9 +29850,8 @@ impl OrchRegistry {
         // that already holds an unpasted kickoff leaves an entry that still
         // says what it is, and `queue.json` never shows one kickoff as a
         // kickoff and another as a plain prompt purely by admission timing.
-        // SCRATCH COMMIT — #620 red-before-green evidence, reverted next commit.
         let admitted =
-            self.enqueue_text_as(&a.group, agent_id, from, text, pty_id, reason, Delivery::MidSession)?;
+            self.enqueue_text_as(&a.group, agent_id, from, text, pty_id, reason, delivery)?;
 
         if !admitted.was_first {
             // Landed behind an existing entry (or coalesced into one) — a
