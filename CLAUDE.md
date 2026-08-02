@@ -27,13 +27,9 @@ opinions — see the `ci-validate` skill.)
 The Commands table above is for humans. For agent workers, **local
 `cargo` builds and tests of ANY size are banned entirely** — no `cargo
 build`, no `cargo check`, no single-test `-j 4` iteration, nothing that
-invokes `rustc`. This is a human hard directive (2026-07-30, third
-disk-exhaustion incident): the scope-based carve-out that permitted
-"quick local iteration" still cost 5-8 GB of `target/` per worktree for
-the first compile of the dependency tree, and a six-worker fleet filled
-the drive and crashed loomux even with every worker obeying the
-single-test rule (#488 lineage; supersedes the #320 interim ban and the
-scope/duration rule that replaced it).
+invokes `rustc`. This is a human hard directive: a first compile costs
+5-8 GB of `target/` per worktree, and a worker fleet building locally
+exhausts the disk (#488).
 
 How workers validate instead: push early, open a draft PR immediately,
 and read CI (`ci-validate` skill's draft-PR-early flow). Iterate by
@@ -91,21 +87,17 @@ compiles.
    here" as repo config, the way the resource guard's `resources:` block does)
    and no operator-setup assumptions (paths, core counts, installed tools). A
    behavior that only makes sense for developing loomux itself belongs in
-   `.loomux/` config or the dev docs, not the product. Precedent: the shared
-   `CARGO_TARGET_DIR` cache was removed for violating this (#263).
+   `.loomux/` config or the dev docs, not the product (precedent: #263).
 9. **Never self-approve a security/install gate** (npm's `allow-scripts`
    review, a `gh` shim confirmation, anything else that exists to make a
    human or the orchestrator decide). If one fires, stop and
    `message_orchestrator`/`report("blocked", …)` instead of running the
    approve command yourself — even a narrowly-scoped approval is a security
-   decision, and it isn't yours to make unprompted. Precedent: #357 — a
-   worker hit npm's `allow-scripts` gate for esbuild's postinstall, ran `npm
-   approve-scripts esbuild` to unblock itself, and that was correctly flagged
-   and reverted. The repo now pre-declares the one approval the build
-   genuinely needs (`package.json`'s `allowScripts` field, committed) so this
-   exact gate shouldn't fire again — but if `allow-scripts` (or any other
-   gate) ever fires for something new, the answer is still to ask, not to
-   decide.
+   decision, and it isn't yours to make unprompted (precedent: #357). The
+   repo pre-declares the one approval the build genuinely needs
+   (`package.json`'s `allowScripts` field, committed); if `allow-scripts` or
+   any other gate fires for something new, the answer is still to ask, not
+   to decide.
    **If you're staring at an `allow-scripts` warning right now:** the
    `package.json` entry pins esbuild to an exact version
    (`"esbuild@0.25.12": true`) on purpose, not by oversight — it's the safer
@@ -129,11 +121,18 @@ compiles.
 - Backend: unit tests inline under `#[cfg(test)]` only if they don't link the
   full lib; otherwise integration tests (constraint 4). Orchestration logic is
   covered in `src-tauri/tests/orchestration.rs`.
-- `src-tauri/src/orchestration/mod.rs` is ~11k lines — read it selectively
+- `src-tauri/src/orchestration/mod.rs` is ~35k lines — read it selectively
   (grep for the function/struct), not top to bottom.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
 - Write tests that test intent, not implementation echoes.
+- **Historical context lives in design notes, ADRs, and issue/PR history —
+  never in user docs, prompts, or this file.** Incident stories, superseded
+  rules, dates, and "how we got here" narratives pollute every future
+  reader's context. Reader-facing text carries the current rule and its
+  operational why, with at most a bare issue/PR ref as provenance. When
+  editing docs, strip any such narrative you find; when a reviewer asks for
+  provenance in reader-facing text, the ref alone is the answer.
 
 ## Refinements & scope increases from the user
 
@@ -153,14 +152,11 @@ narrow their ask back down to the original ticket on your own judgment.
   `orchestration`, `pty`, `gitview`, `launcher`, `tasks`, `clipboard`,
   `metrics`, `ui`, `build`, `release`.
 - Branch from `main`; PR to `main`.
-- **Delete a PR's branch once it merges** (human directive, 2026-08-02: the
-  repo had accumulated 96 remote branches). `gh pr merge --delete-branch`
-  handles it — but its remote delete was observed skipped when a local
-  worktree still held the branch (PR #652's merge, 2026-08-02 — the local
-  delete failed on the worktree and no remote delete happened), so after
-  cleaning the worktree always verify with
+- **Delete a PR's branch once it merges.** `gh pr merge --delete-branch`
+  handles it, but skips the remote delete when a local worktree still holds
+  the branch — after cleaning the worktree, verify with
   `git ls-remote --heads origin <branch>` and `git push origin --delete
-  <branch>` if it survived. Whoever performs the merge owns this step.
+  <branch>` if it survived. Whoever performs the merge owns this step (#662).
 - GitHub issues are the work queue. Labels the orchestration workflow uses:
   `agent-managed` (an orchestrator owns it), `agent-ready` (groomed — go),
   `agent-investigation` (research only — post findings as an issue comment,
