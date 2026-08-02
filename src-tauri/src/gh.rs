@@ -1757,7 +1757,7 @@ mod tests {
     }
 
     #[test]
-    fn every_tauri_command_in_this_module_is_async() {
+    fn every_tauri_command_in_this_module_is_async_and_delegates() {
         // #716's claim is about EVERY gh-backed command, and a single sync
         // straggler would keep the freeze while the module's doc claimed
         // otherwise — so this scans this file's own source rather than trusting
@@ -1784,17 +1784,44 @@ mod tests {
             if *line != ATTR {
                 continue;
             }
-            let sig = lines[i + 1..]
-                .iter()
-                .find(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with('#'))
-                .unwrap_or_else(|| panic!("{ATTR} at line {} has no function after it", i + 1));
+            let at = i + 1
+                + lines[i + 1..]
+                    .iter()
+                    .position(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with('#'))
+                    .unwrap_or_else(|| panic!("{ATTR} at line {} has no function after it", i + 1));
+            let sig = lines[at];
             assert!(
                 sig.starts_with("pub async fn "),
                 "line {}: `{sig}` is a synchronous #[tauri::command] — Tauri dispatches it on the \
                  webview main thread, so its `gh` spawn freezes the GUI for the whole round trip \
                  (#716). Make it a thin `pub async fn` over `run_blocking`.",
-                i + 2
+                at + 1
             );
+
+            // `async` alone is NOT the property. An `async fn` whose body still
+            // called the sync work inline would satisfy the check above and
+            // freeze the GUI exactly as before — Tauri polls a command's future
+            // on the main thread, so work done before the first real await point
+            // runs there. The delegation to `run_blocking` is what actually
+            // moves it, so require it in the command's OWN body: from the
+            // signature to the first top-level `}` (these wrappers are one
+            // expression, so a nested block that stopped this scan early would
+            // itself be a shape worth failing on).
+            let end = at
+                + 1
+                + lines[at + 1..]
+                    .iter()
+                    .position(|l| *l == "}")
+                    .unwrap_or_else(|| panic!("no top-level `}}` closing the fn at line {}", at + 1));
+            assert!(
+                lines[at..end].iter().any(|l| l.contains("run_blocking(")),
+                "line {}: `{sig}` is async but its body never calls `run_blocking(` — an async \
+                 command that runs its `gh` spawn inline is polled on the webview main thread and \
+                 freezes the GUI just as a sync one does (#716). Hand the body to \
+                 `run_blocking(move || …_sync(…)).await`.",
+                at + 1
+            );
+
             let name = sig["pub async fn ".len()..]
                 .split(|c: char| c == '(' || c.is_whitespace())
                 .next()
@@ -1823,5 +1850,9 @@ mod tests {
              run_blocking (see the module note) and listed here, so the enumeration this test \
              pins can't silently go stale"
         );
+        // NB: this equality is also the scan's own vacuity guard — a marker
+        // that stopped matching (a formatting change, a renamed attribute path)
+        // yields an empty `found` and fails here, rather than letting the
+        // per-command assertions above pass vacuously over nothing.
     }
 }
