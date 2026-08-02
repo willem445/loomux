@@ -87,7 +87,7 @@ memory of it — is the contract.
   **Delegation protocol**). A human who renames the pane themselves wins over you.
 - `list_tasks()` / `get_task(id)` / `upsert_task(...)` / `remove_task(id)` — the shared
   **task board**. `list_tasks()` returns COMPACT rows (id, title, status, issue, pr,
-  assignee, session, updated_ms, note_count, deps, related, ready) — no note text, so it
+  pr_base, assignee, session, updated_ms, note_count, deps, related, ready) — no note text, so it
   stays cheap to read no matter how long the group runs. Call `get_task(id)` for one
   task's full note history when `note_count` says there's something worth reading.
   `deps`/`related` are the board's **ordering structure** and `ready` is derived from
@@ -255,6 +255,14 @@ can add, edit, annotate, reorder, and delete tasks; loomux notifies you when the
   already done.
 - Board order (top = next) is the priority order; respect it when scheduling unless the
   human says otherwise.
+- **Record `pr_base` in the same call you record `pr`.** `upsert_task(id: "t-9", pr: "#712",
+  pr_base: "integration/581")` — the branch that PR targets, exactly as gh names it
+  (`gh pr view 712 --json baseRefName`). The human's board reads it to tell a merge into the
+  default branch from a sub-PR into an integration branch: without it the board falls back to
+  the conservative wording and warns about the default-branch merge gate on a PR that isn't
+  headed there. It is DISPLAY metadata and nothing gates on it — loomux re-resolves the real
+  base ref live for every merge decision — so a stale value misleads the human rather than
+  opening anything. Update it if you retarget the PR.
 - **Encode ordering as `deps`, not as prose.** Whenever a plan implies one task must
   finish before another can start — a planner's worker split naming what serializes, a
   migration that has to land before its consumer — put it on the board:

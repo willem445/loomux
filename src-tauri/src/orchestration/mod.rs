@@ -6817,6 +6817,23 @@ pub struct Task {
     pub issue: Option<String>,
     #[serde(default)]
     pub pr: Option<String>,
+    /// The branch `pr` targets, as a plain name (`main`, `integration/581`) —
+    /// what `gh pr view --json baseRefName` reports (#581). `None` on every
+    /// task written before this field existed, and on any task whose author
+    /// simply didn't record it, so "unknown" is the normal case and every
+    /// reader must have an answer for it.
+    ///
+    /// **DISPLAY AND QUEUE-HINT METADATA ONLY — NOTHING MAY GATE ON IT.** It is
+    /// board data, and the board is agent-writable: an agent can put any string
+    /// here, so a check that trusted it would be a check the thing being checked
+    /// gets to answer (CLAUDE.md constraint 6's lineage). Anything that decides
+    /// whether a merge may happen — the gh shim's gate, and any future merge
+    /// queue — re-resolves the real base ref live via gh for every decision and
+    /// never reads this field. What it legitimately buys is a more accurate
+    /// story told to the human (the board's Approve relabel) and a hint for
+    /// queueing work, neither of which is an authorization.
+    #[serde(default)]
+    pub pr_base: Option<String>,
     #[serde(default)]
     pub assignee: Option<String>,
     /// Agent CLI session that did/does this work; lets the orchestrator
@@ -6863,6 +6880,9 @@ pub struct TaskSummary {
     pub status: String,
     pub issue: Option<String>,
     pub pr: Option<String>,
+    /// The PR's base branch as recorded on the task (#581) — display/queue-hint
+    /// metadata, never an authorization; see `Task::pr_base`.
+    pub pr_base: Option<String>,
     pub assignee: Option<String>,
     pub session: Option<String>,
     pub updated_ms: u64,
@@ -6924,6 +6944,7 @@ pub fn task_summary(t: &Task, ready: bool) -> TaskSummary {
         status: t.status.clone(),
         issue: t.issue.clone(),
         pr: t.pr.clone(),
+        pr_base: t.pr_base.clone(),
         assignee: t.assignee.clone(),
         session: t.session.clone(),
         updated_ms: t.updated_ms,
@@ -7135,6 +7156,9 @@ pub struct TaskPatch {
     pub status: Option<String>,
     pub issue: Option<String>,
     pub pr: Option<String>,
+    /// The branch the PR targets (#581) — same empty-string-clears rule as
+    /// `pr`. Display/queue-hint metadata only; see `Task::pr_base`.
+    pub pr_base: Option<String>,
     pub assignee: Option<String>,
     pub session: Option<String>,
     pub note: Option<String>,
@@ -18034,6 +18058,7 @@ impl OrchRegistry {
                     status: "queued".into(),
                     issue: None,
                     pr: None,
+                    pr_base: None,
                     assignee: None,
                     session: None,
                     notes: vec![],
@@ -18121,6 +18146,9 @@ impl OrchRegistry {
         }
         if patch.pr.is_some() {
             task.pr = patch.pr.filter(|s| !s.trim().is_empty());
+        }
+        if patch.pr_base.is_some() {
+            task.pr_base = patch.pr_base.filter(|s| !s.trim().is_empty());
         }
         if patch.assignee.is_some() {
             task.assignee = patch.assignee.filter(|s| !s.trim().is_empty());
@@ -25096,6 +25124,12 @@ impl OrchRegistry {
     /// CURRENT roster on every call, never cached from whenever the gate was
     /// armed, so a roster that later regains (or loses) a named reviewer shows
     /// up on the very next read without another toggle.
+    ///
+    /// `default_branch` (#581) is the repo's default branch name, or `null`
+    /// when it doesn't resolve — display data for the board's Approve relabel,
+    /// which compares it against a task's recorded `pr_base`. Neither is an
+    /// enforcement input: the gate is enforced in the gh shim against the base
+    /// ref it resolves live.
     #[doc(hidden)] // pub for integration tests
     pub fn workflow_status(&self, group: &str) -> Value {
         let info = self.group(group);
@@ -25121,9 +25155,17 @@ impl OrchRegistry {
                 "missing_blocks": missing,
             })
         });
+        // The repo's default branch NAME (#581), so the board can tell a merge
+        // into the gated default branch from a sub-PR into an integration
+        // branch. `null` when it doesn't resolve — a real answer the frontend
+        // must read as "unknown" and fall back to its conservative wording,
+        // never as "not the default branch". Local refs only (see
+        // `default_branch_name`): this command is on a UI path.
+        let default_branch = info.as_ref().and_then(|g| crate::git::default_branch_name(&g.repo));
         json!({
             "advanced": guardrails.advanced_orchestrator,
             "name": name,
+            "default_branch": default_branch,
             "blocks": guardrails.blocks.iter().map(|b| json!({
                 "id": b.id,
                 "kind": b.kind.as_str(),
@@ -33737,8 +33779,9 @@ pub fn orch_set_advanced_orchestrator(
 /// The group's current workflow-mode status for the lifecycle UI (Slice C):
 /// whether advanced-orchestrator is on, the resolved roster, and the armed merge
 /// gate (with a freshly-recomputed `satisfiable`/`missing_blocks`, #316's
-/// satisfiability guarantee) — `{ advanced, name, blocks: [{id,kind,cli,model,
-/// persona}], gate: {require,reviewers,also,satisfiable,missing_blocks} | null }`.
+/// satisfiability guarantee) — `{ advanced, name, default_branch: string|null,
+/// blocks: [{id,kind,cli,model,persona}],
+/// gate: {require,reviewers,also,satisfiable,missing_blocks} | null }`.
 /// A slower, separate read from `orch_group_summary` (polled hot) — fetched on
 /// group open/refresh and after the toggle notice, like `orch_group_watches`.
 #[tauri::command]

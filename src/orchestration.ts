@@ -1069,6 +1069,13 @@ export interface WorkflowGateStatus {
 export interface WorkflowStatus {
   advanced: boolean;
   name: string;
+  /** The repo's default branch name (#581) — `"main"`, never `"origin/main"`.
+   *  `null` when loomux could not resolve it, which readers must treat as
+   *  UNKNOWN and never as "so this base isn't the default branch": the board's
+   *  Approve relabel compares a task's `pr_base` against this, and getting it
+   *  wrong would dress a default-branch merge up as a harmless sub-PR. Display
+   *  data — the merge gate itself resolves the real base ref live. */
+  default_branch: string | null;
   blocks: WorkflowStatusBlock[];
   gate: WorkflowGateStatus | null;
 }

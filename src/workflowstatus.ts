@@ -66,15 +66,45 @@ export function gateExitsMessage(): string {
  *  (#197/#222) — it never opens an armed workflow gate — so this is `false`
  *  whenever a gate is armed and the task carries a PR, regardless of whether
  *  the gate is (today) satisfiable. `reason` is short enough for a button
- *  label; call `gateExitsMessage()` for the longer tooltip. */
+ *  label; call `gateExitsMessage()` for the longer tooltip.
+ *
+ *  THE REASON IS THREE-WAY on the PR's base branch (#581), and the branching is
+ *  about accuracy, never about permission — `ok` is `false` in all three cases
+ *  and no merge is opened by any of them:
+ *
+ *  - **base unknown** (no `pr_base` recorded, or no resolved `default_branch`
+ *    to compare it against) → the conservative default-branch wording. Every
+ *    pre-#581 task is in this case, and so is any board whose orchestrator
+ *    doesn't record the field.
+ *  - **base IS the default branch** → the same wording, now actually earned.
+ *  - **base is some other branch** (a sub-PR into an integration branch) → says
+ *    so, and names it. The old text ("won't merge — gate needs …") implied the
+ *    human's grant is what this PR is waiting on; it isn't. The human gate is
+ *    default-branch-only (the shim `exec`s a non-default merge straight
+ *    through), so what actually holds a sub-PR is the workflow gate's verdicts.
+ *
+ *  What does NOT change: the gate applies to EVERY merge of the PR wherever it
+ *  lands (shim property 2), so an unsatisfiable gate still outranks all of this,
+ *  and `pr_base` is agent-written display metadata that nothing enforces on. */
 export function approveWillMerge(
   status: WorkflowStatus,
-  task: { pr?: string | null }
+  task: { pr?: string | null; pr_base?: string | null }
 ): { ok: boolean; reason?: string } {
   const gate = status.gate;
   if (!gate || !task.pr) return { ok: true };
   if (!gate.satisfiable) {
     return { ok: false, reason: "gate unsatisfiable from this session — merges will bounce" };
+  }
+  // Trimmed, never case-folded: git refs are case-sensitive, so `Main` is a
+  // different branch from `main` and folding case would read a typo as the
+  // default branch — the direction this must not be wrong in.
+  const base = task.pr_base?.trim();
+  const def = status.default_branch?.trim();
+  if (base && def && base !== def) {
+    return {
+      ok: false,
+      reason: `sub-PR into ${base} — the orchestrator merges it once the gate verdicts land`,
+    };
   }
   return { ok: false, reason: `won't merge — gate needs ${gate.reviewers.join("/")}` };
 }

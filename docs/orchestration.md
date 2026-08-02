@@ -172,14 +172,25 @@ Board controls:
   relabeled up front whenever the item carries a PR (e.g. "Approve (won't merge
   — gate needs rev-orch/rev-ui/rev-tests)") so you know before you click, and
   the tooltip names your options: run the missing reviewers, toggle the
-  workflow off, or merge via the GitHub UI directly. The relabel keys on "does
-  this item carry a PR at all," not that PR's target branch — a stacked
-  sub-PR merging into an integration branch (not the gated default branch)
-  gets the same warning as one merging straight to `main`. Deliberately
-  conservative: the board only knows a task's PR number, not its base ref, and
-  narrowing that would mean either a live `gh pr view` per row or a new field
-  on the task record — worth doing if this proves noisy in practice, not
-  assumed cheap today.
+  workflow off, or merge via the GitHub UI directly. What the label says
+  depends on the PR's **base branch**, which the orchestrator records on the
+  task alongside the PR itself:
+  - **Base is the default branch** (or the orchestrator recorded no base, or
+    loomux could not resolve the repo's default branch) — the warning above.
+    Unknown is treated as "assume the default branch": a board that guessed the
+    other way would quietly downplay a merge straight into `main`.
+  - **Base is some other branch** — a stacked sub-PR into an integration
+    branch, say — the label says so and names it ("Approve (sub-PR into
+    integration/581 — the orchestrator merges it once the gate verdicts land)").
+    Your Approve grant is the *default-branch* gate, so it was never what this
+    PR was waiting on, and the old wording implied otherwise.
+
+  This narrows the **story**, not the gate. A custom workflow's merge gate
+  applies to every merge of a PR wherever it lands, integration branches
+  included, and it is enforced against the base ref loomux resolves live at
+  merge time — never against what a task says. The recorded base is display
+  metadata the orchestrator writes, so treat it the way you'd treat any other
+  board text: informative, not authoritative.
 - **▶ Proceed** on a `prototype` item (a demo-gated deliverable awaiting your
   verdict) promotes it: two-click confirm flips it to `in-progress`, records
   your decision, and prompts the orchestrator to take the prototype to a full

@@ -29,6 +29,7 @@ const gate = (o: Partial<WorkflowGateStatus> = {}): WorkflowGateStatus => ({
 const status = (o: Partial<WorkflowStatus> = {}): WorkflowStatus => ({
   advanced: true,
   name: "loomux",
+  default_branch: "main",
   blocks: [],
   gate: gate(),
   ...o,
@@ -115,4 +116,76 @@ test("approveWillMerge: an unsatisfiable gate gets its own distinct reason, not 
   const result = approveWillMerge(s, { pr: "42" });
   assert.equal(result.ok, false);
   assert.match(result.reason ?? "", /gate unsatisfiable from this session/);
+});
+
+// #581: the relabel is three-way — the base ref a task records decides WHICH
+// true sentence the human is told. None of these changes whether the merge is
+// gated (the workflow gate applies to every merge of the PR, wherever it
+// lands); they change only the story the board tells about it.
+
+test("approveWillMerge: a base equal to the default branch keeps the default-branch warning", () => {
+  const result = approveWillMerge(status({ default_branch: "main" }), { pr: "42", pr_base: "main" });
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? "", /gate needs rev-orch\/rev-ui\/rev-tests/);
+  assert.doesNotMatch(result.reason ?? "", /sub-PR/);
+});
+
+test("approveWillMerge: a base that is NOT the default branch says sub-PR, and names it", () => {
+  const result = approveWillMerge(status({ default_branch: "main" }), {
+    pr: "42",
+    pr_base: "integration/581",
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? "", /sub-PR into integration\/581/);
+  // The old text implied the HUMAN gate is what's holding this PR. It isn't:
+  // the human grant is default-branch-only, so saying "won't merge" here was
+  // the inaccuracy #581 is fixing.
+  assert.doesNotMatch(result.reason ?? "", /won't merge/);
+});
+
+test("approveWillMerge: no recorded base falls back to the conservative default-branch warning", () => {
+  // Every pre-#581 task, and any task whose author didn't record it.
+  const result = approveWillMerge(status({ default_branch: "main" }), { pr: "42" });
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? "", /gate needs rev-orch\/rev-ui\/rev-tests/);
+  assert.doesNotMatch(result.reason ?? "", /sub-PR/);
+});
+
+test("approveWillMerge: an unresolved default branch is unknown, never 'not the default'", () => {
+  // The fail-conservative direction: with no default branch to compare
+  // against, a recorded base cannot prove the PR is a sub-PR.
+  const result = approveWillMerge(status({ default_branch: null }), {
+    pr: "42",
+    pr_base: "integration/581",
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? "", /gate needs rev-orch\/rev-ui\/rev-tests/);
+  assert.doesNotMatch(result.reason ?? "", /sub-PR/);
+});
+
+test("approveWillMerge: stray whitespace around a recorded base is not a different branch", () => {
+  // Case is NOT normalized alongside it: git refs are case-sensitive, so
+  // `Main` really would be another branch, and folding case would let a typo
+  // read as the default branch.
+  const result = approveWillMerge(status({ default_branch: "main" }), { pr: "42", pr_base: " main " });
+  assert.equal(result.ok, false);
+  assert.doesNotMatch(result.reason ?? "", /sub-PR/);
+});
+
+test("approveWillMerge: an unsatisfiable gate outranks the sub-PR relabel", () => {
+  // The gate applies to EVERY merge of the PR, integration branch included —
+  // so "this session can't spawn the reviewers" is still the fact that decides
+  // it, and the more specific message wins.
+  const s = status({ gate: gate({ satisfiable: false, missing_blocks: ["rev-orch"] }) });
+  const result = approveWillMerge(s, { pr: "42", pr_base: "integration/581" });
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? "", /gate unsatisfiable from this session/);
+});
+
+test("approveWillMerge: a recorded base cannot un-gate a task with no PR, or a gate-free group", () => {
+  assert.deepEqual(approveWillMerge(status(), { pr: null, pr_base: "integration/581" }), { ok: true });
+  assert.deepEqual(
+    approveWillMerge(status({ gate: null }), { pr: "42", pr_base: "integration/581" }),
+    { ok: true }
+  );
 });
