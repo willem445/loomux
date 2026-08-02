@@ -15,8 +15,12 @@
 //!   attribute it, requeue the survivors, reconcile after a crash, and persist
 //!   every step.
 //!
-//! `mod.rs` and `mcp.rs` get registry wiring only; no decision in this feature
-//! lives in either of them.
+//! `mod.rs` gets registry wiring only — a module declaration, a guard field, and
+//! the two `merge_queue_reconcile*` methods, which resolve paths and delegate.
+//! No decision in this feature lives there. **`mcp.rs` is untouched by this
+//! slice**: §11.1's three agent-callable tools are slice E's, so D2 adds no
+//! agent-reachable surface at all (said explicitly because "no role gate found"
+//! and "no role gate needed" look identical from a diff).
 //!
 //! # Why `build_scratch` uses a temporary worktree
 //!
@@ -368,11 +372,28 @@ fn build_in_worktree(
 
 /// Whether a recorded head and a freshly fetched one name the same object.
 ///
-/// Abbreviation-tolerant in **one** direction only: the recorded head may be a
-/// prefix of the fetched full oid (that is how an abbreviated sha is stored),
-/// but a fetched oid that merely *starts with* the record is not enough on its
-/// own — git oids are compared as prefixes everywhere, and the shorter string
-/// has to be the recorded one for that to mean anything.
+/// Abbreviation tolerance runs in **one direction, and the code enforces it**:
+/// the *recorded* head may be an abbreviation of the *fetched* full oid (that is
+/// how a short sha comes to be stored), so `recorded.len() <= fetched.len()` is
+/// required. A fetched value shorter than the record is **not** a match — the
+/// shorter string has to be the recorded one for a prefix comparison to mean
+/// anything, and accepting the reverse would let a truncated *fetch* satisfy a
+/// full recorded head.
+///
+/// An earlier cut documented exactly that rule and implemented
+/// `min(recorded.len(), fetched.len())`, which compares both prefixes and is
+/// **symmetric** — the guarantee in the doc was not the guarantee in the code
+/// (rev-163 N1). No live path differed, because `fetched` always arrives from
+/// `rev_parse` as a full oid; it is fixed rather than re-documented because this
+/// is the head-equality check standing between an approved head and what gets
+/// built into a batch.
+///
+/// **Both sides must look like object names**, and the comparison is over
+/// **bytes**. `&str` indexing panics on a non-char-boundary, so the previous
+/// `recorded[..short]` was total only by the accident that oids are ASCII —
+/// nothing enforced it, and `PrFacts.head` is taken straight from
+/// `headRefOid.trim()`. A malformed value now returns `false` (fail closed)
+/// rather than panicking on a char boundary.
 ///
 /// **An empty recorded head is not a match.** It reads as *unknown*, and unknown
 /// is never "unbound, therefore fine" — the same fail-closed posture
@@ -381,12 +402,18 @@ fn build_in_worktree(
 /// building it into a batch would test an object nobody approved.
 fn same_object(recorded: &str, fetched: &str) -> bool {
     let (recorded, fetched) = (recorded.trim(), fetched.trim());
-    if recorded.is_empty() || fetched.is_empty() {
+    // Hex-only, so the byte comparison below is also a character comparison and
+    // a non-ASCII value can never reach the slice.
+    let hexish = |s: &str| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    if !hexish(recorded) || !hexish(fetched) {
         return false;
     }
-    let short = recorded.len().min(fetched.len());
-    // Guard against a truncated record matching half the repository.
-    short >= 7 && recorded[..short].eq_ignore_ascii_case(&fetched[..short])
+    // A truncated record must not match half the repository, and the record is
+    // the side allowed to be short.
+    if recorded.len() < 7 || recorded.len() > fetched.len() {
+        return false;
+    }
+    recorded.as_bytes().eq_ignore_ascii_case(&fetched.as_bytes()[..recorded.len()])
 }
 
 fn rev_parse(r: &dyn MqRunner, rev: &str) -> Result<String, BatchBuildError> {
