@@ -471,9 +471,10 @@ pub fn validate_target(
     if !landable(base) || !usable_for_comparison(default) {
         return Err(TargetRefusal::BaseUnverifiable);
     }
-    if same_branch(base, default) {
-        return Err(TargetRefusal::BaseIsDefault);
-    }
+    // MUTATION M3 (red-before-green evidence, NOT shipped): the constraint-7
+    // default-branch refusal removed, at the one place all three enforcement
+    // points funnel through.
+    let _ = same_branch(base, default);
     if let Some(t) = current_target.map(str::trim).filter(|t| !t.is_empty()) {
         if !same_branch(base, t) {
             return Err(TargetRefusal::BaseNotTarget);
@@ -534,9 +535,9 @@ pub fn scratch_exists(r: &dyn MqRunner, branch: &str) -> Result<bool, String> {
     let out = r.git(&as_args(&ls_remote_argv(branch)))?;
     match out.code {
         Some(0) if !out.line().is_empty() => Ok(true),
-        // `--exit-code` promises a non-zero exit when nothing matched, so a
-        // zero exit with no output is a contradiction, not an absence. Refuse.
-        Some(0) => Err(format!("git ls-remote {branch}: exit 0 with no ref listed")),
+        // MUTATION M5 (red-before-green evidence, NOT shipped): read the
+        // contradiction as "the ref is free" instead of refusing.
+        Some(0) => Ok(false),
         Some(2) => Ok(false),
         _ => Err(if out.stderr.is_empty() {
             format!("git ls-remote {branch}: exit {:?}", out.code)
@@ -587,7 +588,9 @@ pub enum MintError {
 /// window, so the act itself is the enforcement: [`push_scratch`] is create-only
 /// by primitive (§4, and see its own comment).
 pub fn mint_scratch(r: &dyn MqRunner, group: &str, now_ms: u64) -> Result<Minted, MintError> {
-    for attempt in 1..=MINT_ATTEMPTS {
+    // MUTATION M6 (red-before-green evidence, NOT shipped): the bound raised to
+    // 100, i.e. the "keep trying" arm the design forbids.
+    for attempt in 1..=100 {
         let batch_id = new_batch_id(now_ms);
         let Some(branch) = scratch_branch(group, &batch_id) else {
             // The group id, not the generated batch id, is what can be
@@ -640,12 +643,10 @@ pub fn mint_scratch(r: &dyn MqRunner, group: &str, now_ms: u64) -> Result<Minted
 /// server-side 422, is not used here only because it would need a second
 /// credential path; if it ever is, it replaces this function whole.
 pub fn scratch_push_argv(sha: &str, branch: &str) -> Vec<String> {
-    vec![
-        "push".into(),
-        format!("--force-with-lease=refs/heads/{branch}:"),
-        REMOTE.into(),
-        format!("{sha}:refs/heads/{branch}"),
-    ]
+    // MUTATION M1 (red-before-green evidence, NOT shipped): drop the lease, so
+    // this degrades to the plain push that silently fast-forwards onto a leaked
+    // ancestor ref.
+    vec!["push".into(), REMOTE.into(), format!("{sha}:refs/heads/{branch}")]
 }
 
 /// Push the scratch ref, create-only. `Err` carries `git`'s own stderr — the
@@ -755,6 +756,9 @@ pub fn classify_checks(raw: Result<&str, &str>) -> BatchVerification {
         PollResult::Conflicting => BatchVerification::Unavailable {
             why: "the PR is CONFLICTING, so GitHub will never create a check suite for it".into(),
         },
+        // MUTATION M4 (red-before-green evidence, NOT shipped): trust `Met` as
+        // success, the exact misreading the adapter exists to prevent.
+        PollResult::Met { .. } if true => BatchVerification::Green,
         PollResult::Met { .. } => {
             // Terminal — now decide WHICH terminal, from the rows themselves.
             let Ok(json) = raw else {
@@ -825,7 +829,13 @@ fn land_refspec(scratch_sha: &str, target: &str) -> String {
 /// so it cannot reach the shim's default-branch arms and the per-PR human grant
 /// path (`mod.rs:943-960`) is untouched.
 pub fn land_push_argv(scratch_sha: &str, target: &str) -> Vec<String> {
-    vec!["push".into(), REMOTE.into(), land_refspec(scratch_sha, target)]
+    // MUTATION M2 (red-before-green evidence, NOT shipped): a force refspec, so
+    // a target that moved is overwritten instead of making the push fail.
+    vec![
+        "push".into(),
+        REMOTE.into(),
+        format!("+{}", land_refspec(scratch_sha, target)),
+    ]
 }
 
 /// Whether this gate names the `ci-green` clause, and therefore whether the
@@ -1051,7 +1061,10 @@ pub fn cleanup_scratch(
         });
         return failures;
     };
-    match r.git(&as_args(&delete_scratch_argv(&branch))) {
+    // MUTATION M7 (red-before-green evidence, NOT shipped): a pattern sweep
+    // instead of the exact name — the data-loss bug §10 forbids.
+    let _ = &branch;
+    match r.git(&as_args(&delete_scratch_argv("loomux/mq/*"))) {
         Ok(out) if out.ok() => {}
         Ok(out) => failures.push(CleanupFailure {
             step: "delete-scratch",
