@@ -5173,6 +5173,19 @@ header chip and, via a listener, mirrors the state onto a minimized pane's **doc
   tail looks like a live interactive prompt (`prompt_wait_detected`). The quiet + no-keystroke
   gate is what separates a *live* prompt the human must answer from the same words scrolled
   past or a prompt the human is already typing into.
+- **The tail read is BOUNDED, because it happens under the keystroke path's lock (#717).**
+  Every pane's tail is read through `attention_tail`, which asks
+  `PtyManager::output_tail_bounded` for the trailing `ATTENTION_SCAN_BYTES` (4096) and strips
+  ANSI *after* the read has returned, so nothing is scanned under a lock at all. It used to
+  clone the whole (up to 256 KB) ring and slice the same 4 KB off the result — a 64x copy on a
+  saturated ring, taken while holding the global `ptys` mutex that `write_pty` /
+  `note_user_input` take on every keystroke and behind which the pane's own reader thread
+  queues to append its next chunk. What the detectors see is byte-identical either way
+  (`strip_ansi(&ring[len-N..])` *is* `strip_ansi(&last_N)`), so the heuristic is untouched;
+  only the hold changed. That identity is also why no assertion on the scan's *output* can
+  police this, and why `attention_tail` and `pane_attention_inputs_from` take the raw reader
+  as a closure rather than a pre-read `Vec<u8>`: the size of the request is the only thing a
+  test can reach — `Tier1Scan::read`'s precedent, for the same reason.
 - **#40 — questions weren't detected.** `prompt_wait_detected` originally only fired on a
   selection glyph that *starts* an option line (`starts_with('❯')`), a `1. yes` numbered menu,
   explicit `y/n` tokens, or a fixed list of permission phrasings. Two real interactive-question
@@ -5461,7 +5474,8 @@ subtree — structural, not dependent on any test's own cleanup code running. Ve
 **Cost (rev-15 N4).** Each checkpoint used to clone the FULL (up to 256 KB) output ring and
 `strip_ansi` all of it every 250ms poll, for up to 120s, across up to four sites per delivery.
 `PtyManager::output_tail_bounded` reads only the trailing `QUESTION_SCAN_TAIL_BYTES` (4096, matching
-the attention path's own trailing-window precedent, `pane_attention_inputs_from`) directly off the
+the attention path's own trailing window, `ATTENTION_SCAN_BYTES` — which since #717 is the size of
+that path's *read*, not just of the slice it took afterwards) directly off the
 back of the ring's `VecDeque` — `O(bounded bytes)`, not `O(ring length)` — cutting both the clone and
 the `strip_ansi` pass to a fixed, small size regardless of how much the pane has ever printed.
 
