@@ -20296,6 +20296,16 @@ const FIX_FP_BREADCRUMB: &str = include_str!("fixtures/attention/fp-breadcrumb-s
 const FIX_FP_LEADING_PTR: &str = include_str!("fixtures/attention/fp-leading-pointer-prose.txt");
 const FIX_FP_FENCED_PTR: &str = include_str!("fixtures/attention/fp-fenced-pointer-block.txt");
 const FIX_POS_PTR_LAST: &str = include_str!("fixtures/attention/pos-pointer-last-line.txt");
+// #727, from the live repro: a RESUMED pane's restored screen — a finished
+// turn's report, then the CLI's chrome. The input box is a bare `❯` on its own
+// row (Claude Code's empty prompt, under a custom-agent rule), and it is the
+// third-from-last non-empty row, so it lands squarely inside the detector's own
+// last-3-painted-lines pointer window. Nothing on this screen is asking anyone
+// anything; the pane is idle at an empty box. Captured shape, not imagined:
+// this is `get_output`'s render of w-209 in group loomux-68435179, the pane the
+// question gate held for 25 minutes.
+const FIX_FP_RESUMED_IDLE: &str =
+    include_str!("fixtures/attention/fp-resumed-agent-idle-prompt.txt");
 
 #[test]
 fn prompt_wait_detected_fires_on_interactive_question_fixtures() {
@@ -25700,6 +25710,11 @@ fn prompt_wait_detected_ignores_finished_turn_prose_about_ui() {
         ("› UI breadcrumb", FIX_FP_BREADCRUMB),
         ("leading ❯ repro steps", FIX_FP_LEADING_PTR),
         ("fenced ❯ command block", FIX_FP_FENCED_PTR),
+        // #727: not prose about a UI — the CLI's OWN empty input box, whose
+        // prompt glyph is a bare `❯` in the last painted lines. Unlike the four
+        // above it cannot be pushed out of range by anything, because it IS the
+        // thing the CLI redraws underneath.
+        ("empty ❯ prompt box", FIX_FP_RESUMED_IDLE),
     ] {
         assert!(
             !prompt_wait_detected(&strip_ansi(fixture.as_bytes())),
@@ -25755,6 +25770,7 @@ fn attention_does_not_flag_streaming_or_idle_fixtures() {
         FIX_FP_BREADCRUMB,
         FIX_FP_LEADING_PTR,
         FIX_FP_FENCED_PTR,
+        FIX_FP_RESUMED_IDLE,
     ] {
         let tail: HashMap<String, String> =
             [(wid.clone(), strip_ansi(fixture.as_bytes()))].into_iter().collect();
@@ -35536,6 +35552,7 @@ fn b1_prompt_wait_match_and_prompt_wait_detected_can_never_disagree() {
         ("fp-breadcrumb", FIX_FP_BREADCRUMB),
         ("fp-leading-ptr", FIX_FP_LEADING_PTR),
         ("fp-fenced-ptr", FIX_FP_FENCED_PTR),
+        ("fp-resumed-idle", FIX_FP_RESUMED_IDLE),
     ] {
         let stripped = strip_ansi(tail.as_bytes());
         assert_eq!(
@@ -37019,6 +37036,168 @@ fn e8_a_plain_pane_holding_a_relayed_notice_raises_no_chip_either() {
     assert!(
         quiet.is_empty(),
         "a plain pane showing only loomux's own notice is not waiting on anything: {quiet:?}"
+    );
+}
+
+// ---------- #727: an empty prompt glyph is not a menu pointer ----------
+//
+// The live incident: a pane resumed from a previous session sat at a visibly
+// idle, empty input box, and the question gate held every delivery to it for
+// 25 minutes — twice, deterministically, on the same session. Three panes were
+// lost to it and two queued deliveries were dropped with them.
+//
+// The phantom question was the CLI's own prompt. Claude Code paints an empty
+// input box as a bare `❯` on its own row, and `leads_with_pointer` read that as
+// a menu's highlighted choice. That poisons BOTH readings at once, which is why
+// nothing could clear it: the ring matched (the glyph is in the last painted
+// lines, and `strip_ansi` concatenates it onto whatever was addressed next), and
+// `pointer_rendered` then found the same bare glyph among the rendered rows, so
+// the grid answered `StillRendered` and #534's release — the only thing that
+// ends a hold without a human — could never fire. A resumed pane makes it
+// permanent: its restored screen is static, so the glyph is never repainted
+// away.
+
+#[test]
+fn f1_the_clis_own_empty_prompt_glyph_is_not_a_menu_pointer() {
+    let tail = strip_ansi(FIX_FP_RESUMED_IDLE.as_bytes());
+
+    // Precondition, and the reason this fixture is not a duplicate of the other
+    // `❯` negatives: those are safe because the CLI's redrawn box pushes the
+    // glyph out of the last-3-painted-lines window. This glyph IS that box, so
+    // it is inside the window by construction and nothing can push it out.
+    let last_painted: Vec<String> = tail
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(3)
+        .collect();
+    assert!(
+        last_painted.iter().any(|l| l == "❯"),
+        "precondition: the bare prompt glyph must be inside the detector's own pointer \
+         window, or this test would pass for the reason the other fixtures pass: {last_painted:?}"
+    );
+
+    assert!(
+        prompt_wait_match(&tail).is_none(),
+        "a pointer with nothing after it points at no option — it is an empty prompt, \
+         and an idle pane is the opposite of a pane parked on a question: {:?}",
+        prompt_wait_match(&tail)
+    );
+}
+
+#[test]
+fn f2_a_resumed_panes_restored_screen_does_not_hold_a_delivery() {
+    // The repro, end to end at the gate that queued the delivery: both
+    // readings of the restored screen, through the production predicate.
+    let raw = FIX_FP_RESUMED_IDLE.as_bytes().to_vec();
+
+    // The grid must be worth reading, or a release here would be the blind-start
+    // hole (`Unreadable` -> the ring's word stands) rather than the fix.
+    let visible = trustworthy_composition(loomux_lib::orchestration::termgrid::render_visible(
+        &raw, 100, 12,
+    ))
+    .expect("precondition: the restored screen composes to a readable grid");
+    assert!(
+        visible.contains("auto mode on"),
+        "precondition: the CLI's chrome is genuinely rendered — this is a live screen, \
+         not an absent one: {visible:?}"
+    );
+
+    let pred =
+        question_hold_predicate_sampled(move || sample_from_raw(&raw, 100, 12), None, None, Vec::new());
+    assert!(
+        !pred(),
+        "a pane idling at an empty input box must take its delivery immediately (#727)"
+    );
+}
+
+#[test]
+fn f3_a_pointer_leading_a_real_option_still_matches_and_still_holds() {
+    // The fail-SAFE direction, which this narrowing must not touch: a pointer
+    // that leads an actual choice is still a menu, on both readings.
+    let m = prompt_wait_match(&strip_ansi(FIX_POS_PTR_LAST.as_bytes()))
+        .expect("a highlighted menu choice is still a question");
+    assert_eq!(m.signal, "pointer-option", "and still THIS signal class");
+
+    for screen in [
+        "❯ Overwrite\n  Keep both",
+        // Framed on BOTH sides — the boxed dialog `deframe` exists for. The
+        // trailing border must not be mistaken for "points at nothing".
+        "│ ❯ Overwrite   │\n│   Keep both   │",
+        // A different glyph, and one sitting far above the chrome: the grid
+        // re-read is spatial (C11), and stays so.
+        "→ 1. retry\n  2. abort\nstatus\nstatus\n> \nready",
+    ] {
+        assert!(
+            match_still_rendered(screen, &m),
+            "a pointer leading an option is still the menu, framed or not: {screen:?}"
+        );
+    }
+
+    // ...and the empty prompt is the ONLY thing that stops being one.
+    for empty in ["❯", "  ❯  ", "│ ❯   │", "›"] {
+        assert!(
+            !match_still_rendered(empty, &m),
+            "a glyph with only framing after it is a prompt, not a choice: {empty:?}"
+        );
+    }
+
+    // End to end on a fully composed screen, so the hold is the production
+    // decision and not just the predicate's opinion about a string.
+    let live = painted(&[
+        "Overwrite the existing file?",
+        "❯ Overwrite",
+        "  Keep both",
+        "",
+        "esc to cancel",
+    ]);
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&live, 100, 10),
+        None,
+        None,
+        Vec::new(),
+    );
+    assert!(pred(), "a live menu must still hold the delivery (#420)");
+}
+
+#[test]
+fn f4_a_pointer_hold_releases_once_the_menu_gives_way_to_an_idle_prompt() {
+    // The latch itself, at the reading that is supposed to break it.
+    //
+    // The ring matched a genuine pointer menu and, being append-only, goes on
+    // matching it forever; #534 gave the grid the power to end that hold when
+    // the screen no longer shows it. An idle Claude Code pane's own `❯` made
+    // the grid answer `StillRendered` on EVERY screen, so for this signal class
+    // that release was dead code — which is what turned a transient hold into a
+    // 25-minute one.
+    let m = prompt_wait_match(&redraw_fragmented_pointer_tail()).expect("matches on the ring");
+    assert_eq!(m.needle, QuestionNeedle::LeadingPointer, "the class this is about");
+
+    let idle = loomux_lib::orchestration::termgrid::render_visible(
+        FIX_FP_RESUMED_IDLE.as_bytes(),
+        100,
+        12,
+    );
+    assert!(
+        idle.contains('❯'),
+        "precondition: the prompt glyph IS on the screen — the fix is that it is not a \
+         menu, never that it stopped being rendered: {idle:?}"
+    );
+    assert!(
+        !flat_contains_line(&idle, &m.line),
+        "precondition: the concatenated ring needle is not on this screen either"
+    );
+
+    assert_eq!(
+        grid_evidence_for(&m, Some(&idle)),
+        GridEvidence::NotRendered,
+        "the menu is not among the rendered rows, and an empty prompt is not a stand-in for it"
+    );
+    assert!(
+        !question_shown(Some(&m), Some(&idle)),
+        "the dialog cleared — the hold must end without a human (#534's one transition, \
+         which #727 had made unreachable)"
     );
 }
 
