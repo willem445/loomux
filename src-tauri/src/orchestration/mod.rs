@@ -6016,7 +6016,19 @@ pub fn copilot_autopilot_prompt_detected(tail: &str) -> bool {
 
 /// How a `deliver_prompt` call relates to the pane's lifecycle. Governs the boot
 /// readiness wait AND the one-time copilot autopilot-consent confirm (#101).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// **#620: also a PERSISTED fact** (`queue::QueuedDelivery::delivery_kind`).
+/// A delivery held through a pause is drained minutes or hours later by
+/// `flush_paused_queues`, long after the `deliver_prompt` call that knew what
+/// kind it was returned — so the kind rides on the queue entry rather than
+/// living only on the calling thread's stack. Serialized kebab-case
+/// (`"fresh-kickoff"`) for the reason `QueuedPayload` spells its own tag out:
+/// a human reading a group's `queue.json` after a crash should not need
+/// serde's conventions to know what an entry is. `MidSession` is the `Default`
+/// — see the field's doc for why that is the conservative reading of both an
+/// older build's record and a restart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Delivery {
     /// First prompt to a freshly *booted* pane (a fresh spawn's kickoff): wait
     /// for the CLI to paint, and — for an autopilot copilot agent — answer the
@@ -6031,6 +6043,13 @@ pub enum Delivery {
     ResumeKickoff,
     /// A mid-session delivery to an already-running pane (a follow-up / steer):
     /// no readiness wait, no dialog — long past boot, nothing to confirm.
+    ///
+    /// The `Default`, and deliberately the conservative one (#620): every
+    /// treatment this enum can switch ON — a boot wait, a stray Enter into a
+    /// consent dialog, arming #517's re-delivery — is an ACTION taken against
+    /// a live pane, so a record that cannot say what it was must fall through
+    /// to the kind that takes none of them.
+    #[default]
     MidSession,
 }
 
@@ -11856,28 +11875,64 @@ pub fn kickoff_recovery_action(
 /// actually picks up, and mirroring `deliver_prompt`'s own `was_first` rule
 /// keeps that decision in one place rather than relying on
 /// `FreshFirstAttempt`'s id guard to catch a mismatch after the fact.
-pub fn redelivery_treatment(was_first: bool) -> Option<RedeliveryTreatment> {
-    was_first.then_some(RedeliveryTreatment {
+pub fn redelivery_treatment(was_first: bool) -> Option<KickoffTreatment> {
+    was_first.then_some(KickoffTreatment {
         wait_ready: true,
         confirm_autopilot: false,
         fresh_kickoff: false,
     })
 }
 
-/// The three flags `redelivery_treatment` decides, named rather than a bare
-/// `(bool, bool, bool)`: they are the same type and mean opposite things, so
-/// a positional tuple is one transposed edit away from arming the autopilot
-/// watcher on a recovery, or making a re-delivery recoverable and unbounding
-/// the feature. The public mirror of the private `FreshFirstAttempt` fields
-/// they populate.
+/// The kickoff treatment a delivery HELD THROUGH A PAUSE runs under when
+/// `flush_paused_queues` finally starts a drainer for its pane (#620).
+///
+/// **The finding.** Nothing guards `spawn_agent` against a paused group, and
+/// since #569 a spawn during a pause routes its `Delivery::FreshKickoff`
+/// through `deliver_prompt`'s pause branch like any other delivery. The
+/// resume then flushed it with `None` — `wait_ready: false`,
+/// `confirm_autopilot: false`, `fresh_kickoff: false` — because the queue
+/// entry carried no kind. For a copilot pane under `--autopilot` that is a
+/// wedge rather than a timing nit: per `confirm_copilot_autopilot_dialog`'s
+/// own note the consent dialog appears AFTER the kickoff Enter, so nobody
+/// dismisses it, and #517's late-kickoff recovery is unarmed because the
+/// drainer was never told this was a kickoff.
+///
+/// So, unlike `redelivery_treatment`, this copies the ORIGINAL delivery's own
+/// flags rather than a narrowed set — the pause changed when the brief lands,
+/// not what it is. `confirm_autopilot` is the one flag that cannot come from
+/// the kind alone (it also depends on the group's CLI and posture); the caller
+/// passes `should_confirm_copilot_autopilot`'s verdict, computed exactly as
+/// `deliver_prompt`'s front door computes it.
+///
+/// `None` for `MidSession`, which is every ordinary held prompt and needs no
+/// treatment at all — the same `None` this path has always passed, now said
+/// rather than assumed.
+pub fn paused_flush_treatment(kind: Delivery, confirm_autopilot: bool) -> Option<KickoffTreatment> {
+    (kind != Delivery::MidSession).then_some(KickoffTreatment {
+        wait_ready: kind.wait_ready(),
+        confirm_autopilot,
+        fresh_kickoff: kind.recovers_lost_kickoff(),
+    })
+}
+
+/// The three flags `redelivery_treatment` and `paused_flush_treatment` decide,
+/// named rather than a bare `(bool, bool, bool)`: they are the same type and
+/// mean opposite things, so a positional tuple is one transposed edit away
+/// from arming the autopilot watcher on a recovery, or making a re-delivery
+/// recoverable and unbounding the feature. The public mirror of the private
+/// `FreshFirstAttempt` fields they populate.
+///
+/// #620 renamed this from `RedeliveryTreatment`: it is no longer the shape of
+/// one producer's answer, and each producer's own doc — not this struct's —
+/// is where the values it chooses are argued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RedeliveryTreatment {
-    /// Hold the paste until the CLI has painted — the F4 fix itself.
+pub struct KickoffTreatment {
+    /// Hold the paste until the CLI has painted.
     pub wait_ready: bool,
-    /// Watch for copilot's autopilot-consent dialog. Always false here.
+    /// Watch for copilot's autopilot-consent dialog (#101/#364).
     pub confirm_autopilot: bool,
-    /// Whether THIS delivery may itself be recovered if lost. Always false
-    /// here — the bound on the whole feature.
+    /// Whether THIS delivery may itself be re-delivered by the late monitor
+    /// if it turns out never to have landed (#517).
     pub fresh_kickoff: bool,
 }
 
@@ -19721,7 +19776,28 @@ impl OrchRegistry {
     ///
     /// **Also the restart path.** A loomux restarted in the middle of a pause
     /// reads its queues back through `recover_persisted_queue`, and this is
-    /// what starts them moving when the human resumes.
+    /// what starts them moving when the human resumes. Those entries were
+    /// re-admitted as ordinary prompts (`readmit_recovered`), so the kickoff
+    /// treatment below never applies to them — deliberately; see
+    /// `queue::QueuedDelivery::delivery_kind`.
+    ///
+    /// **#620: what each drainer is started WITH.** This used to pass `None`
+    /// unconditionally, which flushed a held `FreshKickoff` as a plain prompt
+    /// — no boot wait, no copilot autopilot consent, #517's late-kickoff
+    /// recovery unarmed. The kind now rides on the entry, so the treatment is
+    /// read back off the pane's front entry (`paused_flush_kickoff`) instead
+    /// of being assumed absent.
+    ///
+    /// One shape this does NOT cover, stated rather than implied: a pause that
+    /// lands in the milliseconds AFTER an unpaused kickoff's own drainer was
+    /// spawned. That drainer holds the pane for the whole pause (it polls,
+    /// refusing to paste, rather than exiting), so `ensure_drainer` here
+    /// correctly no-ops for it — and its own first pass, which is where
+    /// `FreshFirstAttempt` applies, is long past by the time the resume lands.
+    /// Closing that needs the drainer loop itself to keep an unattempted first
+    /// pass alive across a pause hold, which is a change to `immediate_first_
+    /// pass`'s meaning for the hold-escalation and still-queued-notice gates
+    /// too — out of scope here, and #620 stays open for it.
     ///
     /// Idempotent: `ensure_drainer` no-ops for a pane already draining, so a
     /// double resume costs nothing. Best-effort in exactly one respect — with
@@ -19743,6 +19819,11 @@ impl OrchRegistry {
         if panes.is_empty() {
             return;
         }
+        // #620: what each pane's front entry says it is, decided BEFORE the
+        // audit line below so the record can name the panes whose held
+        // delivery is a kickoff. See `paused_flush_kickoff`.
+        let treatments: Vec<(u32, Option<(u64, KickoffTreatment)>)> =
+            panes.iter().map(|pty_id| (*pty_id, self.paused_flush_kickoff(group, *pty_id))).collect();
         let app = self.app.lock_safe().clone();
         let reg = self.arc();
         // `started` rather than a bare "pause-flush" line: with no `AppHandle`
@@ -19752,12 +19833,77 @@ impl OrchRegistry {
         self.audit(group, "loomux", "pause-flush", json!({
             "panes": &panes,
             "started": app.is_some() && reg.is_some(),
+            // #620: which of those panes is having a KICKOFF flushed back into
+            // it — the boot wait and the copilot consent confirm are actions
+            // taken against a live pane, and this line is the only record that
+            // they were (or, before #620, were not) armed. Gated by `started`
+            // exactly like the rest of this line: with no handle, nothing here
+            // is applied to anything.
+            "kickoff_panes": treatments.iter()
+                .filter(|(_, t)| t.is_some())
+                .map(|(pty_id, _)| *pty_id)
+                .collect::<Vec<u32>>(),
         }));
         if let (Some(app), Some(reg)) = (app, reg) {
-            for pty_id in panes {
-                reg.ensure_drainer(app.clone(), group.to_string(), pty_id, None);
+            for (pty_id, treatment) in treatments {
+                let fresh_first = treatment.map(|(id, t)| FreshFirstAttempt {
+                    id,
+                    wait_ready: t.wait_ready,
+                    confirm_autopilot: t.confirm_autopilot,
+                    fresh_kickoff: t.fresh_kickoff,
+                });
+                reg.ensure_drainer(app.clone(), group.to_string(), pty_id, fresh_first);
             }
         }
+    }
+
+    /// #620: the kickoff treatment `flush_paused_queues` hands the drainer it
+    /// starts for `pty_id`, paired with the id of the entry that treatment
+    /// belongs to — `None` when the pane's front entry is an ordinary prompt,
+    /// which is every routine pause.
+    ///
+    /// **The FRONT entry, and only it.** Kickoff treatment applies to a
+    /// drainer's first pass, which attempts the front of the queue; the id
+    /// travels with it so `FreshFirstAttempt`'s guard can DROP the treatment
+    /// rather than misapply it if `plan_flush` picks a different entry by the
+    /// time that pass runs. Mirrors `redelivery_treatment`'s `was_first` rule:
+    /// the decision about which entry owns the treatment lives at the call
+    /// site, not in the drainer's id check after the fact.
+    ///
+    /// Split out of `flush_paused_queues` rather than written inline for the
+    /// reason `hold_escalation_step`'s doc gives (#560): that function needs a
+    /// real `AppHandle` to do anything observable, so a headless test — which
+    /// is every test in this repo — cannot reach a decision made inside it.
+    #[doc(hidden)] // pub for integration tests
+    pub fn paused_flush_kickoff(&self, group: &str, pty_id: u32) -> Option<(u64, KickoffTreatment)> {
+        let front = {
+            let queues = self.queues.read();
+            queues.get(&pty_id).and_then(|q| q.front()).cloned()
+        }?;
+        // A queue is keyed by pane and a pane belongs to one group, so this
+        // can only fail if `flush_paused_queues`' own pane filter and this
+        // read ever disagree. Cheap to state; the safe answer either way is
+        // no treatment.
+        if front.group != group {
+            return None;
+        }
+        let kind = front.delivery_kind;
+        // The SAME computation `deliver_prompt`'s front door runs, off the
+        // same two inputs (the target's role/CLI and the group's posture) —
+        // `confirm_autopilot` is the one flag the kind cannot decide alone.
+        // Resolved with the `queues` lock released: this file's order is
+        // agents, then groups, and never either under `queues`.
+        let confirm_autopilot = self.agent(&front.agent_id).is_some_and(|a| {
+            let groups = self.groups.lock_safe();
+            groups.get(group).is_some_and(|g| {
+                should_confirm_copilot_autopilot(
+                    g.guardrails.cli_for(a.role),
+                    g.guardrails.auto_ops || a.role == Role::Planner,
+                    kind.confirms_autopilot_dialog(),
+                )
+            })
+        });
+        paused_flush_treatment(kind, confirm_autopilot).map(|t| (front.id, t))
     }
 
     /// #569: tell the orchestrator what a just-ended pause DISCARDED — under
@@ -29641,8 +29787,16 @@ impl OrchRegistry {
         // where it belongs: the `delivery-queued` line's `reason`.
         self.audit(&a.group, from, "prompt", json!({ "to": agent_id, "text": text }));
         if self.is_paused(&a.group) {
-            let admitted = self.enqueue_text(
+            // #620: the entry carries what KIND of delivery this is, because
+            // this branch is exactly where that fact would otherwise be lost.
+            // Nothing here spawns a drainer (see above), so the treatment a
+            // kickoff needs — the boot wait, copilot's autopilot consent,
+            // #517's late-kickoff recovery — cannot be threaded on the stack
+            // the way the unpaused path below does it; `flush_paused_queues`
+            // reads it back off the entry at resume instead.
+            let admitted = self.enqueue_text_as(
                 &a.group, agent_id, from, text, pty_id, queue::EnqueueReason::GroupPaused,
+                delivery,
             )?;
             // #569 review B1: the pause flag is read ABOVE and the admission
             // lands HERE, with no lock across the gap and real I/O inside it
@@ -29689,7 +29843,15 @@ impl OrchRegistry {
         // the SAME audit line's `depth` field, which already distinguishes
         // "landed alone" (depth 1) from "landed behind something" (depth
         // >1) without needing a second field to say the same thing.
-        let admitted = self.enqueue_text(&a.group, agent_id, from, text, pty_id, reason)?;
+        // #620: stamped here too, though nothing reads it back on this path —
+        // the drainer this admission may spawn is handed the same facts
+        // directly, below. It is recorded so the entry's account of itself is
+        // the same whichever branch admitted it: a pause landing on a queue
+        // that already holds an unpasted kickoff leaves an entry that still
+        // says what it is, and `queue.json` never shows one kickoff as a
+        // kickoff and another as a plain prompt purely by admission timing.
+        let admitted =
+            self.enqueue_text_as(&a.group, agent_id, from, text, pty_id, reason, delivery)?;
 
         if !admitted.was_first {
             // Landed behind an existing entry (or coalesced into one) — a
@@ -29790,6 +29952,43 @@ impl OrchRegistry {
         pty_id: u32,
         reason: queue::EnqueueReason,
     ) -> Result<AdmitOutcome, String> {
+        // #620: every caller but the front door admits a payload that is a
+        // plain prompt by the time it gets here — a recovery re-admission
+        // (`readmit_recovered`, whose entry's original kind describes a pane
+        // that no longer exists), #517's own bounded re-delivery
+        // (`redeliver_lost_kickoff`, which must NOT re-arm the kickoff flags —
+        // see `redelivery_treatment`), and the integration tests that seed
+        // arbitrary queue states. Those callers say so by construction here
+        // rather than each passing a kind they would all pass the same.
+        self.enqueue_text_as(group, agent_id, from, text, pty_id, reason, Delivery::MidSession)
+    }
+
+    /// [`enqueue_text`](Self::enqueue_text) with the admitting delivery's KIND
+    /// recorded on the entry (#620) — `deliver_prompt`'s front door is the
+    /// only caller, because it is the only one that knows.
+    ///
+    /// The kind is stamped on BOTH of that function's admission paths, paused
+    /// and not, so the entry's record of what it is does not depend on which
+    /// branch happened to admit it. Only `flush_paused_queues` reads it back
+    /// (see `paused_flush_treatment`); an unpaused admission threads the same
+    /// facts to its drainer directly, on the stack, as it always has.
+    ///
+    /// A COALESCE keeps the surviving (older) entry's kind rather than
+    /// overwriting it: the treatment belongs to the entry that will actually
+    /// drain, and a byte-identical repeat adds no information about it — the
+    /// same argument `queue::admit`'s coalesce rests on.
+    #[doc(hidden)] // pub for integration tests
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_text_as(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        text: &str,
+        pty_id: u32,
+        reason: queue::EnqueueReason,
+        kind: Delivery,
+    ) -> Result<AdmitOutcome, String> {
         // #467, and it must be FIRST: recovery seeds `queue_seq` past every
         // id the previous process left on disk, so it has to run before this
         // call mints one. See `recover_persisted_queue`'s id-collision note.
@@ -29865,6 +30064,7 @@ impl OrchRegistry {
                         group: group.to_string(),
                         to_orchestrator: target.is_orchestrator,
                         session_id: target.session_id,
+                        delivery_kind: kind,
                     });
                     (
                         Admitted::Queued { id, depth: q.len(), was_first },
@@ -30097,6 +30297,12 @@ impl OrchRegistry {
             group: group.to_string(),
             to_orchestrator: target.is_orchestrator,
             session_id: target.session_id.clone(),
+            // #620: a marker is an Enter press against text ALREADY in the
+            // pane's input box — the boot it might once have been part of is
+            // long over by the time one is pushed, and there is no payload to
+            // re-deliver if it is lost. `MidSession` is the only kind that
+            // describes it.
+            delivery_kind: Delivery::MidSession,
         });
         Ok((id, q.len()))
     }

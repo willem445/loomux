@@ -291,6 +291,7 @@ mod tests {
             group: "g1".to_string(),
             to_orchestrator: false,
             session_id: None,
+            delivery_kind: super::super::Delivery::MidSession,
         }
     }
 
