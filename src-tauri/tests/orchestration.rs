@@ -26372,19 +26372,31 @@ fn group_summary_surfaces_live_compaction_state_and_cached_context_usage() {
     assert_eq!(a2["compaction"]["max_attempts"], 3);
 
     // Delivery confirms: the in-flight phase is gone — no lingering `armed`,
-    // `awaiting_evidence` or `reinjecting`. #546 (option 3): what remains for
-    // the recency window is the RESOLUTION, carrying which evidence closed it.
-    // Here that is our own submit sampler, so the panel says `delivery` — the
-    // stronger of the two claims, and the one a reader must be able to tell
-    // apart from a resolution that only ever saw the agent stay alive.
+    // `awaiting_evidence` or `reinjecting`. #546: what remains for the recency
+    // window is the RESOLUTION, carrying which evidence closed it. Here that is
+    // our own submit sampler, so the panel says `delivery` — the stronger of
+    // the two claims, and the one a reader must be able to tell apart from a
+    // resolution that only ever saw the agent stay alive.
+    //
+    // This is the only test that asserts the SERIALIZED shape end to end, so it
+    // is where the frontend's `CompactionStatus` union is actually pinned: a
+    // tag or field renamed on one side and not the other is a badge that
+    // silently stops rendering, and nothing else in either suite would catch it.
     let confirmed = confirmed_delivery(&oid, FAR + 2_000);
     let _ = reg.compact_nudge_tick(FAR + 3_000, &grew, &HashMap::new(), &HashMap::new(), &tokens, &HashMap::new(), &confirmed);
     let s3 = reg.group_summary(&gid);
     let a3 = s3["agents"].as_array().unwrap().iter().find(|a| a["id"] == oid.as_str()).unwrap();
-    assert_eq!(a3["compaction"]["status"], "acked", "resolved — the phase is closed, not in flight");
-    assert_eq!(a3["compaction"]["source"], "delivery", "and the panel says WHICH evidence closed it");
+    assert_eq!(a3["compaction"]["status"], "resolved", "resolved — the phase is closed, not in flight");
+    assert_eq!(a3["compaction"]["evidence"], "delivery", "and the panel says WHICH evidence closed it");
     assert!(a3["compaction"]["since_ms"].as_u64().is_some(), "stamped, so the surfacing ages out");
     assert!(a3["compaction"]["attempt"].is_null(), "no in-flight attempt survives the resolution");
+    // #546: the wire tag was `"acked"`, and that word is the overclaim this
+    // issue is named after — on the liveness arm the agent acknowledged
+    // nothing. Renaming only the rendered label would have left the assertion
+    // living in the payload a human can also read (audit viewer, saved
+    // queries), so the tag had to move too, and this pins that it did.
+    assert_ne!(a3["compaction"]["status"], "acked", "the overclaiming tag must be gone from the wire, not just the label");
+    assert!(a3["compaction"]["source"].is_null(), "renamed to `evidence` — a stale `source` alongside it would let both spellings drift");
 }
 
 #[test]
