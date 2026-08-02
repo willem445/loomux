@@ -615,6 +615,42 @@ compare against, so a `0` there means *nothing to compare*, not *never
 happened*; and only a bounded number of recent sessions are read, so on a
 long-running group a count is a floor rather than a total.
 
+### Watching the merge queue
+
+A repo can turn on a **merge queue** (`merge_queue:` in its `.loomux/workflow.yml`) so a
+batch of approved sub-PRs is tested *together* on a scratch ref before any of them reaches
+the integration branch — the combination is what gets a gate, instead of each PR getting one
+and nobody checking the pile. The queue runs in loomux itself and lands only on an
+integration branch, never on your default branch; see
+[`doc/design/merge-queue.md`](https://github.com/willem445/loomux/blob/main/doc/design/merge-queue.md)
+for the design.
+
+The lifecycle panel shows what it is doing, and nothing more — **the row is read-only**.
+There is no button here to enqueue, cancel, or land anything: the queue is host-run, and the
+orchestrator drives it through its own tools. What you get is the branch the queue is landing
+on, the batch in flight (with the draft PR whose checks it is watching), and one line per
+queued PR:
+
+- **queued** — waiting for a batch. If a PR was rebased after its reviewers passed, its
+  approvals no longer cover its head, so it is queued *and blocked*, and the row says why.
+  It becomes eligible again the moment a re-review covers the new head; nothing merges
+  unreviewed.
+- **in the batch being built · waiting on batch CI · landing** — in flight.
+- **in the bisect · kicked back** — the batch went red and the queue is attributing (or has
+  attributed) it. A kicked-back PR is not going to land as things stand; its own PR carries a
+  comment naming the failing check.
+- **landed · cancelled** — done with.
+
+Two things the row will never do quietly. If more PRs are queued than fit, it says *showing 6
+of 12 entries* rather than showing you six and letting them read as all of them. And if
+loomux cannot read the queue's state file at all — a torn write, or a file written by a newer
+build — it says **that**, loudly, instead of drawing an empty queue: "nothing is queued" and
+"loomux can't read the queue" are the same picture otherwise, and only one of them means
+your PR is fine.
+
+The row is absent entirely until a group actually has a queue, which is the default: no
+`merge_queue:` block means the feature is off and nothing about your group changes.
+
 ## Guardrails
 
 Enforced by loomux, not the model:
