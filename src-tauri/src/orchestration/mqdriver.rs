@@ -306,13 +306,72 @@ pub(super) fn as_args(v: &[String]) -> Vec<&str> {
 /// string that flows onward. This mirrors the shim's `unverifiable-base` posture
 /// at `mod.rs:761-763`: **unknown is never treated as safe.**
 pub fn resolve_default_branch(r: &dyn MqRunner) -> Result<String, TargetRefusal> {
-    let out = r.gh(&as_args(&default_branch_argv())).map_err(|_| TargetRefusal::BaseUnverifiable)?;
+    resolve_default_branch_detailed(r).map_err(ResolveFailure::into_refusal)
+}
+
+/// Why a live lookup did not produce a usable answer, split by **who failed**.
+///
+/// [`TargetRefusal`] deliberately collapses both into `base-unverifiable`,
+/// because §11.1's refusal vocabulary is closed and, for a caller deciding
+/// whether *this PR* may be queued, "unknown" is one answer however it arose.
+/// A caller deciding **whether to keep going** needs the split:
+///
+/// - [`ResolveFailure::Refused`] — the remote answered, and the answer is one
+///   the queue will not act on (the base is the default branch; the base is not
+///   the target). A fact about **that PR**: the next entry is a different
+///   question and worth asking.
+/// - [`ResolveFailure::Runner`] — the call did not complete at all: `gh`
+///   missing, or a remote answering slowly enough to burn `MQ_CMD_TIMEOUT`. A
+///   fact about **the world**: the next entry costs the same again, for the
+///   same reason, and none of them will answer.
+///
+/// The distinction is not cosmetic, and it is not new to this file — `land()`
+/// already draws exactly this line (`backoff = culprit.is_none()`). It matters
+/// here because the selection pass runs inside the one shared `gh` poll loop:
+/// examining `MAX_EXAMINED_PER_BUILD` entries against a slow-but-answering
+/// remote would be that many timeouts back to back, a slice of the loop that
+/// delivers every `notify_when` notice in the fleet — which is #656's point,
+/// undone by fan-out the counts alone do not bound. Treating the first runner
+/// failure as terminal for the pass bounds it at **one** timed-out call.
+///
+/// Same posture as `capture_raw_with_timeout` one layer down: one implementation
+/// of the fallible thing, two readings of its result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveFailure {
+    /// The seam itself failed. Carries `git`/`gh`'s own message for the audit.
+    Runner(String),
+    /// The remote answered and the queue refuses that answer.
+    Refused(TargetRefusal),
+}
+
+impl ResolveFailure {
+    /// The closed-vocabulary refusal an MCP caller sees. A runner failure is
+    /// `base-unverifiable` — unknown is never treated as safe (§7.1).
+    pub fn into_refusal(self) -> TargetRefusal {
+        match self {
+            ResolveFailure::Runner(_) => TargetRefusal::BaseUnverifiable,
+            ResolveFailure::Refused(t) => t,
+        }
+    }
+
+    /// Whether the world failed rather than this PR.
+    pub fn is_runner(&self) -> bool {
+        matches!(self, ResolveFailure::Runner(_))
+    }
+}
+
+/// [`resolve_default_branch`] keeping the who-failed split.
+pub fn resolve_default_branch_detailed(r: &dyn MqRunner) -> Result<String, ResolveFailure> {
+    let out = r.gh(&as_args(&default_branch_argv())).map_err(ResolveFailure::Runner)?;
     if !out.ok() {
-        return Err(TargetRefusal::BaseUnverifiable);
+        // The process ran and `gh` said no. That is an answer, not a stall —
+        // an unauthenticated or renamed repo refuses every entry equally, and
+        // the caller's own loop decides what to do about that.
+        return Err(ResolveFailure::Refused(TargetRefusal::BaseUnverifiable));
     }
     let name = out.line().to_string();
     if name.is_empty() {
-        return Err(TargetRefusal::BaseUnverifiable);
+        return Err(ResolveFailure::Refused(TargetRefusal::BaseUnverifiable));
     }
     Ok(name)
 }
@@ -326,12 +385,17 @@ pub fn resolve_default_branch(r: &dyn MqRunner) -> Result<String, TargetRefusal>
 /// (`UnknownRevision`, its rev-157 filter) — one refusal, in the module that
 /// owns the gate decision, rather than two that could drift apart.
 pub fn resolve_pr(r: &dyn MqRunner, pr: u64) -> Result<PrFacts, TargetRefusal> {
-    let out = r.gh(&as_args(&pr_facts_argv(pr))).map_err(|_| TargetRefusal::BaseUnverifiable)?;
+    resolve_pr_detailed(r, pr).map_err(ResolveFailure::into_refusal)
+}
+
+/// [`resolve_pr`] keeping the who-failed split — see [`ResolveFailure`].
+pub fn resolve_pr_detailed(r: &dyn MqRunner, pr: u64) -> Result<PrFacts, ResolveFailure> {
+    let out = r.gh(&as_args(&pr_facts_argv(pr))).map_err(ResolveFailure::Runner)?;
     if !out.ok() {
-        return Err(TargetRefusal::BaseUnverifiable);
+        return Err(ResolveFailure::Refused(TargetRefusal::BaseUnverifiable));
     }
-    let raw: RawPrFacts =
-        serde_json::from_str(out.line()).map_err(|_| TargetRefusal::BaseUnverifiable)?;
+    let raw: RawPrFacts = serde_json::from_str(out.line())
+        .map_err(|_| ResolveFailure::Refused(TargetRefusal::BaseUnverifiable))?;
     Ok(PrFacts {
         base: raw.base_ref_name.trim().to_string(),
         head: raw.head_ref_oid.trim().to_string(),
@@ -568,9 +632,23 @@ pub fn resolve_and_validate_target(
     current_target: Option<&str>,
     asserted: Option<&str>,
 ) -> Result<(String, PrFacts), TargetRefusal> {
-    let facts = resolve_pr(r, pr)?;
-    let default = resolve_default_branch(r)?;
-    let target = validate_target(&facts.base, &default, current_target, asserted)?;
+    resolve_and_validate_target_detailed(r, pr, current_target, asserted)
+        .map_err(ResolveFailure::into_refusal)
+}
+
+/// [`resolve_and_validate_target`] keeping the who-failed split — see
+/// [`ResolveFailure`]. `validate_target`'s own refusals are always `Refused`:
+/// they are decisions about answers loomux already has.
+pub fn resolve_and_validate_target_detailed(
+    r: &dyn MqRunner,
+    pr: u64,
+    current_target: Option<&str>,
+    asserted: Option<&str>,
+) -> Result<(String, PrFacts), ResolveFailure> {
+    let facts = resolve_pr_detailed(r, pr)?;
+    let default = resolve_default_branch_detailed(r)?;
+    let target = validate_target(&facts.base, &default, current_target, asserted)
+        .map_err(ResolveFailure::Refused)?;
     Ok((target, facts))
 }
 
@@ -862,13 +940,23 @@ pub fn classify_checks(raw: Result<&str, &str>) -> BatchVerification {
 /// shim's `ci-not-green` arm that treats failing, still-running and
 /// no-checks-reported alike.
 pub fn pr_ci_green(r: &dyn MqRunner, pr: u64) -> Option<bool> {
-    let out = r.gh(&as_args(&pr_checks_argv(pr))).ok()?;
+    pr_ci_green_detailed(r, pr).unwrap_or(None)
+}
+
+/// [`pr_ci_green`] keeping the who-failed split — see [`ResolveFailure`].
+///
+/// `Err` is the seam failing; `Ok(None)` is the shim's own `ci-not-green` arm,
+/// which treats failing, still-running and no-checks-reported alike. The two
+/// refuse identically at the gate, and the caller that must not spend another
+/// `MQ_CMD_TIMEOUT` on the next entry needs them apart.
+pub fn pr_ci_green_detailed(r: &dyn MqRunner, pr: u64) -> Result<Option<bool>, String> {
+    let out = r.gh(&as_args(&pr_checks_argv(pr)))?;
     let raw = if out.ok() { Ok(out.stdout.as_str()) } else { Err(out.stderr.as_str()) };
-    match classify_checks(raw) {
+    Ok(match classify_checks(raw) {
         BatchVerification::Green => Some(true),
         BatchVerification::Red { .. } => Some(false),
         BatchVerification::Pending | BatchVerification::Unavailable { .. } => None,
-    }
+    })
 }
 
 // ── landing (§7.3, §7.4, §8) ────────────────────────────────────────────────

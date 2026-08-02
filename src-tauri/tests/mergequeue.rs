@@ -32,8 +32,8 @@
 //! remote, and no agent CLI is spawned by anything in this file.
 
 use loomux_lib::orchestration::mergeq::{
-    scratch_branch, BatchRecord, EntryState, GateSpec, MergeQueueState, QueueEntry,
-    MERGE_QUEUE_VERSION,
+    scratch_branch, valid_id_component, BatchRecord, EntryState, GateSpec, MergeQueueState,
+    QueueEntry, MERGE_QUEUE_VERSION,
 };
 use loomux_lib::orchestration::mqloop::{
     advance_entry, batch_fetch_argv, batch_pr_body, batch_pr_title, bisect_action, build_scratch,
@@ -121,6 +121,13 @@ impl Fake {
 
     fn gh(mut self, matches: &'static str, code: i32, stdout: &str, stderr: &str) -> Fake {
         self.gh_replies.push(Reply { matches, out: out(code, stdout, stderr) });
+        self
+    }
+
+    /// Like [`Fake::gh`], but **ahead of** everything already scripted — see
+    /// [`Fake::git_first`] for why appending cannot override.
+    fn gh_first(mut self, matches: &'static str, code: i32, stdout: &str, stderr: &str) -> Fake {
+        self.gh_replies.insert(0, Reply { matches, out: out(code, stdout, stderr) });
         self
     }
 
@@ -2133,6 +2140,96 @@ fn a_recorded_target_that_is_not_a_branch_name_stops_the_tick_before_any_call() 
     let mut s = queued_state(&[]);
     let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
     assert!(rep.audits.is_empty() && !rep.backoff, "a drained queue is not a corrupt one");
+}
+
+/// **A batch id off disk is validated everywhere it lands, not just where it
+/// becomes a ref** (rev-lead finding 1).
+///
+/// `scratch_branch` always validated it, so the ref namespace was closed. But
+/// the same string off the same file also names the temp worktree
+/// `git worktree add` creates and the body file `fs::write` fills, and those
+/// took it raw — a record carrying `../…` picked both locations. The record is
+/// now validated as a whole, before any path or argv is built from it.
+#[test]
+fn a_batch_id_that_is_not_a_name_stops_the_tick_before_any_path_is_built() {
+    for bad in ["../../evil", "a/b", "", "  ", "-x", "id with spaces", "a\nb"] {
+        let f = drive_fake();
+        let mut s = in_flight_state("mq-placehold", &[612], 641);
+        s.batch.as_mut().unwrap().id = bad.to_string();
+        let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+        assert!(
+            f.calls().is_empty(),
+            "batch id {bad:?} must reach no argv and no path at all: {:?}",
+            f.calls()
+        );
+        assert!(!rep.changed, "a corrupt record is not rewritten on the way past ({bad:?})");
+        assert!(rep.backoff, "batch id {bad:?}");
+        assert!(
+            rep.audits.iter().any(|a| a.action == "mq-stranded"),
+            "batch id {bad:?} must be audited loudly"
+        );
+        // Nothing was written where the id would have pointed.
+        assert!(
+            !scratch_worktree_path(bad).exists(),
+            "batch id {bad:?} must not have named a directory into existence"
+        );
+    }
+    // The predicate is the one `scratch_branch` already applied — named now, so
+    // the three interpolations cannot drift apart.
+    assert!(valid_id_component("mq-7f3a0000") && valid_id_component("g1"));
+    let too_long = "x".repeat(65);
+    for bad in ["../..", "a/b", "", "-g1", "g 1", too_long.as_str()] {
+        assert!(!valid_id_component(bad), "{bad:?}");
+        assert_eq!(scratch_branch("g1", bad), None, "{bad:?} as a batch id");
+        assert_eq!(scratch_branch(bad, "mq-1"), None, "{bad:?} as a group id");
+    }
+}
+
+/// **A stalled seam ends the selection pass; a refused PR does not**
+/// (rev-lead finding 2).
+///
+/// The counts were bounded and the clock was not: `MAX_EXAMINED_PER_BUILD`
+/// entries against a slow-but-answering remote is that many `MQ_CMD_TIMEOUT`s
+/// back to back, inside the one loop that also delivers every `notify_when`
+/// notice in the fleet — #656's point undone by a fan-out the counts do not
+/// bound. The fix is the distinction `land()` already draws: a **runner**
+/// failure is a fact about the world and the next entry answers nothing, while
+/// a **refusal** is a fact about that PR and the next entry is a fresh question.
+#[test]
+fn a_stalled_lookup_stops_the_selection_pass_but_a_refused_pr_does_not() {
+    // ── the world stalls: one lookup, then nothing.
+    let f = Fake::new().spawn_fail("gh");
+    let mut s = queued_state(&[612, 613, 614]);
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    assert_eq!(
+        f.calls().len(),
+        1,
+        "the pass must stop on the FIRST unrunnable call, not spend one per entry: {:?}",
+        f.calls()
+    );
+    assert!(s.batch.is_none(), "nothing is batched on half a picture");
+    assert!(rep.backoff, "a stalled world is not re-derived on the next 30-second wake");
+    assert!(
+        rep.audits.iter().any(|a| a.action == "mq-batch-aborted"),
+        "and it says so, with the runner's own message: {:?}",
+        rep.audits
+    );
+
+    // ── one PR is refused: the remote answered, so the others are still worth
+    //    asking about, and the batch forms without it.
+    let f = drive_fake().gh_first("pr view 613", 0, &pr_json("some-other-branch", HEAD_B, "b"), "");
+    let mut s = queued_state(&[612, 613, 614]);
+    drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+    let b = s.batch.as_ref().expect("a refusal is not a stall — the pass keeps going");
+    assert_eq!(b.prs, vec![612, 614]);
+    assert_eq!(
+        s.entry(613).unwrap().blocked_reason.as_deref(),
+        Some("base-not-target"),
+        "the refusal the remote actually answered with, from the closed vocabulary"
+    );
 }
 
 /// **A queue where nothing is eligible backs the group off.**

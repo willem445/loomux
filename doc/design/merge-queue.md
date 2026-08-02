@@ -787,6 +787,19 @@ deferred, never starved — which is `due_intake_polls`' idiom applied to a thir
 group, a tick performs **at most one state advance**: it never loops waiting for anything,
 never sleeps, and never retries an external call in place.
 
+**A stalled seam ends the pass; a refused PR does not.** The counts above bound how many calls
+a tick makes, and that is not the same as bounding how long it holds the loop. The selection
+pass examines up to `MAX_EXAMINED_PER_BUILD` entries, and against a remote that is *answering
+slowly* rather than refusing, each one burns a full `MQ_CMD_TIMEOUT` — the counts hold and the
+clock does not, which is the property the fleet actually feels, since the same loop delivers
+every `notify_when` notice. So the pass distinguishes **who** failed, exactly as §6's landing
+path already does (`backoff = culprit.is_none()`): a `MqRunner` error is a fact about the world
+— the next entry costs the same again and answers nothing — and ends the pass with a backoff,
+while a refusal the remote actually answered with is a fact about that PR and the next entry is
+a fresh question. `mqdriver::ResolveFailure` carries the split; the closed §11.1 vocabulary is
+unchanged, because a caller deciding whether *this PR* may be queued still sees
+`base-unverifiable` either way. The phase is bounded at **one** timed-out call.
+
 **Every child is bounded, through #656's own primitive.** `MqRunner`'s process implementation
 spawns `git` and `gh` inside that shared loop, so an unbounded wait there would park every
 `notify_when` notice in the fleet — the exact failure #656 closed for `gh_capture`. It reuses
@@ -858,6 +871,24 @@ record; if the driver could produce that shape legitimately, every restart would
 set of innocent PRs. `mq_drive_group_with` therefore also runs `merge_queue_reconcile_with`
 **before** driving — once-only, so it costs nothing after the first call, but it makes
 recovery-before-driving a guarantee instead of an assumption about which bind site ran when.
+
+**The whole record is validated before any name is built from it.** `merge_queue.json` is a
+file, so a torn write or a hand edit can put anything in it, and the tick interpolates two of
+its strings into paths and argv. The **target** reaches a refspec (the batch fetch's
+`+refs/heads/<target>:…` runs long before §7.3's submit-time guard), so it is checked with
+`landable` — the same predicate the landing path uses. The **batch id** reaches three places,
+and only one of them was ever closed: `scratch_branch` validated it and cleanup refused to
+guess at an unbuildable name, but `scratch_worktree_path` picks where `git worktree add`
+creates a directory and `body_file_path` picks where the PR body is written, and both took it
+raw. It is checked with `mergeq::valid_id_component` — `scratch_branch`'s own component check,
+named rather than inlined, so the three interpolations cannot drift apart. Both checks live at
+the top of `drive`, in one place, so a path added later cannot reach the same string by another
+route.
+
+Refusing the tick rather than repairing the record is deliberate: a record loomux will not
+build a name from is also one it cannot clean up by name, so acting on it would leak whatever
+the real batch was. It audits and backs off — a loud, rate-bounded "a human has to look at this
+file" — rather than guessing.
 
 Two more registry-level facts the driver forced:
 

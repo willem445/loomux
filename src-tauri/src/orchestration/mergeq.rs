@@ -529,15 +529,41 @@ pub fn new_batch_id(now_ms: u64) -> String {
 /// "namespace-scoped" write stops being scoped. Rejected, never rewritten —
 /// [`None`] means "do not build a ref for this", not "here is a different one".
 pub fn scratch_branch(group: &str, batch_id: &str) -> Option<String> {
-    fn clean(s: &str) -> Option<&str> {
-        let s = s.trim();
-        let ok = !s.is_empty()
-            && s.len() <= 64
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            && !s.starts_with('-');
-        ok.then_some(s)
+    let (group, batch_id) = (group.trim(), batch_id.trim());
+    if !valid_id_component(group) || !valid_id_component(batch_id) {
+        return None;
     }
-    Some(format!("loomux/mq/{}-{}", clean(group)?, clean(batch_id)?))
+    Some(format!("loomux/mq/{group}-{batch_id}"))
+}
+
+/// Whether a group id or a batch id is one loomux will build **anything** from
+/// — a ref name, a filesystem path, or an argument.
+///
+/// Extracted from [`scratch_branch`] so there is one definition rather than a
+/// second opinion. The ref namespace was never the only place these strings
+/// land: a batch id read back from `merge_queue.json` also names the temp
+/// worktree `git worktree add` creates and the body file `gh --body-file`
+/// reads, and a record carrying `../…` in its id would pick both of those
+/// locations. `scratch_branch` refused such a name and the cleanup path
+/// refused to guess at one, so the *ref* namespace was already closed; the
+/// other two interpolations were not, and this is the predicate that closes
+/// them (the guard at the top of `mqloop::drive`).
+///
+/// Deliberately much stricter than `mqdriver::landable`, which governs a
+/// *branch* the queue lands on and therefore has to accept the shapes a real
+/// branch name takes (`feat/integration-batch-2`). An id is loomux's own
+/// generated or configured token, so it gets the narrower alphabet: a `/` that
+/// is ordinary in a branch name is a directory separator in the two paths
+/// above.
+///
+/// Rejected, never rewritten — `false` means "do not build anything from this",
+/// not "here is a sanitized version".
+pub fn valid_id_component(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !s.starts_with('-')
 }
 
 // ── the batch planner (§4, §8) ──────────────────────────────────────────────

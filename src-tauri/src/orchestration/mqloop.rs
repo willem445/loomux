@@ -46,15 +46,15 @@
 //! function **plus the landing verb**, exactly as §8 warns.
 
 use super::mergeq::{
-    bisect_step, plan_batch, recheck_gate, scratch_branch, BatchPlan, BatchRecord, BisectSearch,
-    BisectStep, EntryState, GateSpec, InvalidTransition, MergeQueueState, PrObservation,
-    QueueEntry, MAX_ENTRIES,
+    bisect_step, plan_batch, recheck_gate, scratch_branch, valid_id_component, BatchPlan,
+    BatchRecord, BisectSearch, BisectStep, EntryState, GateSpec, InvalidTransition,
+    MergeQueueState, PrObservation, QueueEntry, MAX_ENTRIES,
 };
 use super::mergeqview::MERGE_QUEUE_FILE;
 use super::mqdriver::{
     as_args, classify_checks, cleanup_scratch, land_batch, mint_scratch, pr_checks_argv,
-    pr_ci_green, push_scratch, resolve_and_validate_target, scratch_exists, BatchVerification,
-    LandRefusal, MintError, MqRunner, REMOTE,
+    pr_ci_green, push_scratch, resolve_and_validate_target_detailed, scratch_exists,
+    BatchVerification, LandRefusal, MintError, MqRunner, REMOTE,
 };
 use super::notify::sanitize_gh_text;
 use super::workflow::{body_digest, BlockId, ReviewVerdict};
@@ -1435,22 +1435,50 @@ pub fn drive(
     verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
 ) -> DriveReport {
     let mut rep = DriveReport::default();
-    // §4/§7: the recorded target is a string off disk, and **every** branch
-    // below interpolates it into a refspec — the batch fetch's
-    // `+refs/heads/<target>:…` runs long before `land_batch`'s own guard does.
-    // A record that is not a plain branch name is therefore a corrupt record,
-    // and §4's posture on those is to fail loudly rather than hand it to `git`
-    // and find out what happens. Observed, not theorised: with the guard absent
-    // an empty target fetched `+refs/heads/:refs/remotes/loomux-mq/target` and
-    // ran `gh pr create --base ` with an empty base. Checked once, here, so no
-    // branch added later can skip it.
+    // §4: `merge_queue.json` is a file, and a torn write or a hand edit can put
+    // anything in it. **Every string this tick interpolates into a path or an
+    // argv is validated here, once, before any of them is built** — so a branch
+    // added later cannot skip the check by taking a different route to the same
+    // string.
+    //
+    // Two strings qualify, and they get different predicates because they are
+    // different kinds of name:
+    //
+    // - **the target** reaches a refspec — the batch fetch's
+    //   `+refs/heads/<target>:…` runs long before `land_batch`'s own submit-time
+    //   guard does — so it gets `landable`, the same predicate the landing path
+    //   uses. Observed, not theorised: with this guard absent an empty target
+    //   fetched `+refs/heads/:refs/remotes/loomux-mq/target` and ran
+    //   `gh pr create --base ` with an empty base.
+    // - **the batch id** reaches three places, and only one of them was closed.
+    //   `scratch_branch` validated it (and cleanup refused rather than guessing),
+    //   but `scratch_worktree_path` picks where `git worktree add` creates a
+    //   directory and `body_file_path` picks where `fs::write` puts the PR body,
+    //   and both took it raw. It gets `valid_id_component` — the *same*
+    //   predicate `scratch_branch` applies, now named rather than inlined, so
+    //   the three interpolations cannot drift apart.
+    //
+    // Refusing the tick rather than repairing the record is the conservative
+    // half of §4: a record loomux will not build a name from is also one it
+    // cannot clean up by name, so acting on it would leak whatever the real
+    // batch was. It audits every time and backs off, which is a durable, loud,
+    // rate-bounded "a human has to look at this file".
     let live = state.entries.iter().any(|e| !e.state().is_terminal());
-    if live && !super::mqdriver::landable(state.target.trim()) {
+    let unusable = if live && !super::mqdriver::landable(state.target.trim()) {
+        Some(("target", quote(&state.target)))
+    } else {
+        state
+            .batch
+            .as_ref()
+            .filter(|b| !valid_id_component(&b.id))
+            .map(|b| ("batch-id", quote(&b.id)))
+    };
+    if let Some((field, value)) = unusable {
         rep.backoff = true;
         rep.audit(
             audit_action::STRANDED,
-            json!({ "reason": "the recorded target is not a branch name loomux will build a \
-                               refspec from", "target": quote(&state.target) }),
+            json!({ "reason": "merge_queue.json holds a value loomux will not build a name from",
+                    "field": field, "value": value }),
         );
         return rep;
     }
@@ -1909,9 +1937,12 @@ fn start_batch(
     let target = state.target.clone();
     let (selected, examined, truncated) = refresh_and_select(r, state, cfg, gate, verdicts, rep);
     if selected.is_empty() {
-        // Everything at the head of the queue is blocked. That is a real state
-        // (§4) and not a failure — the reasons are on the entries and visible in
-        // `merge_queue_status` — but the refresh that established it costs two
+        // Two ways to get here and both want the same answer. Either the pass
+        // stalled on the seam, in which case it has already audited and set
+        // `backoff`; or everything at the head of the queue is blocked — a real
+        // state (§4) and not a failure, since the reasons are on the entries and
+        // visible in `merge_queue_status`. In that second case the refresh that
+        // established it costs two
         // `gh` round-trips per examined entry, and a queue can sit blocked for
         // hours waiting on a re-review. Retrying that on every 30-second wake
         // would be ~700 `gh` calls an hour for a group doing nothing, which is
@@ -1992,25 +2023,49 @@ fn refresh_and_select(
         // §7 layer 2: live, through the real `gh`, and re-checked against the
         // recorded target — a PR whose base moved under the queue is refused
         // here rather than landed somewhere nobody reviewed it for.
-        let reason = match resolve_and_validate_target(r, *pr, Some(&target), None) {
-            Err(refusal) => Some(refusal.code().to_string()),
+        //
+        // **A runner failure ends the pass.** It is a fact about the world, not
+        // about this PR: the next entry costs another `MQ_CMD_TIMEOUT` for the
+        // same reason and answers nothing. Carrying on would put
+        // `MAX_EXAMINED_PER_BUILD` timeouts back to back inside the one loop
+        // that also delivers every `notify_when` notice in the fleet — the
+        // counts are bounded, but the clock is what the fleet actually feels.
+        // Stopping here bounds the phase at **one** timed-out call, and the
+        // group backs off rather than re-deriving the same stall next wake.
+        // Same line `land()` draws with `backoff = culprit.is_none()`.
+        let reason = match resolve_and_validate_target_detailed(r, *pr, Some(&target), None) {
+            Err(f) if f.is_runner() => return stall(rep, examined, truncated, *pr, &f),
+            Err(f) => Some(f.into_refusal().code().to_string()),
             Ok((_, facts)) => {
-                let observed = PrObservation {
-                    body_digest: Some(body_digest(&facts.body)),
-                    // Fetched only when the gate declares the clause — the same
-                    // predicate `land_batch` uses, which fails *toward* fetching
-                    // (an absent or malformed gate answers yes), so an
-                    // unreadable gate can never be the reason a check was
-                    // skipped. Reused rather than re-decided here because the
-                    // build and the landing must not disagree about when the
-                    // sub-PR's own CI matters, and because this runs once per
-                    // examined entry inside a shared poll tick.
-                    ci_green: if super::mqdriver::declares_ci_green(gate) {
-                        pr_ci_green(r, *pr)
-                    } else {
-                        None
-                    },
+                // Fetched only when the gate declares the clause — the same
+                // predicate `land_batch` uses, which fails *toward* fetching
+                // (an absent or malformed gate answers yes), so an unreadable
+                // gate can never be the reason a check was skipped. Reused
+                // rather than re-decided here because the build and the landing
+                // must not disagree about when the sub-PR's own CI matters, and
+                // because this runs once per examined entry inside a shared
+                // poll tick.
+                let ci_green = if super::mqdriver::declares_ci_green(gate) {
+                    match super::mqdriver::pr_ci_green_detailed(r, *pr) {
+                        // Same reasoning as above, one call later: a seam that
+                        // could not run is the world, and it is why the bound
+                        // holds whichever of the two lookups stalls first.
+                        Err(e) => {
+                            return stall(
+                                rep,
+                                examined,
+                                truncated,
+                                *pr,
+                                &super::mqdriver::ResolveFailure::Runner(e),
+                            )
+                        }
+                        Ok(v) => v,
+                    }
+                } else {
+                    None
                 };
+                let observed =
+                    PrObservation { body_digest: Some(body_digest(&facts.body)), ci_green };
                 let recheck =
                     recheck_gate(gate, &verdicts(*pr), Some(facts.head.as_str()), &observed);
                 if recheck.passed() {
@@ -2033,6 +2088,38 @@ fn refresh_and_select(
         }
     }
     (selected, examined, truncated)
+}
+
+/// End a selection pass because the seam stalled, not because a PR was refused.
+///
+/// Returns an empty selection (so no batch is cut on half a picture), reports
+/// `backoff` (so the next wake is five minutes away rather than 30 seconds), and
+/// audits what happened with the entry it stalled on — an operator looking at a
+/// queue that stopped moving needs the `git`/`gh` message, and `mq-batch-aborted`
+/// is §11.5's action for "a batch was not built and here is why".
+fn stall(
+    rep: &mut DriveReport,
+    examined: usize,
+    truncated: bool,
+    pr: u64,
+    why: &super::mqdriver::ResolveFailure,
+) -> (Vec<u64>, usize, bool) {
+    let detail = match why {
+        super::mqdriver::ResolveFailure::Runner(e) => quote(e),
+        // Unreachable — `stall` is only called on a runner failure — and still
+        // rendered rather than unwrapped, because an audit line that says
+        // nothing is worse than one that says something unexpected.
+        other => format!("{other:?}"),
+    };
+    rep.backoff = true;
+    rep.audit(
+        audit_action::BATCH_ABORTED,
+        json!({ "why": "a live lookup could not be completed; the selection pass stopped rather \
+                        than spending one timeout per entry on the same stall",
+                "pr": pr, "detail": detail,
+                "examined": examined, "examination_truncated": truncated }),
+    );
+    (Vec::new(), examined, truncated)
 }
 
 /// Mint, build, push and open the draft PR — the whole construction half of a
