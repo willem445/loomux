@@ -5955,3 +5955,64 @@ fn the_merge_queue_block_can_never_name_a_branch_or_widen_anything() {
     )
     .is_err());
 }
+
+// ── #687 RED-EVIDENCE (temporary) ───────────────────────────────────────────
+//
+// The per-block model knobs, asserted as BEHAVIOR against a tree that does not
+// have them yet. Everything here compiles on the base branch on purpose — it
+// names no new symbol, only `parse_workflow`, `APP_COMMANDS` and the exact
+// error strings #687 introduces — so this run reddens on what the code DOES,
+// not on a signature that doesn't exist. Replaced by the permanent tests in
+// the next commit.
+
+#[test]
+fn red687_effort_and_context_are_real_keys_with_their_own_errors() {
+    // 1. A declared knob must PARSE. On base, `deny_unknown_fields` rejects the
+    //    key outright — the "this feature does not exist" red.
+    let ok = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    effort: xhigh\n    context: 1m\n",
+    );
+    assert!(ok.is_ok(), "a declared effort:/context: must parse, got: {:?}", ok.err());
+
+    // 2. An out-of-vocabulary value must name ITSELF and the vocabulary, not
+    //    the generic unknown-field noise.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    effort: banana\n",
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("unknown effort \"banana\"")
+            && e.contains("must be one of low, medium, high, xhigh, max")),
+        "{errs:?}"
+    );
+
+    // 3. A knob loomux cannot deliver on THIS cli must be refused by name.
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: copilot\n    context: 1m\n",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("cli \"copilot\" cannot set context:")), "{errs:?}");
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: r\n    kind: reviewer\n    cli: gemini\n    effort: high\n",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("cli \"gemini\" cannot set effort:")), "{errs:?}");
+
+    // 4. The orchestrator block may pin both — the deliberate pin-list widening.
+    assert!(workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: orchestrator\n    kind: orchestrator\n    cli: claude\n    effort: max\n    context: 1m\n"
+    )
+    .is_ok());
+}
+
+#[test]
+fn red687_the_agent_cli_knobs_command_is_registered() {
+    // The launcher's capability query must exist and be ACL-granted. On base
+    // there is no such command at all; after the change, the permanent pin is
+    // `main_has_all_135_and_zero_permission_denies_dangerous_spread`, which
+    // actually invokes it against the main window.
+    assert!(
+        loomux_lib::command_manifest::APP_COMMANDS.contains(&"agent_cli_knobs"),
+        "agent_cli_knobs must be registered in the ACL manifest"
+    );
+}
