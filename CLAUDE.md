@@ -126,13 +126,6 @@ compiles.
 - Comments in this codebase explain *why* (design constraints, Windows quirks,
   issue numbers) — keep that density and style.
 - Write tests that test intent, not implementation echoes.
-- **Historical context lives in design notes, ADRs, and issue/PR history —
-  never in user docs, prompts, or this file.** Incident stories, superseded
-  rules, dates, and "how we got here" narratives pollute every future
-  reader's context. Reader-facing text carries the current rule and its
-  operational why, with at most a bare issue/PR ref as provenance. When
-  editing docs, strip any such narrative you find; when a reviewer asks for
-  provenance in reader-facing text, the ref alone is the answer.
 
 ## Refinements & scope increases from the user
 
@@ -164,3 +157,14 @@ narrow their ask back down to the original ticket on your own judgment.
 - User-visible behavior changes must update the matching user-docs page under
   `docs/` (the README is a pitch, not a manual — only touch it when the pitch
   itself changes); substantial designs get a `doc/design/*.md` note.
+- **Historical context lives in design notes, ADRs, and issue/PR history —
+  never in user docs, this repo's own agent instruction files
+  (`.github/agents/`, `.claude/skills/`, `.loomux/`), or this file.**
+  Incident stories, superseded rules, dates, and "how we got here"
+  narratives pollute every future reader's context. Reader-facing text
+  carries the current rule and its operational why, with at most a bare
+  issue/PR ref as provenance; strip any such narrative you find when
+  editing these surfaces. Code comments are a different surface — the
+  "comments explain *why*" convention governs them. Loomux's *shipped*
+  agent-role templates (`templates/`) are product content governed by
+  their own design notes, not by this bullet.

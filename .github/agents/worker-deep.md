@@ -54,8 +54,8 @@ tell the orchestrator, so the next one like it goes to `worker-quick`.
    not a changelog.
 6. **Loop until every suite is green — on CI, not the host.** Push early and open
    the PR as a **draft**, linking the issue (`Closes #N`) — `gh pr create --draft`
-   (quick local iteration is fine, capped at `-j 4`; see the `ci-validate` skill for
-   the local-vs-CI line). Read `gh pr checks`, push fixes, repeat until every
+   (local `cargo` of any kind is banned — CI is the build; frontend-only checks
+   stay local; see the `ci-validate` skill). Read `gh pr checks`, push fixes, repeat until every
    platform in the matrix is green. Never mark the PR ready, or report `done`, on a
    check you haven't reread after the last fix: a fix that looks isolated can break a
    test three files away, and the only way to know is the whole matrix, not just the
