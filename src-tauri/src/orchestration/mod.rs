@@ -19,6 +19,7 @@ pub mod lessons;
 pub mod mcp;
 pub mod mergeq;
 pub mod mergeqview;
+pub mod mqdriver;
 pub mod notify;
 pub mod profiles;
 pub mod queue;
