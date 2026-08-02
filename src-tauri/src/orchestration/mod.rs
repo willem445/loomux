@@ -30344,12 +30344,6 @@ impl OrchRegistry {
         pty_id: u32,
         reason: queue::EnqueueReason,
     ) -> Result<(), String> {
-        // MUTATION CONTROL — removed in the very next commit, and present in
-        // exactly one CI run so the test below has a red to be red against.
-        // This IS the pre-#560 behavior: the reason is accepted and then
-        // dropped on the floor, which is what taking no parameter did.
-        let _ = reason;
-        let reason = queue::EnqueueReason::Question;
         self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
         let target = self.durable_target(agent_id);
         let pushed = self.queues.mutate(group, self, |queues| {
