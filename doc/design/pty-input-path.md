@@ -111,18 +111,81 @@ readers is written for.
 ## Why `resize_pty` stays synchronous
 
 It gets the lock half of the fix (the ConPTY call is outside the map lock) and
-not the thread half, on purpose.
+not the thread half, on purpose. There are two reasons, and they are
+independent — which matters, because the first one is an assumption.
 
-A resize is bounded local work: `ResizePseudoConsole` repaints, it does not
-wait for the child to consume anything, so it cannot produce the unbounded
-stall above. #432 already collapses resize bursts (16 ms debounce, drag holds,
-same-size skip), so few are issued at all. And a synchronous command inherits
+### Reason 1 (ASSUMED — the docs are silent)
+
+**The claim:** a resize is bounded local work and cannot park on the child the
+way `write_all` can, so it cannot produce the unbounded stall above.
+
+**What the reference actually says.** The `ResizePseudoConsole` page
+([learn.microsoft.com/en-us/windows/console/resizepseudoconsole](https://learn.microsoft.com/en-us/windows/console/resizepseudoconsole))
+is 162 words. In full, its description and remarks are:
+
+> Resizes the internal buffers for a pseudoconsole to the given size.
+
+> This function can resize the internal buffers in the pseudoconsole session to
+> match the window/buffer size being used for display on the terminal end. This
+> ensures that attached Command-Line Interface (CUI) applications using the
+> Console Functions to communicate will have the correct dimensions returned in
+> their calls.
+
+It says nothing about blocking, synchrony, or the attached application. It does
+not say the claim is true and it does not say it is false: **the docs are
+silent**, so this is an assumption, not a citation. (The "repaints the whole
+screen" half is not Microsoft's claim either — it is this repo's own observation
+about the Win10 inbox conhost, the one CLAUDE.md constraint 1 and #63/#432 rest
+on.)
+
+**What supports it anyway, labelled as what it is.** Two observations, neither
+of them proof:
+
+- #432 exists because resizes are *expensive in bursts* — its whole design is
+  debounce, drag holds and same-size skip. Nothing in it, or in #63, reports a
+  resize that failed to **return**.
+- `resize_pty` has been running synchronously on the webview thread for the
+  life of the app, and #719 fingered `write_all` specifically. A resize that
+  parked on a busy child would have produced the same freeze, attributed to a
+  different call.
+
+**What would falsify it, and what to do then.** A GUI freeze correlated with
+resizing rather than typing. The fix at that point is a **sequence-guarded**
+async resize — take an ordering ticket before the first await and skip a
+superseded one — *not* a plain `async`, which would relocate the block and
+reintroduce the reorder Reason 2 is about.
+
+### Reason 2 (verifiable from this repo's code)
+
+A synchronous command inherits
 arrival ordering from the main thread's dispatch, which resizes need:
 `shouldResizePty` (src/panefit.ts) suppresses only an *identically sized*
 in-flight call, so two different sizes can be outstanding at once. Off-thread
 they could land in either order and leave ConPTY at the older geometry with no
 event to correct it. A few milliseconds of jank is the cheaper side of that
-trade.
+trade — and this reason stands whatever Reason 1 turns out to be.
+
+## What Microsoft *does* document, and why it endorses this change
+
+The ConPTY reference is silent on resize blocking, but it is explicit about
+threading, in a warning that reads as a description of the pre-#719 bug
+([Creating a Pseudoconsole session](https://learn.microsoft.com/en-us/windows/console/creating-a-pseudoconsole-session)):
+
+> To prevent race conditions and deadlocks, we highly recommend that each of the
+> communication channels is serviced on a separate thread that maintains its own
+> client buffer state and messaging queue inside your application. Servicing all
+> of the pseudoconsole activities on the same thread may result in a deadlock
+> where one of the communications buffers is filled and waiting for your action
+> while you attempt to dispatch a blocking request on another channel.
+
+The same page also states that the channels are serviced with **synchronous**
+I/O ("These channels are processed by the pseudoconsole system using ReadFile
+and WriteFile with synchronous I/O"), which is why the input write blocks at all.
+
+Before #719 loomux serviced the output channel on its own reader thread but
+dispatched the input channel's blocking write from the webview thread, under a
+lock shared with every other pane. This change puts the input channel on its own
+thread too, which is what the warning asks for.
 
 ## Locking rules this establishes
 

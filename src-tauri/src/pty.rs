@@ -1568,11 +1568,24 @@ pub async fn write_pty(
 /// The global-lock half of the issue applies here and is fixed: the ConPTY
 /// call now happens outside the `ptys` map lock, so a resize can neither wait
 /// behind another pane's work nor make another pane wait behind it. Going
-/// further and moving it off the main thread would be a bad trade. A resize is
-/// bounded local work — `ResizePseudoConsole` repaints, it does not wait on the
-/// child to consume anything — so it cannot produce the unbounded stall
-/// `write_pty` could, and #432 already collapses resize bursts (debounce,
-/// drag holds, same-size skip) so few of them are issued at all. Against that,
+/// further and moving it off the main thread would be a bad trade.
+///
+/// **ASSUMED, not documented (rev finding on #734):** that a resize is bounded
+/// local work and cannot park on the child the way `write_all` can. The
+/// `ResizePseudoConsole` reference is 162 words and says only "Resizes the
+/// internal buffers for a pseudoconsole to the given size" — it is SILENT on
+/// blocking, on synchrony, and on the attached application
+/// (learn.microsoft.com/en-us/windows/console/resizepseudoconsole). The
+/// supporting evidence is observational and this repo's own: #432 was about
+/// resize bursts being *expensive*, never about one failing to return, and
+/// #719 fingered `write_all` specifically while resize had been running
+/// synchronously on this very thread all along. That is evidence, not proof —
+/// if a resize-shaped GUI freeze is ever observed, THIS is the assumption to
+/// break first, and the fix then is a sequence-guarded async resize (an
+/// unguarded one reintroduces the reorder below), not simply `async`.
+///
+/// The second reason does not depend on the first, which is why the deviation
+/// survives the assumption being wrong:
 /// a sync command inherits arrival ordering from the main thread's own
 /// dispatch, and resizes NEED it: `shouldResizePty` (src/panefit.ts) suppresses
 /// only an *identically sized* in-flight call, so two different sizes can be
