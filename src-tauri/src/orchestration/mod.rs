@@ -1736,15 +1736,6 @@ fn capture_raw_inner(
         ));
     };
 
-    // MUTATION (#699, this commit only): park two handles on the success arm,
-    // to see `a_successful_capture_parks_neither_of_its_readers` fail for its
-    // own reason. Reverted in the next commit.
-    {
-        let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
-        leaked.push(std::thread::spawn(Vec::new));
-        leaked.push(std::thread::spawn(Vec::new));
-    }
-
     // Exited on its own: both pipes are at EOF (or about to be), so these joins
     // are the bounded tail of a wait that already finished.
     let stdout = out_reader.join().unwrap_or_default();
