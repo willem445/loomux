@@ -365,6 +365,94 @@ impl loomux_lib::orchestration::mqdriver::MqRunner for MqFake {
     }
 }
 
+/// **The three merge-queue tools are orchestrator-only, at the DISPATCH gate**
+/// (#581 §11.1).
+///
+/// The role-filtered listing is cosmetic — a tool omitted from a listing is
+/// still callable — so what matters is that a worker's *call* is refused, not
+/// merely that a worker's *listing* omits it. `queue_merge` can make the backend
+/// push a ref and open a PR, so this is the check that has to hold. Both halves
+/// are asserted, following the `review_verdict` / `queue_orphans` precedent.
+#[test]
+fn the_merge_queue_tools_are_orchestrator_only_and_the_dispatch_check_is_the_gate() {
+    let (reg, _d, co, cw) = setup_mcp();
+    const TOOLS: [&str; 3] = ["queue_merge", "merge_queue_status", "cancel_queued_merge"];
+
+    // The real gate: a worker calling any of them is refused.
+    for name in TOOLS {
+        let args = if name == "merge_queue_status" { json!({}) } else { json!({ "pr": "612" }) };
+        let denied =
+            dispatch(&reg, &cw, "tools/call", &json!({ "name": name, "arguments": args })).unwrap();
+        assert_eq!(denied["isError"], true, "{name} must refuse a worker at dispatch");
+    }
+
+    // …and the cosmetic half: the orchestrator sees them, a worker does not.
+    let listed = dispatch(&reg, &co, "tools/list", &json!({})).unwrap();
+    let names: Vec<&str> =
+        listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    let worker_listed = dispatch(&reg, &cw, "tools/list", &json!({})).unwrap();
+    let worker_names: Vec<&str> =
+        worker_listed["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+    for name in TOOLS {
+        assert!(names.contains(&name), "the orchestrator must SEE {name}: {names:?}");
+        assert!(!worker_names.contains(&name), "a worker must not be offered {name}");
+    }
+}
+
+/// **With no `merge_queue:` block, every tool refuses `queue-disabled`** — the
+/// product default (§12), and the state every repo is in until it opts in.
+///
+/// Driven through the real `dispatch()`, so this covers the JSON shim, the
+/// registry method and the driver's refusal together.
+#[test]
+fn the_queue_tools_refuse_queue_disabled_until_the_repo_opts_in() {
+    let (reg, d, co, _cw) = setup_mcp();
+
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "queue_merge", "arguments": { "pr": "612" } })).unwrap();
+    assert_eq!(out["isError"], false, "a refusal is a RESULT, not a protocol error");
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["refused"], json!("queue-disabled"));
+    assert_eq!(v["queued"], Value::Null, "a refusal never also reports success");
+
+    // Status is readable with the feature off — it reports `enabled: false`
+    // rather than erroring, so an orchestrator can tell "off" from "broken".
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "merge_queue_status", "arguments": {} })).unwrap();
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["enabled"], json!(false));
+    assert_eq!(v["entries"], json!([]));
+
+    // And the read did NOT create the state file — a status call that conjured
+    // one would collapse slice F's `absent` state for every group.
+    assert!(!d.path().join(&co.group).join("merge_queue.json").exists());
+}
+
+/// A PR that is not in the queue cannot be cancelled, and is told so — rather
+/// than being given a success that means nothing (§11.1's `not-queued`).
+#[test]
+fn cancelling_a_pr_that_is_not_queued_is_refused_not_silently_successful() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "cancel_queued_merge", "arguments": { "pr": "#999" } })).unwrap();
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["refused"], json!("not-queued"));
+    assert_eq!(v["cancelled"], Value::Null);
+}
+
+/// A malformed `pr` argument is rejected before anything is resolved — the
+/// tools take "PR number, #n, or URL" like every other PR-taking tool here, and
+/// an unparseable one must not become PR 0.
+#[test]
+fn a_malformed_pr_argument_is_rejected_rather_than_coerced() {
+    let (reg, _d, co, _cw) = setup_mcp();
+    for bad in ["", "not-a-pr", "#", "abc123"] {
+        let out = dispatch(&reg, &co, "tools/call",
+            &json!({ "name": "queue_merge", "arguments": { "pr": bad } })).unwrap();
+        assert_eq!(out["isError"], true, "{bad:?} must be rejected, not coerced");
+    }
+}
+
 /// A `merge_queue.json` with one entry inside an in-flight batch. Used twice in
 /// the strand test — once to set it up, once to **re-arm** it so the once-only
 /// guard has something it must actually stop.
