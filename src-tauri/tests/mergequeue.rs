@@ -2036,6 +2036,51 @@ fn a_drained_queue_leaves_no_terminal_entries_behind() {
     assert_eq!(s.entries.len(), 1, "only the new campaign's entry: {:?}", s.entries);
 }
 
+/// **The drain keeps `kicked-back`**, and that asymmetry is deliberate.
+///
+/// A `cancelled` entry is a request that has been honoured; a `kicked-back` one
+/// is the queue telling an owner something they have not acted on yet, and the
+/// drain is exactly when someone goes to look. Deleting it there would leave
+/// §4's "strand loudly" alive only in the audit log — and a pane showing nothing
+/// is not loud. Pinned because it is the one place the corpse purge deliberately
+/// does *less* than "drop everything terminal", so nothing but a test stops a
+/// later tidy-up from collapsing the three states into one.
+#[test]
+fn the_drain_keeps_the_conversation_it_has_not_finished() {
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        entries: vec![
+            QueueEntry::new(612, HEAD_A, 0),
+            QueueEntry::new(613, HEAD_B, 0),
+            QueueEntry::new(614, HEAD_A, 0),
+        ],
+        ..Default::default()
+    };
+    // 613 bounced — through the transition the state machine actually allows
+    // (`queued → batching → kicked-back`, §8's "a conflict costs no CI"), not by
+    // teleporting an entry into a terminal state the table would refuse.
+    advance_entry(&mut s, 613, EntryState::Batching).unwrap();
+    advance_entry(&mut s, 613, EntryState::KickedBack).unwrap();
+    assert_eq!(cancel(&mut s, 612), CancelOutcome::Cancelled { was: EntryState::Queued });
+    assert_eq!(cancel(&mut s, 614), CancelOutcome::Cancelled { was: EntryState::Queued });
+
+    assert_eq!(s.target, "", "the campaign is over either way");
+    assert_eq!(
+        s.entries.iter().map(|e| (e.pr, e.state())).collect::<Vec<_>>(),
+        vec![(613, EntryState::KickedBack)],
+        "the cancels are gone; the unanswered kick-back stays"
+    );
+
+    // And it is visible where the human looks — the pane, which counts every
+    // entry rather than only the live ones.
+    let view = loomux_lib::orchestration::mergeqview::project(
+        &serde_json::to_string(&s).expect("state serializes"),
+    );
+    assert_eq!(view["entries_total"], serde_json::json!(1), "{view}");
+    assert_eq!(view["entries"][0]["state"], serde_json::json!("kicked-back"), "{view}");
+}
+
 /// A **live** campaign keeps its corpses — but a bounded number of them.
 ///
 /// Zero would drop the one durable row that tells a human *which* PR bounced;

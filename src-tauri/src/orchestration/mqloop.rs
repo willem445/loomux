@@ -811,15 +811,42 @@ fn drained(state: &MergeQueueState) -> bool {
 /// reaches. Note the agent-facing `status_view` already filtered terminal
 /// entries; `mergeqview::project` does not (`entries_total` is
 /// `state.entries.len()`), so the file itself has to be the thing that is clean.
+///
+/// # Why `kicked-back` survives the drain and the other two do not
+///
+/// The three terminal states are not the same kind of fact, and a blanket
+/// `prune_terminal` here says they are:
+///
+/// - **`cancelled`** is somebody saying "take this out" — the request has been
+///   honoured and there is nothing left to tell them.
+/// - **`landed`** is work that succeeded; the land path already prunes it.
+/// - **`kicked-back`** is the queue telling an owner something they have **not
+///   acted on yet** (a conflict, a culprit, a gate refusal, a batch a restart
+///   could not resume). Dropping it at the drain deletes the only row that names
+///   *which* PR bounced at the exact moment the queue empties — which is the
+///   moment someone goes to look. §4's "strand loudly" would survive only in the
+///   audit log, and a pane that shows nothing is not loud.
+///
+/// So the drain clears the finished work and keeps the unfinished conversation,
+/// bounded by [`trim_terminal`] so "keeps" cannot mean "accumulates". This is
+/// the same argument [`MAX_TERMINAL_RETAINED`] makes for a live campaign, and it
+/// would be incoherent to make it there and not here.
 fn release_if_drained(state: &mut MergeQueueState) {
     if drained(state) {
         state.target.clear();
-        prune_terminal(state);
+        // Spelled as "terminal AND not kicked-back" rather than as "keep only
+        // kicked-back": every entry here is terminal by [`drained`]'s own
+        // definition today, but a retain that deletes whatever that predicate
+        // does not name would quietly start eating live entries if `drained`
+        // were ever loosened. The cost of the longer condition is nothing; the
+        // cost of the coupling is the queue silently dropping queued work.
+        state.entries.retain(|e| !e.state().is_terminal() || e.state() == EntryState::KickedBack);
+        trim_terminal(state);
     }
 }
 
-/// How many terminal entries a **live** campaign keeps before the oldest are
-/// dropped.
+/// How many terminal entries the queue keeps before the oldest are dropped —
+/// in a live campaign, and for the `kicked-back` rows that survive a drain.
 ///
 /// Not zero, and not unbounded, and both bounds have a reason:
 ///

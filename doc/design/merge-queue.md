@@ -196,16 +196,23 @@ is otherwise a question slice C would have to answer by inventing:
   at every transition that can be the last one out — a finished or abandoned batch, a cancel,
   a reconcile that strands what it cannot resume — because no single one of those owns the
   event.
-- **The drain takes the terminal entries with it**, for the same reason it takes the target:
-  a finished campaign's corpses describe work the queue is no longer doing. Terminal entries
-  were previously dropped only by `prune_terminal` at a **land**, which a campaign that ends
-  in cancellation never reaches — so a cancelled batch left rows the pane went on counting
-  (`mergeqview::project` reports `entries_total = state.entries.len()`; the agent-facing
-  `status_view` filters terminal entries and never showed them). Inside a *live* campaign a
-  bounded number is kept (`MAX_TERMINAL_RETAINED`): not zero, because a kicked-back entry is
-  where a human sees which PR bounced; not unbounded, because `project` renders the first
-  `VIEW_ENTRY_LIMIT` entries in file order and enough corpses would push the live ones out of
-  the window — `MAX_ENTRIES` does not bound this, it counts only non-terminal entries.
+- **The drain takes the finished work with it**, for the same reason it takes the target:
+  a finished campaign's `cancelled` and `landed` rows describe work the queue is no longer
+  doing. They were previously dropped only by `prune_terminal` at a **land**, which a campaign
+  that ends in cancellation never reaches — so a cancelled batch left rows the pane went on
+  counting (`mergeqview::project` reports `entries_total = state.entries.len()`; the
+  agent-facing `status_view` filters terminal entries and never showed them).
+- **`kicked-back` survives the drain**, and the asymmetry is the point. The three terminal
+  states are different kinds of fact: `cancelled` is a request that has been honoured,
+  `landed` is work that succeeded, and `kicked-back` is the queue telling an owner something
+  they have **not acted on yet**. The drain is exactly when someone looks, so deleting it
+  there would leave "strand loudly" alive only in the audit log — and a pane showing nothing
+  is not loud.
+- **Terminal entries are bounded, drained or not** (`MAX_TERMINAL_RETAINED`, oldest dropped
+  first): not zero, per the kick-back argument above; not unbounded, because `project` renders
+  the first `VIEW_ENTRY_LIMIT` entries **in file order** and enough corpses would push the live
+  ones out of the window. `MAX_ENTRIES` does not bound this — it counts only non-terminal
+  entries.
 - A later `queue_merge` whose live base is not the current target is refused with
   `base-not-target`. Not queued-for-later, not a second queue, and above all **not a silent
   retarget** — the entries already queued were approved against a different branch, and
