@@ -789,6 +789,21 @@ pub fn land_push_argv(scratch_sha: &str, target: &str) -> Vec<String> {
     vec!["push".into(), REMOTE.into(), land_refspec(scratch_sha, target)]
 }
 
+/// Whether this gate names the `ci-green` clause, and therefore whether the
+/// sub-PR's own checks have to be read at all.
+///
+/// **Fails toward fetching.** `Absent` and `Malformed` both answer `true`, even
+/// though both refuse the landing outright a moment later: the alternative
+/// couples "did we look at CI" to "could we read the gate file", and a future
+/// edit that made an unreadable gate reachable would silently also have made it
+/// unobserved. The cheap direction is the safe one.
+fn declares_ci_green(spec: &GateSpec) -> bool {
+    match spec {
+        GateSpec::Declared(g) => g.also.iter().any(|c| c == "ci-green"),
+        GateSpec::Absent | GateSpec::Malformed => true,
+    }
+}
+
 /// Why a landing was refused. Every variant is a designed path in §10's table.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LandRefusal {
@@ -874,9 +889,17 @@ pub fn land_batch(
 
         // §6, second enforcement point. `head` is the PR's LIVE head, so a
         // rebase since the batch was built disarms the entry here.
+        //
+        // `ci_green` is fetched only when the gate actually declares the clause.
+        // Not an optimization for its own sake: an unconditional `gh pr checks`
+        // per sub-PR is a round-trip whose answer is discarded by every gate
+        // that does not name `ci-green`, and D2's bisect walks this path
+        // repeatedly. Fetching is the DEFAULT — `declares_ci_green` returns true
+        // for a malformed gate too, so an unreadable gate file cannot be the
+        // reason a check was skipped.
         let observed = PrObservation {
             body_digest: Some(body_digest(&facts.body)),
-            ci_green: pr_ci_green(r, pr),
+            ci_green: if declares_ci_green(gate) { pr_ci_green(r, pr) } else { None },
         };
         let recheck = super::mergeq::recheck_gate(
             gate,
