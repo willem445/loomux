@@ -18,6 +18,43 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// Run a `gh`-backed computation off the webview main thread (issue #716).
+/// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
+/// on the main thread — the mechanism `git.rs`'s `run_blocking` (issue #399)
+/// and the file-editor search command (issue #207) already document. Every
+/// command in this module spawns the `gh` CLI, which is a process spawn *plus*
+/// a network round trip, so its worst case is longer than git's: sub-second on
+/// a good day, seconds on a slow link, unbounded if `gh` hangs. For that whole
+/// duration a sync command blocks the GUI thread — no keystroke serviced,
+/// nothing painted.
+///
+/// So every `#[tauri::command]` here is a thin `async fn` that hands the real
+/// work — still a plain, directly unit-testable `*_sync` function — to a
+/// blocking-pool thread and awaits it here instead. A test in this module
+/// scans this file and fails if any command in it is left synchronous: a lone
+/// straggler would keep the freeze while the module claimed not to.
+///
+/// What this gives up, and why that is safe: the freeze WAS an accidental
+/// mutual exclusion — while the main thread sat in a `gh` spawn no second
+/// invoke could start, so two of these could never overlap. Off-thread they
+/// can. Nothing here relied on that: every command is stateless (it spawns
+/// `gh`, parses stdout, returns — no shared state, no `tauri::State`, no file
+/// or registry write, and no event emitted, so there is no event ordering to
+/// preserve either). The only shared state is GitHub itself, and the one place
+/// that races — two `gh label create`s for the same label — is already treated
+/// as success by `ensure_labels_with`, which was written for the concurrent
+/// create it could always hit from another client.
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("gh task panicked: {e}")),
+    }
+}
+
 /// Labels the issues view is permitted to add/remove. These are the durable
 /// go-signals the orchestrator's intake poll watches for (see
 /// `orchestration/templates/orchestrator.md`): `agent-ready` / `agent-investigation`
@@ -374,7 +411,11 @@ struct RawPrActivity {
 /// Report whether `gh` is installed and authenticated. Never errors on a
 /// missing/unauthenticated `gh` — those are states the UI renders, not faults.
 #[tauri::command]
-pub fn gh_auth_status() -> Result<GhAuth, String> {
+pub async fn gh_auth_status() -> Result<GhAuth, String> {
+    run_blocking(gh_auth_status_sync).await
+}
+
+fn gh_auth_status_sync() -> Result<GhAuth, String> {
     match gh_output(None, &["auth", "status"]) {
         Ok(out) => {
             // gh has emitted `auth status` on stdout in some versions and
@@ -404,7 +445,11 @@ pub fn gh_auth_status() -> Result<GhAuth, String> {
 /// orchestrator note warns `--label` server-side filtering silently misses
 /// issues that carry the label).
 #[tauri::command]
-pub fn gh_issue_list(repo: String) -> Result<Vec<GhIssue>, String> {
+pub async fn gh_issue_list(repo: String) -> Result<Vec<GhIssue>, String> {
+    run_blocking(move || gh_issue_list_sync(repo)).await
+}
+
+fn gh_issue_list_sync(repo: String) -> Result<Vec<GhIssue>, String> {
     let out = run_gh(
         Some(&repo),
         &[
@@ -423,7 +468,15 @@ pub fn gh_issue_list(repo: String) -> Result<Vec<GhIssue>, String> {
 
 /// Create an issue from a title and body, returning its number and URL.
 #[tauri::command]
-pub fn gh_issue_create(repo: String, title: String, body: String) -> Result<GhIssueRef, String> {
+pub async fn gh_issue_create(
+    repo: String,
+    title: String,
+    body: String,
+) -> Result<GhIssueRef, String> {
+    run_blocking(move || gh_issue_create_sync(repo, title, body)).await
+}
+
+fn gh_issue_create_sync(repo: String, title: String, body: String) -> Result<GhIssueRef, String> {
     if title.trim().is_empty() {
         return Err("empty issue title".to_string());
     }
@@ -437,7 +490,16 @@ pub fn gh_issue_create(repo: String, title: String, body: String) -> Result<GhIs
 /// validated against `ALLOWED_LABELS` before any spawn, so this can never
 /// attach or strip a label outside the agent go-signal set.
 #[tauri::command]
-pub fn gh_issue_set_labels(
+pub async fn gh_issue_set_labels(
+    repo: String,
+    number: u64,
+    add: Vec<String>,
+    remove: Vec<String>,
+) -> Result<(), String> {
+    run_blocking(move || gh_issue_set_labels_sync(repo, number, add, remove)).await
+}
+
+fn gh_issue_set_labels_sync(
     repo: String,
     number: u64,
     add: Vec<String>,
@@ -465,7 +527,11 @@ pub fn gh_issue_set_labels(
 /// comment thread — backing the issues-view detail pane. Read-only; writes go
 /// through `gh_issue_comment` / `gh_issue_set_labels`.
 #[tauri::command]
-pub fn gh_issue_view(repo: String, number: u64) -> Result<GhDetail, String> {
+pub async fn gh_issue_view(repo: String, number: u64) -> Result<GhDetail, String> {
+    run_blocking(move || gh_issue_view_sync(repo, number)).await
+}
+
+fn gh_issue_view_sync(repo: String, number: u64) -> Result<GhDetail, String> {
     let n = number.to_string();
     let out = run_gh(
         Some(&repo),
@@ -485,7 +551,11 @@ pub fn gh_issue_view(repo: String, number: u64) -> Result<GhDetail, String> {
 /// newlines stay data — see `comment_args`. Empty/whitespace bodies are rejected
 /// before spawning (gh would open an interactive editor with no `--body`).
 #[tauri::command]
-pub fn gh_issue_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+pub async fn gh_issue_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+    run_blocking(move || gh_issue_comment_sync(repo, number, body)).await
+}
+
+fn gh_issue_comment_sync(repo: String, number: u64, body: String) -> Result<(), String> {
     if body.trim().is_empty() {
         return Err("empty comment".to_string());
     }
@@ -498,7 +568,11 @@ pub fn gh_issue_comment(repo: String, number: u64, body: String) -> Result<(), S
 /// `gh_issue_list`; labels returned verbatim for client-side matching. Read-only
 /// — the view lists and comments on PRs but never labels/merges/approves.
 #[tauri::command]
-pub fn gh_pr_list(repo: String) -> Result<Vec<GhPr>, String> {
+pub async fn gh_pr_list(repo: String) -> Result<Vec<GhPr>, String> {
+    run_blocking(move || gh_pr_list_sync(repo)).await
+}
+
+fn gh_pr_list_sync(repo: String) -> Result<Vec<GhPr>, String> {
     let out = run_gh(
         Some(&repo),
         &[
@@ -518,7 +592,11 @@ pub fn gh_pr_list(repo: String) -> Result<Vec<GhPr>, String> {
 /// Full detail for one PR — same shape as `gh_issue_view` (`gh pr view` exposes
 /// the identical `--json` fields), so both feed the one detail pane.
 #[tauri::command]
-pub fn gh_pr_view(repo: String, number: u64) -> Result<GhDetail, String> {
+pub async fn gh_pr_view(repo: String, number: u64) -> Result<GhDetail, String> {
+    run_blocking(move || gh_pr_view_sync(repo, number)).await
+}
+
+fn gh_pr_view_sync(repo: String, number: u64) -> Result<GhDetail, String> {
     let n = number.to_string();
     let out = run_gh(
         Some(&repo),
@@ -536,7 +614,11 @@ pub fn gh_pr_view(repo: String, number: u64) -> Result<GhDetail, String> {
 /// Post a comment on a PR. Same discrete-`--body` safety and empty-body guard as
 /// `gh_issue_comment` (commenting is the one write the read-only PR mode allows).
 #[tauri::command]
-pub fn gh_pr_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+pub async fn gh_pr_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+    run_blocking(move || gh_pr_comment_sync(repo, number, body)).await
+}
+
+fn gh_pr_comment_sync(repo: String, number: u64, body: String) -> Result<(), String> {
     if body.trim().is_empty() {
         return Err("empty comment".to_string());
     }
@@ -558,7 +640,16 @@ pub fn gh_pr_comment(repo: String, number: u64, body: String) -> Result<(), Stri
 /// timeline: a chart silently missing every PR would look like a quiet period,
 /// which is worse than an error the view can say out loud.
 #[tauri::command]
-pub fn gh_activity(repo: String) -> Result<GhActivity, String> {
+pub async fn gh_activity(repo: String) -> Result<GhActivity, String> {
+    run_blocking(move || gh_activity_sync(repo)).await
+}
+
+/// The two `gh` runs stay sequential inside ONE blocking task rather than
+/// becoming two concurrent ones: the fail-whole rule above is only meaningful
+/// if the issue failure short-circuits before the PR list is even attempted,
+/// and doubling the concurrent `gh` processes per refresh buys nothing the
+/// 60 s cadence needs.
+fn gh_activity_sync(repo: String) -> Result<GhActivity, String> {
     let issue_args = activity_issue_args(ACTIVITY_LIMIT);
     let argv: Vec<&str> = issue_args.iter().map(String::as_str).collect();
     let issues = parse_issue_activity(&run_gh(Some(&repo), &argv)?)?;
@@ -1149,13 +1240,13 @@ mod tests {
         // Validation happens before any gh spawn, so this fails fast with no gh /
         // no repo — a whitespace-only body would otherwise open gh's editor.
         let err =
-            gh_issue_comment("C:/nonexistent".to_string(), 1, "   \n".to_string()).unwrap_err();
+            gh_issue_comment_sync("C:/nonexistent".to_string(), 1, "   \n".to_string()).unwrap_err();
         assert!(err.contains("empty comment"), "got: {err}");
     }
 
     #[test]
     fn pr_comment_rejects_empty_body_before_spawning() {
-        let err = gh_pr_comment("C:/nonexistent".to_string(), 1, "".to_string()).unwrap_err();
+        let err = gh_pr_comment_sync("C:/nonexistent".to_string(), 1, "".to_string()).unwrap_err();
         assert!(err.contains("empty comment"), "got: {err}");
     }
 
@@ -1418,7 +1509,7 @@ mod tests {
     fn set_labels_rejects_bad_label_before_spawning() {
         // Validation happens before any gh spawn, so this fails fast even with
         // no gh / no repo present — proving the allow-list is the gate.
-        let err = gh_issue_set_labels(
+        let err = gh_issue_set_labels_sync(
             "C:/nonexistent".to_string(),
             1,
             vec!["definitely-not-allowed".to_string()],
@@ -1432,13 +1523,13 @@ mod tests {
     fn set_labels_noop_when_no_deltas() {
         // Empty add+remove is a success no-op (must not spawn an interactive
         // editor), regardless of repo validity.
-        assert!(gh_issue_set_labels("C:/nonexistent".to_string(), 1, vec![], vec![]).is_ok());
+        assert!(gh_issue_set_labels_sync("C:/nonexistent".to_string(), 1, vec![], vec![]).is_ok());
     }
 
     #[test]
     fn create_rejects_empty_title_before_spawning() {
         let err =
-            gh_issue_create("C:/nonexistent".to_string(), "   ".to_string(), "b".to_string())
+            gh_issue_create_sync("C:/nonexistent".to_string(), "   ".to_string(), "b".to_string())
                 .unwrap_err();
         assert!(err.contains("empty issue title"), "got: {err}");
     }
@@ -1638,5 +1729,130 @@ mod tests {
 
         let logged_out = "You are not logged into any GitHub hosts. Run gh auth login to authenticate.\n";
         assert_eq!(parse_auth_login(logged_out), None);
+    }
+
+    // ----- off-the-main-thread dispatch (#716) -----
+
+    #[test]
+    fn run_blocking_runs_the_work_on_another_thread() {
+        // The whole point of the wrapper: the caller's thread — the webview
+        // main thread in production — must not be the one that runs the `gh`
+        // spawn. Asserting the closure observes a DIFFERENT thread id is the
+        // only direct evidence of that; `async fn` alone proves nothing, since
+        // an async command whose body still ran inline would be just as frozen.
+        let caller = std::thread::current().id();
+        let worker: std::thread::ThreadId =
+            tauri::async_runtime::block_on(run_blocking(move || Ok(std::thread::current().id())))
+                .unwrap();
+        assert_ne!(
+            worker, caller,
+            "run_blocking executed the closure on the calling thread — the GUI freeze (#716) is back"
+        );
+        // Errors still propagate through unchanged: the wrapper is transparent
+        // to the Result the sync body returns, which is what lets every command
+        // keep its exact contract.
+        let err: Result<(), String> =
+            tauri::async_runtime::block_on(run_blocking(|| Err("boom".to_string())));
+        assert_eq!(err.unwrap_err(), "boom");
+    }
+
+    #[test]
+    fn every_tauri_command_in_this_module_is_async_and_delegates() {
+        // #716's claim is about EVERY gh-backed command, and a single sync
+        // straggler would keep the freeze while the module's doc claimed
+        // otherwise — so this scans this file's own source rather than trusting
+        // a hand transcription (the `tests/acl_manifest.rs` precedent, which
+        // parses `generate_handler!` out of `src/lib.rs` for the same reason).
+        //
+        // Bound of the claim, stated rather than implied: this covers the `gh`
+        // module only. It is the whole gh-on-the-GUI-thread surface because the
+        // two spawn entry points here (`gh_output`, `run_gh`) are private to
+        // this module, so no command elsewhere can reach a `gh` spawn through
+        // them; the crate's other `gh` spawns (`orchestration`'s `gh_capture`,
+        // `mqdriver`'s `ProcessRunner::gh`) run on the poll thread, not a
+        // command.
+        //
+        // Split so the literal never appears as a whole line in this file —
+        // otherwise the scan would find its own source and mis-report.
+        const ATTR: &str = concat!("#[tauri::", "command]");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gh.rs"))
+            .expect("read src/gh.rs");
+
+        let lines: Vec<&str> = src.lines().map(str::trim).collect();
+        let mut found: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if *line != ATTR {
+                continue;
+            }
+            let at = i + 1
+                + lines[i + 1..]
+                    .iter()
+                    .position(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with('#'))
+                    .unwrap_or_else(|| panic!("{ATTR} at line {} has no function after it", i + 1));
+            let sig = lines[at];
+            assert!(
+                sig.starts_with("pub async fn "),
+                "line {}: `{sig}` is a synchronous #[tauri::command] — Tauri dispatches it on the \
+                 webview main thread, so its `gh` spawn freezes the GUI for the whole round trip \
+                 (#716). Make it a thin `pub async fn` over `run_blocking`.",
+                at + 1
+            );
+
+            // `async` alone is NOT the property. An `async fn` whose body still
+            // called the sync work inline would satisfy the check above and
+            // freeze the GUI exactly as before — Tauri polls a command's future
+            // on the main thread, so work done before the first real await point
+            // runs there. The delegation to `run_blocking` is what actually
+            // moves it, so require it in the command's OWN body: from the
+            // signature to the first top-level `}` (these wrappers are one
+            // expression, so a nested block that stopped this scan early would
+            // itself be a shape worth failing on).
+            let end = at
+                + 1
+                + lines[at + 1..]
+                    .iter()
+                    .position(|l| *l == "}")
+                    .unwrap_or_else(|| panic!("no top-level `}}` closing the fn at line {}", at + 1));
+            assert!(
+                lines[at..end].iter().any(|l| l.contains("run_blocking(")),
+                "line {}: `{sig}` is async but its body never calls `run_blocking(` — an async \
+                 command that runs its `gh` spawn inline is polled on the webview main thread and \
+                 freezes the GUI just as a sync one does (#716). Hand the body to \
+                 `run_blocking(move || …_sync(…)).await`.",
+                at + 1
+            );
+
+            let name = sig["pub async fn ".len()..]
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            found.push(name);
+        }
+
+        found.sort();
+        let mut expected = vec![
+            "gh_activity",
+            "gh_auth_status",
+            "gh_issue_comment",
+            "gh_issue_create",
+            "gh_issue_list",
+            "gh_issue_set_labels",
+            "gh_issue_view",
+            "gh_pr_comment",
+            "gh_pr_list",
+            "gh_pr_view",
+        ];
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "the set of #[tauri::command]s in gh.rs changed — a new one must be async over \
+             run_blocking (see the module note) and listed here, so the enumeration this test \
+             pins can't silently go stale"
+        );
+        // NB: this equality is also the scan's own vacuity guard — a marker
+        // that stopped matching (a formatting change, a renamed attribute path)
+        // yields an empty `found` and fails here, rather than letting the
+        // per-command assertions above pass vacuously over nothing.
     }
 }
