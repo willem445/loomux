@@ -4117,9 +4117,16 @@ fn a_pre_admission_refusal_never_spends_a_re_send_credit() {
     // line — they carry the payload inline instead. Charging them a credit
     // would consume a re-send that really did land, so the roster would tell a
     // pane to chase a report it already has.
+    // The spawn-to-bind window really does refuse repeatedly — an orchestrator
+    // retrying a brief at a pane that has not bound yet gets the same answer
+    // each time — and then the pane binds and one attempt lands. THREE refusals
+    // before the landing, not one, is what makes this test discriminate the
+    // rule rather than a sign flip: an implementation that charges a
+    // pre-admission refusal ends up at -1 here, which no threshold reads as
+    // "delivered".
     let brief = "task brief: rebase #641 onto main and re-run CI";
-    let dead = AuditEntry {
-        ts_ms: 1_000,
+    let too_early = |ts_ms: u64| AuditEntry {
+        ts_ms,
         actor: "loomux".into(),
         action: "delivery-dropped".into(),
         detail: json!({
@@ -4128,11 +4135,18 @@ fn a_pre_admission_refusal_never_spends_a_re_send_credit() {
             "text": brief,
         }),
     };
-    let entries = vec![dead, prompt_line(2_000, "orch-1", "w-9", brief)];
+    let entries = vec![
+        too_early(1_000),
+        too_early(1_100),
+        too_early(1_200),
+        // The pane bound, and this one was admitted — nothing refused it.
+        prompt_line(2_000, "orch-1", "w-9", brief),
+    ];
     let r = refusal_roster(&entries, "w-9", false);
-    assert_eq!(r.total, 1, "a no-terminal refusal is a refusal: {:?}", r.items);
-    assert!(r.items[0].resent,
-        "the re-send after it landed — the refusal wrote no `prompt` line of its own to spend");
+    assert_eq!(r.total, 3, "a no-terminal refusal is a refusal: {:?}", r.items);
+    assert!(r.items.iter().all(|i| i.resent),
+        "the attempt that landed accounts for all three — none of those refusals wrote a \
+         `prompt` line of its own for it to spend: {:?}", r.items);
 }
 
 #[test]
