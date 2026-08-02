@@ -582,10 +582,12 @@ orchestrator a value system to match its operational one:
   Repetition is not memory: a summary keeps a document's *shape* and loses its *rules*. So the
   eleven rules whose loss is dangerous — the merge gate, the question-hold, disposition, the
   architectural bar, red-before-green, red main, fleet staleness, the label funnel, bounded loops,
-  one-task-per-worker, externalized memory — are stated **once**, in an `## INVARIANTS` digest at
-  the very top, which the orchestrator is told to re-read at session start and after every
-  compaction. Every body section then *stops restating them* and holds only the procedure and the
-  why, cross-referencing the digest by number. That is what pays for the additions above: the
+  one-task-per-worker, externalized memory — are stated **once**, in an `## INVARIANTS` digest
+  leading the bulk of the document (#381 later put a short **Your first turn** call-sequence
+  primer ahead of it, but the digest still precedes every heavier policy section), which the
+  orchestrator is told to re-read at session start and after every compaction. Every body
+  section then *stops restating them* and holds only the procedure and the why, cross-referencing
+  the digest by number. That is what pays for the additions above: the
   orchestrator template grew seven new rules and still ends up denser than it was
   (≈513 → 625 lines for ~2× the rules), because the rhetoric that carried the old ones is gone.
 
