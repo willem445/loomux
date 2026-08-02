@@ -2216,6 +2216,8 @@ pure function over pinned `--json` fields, testable with canned fixtures and no 
 | `NOTIFY_FAIL_STREAK_LIMIT` | 3 | consecutive `gh` failures (auth, `gh-not-found`, unknown PR/run) before the watch is cancelled rather than polled forever against nothing |
 | `GH_CAPTURE_TIMEOUT` | 20s | bound on ONE `gh` child; a stalled subprocess would otherwise park the single poll loop and every notice with it (#656 — see "Bounding one tick") |
 | `MAX_INTAKE_POLLS_PER_TICK` | 4 | groups the intake half polls per scan — 2 `gh` calls each, so the same 8-call budget as `MAX_POLLS_PER_TICK` (#656) |
+| `GH_CAPTURE_REAP_TIMEOUT` | 2s | bounds the post-kill reap, so no arm of the bounded wait is itself unbounded (#656) |
+| `GH_CAPTURE_MAX_LEAKED_READERS` | 16 | process-wide ceiling on readers abandoned by timed-out captures; past it a capture is refused rather than spawned (#656) |
 
 ### Predicates and the "no checks reported" trap
 
@@ -2718,8 +2720,25 @@ discipline (#590) rests on.
   writing into a full pipe never exits. That shape would turn a healthy call into a timeout
   every tick, i.e. trade the hang for an outage. On the *timeout* path the readers are left to
   end with their pipe instead of being joined: a grandchild can hold the handle past the kill,
-  and joining would reinstate exactly the unbounded wait being removed. The leak is two threads
-  per timeout, against a bounded number of calls per tick.
+  and joining would reinstate exactly the unbounded wait being removed.
+- **What bounds the abandoned readers, per process rather than per tick.** Not joining them
+  bounds one call; it does not bound the process, and the case that justifies not joining is
+  precisely the case where they never end — while a persistently stalling condition is
+  re-polled every tick. So an abandoned reader is parked in `GH_CAPTURE_LEAKED_READERS`, every
+  capture first sweeps the ones that have since ended, and a capture is refused once
+  `GH_CAPTURE_MAX_LEAKED_READERS` (16 — two per timed-out call, against a 24-call tick) are
+  still blocked. Be explicit about the trade: past the ceiling `gh` polling in this process
+  stops until the backlog drains, and against a grandchild that holds a pipe forever it never
+  drains. That is the deliberate direction — a named `Err` both callers already surface (a
+  watch cancelled with a reason someone can read) beats thread growth nothing reports, and it
+  is diagnosable where a thousand parked threads are not. In the ordinary stall the child IS
+  `gh`: killing it closes both pipes, the readers end at once, and the backlog stays empty.
+- **No arm of the bound is itself unbounded.** Every wait on a child goes through
+  `wait_bounded`, including the post-kill reap on the timeout path (`GH_CAPTURE_REAP_TIMEOUT`).
+  A bare `wait()` there would be the one place a "bounded" path could still block forever: the
+  kill has landed in every ordinary case, but a child in uninterruptible sleep does not die
+  until it leaves that state. Outliving the reap leaves an unreaped child — a PID-table entry
+  until the process exits — which is the cheaper residue and, unlike the wait, a bounded one.
 - **Per tick: both halves are capped.** The notify half already had `MAX_POLLS_PER_TICK` (8).
   The intake half now has `intake::MAX_INTAKE_POLLS_PER_TICK` (4) — expressed as the same
   *`gh`-call* budget rather than the same group count, since a due group costs two calls. Before
@@ -2734,12 +2753,24 @@ discipline (#590) rests on.
   — point and starve whichever groups landed on the wrong side of it. Sorting by `last_poll_ms`
   (ties broken on the group id, so the answer is stated rather than hash-dependent) makes the
   group this scan deferred the oldest, and therefore the first one the next scan takes: the cap
-  is a queue, not a drop.
+  is a queue, not a drop. Note the asymmetry this creates with the idiom it copies:
+  `notify::due_watches` sorts by `last_poll_ms` with **no** tiebreak, and every watch registers
+  at `last_poll_ms: 0`, so a fresh cohort larger than `MAX_POLLS_PER_TICK` is selected among in
+  `HashMap` order. That is not a starvation (each polled watch gets a real stamp and leaves the
+  zero cohort, so the cohort drains), which is why it is left alone — but if the two selectors
+  are ever unified, align `notify` **up** to the tiebreak rather than aligning `intake` down.
 - **What the tests pin.** `capture_with_timeout_stops_waiting_on_a_stalled_child` asserts
   ELAPSED time against a child that outlives its bound 20x — an implementation that said "timed
   out" only once `output()` finally returned would satisfy the message and none of the point.
   `capture_with_timeout_drains_output_larger_than_a_pipe_buffer` is the regression pin on the
-  reader threads (a ~512 KiB child, past every platform's default buffer). The intake cap is
+  reader threads (a ~512 KiB child, past every platform's default buffer). `wait_bounded` is
+  pinned on both arms (a live child reported at the deadline, an exited one reported with its
+  status), and the reader ceiling on all three of its own: the pure admission boundary, the
+  refusal-then-drain cycle (driven through a seam that parks controllable blocked readers, so
+  it is deterministic on every platform), and — the one that keeps the rest honest — that a
+  timeout whose child left a grandchild holding the pipes really does park its readers where
+  the ceiling can see them. Those tests take a shared serial lock, since the backlog is
+  process-wide state and this binary runs in parallel. The intake cap is
   pinned pure in `intake.rs` (cap, oldest-first ordering, deterministic tiebreak, and
   two-scans-cover-every-group) and on a live registry in
   `poll_intake_caps_one_scan_and_polls_the_deferred_groups_on_the_next`. None of them shells out

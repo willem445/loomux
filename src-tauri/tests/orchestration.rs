@@ -10,6 +10,12 @@ use loomux_lib::orchestration::intake;
 // #656: the intake half's per-scan `gh` budget, asserted against the constant
 // itself so the pin follows a future retune instead of pinning today's 4.
 use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
+// #656 (rev-lead findings 1 and 2): the bounded child wait, and the
+// process-wide ceiling on readers abandoned by a timed-out capture.
+use loomux_lib::orchestration::{
+    gh_capture_admitted, gh_capture_live_readers, seed_leaked_readers_for_test, wait_bounded,
+    GH_CAPTURE_MAX_LEAKED_READERS,
+};
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
@@ -30839,6 +30845,61 @@ fn cat_command(path: &Path) -> std::process::Command {
     }
 }
 
+/// A shell script whose child leaves a GRANDCHILD holding the inherited
+/// pipes after the direct child is killed — the one case that justifies not
+/// joining the readers, and therefore the one that can actually grow the
+/// backlog. On Windows `cmd` spawns `ping` as a separate process (no `>NUL`
+/// here, deliberately: both pipes stay inherited); on Unix the backgrounded
+/// `sleep` survives the shell that started it.
+fn hold_pipes_script() -> String {
+    if cfg!(windows) { "ping -n 31 127.0.0.1".to_string() } else { "sleep 30 & sleep 30".to_string() }
+}
+
+/// The reader backlog is process-wide state, and this binary runs its tests
+/// in parallel — so every test that consults or fills it takes this first.
+/// Without it, the ceiling test's seeding would make a concurrent capture
+/// test fail with the backlog error, and the failure would be real but
+/// meaningless. (`obs.rs`'s own `static SERIAL` precedent.)
+static CAPTURE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn capture_lock() -> std::sync::MutexGuard<'static, ()> {
+    CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A child still running at the deadline must be REPORTED, not waited out —
+/// this is the primitive every wait on a child now goes through, so a
+/// regression here is a regression in both the main wait and the post-kill
+/// reap at once.
+#[test]
+fn wait_bounded_reports_none_for_a_child_still_running_at_the_deadline() {
+    let mut child = shell_command(&sleep_script(20))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the test child");
+    let started = std::time::Instant::now();
+    let verdict = wait_bounded(&mut child, Duration::from_millis(500)).expect("polling a live child is not an error");
+    let waited = started.elapsed();
+    let _ = child.kill();
+    assert!(verdict.is_none(), "a child alive at the deadline must report None rather than block until it exits");
+    assert!(waited < Duration::from_secs(5), "…and must report it AT the deadline (waited {waited:?} on a 20s child)");
+}
+
+/// …while a child that finishes inside the bound is reported with its real
+/// status, so the bound never costs a result that was there to be had.
+#[test]
+fn wait_bounded_reports_the_status_of_a_child_that_exits_first() {
+    let mut child = shell_command("exit 7")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the test child");
+    let status = wait_bounded(&mut child, Duration::from_secs(10))
+        .expect("polling is not an error")
+        .expect("a child that exits inside the bound must be reported, not timed out");
+    assert_eq!(status.code(), Some(7), "the child's own status must survive the bounded wait");
+}
+
 /// A stalled `gh` — the whole reason this bound exists — must not hold the
 /// caller for the child's lifetime. Since #406 there is ONE loop making `gh`
 /// calls, so an unbounded wait here stops every `notify_when` notice in the
@@ -30851,6 +30912,7 @@ fn cat_command(path: &Path) -> std::process::Command {
 /// returned would satisfy the string and none of the point.
 #[test]
 fn capture_with_timeout_stops_waiting_on_a_stalled_child() {
+    let _serial = capture_lock();
     let started = std::time::Instant::now();
     let err = OrchRegistry::capture_with_timeout(shell_command(&sleep_script(20)), Duration::from_secs(1))
         .expect_err("a child that outlives the bound must fail the capture, not be waited out");
@@ -30866,6 +30928,7 @@ fn capture_with_timeout_stops_waiting_on_a_stalled_child() {
 /// own stdout, immediately, exactly as `Command::output()` did.
 #[test]
 fn capture_with_timeout_returns_a_finished_childs_stdout() {
+    let _serial = capture_lock();
     let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-656"), Duration::from_secs(10))
         .expect("a fast child must succeed");
     assert!(out.contains("loomux-656"), "stdout must be captured verbatim, not summarized: {out:?}");
@@ -30882,6 +30945,7 @@ fn capture_with_timeout_returns_a_finished_childs_stdout() {
 /// Windows, 64 KiB Linux, 16 KiB macOS) on stdout alone.
 #[test]
 fn capture_with_timeout_drains_output_larger_than_a_pipe_buffer() {
+    let _serial = capture_lock();
     let dir = tempfile::tempdir().unwrap();
     let big = dir.path().join("big.txt");
     let payload = "loomux-656 ".repeat(48 * 1024); // ~512 KiB
@@ -30904,12 +30968,85 @@ fn capture_with_timeout_drains_output_larger_than_a_pipe_buffer() {
 /// classifications predate the bound.
 #[test]
 fn capture_with_timeout_reports_a_nonzero_exit_as_the_childs_own_failure() {
+    let _serial = capture_lock();
     let started = std::time::Instant::now();
     let err = OrchRegistry::capture_with_timeout(shell_command("exit 3"), Duration::from_secs(10))
         .expect_err("a non-zero exit is an Err, exactly as `output()` made it");
     assert!(!err.contains("timed out"), "a child that exited must never be reported as a timeout: {err}");
     assert!(err.contains('3'), "the exit status must survive into the message the caller surfaces: {err}");
     assert!(started.elapsed() < Duration::from_secs(5), "an immediate failure must return immediately");
+}
+
+/// The ceiling policy itself, pure: a capture is admitted while abandoned
+/// readers are below the ceiling and refused at it. Stated here so the
+/// boundary is pinned without arranging a real leak.
+#[test]
+fn gh_capture_admission_stops_exactly_at_the_reader_ceiling() {
+    assert!(gh_capture_admitted(0), "an empty backlog must never refuse a poll");
+    assert!(
+        gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS - 1),
+        "one slot short of the ceiling is still a poll worth making"
+    );
+    assert!(!gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS), "the ceiling is a ceiling, not a target");
+    assert!(!gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS + 9), "and nothing above it is admitted either");
+}
+
+/// The leak really is bounded per PROCESS, not merely per tick: once the
+/// backlog is at the ceiling a capture is refused outright — with an error
+/// naming the reason, since both callers surface an `Err` — and once those
+/// readers end, captures resume on their own.
+///
+/// Uses the seam rather than a grandchild that holds a pipe: seeded readers
+/// block until this test releases them, so both the refusal and the drain are
+/// deterministic on every platform instead of depending on how one OS
+/// inherits handles.
+#[test]
+fn a_full_reader_backlog_refuses_captures_until_it_drains() {
+    let _serial = capture_lock();
+
+    // Baseline: whatever earlier capture tests left behind (normally zero —
+    // killing a child closes its pipes and its readers end at once).
+    let holds = seed_leaked_readers_for_test(GH_CAPTURE_MAX_LEAKED_READERS);
+    assert!(
+        gh_capture_live_readers() >= GH_CAPTURE_MAX_LEAKED_READERS,
+        "the seam must fill the backlog the way an abandoned reader does"
+    );
+
+    let err = OrchRegistry::capture_with_timeout(shell_command("echo unreachable"), Duration::from_secs(10))
+        .expect_err("a full backlog must refuse the capture rather than spawn another child");
+    assert!(err.contains("backlog"), "the refusal must name itself, not look like a gh failure: {err}");
+
+    // Releasing them is the whole point of the bound: this is a ceiling, not
+    // a latch, so polling must resume without a restart.
+    drop(holds);
+    let settle = std::time::Instant::now();
+    while gh_capture_live_readers() >= GH_CAPTURE_MAX_LEAKED_READERS && settle.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-656-drained"), Duration::from_secs(10))
+        .expect("once the backlog drains, captures must resume on their own");
+    assert!(out.contains("loomux-656-drained"), "…and resume as real captures, not as a stub: {out:?}");
+}
+
+/// The registration itself: a timed-out capture whose child left a grandchild
+/// holding the pipes must PARK its readers where the ceiling can see them.
+/// Without this, deleting the two lines that push into the backlog would
+/// leave every other test in this section passing — the ceiling would simply
+/// never be reached by anything real.
+#[test]
+fn a_timeout_that_cannot_close_its_pipes_parks_its_readers_in_the_backlog() {
+    let _serial = capture_lock();
+    let before = gh_capture_live_readers();
+
+    let err = OrchRegistry::capture_with_timeout(shell_command(&hold_pipes_script()), Duration::from_secs(1))
+        .expect_err("the child outlives the bound, so this is a timeout");
+    assert!(err.contains("timed out"), "precondition: this must be the timeout arm, not another failure: {err}");
+
+    assert!(
+        gh_capture_live_readers() > before,
+        "a reader still blocked on a grandchild's pipe must be counted, not forgotten — \
+         that is the difference between a leak bounded per tick and one bounded per process"
+    );
 }
 
 /// The intake half's per-scan cap, on a live registry rather than only in the

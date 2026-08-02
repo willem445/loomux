@@ -1533,6 +1533,94 @@ pub const GH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 /// enough to add no perceptible latency to a ~1s call, coarse enough that the
 /// wait costs nothing measurable on a loop that wakes every 30s.
 const GH_CAPTURE_POLL_STEP: Duration = Duration::from_millis(25);
+/// How long the timeout path waits to reap the child it just killed (#656,
+/// rev-lead finding 2). Reaping a killed process is normally instantaneous;
+/// this exists only so the tail of a bounded wait is itself bounded, for the
+/// one case where the kill cannot land immediately (a child in
+/// uninterruptible sleep). Short, because waiting longer buys nothing: if it
+/// hasn't been reaped by now it is not the sleep that is slow.
+const GH_CAPTURE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Ceiling on reader threads left blocked on children `capture_with_timeout`
+/// abandoned (#656, rev-lead finding 1). Two per timed-out call, and a tick
+/// makes at most `notify::MAX_POLLS_PER_TICK` × 2 + `intake::
+/// MAX_INTAKE_POLLS_PER_TICK` × 2 = 24 calls, so this engages well inside a
+/// single pathological tick rather than after many — the point is to stop
+/// accumulation across ticks, which is where an unbounded leak would actually
+/// come from.
+pub const GH_CAPTURE_MAX_LEAKED_READERS: usize = 16;
+
+/// Reader threads abandoned by a timed-out `capture_with_timeout`, held so
+/// they can be counted rather than forgotten. Process-wide because the leak
+/// is: the bound has to survive across ticks, and there is one poll loop.
+static GH_CAPTURE_LEAKED_READERS: Mutex<Vec<std::thread::JoinHandle<Vec<u8>>>> = Mutex::new(Vec::new());
+
+/// Drop the handles of readers that have since ended and report how many are
+/// still blocked. A reader ends as soon as its pipe closes, which in the
+/// ordinary stall is the moment its child is killed — so this normally
+/// returns 0 and the ceiling below is never approached.
+fn sweep_leaked_readers() -> usize {
+    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+    leaked.retain(|reader| !reader.is_finished());
+    leaked.len()
+}
+
+/// Whether a capture may spawn a child, given how many abandoned readers are
+/// still blocked. Pure, so the ceiling policy is testable without arranging a
+/// real leak — the `due_watches`/`due_intake_polls` idiom applied to the one
+/// other unbounded resource this poller can grow.
+pub fn gh_capture_admitted(live_readers: usize) -> bool {
+    live_readers < GH_CAPTURE_MAX_LEAKED_READERS
+}
+
+/// Bounded `Child::wait` (#656): poll until the child reports exit or
+/// `timeout` elapses. `Ok(None)` means it was still running at the deadline —
+/// the caller decides whether that is a kill or a give-up. Every wait on a
+/// child in this file goes through here, so there is no arm left that can
+/// block without a deadline.
+///
+/// `pub` for the same reason as `capture_with_timeout`: pinning "still
+/// running at the deadline" needs a real child, not a mock.
+pub fn wait_bounded(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(GH_CAPTURE_POLL_STEP);
+    }
+}
+
+#[doc(hidden)] // pub for integration tests: observe the process-wide reader backlog
+pub fn gh_capture_live_readers() -> usize {
+    sweep_leaked_readers()
+}
+
+/// Park `n` controllable blocked readers in the backlog, as a real abandoned
+/// reader would be. Dropping the returned senders releases them, so a test
+/// can drive both the refusal and the drain without arranging a grandchild
+/// that holds a pipe — which is neither portable nor deterministic.
+#[doc(hidden)] // pub for integration tests
+pub fn seed_leaked_readers_for_test(n: usize) -> Vec<mpsc::Sender<()>> {
+    let mut holds = Vec::new();
+    let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+    for _ in 0..n {
+        let (tx, rx) = mpsc::channel::<()>();
+        holds.push(tx);
+        leaked.push(std::thread::spawn(move || {
+            let _ = rx.recv(); // ends when the test drops its sender
+            Vec::new()
+        }));
+    }
+    holds
+}
 /// Merge-gate hot-reload (#385): how often `run_workflow_gate_reload` re-checks
 /// every advanced-orchestrator group's `.loomux/workflow.yml` against its
 /// currently-armed gate. A human edit reading the workflow file wants to feel
@@ -21836,9 +21924,23 @@ impl OrchRegistry {
     /// immediately and leave the two readers to end when their pipe ends. A
     /// join here would reintroduce exactly the unbounded wait being removed:
     /// a grandchild that inherited the pipe handle keeps it open past its
-    /// parent's death, so the read can outlive the process we killed. The
-    /// leak is bounded by construction — a timeout costs two threads, and a
-    /// tick makes a bounded number of calls.
+    /// parent's death, so the read can outlive the process we killed.
+    ///
+    /// **What bounds that leak (rev-lead finding 1).** Abandoning readers
+    /// bounds one call, not the process: the very case that justifies not
+    /// joining is the case where they never finish, and a persistently
+    /// stalling condition is re-polled every tick. So an abandoned reader is
+    /// parked in `GH_CAPTURE_LEAKED_READERS` instead of forgotten, every
+    /// capture first sweeps the ones that have since ended, and a capture is
+    /// refused outright once `GH_CAPTURE_MAX_LEAKED_READERS` are still
+    /// blocked. Note what that trade is: past the ceiling, `gh` polling in
+    /// this process stops until the backlog drains, and if a grandchild holds
+    /// a pipe forever it never drains. That is deliberate — a named, returned
+    /// error that both callers already surface (a watch cancelled with a
+    /// reason someone can read) beats thread growth nothing reports. In the
+    /// ordinary stall the child IS `gh`, killing it closes both pipes, and the
+    /// readers end at once: the backlog stays empty and the ceiling is never
+    /// approached.
     ///
     /// Kept `pub` (and taking a caller-built `Command`) so the timeout path is
     /// testable against a deliberately-slow subprocess without shelling out to
@@ -21846,6 +21948,11 @@ impl OrchRegistry {
     pub fn capture_with_timeout(mut cmd: std::process::Command, timeout: Duration) -> Result<String, String> {
         use std::io::Read as _;
         use std::process::Stdio;
+
+        let live = sweep_leaked_readers();
+        if !gh_capture_admitted(live) {
+            return Err(format!("gh capture backlog: {live} readers still blocked on abandoned children"));
+        }
 
         // stdin: `output()` nulls it implicitly, `spawn()` does not — and an
         // inherited stdin is how a `gh` that decides to prompt hangs forever.
@@ -21864,19 +21971,21 @@ impl OrchRegistry {
             buf
         });
 
-        let deadline = std::time::Instant::now() + timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {}
-                Err(e) => return Err(e.to_string()),
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait(); // reap; the kill has already landed
-                return Err(format!("timed out after {}s", timeout.as_secs()));
-            }
-            std::thread::sleep(GH_CAPTURE_POLL_STEP);
+        let Some(status) = wait_bounded(&mut child, timeout)? else {
+            let _ = child.kill();
+            // Reap on its own deadline (rev-lead finding 2). A bound whose
+            // last act is an unbounded `wait()` is not a bound: the kill has
+            // landed in every ordinary case, but a child in uninterruptible
+            // sleep does not die until it leaves that state, and `wait()`
+            // would sit there — the exact thing this function exists to stop
+            // doing. Outliving the reap leaves an unreaped child (a PID-table
+            // entry until this process exits), which is the cheaper of the two
+            // residues and the only one that is bounded.
+            let _ = wait_bounded(&mut child, GH_CAPTURE_REAP_TIMEOUT);
+            let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+            leaked.push(out_reader);
+            leaked.push(err_reader);
+            return Err(format!("timed out after {}s", timeout.as_secs()));
         };
 
         // Exited on its own: both pipes are at EOF (or about to be), so these
