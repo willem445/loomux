@@ -1499,6 +1499,19 @@ mod tests {
         cmd.get_argv()[0].to_string_lossy().into_owned()
     }
 
+    /// File-name component of argv[0] — what "is this a shell?" assertions
+    /// must key on. Never the whole `prog()` path: on a temp-dir fixture the
+    /// path carries a random directory segment that can itself contain "sh"
+    /// (e.g. `.../shq7f2ab/agent`), which made this flake platform-agnostic
+    /// (#183) even though the resolved binary was never a shell.
+    fn bin_name(cmd: &CommandBuilder) -> String {
+        Path::new(&prog(cmd))
+            .file_name()
+            .expect("argv[0] must have a file-name component")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Serializes the tests that mutate process-global env vars
     /// (`LOOMUX_NO_DIRECT_SPAWN`, `CARGO_TARGET_DIR`) so they can't race each
     /// other's reads.
@@ -1531,8 +1544,10 @@ mod tests {
         assert_eq!(av[1], "--model");
         assert_eq!(av[2], "opus");
         assert!(
-            !prog(&direct).contains("pwsh") && !prog(&direct).contains("sh"),
-            "a direct spawn must not go through a shell"
+            !bin_name(&direct).contains("pwsh") && !bin_name(&direct).contains("sh"),
+            "a direct spawn must not go through a shell, got binary {:?} (full path {:?})",
+            bin_name(&direct),
+            prog(&direct)
         );
 
         // No argv → shell wrapper runs the command string (plain/custom panes).
