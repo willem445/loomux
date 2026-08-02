@@ -410,11 +410,27 @@ fn advanced_rails() -> Guardrails {
 fn repo_with_merge_queue(tag: &str, enabled: bool) -> std::path::PathBuf {
     let repo = scratch_dir(tag);
     fs::create_dir_all(repo.join(".loomux")).unwrap();
+    // `version:` is REQUIRED (no serde default) and must equal
+    // `workflow::SCHEMA_VERSION` — a file without it fails the parse, which is
+    // how the first cut of this test ended up asserting presence against a
+    // workflow that never loaded.
     fs::write(
         repo.join(".loomux").join("workflow.yml"),
-        format!("merge_queue:\n  enabled: {enabled}\n  max_batch: 3\n"),
+        format!(
+            "version: {}\nmerge_queue:\n  enabled: {enabled}\n  max_batch: 3\n",
+            workflow::SCHEMA_VERSION
+        ),
     )
     .unwrap();
+    // The fixture asserts its OWN validity. Without this, a malformed fixture
+    // fails the caller's `contains(...)` assertion instead — which reads as "the
+    // feature is broken" when the truth is "this file never loaded", and that is
+    // exactly how the first cut of this test misdiagnosed a missing `version:`.
+    let loaded = workflow::load_workflow(repo.to_str().unwrap());
+    assert!(
+        matches!(&loaded, Ok(Some(wf)) if wf.merge_queue.enabled == enabled),
+        "fixture must parse with merge_queue.enabled={enabled}, got {loaded:?}"
+    );
     repo
 }
 
