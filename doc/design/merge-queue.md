@@ -569,7 +569,7 @@ Every row below is a designed path, an audit event (§11), and a test.
 | Gate re-check fails at landing | Landing refused, that entry kicks back, survivors requeue (§6). |
 | Crash mid-batch | Reconcile from `merge_queue.json`: verify the scratch ref exists, the draft PR is open, and the target head matches. Resume only if the world matches; otherwise fail entries **loudly**. Never drop silently (§4). |
 | Entry cancelled while `batching`/`ci-wait` | The in-flight batch is abandoned and rebuilt without it; cleanup runs. |
-| Scratch ref already exists at mint (leaked from a crashed earlier batch) | Refuse to mint on that name; re-mint, bounded at 3 attempts, then fail the batch loudly (`mq-scratch-collision`). The existing ref is **never** deleted to make room. The push is create-only — `--force-with-lease=<ref>:` with an empty expect, or `POST /git/refs`'s 422; a *plain* push would fast-forward onto a descendant leaked ref silently — so the check has no TOCTOU window (§4). |
+| Scratch ref already exists at mint (leaked from a crashed earlier batch) | Refuse to mint on that name; re-mint, bounded at 3 attempts, then fail the batch loudly (`mq-scratch-collision`). The existing ref is **never** deleted to make room. The push is create-only — `--force-with-lease=<ref>:` with an empty expect, or `POST /git/refs`'s 422; a *plain* push would fast-forward onto an **ancestor** leaked ref silently — so the check has no TOCTOU window (§4). |
 | Queue grows without bound | Entries are capped (`64`); enqueue past the cap is refused with a stated reason, keeping `merge_queue.json` bounded. |
 
 **Cleanup runs on every exit path** — green, red, conflict, timeout, cancel, crash-reconcile,
