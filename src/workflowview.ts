@@ -842,7 +842,15 @@ export class WorkflowView {
         // Re-run the same pass the pane would have run had the reply been in
         // hand when the file opened.
         this.analysis = analyzeWorkflow(this.text, this.knobLookup);
-        this.render();
+        // NOT `render()`: this lands whenever the IPC happens to resolve, which
+        // can be mid-keystroke — and `render()` rewrites the YAML textarea from
+        // the model, which is how an editor eats a keystroke (the same reason the
+        // textarea's own input handler refreshes every surface BUT itself). The
+        // form is redrawn only when the human isn't inside it.
+        this.renderRoster();
+        this.renderFindings();
+        this.renderGraph();
+        if (!this.formPane.contains(document.activeElement)) this.renderForm();
       });
     }
   }
