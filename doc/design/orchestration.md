@@ -6612,6 +6612,19 @@ leads a pointer with content and still matches. That is not new — the older bo
 a CLI adopts `❯` plus placeholder text; the answer then is the same one this note takes, a narrower
 signal, not a wider mask.
 
+**The assumption this rests on, stated so a future TUI change is a known break and not a mystery:
+a pointer and the option it points at render on the SAME row.** That is what makes "nothing after
+the glyph" mean "this points at no option" rather than "the option is elsewhere". Two things could
+falsify it — a CLI that paints the glyph on its own row above a multi-row option, or a wrap that
+lands exactly at the glyph — and either would make a *live* menu read as an empty prompt, which is
+the expensive direction. Neither is speculative-only: the whole reason this bug existed is that a
+CLI changed its input box from `> ` to a bare `❯`, so the same surface moves again. What limits the
+damage if it does is that `pointer-option` is one disjunct of five and the last one tried — a real
+dialog painted that way would still have to carry no footer, no numbered option and no yes/no token
+to go undetected, and `grid_evidence_for` reads `prompt_wait_detected` over the whole screen as
+well. The signal to re-check on a CLI upgrade is therefore this one, and `f3` is the test that
+would have to be widened: today it asserts a pointer row and its option are one string.
+
 ## Delivery queue (#445)
 
 **Problem.** `deliver_prompt` has three hold-cap seams — pre-paste box-occupied (#111,
