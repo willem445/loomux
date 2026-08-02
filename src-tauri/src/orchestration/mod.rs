@@ -1968,6 +1968,22 @@ const BOX_TAIL_SCAN_BYTES: usize = QUESTION_SCAN_TAIL_BYTES;
 /// paste — which is exactly the residual `BoxReading::Unverifiable` exists to
 /// say out loud instead of reading as an idle pane.
 const TIER1_SCAN_MAX_BYTES: usize = queue::QUEUE_FLUSH_MAX_BYTES + BOX_TAIL_SCAN_BYTES;
+/// Ceiling on one WIDENED Tier 1 read (#685) — the pty output ring itself,
+/// because that is the whole readable universe: a request past it cannot come
+/// back with a byte the ring does not hold. Derived rather than picked, for the
+/// same reason `TIER1_SCAN_MAX_BYTES` is. In practice the widening lands far
+/// below this (it asks for what the measured retention says it needs, see
+/// `Tier1Scan`); the cap only binds for a tail that is almost entirely escape
+/// bytes.
+const TIER1_SCAN_WIDEN_MAX_BYTES: usize = crate::pty::OUTPUT_RING_CAP;
+/// How many times one Tier 1 read may re-request a wider tail (#685) before it
+/// settles for the widest it got. Each round re-measures, so the estimate is
+/// corrected rather than repeated; three is enough for a scaled request to
+/// converge on a tail whose density is not uniform, and the bound exists so a
+/// pathological one cannot spin. Running out is not a failure mode of its own:
+/// the widest read still classifies, and a short one classifies as
+/// `Unverifiable` exactly as it did before.
+const TIER1_SCAN_WIDEN_ROUNDS: u32 = 3;
 /// Extra slack (normalized characters) added around the pasted text's own
 /// length when windowing "the tail end" for containment — covers box
 /// framing/prompt-symbol/cursor characters immediately around our text
@@ -12819,14 +12835,198 @@ pub fn box_holds_paste(stripped_tail: &str, pasted: &str) -> bool {
 ///
 /// Best-effort, not a guarantee: a heavily-ANSI-escaped tail strips down to
 /// far fewer characters than the bytes read, so even this size can come back
-/// too short. That residual is not papered over — `box_reading` classifies it
-/// as `Unverifiable`.
+/// too short. #583 measured how often (routinely, from ~1.5 KiB up) and #685
+/// turned that residual into a re-read — see `Tier1Scan`, which is what every
+/// call site now goes through. This function keeps the FLOOR: the first request
+/// any Tier 1 read makes, unchanged, so no read is ever narrower than it was.
 #[doc(hidden)] // pub for integration tests
 pub fn tier1_scan_bytes(pasted: &str) -> usize {
     normalize_prompt_text(pasted)
         .len()
         .saturating_add(BOX_TAIL_SCAN_BYTES)
         .min(TIER1_SCAN_MAX_BYTES)
+}
+
+/// One delivery's Tier 1 scan window, counted in the unit the comparison
+/// actually runs in (#685).
+///
+/// #559 derived the read from the paste; #583 measured what that bought. A live
+/// tail retains roughly half its raw bytes through `strip_ansi` +
+/// `normalize_prompt_text`, and the slack (`BOX_TAIL_SCAN_BYTES`) is a
+/// CONSTANT, so the shortfall grows with the paste and crosses the needle's own
+/// length while the paste is still only a couple of KiB. From there up
+/// `box_reading` answered `Unverifiable` out of arithmetic, having learned
+/// nothing about the pane: 58% of live deliveries in the 1.5-2 KiB band, and
+/// every one from 2.5 KiB. That is the SAFE direction and it stayed safe — it
+/// is simply not verification.
+///
+/// So the budget is counted in POST-STRIP characters and the raw request is
+/// whatever it takes to deliver them: read, measure what survived stripping in
+/// THIS pane, and — only when that came up short of the window the comparison
+/// uses — re-request scaled by the retention this pane's own tail just
+/// demonstrated. Scaling by a measured ratio rather than by a chosen inflation
+/// constant is the point: density is a property of a CLI's repaint stream
+/// (#583's whole finding), so any constant is right for one CLI and wrong for
+/// the next.
+///
+/// **What bounds it.**
+/// - `target_chars` is the containment window `box_holds_paste` compares
+///   within — the paste plus `BOX_TAIL_WINDOW_SLACK` — and nothing past it is
+///   ever looked at. An ordinary delivery's first read clears that target with
+///   room to spare and widens not at all; only a read that is truncating the
+///   comparison widens, which is also the only case that costs anything.
+/// - The `TIER1_SCAN_MAX_BYTES` ceiling still caps the target, so a paste past
+///   it stays `Unverifiable` at any density. Raising that ceiling — what
+///   verification should even claim for a paste larger than a whole flush — is
+///   a separate decision (#685's posture half) and is deliberately not taken
+///   here.
+/// - A read the ring UNDER-FILLS ends the widening on the spot: fewer bytes
+///   back than asked for means the ring holds no more, so no wider request can
+///   add one. This is #583's short-*pane* confounder, and it is exactly the
+///   regime where widening buys nothing.
+/// - `TIER1_SCAN_WIDEN_ROUNDS` bounds the re-reads regardless, and running out
+///   returns the widest read taken rather than no read at all.
+///
+/// **Why this cannot manufacture a confirm.** #559's invariant was that every
+/// box read for a delivery uses the same size, because a precondition verified
+/// against a wide tail and then polled against a NARROW one could see the box
+/// cut mid-paste, read `NotHolding`, and confirm a delivery nothing observed.
+/// The hazard needs a narrower read, and there is no longer any way to take
+/// one: the first request is exactly `tier1_scan_bytes`, `request_floor` only
+/// ever rises, and every widening only grows the request. So the invariant is
+/// kept in a strictly stronger form — reads are monotone, not merely equal —
+/// and a wider read can only ever turn a foregone `Unverifiable` into an
+/// observation.
+#[doc(hidden)] // pub for integration tests
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier1Scan {
+    /// Where the NEXT read starts. Seeded with `tier1_scan_bytes` and raised
+    /// (never lowered) by a widening, so a delivery that has already learned
+    /// its pane is dense pays the discovery once instead of on every poll —
+    /// and so successive reads are monotone, which is what makes the
+    /// same-size invariant above hold in its stronger form.
+    request_floor: usize,
+    /// Post-strip characters a read must deliver to cover the containment
+    /// window whole.
+    target_chars: usize,
+}
+
+/// One Tier 1 tail read, as taken (#685) — the request that produced it beside
+/// what came back, so the census records the size actually asked for rather
+/// than the size the delivery started from.
+#[doc(hidden)] // pub for integration tests
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tier1TailRead {
+    /// The FINAL raw request — `Tier1Scan`'s floor when nothing widened.
+    pub requested_bytes: usize,
+    /// Raw bytes the ring returned for it.
+    pub tail_bytes: usize,
+    /// Those bytes after `strip_ansi` — the haystack `box_reading` gets.
+    pub stripped: String,
+}
+
+impl Tier1Scan {
+    /// The scan window for one delivery's `pasted` text. Built once per
+    /// delivery (and once per late monitor), never per read: `pasted_text` is
+    /// fixed for a delivery's whole life, and normalizing a multi-KiB paste is
+    /// not something a 100ms poll should repeat.
+    pub fn for_paste(pasted: &str) -> Self {
+        Self {
+            // Deliberately the same function the old call sites called, rather
+            // than a second copy of its arithmetic: one definition of the floor
+            // is worth one extra normalize per delivery.
+            request_floor: tier1_scan_bytes(pasted),
+            target_chars: normalize_prompt_text(pasted)
+                .len()
+                .saturating_add(BOX_TAIL_WINDOW_SLACK)
+                .min(TIER1_SCAN_MAX_BYTES),
+        }
+    }
+
+    /// Post-strip characters a read has to deliver to cover the whole window
+    /// `box_holds_paste` compares within.
+    pub fn target_chars(&self) -> usize {
+        self.target_chars
+    }
+
+    /// Where the next read starts — `tier1_scan_bytes` until a widening raises
+    /// it.
+    pub fn request_floor(&self) -> usize {
+        self.request_floor
+    }
+
+    /// The next, WIDER raw request after a read of `requested` bytes came back
+    /// as `tail_bytes` raw / `tail_chars` post-strip, or `None` to stop.
+    ///
+    /// Pure, and the whole of the sizing decision — the reader below is just
+    /// the loop around it. Each `None` is a different reason to stop, and they
+    /// are all "a wider request cannot change the answer":
+    /// the window is already covered; the ring under-filled this one; or the
+    /// ratio is undefined because nothing survived stripping (the same
+    /// zero-denominator `retained_pct` refuses to report, and for the same
+    /// reason — a guess dressed as a measurement is worse than the honest
+    /// `Unverifiable` that follows).
+    pub fn widen(&self, requested: usize, tail_bytes: usize, tail_chars: usize) -> Option<usize> {
+        if tail_chars >= self.target_chars || tail_bytes < requested || tail_chars == 0 {
+            return None;
+        }
+        // Scale the RAW request by the shortfall the read just measured:
+        // `requested` bytes bought `tail_chars`, so `target_chars` needs this
+        // many. Rounded up, so a read one character short still grows.
+        let next = (requested as u64)
+            .saturating_mul(self.target_chars as u64)
+            .div_ceil(tail_chars as u64)
+            .min(TIER1_SCAN_WIDEN_MAX_BYTES as u64) as usize;
+        (next > requested).then_some(next)
+    }
+
+    /// Take one Tier 1 tail read, widening until it covers the window or until
+    /// one of `widen`'s stopping conditions says nothing wider would help.
+    /// `None` is no read at all (the pty is gone) — never a short read, which
+    /// is a different fact and is `Some` with the shortfall visible in it.
+    ///
+    /// `read` is the raw-byte reader — `PtyManager::output_tail_bounded` at
+    /// every call site. A closure rather than the manager itself so the loop is
+    /// drivable by a test that counts the requests and sizes them, which is the
+    /// only way to pin "never narrower" and "bounded" on the real code rather
+    /// than on a re-implementation of it.
+    pub fn read(&mut self, mut read: impl FnMut(usize) -> Option<Vec<u8>>) -> Option<Tier1TailRead> {
+        let mut requested = self.request_floor;
+        let mut rounds = 0u32;
+        loop {
+            let raw = read(requested)?;
+            let stripped = strip_ansi(&raw);
+            let chars = normalize_prompt_text(&stripped).len();
+            let wider = (rounds < TIER1_SCAN_WIDEN_ROUNDS)
+                .then(|| self.widen(requested, raw.len(), chars))
+                .flatten();
+            let Some(next) = wider else {
+                return Some(Tier1TailRead {
+                    requested_bytes: requested,
+                    tail_bytes: raw.len(),
+                    stripped,
+                });
+            };
+            requested = next;
+            // Monotone by construction (`widen` only returns a larger request),
+            // and asserted as `max` rather than assignment so the floor cannot
+            // be walked backwards by a future edit to `widen`.
+            self.request_floor = self.request_floor.max(next);
+            rounds += 1;
+        }
+    }
+
+    /// The census for one read of this scan (#583's record, #685's sizes).
+    /// `None` is a read that never happened, and the request recorded then is
+    /// the one that was about to be made — built here rather than at each
+    /// `json!` site for the same reason `Tier1ScanCensus::to_json` is.
+    pub fn census(&self, read: Option<&Tier1TailRead>, pasted: &str) -> Tier1ScanCensus {
+        Tier1ScanCensus::measure(
+            read.map_or(self.request_floor, |r| r.requested_bytes),
+            read.map(|r| (r.tail_bytes, r.stripped.as_str())),
+            pasted,
+        )
+    }
 }
 
 /// What a Tier 1 box read actually ESTABLISHED (#559) — the three-state
@@ -12923,7 +13123,12 @@ pub fn box_reading(stripped_tail: Option<&str>, pasted: &str) -> BoxReading {
 #[doc(hidden)] // pub for integration tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tier1ScanCensus {
-    /// What `tier1_scan_bytes` asked the ring for.
+    /// What the ring was asked for — since #685 the FINAL request of a read
+    /// that may have widened itself, not the `tier1_scan_bytes` floor it
+    /// started from. Both jq recipes in the design note still read it the same
+    /// way: it remains "the window this reading was decided against", which is
+    /// what `tail_bytes == requested_bytes` (the short-ring confounder) and
+    /// every breakeven computed from it depend on.
     pub requested_bytes: usize,
     /// Raw bytes the ring actually returned — short of `requested_bytes`
     /// whenever the pane has simply not produced that much output yet, which
@@ -13118,14 +13323,16 @@ fn run_late_confirmation_monitor(
     let mut paste_seen_in_box = false;
     // #559 (rev-13 N2): computed ONCE for this monitor, not per tick and not
     // per arm. `pasted_text` is fixed for the monitor's whole life, so the
-    // derived scan size is a constant of this delivery — and `tier1_scan_
-    // bytes` normalizes the paste to measure it, which for a coalesced flush
+    // derived scan size is a constant of this delivery — and `Tier1Scan::for_
+    // paste` normalizes the paste to measure it, which for a coalesced flush
     // is a multi-KiB allocation this loop would otherwise repeat every
     // `LATE_MONITOR_POLL` for up to `LATE_MONITOR_MAX_LIFETIME`. Hoisting it
-    // also makes the "every box read for a delivery uses the SAME size"
-    // invariant (see `deliver_prompt`'s `tier1_scan`) structural here rather
-    // than a property of two call sites happening to call the same function.
-    let tier1_scan = tier1_scan_bytes(&pasted_text);
+    // also makes the "no box read for a delivery is narrower than the last"
+    // invariant (see `deliver_prompt`'s `tier1_scan` and `Tier1Scan`'s own doc)
+    // structural here rather than a property of two call sites happening to
+    // call the same function: #685's widening raises this scan's floor, so both
+    // arms below inherit whatever density either one has already discovered.
+    let mut tier1_scan = Tier1Scan::for_paste(&pasted_text);
     loop {
         std::thread::sleep(LATE_MONITOR_POLL);
         // The pty closing (agent exited/killed) means there is nothing left
@@ -13218,9 +13425,10 @@ fn run_late_confirmation_monitor(
                     // conservative posture the old `.unwrap_or(true)` had,
                     // now extended to the tail-too-short case it missed.
                     let reading = box_reading(
-                        ptys.output_tail_bounded(pty_id, tier1_scan)
-                            .map(|b| strip_ansi(&b))
-                            .as_deref(),
+                        tier1_scan
+                            .read(|n| ptys.output_tail_bounded(pty_id, n))
+                            .as_ref()
+                            .map(|r| r.stripped.as_str()),
                         &pasted_text,
                     );
 
@@ -13336,10 +13544,9 @@ fn run_late_confirmation_monitor(
                 // #583: the raw length is kept beside the stripped text (never
                 // re-read) so the `Unverifiable` record below can say HOW short
                 // the tail came back, not only that it did.
-                let box_read =
-                    ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| (b.len(), strip_ansi(&b)));
+                let box_read = tier1_scan.read(|n| ptys.output_tail_bounded(pty_id, n));
                 let reading =
-                    box_reading(box_read.as_ref().map(|(_, t)| t.as_str()), &pasted_text);
+                    box_reading(box_read.as_ref().map(|r| r.stripped.as_str()), &pasted_text);
                 let holds_paste = reading == BoxReading::Holds;
                 // #559: the decline is stated wherever it is reached, not only
                 // where it changes the outcome — an `Unverifiable` reading on
@@ -13347,22 +13554,21 @@ fn run_late_confirmation_monitor(
                 // the box) would otherwise leave no trace that Tier 1 was
                 // blind for it.
                 if reading == BoxReading::Unverifiable {
+                    // #583/#685: the same census `prompt-typed` carries, from
+                    // the same read this reading was decided from. Sampled
+                    // minutes later than the precondition's, against a fuller
+                    // ring — a second, differently-timed sample of the same
+                    // question, not a duplicate of the first. `scan_bytes` is
+                    // read off the census rather than computed beside it, so
+                    // the two cannot disagree about what was asked for once a
+                    // read is allowed to widen itself.
+                    let census = tier1_scan.census(box_read.as_ref(), &pasted_text);
                     append_audit(&root, &group, "loomux", "delivery-unconfirmed-box-unverifiable", json!({
                         "to": agent, "confirm_state": "unconfirmed",
                         "reason": "pasted text is larger than the pane tail loomux could read",
                         "paste_bytes": pasted_text.len(),
-                        "scan_bytes": tier1_scan,
-                        // #583: the same census `prompt-typed` carries, from
-                        // the same read this reading was decided from. Sampled
-                        // minutes later than the precondition's, against a
-                        // fuller ring — a second, differently-timed sample of
-                        // the same question, not a duplicate of the first.
-                        "tier1_scan_census": Tier1ScanCensus::measure(
-                            tier1_scan,
-                            box_read.as_ref().map(|(raw, t)| (*raw, t.as_str())),
-                            &pasted_text,
-                        )
-                        .to_json(),
+                        "scan_bytes": census.requested_bytes,
+                        "tier1_scan_census": census.to_json(),
                     }));
                 }
                 // #522: a pane that is simply DONE — our text consumed, no
@@ -14232,29 +14438,30 @@ fn deliver_now(
     // back to the round-1 hook-or-burst precedence exactly as
     // before — audited explicitly as its own state, never silently.
     //
-    // #559: the read is sized from the paste (`tier1_scan_bytes`), not from
-    // the flat `BOX_TAIL_SCAN_BYTES` — with a 4 KiB window and a flush cap of
-    // 24 KiB, a coalesced paste made this precondition structurally false and
-    // Tier 1 declined every large delivery without ever looking. Every OTHER
-    // box read for this delivery (the confirm loop, the retry loop, and the
-    // late monitor's two) must use this SAME size: a precondition verified
-    // against a wide tail and then polled against a narrow one would read the
-    // box as cleared on the very first poll and confirm a delivery nothing
-    // observed — the one failure mode strictly worse than declining.
-    let tier1_scan = tier1_scan_bytes(&pasted_text);
+    // #559: the read is sized from the paste, not from the flat
+    // `BOX_TAIL_SCAN_BYTES` — with a 4 KiB window and a flush cap of 24 KiB, a
+    // coalesced paste made this precondition structurally false and Tier 1
+    // declined every large delivery without ever looking. #685: and it is sized
+    // in POST-STRIP characters, because the pane returns about half of what it
+    // is asked for and a slack spent in raw bytes was under-covering every
+    // paste past ~1.5 KiB — see `Tier1Scan`.
+    //
+    // Every OTHER box read for this delivery (the confirm loop, the retry loop,
+    // and the late monitor's two) goes through a `Tier1Scan` built the same
+    // way, and none of them can be NARROWER than this one: a precondition
+    // verified against a wide tail and then polled against a narrow one would
+    // read the box as cleared on the very first poll and confirm a delivery
+    // nothing observed — the one failure mode strictly worse than declining.
+    let mut tier1_scan = Tier1Scan::for_paste(&pasted_text);
     // #583: the raw byte count is kept beside the stripped text — one read,
     // measured as well as classified. A census taken from a SECOND read would
     // answer a question nobody asked (a different tail, a different instant),
-    // so both come out of this one.
-    let tier1_read =
-        ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| (b.len(), strip_ansi(&b)));
+    // so both come out of this one. (A read that widened itself is still ONE
+    // read in this sense: only its final tail is classified or measured.)
+    let tier1_read = tier1_scan.read(|n| ptys.output_tail_bounded(pty_id, n));
     let tier1_precondition =
-        box_reading(tier1_read.as_ref().map(|(_, t)| t.as_str()), &pasted_text);
-    let tier1_census = Tier1ScanCensus::measure(
-        tier1_scan,
-        tier1_read.as_ref().map(|(raw, t)| (*raw, t.as_str())),
-        &pasted_text,
-    );
+        box_reading(tier1_read.as_ref().map(|r| r.stripped.as_str()), &pasted_text);
+    let tier1_census = tier1_scan.census(tier1_read.as_ref(), &pasted_text);
     let tier1_governs = tier1_precondition == BoxReading::Holds;
     // The decline is stated, not inferred from an absent `true` (#559). It is
     // carried on `prompt-typed` below rather than as its own event because
@@ -14331,8 +14538,8 @@ fn deliver_now(
             tier_hook_matched = true;
         }
         if tier1_governs {
-            let tail = ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| strip_ansi(&b));
-            match box_reading(tail.as_deref(), &pasted_text) {
+            let tail = tier1_scan.read(|n| ptys.output_tail_bounded(pty_id, n));
+            match box_reading(tail.as_ref().map(|r| r.stripped.as_str()), &pasted_text) {
                 BoxReading::Holds => tier1_reading = Some(true),
                 BoxReading::NotHolding => {
                     tier1_reading = Some(false);
@@ -14428,11 +14635,12 @@ fn deliver_now(
                 break 'retries;
             }
             if tier1_governs {
-                // #559: same paste-derived size as the precondition and the
-                // main window — see `tier1_scan`'s comment for why a narrower
-                // read here would manufacture a confirm.
-                let tail = ptys.output_tail_bounded(pty_id, tier1_scan).map(|b| strip_ansi(&b));
-                match box_reading(tail.as_deref(), &pasted_text) {
+                // #559: the same `Tier1Scan` as the precondition and the main
+                // window — see `tier1_scan`'s comment for why a narrower read
+                // here would manufacture a confirm, and `Tier1Scan`'s for why
+                // #685's widening cannot produce one.
+                let tail = tier1_scan.read(|n| ptys.output_tail_bounded(pty_id, n));
+                match box_reading(tail.as_ref().map(|r| r.stripped.as_str()), &pasted_text) {
                     BoxReading::Holds => tier1_reading = Some(true),
                     BoxReading::NotHolding => {
                         tier1_reading = Some(false);
@@ -14606,7 +14814,11 @@ fn deliver_now(
         // decline is checkable from the record instead of taken on faith.
         "tier1_decline": tier1_decline,
         "tier1_paste_bytes": pasted_text.len(),
-        "tier1_scan_bytes": tier1_scan,
+        // #685: the request the precondition read ACTUALLY made, off the census
+        // rather than computed beside it — a read that widened itself asked for
+        // more than the `tier1_scan_bytes` floor, and two records of one number
+        // that can disagree is how an audit stops being evidence.
+        "tier1_scan_bytes": tier1_census.requested_bytes,
         // #583: the same read, measured — `Tier1ScanCensus`. Carried on EVERY
         // delivery, `Holds` included, because the question is a distribution:
         // "does the slack survive live ANSI density near the cap" cannot be
