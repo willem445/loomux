@@ -49,10 +49,7 @@
 /// budget, and only for a pane that is ALREADY streaming: the leading-edge
 /// rule (see `OutputCoalescer::take_due`) means the first chunk after a quiet
 /// pane emits with no delay at all.
-// TEMPORARY (reverted in the next commit): 0 restores the pre-#712 policy —
-// emit once per read() — so CI shows the new event-count test going red for
-// the reason it is meant to catch. See the PR body's red-before-green section.
-pub const PTY_EMIT_MIN_INTERVAL_MS: u64 = 0;
+pub const PTY_EMIT_MIN_INTERVAL_MS: u64 = 16;
 
 /// Hard cap on how many bytes one `pty-output` event carries. A batch that
 /// reaches it is due immediately regardless of the clock, so a pane dumping
