@@ -257,10 +257,13 @@ export const grantMerge = (
   comment: string | null = null
 ): Promise<number> => invoke<number>("orch_grant_merge", { groupId, pr, comment });
 
-/** Issue a one-time human release/tag grant: authorizes exactly one publish of
- *  `tag` (GH release + npm). Releases are NEVER blanket-allowed by autonomous
- *  mode, so this explicit grant is the only path. Single-use, ~30-min TTL.
- *  Optional `comment` is delivered to the orchestrator. Human-only. */
+/** Issue a human release grant: authorizes the whole release pipeline for `tag`
+ *  (GH release + npm) — the tag push, the release create/edit, and the release
+ *  notes — for a ~90-min window, not a single command (#438). Bounded by that
+ *  tag and that window: no other tag, no other release, nothing after expiry,
+ *  and NOT the version-bump PR's merge. Releases are NEVER blanket-allowed by
+ *  autonomous mode, so this explicit grant is the only path. Optional `comment`
+ *  is delivered to the orchestrator. Human-only. */
 export const grantRelease = (
   groupId: string,
   tag: string,
