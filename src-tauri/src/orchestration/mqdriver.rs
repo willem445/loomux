@@ -258,7 +258,7 @@ struct RawPrFacts {
     body: String,
 }
 
-fn as_args(v: &[String]) -> Vec<&str> {
+pub(super) fn as_args(v: &[String]) -> Vec<&str> {
     v.iter().map(|s| s.as_str()).collect()
 }
 

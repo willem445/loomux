@@ -480,10 +480,14 @@ integration branch into `main` keeps `main` linear**, exactly as it does today. 
 merge-commit noise lives only on an ephemeral integration branch that is deleted after that
 squash.
 
-**The reversal seam.** The choice is isolated in **one function** in `mergeq.rs`:
+**The reversal seam.** The choice is isolated in **one function**, `build_scratch`
+in `orchestration/mqloop.rs` (slice D2). It is *not* in `mergeq.rs`, as this note
+originally said: `mergeq.rs` is the no-I/O pure core, and building a scratch needs
+a runner, so the seam belongs in the driver layer. Corrected here because §8 is
+precisely the artifact a future reverser follows.
 
-    fn build_scratch(target_head: &str, entries: &[Entry], git: &impl GitRunner)
-        -> Result<ScratchRef, BatchBuildError>
+    fn build_scratch(r: &dyn MqRunner, batch_id: &str, branch: &str, target: &str,
+                     heads: &[(u64, String)]) -> ScratchBuild
 
 Nothing outside it knows how the scratch was built; every downstream stage takes a SHA.
 Reversing to squash replay is a rewrite of that function and its tests — **plus** the landing

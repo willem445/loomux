@@ -31,7 +31,16 @@
 //! argv it is handed and replies from a canned script. No `git`, no `gh`, no
 //! remote, and no agent CLI is spawned by anything in this file.
 
-use loomux_lib::orchestration::mergeq::{GateSpec, MERGE_QUEUE_VERSION};
+use loomux_lib::orchestration::mergeq::{
+    BatchRecord, EntryState, GateSpec, MergeQueueState, QueueEntry, MERGE_QUEUE_VERSION,
+};
+use loomux_lib::orchestration::mqloop::{
+    advance_entry, batch_fetch_argv, batch_pr_body, batch_pr_title, bisect_action, build_scratch,
+    cleanup_worktree, culprit_comment, culprit_notice, draft_pr_argv, finish_batch, load_state,
+    observe_batch, pr_comment_argv, pr_state_argv, prune_terminal, reconcile_batch, record_batch,
+    requeue_survivors, scratch_worktree_path, state_path, store_state, unverifiable_notice,
+    walk_bisect, worktree_remove_argv, BatchBuildError, BatchOutcome, BisectAction, StateError,
+};
 use loomux_lib::orchestration::mqdriver::{
     classify_checks, cleanup_scratch, close_draft_argv, default_branch_argv, delete_scratch_argv,
     land_batch, land_push_argv, ls_remote_argv, mint_scratch, pr_checks_argv, pr_ci_green,
@@ -1071,4 +1080,756 @@ fn the_lookup_argvs_are_the_shims_own_two_lookups() {
     // Slice C's schema constant is what D1 builds against — a mismatch here
     // would mean the two slices disagree about the file they share.
     assert_eq!(MERGE_QUEUE_VERSION, 1);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Slice D2 — the driver LOOP.
+//
+// Same `Fake` runner, same constraint-3 posture: no real `git`, no real `gh`,
+// no network. The only real filesystem touched is a scratch dir under the OS
+// temp root, following `tests/orchestration.rs::scratch_dir` (std, not
+// `tempfile` — constraint 2 keeps getrandom out of this crate).
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Std-based scratch dir keyed by tag + pid so parallel runs never collide.
+/// Same pattern and same rationale as `tests/orchestration.rs::scratch_dir`.
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("loomux-mqloop-test-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+const HEAD_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const HEAD_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const TARGET_HEAD: &str = "cccccccccccccccccccccccccccccccccccccccc";
+const MERGED: &str = "dddddddddddddddddddddddddddddddddddddddd";
+
+// ── persistence (§11.3) ─────────────────────────────────────────────────────
+
+/// **An absent file is an empty queue, not an error** — that is the product
+/// default (§12: no `merge_queue:` block, nothing ever enqueued). Every *other*
+/// failure is loud, because "nothing is queued" and "loomux cannot tell what is
+/// queued" are the distinction §4's reconcile exists for.
+#[test]
+fn an_absent_queue_file_is_an_empty_queue_and_every_other_failure_is_loud() {
+    let dir = scratch_dir("persist");
+
+    // Absent → empty, and specifically NOT an error.
+    let s = load_state(&dir).expect("an absent file is the product default, not a failure");
+    assert!(s.entries.is_empty());
+    assert!(s.batch.is_none());
+    assert_eq!(s.version, MERGE_QUEUE_VERSION);
+
+    // Malformed → loud. Never silently replaced with a fresh queue, which would
+    // drop entries a human believes are queued.
+    std::fs::write(state_path(&dir), "{ not json").unwrap();
+    assert!(matches!(load_state(&dir), Err(StateError::Malformed(_))));
+
+    // A future schema → Unsupported, so the driver refuses to operate AND
+    // refuses to write. The file must survive untouched: that is the only way
+    // §11.2's "an older build does not destroy what a newer one wrote" holds
+    // for a version bump that changes meanings rather than adding keys.
+    let future = r#"{"version":99,"target":"integration","entries":[]}"#;
+    std::fs::write(state_path(&dir), future).unwrap();
+    assert_eq!(load_state(&dir), Err(StateError::Unsupported(99)));
+    assert_eq!(std::fs::read_to_string(state_path(&dir)).unwrap(), future, "left untouched");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store/load round trip preserves what a **newer** build wrote. Slice C pins
+/// the type's serde behaviour; this pins that D2's file I/O does not lose it —
+/// a field ignored on read is lost on the next write, and the whole promise is
+/// read *and rewrite*.
+#[test]
+fn the_queue_file_round_trips_a_newer_builds_fields_through_disk() {
+    let dir = scratch_dir("roundtrip");
+    let newer = r#"{"version":1,"target":"integration",
+        "entries":[{"pr":612,"head":"abc","state":"queued","enqueued_ms":7,"priority":"high"}],
+        "batch":null,"second_target":"feat/other"}"#;
+    std::fs::write(state_path(&dir), newer).unwrap();
+
+    let s = load_state(&dir).expect("a newer file with known version still loads");
+    store_state(&dir, &s).expect("and stores");
+
+    let back: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state_path(&dir)).unwrap()).unwrap();
+    assert_eq!(back["second_target"], "feat/other", "a file-level unknown survived disk");
+    assert_eq!(back["entries"][0]["priority"], "high", "an entry-level unknown survived disk");
+    assert_eq!(back["target"], "integration");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── batch construction (§8) ─────────────────────────────────────────────────
+
+/// A runner that answers the whole build sequence, so each test only overrides
+/// the one reply it is about.
+fn build_fake() -> Fake {
+    Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-613", 0, HEAD_B, "")
+        .git("worktree add", 0, "", "")
+        .git("merge --no-ff", 0, "", "")
+        .git("rev-parse HEAD", 0, MERGED, "")
+        .git("worktree remove", 0, "", "")
+}
+
+/// §8's shape, at the argv level: one fetch of the target plus each PR's **pull
+/// ref**, a detached worktree at the target head, one `--no-ff` merge per PR
+/// **in queue order**, and the resulting SHA read back.
+#[test]
+fn the_scratch_is_the_target_head_plus_one_merge_per_pr_in_queue_order() {
+    let f = build_fake();
+    let built = build_scratch(
+        &f,
+        "mq-7f3a0000",
+        "loomux/mq/g1-mq-7f3a0000",
+        "integration",
+        &[(612, HEAD_A.into()), (613, HEAD_B.into())],
+    );
+    let scratch = built.result.expect("a clean build succeeds");
+    assert_eq!(scratch.sha, MERGED, "the SHA CI will judge is what rev-parse HEAD said");
+    assert_eq!(scratch.target_head, TARGET_HEAD);
+    assert_eq!(scratch.branch, "loomux/mq/g1-mq-7f3a0000");
+
+    // One fetch, pull refs, into a namespace of our own so the user's
+    // refs/remotes/origin/* is undisturbed.
+    assert_eq!(
+        f.argv("git", 0),
+        vec![
+            "fetch".to_string(),
+            "--no-tags".into(),
+            "origin".into(),
+            "+refs/heads/integration:refs/remotes/loomux-mq/target".into(),
+            "+refs/pull/612/head:refs/remotes/loomux-mq/pr-612".into(),
+            "+refs/pull/613/head:refs/remotes/loomux-mq/pr-613".into(),
+        ]
+    );
+    assert_eq!(batch_fetch_argv("integration", &[612, 613]), f.argv("git", 0));
+
+    let calls = f.calls();
+    // Detached, at the target head — never a branch checkout in the user's clone.
+    assert!(
+        calls.iter().any(|c| c.contains("worktree add --detach") && c.contains(TARGET_HEAD)),
+        "calls: {calls:?}"
+    );
+    // Queue order: 612's merge precedes 613's.
+    let m612 = calls.iter().position(|c| c.contains("merge --no-ff") && c.contains(HEAD_A));
+    let m613 = calls.iter().position(|c| c.contains("merge --no-ff") && c.contains(HEAD_B));
+    assert!(m612.is_some() && m613.is_some() && m612 < m613, "queue order is contractual: {calls:?}");
+    // `--no-ff` so every queued PR gets its own merge commit, per §8's loop.
+    assert_eq!(calls.iter().filter(|c| c.contains("merge --no-ff")).count(), 2);
+    // Nothing here is a landing or a push.
+    assert!(!calls.iter().any(|c| c.contains("git push")), "construction pushes nothing");
+}
+
+/// **A conflict kicks that entry back with no CI spent** (§8), and the worktree
+/// still goes away.
+#[test]
+fn a_conflicted_merge_kicks_that_entry_back_and_spends_no_ci() {
+    // Built explicitly rather than from `build_fake()`: `Fake` returns the FIRST
+    // matching reply, so the failing `merge` has to be the registered one.
+    let f = Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+        .git("worktree add", 0, "", "")
+        .git("merge --no-ff", 1, "", "CONFLICT (content): Merge conflict in a.rs")
+        .git("worktree remove", 0, "", "");
+    let built = build_scratch(&f, "mq-1", "loomux/mq/g1-mq-1", "integration", &[(612, HEAD_A.into())]);
+    assert_eq!(built.result, Err(BatchBuildError::Conflict { pr: 612 }));
+    // No push, and no draft PR: a conflict costs zero CI.
+    assert!(!f.calls().iter().any(|c| c.contains("push") || c.contains("pr create")));
+}
+
+/// A PR rebased since the entry recorded its head is kicked back too — its
+/// verdicts died with the rebase (§6), so merging the new head would build an
+/// object nobody approved.
+#[test]
+fn a_pr_whose_head_moved_since_the_entry_recorded_it_is_kicked_back() {
+    let f = Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_B, "")
+        .git("worktree add", 0, "", "")
+        .git("worktree remove", 0, "", "");
+    let built =
+        build_scratch(&f, "mq-1", "loomux/mq/g1-mq-1", "integration", &[(612, HEAD_A.into())]);
+    match built.result {
+        Err(BatchBuildError::HeadMoved { pr, expected, actual }) => {
+            assert_eq!(pr, 612);
+            assert_eq!(expected, HEAD_A);
+            assert_eq!(actual, HEAD_B);
+        }
+        other => panic!("a moved head must kick back, got {other:?}"),
+    }
+    assert!(!f.calls().iter().any(|c| c.contains("merge --no-ff")), "never merged the wrong object");
+
+    // An entry whose head loomux never resolved reads as UNKNOWN, and unknown is
+    // never "unbound, therefore fine" — same fail-closed posture as an empty
+    // head in the gate re-check.
+    let f = Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+        .git("worktree add", 0, "", "")
+        .git("worktree remove", 0, "", "");
+    let built = build_scratch(&f, "mq-1", "loomux/mq/g1-mq-1", "integration", &[(612, String::new())]);
+    assert!(matches!(built.result, Err(BatchBuildError::HeadMoved { .. })));
+}
+
+/// The recorded-vs-fetched head comparison is **one-directional and
+/// fail-closed** (rev-163 N1).
+///
+/// Two properties, neither of which the earlier implementation had despite its
+/// doc claiming the first:
+///
+/// - **Only the RECORDED head may be an abbreviation.** The earlier code
+///   compared `min(recorded.len(), fetched.len())` bytes of both, which is
+///   symmetric — so a *fetched* value shorter than the record would have
+///   matched a full recorded head. A prefix comparison only means something
+///   when the short side is the stored one.
+/// - **A non-hex head returns `false`, it does not panic.** `&str` indexing
+///   panics off a char boundary, so the old byte-slice was total only by the
+///   accident that oids are ASCII — and nothing enforced that, since
+///   `PrFacts.head` comes straight from `headRefOid.trim()`.
+///
+/// Exercised through `build_scratch`, because `same_object` is private — which
+/// is the right shape anyway: what matters is that a mismatch **kicks the entry
+/// back** rather than building an object nobody approved.
+#[test]
+fn only_the_recorded_head_may_be_abbreviated_and_a_malformed_one_fails_closed() {
+    // A fetched value SHORTER than the recorded head is not a match, even
+    // though it is a prefix of it.
+    let f = Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, &HEAD_A[..8], "")
+        .git("worktree add", 0, "", "")
+        .git("worktree remove", 0, "", "");
+    let built =
+        build_scratch(&f, "mq-1", "loomux/mq/g1-mq-1", "integration", &[(612, HEAD_A.into())]);
+    assert!(
+        matches!(built.result, Err(BatchBuildError::HeadMoved { .. })),
+        "a short FETCH must not satisfy a full recorded head, got {:?}",
+        built.result
+    );
+    assert!(!f.calls().iter().any(|c| c.contains("merge --no-ff")), "nothing was merged");
+
+    // The supported direction still works: a recorded abbreviation of the
+    // fetched full oid IS the same object.
+    let f = Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+        .git("worktree add", 0, "", "")
+        .git("merge --no-ff", 0, "", "")
+        .git("rev-parse HEAD", 0, MERGED, "")
+        .git("worktree remove", 0, "", "");
+    let built = build_scratch(
+        &f,
+        "mq-1",
+        "loomux/mq/g1-mq-1",
+        "integration",
+        &[(612, HEAD_A[..10].to_string())],
+    );
+    assert!(built.result.is_ok(), "a recorded abbreviation matches: {:?}", built.result);
+
+    // Malformed heads fail closed rather than panicking. The multi-byte case is
+    // the one the old `&str` slice would have panicked on.
+    for bad in ["not-hex-at-all", "aaé", "aaaaaaé_head", "abc"] {
+        let f = Fake::new()
+            .git("fetch", 0, "", "")
+            .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+            .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+            .git("worktree add", 0, "", "")
+            .git("worktree remove", 0, "", "");
+        let built =
+            build_scratch(&f, "mq-1", "loomux/mq/g1-mq-1", "integration", &[(612, bad.to_string())]);
+        assert!(
+            matches!(built.result, Err(BatchBuildError::HeadMoved { .. })),
+            "a malformed recorded head {bad:?} must kick back, got {:?}",
+            built.result
+        );
+    }
+}
+
+/// **The temp worktree is torn down on every exit path, and the outcome is
+/// RETURNED rather than swallowed** (§10: cleanup failure never fails a batch).
+///
+/// The teardown only runs when the directory actually exists — otherwise a build
+/// that failed before `worktree add` would report a cleanup failure for a
+/// worktree that was never created. So this test creates the real directory.
+#[test]
+fn the_temp_worktree_is_torn_down_on_every_exit_path_and_the_outcome_is_returned() {
+    // Success path: real directory present → removal attempted, by exact path.
+    let wt = scratch_worktree_path("mq-teardown");
+    std::fs::create_dir_all(&wt).unwrap();
+    let f = build_fake();
+    let built =
+        build_scratch(&f, "mq-teardown", "loomux/mq/g1-mq-teardown", "integration", &[(612, HEAD_A.into())]);
+    assert!(built.result.is_ok());
+    assert_eq!(built.cleanup_failed, None);
+    let removal = f.calls().into_iter().find(|c| c.contains("worktree remove")).expect("torn down");
+    assert!(removal.contains(&wt.display().to_string()), "by exact path: {removal}");
+    assert_eq!(worktree_remove_argv(&wt.display().to_string())[0..3], ["worktree", "remove", "--force"]);
+
+    // Failure path: the worktree is STILL torn down, and a failed teardown comes
+    // back in `cleanup_failed` rather than failing the batch or vanishing.
+    std::fs::create_dir_all(&wt).unwrap();
+    let f = Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+        .git("worktree add", 0, "", "")
+        .git("merge --no-ff", 1, "", "CONFLICT")
+        .git("worktree remove", 1, "", "fatal: validation failed, cannot remove working tree");
+    let built =
+        build_scratch(&f, "mq-teardown", "loomux/mq/g1-mq-teardown", "integration", &[(612, HEAD_A.into())]);
+    assert_eq!(built.result, Err(BatchBuildError::Conflict { pr: 612 }), "the batch outcome is unchanged");
+    assert!(
+        built.cleanup_failed.as_deref().unwrap_or("").contains("cannot remove working tree"),
+        "a failed teardown is REPORTED, not swallowed: {:?}",
+        built.cleanup_failed
+    );
+
+    // **Never a prune.** Prune is a sweep over the shared `.git/worktrees` dir,
+    // so a peer worktree that is momentarily unreachable is one prune forgets —
+    // the shared-`.git` hazard that made `git stash` a banned verb here (#299).
+    assert!(
+        !f.calls().iter().any(|c| c.contains("prune")),
+        "no pattern sweep, ever: {:?}",
+        f.calls()
+    );
+    let _ = std::fs::remove_dir_all(&wt);
+}
+
+/// A worktree that was never created reports no cleanup failure — the existence
+/// check, rather than matching `git`'s "is not a working tree" stderr, which is
+/// a message and not a contract.
+#[test]
+fn a_worktree_that_was_never_created_is_not_a_cleanup_failure() {
+    let f = Fake::new().git("worktree remove", 1, "", "fatal: is not a working tree");
+    assert_eq!(cleanup_worktree(&f, "mq-never-existed"), None);
+    assert!(f.calls().is_empty(), "nothing to remove means nothing is spawned");
+}
+
+// ── loomux-authored text (§8, §9) ───────────────────────────────────────────
+
+/// **loomux's own text must never contain GitHub's closing pattern** (§8).
+/// The scan is textual and context-blind — it fires from inside a blockquote, a
+/// caveat, or a sentence asking a human to close something by hand (#569 was
+/// auto-closed twice, the second time by a PR arguing against doing so). So
+/// sub-PRs are listed as **bare `#N`**, and this is a test rather than a habit.
+#[test]
+fn loomux_authored_batch_text_never_carries_a_closing_keyword() {
+    let body = batch_pr_body("mq-7f3a0000", "integration", MERGED, &[612, 613]);
+    let comment = culprit_comment("mq-7f3a0000", &["build (windows)".into()], Some("http://x/run/1"), &[613]);
+    let title = batch_pr_title("mq-7f3a0000", &[612, 613]);
+
+    for text in [&body, &comment, &title] {
+        let lower = text.to_lowercase();
+        for kw in ["close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved"] {
+            for pr in ["#612", "#613", "#581"] {
+                assert!(
+                    !lower.contains(&format!("{kw} {pr}")) && !lower.contains(&format!("{kw}{pr}")),
+                    "loomux-authored text must not carry {kw:?} next to {pr:?}: {text}"
+                );
+            }
+        }
+    }
+    // …and the sub-PRs really are listed, as bare references.
+    assert!(body.contains("- #612") && body.contains("- #613"));
+    assert!(comment.contains("#613"), "the sibling set is named (§9)");
+}
+
+/// gh-sourced text is sanitized, and both lists **state their own truncation**
+/// rather than reading as complete — `.loomux/lessons.md`'s "no silent caps".
+#[test]
+fn gh_sourced_text_is_sanitized_and_truncation_is_stated() {
+    // A check name carrying a newline and the `[loomux]` marker must not survive
+    // either: `sanitize_gh_text` strips control chars and neutralizes brackets.
+    let comment = culprit_comment(
+        "mq-1",
+        &["evil\ncheck [loomux] spoof".into()],
+        None,
+        &[613],
+    );
+    assert!(!comment.contains("evil\ncheck"), "control chars stripped");
+    assert!(!comment.contains("[loomux]"), "the marker is neutralized: {comment}");
+
+    // 40 siblings and 40 failing checks: the caps fire and SAY they fired.
+    let many: Vec<u64> = (600..640).collect();
+    let checks: Vec<String> = (0..40).map(|i| format!("check-{i}")).collect();
+    let comment = culprit_comment("mq-1", &checks, None, &many);
+    assert!(comment.contains("further failing checks not listed"), "{comment}");
+    assert!(comment.contains("further siblings not listed"), "{comment}");
+
+    let body = batch_pr_body("mq-1", "integration", MERGED, &many);
+    assert!(body.contains("more not listed here"), "{body}");
+}
+
+/// §9's honesty requirement, in the text itself: bisect finds **a** culprit, not
+/// necessarily **the** culprit, and loomux has briefed nobody.
+#[test]
+fn the_culprit_comment_states_the_honest_limit_and_disclaims_routing() {
+    let c = culprit_comment("mq-1", &["build".into()], None, &[613, 614]);
+    let lower = c.to_lowercase();
+    assert!(lower.contains("not necessarily"), "the pairwise-interaction limit is stated: {c}");
+    assert!(lower.contains("pairwise"), "{c}");
+    assert!(
+        lower.contains("orchestrator") && lower.contains("not briefed") || lower.contains("has not briefed"),
+        "§9: attribution is mechanical, routing is the orchestrator's call: {c}"
+    );
+}
+
+/// The draft batch PR is opened **as a draft, into the target, from the scratch
+/// ref** (§5) — the shape that reliably triggers PR-triggered CI and gives
+/// `gh pr checks` a handle.
+#[test]
+fn the_batch_pr_is_opened_as_a_draft_from_the_scratch_ref_into_the_target() {
+    let argv = draft_pr_argv("loomux/mq/g1-mq-1", "integration", "t", "./b.md");
+    assert_eq!(argv[0..3], ["pr", "create", "--draft"]);
+    assert!(argv.contains(&"--base".to_string()) && argv.contains(&"integration".to_string()));
+    assert!(argv.contains(&"--head".to_string()) && argv.contains(&"loomux/mq/g1-mq-1".to_string()));
+    // Body via file, never `--body` — a batch body carries newlines and
+    // arbitrary sub-PR text.
+    assert!(argv.contains(&"--body-file".to_string()));
+    assert!(!argv.contains(&"--body".to_string()));
+    assert_eq!(pr_comment_argv(612, "./c.md")[0..3], ["pr", "comment", "612"]);
+}
+
+// ── the bisect walk (§9) ────────────────────────────────────────────────────
+
+/// Larger half first, and **survivors keep their original queue order** (§9) —
+/// not the order the search happened to discard halves in.
+#[test]
+fn the_search_isolates_a_culprit_and_requeues_survivors_in_queue_order() {
+    // k = 1: attributed with no further CI.
+    assert_eq!(
+        bisect_action(&[612]),
+        BisectAction::Attribute { culprit: 612, survivors: vec![] }
+    );
+    assert_eq!(bisect_action(&[]), BisectAction::Abort);
+    // k = 3 splits 2/1 — larger half first.
+    assert_eq!(
+        bisect_action(&[612, 613, 614]),
+        BisectAction::Test { subset: vec![612, 613], rest: vec![614] }
+    );
+
+    // A full walk: 614 is the culprit; the survivors come back in the batch's
+    // order (612, 613), not in the order the halves were discarded.
+    let batch = [612, 613, 614, 615];
+    let action = walk_bisect(&batch, |subset| subset.contains(&614));
+    assert_eq!(
+        action,
+        BisectAction::Attribute { culprit: 614, survivors: vec![612, 613, 615] }
+    );
+
+    // Every position, every k, terminates and isolates the right entry.
+    for k in 1..=8usize {
+        let batch: Vec<u64> = (0..k as u64).collect();
+        for culprit in &batch {
+            let mut runs = 0;
+            let action = walk_bisect(&batch, |s| {
+                runs += 1;
+                s.contains(culprit)
+            });
+            match action {
+                BisectAction::Attribute { culprit: got, survivors } => {
+                    assert_eq!(got, *culprit, "k={k}");
+                    assert_eq!(
+                        survivors,
+                        batch.iter().copied().filter(|p| p != culprit).collect::<Vec<_>>(),
+                        "survivors keep queue order"
+                    );
+                }
+                other => panic!("k={k} culprit={culprit}: {other:?}"),
+            }
+            let bound = (usize::BITS - (k.max(1) - 1).leading_zeros()) as usize;
+            assert!(runs <= bound + 1, "k={k} took {runs} observations, bound ~{bound}");
+        }
+    }
+}
+
+// ── the bounded observation loop (§5) ───────────────────────────────────────
+
+/// Terminal answers win immediately; **`Pending` past the bound becomes
+/// `Unverifiable`, never a forever-wait** (§5). Unverifiable is not green.
+#[test]
+fn the_observation_is_bounded_and_unverifiable_is_never_green() {
+    let green = checks_json(&[("build", "SUCCESS")]);
+    let red = checks_json(&[("build", "SUCCESS"), ("test", "FAILURE")]);
+
+    // Terminal wins regardless of elapsed time — evidence beats the clock.
+    let f = Fake::new().gh("pr checks", 0, &green, "");
+    assert_eq!(observe_batch(&f, 700, 0, 999_999_999, 60), BatchOutcome::Green);
+    let f = Fake::new().gh("pr checks", 0, &red, "");
+    assert_eq!(
+        observe_batch(&f, 700, 0, 0, 60),
+        BatchOutcome::Red { failing: vec!["test".into()] }
+    );
+
+    // Pending inside the bound stays pending, and carries the elapsed time so a
+    // caller cannot mistake it for a steady state.
+    let f = Fake::new().gh("pr checks", 0, "[]", "");
+    assert_eq!(observe_batch(&f, 700, 0, 59 * 60_000, 60), BatchOutcome::Pending { elapsed_ms: 59 * 60_000 });
+
+    // At the bound: UNVERIFIABLE, loudly, naming the batch PR. This is the
+    // repo-with-no-CI case that would otherwise pend forever.
+    let f = Fake::new().gh("pr checks", 0, "[]", "");
+    match observe_batch(&f, 700, 0, 60 * 60_000, 60) {
+        BatchOutcome::Unverifiable { why } => {
+            assert!(why.contains("#700") && why.contains("60 minutes"), "{why}");
+        }
+        other => panic!("the bound must fire, got {other:?}"),
+    }
+    // A just-pushed PR's "no checks reported" is Pending, not a bogus instant
+    // anything — inherited from the shared classifier, not re-derived.
+    let f = Fake::new().gh("pr checks", 1, "", "no checks reported on the 'x' branch");
+    assert!(matches!(observe_batch(&f, 700, 0, 0, 60), BatchOutcome::Pending { .. }));
+    // `gh` missing entirely → unavailable, never green (§10).
+    let f = Fake::new().spawn_fail("gh");
+    assert!(matches!(observe_batch(&f, 700, 0, 0, 60), BatchOutcome::Unverifiable { .. }));
+
+    // Only Green may land.
+    assert!(BatchOutcome::Green.may_land());
+    for o in [
+        BatchOutcome::Pending { elapsed_ms: 0 },
+        BatchOutcome::Red { failing: vec![] },
+        BatchOutcome::Unverifiable { why: "x".into() },
+    ] {
+        assert!(!o.may_land(), "{o:?} must never land");
+    }
+}
+
+/// A clock that stepped backwards saturates to zero elapsed rather than
+/// underflowing into a huge one: a backward step can extend the wait, never
+/// fabricate an instant timeout that strands a healthy batch.
+#[test]
+fn a_backward_clock_step_cannot_fabricate_a_timeout() {
+    let f = Fake::new().gh("pr checks", 0, "[]", "");
+    assert_eq!(
+        observe_batch(&f, 700, 1_000_000, 0, 60),
+        BatchOutcome::Pending { elapsed_ms: 0 }
+    );
+}
+
+// ── crash reconcile (§4) ────────────────────────────────────────────────────
+
+fn state_with_batch(draft: Option<u64>) -> MergeQueueState {
+    let mut s = MergeQueueState {
+        target: "integration".into(),
+        entries: vec![QueueEntry::new(612, HEAD_A, 0), QueueEntry::new(613, HEAD_B, 0)],
+        ..Default::default()
+    };
+    for e in s.entries.iter_mut() {
+        e.advance(EntryState::Batching).unwrap();
+        e.advance(EntryState::CiWait).unwrap();
+    }
+    let mut rec = BatchRecord::new("mq-7f3a0000", vec![612, 613], 0);
+    rec.draft_pr = draft;
+    rec.advance(EntryState::CiWait).unwrap();
+    s.batch = Some(rec);
+    s
+}
+
+/// Resume **only** when the world matches the record: the scratch ref still on
+/// the remote AND the draft PR still open.
+#[test]
+fn a_batch_resumes_only_when_the_scratch_ref_and_draft_pr_both_still_exist() {
+    let f = Fake::new()
+        .git("ls-remote", 0, "abc\trefs/heads/loomux/mq/g1-mq-7f3a0000\n", "")
+        .gh("pr view", 0, r#"{"state":"OPEN"}"#, "");
+    let mut s = state_with_batch(Some(640));
+    let report = reconcile_batch(&f, &mut s, "g1");
+    assert!(report.resumed);
+    assert!(report.stranded.is_empty());
+    assert!(s.batch.is_some(), "the record survives a resume");
+    assert_eq!(s.entries[0].state(), EntryState::CiWait, "entries are left where they were");
+    // Phase 1 collects notices; it never sends them (§4 — the lock is not
+    // reentrant, which is what #467/#468 taught).
+    assert_eq!(report.notices.len(), 1);
+    assert!(report.notices[0].contains("resumed batch"));
+    assert_eq!(pr_state_argv(640), vec!["pr", "view", "640", "--json", "state"]);
+}
+
+/// Every way the world can fail to match strands the batch **loudly** — and the
+/// two "cannot tell" cases fail **closed**, because resuming onto a scratch ref
+/// loomux cannot confirm is how the Bors invariant fails at the one point §8
+/// does not guard.
+#[test]
+fn a_world_that_does_not_match_the_record_strands_the_batch_loudly() {
+    let cases: Vec<(&str, Fake)> = vec![
+        (
+            "the scratch ref is gone",
+            Fake::new().git("ls-remote", 2, "", "").gh("pr view", 0, r#"{"state":"OPEN"}"#, ""),
+        ),
+        (
+            "the draft PR is closed",
+            Fake::new()
+                .git("ls-remote", 0, "abc\trefs/heads/x\n", "")
+                .gh("pr view", 0, r#"{"state":"CLOSED"}"#, ""),
+        ),
+        (
+            "the remote could not be asked (fail closed)",
+            Fake::new()
+                .git("ls-remote", 128, "", "fatal: could not read from remote")
+                .gh("pr view", 0, r#"{"state":"OPEN"}"#, ""),
+        ),
+        (
+            "the PR could not be read (fail closed)",
+            Fake::new()
+                .git("ls-remote", 0, "abc\trefs/heads/x\n", "")
+                .gh("pr view", 1, "", "gh: not logged in"),
+        ),
+    ];
+    for (label, f) in cases {
+        let f = f.git("worktree remove", 0, "", "");
+        let mut s = state_with_batch(Some(640));
+        let report = reconcile_batch(&f, &mut s, "g1");
+        assert!(!report.resumed, "{label} must not resume");
+        assert_eq!(report.stranded.len(), 2, "{label}: both entries stranded");
+        assert_eq!(report.transitions.len(), 2, "{label}: both transitions reported for audit");
+        for t in &report.transitions {
+            assert_eq!(t.to, EntryState::KickedBack, "{label}");
+        }
+        assert!(s.batch.is_none(), "{label}: the dead record is cleared");
+        assert_eq!(report.notices.len(), 1, "{label}: one notice, collected not sent");
+        assert!(report.notices[0].contains("could NOT be resumed"), "{label}");
+        // Nothing landed, and nothing was pushed to recover.
+        assert!(!f.calls().iter().any(|c| c.contains("git push origin ")), "{label}");
+    }
+}
+
+/// Entries sitting in an in-flight state with **no batch record** are the crash
+/// shape `plan_batch` refuses to dispatch on — so they are stranded rather than
+/// left to block the queue forever.
+#[test]
+fn in_flight_entries_with_no_batch_record_are_stranded_not_left_to_block_the_queue() {
+    let f = Fake::new();
+    let mut s = state_with_batch(Some(640));
+    s.batch = None; // the record was lost; the entries still say ci-wait
+    let report = reconcile_batch(&f, &mut s, "g1");
+    assert!(!report.resumed);
+    assert_eq!(report.stranded.len(), 2);
+    for (_, why) in &report.stranded {
+        assert!(why.contains("no batch record"), "{why}");
+    }
+    assert!(f.calls().is_empty(), "no record means nothing to check on the remote");
+
+    // A queue with nothing in flight reconciles to a no-op.
+    let mut s = MergeQueueState {
+        entries: vec![QueueEntry::new(612, HEAD_A, 0)],
+        ..Default::default()
+    };
+    let report = reconcile_batch(&Fake::new(), &mut s, "g1");
+    assert_eq!(report, Default::default());
+    assert_eq!(s.entries[0].state(), EntryState::Queued);
+}
+
+// ── audited transitions and requeueing (§9, §11.5) ──────────────────────────
+
+/// `advance_entry` is the audited wrapper over `mergeq`'s only sanctioned
+/// mutation path: it reports the fact, and it refuses exactly what §4 refuses.
+#[test]
+fn advancing_an_entry_reports_the_fact_and_refuses_what_the_core_refuses() {
+    let mut s = MergeQueueState {
+        entries: vec![QueueEntry::new(612, HEAD_A, 0)],
+        ..Default::default()
+    };
+    let t = advance_entry(&mut s, 612, EntryState::Batching).unwrap().expect("moved");
+    assert_eq!((t.pr, t.from, t.to), (612, EntryState::Queued, EntryState::Batching));
+
+    // A transition the design note does not enumerate is refused, and the entry
+    // does not move.
+    assert!(advance_entry(&mut s, 612, EntryState::Landed).is_err());
+    assert_eq!(s.entries[0].state(), EntryState::Batching);
+
+    // An entry that is not in the queue is not an error and is not invented.
+    assert_eq!(advance_entry(&mut s, 999, EntryState::Cancelled), Ok(None));
+}
+
+/// Survivors requeue **at the front, in their original order** (§9): they were
+/// never implicated, and making them wait behind newly-enqueued work would
+/// punish them for a neighbour's failure.
+#[test]
+fn survivors_requeue_at_the_front_preserving_their_original_order() {
+    let mut s = MergeQueueState {
+        entries: vec![
+            QueueEntry::new(612, HEAD_A, 0),
+            QueueEntry::new(613, HEAD_B, 0),
+            QueueEntry::new(614, HEAD_A, 0),
+            QueueEntry::new(700, HEAD_B, 0), // enqueued later, must stay behind
+        ],
+        ..Default::default()
+    };
+    requeue_survivors(&mut s, &[613, 614]);
+    assert_eq!(
+        s.entries.iter().map(|e| e.pr).collect::<Vec<_>>(),
+        vec![613, 614, 612, 700],
+        "survivors first, in their own order; everyone else keeps their relative order"
+    );
+}
+
+/// The target is a property of the work in the queue, not a setting: it is
+/// released when the queue drains (§4), and held while any entry is live.
+#[test]
+fn the_target_is_released_only_when_the_queue_drains() {
+    let mut s = MergeQueueState {
+        target: "integration".into(),
+        entries: vec![QueueEntry::new(612, HEAD_A, 0), QueueEntry::new(613, HEAD_B, 0)],
+        batch: Some(BatchRecord::new("mq-1", vec![612], 0)),
+        ..Default::default()
+    };
+    // One entry terminal, one still queued → the target is held.
+    advance_entry(&mut s, 612, EntryState::Cancelled).unwrap();
+    finish_batch(&mut s);
+    assert!(s.batch.is_none());
+    assert_eq!(s.target, "integration", "a live entry holds the target");
+
+    // Everything terminal → released.
+    advance_entry(&mut s, 613, EntryState::Cancelled).unwrap();
+    finish_batch(&mut s);
+    assert_eq!(s.target, "", "a drained queue releases its target");
+
+    // Pruning drops only terminal entries, keeping order.
+    assert_eq!(prune_terminal(&mut s), 2);
+    assert!(s.entries.is_empty());
+
+    // `record_batch` is the one place a batch record is installed.
+    record_batch(&mut s, BatchRecord::new("mq-2", vec![700], 0));
+    assert_eq!(s.batch.as_ref().unwrap().id, "mq-2");
+}
+
+// ── the two notices (§5, §9) ────────────────────────────────────────────────
+
+/// One decision-grade notice per event, and the two say **different** things:
+/// collapsing them would tell an orchestrator a PR is at fault when none is.
+#[test]
+fn the_two_notices_carry_one_fact_each_and_are_not_interchangeable() {
+    let culprit = culprit_notice(612, "mq-7f3a0000", &["build (windows)".into()], 2);
+    assert!(culprit.contains("#612") && culprit.contains("mq-7f3a0000"));
+    assert!(culprit.contains("build (windows)"), "the failing check is named: {culprit}");
+    assert!(culprit.contains("2 siblings requeued"), "{culprit}");
+    // Terse: a pointer, not a narration (§9).
+    assert!(culprit.len() < 300, "decision-grade means short: {} chars", culprit.len());
+
+    let unver = unverifiable_notice("mq-7f3a0000", Some(700), "no terminal checks within 60 minutes");
+    assert!(unver.contains("UNVERIFIABLE"), "{unver}");
+    assert!(
+        unver.to_lowercase().contains("no pr is implicated"),
+        "an unverifiable batch blames nobody: {unver}"
+    );
+    assert!(unver.contains("#700"), "points at the batch PR, not a sub-PR: {unver}");
+    // The two must not be confusable.
+    assert!(!unver.contains("culprit"));
+    assert!(!culprit.contains("UNVERIFIABLE"));
+
+    // Singular/plural is not a lie either way.
+    assert!(culprit_notice(1, "b", &[], 1).contains("1 sibling requeued"));
+    assert!(culprit_notice(1, "b", &[], 0).contains("0 siblings requeued"));
 }

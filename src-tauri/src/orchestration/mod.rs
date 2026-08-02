@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod mergeq;
 pub mod mergeqview;
 pub mod mqdriver;
+pub mod mqloop;
 pub mod notify;
 pub mod profiles;
 pub mod queue;
@@ -7956,6 +7957,11 @@ pub struct OrchRegistry {
     /// would re-stage entries a first pass already re-admitted and deliver
     /// them twice.
     recovered_groups: Arc<Mutex<HashSet<String>>>,
+    /// Groups whose merge queue has already been reconciled this process
+    /// (#581 §4). Separate from `recovered_groups` on purpose: the delivery
+    /// queue and the merge queue recover independently, and sharing one mark
+    /// would make whichever ran first silently suppress the other.
+    mq_reconciled_groups: Arc<Mutex<HashSet<String>>>,
     /// #560: each pane's open hold EPISODE — when it began, and what has
     /// already been said about it. Keyed by `pty_id`, in memory only (see
     /// [`HoldEpisode`] for the restart argument).
@@ -9073,7 +9079,7 @@ static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// briefly locked (antivirus, an open reader). The temp is fsync'd before the
 /// rename so a rename can't expose a metadata-only file whose data blocks never
 /// reached disk — exactly the disk-full failure mode.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     // Ensure the destination dir exists — group state dirs always do, but the #83
     // grant subdirs (`merge_grants/`, `release_grants/`) may be fresh.
@@ -18030,6 +18036,7 @@ impl OrchRegistry {
             recovered_queue: Arc::new(Mutex::new(HashMap::new())),
             recovered_markers: Arc::new(Mutex::new(HashMap::new())),
             recovered_groups: Arc::new(Mutex::new(HashSet::new())),
+            mq_reconciled_groups: Arc::new(Mutex::new(HashSet::new())),
             queue_draining: Arc::new(queuestate::DrainerRegistry::new()),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
@@ -33075,6 +33082,14 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn readmit_recovered(&self, group: &str, agent_id: &str, pty_id: u32) -> usize {
         self.recover_persisted_queue(group);
+        // #581 §4: the merge queue's own restart reconcile, beside the delivery
+        // queue's. Same shape (once-only guard, two phases), same reason for
+        // being on a BIND site rather than on group creation: phase 2 delivers a
+        // notice, and at group-creation time no pane exists to receive one.
+        // A no-op (one `HashSet` probe) on every call after the first, and a
+        // no-op over an absent `merge_queue.json` on every group that has never
+        // enqueued — which is all of them until slice E ships the MCP tools.
+        self.merge_queue_reconcile(group);
         let target = self.durable_target(agent_id);
         let matches = |e: &queue::PersistedEntry| {
             queue::rebinds_to(&e.delivery, target.is_orchestrator, target.session_id.as_deref())
@@ -33697,6 +33712,145 @@ impl OrchRegistry {
     }
 
     /// Deliver to the group's orchestrator (worker reports, exit notices).
+    // ---------- the bisecting merge queue (#581 slice D2) ----------
+
+    /// Reconcile a group's merge queue against reality after a restart
+    /// (`doc/design/merge-queue.md` §4), following `recover_persisted_queue`'s
+    /// **two-phase** shape for the reason that function documents: phase 1 runs
+    /// under a once-only guard and may not deliver, because this lock is not
+    /// reentrant; phase 2 sends what phase 1 collected, after the guard drops.
+    ///
+    /// **This is wiring, not logic.** Every decision — whether the world matches
+    /// the record, which entries strand, what the notices say — is
+    /// `mqloop::reconcile_batch`'s. This function resolves the group's repo and
+    /// state dir, runs it, audits each transition, persists, and hands the
+    /// notices back. That split is the point: the queue's behaviour is testable
+    /// without an `AppHandle`, and `mod.rs` holds none of it.
+    ///
+    /// **No live caller yet.** Nothing can enqueue until slice E adds the MCP
+    /// tools, so on every group today this is a no-op over an absent file — the
+    /// product default (§12). It is wired now so recovery already works the day
+    /// enqueueing exists, rather than being retrofitted onto a queue that has
+    /// state to lose. Stated because an unreferenced entry point looks like an
+    /// oversight otherwise.
+    ///
+    /// Called from every pane-bind site, beside `recover_persisted_queue` —
+    /// the delivery queue's equivalent — so it runs once per group per process
+    /// at a moment when a pane exists to receive phase 2's notices. Group
+    /// creation would be too early: no orchestrator is bound yet, so a notice
+    /// emitted there would be composed and dropped.
+    ///
+    /// Builds the real runner and delegates; see
+    /// [`merge_queue_reconcile_with`](Self::merge_queue_reconcile_with) for the
+    /// seam an integration test drives.
+    pub fn merge_queue_reconcile(&self, group: &str) {
+        let repo = match self.group(group).map(|g| g.repo) {
+            Some(r) => r,
+            None => return,
+        };
+        let runner = mqdriver::runner_for(std::path::Path::new(&repo));
+        let notices = self.merge_queue_reconcile_with(group, &runner);
+        // ---- phase 2: the guard has dropped; delivering is safe. Same
+        // reasoning as `recover_persisted_queue`'s: a notice is a delivery, a
+        // delivery enqueues, and an enqueue would re-enter the lock phase 1
+        // holds. ----
+        for n in notices {
+            let _ = self.deliver_to_orchestrator(group, &n, "loomux");
+        }
+    }
+
+    /// Phase 1, with the runner injected — the seam `tests/orchestration.rs`
+    /// drives so the whole registry path (the once-only guard, `load_state`,
+    /// `reconcile_batch`, the audit emission, `store_state`) is exercised
+    /// **without spawning `git` or `gh`** (constraint 3).
+    ///
+    /// This is what makes the `#[doc(hidden)] pub` below honest: it is public
+    /// for a consumer that exists. An earlier cut exposed the whole method that
+    /// way for a test that did not exist, which rev-163 correctly called out —
+    /// and which is the same "a door connected to nothing passes every test on
+    /// hand-built records" failure #661's `e20` was written for.
+    ///
+    /// Returns phase-2's notices rather than sending them, because sending is
+    /// what must not happen under the guard.
+    #[doc(hidden)] // pub for integration tests
+    pub fn merge_queue_reconcile_with(
+        &self,
+        group: &str,
+        runner: &dyn mqdriver::MqRunner,
+    ) -> Vec<String> {
+        // ---- phase 1: under the guard ----
+        let notices: Vec<String> = {
+            let mut done = self.mq_reconciled_groups.lock_safe();
+            if !done.insert(group.to_string()) {
+                return Vec::new();
+            }
+            let dir = self.group_dir(group);
+            let mut state = match mqloop::load_state(&dir) {
+                Ok(s) => s,
+                // A file this build cannot act on is audited and **left alone** —
+                // §11.2's forward-compatibility promise is that an older build
+                // does not destroy what a newer one wrote, and rewriting it here
+                // would break exactly that.
+                Err(e) => {
+                    self.audit(
+                        group,
+                        "loomux",
+                        mqloop::audit_action::STRANDED,
+                        json!({ "reason": "unusable merge_queue.json", "detail": format!("{e:?}") }),
+                    );
+                    return Vec::new();
+                }
+            };
+            // Snapshotted before the mutation so the write below is decided by
+            // what actually changed, not by what the report's shape implies.
+            let before = state.clone();
+            let report = mqloop::reconcile_batch(runner, &mut state, group);
+
+            for t in &report.transitions {
+                self.audit(
+                    group,
+                    "loomux",
+                    mqloop::audit_action::STRANDED,
+                    json!({ "pr": t.pr, "from": t.from.as_str(), "to": t.to.as_str() }),
+                );
+            }
+            if report.resumed {
+                self.audit(group, "loomux", mqloop::audit_action::RECOVERED, json!({}));
+            }
+            if let Some(why) = &report.cleanup_failed {
+                self.audit(
+                    group,
+                    "loomux",
+                    mqdriver::audit_action::CLEANUP_FAILED,
+                    json!({ "detail": why }),
+                );
+            }
+            // Written only when reconcile actually CHANGED something. §4 asks
+            // for the snapshot to be rewritten rather than deleted — it does not
+            // ask for one to be conjured. Writing unconditionally would create a
+            // `merge_queue.json` for every group the moment any pane binds,
+            // which would destroy slice F's `absent` state: `merge_queue_view`
+            // distinguishes "never enqueued" (the product default, §12) from
+            // "empty queue", and an always-present file collapses the two.
+            //
+            // Compared against a snapshot of the value rather than inferred from
+            // the report's shape, so this cannot drift out of step with what
+            // `reconcile_batch` mutates.
+            if state != before {
+                if let Err(e) = mqloop::store_state(&dir, &state) {
+                    self.audit(
+                        group,
+                        "loomux",
+                        mqloop::audit_action::STRANDED,
+                        json!({ "reason": "merge_queue.json could not be written", "detail": e }),
+                    );
+                }
+            }
+            report.notices
+        };
+        notices
+    }
+
     pub fn deliver_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
         let orch = self
             .agents

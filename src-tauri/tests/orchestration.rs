@@ -331,6 +331,142 @@ fn fixture_copilot_session(root: &std::path::Path, id: &str, cwd: &str) {
     fs::write(dir.join("workspace.yaml"), format!("id: {id}\nname: fixture\ncwd: {cwd}\n")).unwrap();
 }
 
+// ---------- the merge queue's registry seam (#581 slice D2) ----------
+
+/// A canned `MqRunner` for the reconcile seam. Minimal on purpose — the queue's
+/// own behaviour is covered in `tests/mergequeue.rs`; what this file exists to
+/// reach is the **registry path** around it (the once-only guard, `load_state`,
+/// the audit emission, `store_state`), which no test touched until rev-163
+/// pointed out that the door was connected to nothing.
+///
+/// Constraint 3: canned replies, so reconciling spawns no `git` and no `gh`.
+struct MqFake {
+    git: (i32, String),
+    gh: (i32, String),
+    calls: std::sync::Mutex<usize>,
+}
+
+impl loomux_lib::orchestration::mqdriver::MqRunner for MqFake {
+    fn git(&self, _args: &[&str]) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(loomux_lib::orchestration::mqdriver::CmdOut {
+            code: Some(self.git.0),
+            stdout: self.git.1.clone(),
+            stderr: String::new(),
+        })
+    }
+    fn gh(&self, _args: &[&str]) -> Result<loomux_lib::orchestration::mqdriver::CmdOut, String> {
+        *self.calls.lock().unwrap() += 1;
+        Ok(loomux_lib::orchestration::mqdriver::CmdOut {
+            code: Some(self.gh.0),
+            stdout: self.gh.1.clone(),
+            stderr: String::new(),
+        })
+    }
+}
+
+/// A `merge_queue.json` with one entry inside an in-flight batch. Used twice in
+/// the strand test — once to set it up, once to **re-arm** it so the once-only
+/// guard has something it must actually stop.
+const IN_FLIGHT_QUEUE_JSON: &str = r#"{"version":1,"target":"integration",
+    "entries":[{"pr":612,"head":"aaaaaaa","state":"ci-wait","enqueued_ms":0,"batch":"mq-1"}],
+    "batch":{"id":"mq-1","prs":[612],"scratch_sha":"abc","draft_pr":640,
+             "state":"ci-wait","started_ms":0}}"#;
+
+/// **The production reconcile path, end to end through the registry** (§4).
+///
+/// A batch is recorded as in-flight and the world does not match it (the scratch
+/// ref is gone). The registry must strand the entries, audit it, rewrite the
+/// snapshot rather than delete it, and hand back exactly one phase-2 notice —
+/// and it must do all of that only **once** per group per process.
+#[test]
+fn merge_queue_reconcile_strands_a_batch_the_world_no_longer_matches() {
+    let (reg, d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // The group state dir is the registry root plus the group id.
+    let qfile = d.path().join(&g.id).join("merge_queue.json");
+    fs::write(&qfile, IN_FLIGHT_QUEUE_JSON).unwrap();
+
+    // `ls-remote --exit-code` exits 2 = the scratch ref is gone from the remote.
+    let fake = MqFake {
+        git: (2, String::new()),
+        gh: (0, r#"{"state":"OPEN"}"#.into()),
+        calls: std::sync::Mutex::new(0),
+    };
+    let notices = reg.merge_queue_reconcile_with(&g.id, &fake);
+
+    assert_eq!(notices.len(), 1, "one phase-2 notice, collected not sent");
+    assert!(notices[0].contains("could NOT be resumed"), "{}", notices[0]);
+
+    // The snapshot is REWRITTEN, never deleted — recovery stays re-runnable.
+    let after = fs::read_to_string(&qfile).expect("the queue file still exists");
+    assert!(after.contains("kicked-back"), "the entry was stranded on disk: {after}");
+    assert!(!after.contains("\"batch\":{"), "the dead batch record was cleared: {after}");
+
+    // The transition reached the audit log, which is the durable record even
+    // when the notice cannot be delivered.
+    let audit = reg.audit_log(&g.id);
+    assert!(
+        audit.iter().any(|e| e.action == "mq-stranded"),
+        "expected an mq-stranded audit event, saw: {:?}",
+        audit.iter().map(|e| e.action.clone()).collect::<Vec<_>>()
+    );
+
+    // Once-only: a second call must do nothing, so a restart cannot re-strand
+    // or re-notify entries a previous pass already resolved.
+    //
+    // **The file is re-armed first, and that is the whole point.** The first
+    // pass leaves the queue resolved — the entry terminal, the batch cleared —
+    // so a second pass is naturally a no-op *whether or not the guard exists*.
+    // The original version of this assertion did not re-arm, and mutation I2
+    // (guard removed) left it GREEN: it asserted a property it did not test,
+    // which is exactly the decoration this practice exists to catch. Re-arming
+    // gives the second call real work, so only the guard can stop it.
+    fs::write(&qfile, IN_FLIGHT_QUEUE_JSON).unwrap();
+    let again = reg.merge_queue_reconcile_with(&g.id, &fake);
+    assert!(again.is_empty(), "the once-only guard stops a second reconcile");
+    let untouched = fs::read_to_string(&qfile).expect("still there");
+    assert!(
+        untouched.contains("ci-wait"),
+        "the re-armed queue was not touched by a second pass: {untouched}"
+    );
+}
+
+/// The default path every group is on today: **no `merge_queue.json` at all**.
+///
+/// It must be a clean no-op — no notice, no strand, and **nothing spawned**,
+/// which is what makes it safe to call from a bind site on every group before
+/// slice E exists. Driven through the real `merge_queue_reconcile` (not the
+/// `_with` seam) so the production entry point itself is executed.
+#[test]
+fn merge_queue_reconcile_is_a_silent_no_op_when_nothing_was_ever_queued() {
+    let (reg, d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    // The group state dir is the registry root plus the group id.
+    let qfile = d.path().join(&g.id).join("merge_queue.json");
+    assert!(!qfile.exists(), "precondition: nothing has ever been queued");
+
+    // The real entry point — the one `readmit_recovered` calls.
+    reg.merge_queue_reconcile(&g.id);
+
+    // **The file must still not exist.** This is the property, not a detail:
+    // slice F's `merge_queue_view` reports `absent` — "never enqueued", the
+    // product default (§12) — by the file's absence, so a reconcile that wrote
+    // an empty queue on every bind would silently collapse `absent` into
+    // "empty queue" for every group in the product.
+    assert!(
+        !qfile.exists(),
+        "reconciling an empty queue must not conjure a merge_queue.json"
+    );
+
+    let audit = reg.audit_log(&g.id);
+    assert!(
+        !audit.iter().any(|e| e.action.starts_with("mq-")),
+        "an empty queue produces no merge-queue audit noise, saw: {:?}",
+        audit.iter().map(|e| e.action.clone()).collect::<Vec<_>>()
+    );
+}
+
 // ---------- registry: guardrails, isolation, persistence, audit ----------
 
 #[test]
