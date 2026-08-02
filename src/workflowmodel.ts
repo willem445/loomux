@@ -31,9 +31,10 @@
 // effort keeping its dependency list short. Anything the subset can't read is a parse
 // finding on a line number — the raw-text view still opens, so the file is still fixable.
 
-// The one import: the CLI capability record the BACKEND reports (agent_cli_knobs).
-// This module mirrors no vendor fact of its own — see `validateWorkflow`'s knob pass.
-import type { CliKnobs } from "./selectorknobs";
+// The one import, and it is TYPE-only: the capability answer is handed in by the
+// caller (see `KnobLookup`), never imported, because this module mirrors no
+// vendor fact of its own — see `validateWorkflow`'s knob pass.
+import type { KnobStates } from "./selectorknobs";
 
 // ---------- the closed enums ----------
 
@@ -794,6 +795,10 @@ function emitBlockLines(b: WorkflowBlock, markerIndent = 2): string[] {
   if (b.role_hint !== undefined) out.push(`${field}role_hint: ${emitScalar(b.role_hint)}`);
   out.push(`${field}cli: ${emitScalar(b.cli)}`);
   if (b.model) out.push(`${field}model: ${emitScalar(b.model)}`);
+  // #687: with the model they modify, and only when declared — a block that
+  // pinned neither serializes byte for byte as it did before.
+  if (b.effort !== undefined) out.push(`${field}effort: ${emitScalar(b.effort)}`);
+  if (b.context !== undefined) out.push(`${field}context: ${emitScalar(b.context)}`);
   if (b.profile !== undefined) out.push(`${field}profile: ${emitScalar(b.profile)}`);
   out.push(...extraLines(b.extra, field));
   if (b.prompt !== undefined) out.push(...emitBlockScalar("prompt", b.prompt, field));
@@ -1312,7 +1317,18 @@ const asString = (v: YamlValue): string | null =>
   typeof v === "string" ? v : typeof v === "number" || typeof v === "boolean" ? String(v) : null;
 
 const KNOWN_TOP = new Set(["version", "name", "blocks", "edges", "gates"]);
-const KNOWN_BLOCK = new Set(["id", "name", "kind", "cli", "model", "prompt", "profile", "role_hint"]);
+const KNOWN_BLOCK = new Set([
+  "id",
+  "name",
+  "kind",
+  "cli",
+  "model",
+  "prompt",
+  "profile",
+  "role_hint",
+  "effort",
+  "context",
+]);
 const KNOWN_GATE = new Set(["merge"]);
 
 function collectExtra(
@@ -1443,6 +1459,10 @@ function readBlock(raw: YamlValue, index: number, findings: Finding[]): Workflow
   if (r.prompt !== undefined) block.prompt = asString(r.prompt) ?? "";
   if (r.profile !== undefined) block.profile = asString(r.profile) ?? "";
   if (r.role_hint !== undefined) block.role_hint = asString(r.role_hint) ?? "";
+  // #687. `undefined` (never declared) and `""` (declared empty) are kept apart
+  // the way role_hint keeps them, so a save can't turn one into the other.
+  if (r.effort !== undefined) block.effort = asString(r.effort) ?? "";
+  if (r.context !== undefined) block.context = asString(r.context) ?? "";
   return block;
 }
 
@@ -1500,6 +1520,59 @@ function readGate(raw: YamlValue, findings: Finding[]): MergeGate {
 
 // ---------- validate: the pre-run pass ----------
 
+/** How a caller answers "what can this block's cli and model actually carry?" —
+ *  normally `(cli, model) => knobState(fetched[cli] ?? null, cli, model)`
+ *  (selectorknobs.ts). **`null` means "not known yet"**, and is not the same
+ *  answer as "cannot": the pane fetches `agent_cli_knobs` per CLI
+ *  asynchronously, and a knob check that ran before the reply landed would
+ *  invent a finding out of its own ignorance.
+ *
+ *  Injected rather than imported so this module's "capability is the backend's
+ *  to state, never mirrored here" rule holds at the module-graph level too: the
+ *  pure model has no runtime dependency on the capability layer at all. */
+export type KnobLookup = (cli: string, model: string) => KnobStates | null;
+
+/** The `effort:` / `context:` half of the pre-run pass (#687).
+ *
+ *  Three ways a knob is undeliverable, all of them a REFUSAL on the real engine
+ *  (`validate_knob`, workflow.rs) rather than a silent no-op, so a pane that
+ *  reported the file clean would send a human to a launch that quietly falls back
+ *  to the built-in roster:
+ *
+ *    - a value outside the CLI's own vocabulary (`effort: banana`);
+ *    - a CLI with no seam for the knob at all (copilot's effort);
+ *    - a model the knob has no documented form on — `haiku` + `context: 1m`
+ *      composes `--model haiku[1m]`, which is #709's carried finding, caught here
+ *      at the surface a human hand-writes the file in.
+ *
+ *  **It DEFERS rather than guesses.** A `lookup` that returns `null` — no caps
+ *  fetched for this block's CLI yet, or none passed at all — produces no
+ *  findings, exactly as the real parser skips the CLI half for a block with no
+ *  explicit `cli:` and lets `clamped()` re-check with the resolved CLI in hand. */
+function knobFindings(b: WorkflowBlock, where: string, lookup: KnobLookup | undefined): Finding[] {
+  if (b.effort === undefined && b.context === undefined) return [];
+  const states = lookup?.(b.cli.trim(), b.model);
+  if (!states) return [];
+  const out: Finding[] = [];
+  for (const [key, declared, state] of [
+    ["effort", b.effort, states.effort],
+    ["context", b.context, states.context],
+  ] as const) {
+    const v = (declared ?? "").trim();
+    if (!v) continue; // absent or empty = the CLI's own default, always legal
+    if (state.enabled && state.values.includes(v.toLowerCase())) continue;
+    out.push({
+      severity: "error",
+      code: "knob-unavailable",
+      message:
+        `Block "${where}" declares ${key}: ${v}, which loomux cannot deliver on ${b.cli} — ` +
+        (state.reason || `${key} must be one of ${state.values.join(", ")}.`),
+      blockId: b.id,
+    });
+  }
+  return out;
+}
+
 /** Everything that is wrong with this workflow, before a single agent is spawned.
  *
  *  This is the pass every surveyed tool skipped (#222 §1a-v): Flowise, Langflow and Dify
@@ -1507,7 +1580,7 @@ function readGate(raw: YamlValue, findings: Finding[]): MergeGate {
  *  node isn't even installed. It is cheap, it is pure, and it is the difference between
  *  "your workflow failed after spawning two agents" and "block `rev-perf` doesn't exist —
  *  the merge gate names it". */
-export function validateWorkflow(w: Workflow, _knobs?: Record<string, CliKnobs>): Finding[] {
+export function validateWorkflow(w: Workflow, knobs?: KnobLookup): Finding[] {
   const findings: Finding[] = [];
   const byId = new Map<string, WorkflowBlock>();
 
@@ -1595,6 +1668,7 @@ export function validateWorkflow(w: Workflow, _knobs?: Record<string, CliKnobs>)
         });
       }
     }
+    findings.push(...knobFindings(b, where, knobs));
   }
 
   for (const e of w.edges) {
@@ -2069,12 +2143,15 @@ export interface WorkflowAnalysis {
   graph: WorkflowGraph;
 }
 
-/** Text in, everything the pane renders out. */
-export function analyzeWorkflow(text: string): WorkflowAnalysis {
+/** Text in, everything the pane renders out. `knobs` (#687) is the pane's
+ *  capability lookup — omitted (or answering `null`) simply skips the knob
+ *  checks, so a re-analysis that happens before `agent_cli_knobs` replies reads
+ *  exactly as it did before. */
+export function analyzeWorkflow(text: string, knobs?: KnobLookup): WorkflowAnalysis {
   const { workflow, findings } = parseWorkflow(text);
   return {
     workflow,
-    findings: [...findings, ...validateWorkflow(workflow)],
+    findings: [...findings, ...validateWorkflow(workflow, knobs)],
     graph: deriveGraph(workflow),
   };
 }

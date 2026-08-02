@@ -53,6 +53,8 @@ import {
   type Finding,
   type GraphNode,
 } from "./workflowmodel";
+import { agentCliKnobs } from "./pty";
+import { knobState, type CliKnobs, type KnobState, type KnobStates } from "./selectorknobs";
 import {
   LAYOUT_FILE,
   parseLayout,
@@ -207,6 +209,16 @@ export class WorkflowView {
   private starterBtn: HTMLButtonElement;
   private startPathEl: HTMLElement;
   private errorTitleEl: HTMLElement;
+
+  /** What each CLI can do with the model knobs (#687), as the BACKEND reports it
+   *  (`agent_cli_knobs`): `undefined` = not asked yet, `null` = asked and the
+   *  lookup failed, a record = the answer. The pane never mirrors a capability
+   *  of its own — see `knobLookup`. */
+  private cliKnobs = new Map<string, CliKnobs | null>();
+  /** CLIs already asked about, so a re-analysis per keystroke is not a fetch per
+   *  keystroke. Separate from `cliKnobs` because "asked, still in flight" and
+   *  "asked, failed" are different states and only one of them is answerable. */
+  private knobsAsked = new Set<string>();
 
   // Canvas interaction state. All three are transient — none of them is ever serialized, and
   // the model never learns they existed.
@@ -798,7 +810,41 @@ export class WorkflowView {
   }
 
   private reanalyze(): void {
-    this.analysis = analyzeWorkflow(this.text);
+    this.analysis = analyzeWorkflow(this.text, this.knobLookup);
+    this.ensureCliKnobs();
+  }
+
+  /** The capability answer the model's validation pass asks for (#687).
+   *
+   *  `undefined` in the map = not fetched yet, and the lookup returns `null` for
+   *  it — NOT an answer (see `KnobLookup`), so the pass defers instead of
+   *  inventing a finding out of its own ignorance. `null` in the map = we asked
+   *  and the call failed, which `knobState` renders as disabled-with-a-reason. */
+  private knobLookup = (cli: string, model: string): KnobStates | null => {
+    const caps = this.cliKnobs.get(cli);
+    return caps === undefined ? null : knobState(caps, cli, model);
+  };
+
+  /** Fetch `agent_cli_knobs` for every CLI the file names, once each (#687).
+   *
+   *  The pane mirrors no vendor capability of its own — which knobs a CLI has, and
+   *  the reason it lacks one, are the backend's `CLI_CAPS` row, asked for. Each
+   *  reply re-runs the analysis so the knob findings and the form's controls
+   *  appear the moment the answer lands, without blocking the file from opening
+   *  on an IPC round-trip. */
+  private ensureCliKnobs(): void {
+    for (const b of this.analysis.workflow.blocks) {
+      const cli = b.cli.trim();
+      if (!cli || this.knobsAsked.has(cli)) continue;
+      this.knobsAsked.add(cli);
+      void agentCliKnobs(cli).then((caps) => {
+        this.cliKnobs.set(cli, caps);
+        // Re-run the same pass the pane would have run had the reply been in
+        // hand when the file opened.
+        this.analysis = analyzeWorkflow(this.text, this.knobLookup);
+        this.render();
+      });
+    }
   }
 
   /** The explicit "rewrite this whole file in canonical form" action — the one place left
@@ -927,11 +973,15 @@ export class WorkflowView {
     rows.push(el("div", "wf-roster-head", "Blocks"));
     w.blocks.forEach((b, i) => {
       const bad = this.blockFindings(b).some((f) => f.severity === "error");
+      // #687: a pinned thinking level / context window is part of what this block
+      // will actually run, so the row says so. Unpinned adds nothing — the row
+      // stays the line it has always been.
+      const knobs = `${b.effort ? ` · effort: ${b.effort}` : ""}${b.context ? ` · context: ${b.context}` : ""}`;
       rows.push(
         row(
           { kind: "block", index: i },
           b.name || b.id || "(no id)",
-          `${b.kind || "?"} · ${b.cli || "?"}`,
+          `${b.kind || "?"} · ${b.cli || "?"}${knobs}`,
           bad
         )
       );
@@ -1025,6 +1075,44 @@ export class WorkflowView {
     // the caret) — only the roster, the findings and the graph are.
     i.addEventListener("input", () => onChange(i.value));
     return i;
+  }
+
+  /** One model-knob control (#687): the CLI's own values plus "the CLI's default",
+   *  disabled with the vendor's reason where loomux cannot deliver the knob.
+   *
+   *  `state` is `undefined` while the capability lookup is in flight — the control
+   *  is inert then, because offering values before knowing whether they exist is
+   *  how a form promises something the spawn won't do. A DECLARED value the state
+   *  doesn't offer still shows, marked: this is an editor, and silently dropping
+   *  what the file says would rewrite it the moment any other field is touched. */
+  private knobSelect(
+    state: KnobState | undefined,
+    value: string | undefined,
+    onChange: (v: string) => void
+  ): HTMLSelectElement {
+    const s = document.createElement("select");
+    s.className = "wf-input";
+    const current = (value ?? "").trim();
+    const add = (v: string, label: string): void => {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = label;
+      s.append(opt);
+    };
+    add("", "(the CLI's default)");
+    for (const v of state?.values ?? []) add(v, v);
+    if (current && !(state?.values ?? []).includes(current)) add(current, `${current} (not delivered)`);
+    s.value = current;
+    s.disabled = !state?.enabled && !current;
+    s.addEventListener("change", () => onChange(s.value));
+    return s;
+  }
+
+  /** The hint under a knob control: the vendor's reason when it is unavailable,
+   *  the plain description when it is not. */
+  private knobHint(state: KnobState | undefined, key: string, what: string): string {
+    if (!state) return `${key} — reading this CLI's capabilities…`;
+    return state.enabled ? `${key} — ${what}. Blank leaves the CLI's default.` : state.reason;
   }
 
   private select(
@@ -1141,6 +1229,38 @@ export class WorkflowView {
         "Model",
         this.textInput(b.model, (v) => edit((t) => (t.model = v), false), "(the CLI's default)"),
         "e.g. opus, sonnet, auto. Blank leaves the CLI's default."
+      )
+    );
+
+    // The two model knobs (#687). Their VALUES and their availability come from
+    // the backend's capability row for this block's CLI (`agent_cli_knobs`) — the
+    // pane states no vendor fact of its own — narrowed by what the selected model
+    // can carry. A knob this CLI/model cannot take renders disabled with that
+    // reason as the hint, which is also the finding the validation pass raises if
+    // the file declares one anyway.
+    const states = this.knobLookup(b.cli.trim(), b.model);
+    box.append(
+      this.field(
+        "Thinking level",
+        this.knobSelect(states?.effort, b.effort, (v) =>
+          edit((t) => {
+            if (v) t.effort = v;
+            else delete t.effort;
+          })
+        ),
+        this.knobHint(states?.effort, "effort:", "how hard this block's agent thinks")
+      )
+    );
+    box.append(
+      this.field(
+        "Context window",
+        this.knobSelect(states?.context, b.context, (v) =>
+          edit((t) => {
+            if (v) t.context = v;
+            else delete t.context;
+          })
+        ),
+        this.knobHint(states?.context, "context:", "the model's context window")
       )
     );
 

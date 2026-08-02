@@ -10,6 +10,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import type { ShellKind } from "./panesetup";
+import type { CliKnobs } from "./selectorknobs";
 
 export interface SpawnOptions {
   cols: number;
@@ -101,6 +102,20 @@ export const dirInfo = (path: string): Promise<DirInfo> => invoke("dir_info", { 
  *  Bash shell kind with a reason before any pane is spawned. */
 export const discoverGitBash = (): Promise<string | null> =>
   invoke<string | null>("discover_git_bash");
+
+/** The model knobs loomux can actually set on an agent CLI (#687) — the CLI's
+ *  `CLI_CAPS` row, reported verbatim by the backend so the launcher, the workflow
+ *  parser and the spawn path can never disagree about what a CLI supports.
+ *
+ *  This is slice A's deferred caller: the command was registered there and its
+ *  wrapper left to the surface that uses it (the launcher's per-role selector and
+ *  the workflow pane's block form), rather than shipping an unused one.
+ *
+ *  Never throws: a capability lookup we couldn't make is not worth failing a form
+ *  over. A `null` reply reads as "not known yet" everywhere it lands, which
+ *  renders every knob disabled with a reason — the honest, and safe, direction. */
+export const agentCliKnobs = (cli: string): Promise<CliKnobs | null> =>
+  invoke<CliKnobs>("agent_cli_knobs", { cli }).catch(() => null);
 
 /** Drive a pane's shell to `cd` into `path`. */
 export const changeDir = (id: number, path: string): Promise<void> =>

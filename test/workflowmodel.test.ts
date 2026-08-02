@@ -35,7 +35,7 @@ import {
   type Finding,
   type FindingCode,
 } from "../src/workflowmodel.ts";
-import type { CliKnobs } from "../src/selectorknobs.ts";
+import { knobState, type CliKnobs } from "../src/selectorknobs.ts";
 
 /** The schema sketch from the #222 investigation (§4), verbatim in spirit: the file the
  *  feature was designed around. If this stops reading, the feature is broken. */
@@ -1342,6 +1342,11 @@ const KNOBS: Record<string, CliKnobs> = {
   },
 };
 
+/** The lookup the pane hands to `validateWorkflow`: what has been fetched so
+ *  far, and `null` for a CLI whose reply hasn't landed. */
+const lookup = (cli: string, model: string) =>
+  KNOBS[cli] ? knobState(KNOBS[cli]!, cli, model) : null;
+
 test("effort:/context: are real keys the pane reads, not unknown ones it merely keeps", () => {
   // Before #687 these landed in `extra` — preserved, but invisible to the form and
   // to validation. The engine parses them, so the pane must too.
@@ -1392,7 +1397,7 @@ test("a knob the block's CLI cannot honor is a finding quoting that CLI's own re
   const w = starterWorkflow();
   w.blocks[1]!.cli = "copilot";
   w.blocks[1]!.effort = "xhigh";
-  const f = validateWorkflow(w, KNOBS);
+  const f = validateWorkflow(w, lookup);
   assert.ok(has(f, "knob-unavailable"));
   const finding = f.find((x) => x.code === "knob-unavailable")!;
   assert.equal(finding.blockId, "worker");
@@ -1404,14 +1409,14 @@ test("a knob the block's CLI cannot honor is a finding quoting that CLI's own re
 test("a value outside the CLI's own vocabulary is a finding that names the vocabulary", () => {
   const w = starterWorkflow();
   w.blocks[1]!.effort = "banana";
-  const f = validateWorkflow(w, KNOBS);
+  const f = validateWorkflow(w, lookup);
   assert.ok(has(f, "knob-unavailable"));
   assert.match(f.find((x) => x.code === "knob-unavailable")!.message, /low, medium, high, xhigh, max/);
   // The legal values are clean, and so is an empty one (= the CLI's default).
   for (const level of ["low", "medium", "high", "xhigh", "max", ""]) {
     const ok = starterWorkflow();
     ok.blocks[1]!.effort = level;
-    assert.deepEqual(codes(validateWorkflow(ok, KNOBS)), [], `effort: ${level || "(empty)"} is legal`);
+    assert.deepEqual(codes(validateWorkflow(ok, lookup)), [], `effort: ${level || "(empty)"} is legal`);
   }
 });
 
@@ -1424,7 +1429,7 @@ test("context: is gated on the MODEL, not just the CLI (#709 carried finding)", 
   const w = starterWorkflow();
   w.blocks[1]!.model = "haiku";
   w.blocks[1]!.context = "1m";
-  const f = validateWorkflow(w, KNOBS);
+  const f = validateWorkflow(w, lookup);
   assert.ok(has(f, "knob-unavailable"));
   assert.match(f.find((x) => x.code === "knob-unavailable")!.message, /haiku\[1m\]/);
 
@@ -1432,13 +1437,13 @@ test("context: is gated on the MODEL, not just the CLI (#709 carried finding)", 
   const ok = starterWorkflow();
   ok.blocks[1]!.model = "sonnet";
   ok.blocks[1]!.context = "1m";
-  assert.deepEqual(codes(validateWorkflow(ok, KNOBS)), []);
+  assert.deepEqual(codes(validateWorkflow(ok, lookup)), []);
   // ...and effort is NOT gated with it: a model that lacks a level falls back to
   // the highest it supports (model-config §Adjust effort level).
   const effortOnHaiku = starterWorkflow();
   effortOnHaiku.blocks[1]!.model = "haiku";
   effortOnHaiku.blocks[1]!.effort = "max";
-  assert.deepEqual(codes(validateWorkflow(effortOnHaiku, KNOBS)), []);
+  assert.deepEqual(codes(validateWorkflow(effortOnHaiku, lookup)), []);
 });
 
 test("with no capability data the knob checks DEFER — they never guess", () => {
@@ -1450,7 +1455,11 @@ test("with no capability data the knob checks DEFER — they never guess", () =>
   w.blocks[1]!.cli = "copilot";
   w.blocks[1]!.effort = "xhigh";
   assert.deepEqual(codes(validateWorkflow(w)), [], "no caps in hand = no finding invented");
-  assert.deepEqual(codes(validateWorkflow(w, { claude: KNOBS.claude! })), []);
+  assert.deepEqual(
+    codes(validateWorkflow(w, (cli, model) => (cli === "claude" ? knobState(KNOBS.claude!, cli, model) : null))),
+    [],
+    "caps for the OTHER cli in hand is still no answer about this one"
+  );
   // And a file that pins no knobs is unaffected whether caps are present or not.
-  assert.deepEqual(codes(validateWorkflow(starterWorkflow(), KNOBS)), []);
+  assert.deepEqual(codes(validateWorkflow(starterWorkflow(), lookup)), []);
 });

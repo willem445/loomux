@@ -202,6 +202,11 @@ export function builtinRoster(picks: readonly RolePick[], groupCli: string): Ros
       cli: pick?.cli?.trim() || groupCli,
       model: pick?.model?.trim() ?? "",
       persona: "none" as const,
+      // #687: NOT inherited from the group the way `cli` is — a thinking level
+      // is a per-role choice, and there is no group-wide one to fall back to.
+      // Absent stays absent, which every emit path reads as "say nothing".
+      effort: pick?.effort?.trim() ?? "",
+      context: pick?.context?.trim() ?? "",
     };
   });
 }
@@ -307,7 +312,13 @@ export function describeBlock(b: RosterBlock): string {
         ? " · repo persona"
         : "";
   const chip = roleHintChip(b.role_hint);
-  return `${b.kind} · ${b.cli} · ${b.model || "default model"}${persona}${chip ? ` · ${chip}` : ""}`;
+  // #687: the knobs sit with the model they modify, before the persona and the
+  // chip (which are about the agent's INSTRUCTIONS, not what it runs on). Spelled
+  // with the workflow file's own key names, so the line teaches what to write.
+  // Empty/absent renders nothing at all: "effort: (default)" on every row would
+  // be noise on every group that pinned nothing, i.e. nearly all of them.
+  const knobs = `${b.effort ? ` · effort: ${b.effort}` : ""}${b.context ? ` · context: ${b.context}` : ""}`;
+  return `${b.kind} · ${b.cli} · ${b.model || "default model"}${knobs}${persona}${chip ? ` · ${chip}` : ""}`;
 }
 
 /** Whether the roster is worth showing the human before they launch. The built-in
