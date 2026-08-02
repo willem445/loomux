@@ -31,8 +31,10 @@ pub const NOTIFY_EXPIRES_MAX: u32 = 240;
 pub const MAX_WATCHES_PER_AGENT: usize = 4;
 pub const MAX_WATCHES_PER_GROUP: usize = 12;
 
-/// How often the background poller wakes (`start_notify_poller`) and the
-/// minimum interval between polls of any one watch (`poll_watches`).
+/// How often the unified background `gh` poller wakes (`start_gh_poller`,
+/// #406 — this is the wake cadence of the whole loop, not just of this
+/// feature) and the minimum interval between polls of any one watch
+/// (`poll_watches`).
 pub const NOTIFY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// At most this many watches are polled in one tick, round-robin by

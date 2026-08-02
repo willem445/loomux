@@ -78,8 +78,12 @@ pub fn run() {
             orchestration::start_idle_tick(reg.clone());
             orchestration::start_compact_nudge(reg.clone());
             orchestration::start_disk_monitor(reg.clone());
-            orchestration::start_notify_poller(reg.clone());
-            orchestration::start_intake_poller(reg.clone());
+            // #406: ONE background loop makes `gh` calls per app instance —
+            // the notification backend (#243) and the idle-tick intake gate
+            // (#332) are both serviced by this tick, sharing its clock and
+            // its GitHub API budget. Adding a second `gh`-polling thread here
+            // is the thing that issue exists to prevent.
+            orchestration::start_gh_poller(reg.clone());
             orchestration::start_workflow_gate_reload(reg.clone());
             std::thread::spawn(move || orchestration::mcp::serve(reg));
             Ok(())

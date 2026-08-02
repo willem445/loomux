@@ -36,6 +36,8 @@ use loomux_lib::orchestration::{
     gh_shim_cmd, gh_shim_sh, git_shim_cmd, git_shim_sh, git_tag_push, grant_segment, grant_unexpired, hold_for_human_input,
     resolve_shim_toolchain, ShimPaths,
     hold_until_quiet, idle_output_is_activity, idle_should_kill, idle_tick_should_fire,
+    // #406: the unified `gh` poller's shared scan cadence.
+    intake_scan_due,
     low_disk_notice, low_disk_transition, max_agents_notice, pr_number, release_gate_decision,
     workflow_mode_notice,
     GhGate, GitTagPush,
@@ -28501,6 +28503,62 @@ fn app_setup_starts_exactly_one_gh_polling_loop() {
         0,
         "the intake-only poller is gone — a second gh-polling thread is the coupling #406 closed"
     );
+}
+
+/// One wake of the single loop services BOTH features: the notify half
+/// resolves a due watch and the intake half runs its due-group scan, off the
+/// same injected instant. Before #406 these were two threads on two clocks,
+/// so "one tick did both" was not a statement that could be made at all.
+#[test]
+fn one_gh_poll_tick_services_both_notify_and_intake() {
+    let (reg, _d, _co, cw) = setup_mcp();
+    let text = register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "406", "expires_minutes": 5 })).unwrap();
+    let id = extract_watch_id(&text);
+
+    // 6 minutes on: the watch is past its TTL (the notify half's own,
+    // unchanged, time-based decision) and the intake scan has never run.
+    let tick = reg.gh_poll_tick(now_ms() + 6 * 60_000, &HashMap::new());
+    assert_eq!(tick.fired, vec![id], "the notify half must still resolve a due watch on this wake");
+    assert!(tick.intake_scanned, "and the SAME wake must run the intake scan — one loop, not two");
+}
+
+/// The unification must not change either feature's cadence: the notify half
+/// runs on EVERY wake (watch-firing latency stays the loop's 30s), while the
+/// intake half keeps its own coarser 60s scan floor instead of inheriting the
+/// faster wake it now rides on.
+#[test]
+fn intake_half_keeps_its_scan_floor_while_notify_runs_every_wake() {
+    // Pure cadence first: never-scanned is due, then the 60s floor.
+    let t = 1_700_000_000_000u64;
+    assert!(intake_scan_due(t, None), "the first wake after launch must scan");
+    assert!(!intake_scan_due(t + 59_999, Some(t)), "a wake inside the floor must not scan");
+    assert!(intake_scan_due(t + 60_000, Some(t)), "the floor is INTAKE_POLL_SCAN_INTERVAL, exactly");
+
+    // And through the tick, on a live registry: wake 1 scans, wake 2 (one
+    // 30s wake later) does not — but still fires a watch that resolved in
+    // between, which is the half that must never be starved by the other's
+    // slower cadence.
+    let (reg, _d, _co, cw) = setup_mcp();
+    let expiring =
+        extract_watch_id(&register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "406", "expires_minutes": 5 })).unwrap());
+    let long_lived = extract_watch_id(
+        &register_notify(&reg, &cw, json!({ "kind": "pr_checks", "pr": "407", "expires_minutes": 240 })).unwrap(),
+    );
+
+    let wake1 = now_ms() + 6 * 60_000;
+    let first = reg.gh_poll_tick(wake1, &HashMap::new());
+    assert_eq!(first.fired, vec![expiring], "wake 1 expires the short-TTL watch");
+    assert!(first.intake_scanned, "wake 1 is the first scan ever, so it scans");
+
+    let mut met = HashMap::new();
+    met.insert(long_lived.clone(), notify::PollResult::Met { summary: "SUCCESS — all 3 checks passed".into() }.into());
+    let second = reg.gh_poll_tick(wake1 + 30_000, &met);
+    assert_eq!(second.fired, vec![long_lived], "wake 2 must still deliver the notify half — every wake does");
+    assert!(!second.intake_scanned, "…while the intake scan holds its own 60s floor on that same wake");
+
+    // A wake past the floor scans again — the floor is a floor, not a latch.
+    let third = reg.gh_poll_tick(wake1 + 60_000, &HashMap::new());
+    assert!(third.intake_scanned, "the next wake past the floor scans again");
 }
 
 // ---------- group_watches: the group view's "⏳ waiting on …" indicator (#248) ----------
