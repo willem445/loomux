@@ -207,3 +207,21 @@ the shared resource looks private from inside one agent.
 The rule, now in `worker.md` and `reviewer.md`: temp and scratch files live under the agent's
 own worktree — `./.scratch/`, gitignored — never a bare `/tmp` name. A path only you can own
 costs nothing and removes the failure mode entirely.
+
+## A green suite's coverage claim is a claim like any other — the mutation round is what corrects it
+
+Three PRs in one batch had a mutation round FALSIFY the author's own written claim about what
+the tests cover — not merely supply missing red evidence. #664: a "dead defense" test claimed
+by the body turned out to be exactly that, dead, and was deleted once the mutation proved
+nothing reddened. #673: a test named for the credit rule passed with the guard removed — a
+vacuous test in the exact spot where a wrong answer tells a pane a lost report is handled;
+designing the mutation caught it before any run. #682: the body credited one negative control
+with catching a blanket relabel; the run showed a PAIR performs the catch, and one member is a
+pre-existing test whose connection to the property is invisible from its name.
+
+The pattern: attribution written from intention ("this test guards X") is wrong often enough
+that it should not survive unexecuted. When a PR's body claims a specific test polices a
+specific property, run the one mutation that removes the property and watch WHICH tests redden
+— the diff between predicted and actual failure lists is where the review value lives. A
+mutation whose result matches prediction is evidence; one that doesn't is a correction, and
+disclosing it beats a quiet re-run every time.
