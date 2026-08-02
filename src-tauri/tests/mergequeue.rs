@@ -37,11 +37,12 @@ use loomux_lib::orchestration::mergeq::{
 };
 use loomux_lib::orchestration::mqloop::{
     advance_entry, batch_fetch_argv, batch_pr_body, batch_pr_title, bisect_action, build_scratch,
-    cleanup_worktree, culprit_comment, culprit_notice, draft_pr_argv, drive, finish_batch,
-    load_state, observe_batch, parse_created_pr, pr_comment_argv, pr_state_argv, prune_terminal,
-    reconcile_batch, record_batch, requeue_survivors, scratch_worktree_path, state_path,
-    store_state, unverifiable_notice, walk_bisect, worktree_remove_argv, BatchBuildError,
-    BatchOutcome, BisectAction, DriveConfig, StateError,
+    cancel, cleanup_worktree, culprit_comment, culprit_notice, draft_pr_argv, drive, enqueue,
+    finish_batch, load_state, observe_batch, parse_created_pr, pr_comment_argv, pr_state_argv,
+    prune_terminal, reconcile_batch, record_batch, requeue_survivors, scratch_worktree_path,
+    state_path, status_view, store_state, unverifiable_notice, walk_bisect, worktree_remove_argv,
+    BatchBuildError, BatchOutcome, BisectAction, CancelOutcome, DriveConfig, EnqueueOutcome,
+    StateError, MAX_TERMINAL_RETAINED,
 };
 use loomux_lib::orchestration::mqdriver::{
     classify_checks, cleanup_scratch, close_draft_argv, default_branch_argv, delete_scratch_argv,
@@ -1856,18 +1857,380 @@ fn the_target_is_released_only_when_the_queue_drains() {
     assert!(s.batch.is_none());
     assert_eq!(s.target, "integration", "a live entry holds the target");
 
-    // Everything terminal → released.
+    // Everything terminal → released, and the campaign's corpses go with the
+    // target: both are properties of the work that was in the queue, and a
+    // finished campaign keeps neither (the pane counts `entries`, not just the
+    // live ones — see `a_drained_queue_leaves_no_terminal_entries_behind`).
     advance_entry(&mut s, 613, EntryState::Cancelled).unwrap();
     finish_batch(&mut s);
     assert_eq!(s.target, "", "a drained queue releases its target");
+    assert!(s.entries.is_empty(), "…and leaves no corpses: {:?}", s.entries);
+    assert_eq!(prune_terminal(&mut s), 0, "there is nothing left to prune");
 
-    // Pruning drops only terminal entries, keeping order.
-    assert_eq!(prune_terminal(&mut s), 2);
-    assert!(s.entries.is_empty());
+    // Pruning itself still drops only terminal entries, keeping order — pinned
+    // on a queue that has NOT drained, which is the only place it now has work
+    // to do.
+    let mut live = MergeQueueState {
+        target: "integration".into(),
+        entries: vec![
+            QueueEntry::new(700, HEAD_A, 0),
+            QueueEntry::new(701, HEAD_B, 0),
+            QueueEntry::new(702, HEAD_A, 0),
+        ],
+        ..Default::default()
+    };
+    advance_entry(&mut live, 700, EntryState::Cancelled).unwrap();
+    advance_entry(&mut live, 702, EntryState::Cancelled).unwrap();
+    assert_eq!(prune_terminal(&mut live), 2);
+    assert_eq!(live.entries.iter().map(|e| e.pr).collect::<Vec<_>>(), vec![701]);
 
     // `record_batch` is the one place a batch record is installed.
     record_batch(&mut s, BatchRecord::new("mq-2", vec![700], 0));
     assert_eq!(s.batch.as_ref().unwrap().id, "mq-2");
+}
+
+// ── #710: the target does not outlive the work that established it ──────────
+
+/// The two branches #710 is about, plus the default, answered live.
+fn drain_fake() -> Fake {
+    Fake::new()
+        .gh("repo view", 0, "main\n", "")
+        .gh("pr view 612", 0, &pr_json("integration/batch3", HEAD_A, "b"), "")
+        .gh("pr view 705", 0, &pr_json("integration/batch4", HEAD_B, "b"), "")
+        // Read unconditionally by `enqueue`; this gate declares no `ci-green`
+        // clause, so the answer only has to exist.
+        .gh("pr checks", 0, &checks_json(&[("build", "SUCCESS")]), "")
+}
+
+/// The live #710 sequence, up to the point each test is about: enqueue 612
+/// (establishing `integration/batch3`), then cancel it — leaving a queue with
+/// no live entry, no batch, and whatever the target does next.
+///
+/// Shared so the two properties below can each fail on their **own** assertion
+/// rather than one of them tripping over the other's: a single test asserting
+/// both would panic at the first and never execute the second, and a property
+/// that never ran is a property nobody has seen fail.
+fn cancelled_to_empty(f: &Fake, gate: &GateSpec) -> MergeQueueState {
+    let mut s = MergeQueueState { version: MERGE_QUEUE_VERSION, ..Default::default() };
+    assert_eq!(
+        enqueue(f, &mut s, 612, None, true, gate, &verdict_map(HEAD_A, "b"), 0),
+        EnqueueOutcome::Queued { position: 1 },
+        "the first enqueue establishes the target, as it always has"
+    );
+    assert_eq!(s.target, "integration/batch3");
+    // While that entry is live the drain-first refusal is exactly what it was —
+    // asserted here so both tests below start from a queue that has genuinely
+    // refused, not merely from one that was never asked.
+    assert_eq!(
+        enqueue(f, &mut s, 705, None, true, gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Refused { reason: TargetRefusal::BaseNotTarget.code() },
+        "a live entry was approved against the old target and must not be retargeted"
+    );
+    assert_eq!(s.target, "integration/batch3", "a refused enqueue changes nothing");
+    assert_eq!(cancel(&mut s, 612), CancelOutcome::Cancelled { was: EntryState::Queued });
+    s
+}
+
+/// **#710, the wedge itself.** A queue that has drained takes the next
+/// enqueue's target.
+///
+/// The refusal this relaxes is §4's drain-first rule, and it protects
+/// *entries* — work already approved against the old target. With none left
+/// there is nobody to protect, and the refusal becomes "this queue is already
+/// landing elsewhere, drain it first" said about a queue that IS drained. Found
+/// live: `queue_merge(705, "integration/batch4")` refused `base-not-target`
+/// against `{"entries":[],"target":"integration/batch3"}` — a branch deleted
+/// when that batch closed. `merge_queue.json` is persistent by design, so no
+/// restart clears it: one cancelled batch wedged the group permanently.
+#[test]
+fn a_drained_queue_takes_the_next_enqueues_target() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+    let mut s = cancelled_to_empty(&f, &gate);
+
+    // The assertion form too, which must narrow what happens rather than be
+    // contradicted by a residue nobody asserted anything about.
+    let asserted = Some("integration/batch4");
+    assert_eq!(
+        enqueue(&f, &mut s, 705, asserted, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Queued { position: 1 },
+        "a drained queue has no entry left to protect, so this establishes"
+    );
+    assert_eq!(s.target, "integration/batch4");
+    assert_eq!(status_view(&s, true, 7)["target"], serde_json::json!("integration/batch4"));
+}
+
+/// **#710's other half:** the drained queue *says* it is drained.
+///
+/// Separate from the enqueue property on purpose — this is what a reader (an
+/// orchestrator, or the chrome) sees, and a status that keeps naming a branch
+/// the queue is not landing on is what sent a live orchestrator looking for a
+/// queue to drain. It is also the state the empty-target readers have to
+/// tolerate: `mergeqview::absent` already publishes `"target": ""` and
+/// `src/mergequeue.ts` already guards for it, so this is not a new wire shape.
+#[test]
+fn a_drained_queue_reports_that_it_is_landing_nowhere() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+    let s = cancelled_to_empty(&f, &gate);
+
+    assert_eq!(s.target, "", "nothing is queued, so the queue is landing nowhere");
+    let view = status_view(&s, true, 7);
+    assert_eq!(view["target"], serde_json::json!(""));
+    assert_eq!(view["entries"], serde_json::json!([]), "a terminal entry is not queued work");
+    assert_eq!(view["enabled"], serde_json::json!(true));
+    assert!(view.get("batch").is_none(), "no batch record, no batch key");
+}
+
+/// **A drained queue leaves no corpses** — reported live: the pane read
+/// `merge queue · → integration/batch3 · 4 entries` against a queue whose four
+/// entries were all cancelled and whose campaign was over.
+///
+/// Asserted through `mergeqview::project`, not only through `status_view`,
+/// because the two views disagree about terminal entries and **only the second
+/// one was ever clean**: `status_view` filters them (so the MCP tool never
+/// showed this), while `project` renders `state.entries` and reports
+/// `entries_total = state.entries.len()`, which is where the "4 entries" the
+/// human read came from. A fix pinned only at `status_view` would assert the
+/// surface that was already correct.
+#[test]
+fn a_drained_queue_leaves_no_terminal_entries_behind() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+
+    // Four entries against batch-3, every one of them cancelled — the campaign
+    // that wedged the group in the field.
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        entries: (0..4).map(|i| QueueEntry::new(600 + i, HEAD_A, 0)).collect(),
+        ..Default::default()
+    };
+    for i in 0..4 {
+        assert_eq!(
+            cancel(&mut s, 600 + i),
+            CancelOutcome::Cancelled { was: EntryState::Queued }
+        );
+    }
+
+    // The drain took the target AND the corpses with it.
+    assert!(s.entries.is_empty(), "a finished campaign leaves nothing behind: {:?}", s.entries);
+    assert_eq!(s.target, "");
+
+    // The pane the human actually read.
+    let view = loomux_lib::orchestration::mergeqview::project(
+        &serde_json::to_string(&s).expect("state serializes"),
+    );
+    assert_eq!(view["status"], serde_json::json!("ok"));
+    assert_eq!(view["entries_total"], serde_json::json!(0), "the header's count: {view}");
+    assert_eq!(view["entries"], serde_json::json!([]));
+    assert_eq!(view["target"], serde_json::json!(""));
+
+    // …and re-establishing a target starts from an empty queue rather than
+    // inheriting the old campaign's rows.
+    assert_eq!(
+        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Queued { position: 1 }
+    );
+    assert_eq!(s.target, "integration/batch4");
+    assert_eq!(s.entries.len(), 1, "only the new campaign's entry: {:?}", s.entries);
+}
+
+/// **The drain keeps `kicked-back`**, and that asymmetry is deliberate.
+///
+/// A `cancelled` entry is a request that has been honoured; a `kicked-back` one
+/// is the queue telling an owner something they have not acted on yet, and the
+/// drain is exactly when someone goes to look. Deleting it there would leave
+/// §4's "strand loudly" alive only in the audit log — and a pane showing nothing
+/// is not loud. Pinned because it is the one place the corpse purge deliberately
+/// does *less* than "drop everything terminal", so nothing but a test stops a
+/// later tidy-up from collapsing the three states into one.
+#[test]
+fn the_drain_keeps_the_conversation_it_has_not_finished() {
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        entries: vec![
+            QueueEntry::new(612, HEAD_A, 0),
+            QueueEntry::new(613, HEAD_B, 0),
+            QueueEntry::new(614, HEAD_A, 0),
+        ],
+        ..Default::default()
+    };
+    // 613 bounced — through the transition the state machine actually allows
+    // (`queued → batching → kicked-back`, §8's "a conflict costs no CI"), not by
+    // teleporting an entry into a terminal state the table would refuse.
+    advance_entry(&mut s, 613, EntryState::Batching).unwrap();
+    advance_entry(&mut s, 613, EntryState::KickedBack).unwrap();
+    assert_eq!(cancel(&mut s, 612), CancelOutcome::Cancelled { was: EntryState::Queued });
+    assert_eq!(cancel(&mut s, 614), CancelOutcome::Cancelled { was: EntryState::Queued });
+
+    assert_eq!(s.target, "", "the campaign is over either way");
+    assert_eq!(
+        s.entries.iter().map(|e| (e.pr, e.state())).collect::<Vec<_>>(),
+        vec![(613, EntryState::KickedBack)],
+        "the cancels are gone; the unanswered kick-back stays"
+    );
+
+    // And it is visible where the human looks — the pane, which counts every
+    // entry rather than only the live ones.
+    let view = loomux_lib::orchestration::mergeqview::project(
+        &serde_json::to_string(&s).expect("state serializes"),
+    );
+    assert_eq!(view["entries_total"], serde_json::json!(1), "{view}");
+    assert_eq!(view["entries"][0]["state"], serde_json::json!("kicked-back"), "{view}");
+}
+
+/// A **live** campaign keeps its corpses — but a bounded number of them.
+///
+/// Zero would drop the one durable row that tells a human *which* PR bounced;
+/// unbounded lets terminal entries push live ones out of `project`'s
+/// `VIEW_ENTRY_LIMIT` window, since it renders in file order and corpses sit at
+/// the front. `MAX_ENTRIES` does not bound this — it counts only non-terminal
+/// entries.
+#[test]
+fn a_live_campaign_bounds_the_corpses_it_keeps() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+
+    // One live entry FIRST — so the queue never drains while the rest are
+    // cancelled, and the release-on-drain path is not what is under test here.
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        entries: std::iter::once(QueueEntry::new(612, HEAD_A, 0))
+            .chain((0..20).map(|i| QueueEntry::new(800 + i, HEAD_A, 0)))
+            .collect(),
+        ..Default::default()
+    };
+    for i in 0..20 {
+        assert_eq!(
+            cancel(&mut s, 800 + i),
+            CancelOutcome::Cancelled { was: EntryState::Queued }
+        );
+    }
+    assert_eq!(s.entries.len(), 21, "612 holds the queue open, so nothing was released");
+    assert_eq!(s.target, "integration/batch3");
+
+    // A cheap refusal writes nothing — the trim happens on the path that was
+    // already rewriting the file, not on every touch.
+    assert_eq!(
+        enqueue(&f, &mut s, 612, None, true, &gate, &verdict_map(HEAD_A, "b"), 0),
+        EnqueueOutcome::Refused { reason: loomux_lib::orchestration::mqloop::refusal::ALREADY_QUEUED },
+        "the live 612 is still queued"
+    );
+    assert_eq!(s.entries.len(), 21, "a cheap refusal leaves the file alone");
+
+    // A real enqueue against the SAME target tidies as it writes.
+    let f2 = drain_fake().gh("pr view 613", 0, &pr_json("integration/batch3", HEAD_B, "b"), "");
+    assert_eq!(
+        enqueue(&f2, &mut s, 613, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Queued { position: 2 },
+        "612 and 613 are the live entries; the corpses are not queued work"
+    );
+
+    let terminal: Vec<u64> =
+        s.entries.iter().filter(|e| e.state().is_terminal()).map(|e| e.pr).collect();
+    assert_eq!(terminal.len(), MAX_TERMINAL_RETAINED, "bounded: {terminal:?}");
+    assert_eq!(
+        terminal,
+        (12..20).map(|i| 800 + i).collect::<Vec<u64>>(),
+        "the OLDEST are the ones dropped"
+    );
+    // The live work is still there, and still visible.
+    assert!(s.entries.iter().any(|e| e.pr == 612 && !e.state().is_terminal()));
+    assert!(s.entries.iter().any(|e| e.pr == 613 && !e.state().is_terminal()));
+}
+
+/// **A refused enqueue releases the stale target too** (rev N2).
+///
+/// The release is asked *before* the decision and does not depend on it, so the
+/// first touch of a drained-but-stale queue stops it naming a branch it is not
+/// landing on — rather than leaving that to the next restart's reconcile or to
+/// whichever later enqueue happens to succeed. The refusal here is
+/// constraint 7's (`base-is-default`), which fires before a target could be
+/// established, so nothing writes the target back afterwards.
+#[test]
+fn a_refused_enqueue_still_releases_a_stale_target() {
+    let f = drain_fake().gh("pr view 800", 0, &pr_json("main", HEAD_A, "b"), "");
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        enqueue(&f, &mut s, 800, None, true, &one_reviewer_gate(), &verdict_map(HEAD_A, "b"), 0),
+        EnqueueOutcome::Refused { reason: TargetRefusal::BaseIsDefault.code() },
+        "constraint 7 outranks everything and is unaffected by the release"
+    );
+    assert_eq!(s.target, "", "the queue stops naming a branch it is not landing on");
+    assert_eq!(status_view(&s, true, 7)["target"], serde_json::json!(""));
+
+    // A *disabled* queue is still byte-for-byte untouched (§12) — the release
+    // sits after that refusal, not before it.
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        ..Default::default()
+    };
+    let before = s.clone();
+    assert_eq!(
+        enqueue(&f, &mut s, 800, None, false, &one_reviewer_gate(), &verdict_map(HEAD_A, "b"), 0),
+        EnqueueOutcome::Refused {
+            reason: loomux_lib::orchestration::mqloop::refusal::QUEUE_DISABLED
+        }
+    );
+    assert_eq!(s, before, "a repo that never opted in must see no state change at all");
+}
+
+/// The other side of the same rule: **drained means both halves of §4** — no
+/// non-terminal entry *and* no batch in flight.
+///
+/// The second half is the one a narrower fix would miss. `cancel` can take the
+/// last live entry out from under an in-flight batch, and §10 abandons that
+/// batch on the *next* driver tick, not synchronously — so between the two
+/// there is a window with a scratch ref and a draft PR built for the old target
+/// still on the remote. Retargeting there would leave the driver about to land
+/// an object built from one branch onto another.
+#[test]
+fn a_queue_that_has_not_drained_still_refuses_a_different_branch() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+
+    // (1) One entry terminal, one still queued — a partial drain is not a drain.
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        entries: vec![QueueEntry::new(612, HEAD_A, 0), QueueEntry::new(613, HEAD_B, 0)],
+        ..Default::default()
+    };
+    assert_eq!(cancel(&mut s, 612), CancelOutcome::Cancelled { was: EntryState::Queued });
+    assert_eq!(s.target, "integration/batch3", "613 is still live and holds the target");
+    assert_eq!(
+        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Refused { reason: TargetRefusal::BaseNotTarget.code() }
+    );
+
+    // (2) Every entry terminal, but a batch still in flight.
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        entries: vec![QueueEntry::new(612, HEAD_A, 0)],
+        batch: Some(BatchRecord::new("mq-710", vec![612], 0)),
+        ..Default::default()
+    };
+    assert_eq!(cancel(&mut s, 612), CancelOutcome::Cancelled { was: EntryState::Queued });
+    assert_eq!(
+        s.target, "integration/batch3",
+        "an in-flight batch was built against this target and has not been abandoned yet"
+    );
+    assert_eq!(
+        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Refused { reason: TargetRefusal::BaseNotTarget.code() },
+        "the landing path reads state.target: retargeting under a live batch would \
+         land an object built from one branch onto another"
+    );
 }
 
 // ── the two notices (§5, §9) ────────────────────────────────────────────────
@@ -2580,6 +2943,19 @@ fn a_cancelled_member_abandons_the_in_flight_batch() {
     );
     assert!(rep.audits.iter().any(|a| a.action == "mq-batch-aborted"));
     assert_no_orphan_in_flight(&s, "after a cancel abandoned the batch");
+    assert_eq!(s.target, "integration", "613 requeued, so the target is still held");
+
+    // …and when the cancels took the last live entry with them, abandoning the
+    // batch is also the transition that drains the queue. That path cleared the
+    // batch record without asking §4's release question, which is how #710's
+    // wedge was reached in the field: a cancelled batch, an empty queue, and a
+    // target nothing would ever clear.
+    let f = drive_fake();
+    let mut s = in_flight_state("mq-cancel02", &[612], 641);
+    s.entries[0].advance(EntryState::Cancelled).unwrap();
+    drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+    assert!(s.batch.is_none(), "the batch is abandoned");
+    assert_eq!(s.target, "", "a queue drained by cancellation is landing nowhere");
 }
 
 /// The draft PR's number comes back from `gh pr create`'s URL, and an answer
