@@ -17,7 +17,11 @@ use crate::obs::LockExt;
 
 /// Cap on the per-pty output ring used by orchestration's `get_output` —
 /// enough for a few screens of TUI history without unbounded growth.
-const OUTPUT_RING_CAP: usize = 256 * 1024;
+///
+/// `pub(crate)` for orchestration's Tier 1 scan (#685): a read that widens
+/// itself needs a ceiling, and the ring is the only honest one — no request
+/// past it can return a byte the ring does not hold.
+pub(crate) const OUTPUT_RING_CAP: usize = 256 * 1024;
 
 /// Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (issue #78).
 ///
@@ -1499,6 +1503,19 @@ mod tests {
         cmd.get_argv()[0].to_string_lossy().into_owned()
     }
 
+    /// File-name component of argv[0] — what "is this a shell?" assertions
+    /// must key on. Never the whole `prog()` path: on a temp-dir fixture the
+    /// path carries a random directory segment that can itself contain "sh"
+    /// (e.g. `.../shq7f2ab/agent`), which made this flake platform-agnostic
+    /// (#183) even though the resolved binary was never a shell.
+    fn bin_name(cmd: &CommandBuilder) -> String {
+        Path::new(&prog(cmd))
+            .file_name()
+            .expect("argv[0] must have a file-name component")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Serializes the tests that mutate process-global env vars
     /// (`LOOMUX_NO_DIRECT_SPAWN`, `CARGO_TARGET_DIR`) so they can't race each
     /// other's reads.
@@ -1509,7 +1526,12 @@ mod tests {
     #[test]
     fn direct_spawn_selection() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        // Prefix deliberately contains "sh": pins that the shell check below
+        // must key on the binary's file name, not the whole path — a random
+        // tempdir segment containing "sh" is exactly what made this flake
+        // (#183), so the fixture now forces that condition every run instead
+        // of leaving it to chance.
+        let tmp = tempfile::Builder::new().prefix("agentsh_").tempdir().unwrap();
         let exe = tmp.path().join(if cfg!(windows) { "agent.exe" } else { "agent" });
         std::fs::write(&exe, b"x").unwrap();
         let exe_str = exe.to_string_lossy().into_owned();
@@ -1526,8 +1548,10 @@ mod tests {
         assert_eq!(av[1], "--model");
         assert_eq!(av[2], "opus");
         assert!(
-            !prog(&direct).contains("pwsh") && !prog(&direct).contains("sh"),
-            "a direct spawn must not go through a shell"
+            !bin_name(&direct).contains("pwsh") && !bin_name(&direct).contains("sh"),
+            "a direct spawn must not go through a shell, got binary {:?} (full path {:?})",
+            bin_name(&direct),
+            prog(&direct)
         );
 
         // No argv → shell wrapper runs the command string (plain/custom panes).

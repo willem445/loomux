@@ -100,26 +100,38 @@ context — exactly the persistence vector #189's threat model warns about,
 just with the repo itself as the untrusted-content carrier instead of an
 issue comment. Four guardrails, all enforced in `lessons.rs`, none optional:
 
-1. **Hard byte cap, oldest-drop.** `LESSONS_BYTE_CAP` (4096 bytes, roughly
-   1,000 tokens — a few paragraphs' worth, not a novel) bounds the
-   **untrusted lesson content read from the file** — that is what
-   `load_lessons_note` returns, and it is the only part of the injected block
-   that scales with the file. An oversized file is truncated to its **last**
-   `CAP` bytes of *that content*, cut forward to the next line boundary so
-   truncation never opens mid-sentence, with a one-line notice prepended
-   naming the full path. **Oldest-drop, not reject-at-cap:** the convention
-   (argued below) is newest lessons appended at the bottom, so keeping the
-   byte-suffix keeps the most recently learned, presumably most relevant
-   entries and drops the stalest ones — a graceful degradation. Reject-at-cap
-   would deny the *entire* file over one contributor's over-long entry, which
-   is worse for availability (all lessons gone vs. the oldest few) and
-   directly conflicts with the "malformed file degrades, never denies"
-   requirement below — an oversized file is not malformed, and treating it as
-   fatal would be inconsistent with how this design treats a genuinely broken
-   one. The cap does **not** bound the total bytes a kickoff gains: the fixed
-   provenance framing and sentinel lines below (guardrail 2) add a small,
-   constant ~524 bytes of *trusted* text on top, independent of file size —
-   don't read "4096-byte cap" as a promise about the whole injected block.
+1. **Hard byte cap, whole-entry eviction, oldest first (#498).**
+   `LESSONS_BYTE_CAP` (4096 bytes, roughly 1,000 tokens — a few paragraphs'
+   worth, not a novel) bounds the **untrusted lesson content read from the
+   file** — that is what `load_lessons_note` returns, and it is the only part
+   of the injected block that scales with the file. An oversized file is
+   brought under the cap by **dropping whole entries**, in this order: the
+   preamble, then unpinned entries oldest-to-newest, then pinned ones
+   oldest-to-newest — with a one-line notice prepended that **names every
+   entry it dropped** and points at the full file. **Degrade, not
+   reject-at-cap:** the convention (argued below) is newest lessons appended
+   at the bottom, so dropping from the top keeps the most recently learned,
+   presumably most relevant entries. Reject-at-cap would deny the *entire*
+   file over one contributor's over-long entry, which is worse for
+   availability and directly conflicts with the "malformed file degrades,
+   never denies" requirement below — an oversized file is not malformed.
+
+   The unit is an entry, not a byte, because the first cut of this kept the
+   last `CAP` bytes: the window could open *inside* an entry, so its body was
+   injected headless under whatever heading preceded the cut, and the notice
+   said only that "earlier lessons" were gone, never which. On this repo's own
+   file that put the getrandom safety constraint outside every kickoff, seen
+   by nobody. Two fallbacks keep the degrade-never-deny promise when there is
+   no entry structure to evict on: a file with **no `## ` heading at all**
+   takes the original byte-suffix cut (cut forward to a whole line), and a
+   **single entry larger than the whole cap** is byte-cut too, with the notice
+   saying so. The cap does **not** bound the total bytes a kickoff gains: the
+   fixed provenance framing and sentinel lines below (guardrail 2) add a
+   small, constant ~524 bytes of *trusted* text on top, and the eviction
+   notice adds at most `NOTICE_BYTE_CAP` more — the notice quotes headings,
+   which are untrusted bytes, so it is bounded twice (each title clipped, the
+   list closed with "and N more") rather than trusted to stay short, and it is
+   injected *inside* the sentinels for the same reason.
 2. **Provenance framing with an explicit end, always.** The injected block is
    never bare text, and a leading sentence alone is not enough: nothing would
    *close* the untrusted region, so lesson content that happened to end in
@@ -178,10 +190,41 @@ one difference being workflow.yml has a *schema* it can fail, so its failure
 mode is "parse error, audited, fall back to the default roster," while
 lessons.md has no schema to fail against at all.
 
-## Format convention (not enforced, documented for the dogfood file)
+## Format convention, and the one thing the reader now depends on
 
 Newest entries appended at the bottom (an append log, matching how a PR adds
 to it over time), each as a `## ` heading naming the constraint plus a short
-body. Nothing parses these headings — they exist for human/agent
-readability and so the byte-suffix cap tends to cut between (rather than
-inside) entries in practice, not because the cap depends on it.
+body.
+
+Since #498 the `## ` heading is the **eviction boundary** — the one piece of
+the convention `lessons.rs` reads. It is still not a schema and there is
+nothing to fail: headings are found by "a line starting with `## `", a file
+with none falls back to the byte-suffix cut, and content is never rewritten.
+But it does mean a heading is now load-bearing for *what a kickoff carries*,
+so it is a file-format contract and belongs here:
+
+- **A `## ` line inside a fenced code block is not a boundary.** An entry that
+  *quotes* a heading — an entry about this format is the obvious case, and the
+  user docs quote `## … [pinned]` as an example — stays one entry. Without
+  this the splitter would cut an entry at the line it merely quotes, and
+  eviction could keep the far half under a heading the file never declared,
+  or read a quoted `[pinned]` as a real pin: exactly the defect this design
+  removes, re-introduced by a file that talks about the rule. Fences follow
+  CommonMark's shape (3+ backticks or tildes, ≤3 spaces of indent, closed by
+  a bare run at least as long, unclosed runs to EOF); the nuances left out
+  degrade to "that line is a boundary after all", never to an error.
+- **`[pinned]` in a `## ` heading** (`PIN_MARKER`) moves that entry to the
+  back of the eviction order — it survives while newer unpinned entries are
+  dropped around it. Position stops deciding whether a safety constraint
+  reaches a kickoff; the file gets to say so.
+- **A pin is a priority, not an exemption.** If the pinned entries *alone*
+  still exceed the cap, the oldest pin is evicted like anything else. The cap
+  is the #189 bound on untrusted bytes reaching an agent, and nothing written
+  inside the file may argue past it — pinning everything is the same as
+  pinning nothing.
+- **The marker is injected verbatim**, like every other byte of a heading.
+  This module reads the convention; it never edits the file.
+
+Pinning is for the entries whose absence is a safety failure (a "the binary
+won't load" constraint), not for whatever feels important this week — the more
+that is pinned, the closer the file gets back to eviction by position.

@@ -1607,11 +1607,33 @@ sizing is best-effort; the honesty is structural** — which is the right way ro
 best-effort number that quietly reports its own failures as observations is exactly what #559
 was.
 
-One invariant the code depends on, stated so an edit cannot lose it silently: **every box read for
-a given delivery must use the same `tier1_scan_bytes`.** A precondition verified against a wide
-tail and then polled against a narrow one would read the box as cleared on the first poll and
-confirm a delivery nothing observed. The five call sites (precondition, confirm loop, retry loop,
-and the late monitor's two) all size from `pasted_text` for that reason.
+One invariant the code depends on, stated so an edit cannot lose it silently: **a box read must
+never be narrower than the read whose answer it is revisiting.** A precondition verified against a
+wide tail and then polled against a narrow one would read the box as cleared on the first poll and
+confirm a delivery nothing observed. Until #685 that was enforced by size equality — all five call
+sites (precondition, confirm loop, retry loop, and the late monitor's two) computed the same
+`tier1_scan_bytes` from the same `pasted_text`.
+
+Since #685 it is enforced two ways at once, and the distinction matters to anyone editing here:
+
+- **Within one `Tier1Scan`, reads are monotone.** Its floor starts at `tier1_scan_bytes` and only
+  ever rises, so the confirm loop and the retry loop can never poll narrower than the precondition
+  read they are revisiting. This is the case the invariant was written for, and it is now strictly
+  stronger than equality.
+- **There are two `Tier1Scan` instances, not one** — `deliver_now`'s (precondition, confirm loop,
+  retry loop) and `run_late_confirmation_monitor`'s (its two arms). They are independent, on
+  different threads, and the monitor's floor starts at `tier1_scan_bytes` again, so its first
+  *request* can be narrower than a widened request `deliver_now` already made. What makes that safe
+  is not the request size: **every read widens itself before anything classifies it**, so what a
+  reading is decided from is a tail that covers the containment window whenever the pane's density
+  allows it at all — and when it does not, the tail is shorter than the needle and `box_reading`
+  returns `Unverifiable`, never `NotHolding`. A narrower first request costs a re-read, not a
+  confirm.
+
+The load-bearing property, stated plainly so it is the one an edit has to preserve: **what makes a
+`NotHolding` trustworthy is that the read covered the window, not that it matched some earlier
+read's byte count.** Size equality was a proxy for that, and a poor one — two byte-equal reads
+taken seconds apart already saw different tails as the ring filled.
 
 #### Measuring the residual, rather than tuning against a guess (#583)
 
@@ -1652,7 +1674,7 @@ read, never a second one — and both records carry it as `tier1_scan_census`:
 
 | Field | Meaning |
 |---|---|
-| `requested_bytes` | what `tier1_scan_bytes` asked the ring for |
+| `requested_bytes` | what the ring was asked for — since #685 the **final** request of a read that may have widened itself, not the `tier1_scan_bytes` floor it started from |
 | `tail_bytes` | raw bytes the ring actually returned; `null` = no read at all (pty gone) |
 | `tail_chars` | what those bytes came to after `strip_ansi` + `normalize_prompt_text` |
 | `paste_chars` | the needle's own normalized length (**not** `tier1_paste_bytes`, which is raw) |
@@ -1710,6 +1732,8 @@ what each one implies:
    slack is the problem, and the fix is sized from the measured low-percentile retention: either a
    proportional slack (ask for `paste / ρ` rather than `paste + K`) or strip before sizing and re-read.
    Both cost scan bytes per delivery, which is why neither is worth doing on a guess.
+   **This is what the live run came back as, and #685 took the second option — see the next
+   section.**
 3. **`unverifiable` with `tail_bytes < requested_bytes`** — a short ring, not density. Widening the
    slack buys nothing; the pane had not spoken yet, and only waiting or re-reading would help.
 4. **`paste_chars` past the ceiling** — the proven regime above. Read it separately or it will
@@ -1725,6 +1749,70 @@ no new vocabulary, and no change to any existing field. `Tier1ScanCensus::to_jso
 place the shape is built, for the same reason `BoxReading::as_str` sits next to its enum — two
 records of one fact in two vocabularies cannot be aggregated, and this record exists only to be
 aggregated.
+
+#### Sizing the window in post-strip characters (#685)
+
+The measurement came back as reading 2. Over 400 live Tier 1 reads on beta4, retention ran ~50%,
+and verification coverage collapsed with paste size: 58% `unverifiable` in the 1.5-2 KiB bucket and
+**100% from 2.5 KiB up**. Zero false confirms in either regime — the residual was always the safe
+direction — but from a couple of KiB up, `box_reading` was answering out of arithmetic and the pane
+was never consulted. That is not verification; it is a decline wearing a reading's name.
+
+**The unit was the bug.** The read asked for `paste_chars + BOX_TAIL_SCAN_BYTES` *raw bytes* and the
+comparison spends *post-strip characters*, so at ~50% retention the read handed the comparison about
+half the haystack it asked for — and because the slack is a constant, the shortfall grows with the
+paste until it crosses the needle's own length.
+
+So `Tier1Scan` counts the budget in the unit that is actually spent:
+
+1. read at the `tier1_scan_bytes` floor — exactly what #559 asked for;
+2. measure what survived `strip_ansi` + `normalize_prompt_text` **in this pane**;
+3. if that is short of the containment window, re-request scaled by the retention this tail just
+   demonstrated: `requested × target ÷ tail_chars`.
+
+**Why measured rather than a constant.** A proportional slack (`paste / ρ`, the other option above)
+needs one ρ for every CLI, and #583's whole finding is that density is a property of a *repaint
+stream* — a constant would be right for one CLI and wrong for the next, and it would over-read on
+every ordinary delivery to buy headroom the ordinary delivery never needed. Scaling by what the read
+in hand actually returned needs no ρ at all.
+
+**What bounds it:**
+
+- **The target is the containment window**, `paste + BOX_TAIL_WINDOW_SLACK` — the last of the
+  normalized tail `box_holds_paste` ever looks at, not the whole 4 KiB budget. An ordinary delivery
+  clears it on the first read and never widens, so only a read that was truncating the comparison
+  costs anything (`an_ordinary_delivery_still_takes_exactly_one_read`).
+- **`TIER1_SCAN_MAX_BYTES` still caps the target**, so a paste past the ceiling stays `Unverifiable`
+  at any density — the widening cannot raise a ceiling nobody decided to raise
+  (`a_paste_past_the_ceiling_is_still_unverifiable_however_wide_the_ring_is`).
+- **A read the ring under-fills ends the widening on the spot.** Fewer bytes back than asked for
+  means the ring holds no more, so no wider request can add one. This is reading 3's short-*pane*
+  regime, and #685 leaves it exactly where it was: honestly `Unverifiable`.
+- **`TIER1_SCAN_WIDEN_ROUNDS`** bounds the re-reads regardless, and running out classifies the
+  widest read taken rather than no read at all. The raw ceiling is `OUTPUT_RING_CAP` — the whole
+  readable universe, derived rather than picked, and in practice far above where the scaled request
+  lands.
+
+**Why this cannot manufacture a confirm.** The hazard needs a read *narrower* than the one it is
+revisiting — one that sees the box cut mid-paste, reads `NotHolding`, and confirms a delivery
+nothing observed. Two things rule it out. The first request is `tier1_scan_bytes` unchanged and
+widening only grows it, so **no read after this change is narrower than the read the same call site
+took before it**; and within a `Tier1Scan` the floor only rises, so a poll is never narrower than
+the precondition it revisits (see the invariant above for what that does and does not cover across
+the two instances). `box_reading` is untouched; `Unverifiable` governs everywhere it did.
+
+**The residual this does not close**, stated rather than left for a reader to find: a read landing
+between `paste_chars` and `paste_chars + BOX_TAIL_WINDOW_SLACK` post-strip characters can still
+return `NotHolding` off a tail truncated mid-paste, because `box_reading`'s own threshold is the
+needle's length, not the window's. That band is pre-existing and #685 makes it strictly rarer by
+driving reads to cover the whole window; narrowing it further means changing the *classifier*, which
+is a separate decision.
+
+**What is deliberately NOT decided here.** #685 also asks what verification should *claim* for a
+paste larger than a whole coalesced flush — the regime above the ceiling, where no window sizing
+reaches and the only options are a different ceiling or a different channel. That is a posture
+question with a human's name on it, and this change does not pre-empt it: the ceiling is the same
+number it was, and the same regime is still `Unverifiable`.
 
 #### Tier 2: the hook, no longer bounded by the window
 
@@ -2090,7 +2178,8 @@ pure function over pinned `--json` fields, testable with canned fixtures and no 
   `main` had no `pr_head` — it exists only on the not-yet-merged `feat/222-custom-workflows`
   branch (user-defined agent workflows). A follow-up should fold `pr_head` into
   `gh_capture` once #222 merges, rather than keep two copies of the same subprocess shape
-  permanently; noted here so it isn't lost.
+  permanently; noted here so it isn't lost. The wait itself is bounded rather than an
+  `output()` — see "Bounding one tick (#656)" below.
 - **The tick split** (the `watchdog_tick` shape, exactly): `poll_watches(&self)` is the
   impure half — shells out to `gh` for each id `notify::due_watches` selects, and classifies
   each result with the pure predicate. **The selection policy itself is pure**, not just the
@@ -2125,6 +2214,10 @@ pure function over pinned `--json` fields, testable with canned fixtures and no 
 | `MAX_WATCHES_PER_GROUP` | 12 | per-group cap; a rejection names it (independently of the per-agent cap) |
 | `NOTIFY_EXPIRES_DEFAULT_MIN` / `_MIN` / `_MAX` | 60 / 5 / 240 | TTL default and clamp (`Guardrails::clamped` idiom — never reject a plausible number, never trust it unclamped) |
 | `NOTIFY_FAIL_STREAK_LIMIT` | 3 | consecutive `gh` failures (auth, `gh-not-found`, unknown PR/run) before the watch is cancelled rather than polled forever against nothing |
+| `GH_CAPTURE_TIMEOUT` | 20s | bound on ONE `gh` child; a stalled subprocess would otherwise park the single poll loop and every notice with it (#656 — see "Bounding one tick") |
+| `MAX_INTAKE_POLLS_PER_TICK` | 4 | groups the intake half polls per scan — 2 `gh` calls each, so the same 8-call budget as `MAX_POLLS_PER_TICK` (#656) |
+| `GH_CAPTURE_REAP_TIMEOUT` | 2s | bounds the post-kill reap, so no arm of the bounded wait is itself unbounded (#656) |
+| `GH_CAPTURE_MAX_LEAKED_READERS` | 16 | process-wide ceiling on readers abandoned by timed-out captures; past it a capture is refused rather than spawned (#656) |
 
 ### Predicates and the "no checks reported" trap
 
@@ -2444,7 +2537,8 @@ check-state transitions.
   every **autonomous** group whose EFFECTIVE `intake_poll_minutes`
   (`intake::effective_intake_poll_minutes` — #429's smart default, resolved fresh every scan) is
   nonzero and due (`intake::due_intake_polls`, the `notify::due_watches` per-group-interval
-  idiom) — shells out
+  idiom, plus that idiom's per-tick cap and oldest-polled-first ordering — see "Bounding one
+  tick") — shells out
   to `gh issue list --json number,title,labels` and `gh pr list --json
   number,title,statusCheckRollup` (via the existing `gh_capture` helper `poll_watches` already
   uses; no new subprocess plumbing) and diffs the result against that group's last-seen state
@@ -2585,19 +2679,7 @@ was default-off, a latent coupling once it isn't. #406 folds them into one loop:
   clocks, and a budget number nothing reads would be a claim with no consumer (the repo's "a
   claim is a deliverable" lesson). Per-tick `gh` budgeting IS wanted — it is the rest of #406's
   ask — but as a bound a scheduler enforces, not a number it reports; one loop is the
-  precondition for it, and #656 carries the concrete shape (`notify::MAX_POLLS_PER_TICK`
-  applied to the intake half's due list).
-- **The accepted cost of one loop: one hang parks everything (#656).** `gh_capture` has no
-  timeout (pre-existing). With two threads, a `gh` stalled on a dead connection froze only its
-  own feature; with one, a hang in either half parks the loop and **all** `notify_when` watches
-  stop resolving indefinitely — which the fleet's "register the watch and end the turn"
-  discipline (#590) depends on. The per-tick exposure is also asymmetric: the notify half is
-  capped at `notify::MAX_POLLS_PER_TICK` (8), while the intake half is 2 `gh` calls per due
-  group with no cap, so N groups due on one scan wake is 2N sequential subprocesses inside one
-  tick. Both are tracked in #656 (a bounded wait on the subprocess; the `due_watches` cap idiom
-  applied to `due_intake_polls`), and that per-tick cap is the concrete remainder of #406's
-  "one shared rate-limit-aware scheduling policy" — this section delivers the single loop and
-  the single clock, not a cross-half budget.
+  precondition for it, and "Bounding one tick" below is that bound.
 - **What the tests pin.** `app_setup_starts_exactly_one_gh_polling_loop` parses `src/lib.rs`'s
   setup block (the `tests/acl_manifest.rs` precedent) — "how many threads call `gh`" is a property
   of that call list and of nothing else, so a future `start_*_poller` added beside it fails this
@@ -2606,6 +2688,95 @@ was default-off, a latent coupling once it isn't. #406 folds them into one loop:
 
 `start_workflow_gate_reload` is deliberately **not** folded in: it reads a file, not `gh`, so it
 spends none of the budget this section is about.
+
+### Bounding one tick (#656)
+
+One loop means one tick's `gh` work is the whole process's `gh` work, so that work has to be
+finite in both directions: no single call may wait forever, and no single wake may make an
+unbounded number of calls. Neither held before #656 — and the first mattered more after #406
+than before it, because a hang that used to freeze one feature now stops every `notify_when`
+notice in the process, which is what the fleet's "register the watch and end the turn"
+discipline (#590) rests on.
+
+- **Per call: `capture_with_timeout`.** `gh_capture` builds the `Command` and hands it to
+  `OrchRegistry::capture_with_timeout(cmd, GH_CAPTURE_TIMEOUT)`, which spawns, waits to the
+  deadline, and kills the child rather than waiting past it. A timeout is returned as the
+  ordinary `Err` both callers already classify: `poll_watches` counts it toward
+  `NOTIFY_FAIL_STREAK_LIMIT`, `poll_intake` skips that half of its diff and still stamps the
+  attempt. No new failure channel, no new dependency (a std spawn plus a manual deadline —
+  every timeout crate in reach pulls `getrandom`-adjacent weight this crate refuses, and none
+  of them is needed for one deadline).
+- **Why the bound is generous rather than tight.** A false timeout is not free: three of them
+  in a row cancel a watch that was about to resolve. A live `gh` call lands in ~1s and a
+  genuinely stalled one hangs for minutes or forever, so the two cases separate at any value in
+  a wide band, and erring long costs only a slower tick. Worth stating the price plainly: with
+  both caps, a tick makes at most 8×2 + 4×2 = 24 calls, so an all-stalled tick is bounded at
+  ~8 minutes rather than at infinity. That is a bound, not a comfortable one — it is the
+  pathological case (every call stalling at once), and tightening it further is a job for a
+  cross-half per-tick budget, which #406 deliberately did not ship and this does not either.
+- **Why both pipes are drained on their own threads.** The obvious shape — poll `try_wait`,
+  read the output once the child reports exit — deadlocks against the very calls this poller
+  makes: `gh issue list --json` on a busy repo outruns the OS pipe buffer, and a child blocked
+  writing into a full pipe never exits. That shape would turn a healthy call into a timeout
+  every tick, i.e. trade the hang for an outage. On the *timeout* path the readers are left to
+  end with their pipe instead of being joined: a grandchild can hold the handle past the kill,
+  and joining would reinstate exactly the unbounded wait being removed.
+- **What bounds the abandoned readers, per process rather than per tick.** Not joining them
+  bounds one call; it does not bound the process, and the case that justifies not joining is
+  precisely the case where they never end — while a persistently stalling condition is
+  re-polled every tick. So an abandoned reader is parked in `GH_CAPTURE_LEAKED_READERS`, every
+  capture first sweeps the ones that have since ended, and a capture is refused once
+  `GH_CAPTURE_MAX_LEAKED_READERS` (16 — two per timed-out call, against a 24-call tick) are
+  still blocked. Be explicit about the trade: past the ceiling `gh` polling in this process
+  stops until the backlog drains, and against a grandchild that holds a pipe forever it never
+  drains. That is the deliberate direction — a named `Err` both callers already surface (a
+  watch cancelled with a reason someone can read) beats thread growth nothing reports, and it
+  is diagnosable where a thousand parked threads are not. In the ordinary stall the child IS
+  `gh`: killing it closes both pipes, the readers end at once, and the backlog stays empty.
+- **No arm of the bound is itself unbounded.** Every wait on a child goes through
+  `wait_bounded`, including the post-kill reap on the timeout path (`GH_CAPTURE_REAP_TIMEOUT`).
+  A bare `wait()` there would be the one place a "bounded" path could still block forever: the
+  kill has landed in every ordinary case, but a child in uninterruptible sleep does not die
+  until it leaves that state. Outliving the reap leaves an unreaped child — a PID-table entry
+  until the process exits — which is the cheaper residue and, unlike the wait, a bounded one.
+- **Per tick: both halves are capped.** The notify half already had `MAX_POLLS_PER_TICK` (8).
+  The intake half now has `intake::MAX_INTAKE_POLLS_PER_TICK` (4) — expressed as the same
+  *`gh`-call* budget rather than the same group count, since a due group costs two calls. Before
+  it, N autonomous groups falling due on one scan wake was 2N sequential round-trips inside a
+  single tick, and every watch notice waited behind them. What the cap costs in exchange: a
+  group's effective cadence becomes `max(intake_poll_minutes, ceil(N/4) scans)` — the scan
+  itself is `INTAKE_POLL_SCAN_INTERVAL` (60s), so 20 autonomous groups all due at once are all
+  polled within 5 scans rather than in one burst. That is why `docs/autonomous-mode.md` calls
+  the per-group setting a floor rather than a schedule.
+- **The cap's ordering is load-bearing, not cosmetic.** `due_intake_polls` reads a `HashMap`, so
+  a bare truncation would cut the due list at an arbitrary — but, for a given hash seed, stable
+  — point and starve whichever groups landed on the wrong side of it. Sorting by `last_poll_ms`
+  (ties broken on the group id, so the answer is stated rather than hash-dependent) makes the
+  group this scan deferred the oldest, and therefore the first one the next scan takes: the cap
+  is a queue, not a drop. Note the asymmetry this creates with the idiom it copies:
+  `notify::due_watches` sorts by `last_poll_ms` with **no** tiebreak, and every watch registers
+  at `last_poll_ms: 0`, so a fresh cohort larger than `MAX_POLLS_PER_TICK` is selected among in
+  `HashMap` order. That is not a starvation (each polled watch gets a real stamp and leaves the
+  zero cohort, so the cohort drains), which is why it is left alone — but if the two selectors
+  are ever unified, align `notify` **up** to the tiebreak rather than aligning `intake` down.
+- **What the tests pin.** `capture_with_timeout_stops_waiting_on_a_stalled_child` asserts
+  ELAPSED time against a child that outlives its bound 20x — an implementation that said "timed
+  out" only once `output()` finally returned would satisfy the message and none of the point.
+  `capture_with_timeout_drains_output_larger_than_a_pipe_buffer` is the regression pin on the
+  reader threads (a ~512 KiB child, past every platform's default buffer). `wait_bounded` is
+  pinned on both arms (a live child reported at the deadline, an exited one reported with its
+  status), and the reader ceiling on all three of its own: the pure admission boundary, the
+  refusal-then-drain cycle (driven through a seam that parks controllable blocked readers, so
+  it is deterministic on every platform), and — the one that keeps the rest honest — that a
+  timeout whose child left a grandchild holding the pipes really does park its readers where
+  the ceiling can see them. Those tests take a shared serial lock, since the backlog is
+  process-wide state and this binary runs in parallel. The intake cap is
+  pinned pure in `intake.rs` (cap, oldest-first ordering, deterministic tiebreak, and
+  two-scans-cover-every-group) and on a live registry in
+  `poll_intake_caps_one_scan_and_polls_the_deferred_groups_on_the_next`. None of them shells out
+  to `gh`: the subprocess tests drive a deliberately slow/chatty/failing shell command, and the
+  registry test's groups point at nonexistent repo paths, so every `gh_capture` inside it
+  returns at its "no such directory" guard before a program is resolved.
 
 ## Compact-nudge (#287)
 

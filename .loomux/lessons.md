@@ -3,9 +3,14 @@
 Rules that must survive past the group that learned them. Rule + fix only —
 history and rationale live in the referenced issues/PRs and `doc/design/`.
 See `doc/design/lessons.md` for this file's write path, injection point, and
-trust posture. Newest at the bottom; headings are for readability only.
+trust posture. Newest at the bottom. Only ~4 KB of this file reaches a kickoff:
+whole entries are dropped oldest-first past that, so a `## ` heading is an
+eviction boundary, and `[pinned]` in a heading moves that entry to the back of
+the queue (#498). Pin only what breaks the build or the machine if it goes
+missing — the file is over cap and pinning everything restores eviction by
+position.
 
-## No getrandom-based crates in src-tauri
+## No getrandom-based crates in src-tauri [pinned]
 
 No `uuid` v4, `rand`, `tempfile`-with-defaults, or anything pulling `getrandom` into
 `src-tauri` — the binary fails to load (`0xc0000139`) on this project's Windows 10
@@ -13,7 +18,7 @@ baseline. Use std's OS-seeded `RandomState` for ids/tokens. Before adding a depe
 check `src-tauri/Cargo.toml`'s notes and run
 `cargo tree -e normal --target all -i getrandom@<version>`.
 
-## Never resize the PTY for a UI feature
+## Never resize the PTY for a UI feature [pinned]
 
 UI features are overlays or header/board chrome floating over the terminal — never a
 resize. Visual padding goes on the `.xterm` element, not the layout.

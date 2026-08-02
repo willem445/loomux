@@ -7,6 +7,15 @@
 //! applies to integration-test targets.
 
 use loomux_lib::orchestration::intake;
+// #656: the intake half's per-scan `gh` budget, asserted against the constant
+// itself so the pin follows a future retune instead of pinning today's 4.
+use loomux_lib::orchestration::intake::MAX_INTAKE_POLLS_PER_TICK;
+// #656 (rev-lead findings 1 and 2): the bounded child wait, and the
+// process-wide ceiling on readers abandoned by a timed-out capture.
+use loomux_lib::orchestration::{
+    gh_capture_admitted, gh_capture_live_readers, seed_leaked_readers_for_test, wait_bounded,
+    GH_CAPTURE_MAX_LEAKED_READERS,
+};
 use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::notify;
 use loomux_lib::orchestration::queue;
@@ -91,6 +100,8 @@ use loomux_lib::orchestration::{
     box_reading, tier1_scan_bytes, BoxReading,
     // #583: the same read, measured — is `Unverifiable` the near-cap norm?
     Tier1ScanCensus,
+    // #685: it was — so the window is sized in post-strip chars, by re-reading.
+    Tier1Scan, TIER1_SCAN_WIDEN_ROUNDS,
     HUMAN_INPUT_BLOCK_BOUND_MS, UNCONFIRMED_ACK_SETTLE_MS, UNCONFIRMED_NOTICE_IDS_MAX,
     record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
@@ -581,10 +592,15 @@ fn a_loomux_fault_is_labelled_as_one_and_never_as_a_policy_refusal() {
     let v = reg.queue_merge("no-such-group", 612, None);
     assert_eq!(v["refused"], json!("queue-unavailable"));
 
-    // And all three are flagged as faults by the predicate the tool descriptions
+    // And all four are flagged as faults by the predicate the tool descriptions
     // and any future caller branch on — so the distinction cannot be lost by
     // someone re-listing the strings and missing one.
-    for label in ["queue-state-unreadable", "queue-state-unwritable", "queue-unavailable"] {
+    for label in [
+        "queue-state-unreadable",
+        "queue-state-unwritable",
+        "queue-unavailable",
+        "gate-unreadable",
+    ] {
         assert!(loomux_lib::orchestration::mqloop::refusal::is_loomux_fault(label), "{label}");
     }
     for label in ["queue-disabled", "not-queued", "gate-not-met", "base-is-default"] {
@@ -635,6 +651,56 @@ fn a_queue_change_that_cannot_be_persisted_is_reported_as_unwritable() {
          not 'that PR was never queued'"
     );
     assert_eq!(v["cancelled"], Value::Null, "a fault never also reports success");
+}
+
+/// The gate half of #681: a `merge_gate` file that is ON DISK but an I/O error
+/// (here, permission denied) keeps loomux from reading it must refuse
+/// `gate-unreadable` — a loomux FAULT — never a policy refusal, which asserts
+/// something read a well-formed answer out of the file (present-and-declared,
+/// present-and-empty, or absent) rather than failing to read it at all.
+///
+/// This fixture's own repo has no `merge_queue:` block (`setup_mcp()`'s fake
+/// repo carries no `workflow.yml`), so `merge_queue_enabled` is false and the
+/// pre-fix label here is `queue-disabled`, not literally `gate-not-configured`
+/// — that one only fires once the queue is enabled and enqueue reaches the
+/// gate check. The property this test actually pins is the more general one
+/// #681 asked for: **a gate-read fault preempts every policy question**,
+/// `queue-disabled` included, the same way `STATE_UNREADABLE` already
+/// preempts it above — not merely the one policy label the issue happened to
+/// name. A malformed (but readable) gate file is NOT this case — it still
+/// parses fine as far as `fs::read_to_string` is concerned and correctly
+/// stays `gate-not-met` via `GateSpec::Malformed`, covered by the existing
+/// gate tests in mergequeue.rs.
+///
+/// `#[cfg(unix)]` for the same reason as the unwritable test above: Windows
+/// has no portable way to make an existing file's own read fail.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_gate_file_is_labelled_as_a_fault_never_a_policy_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+    let (reg, d, co, _cw) = setup_mcp();
+    let gate_file = d.path().join(&co.group).join("merge_gate");
+    fs::write(&gate_file, "require all-pass\nreviewer rev-a\n").unwrap();
+
+    // Readable state (none written — `load_state` defaults cleanly), but the
+    // gate file itself cannot be opened for reading.
+    fs::set_permissions(&gate_file, fs::Permissions::from_mode(0o000)).unwrap();
+    let v = reg.queue_merge(&co.group, 612, None);
+    // Restored before asserting, so a failure cannot leave an unreadable file
+    // behind for the tempdir's own cleanup.
+    fs::set_permissions(&gate_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        v["refused"],
+        json!("gate-unreadable"),
+        "an unreadable gate file must never masquerade as a policy refusal — \
+         here, pre-fix, it would read as 'queue-disabled' ('the repo never opted \
+         in'), when the truth is a loomux fault"
+    );
+    assert!(
+        loomux_lib::orchestration::mqloop::refusal::is_loomux_fault("gate-unreadable"),
+        "gate-unreadable must be flagged as a loomux fault, not a policy refusal"
+    );
 }
 
 /// A malformed `pr` argument is rejected before anything is resolved — the
@@ -30727,6 +30793,308 @@ fn intake_half_keeps_its_scan_floor_while_notify_runs_every_wake() {
     assert_eq!(reg.intake_last_poll_at(&gid), Some(wake1 + 60_000), "…and that scan ran too, restamping the group");
 }
 
+// ---------- bounding one poll tick (#656): the subprocess wait, the intake fan-out ----------
+//
+// Still no `gh` and no agent CLI anywhere in this section. The subprocess
+// tests drive `capture_with_timeout` — the exact body `gh_capture` runs, with
+// the `gh` argv swapped for a deliberately slow / chatty / failing shell
+// command — and the intake test reaches `poll_intake` on a live registry
+// whose groups point at nonexistent repo paths, so every `gh_capture` inside
+// it returns at the "no such directory" guard before a program is resolved.
+
+/// A `Command` running `script` through the host shell: the portable way to
+/// spawn a child that behaves a specific way (stalls, floods its pipe, exits
+/// non-zero) without shelling out to `gh`, which no test here may do.
+fn shell_command(script: &str) -> std::process::Command {
+    let mut cmd = if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C");
+        c
+    } else {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c");
+        c
+    };
+    cmd.arg(script);
+    cmd
+}
+
+/// A shell script that does nothing for `secs` seconds. `ping` is the
+/// dependency-free Windows sleep: `-n N` sends N pings a second apart, so
+/// N = secs + 1 loopback pings take about `secs`.
+fn sleep_script(secs: u32) -> String {
+    if cfg!(windows) { format!("ping -n {} 127.0.0.1 >NUL", secs + 1) } else { format!("sleep {secs}") }
+}
+
+/// A `Command` that streams `path` to stdout. Deliberately NOT built through
+/// [`shell_command`]: a path baked into a `cmd /C <script>` string has to be
+/// quoted, and `Command` then escapes those quotes the MSVC way (`\"`), which
+/// `cmd.exe` does not understand — the child fails with "The filename,
+/// directory name, or volume label syntax is incorrect" instead of reading
+/// the file. Passing the path as its own argv element lets `Command` quote it
+/// the one way `cmd` parses.
+fn cat_command(path: &Path) -> std::process::Command {
+    if cfg!(windows) {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "type"]).arg(path);
+        c
+    } else {
+        let mut c = std::process::Command::new("cat");
+        c.arg(path);
+        c
+    }
+}
+
+/// A shell script whose child leaves a GRANDCHILD holding the inherited
+/// pipes after the direct child is killed — the one case that justifies not
+/// joining the readers, and therefore the one that can actually grow the
+/// backlog. On Windows `cmd` spawns `ping` as a separate process (no `>NUL`
+/// here, deliberately: both pipes stay inherited); on Unix the backgrounded
+/// `sleep` survives the shell that started it.
+fn hold_pipes_script() -> String {
+    if cfg!(windows) { "ping -n 31 127.0.0.1".to_string() } else { "sleep 30 & sleep 30".to_string() }
+}
+
+/// The reader backlog is process-wide state, and this binary runs its tests
+/// in parallel — so every test that consults or fills it takes this first.
+/// Without it, the ceiling test's seeding would make a concurrent capture
+/// test fail with the backlog error, and the failure would be real but
+/// meaningless. (`obs.rs`'s own `static SERIAL` precedent.)
+static CAPTURE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn capture_lock() -> std::sync::MutexGuard<'static, ()> {
+    CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A child still running at the deadline must be REPORTED, not waited out —
+/// this is the primitive every wait on a child now goes through, so a
+/// regression here is a regression in both the main wait and the post-kill
+/// reap at once.
+#[test]
+fn wait_bounded_reports_none_for_a_child_still_running_at_the_deadline() {
+    let mut child = shell_command(&sleep_script(20))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the test child");
+    let started = std::time::Instant::now();
+    let verdict = wait_bounded(&mut child, Duration::from_millis(500)).expect("polling a live child is not an error");
+    let waited = started.elapsed();
+    let _ = child.kill();
+    assert!(verdict.is_none(), "a child alive at the deadline must report None rather than block until it exits");
+    assert!(waited < Duration::from_secs(5), "…and must report it AT the deadline (waited {waited:?} on a 20s child)");
+}
+
+/// …while a child that finishes inside the bound is reported with its real
+/// status, so the bound never costs a result that was there to be had.
+#[test]
+fn wait_bounded_reports_the_status_of_a_child_that_exits_first() {
+    let mut child = shell_command("exit 7")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the test child");
+    let status = wait_bounded(&mut child, Duration::from_secs(10))
+        .expect("polling is not an error")
+        .expect("a child that exits inside the bound must be reported, not timed out");
+    assert_eq!(status.code(), Some(7), "the child's own status must survive the bounded wait");
+}
+
+/// A stalled `gh` — the whole reason this bound exists — must not hold the
+/// caller for the child's lifetime. Since #406 there is ONE loop making `gh`
+/// calls, so an unbounded wait here stops every `notify_when` notice in the
+/// process, and the fleet's "register the watch, end the turn" discipline
+/// rests on those notices arriving.
+///
+/// The child outlives its bound by 20x, so returning early cannot be luck,
+/// and the assertion is on ELAPSED time rather than on the message alone: an
+/// implementation that reported "timed out" only after `output()` finally
+/// returned would satisfy the string and none of the point.
+#[test]
+fn capture_with_timeout_stops_waiting_on_a_stalled_child() {
+    let _serial = capture_lock();
+    let started = std::time::Instant::now();
+    let err = OrchRegistry::capture_with_timeout(shell_command(&sleep_script(20)), Duration::from_secs(1))
+        .expect_err("a child that outlives the bound must fail the capture, not be waited out");
+    let waited = started.elapsed();
+    assert!(err.contains("timed out"), "the error must name the bound as the cause, not look like a gh failure: {err}");
+    assert!(
+        waited < Duration::from_secs(10),
+        "the wait must be bounded by the timeout, not by the child (slept {waited:?} against a 20s child)"
+    );
+}
+
+/// The bound is a ceiling, not a schedule: a child that finishes returns its
+/// own stdout, immediately, exactly as `Command::output()` did.
+#[test]
+fn capture_with_timeout_returns_a_finished_childs_stdout() {
+    let _serial = capture_lock();
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-656"), Duration::from_secs(10))
+        .expect("a fast child must succeed");
+    assert!(out.contains("loomux-656"), "stdout must be captured verbatim, not summarized: {out:?}");
+}
+
+/// The failure mode the reader threads exist to prevent, and the one a
+/// "simplify it to try_wait + wait_with_output" edit would reintroduce: a
+/// child whose output exceeds the OS pipe buffer blocks writing until someone
+/// drains it. Nobody draining means the child never exits, so a HEALTHY `gh
+/// issue list` on a busy repo would time out every single tick — the bound
+/// turned into a new outage instead of a backstop.
+///
+/// 512 KiB is comfortably past both platforms' default buffer (64 KiB
+/// Windows, 64 KiB Linux, 16 KiB macOS) on stdout alone.
+#[test]
+fn capture_with_timeout_drains_output_larger_than_a_pipe_buffer() {
+    let _serial = capture_lock();
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.txt");
+    let payload = "loomux-656 ".repeat(48 * 1024); // ~512 KiB
+    fs::write(&big, &payload).unwrap();
+    let started = std::time::Instant::now();
+    let out = OrchRegistry::capture_with_timeout(cat_command(&big), Duration::from_secs(10))
+        .expect("a chatty but healthy child must complete, not trip the bound");
+    assert!(
+        out.len() >= payload.len(),
+        "the whole stream must be captured, not one buffer's worth: got {} of {} bytes",
+        out.len(),
+        payload.len()
+    );
+    assert!(started.elapsed() < Duration::from_secs(5), "…and must not have needed the bound to get there");
+}
+
+/// A child that fails on its own is still a child failure: the timeout must
+/// not swallow, relabel, or delay it. `poll_watches` turns this `Err` into a
+/// fail-streak increment and `poll_intake` into a skipped half-diff, and both
+/// classifications predate the bound.
+#[test]
+fn capture_with_timeout_reports_a_nonzero_exit_as_the_childs_own_failure() {
+    let _serial = capture_lock();
+    let started = std::time::Instant::now();
+    let err = OrchRegistry::capture_with_timeout(shell_command("exit 3"), Duration::from_secs(10))
+        .expect_err("a non-zero exit is an Err, exactly as `output()` made it");
+    assert!(!err.contains("timed out"), "a child that exited must never be reported as a timeout: {err}");
+    assert!(err.contains('3'), "the exit status must survive into the message the caller surfaces: {err}");
+    assert!(started.elapsed() < Duration::from_secs(5), "an immediate failure must return immediately");
+}
+
+/// The ceiling policy itself, pure: a capture is admitted while abandoned
+/// readers are below the ceiling and refused at it. Stated here so the
+/// boundary is pinned without arranging a real leak.
+#[test]
+fn gh_capture_admission_stops_exactly_at_the_reader_ceiling() {
+    assert!(gh_capture_admitted(0), "an empty backlog must never refuse a poll");
+    assert!(
+        gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS - 1),
+        "one slot short of the ceiling is still a poll worth making"
+    );
+    assert!(!gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS), "the ceiling is a ceiling, not a target");
+    assert!(!gh_capture_admitted(GH_CAPTURE_MAX_LEAKED_READERS + 9), "and nothing above it is admitted either");
+}
+
+/// The leak really is bounded per PROCESS, not merely per tick: once the
+/// backlog is at the ceiling a capture is refused outright — with an error
+/// naming the reason, since both callers surface an `Err` — and once those
+/// readers end, captures resume on their own.
+///
+/// Uses the seam rather than a grandchild that holds a pipe: seeded readers
+/// block until this test releases them, so both the refusal and the drain are
+/// deterministic on every platform instead of depending on how one OS
+/// inherits handles.
+#[test]
+fn a_full_reader_backlog_refuses_captures_until_it_drains() {
+    let _serial = capture_lock();
+
+    // Baseline: whatever earlier capture tests left behind (normally zero —
+    // killing a child closes its pipes and its readers end at once).
+    let holds = seed_leaked_readers_for_test(GH_CAPTURE_MAX_LEAKED_READERS);
+    assert!(
+        gh_capture_live_readers() >= GH_CAPTURE_MAX_LEAKED_READERS,
+        "the seam must fill the backlog the way an abandoned reader does"
+    );
+
+    let err = OrchRegistry::capture_with_timeout(shell_command("echo unreachable"), Duration::from_secs(10))
+        .expect_err("a full backlog must refuse the capture rather than spawn another child");
+    assert!(err.contains("backlog"), "the refusal must name itself, not look like a gh failure: {err}");
+
+    // Releasing them is the whole point of the bound: this is a ceiling, not
+    // a latch, so polling must resume without a restart.
+    drop(holds);
+    let settle = std::time::Instant::now();
+    while gh_capture_live_readers() >= GH_CAPTURE_MAX_LEAKED_READERS && settle.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = OrchRegistry::capture_with_timeout(shell_command("echo loomux-656-drained"), Duration::from_secs(10))
+        .expect("once the backlog drains, captures must resume on their own");
+    assert!(out.contains("loomux-656-drained"), "…and resume as real captures, not as a stub: {out:?}");
+}
+
+/// The registration itself: a timed-out capture whose child left a grandchild
+/// holding the pipes must PARK its readers where the ceiling can see them.
+/// Without this, deleting the two lines that push into the backlog would
+/// leave every other test in this section passing — the ceiling would simply
+/// never be reached by anything real.
+#[test]
+fn a_timeout_that_cannot_close_its_pipes_parks_its_readers_in_the_backlog() {
+    let _serial = capture_lock();
+    let before = gh_capture_live_readers();
+
+    let err = OrchRegistry::capture_with_timeout(shell_command(&hold_pipes_script()), Duration::from_secs(1))
+        .expect_err("the child outlives the bound, so this is a timeout");
+    assert!(err.contains("timed out"), "precondition: this must be the timeout arm, not another failure: {err}");
+
+    assert!(
+        gh_capture_live_readers() > before,
+        "a reader still blocked on a grandchild's pipe must be counted, not forgotten — \
+         that is the difference between a leak bounded per tick and one bounded per process"
+    );
+}
+
+/// The intake half's per-scan cap, on a live registry rather than only in the
+/// pure selector: N autonomous groups falling due on one scan wake used to be
+/// 2N sequential `gh` round-trips inside a single tick of the one loop that
+/// also delivers every watch notice.
+///
+/// Asserts the EFFECT (`intake_last_poll_at` moves only for a group the scan
+/// actually reached the `gh` call for) and the deferral: the groups the cap
+/// left out are polled by the very next scan, so the cap is a queue and not a
+/// starvation. Every group's repo path is nonexistent, so the scan runs its
+/// whole body against `Err`s and spawns nothing.
+#[test]
+fn poll_intake_caps_one_scan_and_polls_the_deferred_groups_on_the_next() {
+    let (reg, _d) = test_registry();
+    let due_groups = MAX_INTAKE_POLLS_PER_TICK + 3;
+    let mut gids = Vec::new();
+    for i in 0..due_groups {
+        // Distinct repo paths: the group id is repo-derived, and a group with
+        // no live agents is reused rather than duplicated.
+        let g = reg
+            .create_group(
+                &format!("C:/tmp/repo-656-{i}"),
+                Guardrails { intake_poll_minutes: Some(1), idle_tick_fallback_minutes: 180, ..rails() },
+            )
+            .unwrap();
+        reg.set_autonomous(&g.id, true).unwrap();
+        gids.push(g.id);
+    }
+
+    let scanned = |now: u64| gids.iter().filter(|g| reg.intake_last_poll_at(g) == Some(now)).count();
+
+    let first = now_ms() + 60 * 60_000; // every group is due: none has ever been polled
+    reg.poll_intake(first);
+    assert_eq!(
+        scanned(first),
+        MAX_INTAKE_POLLS_PER_TICK,
+        "one scan must poll at most the cap, however many groups came due together"
+    );
+
+    // The same instant, so nothing has newly become due and the groups just
+    // polled are inside their own per-group floor: this scan can only be the
+    // deferred ones.
+    reg.poll_intake(first);
+    let polled_at_all = gids.iter().filter(|g| reg.intake_last_poll_at(g).is_some()).count();
+    assert_eq!(polled_at_all, due_groups, "the groups the cap deferred must be picked up by the next scan, not starved");
+}
+
 // ---------- group_watches: the group view's "⏳ waiting on …" indicator (#248) ----------
 
 #[test]
@@ -34333,6 +34701,342 @@ fn the_census_records_an_absent_read_as_absent_rather_than_zero() {
         Value::Null,
         "a ratio over zero bytes read is undefined, and 0% would read as a total-loss tail"
     );
+}
+
+// ---------- #685: the scan window, sized in POST-STRIP characters ----------
+//
+// #583's measurement came back: retention is ~50%, so the raw-byte slack was
+// under-covering from ~1.5 KiB of paste up, and `Unverifiable` was being
+// decided by arithmetic before the pane was consulted. `Tier1Scan` re-reads
+// scaled by the retention the tail itself demonstrates.
+//
+// What these pin, in the order they matter: a paste in the formerly-collapsing
+// range now VERIFIES; the widening never manufactures a verification it cannot
+// take (a ring with nothing more in it, a paste past the ceiling); and no read
+// is ever narrower than the one #559 took, which is the property the whole
+// same-size invariant rested on.
+
+/// A pane ring the way a repaint-heavy TUI leaves one: `lead_bytes` of older
+/// output, then our paste echoed in `chunk`-sized runs each led by an SGR
+/// sequence, then the box's own trailing frame. Retention is `chunk / (chunk +
+/// 4)` — at `chunk = 4`, the ~50% #583 measured live.
+///
+/// Unlike `repainted_tail` above (which cuts to exactly the window under test,
+/// so a read can never come up short for want of ring), this builds the WHOLE
+/// ring: a read has more to find whenever it asks for more, which is the
+/// difference between "the slack was too small" and "the pane had not spoken
+/// yet" — the two causes #685 has to keep apart.
+fn repaint_ring(pasted: &str, chunk: usize, lead_bytes: usize) -> Vec<u8> {
+    let mut raw = String::new();
+    let filler = "waiting on the previous turn, still streaming output here ";
+    while raw.len() < lead_bytes {
+        for c in filler.as_bytes().chunks(chunk) {
+            raw.push_str("\x1b[0m");
+            raw.push_str(std::str::from_utf8(c).expect("filler is ASCII"));
+        }
+    }
+    for c in pasted.as_bytes().chunks(chunk) {
+        raw.push_str("\x1b[0m");
+        raw.push_str(std::str::from_utf8(c).expect("flush_paste is ASCII"));
+    }
+    // Box chrome after our text, well inside `BOX_TAIL_WINDOW_SLACK` so the
+    // containment window still reaches back over the whole paste.
+    raw.push_str("\x1b[2m\r\n> \x1b[0m");
+    raw.into_bytes()
+}
+
+/// The reading the code took BEFORE #685, spelled out rather than described:
+/// one request of `tier1_scan_bytes` raw bytes, stripped, classified. Every
+/// fixture below asserts this, so a test can never quietly stop being about a
+/// paste that used to collapse.
+fn pre_685_reading(pm: &PtyManager, pty: u32, pasted: &str) -> BoxReading {
+    box_reading(
+        pm.output_tail_bounded(pty, tier1_scan_bytes(pasted))
+            .map(|b| strip_ansi(&b))
+            .as_deref(),
+        pasted,
+    )
+}
+
+#[test]
+fn a_repaint_heavy_pane_verifies_once_the_window_is_sized_in_post_strip_chars() {
+    // The headline: an 8 KiB paste sitting IN THE BOX, on a pane whose tail
+    // retains half its bytes through stripping. The old read asked for
+    // paste + 4 KiB raw, got half of it in characters, and declined to govern
+    // a delivery whose text was right there.
+    let pasted = flush_paste(8 * 1024);
+    let pty = 6851;
+    let pm = PtyManager::default();
+    pm.register_fake_for_test(pty, &repaint_ring(&pasted, 4, 32 * 1024));
+
+    assert_eq!(
+        pre_685_reading(&pm, pty, &pasted),
+        BoxReading::Unverifiable,
+        "the fixture must still be a member of the class it witnesses: one fixed-size read of \
+         this pane could not verify a paste that is plainly in its box"
+    );
+
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    let read = scan.read(|n| pm.output_tail_bounded(pty, n)).expect("the fake pty is alive");
+    assert_eq!(
+        box_reading(Some(&read.stripped), &pasted),
+        BoxReading::Holds,
+        "sized in post-strip chars, the same pane and the same paste now VERIFY"
+    );
+    assert!(
+        read.requested_bytes > tier1_scan_bytes(&pasted),
+        "and it got there by widening, not by the fixture being generous: {} vs the {} floor",
+        read.requested_bytes,
+        tier1_scan_bytes(&pasted)
+    );
+    assert_eq!(
+        read.tail_bytes, read.requested_bytes,
+        "the ring FILLED the widened request — a short pane is a different cause (#583's \
+         confounder) and is not what this test is about"
+    );
+}
+
+#[test]
+fn a_paste_in_the_measured_collapsing_band_verifies() {
+    // The band #583 actually measured, given its own witness: 1.5-2 KiB, where
+    // 58% of live deliveries came back `Unverifiable`, on the way to 100% from
+    // 2.5 KiB up. The headline test above is an 8 KiB paste because that is the
+    // smallest that collapses at ~50% retention — but the issue is written
+    // about THIS band, and a suite that only brackets it would not notice a
+    // future `BOX_TAIL_SCAN_BYTES` or slack edit moving the boundary back into
+    // it. The band is reachable at a denser pane instead of a bigger paste:
+    // `chunk = 1` is one escape per text byte, ~20% retention, which is what a
+    // repaint-heavy TUI looks like when it is painting per character.
+    let pasted = flush_paste(1800);
+    assert!(
+        (1536..=2560).contains(&pasted.len()),
+        "this fixture's whole point is WHICH bucket it lands in — {} chars is outside the \
+         1.5-2.5 KiB band #583 measured",
+        pasted.len()
+    );
+    let pty = 6857;
+    let pm = PtyManager::default();
+    pm.register_fake_for_test(pty, &repaint_ring(&pasted, 1, 32 * 1024));
+
+    assert_eq!(
+        pre_685_reading(&pm, pty, &pasted),
+        BoxReading::Unverifiable,
+        "the fixture must be a member of the class it witnesses: a paste in the measured band, \
+         unverifiable under the old fixed-size read"
+    );
+
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    let read = scan.read(|n| pm.output_tail_bounded(pty, n)).expect("the fake pty is alive");
+    assert_eq!(
+        box_reading(Some(&read.stripped), &pasted),
+        BoxReading::Holds,
+        "the band the issue is written about is the band that now verifies"
+    );
+    assert_eq!(
+        read.tail_bytes, read.requested_bytes,
+        "the ring FILLED the widened request — a short pane is the other cause, and not this one"
+    );
+}
+
+#[test]
+fn an_ordinary_delivery_still_takes_exactly_one_read() {
+    // The cost argument, pinned. The target is the containment window, not the
+    // whole 4 KiB budget, so an ordinary prompt clears it on the first read and
+    // widens not at all — only a read that was truncating the comparison pays
+    // for anything. If this ever fails, every delivery just started re-reading
+    // the ring several times per poll.
+    let pasted = "please post the status roll-up on #685";
+    let pty = 6852;
+    let pm = PtyManager::default();
+    pm.register_fake_for_test(pty, &repaint_ring(pasted, 4, 32 * 1024));
+
+    let mut requests = Vec::new();
+    let mut scan = Tier1Scan::for_paste(pasted);
+    let read = scan
+        .read(|n| {
+            requests.push(n);
+            pm.output_tail_bounded(pty, n)
+        })
+        .expect("the fake pty is alive");
+
+    assert_eq!(requests, vec![tier1_scan_bytes(pasted)], "one read, at the unchanged floor");
+    assert_eq!(box_reading(Some(&read.stripped), pasted), BoxReading::Holds);
+}
+
+#[test]
+fn a_ring_with_nothing_more_in_it_ends_the_widening_rather_than_re_asking() {
+    // #685's OTHER cause, which this change deliberately does not paper over:
+    // the tail under-delivers against the request because the pane has not
+    // produced that much output yet. There is no retention to scale by and no
+    // wider request that could return a byte the ring does not hold, so the
+    // reader stops at one read and the delivery stays `Unverifiable` — stated,
+    // notified, never a confirm.
+    let pasted = flush_paste(4 * 1024);
+    let pty = 6853;
+    let pm = PtyManager::default();
+    // A ring holding a fraction of the paste: the live shape #583 logged as
+    // 6153 requested, 1408 returned.
+    pm.register_fake_for_test(pty, &repaint_ring(&pasted, 4, 0)[..1408].to_vec());
+
+    let mut requests = Vec::new();
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    let read = scan
+        .read(|n| {
+            requests.push(n);
+            pm.output_tail_bounded(pty, n)
+        })
+        .expect("the fake pty is alive");
+
+    assert_eq!(requests.len(), 1, "an under-filled read is the end of the widening, not the start");
+    assert!(read.tail_bytes < read.requested_bytes, "the fixture must under-fill, or it proves nothing");
+    assert_eq!(
+        box_reading(Some(&read.stripped), &pasted),
+        BoxReading::Unverifiable,
+        "fail-safe is unchanged: a delivery loomux could not read is never reported verified"
+    );
+}
+
+#[test]
+fn a_paste_past_the_ceiling_is_still_unverifiable_however_wide_the_ring_is() {
+    // The ceiling regime `a_paste_past_the_scan_ceiling_is_unverifiable_at_any_
+    // density` proves for the old sizing, re-asked of the new one — because a
+    // re-reading window is exactly the mechanism that could have quietly
+    // raised a ceiling nobody decided to raise. `target_chars` is capped at
+    // `TIER1_SCAN_MAX_BYTES` too, so the widening never fires and the answer is
+    // the same one arithmetic gave before: what verification should CLAIM up
+    // here is #685's posture half, and it is not decided by this change.
+    let ceiling = queue::QUEUE_FLUSH_MAX_BYTES + tier1_scan_bytes("");
+    let pasted = flush_paste(ceiling + 1024);
+    let pty = 6854;
+    let pm = PtyManager::default();
+    // Pure text, no escapes at all, and a ring far larger than the paste: 100%
+    // retention with everything to read. Nothing but the ceiling is left to
+    // blame.
+    let mut ring = "older output\r\n".repeat(2048).into_bytes();
+    ring.extend_from_slice(pasted.as_bytes());
+    pm.register_fake_for_test(pty, &ring);
+
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    assert!(
+        scan.target_chars() < pasted.len(),
+        "the ceiling caps the TARGET as well as the floor, so no read this scan can take — \
+         however wide, however clean — covers the needle: {} chars aimed for, {} needed",
+        scan.target_chars(),
+        pasted.len()
+    );
+    let read = scan.read(|n| pm.output_tail_bounded(pty, n)).expect("the fake pty is alive");
+    assert!(
+        ring.len() > read.requested_bytes,
+        "the ring had more to give, so a short pane is not what makes this unverifiable"
+    );
+    assert_eq!(box_reading(Some(&read.stripped), &pasted), BoxReading::Unverifiable);
+}
+
+#[test]
+fn no_widened_read_is_ever_narrower_than_the_one_it_replaced() {
+    // The invariant #559 stated as "every box read for a delivery uses the same
+    // size", in the stronger form #685 leaves it: reads are MONOTONE. The
+    // hazard it guards is a precondition verified against a wide tail and then
+    // polled against a narrow one — the poll sees the box cut mid-paste, reads
+    // `NotHolding`, and confirms a delivery nothing observed. It needs a
+    // narrower read, and this asserts there is no way to take one: not across
+    // the widening rounds of a single read, and not across the successive reads
+    // one delivery's confirm loop takes.
+    let pasted = flush_paste(8 * 1024);
+    let pty = 6855;
+    let pm = PtyManager::default();
+    // Dense enough that one widening is not enough: ~20% retention, so the
+    // scaled re-request has to converge over more than one round.
+    pm.register_fake_for_test(pty, &repaint_ring(&pasted, 1, 64 * 1024));
+
+    let floor = tier1_scan_bytes(&pasted);
+    let mut requests = Vec::new();
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    for _ in 0..3 {
+        let _ = scan.read(|n| {
+            requests.push(n);
+            pm.output_tail_bounded(pty, n)
+        });
+    }
+
+    assert!(requests.len() > 3, "the fixture must actually widen, or this asserts nothing");
+    assert!(
+        requests.windows(2).all(|w| w[1] >= w[0]),
+        "requests must never shrink, within a read or between reads: {requests:?}"
+    );
+    assert!(
+        requests.iter().all(|n| *n >= floor),
+        "and never below the size #559's own read used: {requests:?} vs floor {floor}"
+    );
+}
+
+#[test]
+fn the_widening_is_bounded_and_fails_safe_on_a_tail_it_cannot_cover() {
+    // Termination, on the worst tail this fixture set can build: a coalesced
+    // paste at the flush cap against an almost entirely-escape ring, where even
+    // the widest request the ring can serve strips to less than the needle. The
+    // reader must widen (it is short), must stop (bounded), and must leave the
+    // reading `Unverifiable` — a wider window buying nothing is exactly the
+    // residual `Unverifiable` exists to say out loud.
+    let pasted = flush_paste(queue::QUEUE_FLUSH_MAX_BYTES);
+    let pty = 6856;
+    let pm = PtyManager::default();
+    let mut ring = Vec::new();
+    while ring.len() < 250 * 1024 {
+        ring.extend_from_slice(b"\x1b[2m\x1b[0m\x1b[Kx");
+    }
+    pm.register_fake_for_test(pty, &ring);
+
+    let mut requests = Vec::new();
+    let mut scan = Tier1Scan::for_paste(&pasted);
+    let read = scan
+        .read(|n| {
+            requests.push(n);
+            pm.output_tail_bounded(pty, n)
+        })
+        .expect("the fake pty is alive");
+
+    assert!(requests.len() >= 2, "a read this short must have tried to widen: {requests:?}");
+    assert!(
+        requests.len() as u32 <= 1 + TIER1_SCAN_WIDEN_ROUNDS,
+        "one read plus the bounded re-reads, and not one more: {requests:?}"
+    );
+    assert_eq!(
+        box_reading(Some(&read.stripped), &pasted),
+        BoxReading::Unverifiable,
+        "a window that cannot be covered classifies the widest read taken — fail-safe, as before"
+    );
+}
+
+#[test]
+fn the_sizing_stops_for_a_reason_it_can_state() {
+    // `widen` is the whole decision; the reader is the loop around it. Each
+    // `None` is a distinct "a wider request cannot change the answer", and
+    // pinning them separately is what keeps the reader's stopping conditions
+    // from collapsing into one another under a later edit.
+    // Sized by hand rather than from `flush_paste`, so the arithmetic below is
+    // exact and readable: 1,000 chars of needle, a 1,200-char window, and a
+    // first request of 1,000 + `BOX_TAIL_SCAN_BYTES`.
+    let pasted = "x".repeat(1000);
+    let scan = Tier1Scan::for_paste(&pasted);
+    let target = scan.target_chars();
+    let floor = scan.request_floor();
+    assert_eq!(target, 1200, "the window is the needle plus the containment slack");
+    assert_eq!(floor, tier1_scan_bytes(&pasted), "the first request is exactly #559's");
+
+    // Covered: the read delivered the whole containment window.
+    assert_eq!(scan.widen(floor, floor, target), None);
+    // Under-filled: the ring holds no more, so no wider request can add a byte.
+    assert_eq!(scan.widen(floor, floor - 1, target / 4), None);
+    // Nothing survived stripping: the ratio is undefined, and a guess dressed
+    // as a measurement is worse than the honest `Unverifiable` that follows.
+    assert_eq!(scan.widen(floor, floor, 0), None);
+
+    // And when it does widen, it widens by what the shortfall measured: half
+    // the characters back means twice the bytes asked for — the measured
+    // retention, not a doubling constant (a quarter back asks for four times).
+    assert_eq!(scan.widen(floor, floor, target / 2), Some(floor * 2));
+    assert_eq!(scan.widen(floor, floor, target / 4), Some(floor * 4));
 }
 
 // ---------- #534 / #513(c): question evidence from the COMPOSED GRID ----------
