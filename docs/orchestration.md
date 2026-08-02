@@ -718,6 +718,15 @@ build — it says **that**, loudly, instead of drawing an empty queue: "nothing 
 "loomux can't read the queue" are the same picture otherwise, and only one of them means
 your PR is fine.
 
+**How quickly it moves.** The queue is driven by loomux's background poller, which wakes
+every 30 seconds and advances **one group's queue per wake** — so a batch normally starts
+within a wake or two of the last PR being queued, and a batch whose CI has just gone green
+lands about that fast too. If several groups have live queues they take turns, oldest first.
+That bound is deliberate: the same loop delivers every agent's `notify_when` CI notice, and a
+driver that serviced every group on one wake would hold those up. If something external
+fails — the remote is unreachable, a push is rejected — the queue holds that group off for
+five minutes rather than retrying every wake, so you get one notice about it rather than ten.
+
 The row is absent entirely until a group actually has a queue, which is the default: no
 `merge_queue:` block means the feature is off and nothing about your group changes. See
 [Turning on the merge queue](#turning-on-the-merge-queue) for the block itself.

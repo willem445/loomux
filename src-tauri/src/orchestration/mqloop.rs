@@ -10,17 +10,16 @@
 //! - `mqdriver.rs` (slice D1) — the **write primitives and their gates**. The
 //!   `MqRunner` seam, the live lookups, the constraint-7 refusal core, the
 //!   create-only scratch push, the landing function, cleanup.
-//! - this file (slice D2) — the **loop that sequences them**: build the scratch,
-//!   open the draft PR, observe the checks under a bound, bisect a red batch and
-//!   attribute it, requeue the survivors, reconcile after a crash, and persist
-//!   every step.
+//! - this file (slices D2 and D3) — the **loop that sequences them**: build the
+//!   scratch, open the draft PR, observe the checks under a bound, bisect a red
+//!   batch and attribute it, requeue the survivors, reconcile after a crash, and
+//!   persist every step — plus [`drive`], the one-step-per-call tick that
+//!   decides which of those happens next (§13, #698).
 //!
-//! `mod.rs` gets registry wiring only — a module declaration, a guard field, and
-//! the two `merge_queue_reconcile*` methods, which resolve paths and delegate.
-//! No decision in this feature lives there. **`mcp.rs` is untouched by this
-//! slice**: §11.1's three agent-callable tools are slice E's, so D2 adds no
-//! agent-reachable surface at all (said explicitly because "no role gate found"
-//! and "no role gate needed" look identical from a diff).
+//! `mod.rs` gets registry wiring only — a module declaration, three fields, the
+//! two `merge_queue_reconcile*` methods and the `mq_drive_group_with` /
+//! `mq_driver_tick` pair, all of which resolve paths and delegate. No decision
+//! in this feature lives there.
 //!
 //! # Why `build_scratch` uses a temporary worktree
 //!
@@ -47,18 +46,20 @@
 //! function **plus the landing verb**, exactly as §8 warns.
 
 use super::mergeq::{
-    bisect_step, recheck_gate, scratch_branch, BatchRecord, BisectStep, EntryState, GateSpec,
-    InvalidTransition, MergeQueueState, PrObservation, QueueEntry, MAX_ENTRIES,
+    bisect_step, plan_batch, recheck_gate, scratch_branch, valid_id_component, BatchPlan,
+    BatchRecord, BisectSearch, BisectStep, EntryState, GateSpec, InvalidTransition,
+    MergeQueueState, PrObservation, QueueEntry, MAX_ENTRIES,
 };
 use super::mergeqview::MERGE_QUEUE_FILE;
 use super::mqdriver::{
-    as_args, classify_checks, pr_checks_argv, pr_ci_green, resolve_and_validate_target,
-    scratch_exists, BatchVerification, MqRunner, REMOTE,
+    as_args, classify_checks, cleanup_scratch, land_batch, mint_scratch, pr_checks_argv,
+    pr_ci_green, push_scratch, resolve_and_validate_target, resolve_and_validate_target_detailed,
+    scratch_exists, BatchVerification, LandRefusal, MintError, MqRunner, REMOTE,
 };
 use super::notify::sanitize_gh_text;
 use super::workflow::{body_digest, BlockId, ReviewVerdict};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -186,8 +187,25 @@ fn worktree_dir_name(batch_id: &str) -> String {
 ///
 /// The path is a pure function of the batch id, which is what lets every
 /// teardown ([`remove_worktree`]) name it exactly rather than search for it.
-pub fn scratch_worktree_path(batch_id: &str) -> PathBuf {
-    std::env::temp_dir().join(worktree_dir_name(batch_id))
+///
+/// **`None` for an id this module will not build a name from** — the same
+/// `mergeq::valid_id_component` `scratch_branch` applies, enforced *here* rather
+/// than by whoever calls it (rev-183).
+///
+/// The distinction is not pedantry. `drive`'s top-of-function guard rejects an
+/// unusable record before any path is built, and that was true of every path the
+/// *driver* builds — but `merge_queue_reconcile_with` runs **before** that guard
+/// in the same tick, and `reconcile_batch` hands `cleanup_worktree` a batch id
+/// straight off disk. So the guard's protection was **positional**: it held for
+/// the callers that happened to sit after it, and a caller added earlier (or a
+/// path reached by a route nobody re-checked) got nothing. Validating inside the
+/// builder makes it structural — there is no argument, and no call order, that
+/// produces a path from a name this module rejects.
+pub fn scratch_worktree_path(batch_id: &str) -> Option<PathBuf> {
+    if !valid_id_component(batch_id) {
+        return None;
+    }
+    Some(std::env::temp_dir().join(worktree_dir_name(batch_id.trim())))
 }
 
 /// The one fetch a batch build performs: the target branch, plus every queued
@@ -249,7 +267,15 @@ pub fn build_scratch(
         Ok(_) => {}
     }
 
-    let wt = scratch_worktree_path(batch_id);
+    // Unreachable in practice — `mint_scratch` only ever hands back an id that
+    // already built a ref name — and refused rather than unwrapped, because the
+    // guarantee this function offers must not depend on which caller reached it.
+    let Some(wt) = scratch_worktree_path(batch_id) else {
+        return ScratchBuild::failed(BatchBuildError::Git(format!(
+            "refusing to build a worktree path from batch id {:?}",
+            quote(batch_id)
+        )));
+    };
     let wt_s = wt.display().to_string();
     // Bound to a local rather than `?`-propagated: the teardown below has to run
     // between the build and the return, on every one of the build's outcomes.
@@ -443,8 +469,19 @@ pub fn worktree_remove_argv(path: &str) -> Vec<String> {
 /// checked first, never a prune, never a wildcard, and the failure **returned**
 /// for the caller to audit as `mq-cleanup-failed` rather than raised. §10:
 /// cleanup failure never blocks landing and never fails a batch.
+/// **This is the caller the builder's own check exists for** (rev-183):
+/// `reconcile_batch` reaches it with a batch id straight off disk, and reconcile
+/// runs *before* `drive`'s record guard in the same tick. An unusable id is
+/// reported as a cleanup failure — the channel this function already has for
+/// "there is a leftover somebody has to look at" — rather than becoming a path.
 pub fn cleanup_worktree(r: &dyn MqRunner, batch_id: &str) -> Option<String> {
-    remove_worktree(r, &scratch_worktree_path(batch_id))
+    let Some(wt) = scratch_worktree_path(batch_id) else {
+        return Some(format!(
+            "refusing to build a worktree path from batch id {:?}",
+            quote(batch_id)
+        ));
+    };
+    remove_worktree(r, &wt)
 }
 
 // ── the batch draft PR (§5, §8) ─────────────────────────────────────────────
@@ -668,6 +705,16 @@ pub fn walk_bisect(
 pub mod audit_action {
     pub const ENQUEUED: &str = "mq-enqueued";
     pub const BATCH_BUILT: &str = "mq-batch-built";
+    /// A batch that could not be constructed or could not be observed, and was
+    /// abandoned with its entries returned to `queued` (§10's "batch aborts,
+    /// entries return to queued" rows).
+    ///
+    /// **Added to §11.5's vocabulary by the #698 driver, deliberately rather
+    /// than by reusing `mq-batch-built` with a falsy field.** §11.5 requires an
+    /// audit action to name what actually happened, and "built: false" on a
+    /// `built` event is the exact mislabel #461 catalogues — a filter looking
+    /// for batches that were built would match a batch that was not.
+    pub const BATCH_ABORTED: &str = "mq-batch-aborted";
     pub const CHECKS_GREEN: &str = "mq-checks-green";
     pub const CHECKS_RED: &str = "mq-checks-red";
     pub const CHECKS_UNVERIFIABLE: &str = "mq-checks-unverifiable";
@@ -1268,4 +1315,1367 @@ pub fn status_view(state: &MergeQueueState, enabled: bool, now_ms: u64) -> Value
         );
     }
     Value::Object(out)
+}
+
+// ── the driver tick (#698) ───────────────────────────────────────────────────
+//
+// Everything above this line was reachable only from a tool call or a restart.
+// `queue_merge` enqueued, `merge_queue_status` read, `cancel_queued_merge`
+// cancelled, `merge_queue_reconcile` recovered — and nothing anywhere started a
+// batch when entries were queued and the target was idle. The whole
+// queued → batching → ci-wait → landing lifecycle had no production caller
+// (#698): every slice test drove the seams directly, so everything was green
+// while no path connected them. This section is that path.
+//
+// # One step per call, and why the shape is a step rather than a loop
+//
+// [`drive`] performs **at most one state advance**. It never loops waiting for
+// anything, never sleeps, and never retries an external call in place. It is
+// called from the unified `gh` poll loop (#406/#652), which is the one thread in
+// this process that makes `gh` calls, and that loop's per-tick budget (#656) is
+// a shared resource: a driver that blocked it would stop every `notify_when`
+// watch in the fleet from firing, which is the deadlock #590 is about, one layer
+// down.
+//
+// So the sequencing that a synchronous implementation would express as a loop is
+// expressed as **state**: the batch record on `merge_queue.json` says where the
+// batch is, each tick reads it, does the one next thing, and writes it back. A
+// bisect that needs three CI runs is three ticks-worth of transitions spread over
+// however long those runs take, not a `walk_bisect` call blocking a thread for
+// forty minutes. [`walk_bisect`] remains the executable statement of the search's
+// *shape* — and the property its test pins, that the search terminates within
+// ceil(log2 k) runs, is the property this state machine has to match — but the
+// production search is [`bisect_step`] applied once per tick, because its
+// `reproduces` closure can only ever be a full build-push-observe cycle.
+//
+// # The invariant that keeps a crash recoverable
+//
+// **An entry is in an in-flight state only while `state.batch` is `Some`.** Every
+// path here that clears the batch record first moves its entries out of the
+// in-flight states, and every path that puts entries into one records a batch in
+// the same call. That is what makes `reconcile_batch`'s two rules — resume only
+// when the world matches, strand an in-flight entry with no batch record — a
+// statement about a *crash* rather than a statement about a tick that was midway
+// through its work. It is why a bisect probe carries a batch record of its own
+// (`BatchRecord::new_probe`) instead of the search running between batches.
+
+/// How many `queued` entries one build attempt examines from the head of the
+/// queue before it stops looking.
+///
+/// Bounded because each examined entry costs two or three `gh` round-trips (§7's
+/// live lookups plus the gate's `ci-green` clause), and the queue holds up to
+/// [`MAX_ENTRIES`] — an unbounded refresh pass would put 190 round-trips inside
+/// one poll tick, which is the fan-out #656 exists to stop.
+///
+/// The window deliberately includes entries that are **already blocked**: §4's
+/// `blocked_reason` is "refreshed at every batch build" and becomes eligible
+/// again the instant a re-review covers the new head, so an entry loomux never
+/// re-examines is an entry that can never unblock. The cost of that is a
+/// truncation, which is **stated** in the `mq-batch-built` / `mq-batch-aborted`
+/// detail rather than silent (`.loomux/lessons.md`: no silent caps).
+pub const MAX_EXAMINED_PER_BUILD: usize = 8;
+
+/// One audit event the driver decided on, for the registry to emit.
+///
+/// Returned rather than emitted here for the same reason
+/// [`ReconcileReport::notices`] is: this module owns no registry, and a driver
+/// that reached for one would put the queue's decisions back inside `mod.rs`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DriveAudit {
+    /// One of §11.5's actions — always a constant from [`audit_action`] or
+    /// `mqdriver::audit_action`, never a literal built at the call site.
+    pub action: &'static str,
+    pub detail: Value,
+}
+
+/// What one driver step decided.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DriveReport {
+    /// Audit events, in the order they happened.
+    pub audits: Vec<DriveAudit>,
+    /// Orchestrator notices. Handed back rather than sent, so the caller can
+    /// deliver them outside whatever lock it holds — the #467/#468 two-phase
+    /// posture `reconcile_batch` already takes.
+    pub notices: Vec<String>,
+    /// Whether `state` was mutated and must be persisted. A tick that only
+    /// observed a still-pending batch changes nothing, and must not rewrite the
+    /// file for it.
+    pub changed: bool,
+    /// Whether this tick reached a state whose next attempt should be held off
+    /// rather than retried on the next wake.
+    ///
+    /// Two shapes set it, for the same underlying reason — the next attempt
+    /// would cost the same external calls and reach the same answer:
+    ///
+    /// - **An external failure.** §10's failure rows all end "entries return to
+    ///   `queued`", so the very next tick tries the same thing — one notice and
+    ///   one audit line per tick, forever, against a remote that is simply down.
+    /// - **Nothing eligible to batch.** Establishing that costs two `gh`
+    ///   round-trips per examined entry, and a queue can sit blocked on a
+    ///   re-review for hours.
+    ///
+    /// The bound itself lives in the caller (a per-group floor, the
+    /// `due_intake_polls` idiom); this flag is how the driver says which
+    /// outcomes deserve it. It is deliberately **not** a retry counter on disk:
+    /// the condition is about the world, not about the queue, and a counter that
+    /// survived a restart would keep punishing a batch for a network that has
+    /// since come back.
+    pub backoff: bool,
+}
+
+impl DriveReport {
+    fn audit(&mut self, action: &'static str, detail: Value) {
+        self.audits.push(DriveAudit { action, detail });
+    }
+}
+
+/// The per-group facts one driver step needs and this module will not resolve
+/// for itself: which group, the repo's policy (§11.2), and the clock.
+///
+/// `now_ms` is an argument rather than a clock read for the same reason
+/// [`observe_batch`]'s is — the `checks_timeout_minutes` backstop has to be
+/// testable without waiting for it.
+#[derive(Clone, Copy, Debug)]
+pub struct DriveConfig<'a> {
+    pub group: &'a str,
+    pub max_batch: u32,
+    pub checks_timeout_minutes: u32,
+    pub now_ms: u64,
+}
+
+/// **One driver step for one group** (#698).
+///
+/// Two branches and no third:
+///
+/// 1. **A batch is in flight** — observe its draft PR once and advance it: land
+///    on green, bisect or attribute on red, requeue on unverifiable. A cancelled
+///    or vanished member abandons it first (§10).
+/// 2. **No batch is in flight** — refresh the head of the queue against the
+///    world, cut a batch from what is still eligible, build it, push it
+///    create-only, and open its draft PR.
+///
+/// Both branches are bounded: a fixed number of `gh`/`git` calls, no loop that
+/// waits on anything, and at most one advance. Nothing here retries an external
+/// call in place — §3's "no unbounded retry" arm, which is why every failure
+/// path below ends in a state change plus an audit rather than in a second
+/// attempt.
+///
+/// `verdicts` is a closure rather than a map because the batch paths need one
+/// PR's verdicts at a time and the files live in the group dir, which is the
+/// registry's business — the same separation [`land_batch`] already takes.
+pub fn drive(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    cfg: &DriveConfig<'_>,
+    gate: &GateSpec,
+    verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
+) -> DriveReport {
+    let mut rep = DriveReport::default();
+    // §4: `merge_queue.json` is a file, and a torn write or a hand edit can put
+    // anything in it. **Every string this tick interpolates into a path or an
+    // argv is validated here, once, before any of them is built** — so a branch
+    // added later cannot skip the check by taking a different route to the same
+    // string.
+    //
+    // Two strings qualify, and they get different predicates because they are
+    // different kinds of name:
+    //
+    // - **the target** reaches a refspec — the batch fetch's
+    //   `+refs/heads/<target>:…` runs long before `land_batch`'s own submit-time
+    //   guard does — so it gets `landable`, the same predicate the landing path
+    //   uses. Observed, not theorised: with this guard absent an empty target
+    //   fetched `+refs/heads/:refs/remotes/loomux-mq/target` and ran
+    //   `gh pr create --base ` with an empty base.
+    // - **the batch id** reaches three places — the scratch ref name, the temp
+    //   worktree path, and the body file — and gets `valid_id_component`, the
+    //   *same* predicate `scratch_branch` applies, named rather than inlined so
+    //   the three cannot drift apart.
+    //
+    // **This guard is an early, loud stop, not the guarantee** (rev-183). All
+    // three builders enforce `valid_id_component` themselves and return `None`
+    // on a name they will not build, because a check that lives only here is
+    // *positional*: it holds for the callers that happen to sit after it, and
+    // `merge_queue_reconcile_with` runs **before** it in the same tick with a
+    // batch id straight off disk. What this guard buys is that the whole tick
+    // stops on one audit line rather than each builder refusing separately
+    // further in.
+    //
+    // Refusing the tick rather than repairing the record is the conservative
+    // half of §4: a record loomux will not build a name from is also one it
+    // cannot clean up by name, so acting on it would leak whatever the real
+    // batch was. It audits every time and backs off, which is a durable, loud,
+    // rate-bounded "a human has to look at this file".
+    let live = state.entries.iter().any(|e| !e.state().is_terminal());
+    let unusable = if live && !super::mqdriver::landable(state.target.trim()) {
+        Some(("target", quote(&state.target)))
+    } else {
+        state
+            .batch
+            .as_ref()
+            .filter(|b| !valid_id_component(&b.id))
+            .map(|b| ("batch-id", quote(&b.id)))
+    };
+    if let Some((field, value)) = unusable {
+        rep.backoff = true;
+        rep.audit(
+            audit_action::STRANDED,
+            json!({ "reason": "merge_queue.json holds a value loomux will not build a name from",
+                    "field": field, "value": value }),
+        );
+        return rep;
+    }
+    match state.batch.clone() {
+        Some(batch) => advance_in_flight(r, state, cfg, gate, verdicts, batch, &mut rep),
+        None => start_batch(r, state, cfg, gate, verdicts, &mut rep),
+    }
+    rep
+}
+
+// ── branch 1: a batch is in flight ──────────────────────────────────────────
+
+fn advance_in_flight(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    cfg: &DriveConfig<'_>,
+    gate: &GateSpec,
+    verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
+    batch: BatchRecord,
+    rep: &mut DriveReport,
+) {
+    // §10: "Entry cancelled while batching/ci-wait — the in-flight batch is
+    // abandoned and rebuilt without it." `cancel` deliberately does not touch
+    // the batch record (it cannot clean up a scratch ref or close a draft PR),
+    // so noticing is this loop's job and this is the first thing it does: there
+    // is no point spending a `gh pr checks` on a batch that is already void.
+    let gone: Vec<u64> = batch
+        .prs
+        .iter()
+        .copied()
+        .filter(|pr| state.entry(*pr).map(|e| e.state().is_terminal()).unwrap_or(true))
+        .collect();
+    if !gone.is_empty() {
+        let mut moves = Vec::new();
+        for pr in &batch.prs {
+            requeue(state, &mut moves, *pr);
+            // Cleared even for the member that could not move — a cancelled
+            // entry still pointing at a batch that no longer exists is a record
+            // saying something untrue, and `requeue` deliberately leaves an
+            // entry it did not move alone.
+            set_batch_tag(state, *pr, None);
+        }
+        teardown(r, cfg.group, &batch, rep);
+        state.batch = None;
+        rep.changed = true;
+        rep.audit(
+            audit_action::BATCH_ABORTED,
+            json!({ "batch": batch.id, "why": "a member left the queue", "left": gone,
+                    "transitions": moves_json(&moves) }),
+        );
+        return;
+    }
+
+    // A batch past construction always has a draft PR — this driver records the
+    // batch and its draft PR in the same call. One without is therefore a file a
+    // crash or a hand edit produced, and §4's posture on those is loud failure
+    // rather than a guess at what was meant.
+    let Some(draft_pr) = batch.draft_pr else {
+        let mut moves = Vec::new();
+        for pr in &batch.prs {
+            mv(state, &mut moves, *pr, EntryState::KickedBack);
+            set_batch_tag(state, *pr, None);
+        }
+        teardown(r, cfg.group, &batch, rep);
+        state.batch = None;
+        rep.changed = true;
+        rep.audit(
+            audit_action::STRANDED,
+            json!({ "batch": batch.id, "why": "an in-flight batch with no draft PR",
+                    "transitions": moves_json(&moves) }),
+        );
+        rep.notices.push(format!(
+            "[loomux] merge queue: batch {} has no draft PR on record and cannot be observed. \
+             {} entr{} kicked back; nothing landed.",
+            quote(&batch.id),
+            batch.prs.len(),
+            if batch.prs.len() == 1 { "y" } else { "ies" }
+        ));
+        return;
+    };
+
+    let probe = batch.is_probe();
+    match observe_batch(r, draft_pr, batch.started_ms, cfg.now_ms, cfg.checks_timeout_minutes) {
+        // Nothing to do and nothing to write. A pending batch is the steady
+        // state, and rewriting the file on every tick of it would be churn on a
+        // value that did not change.
+        BatchOutcome::Pending { .. } => {}
+        BatchOutcome::Green => {
+            rep.audit(
+                audit_action::CHECKS_GREEN,
+                json!({ "batch": batch.id, "draft_pr": draft_pr, "prs": batch.prs,
+                        "probe": probe }),
+            );
+            if probe {
+                // §9: a probe never lands. Its green says only that this half of
+                // the red set is innocent — the culprit is in the other half.
+                narrow_search(r, state, cfg, &batch, false, rep);
+            } else {
+                land(r, state, cfg, gate, verdicts, &batch, rep);
+            }
+        }
+        BatchOutcome::Red { failing } => {
+            rep.audit(
+                audit_action::CHECKS_RED,
+                json!({ "batch": batch.id, "draft_pr": draft_pr, "prs": batch.prs,
+                        "failing": failing, "probe": probe }),
+            );
+            let mut opened = batch.clone();
+            if !probe {
+                // The whole batch is the red set, and the search opens here.
+                // Both facts it records are ones a later tick cannot recompute —
+                // see `mergeq::BisectSearch`.
+                opened.bisect = Some(BisectSearch::new(batch.prs.clone(), failing));
+            }
+            narrow_search(r, state, cfg, &opened, true, rep);
+        }
+        BatchOutcome::Unverifiable { why } => {
+            // §5: unverifiable is **not** red and no PR is implicated — nothing
+            // lands, everything requeues, and the whole search (if this was one)
+            // is abandoned rather than continued on an answer loomux never got.
+            let mut moves = Vec::new();
+            for pr in search_set(state, &batch) {
+                requeue(state, &mut moves, pr);
+            }
+            teardown(r, cfg.group, &batch, rep);
+            state.batch = None;
+            rep.changed = true;
+            rep.backoff = true;
+            rep.audit(
+                audit_action::CHECKS_UNVERIFIABLE,
+                json!({ "batch": batch.id, "draft_pr": draft_pr, "why": quote(&why),
+                        "transitions": moves_json(&moves) }),
+            );
+            rep.notices.push(unverifiable_notice(&batch.id, Some(draft_pr), &why));
+        }
+    }
+}
+
+/// Land a green batch (§7.3, §8) and clear it.
+fn land(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    cfg: &DriveConfig<'_>,
+    gate: &GateSpec,
+    verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
+    batch: &BatchRecord,
+    rep: &mut DriveReport,
+) {
+    let mut moves = Vec::new();
+    for pr in &batch.prs {
+        mv(state, &mut moves, *pr, EntryState::Landing);
+    }
+    rep.changed = true;
+    let target = state.target.clone();
+    // §6's second enforcement point and §7's third layer both live inside
+    // `land_batch`, which re-resolves the default branch and every sub-PR's base
+    // at the moment of submit. Nothing is resolved here and carried in.
+    match land_batch(r, &batch.scratch_sha, &target, &batch.prs, gate, verdicts) {
+        Ok(landed) => {
+            for pr in &batch.prs {
+                mv(state, &mut moves, *pr, EntryState::Landed);
+                set_batch_tag(state, *pr, None);
+            }
+            teardown(r, cfg.group, batch, rep);
+            state.batch = None;
+            finish_batch(state);
+            prune_terminal(state);
+            rep.audit(
+                super::mqdriver::audit_action::LANDED,
+                json!({ "batch": batch.id, "target": landed.target,
+                        "scratch_sha": landed.scratch_sha, "prs": batch.prs,
+                        "transitions": moves_json(&moves) }),
+            );
+            rep.notices.push(landed_notice(&batch.id, &landed.target, &batch.prs));
+        }
+        Err(refusal) => {
+            // One bad entry refuses the whole landing before anything is pushed
+            // (`land_batch` re-checks every sub-PR first), so nothing partial
+            // reached the target and the survivors are genuinely untouched.
+            let culprit = match &refusal {
+                LandRefusal::Gate { pr, .. } => Some(*pr),
+                LandRefusal::Target { pr, .. } if *pr != 0 => Some(*pr),
+                _ => None,
+            };
+            for pr in &batch.prs {
+                if Some(*pr) == culprit {
+                    mv(state, &mut moves, *pr, EntryState::KickedBack);
+                } else {
+                    requeue(state, &mut moves, *pr);
+                }
+                set_batch_tag(state, *pr, None);
+            }
+            teardown(r, cfg.group, batch, rep);
+            state.batch = None;
+            finish_batch(state);
+            prune_terminal(state);
+            let why = land_refusal_text(&refusal);
+            // A push that failed because the target moved is a fact about the
+            // world; a gate that no longer holds is a fact about one PR. Only
+            // the first should slow the group down.
+            rep.backoff = culprit.is_none();
+            rep.audit(
+                super::mqdriver::audit_action::LAND_REFUSED,
+                json!({ "batch": batch.id, "target": target, "why": why, "pr": culprit,
+                        "transitions": moves_json(&moves) }),
+            );
+            rep.notices.push(land_refused_notice(&batch.id, culprit, &why, batch.prs.len()));
+        }
+    }
+}
+
+/// Advance the bisect: narrow the red set by this probe's answer, then either
+/// attribute a culprit or build the next probe (§9).
+///
+/// `reproduced` is what the observation said about **this probe's** subset —
+/// red means the culprit is inside it, green means the culprit is in what the
+/// probe left out. Either way the entries on the exonerated side leave the
+/// search immediately: §9 requeues survivors the moment they are cleared rather
+/// than making them wait for the search to finish.
+fn narrow_search(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    cfg: &DriveConfig<'_>,
+    batch: &BatchRecord,
+    reproduced: bool,
+    rep: &mut DriveReport,
+) {
+    let search = batch.bisect.clone().unwrap_or_else(|| BisectSearch::new(batch.prs.clone(), Vec::new()));
+    let universe = search_set(state, batch);
+    let red: Vec<u64> = if reproduced {
+        // The tested subset reproduces: the culprit is in it. (For a batch that
+        // has only just gone red, the subset IS the whole batch.)
+        universe.iter().copied().filter(|p| batch.prs.contains(p)).collect()
+    } else {
+        universe.iter().copied().filter(|p| !batch.prs.contains(p)).collect()
+    };
+    let exonerated: Vec<u64> = universe.iter().copied().filter(|p| !red.contains(p)).collect();
+
+    let mut moves = Vec::new();
+    // Everything in the batch (and the wider search) that is not in the new red
+    // set has to leave the in-flight states before the batch record goes, or the
+    // invariant this module rests on breaks.
+    for pr in &exonerated {
+        // Straight from ci-wait/bisecting back to queued, then re-ordered to the
+        // front below — §9 gives survivors their original queue order back
+        // rather than the order the search happened to clear them in.
+        requeue(state, &mut moves, *pr);
+    }
+    requeue_survivors(state, &exonerated);
+    // Everything still suspected enters (or stays in) `bisecting`, so the batch
+    // record can be replaced without any entry ever sitting in `ci-wait` with no
+    // batch behind it. On the round that opens a search this is the whole batch;
+    // on later rounds the entries are already there and nothing moves.
+    for pr in &red {
+        if state.entry(*pr).map(|e| e.state()) == Some(EntryState::CiWait) {
+            mv(state, &mut moves, *pr, EntryState::Bisecting);
+        }
+    }
+    teardown(r, cfg.group, batch, rep);
+    state.batch = None;
+    rep.changed = true;
+
+    match bisect_action(&red) {
+        // An empty red set means the search has nothing to attribute, and §9 is
+        // explicit that it must not invent something. Requeue what is left and
+        // say so.
+        BisectAction::Abort => {
+            finish_batch(state);
+            rep.audit(
+                audit_action::BISECT_STEP,
+                json!({ "batch": batch.id, "outcome": "abort",
+                        "transitions": moves_json(&moves) }),
+            );
+            rep.notices.push(format!(
+                "[loomux] merge queue: batch {}'s search ended with nothing to attribute. \
+                 Entries requeued; no PR is implicated.",
+                quote(&batch.id)
+            ));
+        }
+        BisectAction::Attribute { culprit, .. } => {
+            attribute(r, state, batch, &search, culprit, &mut moves, rep);
+        }
+        BisectAction::Test { subset, rest } => {
+            rep.audit(
+                audit_action::BISECT_STEP,
+                json!({ "batch": batch.id, "outcome": "split", "red": red,
+                        "test": subset, "rest": rest, "exonerated": exonerated,
+                        "transitions": moves_json(&moves) }),
+            );
+            // The next probe is built now, in this same tick, so the search is
+            // never in the "entries bisecting, no batch record" shape that
+            // `reconcile_batch` (correctly) strands. If the build fails, the
+            // search is abandoned loudly instead — never left half-shaped.
+            build_probe(r, state, cfg, batch, &search, &subset, &red, rep);
+        }
+    }
+}
+
+/// The search this batch belongs to: every entry currently inside it.
+///
+/// For a fresh red batch that is the batch itself; for a probe it is the wider
+/// set of entries still in `bisecting`, which is where the halves the search has
+/// not yet reached are kept. Deliberately derived from the entries rather than
+/// stored on the batch: the entries are the durable record of who is still under
+/// suspicion, and a second copy on the batch record could disagree with it.
+fn search_set(state: &MergeQueueState, batch: &BatchRecord) -> Vec<u64> {
+    let mut set: Vec<u64> = state
+        .entries
+        .iter()
+        .filter(|e| e.state() == EntryState::Bisecting)
+        .map(|e| e.pr)
+        .collect();
+    for pr in &batch.prs {
+        if !set.contains(pr) && state.entry(*pr).map(|e| !e.state().is_terminal()).unwrap_or(false)
+        {
+            set.push(*pr);
+        }
+    }
+    // Queue order, which §9 requires the survivors to keep.
+    let order: Vec<u64> = state.entries.iter().map(|e| e.pr).collect();
+    set.sort_by_key(|p| order.iter().position(|q| q == p).unwrap_or(usize::MAX));
+    set
+}
+
+/// Name a culprit, kick it back, and tell the two audiences §9 names: a durable
+/// comment on the PR, and one decision-grade notice to the orchestrator.
+///
+/// The siblings named are the **original batch's**, not the last round's — a
+/// pairwise interaction is only visible if the reader can see everyone the
+/// culprit was combined with, which is the whole reason
+/// [`BisectSearch::origin_prs`] is carried.
+fn attribute(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    batch: &BatchRecord,
+    search: &BisectSearch,
+    culprit: u64,
+    moves: &mut Vec<Transition>,
+    rep: &mut DriveReport,
+) {
+    let survivors: Vec<u64> = search.origin_prs.iter().copied().filter(|p| *p != culprit).collect();
+    mv(state, moves, culprit, EntryState::KickedBack);
+    set_batch_tag(state, culprit, None);
+    finish_batch(state);
+    prune_terminal(state);
+
+    // §9's honest limit, checked rather than assumed: a batch still red at k = 1
+    // while that PR's OWN checks are green is an infrastructure/flake case, and
+    // saying "this PR broke the batch" there would be a confident half-truth.
+    let own_ci = pr_ci_green(r, culprit);
+    // `run_url` is `None` on purpose: §5's classification adapter narrows
+    // `gh pr checks` to names and a verdict, and the queue does not keep a
+    // second parse of that JSON just to carry a link. The batch id and the
+    // sibling set are the handles the comment gives instead. An invented or
+    // repurposed URL — the batch PR's, say, under a field labelled `run` —
+    // would be the mislabel §11.5 forbids one layer over.
+    let comment = culprit_comment(&batch.id, &search.failing, None, &survivors);
+    let posted = post_comment(r, &batch.id, culprit, &comment);
+    if let Err(why) = &posted {
+        rep.audit(
+            super::mqdriver::audit_action::CLEANUP_FAILED,
+            json!({ "batch": batch.id, "step": "culprit-comment", "pr": culprit,
+                    "detail": quote(why) }),
+        );
+    }
+    rep.audit(
+        audit_action::CULPRIT,
+        json!({ "batch": batch.id, "pr": culprit, "survivors": survivors,
+                "failing": search.failing, "own_checks_green": own_ci,
+                "comment_posted": posted.is_ok(), "transitions": moves_json(moves) }),
+    );
+    rep.audit(
+        audit_action::KICKED_BACK,
+        json!({ "batch": batch.id, "pr": culprit, "why": "isolated as the batch's culprit" }),
+    );
+    rep.notices.push(if own_ci == Some(true) {
+        flake_notice(culprit, &batch.id, &search.failing, survivors.len())
+    } else {
+        culprit_notice(culprit, &batch.id, &search.failing, survivors.len())
+    });
+}
+
+/// Build, push and open the next probe of a search (§9), leaving the state with
+/// a batch record for it.
+#[allow(clippy::too_many_arguments)]
+fn build_probe(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    cfg: &DriveConfig<'_>,
+    prev: &BatchRecord,
+    search: &BisectSearch,
+    subset: &[u64],
+    red: &[u64],
+    rep: &mut DriveReport,
+) {
+    let heads: Vec<(u64, String)> = subset
+        .iter()
+        .filter_map(|pr| state.entry(*pr).map(|e| (*pr, e.head.clone())))
+        .collect();
+    let target = state.target.clone();
+    let mut moves = Vec::new();
+    match construct(r, state, cfg, &heads, &target, Some(search.clone()), &mut moves, rep) {
+        Some(rec) => {
+            for pr in subset {
+                set_batch_tag(state, *pr, Some(&rec.id));
+            }
+            record_batch(state, rec);
+            rep.changed = true;
+        }
+        None => {
+            // Abandoning the search is the bounded answer: every entry still
+            // under suspicion goes back to `queued` and a later ordinary batch
+            // re-derives the whole question. Nothing is attributed on a probe
+            // that never ran — that would be blaming a PR for a `git` failure.
+            for pr in red {
+                requeue(state, &mut moves, *pr);
+            }
+            finish_batch(state);
+            rep.changed = true;
+            rep.audit(
+                audit_action::BATCH_ABORTED,
+                json!({ "batch": prev.id, "why": "the next bisect probe could not be built",
+                        "red": red, "transitions": moves_json(&moves) }),
+            );
+            rep.notices.push(format!(
+                "[loomux] merge queue: batch {}'s search was abandoned - the next probe could \
+                 not be built. {} entr{} requeued; nothing attributed.",
+                quote(&prev.id),
+                red.len(),
+                if red.len() == 1 { "y" } else { "ies" }
+            ));
+        }
+    }
+}
+
+// ── branch 2: cut a batch ───────────────────────────────────────────────────
+
+fn start_batch(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    cfg: &DriveConfig<'_>,
+    gate: &GateSpec,
+    verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
+    rep: &mut DriveReport,
+) {
+    // The single-in-flight discipline (§4), held on the entries as well as on
+    // the batch record — `plan_batch` refuses on either, and an inconsistent
+    // file must never be the reason a second batch races the first. Nothing here
+    // repairs that shape: it is `reconcile_batch`'s, once, at startup.
+    if !matches!(plan_batch(state, cfg.max_batch), BatchPlan::Idle | BatchPlan::Build(_)) {
+        return;
+    }
+    if !state.entries.iter().any(|e| e.state() == EntryState::Queued) {
+        return;
+    }
+    let target = state.target.clone();
+    let (selected, examined, truncated) = refresh_and_select(r, state, cfg, gate, verdicts, rep);
+    if selected.is_empty() {
+        // Two ways to get here and both want the same answer. Either the pass
+        // stalled on the seam, in which case it has already audited and set
+        // `backoff`; or everything at the head of the queue is blocked — a real
+        // state (§4) and not a failure, since the reasons are on the entries and
+        // visible in `merge_queue_status`. In that second case the refresh that
+        // established it costs two
+        // `gh` round-trips per examined entry, and a queue can sit blocked for
+        // hours waiting on a re-review. Retrying that on every 30-second wake
+        // would be ~700 `gh` calls an hour for a group doing nothing, which is
+        // the fan-out this tick's whole design is about not producing. So the
+        // group backs off, and an unblocking re-review is picked up within the
+        // backoff rather than within a wake. Nothing is *waiting* on that
+        // latency: the human action that unblocks it takes longer than the
+        // backoff does.
+        rep.backoff = true;
+        return;
+    }
+
+    let heads: Vec<(u64, String)> = selected
+        .iter()
+        .filter_map(|pr| state.entry(*pr).map(|e| (*pr, e.head.clone())))
+        .collect();
+    let mut moves = Vec::new();
+    match construct(r, state, cfg, &heads, &target, None, &mut moves, rep) {
+        Some(rec) => {
+            for pr in &selected {
+                mv(state, &mut moves, *pr, EntryState::CiWait);
+                set_batch_tag(state, *pr, Some(&rec.id));
+            }
+            rep.audit(
+                audit_action::BATCH_BUILT,
+                json!({ "batch": rec.id, "target": target, "prs": rec.prs,
+                        "scratch_sha": rec.scratch_sha, "draft_pr": rec.draft_pr,
+                        "examined": examined, "examination_truncated": truncated,
+                        "transitions": moves_json(&moves) }),
+            );
+            record_batch(state, rec);
+            rep.changed = true;
+        }
+        None => {
+            // `construct` has already audited exactly what failed and returned
+            // the entries to `queued`; there is nothing to add here.
+        }
+    }
+}
+
+/// Refresh §4's live eligibility predicate over the head of the queue and return
+/// what may go into a batch.
+///
+/// This is §7 layer 2 and §6's **first** enforcement point, and both are done
+/// per entry at build time rather than once for the batch: a PR that was
+/// approved when it was enqueued may have been rebased, re-reviewed, or
+/// retargeted since, and the queue is only ever as strong as the moment it last
+/// asked.
+///
+/// A refusal does not remove the entry — it records the reason and leaves it
+/// `queued` (§4: "paused" is a predicate, not a ninth state), so a re-review that
+/// covers the new head makes it eligible again with no agent action at all.
+///
+/// Returns `(selected, examined, truncated)`; the last two exist so the audit
+/// event can say the window was capped rather than implying the whole queue was
+/// considered.
+fn refresh_and_select(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    cfg: &DriveConfig<'_>,
+    gate: &GateSpec,
+    verdicts: &dyn Fn(u64) -> BTreeMap<BlockId, ReviewVerdict>,
+    rep: &mut DriveReport,
+) -> (Vec<u64>, usize, bool) {
+    let queued: Vec<u64> =
+        state.entries.iter().filter(|e| e.state() == EntryState::Queued).map(|e| e.pr).collect();
+    let truncated = queued.len() > MAX_EXAMINED_PER_BUILD;
+    let window: Vec<u64> = queued.into_iter().take(MAX_EXAMINED_PER_BUILD).collect();
+    let target = state.target.clone();
+
+    let mut selected: Vec<u64> = Vec::new();
+    let mut examined = 0usize;
+    for pr in &window {
+        if selected.len() >= cfg.max_batch as usize {
+            break;
+        }
+        examined += 1;
+        // §7 layer 2: live, through the real `gh`, and re-checked against the
+        // recorded target — a PR whose base moved under the queue is refused
+        // here rather than landed somewhere nobody reviewed it for.
+        //
+        // **A runner failure ends the pass.** It is a fact about the world, not
+        // about this PR: the next entry costs another `MQ_CMD_TIMEOUT` for the
+        // same reason and answers nothing. Carrying on would put
+        // `MAX_EXAMINED_PER_BUILD` timeouts back to back inside the one loop
+        // that also delivers every `notify_when` notice in the fleet — the
+        // counts are bounded, but the clock is what the fleet actually feels.
+        // Stopping here bounds the phase at **one** timed-out call, and the
+        // group backs off rather than re-deriving the same stall next wake.
+        // Same line `land()` draws with `backoff = culprit.is_none()`.
+        let reason = match resolve_and_validate_target_detailed(r, *pr, Some(&target), None) {
+            Err(f) if f.is_runner() => return stall(rep, examined, truncated, *pr, &f),
+            Err(f) => Some(f.into_refusal().code().to_string()),
+            Ok((_, facts)) => {
+                // Fetched only when the gate declares the clause — the same
+                // predicate `land_batch` uses, which fails *toward* fetching
+                // (an absent or malformed gate answers yes), so an unreadable
+                // gate can never be the reason a check was skipped. Reused
+                // rather than re-decided here because the build and the landing
+                // must not disagree about when the sub-PR's own CI matters, and
+                // because this runs once per examined entry inside a shared
+                // poll tick.
+                let ci_green = if super::mqdriver::declares_ci_green(gate) {
+                    match super::mqdriver::pr_ci_green_detailed(r, *pr) {
+                        // Same reasoning as the target lookup, one call later: a
+                        // seam that could not run is the world, and handling it
+                        // here is why the bound holds whichever of the two
+                        // lookups stalls first.
+                        Err(e) => {
+                            return stall(
+                                rep,
+                                examined,
+                                truncated,
+                                *pr,
+                                &super::mqdriver::ResolveFailure::Runner(e),
+                            )
+                        }
+                        Ok(v) => v,
+                    }
+                } else {
+                    None
+                };
+                let observed =
+                    PrObservation { body_digest: Some(body_digest(&facts.body)), ci_green };
+                let recheck =
+                    recheck_gate(gate, &verdicts(*pr), Some(facts.head.as_str()), &observed);
+                if recheck.passed() {
+                    // The head is refreshed from the live answer, so the batch
+                    // is built on the object the gate was just checked against.
+                    if set_head(state, *pr, &facts.head) {
+                        rep.changed = true;
+                    }
+                    None
+                } else {
+                    Some(recheck.refusal_code().unwrap_or(refusal::GATE_NOT_MET).to_string())
+                }
+            }
+        };
+        if set_blocked(state, *pr, reason.clone()) {
+            rep.changed = true;
+        }
+        if reason.is_none() {
+            selected.push(*pr);
+        }
+    }
+    (selected, examined, truncated)
+}
+
+/// End a selection pass because the seam stalled, not because a PR was refused.
+///
+/// Returns an empty selection (so no batch is cut on half a picture), reports
+/// `backoff` (so the next wake is five minutes away rather than 30 seconds), and
+/// audits what happened with the entry it stalled on — an operator looking at a
+/// queue that stopped moving needs the `git`/`gh` message, and `mq-batch-aborted`
+/// is §11.5's action for "a batch was not built and here is why".
+fn stall(
+    rep: &mut DriveReport,
+    examined: usize,
+    truncated: bool,
+    pr: u64,
+    why: &super::mqdriver::ResolveFailure,
+) -> (Vec<u64>, usize, bool) {
+    let detail = match why {
+        super::mqdriver::ResolveFailure::Runner(e) => quote(e),
+        // Unreachable — `stall` is only called on a runner failure — and still
+        // rendered rather than unwrapped, because an audit line that says
+        // nothing is worse than one that says something unexpected.
+        other => format!("{other:?}"),
+    };
+    rep.backoff = true;
+    rep.audit(
+        audit_action::BATCH_ABORTED,
+        json!({ "why": "a live lookup could not be completed; the selection pass stopped rather \
+                        than spending one timeout per entry on the same stall",
+                "pr": pr, "detail": detail,
+                "examined": examined, "examination_truncated": truncated }),
+    );
+    (Vec::new(), examined, truncated)
+}
+
+/// Mint, build, push and open the draft PR — the whole construction half of a
+/// batch, shared by an ordinary batch and a bisect probe because every step of
+/// it and every failure of it is identical between them.
+///
+/// Returns the batch record on success. On failure the selected entries have
+/// been returned to `queued`, the audit event has been recorded and the notice
+/// (if the failure deserves one) is on the report — so a caller has nothing left
+/// to clean up, which is what keeps the two call sites from each having to get
+/// six failure paths right.
+#[allow(clippy::too_many_arguments)]
+fn construct(
+    r: &dyn MqRunner,
+    state: &mut MergeQueueState,
+    cfg: &DriveConfig<'_>,
+    heads: &[(u64, String)],
+    target: &str,
+    search: Option<BisectSearch>,
+    moves: &mut Vec<Transition>,
+    rep: &mut DriveReport,
+) -> Option<BatchRecord> {
+    let prs: Vec<u64> = heads.iter().map(|(p, _)| *p).collect();
+    let probe = search.is_some();
+    if !probe {
+        // An ordinary batch's entries enter `batching` before any external call,
+        // so a crash anywhere below leaves a shape `reconcile_batch` recognises.
+        // A probe's entries are already `bisecting` and stay there.
+        for pr in &prs {
+            mv(state, moves, *pr, EntryState::Batching);
+        }
+        rep.changed = true;
+    }
+
+    let abort = |state: &mut MergeQueueState, rep: &mut DriveReport, why: String, backoff: bool| {
+        let mut back = Vec::new();
+        if !probe {
+            for pr in &prs {
+                requeue(state, &mut back, *pr);
+            }
+        }
+        rep.changed = true;
+        rep.backoff = rep.backoff || backoff;
+        rep.audit(
+            audit_action::BATCH_ABORTED,
+            json!({ "prs": prs, "why": quote(&why), "probe": probe,
+                    "transitions": moves_json(&back) }),
+        );
+        why
+    };
+
+    let minted = match mint_scratch(r, cfg.group, cfg.now_ms) {
+        Ok(m) => m,
+        Err(MintError::Collision { attempts }) => {
+            let why = abort(
+                state,
+                rep,
+                format!("{attempts} scratch-ref names in a row already existed on the remote"),
+                true,
+            );
+            rep.audit(
+                super::mqdriver::audit_action::SCRATCH_COLLISION,
+                json!({ "prs": prs, "attempts": attempts }),
+            );
+            rep.notices.push(batch_aborted_notice(&prs, &why));
+            return None;
+        }
+        Err(MintError::Lookup(e)) => {
+            let why = abort(state, rep, format!("the remote could not be asked: {e}"), true);
+            rep.notices.push(batch_aborted_notice(&prs, &why));
+            return None;
+        }
+        Err(MintError::BadName) => {
+            // The group id will not build a ref name, and will not on any retry
+            // — so this is a permanent refusal, not a transient one.
+            let why = abort(
+                state,
+                rep,
+                format!("no scratch ref name can be built for group {:?}", cfg.group),
+                true,
+            );
+            rep.notices.push(batch_aborted_notice(&prs, &why));
+            return None;
+        }
+    };
+
+    let build = build_scratch(r, &minted.batch_id, &minted.branch, target, heads);
+    if let Some(why) = build.cleanup_failed {
+        // §10: cleanup failure never fails a batch. Audited, not acted on.
+        rep.audit(
+            super::mqdriver::audit_action::CLEANUP_FAILED,
+            json!({ "batch": minted.batch_id, "step": "remove-worktree", "detail": quote(&why) }),
+        );
+    }
+    let scratch = match build.result {
+        Ok(s) => s,
+        // §8: a conflict costs no CI. The entry kicks back immediately, before
+        // anything is pushed, and the batch rebuilds without it on the next tick
+        // — a tick rather than a retry here, because "one advance per call" is
+        // what keeps this bounded inside the shared poll loop.
+        Err(BatchBuildError::Conflict { pr }) => {
+            kick_back_one(state, rep, &prs, pr, "the speculative merge conflicted", probe);
+            return None;
+        }
+        // A head that moved has lost its verdicts (§6), which is a better reason
+        // to kick back than a conflict is.
+        Err(BatchBuildError::HeadMoved { pr, expected, actual }) => {
+            kick_back_one(
+                state,
+                rep,
+                &prs,
+                pr,
+                &format!(
+                    "its head moved under the queue ({} -> {})",
+                    quote(&expected),
+                    quote(&actual)
+                ),
+                probe,
+            );
+            return None;
+        }
+        Err(BatchBuildError::NoTargetHead(e)) => {
+            let why = abort(state, rep, format!("the target {target:?} could not be resolved: {e}"), true);
+            rep.notices.push(batch_aborted_notice(&prs, &why));
+            return None;
+        }
+        Err(BatchBuildError::Git(e)) => {
+            let why = abort(state, rep, format!("git failed while building the batch: {e}"), true);
+            rep.notices.push(batch_aborted_notice(&prs, &why));
+            return None;
+        }
+    };
+
+    // §4: create-only by primitive. A lease rejection here means a ref this
+    // batch does not own is sitting on the name, which is the collision the mint
+    // check exists for — and it is not deleted to make room.
+    if let Err(e) = push_scratch(r, &scratch.sha, &minted.branch) {
+        let why = abort(state, rep, format!("the scratch push was rejected: {e}"), true);
+        rep.audit(
+            super::mqdriver::audit_action::SCRATCH_COLLISION,
+            json!({ "batch": minted.batch_id, "branch": minted.branch, "detail": quote(&e) }),
+        );
+        rep.notices.push(batch_aborted_notice(&prs, &why));
+        return None;
+    }
+    rep.audit(
+        super::mqdriver::audit_action::BATCH_PUSHED,
+        json!({ "batch": minted.batch_id, "branch": minted.branch, "sha": scratch.sha,
+                "target_head": scratch.target_head, "mint_attempts": minted.attempts }),
+    );
+
+    let title = batch_pr_title(&minted.batch_id, &prs);
+    let body = batch_pr_body(&minted.batch_id, target, &scratch.sha, &prs);
+    match open_draft_pr(r, &minted.batch_id, &minted.branch, target, &title, &body) {
+        Ok(draft_pr) => {
+            let mut rec = match search {
+                Some(s) => BatchRecord::new_probe(&minted.batch_id, prs.clone(), cfg.now_ms, s),
+                None => BatchRecord::new(&minted.batch_id, prs.clone(), cfg.now_ms),
+            };
+            rec.scratch_sha = scratch.sha;
+            rec.draft_pr = Some(draft_pr);
+            if !probe {
+                // batching -> ci-wait: the scratch is pushed and the draft PR is
+                // open, which is exactly what that state means (§4).
+                let _ = rec.advance(EntryState::CiWait);
+            }
+            Some(rec)
+        }
+        Err(e) => {
+            // The scratch ref is already on the remote at this point, so cleanup
+            // has something real to do. `cleanup_scratch` is given no draft PR
+            // because there is none to close — or, in the unparseable-number
+            // case, none loomux can name, which the notice says out loud rather
+            // than leaving a stray draft PR nobody knows about.
+            for f in cleanup_scratch(r, cfg.group, &minted.batch_id, None) {
+                rep.audit(
+                    super::mqdriver::audit_action::CLEANUP_FAILED,
+                    json!({ "batch": minted.batch_id, "step": f.step, "detail": quote(&f.why) }),
+                );
+            }
+            let why = abort(state, rep, format!("the batch draft PR could not be opened: {e}"), true);
+            rep.notices.push(batch_aborted_notice(&prs, &why));
+            None
+        }
+    }
+}
+
+/// Kick one entry out of a batch under construction and return the rest to
+/// `queued` (§8's conflict path, §6's moved-head path).
+fn kick_back_one(
+    state: &mut MergeQueueState,
+    rep: &mut DriveReport,
+    batch: &[u64],
+    pr: u64,
+    why: &str,
+    probe: bool,
+) {
+    let mut moves = Vec::new();
+    mv(state, &mut moves, pr, EntryState::KickedBack);
+    set_batch_tag(state, pr, None);
+    for other in batch {
+        if *other != pr {
+            requeue(state, &mut moves, *other);
+        }
+    }
+    if probe {
+        // A probe whose construction kicked one of its own members back cannot
+        // continue the search — the set under test has changed underneath it.
+        // Everything still suspected goes back to `queued`; a later ordinary
+        // batch re-derives the question from scratch.
+        let still: Vec<u64> = state
+            .entries
+            .iter()
+            .filter(|e| e.state() == EntryState::Bisecting)
+            .map(|e| e.pr)
+            .collect();
+        for other in still {
+            requeue(state, &mut moves, other);
+        }
+    }
+    // Releases the target if that kick-back emptied the queue (§4: a target is a
+    // property of the work in it). The batch record is already `None` on both
+    // call paths, so this is the release and nothing else.
+    finish_batch(state);
+    prune_terminal(state);
+    rep.changed = true;
+    rep.audit(
+        audit_action::KICKED_BACK,
+        json!({ "pr": pr, "why": why, "batch_prs": batch, "probe": probe,
+                "transitions": moves_json(&moves) }),
+    );
+    rep.notices.push(format!(
+        "[loomux] merge queue: #{pr} was kicked back before any CI was spent - {}. \
+         The batch rebuilds without it.",
+        quote(why)
+    ));
+}
+
+// ── the driver's small mutations, in one place ──────────────────────────────
+
+/// Apply one transition and record it for the audit. `false` when the entry is
+/// gone or the state machine refused — refusals are not silently rendered as
+/// successes, they simply produce no transition to report.
+fn mv(
+    state: &mut MergeQueueState,
+    moves: &mut Vec<Transition>,
+    pr: u64,
+    to: EntryState,
+) -> bool {
+    match advance_entry(state, pr, to) {
+        Ok(Some(t)) => {
+            moves.push(t);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Return one entry to `queued` and detach it from whatever batch it was in.
+fn requeue(state: &mut MergeQueueState, moves: &mut Vec<Transition>, pr: u64) -> bool {
+    let moved = mv(state, moves, pr, EntryState::Queued);
+    if moved {
+        set_batch_tag(state, pr, None);
+    }
+    moved
+}
+
+fn set_batch_tag(state: &mut MergeQueueState, pr: u64, batch: Option<&str>) {
+    if let Some(e) = state.entries.iter_mut().find(|e| e.pr == pr) {
+        e.batch = batch.map(|b| b.to_string());
+    }
+}
+
+fn set_blocked(state: &mut MergeQueueState, pr: u64, reason: Option<String>) -> bool {
+    match state.entries.iter_mut().find(|e| e.pr == pr) {
+        Some(e) if e.blocked_reason != reason => {
+            e.blocked_reason = reason;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn set_head(state: &mut MergeQueueState, pr: u64, head: &str) -> bool {
+    match state.entries.iter_mut().find(|e| e.pr == pr) {
+        Some(e) if e.head != head => {
+            e.head = head.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+fn moves_json(moves: &[Transition]) -> Value {
+    Value::Array(
+        moves
+            .iter()
+            .map(|t| json!({ "pr": t.pr, "from": t.from.as_str(), "to": t.to.as_str() }))
+            .collect(),
+    )
+}
+
+/// §10's "cleanup runs on every exit path": close the draft PR and delete the
+/// scratch ref by exact name, plus the temp worktree in case a crash left one.
+/// Every failure is audited and none of them fails anything.
+fn teardown(r: &dyn MqRunner, group: &str, batch: &BatchRecord, rep: &mut DriveReport) {
+    for f in cleanup_scratch(r, group, &batch.id, batch.draft_pr) {
+        rep.audit(
+            super::mqdriver::audit_action::CLEANUP_FAILED,
+            json!({ "batch": batch.id, "step": f.step, "detail": quote(&f.why) }),
+        );
+    }
+    if let Some(why) = cleanup_worktree(r, &batch.id) {
+        rep.audit(
+            super::mqdriver::audit_action::CLEANUP_FAILED,
+            json!({ "batch": batch.id, "step": "remove-worktree", "detail": quote(&why) }),
+        );
+    }
+}
+
+// ── the two `gh` writes the driver performs ─────────────────────────────────
+
+/// Where a body file for one `gh` write lives.
+///
+/// The OS temp dir, under a name built from the **batch id** — which is
+/// `RandomState`-derived (§11.4), so two agents, two groups or two batches on
+/// one machine cannot pick the same path. That is not a theoretical concern:
+/// `/tmp/body.md` is the obvious name, everybody picks it, and two writers
+/// seconds apart published one PR's body under the other's text (#625). A path
+/// only this batch can name is the fix.
+/// **`None` for an id this module will not build a name from**, enforced here
+/// rather than by the caller — see [`scratch_worktree_path`] for why the
+/// difference between "the guard runs first" and "the builder refuses" is the
+/// difference between a positional guarantee and a structural one (rev-183).
+fn body_file_path(batch_id: &str, kind: &str) -> Option<PathBuf> {
+    if !valid_id_component(batch_id) {
+        return None;
+    }
+    Some(std::env::temp_dir().join(format!("loomux-mq-{}-{kind}.md", batch_id.trim())))
+}
+
+/// Write a body file, run `f` with its path, and remove it whatever happened.
+///
+/// `--body-file` rather than `--body` because a batch body is multi-line and a
+/// culprit comment is longer still; the arg-vector rule makes a long argument
+/// safe but not portable, and `gh` reads a file the same way on every platform.
+fn with_body_file<T>(
+    batch_id: &str,
+    kind: &str,
+    text: &str,
+    f: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let path = body_file_path(batch_id, kind)
+        .ok_or_else(|| format!("refusing to build a body-file path from batch id {batch_id:?}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let out = f(&path.display().to_string());
+    // Best effort: a leftover body file in the OS temp dir is inert, and failing
+    // a landed batch over one would be the tail wagging the dog.
+    let _ = std::fs::remove_file(&path);
+    out
+}
+
+/// The PR number `gh pr create` just reported.
+///
+/// `gh` prints the new PR's URL on stdout, possibly after other chatter, so the
+/// **last** line carrying `/pull/<n>` wins. Anything else is an error rather
+/// than a guess: a draft PR whose number loomux cannot name is one it can never
+/// observe, close, or clean up, and inventing a number would attach the batch to
+/// somebody else's PR.
+pub fn parse_created_pr(stdout: &str) -> Option<u64> {
+    stdout.lines().rev().find_map(|line| {
+        let (_, tail) = line.trim().rsplit_once("/pull/")?;
+        tail.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    })
+}
+
+/// Open the batch's draft PR and return its number (§5).
+fn open_draft_pr(
+    r: &dyn MqRunner,
+    batch_id: &str,
+    branch: &str,
+    target: &str,
+    title: &str,
+    body: &str,
+) -> Result<u64, String> {
+    with_body_file(batch_id, "batch", body, |file| {
+        let argv = draft_pr_argv(branch, target, title, file);
+        let out = r.gh(&as_args(&argv))?;
+        if !out.ok() {
+            return Err(if out.stderr.is_empty() {
+                format!("gh pr create: exit {:?}", out.code)
+            } else {
+                out.stderr.clone()
+            });
+        }
+        parse_created_pr(&out.stdout).ok_or_else(|| {
+            format!(
+                "gh pr create reported no PR number for {branch}; a draft PR may be open on \
+                 that branch and will need closing by hand"
+            )
+        })
+    })
+}
+
+/// Post the culprit comment (§9).
+fn post_comment(r: &dyn MqRunner, batch_id: &str, pr: u64, body: &str) -> Result<(), String> {
+    with_body_file(batch_id, "culprit", body, |file| {
+        let out = r.gh(&as_args(&pr_comment_argv(pr, file)))?;
+        if out.ok() {
+            Ok(())
+        } else if out.stderr.is_empty() {
+            Err(format!("gh pr comment {pr}: exit {:?}", out.code))
+        } else {
+            Err(out.stderr.clone())
+        }
+    })
+}
+
+// ── the driver's notices ────────────────────────────────────────────────────
+
+/// A batch landed. Decision-grade: what is on the target now, and what the
+/// orchestrator no longer has to chase.
+///
+/// The sub-PRs are named as bare `#N` references. This text is loomux-authored
+/// and it reaches an orchestrator pane rather than GitHub, so the closing-keyword
+/// scan cannot see it — but the rule that loomux's own text never carries the
+/// pattern is a habit worth keeping uniform, because a notice's wording is
+/// exactly the kind of thing that later gets pasted into a PR body.
+pub fn landed_notice(batch_id: &str, target: &str, prs: &[u64]) -> String {
+    let named: Vec<String> =
+        prs.iter().take(MAX_SIBLINGS_LISTED).map(|p| format!("#{p}")).collect();
+    let more = if prs.len() > MAX_SIBLINGS_LISTED {
+        format!(" +{} more", prs.len() - MAX_SIBLINGS_LISTED)
+    } else {
+        String::new()
+    };
+    format!(
+        "[loomux] merge queue: batch {} landed on {} - {}{}. The tested object is the target head.",
+        quote(batch_id),
+        quote(target),
+        named.join(", "),
+        more
+    )
+}
+
+/// A green batch that was refused at the moment of submit (§6, §10).
+pub fn land_refused_notice(
+    batch_id: &str,
+    culprit: Option<u64>,
+    why: &str,
+    batch_size: usize,
+) -> String {
+    match culprit {
+        Some(pr) => format!(
+            "[loomux] merge queue: batch {} was REFUSED at landing on #{pr} ({}). \
+             #{pr} kicked back; {} sibling{} requeued; nothing landed.",
+            quote(batch_id),
+            quote(why),
+            batch_size.saturating_sub(1),
+            if batch_size == 2 { "" } else { "s" }
+        ),
+        None => format!(
+            "[loomux] merge queue: batch {} could NOT land ({}). All {batch_size} entries \
+             requeued; nothing landed and no PR is implicated.",
+            quote(batch_id),
+            quote(why)
+        ),
+    }
+}
+
+/// A batch that could not be constructed at all (§10's abort rows).
+pub fn batch_aborted_notice(prs: &[u64], why: &str) -> String {
+    format!(
+        "[loomux] merge queue: a batch of {} entr{} was ABORTED before CI - {}. \
+         Entries requeued; nothing landed.",
+        prs.len(),
+        if prs.len() == 1 { "y" } else { "ies" },
+        quote(why)
+    )
+}
+
+/// §9's infrastructure/flake case: the batch is still red at k = 1 while that
+/// PR's **own** checks are green.
+///
+/// Distinct from [`culprit_notice`] because it asks for something different.
+/// "This PR broke the batch" and "this PR looks fine on its own and the batch
+/// still fails" send a reader to different places, and collapsing them would
+/// route somebody to re-review a diff when the thing to look at is CI. §9 is
+/// explicit that this is surfaced, not looped on — the entry is still kicked
+/// back, exactly once.
+pub fn flake_notice(culprit: u64, batch_id: &str, failing: &[String], survivors: usize) -> String {
+    let check = failing.first().map(|f| format!(" ({})", quote(f))).unwrap_or_default();
+    format!(
+        "[loomux] merge queue: batch {} is still red at k=1 on #{culprit}{check}, but #{culprit}'s \
+         OWN checks are green - treat this as infrastructure/flake, not a bad diff. \
+         #{culprit} kicked back; {survivors} sibling{} requeued.",
+        quote(batch_id),
+        if survivors == 1 { "" } else { "s" }
+    )
+}
+
+/// One line naming what a [`LandRefusal`] actually was — for the audit detail
+/// and the notice, which §11.5 requires to name what happened.
+fn land_refusal_text(refusal: &LandRefusal) -> String {
+    match refusal {
+        LandRefusal::Target { pr, refusal } => {
+            format!("the constraint-7 re-check refused at submit on #{pr}: {}", refusal.clone().code())
+        }
+        LandRefusal::Gate { pr, recheck } => format!(
+            "the merge gate no longer holds for #{pr}: {}",
+            recheck.refusal_code().unwrap_or("gate-not-met")
+        ),
+        LandRefusal::BadScratch => "the recorded scratch sha is not an object name".to_string(),
+        LandRefusal::PushFailed(e) => format!("the fast-forward push failed: {}", quote(e)),
+    }
 }
