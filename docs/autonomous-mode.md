@@ -57,9 +57,8 @@ All of these controls are in the **orchestrator group's lifecycle panel** (the
 section alongside pause, end-orchestration, and the max-agents stepper:
 
 - an **Autonomous mode** on/off toggle;
-- **Require human approval before merge** — a checkbox, *checked* by default
-  (today's human merge gate). Unchecking it lets the orchestrator merge on its own
-  while autonomous;
+- **Require human approval before merge** — a checkbox, *checked* by default.
+  Unchecking it lets the orchestrator merge on its own while autonomous;
 - **Auto-release** — a checkbox letting the orchestrator publish releases/tags
   itself while autonomous;
 - **⚠ Dangerous mode** — a danger-styled toggle for supervised merges/releases
@@ -99,17 +98,17 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   the tick — it never fires while you're actively steering — but that deferral is
   capped at 15 minutes past the orchestrator's last real output (`group.json`'s
   `idle_tick_input_defer_max_minutes`; no panel control yet, hand-edit the file to
-  change it). This closed a real deadlock: on a copilot orchestrator, terminal
-  traffic the pane itself generates could look exactly like "you're typing" with
-  nobody there, silencing the tick forever until you pressed Enter yourself. Past
-  the bound the tick fires anyway rather than staying silent forever — a genuinely
+  change it). The cap matters because terminal traffic a pane generates on its own
+  (a Copilot orchestrator is the usual case) can read as "you're typing" with
+  nobody there, and an uncapped deferral would then silence the tick until you
+  pressed Enter yourself. Past the bound the tick fires anyway — a genuinely
   quiet stretch (no output, no typing) is either a stuck pane or you've stepped
   away, and both are correct to check in on.
 - **Pause still wins.** A [paused group](orchestration.html#group-lifecycle) is
   skipped entirely — no ticks, no deliveries — and your pause/off toggle is
   instant.
 - **An intake gate runs by default whenever autonomous mode is on.** Out of the
-  box, the idle window firing is no longer sufficient on its own: loomux also
+  box, the idle window firing is not sufficient on its own: loomux also
   runs a zero-token, host-side check (`gh issue list` / `gh pr list`, no LLM
   turn) for the same signals the tick exists to catch, and the orchestrator is
   only actually woken when there's something new — or when something else
@@ -118,8 +117,8 @@ PRs) simply never runs. Autonomous mode adds the missing **tick source**.
   as `idle-tick-skipped`, with a `"suppressed":true` marker), and a bounded
   fallback (every few hours, tunable, and never disableable) still wakes the
   orchestrator regardless, so a quiet stretch is never left unchecked forever.
-  **To opt a group OUT of the gate** (autonomous ticks fire unconditionally
-  again, exactly like before this feature existed) — set `intake_poll_minutes`
+  **To opt a group OUT of the gate** (autonomous ticks then fire unconditionally
+  on the idle window alone) — set `intake_poll_minutes`
   to `0` by hand in that group's `group.json` (there's no panel control for
   this; it's a deliberate, explicit override, not a toggle). Any other value
   there sets a custom poll cadence in minutes instead of the default.
@@ -153,11 +152,10 @@ money-stop.
 
 ## The merge & release gate
 
-"Never merge" used to be only an *instruction* in the orchestrator's prompt — and
-a live incident proved instructions aren't a boundary (an orchestrator merged four
-PRs straight to `main`). So the gate is now **structurally enforced**: every agent
-pane runs behind a loomux `gh` / `git` shim that **blocks** a default-branch merge
-or a release/tag publish unless it's authorized.
+"Never merge" is **structurally enforced**, not merely instructed — an instruction
+in a prompt is not a boundary. Every agent pane runs behind a loomux `gh` / `git`
+shim that **blocks** a default-branch merge or a release/tag publish unless it's
+authorized.
 
 A default-branch **merge** or a **release/tag publish** is allowed only when one of
 these holds:
@@ -220,7 +218,7 @@ Releases publish to the world — a `v*` tag push triggers the release workflow
   a release stays a deliberate opt-in.
 
 When on, the orchestrator may run `gh release create/edit/delete` and push a `v*`
-tag itself; read-only `gh release view/list/download` was never gated.
+tag itself; read-only `gh release view/list/download` is not gated.
 
 ## Supervised dangerous mode
 
@@ -239,9 +237,8 @@ each one**, while you supervise.
 
 - **Standalone and durable.** Unlike auto-merge/auto-release, dangerous mode is
   valid on its own (it *is* the not-autonomous posture) and survives a restart.
-- **No auto-expiry (yet).** Dangerous mode is a standing switch with no TTL — you
-  turn it off (or it clears when you enable autonomous). A time-based auto-expire is
-  a noted future hardening, deliberately left out for now.
+- **No auto-expiry.** Dangerous mode is a standing switch with no TTL — you turn it
+  off yourself, or it clears when you enable autonomous.
 - **Default off**, and — like the grant setters — it can be set **only from the UI**,
   never by any agent tool.
 

@@ -106,8 +106,7 @@ create) is hidden or disabled, with a **🔒 read-only** badge in the header.
 Click the badge to **unlock writes** for that worktree (it turns **🔓 writable**).
 The unlock is scoped to that one selection and is dropped the moment you switch
 worktrees — re-selecting it is read-only again, so you never leave writes armed
-on a tree you've moved away from. The **primary checkout keeps full write access**
-exactly as before.
+on a tree you've moved away from. The **primary checkout keeps full write access**.
 
 ## Safety
 

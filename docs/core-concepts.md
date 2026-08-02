@@ -86,8 +86,8 @@ What differs from the overlay, and only this:
   orchestration group is ended) *stays open* if its editor has unsaved edits, and its
   banner says so. The agent is already dead; your half-written file needn't be.
 - **Discard means discard.** Answering "Discard unsaved changes?" with *Discard* drops
-  the edits — the file goes back to what's on disk. It no longer hides the buffer and
-  asks you the same question again later.
+  the edits — the file goes back to what's on disk, and you aren't asked about that
+  buffer again.
 - **The git pane refreshes on open, after its own actions, and on ↻** — not on focus.
   Refreshing rebuilds the changes strip, which would wipe a half-typed commit message
   every time you tabbed away and back.
@@ -278,9 +278,7 @@ a restart — are on the **[Project tabs](features/project-tabs.html)** feature 
   selected it's still your terminal's interrupt key (`^C`), unchanged.
   `Ctrl+Shift+C` always copies a selection and is otherwise a no-op, so use
   it if you want a gesture that's never ambiguous with interrupting a
-  running process. There's no right-click menu for this (one existed
-  briefly; its paste path proved unreliable and was removed rather than
-  iterated on) and no copy-on-select.
+  running process. There's no right-click menu for this and no copy-on-select.
 - **Paste** — `Ctrl+Shift+V` always pastes. Plain `Ctrl+V` also pastes by
   default — turn that off if you use vim/nvim's `Ctrl+V` **VISUAL BLOCK**
   mode, readline's quoted-insert, or run anything else in the pane that wants

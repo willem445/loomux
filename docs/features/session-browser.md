@@ -25,9 +25,7 @@ It scans the local machine for resumable agent sessions:
 - **Claude Code** — `~/.claude/projects/*/*.jsonl` (titled by the first real
   prompt, resumed with `claude --resume <id>`).
 - **Copilot CLI** — `~/.copilot/session-state/*/workspace.yaml` (resumed with
-  `copilot --resume=<id>` — the `=` form, since Copilot documents `--resume` as
-  an optional-value flag and a space-separated id risks being misparsed as a
-  bare `--resume` plus a stray positional, see #458).
+  `copilot --resume=<id>`) (#458).
 
 Clicking a session opens a new pane in the session's original working directory
 and resumes it there. The pane is auto-named from the session.
