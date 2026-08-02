@@ -1,0 +1,10 @@
+● CI is green on draft PR #715 (head 180598c, full matrix passing). It stays in
+  draft, waiting on slice B (launcher UI) to land — reported to the orchestrator,
+  who owns the merge sequencing. Nothing further to do until B lands.
+
+✻ Crunched for 13s
+
+────────────────────── loomux-loomux-68435179-worker-deep ──
+[38;5;153m❯[0m
+─────────────────────────────────────────────────────────────
+  [2m⏵⏵ auto mode on (shift+tab to cycle) · PR #715 · ← for agents[0m
