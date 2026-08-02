@@ -169,12 +169,19 @@ For anything beyond the frontend-only and `rustfmt --check` steps above:
    gh pr checks <pr>
    gh run view <run-id> --log-failed   # when a check failed, to see why
    ```
-   **`gh pr checks` exits non-zero for "not finished yet", not only for "failed":
-   `8` means *checks pending* (`gh help exit-codes`), `1` means a check actually
-   failed.** A pane surfaces either as a red "Exit code N" tool error, so read the
-   code and the per-check rows — treating an `8` as a failure sends you debugging
+   **`gh pr checks` exits non-zero for "not finished yet", not only for
+   "failed": `8` means *checks pending*, `1` means a check actually failed.**
+   A pane surfaces either as a red "Exit code N" tool error, so read the code
+   and the per-check rows — treating an `8` as a failure sends you debugging
    green CI. The `E2E (Playwright, experimental)` row is the usual reason an
    otherwise-finished PR still reports `8`.
+
+   Check the **command's** help, not the general page: `gh pr checks --help`
+   ends with *"Additional exit codes: 8: Checks pending"*, while `gh help
+   exit-codes` lists only 0/1/2/4 and never mentions `8` — it just warns that
+   *"a particular command may have more exit codes, so it is a good practice
+   to check documentation for the command."* Reading only the general page is
+   how `8` comes to look like an anomaly rather than a documented state.
 4. **Never block the turn on the checks — register, end the turn, act on the
    notice.** With loomux's `notify_when` MCP tool available:
    ```
