@@ -172,6 +172,52 @@ test("approveWillMerge: stray whitespace around a recorded base is not a differe
   assert.doesNotMatch(result.reason ?? "", /sub-PR/);
 });
 
+test("approveWillMerge: an origin/-prefixed record of the DEFAULT branch is not a sub-PR", () => {
+  // rev-157 NB1: `pr_base` is agent-written and "the base ref" is as naturally
+  // written `origin/main` as `main`. Against a resolved default of `main` the
+  // raw comparison called that a sub-PR — a merge INTO the default branch
+  // dressed up as harmless, the one direction worth spending code on.
+  const result = approveWillMerge(status({ default_branch: "main" }), {
+    pr: "42",
+    pr_base: "origin/main",
+  });
+  assert.equal(result.ok, false);
+  assert.doesNotMatch(result.reason ?? "", /sub-PR/);
+  assert.match(result.reason ?? "", /gate needs rev-orch\/rev-ui\/rev-tests/);
+});
+
+test("approveWillMerge: an origin/-prefixed sub-PR base still reads as a sub-PR, named bare", () => {
+  // The strip is a vocabulary normalization, not a special case for the default
+  // branch: a genuine sub-PR recorded the same way must still relabel, and the
+  // label must name the branch the way the rest of loomux does.
+  const result = approveWillMerge(status({ default_branch: "main" }), {
+    pr: "42",
+    pr_base: "origin/integration/581",
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? "", /sub-PR into integration\/581/);
+  assert.doesNotMatch(result.reason ?? "", /origin\//);
+});
+
+test("approveWillMerge: only ONE leading origin/ is stripped — a doubled prefix is a typo, not a vocabulary", () => {
+  const result = approveWillMerge(status({ default_branch: "main" }), {
+    pr: "42",
+    pr_base: "origin/origin/main",
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason ?? "", /sub-PR into origin\/main/, "repairing this would be guessing");
+});
+
+test("approveWillMerge: a branch merely NAMED origin/... is not mistaken for a remote prefix twice over", () => {
+  // A real branch called `originals` must not lose characters to a prefix match
+  // on `origin` — the strip keys on the `origin/` separator, not on `origin`.
+  const result = approveWillMerge(status({ default_branch: "main" }), {
+    pr: "42",
+    pr_base: "originals",
+  });
+  assert.match(result.reason ?? "", /sub-PR into originals/);
+});
+
 test("approveWillMerge: an unsatisfiable gate outranks the sub-PR relabel", () => {
   // The gate applies to EVERY merge of the PR, integration branch included —
   // so "this session can't spawn the reviewers" is still the fact that decides

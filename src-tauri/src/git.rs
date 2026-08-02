@@ -738,10 +738,22 @@ fn resolve_default_base(repo: &str, how: BaseLookup) -> Option<String> {
 /// vocabulary a PR's base ref is in (`gh pr view --json baseRefName` reports
 /// `main`), and the two are only comparable in the same vocabulary.
 ///
+/// **What skipping the network costs: this answer is only as fresh as the last
+/// fetch somebody else happened to run.** It reads `origin/HEAD` and the local
+/// branches as they sit in the clone, so a remote default-branch rename
+/// (`master` → `main` is the usual one) is invisible here until something
+/// fetches, and until then this returns the OLD name — confidently, and with no
+/// signal that it is stale (rev-157 NB2). The name reads like an authority; it
+/// isn't one. Use it where a wrong answer costs a wrong sentence on screen, and
+/// never where a wrong answer would authorize something — anything deciding
+/// whether a merge may happen resolves the default branch live instead (the gh
+/// shim's own `gh repo view --json defaultBranchRef`).
+///
 /// `None` is a real answer — "this loomux cannot tell you the default branch" —
-/// and callers must treat it as unknown rather than substituting a guess: a
-/// wrong default branch here would relabel a merge INTO the default branch as a
-/// harmless sub-PR, the one direction this must never be wrong in.
+/// and callers must treat it as unknown rather than substituting a guess. It is
+/// not, however, the only way this can be wrong: a stale name (above) is
+/// non-`None` and wrong, and it errs toward calling a default-branch merge
+/// something else. Callers arrange to reduce that, not to eliminate it.
 pub fn default_branch_name(repo: &str) -> Option<String> {
     let r = resolve_default_base(repo, BaseLookup::Display)?;
     let name = r.strip_prefix("origin/").unwrap_or(&r).trim();

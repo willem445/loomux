@@ -25160,7 +25160,11 @@ impl OrchRegistry {
         // branch. `null` when it doesn't resolve — a real answer the frontend
         // must read as "unknown" and fall back to its conservative wording,
         // never as "not the default branch". Local refs only (see
-        // `default_branch_name`): this command is on a UI path.
+        // `default_branch_name`): this command is on a UI path, so the answer
+        // is also as stale as the clone's last fetch — a rename on the remote
+        // reads as the old name here until something fetches (rev-157 NB1/NB2).
+        // Both are tolerable for the same reason: the label is the only
+        // consumer, and no gate reads this.
         let default_branch = info.as_ref().and_then(|g| crate::git::default_branch_name(&g.repo));
         json!({
             "advanced": guardrails.advanced_orchestrator,

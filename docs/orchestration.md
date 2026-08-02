@@ -190,7 +190,13 @@ Board controls:
   included, and it is enforced against the base ref loomux resolves live at
   merge time — never against what a task says. The recorded base is display
   metadata the orchestrator writes, so treat it the way you'd treat any other
-  board text: informative, not authoritative.
+  board text: informative, not authoritative. Two ways the label can be
+  *wrong-but-harmless*, both worth knowing: the orchestrator can record a stale
+  base if it retargets the PR without updating the board, and loomux reads your
+  repo's default branch from the clone's own refs rather than fetching, so a
+  default branch renamed on the remote reads as the old name until something
+  fetches. Either way the worst case is a sentence that misdescribes the PR —
+  no merge is authorized by any of this.
 - **▶ Proceed** on a `prototype` item (a demo-gated deliverable awaiting your
   verdict) promotes it: two-click confirm flips it to `in-progress`, records
   your decision, and prompts the orchestrator to take the prototype to a full

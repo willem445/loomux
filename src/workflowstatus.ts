@@ -85,7 +85,17 @@ export function gateExitsMessage(): string {
  *
  *  What does NOT change: the gate applies to EVERY merge of the PR wherever it
  *  lands (shim property 2), so an unsatisfiable gate still outranks all of this,
- *  and `pr_base` is agent-written display metadata that nothing enforces on. */
+ *  and `pr_base` is agent-written display metadata that nothing enforces on.
+ *
+ *  The wrong-in-the-reassuring-direction case — a merge into the default branch
+ *  labelled a harmless sub-PR — is what the comparison below is arranged to
+ *  avoid, but it is REDUCED, not eliminated (rev-157 NB1). Two known residuals
+ *  survive: `default_branch` is resolved from local refs, so a clone that never
+ *  fetched a remote default-branch rename compares against the old name; and
+ *  `pr_base` is agent-written, so a value in some vocabulary neither side
+ *  expects reads as "a different branch". Nothing gates on either — the shim
+ *  resolves base and default live at merge time — so the cost of both is a
+ *  misleading sentence, never an authorization. */
 export function approveWillMerge(
   status: WorkflowStatus,
   task: { pr?: string | null; pr_base?: string | null }
@@ -95,10 +105,7 @@ export function approveWillMerge(
   if (!gate.satisfiable) {
     return { ok: false, reason: "gate unsatisfiable from this session — merges will bounce" };
   }
-  // Trimmed, never case-folded: git refs are case-sensitive, so `Main` is a
-  // different branch from `main` and folding case would read a typo as the
-  // default branch — the direction this must not be wrong in.
-  const base = task.pr_base?.trim();
+  const base = task.pr_base ? baseBranchName(task.pr_base) : undefined;
   const def = status.default_branch?.trim();
   if (base && def && base !== def) {
     return {
@@ -108,5 +115,25 @@ export function approveWillMerge(
   }
   return { ok: false, reason: `won't merge — gate needs ${gate.reviewers.join("/")}` };
 }
+
+/** A recorded base ref in the vocabulary `default_branch` speaks: trimmed, and
+ *  with one leading `origin/` removed (`origin/main` → `main`).
+ *
+ *  `pr_base` is agent-written and `gh pr view --json baseRefName` reports a bare
+ *  branch name, but "the base ref" is equally naturally written `origin/main` —
+ *  and against a resolved default of `main` that mismatch produced "sub-PR into
+ *  origin/main" for a PR heading straight at the default branch (rev-157 NB1),
+ *  the one direction worth spending code on. One leading segment only: an
+ *  `origin/origin/main` is a typo, not a vocabulary, and quietly repairing it
+ *  would be guessing rather than normalizing.
+ *
+ *  Case is deliberately NOT folded. Git refs are case-sensitive, so `Main` and
+ *  `main` really are two branches, and folding would make a typo read as the
+ *  default branch — which is the reassuring direction, the opposite of what the
+ *  `origin/` strip is for. */
+const baseBranchName = (ref: string): string => {
+  const t = ref.trim();
+  return t.startsWith("origin/") ? t.slice("origin/".length).trim() : t;
+};
 
 export type { WorkflowGateStatus, WorkflowStatus };
