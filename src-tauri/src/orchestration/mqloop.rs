@@ -1053,6 +1053,41 @@ pub mod refusal {
     /// terminal. Not in §11.1's `queue_merge` list because it cannot arise
     /// there — kept beside them so the whole vocabulary is one place.
     pub const NOT_QUEUED: &str = "not-queued";
+
+    // ── loomux faults, distinct from policy refusals (rev-163 NB) ───────────
+    //
+    // The eight above are **policy**: they say the queue considered the request
+    // and declined it, and each names something the caller can act on. These
+    // three say loomux itself failed, and conflating the two is the defect this
+    // module otherwise exists to prevent — an orchestrator told `queue-disabled`
+    // concludes the repo never opted in and stops, which is precisely the wrong
+    // move when the truth is a torn state file. A wrong label does not merely
+    // under-inform; it actively sends the reader somewhere else.
+    //
+    // Shape borrowed from `queue_orphans`' `no-app-handle` / `registry-not-shared`,
+    // which the tool description already flags as "should never appear in a
+    // running build, so treat one as a loomux defect worth reporting to the
+    // human". Same posture here, and the tool descriptions say so.
+
+    /// `merge_queue.json` exists and could not be read or parsed — a torn write,
+    /// a hand edit, or a file written by a newer schema. **Not** "nothing is
+    /// queued": loomux cannot tell what is queued, which is the distinction §4's
+    /// loud reconcile is built around.
+    pub const STATE_UNREADABLE: &str = "queue-state-unreadable";
+    /// The change was computed but could not be persisted. Reported as a
+    /// **failure** rather than a success, because an enqueue the next restart
+    /// forgets is not an enqueue.
+    pub const STATE_UNWRITABLE: &str = "queue-state-unwritable";
+    /// The group could not be resolved at all. Should never appear in a running
+    /// build; if it does, it is a loomux defect, not a queue state.
+    pub const QUEUE_UNAVAILABLE: &str = "queue-unavailable";
+
+    /// Whether a refusal string names a **loomux fault** rather than a policy
+    /// decision. Exposed so a caller (and a test) can branch on the distinction
+    /// without re-listing the strings and getting the list wrong later.
+    pub fn is_loomux_fault(reason: &str) -> bool {
+        matches!(reason, STATE_UNREADABLE | STATE_UNWRITABLE | QUEUE_UNAVAILABLE)
+    }
 }
 
 /// What `queue_merge` did.

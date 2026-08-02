@@ -33849,7 +33849,9 @@ impl OrchRegistry {
     pub fn queue_merge(&self, group: &str, pr: u64, target: Option<&str>) -> Value {
         let runner = match self.group(group).map(|g| g.repo) {
             Some(repo) => mqdriver::runner_for(std::path::Path::new(&repo)),
-            None => return json!({ "refused": mqloop::refusal::QUEUE_DISABLED }),
+            // A group loomux cannot resolve is a FAULT, not "the repo did not
+            // opt in" (rev-163 NB).
+            None => return json!({ "refused": mqloop::refusal::QUEUE_UNAVAILABLE }),
         };
         self.queue_merge_with(group, pr, target, &runner)
     }
@@ -33870,9 +33872,13 @@ impl OrchRegistry {
         let mut state = match mqloop::load_state(&dir) {
             Ok(s) => s,
             Err(e) => {
+                // A state file loomux cannot read is a FAULT, and saying
+                // `queue-disabled` here would tell an orchestrator the repo
+                // never opted in — so it would stop, which is the one wrong move
+                // (rev-163 NB).
                 self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
-                    json!({ "pr": pr, "reason": "unusable merge_queue.json", "detail": format!("{e:?}") }));
-                return json!({ "refused": mqloop::refusal::QUEUE_DISABLED });
+                    json!({ "pr": pr, "reason": mqloop::refusal::STATE_UNREADABLE, "detail": format!("{e:?}") }));
+                return json!({ "refused": mqloop::refusal::STATE_UNREADABLE });
             }
         };
         let gate = self.merge_queue_gate(group);
@@ -33886,8 +33892,8 @@ impl OrchRegistry {
                     // write is a failed enqueue — reported as such rather than
                     // returning a `queued: true` the next restart would forget.
                     self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
-                        json!({ "pr": pr, "reason": "merge_queue.json could not be written", "detail": e }));
-                    return json!({ "refused": mqloop::refusal::QUEUE_DISABLED });
+                        json!({ "pr": pr, "reason": mqloop::refusal::STATE_UNWRITABLE, "detail": e }));
+                    return json!({ "refused": mqloop::refusal::STATE_UNWRITABLE });
                 }
                 self.audit(group, "loomux", mqloop::audit_action::ENQUEUED,
                     json!({ "pr": pr, "target": state.target, "position": position }));
@@ -33920,15 +33926,26 @@ impl OrchRegistry {
     #[doc(hidden)] // pub for integration tests
     pub fn cancel_queued_merge(&self, group: &str, pr: u64) -> Value {
         let dir = self.group_dir(group);
-        let Ok(mut state) = mqloop::load_state(&dir) else {
-            return json!({ "refused": mqloop::refusal::NOT_QUEUED });
+        // Same species as `queue_merge`'s two, and not in rev-163's list because
+        // it wears a different label: `not-queued` asserts the PR is not in the
+        // queue, which loomux cannot possibly know from a state file it could
+        // not read. Fixed here rather than left for a later round.
+        let mut state = match mqloop::load_state(&dir) {
+            Ok(s) => s,
+            Err(e) => {
+                self.audit(group, "loomux", mqloop::audit_action::CANCELLED,
+                    json!({ "pr": pr, "reason": mqloop::refusal::STATE_UNREADABLE, "detail": format!("{e:?}") }));
+                return json!({ "refused": mqloop::refusal::STATE_UNREADABLE });
+            }
         };
         match mqloop::cancel(&mut state, pr) {
             mqloop::CancelOutcome::Cancelled { was } => {
                 if let Err(e) = mqloop::store_state(&dir, &state) {
+                    // A cancel the next restart forgets is not a cancel — and it
+                    // is certainly not "that PR was never queued".
                     self.audit(group, "loomux", mqloop::audit_action::CANCELLED,
-                        json!({ "pr": pr, "persisted": false, "detail": e }));
-                    return json!({ "refused": mqloop::refusal::NOT_QUEUED });
+                        json!({ "pr": pr, "reason": mqloop::refusal::STATE_UNWRITABLE, "detail": e }));
+                    return json!({ "refused": mqloop::refusal::STATE_UNWRITABLE });
                 }
                 self.audit(group, "loomux", mqloop::audit_action::CANCELLED,
                     json!({ "pr": pr, "from": was.as_str() }));

@@ -539,6 +539,104 @@ fn cancelling_a_pr_that_is_not_queued_is_refused_not_silently_successful() {
     assert_eq!(v["cancelled"], Value::Null);
 }
 
+/// **A loomux fault must read as a fault, never as a policy refusal**
+/// (rev-163 NB).
+///
+/// `queue-disabled` and `not-queued` are *decisions*: they say the queue looked
+/// at the request and declined, and each tells the caller something true they
+/// can act on. An unreadable state file is neither — and labelling it
+/// `queue-disabled` would tell an orchestrator its repo never opted in, so it
+/// would **stop**, which is the one wrong move when the truth is a torn write.
+/// A wrong label does not merely under-inform; it sends the reader elsewhere.
+///
+/// Shape borrowed from `queue_orphans`' `no-app-handle` / `registry-not-shared`,
+/// which are documented as "should never appear in a running build, so treat one
+/// as a loomux defect worth reporting".
+#[test]
+fn a_loomux_fault_is_labelled_as_one_and_never_as_a_policy_refusal() {
+    let (reg, d, co, _cw) = setup_mcp();
+    let qfile = d.path().join(&co.group).join("merge_queue.json");
+
+    // (1) queue_merge with an unreadable state file.
+    fs::write(&qfile, "{ this is not json").unwrap();
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "queue_merge", "arguments": { "pr": "612" } })).unwrap();
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        v["refused"], json!("queue-state-unreadable"),
+        "an unreadable queue must not read as 'the repo never opted in'"
+    );
+
+    // (2) cancel_queued_merge with the same file. `not-queued` would assert the
+    //     PR is absent, which loomux cannot know from a file it could not read.
+    let out = dispatch(&reg, &co, "tools/call",
+        &json!({ "name": "cancel_queued_merge", "arguments": { "pr": "612" } })).unwrap();
+    let v: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["refused"], json!("queue-state-unreadable"));
+
+    // (3) an unresolvable group — a fault, not a queue state. Called on the
+    //     registry directly: `dispatch` always uses `caller.group`, so there is
+    //     no agent-reachable path that names another group (which is itself the
+    //     reason there is no cross-group check to test).
+    let v = reg.queue_merge("no-such-group", 612, None);
+    assert_eq!(v["refused"], json!("queue-unavailable"));
+
+    // And all three are flagged as faults by the predicate the tool descriptions
+    // and any future caller branch on — so the distinction cannot be lost by
+    // someone re-listing the strings and missing one.
+    for label in ["queue-state-unreadable", "queue-state-unwritable", "queue-unavailable"] {
+        assert!(loomux_lib::orchestration::mqloop::refusal::is_loomux_fault(label), "{label}");
+    }
+    for label in ["queue-disabled", "not-queued", "gate-not-met", "base-is-default"] {
+        assert!(
+            !loomux_lib::orchestration::mqloop::refusal::is_loomux_fault(label),
+            "{label} is a policy decision, not a fault"
+        );
+    }
+}
+
+/// The unwritable half, on the one platform where a directory's permissions
+/// portably stop a write.
+///
+/// `#[cfg(unix)]` deliberately: on Windows the read-only *directory* attribute
+/// does not prevent file creation, so there is no portable way to force
+/// `atomic_write` to fail — and a test that silently does nothing on a platform
+/// is worse than one that states where it runs. The other four relabeled paths
+/// are covered on all three platforms above.
+/// Driven through **cancel** rather than enqueue, deliberately. Enqueue only
+/// reaches the write after resolving a target and satisfying the merge gate, so
+/// forcing a write failure there would mean standing up a whole gated repo — and
+/// a cheaper setup that refused earlier would produce an assertion that passes
+/// for the wrong reason. Cancel needs nothing but a readable queue file, so the
+/// write is genuinely the step under test.
+///
+/// `#[cfg(unix)]` deliberately: on Windows the read-only *directory* attribute
+/// does not prevent file creation, so there is no portable way to force
+/// `atomic_write` to fail. Stated rather than silently no-op'd on a platform.
+/// (Also inert if run as root, which CI is not.)
+#[cfg(unix)]
+#[test]
+fn a_queue_change_that_cannot_be_persisted_is_reported_as_unwritable() {
+    use std::os::unix::fs::PermissionsExt;
+    let (reg, d, co, _cw) = setup_mcp();
+    let gdir = d.path().join(&co.group);
+    fs::write(gdir.join("merge_queue.json"), IN_FLIGHT_QUEUE_JSON).unwrap();
+
+    // Readable, so `load_state` succeeds; not writable, so `store_state` fails.
+    fs::set_permissions(&gdir, fs::Permissions::from_mode(0o555)).unwrap();
+    let v = reg.cancel_queued_merge(&co.group, 612);
+    // Restored before asserting, so a failure cannot leave an undeletable dir.
+    fs::set_permissions(&gdir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        v["refused"],
+        json!("queue-state-unwritable"),
+        "a cancel the next restart would forget is not a cancel — and it is certainly \
+         not 'that PR was never queued'"
+    );
+    assert_eq!(v["cancelled"], Value::Null, "a fault never also reports success");
+}
+
 /// A malformed `pr` argument is rejected before anything is resolved — the
 /// tools take "PR number, #n, or URL" like every other PR-taking tool here, and
 /// an unparseable one must not become PR 0.
