@@ -5624,14 +5624,52 @@ and the caller's handling of `Clear` changed. `unconfirmed_disposition` and the 
 lifecycle are not involved. No queue is mutated by any of this, so no new `persist_queues`
 obligation arises under #523's mutation-site table.
 
-**Deferred, deliberately:** `push_stranded_front_locked` hardcodes `reason: EnqueueReason::Question`
-on every marker it pushes, so the audit trail attributes a stranded-front marker to a question hold
-that may not have happened (#560's second issue comment). It is audit-only — nothing branches on the
-field — and the honest fix for its *other* call site (`admit_stranded_selfheal`, where the cause is
-a self-heal and no `EnqueueReason` variant says so) needs a new variant, which reaches the
-sender-facing notice vocabulary (`queued_notice` matches exhaustively) and the persisted snapshot's
-reason string. That is a different review surface from the escalation clock, and fixing only the
-drainer half would leave the identical false claim on the other marker push.
+**Deferred at the time, landed since:** `push_stranded_front_locked` hardcoded
+`reason: EnqueueReason::Question` on every marker it pushed, so the audit trail attributed a
+stranded-front marker to a question hold that may not have happened (#560's second issue comment).
+It is audit-only — nothing branches on the field — but the record it falsifies is the only one there
+is for a write loomux decides to make on its own initiative. The remainder was left out of the
+escalation-clock PR because the honest fix is a different review surface, not because it was
+acceptable; it is described in its own section below.
+
+### The reason a marker is queued under (#560's residual)
+
+`push_stranded_front_locked` is shared by the two marker pushes, and only ONE of them is a question:
+
+| Call site | Why a marker exists | Reason |
+| --- | --- | --- |
+| `enqueue_stranded_front` (the drainer, from `DeliverOutcome::AbortedPreEnter`) | a pre-Enter gate declined the Enter; the marker is the remainder of that held delivery | `EnqueueReason::Question` |
+| `admit_stranded_selfheal` (#496 PR-C) | the pane went **quiet** with our text stranded in its box and loomux decided by itself to press Enter | `EnqueueReason::StrandedSelfHeal` |
+
+The two readings are opposites — "a dialog is on screen" versus "nothing is on screen at all" — so
+the self-heal's `delivery-queued` line was sending a human reconstructing that wedge to look for a
+dialog that never existed. The fix is the same shape as #532 rev-12 NB1's (`AbortedPreEnter` carrying
+its own reason): a shared helper cannot know which cause it is serving, so it no longer guesses —
+`reason` is a parameter, and `audit_stranded_push` echoes the caller's rather than re-deciding it
+(a second hardcode at the point of RECORDING would put the lie straight back).
+
+Three consequences worth stating, because they are what made this a separate PR:
+
+- **`queued_notice` matches exhaustively**, so the new variant had to be decided there. It is
+  unreachable for a structural reason rather than a convention: the drainer notifies from the reason
+  the ABORT carried — a fact about the gate that just declined — never from the entry it is looking
+  at, and this reason only ever sits on a marker. The arm is spelled out anyway, which is what has
+  kept every notice string in that module honest.
+- **`EnqueueReason` is persisted** (it is a field of `QueuedDelivery`, which IS the on-disk record).
+  Old file → new build is free: variants are only ever added, so nothing on disk stops parsing. New
+  file → OLD build resolves to `parse_snapshot`'s per-entry tolerance — the entry is skipped and
+  counted (the caller audits skips), siblings intact. There is deliberately no `#[serde(other)]`
+  default: an unknown variant has no safe value, and folding it onto an existing reason would make a
+  downgrade silently mislabel the entry, which is the exact defect this variant removes. A visible
+  skip beats an invisible lie, and here it costs nothing real — the reason rides only a
+  `StrandedSubmit` marker, which no build replays across a restart anyway (`split_recovered`).
+- **Still audit-only.** Nothing branches on the value; `cap_headroom` is 0 like every reason but the
+  pause-loss notice, and the marker drains through the identical `drain_stranded_submit` press.
+
+**Known, adjacent, and NOT fixed here:** `AbortedPreEnter` has carried its own reason since #532 —
+which since that PR can be `BoxOccupied` rather than `Question` — but `enqueue_stranded_front` takes
+no reason and so records `question` for both. That is the same defect class one call site over, on a
+`pub` signature with its own test call sites; it is called out rather than folded in.
 
 ### Composition with #541's `REINJECT_ACK_SETTLE_MS`, and why nothing here belongs in it
 
