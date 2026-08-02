@@ -18,6 +18,33 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// Run a `gh`-backed computation off the webview main thread (issue #716).
+/// Tauri dispatches a *synchronous* `#[tauri::command]` by calling it directly
+/// on the main thread — the mechanism `git.rs`'s `run_blocking` (issue #399)
+/// and the file-editor search command (issue #207) already document. Every
+/// command in this module spawns the `gh` CLI, which is a process spawn *plus*
+/// a network round trip, so its worst case is longer than git's: sub-second on
+/// a good day, seconds on a slow link, unbounded if `gh` hangs. For that whole
+/// duration a sync command blocks the GUI thread — no keystroke serviced,
+/// nothing painted.
+///
+/// So every `#[tauri::command]` here is a thin `async fn` that hands the real
+/// work — still a plain, directly unit-testable `*_sync` function — to a
+/// blocking-pool thread and awaits it here instead. A test in this module
+/// scans this file and fails if any command in it is left synchronous: a lone
+/// straggler would keep the freeze while the module claimed not to.
+#[allow(dead_code)] // wired to every command by the next commit (#716)
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tauri::async_runtime::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("gh task panicked: {e}")),
+    }
+}
+
 /// Labels the issues view is permitted to add/remove. These are the durable
 /// go-signals the orchestrator's intake poll watches for (see
 /// `orchestration/templates/orchestrator.md`): `agent-ready` / `agent-investigation`
@@ -1638,5 +1665,99 @@ mod tests {
 
         let logged_out = "You are not logged into any GitHub hosts. Run gh auth login to authenticate.\n";
         assert_eq!(parse_auth_login(logged_out), None);
+    }
+
+    // ----- off-the-main-thread dispatch (#716) -----
+
+    #[test]
+    fn run_blocking_runs_the_work_on_another_thread() {
+        // The whole point of the wrapper: the caller's thread — the webview
+        // main thread in production — must not be the one that runs the `gh`
+        // spawn. Asserting the closure observes a DIFFERENT thread id is the
+        // only direct evidence of that; `async fn` alone proves nothing, since
+        // an async command whose body still ran inline would be just as frozen.
+        let caller = std::thread::current().id();
+        let worker: std::thread::ThreadId =
+            tauri::async_runtime::block_on(run_blocking(move || Ok(std::thread::current().id())))
+                .unwrap();
+        assert_ne!(
+            worker, caller,
+            "run_blocking executed the closure on the calling thread — the GUI freeze (#716) is back"
+        );
+        // Errors still propagate through unchanged: the wrapper is transparent
+        // to the Result the sync body returns, which is what lets every command
+        // keep its exact contract.
+        let err: Result<(), String> =
+            tauri::async_runtime::block_on(run_blocking(|| Err("boom".to_string())));
+        assert_eq!(err.unwrap_err(), "boom");
+    }
+
+    #[test]
+    fn every_tauri_command_in_this_module_is_async() {
+        // #716's claim is about EVERY gh-backed command, and a single sync
+        // straggler would keep the freeze while the module's doc claimed
+        // otherwise — so this scans this file's own source rather than trusting
+        // a hand transcription (the `tests/acl_manifest.rs` precedent, which
+        // parses `generate_handler!` out of `src/lib.rs` for the same reason).
+        //
+        // Bound of the claim, stated rather than implied: this covers the `gh`
+        // module only. It is the whole gh-on-the-GUI-thread surface because the
+        // two spawn entry points here (`gh_output`, `run_gh`) are private to
+        // this module, so no command elsewhere can reach a `gh` spawn through
+        // them; the crate's other `gh` spawns (`orchestration`'s `gh_capture`,
+        // `mqdriver`'s `ProcessRunner::gh`) run on the poll thread, not a
+        // command.
+        //
+        // Split so the literal never appears as a whole line in this file —
+        // otherwise the scan would find its own source and mis-report.
+        const ATTR: &str = concat!("#[tauri::", "command]");
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/gh.rs"))
+            .expect("read src/gh.rs");
+
+        let lines: Vec<&str> = src.lines().map(str::trim).collect();
+        let mut found: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if *line != ATTR {
+                continue;
+            }
+            let sig = lines[i + 1..]
+                .iter()
+                .find(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with('#'))
+                .unwrap_or_else(|| panic!("{ATTR} at line {} has no function after it", i + 1));
+            assert!(
+                sig.starts_with("pub async fn "),
+                "line {}: `{sig}` is a synchronous #[tauri::command] — Tauri dispatches it on the \
+                 webview main thread, so its `gh` spawn freezes the GUI for the whole round trip \
+                 (#716). Make it a thin `pub async fn` over `run_blocking`.",
+                i + 2
+            );
+            let name = sig["pub async fn ".len()..]
+                .split(|c: char| c == '(' || c.is_whitespace())
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            found.push(name);
+        }
+
+        found.sort();
+        let mut expected = vec![
+            "gh_activity",
+            "gh_auth_status",
+            "gh_issue_comment",
+            "gh_issue_create",
+            "gh_issue_list",
+            "gh_issue_set_labels",
+            "gh_issue_view",
+            "gh_pr_comment",
+            "gh_pr_list",
+            "gh_pr_view",
+        ];
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "the set of #[tauri::command]s in gh.rs changed — a new one must be async over \
+             run_blocking (see the module note) and listed here, so the enumeration this test \
+             pins can't silently go stale"
+        );
     }
 }
