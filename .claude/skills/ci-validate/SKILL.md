@@ -5,26 +5,15 @@ description: Why agent workers never build or test Rust locally (hard ban — CI
 
 # Local iteration vs. CI proof
 
-Lineage: #320 was the interim response to a hard-kill (every worker running
-`cargo build` at once exhausted the host) — a hard ban on any local
-build/test. A per-class concurrency guard was attempted (#318/#322) but
-shelved (2026-07-16): its shim couldn't reliably intercept every invocation
-path (PowerShell/cmd bypassed it), so the coverage wasn't worth the
-complexity right now. What's below is the model that replaces both: no guard
-involved, no precondition to check — just a plain cap on local jobs plus a
-line drawn on scope/duration, not on any mechanism's state.
-
 ## The decision rule
 
 > **Local `cargo` of ANY kind is banned for agents** — no `cargo build`,
 > no `cargo check`, no single-test iteration, nothing that invokes
-> `rustc`. Human hard directive, 2026-07-30, after the THIRD
-> disk-exhaustion incident: the previous scope-based carve-out ("a single
-> test you are actively iterating on is fine at `-j 4`") still cost each
-> fresh worktree its first full dependency compile — 5-8 GB of `target/`
-> per worker — and a six-worker fleet filled the drive and crashed loomux
-> with every worker individually obeying the rule. Scope caps don't cap
-> the first compile; only not compiling does.
+> `rustc` (human hard directive, #488; a cargo-intercepting shim was
+> tried and shelved: #318/#322). A fresh worktree's first compile
+> costs 5-8 GB of `target/` per worker, and a fleet building locally
+> exhausts the disk. Scope caps don't cap the first compile; only not
+> compiling does.
 >
 > **Everything Rust goes to CI**: push early, open the draft PR
 > immediately (below), read the results. Iterate by reasoning about the
@@ -151,8 +140,7 @@ consistent" — that's what the bump PR's own CI run is for.
 
 ## The CI path — draft-PR-early flow
 
-For anything that's full/longer-running validation rather than quick local
-iteration:
+For anything beyond the frontend-only and `rustfmt --check` steps above:
 
 1. **Commit and push early.** As soon as there's one coherent commit — it
    doesn't need to be the finished change — push the branch.
@@ -245,11 +233,13 @@ context. Still `continue-on-error` regardless: a new job earns required-check
 status with a track record, not on day one.
 
 Locally, PoC-level smoke only, and only against the isolated E2E profile —
-never against a real install:
+never against a real install. **This local path is for humans**: producing
+the exe under test requires `npx tauri build`, a full `rustc` compile, which
+the cargo ban covers — agents validate E2E through the CI job only.
 
 - A single spec file (`npx playwright test e2e/tests/<name>.spec.ts`) to
-  sanity-check a change before pushing is fine, same "quick local iteration"
-  line as a single `cargo test`/`node --test` file above.
+  sanity-check a change before pushing (against an exe a human already
+  built) is the local line here.
 - The exe under test must always be the `tauri.e2e.conf.json`-identifier
   build (`npx tauri build --debug --no-bundle --config
   src-tauri/tauri.e2e.conf.json`) launched through `e2e/fixtures.ts`'s
@@ -260,6 +250,7 @@ never against a real install:
 - The full `npx playwright test` suite as "it passes" evidence is CI's job,
   same as the backend/frontend suites above — cite the `e2e-windows` run, not
   a local one, **once that job is actually green** for a given push. While
-  it's failing on the known High-IL/WebView2 issue above, cite a local
-  full-suite run instead and say explicitly that `e2e-windows` is expected-red
-  for the documented reason, not silently ignore it.
+  it's failing on the known High-IL/WebView2 issue above, say explicitly that
+  `e2e-windows` is expected-red for the documented reason, not silently
+  ignore it (a substitute local full-suite run is a human's to produce — the
+  exe build is `rustc`).
