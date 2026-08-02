@@ -434,6 +434,16 @@ fn merge_queue_reconcile_is_a_silent_no_op_when_nothing_was_ever_queued() {
     // The real entry point — the one `readmit_recovered` calls.
     reg.merge_queue_reconcile(&g.id);
 
+    // **The file must still not exist.** This is the property, not a detail:
+    // slice F's `merge_queue_view` reports `absent` — "never enqueued", the
+    // product default (§12) — by the file's absence, so a reconcile that wrote
+    // an empty queue on every bind would silently collapse `absent` into
+    // "empty queue" for every group in the product.
+    assert!(
+        !qfile.exists(),
+        "reconciling an empty queue must not conjure a merge_queue.json"
+    );
+
     let audit = reg.audit_log(&g.id);
     assert!(
         !audit.iter().any(|e| e.action.starts_with("mq-")),

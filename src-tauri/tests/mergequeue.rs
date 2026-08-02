@@ -1281,6 +1281,82 @@ fn a_pr_whose_head_moved_since_the_entry_recorded_it_is_kicked_back() {
     assert!(matches!(built.result, Err(BatchBuildError::HeadMoved { .. })));
 }
 
+/// The recorded-vs-fetched head comparison is **one-directional and
+/// fail-closed** (rev-163 N1).
+///
+/// Two properties, neither of which the earlier implementation had despite its
+/// doc claiming the first:
+///
+/// - **Only the RECORDED head may be an abbreviation.** The earlier code
+///   compared `min(recorded.len(), fetched.len())` bytes of both, which is
+///   symmetric — so a *fetched* value shorter than the record would have
+///   matched a full recorded head. A prefix comparison only means something
+///   when the short side is the stored one.
+/// - **A non-hex head returns `false`, it does not panic.** `&str` indexing
+///   panics off a char boundary, so the old byte-slice was total only by the
+///   accident that oids are ASCII — and nothing enforced that, since
+///   `PrFacts.head` comes straight from `headRefOid.trim()`.
+///
+/// Exercised through `build_scratch`, because `same_object` is private — which
+/// is the right shape anyway: what matters is that a mismatch **kicks the entry
+/// back** rather than building an object nobody approved.
+#[test]
+fn only_the_recorded_head_may_be_abbreviated_and_a_malformed_one_fails_closed() {
+    // A fetched value SHORTER than the recorded head is not a match, even
+    // though it is a prefix of it.
+    let f = Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, &HEAD_A[..8], "")
+        .git("worktree add", 0, "", "")
+        .git("worktree remove", 0, "", "");
+    let built =
+        build_scratch(&f, "mq-1", "loomux/mq/g1-mq-1", "integration", &[(612, HEAD_A.into())]);
+    assert!(
+        matches!(built.result, Err(BatchBuildError::HeadMoved { .. })),
+        "a short FETCH must not satisfy a full recorded head, got {:?}",
+        built.result
+    );
+    assert!(!f.calls().iter().any(|c| c.contains("merge --no-ff")), "nothing was merged");
+
+    // The supported direction still works: a recorded abbreviation of the
+    // fetched full oid IS the same object.
+    let f = Fake::new()
+        .git("fetch", 0, "", "")
+        .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+        .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+        .git("worktree add", 0, "", "")
+        .git("merge --no-ff", 0, "", "")
+        .git("rev-parse HEAD", 0, MERGED, "")
+        .git("worktree remove", 0, "", "");
+    let built = build_scratch(
+        &f,
+        "mq-1",
+        "loomux/mq/g1-mq-1",
+        "integration",
+        &[(612, HEAD_A[..10].to_string())],
+    );
+    assert!(built.result.is_ok(), "a recorded abbreviation matches: {:?}", built.result);
+
+    // Malformed heads fail closed rather than panicking. The multi-byte case is
+    // the one the old `&str` slice would have panicked on.
+    for bad in ["not-hex-at-all", "aaé", "aaaaaaé_head", "abc"] {
+        let f = Fake::new()
+            .git("fetch", 0, "", "")
+            .git("rev-parse refs/remotes/loomux-mq/target", 0, TARGET_HEAD, "")
+            .git("rev-parse refs/remotes/loomux-mq/pr-612", 0, HEAD_A, "")
+            .git("worktree add", 0, "", "")
+            .git("worktree remove", 0, "", "");
+        let built =
+            build_scratch(&f, "mq-1", "loomux/mq/g1-mq-1", "integration", &[(612, bad.to_string())]);
+        assert!(
+            matches!(built.result, Err(BatchBuildError::HeadMoved { .. })),
+            "a malformed recorded head {bad:?} must kick back, got {:?}",
+            built.result
+        );
+    }
+}
+
 /// **The temp worktree is torn down on every exit path, and the outcome is
 /// RETURNED rather than swallowed** (§10: cleanup failure never fails a batch).
 ///
