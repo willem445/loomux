@@ -250,6 +250,7 @@ the cargo ban covers — agents validate E2E through the CI job only.
 - The full `npx playwright test` suite as "it passes" evidence is CI's job,
   same as the backend/frontend suites above — cite the `e2e-windows` run, not
   a local one, **once that job is actually green** for a given push. While
-  it's failing on the known High-IL/WebView2 issue above, cite a local
-  full-suite run instead and say explicitly that `e2e-windows` is expected-red
-  for the documented reason, not silently ignore it.
+  it's failing on the known High-IL/WebView2 issue above, say explicitly that
+  `e2e-windows` is expected-red for the documented reason, not silently
+  ignore it (a substitute local full-suite run is a human's to produce — the
+  exe build is `rustc`).
