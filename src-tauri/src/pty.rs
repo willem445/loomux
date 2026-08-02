@@ -198,6 +198,25 @@ impl PtyManager {
         pty.writer.write_all(bytes).map_err(|e| e.to_string())
     }
 
+    /// The whole body of the `write_pty` command, minus the Tauri wrapper —
+    /// extracted so an integration test can drive exactly what a frontend
+    /// keystroke runs against a real (fake) pty with no `AppHandle`, the same
+    /// seam and the same reason as `note_user_input` (#496 PR-A).
+    pub fn write_from_frontend(&self, id: u32, data: &str, human: bool) -> Result<(), String> {
+        self.note_user_input(id, data, human);
+        self.write_bytes(id, data.as_bytes())
+    }
+
+    /// The body of the `change_dir` command: format the `cd` for this pane's
+    /// OWN shell and write it. Same extraction rationale as
+    /// `write_from_frontend`.
+    pub fn write_cd(&self, id: u32, path: &str) -> Result<(), String> {
+        let mut ptys = self.ptys.lock_safe();
+        let pty = ptys.get_mut(&id).ok_or("pty not found")?;
+        let line = cd_command_line(path, pty.shell_kind);
+        pty.writer.write_all(line.as_bytes()).map_err(|e| e.to_string())
+    }
+
     /// Record one FRONTEND-originated write for the human-input signals
     /// (#111 box occupancy, `last_user_input_ms`) — extracted out of
     /// `write_pty` so an integration test can drive it directly against a
@@ -450,6 +469,35 @@ impl PtyManager {
     /// cleanup code running.
     #[doc(hidden)] // pub for integration tests
     pub fn register_fake_for_test(&self, id: u32, initial_output: &[u8]) -> Arc<Mutex<Vec<u8>>> {
+        self.register_fake_inner(id, initial_output, None)
+    }
+
+    /// Test-only (#719): a fake pty whose writer PARKS inside `write` until
+    /// the returned [`PtyWriteGate`] is opened. That is the hazard this issue
+    /// is about — a child that has stopped draining its stdin pipe, so
+    /// `write_all` does not return — reproduced deterministically, with no
+    /// sleeps, no real agent CLI (CLAUDE.md constraint 3), and no dependence
+    /// on how full a real ConPTY input pipe happens to be on the host.
+    ///
+    /// The gate is entered BEFORE the bytes are captured, so a parked write is
+    /// observably "in the pipe but not through it": a test can assert both
+    /// that the caller has not returned and that nothing has landed yet.
+    #[doc(hidden)] // pub for integration tests
+    pub fn register_gated_fake_for_test(
+        &self,
+        id: u32,
+    ) -> (Arc<Mutex<Vec<u8>>>, Arc<PtyWriteGate>) {
+        let gate = Arc::new(PtyWriteGate::default());
+        let captured = self.register_fake_inner(id, b"", Some(gate.clone()));
+        (captured, gate)
+    }
+
+    fn register_fake_inner(
+        &self,
+        id: u32,
+        initial_output: &[u8],
+        gate: Option<Arc<PtyWriteGate>>,
+    ) -> Arc<Mutex<Vec<u8>>> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
@@ -474,9 +522,15 @@ impl PtyManager {
             None => None,
         };
 
-        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>, Option<Arc<PtyWriteGate>>);
         impl Write for CaptureWriter {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                // Park first, capture second: a gated write is then observably
+                // stuck *before* its bytes land, which is what makes "the
+                // caller has not returned AND nothing was written" assertable.
+                if let Some(gate) = &self.1 {
+                    gate.enter();
+                }
                 self.0.lock_safe().extend_from_slice(buf);
                 Ok(buf.len())
             }
@@ -493,7 +547,7 @@ impl PtyManager {
             id,
             PtyHandle {
                 master: pair.master,
-                writer: Box::new(CaptureWriter(captured.clone())),
+                writer: Box::new(CaptureWriter(captured.clone(), gate)),
                 killer,
                 output,
                 user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -549,6 +603,68 @@ impl PtyManager {
         if let Some(pty) = ptys.get(&id) {
             pty.user_input_ms.store(ms, Ordering::Relaxed);
         }
+    }
+}
+
+/// Test-only write barrier for [`PtyManager::register_gated_fake_for_test`]
+/// (#719). A fake pty's writer calls `enter` and parks there until
+/// [`PtyWriteGate::open`] releases it, standing in for a child that has
+/// stopped draining its stdin pipe.
+///
+/// Deliberately a rendezvous, not a sleep: the test learns the write is
+/// *inside* the writer from [`PtyWriteGate::wait_for_writes`] rather than
+/// guessing at a duration, so the assertions that follow ("the pane is wedged
+/// — now can anything else still make progress?") are about a state that has
+/// actually been reached, on a slow CI runner as much as a fast one.
+#[doc(hidden)] // pub for integration tests
+#[derive(Default)]
+pub struct PtyWriteGate {
+    state: Mutex<PtyWriteGateState>,
+    cv: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PtyWriteGateState {
+    open: bool,
+    /// How many writes have reached the barrier over this gate's lifetime.
+    /// Counted, not a flag, so a test can wait for the Nth write specifically.
+    entered: u32,
+}
+
+impl PtyWriteGate {
+    /// Called from the fake writer: announce this write and park until open.
+    fn enter(&self) {
+        let mut st = self.state.lock_safe();
+        st.entered += 1;
+        self.cv.notify_all();
+        while !st.open {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Block until at least `n` writes have parked in the writer, or
+    /// `timeout` elapses. Returns whether they did.
+    pub fn wait_for_writes(&self, n: u32, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut st = self.state.lock_safe();
+        while st.entered < n {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+            else {
+                return false;
+            };
+            let (guard, _) = self
+                .cv
+                .wait_timeout(st, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            st = guard;
+        }
+        true
+    }
+
+    /// Release every parked write, and every later one.
+    pub fn open(&self) {
+        self.state.lock_safe().open = true;
+        self.cv.notify_all();
     }
 }
 
@@ -1337,12 +1453,7 @@ pub fn write_pty(
     data: String,
     human: Option<bool>,
 ) -> Result<(), String> {
-    state.note_user_input(id, &data, human.unwrap_or(true));
-    let mut ptys = state.ptys.lock_safe();
-    let pty = ptys.get_mut(&id).ok_or("pty not found")?;
-    pty.writer
-        .write_all(data.as_bytes())
-        .map_err(|e| e.to_string())
+    state.write_from_frontend(id, &data, human.unwrap_or(true))
 }
 
 #[tauri::command]
@@ -1393,12 +1504,7 @@ pub fn dir_info(path: String) -> DirInfo {
 /// machine default — a cmd or Git Bash pane must not receive PowerShell syntax.
 #[tauri::command]
 pub fn change_dir(state: State<PtyManager>, id: u32, path: String) -> Result<(), String> {
-    let mut ptys = state.ptys.lock_safe();
-    let pty = ptys.get_mut(&id).ok_or("pty not found")?;
-    let line = cd_command_line(&path, pty.shell_kind);
-    pty.writer
-        .write_all(line.as_bytes())
-        .map_err(|e| e.to_string())
+    state.write_cd(id, &path)
 }
 
 /// Build a shell-appropriate `cd` command line (Enter-terminated) for the pane's
