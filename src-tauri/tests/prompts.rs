@@ -650,3 +650,75 @@ fn the_reviewer_has_the_lanes_and_classifies_every_finding() {
          report: the orchestrator merges on what you told it, and a review that reads like a clean \
          bill of health is how feedback dies at the merge");
 }
+
+// ---------------------------------------------------------------------------------------------
+// #381: a first-turn MCP primer leads every role template, above the heavier policy prose
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_first_turn_primer_leads_every_role_template_with_only_the_tools_it_has() {
+    // A fresh session — especially a weaker instruction-follower like copilot — used to wade
+    // through the bulk of the document before learning what to DO on turn one:
+    // `orchestrator.md`'s own session-start checklist sat behind an 11-rule INVARIANTS digest,
+    // hundreds of lines in. Each role template now opens with a short, imperative "Your first
+    // turn" section naming the exact first-turn call sequence, scoped to the tools that role
+    // actually has — never a manual, just what saves the round-trip of discovering the tools by
+    // trial and error. This pins that the primer (a) exists, (b) leads the document ahead of the
+    // heavier prose, and (c) names the calls specific to each role.
+    let orch = instructions("orchestrator.md");
+    let worker = instructions("worker.md");
+    let reviewer = instructions("reviewer.md");
+    let planner = instructions("planner.md");
+
+    for (name, doc, heavy_heading) in [
+        ("orchestrator.md", &orch, "## invariants"),
+        ("worker.md", &worker, "## your loomux mcp tools"),
+        ("reviewer.md", &reviewer, "## your loomux mcp tools"),
+        ("planner.md", &planner, "## your loomux mcp tools"),
+    ] {
+        let flat_doc = flat(doc);
+        let primer = flat_doc
+            .find("## your first turn")
+            .unwrap_or_else(|| panic!("{name} must open with a \"Your first turn\" primer"));
+        let heavy = flat_doc
+            .find(heavy_heading)
+            .unwrap_or_else(|| panic!("{name} lost its policy section entirely"));
+        assert!(
+            primer < heavy,
+            "{name}'s first-turn primer must precede the heavier policy prose, or a fresh \
+             session still wades through it before learning what to do: {doc}"
+        );
+    }
+
+    // Each role's primer names ONLY the tools it actually has — an orchestrator's re-sync reads,
+    // a worker's delivery-id check and progress report, a reviewer's PR read, a planner's
+    // issue read — never a promise of a tool that role doesn't hold.
+    let o = flat(&orch);
+    let orch_primer = section(&o, "## your first turn", "## invariants");
+    for (call, why) in [
+        ("get_state()", "durable memory must be the first read — it survives a compact"),
+        ("list_tasks()", "the shared board is check #2, or a fresh session re-derives it \
+          from scratch"),
+        ("list_agents()", "who else is running is the other half of the re-sync"),
+    ] {
+        pinned("orchestrator.md's first-turn primer", orch_primer, call, why);
+    }
+
+    let w = flat(&worker);
+    let worker_primer = section(&w, "## your first turn", "## your loomux mcp tools");
+    pinned("worker.md's first-turn primer", worker_primer, "delivery id",
+        "the duplicate-delivery check must be the FIRST thing a worker does, or it can burn a \
+         whole turn re-doing work it already did");
+    pinned("worker.md's first-turn primer", worker_primer, "report(\"progress\"",
+        "the orchestrator should hear a worker is on the task before anything else happens");
+
+    let r = flat(&reviewer);
+    let reviewer_primer = section(&r, "## your first turn", "## your loomux mcp tools");
+    pinned("reviewer.md's first-turn primer", reviewer_primer, "gh pr view",
+        "a reviewer's first move is reading the PR, not guessing at its own tools");
+
+    let p = flat(&planner);
+    let planner_primer = section(&p, "## your first turn", "## your loomux mcp tools");
+    pinned("planner.md's first-turn primer", planner_primer, "gh issue view",
+        "a planner's first move is reading the work item in full");
+}
