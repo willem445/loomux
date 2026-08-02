@@ -17936,6 +17936,66 @@ fn release_grant_covers_one_tags_whole_pipeline_and_resolves_release_ids_fail_cl
 }
 
 #[test]
+fn release_id_addressed_calls_resolve_to_their_tag_before_the_grant_is_checked() {
+    // #437 ON ITS OWN. The pipeline test above covers this too, but it reaches
+    // it only *after* asserting #438's retained-grant behaviour — so on the
+    // pre-fix shim it panics on a #438 line and #437 is never witnessed red at
+    // all. This test's FIRST assertion is the #437 one, against a grant no
+    // earlier step has touched: it fails on the old shim because an
+    // id-addressed release write carries no tag to key a grant on, and for no
+    // other reason. Two halves of one PR need two witnesses.
+    use std::process::Command;
+    if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP release_id_addressed_calls_resolve…: no POSIX sh");
+        return;
+    }
+    let td = tempfile::tempdir().unwrap();
+    let root = td.path();
+    let group = root.join("group");
+    std::fs::create_dir_all(&group).unwrap();
+    let log = root.join("gh.log");
+    let fake = write_fake_gh(root, &log);
+    let shim = root.join("gh");
+    std::fs::write(&shim, gh_shim_sh(&fake.display().to_string(), &shim_paths())).unwrap();
+    let _ = Command::new("sh").arg("-c").arg(format!("chmod +x '{}' '{}'", fake.display(), shim.display())).status();
+
+    // 555 is the granted tag's release; 777 is somebody else's; nothing else resolves.
+    let run = |argv: &[&str]| -> bool {
+        Command::new("sh").arg(&shim).args(argv)
+            .env("LOOMUX_GROUP_DIR", &group).env("FAKE_REL_MAP", "555=v1.2.3 777=v0.0.9")
+            .status().unwrap().success()
+    };
+    let write_grant = || {
+        std::fs::create_dir_all(group.join("release_grants")).unwrap();
+        std::fs::write(group.join("release_grants/v1.2.3"), b"99999999999\n1\n").unwrap();
+    };
+
+    // THE #437 ASSERTION. `gh api -X PATCH repos/O/R/releases/<id> -F body=@…`
+    // is how the release skill mandates notes be applied — by canonical release
+    // id, never by tag lookup, because a tag can resolve to more than one
+    // release (#282). Under a live grant for the tag that release belongs to,
+    // it must be ALLOWED.
+    write_grant();
+    assert!(run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-F", "body=@notes.md"]),
+        "an id-addressed write to the GRANTED tag's release must resolve and be allowed (#437)");
+
+    // …and the resolution is what authorizes it, not the mere presence of a
+    // grant: the same shape against a release belonging to another tag is
+    // refused, with the same grant still live.
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/777", "-F", "body=@notes.md"]),
+        "the id must be resolved to ITS tag — another release is not covered");
+    // An id gh cannot resolve at all (404 / network / unauthenticated) is
+    // refused, never charitably read as the granted one.
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/424242", "-F", "body=@notes.md"]),
+        "an unresolvable release id fails closed");
+    // No grant at all → refused even for the resolvable id, so the assertion
+    // above is measuring the grant match and not a hole in the gate.
+    let _ = std::fs::remove_dir_all(group.join("release_grants"));
+    assert!(!run(&["api", "-X", "PATCH", "repos/o/r/releases/555", "-F", "body=@notes.md"]),
+        "resolving an id must not by itself authorize anything");
+}
+
+#[test]
 fn git_shim_harness_gates_tag_pushes() {
     use std::process::Command;
     if Command::new("sh").arg("-c").arg("exit 0").status().map(|s| !s.success()).unwrap_or(true) {
