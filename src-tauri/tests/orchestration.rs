@@ -3587,6 +3587,287 @@ fn a_recovered_entry_that_cannot_be_re_admitted_stays_an_orphan() {
     assert_eq!(rejected.detail["count"], json!(3));
 }
 
+// ---------- #547: the staged-orphan archive ----------
+//
+// These helpers all edit `queue.json` as JSON rather than through
+// `queue::serialize_snapshot`, for the reason the corrupt-snapshot test above
+// does: what is being pinned is what a RESTART reads off disk, and going
+// through the writer would test the writer's round trip instead. They also
+// spell the policy numbers as literals rather than importing
+// `queue::STAGED_*`, so every test here compiles against a build WITHOUT the
+// archive and its red run is a behavioral failure rather than a missing name.
+
+/// Make every entry in `group`'s snapshot look `by_ms` older than it is —
+/// the only way to reach the age rule without a test that sleeps for a day.
+fn age_snapshot(dir: &Path, group: &str, by_ms: u64) {
+    let path = dir.join(group).join("queue.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for e in v["entries"].as_array_mut().unwrap() {
+        let cur = e["enqueued_ms"].as_u64().unwrap();
+        e["enqueued_ms"] = json!(cur.saturating_sub(by_ms));
+    }
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+/// Fan `group`'s snapshot out into `n` fresh-but-unbindable entries carrying
+/// `text`, ids ascending from the existing one. Reaching the entry/byte
+/// backstops needs more entries than `QUEUE_MAX_PER_PANE` allows a fixture to
+/// queue for real, and their AGE must stay recent or the age rule would be
+/// what fired.
+fn fan_out_snapshot(dir: &Path, group: &str, n: usize, text: &str) -> Vec<u64> {
+    let path = dir.join(group).join("queue.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let template = v["entries"][0].clone();
+    let base = template["id"].as_u64().unwrap();
+    let mut entries = Vec::new();
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let mut e = template.clone();
+        e["id"] = json!(base + i as u64);
+        e["payload"] = json!({ "kind": "text", "text": text });
+        entries.push(e);
+        ids.push(base + i as u64);
+    }
+    v["entries"] = json!(entries);
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    ids
+}
+
+/// Every record currently in `group`'s archive file, in file order.
+fn archive_rows(dir: &Path, group: &str) -> Vec<Value> {
+    let path = dir.join(group).join("queue-orphans-archive.jsonl");
+    match fs::read_to_string(&path) {
+        Ok(t) => t
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).expect("every archive line must be one JSON record"))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Payload texts `group`'s snapshot currently holds.
+fn snapshot_texts(dir: &Path, group: &str) -> Vec<String> {
+    let body = fs::read_to_string(dir.join(group).join("queue.json")).unwrap();
+    let (entries, skipped) = queue::parse_snapshot(&body);
+    assert_eq!(skipped, 0, "the fixture must leave a readable snapshot");
+    entries.iter().filter_map(|e| e.delivery.payload.text().map(str::to_string)).collect()
+}
+
+/// Restart into `dir` and make ONE ordinary admission — the cheapest thing
+/// that runs `persist_queues`, which is where recovery stages and where the
+/// roll happens. Returns the live registry so the caller can keep asking it
+/// questions.
+fn restart_and_admit(dir: &Path, gid: &str, pty: u32) -> OrchRegistry {
+    let reg = relaunch_registry(dir);
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let fresh = reg.spawn_agent(gid, Role::Worker, "unrelated", "t", false, None).unwrap();
+    reg.enqueue_text(gid, &fresh.id, "orch-1", "ordinary new work", pty, queue::EnqueueReason::Arrival)
+        .unwrap();
+    reg
+}
+
+#[test]
+fn a_staged_orphan_past_the_hot_window_moves_off_the_snapshot_and_says_so() {
+    // #547's defect, stated as the property it broke: `queue.json` is
+    // rewritten and fsynced on EVERY admission and carries the staged set,
+    // staging is never cleared, and worker panes do not survive a restart —
+    // so every restart permanently adds that restart's backlog to the cost of
+    // every future delivery. An entry past the hot window must leave the
+    // file, and its departure must be a per-entry audit line naming what and
+    // why, not an inference from a file that got smaller.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["ancient ask", "also ancient"]);
+    // Two days: comfortably past `queue::STAGED_ARCHIVE_AFTER_MS` (24h).
+    age_snapshot(dir.path(), &gid, 2 * 24 * 60 * 60 * 1000);
+
+    let reg = restart_and_admit(dir.path(), &gid, 940);
+
+    let texts = snapshot_texts(dir.path(), &gid);
+    assert!(!texts.contains(&"ancient ask".to_string()) && !texts.contains(&"also ancient".to_string()),
+        "an entry past the hot window must stop being fsynced on every admission: {texts:?}");
+    assert!(texts.contains(&"ordinary new work".to_string()),
+        "...while the live queue is untouched: {texts:?}");
+
+    let rows = archive_rows(dir.path(), &gid);
+    let archived: Vec<&str> =
+        rows.iter().filter_map(|r| r["entry"]["payload"]["text"].as_str()).collect();
+    assert_eq!(archived, ["ancient ask", "also ancient"],
+        "and it must be IN the archive, oldest first, payload intact — moved, not evicted: {rows:?}");
+
+    let lines: Vec<_> = reg.audit_log(&gid).into_iter()
+        .filter(|e| e.action == "queue-orphan-archived").collect();
+    assert_eq!(lines.len(), 2, "every roll is named individually, never as a silent compaction");
+    assert_eq!(lines[0].detail["reason"], json!("staged-past-hot-window"),
+        "the audit line says WHY it moved: {:?}", lines[0].detail);
+    assert!(lines[0].detail["id"].as_u64().is_some() && lines[0].detail["to"].as_str().is_some(),
+        "...and WHAT moved: {:?}", lines[0].detail);
+}
+
+#[test]
+fn an_archived_orphan_is_still_reported_with_its_payload_and_says_which_file() {
+    // The half that makes this a move rather than an eviction. #547 rules out
+    // a cap and rules out an audited drop: the staged set exists to report
+    // work nobody received, so anything that stops reporting reintroduces the
+    // silent loss #523 removed. An archived entry must come back from
+    // `queue_orphans` with the same bytes it had, distinguishable only by
+    // `source` — which is a THIRD value on that field, so a reader keyed on
+    // "snapshot" learns it must look somewhere else rather than seeing a row
+    // vanish.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["re-send me verbatim"]);
+    age_snapshot(dir.path(), &gid, 2 * 24 * 60 * 60 * 1000);
+    let reg = restart_and_admit(dir.path(), &gid, 941);
+
+    let out = reg.queue_orphans_json(&gid);
+    let rows = out["orphans"].as_array().unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r["text"] == json!("re-send me verbatim"))
+        .unwrap_or_else(|| panic!("an archived orphan must still be reported: {out}"));
+    assert_eq!(row["source"], json!("archive"),
+        "and must say which file holds it, so a human doing forensics opens the right one: {row}");
+    assert_eq!(row["truncated"], json!(false));
+    assert!(row["queued_minutes_ago"].as_u64().unwrap() >= 24 * 60,
+        "staleness is still the reader's judgement to make, so the age must survive the move: {row}");
+}
+
+#[test]
+fn an_archived_orphan_is_still_re_admitted_when_its_pane_comes_back() {
+    // Rolling an entry off the hot file must not quietly cost it its
+    // automatic rebind — that would be a recoverable delivery destroyed, just
+    // slowly. The archive is read on bind exactly like staging is, oldest id
+    // first, and the archived line is removed only once the fresh live entry
+    // is already durable.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, session) = queued_then_crashed(dir.path(), &["owed to the resumed pane"]);
+    age_snapshot(dir.path(), &gid, 2 * 24 * 60 * 60 * 1000);
+
+    let reg = restart_and_admit(dir.path(), &gid, 942);
+    assert_eq!(archive_rows(dir.path(), &gid).len(), 1, "precondition: it rolled off the hot file");
+
+    let resumed = reg
+        .spawn_agent_ex(&gid, Role::Worker, None, "w", "", false, None, None,
+                        Some(session), Some(dir.path().to_string_lossy().to_string()), None)
+        .unwrap();
+    let pty = 943u32;
+    assert_eq!(reg.readmit_recovered(&gid, &resumed.id, pty), 1,
+        "an archived entry rebinds on exactly the rule a staged one does");
+    let queued = reg.queue_snapshot(pty);
+    let live: Vec<Option<&str>> = queued.iter().map(|e| e.payload.text()).collect();
+    assert_eq!(live, [Some("owed to the resumed pane")], "with its bytes, through the ordinary front door");
+
+    assert!(archive_rows(dir.path(), &gid).is_empty(),
+        "and leaves the archive once it is live again — otherwise it is reported as lost while delivering");
+    assert!(reg.queue_orphans(&gid).is_empty(),
+        "re-queued and delivering is not lost work, and must not invite a re-send");
+    let closed = reg.audit_log(&gid).into_iter()
+        .find(|e| e.action == "delivery-recovered" && e.detail["source"] == json!("archive"))
+        .expect("the old id must be closed out, and say which store it came from");
+    assert!(closed.detail["readmitted_as"].as_u64().is_some(), "{:?}", closed.detail);
+}
+
+#[test]
+fn a_burst_of_recent_staged_orphans_is_bounded_by_the_entry_backstop() {
+    // The age rule alone is not a bound: a crash loop stages a fresh backlog
+    // every few seconds, and every one of them is younger than the window. A
+    // bound with an "unless it is recent" exception is not a bound, so the
+    // entry backstop (`queue::STAGED_HOT_MAX_ENTRIES`, 64) fires regardless of
+    // age and takes the OLDEST ids — the ones with the weakest remaining claim
+    // on a live pane.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["burst"]);
+    let ids = fan_out_snapshot(dir.path(), &gid, 70, "burst");
+
+    let reg = restart_and_admit(dir.path(), &gid, 944);
+
+    let rows = archive_rows(dir.path(), &gid);
+    let archived: Vec<u64> =
+        rows.iter().map(|r| r["entry"]["id"].as_u64().unwrap()).collect();
+    assert_eq!(archived, ids[..6], "70 staged, 64 kept hot — the 6 oldest roll: {archived:?}");
+    assert_eq!(rows[0]["why"], json!("staged-entry-backstop"),
+        "and say which of the three rules moved them: {:?}", rows[0]);
+    // The live admission is in the file too, so the staged count is what is
+    // being bounded here, not the file's total length.
+    assert_eq!(snapshot_texts(dir.path(), &gid).iter().filter(|t| t.as_str() == "burst").count(), 64,
+        "the hot snapshot must not carry more staged entries than the backstop allows");
+    assert_eq!(reg.queue_orphans(&gid).len(), 70, "and all 70 are still reported — nothing was capped away");
+}
+
+#[test]
+fn large_staged_payloads_are_bounded_by_the_byte_backstop() {
+    // The entry count does not bound the WRITE: a queued payload is a whole
+    // task brief and nothing clamps what is stored (`ORPHAN_TEXT_CAP_BYTES`
+    // clamps only what `queue_orphans` hands back). Ten 16 KiB briefs are
+    // well inside the 64-entry backstop and 2.5x over the 64 KiB one.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["big"]);
+    let big = "x".repeat(16 * 1024);
+    let ids = fan_out_snapshot(dir.path(), &gid, 10, &big);
+
+    restart_and_admit(dir.path(), &gid, 945);
+
+    let rows = archive_rows(dir.path(), &gid);
+    let archived: Vec<u64> = rows.iter().map(|r| r["entry"]["id"].as_u64().unwrap()).collect();
+    assert_eq!(archived, ids[..6],
+        "163_840 staged bytes against a 65_536 cap: the 6 oldest roll until it fits: {archived:?}");
+    assert_eq!(rows[0]["why"], json!("staged-byte-backstop"), "{:?}", rows[0]);
+    let staged_bytes: usize = snapshot_texts(dir.path(), &gid)
+        .iter().filter(|t| t.len() == 16 * 1024).map(|t| t.len()).sum();
+    assert!(staged_bytes <= 64 * 1024,
+        "the per-admission fsync must stay bounded, not grow with the install: {staged_bytes}");
+}
+
+#[test]
+fn archiving_the_whole_staged_set_still_cannot_let_a_fresh_id_collide_with_it() {
+    // The hazard the archive INTRODUCES, and the one nothing else would
+    // catch. `queue_seq` restarts at zero every process and is seeded past
+    // the highest id the snapshot holds — but archiving takes ids OUT of the
+    // snapshot, so a group whose whole staged set has rolled off presents an
+    // empty file and would re-mint ids an archived orphan still carries.
+    // Both consequences of that collision are silent: `queue_orphans`'s
+    // live-id filter hides a real orphan behind an unrelated fresh delivery,
+    // and the audit scan reads the NEW id's `delivery-dequeued` as closing
+    // the OLD id's `delivery-queued`.
+    let dir = tempfile::tempdir().unwrap();
+    let (gid, _old, _session) = queued_then_crashed(dir.path(), &["archived, id still spent"]);
+    age_snapshot(dir.path(), &gid, 2 * 24 * 60 * 60 * 1000);
+
+    // Process 2: the roll happens, and its own live entry dies with it.
+    {
+        restart_and_admit(dir.path(), &gid, 946);
+    }
+    let archived_ids: Vec<u64> = archive_rows(dir.path(), &gid)
+        .iter().map(|r| r["entry"]["id"].as_u64().unwrap()).collect();
+    assert_eq!(archived_ids.len(), 1, "precondition: the staged set rolled off entirely");
+
+    // ...and the live admission that triggered the roll was delivered before
+    // process 2 died, so what process 3 opens is an EMPTY snapshot beside a
+    // non-empty archive. That is the state the seed's blind spot needs, and
+    // it is the ordinary one: a delivered entry leaves the file.
+    let path = dir.path().join(&gid).join("queue.json");
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["entries"] = json!([]);
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    // Process 3 sees a snapshot with no id in it at all.
+    let reg = relaunch_registry(dir.path());
+    reg.set_port(45999);
+    reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let fresh = reg.spawn_agent(&gid, Role::Worker, "unrelated", "t", false, None).unwrap();
+    let minted = reg
+        .enqueue_text(&gid, &fresh.id, "orch-1", "brand new", 947, queue::EnqueueReason::Arrival)
+        .unwrap();
+    assert!(minted.id > archived_ids[0],
+        "the id seed must read the archive too — {} would re-use an archived orphan's id {}",
+        minted.id, archived_ids[0]);
+    let orphans = reg.queue_orphans(&gid);
+    assert!(orphans.iter().any(|o| o.id == archived_ids[0] && o.text.is_some()),
+        "and the archived orphan must still be reported — a re-used id makes the live filter \
+         hide it behind an unrelated fresh delivery: {orphans:?}");
+}
+
 #[test]
 fn queue_orphans_is_an_orchestrator_only_tool_and_reports_what_a_restart_lost() {
     // The #467 wiring itself: the derivation only becomes a recovery when
