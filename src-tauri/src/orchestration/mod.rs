@@ -3018,6 +3018,59 @@ pub struct CliCaps {
     /// refusal so a rejected workflow says what is actually missing instead of
     /// "unsupported".
     pub containment_note: &'static str,
+    /// The thinking-effort levels loomux can actually **set** on this CLI at
+    /// spawn — a subset of [`EFFORT_LEVELS`], or empty for a CLI with no
+    /// loomux-usable seam (#687).
+    ///
+    /// Empty is a claim, not an omission, and it is why the note below is not
+    /// optional: a knob loomux cannot deliver renders **disabled with a
+    /// reason** in the launcher and is a **parse error** in a workflow file —
+    /// never silently ignored, which is the failure mode where a human sets a
+    /// thinking level and quietly does not get one.
+    pub effort_levels: &'static [&'static str],
+    /// How this CLI's effort level is (or is not) reachable — the launcher's
+    /// hint text and the parse error's reason. Always non-empty; pinned by
+    /// `every_cli_row_explains_both_knobs`.
+    pub effort_note: &'static str,
+    /// The context-window variants loomux can set on this CLI — a subset of
+    /// [`CONTEXT_VARIANTS`], or empty. Same "empty is a claim" rule as
+    /// [`Self::effort_levels`].
+    pub context_variants: &'static [&'static str],
+    /// How this CLI's context window is (or is not) reachable. Always
+    /// non-empty.
+    pub context_note: &'static str,
+}
+
+/// The closed vocabulary of a block's `effort:` (#687) — the thinking level.
+///
+/// This is loomux's vocabulary, not one CLI's: a value outside it is a parse
+/// error whatever the CLI, and a value inside it is still refused on a CLI
+/// whose [`CliCaps::effort_levels`] omits it. `ultracode` is deliberately
+/// absent — it is a Claude Code orchestration mode, not a model effort level.
+pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// The closed vocabulary of a block's `context:` (#687) — the context-window
+/// variant. One entry today; the shape is a value set, not a boolean, so a
+/// future tier is a row here rather than a new key.
+pub const CONTEXT_VARIANTS: &[&str] = &["1m"];
+
+/// The value of a block knob (`effort:` / `context:`) this CLI will actually
+/// honor, or **empty** — which every emit path reads as "say nothing", i.e.
+/// the pre-#687 command line byte for byte.
+///
+/// This is the silent half of the pair: `parse_workflow` rejects an
+/// unsupported knob loudly, with the author present to read the error;
+/// `Guardrails::clamped` calls this for the other way a knob can arrive — a
+/// hand-edited `group.json`, which never met the parser and has no human to
+/// show anything to. Same belt-and-braces, and the same fail-to-default
+/// direction, as `sanitize_model`.
+pub fn clamped_knob(allowed: &[&str], v: &str) -> String {
+    let want = v.trim().to_ascii_lowercase();
+    if allowed.contains(&want.as_str()) {
+        want
+    } else {
+        String::new()
+    }
 }
 
 /// The capability table. Rows exist for CLIs loomux does **not** spawn too:
@@ -3053,6 +3106,29 @@ pub struct CliCaps {
 ///   removes the tests and the `gh` a reviewer's job is made of. That leaves
 ///   `workspace-write`, i.e. no containment at all, so its ceiling is
 ///   [`Containment::None`] and a reviewer or planner block cannot run on it.
+///
+/// The `effort_*` / `context_*` fields (#687) are docs-verified the same way
+/// (checked 2026-08-02):
+///
+/// - **claude** — `--effort <level>` is in the
+///   [CLI reference](https://code.claude.com/docs/en/cli-reference); per
+///   [model config](https://code.claude.com/docs/en/model-config) §Adjust
+///   effort level, a model that does not support a level falls back to the
+///   highest one it supports at or below it, so any of the five is safe to
+///   emit. §Extended context documents the **`[1m]` model-alias suffix**
+///   (`sonnet[1m]`, `claude-opus-4-8[1m]`) — there is no separate flag.
+/// - **copilot** — the
+///   [CLI programmatic reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference)
+///   documents `effortLevel` in `~/.copilot/settings.json` and **no** flag or
+///   environment variable for it, and the
+///   [command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference)
+///   puts the context window behind the interactive `/context` control.
+/// - **gemini** — thinking level is
+///   `modelConfigs.aliases.<alias>.thinkingConfig` in settings
+///   ([configuration reference](https://geminicli.com/docs/reference/configuration/));
+///   loomux already generates gemini's settings file, so the seam exists, but
+///   the schema needs a live verification loomux's own agents may not perform
+///   (CLAUDE.md constraint 3), so it stays unwired and the row says so.
 pub const CLI_CAPS: &[CliCaps] = &[
     CliCaps {
         cli: "claude",
@@ -3060,6 +3136,10 @@ pub const CLI_CAPS: &[CliCaps] = &[
         mcp_argv_seam: true,
         max_containment: Containment::ReadOnly,
         containment_note: "--disallowedTools denies tools by name and beats both the permission mode and the allow list",
+        effort_levels: EFFORT_LEVELS,
+        effort_note: "--effort <level> is a session-scoped flag; a model that lacks a level falls back to the highest one it supports at or below it",
+        context_variants: CONTEXT_VARIANTS,
+        context_note: "the [1m] model-alias suffix (sonnet[1m]) — access is plan- and credit-gated, so a tier the account cannot serve fails at the CLI, visibly in the pane",
     },
     CliCaps {
         cli: "copilot",
@@ -3067,6 +3147,10 @@ pub const CLI_CAPS: &[CliCaps] = &[
         mcp_argv_seam: true,
         max_containment: Containment::ReadOnly,
         containment_note: "--deny-tool denies the write category and shell prefixes, and deny beats --allow-all-tools",
+        effort_levels: &[],
+        effort_note: "copilot reads effortLevel from ~/.copilot/settings.json — its programmatic reference documents no flag and no environment variable, and loomux never writes a user's global settings file",
+        context_variants: &[],
+        context_note: "copilot's context window is an interactive-only control (/context) with no argv or settings equivalent",
     },
     CliCaps {
         cli: "gemini",
@@ -3074,6 +3158,10 @@ pub const CLI_CAPS: &[CliCaps] = &[
         mcp_argv_seam: false,
         max_containment: Containment::ReadOnly,
         containment_note: "policy-engine deny rules and tools.exclude both name built-in tools (write_file/replace) and shell command prefixes, and both outrank --approval-mode yolo",
+        effort_levels: &[],
+        effort_note: "gemini's thinking level is a settings-file key (modelConfigs.aliases.<alias>.thinkingConfig) — the generated-settings seam exists, but the schema is unverified against a live run, so loomux does not write it yet",
+        context_variants: &[],
+        context_note: "gemini's context window is model-determined; its compression knobs (model.compressionThreshold) are compaction, not window size",
     },
     CliCaps {
         cli: "codex",
@@ -3081,6 +3169,10 @@ pub const CLI_CAPS: &[CliCaps] = &[
         mcp_argv_seam: false,
         max_containment: Containment::None,
         containment_note: "codex has no tool-level edit deny (its `tools` config covers only view_image/web_search); its sandbox_mode is all-or-nothing, and its read-only rung also blocks running commands and network access, so a contained agent could neither edit nor run the tests it exists to run",
+        effort_levels: &[],
+        effort_note: "codex is evaluated but not spawned by loomux, so no knob is delivered on it at all (see max_containment)",
+        context_variants: &[],
+        context_note: "codex is evaluated but not spawned by loomux, so no knob is delivered on it at all (see max_containment)",
     },
 ];
 
@@ -3449,6 +3541,15 @@ impl Guardrails {
             // Copilot picks its own best model with "auto"; Claude needs a tier.
             let cli = if b.cli.trim().is_empty() { self.agent_cli.clone() } else { b.cli.clone() };
             b.model = sanitize_model(&b.model, default_model(&cli, b.kind));
+            // #687: the model knobs, against the block's RESOLVED CLI — which
+            // is why this can't live in the parser alone: a block that
+            // inherits the group default has no CLI to check against until
+            // here. A value the CLI cannot honor becomes empty, i.e. no flag
+            // and no model suffix; see `clamped_knob` for why that half is
+            // silent while the parser's is loud.
+            let caps = cli_caps(&cli);
+            b.effort = clamped_knob(caps.map_or(&[][..], |c| c.effort_levels), &b.effort);
+            b.context = clamped_knob(caps.map_or(&[][..], |c| c.context_variants), &b.context);
         }
         self.idle_kill_minutes = self.idle_kill_minutes.min(MAX_IDLE_KILL_MINUTES);
         self.max_spawns_per_hour = self.max_spawns_per_hour.min(MAX_SPAWNS_PER_HOUR);
@@ -6595,6 +6696,34 @@ fn sanitize_model(m: &str, fallback: &str) -> String {
     }
 }
 
+/// Claude's `--model` value with the block's context variant applied (#687), as
+/// **one literal argv token**: the plain model when no variant is set, else the
+/// documented `{model}[{variant}]` extended-context alias (`sonnet[1m]`).
+///
+/// Composed here, at emit, rather than stored in `Block::model`, because
+/// `sanitize_model` strips brackets — a `sonnet[1m]` written as a model id
+/// would silently become the broken `sonnet1m` — and widening that sanitizer to
+/// admit brackets would put a shell glob pattern into every model string.
+pub(crate) fn claude_model_token(model: &str, context: &str) -> String {
+    if context.is_empty() {
+        model.to_string()
+    } else {
+        format!("{model}[{context}]")
+    }
+}
+
+/// [`claude_model_token`] for the SHELL form. Quoted when — and only when — a
+/// variant is set: `[1m]` is a glob pattern to a POSIX shell and a bare bracket
+/// starts an attribute in PowerShell, while quoting unconditionally would
+/// change the emitted line for every group that pinned nothing.
+fn claude_model_arg(model: &str, context: &str) -> String {
+    if context.is_empty() {
+        model.to_string()
+    } else {
+        format!("\"{}\"", claude_model_token(model, context))
+    }
+}
+
 /// `sanitize_model` with no fallback: an empty/unusable model stays empty, which
 /// a block reads as "inherit the class default for my CLI" (`workflow::model_of`).
 /// The workflow parser needs this because a block's *effective* CLI isn't known
@@ -6653,6 +6782,14 @@ fn read_blocks(g: &Value) -> Vec<workflow::Block> {
                         let hint = raw.trim().to_ascii_lowercase();
                         (workflow::role_hint_requires(&hint) == Some(kind)).then_some(hint)
                     }),
+                    // #687: read raw and let `clamped()` decide — the block's
+                    // effective CLI (its own, else the group default) isn't
+                    // resolvable from one array element, and `clamped()` is
+                    // the one place that already knows it. An ABSENT key is
+                    // the pre-#687 group.json: empty, i.e. no knob, i.e.
+                    // today's spawn byte for byte.
+                    effort: s(b, "effort"),
+                    context: s(b, "context"),
                 })
             })
             .collect();
@@ -6689,6 +6826,8 @@ fn blocks_json(blocks: &[workflow::Block]) -> Value {
                     "profile": b.profile,
                     "allow": b.allow,
                     "role_hint": b.role_hint,
+                    "effort": b.effort,
+                    "context": b.context,
                 })
             })
             .collect(),
@@ -30162,12 +30301,60 @@ impl OrchRegistry {
     /// So a new flag added to the claude branch goes after the allow values, not
     /// between them and their flag. `claude_allow_patterns_are_not_severed_from_
     /// the_allowedtools_flag` pins the property rather than the current order.
+    ///
+    /// This form pins **no model knobs** (#687) — it is
+    /// [`Self::build_agent_command_ex`] with [`workflow::ModelKnobs::default`],
+    /// i.e. the pre-#687 command line byte for byte. Every spawn path calls the
+    /// `_ex` form with its block's knobs (the `spawn_agent`/`spawn_agent_ex`
+    /// shape); this one survives because "a block that pinned nothing produces
+    /// exactly today's line" is a property worth keeping directly assertable.
     #[allow(clippy::too_many_arguments)]
     #[doc(hidden)] // pub for integration tests
     pub fn build_agent_command(
         &self,
         cli: &str,
         model: &str,
+        auto_ops: bool,
+        cfg: &Path,
+        hook_settings: Option<&Path>,
+        group_dir: &Path,
+        workdir: &Path,
+        session: Option<&str>,
+        resume: bool,
+        containment: Containment,
+        persona: &PersonaInject,
+    ) -> String {
+        self.build_agent_command_ex(
+            cli,
+            model,
+            workflow::ModelKnobs::default(),
+            auto_ops,
+            cfg,
+            hook_settings,
+            group_dir,
+            workdir,
+            session,
+            resume,
+            containment,
+            persona,
+        )
+    }
+
+    /// [`Self::build_agent_command`] with the block's model knobs (#687):
+    /// `knobs.effort` becomes claude's `--effort <level>` and `knobs.context`
+    /// composes the `{model}[{variant}]` alias. Both are **only-when-set**, and
+    /// neither is emitted on copilot or gemini — see [`CliCaps`] for why (their
+    /// seams are a user-owned settings file and an interactive control), which
+    /// is also why an unset knob is not merely a default but the whole
+    /// back-compat guarantee: a group on a CLI build predating `--effort` is
+    /// unaffected unless a human opts in.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)] // pub for integration tests
+    pub fn build_agent_command_ex(
+        &self,
+        cli: &str,
+        model: &str,
+        knobs: workflow::ModelKnobs<'_>,
         auto_ops: bool,
         cfg: &Path,
         // Claude's `--settings` file (#417) — `write_hook_settings_file`'s
@@ -30357,9 +30544,10 @@ impl OrchRegistry {
                 // including the fail-open direction #465 closes for a planner
                 // and cannot close here.
                 let perm = claude_effective_permission_mode(unattended, containment.is_read_only());
+                let model_arg = claude_model_arg(model, knobs.context);
                 let mut cmd = format!(
                     "claude {session_flag}--mcp-config \"{}\" --strict-mcp-config \
-                     --model {model} --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
+                     --model {model_arg} --permission-mode {perm} --add-dir \"{}\" --allowedTools mcp__loomux",
                     cfg.display(),
                     group_dir.display()
                 );
@@ -30406,6 +30594,16 @@ impl OrchRegistry {
                 // between `--allowedTools` and its values.
                 if let Some(hs) = hook_settings {
                     cmd.push_str(&format!(" --settings \"{}\"", hs.display()));
+                }
+                // #687: the block's thinking level, ONLY when one is set —
+                // and emitted here, below `--settings`, for exactly the #610
+                // reason stated above it: any flag added to this branch goes
+                // after the last `--allowedTools` value, never between the
+                // flag and its values. `knobs.effort` is a member of a closed
+                // enum by the time it reaches here (parser + `clamped_knob`),
+                // so it needs no quoting — the same argument `model` rests on.
+                if !knobs.effort.is_empty() {
+                    cmd.push_str(&format!(" --effort {}", knobs.effort));
                 }
                 if containment.denies_edits() {
                     // Deny the file-editing tools — and, for a ReadOnly class,
@@ -30489,6 +30687,42 @@ impl OrchRegistry {
         &self,
         cli: &str,
         model: &str,
+        auto_ops: bool,
+        cfg: &Path,
+        hook_settings: Option<&Path>,
+        group_dir: &Path,
+        workdir: &Path,
+        session: Option<&str>,
+        resume: bool,
+        containment: Containment,
+        persona: &PersonaInject,
+    ) -> Vec<String> {
+        self.build_agent_argv_ex(
+            cli,
+            model,
+            workflow::ModelKnobs::default(),
+            auto_ops,
+            cfg,
+            hook_settings,
+            group_dir,
+            workdir,
+            session,
+            resume,
+            containment,
+            persona,
+        )
+    }
+
+    /// [`Self::build_agent_argv`] with the block's model knobs (#687) — the
+    /// structured twin of [`Self::build_agent_command_ex`], and pinned equal to
+    /// it (knobs included) by `build_agent_argv_matches_command_line`.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)] // pub for integration tests
+    pub fn build_agent_argv_ex(
+        &self,
+        cli: &str,
+        model: &str,
+        knobs: workflow::ModelKnobs<'_>,
         auto_ops: bool,
         cfg: &Path,
         hook_settings: Option<&Path>,
@@ -30597,7 +30831,10 @@ impl OrchRegistry {
                 a.push(cfg.display().to_string());
                 push(&mut a, "--strict-mcp-config");
                 push(&mut a, "--model");
-                push(&mut a, model);
+                // The [1m] suffix as ONE literal token — no shell here, so no
+                // quotes (the string form quotes it because `[1m]` is a glob
+                // pattern to a POSIX shell).
+                a.push(claude_model_token(model, knobs.context));
                 push(&mut a, "--permission-mode");
                 // Same tier predicate as the string form (#465 + #462) — see
                 // that call for why it is is_read_only(), not denies_edits().
@@ -30622,6 +30859,11 @@ impl OrchRegistry {
                 if let Some(hs) = hook_settings {
                     push(&mut a, "--settings");
                     a.push(hs.display().to_string());
+                }
+                // #687 — same position as the string form, for the same reason.
+                if !knobs.effort.is_empty() {
+                    push(&mut a, "--effort");
+                    push(&mut a, knobs.effort);
                 }
                 if containment.denies_edits() {
                     push(&mut a, "--disallowedTools");
@@ -30934,9 +31176,10 @@ impl OrchRegistry {
         if cli == "copilot" {
             let _ = self.ensure_copilot_compact_hook();
         }
-        let command = self.build_agent_command(
+        let command = self.build_agent_command_ex(
             &cli,
             &model,
+            block.knobs(), // #687: already clamped to what this CLI can honor
             group.guardrails.auto_ops,
             &cfg,
             hook_settings.as_deref(),
@@ -30947,9 +31190,10 @@ impl OrchRegistry {
             role.containment(), // deny edits (and, for a planner, commits) at the CLI level
             &inject,
         );
-        let argv = self.build_agent_argv(
+        let argv = self.build_agent_argv_ex(
             &cli,
             &model,
+            block.knobs(),
             group.guardrails.auto_ops,
             &cfg,
             hook_settings.as_deref(),
@@ -36123,6 +36367,65 @@ pub fn agent_autopilot_flags(program: String) -> String {
     single_pane_autopilot_flags(&program)
 }
 
+/// The model knobs (#687) loomux can actually set on `cli`, straight off its
+/// [`CliCaps`] row: the `effort`/`context` value sets, and — always — the note
+/// that says *why* a set is what it is.
+///
+/// The launcher's per-role selector reads this so a knob loomux cannot deliver
+/// renders **disabled with the vendor's reason** rather than silently doing
+/// nothing. That is the whole point of shipping the note alongside the values:
+/// a hidden control reads as "loomux forgot", while a disabled one that says
+/// "copilot reads effortLevel from ~/.copilot/settings.json" states the fact.
+///
+/// Stateless (no registry), and deliberately not a second copy of the vendor
+/// facts — it reports [`CLI_CAPS`] verbatim, so the launcher, the workflow
+/// parser and the spawn path can never disagree about what a CLI supports.
+#[tauri::command]
+pub fn agent_cli_knobs(cli: String) -> Value {
+    cli_knobs_json(&cli)
+}
+
+/// The pure body of [`agent_cli_knobs`], so the wire shape is assertable
+/// without a tauri runtime. An unknown CLI is `known: false` with both sets
+/// empty — the launcher renders every knob disabled, which is the honest
+/// answer for a CLI loomux has never evaluated.
+pub fn cli_knobs_json(cli: &str) -> Value {
+    let caps = cli_caps(cli);
+    json!({
+        "cli": cli,
+        "known": caps.is_some(),
+        "effort": {
+            "values": caps.map(|c| c.effort_levels).unwrap_or(&[]),
+            "note": caps.map(|c| c.effort_note).unwrap_or(""),
+        },
+        "context": {
+            "values": caps.map(|c| c.context_variants).unwrap_or(&[]),
+            "note": caps.map(|c| c.context_note).unwrap_or(""),
+        },
+    })
+}
+
+/// The launcher's per-role model knobs (#687), as ONE optional payload object
+/// rather than eight more positional arguments on [`create_orchestration`]
+/// (which already carries eighteen).
+///
+/// Optional on purpose: **absent is the pre-#687 caller**, and it means "no
+/// knob on any role" — today's group, byte for byte. Tauri treats a missing
+/// key for an `Option<T>` argument as `None`, so a frontend that does not send
+/// this keeps working unchanged.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RoleKnobs {
+    pub orchestrator_effort: String,
+    pub orchestrator_context: String,
+    pub worker_effort: String,
+    pub worker_context: String,
+    pub reviewer_effort: String,
+    pub reviewer_context: String,
+    pub planner_effort: String,
+    pub planner_context: String,
+}
+
 /// Create (or reattach to) an orchestration group and register its
 /// orchestrator. Returns the pane spec the frontend opens directly; initial
 /// idle workers are spawned in the background once the orchestrator binds.
@@ -36152,6 +36455,9 @@ pub fn create_orchestration(
     // repo's `.loomux/workflow.yml` and runs the roster below, exactly as loomux
     // did before workflows existed.
     advanced_orchestrator: bool,
+    // Per-role thinking level / context window (#687). Omitted = no knob on any
+    // role, i.e. today's group byte for byte — see `RoleKnobs`.
+    role_knobs: Option<RoleKnobs>,
 ) -> Result<SpawnRequest, String> {
     // The launcher still collects one CLI + model per role — that IS the
     // built-in 4-block roster (#222), just spelled as flat form fields. Convert
@@ -36159,11 +36465,38 @@ pub fn create_orchestration(
     // the backend has blocks from this point on. A repo that declares
     // `.loomux/workflow.yml` overrides this roster in `create_group` — but only
     // when `advanced_orchestrator` is on.
-    let blocks = workflow::default_roster(&[
-        (Role::Orchestrator, &orchestrator_cli, &orchestrator_model),
-        (Role::Worker, &worker_cli, &worker_model),
-        (Role::Reviewer, &reviewer_cli, &reviewer_model),
-        (Role::Planner, &planner_cli, &planner_model),
+    //
+    // The knobs are passed through RAW: `create_orchestration_group` runs
+    // `Guardrails::clamped`, which is the one place that knows each block's
+    // resolved CLI and therefore whether the knob can be honored at all. The
+    // launcher already greys out what a CLI can't do (`agent_cli_knobs`), so
+    // this is the belt to that braces, not the only check.
+    let k = role_knobs.unwrap_or_default();
+    let blocks = workflow::default_roster_ex(&[
+        (
+            Role::Orchestrator,
+            &orchestrator_cli,
+            &orchestrator_model,
+            workflow::ModelKnobs { effort: &k.orchestrator_effort, context: &k.orchestrator_context },
+        ),
+        (
+            Role::Worker,
+            &worker_cli,
+            &worker_model,
+            workflow::ModelKnobs { effort: &k.worker_effort, context: &k.worker_context },
+        ),
+        (
+            Role::Reviewer,
+            &reviewer_cli,
+            &reviewer_model,
+            workflow::ModelKnobs { effort: &k.reviewer_effort, context: &k.reviewer_context },
+        ),
+        (
+            Role::Planner,
+            &planner_cli,
+            &planner_model,
+            workflow::ModelKnobs { effort: &k.planner_effort, context: &k.planner_context },
+        ),
     ]);
     create_orchestration_group(
         reg.inner(),
@@ -36303,6 +36636,15 @@ pub fn orch_workflow_preview(repo: String, agent_cli: String) -> Value {
             // advisor/process block — cosmetic only, never a capability (see
             // `workflow::Block::role_hint`).
             "role_hint": b.role_hint,
+            // #687: the block's RESOLVED knobs (these rows have been through
+            // `clamped()` above), because the preview's job is to state the whole
+            // spawn and a thinking level is part of it. It is also what makes the
+            // trust argument for letting a repo file pin `effort:` on the
+            // ORCHESTRATOR block (doc/design/workflows.md) true rather than
+            // aspirational: that argument rests on the human being shown every
+            // block's resolved value here, before the toggle that reads the file.
+            "effort": b.effort,
+            "context": b.context,
             // What the human is really being asked to consent to: whether this
             // block carries repo-authored instructions for the agent.
             //
@@ -36879,9 +37221,13 @@ fn register_orchestrator_pane(
     if cli == "copilot" {
         let _ = reg.ensure_copilot_compact_hook();
     }
-    let command = reg.build_agent_command(
+    let command = reg.build_agent_command_ex(
         &cli,
         &model,
+        // #687: the orchestrator block may pin these too — a value-set pick,
+        // so it joins `cli`/`model` on the allowed-to-pin list rather than
+        // `prompt:`/`allow:` on the refused one (see `parse_workflow`).
+        block.knobs(),
         group.guardrails.auto_ops,
         &cfg,
         hook_settings.as_deref(),
@@ -36895,9 +37241,10 @@ fn register_orchestrator_pane(
         block.kind.containment(),
         &inject,
     );
-    let argv = reg.build_agent_argv(
+    let argv = reg.build_agent_argv_ex(
         &cli,
         &model,
+        block.knobs(),
         group.guardrails.auto_ops,
         &cfg,
         hook_settings.as_deref(),

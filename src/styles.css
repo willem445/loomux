@@ -1409,6 +1409,13 @@ body.dragging-pane, body.dragging-pane * { cursor: grabbing !important; }
 .dlg-row > .dlg-field { flex: 1; min-width: 0; }
 .dlg-num { width: 100%; }
 .model-picker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+/* #687: a per-role row is [cli] [model] [thinking level] [context]. The model
+   picker takes the slack; the knob selects keep their content width and the row
+   wraps rather than overflowing a narrow setup pane. */
+.role-row { flex-wrap: wrap; align-items: start; }
+.role-row > .model-picker { flex: 1 1 140px; }
+.role-row > .dlg-select { min-width: 0; }
+.role-row > .dlg-select:disabled { opacity: 0.55; cursor: not-allowed; }
 .model-picker select, .model-picker input { width: 100%; }
 .dlg-input, .dlg-select {
   background: var(--bg-app); color: var(--text);

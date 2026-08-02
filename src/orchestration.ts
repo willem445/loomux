@@ -98,6 +98,25 @@ export interface OrchestratorConfig {
    *  per-role picks above then apply only as the CLI a block inherits when it
    *  names none). A launch choice, persisted with the group. */
   advancedOrchestrator: boolean;
+  /** Per-role thinking level / context window (#687), as ONE optional object —
+   *  the backend's `RoleKnobs`, camelCase, every field optional. Empty (or the
+   *  whole object omitted) means "no knob on any role", which is today's group
+   *  byte for byte: the backend emits no `--effort` and no `[1m]` model suffix.
+   *
+   *  The launcher has already run each value through `selectorknobs.knobValue`,
+   *  so a knob its CLI or model cannot carry arrives as "". The backend clamps
+   *  again against each block's RESOLVED cli (`Guardrails::clamped`) — this is
+   *  the belt to that braces, never the only check. */
+  roleKnobs?: {
+    orchestratorEffort: string;
+    orchestratorContext: string;
+    workerEffort: string;
+    workerContext: string;
+    reviewerEffort: string;
+    reviewerContext: string;
+    plannerEffort: string;
+    plannerContext: string;
+  };
 }
 
 /** One pane that needs the human, from the backend attention scan. `reason`
@@ -820,6 +839,10 @@ export async function launchOrchestrator(
     maxSpawnsPerHour: config.maxSpawnsPerHour,
     watchdogStallMinutes: config.watchdogStallMinutes,
     advancedOrchestrator: config.advancedOrchestrator,
+    // #687: omitted when the launcher collected nothing, because a MISSING key
+    // for the backend's `Option<RoleKnobs>` argument is exactly `None` — the
+    // pre-#687 call, unchanged.
+    roleKnobs: config.roleKnobs,
   });
   // #83: create_orchestration has no budget parameter (W1's frozen contract), so
   // apply any launcher-collected autonomous budget via the setter now the group

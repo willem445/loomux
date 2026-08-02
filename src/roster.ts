@@ -51,6 +51,15 @@ export interface RosterBlock {
   cli: string;
   model: string;
   persona: BlockPersona;
+  /** The block's thinking level and context-window variant (#687), as the
+   *  backend resolved them — `""`/absent means "the CLI's own default", which is
+   *  the pre-#687 command line byte for byte. Shown in the roster because the
+   *  preview's job is to state what will actually be spawned, and because the
+   *  trust argument for letting a repo file pin these on the ORCHESTRATOR block
+   *  (`doc/design/workflows.md`) rests on the human seeing every block's resolved
+   *  value here, before the toggle that reads the file at all. */
+  effort?: string;
+  context?: string;
   /** OPTIONAL, INERT persona/template marker (#250/#324) — `"advisor"` |
    *  `"process"` | absent. Backend-resolved, so it is never a value the
    *  backend's own `role_hint_requires` wouldn't accept: capability still
@@ -140,6 +149,12 @@ export interface RolePick {
   key: OrchRole;
   cli: string;
   model: string;
+  /** The role's model knobs (#687), or `""`/absent for the CLI's own default.
+   *  Already gated by `selectorknobs.knobValue` where the form collected them —
+   *  the preview shows what the payload will carry, not what a stale control
+   *  still displays. */
+  effort?: string;
+  context?: string;
 }
 
 /** What the group will run, and why.
@@ -187,6 +202,11 @@ export function builtinRoster(picks: readonly RolePick[], groupCli: string): Ros
       cli: pick?.cli?.trim() || groupCli,
       model: pick?.model?.trim() ?? "",
       persona: "none" as const,
+      // #687: NOT inherited from the group the way `cli` is — a thinking level
+      // is a per-role choice, and there is no group-wide one to fall back to.
+      // Absent stays absent, which every emit path reads as "say nothing".
+      effort: pick?.effort?.trim() ?? "",
+      context: pick?.context?.trim() ?? "",
     };
   });
 }
@@ -292,7 +312,13 @@ export function describeBlock(b: RosterBlock): string {
         ? " · repo persona"
         : "";
   const chip = roleHintChip(b.role_hint);
-  return `${b.kind} · ${b.cli} · ${b.model || "default model"}${persona}${chip ? ` · ${chip}` : ""}`;
+  // #687: the knobs sit with the model they modify, before the persona and the
+  // chip (which are about the agent's INSTRUCTIONS, not what it runs on). Spelled
+  // with the workflow file's own key names, so the line teaches what to write.
+  // Empty/absent renders nothing at all: "effort: (default)" on every row would
+  // be noise on every group that pinned nothing, i.e. nearly all of them.
+  const knobs = `${b.effort ? ` · effort: ${b.effort}` : ""}${b.context ? ` · context: ${b.context}` : ""}`;
+  return `${b.kind} · ${b.cli} · ${b.model || "default model"}${knobs}${persona}${chip ? ` · ${chip}` : ""}`;
 }
 
 /** Whether the roster is worth showing the human before they launch. The built-in

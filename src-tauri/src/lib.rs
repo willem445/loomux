@@ -135,6 +135,7 @@ pub fn run() {
             gitwatch::git_watch,
             gitwatch::git_unwatch,
             orchestration::agent_autopilot_flags,
+            orchestration::agent_cli_knobs,
             orchestration::create_orchestration,
             orchestration::bind_agent,
             orchestration::orch_agent_renamed,

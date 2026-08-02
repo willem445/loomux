@@ -35,6 +35,7 @@ import {
   type Finding,
   type FindingCode,
 } from "../src/workflowmodel.ts";
+import { knobState, type CliKnobs } from "../src/selectorknobs.ts";
 
 /** The schema sketch from the #222 investigation (§4), verbatim in spirit: the file the
  *  feature was designed around. If this stops reading, the feature is broken. */
@@ -1320,4 +1321,145 @@ test("deleting a broken block deletes THAT block — not everything shaped like 
   assert.deepEqual(after.edges, dupes.edges, "the surviving twin still answers to that id");
   assert.deepEqual(after.gates.merge!.reviewers, ["reviewer"]);
   assert.deepEqual(codes(validateWorkflow(after)), [], "and the duplicate is resolved by the delete");
+});
+
+// ---------- model knobs: effort / context (#687) ----------
+
+/** The `agent_cli_knobs` replies the pane fetches per CLI, verbatim from
+ *  `CLI_CAPS` (mod.rs) — the pane never mirrors a vendor fact, it asks. */
+const KNOBS: Record<string, CliKnobs> = {
+  claude: {
+    cli: "claude",
+    known: true,
+    effort: { values: ["low", "medium", "high", "xhigh", "max"], note: "--effort <level> is a session-scoped flag" },
+    context: { values: ["1m"], note: "the [1m] model-alias suffix (sonnet[1m])" },
+  },
+  copilot: {
+    cli: "copilot",
+    known: true,
+    effort: { values: [], note: "copilot reads effortLevel from ~/.copilot/settings.json" },
+    context: { values: [], note: "copilot's context window is an interactive-only control (/context)" },
+  },
+};
+
+/** The lookup the pane hands to `validateWorkflow`: what has been fetched so
+ *  far, and `null` for a CLI whose reply hasn't landed. */
+const lookup = (cli: string, model: string) =>
+  KNOBS[cli] ? knobState(KNOBS[cli]!, cli, model) : null;
+
+test("effort:/context: are real keys the pane reads, not unknown ones it merely keeps", () => {
+  // Before #687 these landed in `extra` — preserved, but invisible to the form and
+  // to validation. The engine parses them, so the pane must too.
+  const { workflow, findings } = parseWorkflow(`version: 1
+blocks:
+  - id: worker
+    name: Worker
+    kind: worker
+    cli: claude
+    model: opus
+    effort: xhigh
+    context: 1m
+`);
+  assert.deepEqual(
+    findings.map((f) => f.code),
+    []
+  );
+  const b = workflow.blocks[0]!;
+  assert.equal(b.effort, "xhigh");
+  assert.equal(b.context, "1m");
+  assert.equal(b.extra, undefined, "a known key must not ALSO be carried as an unknown one");
+});
+
+test("the knobs round-trip through serialize/parse, and a block without them stays clean", () => {
+  const w = starterWorkflow();
+  w.blocks[1]!.effort = "max"; // blocks[1] is the worker
+  w.blocks[1]!.context = "1m";
+  const text = serializeWorkflow(w);
+  assert.match(text, /^ {4}effort: max$/m);
+  assert.match(text, /^ {4}context: 1m$/m);
+  const reread = parseWorkflow(text).workflow;
+  assert.equal(reread.blocks[1]!.effort, "max");
+  assert.equal(reread.blocks[1]!.context, "1m");
+  // A block that declared neither stays undefined, not "" — the same distinction
+  // role_hint keeps, and what makes "absent = the CLI's default" survive a save.
+  assert.equal(reread.blocks[0]!.effort, undefined);
+  assert.equal(reread.blocks[0]!.context, undefined);
+  // Serializing twice is still a no-op with the fields present.
+  assert.equal(serializeWorkflow(reread), serializeWorkflow(w));
+  // ...and a file that pins nothing is unchanged, byte for byte.
+  assert.equal(serializeWorkflow(starterWorkflow()), serializeWorkflow(parseWorkflow(serializeWorkflow(starterWorkflow())).workflow));
+});
+
+test("a knob the block's CLI cannot honor is a finding quoting that CLI's own reason", () => {
+  // The engine REFUSES this file (`validate_knob`, workflow.rs). A pane that
+  // reported it clean would send the human to a launch that falls back to the
+  // built-in roster with no idea why.
+  const w = starterWorkflow();
+  w.blocks[1]!.cli = "copilot";
+  w.blocks[1]!.effort = "xhigh";
+  const f = validateWorkflow(w, lookup);
+  assert.ok(has(f, "knob-unavailable"));
+  const finding = f.find((x) => x.code === "knob-unavailable")!;
+  assert.equal(finding.blockId, "worker");
+  assert.equal(finding.severity, "error");
+  assert.match(finding.message, /effort/);
+  assert.match(finding.message, /~\/\.copilot\/settings\.json/, "the vendor's reason, not 'unsupported'");
+});
+
+test("a value outside the CLI's own vocabulary is a finding that names the vocabulary", () => {
+  const w = starterWorkflow();
+  w.blocks[1]!.effort = "banana";
+  const f = validateWorkflow(w, lookup);
+  assert.ok(has(f, "knob-unavailable"));
+  assert.match(f.find((x) => x.code === "knob-unavailable")!.message, /low, medium, high, xhigh, max/);
+  // The legal values are clean, and so is an empty one (= the CLI's default).
+  for (const level of ["low", "medium", "high", "xhigh", "max", ""]) {
+    const ok = starterWorkflow();
+    ok.blocks[1]!.effort = level;
+    assert.deepEqual(codes(validateWorkflow(ok, lookup)), [], `effort: ${level || "(empty)"} is legal`);
+  }
+});
+
+test("context: is gated on the MODEL, not just the CLI (#709 carried finding)", () => {
+  // `model: haiku` + `context: 1m` composes `--model haiku[1m]` — an alias the
+  // vendor docs do not define (model-config §Extended context lists Fable 5,
+  // Sonnet 5, Opus 4.6+ and Sonnet 4.6). The launcher can't produce it (the
+  // control is disabled); a hand-written file can, and this is where that is
+  // caught, at the surface a human authors it in.
+  const w = starterWorkflow();
+  w.blocks[1]!.model = "haiku";
+  w.blocks[1]!.context = "1m";
+  const f = validateWorkflow(w, lookup);
+  assert.ok(has(f, "knob-unavailable"));
+  assert.match(f.find((x) => x.code === "knob-unavailable")!.message, /haiku\[1m\]/);
+
+  // The same block on a 1M-capable model is clean...
+  const ok = starterWorkflow();
+  ok.blocks[1]!.model = "sonnet";
+  ok.blocks[1]!.context = "1m";
+  assert.deepEqual(codes(validateWorkflow(ok, lookup)), []);
+  // ...and effort is NOT gated with it: a model that lacks a level falls back to
+  // the highest it supports (model-config §Adjust effort level).
+  const effortOnHaiku = starterWorkflow();
+  effortOnHaiku.blocks[1]!.model = "haiku";
+  effortOnHaiku.blocks[1]!.effort = "max";
+  assert.deepEqual(codes(validateWorkflow(effortOnHaiku, lookup)), []);
+});
+
+test("with no capability data the knob checks DEFER — they never guess", () => {
+  // The pane fetches caps asynchronously, and a block may name a CLI it hasn't
+  // fetched. Same deferral the real parser makes for a block with no explicit
+  // `cli:` (workflow.rs): check what you can know here, and let the layer that
+  // knows the resolved CLI check the rest.
+  const w = starterWorkflow();
+  w.blocks[1]!.cli = "copilot";
+  w.blocks[1]!.effort = "xhigh";
+  assert.deepEqual(codes(validateWorkflow(w)), [], "no caps in hand = no finding invented");
+  assert.deepEqual(
+    codes(validateWorkflow(w, (cli, model) => (cli === "claude" ? knobState(KNOBS.claude!, cli, model) : null))),
+    [],
+    "caps for the OTHER cli in hand is still no answer about this one"
+  );
+  // And a file that pins no knobs is unaffected whether caps are present or not.
+  assert.deepEqual(codes(validateWorkflow(starterWorkflow(), lookup)), []);
 });
