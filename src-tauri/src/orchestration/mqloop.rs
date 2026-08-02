@@ -187,8 +187,25 @@ fn worktree_dir_name(batch_id: &str) -> String {
 ///
 /// The path is a pure function of the batch id, which is what lets every
 /// teardown ([`remove_worktree`]) name it exactly rather than search for it.
-pub fn scratch_worktree_path(batch_id: &str) -> PathBuf {
-    std::env::temp_dir().join(worktree_dir_name(batch_id))
+///
+/// **`None` for an id this module will not build a name from** — the same
+/// `mergeq::valid_id_component` `scratch_branch` applies, enforced *here* rather
+/// than by whoever calls it (rev-183).
+///
+/// The distinction is not pedantry. `drive`'s top-of-function guard rejects an
+/// unusable record before any path is built, and that was true of every path the
+/// *driver* builds — but `merge_queue_reconcile_with` runs **before** that guard
+/// in the same tick, and `reconcile_batch` hands `cleanup_worktree` a batch id
+/// straight off disk. So the guard's protection was **positional**: it held for
+/// the callers that happened to sit after it, and a caller added earlier (or a
+/// path reached by a route nobody re-checked) got nothing. Validating inside the
+/// builder makes it structural — there is no argument, and no call order, that
+/// produces a path from a name this module rejects.
+pub fn scratch_worktree_path(batch_id: &str) -> Option<PathBuf> {
+    if !valid_id_component(batch_id) {
+        return None;
+    }
+    Some(std::env::temp_dir().join(worktree_dir_name(batch_id.trim())))
 }
 
 /// The one fetch a batch build performs: the target branch, plus every queued
@@ -250,7 +267,15 @@ pub fn build_scratch(
         Ok(_) => {}
     }
 
-    let wt = scratch_worktree_path(batch_id);
+    // Unreachable in practice — `mint_scratch` only ever hands back an id that
+    // already built a ref name — and refused rather than unwrapped, because the
+    // guarantee this function offers must not depend on which caller reached it.
+    let Some(wt) = scratch_worktree_path(batch_id) else {
+        return ScratchBuild::failed(BatchBuildError::Git(format!(
+            "refusing to build a worktree path from batch id {:?}",
+            quote(batch_id)
+        )));
+    };
     let wt_s = wt.display().to_string();
     // Bound to a local rather than `?`-propagated: the teardown below has to run
     // between the build and the return, on every one of the build's outcomes.
@@ -444,8 +469,19 @@ pub fn worktree_remove_argv(path: &str) -> Vec<String> {
 /// checked first, never a prune, never a wildcard, and the failure **returned**
 /// for the caller to audit as `mq-cleanup-failed` rather than raised. §10:
 /// cleanup failure never blocks landing and never fails a batch.
+/// **This is the caller the builder's own check exists for** (rev-183):
+/// `reconcile_batch` reaches it with a batch id straight off disk, and reconcile
+/// runs *before* `drive`'s record guard in the same tick. An unusable id is
+/// reported as a cleanup failure — the channel this function already has for
+/// "there is a leftover somebody has to look at" — rather than becoming a path.
 pub fn cleanup_worktree(r: &dyn MqRunner, batch_id: &str) -> Option<String> {
-    remove_worktree(r, &scratch_worktree_path(batch_id))
+    let Some(wt) = scratch_worktree_path(batch_id) else {
+        return Some(format!(
+            "refusing to build a worktree path from batch id {:?}",
+            quote(batch_id)
+        ));
+    };
+    remove_worktree(r, &wt)
 }
 
 // ── the batch draft PR (§5, §8) ─────────────────────────────────────────────
@@ -1450,13 +1486,19 @@ pub fn drive(
     //   uses. Observed, not theorised: with this guard absent an empty target
     //   fetched `+refs/heads/:refs/remotes/loomux-mq/target` and ran
     //   `gh pr create --base ` with an empty base.
-    // - **the batch id** reaches three places, and only one of them was closed.
-    //   `scratch_branch` validated it (and cleanup refused rather than guessing),
-    //   but `scratch_worktree_path` picks where `git worktree add` creates a
-    //   directory and `body_file_path` picks where `fs::write` puts the PR body,
-    //   and both took it raw. It gets `valid_id_component` — the *same*
-    //   predicate `scratch_branch` applies, now named rather than inlined, so
-    //   the three interpolations cannot drift apart.
+    // - **the batch id** reaches three places — the scratch ref name, the temp
+    //   worktree path, and the body file — and gets `valid_id_component`, the
+    //   *same* predicate `scratch_branch` applies, named rather than inlined so
+    //   the three cannot drift apart.
+    //
+    // **This guard is an early, loud stop, not the guarantee** (rev-183). All
+    // three builders enforce `valid_id_component` themselves and return `None`
+    // on a name they will not build, because a check that lives only here is
+    // *positional*: it holds for the callers that happen to sit after it, and
+    // `merge_queue_reconcile_with` runs **before** it in the same tick with a
+    // batch id straight off disk. What this guard buys is that the whole tick
+    // stops on one audit line rather than each builder refusing separately
+    // further in.
     //
     // Refusing the tick rather than repairing the record is the conservative
     // half of §4: a record loomux will not build a name from is also one it
@@ -2451,8 +2493,15 @@ fn teardown(r: &dyn MqRunner, group: &str, batch: &BatchRecord, rep: &mut DriveR
 /// `/tmp/body.md` is the obvious name, everybody picks it, and two writers
 /// seconds apart published one PR's body under the other's text (#625). A path
 /// only this batch can name is the fix.
-fn body_file_path(batch_id: &str, kind: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("loomux-mq-{batch_id}-{kind}.md"))
+/// **`None` for an id this module will not build a name from**, enforced here
+/// rather than by the caller — see [`scratch_worktree_path`] for why the
+/// difference between "the guard runs first" and "the builder refuses" is the
+/// difference between a positional guarantee and a structural one (rev-183).
+fn body_file_path(batch_id: &str, kind: &str) -> Option<PathBuf> {
+    if !valid_id_component(batch_id) {
+        return None;
+    }
+    Some(std::env::temp_dir().join(format!("loomux-mq-{}-{kind}.md", batch_id.trim())))
 }
 
 /// Write a body file, run `f` with its path, and remove it whatever happened.
@@ -2466,7 +2515,8 @@ fn with_body_file<T>(
     text: &str,
     f: impl FnOnce(&str) -> Result<T, String>,
 ) -> Result<T, String> {
-    let path = body_file_path(batch_id, kind);
+    let path = body_file_path(batch_id, kind)
+        .ok_or_else(|| format!("refusing to build a body-file path from batch id {batch_id:?}"))?;
     std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     let out = f(&path.display().to_string());
     // Best effort: a leftover body file in the OS temp dir is inert, and failing

@@ -881,9 +881,16 @@ and only one of them was ever closed: `scratch_branch` validated it and cleanup 
 guess at an unbuildable name, but `scratch_worktree_path` picks where `git worktree add`
 creates a directory and `body_file_path` picks where the PR body is written, and both took it
 raw. It is checked with `mergeq::valid_id_component` — `scratch_branch`'s own component check,
-named rather than inlined, so the three interpolations cannot drift apart. Both checks live at
-the top of `drive`, in one place, so a path added later cannot reach the same string by another
-route.
+named rather than inlined, so the three interpolations cannot drift apart.
+
+**Where that check lives is the whole point.** Both checks run at the top of `drive`, which
+stops a bad record on one audit line rather than at whichever builder happens to be reached
+first — but the *guarantee* is in the builders. `scratch_worktree_path` and `body_file_path`
+apply `valid_id_component` themselves and return `None` on a name they will not build, because
+a check that lives only in the guard is **positional**: it holds for the callers that happen to
+sit after it, and `merge_queue_reconcile_with` runs *before* it in the same tick, handing
+`cleanup_worktree` a batch id straight off disk. A guard is an ordering claim; a builder that
+refuses is a structural one, and only the second survives a caller added later.
 
 Refusing the tick rather than repairing the record is deliberate: a record loomux will not
 build a name from is also one it cannot clean up by name, so acting on it would leak whatever

@@ -1431,7 +1431,7 @@ fn only_the_recorded_head_may_be_abbreviated_and_a_malformed_one_fails_closed() 
 #[test]
 fn the_temp_worktree_is_torn_down_on_every_exit_path_and_the_outcome_is_returned() {
     // Success path: real directory present → removal attempted, by exact path.
-    let wt = scratch_worktree_path("mq-teardown");
+    let wt = scratch_worktree_path("mq-teardown").expect("a well-formed id builds a path");
     std::fs::create_dir_all(&wt).unwrap();
     let f = build_fake();
     let built =
@@ -2175,10 +2175,12 @@ fn a_batch_id_that_is_not_a_name_stops_the_tick_before_any_path_is_built() {
             rep.audits.iter().any(|a| a.action == "mq-stranded"),
             "batch id {bad:?} must be audited loudly"
         );
-        // Nothing was written where the id would have pointed.
-        assert!(
-            !scratch_worktree_path(bad).exists(),
-            "batch id {bad:?} must not have named a directory into existence"
+        // And the path builders refuse the name themselves, so the guarantee
+        // does not depend on this guard having run first (rev-183).
+        assert_eq!(
+            scratch_worktree_path(bad),
+            None,
+            "batch id {bad:?} must not build a worktree path at all"
         );
     }
     // The predicate is the one `scratch_branch` already applied — named now, so
@@ -2190,6 +2192,42 @@ fn a_batch_id_that_is_not_a_name_stops_the_tick_before_any_path_is_built() {
         assert_eq!(scratch_branch("g1", bad), None, "{bad:?} as a batch id");
         assert_eq!(scratch_branch(bad, "mq-1"), None, "{bad:?} as a group id");
     }
+}
+
+/// **The path builders refuse a bad id themselves, so RECONCILE is covered too**
+/// (rev-183).
+///
+/// `drive`'s record guard rejects an unusable batch id before the driver builds
+/// any path from it — but `merge_queue_reconcile_with` runs **before** that guard
+/// in the same tick, and `reconcile_batch` hands `cleanup_worktree` a batch id
+/// straight off disk. So the guard's protection was *positional*: true for the
+/// callers that happened to sit after it, and worth nothing to one that sits
+/// before it. This drives the reconcile path directly, which is the one the
+/// guard cannot reach.
+#[test]
+fn reconcile_refuses_to_build_a_path_from_a_batch_id_the_guard_never_saw() {
+    let f = Fake::new()
+        // `ls-remote` is never reached: `scratch_branch` refuses the name first.
+        .gh("pr view", 0, r#"{"state":"OPEN"}"#, "");
+    let mut s = in_flight_state("mq-placehold", &[612], 640);
+    s.batch.as_mut().unwrap().id = "../../evil".into();
+
+    let report = reconcile_batch(&f, &mut s, "g1");
+
+    assert_eq!(
+        report.cleanup_failed.as_deref(),
+        Some("refusing to build a worktree path from batch id \"../../evil\""),
+        "the refusal is REPORTED, on the channel §10 already has for leftovers"
+    );
+    assert!(
+        !f.calls().iter().any(|c| c.contains("worktree")),
+        "and no worktree path was handed to git at all: {:?}",
+        f.calls()
+    );
+    // The entries are still stranded loudly — refusing to name a path is not a
+    // reason to leave a batch in flight (§4).
+    assert_eq!(s.entry(612).unwrap().state(), EntryState::KickedBack);
+    assert!(s.batch.is_none());
 }
 
 /// **A stalled seam ends the selection pass; a refused PR does not**
