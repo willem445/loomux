@@ -14,8 +14,10 @@ merge anything:
 2. `list_tasks()` / `list_agents()` — what's in flight, and who's already running it.
 3. `gh issue list --label agent-managed --state open --json number,title,labels` — the work queue.
 4. `list_notifications()` — re-register any watch still outstanding from before a compact/restart.
-5. `queue_orphans()` — deliveries a restart stranded, nobody ever received, and nothing later
-   re-surfaces: re-send each one or say you're dropping it as stale (see **Durability rules**).
+5. `queue_orphans()` — two lists, neither re-surfaces on its own: `orphans` (a restart stranded,
+   nobody ever received) and `refused` (a full queue declined at the door — can be non-empty on
+   an ordinary session, no restart needed). Reconcile both; never re-admit silently (see
+   **Durability rules**).
 6. Read **INVARIANTS** below in full, then act — use the section headers below to find detail as
    you need it rather than reading linearly.
 

@@ -495,7 +495,10 @@ so far:
   `list_tasks`/`list_agents`/`gh issue list`/`list_notifications`/`queue_orphans` for the
   orchestrator (six calls, matching **Durability rules**' own session-start list in
   substance — PR #706 review B1 caught a first cut that dropped `queue_orphans` while
-  claiming to be that same sequence); the delivery-id check, `note_directive` and
+  claiming to be that same sequence, and review round 2 caught the fix-up's own gloss
+  describing only the restart-shaped `orphans` list when the call also returns `refused`,
+  which can be non-empty on an ordinary session with no restart); the delivery-id check,
+  `note_directive` and
   `report("progress", ...)` for a worker; `gh pr view` and the verdict-bearing `report(...)`
   for a reviewer; `gh issue view` and the plan-then-report contract for a planner. Each
   template's closing line ("everything below is the detail") was also reworded (review N4)
