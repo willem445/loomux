@@ -1139,7 +1139,12 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                 // Legacy path: byte-for-byte the pre-#398 message, uncapped.
                 None => format!("[loomux] {} reports {status}: {}", caller.agent_id, note.or(summary).unwrap()),
             };
-            reg.deliver_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
+            // #576 residual: the relay variant, which opts this notice into the
+            // question gate's delivery record — the note is the CALLER's words
+            // landing in the ORCHESTRATOR's pane, which is the cross-pane
+            // authorship the record requires. See
+            // `deliver_relayed_to_orchestrator`.
+            reg.deliver_relayed_to_orchestrator(&caller.group, &message, &caller.agent_id)?;
             // #203: a planner's contract is one plan → one report → exit. Close
             // its pane deterministically on the `done` report so it stops holding
             // a delegate slot the instant its work is posted — the role-template
@@ -1277,7 +1282,8 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
             // A message is a sign of life: reset the watchdog's silence clock
             // (report already does this via set_agent_idle).
             reg.note_agent_activity(&caller.agent_id);
-            reg.deliver_to_orchestrator(
+            // #576 residual: same relay variant, same reason as `report` above.
+            reg.deliver_relayed_to_orchestrator(
                 &caller.group,
                 &format!("[loomux] message from {}: {text}", caller.agent_id),
                 &caller.agent_id,

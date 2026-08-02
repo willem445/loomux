@@ -6082,8 +6082,47 @@ Three properties do the work:
   everything else, so a kickoff brief, an orchestrator's prompt, and a coalesced flush's verbatim
   constituent payloads never enter it. Recording those would give the mask the power to blind the
   gate to ordinary agent content — the blindness `e11` pins as deliberately *not* taken (`e16`).
+- **A producer must opt the notice in.** `mark_notice_maskable` is the door, and it is
+  default-closed — see the next subsection, which is the whole of why it exists.
 - **Written after the write, never before.** A record of text that never reached the pane would let
   the mask claim rows nobody wrote, which is the fail-open direction.
+
+### The door: marker-led is a necessary condition, never a sufficient one
+
+This was found in review (rev-163), and it is the part of the design most worth reading, because
+the first cut got it wrong in a way that read as safe.
+
+A marker-led line is loomux's **framing** — and framing routinely carries a field somebody else
+chose. The one that matters: `notify_when(kind, pr, note)` takes an agent-supplied `note`, and
+`notify_tick` delivers the fired notice **to the registering agent's own pane**. `sanitize_gh_text`
+maps `[`/`]` to parens and strips control characters; it leaves ordinary words, `?`, `(`, `)` and
+`❯` alone — everything a dialog row is made of. So with one tool call it makes itself, one agent
+can put a line of its own choosing into its own pane's record, print that line's head into its own
+pane, and let its CLI paint a permission dialog that is exactly the line's remainder. The run
+reconstructs, the dialog rows are masked, the gate reads clear, loomux presses Enter. **One party,
+no coincidences** — and the same shape is reachable through a compact re-grounding notice, which
+embeds the agent's own directive ledger.
+
+So entry to the record is an explicit promise a producer makes, not a property of the text:
+
+> Every span of this text is either loomux-composed or was supplied by an agent **other than the
+> pane's own occupant**.
+
+`mark_notice_maskable` is where that promise is made and `deliver_relayed_to_orchestrator` is, for
+now, the only caller: the `report` and `message_orchestrator` relays, whose fields can be
+enumerated and checked (`[loomux] {agent_id} reports {outcome}: {body}` — a loomux-minted id, a
+fixed outcome word, and text `from` wrote; no orchestrator-chosen agent NAME, no task title, no
+GitHub string), and which are cross-pane by construction. `from == orch` — an orchestrator
+reporting to itself — takes the default and is not marked.
+
+**Omission is the safe direction.** A producer that never calls it leaves its notices exactly as
+they were: the marker rule, one row per marker, a wrapped notice latching until `QuestionStale`
+reports it at ten minutes. Forgetting to opt in costs a hold, never a release. That is why the
+enumeration above can be short and grow deliberately rather than having to be complete today.
+
+`e14b` pins the closed door behaviourally with the `notify_when` shape; `e18` pins that marking
+without a write and writing without a mark both claim nothing; `e20` drives a real MCP `report`
+through the relay so the door cannot be perfectly built and connected to nothing.
 
 **What the mask does with it.** `mask_loomux_notices_with_record` keeps the marker rule
 unconditionally (one row, no record needed) and adds two rules that are anchored in the record
@@ -6097,7 +6136,10 @@ alone:
   bytes, the grid the last rows), so the first non-empty row of a reading is the one place a line
   can legitimately appear headless. There, and only there, a run may anchor mid-line — still
   reconstructing to the recorded line's end. A headless fragment anywhere else is not claimed:
-  nothing was truncated there, so the rows above it would have shown the head (`e15`).
+  nothing was truncated there, so the rows above it would have shown the head (`e15`). The anchor
+  must also clear an evidence floor (`R_TOP_MIN_ANCHOR_CHARS`, 24): without one, a fragment as
+  short as a single character would carry a claim over everything below it that completes the
+  line, and a genuine scrolled-off continuation is a full terminal row anyway (rev-163 N1).
 
 **Reconstruct-to-the-end is the whole safety argument.** A run that merely *starts* a recorded line
 proves nothing about the rows after it, and claiming them would be the rejected run-mask. Requiring
@@ -6139,15 +6181,35 @@ threaded to every one of them in the same change. `question_hold_predicate_sampl
 **required** argument rather than a defaulted one: an empty record is a legitimate value (a pane
 loomux never wrote to, or one a restart cleared) but it must be stated, not acquired by omission.
 
-**Residual, stated rather than mitigated.** The record's *content* is partly agent-authored — a
+**Residual, restated accurately after review.** The record's *content* is partly agent-authored — a
 relayed `report` note is the worker's own words inside loomux's framing. So an agent that can (a)
 get a marker-led line delivered into a pane, (b) print that line's head into that same pane, and
 (c) have its CLI paint a live dialog whose rows are byte-identical to that line's remainder, in
-order, could hide the dialog. That is two parties and three coincidences, against the rejected
-run-mask which needed one pane to print one row; and every row it can claim is still a row loomux
-verifiably pasted there. `mask_own_paste` already masks whole lines of agent-authored text this
-way for the *current* delivery — the record extends the same accepted mechanism backwards in time,
-under a reconstruct-to-the-end rule that whole-line matching does not have.
+order, hides the dialog.
+
+The first version of this paragraph called that *"two parties and three coincidences"*. **It was
+wrong**, and the correction is the reason the door above exists: through `notify_when`'s note, all
+three are available to one agent in its own pane, deterministically. What is left after the door is
+the two-party case the sentence originally described — a relayed notice carries one agent's words
+into *another* agent's pane, so the author must induce the recipient to print the head row.
+
+Worth being precise about what that buys an attacker, since the bar elsewhere is lower: an agent
+that can be induced to print an attacker-chosen row into its own pane can generally be induced to
+do the thing the dialog was guarding. The gate stops **loomux** pressing Enter, not an agent
+acting. The one-party case mattered more because there the attacker *is* the pane's occupant, using
+the gate to self-grant a permission its CLI was asking a human for. `e14c` pins the remaining case
+as known rather than leaving it to be discovered — the `e11` treatment, applied to the dangerous
+direction.
+
+Two shapes that were considered and rejected, recorded because they look attractive:
+
+- *Refuse to claim a continuation row that is itself question-shaped.* Vacuous. The rows the record
+  exists to claim are precisely the ones carrying `(y/n)` and `do you want to run`; refusing them
+  means the gate latches in every case where the record would have changed its answer.
+- *Record only notices with no agent-supplied field at all.* Guts the motivating case. #576's own
+  example is `[loomux] w-119 reports blocked: <note>`, where the question-shaped tokens **are** the
+  note. Masking a relay notice's wrap necessarily means claiming agent-chosen text; the only
+  question is whether its author also occupies the pane, which is what the door decides.
 
 ## #632: the multi-row notices, fixed at the producer rather than at the mask
 

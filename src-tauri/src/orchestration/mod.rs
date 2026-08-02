@@ -15566,14 +15566,21 @@ fn reconstructs_to_end(rows: &[String], from: usize, line: &str, at: usize) -> O
 ///
 /// **What `delivered` is, and why it is the only thing allowed to widen the
 /// mask.** It is the marker-led lines loomux has actually written into THIS
-/// pane ([`DeliveredNotices`], filled at the one place that writes bytes to a
-/// pane). A pane cannot add to it: the record is written on the delivery side,
-/// from the text loomux pasted, so pane output — the direction
+/// pane ([`DeliveredNotices`]) that a producer has ALSO promised the pane's own
+/// agent did not author any span of ([`OrchRegistry::mark_notice_maskable`]).
+/// A pane cannot add to it: the record is written on the delivery side, from
+/// the text loomux pasted, so pane output — the direction
 /// [`LOOMUX_NOTICE_MARKER`] is forgeable in — cannot reach it. That is the
 /// property #576 asked for and the reason the widening below is keyed off the
 /// record and never off the marker: **an agent-printed marker row still widens
 /// nothing**, because a row that merely looks like a notice matches no recorded
 /// line (#420's harm, restated as the rule this function obeys).
+///
+/// The second half of that — the producer's promise — is what stops the
+/// unforgeability being hollow: a line loomux wrote can still be a line an
+/// agent CHOSE, and the record must not hand an agent the mask over its own
+/// pane. See the residual note at the bottom for the review finding that
+/// established this.
 ///
 /// **Two rules, both anchored in the record:**
 ///
@@ -15600,16 +15607,37 @@ fn reconstructs_to_end(rows: &[String], from: usize, line: &str, at: usize) -> O
 /// ours. Reconstruction asks the safe question instead: not "where would this
 /// have wrapped" but "is this row, verbatim, the next thing we wrote".
 ///
-/// **The residual, stated rather than mitigated.** The record's CONTENT is
-/// partly agent-authored — a relayed `report` note is the worker's own words
-/// inside loomux's framing — so an agent that can (a) get a marker-led line
-/// delivered into a pane, (b) print that line's head into that same pane, and
-/// (c) have its CLI paint a live dialog whose rows are byte-identical to that
-/// line's remainder, in order, could hide the dialog. That is two parties and
-/// three coincidences, against #621's rejected run-mask which needed one pane
-/// to print one row; and every row it can claim is still a row loomux verifiably
-/// pasted there. Under-masking stays the cheap error and this function keeps
-/// choosing it: any mismatch, any missing tail, any lost record ends the run.
+/// **The residual, restated accurately after review (rev-163 B1).** The record's
+/// CONTENT is partly agent-authored — a relayed `report` note is the worker's
+/// own words inside loomux's framing — so an agent that can (a) get a
+/// marker-led line delivered into a pane, (b) print that line's head into that
+/// same pane, and (c) have its CLI paint a live dialog whose rows are
+/// byte-identical to that line's remainder, in order, hides the dialog.
+///
+/// An earlier version of this paragraph called that "two parties and three
+/// coincidences". **That was wrong**, and the way it was wrong is the reason
+/// entry to the record is now an explicit producer promise: via `notify_when`'s
+/// agent-supplied `note`, all three are available to ONE agent in its OWN pane,
+/// deterministically — the note is a tool argument it writes itself, the
+/// delivered line is typed into its own pane so it knows the bytes, and the
+/// "coincidence" in (c) is a choice it makes when authoring the note. See
+/// [`OrchRegistry::mark_notice_maskable`], which is what closes it: a line is
+/// claimable only where its producer has promised the pane's own occupant did
+/// not author any span of it.
+///
+/// What remains is the two-party case the old sentence described: a relayed
+/// notice carries one agent's words into ANOTHER agent's pane, so the author
+/// must induce the recipient to print the head row. It is worth being precise
+/// about what that buys an attacker, because the bar elsewhere is lower — an
+/// agent that can be induced to print an attacker-chosen row into its own pane
+/// can generally be induced to do the thing the dialog was guarding. The gate
+/// protects against LOOMUX pressing Enter, not against an agent acting; the
+/// one-party case mattered more because there the attacker is the pane's own
+/// occupant, using the gate to self-grant a permission its CLI was asking a
+/// human for.
+///
+/// Under-masking stays the cheap error and this function keeps choosing it: any
+/// mismatch, any missing tail, any unmarked line, any lost record ends the run.
 pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> String {
     let rows: Vec<&str> = tail.lines().collect();
     let norm: Vec<String> = rows.iter().map(|r| wrap_normalize(deframe(r))).collect();
@@ -15634,7 +15662,7 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
                 // row of the reading and nowhere else. `at > 0` because offset
                 // zero is `R-wrap` above — a headless run is by definition
                 // missing something.
-                (first_row == Some(i))
+                (first_row == Some(i) && norm[i].chars().count() >= R_TOP_MIN_ANCHOR_CHARS)
                     .then(|| {
                         line.match_indices(norm[i].as_str())
                             .find_map(|(at, _)| {
@@ -15661,7 +15689,7 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
 
 /// The lines of a delivery that [`mask_loomux_notices`] would claim — i.e. the
 /// part of what loomux just pasted that is loomux's OWN writing, and the only
-/// part [`DeliveredNotices`] keeps.
+/// part [`DeliveredNotices`] can ever hold.
 ///
 /// **Why the filter, rather than recording the whole payload.** Most of what
 /// `deliver_now` pastes is agent text: a kickoff brief, an orchestrator's
@@ -15672,10 +15700,24 @@ pub fn mask_loomux_notices_with_record(tail: &str, delivered: &[String]) -> Stri
 /// pane exactly as it would have unqueued). Marker-led lines are loomux's
 /// framing, so the record holds only what the mask was always allowed to claim,
 /// and the record's job is limited to the rows those lines WRAPPED onto.
+///
+/// **A necessary condition, never a sufficient one (rev-163 B1).** A line
+/// passing this filter is still not recordable: it must ALSO have been marked
+/// by its producer through [`OrchRegistry::mark_notice_maskable`]. See that
+/// method for the attack this ordering exists to stop — a marker-led line is
+/// loomux's *framing*, and framing routinely carries a field some agent chose.
+///
+/// De-framed on the way in, so what the record holds is what
+/// [`mask_loomux_notices_with_record`] compares against: the mask normalizes
+/// rows as `wrap_normalize(deframe(row))`, and a payload line that arrived
+/// framed would otherwise be recognised here (`leads_with_notice_marker` itself
+/// de-frames), stored WITH the frame, and then match nothing (rev-163 N2 — a
+/// fail-closed drift, but a drift, and `leads_with_notice_marker`'s doc claims
+/// there is none).
 pub fn loomux_authored_lines(text: &str) -> Vec<String> {
     text.lines()
         .filter(|l| leads_with_notice_marker(l))
-        .map(|l| l.trim().chars().take(DELIVERED_NOTICE_CHARS).collect())
+        .map(|l| deframe(l).trim().chars().take(DELIVERED_NOTICE_CHARS).collect())
         .collect()
 }
 
@@ -15687,6 +15729,21 @@ pub fn loomux_authored_lines(text: &str) -> Vec<String> {
 fn delivered_lines(reg: &Option<Arc<OrchRegistry>>, pty_id: u32) -> Vec<String> {
     reg.as_ref().map(|r| r.delivered_notice_lines(pty_id)).unwrap_or_default()
 }
+
+/// The evidence floor a MID-LINE anchor must clear (rev-163 N1).
+///
+/// `R-top` claims a run whose first row is a fragment of a recorded line, on
+/// the argument that the head scrolled off. Without a floor the fragment could
+/// be one character, so any short first row that happens to appear somewhere in
+/// a recorded line would carry a claim over everything below it that completes
+/// the line — a one-character "proof" that the head scrolled off.
+///
+/// 24 chars is chosen from what the case being served actually looks like: a
+/// scrolled-off wrap continuation is a full terminal row, so it is tens of
+/// characters at minimum, and the narrowest pane anyone runs still leaves a
+/// continuation far above this. The cost of the floor is therefore borne only
+/// by fragments that were never good evidence.
+const R_TOP_MIN_ANCHOR_CHARS: usize = 24;
 
 /// Longest recorded line, in chars. `notify::NOTICE_TOTAL_CAP` already caps a
 /// composed notice at 400; 512 leaves room for the framing a producer adds
@@ -15725,31 +15782,64 @@ pub const DELIVERED_NOTICE_PANES: usize = 64;
 /// the marker rule alone, so a wrapped notice latches the gate until the
 /// ten-minute `QuestionStale` badge surfaces it — which is the cheap error, and
 /// the same one every other failure path here chooses.
+/// **Two phases, and both are required (rev-163 B1).** A line becomes
+/// claimable only if its PRODUCER marked it ([`OrchRegistry::mark_notice_maskable`],
+/// which is the authorship promise) and a WRITE then delivered it
+/// ([`OrchRegistry::record_delivered_text`], which is the "it really is on that
+/// screen" half). Marking without a write claims text nobody painted; writing
+/// without a mark claims text an agent may have chosen. Neither alone is
+/// enough, and the default — a line nobody marked — is never claimable no
+/// matter how often it is delivered.
 #[derive(Debug, Default)]
 pub struct DeliveredNotices {
-    lines: VecDeque<String>,
+    lines: VecDeque<RecordedLine>,
     /// Monotonic write stamp, for evicting the least-recently-written PANE.
     /// Not a clock: eviction only needs an order, and `now_ms()` would make the
     /// record's bound depend on the wall clock.
     seq: u64,
 }
 
+/// One line of [`DeliveredNotices`], and which of the two phases it has
+/// reached. Only `written` lines are handed to the mask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedLine {
+    text: String,
+    written: bool,
+}
+
 impl DeliveredNotices {
-    /// Remember the loomux-authored lines of one delivery. Repeats of the most
-    /// recent line are dropped: `deliver_now`'s echo-verified typing loop may
-    /// write the same payload more than once, and a record full of one repeated
-    /// notice would evict the earlier ones for nothing.
-    fn record(&mut self, text: &str, seq: u64) {
+    /// Phase 1: a producer promises this text's spans are safe to claim in this
+    /// pane. Nothing is claimable yet — the line is parked until a write
+    /// delivers it.
+    fn note_pending(&mut self, text: &str, seq: u64) {
         self.seq = seq;
-        for line in loomux_authored_lines(text) {
-            if self.lines.back() == Some(&line) {
+        for text in loomux_authored_lines(text) {
+            if self.lines.iter().any(|l| l.text == text) {
                 continue;
             }
-            self.lines.push_back(line);
+            self.lines.push_back(RecordedLine { text, written: false });
             while self.lines.len() > DELIVERED_NOTICES_PER_PANE {
                 self.lines.pop_front();
             }
         }
+    }
+
+    /// Phase 2: these bytes just went to the pane. A line that was marked
+    /// becomes claimable; a line that was NOT marked is ignored — deliberately
+    /// silently, since most deliveries carry unmarked loomux framing and that
+    /// is the ordinary case, not an error.
+    fn note_written(&mut self, text: &str, seq: u64) {
+        self.seq = seq;
+        for delivered in loomux_authored_lines(text) {
+            if let Some(l) = self.lines.iter_mut().find(|l| l.text == delivered) {
+                l.written = true;
+            }
+        }
+    }
+
+    /// The claimable lines: marked by a producer AND delivered.
+    fn claimable(&self) -> Vec<String> {
+        self.lines.iter().filter(|l| l.written).map(|l| l.text.clone()).collect()
     }
 }
 
@@ -31198,9 +31288,61 @@ impl OrchRegistry {
         }
     }
 
-    /// #576: remember the loomux-authored lines of a delivery just written to
-    /// `pty_id`, so the question gate's mask can recognise the rows they
-    /// WRAPPED onto (see [`mask_loomux_notices_with_record`]).
+    /// #576: mark `text` as safe for the question mask to claim in `to_agent`'s
+    /// pane — the OPT-IN, without which a delivered line widens nothing.
+    ///
+    /// **The promise a caller makes, and it is per FIELD (rev-163 B1).** Every
+    /// span of this text is either loomux-composed or was supplied by an agent
+    /// OTHER than `to_agent`. Nothing weaker will do, and "the notice leads with
+    /// the marker" is much weaker: loomux's framing routinely carries a field
+    /// somebody chose — a `notify_when` note, an agent NAME the orchestrator
+    /// picked at spawn, a task title, a PR title from GitHub.
+    ///
+    /// **The attack this exists to stop**, because it is not obvious and it was
+    /// found in review rather than in design. `notify_when(kind, pr, note)`
+    /// takes an agent-supplied `note` (up to `NOTICE_FIELD_CAP`), and
+    /// `notify_tick` delivers the fired notice **to the registering agent's own
+    /// pane**. `sanitize_gh_text` maps `[`/`]` to parens and strips control
+    /// characters — it does not touch ordinary words, `?`, `(`, `)` or `❯`,
+    /// which is everything a dialog row is made of. So one agent, with one tool
+    /// call it makes itself, can put a line of its own choosing into its own
+    /// pane's record; then print that line's head into its own pane; then let
+    /// its CLI paint a permission dialog whose rows are exactly that line's
+    /// remainder. The run reconstructs, the dialog rows are masked away, the
+    /// gate reads clear and loomux presses Enter into a live question. That is
+    /// the #420 harm from ONE party, deterministically — which is why entry to
+    /// the record is an explicit promise a producer makes and not a property of
+    /// the text.
+    ///
+    /// **Default-closed, and omission is the safe direction.** A producer that
+    /// never calls this leaves its notices exactly as they were before #576's
+    /// residual work: the marker rule alone, one row per marker, a wrapped
+    /// notice latching until `QuestionStale` reports it. That is the cheap
+    /// error, so forgetting to opt in costs a hold, never a release.
+    ///
+    /// Marking is phase one only — see [`DeliveredNotices`]. Nothing becomes
+    /// claimable until [`OrchRegistry::record_delivered_text`] observes the
+    /// same line actually going to the pane.
+    #[doc(hidden)] // pub for integration tests
+    pub fn mark_notice_maskable(&self, to_agent: &str, text: &str) {
+        if loomux_authored_lines(text).is_empty() {
+            return;
+        }
+        let Some(pty_id) = self.agents.lock_safe().get(to_agent).and_then(|a| a.pty_id) else {
+            // No pane bound yet: nothing can be on its screen, so there is
+            // nothing for a mask to claim. The delivery still happens; it just
+            // never becomes claimable, which is the default.
+            return;
+        };
+        let mut map = self.delivered_notices.lock_safe();
+        let seq = Self::next_record_seq(&map);
+        map.entry(pty_id).or_default().note_pending(text, seq);
+        Self::evict_stalest_panes(&mut map);
+    }
+
+    /// #576: these bytes just went to `pty_id`. A line its producer marked
+    /// ([`OrchRegistry::mark_notice_maskable`]) becomes claimable by the
+    /// question gate's mask; anything else is ignored.
     ///
     /// **Called after the write, never before it.** A record of text that never
     /// reached the pane would let the mask claim rows nobody wrote — the
@@ -31208,18 +31350,31 @@ impl OrchRegistry {
     /// the record a statement about bytes that went out.
     #[doc(hidden)] // pub for integration tests
     pub fn record_delivered_text(&self, pty_id: u32, text: &str) {
-        let lines = loomux_authored_lines(text);
-        if lines.is_empty() {
+        if loomux_authored_lines(text).is_empty() {
             return;
         }
         let mut map = self.delivered_notices.lock_safe();
-        let seq = map.values().map(|d| d.seq).max().unwrap_or(0) + 1;
-        map.entry(pty_id).or_default().record(text, seq);
-        // Evict the least-recently-written pane, one per insert, so the map
-        // cannot outgrow the fleet that is actually being delivered to. Only a
-        // pane that has taken no delivery since 63 others did can be chosen,
-        // and losing its record costs it the wrap masking until its next
-        // delivery — fail-closed, like every other loss here.
+        let seq = Self::next_record_seq(&map);
+        // `get_mut`, never `entry(..).or_default()`: a pane with no record has
+        // nothing marked, and creating one here would be a map entry that can
+        // only ever hold unclaimable lines.
+        if let Some(rec) = map.get_mut(&pty_id) {
+            rec.note_written(text, seq);
+        }
+    }
+
+    /// The next write stamp: max over panes + 1, so the pane just written is
+    /// always the newest and can never be the eviction victim.
+    fn next_record_seq(map: &HashMap<u32, DeliveredNotices>) -> u64 {
+        map.values().map(|d| d.seq).max().unwrap_or(0) + 1
+    }
+
+    /// Evict the least-recently-written pane, so the map cannot outgrow the
+    /// fleet actually being delivered to. Only a pane that has taken nothing
+    /// since `DELIVERED_NOTICE_PANES` others did can be chosen, and losing its
+    /// record costs it the wrap masking until its next delivery — fail-closed,
+    /// like every other loss here.
+    fn evict_stalest_panes(map: &mut HashMap<u32, DeliveredNotices>) {
         while map.len() > DELIVERED_NOTICE_PANES {
             let Some(&stalest) = map.iter().min_by_key(|(_, d)| d.seq).map(|(k, _)| k) else {
                 break;
@@ -31233,11 +31388,7 @@ impl OrchRegistry {
     /// record-free marker rule, i.e. today's behaviour.
     #[doc(hidden)] // pub for integration tests
     pub fn delivered_notice_lines(&self, pty_id: u32) -> Vec<String> {
-        self.delivered_notices
-            .lock_safe()
-            .get(&pty_id)
-            .map(|d| d.lines.iter().cloned().collect())
-            .unwrap_or_default()
+        self.delivered_notices.lock_safe().get(&pty_id).map(|d| d.claimable()).unwrap_or_default()
     }
 
     /// #560: when `pty_id`'s open hold episode began, if one is open.
@@ -33090,6 +33241,43 @@ impl OrchRegistry {
             .find(|a| a.group == group && a.role == Role::Orchestrator && a.status != AgentStatus::Dead)
             .map(|a| a.id.clone())
             .ok_or("no live orchestrator in this group")?;
+        self.deliver_prompt(&orch, text, from, Delivery::MidSession)
+    }
+
+    /// `deliver_to_orchestrator` for a notice that relays ONE agent's own words
+    /// to the orchestrator — a `report` note, a `message_orchestrator` body
+    /// (#576 residual, rev-163 B1). Identical delivery; the difference is that
+    /// this one opts the notice into the question mask's delivery record.
+    ///
+    /// **Why these two and not `deliver_to_orchestrator` generally.** The
+    /// promise [`OrchRegistry::mark_notice_maskable`] wants is per FIELD, and
+    /// these two notices are the ones whose fields can be enumerated and
+    /// checked: `[loomux] {agent_id} reports {outcome}: {body}` and
+    /// `[loomux] message from {agent_id}: {text}` embed a loomux-minted agent
+    /// id, a fixed outcome word, and text `from` wrote — no agent NAME the
+    /// orchestrator chose at spawn, no task title, no GitHub-supplied string.
+    /// Every other orchestrator-directed notice (queue notices, pause
+    /// suppression, flush framing) keeps the default and is never claimable,
+    /// which costs only a hold.
+    ///
+    /// **`from == orch` is the whole check.** These are cross-pane by
+    /// construction — a worker's words landing in the orchestrator's pane — and
+    /// the harm needs the text's AUTHOR to be the pane's own occupant. An
+    /// orchestrator reporting to itself is exactly that case, so it takes the
+    /// default and is not marked. `message_orchestrator` refuses an
+    /// orchestrator caller a layer up; `report` does not, which is why the
+    /// check lives here rather than at either call site.
+    fn deliver_relayed_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
+        let orch = self
+            .agents
+            .lock_safe()
+            .values()
+            .find(|a| a.group == group && a.role == Role::Orchestrator && a.status != AgentStatus::Dead)
+            .map(|a| a.id.clone())
+            .ok_or("no live orchestrator in this group")?;
+        if from != orch {
+            self.mark_notice_maskable(&orch, text);
+        }
         self.deliver_prompt(&orch, text, from, Delivery::MidSession)
     }
 

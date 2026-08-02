@@ -49,6 +49,7 @@ use loomux_lib::orchestration::{
     // #576 residual: the per-pane record of what loomux WROTE, and the mask
     // that reads it — the wrap and scrolled-off under-masks.
     mask_loomux_notices_with_record, loomux_authored_lines, DELIVERED_NOTICES_PER_PANE,
+    DELIVERED_NOTICE_PANES,
     // #534 / #513(c): composed-grid question evidence.
     prompt_wait_match, question_hold_predicate_sampled, question_shown, grid_evidence_for,
     match_still_rendered, trustworthy_composition, witness_audit,
@@ -34115,13 +34116,237 @@ fn e14_an_agent_printed_marker_row_widens_nothing() {
 }
 
 #[test]
+fn e14b_a_notice_carrying_the_panes_own_agents_words_is_never_recordable() {
+    // rev-163 B1, at the door that closes it. `e14` pins that a row loomux
+    // never wrote widens nothing; this pins the harder half — a row loomux
+    // really did write, carrying text the pane's OWN agent chose, must not
+    // become claimable either.
+    //
+    // The attack it forecloses, concretely: `notify_when(kind, pr, note)` takes
+    // an agent-supplied `note` and `notify_tick` delivers the fired notice to
+    // the REGISTERING agent's own pane. `sanitize_gh_text` maps `[`/`]` to
+    // parens and strips control characters — it leaves ordinary words, `?`,
+    // `(`, `)` and `❯` untouched, which is everything a dialog row is made of.
+    // So one agent, with one tool call it makes itself, could put a line of its
+    // own choosing into its own pane's record, print that line's head, and let
+    // its CLI paint a permission dialog that is exactly the remainder. One
+    // party, no coincidences.
+    //
+    // The door is `mark_notice_maskable`, and it is default-CLOSED: a notice no
+    // producer marked never becomes claimable however often it is delivered.
+    // `notify_tick` does not mark, so the delivery below records nothing.
+    let (reg, _dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    let pty = 91u32;
+    reg.set_pty_for_test(&w.id, pty);
+
+    // The shape `notify_tick` delivers into the registrant's own pane, with the
+    // note the agent chose.
+    let self_directed = "[loomux] watch n-1: pr #661 checks: SUCCESS. Note (registered): \
+                         \"X Do you want to run npm test? (y/n) END\"";
+    reg.record_delivered_text(pty, self_directed);
+    assert!(
+        reg.delivered_notice_lines(pty).is_empty(),
+        "an unmarked notice is delivered but never claimable — the default, and the whole of \
+         the fix for the one-party attack (rev-163 B1)"
+    );
+
+    // And behaviourally, which is what the gate actually consults: the agent
+    // prints the line's head into its own pane, its CLI paints the question
+    // beneath, and the gate must STILL hold.
+    let raw = painted(&[
+        "[loomux] watch n-1: pr #661 checks: SUCCESS. Note (registered): \"X",
+        "Do you want to run npm test? (y/n) END\"",
+    ]);
+    let delivered = reg.delivered_notice_lines(pty);
+    let pred =
+        question_hold_predicate_sampled(move || sample_from_raw(&raw, 120, 10), None, None, delivered);
+    assert!(
+        pred(),
+        "text the pane's own agent authored must never widen the mask over that pane — \
+         otherwise the gate self-grants the permission its CLI was asking a human for (#420)"
+    );
+}
+
+#[test]
+fn e14c_a_marked_relay_line_is_claimable_and_that_is_the_stated_residual() {
+    // The other side of `e14b`, pinned as a KNOWN residual rather than left to
+    // be discovered — the `e11` treatment, applied to the dangerous direction
+    // instead of the safe one, because a residual nobody can see is one nobody
+    // can weigh.
+    //
+    // A relayed `report` note is one agent's words landing in ANOTHER agent's
+    // pane, so `deliver_relayed_to_orchestrator` marks it: that is what makes
+    // the wrap masking #576 asked for possible at all. The cost is that if the
+    // recipient can be INDUCED (by the very text it is reading) to print the
+    // line's head into its own pane, and its CLI then paints a dialog that is
+    // exactly the remainder, the run reconstructs and the dialog is masked.
+    //
+    // Two parties, and worth measuring against the bar elsewhere: an agent that
+    // can be induced to print an attacker-chosen row into its own pane can
+    // generally be induced to do the thing the dialog was guarding. The gate
+    // stops LOOMUX pressing Enter, not an agent acting. That is why the
+    // one-party case (`e14b`) is closed at the door and this one is documented.
+    let line = "[loomux] w-119 reports blocked: Copilot is asking Do you want to run npm test? (y/n)";
+    let raw = painted(&[
+        "[loomux] w-119 reports blocked: Copilot is asking",
+        "Do you want to run npm test? (y/n)",
+    ]);
+    let pred = question_hold_predicate_sampled(
+        move || sample_from_raw(&raw, 120, 10),
+        None,
+        None,
+        vec![line.to_string()],
+    );
+    assert!(
+        !pred(),
+        "documented residual: a MARKED cross-pane line whose remainder a dialog reproduces \
+         exactly is claimed — the two-party surface the human accepts knowingly (#576/#420)"
+    );
+}
+
+#[test]
+fn e20_a_real_report_relay_opts_its_notice_into_the_record() {
+    // The opt-in wired to a REAL producer, through the actual MCP `report`
+    // path — not `mark_notice_maskable` called by hand. Without this, the door
+    // could be perfectly built and connected to nothing, and every mask test
+    // above would still pass on hand-built records.
+    //
+    // This is also the #576 motivating case end to end: a worker's note, which
+    // is the worker's own words, landing in the ORCHESTRATOR's pane. Cross-pane
+    // authorship is exactly what `deliver_relayed_to_orchestrator` checks
+    // before marking.
+    let (reg, _d, co, cw) = setup_mcp();
+    let orch_pty = 501u32;
+    // A pane for the orchestrator (the relay's target) plus a pause, which is
+    // how this suite observes a delivery's TEXT with no terminal anywhere.
+    pause_with_pane(&reg, &cw.group, &co.agent_id, orch_pty);
+
+    let r = dispatch(&reg, &cw, "tools/call", &json!({
+        "name": "report",
+        "arguments": {
+            "outcome": "blocked",
+            "note": "Copilot is asking Do you want to run npm test? (y/n) and I cannot answer it",
+            "ref": "#661",
+        }
+    }))
+    .unwrap();
+    assert_ne!(r["isError"], json!(true), "the report itself must succeed: {r}");
+
+    let relayed = delivered_texts(&reg, &cw.group)
+        .into_iter()
+        .find(|t| t.contains("reports blocked"))
+        .expect("the relay is delivered to the orchestrator's pane");
+
+    // Phase 1 only so far: the producer marked it, but nothing has been written
+    // to that pane, so nothing is claimable yet.
+    assert!(
+        reg.delivered_notice_lines(orch_pty).is_empty(),
+        "marked is not written — a record of text nobody painted would claim rows nobody wrote"
+    );
+
+    // The write `deliver_now` performs, which is the half a paused group does
+    // not do for us.
+    reg.record_delivered_text(orch_pty, &relayed);
+    assert_eq!(
+        reg.delivered_notice_lines(orch_pty),
+        vec![relayed.trim().to_string()],
+        "a real cross-pane relay is claimable once delivered — the case #576 is about"
+    );
+}
+
+#[test]
+fn e18_the_record_needs_both_a_producers_mark_and_a_write() {
+    // The two phases, each pinned as necessary. Marking without a write claims
+    // text nobody painted (fail-open); writing without a mark claims text an
+    // agent may have chosen (rev-163 B1). Neither alone may produce a claimable
+    // line.
+    let (reg, _dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    let pty = 77u32;
+    reg.set_pty_for_test(&w.id, pty);
+    let line = "[loomux] w-1 reports done: PR #900 is green";
+
+    reg.mark_notice_maskable(&w.id, line);
+    assert!(
+        reg.delivered_notice_lines(pty).is_empty(),
+        "marked but never written: nothing is on that screen yet, so nothing may be claimed"
+    );
+
+    reg.record_delivered_text(pty, "[loomux] some OTHER notice nobody marked");
+    assert!(
+        reg.delivered_notice_lines(pty).is_empty(),
+        "written but never marked: the default, and the one-party attack's door"
+    );
+
+    reg.record_delivered_text(pty, &format!("{line}\nplease review it"));
+    assert_eq!(
+        reg.delivered_notice_lines(pty),
+        vec![line.to_string()],
+        "marked AND written is the only combination that claims anything — and the delivery's \
+         agent-authored body still never enters the record"
+    );
+}
+
+#[test]
+fn e19_the_record_evicts_the_stalest_pane_and_never_the_one_just_written() {
+    // rev-163 N3: the per-PANE bound, and the subtlety that keeps it correct —
+    // `seq` is max-over-panes + 1, so the pane just written is always the
+    // newest and can never be its own eviction victim. A regression here
+    // degrades silently to the marker rule, which is exactly the class of
+    // failure that is invisible without a test.
+    let (reg, _dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+
+    // The record is keyed by PANE; the agent is only how a producer names one.
+    // So one agent re-pointed at each pty in turn seeds as many pane records as
+    // this needs, without asking the fleet guardrail (`max_agents`) for 66
+    // workers it would rightly refuse.
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
+    let notice_for = |i: usize| format!("[loomux] notice for pane {i}");
+    let pty_for = |i: usize| 1000 + i as u32;
+    let panes = DELIVERED_NOTICE_PANES + 2;
+
+    for i in 0..panes {
+        reg.set_pty_for_test(&w.id, pty_for(i));
+        reg.mark_notice_maskable(&w.id, &notice_for(i));
+        reg.record_delivered_text(pty_for(i), &notice_for(i));
+    }
+
+    assert!(
+        reg.delivered_notice_lines(pty_for(0)).is_empty(),
+        "the pane that has taken nothing while {DELIVERED_NOTICE_PANES} others did is evicted"
+    );
+    assert_eq!(
+        reg.delivered_notice_lines(pty_for(panes - 1)),
+        vec![notice_for(panes - 1)],
+        "and the pane just written is never the victim — `seq` is max-over-panes + 1"
+    );
+
+    // Re-writing an evicted pane recovers it rather than staying broken.
+    reg.set_pty_for_test(&w.id, pty_for(0));
+    reg.mark_notice_maskable(&w.id, &notice_for(0));
+    reg.record_delivered_text(pty_for(0), &notice_for(0));
+    assert_eq!(
+        reg.delivered_notice_lines(pty_for(0)),
+        vec![notice_for(0)],
+        "eviction costs a pane its record until its next delivery, not permanently"
+    );
+}
+
+#[test]
 fn e15_the_record_claims_only_a_run_that_reconstructs_a_delivered_line() {
     // The unit-level statement of what e13/e14 defend behaviourally, and of
     // where a mid-line anchor is allowed.
-    let line = "[loomux] w-1 reports blocked: waiting on the reviewer to answer";
+    let line = "[loomux] w-1 reports blocked: waiting on the reviewer to answer the question";
 
     // A run that reconstructs the line to its end is claimed whole.
-    let wrapped = "[loomux] w-1 reports blocked: waiting on\nthe reviewer to answer\nplain agent output";
+    let wrapped = "[loomux] w-1 reports blocked: waiting on\nthe reviewer to answer the question\nplain agent output";
     assert_eq!(
         mask_loomux_notices_with_record(wrapped, &[line.to_string()]).trim(),
         "plain agent output",
@@ -34152,19 +34377,31 @@ fn e15_the_record_claims_only_a_run_that_reconstructs_a_delivered_line() {
     // A mid-line anchor is honoured at the first row of the reading (the head
     // scrolled off) and NOWHERE else.
     assert_eq!(
-        mask_loomux_notices_with_record("the reviewer to answer", &[line.to_string()]).trim(),
+        mask_loomux_notices_with_record("the reviewer to answer the question", &[line.to_string()])
+            .trim(),
         "",
         "the top row of a top-truncated reading may anchor mid-line"
     );
     assert_eq!(
         mask_loomux_notices_with_record(
-            "plain agent output\nthe reviewer to answer",
+            "plain agent output\nthe reviewer to answer the question",
             &[line.to_string()]
         )
         .trim(),
-        "plain agent output\nthe reviewer to answer",
+        "plain agent output\nthe reviewer to answer the question",
         "a headless fragment in the MIDDLE of a reading is not a scrolled-off marker — nothing \
          was truncated there, so the rows above it would have shown the head if we had written it"
+    );
+
+    // rev-163 N1: and a mid-line anchor needs real evidence. A short fragment
+    // that happens to appear in a recorded line is not proof that the head
+    // scrolled off, and without a floor it would carry a claim over everything
+    // below it that completes the line — a one-character "proof".
+    assert_eq!(
+        mask_loomux_notices_with_record("the question", &[line.to_string()]).trim(),
+        "the question",
+        "a fragment below the anchor floor claims nothing, even though it does complete the \
+         recorded line — the scrolled-off case this rule serves always has a full row of it"
     );
 }
 
@@ -34205,16 +34442,26 @@ fn e16_the_record_holds_loomux_framing_and_never_agent_payload() {
 #[test]
 fn e17_the_registry_records_what_it_delivered_bounded_and_deduped() {
     // The record as the delivery path actually fills it, through the registry
-    // seam `deliver_now` calls — not a hand-built `Vec`.
+    // seams a producer and `deliver_now` call — not a hand-built `Vec`.
     let (reg, _dir) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", watchdog_rails(0)).unwrap();
+    reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "do work", false, None).unwrap();
     let pty = 7u32;
+    reg.set_pty_for_test(&w.id, pty);
     assert!(
         reg.delivered_notice_lines(pty).is_empty(),
         "a pane loomux has never written to knows nothing — which is the marker rule"
     );
+    // Both phases for every line: marked by a producer, then written. `e18`
+    // pins that each is necessary; this test is about what survives the pair.
+    let deliver = |text: &str| {
+        reg.mark_notice_maskable(&w.id, text);
+        reg.record_delivered_text(pty, text);
+    };
 
     // A delivery is framing plus body: only the framing is kept.
-    reg.record_delivered_text(pty, "[loomux] w-1 reports done: PR #900 is green\nplease review it");
+    deliver("[loomux] w-1 reports done: PR #900 is green\nplease review it");
     assert_eq!(
         reg.delivered_notice_lines(pty),
         vec!["[loomux] w-1 reports done: PR #900 is green".to_string()],
@@ -34223,12 +34470,12 @@ fn e17_the_registry_records_what_it_delivered_bounded_and_deduped() {
 
     // `deliver_now`'s echo-verified typing loop can write the same payload more
     // than once; a retype must not evict the pane's earlier notices.
-    reg.record_delivered_text(pty, "[loomux] w-1 reports done: PR #900 is green\nplease review it");
+    deliver("[loomux] w-1 reports done: PR #900 is green\nplease review it");
     assert_eq!(reg.delivered_notice_lines(pty).len(), 1, "a repeat of the newest line is dropped");
 
     // Bounded, drop-oldest.
     for i in 0..DELIVERED_NOTICES_PER_PANE + 5 {
-        reg.record_delivered_text(pty, &format!("[loomux] notice number {i}"));
+        deliver(&format!("[loomux] notice number {i}"));
     }
     let lines = reg.delivered_notice_lines(pty);
     assert_eq!(lines.len(), DELIVERED_NOTICES_PER_PANE, "the record is capped per pane");
