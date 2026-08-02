@@ -30977,6 +30977,41 @@ fn capture_with_timeout_reports_a_nonzero_exit_as_the_childs_own_failure() {
     assert!(started.elapsed() < Duration::from_secs(5), "an immediate failure must return immediately");
 }
 
+/// **The raw variant hands back what the child did, not a verdict on it**
+/// (#698) — which is the entire reason `capture_with_timeout` was split.
+///
+/// The merge queue's `git ls-remote --exit-code` answers "does this ref exist"
+/// as `0` vs `2`, so collapsing a non-zero exit into `Err` (right for a `gh`
+/// read, and what the test above pins) would make "no such ref" and "the
+/// network is down" the same value — the one confusion the queue's collision
+/// check must not have, since one means *push* and the other means *refuse*.
+/// Both go through the same bounded machinery, so there is one implementation
+/// of the delicate part and two readings of its result.
+#[test]
+fn capture_raw_with_timeout_reports_a_nonzero_exit_as_data_not_as_an_error() {
+    let _serial = capture_lock();
+    let (status, stdout, _stderr) = loomux_lib::orchestration::capture_raw_with_timeout(
+        shell_command("echo keep-me; exit 3"),
+        Duration::from_secs(10),
+    )
+    .expect("a child that ran and failed is not an Err here — that is the point");
+    assert_eq!(status.code(), Some(3), "the exit CODE is the answer, not a collapsed Err");
+    assert!(
+        stdout.contains("keep-me"),
+        "and its stdout survives a non-zero exit: {stdout:?}"
+    );
+
+    // The bound still applies to it — it is the same machinery underneath.
+    let started = std::time::Instant::now();
+    let err = loomux_lib::orchestration::capture_raw_with_timeout(
+        shell_command(&sleep_script(20)),
+        Duration::from_secs(1),
+    )
+    .expect_err("a stalled child must not be waited on forever");
+    assert!(err.contains("timed out"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(10), "the bound is what returned, not the child");
+}
+
 /// The ceiling policy itself, pure: a capture is admitted while abandoned
 /// readers are below the ceiling and refused at it. Stated here so the
 /// boundary is pinned without arranging a real leak.

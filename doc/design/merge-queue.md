@@ -780,12 +780,25 @@ a batch's steady state is cheap: one `gh pr checks` on the draft PR, per wake, f
 group with a batch in flight.
 
 **The per-tick bound is one group per wake, oldest-serviced first.** Structural rather than a
-counter, and it is the constraint #656 is about, met before #656's own cap lands: the loop is
+counter, and it is the same constraint #656 imposed on the loop's other two halves: the loop is
 shared with every watch in the fleet, so a driver that serviced N groups on one wake would put
 N batch builds inside one tick. Ordering by last-serviced makes the rotation fair — a group is
-deferred, never starved — which is the `due_intake_polls` idiom #656 asks for on the intake
-half. Within a group, a tick performs **at most one state advance**: it never loops waiting
-for anything, never sleeps, and never retries an external call in place.
+deferred, never starved — which is `due_intake_polls`' idiom applied to a third half. Within a
+group, a tick performs **at most one state advance**: it never loops waiting for anything,
+never sleeps, and never retries an external call in place.
+
+**Every child is bounded, through #656's own primitive.** `MqRunner`'s process implementation
+spawns `git` and `gh` inside that shared loop, so an unbounded wait there would park every
+`notify_when` notice in the fleet — the exact failure #656 closed for `gh_capture`. It reuses
+that machinery rather than repeating it: `capture_raw_with_timeout` (split out of
+`capture_with_timeout` for this) does the null stdin, the two concurrent pipe drains, the
+bounded wait, the kill with its own bounded reap, and the process-wide abandoned-reader
+ceiling; the queue reads its result differently, because `git ls-remote --exit-code` answers a
+question *with* its exit code and cannot have a non-zero exit collapsed into an error. One
+implementation of the delicate part, two readings of its result. `MQ_CMD_TIMEOUT` is longer
+than `GH_CAPTURE_TIMEOUT` (60s vs 20s) because a batch build is a fetch plus one merge per
+sub-PR against a real working tree rather than a single API read — and it is still a bound the
+worst case has to live inside, since a hung call parks the loop for its duration.
 
 Beside the per-tick bound there is a **rate** bound: the group is held off for five minutes
 (`MQ_DRIVE_BACKOFF_MS`) after any tick whose next attempt would cost the same external calls

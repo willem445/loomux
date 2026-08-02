@@ -161,21 +161,57 @@ impl ProcessRunner {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let out = cmd.output().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                // §10: the sentinel the queue reports itself **unavailable** on,
-                // rather than silently doing nothing.
-                format!("{bin}-not-found")
-            } else {
-                e.to_string()
-            }
-        })?;
-        Ok(CmdOut {
-            code: out.status.code(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        })
+        // **Bounded** (#656, applied here by #698). These calls run inside the
+        // one `gh` poll loop, so a `git fetch` parked on a stalled connection
+        // would stop every `notify_when` notice in the fleet from firing — the
+        // exact failure #656 closed for `gh_capture`, and the one the fleet's
+        // "register the watch, end the turn" discipline rests on. Reusing that
+        // primitive rather than writing a second one is deliberate: every arm
+        // of it (null stdin, both pipes drained concurrently, the kill's own
+        // bounded reap, the abandoned-reader ceiling) exists because of a
+        // specific way an unbounded wait bites, and a copy would drift.
+        match super::capture_raw_with_timeout(cmd, MQ_CMD_TIMEOUT) {
+            Ok((status, stdout, stderr)) => Ok(CmdOut {
+                code: status.code(),
+                stdout,
+                stderr: stderr.trim().to_string(),
+            }),
+            // The spawn-failure sentinel §10 reports the queue **unavailable**
+            // on. `capture_raw_with_timeout` flattens the spawn error to a
+            // string, so the not-found case is recognised by its text rather
+            // than by `ErrorKind` — matched on the two spellings the std error
+            // uses across platforms, and falling through to the raw message
+            // rather than guessing when it is something else.
+            Err(e) if is_not_found(&e) => Err(format!("{bin}-not-found")),
+            Err(e) => Err(e),
+        }
     }
+}
+
+/// How long one merge-queue `git`/`gh` call may run before it is killed (#656's
+/// bound, this feature's value).
+///
+/// Longer than `GH_CAPTURE_TIMEOUT`'s 20s because the work is different in kind:
+/// a `gh pr list` is a single API read, while a batch build is a `git fetch` of
+/// several pull refs plus one merge per sub-PR against a real working tree.
+/// Short enough that the worst case still matters: this runs on the shared poll
+/// loop, so a hung call parks every watch notice for its duration. Sixty seconds
+/// is the trade — a fetch that has not finished in a minute is not going to, and
+/// a batch that trips this aborts loudly and backs the group off rather than
+/// retrying into the same stall.
+pub const MQ_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a spawn error means the binary is not installed.
+///
+/// Kept to the two spellings `std::io::Error`'s `NotFound` produces on the
+/// platforms this ships on, rather than a substring like "not found" that a
+/// *repository* path in the message could also satisfy — mislabeling a missing
+/// directory as a missing `git` would send a reader looking for the wrong thing.
+fn is_not_found(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    e.contains("no such file or directory")
+        || e.contains("the system cannot find the file specified")
+        || e.contains("program not found")
 }
 
 impl MqRunner for ProcessRunner {

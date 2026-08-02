@@ -1598,6 +1598,83 @@ pub fn wait_bounded(
     }
 }
 
+/// Spawn a child under a deadline and return **what it did**, not a verdict on
+/// it: its exit status, its stdout and its stderr (#656; split out of
+/// `OrchRegistry::capture_with_timeout` by #698).
+///
+/// Both callers need the same delicate machinery — null stdin, concurrent
+/// drains of both pipes, a bounded wait, a kill with its own bounded reap, and
+/// the process-wide abandoned-reader ceiling — and they differ only in what
+/// they do with the result. `capture_with_timeout` collapses a non-zero exit
+/// into `Err`, which is right for a `gh` read whose only question is "did it
+/// work". The merge queue cannot: `git ls-remote --exit-code` answers "does
+/// this ref exist" as `0` vs `2`, so for it a non-zero exit is **data**
+/// (`mqdriver::CmdOut`). Writing that a second time would be a second
+/// implementation of the one primitive in this file that must not have two —
+/// every arm of it exists because of a specific way an unbounded wait bites.
+///
+/// # Why the merge queue is in scope for the bound at all
+///
+/// Its `git`/`gh` calls run inside the same single poll loop (#406/#652), so a
+/// `git fetch` parked on a stalled connection would stop every `notify_when`
+/// notice in the fleet from firing — precisely the failure #656 closed, and the
+/// one the fleet's "register the watch, end the turn" discipline rests on.
+///
+/// See [`OrchRegistry::capture_with_timeout`]'s comment for the argument behind
+/// each step; it is not repeated here.
+pub fn capture_raw_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, String, String), String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let live = sweep_leaked_readers();
+    if !gh_capture_admitted(live) {
+        return Err(format!("gh capture backlog: {live} readers still blocked on abandoned children"));
+    }
+
+    // stdin: `output()` nulls it implicitly, `spawn()` does not — and an
+    // inherited stdin is how a `gh` that decides to prompt hangs forever. It
+    // matters at least as much for `git`, whose credential helpers prompt on a
+    // terminal the backend does not have anyone watching.
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut child_out = child.stdout.take().expect("stdout piped just above");
+    let mut child_err = child.stderr.take().expect("stderr piped just above");
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_out.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = child_err.read_to_end(&mut buf);
+        buf
+    });
+
+    let Some(status) = wait_bounded(&mut child, timeout)? else {
+        let _ = child.kill();
+        // Reap on its own deadline (rev-lead finding 2). A bound whose last act
+        // is an unbounded `wait()` is not a bound.
+        let _ = wait_bounded(&mut child, GH_CAPTURE_REAP_TIMEOUT);
+        let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
+        leaked.push(out_reader);
+        leaked.push(err_reader);
+        return Err(format!("timed out after {}s", timeout.as_secs()));
+    };
+
+    // Exited on its own: both pipes are at EOF (or about to be), so these joins
+    // are the bounded tail of a wait that already finished.
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    Ok((
+        status,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    ))
+}
+
 #[doc(hidden)] // pub for integration tests: observe the process-wide reader backlog
 pub fn gh_capture_live_readers() -> usize {
     sweep_leaked_readers()
@@ -22007,57 +22084,12 @@ impl OrchRegistry {
     /// Kept `pub` (and taking a caller-built `Command`) so the timeout path is
     /// testable against a deliberately-slow subprocess without shelling out to
     /// `gh`, which no test in this repo is allowed to do.
-    pub fn capture_with_timeout(mut cmd: std::process::Command, timeout: Duration) -> Result<String, String> {
-        use std::io::Read as _;
-        use std::process::Stdio;
-
-        let live = sweep_leaked_readers();
-        if !gh_capture_admitted(live) {
-            return Err(format!("gh capture backlog: {live} readers still blocked on abandoned children"));
-        }
-
-        // stdin: `output()` nulls it implicitly, `spawn()` does not — and an
-        // inherited stdin is how a `gh` that decides to prompt hangs forever.
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-        let mut child_out = child.stdout.take().expect("stdout piped just above");
-        let mut child_err = child.stderr.take().expect("stderr piped just above");
-        let out_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = child_out.read_to_end(&mut buf);
-            buf
-        });
-        let err_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = child_err.read_to_end(&mut buf);
-            buf
-        });
-
-        let Some(status) = wait_bounded(&mut child, timeout)? else {
-            let _ = child.kill();
-            // Reap on its own deadline (rev-lead finding 2). A bound whose
-            // last act is an unbounded `wait()` is not a bound: the kill has
-            // landed in every ordinary case, but a child in uninterruptible
-            // sleep does not die until it leaves that state, and `wait()`
-            // would sit there — the exact thing this function exists to stop
-            // doing. Outliving the reap leaves an unreaped child (a PID-table
-            // entry until this process exits), which is the cheaper of the two
-            // residues and the only one that is bounded.
-            let _ = wait_bounded(&mut child, GH_CAPTURE_REAP_TIMEOUT);
-            let mut leaked = GH_CAPTURE_LEAKED_READERS.lock_safe();
-            leaked.push(out_reader);
-            leaked.push(err_reader);
-            return Err(format!("timed out after {}s", timeout.as_secs()));
-        };
-
-        // Exited on its own: both pipes are at EOF (or about to be), so these
-        // joins are the bounded tail of a wait that already finished.
-        let stdout = out_reader.join().unwrap_or_default();
-        let stderr = err_reader.join().unwrap_or_default();
+    pub fn capture_with_timeout(cmd: std::process::Command, timeout: Duration) -> Result<String, String> {
+        let (status, stdout, stderr) = capture_raw_with_timeout(cmd, timeout)?;
         if status.success() {
-            Ok(String::from_utf8_lossy(&stdout).into_owned())
+            Ok(stdout)
         } else {
-            let err = String::from_utf8_lossy(&stderr).trim().to_string();
+            let err = stderr.trim().to_string();
             if err.is_empty() { Err(format!("gh exited with {status}")) } else { Err(err) }
         }
     }
@@ -35288,7 +35320,27 @@ impl OrchRegistry {
             return mqloop::DriveReport::default();
         }
         let dir = self.group_dir(group);
-        let gate = self.merge_queue_gate(group);
+        let gate = match self.merge_queue_gate(group) {
+            Ok(g) => g,
+            Err(e) => {
+                // #681's posture, which the driver has to keep: a gate file that
+                // is on disk and unreadable is a **fault**, not "no gate covers
+                // this target". Treating it as `Absent` would still fail closed
+                // — every entry would block — but it would block them all with
+                // `gate-not-configured`, telling a human the repo declares no
+                // gate when the truth is that loomux could not read the one it
+                // has. A wrong label sends the reader somewhere else.
+                self.audit(
+                    group,
+                    "loomux",
+                    mqloop::audit_action::STRANDED,
+                    json!({ "reason": mqloop::refusal::GATE_UNREADABLE,
+                            "detail": format!("{e:?}") }),
+                );
+                self.mq_defer(group, now.saturating_add(MQ_DRIVE_BACKOFF_MS));
+                return mqloop::DriveReport::default();
+            }
+        };
         let report = {
             let _state_guard = self.mq_state_lock.lock_safe();
             let mut state = match mqloop::load_state(&dir) {
