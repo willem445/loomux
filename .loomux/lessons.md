@@ -229,3 +229,21 @@ WHICH tests redden
 — the diff between predicted and actual failure lists is where the review value lives. A
 mutation whose result matches prediction is evidence; one that doesn't is a correction, and
 disclosing it beats a quiet re-run every time.
+
+## When a declared value converges with the default, the assertion loses its witness — move it, never relax it
+
+Three rounds of one PR (#689) hit the same shape: a test asserting "the declared value
+must differ from / not be flattened to the default" stops being expressible the moment a
+directive makes the declared value EQUAL the default it was distinguishing itself from.
+worker-quick moving haiku→sonnet made `!cmd.contains("--model sonnet")` fire on a correct
+command; the repo's own workflow file arming the merge queue falsified the test using it
+as the "no queue declared" specimen; the roster losing two reviewer lanes gutted the
+"gate waits for every lane" pin's concrete list.
+
+The trap in every case is the same tempting fix: relax the assertion until the converged
+case passes — which silently retires the property for every case that still distinguishes.
+The right move is to relocate the property onto a witness that still distinguishes (a
+block whose declared model differs from the pick; a synthetic specimen with no queue key;
+a generic rule — "every declared reviewer-kind block is in the gate" — that survives any
+roster). If the converged case still deserves coverage, give it its own strictly-weaker,
+explicitly-labeled assertion; never let it dilute the strong one.
