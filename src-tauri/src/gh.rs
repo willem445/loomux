@@ -33,7 +33,17 @@ use std::process::{Command, Output};
 /// blocking-pool thread and awaits it here instead. A test in this module
 /// scans this file and fails if any command in it is left synchronous: a lone
 /// straggler would keep the freeze while the module claimed not to.
-#[allow(dead_code)] // wired to every command by the next commit (#716)
+///
+/// What this gives up, and why that is safe: the freeze WAS an accidental
+/// mutual exclusion — while the main thread sat in a `gh` spawn no second
+/// invoke could start, so two of these could never overlap. Off-thread they
+/// can. Nothing here relied on that: every command is stateless (it spawns
+/// `gh`, parses stdout, returns — no shared state, no `tauri::State`, no file
+/// or registry write, and no event emitted, so there is no event ordering to
+/// preserve either). The only shared state is GitHub itself, and the one place
+/// that races — two `gh label create`s for the same label — is already treated
+/// as success by `ensure_labels_with`, which was written for the concurrent
+/// create it could always hit from another client.
 async fn run_blocking<T, F>(f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -401,7 +411,11 @@ struct RawPrActivity {
 /// Report whether `gh` is installed and authenticated. Never errors on a
 /// missing/unauthenticated `gh` — those are states the UI renders, not faults.
 #[tauri::command]
-pub fn gh_auth_status() -> Result<GhAuth, String> {
+pub async fn gh_auth_status() -> Result<GhAuth, String> {
+    run_blocking(gh_auth_status_sync).await
+}
+
+fn gh_auth_status_sync() -> Result<GhAuth, String> {
     match gh_output(None, &["auth", "status"]) {
         Ok(out) => {
             // gh has emitted `auth status` on stdout in some versions and
@@ -431,7 +445,11 @@ pub fn gh_auth_status() -> Result<GhAuth, String> {
 /// orchestrator note warns `--label` server-side filtering silently misses
 /// issues that carry the label).
 #[tauri::command]
-pub fn gh_issue_list(repo: String) -> Result<Vec<GhIssue>, String> {
+pub async fn gh_issue_list(repo: String) -> Result<Vec<GhIssue>, String> {
+    run_blocking(move || gh_issue_list_sync(repo)).await
+}
+
+fn gh_issue_list_sync(repo: String) -> Result<Vec<GhIssue>, String> {
     let out = run_gh(
         Some(&repo),
         &[
@@ -450,7 +468,15 @@ pub fn gh_issue_list(repo: String) -> Result<Vec<GhIssue>, String> {
 
 /// Create an issue from a title and body, returning its number and URL.
 #[tauri::command]
-pub fn gh_issue_create(repo: String, title: String, body: String) -> Result<GhIssueRef, String> {
+pub async fn gh_issue_create(
+    repo: String,
+    title: String,
+    body: String,
+) -> Result<GhIssueRef, String> {
+    run_blocking(move || gh_issue_create_sync(repo, title, body)).await
+}
+
+fn gh_issue_create_sync(repo: String, title: String, body: String) -> Result<GhIssueRef, String> {
     if title.trim().is_empty() {
         return Err("empty issue title".to_string());
     }
@@ -464,7 +490,16 @@ pub fn gh_issue_create(repo: String, title: String, body: String) -> Result<GhIs
 /// validated against `ALLOWED_LABELS` before any spawn, so this can never
 /// attach or strip a label outside the agent go-signal set.
 #[tauri::command]
-pub fn gh_issue_set_labels(
+pub async fn gh_issue_set_labels(
+    repo: String,
+    number: u64,
+    add: Vec<String>,
+    remove: Vec<String>,
+) -> Result<(), String> {
+    run_blocking(move || gh_issue_set_labels_sync(repo, number, add, remove)).await
+}
+
+fn gh_issue_set_labels_sync(
     repo: String,
     number: u64,
     add: Vec<String>,
@@ -492,7 +527,11 @@ pub fn gh_issue_set_labels(
 /// comment thread — backing the issues-view detail pane. Read-only; writes go
 /// through `gh_issue_comment` / `gh_issue_set_labels`.
 #[tauri::command]
-pub fn gh_issue_view(repo: String, number: u64) -> Result<GhDetail, String> {
+pub async fn gh_issue_view(repo: String, number: u64) -> Result<GhDetail, String> {
+    run_blocking(move || gh_issue_view_sync(repo, number)).await
+}
+
+fn gh_issue_view_sync(repo: String, number: u64) -> Result<GhDetail, String> {
     let n = number.to_string();
     let out = run_gh(
         Some(&repo),
@@ -512,7 +551,11 @@ pub fn gh_issue_view(repo: String, number: u64) -> Result<GhDetail, String> {
 /// newlines stay data — see `comment_args`. Empty/whitespace bodies are rejected
 /// before spawning (gh would open an interactive editor with no `--body`).
 #[tauri::command]
-pub fn gh_issue_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+pub async fn gh_issue_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+    run_blocking(move || gh_issue_comment_sync(repo, number, body)).await
+}
+
+fn gh_issue_comment_sync(repo: String, number: u64, body: String) -> Result<(), String> {
     if body.trim().is_empty() {
         return Err("empty comment".to_string());
     }
@@ -525,7 +568,11 @@ pub fn gh_issue_comment(repo: String, number: u64, body: String) -> Result<(), S
 /// `gh_issue_list`; labels returned verbatim for client-side matching. Read-only
 /// — the view lists and comments on PRs but never labels/merges/approves.
 #[tauri::command]
-pub fn gh_pr_list(repo: String) -> Result<Vec<GhPr>, String> {
+pub async fn gh_pr_list(repo: String) -> Result<Vec<GhPr>, String> {
+    run_blocking(move || gh_pr_list_sync(repo)).await
+}
+
+fn gh_pr_list_sync(repo: String) -> Result<Vec<GhPr>, String> {
     let out = run_gh(
         Some(&repo),
         &[
@@ -545,7 +592,11 @@ pub fn gh_pr_list(repo: String) -> Result<Vec<GhPr>, String> {
 /// Full detail for one PR — same shape as `gh_issue_view` (`gh pr view` exposes
 /// the identical `--json` fields), so both feed the one detail pane.
 #[tauri::command]
-pub fn gh_pr_view(repo: String, number: u64) -> Result<GhDetail, String> {
+pub async fn gh_pr_view(repo: String, number: u64) -> Result<GhDetail, String> {
+    run_blocking(move || gh_pr_view_sync(repo, number)).await
+}
+
+fn gh_pr_view_sync(repo: String, number: u64) -> Result<GhDetail, String> {
     let n = number.to_string();
     let out = run_gh(
         Some(&repo),
@@ -563,7 +614,11 @@ pub fn gh_pr_view(repo: String, number: u64) -> Result<GhDetail, String> {
 /// Post a comment on a PR. Same discrete-`--body` safety and empty-body guard as
 /// `gh_issue_comment` (commenting is the one write the read-only PR mode allows).
 #[tauri::command]
-pub fn gh_pr_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+pub async fn gh_pr_comment(repo: String, number: u64, body: String) -> Result<(), String> {
+    run_blocking(move || gh_pr_comment_sync(repo, number, body)).await
+}
+
+fn gh_pr_comment_sync(repo: String, number: u64, body: String) -> Result<(), String> {
     if body.trim().is_empty() {
         return Err("empty comment".to_string());
     }
@@ -585,7 +640,16 @@ pub fn gh_pr_comment(repo: String, number: u64, body: String) -> Result<(), Stri
 /// timeline: a chart silently missing every PR would look like a quiet period,
 /// which is worse than an error the view can say out loud.
 #[tauri::command]
-pub fn gh_activity(repo: String) -> Result<GhActivity, String> {
+pub async fn gh_activity(repo: String) -> Result<GhActivity, String> {
+    run_blocking(move || gh_activity_sync(repo)).await
+}
+
+/// The two `gh` runs stay sequential inside ONE blocking task rather than
+/// becoming two concurrent ones: the fail-whole rule above is only meaningful
+/// if the issue failure short-circuits before the PR list is even attempted,
+/// and doubling the concurrent `gh` processes per refresh buys nothing the
+/// 60 s cadence needs.
+fn gh_activity_sync(repo: String) -> Result<GhActivity, String> {
     let issue_args = activity_issue_args(ACTIVITY_LIMIT);
     let argv: Vec<&str> = issue_args.iter().map(String::as_str).collect();
     let issues = parse_issue_activity(&run_gh(Some(&repo), &argv)?)?;
@@ -1176,13 +1240,13 @@ mod tests {
         // Validation happens before any gh spawn, so this fails fast with no gh /
         // no repo — a whitespace-only body would otherwise open gh's editor.
         let err =
-            gh_issue_comment("C:/nonexistent".to_string(), 1, "   \n".to_string()).unwrap_err();
+            gh_issue_comment_sync("C:/nonexistent".to_string(), 1, "   \n".to_string()).unwrap_err();
         assert!(err.contains("empty comment"), "got: {err}");
     }
 
     #[test]
     fn pr_comment_rejects_empty_body_before_spawning() {
-        let err = gh_pr_comment("C:/nonexistent".to_string(), 1, "".to_string()).unwrap_err();
+        let err = gh_pr_comment_sync("C:/nonexistent".to_string(), 1, "".to_string()).unwrap_err();
         assert!(err.contains("empty comment"), "got: {err}");
     }
 
@@ -1445,7 +1509,7 @@ mod tests {
     fn set_labels_rejects_bad_label_before_spawning() {
         // Validation happens before any gh spawn, so this fails fast even with
         // no gh / no repo present — proving the allow-list is the gate.
-        let err = gh_issue_set_labels(
+        let err = gh_issue_set_labels_sync(
             "C:/nonexistent".to_string(),
             1,
             vec!["definitely-not-allowed".to_string()],
@@ -1459,13 +1523,13 @@ mod tests {
     fn set_labels_noop_when_no_deltas() {
         // Empty add+remove is a success no-op (must not spawn an interactive
         // editor), regardless of repo validity.
-        assert!(gh_issue_set_labels("C:/nonexistent".to_string(), 1, vec![], vec![]).is_ok());
+        assert!(gh_issue_set_labels_sync("C:/nonexistent".to_string(), 1, vec![], vec![]).is_ok());
     }
 
     #[test]
     fn create_rejects_empty_title_before_spawning() {
         let err =
-            gh_issue_create("C:/nonexistent".to_string(), "   ".to_string(), "b".to_string())
+            gh_issue_create_sync("C:/nonexistent".to_string(), "   ".to_string(), "b".to_string())
                 .unwrap_err();
         assert!(err.contains("empty issue title"), "got: {err}");
     }
