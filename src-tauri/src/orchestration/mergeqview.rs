@@ -72,9 +72,7 @@ pub fn merge_queue_view(dir: &Path) -> Value {
         Ok(text) => project(&text),
         // No file: this group has never enqueued anything (or the feature is
         // off, which is the product default, §12). Not a problem to report.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            problem("unreadable", None, &format!("{MERGE_QUEUE_FILE} could not be read: {e}"))
-        } // MV1
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => absent(),
         // A file that is there and unreadable is a *fact*, and the one thing
         // this command must never do is let it read as "nothing queued".
         Err(e) => problem("unreadable", None, &format!("{MERGE_QUEUE_FILE} could not be read: {e}")),
@@ -91,9 +89,11 @@ pub fn merge_queue_view(dir: &Path) -> Value {
 pub fn project(text: &str) -> Value {
     let state: MergeQueueState = match serde_json::from_str(text) {
         Ok(s) => s,
-        Err(_e) => return absent(), // MV3
+        Err(e) => {
+            return problem("unreadable", None, &format!("{MERGE_QUEUE_FILE} did not parse: {e}"))
+        }
     };
-    if false && !state.version_supported() { // MV4
+    if !state.version_supported() {
         return problem(
             "unsupported-version",
             Some(state.version),
@@ -109,39 +109,40 @@ pub fn project(text: &str) -> Value {
     // `entries.len() == VIEW_ENTRY_LIMIT`, which cannot distinguish a list that
     // was cut from one that happened to hold exactly the cap (#579's argument,
     // and `audit_log_windowed`'s shape).
-    if !state.extra.is_empty() {
-        return problem("unreadable", None, "merge_queue.json carries fields this build does not know"); // MV5
-    }
     let total = state.entries.len();
     let entries: Vec<Value> = state
         .entries
         .iter()
         .take(VIEW_ENTRY_LIMIT)
         .map(|e| {
-            let state_word = if e.state().is_terminal() { "done" } else { e.state().as_str() }; // MV2
             json!({
                 "pr": e.pr,
                 // `EntryState::as_str` — the same word serde writes, so the
                 // wire and the file can never disagree about a state's name.
-                "state": state_word,
-                "blocked_reason": Value::Null, // MV8
+                "state": e.state().as_str(),
+                "blocked_reason": e.blocked_reason,
                 "head": e.head,
                 "enqueued_ms": e.enqueued_ms,
                 "batch": e.batch,
             })
         })
         .collect();
-    let shown = entries.len(); // MV6
-    let _ = total;
     json!({
         "status": "ok",
         "detail": Value::Null,
         "version": state.version,
         "target": state.target,
         "entries": entries,
-        "entries_total": shown, // MV6a
-        "truncated": shown >= VIEW_ENTRY_LIMIT, // MV6b
-        "batch": state.batch.as_ref().map(|b| json!(b.id)), // MV7
+        "entries_total": total,
+        "truncated": total > entries.len(),
+        "batch": state.batch.as_ref().map(|b| json!({
+            "id": b.id,
+            "prs": b.prs,
+            "state": b.state().as_str(),
+            "draft_pr": b.draft_pr,
+            "scratch_sha": b.scratch_sha,
+            "started_ms": b.started_ms,
+        })),
     })
 }
 
@@ -180,10 +181,11 @@ fn problem(status: &str, version: Option<u32>, detail: &str) -> Value {
 /// Char-bounded, not byte-bounded: slicing a `String` at a byte offset panics
 /// mid-codepoint, and a parser message can quote anything the file held.
 fn clip(s: &str) -> String {
-    if s.len() <= MAX_DETAIL_CHARS {
+    if s.chars().count() <= MAX_DETAIL_CHARS {
         return s.to_string();
     }
-    format!("{}…", &s[..MAX_DETAIL_CHARS]) // MV9
+    let head: String = s.chars().take(MAX_DETAIL_CHARS).collect();
+    format!("{head}…")
 }
 
 #[cfg(test)]
