@@ -172,8 +172,8 @@ as a state would mean *persisting* a fact that is only true relative to the PR's
 now, and a persisted staleness flag is a claim that rots the moment the world moves. Instead
 the entry stays `queued` and carries a `blocked_reason: Option<String>` refreshed at every
 batch build; a `queued` entry with a blocking reason is skipped, shown to the human with that
-reason, and becomes eligible again the instant a re-review covers the new head. Seven states,
-none of them lying.
+reason, and becomes eligible again the instant a re-review covers the new head. **Eight states
+and no ninth**, none of them lying.
 
 **One in-flight batch per target.** Bors discipline: dispatch as soon as the queue is
 non-empty and nothing is in flight — no timed accumulation window, entries pile up naturally
@@ -182,14 +182,69 @@ to reason about when only one batch can be racing the target head, and a single 
 batch makes the crash-reconcile question ("what was happening when we died?") have exactly
 one answer.
 
+**One target per group in v1 — and a PR whose base is not that target is refused, never
+silently retargeted.** `merge_queue.json` carries a single `"target"` (§11.3) and
+`merge_queue_status()` returns one, so the queue is one-target-per-group; the note is explicit
+about how that target comes to exist, because "how does the queue know where it is landing"
+is otherwise a question slice C would have to answer by inventing:
+
+- The target is **established by the first successful enqueue**, from that PR's live
+  `baseRefName` (resolved as §7.1 describes, and subject to every refusal there).
+- It is **released when the queue drains** to zero entries with no batch in flight. A target
+  is a property of the work in the queue, not a configured setting — nothing in
+  `.loomux/workflow.yml` names a branch.
+- A later `queue_merge` whose live base is not the current target is refused with
+  `base-not-target`. Not queued-for-later, not a second queue, and above all **not a silent
+  retarget** — the entries already queued were approved against a different branch, and
+  moving the target under them would land them somewhere nobody reviewed them for.
+- `queue_merge`'s optional `target` argument (§11.1) is an **assertion, not a selection**: if
+  present it must equal the target the base resolves to, and mismatches refuse. Caller-supplied
+  input can narrow what happens, never widen it — the same posture constraint 6 takes on every
+  other agent-supplied argument.
+
+Multi-target queues are deliberately out of v1. When they arrive they are a map of
+target → queue, which is why the target lives in the state file rather than in config.
+
 **Restart reconcile — the #467/#468 pattern, copied deliberately.** The delivery queue learned
-this the hard way; `mod.rs::recover_persisted_queue:31537` is the shape to mirror:
+this the hard way; `mod.rs::recover_persisted_queue:31532` is the shape to mirror:
 
 - **Two phases.** Phase 1 runs under a once-only guard held across the whole phase (the
-  `HashSet::insert` doubles as the check): read the file, parse, **push the batch-id sequence
-  past the maximum recovered id** so a fresh batch cannot reuse one, classify entries into
+  `HashSet::insert` doubles as the check): read the file, parse, classify entries into
   resumable and stranded, audit both. Nothing inside phase 1 may deliver or enqueue — the
   mutex is not reentrant. Phase 2, after the guard drops, sends the notices phase 1 collected.
+- **Batch-id non-reuse is enforced against the remote, not against a counter.** The delivery
+  queue's version of this step advances a monotonic `queue_seq` past the highest id on disk,
+  and that is the right guarantee *for ids that are a sequence*. Batch ids are not (§11.4):
+  they are `RandomState`-derived, with no ordering and no maximum to advance past, so the
+  analogous guarantee has to take a different form here. Reuse is a virtue right up to the
+  point where it changes what a check means — this is the second place in this note where
+  that bites, the first being `default_base_ref` (§7).
+
+  What is actually at risk is a **remote object**: `refs/heads/loomux/mq/<group>-<batch-id>`
+  colliding with a **leaked** scratch ref from an earlier batch — the exact ref §10 permits
+  cleanup to leave behind ("a leaked scratch ref is cheap"). A fresh batch pushing onto a
+  leaked ref of the same name is the one way this design can end up testing an object it did
+  not construct, which is the Bors invariant (§8) failing at the one point §8 does not guard.
+  So:
+
+  1. **Refuse to mint a batch whose scratch ref already exists on the remote** — one
+     `git ls-remote --exit-code` per mint. On collision, re-mint; bounded at 3 attempts, then
+     fail the batch loudly (`mq-scratch-collision`). The colliding ref is **never deleted to
+     make room**: a ref loomux cannot account for is not a ref it gets to overwrite, and
+     blind deletion is precisely the sweep hazard §10 forbids.
+  2. **The scratch push is create-only, so the check is not load-bearing.** A check-then-act
+     leaves a window; the act itself has to be the enforcement. This is the #532 rule (§6)
+     applied to a ref instead of a gate — verify at mint, and re-verify *inside the operation
+     that writes*.
+
+  **Why not a persisted counter** (which constraint 2 would permit — it forbids getrandom
+  crates, not counters): a counter's non-reuse guarantee is scoped to **loomux's own record**,
+  while the object at risk lives on the **remote**. A counter is silently defeated by a leaked
+  ref from a build whose `merge_queue.json` was lost, reset, or written by a version predating
+  the counter — which is the crash case this whole section exists for. The remote check
+  subsumes what a counter would cover *and* adds that case; a counter does not subsume the
+  remote check. Ids therefore stay opaque and unordered, and nothing in the design is allowed
+  to read meaning into one.
 - **Reconcile against reality, not just the file.** For an entry in `ci-wait` or `landing`,
   the file says what loomux *intended*; the truth is whether the scratch ref still exists,
   whether the draft PR is still open, and where the target head is now. Resume only when the
@@ -219,7 +274,9 @@ branch, and read its checks. Three reasons this shape and not another:
 
 **Reuse the existing classification — do not write a third.** Terminal-state logic exists
 twice already: `orchestration/notify.rs::pr_checks_result:310` (with `check_is_pending` at
-~299) and `orchestration/intake.rs::parse_pr_list:183`. Both already encode the property that
+`notify.rs:284` — **not** `:299`, which is `check_is_failing`, the neighbouring predicate an
+implementer is most likely to grab by mistake given the subject here) and
+`orchestration/intake.rs::parse_pr_list:183`. Both already encode the property that
 matters most — **an empty check list is not success**, it is pending. `notify.rs` is the one
 to build on, since it also handles the `"no checks reported"` stderr case.
 
@@ -293,6 +350,21 @@ One gate definition, two enforcement points, zero drift. **A third implementatio
 decision is a defect, not an optimization** — if the queue's needs ever diverge from the
 parsers, the parsers move.
 
+**No gate configured is a refusal, not a pass.** A repo can perfectly well set
+`merge_queue: enabled: true` with no `gates:` block at all — that is the state of most repos,
+and it is reachable on day one. `evaluate_merge_gate` with no gate returns *allowed*, which is
+correct for the shim (an ungated repo merges normally, as it always did) and **wrong** for the
+queue: it would mean the backend pushing approved-by-nobody PRs onto a branch under its own
+authority, which is the one thing §3's new authority is not for. So `queue_merge` refuses with
+`gate-not-configured` when no gate covers the target, and the batch build refuses the same way
+if the gate disappears mid-flight.
+
+The general rule this is an instance of, worth stating because it constrains every later
+change: **the queue is strictly additive to the gate. It never grants what the gate would not,
+and its own green is never a substitute for a reviewer's `pass`.** A queue that could land
+something the shim would have refused is not a stronger gate, it is a bypass with better
+telemetry.
+
 ## 7. Constraint-7 structural proof
 
 Constraint 7: the queue must be **structurally incapable** of targeting the default branch.
@@ -328,6 +400,26 @@ Reuse is a virtue right up to the point where it changes what a check means.
    default refused; batch build against a target that became the default aborted; the
    adversarial rename refused at step 3; a lookup failure refused rather than defaulted; and
    the landing function's refspec asserted to be exactly `<tested-sha>:refs/heads/<target>`.
+
+**What this proves is half of constraint 7's carve-out — say so, so slice C does not guess.**
+The five layers prove the queue cannot target the **default branch**. Constraint 7's carve-out
+is narrower than that: a non-default branch **the orchestrator owns**, typically an integration
+branch. **Ownership is not modelled here, and that is intentional** — nothing above would stop
+the queue targeting a release branch, another worker's feature branch, or a human's WIP.
+
+Two reasons it is the right bound for v1. First, **parity with the shim**: `mod.rs:929-931`
+already lets any non-default merge through without a gate grant, so an ownership check here
+would be loomux enforcing on the queue path something it does not enforce on the path the
+queue replaces — a difference that would push work back to the unguarded route. Second, and
+more importantly, **§6 is what actually makes an unowned target safe**: every PR in a batch has
+satisfied the repo's own merge gate, re-verified at landing. Ownership would answer "who may be
+landed *into*"; the gate answers "what may be landed", which is the stronger question.
+
+If an ownership check is ever wanted, it is a **narrowing** applied at §7.1 (enqueue) and §7.2
+(batch build) beside the existing default-branch refusal, with a new `target-not-owned`
+refusal in §11.1 — and it needs a durable notion of orchestrator branch ownership, which does
+not exist today. Written down so that slice C neither invents one nor omits one a reader
+expected.
 
 **`Task.pr_base` (slice A) is a hint, never a gate input.** It is agent-writable board data.
 It exists to make the Approve-button relabel accurate (`docs/orchestration.md`) and to let the
@@ -454,6 +546,7 @@ Every row below is a designed path, an audit event (§11), and a test.
 | Gate re-check fails at landing | Landing refused, that entry kicks back, survivors requeue (§6). |
 | Crash mid-batch | Reconcile from `merge_queue.json`: verify the scratch ref exists, the draft PR is open, and the target head matches. Resume only if the world matches; otherwise fail entries **loudly**. Never drop silently (§4). |
 | Entry cancelled while `batching`/`ci-wait` | The in-flight batch is abandoned and rebuilt without it; cleanup runs. |
+| Scratch ref already exists at mint (leaked from a crashed earlier batch) | Refuse to mint on that name; re-mint, bounded at 3 attempts, then fail the batch loudly (`mq-scratch-collision`). The existing ref is **never** deleted to make room. The push is create-only, so the check has no TOCTOU window (§4). |
 | Queue grows without bound | Entries are capped (`64`); enqueue past the cap is refused with a stated reason, keeping `merge_queue.json` bounded. |
 
 **Cleanup runs on every exit path** — green, red, conflict, timeout, cancel, crash-reconcile,
@@ -480,8 +573,8 @@ check, because a tool omitted from a listing is still callable.
 
     queue_merge(pr: number, target?: string)
       -> { queued: true, position: n } | { refused: "<reason>" }
-      refusals: base-is-default | base-unverifiable | gate-not-met | already-queued
-              | queue-full | queue-disabled
+      refusals: base-is-default | base-unverifiable | base-not-target | gate-not-met
+              | gate-not-configured | already-queued | queue-full | queue-disabled
 
     merge_queue_status()
       -> { enabled, target, entries: [{ pr, state, blocked_reason?, since_ms }],
@@ -503,6 +596,24 @@ A sibling of the existing `gates:` block, parsed in `workflow.rs` alongside it:
 same posture `gates:` takes. Parse errors are **loud**, following the existing
 `workflow-invalid` audit path; a malformed block never degrades to defaults, because a queue
 running on silently-substituted policy is a queue nobody can reason about.
+
+**Adding the block breaks the file for builds that predate slice C — deliberately.**
+`RawWorkflow` is `#[serde(deny_unknown_fields)]` (`workflow.rs:593-620`), so `merge_queue:` is
+not a tolerated unknown key on an older build: it fails the parse of the **whole**
+`.loomux/workflow.yml`, gates and all, down the loud `workflow-invalid` path. This is a real
+property of the opt-in and not a footnote — §12's "delete the block and the feature is off"
+is true, but the converse is not symmetrical, and anyone adding the block to a repo whose
+users may run mixed versions should know that before they push it.
+
+It is the right behavior anyway. `workflow.yml` is **human-authored policy**, and a key the
+build does not understand means a human believes a policy is in force that is not — silent
+tolerance there is the exact silent-degradation failure the loud parse exists to prevent.
+
+Note the **deliberate asymmetry** with §11.3, since the two persisted surfaces this design
+adds take opposite forward-compatibility postures and a reader will otherwise infer one from
+the other: `merge_queue.json` **tolerates** unknown fields, because it is **machine-authored
+state** and an older build must be able to read and rewrite it without destroying what a newer
+one wrote. Policy fails loud; state degrades gracefully. Different documents, different jobs.
 
 *A correction to the plan worth recording:* the plan and CLAUDE.md constraint 8 both cite "the
 way the resource guard's `resources:` block does" as the precedent. **That block does not exist
@@ -532,8 +643,13 @@ recovery — rewritten alongside live entries, the #467/#468 posture.
     refs/heads/loomux/mq/<group>-<batch-id>
 
 **Reserved.** Nothing else in loomux writes under `loomux/`, and the queue writes nowhere else.
+
 Batch ids come from the std `RandomState` idiom — **no getrandom-based crates** (constraint 2;
-see the notes in `src-tauri/Cargo.toml`).
+see the notes in `src-tauri/Cargo.toml`). They are **opaque and unordered**: not a sequence, not
+monotonic, and carrying no "which batch came first" meaning that any code may read. Non-reuse
+across a restart is guaranteed by the remote check in §4 (refuse to mint onto an existing ref,
+create-only push), **not** by advancing a counter — §4 argues why, and the two specs have to be
+read together.
 
 ### 11.5 Audit events
 
@@ -543,7 +659,7 @@ case, matching the existing convention (`queue-recovered`, `merge-gate-allowed`,
 `mq-enqueued` · `mq-enqueue-refused` · `mq-batch-built` · `mq-batch-pushed` ·
 `mq-checks-green` · `mq-checks-red` · `mq-checks-unverifiable` · `mq-landed` ·
 `mq-land-refused` · `mq-bisect-step` · `mq-culprit` · `mq-kicked-back` · `mq-cancelled` ·
-`mq-cleanup-failed` · `mq-recovered` · `mq-stranded`
+`mq-cleanup-failed` · `mq-scratch-collision` · `mq-recovered` · `mq-stranded`
 
 Every state transition and every external write appears here. An audit action must name what
 actually happened — labeling a failed landing as a success is the exact defect class #461
@@ -560,7 +676,10 @@ One read-only Tauri command `orch_merge_queue` plus a typed wrapper in `src/pty.
 
 - **Product default: off.** No `merge_queue:` block, no behavior change anywhere. This is not
   a soft default — it is the reversal mechanism (see the last bullet below).
-- **Enabled per repo**, in that repo's `.loomux/workflow.yml`, exactly like `gates:`.
+- **Enabled per repo**, in that repo's `.loomux/workflow.yml`, exactly like `gates:` — but note
+  that **adding the block is not inert to older builds**: `deny_unknown_fields` makes its mere
+  presence a hard parse failure of the whole file on any build predating slice C (§11.2). The
+  opt-in is reversible; it is not version-transparent.
 - **Ordering** (plan part 7): A ∥ B → C (gated on this note's sign-off) → D (also needs A;
   both touch `mod.rs`) → E; F after C, parallel with D/E. Slices A, D and E serialize on
   `mod.rs`/`mcp.rs`; the queue engine is a new file (`orchestration/mergeq.rs` — `queue.rs` is
