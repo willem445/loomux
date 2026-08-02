@@ -20,7 +20,7 @@ use loomux_lib::orchestration::mcp::dispatch;
 use loomux_lib::orchestration::profiles::{self, ProfileMode};
 use loomux_lib::orchestration::workflow::{self, GateRequire};
 use loomux_lib::orchestration::{
-    block_contract_text, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role,
+    block_contract_text, cli_caps, command_line_length_guard, Caller, Containment, ContractCarrier, Guardrails, Launch, OrchRegistry, Role, EFFORT_LEVELS,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -5956,26 +5956,54 @@ fn the_merge_queue_block_can_never_name_a_branch_or_widen_anything() {
     .is_err());
 }
 
-// ── #687 RED-EVIDENCE (temporary) ───────────────────────────────────────────
-//
-// The per-block model knobs, asserted as BEHAVIOR against a tree that does not
-// have them yet. Everything here compiles on the base branch on purpose — it
-// names no new symbol, only `parse_workflow`, `APP_COMMANDS` and the exact
-// error strings #687 introduces — so this run reddens on what the code DOES,
-// not on a signature that doesn't exist. Replaced by the permanent tests in
-// the next commit.
+// ───────────────── per-block model knobs: effort: / context: (#687) ─────────
 
+/// The happy path, and the whole back-compat guarantee alongside it: a declared
+/// knob survives parsing normalized, and an ABSENT one is the empty string —
+/// which every emit path reads as "say nothing".
 #[test]
-fn red687_effort_and_context_are_real_keys_with_their_own_errors() {
-    // 1. A declared knob must PARSE. On base, `deny_unknown_fields` rejects the
-    //    key outright — the "this feature does not exist" red.
-    let ok = workflow::parse_workflow(
-        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    effort: xhigh\n    context: 1m\n",
-    );
-    assert!(ok.is_ok(), "a declared effort:/context: must parse, got: {:?}", ok.err());
+fn block_effort_and_context_parse_as_closed_enums() {
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: w\n    kind: worker\n    cli: claude\n    effort: xhigh\n    context: 1m\n",
+    )
+    .unwrap();
+    let w = wf.block("w").unwrap();
+    assert_eq!(w.effort, "xhigh");
+    assert_eq!(w.context, "1m");
 
-    // 2. An out-of-vocabulary value must name ITSELF and the vocabulary, not
-    //    the generic unknown-field noise.
+    // Normalized, not rejected, on case/whitespace — the `role_hint` shape.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    effort: \"  MAX \"\n",
+    )
+    .unwrap();
+    assert_eq!(wf.block("w").unwrap().effort, "max");
+
+    // Absent = empty = today's behavior, byte for byte.
+    let wf = workflow::parse_workflow("version: 1\nblocks:\n  - id: w\n    kind: worker\n").unwrap();
+    let w = wf.block("w").unwrap();
+    assert_eq!((w.effort.as_str(), w.context.as_str()), ("", ""));
+
+    // Every level in loomux's vocabulary is accepted on claude — a pin on the
+    // vocabulary itself, so dropping one from `EFFORT_LEVELS` reddens here and
+    // not only in the caps table's own test.
+    for level in EFFORT_LEVELS {
+        let wf = workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    effort: {level}\n"
+        ))
+        .unwrap();
+        assert_eq!(wf.block("w").unwrap().effort, *level);
+    }
+}
+
+/// The refusal side, which is the half that matters: a knob loomux cannot
+/// deliver is a **loud parse error**, never a silent no-op. The failure this
+/// closes is the quiet one — a human writes `effort: xhigh` on a copilot block,
+/// the file loads, and nothing anywhere ever tells them their reviewer is
+/// thinking exactly as hard as it was before.
+#[test]
+fn a_knob_that_is_unknown_or_undeliverable_is_a_loud_parse_error() {
+    // (1) Outside loomux's closed vocabulary — never coerced to a neighbour.
     let errs = workflow::parse_workflow(
         "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    effort: banana\n",
     )
@@ -5983,36 +6011,158 @@ fn red687_effort_and_context_are_real_keys_with_their_own_errors() {
     assert!(
         errs.iter().any(|e| e.contains("unknown effort \"banana\"")
             && e.contains("must be one of low, medium, high, xhigh, max")),
+        "the error must name the value AND the vocabulary: {errs:?}"
+    );
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: claude\n    context: 2m\n",
+    )
+    .unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains("unknown context \"2m\"") && e.contains("must be one of 1m")),
         "{errs:?}"
     );
 
-    // 3. A knob loomux cannot deliver on THIS cli must be refused by name.
+    // (2) In the vocabulary, but not deliverable on THIS cli — and the error
+    // quotes the vendor fact from the CLI's own capability row rather than
+    // saying "unsupported".
     let errs = workflow::parse_workflow(
         "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: copilot\n    context: 1m\n",
     )
     .unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("cli \"copilot\" cannot set context:")), "{errs:?}");
+    assert!(
+        errs.iter().any(|e| e.contains("cli \"copilot\" cannot set context:")
+            && e.contains(cli_caps("copilot").unwrap().context_note)),
+        "the refusal must carry copilot's own reason: {errs:?}"
+    );
     let errs = workflow::parse_workflow(
         "version: 1\nblocks:\n  - id: r\n    kind: reviewer\n    cli: gemini\n    effort: high\n",
     )
     .unwrap_err();
-    assert!(errs.iter().any(|e| e.contains("cli \"gemini\" cannot set effort:")), "{errs:?}");
-
-    // 4. The orchestrator block may pin both — the deliberate pin-list widening.
-    assert!(workflow::parse_workflow(
-        "version: 1\nblocks:\n  - id: orchestrator\n    kind: orchestrator\n    cli: claude\n    effort: max\n    context: 1m\n"
+    assert!(
+        errs.iter().any(|e| e.contains("cli \"gemini\" cannot set effort:")
+            && e.contains(cli_caps("gemini").unwrap().effort_note)),
+        "{errs:?}"
+    );
+    let errs = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    cli: copilot\n    effort: low\n",
     )
-    .is_ok());
+    .unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("cli \"copilot\" cannot set effort:")), "{errs:?}");
+
+    // (3) A block that inherits the group's CLI defers the cli half — the
+    // group default is not known at parse time (the same deferral
+    // `cli_can_host` makes), and `Guardrails::clamped` re-checks it at spawn.
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    effort: high\n",
+    )
+    .unwrap();
+    assert_eq!(wf.block("w").unwrap().effort, "high");
+
+    // (4) `deny_unknown_fields` still catches a typo'd key — the new keys are
+    // declared fields, not a door that widens what else is accepted.
+    assert!(workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: w\n    kind: worker\n    efort: high\n"
+    )
+    .is_err());
 }
 
+/// The orchestrator block's pin list widens by exactly two value-set picks
+/// (#687) — and by nothing else. This is the deliberate design change the PR
+/// argues for in `doc/design/workflows.md`: a level from a closed enum authors
+/// no text and pre-approves no tool, so it opens no injection seam into the
+/// trust root, while `prompt:`/`profile:`/`allow:` stay refused.
 #[test]
-fn red687_the_agent_cli_knobs_command_is_registered() {
-    // The launcher's capability query must exist and be ACL-granted. On base
-    // there is no such command at all; after the change, the permanent pin is
-    // `main_has_all_135_and_zero_permission_denies_dangerous_spread`, which
-    // actually invokes it against the main window.
+fn an_orchestrator_block_may_pin_effort_and_context_but_still_not_a_persona() {
+    let wf = workflow::parse_workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: orchestrator\n    kind: orchestrator\n    cli: claude\n\
+         \x20   model: opus\n    effort: max\n    context: 1m\n",
+    )
+    .unwrap();
+    let o = wf.block("orchestrator").unwrap();
+    assert_eq!((o.effort.as_str(), o.context.as_str()), ("max", "1m"));
+
+    // The refusals the widening must NOT have loosened.
+    for line in
+        ["prompt: rewrite your contract", "profile: .github/agents/o.md", "allow: [\"Bash(x *)\"]"]
+    {
+        let errs = workflow::parse_workflow(&format!(
+            "version: 1\nblocks:\n  - id: orchestrator\n    kind: orchestrator\n    {line}\n"
+        ))
+        .unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("loomux's trust root")),
+            "{line:?} must still be refused on the orchestrator block: {errs:?}"
+        );
+    }
+    // An invalid knob is refused on the orchestrator too — pinnable is not
+    // unvalidated.
+    assert!(workflow::parse_workflow(
+        "version: 1\nblocks:\n  - id: orchestrator\n    kind: orchestrator\n    cli: copilot\n    effort: max\n"
+    )
+    .is_err());
+}
+
+/// The persisted roster (`blocks_json` / `read_blocks`) is a SEPARATE wire
+/// format from workflow.yml, so the knobs must survive it too — otherwise a
+/// group resumed after an app restart would silently drop back to the CLI's
+/// default thinking level. Mirrors `role_hint_round_trips_through_group_json_too`.
+#[test]
+fn block_knobs_round_trip_through_group_json_too() {
+    let (reg, dir) = test_registry();
+    let repo = Repo::new().workflow(
+        "version: 1\nblocks:\n\
+         \x20 - id: deep\n    kind: worker\n    cli: claude\n    effort: xhigh\n    context: 1m\n",
+    );
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let deep = g.guardrails.block("deep").unwrap();
+    assert_eq!((deep.effort.as_str(), deep.context.as_str()), ("xhigh", "1m"));
+
+    let gj: Value = serde_json::from_str(
+        &fs::read_to_string(reg.state_root().join(&g.id).join("group.json")).unwrap(),
+    )
+    .unwrap();
+    let blocks = gj["guardrails"]["blocks"].as_array().unwrap();
+    let persisted = blocks.iter().find(|b| b["id"] == "deep").unwrap();
+    assert_eq!(persisted["effort"], "xhigh", "effort must be persisted, not dropped");
+    assert_eq!(persisted["context"], "1m", "context must be persisted, not dropped");
+    // The block that pinned nothing (loomux's guaranteed orchestrator) persists
+    // as empty — the shape a pre-#687 group.json has by omission.
+    let orch = blocks.iter().find(|b| b["id"] == "orchestrator").unwrap();
+    assert_eq!((orch["effort"].as_str(), orch["context"].as_str()), (Some(""), Some("")));
+
+    let reg2 = relaunch_registry(dir.path());
+    let g2 = reg2.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(g2.guardrails.blocks, g.guardrails.blocks, "the roster must round-trip unchanged");
+}
+
+/// Back-compat as a test rather than as a hope: a `group.json` written before
+/// #687 carries NO `effort`/`context` keys at all, and must resume with the
+/// knobs empty — i.e. with the command line it was launched with — rather than
+/// with anything invented. The specimen is synthesized by DELETING the keys
+/// from a freshly written file, because every file this build writes has them.
+#[test]
+fn a_group_json_predating_the_knobs_resumes_with_none() {
+    let (reg, dir) = test_registry();
+    let repo = Repo::new();
+    let g = reg.create_group(&repo.path(), rails()).unwrap();
+    let path = reg.state_root().join(&g.id).join("group.json");
+    let mut raw: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let blocks = raw["guardrails"]["blocks"].as_array_mut().unwrap();
+    assert!(!blocks.is_empty(), "the fixture needs a roster to strip");
+    for b in blocks {
+        let o = b.as_object_mut().unwrap();
+        assert!(o.remove("effort").is_some(), "this build must write the key it strips");
+        assert!(o.remove("context").is_some());
+    }
+    fs::write(&path, serde_json::to_string_pretty(&raw).unwrap()).unwrap();
+
+    let reg2 = relaunch_registry(dir.path());
+    let resumed = reg2.create_group(&repo.path(), rails()).unwrap();
+    assert_eq!(resumed.id, g.id, "the restart must resume the same group");
     assert!(
-        loomux_lib::command_manifest::APP_COMMANDS.contains(&"agent_cli_knobs"),
-        "agent_cli_knobs must be registered in the ACL manifest"
+        resumed.guardrails.blocks.iter().all(|b| b.effort.is_empty() && b.context.is_empty()),
+        "a pre-#687 group.json must resume with no knobs at all: {:?}",
+        resumed.guardrails.blocks
     );
 }

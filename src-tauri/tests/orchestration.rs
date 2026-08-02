@@ -121,6 +121,9 @@ use loomux_lib::orchestration::{
     // that decides which classes any CLI may host.
     cli_can_host, cli_caps, cli_extra_env, gemini_policy_toml, gemini_settings_json,
     CLI_CAPS, GEMINI_EDIT_DENY_TOOLS, GEMINI_READONLY_DENY_GIT, KNOWN_GEMINI_TOOLS,
+    // #687: the per-block model knobs — the capability rows that decide which
+    // CLI can honor one, and the query the launcher reads them through.
+    cli_knobs_json, CONTEXT_VARIANTS, EFFORT_LEVELS,
 };
 use loomux_lib::pty::{phantom_gate_tick, PtyManager};
 use serde_json::{json, Value};
@@ -7144,6 +7147,16 @@ fn build_agent_argv_matches_command_line() {
     // with it every ordering question its position raises — was never
     // tokenized here at all. Both states now ride the matrix.
     let hooks = PathBuf::from("C:/x/cfg-hooks.json");
+    // #687: the model knobs ride the matrix too, and the `[1m]` case is the one
+    // that earns its place — it is the only value either form QUOTES
+    // differently (`--model "sonnet[1m]"` in the shell form, one bare token in
+    // argv), so a drift in that composition is invisible to every other entry.
+    let knob_sets = [
+        workflow::ModelKnobs::default(),
+        workflow::ModelKnobs { effort: "xhigh", context: "" },
+        workflow::ModelKnobs { effort: "", context: "1m" },
+        workflow::ModelKnobs { effort: "low", context: "1m" },
+    ];
     for cli in ["claude", "copilot", "totally-unknown-cli"] {
         for auto_ops in [false, true] {
             // Every tier, not just the two that existed before #462 — a
@@ -7153,20 +7166,22 @@ fn build_agent_argv_matches_command_line() {
                 for hook_settings in [None, Some(hooks.as_path())] {
                     for (session, resume) in sessions {
                         for persona in &personas {
-                            let line = reg.build_agent_command(
-                                cli, "m", auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
+                            for knobs in knob_sets {
+                            let line = reg.build_agent_command_ex(
+                                cli, "m", knobs, auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
                             );
-                            let argv = reg.build_agent_argv(
-                                cli, "m", auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
+                            let argv = reg.build_agent_argv_ex(
+                                cli, "m", knobs, auto_ops, cfg, hook_settings, gdir, wd, session, resume, containment, persona,
                             );
                             assert_eq!(
                                 shell_tokenize(&line),
                                 argv,
                                 "argv must equal the tokenized command line for \
                                  cli={cli} auto_ops={auto_ops} containment={containment:?} \
-                                 hook_settings={hook_settings:?} \
+                                 hook_settings={hook_settings:?} knobs={knobs:?} \
                                  session={session:?} resume={resume} persona={persona:?}\n  line: {line}"
                             );
+                            }
                         }
                     }
                 }
@@ -36997,4 +37012,265 @@ fn the_driver_tick_skips_a_group_whose_repo_did_not_opt_in() {
 
     let tick = reg.gh_poll_tick(1_000, &std::collections::HashMap::new());
     assert_eq!(tick.mq_serviced, None, "a group that did not opt in is never driven");
+}
+
+// ─────────── per-block model knobs: the emit + clamp side (#687) ────────────
+
+/// The capability table's #687 rows are the single source of truth the parser,
+/// `clamped()` and the launcher all read, so its own invariants are worth
+/// pinning: every row's values come from loomux's closed vocabulary, and every
+/// row — including the ones with NO values — carries a reason.
+///
+/// The empty-with-a-reason rule is the one that matters. A CLI whose knob
+/// loomux cannot deliver renders disabled in the launcher and refused by the
+/// parser, and both surfaces quote this note. A row with an empty note would
+/// degrade the honest "copilot reads effortLevel from ~/.copilot/settings.json"
+/// into a bare "unsupported", which reads as loomux having forgotten.
+#[test]
+fn every_cli_row_explains_both_knobs() {
+    for row in CLI_CAPS {
+        for v in row.effort_levels {
+            assert!(
+                EFFORT_LEVELS.contains(v),
+                "{}'s effort_levels names {v:?}, which is not in loomux's vocabulary",
+                row.cli
+            );
+        }
+        for v in row.context_variants {
+            assert!(
+                CONTEXT_VARIANTS.contains(v),
+                "{}'s context_variants names {v:?}, which is not in loomux's vocabulary",
+                row.cli
+            );
+        }
+        assert!(!row.effort_note.is_empty(), "{} must say why its effort set is what it is", row.cli);
+        assert!(!row.context_note.is_empty(), "{} must say why its context set is what it is", row.cli);
+    }
+    // The vendor facts this round rests on, asserted rather than assumed: only
+    // claude has a loomux-usable seam for either knob today.
+    assert_eq!(cli_caps("claude").unwrap().effort_levels, EFFORT_LEVELS);
+    assert_eq!(cli_caps("claude").unwrap().context_variants, CONTEXT_VARIANTS);
+    for cli in ["copilot", "gemini"] {
+        let caps = cli_caps(cli).unwrap();
+        assert!(caps.effort_levels.is_empty(), "{cli} has no flag/env seam for effort");
+        assert!(caps.context_variants.is_empty(), "{cli}'s context window is not loomux-settable");
+    }
+}
+
+/// `agent_cli_knobs`' wire shape (#687), which the launcher's selector reads to
+/// decide enabled-vs-disabled-with-a-reason. Asserted on the pure body so no
+/// tauri runtime is needed.
+#[test]
+fn agent_cli_knobs_reports_the_capability_row_verbatim() {
+    let claude = cli_knobs_json("claude");
+    assert_eq!(claude["known"], true);
+    assert_eq!(claude["effort"]["values"], json!(["low", "medium", "high", "xhigh", "max"]));
+    assert_eq!(claude["context"]["values"], json!(["1m"]));
+    assert_eq!(claude["effort"]["note"], cli_caps("claude").unwrap().effort_note);
+
+    // An unsupported knob is an EMPTY value set plus a non-empty reason — the
+    // shape the launcher needs to render "disabled, because <vendor fact>"
+    // instead of hiding the control.
+    let copilot = cli_knobs_json("copilot");
+    assert_eq!(copilot["known"], true);
+    assert_eq!(copilot["effort"]["values"], json!([]));
+    assert!(copilot["effort"]["note"].as_str().unwrap().contains("settings.json"));
+    assert_eq!(copilot["context"]["values"], json!([]));
+    assert!(!copilot["context"]["note"].as_str().unwrap().is_empty());
+
+    // A CLI loomux has never evaluated: every knob off, and it says so rather
+    // than pretending the claude answer applies.
+    let unknown = cli_knobs_json("totally-unknown-cli");
+    assert_eq!(unknown["known"], false);
+    assert_eq!(unknown["effort"]["values"], json!([]));
+    assert_eq!(unknown["context"]["values"], json!([]));
+}
+
+/// The silent half of the pair (`clamped_knob`): a knob that reached the roster
+/// WITHOUT meeting the parser — a hand-edited `group.json` — is dropped to
+/// empty against the block's **resolved** CLI, which is the piece the parser
+/// structurally cannot do for a block that inherits the group default.
+#[test]
+fn clamped_drops_a_knob_the_resolved_cli_cannot_honor() {
+    let block = |cli: &str, effort: &str, context: &str| workflow::Block {
+        id: "w".into(),
+        name: "w".into(),
+        kind: Role::Worker,
+        cli: cli.into(),
+        model: String::new(),
+        prompt: None,
+        profile: None,
+        allow: Vec::new(),
+        role_hint: None,
+        effort: effort.into(),
+        context: context.into(),
+    };
+    let resolve = |agent_cli: &str, b: workflow::Block| -> workflow::Block {
+        let g = Guardrails {
+            max_agents: 4,
+            agent_cli: agent_cli.into(),
+            blocks: vec![b],
+            ..Guardrails::default()
+        }
+        .clamped();
+        g.block("w").cloned().unwrap()
+    };
+
+    // Valid on claude: kept, normalized.
+    let ok = resolve("claude", block("claude", " XHIGH ", "1M"));
+    assert_eq!((ok.effort.as_str(), ok.context.as_str()), ("xhigh", "1m"));
+
+    // Garbage: dropped to empty, never coerced to a neighbouring level.
+    let junk = resolve("claude", block("claude", "banana", "9m"));
+    assert_eq!((junk.effort.as_str(), junk.context.as_str()), ("", ""));
+
+    // Valid VALUE, wrong CLI: still dropped — the vocabulary check is not the
+    // capability check.
+    let wrong = resolve("claude", block("copilot", "max", "1m"));
+    assert_eq!((wrong.effort.as_str(), wrong.context.as_str()), ("", ""));
+
+    // The inheriting block — the case the parser defers: the block names no
+    // cli, so only `clamped()` knows it resolved to copilot.
+    let inherited = resolve("copilot", block("", "max", "1m"));
+    assert_eq!((inherited.effort.as_str(), inherited.context.as_str()), ("", ""));
+    let inherited_ok = resolve("claude", block("", "max", "1m"));
+    assert_eq!((inherited_ok.effort.as_str(), inherited_ok.context.as_str()), ("max", "1m"));
+
+    // Absent stays absent — no default is invented on anyone's behalf.
+    let none = resolve("claude", block("claude", "", ""));
+    assert_eq!((none.effort.as_str(), none.context.as_str()), ("", ""));
+}
+
+/// The emit matrix (#687): claude gets `--effort <level>` and the `[1m]`-suffixed
+/// model **only when set**, copilot and gemini get neither ever, and the two
+/// spawn forms agree token for token.
+#[test]
+fn claude_emits_the_knobs_only_when_set_and_no_other_cli_ever_does() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let knobs = |effort, context| workflow::ModelKnobs { effort, context };
+    let line = |cli, model, k| {
+        reg.build_agent_command_ex(
+            cli, model, k, false, cfg, None, gdir, wd, None, false, Containment::None,
+            &PersonaInject::default(),
+        )
+    };
+    let argv = |cli, model, k| {
+        reg.build_agent_argv_ex(
+            cli, model, k, false, cfg, None, gdir, wd, None, false, Containment::None,
+            &PersonaInject::default(),
+        )
+    };
+
+    // Nothing pinned ⇒ the pre-#687 line, byte for byte (the `default()`
+    // wrapper is the same call the whole existing suite makes).
+    assert_eq!(
+        line("claude", "sonnet", knobs("", "")),
+        reg.build_agent_command(
+            "claude", "sonnet", false, cfg, None, gdir, wd, None, false, Containment::None,
+            &PersonaInject::default(),
+        )
+    );
+    assert!(!line("claude", "sonnet", knobs("", "")).contains("--effort"));
+    assert!(line("claude", "sonnet", knobs("", "")).contains("--model sonnet "));
+
+    // Effort alone: the flag appears, the model is untouched.
+    let e = line("claude", "sonnet", knobs("xhigh", ""));
+    assert!(e.contains(" --effort xhigh"), "{e}");
+    assert!(e.contains("--model sonnet "), "the model must not gain a suffix it wasn't given: {e}");
+
+    // Context alone: the composed alias, QUOTED — `[1m]` is a glob pattern to a
+    // POSIX shell — and no --effort.
+    let c = line("claude", "sonnet", knobs("", "1m"));
+    assert!(c.contains("--model \"sonnet[1m]\""), "{c}");
+    assert!(!c.contains("--effort"), "{c}");
+    // A full model name takes the same suffix (model-config §Extended context).
+    assert!(line("claude", "claude-opus-4-8", knobs("", "1m")).contains("--model \"claude-opus-4-8[1m]\""));
+
+    // Both, on both forms — and the argv token is UNQUOTED, because there is no
+    // shell there to quote for.
+    let both = line("claude", "opus", knobs("max", "1m"));
+    assert!(both.contains("--model \"opus[1m]\"") && both.contains(" --effort max"), "{both}");
+    let both_argv = argv("claude", "opus", knobs("max", "1m"));
+    assert!(both_argv.contains(&"opus[1m]".to_string()), "{both_argv:?}");
+    assert!(both_argv.windows(2).any(|w| w == ["--effort", "max"]), "{both_argv:?}");
+    assert_eq!(shell_tokenize(&both), both_argv, "the two forms must not drift on the knobs");
+
+    // copilot and gemini emit NEITHER, whatever they are handed — their seams
+    // are a user-owned settings file and an interactive control, so there is no
+    // flag to emit and inventing one would be a command line the CLI rejects.
+    // (`clamped()` empties these long before a real spawn; this pins the emit
+    // layer's own refusal, so the guarantee doesn't rest on the clamp alone.)
+    for cli in ["copilot", "gemini"] {
+        let l = line(cli, "auto", knobs("max", "1m"));
+        assert!(!l.contains("--effort"), "{cli} must never be handed --effort: {l}");
+        assert!(!l.contains("[1m]"), "{cli} must never be handed a [1m] model alias: {l}");
+        assert!(l.contains("--model auto"), "{cli}'s model must be untouched: {l}");
+        assert_eq!(shell_tokenize(&l), argv(cli, "auto", knobs("max", "1m")));
+    }
+}
+
+/// #610's flag-placement rule, applied to the flag #687 adds: `--effort` must
+/// land AFTER the last `--allowedTools` value, never between the flag and its
+/// values — a flag emitted mid-list ends the list and demotes every pattern
+/// after it to a stray positional argument.
+///
+/// This is the same property `claude_allow_patterns_are_not_severed_from_the_
+/// allowedtools_flag` pins, re-run with the new flag present: that test fixes
+/// the knobs at their defaults, so `--effort` never appears in it at all.
+#[test]
+fn the_effort_flag_does_not_sever_the_allowedtools_value_list() {
+    let (reg, _d) = test_registry();
+    let cfg = Path::new("C:/x/cfg.json");
+    let hooks = Path::new("C:/x/cfg-hooks.json");
+    let gdir = Path::new("C:/data/group");
+    let wd = Path::new("C:/repo");
+    let persona =
+        PersonaInject { extra_allow: vec!["Bash(make:*)".into()], ..PersonaInject::default() };
+
+    for containment in [Containment::None, Containment::NoEdits, Containment::ReadOnly] {
+        // A read-only block never carries `extra_allow` (#222's capability
+        // closure empties it) — pass it only where it can legitimately appear.
+        let p = if containment == Containment::ReadOnly {
+            PersonaInject::default()
+        } else {
+            persona.clone()
+        };
+        let mut want = vec!["mcp__loomux", "Bash(git *)", "Bash(gh *)"];
+        if containment != Containment::ReadOnly {
+            want.push("Bash(make:*)");
+        }
+        for knobs in [
+            workflow::ModelKnobs { effort: "max", context: "" },
+            workflow::ModelKnobs { effort: "low", context: "1m" },
+        ] {
+            let line = reg.build_agent_command_ex(
+                "claude", "opus", knobs, true, cfg, Some(hooks), gdir, wd, None, false,
+                containment, &p,
+            );
+            let argv_form = reg.build_agent_argv_ex(
+                "claude", "opus", knobs, true, cfg, Some(hooks), gdir, wd, None, false,
+                containment, &p,
+            );
+            for (form, tokens) in [("command", shell_tokenize(&line)), ("argv", argv_form)] {
+                let allowed = claude_allowed_tools_values(&tokens);
+                for w in &want {
+                    assert!(
+                        allowed.iter().any(|t| t == w),
+                        "#610/#687: {w:?} is missing from the {form} form's --allowedTools value \
+                         list for {containment:?} with {knobs:?} — a flag was emitted BETWEEN the \
+                         flag and its values, which terminates the list. Seen: {allowed:?}\n  \
+                         line: {line}"
+                    );
+                }
+                assert!(
+                    !allowed.iter().any(|t| t == knobs.effort),
+                    "the effort LEVEL must never land inside the allow list as a stray \
+                     positional: {allowed:?}\n  line: {line}"
+                );
+            }
+        }
+    }
 }

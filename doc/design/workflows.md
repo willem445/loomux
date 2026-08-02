@@ -85,11 +85,13 @@ inert text or a choice from a value set loomux already ships:
 | `kind` | select one of 4 classes | closed enum; unknown values are **rejected**, not coerced (see below) |
 | `cli` | select `claude` \| `copilot` \| `gemini` | validated against `SUPPORTED_CLIS` at parse *and* at spawn — and, since #267, against `CLI_CAPS`: a CLI that cannot enforce the class's containment tier is refused at both ends too |
 | `model` | name a model | `sanitize_model` — the pre-existing allowlist filter |
+| `effort` | select a thinking level | closed enum (`low`/`medium`/`high`/`xhigh`/`max`); rejected outright if it isn't in the vocabulary, **and** if the block's `cli:` has no `effort_levels` in `CLI_CAPS` |
+| `context` | select a context window | closed enum (`1m`); same two-stage check. Composed into the model alias (`sonnet[1m]`) at emit, never stored in `model:` — `sanitize_model` strips brackets, so a `sonnet[1m]` written as a model id would silently become `sonnet1m` |
 | `prompt` | free text | inert; sanitized, then delivered as a persona **addendum**, never as a replacement for the loomux contract |
 | `profile` | name a repo file | confined to the repo (no `..`, no absolute path, no drive prefix) |
 | `allow` | add tool patterns | **banned outright on a read-only class** (see below); inert for the rest — deny beats allow on both CLIs, so it can never re-grant what a class's tier denies |
 | `id` | name the block | reserved: the four class names may only be used by their own class, so no block can hijack another's contract file |
-| *(on a `kind: orchestrator` block)* | pin `cli` / `model` only | `prompt:`/`profile:`/`allow:` are a **parse error** — the trust root is not a repo-writable surface (see below) |
+| *(on a `kind: orchestrator` block)* | pin `cli` / `model` / `effort` / `context` only | `prompt:`/`profile:`/`allow:` are a **parse error** — the trust root is not a repo-writable surface (see below) |
 | — | grant write access | **no spelling exists.** No `read_only:`, no fifth class, no capability key of any kind |
 
 `deny_unknown_fields` on the wire types is what makes that last row true: a
@@ -118,10 +120,20 @@ to be in `call_tool`. `mcp_spawn_refuses_kind_orchestrator` pins it.
 
 ### The orchestrator block is loomux-owned
 
-A repo may pin the orchestrator's `cli` and `model`. It may **not** author its
-`prompt:`/`profile:`, and may not give it `allow:`. Both are parse errors, and
-both are dropped-and-audited if they arrive from a hand-edited `group.json` that
-never met the parser.
+A repo may pin the orchestrator's `cli`, `model`, `effort` and `context`. It may
+**not** author its `prompt:`/`profile:`, and may not give it `allow:`. Both are
+parse errors, and both are dropped-and-audited if they arrive from a hand-edited
+`group.json` that never met the parser.
+
+The pin list is not a list of "harmless-looking keys"; it is exactly **the picks
+from a value set loomux already ships**, which is why #687's two knobs joined it
+and why nothing else can. A closed-enum thinking level authors no text and
+pre-approves no tool, so it opens no seam of the kind the paragraph below is
+about: the worst a hostile repo buys is an orchestrator that thinks harder or
+holds more context — and the human is shown the resolved value for every block
+in the launcher's roster preview, before the toggle that reads the file at all.
+The test of a candidate key is therefore not "is it small?" but "can its value
+carry text the trust root will act on?" — `prompt:` can, `effort: xhigh` cannot.
 
 This one is not a capability argument, and it is worth being clear about that:
 the orchestrator already holds every tool, so a repo-authored prompt grants it
