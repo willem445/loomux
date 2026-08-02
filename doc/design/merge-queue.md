@@ -237,6 +237,29 @@ this the hard way; `mod.rs::recover_persisted_queue:31532` is the shape to mirro
      applied to a ref instead of a gate — verify at mint, and re-verify *inside the operation
      that writes*.
 
+     **"Create-only" is a named primitive, not a property a plain push has.** A plain
+     `git push origin <sha>:refs/heads/loomux/mq/<id>` does **not** provide it: if the leaked
+     ref happens to be an **ancestor** of the new scratch, the push is a fast-forward and
+     succeeds **silently** — verified empirically in review of this note, and it is the exact
+     case the collision check is for, since a leaked scratch built on an older head of the same
+     target is a plausible ancestor rather than an unrelated object. Non-fast-forward rejection
+     is therefore not the guarantee; it only catches the *divergent* half of the failure. Use
+     one of:
+
+     - `git push --force-with-lease=refs/heads/loomux/mq/<id>: origin <sha>:refs/heads/loomux/mq/<id>`
+       — the **empty** expect value after the colon means "expect this ref not to exist", so
+       the push is rejected outright if it does. Note the trailing colon is the whole
+       mechanism; dropping it turns the lease into an ordinary force push, which is the
+       opposite of what is wanted.
+     - or `POST /repos/{owner}/{repo}/git/refs`, which is server-side create-only and returns
+       **422** when the ref already exists.
+
+     **Slice D asserts this at the argv level** — a test on the exact argument vector handed to
+     `git`/`gh`, not on the resulting ref — because every way of getting this wrong degrades to
+     a *silently successful* ordinary push, and an outcome-only test ("did the ref end up at the
+     right SHA?") passes in exactly the cases this bullet exists to prevent. Same posture §7.5
+     takes on the landing refspec, and for the same reason.
+
   **Why not a persisted counter** (which constraint 2 would permit — it forbids getrandom
   crates, not counters): a counter's non-reuse guarantee is scoped to **loomux's own record**,
   while the object at risk lives on the **remote**. A counter is silently defeated by a leaked
@@ -546,7 +569,7 @@ Every row below is a designed path, an audit event (§11), and a test.
 | Gate re-check fails at landing | Landing refused, that entry kicks back, survivors requeue (§6). |
 | Crash mid-batch | Reconcile from `merge_queue.json`: verify the scratch ref exists, the draft PR is open, and the target head matches. Resume only if the world matches; otherwise fail entries **loudly**. Never drop silently (§4). |
 | Entry cancelled while `batching`/`ci-wait` | The in-flight batch is abandoned and rebuilt without it; cleanup runs. |
-| Scratch ref already exists at mint (leaked from a crashed earlier batch) | Refuse to mint on that name; re-mint, bounded at 3 attempts, then fail the batch loudly (`mq-scratch-collision`). The existing ref is **never** deleted to make room. The push is create-only, so the check has no TOCTOU window (§4). |
+| Scratch ref already exists at mint (leaked from a crashed earlier batch) | Refuse to mint on that name; re-mint, bounded at 3 attempts, then fail the batch loudly (`mq-scratch-collision`). The existing ref is **never** deleted to make room. The push is create-only — `--force-with-lease=<ref>:` with an empty expect, or `POST /git/refs`'s 422; a *plain* push would fast-forward onto a descendant leaked ref silently — so the check has no TOCTOU window (§4). |
 | Queue grows without bound | Entries are capped (`64`); enqueue past the cap is refused with a stated reason, keeping `merge_queue.json` bounded. |
 
 **Cleanup runs on every exit path** — green, red, conflict, timeout, cancel, crash-reconcile,
