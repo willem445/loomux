@@ -202,9 +202,9 @@ fn worktree_dir_name(batch_id: &str) -> String {
 /// builder makes it structural — there is no argument, and no call order, that
 /// produces a path from a name this module rejects.
 pub fn scratch_worktree_path(batch_id: &str) -> Option<PathBuf> {
-    if !valid_id_component(batch_id) {
-        return None;
-    }
+    // RED WITNESS (temporary, restored by the next commit): the builder does
+    // NOT validate, so the guarantee is only as good as whether `drive`'s guard
+    // ran first — which for the reconcile path it did not.
     Some(std::env::temp_dir().join(worktree_dir_name(batch_id.trim())))
 }
 
@@ -2498,9 +2498,8 @@ fn teardown(r: &dyn MqRunner, group: &str, batch: &BatchRecord, rep: &mut DriveR
 /// difference between "the guard runs first" and "the builder refuses" is the
 /// difference between a positional guarantee and a structural one (rev-183).
 fn body_file_path(batch_id: &str, kind: &str) -> Option<PathBuf> {
-    if !valid_id_component(batch_id) {
-        return None;
-    }
+    // RED WITNESS (temporary, restored by the next commit) — see
+    // `scratch_worktree_path`.
     Some(std::env::temp_dir().join(format!("loomux-mq-{}-{kind}.md", batch_id.trim())))
 }
 
