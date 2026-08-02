@@ -112,9 +112,15 @@ impl OutputCoalescer {
     ///
     /// Never hands back more than `max_batch`: a chunk can push the buffer
     /// past the cap in one go, and the cap is a promise about the SIZE OF AN
-    /// EVENT, not a threshold to notice afterwards. Whatever is left over is
-    /// still over the cap, so it is due again at this same instant — callers
-    /// drain in a loop (see `pty_output_pump`).
+    /// EVENT, not a threshold to notice afterwards.
+    ///
+    /// **`None` does not mean the buffer is empty**, and a caller that treats
+    /// it that way loses data. An over-cap buffer comes out in cap-sized
+    /// pieces, each of which is due at the same instant — but the LAST piece
+    /// is sub-cap by definition, and it is `min_interval_ms` away, not due
+    /// now. So a drain loop ends on `pending() == 0`, and what schedules that
+    /// final piece is `wait_ms` (see `pty_output_pump`, and the review finding
+    /// on PR #714 that this doc originally got wrong).
     pub fn take_due(&mut self, now_ms: u64) -> Option<Vec<u8>> {
         if !self.due(now_ms) {
             return None;
@@ -205,20 +211,28 @@ pub fn pty_output_pump_with<F: FnMut(Vec<u8>)>(
             Ok(chunk) => co.push(&chunk),
             Err(_) => break,
         }
+        // Stay in this loop until NOTHING is held back. The condition is
+        // `pending() == 0`, never "take_due said no": a buffer pushed past the
+        // cap comes out in cap-sized pieces, and the LAST piece is by
+        // definition sub-cap, so `take_due` refuses it at this instant and the
+        // window has to schedule it. Breaking on that `None` sent the loop back
+        // to the untimed `rx.recv()` below and stranded the remainder until the
+        // pane happened to produce more output — i.e. forever for the very
+        // common "big burst, then quiet" shape (review finding on PR #714).
         loop {
             let now = now_ms();
             if let Some(batch) = co.take_due(now) {
                 emit(batch);
-                // A batch that ran past the cap comes out in cap-sized pieces:
-                // each `take_due` hands over at most one, and the remainder is
-                // still over the cap, so it is due at this same instant.
-                while let Some(more) = co.take_due(now) {
-                    emit(more);
-                }
+                // Re-check rather than fall through to the wait: while the
+                // remainder is still at or over the cap it is due right now.
+                continue;
+            }
+            if co.pending() == 0 {
                 break;
             }
-            // `wait_ms` is Some(>0) here: the buffer is non-empty (we just
-            // pushed) and not due (take_due said so).
+            // `wait_ms` is Some(>0) here: the buffer is non-empty (checked
+            // just above) and not due (take_due said so), and `wait_ms`
+            // returns 0 only when it IS due — so this can never spin.
             let wait = co.wait_ms(now).unwrap_or(0);
             match rx.recv_timeout(Duration::from_millis(wait)) {
                 Ok(chunk) => co.push(&chunk),
@@ -373,6 +387,25 @@ mod tests {
             sizes.push(b.len());
         }
         assert_eq!(sizes, vec![1024, 1024, 1024, 1024]);
+        assert_eq!(co.pending(), 0);
+    }
+
+    /// The invariant the pump's drain loop stands on, and the one this
+    /// module's doc originally got wrong (review finding on PR #714): an
+    /// over-cap buffer's LAST piece is sub-cap, so `take_due` refuses it at
+    /// that instant while `pending()` is still non-zero. A caller that read
+    /// `None` as "nothing left" would strand exactly that tail.
+    #[test]
+    fn take_due_returning_none_does_not_mean_the_buffer_is_empty() {
+        let mut co = OutputCoalescer::new(W, 1024);
+        co.push(&[b'q'; 2500]);
+        assert_eq!(co.take_due(0).map(|b| b.len()), Some(1024));
+        assert_eq!(co.take_due(0).map(|b| b.len()), Some(1024));
+        assert_eq!(co.take_due(0), None, "the 452-byte tail is not due at this instant");
+        assert_eq!(co.pending(), 452, "but it is still held, not gone");
+        // The window is what releases it — nothing else will.
+        assert_eq!(co.wait_ms(0), Some(W));
+        assert_eq!(co.take_due(W).map(|b| b.len()), Some(452));
         assert_eq!(co.pending(), 0);
     }
 
