@@ -14850,7 +14850,15 @@ fn run_queue_drainer(
                 // unsubmitted text with no signal at all (mitigated only by
                 // the next delivery's own stranded-text flush eventually
                 // submitting it — never guaranteed to be loud about it).
-                if let Err(_queue_full) = reg.enqueue_stranded_front(&group, &front.agent_id, &front.from, pty_id) {
+                // #560: `reason` is this arm's own binding — the gate that
+                // actually declined the Enter, `BoxOccupied` as readily as
+                // `Question` since #532 — and it is what the marker is
+                // recorded under. It is the same value the notice above was
+                // already sent with; the audit line simply stopped disagreeing
+                // with the notice about one event.
+                if let Err(_queue_full) =
+                    reg.enqueue_stranded_front(&group, &front.agent_id, &front.from, pty_id, reason)
+                {
                     // #533-A: the marker that failed to push stood for the
                     // WHOLE batch that was pasted, so the count names every
                     // delivery left pasted-but-unsubmitted — saying "1" here
@@ -30316,13 +30324,36 @@ impl OrchRegistry {
     /// the only entry) or non-empty (the drainer converting the item it's
     /// mid-replaying). Bounded by the SAME cap as a text enqueue — a marker
     /// still occupies a queue slot.
+    ///
+    /// **`reason` is the abort's, and there are two of them (#560).** The
+    /// caller is `run_queue_drainer`'s `DeliverOutcome::AbortedPreEnter(reason)`
+    /// arm, and since #532 that reason is `BoxOccupied` as often as it is
+    /// `Question` — the pre-Enter gate has two causes. This took no reason at
+    /// all and recorded `question` for both, so a marker left by a human's
+    /// half-typed line was audited as a dialog that was never on screen: the
+    /// same false claim #560 fixes one call site over, reached by dropping the
+    /// information rather than by hardcoding over it. Both reasons are honest
+    /// as they stand (see `EnqueueReason::BoxOccupied`'s doc, amended for the
+    /// pre-Enter case), so this needs no new variant — only the parameter.
     #[doc(hidden)] // pub for integration tests
-    pub fn enqueue_stranded_front(&self, group: &str, agent_id: &str, from: &str, pty_id: u32) -> Result<(), String> {
+    pub fn enqueue_stranded_front(
+        &self,
+        group: &str,
+        agent_id: &str,
+        from: &str,
+        pty_id: u32,
+        reason: queue::EnqueueReason,
+    ) -> Result<(), String> {
         self.recover_persisted_queue(group); // before an id is minted — see `enqueue_text`
         let target = self.durable_target(agent_id);
         let pushed = self.queues.mutate(group, self, |queues| {
             let q = queues.entry(pty_id).or_default();
-            let pushed = self.push_stranded_front_locked(q, agent_id, from, group, &target);
+            // #560: the abort's own reason, forwarded — the marker is the
+            // remainder of the delivery the pre-Enter gate declined, and which
+            // of that gate's two causes declined it is the whole of what this
+            // line records.
+            let pushed =
+                self.push_stranded_front_locked(q, agent_id, from, group, &target, reason);
             // A refused push (the pane is at cap) leaves the queue exactly
             // as it was — see `QueueDirty::nothing_persisted` for why the
             // `entry().or_default()` above does not count either.
@@ -30333,7 +30364,7 @@ impl OrchRegistry {
             };
             (pushed, dirty)
         });
-        let out = self.audit_stranded_push(group, agent_id, pushed).map(|_id| ());
+        let out = self.audit_stranded_push(group, agent_id, pushed, reason).map(|_id| ());
         // #563: either the marker took a slot (depth up) or it was refused at
         // cap — both are capacity facts, and the refusal is the one that
         // leaves pasted-but-unsubmitted text in the pane with nothing queued
@@ -30358,6 +30389,14 @@ impl OrchRegistry {
     /// re-derivation dropped. It no longer is: both callers reach this from
     /// inside a `QueueMap::mutate` closure, so the write follows the
     /// mutation whether or not either caller remembers it exists.
+    ///
+    /// **`reason` is the caller's, never this function's (#560).** It shipped
+    /// hardcoding `EnqueueReason::Question`, which is true of the drainer's
+    /// push — a pre-Enter question really did decline that Enter — and false
+    /// of `admit_stranded_selfheal`'s, whose trigger is a pane that went QUIET
+    /// with our text stranded in it. A shared helper cannot know which, so it
+    /// no longer guesses: same mislabel, and same fix, as `AbortedPreEnter`
+    /// carrying its own reason since #532 rev-12 NB1.
     fn push_stranded_front_locked(
         &self,
         q: &mut VecDeque<queue::QueuedDelivery>,
@@ -30365,6 +30404,7 @@ impl OrchRegistry {
         from: &str,
         group: &str,
         target: &DurableTarget,
+        reason: queue::EnqueueReason,
     ) -> Result<(u64, usize), usize> {
         if q.len() >= queue::QUEUE_MAX_PER_PANE {
             return Err(q.len());
@@ -30373,7 +30413,7 @@ impl OrchRegistry {
         q.push_front(queue::QueuedDelivery {
             id, agent_id: agent_id.to_string(), from: from.to_string(),
             payload: queue::QueuedPayload::StrandedSubmit,
-            reason: queue::EnqueueReason::Question, enqueued_ms: now_ms(), coalesced: 0,
+            reason, enqueued_ms: now_ms(), coalesced: 0,
             // Stamped like any other entry even though a marker can never
             // be REPLAYED after a restart (`queue::split_recovered`): the
             // recovery path still has to name which group's snapshot it came
@@ -30394,11 +30434,22 @@ impl OrchRegistry {
 
     /// The audit tail shared by both marker-push call sites — run AFTER the
     /// `queues` lock is released, never under it.
+    ///
+    /// `reason` is the one the push was admitted under, and is echoed rather
+    /// than re-decided here (#560): this function writes the `delivery-queued`
+    /// line a human greps to reconstruct a wedge, and a second hardcoded
+    /// `"question"` at the point of RECORDING would put the lie back the
+    /// threading through `push_stranded_front_locked` just took out. The
+    /// refusal line's `blocked_reason` takes it for the same reason — a
+    /// marker refused at cap leaves text pasted in a pane with nothing to
+    /// submit it, and which trigger got that far is the first thing the reader
+    /// of that line needs.
     fn audit_stranded_push(
         &self,
         group: &str,
         agent_id: &str,
         pushed: Result<(u64, usize), usize>,
+        reason: queue::EnqueueReason,
     ) -> Result<u64, String> {
         match pushed {
             Err(depth) => {
@@ -30411,11 +30462,11 @@ impl OrchRegistry {
                     "payload": "stranded-submit",
                     "consequence": "text is pasted in the pane with nothing queued to submit it",
                 }));
-                Err(queue::queue_full_error(agent_id, depth, "question"))
+                Err(queue::queue_full_error(agent_id, depth, reason.as_str()))
             }
             Ok((id, depth)) => {
                 self.audit(group, "loomux", "delivery-queued", json!({
-                    "to": agent_id, "id": id, "reason": "question",
+                    "to": agent_id, "id": id, "reason": reason.as_str(),
                     "depth": depth, "marker": "stranded-submit",
                 }));
                 Ok(id)
@@ -30486,7 +30537,13 @@ impl OrchRegistry {
                 Some(reason) => (Admission::Declined(reason), queuestate::QueueDirty::nothing_persisted()),
                 None => {
                     let q = queues.entry(pty_id).or_default();
-                    let pushed = self.push_stranded_front_locked(q, agent_id, from, group, &target);
+                    // #560: the self-heal's own reason. Nothing is on screen
+                    // here — the trigger is a QUIET pane holding our stranded
+                    // text — so the `Question` this shared helper used to
+                    // hardcode sent a human reading `audit.jsonl` looking for a
+                    // dialog that never existed.
+                    let pushed = self.push_stranded_front_locked(
+                        q, agent_id, from, group, &target, queue::EnqueueReason::StrandedSelfHeal);
                     let dirty = if pushed.is_ok() {
                         queuestate::QueueDirty::snapshot()
                     } else {
@@ -30507,7 +30564,8 @@ impl OrchRegistry {
                 // whose capacity state most needs reporting, and an early
                 // return would skip it.
                 self.note_queue_capacity(group, pty_id, Some(agent_id));
-                self.audit_stranded_push(group, agent_id, pushed)?;
+                self.audit_stranded_push(
+                    group, agent_id, pushed, queue::EnqueueReason::StrandedSelfHeal)?;
                 self.audit(group, "loomux", "stranded-selfheal-submit",
                     json!({ "to": agent_id, "via": "queue-front-marker" }));
                 Ok(true)

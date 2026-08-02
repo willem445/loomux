@@ -94,10 +94,47 @@ pub const QUEUE_STILL_QUEUED_NOTICE_AFTER: Duration = Duration::from_secs(30 * 6
 
 /// Why an entry entered the queue — carried into the audit line and (for
 /// the two hold-cap reasons) the sender-facing notice.
+///
+/// **This is a persisted vocabulary, so adding a variant is a format change
+/// in both directions (#560).** It is a field of [`QueuedDelivery`], which IS
+/// the on-disk record (#468), and both directions have an answer that is a
+/// decision rather than an accident:
+///
+/// - **New build, OLD snapshot** — every variant that has ever been written
+///   is still spelled here, so an older `queue.json` parses unchanged. A
+///   variant is only ever ADDED; renaming or removing one would strand the
+///   entries already on disk carrying it, which is why `as_str` and the serde
+///   `kebab-case` rename must keep agreeing (the audit log and the snapshot
+///   are read side by side, and a reason that reads differently in the two is
+///   a reason a human cannot grep for — see [`STRANDED_ORPHAN_REASON`] for
+///   what that costs).
+/// - **OLD build, NEW snapshot** — the old build has no such variant, so
+///   `parse_snapshot`'s per-entry tolerance skips exactly that entry and
+///   counts it in `skipped` (audited by the caller), leaving every sibling
+///   entry intact. That is the same downgrade shape [`QueuedDelivery`]'s
+///   `#[serde(default)]` fields take, minus the default: an unknown *variant*
+///   has no safe value to fall back to, and inventing one (`#[serde(other)]`
+///   → some existing reason) would make a downgrade SILENTLY MISLABEL an
+///   entry — precisely the false audit claim this enum exists to prevent. A
+///   visible skip beats an invisible lie. For [`EnqueueReason::
+///   StrandedSelfHeal`] specifically the loss is nil in practice: it only
+///   ever rides a `StrandedSubmit` marker, which no build replays across a
+///   restart anyway (`split_recovered`) — the older build drops it one line
+///   earlier, as a skip rather than as an unreplayable marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EnqueueReason {
-    /// The pre-paste box-occupied hold (#111) capped out — nothing pasted.
+    /// A box-occupied hold gave way to the human's own content: either the
+    /// pre-paste hold (#111) capped out with nothing pasted, or — since #532 —
+    /// the pre-Enter occupancy gate declined the Enter with the text already
+    /// in the box, leaving a `StrandedSubmit` marker to press it later.
+    ///
+    /// The second half of that sentence is #560's: this variant read
+    /// "pre-paste … nothing pasted" while `AbortedPreEnter` had been carrying
+    /// it since #532, and the marker push then recorded `Question` for it
+    /// anyway. Both facts a reader needs — a human's line is in the box, and
+    /// the delivery is past its paste — are true of one reason, so this stays
+    /// ONE variant; what was missing was letting it reach the record.
     BoxOccupied,
     /// A pre-paste or pre-Enter interactive-question hold (#420) capped out.
     Question,
@@ -169,6 +206,29 @@ pub enum EnqueueReason {
     /// and a second resume that finds the headroom still occupied is refused
     /// like anything else.
     PauseLossNotice,
+    /// #560: a `StrandedSubmit` marker pushed by #496's self-heal — loomux
+    /// noticed by itself that a delivery's text is sitting unsubmitted in a
+    /// pane's box and queued the Enter press that rescues it
+    /// (`admit_stranded_selfheal`).
+    ///
+    /// **Why it exists, which is the whole of this variant's value.** Both
+    /// marker pushes go through `push_stranded_front_locked`, which hardcoded
+    /// `Question` for all of them — true of the drainer's push (the pre-Enter
+    /// question gate really did decline the Enter, and the marker is the
+    /// remainder of that delivery) and FALSE of this one, where nothing is on
+    /// screen at all: the trigger is a pane that has gone QUIET with our text
+    /// stranded in its box, which is the opposite reading. So a self-heal's
+    /// `delivery-queued` line claimed `question`, and a human reconstructing a
+    /// wedge from `audit.jsonl` — the only record of a write loomux made on its
+    /// own initiative — was told to go look for a dialog that was never there.
+    /// Same class as the mislabel `AbortedPreEnter`'s own reason (#532 rev-12
+    /// NB1) and `write_admission_badges_the_gate_that_actually_blocked` exist
+    /// to prevent, on the one path that had no variant to be honest WITH.
+    ///
+    /// Audit-only, deliberately: it names why the marker was queued, never how
+    /// the marker drains (that is `drain_stranded_submit`'s press, identical
+    /// for both pushes) and never a notice — see `queued_notice` below.
+    StrandedSelfHeal,
 }
 
 impl EnqueueReason {
@@ -183,7 +243,8 @@ impl EnqueueReason {
             | EnqueueReason::Arrival
             | EnqueueReason::KickoffRecovery
             | EnqueueReason::Recovered
-            | EnqueueReason::GroupPaused => 0,
+            | EnqueueReason::GroupPaused
+            | EnqueueReason::StrandedSelfHeal => 0,
         }
     }
 }
@@ -204,6 +265,7 @@ impl EnqueueReason {
             EnqueueReason::Recovered => "recovered",
             EnqueueReason::GroupPaused => "group-paused",
             EnqueueReason::PauseLossNotice => "pause-loss-notice",
+            EnqueueReason::StrandedSelfHeal => "stranded-self-heal",
         }
     }
 }
@@ -462,6 +524,16 @@ pub fn queued_notice(agent_id: &str, reason: EnqueueReason) -> String {
         // something, never a delivery whose sender is waiting to hear it was
         // queued.
         EnqueueReason::PauseLossNotice => "it reports what a pause lost",
+        // #560: also unreachable, and for a structural reason rather than a
+        // convention — this reason only ever sits on a `StrandedSubmit`
+        // marker, and no marker's own `reason` field is ever handed to this
+        // function. The drainer notifies from the reason the ABORT carried
+        // (`DeliverOutcome::AbortedPrePaste`/`AbortedPreEnter`), which is a
+        // fact about the gate that just declined, not about the entry it is
+        // looking at. Spelled out for the same compile-time reason as
+        // `Recovered` above: the next variant added to this enum must be
+        // decided here rather than defaulted.
+        EnqueueReason::StrandedSelfHeal => "loomux is re-submitting text left in the box",
     };
     format!(
         "[loomux] delivery to {agent_id} queued ({why}) — delivers automatically once clear; do NOT re-send"
@@ -1577,6 +1649,7 @@ mod tests {
             EnqueueReason::KickoffRecovery,
             EnqueueReason::Recovered,
             EnqueueReason::GroupPaused,
+            EnqueueReason::StrandedSelfHeal,
         ] {
             assert_eq!(
                 admit(&q, "one-more", ordinary),

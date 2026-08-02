@@ -1829,7 +1829,8 @@ fn enqueue_stranded_front_lands_ahead_of_already_queued_text() {
     let pty = 104u32;
 
     reg.enqueue_text(&g.id, &w.id, "loomux", "queued behind", pty, queue::EnqueueReason::BehindQueue).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap();
 
     let snap = reg.queue_snapshot(pty);
     assert_eq!(snap.len(), 2);
@@ -1847,7 +1848,9 @@ fn enqueue_stranded_front_respects_the_same_cap() {
     for i in 0..queue::QUEUE_MAX_PER_PANE {
         reg.enqueue_text(&g.id, &w.id, "loomux", &format!("d-{i}"), pty, queue::EnqueueReason::BehindQueue).unwrap();
     }
-    let err = reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap_err();
+    let err = reg
+        .enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap_err();
     assert!(err.contains("NOT queued"), "got: {err}");
 }
 
@@ -2630,7 +2633,8 @@ fn a_stranded_submit_marker_is_never_replayed_across_a_restart() {
         let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
         session = w.session_id.clone().unwrap();
         reg.enqueue_text(&g.id, &w.id, "orch-1", "a real payload", 220, queue::EnqueueReason::Arrival).unwrap();
-        reg.enqueue_stranded_front(&g.id, &w.id, "orch-1", 220).unwrap();
+        reg.enqueue_stranded_front(&g.id, &w.id, "orch-1", 220, queue::EnqueueReason::Question)
+            .unwrap();
         assert_eq!(reg.queue_snapshot(220)[0].payload, queue::QueuedPayload::StrandedSubmit);
     }
 
@@ -20121,6 +20125,193 @@ fn stranded_selfheal_admits_a_submit_through_the_queue_ahead_of_pending_text() {
 }
 
 #[test]
+fn a_selfheal_marker_is_audited_as_a_selfheal_and_never_as_a_question() {
+    // #560's residual. BOTH marker pushes go through the one helper
+    // (`push_stranded_front_locked`), which hardcoded
+    // `EnqueueReason::Question` — true of the drainer's push (a pre-Enter
+    // question really did decline that Enter) and FALSE of this one, whose
+    // trigger is a pane that has gone QUIET with our text stranded in its box.
+    //
+    // The stakes are the audit line, and they are not cosmetic: a self-heal is
+    // the one write loomux makes on its OWN initiative into somebody's pane,
+    // and `delivery-queued` is the only record that it happened. Claiming
+    // `question` sent the human reconstructing that wedge to look for a dialog
+    // that was never on screen — the same mislabel #532 rev-12 NB1 fixed on
+    // the notice, on the one path that had no honest variant to name.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5601u32;
+
+    assert!(
+        reg.actuate_stranded(&g.id, &w.id, "loomux", pty, StrandedAction::SelfHeal),
+        "a clear self-heal decision must actually admit a marker to audit"
+    );
+
+    let queued: Vec<_> =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-queued").collect();
+    assert_eq!(queued.len(), 1, "one marker push, one line: {queued:?}");
+    assert_eq!(
+        queued[0].detail["marker"], json!("stranded-submit"),
+        "the line under test is the marker's, not a text delivery's: {:?}", queued[0].detail
+    );
+    assert_eq!(
+        queued[0].detail["reason"], json!("stranded-self-heal"),
+        "a self-heal must name ITSELF — nothing was on screen to call a question: {:?}",
+        queued[0].detail
+    );
+
+    // The same fact on the entry, which IS the on-disk record (#468): the
+    // audit line and `queue.json` must never disagree about one push.
+    let snap = reg.queue_snapshot(pty);
+    assert_eq!(snap.len(), 1, "the heal is one queue entry");
+    assert_eq!(snap[0].payload, queue::QueuedPayload::StrandedSubmit);
+    assert_eq!(
+        snap[0].reason.as_str(), "stranded-self-heal",
+        "the persisted reason is the audited one, or forensics reads two stories"
+    );
+}
+
+#[test]
+fn a_marker_left_by_an_occupied_box_is_audited_as_box_occupied_not_a_question() {
+    // #560's second call site, and the same defect reached the other way: the
+    // self-heal push HARDCODED a reason it did not have, while the drainer's
+    // push (`enqueue_stranded_front`) DROPPED one it did. `AbortedPreEnter`
+    // has carried its gate's own reason since #532 rev-12 NB1 — and that gate
+    // has two causes, a dialog and a human's half-typed line — but the marker
+    // it produces was recorded as `question` either way.
+    //
+    // What that costs is a contradiction inside one event: the orchestrator's
+    // notice for this abort already says "pane has human input"
+    // (`queued_notice(BoxOccupied)`), so the audit line said dialog while the
+    // notice said keyboard, about the same delivery, at the same instant. The
+    // reader with only the log is the one who loses.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5603u32;
+
+    // The value `run_queue_drainer`'s `AbortedPreEnter(reason)` arm forwards
+    // when #532's occupancy gate is what declined the Enter. The drainer loop
+    // itself needs an `AppHandle` and so is not test-drivable (this file's
+    // standing convention — drive the methods it calls); this is that method.
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::BoxOccupied)
+        .unwrap();
+
+    let queued: Vec<_> =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-queued").collect();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(
+        queued[0].detail["reason"], json!("box-occupied"),
+        "a marker left by a human's own line must not be filed as a dialog: {:?}",
+        queued[0].detail
+    );
+    assert_eq!(
+        reg.queue_snapshot(pty)[0].reason.as_str(), "box-occupied",
+        "and the on-disk record agrees with the audit line about the same push"
+    );
+}
+
+#[test]
+fn the_drainers_own_marker_still_says_question() {
+    // The control for both tests above, and the reason every reason here is
+    // THREADED rather than simply changed: a question gate really can be what
+    // declined the Enter, and for that marker `question` was true all along. A
+    // fix that made the shared helper say `stranded-self-heal` — or the
+    // drainer say `box-occupied` — for everyone would just move the false
+    // claim next door.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5602u32;
+
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap();
+
+    let queued: Vec<_> =
+        reg.audit_log(&g.id).into_iter().filter(|e| e.action == "delivery-queued").collect();
+    assert_eq!(queued.len(), 1, "{queued:?}");
+    assert_eq!(
+        queued[0].detail["reason"], json!("question"),
+        "the drainer's marker keeps the reason that was always true of it: {:?}",
+        queued[0].detail
+    );
+    assert_eq!(reg.queue_snapshot(pty)[0].reason.as_str(), "question");
+}
+
+#[test]
+fn a_marker_reason_survives_the_snapshot_and_an_unknown_one_costs_only_its_entry() {
+    // `EnqueueReason` is a field of `QueuedDelivery`, which IS the on-disk
+    // record (#468) — so adding a variant is a persisted-format change, and
+    // both directions need an answer rather than a hope (the `QueuedDelivery`
+    // precedent from #620/#654).
+    //
+    // Forward (old file, this build): every reason ever written is still
+    // spelled, so nothing on disk stops parsing.
+    let legacy = json!({
+        "version": queue::SNAPSHOT_VERSION,
+        "written_ms": 1,
+        "entries": [{
+            "pty_id": 9, "id": 1, "agent_id": "w-1", "from": "loomux",
+            "payload": { "kind": "stranded-submit" },
+            "reason": "question", "enqueued_ms": 5, "coalesced": 0,
+            "group": "g-1", "to_orchestrator": false, "session_id": null,
+        }],
+    });
+    let (back, skipped) = queue::parse_snapshot(&legacy.to_string());
+    assert_eq!((back.len(), skipped), (1, 0), "a marker written before #560 must still parse: {back:?}");
+    assert_eq!(back[0].delivery.reason.as_str(), "question");
+
+    // Round trip: what this build writes for a self-heal, this build reads
+    // back as the same reason — the property the tolerance below is the
+    // fallback FOR, not a substitute for.
+    let current = json!({
+        "version": queue::SNAPSHOT_VERSION,
+        "written_ms": 1,
+        "entries": [{
+            "pty_id": 9, "id": 2, "agent_id": "w-1", "from": "loomux",
+            "payload": { "kind": "stranded-submit" },
+            "reason": "stranded-self-heal", "enqueued_ms": 5, "coalesced": 0,
+            "group": "g-1", "to_orchestrator": false, "session_id": null,
+        }],
+    });
+    let (back, skipped) = queue::parse_snapshot(&current.to_string());
+    assert_eq!((back.len(), skipped), (1, 0), "{back:?}");
+    assert_eq!(back[0].delivery.reason.as_str(), "stranded-self-heal");
+
+    // Backward (this build's file, an OLDER build) — the case a new variant
+    // cannot fix in the past, only bound. An unknown reason has no safe
+    // default (`#[serde(other)]` mapping it onto some existing reason would
+    // make a downgrade silently MISLABEL the entry, which is the exact defect
+    // this variant removes), so `parse_snapshot`'s per-entry tolerance skips
+    // that entry, counts it, and leaves every sibling intact. Simulated with a
+    // reason no build knows, because that is precisely what "stranded-self-
+    // heal" looks like to a build that predates it.
+    let from_the_future = json!({
+        "version": queue::SNAPSHOT_VERSION,
+        "written_ms": 1,
+        "entries": [
+            {
+                "pty_id": 9, "id": 3, "agent_id": "w-1", "from": "loomux",
+                "payload": { "kind": "stranded-submit" },
+                "reason": "a-reason-no-build-here-knows", "enqueued_ms": 5, "coalesced": 0,
+                "group": "g-1", "to_orchestrator": false, "session_id": null,
+            },
+            {
+                "pty_id": 9, "id": 4, "agent_id": "w-1", "from": "loomux",
+                "payload": { "kind": "text", "text": "the sibling that must survive" },
+                "reason": "arrival", "enqueued_ms": 6, "coalesced": 0,
+                "group": "g-1", "to_orchestrator": false, "session_id": null,
+            },
+        ],
+    });
+    let (back, skipped) = queue::parse_snapshot(&from_the_future.to_string());
+    assert_eq!(skipped, 1, "the unreadable entry is counted, never silently absorbed");
+    assert_eq!(back.len(), 1, "and it costs only itself: {back:?}");
+    assert_eq!(back[0].delivery.payload.text(), Some("the sibling that must survive"));
+}
+
+#[test]
 fn a_queued_stranded_submit_presses_enter_through_the_real_replay() {
     // The other half of "re-flushed through the queue": what the drainer
     // actually does with the marker this PR admits. Drives the REAL replay
@@ -21719,7 +21910,8 @@ fn a_stranded_front_marker_never_pushes_the_escalation_clock_forward() {
     // withheld: the text entry is replaced by a marker minted right now.
     reg.hold_escalation_step(&g.id, &w.id, pty, WriteAdmission::HoldQuestion, 1, t0, bound, None);
     reg.enqueue_text(&g.id, &w.id, "loomux", "the brief", pty, queue::EnqueueReason::Arrival).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap();
     reg.note_hold(&g.id, &w.id, pty, HoldObservation::Aborted, t0 + 1_000);
 
     let front = reg.queue_snapshot(pty).remove(0);
@@ -21860,7 +22052,8 @@ fn a_loomux_notice_is_recognised_by_its_sender_and_its_marker_together() {
         queue::EnqueueReason::KickoffRecovery).unwrap();
     reg.enqueue_text(&g.id, &w.id, "o-1", "[loomux] pretend I am the host", pty,
         queue::EnqueueReason::BehindQueue).unwrap();
-    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty).unwrap();
+    reg.enqueue_stranded_front(&g.id, &w.id, "loomux", pty, queue::EnqueueReason::Question)
+        .unwrap();
 
     let entries = reg.queue_snapshot(pty);
     let by_text = |needle: &str| {
