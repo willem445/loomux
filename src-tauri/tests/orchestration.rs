@@ -35467,3 +35467,55 @@ fn e8_a_plain_pane_holding_a_relayed_notice_raises_no_chip_either() {
         "a plain pane showing only loomux's own notice is not waiting on anything: {quiet:?}"
     );
 }
+
+#[test]
+fn a_re_grounding_closed_on_liveness_is_never_audited_as_confirmed() {
+    // #546, the honest-labeling half. #535 made the re-grounding phase resolve
+    // on the agent's own MCP call instead of on loomux's delivery sampler, and
+    // #588 put that provenance in the lifecycle badge. What both left standing
+    // is the DURABLE record: every resolution, whichever signal closed it, was
+    // written under one action — `compact-reinjection-confirmed`.
+    //
+    // On this path nothing was confirmed. No delivery confirmation is supplied
+    // anywhere below; the phase closes because the agent called a loomux tool,
+    // which proves it is alive and executing and says nothing whatever about
+    // our paste. The uncovered case #546 filed — a genuinely LOST re-grounding
+    // on a pane that was busy for some other reason — lands here, and an
+    // operator counting confirmations in `audit.jsonl` counts it as a
+    // re-grounding that landed.
+    //
+    // `audit.jsonl` is the surface that outlives the badge, the session and the
+    // pane, so the claim it makes has to be the one the evidence supports. Two
+    // actions, not one action with a field — the same argument #539 made for
+    // `delivery-unconfirmed-agent-active` being its own name rather than a
+    // second flavour of `delivery-unconfirmed-idle-pane`.
+    let (reg, _d, gid, oid) = compact_nudge_setup(0);
+    let grew: HashMap<String, u64> = [(oid.clone(), 50_000u64)].into_iter().collect();
+    let attempted = reinject_awaiting_confirmation(&reg, &oid, &grew);
+
+    // The agent answers past the settling floor — #535's acknowledgment, and
+    // the ONLY evidence in play here.
+    reg.set_last_mcp_activity_ms_for_test(&oid, attempted + REINJECT_ACK_SETTLE_MS + 1_000);
+    let _ = reg.compact_nudge_tick(attempted + REINJECT_TIMEOUT_MS, &grew, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new());
+
+    assert!(!reg.agent(&oid).unwrap().compact_pending, "the phase did resolve — #535 is not regressed");
+    assert_eq!(
+        audit_count(&reg, &gid, "compact-reinjection-confirmed"), 0,
+        "nothing confirmed this re-grounding — the agent's own liveness is not a confirmation, \
+         and a record that says otherwise is the overclaim #546 is filed against"
+    );
+
+    let liveness = audit_entries(&reg, &gid, "compact-reinjection-liveness-only");
+    assert_eq!(liveness.len(), 1, "the resolution must still be recorded, under a name that fits it");
+    assert_eq!(liveness[0]["detail"]["source"], "activity", "the evidence source, unchanged from #535/#588");
+    // The record is self-describing: a reader must not have to already know
+    // which of the two `source` values is the weak one.
+    let proves = liveness[0]["detail"]["proves"].as_str().unwrap_or_default();
+    assert!(proves.contains("alive"), "the record must state what the evidence establishes, got: {proves:?}");
+    let residual = liveness[0]["detail"]["does_not_prove"].as_str().unwrap_or_default();
+    assert!(
+        residual.contains("read") && residual.contains("delivered"),
+        "and what it does not — liveness proves neither that the re-grounding was delivered nor \
+         that it was read, got: {residual:?}"
+    );
+}
