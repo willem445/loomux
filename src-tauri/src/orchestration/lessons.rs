@@ -186,11 +186,40 @@ impl Block<'_> {
 /// module doc's whole point), so a file with no headings, one heading, or
 /// nothing but headings all split without error. Tolerates CRLF because a
 /// heading is detected at its *start* and the title is trimmed at its end.
+///
+/// **Fenced blocks are skipped** (#696 review finding 2). An entry that
+/// *quotes* a `## ` line — a lessons entry about this very format is the
+/// obvious case — would otherwise be split at the quoted line, and eviction
+/// could then keep the far half under a heading the file never declared, or
+/// read a quoted `[pinned]` as a real pin. That is the defect this whole
+/// change exists to remove, so the boundary rule has to survive a file
+/// talking about the boundary rule.
+///
+/// Fence handling is CommonMark's shape, not its letter: three or more
+/// backticks or tildes, indented at most three spaces, closed by a run of the
+/// same character at least as long carrying no info string, and an unclosed
+/// fence runs to the end of the file (as it does in every Markdown renderer).
+/// The nuances left out — an info string containing a backtick, fences inside
+/// list items — cannot change which lines are headings in a file this simple,
+/// and a wrong guess degrades to the pre-#696 behavior for that one file, not
+/// to an error.
 fn split_blocks(text: &str) -> Vec<Block<'_>> {
     let mut starts: Vec<usize> = Vec::new();
     let mut at = 0usize;
+    let mut fence: Option<(char, usize)> = None;
     for line in text.split_inclusive('\n') {
-        if line.starts_with("## ") {
+        let bare = line.trim_end_matches(['\n', '\r']);
+        let undented = bare.trim_start_matches(' ');
+        let marker = if bare.len() - undented.len() <= 3 { fence_marker(undented) } else { None };
+        let inside_fence = fence.is_some();
+        match (fence, marker) {
+            (None, Some((c, n, _))) => fence = Some((c, n)),
+            (Some((open_c, open_n)), Some((c, n, closing))) if c == open_c && n >= open_n && closing => {
+                fence = None
+            }
+            _ => {}
+        }
+        if !inside_fence && line.starts_with("## ") {
             starts.push(at);
         }
         at += line.len();
@@ -213,6 +242,22 @@ fn split_blocks(text: &str) -> Vec<Block<'_>> {
             Block { text: slice, pinned: title.map(|t| t.contains(PIN_MARKER)).unwrap_or(false), title }
         })
         .collect()
+}
+
+/// A code-fence marker at the start of `line`: the fence character, how long
+/// the run is, and whether the rest of the line is empty — which is what
+/// makes a run eligible to *close* an open fence rather than only open one.
+fn fence_marker(line: &str) -> Option<(char, usize, bool)> {
+    let c = line.chars().next()?;
+    if c != '`' && c != '~' {
+        return None;
+    }
+    let run = line.chars().take_while(|&x| x == c).count();
+    if run < 3 {
+        return None;
+    }
+    // `run` counts ASCII fence characters, so it is also the byte offset.
+    Some((c, run, line[run..].trim().is_empty()))
 }
 
 /// Block indices in the order eviction takes them: the preamble first (it is
@@ -289,12 +334,11 @@ fn notice(dropped: &[&str], survivor_cut: bool) -> String {
     let mut list = String::new();
     let mut shown = 0usize;
     for title in dropped {
-        // TEMPORARY MUTATION — #696 finding 1's mutation round. One title per
-        // line, unquoted: the plausible "easier to read" edit the untested
-        // claim was resting on. Reverted in the very next commit; it exists
-        // only so CI shows the new sentinel-shape pin going red for exactly
-        // this regression instead of being asserted to be capable of it.
-        let item = format!("{}{}", if shown == 0 { "" } else { "\n" }, clip(title, TITLE_BYTE_CAP));
+        // Quoted, comma-joined, one line: see this function's doc — a title
+        // on a line of its own could present as a sentinel line, and
+        // `a_sentinel_shaped_heading_cannot_present_as_a_sentinel_line` pins
+        // that rather than trusting the comment.
+        let item = format!("{}\"{}\"", if shown == 0 { "" } else { ", " }, clip(title, TITLE_BYTE_CAP));
         if list.len() + item.len() > limit {
             break;
         }

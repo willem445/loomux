@@ -203,6 +203,16 @@ with none falls back to the byte-suffix cut, and content is never rewritten.
 But it does mean a heading is now load-bearing for *what a kickoff carries*,
 so it is a file-format contract and belongs here:
 
+- **A `## ` line inside a fenced code block is not a boundary.** An entry that
+  *quotes* a heading — an entry about this format is the obvious case, and the
+  user docs quote `## … [pinned]` as an example — stays one entry. Without
+  this the splitter would cut an entry at the line it merely quotes, and
+  eviction could keep the far half under a heading the file never declared,
+  or read a quoted `[pinned]` as a real pin: exactly the defect this design
+  removes, re-introduced by a file that talks about the rule. Fences follow
+  CommonMark's shape (3+ backticks or tildes, ≤3 spaces of indent, closed by
+  a bare run at least as long, unclosed runs to EOF); the nuances left out
+  degrade to "that line is a boundary after all", never to an error.
 - **`[pinned]` in a `## ` heading** (`PIN_MARKER`) moves that entry to the
   back of the eviction order — it survives while newer unpinned entries are
   dropped around it. Position stops deciding whether a safety constraint

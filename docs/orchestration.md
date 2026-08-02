@@ -669,6 +669,8 @@ outgrow that, so what happens at the edge is worth knowing:
 
 - **Whole entries are dropped, oldest first.** The unit is a `## ` heading and its
   body; you never get half an entry, or a body injected under the wrong heading.
+  A `## ` line inside a fenced code block doesn't count — an entry can quote a
+  heading (including this page's `[pinned]` example) without being split in two.
 - **The injection says what it dropped.** The first line names each evicted entry
   by heading, so "the rule about X isn't reaching agents any more" is visible in
   the kickoff instead of being something you find out the hard way.
