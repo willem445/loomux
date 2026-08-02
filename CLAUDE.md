@@ -153,6 +153,12 @@ narrow their ask back down to the original ticket on your own judgment.
   `orchestration`, `pty`, `gitview`, `launcher`, `tasks`, `clipboard`,
   `metrics`, `ui`, `build`, `release`.
 - Branch from `main`; PR to `main`.
+- **Delete a PR's branch once it merges** (human directive, 2026-08-02: the
+  repo had accumulated 96 remote branches). `gh pr merge --delete-branch`
+  handles it — but its remote delete is skipped when a local worktree still
+  holds the branch, so after cleaning the worktree always verify with
+  `git ls-remote --heads origin <branch>` and `git push origin --delete
+  <branch>` if it survived. Whoever performs the merge owns this step.
 - GitHub issues are the work queue. Labels the orchestration workflow uses:
   `agent-managed` (an orchestrator owns it), `agent-ready` (groomed — go),
   `agent-investigation` (research only — post findings as an issue comment,
