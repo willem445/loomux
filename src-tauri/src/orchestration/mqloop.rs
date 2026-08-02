@@ -1058,7 +1058,7 @@ pub mod refusal {
     //
     // The eight above are **policy**: they say the queue considered the request
     // and declined it, and each names something the caller can act on. These
-    // three say loomux itself failed, and conflating the two is the defect this
+    // four say loomux itself failed, and conflating the two is the defect this
     // module otherwise exists to prevent — an orchestrator told `queue-disabled`
     // concludes the repo never opted in and stops, which is precisely the wrong
     // move when the truth is a torn state file. A wrong label does not merely
@@ -1081,12 +1081,21 @@ pub mod refusal {
     /// The group could not be resolved at all. Should never appear in a running
     /// build; if it does, it is a loomux defect, not a queue state.
     pub const QUEUE_UNAVAILABLE: &str = "queue-unavailable";
+    /// The `merge_gate` file is on disk but an I/O error (permissions, a
+    /// transient read failure, non-UTF-8 bytes) kept loomux from reading it —
+    /// **not** [`GATE_NOT_CONFIGURED`] (the file genuinely absent, a policy
+    /// choice) and **not** [`GATE_NOT_MET`] (the file read fine and
+    /// `GateSpec::Malformed` rejected its contents). Collapsing this into
+    /// `gate-not-configured` via `Result::ok()` is the exact defect #681 fixed:
+    /// an orchestrator told "no gate covers this target" has no reason to
+    /// suspect a torn or permission-denied file instead.
+    pub const GATE_UNREADABLE: &str = "gate-unreadable";
 
     /// Whether a refusal string names a **loomux fault** rather than a policy
     /// decision. Exposed so a caller (and a test) can branch on the distinction
     /// without re-listing the strings and getting the list wrong later.
     pub fn is_loomux_fault(reason: &str) -> bool {
-        matches!(reason, STATE_UNREADABLE | STATE_UNWRITABLE | QUEUE_UNAVAILABLE)
+        matches!(reason, STATE_UNREADABLE | STATE_UNWRITABLE | QUEUE_UNAVAILABLE | GATE_UNREADABLE)
     }
 }
 
