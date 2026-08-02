@@ -4667,12 +4667,13 @@ impl ReinjectAck {
     /// neither proves the re-grounding was read; the `LivenessOnly` arm's is
     /// the larger residual #546 filed.
     pub fn does_not_prove(self) -> &'static str {
+        // MUTATION PROBE (b) — NOT FOR MERGE. Returns nothing for either arm:
+        // the record still carries the field, so it still parses, but it states
+        // no residual at all. This is the silent-hollowing failure the PR body
+        // claims the vocabulary test attributes; this branch proves it.
         match self {
-            Self::Delivered =>
-                "that the agent read the re-grounding — no artifact loomux can observe proves that",
-            Self::LivenessOnly =>
-                "that the re-grounding was delivered or read. A genuinely lost paste on an agent \
-                 that is busy for some other reason closes the phase exactly this way",
+            Self::Delivered => "",
+            Self::LivenessOnly => "",
         }
     }
 }
