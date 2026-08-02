@@ -42,7 +42,7 @@ use loomux_lib::orchestration::mqloop::{
     prune_terminal, reconcile_batch, record_batch, requeue_survivors, scratch_worktree_path,
     state_path, status_view, store_state, unverifiable_notice, walk_bisect, worktree_remove_argv,
     BatchBuildError, BatchOutcome, BisectAction, CancelOutcome, DriveConfig, EnqueueOutcome,
-    StateError,
+    StateError, MAX_TERMINAL_RETAINED,
 };
 use loomux_lib::orchestration::mqdriver::{
     classify_checks, cleanup_scratch, close_draft_argv, default_branch_argv, delete_scratch_argv,
@@ -1857,14 +1857,32 @@ fn the_target_is_released_only_when_the_queue_drains() {
     assert!(s.batch.is_none());
     assert_eq!(s.target, "integration", "a live entry holds the target");
 
-    // Everything terminal → released.
+    // Everything terminal → released, and the campaign's corpses go with the
+    // target: both are properties of the work that was in the queue, and a
+    // finished campaign keeps neither (the pane counts `entries`, not just the
+    // live ones — see `a_drained_queue_leaves_no_terminal_entries_behind`).
     advance_entry(&mut s, 613, EntryState::Cancelled).unwrap();
     finish_batch(&mut s);
     assert_eq!(s.target, "", "a drained queue releases its target");
+    assert!(s.entries.is_empty(), "…and leaves no corpses: {:?}", s.entries);
+    assert_eq!(prune_terminal(&mut s), 0, "there is nothing left to prune");
 
-    // Pruning drops only terminal entries, keeping order.
-    assert_eq!(prune_terminal(&mut s), 2);
-    assert!(s.entries.is_empty());
+    // Pruning itself still drops only terminal entries, keeping order — pinned
+    // on a queue that has NOT drained, which is the only place it now has work
+    // to do.
+    let mut live = MergeQueueState {
+        target: "integration".into(),
+        entries: vec![
+            QueueEntry::new(700, HEAD_A, 0),
+            QueueEntry::new(701, HEAD_B, 0),
+            QueueEntry::new(702, HEAD_A, 0),
+        ],
+        ..Default::default()
+    };
+    advance_entry(&mut live, 700, EntryState::Cancelled).unwrap();
+    advance_entry(&mut live, 702, EntryState::Cancelled).unwrap();
+    assert_eq!(prune_terminal(&mut live), 2);
+    assert_eq!(live.entries.iter().map(|e| e.pr).collect::<Vec<_>>(), vec![701]);
 
     // `record_batch` is the one place a batch record is installed.
     record_batch(&mut s, BatchRecord::new("mq-2", vec![700], 0));
@@ -1962,6 +1980,163 @@ fn a_drained_queue_reports_that_it_is_landing_nowhere() {
     assert_eq!(view["entries"], serde_json::json!([]), "a terminal entry is not queued work");
     assert_eq!(view["enabled"], serde_json::json!(true));
     assert!(view.get("batch").is_none(), "no batch record, no batch key");
+}
+
+/// **A drained queue leaves no corpses** — reported live: the pane read
+/// `merge queue · → integration/batch3 · 4 entries` against a queue whose four
+/// entries were all cancelled and whose campaign was over.
+///
+/// Asserted through `mergeqview::project`, not only through `status_view`,
+/// because the two views disagree about terminal entries and **only the second
+/// one was ever clean**: `status_view` filters them (so the MCP tool never
+/// showed this), while `project` renders `state.entries` and reports
+/// `entries_total = state.entries.len()`, which is where the "4 entries" the
+/// human read came from. A fix pinned only at `status_view` would assert the
+/// surface that was already correct.
+#[test]
+fn a_drained_queue_leaves_no_terminal_entries_behind() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+
+    // Four entries against batch-3, every one of them cancelled — the campaign
+    // that wedged the group in the field.
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        entries: (0..4).map(|i| QueueEntry::new(600 + i, HEAD_A, 0)).collect(),
+        ..Default::default()
+    };
+    for i in 0..4 {
+        assert_eq!(
+            cancel(&mut s, 600 + i),
+            CancelOutcome::Cancelled { was: EntryState::Queued }
+        );
+    }
+
+    // The drain took the target AND the corpses with it.
+    assert!(s.entries.is_empty(), "a finished campaign leaves nothing behind: {:?}", s.entries);
+    assert_eq!(s.target, "");
+
+    // The pane the human actually read.
+    let view = loomux_lib::orchestration::mergeqview::project(
+        &serde_json::to_string(&s).expect("state serializes"),
+    );
+    assert_eq!(view["status"], serde_json::json!("ok"));
+    assert_eq!(view["entries_total"], serde_json::json!(0), "the header's count: {view}");
+    assert_eq!(view["entries"], serde_json::json!([]));
+    assert_eq!(view["target"], serde_json::json!(""));
+
+    // …and re-establishing a target starts from an empty queue rather than
+    // inheriting the old campaign's rows.
+    assert_eq!(
+        enqueue(&f, &mut s, 705, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Queued { position: 1 }
+    );
+    assert_eq!(s.target, "integration/batch4");
+    assert_eq!(s.entries.len(), 1, "only the new campaign's entry: {:?}", s.entries);
+}
+
+/// A **live** campaign keeps its corpses — but a bounded number of them.
+///
+/// Zero would drop the one durable row that tells a human *which* PR bounced;
+/// unbounded lets terminal entries push live ones out of `project`'s
+/// `VIEW_ENTRY_LIMIT` window, since it renders in file order and corpses sit at
+/// the front. `MAX_ENTRIES` does not bound this — it counts only non-terminal
+/// entries.
+#[test]
+fn a_live_campaign_bounds_the_corpses_it_keeps() {
+    let f = drain_fake();
+    let gate = one_reviewer_gate();
+
+    // One live entry FIRST — so the queue never drains while the rest are
+    // cancelled, and the release-on-drain path is not what is under test here.
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        entries: std::iter::once(QueueEntry::new(612, HEAD_A, 0))
+            .chain((0..20).map(|i| QueueEntry::new(800 + i, HEAD_A, 0)))
+            .collect(),
+        ..Default::default()
+    };
+    for i in 0..20 {
+        assert_eq!(
+            cancel(&mut s, 800 + i),
+            CancelOutcome::Cancelled { was: EntryState::Queued }
+        );
+    }
+    assert_eq!(s.entries.len(), 21, "612 holds the queue open, so nothing was released");
+    assert_eq!(s.target, "integration/batch3");
+
+    // A cheap refusal writes nothing — the trim happens on the path that was
+    // already rewriting the file, not on every touch.
+    assert_eq!(
+        enqueue(&f, &mut s, 612, None, true, &gate, &verdict_map(HEAD_A, "b"), 0),
+        EnqueueOutcome::Refused { reason: loomux_lib::orchestration::mqloop::refusal::ALREADY_QUEUED },
+        "the live 612 is still queued"
+    );
+    assert_eq!(s.entries.len(), 21, "a cheap refusal leaves the file alone");
+
+    // A real enqueue against the SAME target tidies as it writes.
+    let f2 = drain_fake().gh("pr view 613", 0, &pr_json("integration/batch3", HEAD_B, "b"), "");
+    assert_eq!(
+        enqueue(&f2, &mut s, 613, None, true, &gate, &verdict_map(HEAD_B, "b"), 0),
+        EnqueueOutcome::Queued { position: 2 },
+        "612 and 613 are the live entries; the corpses are not queued work"
+    );
+
+    let terminal: Vec<u64> =
+        s.entries.iter().filter(|e| e.state().is_terminal()).map(|e| e.pr).collect();
+    assert_eq!(terminal.len(), MAX_TERMINAL_RETAINED, "bounded: {terminal:?}");
+    assert_eq!(
+        terminal,
+        (12..20).map(|i| 800 + i).collect::<Vec<u64>>(),
+        "the OLDEST are the ones dropped"
+    );
+    // The live work is still there, and still visible.
+    assert!(s.entries.iter().any(|e| e.pr == 612 && !e.state().is_terminal()));
+    assert!(s.entries.iter().any(|e| e.pr == 613 && !e.state().is_terminal()));
+}
+
+/// **A refused enqueue releases the stale target too** (rev N2).
+///
+/// The release is asked *before* the decision and does not depend on it, so the
+/// first touch of a drained-but-stale queue stops it naming a branch it is not
+/// landing on — rather than leaving that to the next restart's reconcile or to
+/// whichever later enqueue happens to succeed. The refusal here is
+/// constraint 7's (`base-is-default`), which fires before a target could be
+/// established, so nothing writes the target back afterwards.
+#[test]
+fn a_refused_enqueue_still_releases_a_stale_target() {
+    let f = drain_fake().gh("pr view 800", 0, &pr_json("main", HEAD_A, "b"), "");
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        enqueue(&f, &mut s, 800, None, true, &one_reviewer_gate(), &verdict_map(HEAD_A, "b"), 0),
+        EnqueueOutcome::Refused { reason: TargetRefusal::BaseIsDefault.code() },
+        "constraint 7 outranks everything and is unaffected by the release"
+    );
+    assert_eq!(s.target, "", "the queue stops naming a branch it is not landing on");
+    assert_eq!(status_view(&s, true, 7)["target"], serde_json::json!(""));
+
+    // A *disabled* queue is still byte-for-byte untouched (§12) — the release
+    // sits after that refusal, not before it.
+    let mut s = MergeQueueState {
+        version: MERGE_QUEUE_VERSION,
+        target: "integration/batch3".into(),
+        ..Default::default()
+    };
+    let before = s.clone();
+    assert_eq!(
+        enqueue(&f, &mut s, 800, None, false, &one_reviewer_gate(), &verdict_map(HEAD_A, "b"), 0),
+        EnqueueOutcome::Refused {
+            reason: loomux_lib::orchestration::mqloop::refusal::QUEUE_DISABLED
+        }
+    );
+    assert_eq!(s, before, "a repo that never opted in must see no state change at all");
 }
 
 /// The other side of the same rule: **drained means both halves of §4** — no

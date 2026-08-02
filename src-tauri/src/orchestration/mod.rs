@@ -35089,6 +35089,14 @@ impl OrchRegistry {
             }
         };
         let verdicts = self.verdict_map(group, pr);
+        // #710: `enqueue` releases a stale target on a drained queue whatever it
+        // then decides, so even a REFUSED enqueue can be a state change worth
+        // persisting — otherwise `merge_queue_status` keeps naming a branch the
+        // queue is not landing on until the next restart's reconcile. Snapshotted
+        // rather than inferred from the outcome, the same way
+        // `merge_queue_reconcile_with` decides its write: a value comparison
+        // cannot drift out of step with what the callee actually mutates.
+        let before = state.clone();
         let outcome =
             mqloop::enqueue(runner, &mut state, pr, target, enabled, &gate, &verdicts, now_ms());
         match outcome {
@@ -35106,8 +35114,25 @@ impl OrchRegistry {
                 json!({ "queued": true, "position": position })
             }
             mqloop::EnqueueOutcome::Refused { reason } => {
-                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED,
-                    json!({ "pr": pr, "reason": reason }));
+                // Written only when the refusal actually changed something — a
+                // released stale target, today. Unconditionally writing here
+                // would create a `merge_queue.json` for any group whose first
+                // `queue_merge` is refused, which collapses slice F's `absent`
+                // state (`merge_queue_view` distinguishes "never enqueued" from
+                // "empty queue"); a default state is already drained, so the
+                // release is a no-op there and `state == before` holds.
+                let mut detail = json!({ "pr": pr, "reason": reason });
+                if state != before {
+                    if let Err(e) = mqloop::store_state(&dir, &state) {
+                        // The refusal itself stands — it is a decision about this
+                        // PR and nothing about the write changes it. But a
+                        // release that did not reach disk means the queue still
+                        // names a branch it is not landing on, so it is stated in
+                        // the audit rather than lost (no silent failures).
+                        detail["stale_target_not_released"] = Value::from(e);
+                    }
+                }
+                self.audit(group, "loomux", mqdriver::audit_action::ENQUEUE_REFUSED, detail);
                 json!({ "refused": reason })
             }
         }
