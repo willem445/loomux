@@ -662,8 +662,9 @@ impl GateRecheck {
 ///
 /// - **A stale pass is not a pass.** A verdict whose recorded head is not the
 ///   PR's current head does not count — that is `ReviewVerdict::reviewed`, and
-///   `evaluate_merge_gate` already applies it. `head: None` refuses outright
-///   (`UnknownRevision`).
+///   `evaluate_merge_gate` already applies it. An unresolvable head refuses
+///   outright (`UnknownRevision`) — `None`, and an empty or blank string, which
+///   this function normalizes to `None` before anything reads it (rev-157).
 /// - **One `fail` beats any number of passes.** Blockers are checked before any
 ///   counting, whatever the threshold — also already in `evaluate_merge_gate`.
 /// - **The #565 body-digest asymmetry.** Only *live passes* are digest-checked;
@@ -683,6 +684,15 @@ pub fn recheck_gate(
         GateSpec::Malformed => return GateRecheck::Malformed,
         GateSpec::Declared(g) => g,
     };
+    // An empty head is NO head (rev-157). `evaluate_merge_gate` would refuse an
+    // empty string anyway — but only incidentally, because no stored head
+    // equals `""` so every verdict reads *stale*, which is arithmetic about
+    // pass counts rather than a statement about whether the head is usable at
+    // all. Normalizing here makes the refusal this module's own rule, and puts
+    // the head on the same footing as the body digest, which `body_unchanged`
+    // has always filtered the same way. Slice D writes this call site next, so
+    // it is closed before there is a caller to get it wrong.
+    let head = head.filter(|h| !h.trim().is_empty());
     // The reviewer half, from the one definition. Note this is where "a stale
     // pass is not a pass" and "one fail beats any count of passes" live — they
     // are not re-derived here.
