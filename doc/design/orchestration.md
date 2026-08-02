@@ -6947,19 +6947,126 @@ a bind.
   which pops without delegating to `pop_front_dequeued`. Neither inherited a write when the two
   changes were merged; both are in the mutation-site table above and pinned by
   `the_snapshot_tracks_the_coalesced_flush_paths_too`.
-- **Staged orphans are never cleared.** Once staged, an entry stays in `recovered_queue` /
-  `recovered_markers` — and therefore keeps appearing in `queue_orphans` — for the life of the
-  process. There is no "acknowledge" step, deliberately: nothing in the registry can tell whether
-  the orchestrator actually re-sent the work or merely read the row, so an ack would be a claim the
-  code cannot back. The cost is that an orchestrator calling `queue_orphans` twice in one session
-  sees the same rows twice, which is why the tool's own description says to call it once at session
-  start (a restart is the only thing that produces these, so re-polling finds nothing new). The
-  alternative failure — forgetting lost work — is the one this feature exists to prevent.
+- **Staged orphans are never cleared.** Once staged, an entry keeps being reported by
+  `queue_orphans` for the life of the install — it may MOVE off the hot snapshot into the archive
+  (#547, below), but nothing stops reporting it. There is no "acknowledge" step, deliberately:
+  nothing in the registry can tell whether the orchestrator actually re-sent the work or merely read
+  the row, so an ack would be a claim the code cannot back. The cost is that an orchestrator calling
+  `queue_orphans` twice in one session sees the same rows twice, which is why the tool's own
+  description says to call it once at session start (a restart is the only thing that produces
+  these, so re-polling finds nothing new). The alternative failure — forgetting lost work — is the
+  one this feature exists to prevent.
 - **No age cutoff.** #468 asked whether staleness should expire a recovered entry; it does not — the
   same answer #445 gave for the live queue (a queue behind an unanswered question is the designed
   case, not a leak). Instead the staleness *judgement* is handed to whoever can make it:
   `recovered_notice` says how long the backlog waited, and `queue_orphans` reports
   `queued_minutes_ago` per entry.
+
+### Bounding the snapshot write: the staged-orphan archive (#547)
+
+**The cost the two bullets above create.** `queue.json` is rewritten and fsynced on every
+admission, and it carries the staged set as well as the live queues. Staging is never cleared, and
+worker panes do not survive a restart, so every restart permanently adds that restart's unbindable
+backlog: the per-delivery write grows with the age of the install rather than with what is pending.
+Staged payloads are uncapped on disk too — `ORPHAN_TEXT_CAP_BYTES` clamps what `queue_orphans`
+hands back, not what is stored. The "a pane's queue is 8 entries, so the file is a few KB" argument
+that justified whole-file rewriting stopped covering the file once #523 put staging in it.
+
+**The fix is a change of FILE, not of disposition.** Staged entries that no longer belong on the
+hot path move into an append-only `queue-orphans-archive.jsonl` beside `queue.json`. A cap and an
+audited eviction were both considered and both rejected in #547's own filing: the staged set exists
+to report work nobody received, so dropping from it reintroduces one level down the silent loss
+#523 exists to remove, and an eviction the orchestrator only learns about from an audit line is
+still a drop at the moment it matters. So nothing is dropped. Everything rolled is still on disk,
+still surfaced by `queue_orphans` (with `source: "archive"`), still re-admitted by
+`readmit_archived` when its pane binds, and named per entry in the audit
+(`queue-orphan-archived`, carrying id, target, reason, staged age and payload size).
+
+**The policy is three rules, in order** (`queue::plan_archive`, pure over an id/age/bytes
+projection so the decision costs no clone on the hot path):
+
+1. **Age** — staged longer than `STAGED_ARCHIVE_AFTER_MS` (24h). The rebind window is minutes, not
+   days: a pane rebinds in the restore that follows the restart.
+2. **Entry backstop** — `STAGED_HOT_MAX_ENTRIES` (64 = eight full panes), oldest id first.
+3. **Byte backstop** — `STAGED_HOT_MAX_BYTES` (64 KiB of payload), oldest id first.
+
+The two backstops ignore age deliberately. A crash loop stages a fresh backlog every few seconds
+and every entry in it is younger than the window, so a bound with an "unless it is recent"
+exception is not a bound. Rule 3 exists because rule 2 does not bound the WRITE: a queued payload
+is a whole task brief. This is not the age cutoff #468 refused — that would have expired a
+recovered entry; this expires nothing, and the staleness judgement stays with the reader
+(`queued_minutes_ago` survives the move unchanged).
+
+**Ordering, in both directions, is append-then-remove.**
+
+- Rolling off: the archive append is fsynced (`append_durable`) and staging is edited only once it
+  returns `Ok`. A crash or a failed append leaves the entry in BOTH stores, never in neither;
+  `queue::parse_archive` dedupes on delivery id and `queue_orphans` skips an archived id that is
+  still staged, so the duplicate is invisible and self-healing. A failed append audits
+  `queue-archive-failed` and the snapshot simply stays fat — a cost, not a loss.
+- Re-admitting: `enqueue_text` persists the fresh live entry before the archived line is removed,
+  so the same crash leaves a duplicate rather than a hole. Its cost is the double-delivery window
+  #467 already bounds — the replay is byte-identical, so `queue::admit`'s exact-equality coalesce
+  collapses it into the live entry. The rewrite re-reads the file under `queue_persist` rather than
+  writing back what it read minutes earlier, because `archive_staged_overflow` may have appended in
+  between and a stale rewrite would delete those appends.
+
+**The rewrite works over RAW LINES, never over parsed records** (review B1), and that is the
+difference between "nothing is dropped" being a property of the file and being a property of the
+reader's vocabulary. `parse_archive` is deliberately lossy — it skips a line whose version this
+build does not know, because interpreting one would mean guessing at a shape — which is right for
+every path that ACTS on records (the orphan report, the rebind) and fatal for the one that
+REWRITES the file: rebuilding it from parsed output deletes exactly the lines the per-line `v`
+exists to protect. The failure it produced is worth stating, because it is the shape this whole
+section argues against arriving through the mechanism meant to prevent it: a newer build writes
+`v: 2` records, a rollback follows, and the next bind that re-admits anything erases them —
+silently, since the skip count was discarded. So `queue::scan_archive` reads the file as lines,
+each carried through byte for byte, and parsing answers one question only: *is this the record I am
+deliberately removing?* A line that is not JSON at all is carried too — unreadable is not the same
+as unwanted, and a line with no readable id can never be matched, so it can never be removed.
+
+The **`queue_seq` seed reads ids the same raw way**, for the same reason and against the same
+failure: an id sitting on a line this build cannot interpret is still an id in use, and reading it
+through `parse_archive` would make a newer build's record invisible to the very check that exists
+to stop an id being re-minted. The one case that genuinely cannot be accounted for — a line whose
+id is unreadable even as raw JSON, so there is no number to account — is audited
+(`queue-archive-id-unreadable`) rather than left as a silent shortfall, because the consequence of
+a re-minted id is itself silent.
+
+**Archived entries re-bind BEFORE staged ones.** An entry only reaches the archive by being among
+the oldest, ids are monotonic per group, and admission order is delivery order — so re-admitting
+the archive after staging would invert arrival order across the two stores, which is the property
+the N5 id-sort exists to protect.
+
+**The `queue_seq` seed reads the archive too**, and that is load-bearing rather than tidy.
+Archiving takes ids OUT of the snapshot, so a group whose whole staged set has rolled off presents
+an empty file; seeding from it alone would restart the counter at zero and re-mint an id an
+archived orphan still carries. Both consequences of that collision are silent, and they are the two
+the seed was written for: `queue_orphans`'s live-id filter hides a real orphan behind an unrelated
+fresh delivery, and the audit scan reads the new id's `delivery-dequeued` as closing the old id's
+`delivery-queued`. One extra file read, once per group per process, inside the recovery guard.
+
+**Compatibility, both directions, on `QueuedDelivery`'s serde precedent.** Each archive line
+carries its own `v` (per line, not per file — an append-only file outlives the build that wrote its
+older records), `#[serde(default)]`ed so a line written before the field existed still parses, and
+`parse_archive` skips-and-counts a line whose version this build does not know rather than guessing
+at its shape. Downgrading past the archive entirely loses SIGHT of archived entries — such a build
+never opens the file — but destroys nothing: `queue.json` is still a valid, smaller snapshot of the
+same schema, and the audit-derived orphan view still names the ids.
+
+**Archive-era skew — the case the per-line `v` actually exists for — is the one where an older
+build DOES open the file**, and it is handled structurally by the raw-line rule above rather than
+by that build's ability to read what it finds. Skipping a record it cannot interpret and
+*preserving* that record are different obligations; honoring only the first is what review B1
+caught. Both are honored now, so "nothing is dropped" does not depend on the reader understanding
+every record — the only version of that claim worth making about a file designed to outlive the
+build that wrote it.
+
+**What was deliberately NOT done here.** `queue_orphans`'s orphan LIST stays uncapped. It was
+already unbounded before this change (staging accumulated the same way), so capping it is not a
+regression this PR creates, and a cap on that list is a change to the tool's wire shape — the
+`refused` list's own cap (#579) is the precedent for that being owed its own argument, and the
+argument would be about an orchestrator's context budget rather than about disk writes.
 
 **Relationship to #451 — clean composition by construction.** #451 owns everything AFTER Enter
 (acceptance evidence, `Confirmed`/`Pending`/`Failed`, the late-correction notice); this queue owns

@@ -1327,6 +1327,308 @@ pub fn split_recovered(entries: Vec<PersistedEntry>) -> RecoverySplit {
     split
 }
 
+// ---------- the staged-orphan archive (#547) ----------
+
+/// How long a staged orphan stays in the HOT snapshot before it rolls off
+/// into the append-only archive (#547).
+///
+/// **Why an archive at all, and why this is not the age cutoff #468
+/// refused.** `persist_queues` rewrites and fsyncs the WHOLE `queue.json` on
+/// every admission, and since #523 that file carries the staged set as well
+/// as the live queues. Staged entries are deliberately never cleared (see
+/// `OrchRegistry::queue_orphans`), and worker panes do not survive a restart
+/// — so every restart permanently adds that restart's unbindable backlog,
+/// and the per-delivery write cost grows without bound. Rolling the tail into
+/// `queue-orphans-archive.jsonl` moves those bytes off the write path
+/// *without moving them off the recovery path*: `queue_orphans` reads the
+/// archive, `readmit_archived` re-binds out of it, and every roll is audited
+/// per entry. Nothing is dropped, capped away, or inferred to have been
+/// acknowledged — which is what #547 explicitly rules out and what #468's
+/// "no age cutoff" bullet is about. This is a change of *file*, not of
+/// disposition.
+///
+/// 24h because the rebind window is minutes, not days: a pane rebinds when
+/// its session is resumed, which happens in the restore that follows the
+/// restart. A day keeps a full working day of orphans in the file a human
+/// opens first, and still bounds the steady state to one day's restarts
+/// rather than to the life of the install.
+pub const STAGED_ARCHIVE_AFTER_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Hard backstop on how many staged entries stay hot (#547), applied
+/// **regardless of age** — because a bound with an "unless it is recent"
+/// exception is not a bound, and a crash loop stages a fresh backlog every
+/// few seconds. 64 is eight full panes at `QUEUE_MAX_PER_PANE`, so one whole
+/// fleet's worth of one restart's backlog still rides in the hot file.
+pub const STAGED_HOT_MAX_ENTRIES: usize = 64;
+
+/// Hard backstop on staged *payload bytes* kept hot (#547). The entry count
+/// alone does not bound the write, because a queued payload is a whole task
+/// brief and nothing clamps what is STORED — `ORPHAN_TEXT_CAP_BYTES` clamps
+/// only what `queue_orphans` hands back. 64 KiB is ~8 full briefs; past that
+/// the per-admission fsync stops being the "few KB" the snapshot design
+/// assumed.
+pub const STAGED_HOT_MAX_BYTES: usize = 64 * 1024;
+
+/// Why one staged entry rolled off the hot snapshot (#547). Carried in the
+/// archive line and in the `queue-orphan-archived` audit line, because "it
+/// moved" is not enough for a human reconstructing what happened — the three
+/// causes have different follow-ups (a slow leak vs. a burst).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveReason {
+    /// Staged longer than [`STAGED_ARCHIVE_AFTER_MS`].
+    Age,
+    /// The hot set was over [`STAGED_HOT_MAX_ENTRIES`]; this was among the
+    /// oldest.
+    Entries,
+    /// The hot set was over [`STAGED_HOT_MAX_BYTES`]; this was among the
+    /// oldest.
+    Bytes,
+}
+
+impl ArchiveReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArchiveReason::Age => "staged-past-hot-window",
+            ArchiveReason::Entries => "staged-entry-backstop",
+            ArchiveReason::Bytes => "staged-byte-backstop",
+        }
+    }
+}
+
+/// The three numbers the archive decision is made on (#547), so the decision
+/// itself is pure and testable and the caller never has to CLONE the staged
+/// set to ask the question — the whole point is to stop paying per admission
+/// for entries nobody is reading.
+#[derive(Clone, Copy, Debug)]
+pub struct ArchivePolicy {
+    pub max_age_ms: u64,
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for ArchivePolicy {
+    fn default() -> Self {
+        Self {
+            max_age_ms: STAGED_ARCHIVE_AFTER_MS,
+            max_entries: STAGED_HOT_MAX_ENTRIES,
+            max_bytes: STAGED_HOT_MAX_BYTES,
+        }
+    }
+}
+
+/// One staged entry, reduced to what [`plan_archive`] needs. Built by walking
+/// the staging maps under their lock; deliberately `Copy`-cheap so that walk
+/// is a projection rather than a copy of every payload.
+#[derive(Clone, Copy, Debug)]
+pub struct StagedCost {
+    pub id: u64,
+    pub enqueued_ms: u64,
+    /// Payload bytes this entry contributes to `queue.json`. A marker
+    /// contributes 0 — it has no text — which is correct: a marker costs the
+    /// write almost nothing and is the one entry with no bytes left to lose.
+    pub bytes: usize,
+}
+
+/// Decide which staged ids roll off the hot snapshot, oldest first (#547).
+///
+/// Pure, and returns *ids* rather than entries so the caller can plan under
+/// the staging lock without cloning anything it is not about to move.
+///
+/// Order of the three rules is the argument, not an implementation detail:
+///
+/// 1. **Age first**, because an entry past the window rolls whether or not
+///    the set is over any cap — that is the steady-state leak #547 filed.
+/// 2. **Then the entry backstop, oldest id first.** Ids are monotonic per
+///    group, so lowest id is oldest ask, which is the one with the weakest
+///    remaining claim on a live pane.
+/// 3. **Then the byte backstop**, over what survived (2), same order.
+///
+/// A single entry larger than `max_bytes` rolls the whole hot set to empty
+/// rather than looping — bounded, and the entry is in the archive either way.
+pub fn plan_archive(
+    staged: &[StagedCost],
+    now_ms: u64,
+    policy: &ArchivePolicy,
+) -> Vec<(u64, ArchiveReason)> {
+    let mut hot: Vec<&StagedCost> = Vec::with_capacity(staged.len());
+    let mut rolled: Vec<(u64, ArchiveReason)> = Vec::new();
+    let mut by_age: Vec<&StagedCost> = staged.iter().collect();
+    by_age.sort_by_key(|c| c.id);
+    for c in by_age {
+        if now_ms.saturating_sub(c.enqueued_ms) >= policy.max_age_ms {
+            rolled.push((c.id, ArchiveReason::Age));
+        } else {
+            hot.push(c);
+        }
+    }
+    let mut cut = 0usize;
+    let mut bytes: usize = hot.iter().map(|c| c.bytes).sum();
+    while hot.len() - cut > policy.max_entries {
+        bytes = bytes.saturating_sub(hot[cut].bytes);
+        rolled.push((hot[cut].id, ArchiveReason::Entries));
+        cut += 1;
+    }
+    while bytes > policy.max_bytes && cut < hot.len() {
+        bytes = bytes.saturating_sub(hot[cut].bytes);
+        rolled.push((hot[cut].id, ArchiveReason::Bytes));
+        cut += 1;
+    }
+    rolled.sort_by_key(|(id, _)| *id);
+    rolled
+}
+
+/// The on-disk version of ONE archive line (#547). Per line, not per file:
+/// the archive is append-only, so a build that changes the record shape has
+/// to coexist with lines an older build already wrote — a file-level version
+/// could only say what the NEWEST writer thought.
+pub const ARCHIVE_LINE_VERSION: u32 = 1;
+
+fn archive_line_version() -> u32 {
+    ARCHIVE_LINE_VERSION
+}
+
+/// One line of a group's `queue-orphans-archive.jsonl` (#547): the staged
+/// entry exactly as `queue.json` held it, plus when and why it rolled off.
+///
+/// **Compatible in both directions, following `QueuedDelivery`'s serde
+/// precedent.** Forward: `v` carries `#[serde(default)]` so a line written
+/// before it existed still parses, and [`parse_archive`] skips-and-counts a
+/// line whose `v` this build does not know rather than guessing at its shape
+/// (`parse_snapshot`'s stance, for the same reason — the failure direction of
+/// guessing is replaying the wrong bytes into a terminal). Backward: an older
+/// build simply never opens this file; it reads a `queue.json` that is a
+/// valid, smaller snapshot of the same schema, so a downgrade loses SIGHT of
+/// archived entries but destroys nothing — they are still on disk and the
+/// audit-derived orphan view still names their ids.
+///
+/// `entry` is nested rather than `#[serde(flatten)]`ed. `PersistedEntry`
+/// already flattens `QueuedDelivery`, and a second flatten around it would
+/// buy a slightly flatter object at the cost of a nested-flatten shape; an
+/// explicit `entry` object also reads better in the file a human opens after
+/// a crash, which is what `QueuedPayload`'s explicit tag is about too.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArchivedEntry {
+    #[serde(default = "archive_line_version")]
+    pub v: u32,
+    /// When the roll happened — distinct from `enqueued_ms`, which is when
+    /// the delivery was first queued and is what staleness is judged on.
+    pub archived_ms: u64,
+    /// [`ArchiveReason::as_str`].
+    pub why: String,
+    pub entry: PersistedEntry,
+}
+
+/// Build one archive record. Split from [`archive_line`] so the roll's two
+/// halves — deciding what a record says, and turning it into a line — stay
+/// separable and separately testable.
+///
+/// **Nothing re-serializes a record it read back.** A rewrite carries the
+/// original line through verbatim ([`scan_archive`]); re-emitting through
+/// this type would silently normalize away anything the reading build did
+/// not understand, which is the defect [`scan_archive`]'s doc describes.
+pub fn new_archive_record(archived_ms: u64, why: ArchiveReason, entry: PersistedEntry) -> ArchivedEntry {
+    ArchivedEntry { v: ARCHIVE_LINE_VERSION, archived_ms, why: why.as_str().to_string(), entry }
+}
+
+/// Serialize one archive record as its file line, WITHOUT the newline — the
+/// caller owns batching, because an append is atomic per `write_all` syscall
+/// and a batch has to reach the OS as one buffer (`append_audit`'s rule 1).
+///
+/// Compact, not pretty-printed, unlike `serialize_snapshot`: this file is one
+/// record per line by construction, and a pretty-printed record would span
+/// lines and stop being one.
+pub fn archive_line(rec: &ArchivedEntry) -> String {
+    // Same fallback discipline as `serialize_snapshot`: a durability path
+    // must not carry an `unwrap`. A record that will not serialize is skipped
+    // by the caller (an empty line parses as nothing) rather than panicking
+    // the delivery that triggered the roll.
+    serde_json::to_string(rec).unwrap_or_default()
+}
+
+/// Read a `queue-orphans-archive.jsonl` back, tolerant per line and strict
+/// about the per-line version — `parse_snapshot`'s stance, applied to an
+/// append-only file.
+///
+/// **Deduped by delivery id, first occurrence wins.** The archive can
+/// legitimately hold an id twice: the roll appends BEFORE it removes from
+/// staging (so a crash in between leaves a copy in both stores, never
+/// neither), and the next roll re-appends the entry the crash left staged.
+/// Both records describe the same delivery; the first is the original.
+/// Returns what it could read plus the number of lines it had to skip, so the
+/// caller audits the skip instead of coming up silently short.
+pub fn parse_archive(text: &str) -> (Vec<ArchivedEntry>, usize) {
+    let mut out: Vec<ArchivedEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut skipped = 0usize;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<ArchivedEntry>(line) {
+            Ok(rec) if rec.v == ARCHIVE_LINE_VERSION => {
+                if seen.insert(rec.entry.delivery.id) {
+                    out.push(rec);
+                }
+            }
+            _ => skipped += 1,
+        }
+    }
+    (out, skipped)
+}
+
+/// One raw archive line, kept **verbatim**, plus the little this build can
+/// tell about it without claiming to understand it (#547 review B1).
+///
+/// See [`scan_archive`] for why this exists at all.
+pub struct ArchiveLine<'a> {
+    /// The line exactly as it sits in the file. What a rewrite writes back
+    /// when it is not deliberately removing this record — byte for byte, so
+    /// a record this build cannot interpret is not silently normalized into
+    /// what this build would have written.
+    pub raw: &'a str,
+    /// The delivery id, read **without interpreting the record**: probed
+    /// straight out of the JSON rather than through [`ArchivedEntry`], so it
+    /// works across versions this build does not know. `None` for a line
+    /// that is not JSON at all, or whose shape has moved far enough that the
+    /// id is no longer where it was — and a line with no id can never be
+    /// matched, so it can never be removed.
+    pub id: Option<u64>,
+}
+
+/// Read the archive as **lines**, not as records (#547 review B1).
+///
+/// **Why this exists, and why [`parse_archive`] cannot be used for it.**
+/// `parse_archive` is deliberately lossy: it skips a line whose version this
+/// build does not know, because interpreting one would mean guessing at a
+/// shape. That is the right stance for every path that ACTS on records — the
+/// orphan report, the rebind — and exactly the wrong one for the path that
+/// REWRITES the file. Reconstructing the file from parsed records deletes
+/// every line the parse dropped, which turns the one mechanism that exists to
+/// survive version skew into the thing that destroys it: a newer build writes
+/// `v: 2` lines, a rollback follows, and the next bind that re-admits
+/// anything erases them. It also blinds the `queue_seq` seed to the ids on
+/// those lines, re-opening the id collision the seed exists to prevent.
+///
+/// So the rewrite and the seed both read the file this way instead: every
+/// line is carried, and parsing is used only to answer "is THIS the record I
+/// am deliberately removing?". Nothing is dropped because this build could
+/// not read it — which is the guarantee the archive is for, made structural
+/// rather than dependent on the reader's vocabulary.
+///
+/// Blank lines are skipped: they carry nothing and re-emitting them would
+/// grow the file by one byte per rewrite.
+pub fn scan_archive(text: &str) -> Vec<ArchiveLine<'_>> {
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|raw| {
+            let id = serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|v| v.get("entry").and_then(|e| e.get("id")).and_then(serde_json::Value::as_u64));
+            ArchiveLine { raw, id }
+        })
+        .collect()
+}
+
 /// Whether a recovered entry has a durable identity to re-bind to when
 /// `agent` comes back (#467). Pure so the matching rule is stated in one
 /// place and tested directly, rather than being an `if` buried in a bind
@@ -1414,6 +1716,18 @@ pub enum OrphanSource {
     Snapshot,
     /// Derived from `audit.jsonl` alone — no payload.
     Audit,
+    /// Read out of the group's `queue-orphans-archive.jsonl` (#547) —
+    /// payload included, exactly like `Snapshot`.
+    ///
+    /// **A third value on an existing field, added additively** (the #579
+    /// precedent for `refused`): a reader written against the two-value shape
+    /// sees no change on the rows it already knew, and the new value is
+    /// documented in the tool description rather than inferred. It is a
+    /// distinct value rather than more `Snapshot` rows because the two say
+    /// different things to a human doing forensics — which FILE to open — and
+    /// because collapsing them would make the archive invisible in the one
+    /// view that exists to make lost work visible.
+    Archive,
 }
 
 impl OrphanSource {
@@ -1421,6 +1735,7 @@ impl OrphanSource {
         match self {
             OrphanSource::Snapshot => "snapshot",
             OrphanSource::Audit => "audit",
+            OrphanSource::Archive => "archive",
         }
     }
 }

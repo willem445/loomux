@@ -66,6 +66,7 @@ that without a getrandom crate.
 | `group.json` | `persist_max_agents` | — | already atomic; refactored onto the shared helper |
 | `usage.json` | `upsert_usage_snapshot` | `tasks_lock` | already atomic; refactored onto the shared helper |
 | `queue.json` | `persist_queues` (#468) | `queue_persist`, held across read-then-write | `atomic_write`. **Snapshot, not journal** — see below |
+| `queue-orphans-archive.jsonl` (#547) | `archive_staged_overflow` (append), `readmit_archived` (rewrite) | `queue_persist`, held across both | **append-only** for the roll (`append_durable` — one `write_all`, then `sync_all`); `atomic_write` for the rewrite that removes a re-admitted entry. See below |
 | `audit.jsonl` | `append_audit` | `AUDIT_LOCK` (#240) | **append-only** — a failed append can't truncate prior lines, so `atomic_write` is the wrong tool. Its own atomicity problem, and its own fix: see Part 1b |
 | `configs/<id>.json`, role `*.md`, attachments | derived/one-shot | — | not mutable durable state — regenerated or uniquely named, so a failed write is retryable, not destructive; left as plain `fs::write` |
 | `agent-seq.json` (#524) | `mint_agent_seq` | `agent_seq_persist`, held across seed-then-mint-then-write | `atomic_write`. **At the orchestration ROOT, not in a group dir** — see below |
@@ -106,6 +107,37 @@ last-writer-wins note above tolerates, which a queue cannot. Lock order is
 `queue_persist` → `queues`, and the write happens with no queue lock held: file
 I/O inside that critical section would stall every delivery in the registry. See
 `doc/design/orchestration.md`'s "Durability (#468/#467)".
+
+`queue-orphans-archive.jsonl` (#547) is the one file here that is **both**
+shapes, and each half is chosen for the failure it must not have. It holds
+staged orphans that have rolled off `queue.json` so the per-admission fsync
+stops growing with the age of the install (the argument, the policy and the
+crash-ordering are in `doc/design/orchestration.md`'s "Bounding the snapshot
+write"). The roll is an **append** — `append_durable`, one `write_all` then
+`sync_all` — because these records are the only remaining copy of payloads
+just removed from the snapshot, so the file must be at least as durable as
+what it took them out of, and an append cannot truncate the records already
+in it. Removing a record (a re-admitted entry) is the one operation an append
+cannot express, and it is a whole-file **replace** through `atomic_write` for
+`tasks.json`'s reason: a truncating in-place rewrite of this file would be a
+disk-full path that eats every other orphan in it. Both halves are taken under
+`queue_persist`, the same lock `queue.json` is written under, because the two
+files are one store: an entry is being moved between them and the pair must
+never be observed with it in neither. The ordering that guarantees that —
+append before remove, in both directions — is why the worst crash outcome here
+is a duplicate record, which `queue::parse_archive` dedupes on delivery id.
+
+**The replace half carries every line it did not set out to remove, verbatim**
+(#547 review B1). It is built from the file's raw lines (`queue::scan_archive`),
+not from parsed records: parsing is used only to test whether a line is the
+record being removed, so a record written by a build with a newer per-line `v`
+— or a line torn by the very disk-full failure this document is about — is
+written back byte for byte instead of being dropped for being unreadable. This
+is the property that makes the pair safe to describe as one store. A
+whole-file replace rebuilt from what the writer could parse is a *lossy*
+replace, and a lossy replace of the file holding the only copy of a payload is
+the #133 failure with extra steps: it does not truncate the file, it truncates
+the set.
 
 `agent-seq.json` (#524) is the one entry in this table that is **not** in a
 group dir, and that placement is the design decision rather than an oversight.

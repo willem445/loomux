@@ -9303,6 +9303,31 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Append `bytes` to an append-only durable file and **fsync it** (#547).
+///
+/// Two differences from `append_audit`, both deliberate:
+///
+/// - **It fsyncs.** The audit log is best-effort history; the staged-orphan
+///   archive holds the only remaining copy of payloads that were just removed
+///   from `queue.json`, so it has to be at least as durable as the snapshot
+///   it took them out of — which `atomic_write` fsyncs.
+/// - **It reports failure** instead of swallowing it. A failed append means
+///   the caller must NOT go on to remove the entries from staging; see
+///   `archive_staged_overflow`'s ordering argument.
+///
+/// The single-`write_all` rule is `append_audit`'s rule 1 and applies here for
+/// the same reason: append atomicity is per syscall, so a batch of records has
+/// to reach the OS as one buffer or a concurrent writer can be scheduled into
+/// the middle of it. The caller assembles the whole batch.
+fn append_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut f = fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
 /// Audit-log writer usable from background threads (delivery outcomes)
 /// without holding a registry reference.
 ///
@@ -33065,6 +33090,15 @@ impl OrchRegistry {
         self.group_dir(group).join("queue.json")
     }
 
+    /// Path of `group`'s staged-orphan archive (#547) — the append-only
+    /// sibling of `queue.json` that holds staged entries which have rolled off
+    /// the hot write path. Named for what it holds rather than for the
+    /// mechanism, because the human who opens it after a crash is looking for
+    /// orphans, not for an archive.
+    fn queue_archive_path(&self, group: &str) -> PathBuf {
+        self.group_dir(group).join("queue-orphans-archive.jsonl")
+    }
+
     /// Write `group`'s live queues to disk (#468). Called after EVERY
     /// mutation of `queues` that changes what is pending, always with no
     /// lock held — see `queue_persist`'s doc for the lock order and for why
@@ -33106,11 +33140,292 @@ impl OrchRegistry {
         // holds nothing.
         self.recover_persisted_queue(group);
         let _writer = self.queue_persist.lock_safe();
+        // #547: roll the staged tail off the hot path BEFORE measuring what
+        // the snapshot must carry, so this write pays for what is still
+        // live-ish rather than for every orphan the install has accumulated.
+        // Under `queue_persist`, which is what serializes it against the
+        // archive's other writer (`readmit_archived`'s rewrite).
+        self.archive_staged_overflow(group);
         let entries = self.group_queue_entries(group);
         let body = queue::serialize_snapshot(now_ms(), entries);
         if let Err(e) = atomic_write(&self.queue_snapshot_path(group), body.as_bytes()) {
             self.audit(group, "loomux", "queue-persist-failed", json!({ "error": e.to_string() }));
         }
+    }
+
+    /// Move staged orphans that no longer belong on the hot write path into
+    /// `queue-orphans-archive.jsonl` (#547). Called by `persist_queues` alone,
+    /// with `queue_persist` already held.
+    ///
+    /// **Why the snapshot needed a bound at all.** `queue.json` is rewritten
+    /// and fsynced on every admission, and it carries the staged set (#523).
+    /// Staging is never cleared, and worker panes do not survive a restart, so
+    /// each restart permanently adds that restart's unbindable backlog: the
+    /// per-delivery write cost grows with the age of the install. The bound is
+    /// stated in `queue::ArchivePolicy` — age, then an entry backstop, then a
+    /// byte backstop — and argued at each constant.
+    ///
+    /// **This is a move, not an eviction, and the distinction is the whole
+    /// design.** #547 rules out a cap and rules out an audited eviction: the
+    /// staged set exists to report work nobody received, so dropping from it
+    /// reintroduces one level down the silent loss #523 exists to eliminate.
+    /// Everything rolled here is still on disk, still surfaced by
+    /// `queue_orphans` (with `source: "archive"`), still re-admitted by
+    /// `readmit_archived` when its pane comes back, and named individually in
+    /// the audit. The only thing that changes is which file it is fsynced from.
+    ///
+    /// **Ordering: append, then remove — never the reverse.** The archive
+    /// append is fsynced first and staging is only edited once it returned
+    /// `Ok`. A crash or a failed append therefore leaves the entry in BOTH
+    /// stores (or in staging alone), never in neither; `queue::parse_archive`
+    /// dedupes an id that ended up twice, and `queue_orphans` skips an
+    /// archived id that is still staged. The opposite order buys nothing and
+    /// costs a lost payload in exactly the failure this file exists for.
+    ///
+    /// **Its audit lines are deliberately NOT terminal for the orphan scan**,
+    /// the same rule `recover_persisted_queue`'s staging lines follow:
+    /// `queue::orphaned_queue_entries` closes an id only on
+    /// `delivery-dequeued`/`-dropped`/`-recovered`, and an archived entry's
+    /// disposition has not changed — writing a terminal line here would tell
+    /// the one derivation that needs no snapshot that the work was resolved.
+    fn archive_staged_overflow(&self, group: &str) {
+        let now = now_ms();
+        let policy = queue::ArchivePolicy::default();
+        // Plan under the staging locks over a PROJECTION (id/age/bytes), not
+        // over clones: this runs on every admission, and cloning the staged
+        // set to ask whether any of it should move would be its own version of
+        // the cost being removed. Lock order is `recovered_queue` →
+        // `recovered_markers`, matching `group_queue_entries`.
+        let to_roll: Vec<(queue::PersistedEntry, queue::ArchiveReason)> = {
+            let staged = self.recovered_queue.lock_safe();
+            let markers = self.recovered_markers.lock_safe();
+            let mut costs: Vec<queue::StagedCost> = Vec::new();
+            for list in [staged.get(group), markers.get(group)].into_iter().flatten() {
+                costs.extend(list.iter().map(|e| queue::StagedCost {
+                    id: e.delivery.id,
+                    enqueued_ms: e.delivery.enqueued_ms,
+                    bytes: e.delivery.payload.text().map_or(0, str::len),
+                }));
+            }
+            let plan = queue::plan_archive(&costs, now, &policy);
+            if plan.is_empty() {
+                return;
+            }
+            let why: HashMap<u64, queue::ArchiveReason> = plan.into_iter().collect();
+            let mut picked: Vec<(queue::PersistedEntry, queue::ArchiveReason)> = Vec::new();
+            for list in [staged.get(group), markers.get(group)].into_iter().flatten() {
+                for e in list.iter() {
+                    if let Some(r) = why.get(&e.delivery.id) {
+                        picked.push((e.clone(), *r));
+                    }
+                }
+            }
+            picked.sort_by_key(|(e, _)| e.delivery.id);
+            picked
+        };
+        if to_roll.is_empty() {
+            return;
+        }
+        let mut buf = String::new();
+        for (e, why) in &to_roll {
+            let rec = queue::new_archive_record(now, *why, e.clone());
+            let line = queue::archive_line(&rec);
+            if line.is_empty() {
+                // `archive_line`'s serialize fallback. An unserializable entry
+                // must stay staged rather than be removed against a line that
+                // says nothing — the safe direction is "still costs a write",
+                // not "gone".
+                continue;
+            }
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        let path = self.queue_archive_path(group);
+        if buf.is_empty() {
+            return;
+        }
+        if let Err(e) = append_durable(&path, buf.as_bytes()) {
+            // Nothing has left staging yet, so this degrades to "the snapshot
+            // stays fat" — a cost, not a loss. Named so a disk that has
+            // started refusing writes is visible rather than inferred from a
+            // file that keeps growing.
+            self.audit(group, "loomux", "queue-archive-failed",
+                json!({ "error": e.to_string(), "entries": to_roll.len() }));
+            return;
+        }
+        let rolled: HashSet<u64> = to_roll.iter().map(|(e, _)| e.delivery.id).collect();
+        {
+            let mut staged = self.recovered_queue.lock_safe();
+            let mut markers = self.recovered_markers.lock_safe();
+            for list in [staged.get_mut(group), markers.get_mut(group)].into_iter().flatten() {
+                list.retain(|e| !rolled.contains(&e.delivery.id));
+            }
+        }
+        // One line per entry, with the payload's size rather than its bytes
+        // (the bytes are in the archive, and the audit log already carries
+        // them on that delivery's own `prompt` line). "What and why", per
+        // entry, is the standard a silent roll would fail.
+        for (e, why) in &to_roll {
+            self.audit(group, "loomux", "queue-orphan-archived", json!({
+                "to": e.delivery.agent_id,
+                "id": e.delivery.id,
+                "reason": why.as_str(),
+                "staged_ms": now.saturating_sub(e.delivery.enqueued_ms),
+                "bytes": e.delivery.payload.text().map_or(0, str::len),
+                "file": "queue-orphans-archive.jsonl",
+            }));
+        }
+    }
+
+    /// The archived half of this group's orphan view (#547) — the same rows
+    /// `queue_orphans` derives from staging, for entries that have rolled off
+    /// the hot snapshot.
+    ///
+    /// Read on demand and never cached: `queue_orphans` is a once-per-session
+    /// call by design (see its tool description), so a file read there is
+    /// cheaper than any structure kept live for it — which would put the cost
+    /// back on the hot path this change exists to clear.
+    fn archived_orphans(&self, group: &str) -> Vec<queue::OrphanedQueueEntry> {
+        let Ok(text) = fs::read_to_string(self.queue_archive_path(group)) else {
+            return Vec::new();
+        };
+        let (rows, skipped) = queue::parse_archive(&text);
+        if skipped > 0 {
+            self.audit(group, "loomux", "queue-archive-skipped", json!({ "entries": skipped }));
+        }
+        rows.into_iter()
+            .map(|a| queue::OrphanedQueueEntry {
+                id: a.entry.delivery.id,
+                agent_id: a.entry.delivery.agent_id.clone(),
+                enqueued_ms: a.entry.delivery.enqueued_ms,
+                // A marker reports WHY IT CANNOT BE REPLAYED, exactly as it
+                // does from staging — the archive changed where it lives, not
+                // what it is, and `STRANDED_ORPHAN_REASON` is the one string
+                // every channel uses for it.
+                reason: match a.entry.delivery.payload {
+                    queue::QueuedPayload::StrandedSubmit => queue::STRANDED_ORPHAN_REASON.to_string(),
+                    _ => a.entry.delivery.reason.as_str().to_string(),
+                },
+                text: a.entry.delivery.payload.text().map(str::to_string),
+                source: queue::OrphanSource::Archive,
+            })
+            .collect()
+    }
+
+    /// Re-admit archived entries for the pane that just bound (#547) — the
+    /// half of the archive design that keeps it a MOVE rather than a
+    /// downgrade.
+    ///
+    /// Without this, rolling an entry off the snapshot would quietly cost it
+    /// its automatic rebind, and "nothing recoverable is destroyed" would hold
+    /// only for the report. Matching is `queue::rebinds_to`, the same rule
+    /// `readmit_recovered` uses, and admission goes through `enqueue_text` —
+    /// the same front door — so an archived entry rejoins the queue by the
+    /// ordinary rules.
+    ///
+    /// **Archived entries are re-admitted BEFORE staged ones** (the caller
+    /// orders it), because they are strictly older: ids are monotonic per
+    /// group and an entry only reaches the archive by being among the oldest
+    /// staged. Arrival order across the two stores is the property #523's N5
+    /// sort exists to protect, and it would break the other way round.
+    ///
+    /// **Ordering: admit, then unarchive.** `enqueue_text` persists the fresh
+    /// live entry into `queue.json` before this removes the archived line, so
+    /// a crash in between leaves the payload in both stores rather than in
+    /// neither. Its cost is the double-delivery window #467 already bounds:
+    /// the replay is byte-identical, so `queue::admit`'s exact-equality
+    /// coalesce collapses it into the live entry.
+    ///
+    /// The rewrite re-reads the file under `queue_persist` rather than writing
+    /// back what this function read minutes earlier — `archive_staged_overflow`
+    /// may have appended in between, and rewriting a stale copy would delete
+    /// those appends. Returns how many were re-admitted and the oldest
+    /// `enqueued_ms` among them (`u64::MAX` when none), which the caller folds
+    /// into the recovery notice's age.
+    fn readmit_archived(
+        &self,
+        group: &str,
+        agent_id: &str,
+        pty_id: u32,
+        target: &DurableTarget,
+    ) -> (usize, u64) {
+        let path = self.queue_archive_path(group);
+        let Ok(text) = fs::read_to_string(&path) else {
+            return (0, u64::MAX);
+        };
+        let (rows, _skipped) = queue::parse_archive(&text);
+        let mut candidates: Vec<queue::PersistedEntry> = rows
+            .into_iter()
+            .map(|a| a.entry)
+            // A marker is never replayable (`queue::split_recovered`'s
+            // judgement): the pane whose input box gave it meaning is gone.
+            // It stays archived and stays reported.
+            .filter(|e| {
+                e.delivery.payload.text().is_some()
+                    && queue::rebinds_to(&e.delivery, target.is_orchestrator, target.session_id.as_deref())
+            })
+            .collect();
+        if candidates.is_empty() {
+            return (0, u64::MAX);
+        }
+        candidates.sort_by_key(|e| e.delivery.id);
+        let mut done: HashSet<u64> = HashSet::new();
+        let mut oldest_ms = u64::MAX;
+        for e in candidates {
+            let Some(body) = e.delivery.payload.text().map(str::to_string) else { continue };
+            let from = e.delivery.from.clone();
+            match self.enqueue_text(group, agent_id, &from, &body, pty_id, queue::EnqueueReason::Recovered) {
+                Ok(fresh) => {
+                    oldest_ms = oldest_ms.min(e.delivery.enqueued_ms);
+                    done.insert(e.delivery.id);
+                    // Same closing line staging's re-admission writes, for the
+                    // same reason (the old id's disposition is now durable
+                    // under a fresh one), plus which store it came out of.
+                    self.audit(group, "loomux", "delivery-recovered", json!({
+                        "to": agent_id, "id": e.delivery.id, "readmitted_as": fresh.id,
+                        "source": "archive",
+                        "queued_ms": now_ms().saturating_sub(e.delivery.enqueued_ms),
+                    }));
+                }
+                // The pane is at `QUEUE_MAX_PER_PANE`. It stays archived and
+                // stays reported — the same "back where it was, never dropped"
+                // answer `readmit_recovered`'s rejection path gives.
+                Err(_) => {}
+            }
+        }
+        if done.is_empty() {
+            return (0, u64::MAX);
+        }
+        {
+            let _writer = self.queue_persist.lock_safe();
+            let current = fs::read_to_string(&path).unwrap_or_default();
+            // **Over RAW lines, never over parsed records** (#547 review B1).
+            // `parse_archive` drops a line whose version this build does not
+            // know — correct for acting on records, fatal for rewriting the
+            // file: rebuilding it from parsed output deletes exactly the
+            // lines the per-line `v` exists to protect, so a rollback after a
+            // `v: 2` writer would lose them on the next bind. Parsing here
+            // answers one question only — "is this the record I am
+            // deliberately removing?" — and everything else, including a line
+            // that is not JSON at all, is carried through byte for byte.
+            let mut body = String::new();
+            for line in queue::scan_archive(&current) {
+                if line.id.is_some_and(|id| done.contains(&id)) {
+                    continue;
+                }
+                body.push_str(line.raw);
+                body.push('\n');
+            }
+            if let Err(e) = atomic_write(&path, body.as_bytes()) {
+                // The entries are already live and delivering; a failed
+                // rewrite only means the archive still lists them, which
+                // surfaces as an orphan row for work that is in flight. Named
+                // rather than silent, because that is a confusing row to read.
+                self.audit(group, "loomux", "queue-archive-rewrite-failed",
+                    json!({ "error": e.to_string(), "entries": done.len() }));
+            }
+        }
+        (done.len(), oldest_ms)
     }
 
     /// Everything `group` still owes a pane: the live queues, plus whatever a
@@ -33265,7 +33580,35 @@ impl OrchRegistry {
             // group; a collision across groups is harmless because every
             // consumer of an id — the live filter, the audit scan, the
             // snapshot — is group-scoped.
-            let high = entries.iter().map(|e| e.delivery.id).max().unwrap_or(0);
+            // #547: the archive holds ids the snapshot no longer does, so the
+            // seed has to read BOTH or it regresses exactly when archiving has
+            // done its job. A group whose whole staged set has rolled off has
+            // an EMPTY snapshot and a non-empty archive; seeding from the
+            // snapshot alone would restart the counter at zero and hand a
+            // fresh delivery an id an archived orphan still carries — the same
+            // two silent consequences this seed exists to prevent, reintroduced
+            // by the fix for a different problem. One file read, once per
+            // group per process, inside the guard: no delivery, no re-entry.
+            //
+            // Over RAW lines, for the same reason the rewrite is (#547 review
+            // B1): reading ids through `parse_archive` would skip every line
+            // this build cannot interpret, so a `v: 2` record written before a
+            // rollback would carry an id the seed never saw — which is this
+            // hazard again, arriving through the compatibility mechanism meant
+            // to prevent it.
+            let archive_text =
+                fs::read_to_string(self.queue_archive_path(group)).unwrap_or_default();
+            let archive_lines = queue::scan_archive(&archive_text);
+            let archived_high = archive_lines.iter().filter_map(|l| l.id).max().unwrap_or(0);
+            // A line whose id cannot be read even as raw JSON is the one case
+            // the seed genuinely cannot account for — there is no number to
+            // account. Said out loud rather than left as a silent shortfall,
+            // because the consequence (a re-minted id) is itself silent.
+            let opaque = archive_lines.iter().filter(|l| l.id.is_none()).count();
+            if opaque > 0 {
+                self.audit(group, "loomux", "queue-archive-id-unreadable", json!({ "lines": opaque }));
+            }
+            let high = entries.iter().map(|e| e.delivery.id).max().unwrap_or(0).max(archived_high);
             let _ = self.queue_seq.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
                 (cur < high).then_some(high)
             });
@@ -33341,6 +33684,11 @@ impl OrchRegistry {
         // enqueued — which is all of them until slice E ships the MCP tools.
         self.merge_queue_reconcile(group);
         let target = self.durable_target(agent_id);
+        // #547: the archive first, because everything in it is older than
+        // everything still staged (an entry reaches it by being among the
+        // oldest) and admission order is delivery order. See
+        // `readmit_archived`.
+        let (from_archive, archive_oldest_ms) = self.readmit_archived(group, agent_id, pty_id, &target);
         let matches = |e: &queue::PersistedEntry| {
             queue::rebinds_to(&e.delivery, target.is_orchestrator, target.session_id.as_deref())
         };
@@ -33369,10 +33717,16 @@ impl OrchRegistry {
         // The loop re-locks per iteration rather than hoisting the guard
         // because holding `recovered_queue` across `enqueue_text` would
         // invert this file's lock order (see `group_queue_entries`).
-        let mut readmitted = 0usize;
-        let mut offered = 0usize;
+        // Seeded from the archive pass, not zeroed: an entry re-admitted out of
+        // the archive was offered, was re-admitted, and is as old as it says —
+        // and the `offered == 0` early return below would otherwise swallow a
+        // bind whose whole backlog had rolled off (no `delivery-requeued` line,
+        // no drainer nudge, no notice, and a return of 0 for work that IS
+        // queued).
+        let mut readmitted = from_archive;
+        let mut offered = from_archive;
         let mut rejected = 0usize;
-        let mut oldest_ms = u64::MAX;
+        let mut oldest_ms = archive_oldest_ms;
         let mut parked: HashSet<u64> = HashSet::new();
         // Return `entry` to staging and make that durable before anything
         // else is taken out. Takes the id back so the caller can mark it
@@ -33509,6 +33863,17 @@ impl OrchRegistry {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default(),
+        );
+        // #547: and the staged entries that have rolled off the hot snapshot.
+        // They belong in the SNAPSHOT half of the merge, not beside the audit
+        // derivation, because like a staged row they carry the payload bytes —
+        // the archive changed which file holds them, not what is known about
+        // them. Filtered against ids still staged, which is the crash window
+        // `archive_staged_overflow`'s append-then-remove ordering deliberately
+        // leaves open: an entry in both stores is one delivery, reported once.
+        let staged_ids: HashSet<u64> = from_snapshot.iter().map(|o| o.id).collect();
+        from_snapshot.extend(
+            self.archived_orphans(group).into_iter().filter(|o| !staged_ids.contains(&o.id)),
         );
         // Ids sitting in the live queue right now — see `merge_orphans`'s
         // doc for why excluding them is load-bearing and not a tidy-up: an
