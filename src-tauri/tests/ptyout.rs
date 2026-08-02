@@ -1,0 +1,224 @@
+//! Integration tests for PTY output coalescing (#712).
+//!
+//! Must be an integration test, not a unit test (CLAUDE.md constraint #4 — the
+//! Windows test exe needs build.rs's comctl32-v6 manifest). These drive the
+//! SHIPPED pump — `ptyout::pty_output_pump`, with its real `mpsc` channel and
+//! its real monotonic clock, on its own thread, exactly as `spawn_pty` runs it
+//! — rather than the pure policy underneath, which `src/ptyout.rs`'s own unit
+//! tests already pin against a synthetic clock. What is proven here is the
+//! property #712 is about and the policy tests cannot reach: that the number
+//! of IPC EVENTS a busy pane costs is bounded by the coalescing window instead
+//! of by the child's write pattern.
+//!
+//! No Tauri runtime and no real agent CLI are involved: the pump takes its
+//! emit sink as a parameter, so the sink here is a counting closure.
+
+use loomux_lib::ptyout::{
+    pty_output_pump, pty_output_pump_with, PTY_EMIT_MAX_BATCH, PTY_EMIT_MIN_INTERVAL_MS,
+};
+use std::sync::mpsc::channel;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Run the real pump against `chunks`, sending them with `gap` between each,
+/// and return every batch it emitted, in order.
+fn run_pump(chunks: Vec<Vec<u8>>, gap: Duration) -> Vec<Vec<u8>> {
+    run_pump_inner(chunks, gap, None)
+}
+
+/// Same, but with the coalescing window overridden — `Some(0)` reproduces the
+/// pre-#712 policy (emit once per chunk) through the same loop.
+fn run_pump_window(chunks: Vec<Vec<u8>>, window_ms: u64) -> Vec<Vec<u8>> {
+    run_pump_inner(chunks, Duration::ZERO, Some(window_ms))
+}
+
+fn run_pump_inner(chunks: Vec<Vec<u8>>, gap: Duration, window_ms: Option<u64>) -> Vec<Vec<u8>> {
+    let (tx, rx) = channel::<Vec<u8>>();
+    let emitted: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = emitted.clone();
+    let pump = std::thread::spawn(move || {
+        let push = move |batch: Vec<u8>| sink.lock().unwrap().push(batch);
+        match window_ms {
+            None => pty_output_pump(rx, push),
+            Some(ms) => pty_output_pump_with(rx, ms, PTY_EMIT_MAX_BATCH, push),
+        }
+    });
+    for c in chunks {
+        tx.send(c).expect("pump alive");
+        if !gap.is_zero() {
+            std::thread::sleep(gap);
+        }
+    }
+    // Dropping the sender is how the reader thread signals EOF in production.
+    drop(tx);
+    pump.join().expect("pump thread");
+    let out = emitted.lock().unwrap().clone();
+    out
+}
+
+/// The defect: before #712 a pane cost one IPC event per `read()` return, so
+/// 1000 small chunks meant 1000 one-shot script compilations on the GUI
+/// thread. Coalescing must collapse that by an order of magnitude.
+///
+/// The bound is deliberately loose (a quarter of the chunks) so it cannot
+/// flake on a stalled CI runner: 1000 chunks pushed back-to-back would have to
+/// take longer than 250 coalescing windows — four seconds of wall clock for
+/// what is a few milliseconds of channel traffic — before it could fail here,
+/// while the pre-#712 behaviour (one event per chunk) fails it by 4x.
+#[test]
+fn a_burst_costs_far_fewer_events_than_chunks() {
+    let chunks = || -> Vec<Vec<u8>> {
+        (0..1000).map(|i| format!("line {i}\r\n").into_bytes()).collect()
+    };
+
+    // The pre-#712 policy, measured on this very loop rather than asserted
+    // from memory: with no window, every chunk is its own IPC event.
+    let before = run_pump_window(chunks(), 0);
+    assert_eq!(
+        before.len(),
+        1000,
+        "a zero window is the old policy: one event per read() return"
+    );
+
+    let after = run_pump(chunks(), Duration::ZERO);
+    eprintln!(
+        "#712: 1000 chunks -> {} events without a window, {} events with the shipped {PTY_EMIT_MIN_INTERVAL_MS}ms window",
+        before.len(),
+        after.len()
+    );
+    assert!(
+        after.len() <= 250,
+        "1000 chunks produced {} events; coalescing should be far below one-per-chunk",
+        after.len()
+    );
+    assert!(!after.is_empty(), "the stream must still be delivered");
+}
+
+/// Coalescing is allowed to change how many events carry the bytes and
+/// nothing else. Concatenating every batch must reproduce the byte stream
+/// exactly, in order — a terminal cannot survive a reordered or truncated
+/// escape sequence.
+#[test]
+fn every_byte_arrives_exactly_once_and_in_order() {
+    let chunks: Vec<Vec<u8>> =
+        (0..1000).map(|i| format!("\x1b[3{}mline {i}\x1b[0m\r\n", i % 8).into_bytes()).collect();
+    let expected: Vec<u8> = chunks.iter().flatten().copied().collect();
+    let batches = run_pump(chunks, Duration::ZERO);
+    let got: Vec<u8> = batches.iter().flatten().copied().collect();
+    assert_eq!(got, expected);
+}
+
+/// A pane that goes quiet mid-window must still deliver what it had. This is
+/// the production EOF path: the reader thread drops its sender when the child
+/// closes the pty, and the last bytes (a shell's goodbye, an exit message) are
+/// typically well inside one window.
+#[test]
+fn the_last_bytes_before_eof_are_not_lost() {
+    let batches = run_pump(vec![b"first".to_vec(), b"last".to_vec()], Duration::ZERO);
+    let got: Vec<u8> = batches.iter().flatten().copied().collect();
+    assert_eq!(got, b"firstlast".to_vec());
+}
+
+/// Interactive echo must not have become slower. A chunk arriving into a
+/// quiet pane is emitted on arrival, so a keystroke echo still crosses in one
+/// event with no window added — here, three chunks separated by more than a
+/// window each stay three separate, immediate events.
+#[test]
+fn a_quiet_panes_chunks_are_not_held_back() {
+    let chunks = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+    let batches = run_pump(chunks, Duration::from_millis(60));
+    assert_eq!(
+        batches,
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+        "an idle pane's chunks must cross immediately, not be merged"
+    );
+}
+
+/// Send `chunks` into the real pump and then wait — **with the sender still
+/// open** — for `expect` bytes to come out, up to `timeout`. Returns how many
+/// bytes actually arrived.
+///
+/// Every other test in this file drops the sender, which takes the pump's
+/// `Disconnected` → `take_all` path and flushes any residue for free. That is
+/// precisely why the whole suite was blind to a tail stranded *while the pane
+/// is still alive* (review finding on PR #714), so this helper keeps the
+/// sender open for the entire measurement.
+fn bytes_out_with_sender_open(chunks: Vec<Vec<u8>>, expect: usize, timeout: Duration) -> usize {
+    let (tx, rx) = channel::<Vec<u8>>();
+    let emitted: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = emitted.clone();
+    let pump = std::thread::spawn(move || {
+        pty_output_pump(rx, move |batch: Vec<u8>| sink.lock().unwrap().push(batch));
+    });
+    for c in chunks {
+        tx.send(c).expect("pump alive");
+    }
+
+    let deadline = Instant::now() + timeout;
+    let delivered = loop {
+        let n: usize = emitted.lock().unwrap().iter().map(|b| b.len()).sum();
+        if n >= expect || Instant::now() >= deadline {
+            break n;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Only now does the pane "close" — after the measurement, so a flush that
+    // only EOF would have produced cannot rescue the assertion.
+    drop(tx);
+    pump.join().expect("pump thread");
+    delivered
+}
+
+/// A burst that overruns the cap by a NON-MULTIPLE leaves a sub-cap remainder,
+/// and that remainder must be scheduled by the coalescing window — not left
+/// waiting for the pane's next `read()`, which for the very common "big burst,
+/// then quiet" shape never comes.
+///
+/// Deterministic in the failing direction: one over-cap chunk puts the pump in
+/// exactly the state the bug needed — cap-sized pieces emitted at one instant,
+/// then a sub-cap tail that `take_due` refuses — with no timing race deciding
+/// whether it gets there.
+#[test]
+fn an_over_cap_burst_flushes_its_sub_cap_tail_while_the_pane_is_still_alive() {
+    let total = PTY_EMIT_MAX_BATCH * 2 + 1234; // deliberately not a multiple
+    let delivered =
+        bytes_out_with_sender_open(vec![vec![b'x'; total]], total, Duration::from_secs(5));
+    assert_eq!(
+        delivered, total,
+        "{} of {total} bytes arrived; the sub-cap tail of an over-cap burst was stranded until the next read()",
+        delivered
+    );
+}
+
+/// The same property by the route production actually takes: the reader thread
+/// reads at most 8 KiB at a time, so an over-cap buffer is reached by
+/// ACCUMULATION inside one window rather than by a single huge chunk. Total is
+/// again a non-multiple of the cap, and the sender again stays open.
+#[test]
+fn an_accumulated_over_cap_burst_also_flushes_its_tail() {
+    let mut chunks: Vec<Vec<u8>> = (0..24).map(|_| vec![b'y'; 8192]).collect();
+    chunks.push(vec![b'y'; 1234]);
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    assert_ne!(total % PTY_EMIT_MAX_BATCH, 0, "the point is a ragged tail");
+    let delivered = bytes_out_with_sender_open(chunks, total, Duration::from_secs(5));
+    assert_eq!(delivered, total, "{} of {total} bytes arrived", delivered);
+}
+
+/// A pane dumping faster than the window drains still emits in bounded
+/// pieces: no single event may carry more than the batch cap, so one `cat` of
+/// a large file cannot turn into one enormous script string.
+#[test]
+fn no_single_event_exceeds_the_batch_cap() {
+    // 4 MiB in 16 KiB chunks, sent as fast as the channel takes them.
+    let chunks: Vec<Vec<u8>> = (0..256).map(|_| vec![b'x'; 16 * 1024]).collect();
+    let total: usize = chunks.iter().map(|c| c.len()).sum();
+    let batches = run_pump(chunks, Duration::ZERO);
+    for b in &batches {
+        assert!(
+            b.len() <= PTY_EMIT_MAX_BATCH,
+            "one event carried {} bytes, over the {PTY_EMIT_MAX_BATCH} cap",
+            b.len()
+        );
+    }
+    assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), total);
+}

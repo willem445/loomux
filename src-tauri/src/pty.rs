@@ -1191,7 +1191,29 @@ pub fn spawn_pty(
     // The frontend router buffers payloads for panes that haven't attached
     // their handler yet, so no output can be lost at startup. A rolling tail
     // is teed into the ring for orchestration's `get_output`.
+    //
+    // #712: the reader hands chunks to a per-pane COALESCING pump rather than
+    // emitting each one. Every `pty-output` event costs a one-shot script
+    // compilation on the GUI thread (see `crate::ptyout`'s module doc for the
+    // transport chain), so an event rate set by the child's write pattern and
+    // multiplied by the pane count saturated that single thread — the app-wide
+    // sluggishness in #712. Only the EVENT rate changes: the bytes, their
+    // order, and the ring tee below are exactly as before, and the ring is
+    // still updated the instant bytes arrive so orchestration's view of a pane
+    // (attention scan, question detection, `get_output`) does not move at all.
     let out_app = app.clone();
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        crate::ptyout::pty_output_pump(out_rx, |batch| {
+            let _ = out_app.emit(
+                "pty-output",
+                OutputPayload {
+                    id,
+                    data: B64.encode(&batch),
+                },
+            );
+        });
+    });
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         loop {
@@ -1207,16 +1229,16 @@ pub fn spawn_pty(
                             out.ring.drain(..overflow);
                         }
                     }
-                    let _ = out_app.emit(
-                        "pty-output",
-                        OutputPayload {
-                            id,
-                            data: B64.encode(&buf[..n]),
-                        },
-                    );
+                    // Send failure means the pump thread is gone (only on
+                    // shutdown); stop reading rather than spin on a dead pipe.
+                    if out_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
                 }
             }
         }
+        // Dropping `out_tx` here ends the pump, which flushes any residue held
+        // inside the window — a child's last bytes before exit must still land.
     });
 
     // Waiter thread: reap the child, then tear down and notify. Orchestration
