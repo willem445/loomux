@@ -105,6 +105,20 @@ impl Fake {
         self
     }
 
+    /// Like [`Fake::git`], but **ahead of** everything already scripted.
+    ///
+    /// Replies are first-match-wins, so a builder that only appends cannot
+    /// override a reply a shared fixture already answers — the "override" is
+    /// simply never reached, the fixture's own answer stands, and the test
+    /// passes or fails for a reason that has nothing to do with what it was
+    /// written to check. That is not hypothetical: the first cut of the
+    /// batch-abort and merge-conflict tests below appended, so both ran against
+    /// a *successful* build and failed on an assertion three steps later.
+    fn git_first(mut self, matches: &'static str, code: i32, stdout: &str, stderr: &str) -> Fake {
+        self.git_replies.insert(0, Reply { matches, out: out(code, stdout, stderr) });
+        self
+    }
+
     fn gh(mut self, matches: &'static str, code: i32, stdout: &str, stderr: &str) -> Fake {
         self.gh_replies.push(Reply { matches, out: out(code, stdout, stderr) });
         self
@@ -2080,6 +2094,39 @@ fn a_build_time_gate_refusal_blocks_that_entry_and_the_batch_forms_without_it() 
     assert_eq!(s.entry(612).unwrap().blocked_reason, None, "an eligible entry carries no reason");
 }
 
+/// **A corrupt recorded target never reaches `git`** (§4, §7).
+///
+/// `state.target` comes off disk and is interpolated into a refspec by *every*
+/// branch of the tick — the batch fetch's `+refs/heads/<target>:…` runs long
+/// before `land_batch`'s own guard. A hand-edited or torn record that is not a
+/// plain branch name has to fail loudly rather than be handed to `git` to find
+/// out, which is the same posture §4 takes on every other unusable record.
+#[test]
+fn a_recorded_target_that_is_not_a_branch_name_stops_the_tick_before_any_call() {
+    for bad in ["", "  ", "a:refs/heads/main", "-x", "refs/heads/main", "HEAD", "a..b", "a b"] {
+        let f = drive_fake();
+        let mut s = queued_state(&[612]);
+        s.target = bad.to_string();
+        let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+
+        assert!(f.calls().is_empty(), "target {bad:?} must reach no argv at all: {:?}", f.calls());
+        assert!(s.batch.is_none(), "target {bad:?}");
+        assert!(!rep.changed, "a corrupt record is not rewritten on the way past ({bad:?})");
+        assert!(rep.backoff, "target {bad:?}");
+        assert!(
+            rep.audits.iter().any(|a| a.action == "mq-stranded"),
+            "target {bad:?} must be audited loudly, saw {:?}",
+            rep.audits.iter().map(|a| a.action).collect::<Vec<_>>()
+        );
+    }
+    // …and the guard is scoped to a queue that has live work: a drained queue
+    // has released its target (§4), and that empty string is not a corruption.
+    let f = drive_fake();
+    let mut s = queued_state(&[]);
+    let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
+    assert!(rep.audits.is_empty() && !rep.backoff, "a drained queue is not a corrupt one");
+}
+
 /// **A queue where nothing is eligible backs the group off.**
 ///
 /// Establishing "everything is blocked" costs two `gh` round-trips per examined
@@ -2313,7 +2360,7 @@ fn a_pending_batch_changes_nothing_and_says_nothing() {
 /// pushed, and the batch rebuilds without it on a later tick.
 #[test]
 fn a_conflicting_entry_kicks_back_before_any_push() {
-    let f = drive_fake().git("merge --no-ff", 1, "", "CONFLICT (content): merge conflict");
+    let f = drive_fake().git_first("merge --no-ff", 1, "", "CONFLICT (content): merge conflict");
     let mut s = queued_state(&[612, 613]);
     let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
 
@@ -2333,7 +2380,7 @@ fn a_conflicting_entry_kicks_back_before_any_push() {
 /// (§10) — entries return to `queued`, and nothing is left half-shaped.
 #[test]
 fn a_batch_that_cannot_be_built_aborts_and_returns_its_entries_to_queued() {
-    let f = drive_fake().git("fetch", 1, "", "fatal: could not read from remote repository");
+    let f = drive_fake().git_first("fetch", 1, "", "fatal: could not read from remote repository");
     let mut s = queued_state(&[612, 613]);
     let rep = drive(&f, &mut s, &cfg(3, 1_000), &one_reviewer_gate(), &live_verdicts);
 

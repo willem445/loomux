@@ -22399,8 +22399,11 @@ impl OrchRegistry {
         // because the steady state is a single `gh pr checks` on the batch's
         // draft PR, which is exactly a watch poll; the expensive paths are
         // transitions, and a transition happens once per batch.
-        // RED WITNESS (temporary, reverted by the next commit): the poll loop
-        // does not reach the driver — the #698 defect exactly.
+        // RED WITNESS (temporary, restored two commits from here): the poll loop
+        // does not reach the driver — the #698 defect exactly. It stays cut
+        // until `tests/mergequeue.rs` is green, because `cargo test` stops at
+        // the first failing binary and `tests/orchestration.rs` runs after it —
+        // so the wiring test cannot even execute until then.
         let mq_serviced: Option<String> = None;
         let _ = |now: u64| self.mq_driver_tick(now);
         GhPollTick { fired, intake_scanned, mq_serviced }
