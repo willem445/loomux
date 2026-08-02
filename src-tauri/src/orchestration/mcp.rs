@@ -805,12 +805,16 @@ fn call_tool(reg: &OrchRegistry, caller: &Caller, name: &str, args: &Value) -> R
                         // the most-privileged class with nothing said. Refuse
                         // instead: this is the same "never guess a capability
                         // class" rule the fresh-spawn requirement above states.
-                        // SCRATCH COMMIT — the pre-#544 fallback, restored on
-                        // purpose for one push so CI records the red for the
-                        // test above (rev-157 NB2 asked for exactly this
-                        // mutation). The next commit puts the refusal back.
                         let owner_role = super::workflow::kind_from_str(&owner_rec.role)
-                            .unwrap_or(Role::Worker);
+                            .ok_or_else(|| {
+                                format!(
+                                    "session {session_id:?} is recorded under an unrecognized \
+                                     role {:?} and carries no block id, so its capability class \
+                                     cannot be inherited (#544) — pass block (or kind) \
+                                     explicitly. It is not assumed to be a worker.",
+                                    owner_rec.role
+                                )
+                            })?;
                         reg.group(&caller.group)
                             .and_then(|g| g.guardrails.block_for(owner_role).map(|b| b.id.clone()))
                             .ok_or_else(|| {
