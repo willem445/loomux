@@ -9,7 +9,8 @@ description: Why agent workers never build or test Rust locally (hard ban — CI
 
 > **Local `cargo` of ANY kind is banned for agents** — no `cargo build`,
 > no `cargo check`, no single-test iteration, nothing that invokes
-> `rustc` (human hard directive, #488). A fresh worktree's first compile
+> `rustc` (human hard directive, #488; a cargo-intercepting shim was
+> tried and shelved: #318/#322). A fresh worktree's first compile
 > costs 5-8 GB of `target/` per worker, and a fleet building locally
 > exhausts the disk. Scope caps don't cap the first compile; only not
 > compiling does.
@@ -232,11 +233,13 @@ context. Still `continue-on-error` regardless: a new job earns required-check
 status with a track record, not on day one.
 
 Locally, PoC-level smoke only, and only against the isolated E2E profile —
-never against a real install:
+never against a real install. **This local path is for humans**: producing
+the exe under test requires `npx tauri build`, a full `rustc` compile, which
+the cargo ban covers — agents validate E2E through the CI job only.
 
 - A single spec file (`npx playwright test e2e/tests/<name>.spec.ts`) to
-  sanity-check a change before pushing is fine, same local line as a single
-  `node --test` file above (the cargo ban stands; specs don't invoke `rustc`).
+  sanity-check a change before pushing (against an exe a human already
+  built) is the local line here.
 - The exe under test must always be the `tauri.e2e.conf.json`-identifier
   build (`npx tauri build --debug --no-bundle --config
   src-tauri/tauri.e2e.conf.json`) launched through `e2e/fixtures.ts`'s

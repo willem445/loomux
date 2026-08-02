@@ -159,12 +159,13 @@ narrow their ask back down to the original ticket on your own judgment.
   itself changes); substantial designs get a `doc/design/*.md` note.
 - **Historical context lives in design notes, ADRs, and issue/PR history —
   never in user docs, this repo's own agent instruction files
-  (`.github/agents/`, `.claude/skills/`, `.loomux/`), or this file.**
-  Incident stories, superseded rules, dates, and "how we got here"
+  (`.github/agents/`, `.claude/skills/`, `.loomux/workflow.yml`), or this
+  file.** Incident stories, superseded rules, dates, and "how we got here"
   narratives pollute every future reader's context. Reader-facing text
   carries the current rule and its operational why, with at most a bare
   issue/PR ref as provenance; strip any such narrative you find when
-  editing these surfaces. Code comments are a different surface — the
-  "comments explain *why*" convention governs them. Loomux's *shipped*
-  agent-role templates (`templates/`) are product content governed by
-  their own design notes, not by this bullet.
+  editing these surfaces. Out of scope: code comments (the "comments
+  explain *why*" convention), `.loomux/lessons.md` (an incident diary by
+  design), and the shipped agent-role templates
+  (`src-tauri/src/orchestration/templates/`, governed by their design
+  notes).
