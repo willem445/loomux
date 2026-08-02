@@ -289,7 +289,12 @@ fn notice(dropped: &[&str], survivor_cut: bool) -> String {
     let mut list = String::new();
     let mut shown = 0usize;
     for title in dropped {
-        let item = format!("{}\"{}\"", if shown == 0 { "" } else { ", " }, clip(title, TITLE_BYTE_CAP));
+        // TEMPORARY MUTATION — #696 finding 1's mutation round. One title per
+        // line, unquoted: the plausible "easier to read" edit the untested
+        // claim was resting on. Reverted in the very next commit; it exists
+        // only so CI shows the new sentinel-shape pin going red for exactly
+        // this regression instead of being asserted to be capable of it.
+        let item = format!("{}{}", if shown == 0 { "" } else { "\n" }, clip(title, TITLE_BYTE_CAP));
         if list.len() + item.len() > limit {
             break;
         }
