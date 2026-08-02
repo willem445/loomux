@@ -106,6 +106,10 @@ use loomux_lib::orchestration::{
     record_stranded_outcome_at_for_test,
     should_notify_unconfirmed, single_pane_autopilot_flags,
     spawn_opens_minimized,
+    // #717: the attention scan's per-pane ring read, and the byte budget it is
+    // bounded to — the whole of what that issue changes is the SIZE of this
+    // request, so both have to be reachable from a test.
+    attention_tail, ATTENTION_SCAN_BYTES,
     spawn_rate_exceeded, spawn_request_expired, strip_ansi, submit_confirmed, submit_sequence,
     board_summaries, cap_task_notes, task_ready, task_summary, unmet_deps,
     unconfirmed_delivery_notice, delivery_eaten_notice, watchdog_should_notify, worktree_cleanup_targets,
@@ -25928,14 +25932,27 @@ fn pane_attention_inputs_from_strips_ansi_and_skips_agent_ptys() {
     // #40 review: drive the gather wiring with a fake live-ids source. Raw bytes
     // carry ANSI + box drawing; the built tail must be stripped, agent ptys must
     // be skipped (not gathered), and the stripped tail must still detect a prompt.
+    //
+    // #717: the reader is injected rather than pre-read, so this also pins WHAT
+    // the gather asks each pane's ring for — a bounded tail, never the whole
+    // (up to 256 KB) ring — and that an agent pty's ring is never read AT ALL,
+    // which the old shape could only assert by the absence of an output entry.
     let (reg, _d, _g, _w) = attention_setup();
     let raw_menu = FIX_COPILOT_ASK.as_bytes().to_vec();
     let live = vec![
-        (7u32, 42u64, raw_menu.clone(), 0u64),   // a plain pane
-        (5u32, 99u64, raw_menu.clone(), 123u64), // an agent's pty — must be skipped
+        (7u32, 42u64, 0u64),   // a plain pane
+        (5u32, 99u64, 123u64), // an agent's pty — must be skipped
     ];
     let agent_ptys: HashSet<u32> = [5u32].into_iter().collect();
-    let (outs, tails, ins) = reg.pane_attention_inputs_from(&live, &agent_ptys);
+    let requests: std::cell::RefCell<Vec<(u32, usize)>> = std::cell::RefCell::new(Vec::new());
+    let (outs, tails, ins) = reg.pane_attention_inputs_from(
+        &live,
+        |pid, n| {
+            requests.borrow_mut().push((pid, n));
+            Some(raw_menu.clone())
+        },
+        &agent_ptys,
+    );
 
     assert!(!outs.contains_key(&5) && !tails.contains_key(&5), "agent pty must be skipped");
     assert_eq!(outs.get(&7), Some(&42u64));
@@ -25943,6 +25960,102 @@ fn pane_attention_inputs_from_strips_ansi_and_skips_agent_ptys() {
     let tail7 = tails.get(&7).expect("plain pty tail present");
     assert!(!tail7.contains('\u{1b}'), "ANSI escapes must be stripped from the gathered tail");
     assert!(prompt_wait_detected(tail7), "the stripped tail still detects the menu");
+    assert_eq!(
+        *requests.borrow(),
+        vec![(7u32, ATTENTION_SCAN_BYTES)],
+        "the gather must make exactly one BOUNDED read, for the plain pane only: an \
+         unbounded request (or any request at all against the agent's pty) is a whole-ring \
+         clone taken under the same mutex every keystroke takes (#717)"
+    );
+}
+
+#[test]
+fn a_pane_the_scan_cannot_read_still_gets_an_entry_rather_than_vanishing() {
+    // The failure edge of the injected read (#717): a pty that died between
+    // `live_ids` and the tail read hands back `None`. That must not drop the
+    // pane out of the maps — `plain_pane_attention` compares this tick's
+    // output_total against the last one, and a pane that vanishes from `outs`
+    // is a pane whose quiet-streak bookkeeping restarts. An empty tail is the
+    // honest answer (nothing readable => nothing prompt-shaped), and it is what
+    // the pre-#717 `output_tail(pid).unwrap_or_default()` produced too.
+    let (reg, _d, _g, _w) = attention_setup();
+    let live = vec![(9u32, 7u64, 0u64)];
+    let (outs, tails, ins) =
+        reg.pane_attention_inputs_from(&live, |_, _| None, &HashSet::new());
+    assert_eq!(outs.get(&9), Some(&7u64), "an unreadable pane keeps its output counter entry");
+    assert_eq!(ins.get(&9), Some(&0u64));
+    assert_eq!(tails.get(&9).map(String::as_str), Some(""), "and an empty tail, not a missing one");
+    assert!(!prompt_wait_detected(tails.get(&9).unwrap()), "an empty tail is never a question");
+}
+
+#[test]
+fn the_attention_scan_reads_only_the_tail_of_a_saturated_ring_never_the_whole_of_it() {
+    // #717. The attention tick's ring read happens under the global `ptys`
+    // mutex — the same one `write_pty`/`note_user_input` take on every
+    // keystroke, and the same one the pane's reader thread queues behind to
+    // append. It used to clone the WHOLE ring (up to 256 KB) and then slice the
+    // last 4 KB off the result.
+    //
+    // The slice makes the two shapes produce byte-identical text, so no
+    // assertion about the returned STRING can tell them apart. What separates
+    // them is the size of the request, and that is what this pins — against a
+    // real `PtyManager` whose ring is genuinely saturated, so "bounded" is a
+    // measurement and not an arithmetic identity on a short buffer.
+    let pm = PtyManager::default();
+    let pty = 7717u32;
+    pm.register_fake_for_test(pty, b"");
+    // Saturate the ring the way the reader thread does (cap arithmetic and
+    // all), then paint a real question as the last thing on screen.
+    let chunk = vec![b'x'; 64 * 1024];
+    for _ in 0..5 {
+        pm.append_fake_output_for_test(pty, &chunk);
+    }
+    pm.append_fake_output_for_test(pty, FIX_COPILOT_ASK.as_bytes());
+    assert_eq!(
+        pm.output_tail(pty).unwrap().len(),
+        256 * 1024,
+        "the ring must actually be saturated — otherwise a bounded read proves nothing"
+    );
+
+    let requested = std::cell::Cell::new(0usize);
+    let handed_back = std::cell::Cell::new(0usize);
+    let tail = attention_tail(|n| {
+        requested.set(n);
+        let raw = pm.output_tail_bounded(pty, n);
+        handed_back.set(raw.as_ref().map_or(0, Vec::len));
+        raw
+    })
+    .expect("the fake pty is alive");
+
+    assert_eq!(
+        requested.get(),
+        ATTENTION_SCAN_BYTES,
+        "the scan must ask for a bounded tail; asking for the ring is the defect"
+    );
+    assert_eq!(
+        handed_back.get(),
+        ATTENTION_SCAN_BYTES,
+        "and on a saturated ring that request must copy 4 KB under the lock, not 256 KB"
+    );
+    assert!(prompt_wait_detected(&tail), "the bounded tail still carries the live question");
+
+    // The pre-#717 shape, written out as a control rather than described:
+    // clone the whole ring, then slice the same bytes off the end. The text is
+    // IDENTICAL — which is the point. A future edit that reverts the call sites
+    // to `output_tail` is reverting to something this file states the cost of,
+    // and no output assertion anywhere would notice.
+    let whole = pm.output_tail(pty).expect("the fake pty is alive");
+    let start = whole.len().saturating_sub(ATTENTION_SCAN_BYTES);
+    assert_eq!(
+        strip_ansi(&whole[start..]),
+        tail,
+        "bounding the read must not change one byte of what the detectors see"
+    );
+    assert_eq!(
+        whole.len() / handed_back.get(),
+        64,
+        "the copy the old shape made under the lock was 64x this one on a saturated ring"
+    );
 }
 
 #[test]

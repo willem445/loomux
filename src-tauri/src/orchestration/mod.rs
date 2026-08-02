@@ -2187,6 +2187,17 @@ const ATTENTION_QUIET_MS: u64 = 4000;
 /// If the human typed into a pane within this window it does not "need
 /// attention" — they are already at the keyboard on it.
 const ATTENTION_RECENT_INPUT_MS: u64 = 6000;
+/// How many RAW bytes of a pane's output ring one attention tick reads (#717).
+/// Everything the scan looks for (a prompt, a question, a menu) is the last
+/// thing the CLI painted, so the tail has always been all it needed — but the
+/// read used to fetch the whole (up to 256 KB) ring and slice these bytes off
+/// the end, and that fetch happens under the global `ptys` mutex, the one
+/// `write_pty`/`note_user_input` take on every keystroke and the one the pane's
+/// own reader thread contends with on the ring behind it. Bounding the REQUEST
+/// is the entire point: the stripped text handed to the detectors is
+/// byte-identical either way (`strip_ansi(&ring[len-N..])` is
+/// `strip_ansi(&last_N)`), so what changes is only how long the lock is held.
+pub const ATTENTION_SCAN_BYTES: usize = 4096;
 /// How long the frontend gets to open a pane and report its pty id.
 const BIND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between the bracketed paste and the Enter that submits it.
@@ -2399,9 +2410,10 @@ const QUESTION_HOLD_POLL: Duration = Duration::from_millis(250);
 /// Bytes of the pane's live output tail scanned for a pending question
 /// (rev-15 N4): `prompt_wait_detected` only ever reads the last ~12 non-empty
 /// lines, so a bounded trailing slice is enough — matches the attention
-/// path's own trailing-window precedent (`pane_attention_inputs_from`, which
-/// trims to this same size for the identical "the prompt is at the end"
-/// reason), instead of cloning the whole (up to 256 KB) output ring on every
+/// path's own trailing window (`ATTENTION_SCAN_BYTES`, the same size for the
+/// identical "the prompt is at the end" reason — and since #717 the size of
+/// that path's READ, not just of the slice it took afterwards), instead of
+/// cloning the whole (up to 256 KB) output ring on every
 /// 250ms poll for up to two minutes.
 const QUESTION_SCAN_TAIL_BYTES: usize = 4096;
 /// Bytes replayed onto a composed grid for the "is it still DISPLAYED"
@@ -11108,6 +11120,24 @@ pub fn resolve_output_text(live: Option<String>, last_exit_tail: Option<&str>) -
         // last resort rather than inventing content that was never seen.
         _ => Err("terminal already closed".to_string()),
     }
+}
+
+/// One pane's attention-scan tail: a BOUNDED raw read of its output ring,
+/// ANSI-stripped (#717).
+///
+/// `read` is the raw-byte reader — `PtyManager::output_tail_bounded` at every
+/// production call site (`attention_inputs` for agent panes,
+/// `pane_attention_inputs_from` for plain ones). A closure rather than the
+/// manager itself for the same reason `Tier1Scan::read` takes one: the SIZE of
+/// the request is the only thing an assertion can reach here. Slicing the last
+/// `ATTENTION_SCAN_BYTES` off a whole-ring read produces a byte-identical
+/// string, so a test that only looks at the returned text cannot tell a 4 KB
+/// copy under the `ptys` mutex from a 256 KB one — and the copy is the defect.
+///
+/// The strip runs OUTSIDE the read (the reader has already released both locks
+/// by the time it returns), so no scanning happens under the lock at all.
+pub fn attention_tail(read: impl FnOnce(usize) -> Option<Vec<u8>>) -> Option<String> {
+    read(ATTENTION_SCAN_BYTES).map(|raw| strip_ansi(&raw))
 }
 
 /// Strip ANSI escape sequences (CSI, OSC, two-byte ESC) and carriage
@@ -27037,19 +27067,31 @@ impl OrchRegistry {
             return (outs, tails, ins);
         };
         let ptys = app.state::<crate::pty::PtyManager>();
-        for a in self.agents.lock_safe().values() {
-            let Some(pid) = a.pty_id else { continue };
+        // Snapshot (agent id, pty id) and DROP the agents lock before touching
+        // any pty: the reads below each take the global `ptys` mutex, and
+        // holding `agents` across all of them pins two locks for the length of
+        // the whole gather instead of one lock per read (#717). An agent that
+        // disappears in the gap simply has no pty to read, which is the same
+        // outcome the `pty_id`/`output_total` guards already produce and which
+        // the scan already treats as "no item this tick".
+        let panes: Vec<(String, u32)> = self
+            .agents
+            .lock_safe()
+            .values()
+            .filter_map(|a| a.pty_id.map(|pid| (a.id.clone(), pid)))
+            .collect();
+        for (id, pid) in panes {
             if let Some(t) = ptys.output_total(pid) {
-                outs.insert(a.id.clone(), t);
+                outs.insert(id.clone(), t);
             }
-            if let Some(raw) = ptys.output_tail(pid) {
-                // A prompt is at the very end; strip only the last few KB so
-                // the scan stays cheap against a saturated 256 KB ring.
-                let start = raw.len().saturating_sub(4096);
-                tails.insert(a.id.clone(), strip_ansi(&raw[start..]));
+            // A prompt is at the very end, so only the last few KB are read —
+            // never the whole (up to 256 KB) ring, which is a copy made under
+            // the same mutex every keystroke takes (#717).
+            if let Some(t) = attention_tail(|n| ptys.output_tail_bounded(pid, n)) {
+                tails.insert(id.clone(), t);
             }
             if let Some(u) = ptys.last_user_input_ms(pid) {
-                ins.insert(a.id.clone(), u);
+                ins.insert(id, u);
             }
         }
         (outs, tails, ins)
@@ -27058,7 +27100,8 @@ impl OrchRegistry {
     /// Pty snapshots for every live pane that is NOT a registered agent, keyed
     /// by pty id, plus the agent-pty set. Feeds `plain_pane_attention` so the
     /// scan reaches plain shells the human opened by hand (#40). Empty without an
-    /// app handle (unit tests drive the pure core `pane_attention_inputs_from`).
+    /// app handle (tests drive the gather core `pane_attention_inputs_from`, which
+    /// owns the bounded ring read and takes its reader injected).
     #[allow(clippy::type_complexity)]
     fn pane_attention_inputs(
         &self,
@@ -27075,44 +27118,55 @@ impl OrchRegistry {
         let ptys = app.state::<crate::pty::PtyManager>();
         let mut live = Vec::new();
         for pid in ptys.live_ids() {
-            // Skip agent ptys *before* touching the ring: `attention_tick`
-            // already covers them, and `attention_inputs` already cloned their
-            // (up-to-256 KB) output ring this tick — cloning it a second time
-            // here would be pure waste (#40 review).
+            // Skip agent ptys *before* touching the pty at all: `attention_tick`
+            // already covers them, and `attention_inputs` already read their
+            // tail this tick — reading it a second time here would be pure
+            // waste (#40 review). The gather core below repeats the skip, which
+            // is where a test can observe that the ring is never READ for an
+            // agent pty rather than merely that no entry came out (#717).
             if agent_ptys.contains(&pid) {
                 continue;
             }
             let Some(total) = ptys.output_total(pid) else { continue };
-            let raw = ptys.output_tail(pid).unwrap_or_default();
             let input = ptys.last_user_input_ms(pid).unwrap_or(0);
-            live.push((pid, total, raw, input));
+            live.push((pid, total, input));
         }
-        let (outs, tails, ins) = self.pane_attention_inputs_from(&live, &agent_ptys);
+        let (outs, tails, ins) = self.pane_attention_inputs_from(
+            &live,
+            |pid, n| ptys.output_tail_bounded(pid, n),
+            &agent_ptys,
+        );
         (outs, tails, ins, agent_ptys)
     }
 
-    /// Pure core of `pane_attention_inputs`: build the pty-keyed snapshot maps
+    /// Gather core of `pane_attention_inputs`: build the pty-keyed snapshot maps
     /// `plain_pane_attention` consumes from a list of live pane snapshots
-    /// `(pty_id, output_total, raw_tail, last_input_ms)`, ANSI-stripping only the
-    /// trailing few KB of each tail (a prompt is at the end). Agent ptys are
-    /// skipped. Pure w.r.t. the pty, so run_attention's gather wiring is testable
+    /// `(pty_id, output_total, last_input_ms)`, reading and ANSI-stripping only
+    /// the trailing `ATTENTION_SCAN_BYTES` of each tail (a prompt is at the
+    /// end). Agent ptys are skipped without being read at all.
+    ///
+    /// `read` is the raw-byte reader — `PtyManager::output_tail_bounded` in
+    /// production — rather than a pre-read `Vec<u8>` per pane, so the size of
+    /// the request the scan makes under the `ptys` mutex is part of what this
+    /// function decides, and therefore part of what a test can pin (#717). Pure
+    /// w.r.t. the OS otherwise, so run_attention's gather wiring stays testable
     /// with a fake live-ids source (#40 review).
     #[allow(clippy::type_complexity)]
     pub fn pane_attention_inputs_from(
         &self,
-        live: &[(u32, u64, Vec<u8>, u64)],
+        live: &[(u32, u64, u64)],
+        mut read: impl FnMut(u32, usize) -> Option<Vec<u8>>,
         agent_ptys: &HashSet<u32>,
     ) -> (HashMap<u32, u64>, HashMap<u32, String>, HashMap<u32, u64>) {
         let mut outs = HashMap::new();
         let mut tails = HashMap::new();
         let mut ins = HashMap::new();
-        for (pid, total, raw, input) in live {
+        for (pid, total, input) in live {
             if agent_ptys.contains(pid) {
                 continue;
             }
             outs.insert(*pid, *total);
-            let start = raw.len().saturating_sub(4096);
-            tails.insert(*pid, strip_ansi(&raw[start..]));
+            tails.insert(*pid, attention_tail(|n| read(*pid, n)).unwrap_or_default());
             ins.insert(*pid, *input);
         }
         (outs, tails, ins)
