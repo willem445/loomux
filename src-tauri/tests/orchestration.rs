@@ -3938,6 +3938,96 @@ fn a_missed_withdrawal_stays_an_orphan_and_is_never_listed_as_a_refusal() {
         "and it must NOT also be listed as a refusal — one loss, one row: {v}");
 }
 
+// ---------------------------------------------------------------------------
+// #658 — the drain-time refusal roster.
+//
+// A refusal to a LIVE pane had no push path to that pane at all. The sender was
+// told synchronously, the loss was audited (#563/#633), and #578's rider told
+// an orchestrator its own queue was FULL — but nothing ever named WHO was
+// refused to the pane that refused them, so a mid-session refusal surfaced only
+// if an orchestrator happened to call `queue_orphans`, which its own contract
+// frames as a start-of-session recovery step. These tests pin the missing half:
+// the moment the pane's depth comes back below the cap, it is told.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_pane_that_drains_below_its_cap_is_told_who_it_refused() {
+    // #658's live instance, end to end: the orchestrator's pane hits 8/8 during
+    // a report burst, a worker's done-report is refused, and the pane drains a
+    // moment later. Before this, that drain said nothing — the pressure notices
+    // announce the pane's STATE ("FULL", "6/8 and backing up") and never the
+    // roster of what was lost, which is the whole gap.
+    let (reg, _d) = test_registry();
+    let pty = 5890u32;
+    let (gid, orch, w) = orch_pane_at_capacity(&reg, pty);
+
+    let report = "report: done, PR #654 is ready for review — CI green on all three platforms";
+    let err = reg.deliver_prompt(&orch.id, report, &w.id, Delivery::MidSession).unwrap_err();
+    assert!(err.contains("NOT queued"), "the sender is still told synchronously: {err}");
+
+    // One entry drains: 8/8 -> 7/8. That edge is the first moment loomux can
+    // tell this pane anything at all without queueing behind the block it is
+    // reporting on.
+    let front = reg.queue_snapshot(pty).remove(0);
+    reg.pop_front_dequeued(&gid, pty, front.id, front.enqueued_ms);
+
+    let relay = reg
+        .take_orchestrator_notices(&gid)
+        .expect("the drain must relay something to the orchestrator");
+    assert!(relay.contains("REFUSED and never queued"),
+        "the roster itself, not just a queue-state notice: {relay}");
+    assert!(relay.contains(&w.id),
+        "it has to name the SENDER — the recipient's only way to ask for the work again: {relay}");
+    assert!(relay.contains("PR #654"),
+        "and enough of the payload to tell WHICH delivery was lost: {relay}");
+    assert!(relay.contains("queue-full-at-call"),
+        "and the reason, which is what makes the row actionable: {relay}");
+    assert!(relay.contains("NOT re-sent"),
+        "nobody has re-sent it, so the roster must ask for it rather than imply it is handled: {relay}");
+}
+
+#[test]
+fn a_worker_pane_that_drains_is_told_by_a_delivery_rather_than_a_relay() {
+    // The channel is chosen the way #578 chose it: an orchestrator's own pane
+    // cannot be told by a delivery (it would queue behind the very block it
+    // reports), so its roster rides a tool result — but every OTHER pane is
+    // told the ordinary way, by a delivery into its own queue. Same words, both
+    // channels; this pins that the non-orchestrator half exists at all.
+    let (reg, _d) = test_registry();
+    let g = reg.create_group("C:/tmp/repo", rails()).unwrap();
+    let orch = reg.spawn_agent(&g.id, Role::Orchestrator, "orch", "", false, None).unwrap();
+    let w = reg.spawn_agent(&g.id, Role::Worker, "w", "t", false, None).unwrap();
+    let pty = 5891u32;
+    reg.set_pty_for_test(&w.id, pty);
+    for i in 0..queue::QUEUE_MAX_PER_PANE {
+        reg.enqueue_text(&g.id, &w.id, "loomux", &format!("[loomux] advisory {i}"), pty,
+            queue::EnqueueReason::Arrival).unwrap();
+    }
+
+    let brief = "review finding: PR #661 masks on what a row claims, not on what loomux wrote";
+    let err = reg.deliver_prompt(&w.id, brief, &orch.id, Delivery::MidSession).unwrap_err();
+    assert!(err.contains("NOT queued"), "the sender is told synchronously: {err}");
+
+    let front = reg.queue_snapshot(pty).remove(0);
+    reg.pop_front_dequeued(&g.id, pty, front.id, front.enqueued_ms);
+
+    let snap = reg.queue_snapshot(pty);
+    let roster = snap
+        .last()
+        .and_then(|e| e.payload.text())
+        .expect("the drain must queue a roster for this pane");
+    assert!(roster.contains("REFUSED and never queued"), "the roster, not a pressure notice: {roster}");
+    assert!(roster.contains(&orch.id), "naming the sender to ask: {roster}");
+    assert!(roster.contains("PR #661"), "and which delivery it was: {roster}");
+    assert!(roster.starts_with("[loomux]"),
+        "one marker-led line, so the same string can also be parked in the relay block: {roster}");
+    assert!(!roster.contains('\n'), "…and a single line at that: {roster}");
+    // It obeys the cap it reports on: the roster took the slot the drain freed
+    // and nothing more.
+    assert_eq!(reg.queue_depth(pty), queue::QUEUE_MAX_PER_PANE,
+        "one entry out, one roster in — never past the cap: {snap:?}");
+}
+
 #[test]
 fn deliver_prompt_front_door_enqueues_behind_a_non_empty_queue_without_an_app_handle() {
     // #445/#470: landing BEHIND an existing entry never needs an app handle
