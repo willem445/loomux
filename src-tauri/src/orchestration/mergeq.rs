@@ -374,9 +374,55 @@ pub struct BatchRecord {
     state: EntryState,
     #[serde(default)]
     pub started_ms: u64,
+    /// Present exactly when this batch is a **bisect probe** rather than a batch
+    /// that might land (§9, the #698 driver) — see [`BisectSearch`].
+    ///
+    /// Additive and `#[serde(default)]`, so a file written by a build that
+    /// predates it still reads, and `extra` carries it back out of one that does
+    /// not understand it (§11.3's machine-authored-state posture).
+    #[serde(default)]
+    pub bisect: Option<BisectSearch>,
     /// Preserved unknown fields — see the section comment above.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// What a bisect probe has to remember about the search it belongs to (§9).
+///
+/// Both fields are facts about the **original red batch**, carried unchanged
+/// through every probe, because the tick that finally attributes a culprit
+/// frequently cannot recompute either of them:
+///
+/// - **`failing`** — attribution can land on a probe whose own observation was
+///   *green*: when a probe exonerates its half, the culprit is the other half,
+///   and that tick has no failing checks of its own to report. Nothing on the
+///   remote still holds the originals by then either; the draft PR is closed and
+///   the scratch ref deleted on every exit path (§10).
+/// - **`origin_prs`** — §9 requires the culprit comment to name the **sibling
+///   set**, precisely so a genuine pairwise interaction is visible rather than
+///   hidden behind a confident single name. Siblings leave the search as they
+///   are exonerated and go back to `queued`, where they are indistinguishable
+///   from freshly enqueued work, so by the last round the set is unrecoverable
+///   from the entries.
+///
+/// Recomputing is not an option for either; carrying is.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BisectSearch {
+    /// The PRs the original red batch contained, in its queue order.
+    #[serde(default)]
+    pub origin_prs: Vec<u64>,
+    /// The failing check names that opened the search.
+    #[serde(default)]
+    pub failing: Vec<String>,
+    /// Preserved unknown fields — see the section comment above.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl BisectSearch {
+    pub fn new(origin_prs: Vec<u64>, failing: Vec<String>) -> BisectSearch {
+        BisectSearch { origin_prs, failing, extra: BTreeMap::new() }
+    }
 }
 
 impl BatchRecord {
@@ -389,8 +435,47 @@ impl BatchRecord {
             draft_pr: None,
             state: EntryState::Batching,
             started_ms,
+            bisect: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    /// A **bisect probe**: the same object as a batch, constructed already in
+    /// `bisecting` (§9, the #698 driver).
+    ///
+    /// A probe is a step of the search from the moment it is constructed — it
+    /// is not a batch that might land, and no green result it produces ever
+    /// lands anything (§9: the search attributes, and survivors are requeued for
+    /// a later ordinary batch). Constructing it in `bisecting` says that, where
+    /// walking it `batching → ci-wait → bisecting` would claim it passed through
+    /// two states it was never in. Construction is not a transition — the same
+    /// reason [`BatchRecord::new`] may start at `batching` without going through
+    /// [`transition`].
+    ///
+    /// `search` is what the original red batch knew ([`BisectSearch`]), carried
+    /// so the culprit comment can name it however the search terminates.
+    pub fn new_probe(
+        id: &str,
+        prs: Vec<u64>,
+        started_ms: u64,
+        search: BisectSearch,
+    ) -> BatchRecord {
+        BatchRecord {
+            id: id.to_string(),
+            prs,
+            scratch_sha: String::new(),
+            draft_pr: None,
+            state: EntryState::Bisecting,
+            started_ms,
+            bisect: Some(search),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// Whether this batch is a **bisect probe** — one source of truth, so the
+    /// record's state and its search data can never be read as disagreeing.
+    pub fn is_probe(&self) -> bool {
+        self.bisect.is_some()
     }
 
     pub fn state(&self) -> EntryState {

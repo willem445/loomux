@@ -1631,6 +1631,18 @@ pub fn seed_leaked_readers_for_test(n: usize) -> Vec<mpsc::Sender<()>> {
 /// landed, coarse enough that a small per-group YAML read+parse is negligible
 /// even with several live groups.
 const WORKFLOW_GATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// How long the merge-queue driver holds a group off after an external failure
+/// (#698 — `mqloop::DriveReport::backoff`).
+///
+/// §10's failure rows all end "entries return to `queued`", which means the very
+/// next poll tick would retry the same thing: one abort notice and one audit
+/// line every 30 seconds against a remote that is simply down. The bound is not
+/// a retry *limit* — §10 is explicit that the entries requeue and a later batch
+/// re-derives the question — it is a **rate**, so a broken world costs the
+/// orchestrator one notice every five minutes instead of ten an hour per group.
+/// Five minutes because that is long enough to be quiet and short enough that a
+/// transient auth blip does not park a batch for a coffee break.
+const MQ_DRIVE_BACKOFF_MS: u64 = 5 * 60_000;
 /// Autonomous mode (#83): default output-quiet window before an idle tick fires,
 /// when the group's `idle_tick_minutes` guardrail isn't set. Lowered from the
 /// original 15 to **5** after a live test: a human who turns autonomous mode on
@@ -8285,6 +8297,34 @@ pub struct OrchRegistry {
     /// queue and the merge queue recover independently, and sharing one mark
     /// would make whichever ran first silently suppress the other.
     mq_reconciled_groups: Arc<Mutex<HashSet<String>>>,
+    /// Serializes every read-modify-write of a `merge_queue.json` (#698).
+    ///
+    /// The driver tick and the three MCP tools are on different threads, and
+    /// each of them is a `load_state` → decide → `store_state` sequence. Without
+    /// this, a `queue_merge` that lands while a batch is being built reads the
+    /// pre-build file, writes it back afterwards, and the batch record is simply
+    /// gone — a lost update whose symptom is the exact "queued and never
+    /// landed" #698 reports, one layer down.
+    ///
+    /// **One registry-wide lock rather than one per group**, deliberately. The
+    /// only thread that holds it for long is the driver, which services one
+    /// group per tick by construction (`mq_driver_tick`), so a per-group map
+    /// would buy no concurrency the design can actually use, at the cost of a
+    /// lock-ordering question every future caller would have to get right.
+    ///
+    /// **Never held across a notice delivery.** A delivery enqueues, and an
+    /// enqueue can re-enter registry locks — the #467/#468 two-phase rule that
+    /// `merge_queue_reconcile` already follows.
+    mq_state_lock: Arc<Mutex<()>>,
+    /// Earliest wall-clock at which the driver may service each group again
+    /// (#698). Absent = now.
+    ///
+    /// In memory only, and that is the point: it exists to stop a group whose
+    /// remote is down from emitting one abort notice per poll tick, and that
+    /// condition is a fact about the world rather than about the queue. A
+    /// persisted backoff would keep punishing a batch for a network that has
+    /// since come back.
+    mq_service_ms: Arc<Mutex<HashMap<String, u64>>>,
     /// #560: each pane's open hold EPISODE — when it began, and what has
     /// already been said about it. Keyed by `pty_id`, in memory only (see
     /// [`HoldEpisode`] for the restart argument).
@@ -18595,6 +18635,8 @@ impl OrchRegistry {
             recovered_markers: Arc::new(Mutex::new(HashMap::new())),
             recovered_groups: Arc::new(Mutex::new(HashSet::new())),
             mq_reconciled_groups: Arc::new(Mutex::new(HashSet::new())),
+            mq_state_lock: Arc::new(Mutex::new(())),
+            mq_service_ms: Arc::new(Mutex::new(HashMap::new())),
             queue_draining: Arc::new(queuestate::DrainerRegistry::new()),
             drainer_gen: Arc::new(AtomicU64::new(0)),
             queue_still_notified: Arc::new(Mutex::new(HashSet::new())),
@@ -22331,7 +22373,14 @@ impl OrchRegistry {
         if intake_scanned {
             self.poll_intake(now);
         }
-        GhPollTick { fired, intake_scanned }
+        // #698: the merge queue's driver, on every wake and for at most ONE
+        // group — see `mq_driver_tick` for why the bound is one group rather
+        // than a budget. On every wake rather than a coarser cadence of its own
+        // because the steady state is a single `gh pr checks` on the batch's
+        // draft PR, which is exactly a watch poll; the expensive paths are
+        // transitions, and a transition happens once per batch.
+        let mq_serviced = self.mq_driver_tick(now);
+        GhPollTick { fired, intake_scanned, mq_serviced }
     }
 
     // ---------- idle-tick intake gate (#332): host-side, zero-token label/PR-check poll ----------
@@ -34780,11 +34829,27 @@ impl OrchRegistry {
     /// `gate-not-configured`. One toggle governs the file; the queue is part of
     /// the file.
     fn merge_queue_enabled(&self, group: &str) -> bool {
-        let Some(g) = self.group(group) else { return false };
+        self.merge_queue_policy(group).enabled
+    }
+
+    /// This group's `merge_queue:` policy (§11.2) — `max_batch` and
+    /// `checks_timeout_minutes` as declared, or the off-by-default when the
+    /// block is absent, the file will not parse, or the workflow is not in
+    /// force at all.
+    ///
+    /// One reader for the whole block, so `merge_queue_enabled` and the driver's
+    /// per-tick bounds cannot come to different conclusions about whether this
+    /// group runs a queue — the failure mode being a driver that batches for a
+    /// group whose tools all refuse `queue-disabled`.
+    fn merge_queue_policy(&self, group: &str) -> workflow::MergeQueuePolicy {
+        let Some(g) = self.group(group) else { return workflow::MergeQueuePolicy::default() };
         if !g.guardrails.advanced_orchestrator {
-            return false;
+            return workflow::MergeQueuePolicy::default();
         }
-        matches!(workflow::load_workflow(&g.repo), Ok(Some(wf)) if wf.merge_queue.enabled)
+        match workflow::load_workflow(&g.repo) {
+            Ok(Some(wf)) => wf.merge_queue,
+            _ => workflow::MergeQueuePolicy::default(),
+        }
     }
 
     /// The gate spec the queue re-enforces (§6), read through the same
@@ -34834,6 +34899,11 @@ impl OrchRegistry {
     ) -> Value {
         let enabled = self.merge_queue_enabled(group);
         let dir = self.group_dir(group);
+        // #698: serialized against the driver tick, whose own load-decide-store
+        // can span a whole batch build. Without it an enqueue that lands mid-
+        // build reads the pre-build file and writes it back, erasing the batch
+        // record — a lost update whose symptom is a queue that never lands.
+        let _state_guard = self.mq_state_lock.lock_safe();
         let mut state = match mqloop::load_state(&dir) {
             Ok(s) => s,
             Err(e) => {
@@ -34905,6 +34975,7 @@ impl OrchRegistry {
         // it wears a different label: `not-queued` asserts the PR is not in the
         // queue, which loomux cannot possibly know from a state file it could
         // not read. Fixed here rather than left for a later round.
+        let _state_guard = self.mq_state_lock.lock_safe(); // #698, see `queue_merge_with`
         let mut state = match mqloop::load_state(&dir) {
             Ok(s) => s,
             Err(e) => {
@@ -35002,6 +35073,11 @@ impl OrchRegistry {
             if !done.insert(group.to_string()) {
                 return Vec::new();
             }
+            // #698: every read-modify-write of this file is serialized, so a
+            // concurrent `queue_merge` cannot read the pre-reconcile state and
+            // write it back over the recovery. Taken AFTER the once-only guard,
+            // which is the lock order every merge-queue path uses.
+            let _state_guard = self.mq_state_lock.lock_safe();
             let dir = self.group_dir(group);
             let mut state = match mqloop::load_state(&dir) {
                 Ok(s) => s,
@@ -35067,6 +35143,169 @@ impl OrchRegistry {
             report.notices
         };
         notices
+    }
+
+    // ---------- the merge queue's DRIVER (#698) ----------
+
+    /// **One driver step, for at most one group** — the production caller the
+    /// batch pipeline never had (#698).
+    ///
+    /// Called from `gh_poll_tick`, the unified `gh` poller (#406/#652), because
+    /// observing a batch's checks is a `gh` poll like any watch and because that
+    /// loop is the one place in this process that makes `gh` calls, with one
+    /// shared cadence and one shared budget.
+    ///
+    /// **At most one group per wake, oldest-serviced first.** That is the whole
+    /// per-tick bound, and it is structural rather than a counter: the loop is
+    /// shared with every `notify_when` watch in the fleet, and a driver that
+    /// serviced N groups on one wake would put N batch builds inside one tick —
+    /// the unbounded fan-out #656 exists to stop, in a half that had never had a
+    /// cap. Ordering by last-serviced makes the rotation fair, so a group is
+    /// deferred rather than starved (the `due_intake_polls` idiom #656 asks for
+    /// on the intake half).
+    ///
+    /// Returns the group serviced, if any — for the audit-free assertion a test
+    /// needs that the tick actually reached a group.
+    pub fn run_mq_driver_tick(&self) -> Option<String> {
+        self.mq_driver_tick(now_ms())
+    }
+
+    /// [`run_mq_driver_tick`](Self::run_mq_driver_tick) with the clock injected.
+    pub fn mq_driver_tick(&self, now: u64) -> Option<String> {
+        let group = self.next_mq_group(now)?;
+        let repo = self.group(&group).map(|g| g.repo)?;
+        let runner = mqdriver::runner_for(std::path::Path::new(&repo));
+        self.mq_drive_group_with(&group, &runner, now);
+        Some(group)
+    }
+
+    /// The one group this wake will service, or `None`.
+    ///
+    /// Three filters, cheapest first, and each of them is a reason not to spend
+    /// a subprocess: the group must not be inside a backoff window, it must have
+    /// a `merge_queue.json` at all (the product default is that no group does,
+    /// §12 — and a *file check* rather than a parse, so an unreadable file still
+    /// reaches the driver's own loud handling), and its repo must actually
+    /// declare the queue.
+    fn next_mq_group(&self, now: u64) -> Option<String> {
+        let all: Vec<String> = self.groups.lock_safe().keys().cloned().collect();
+        let service = self.mq_service_ms.lock_safe().clone();
+        let mut due: Vec<(u64, String)> = all
+            .into_iter()
+            .filter(|g| service.get(g).map(|t| now >= *t).unwrap_or(true))
+            .filter(|g| mqloop::state_path(&self.group_dir(g)).exists())
+            .filter(|g| self.merge_queue_enabled(g))
+            .map(|g| (service.get(&g).copied().unwrap_or(0), g))
+            .collect();
+        // Oldest-serviced first; the group id breaks a tie deterministically so
+        // two never-serviced groups do not alternate on HashMap iteration order.
+        due.sort();
+        due.into_iter().next().map(|(_, g)| g)
+    }
+
+    /// Hold `group` off until `at`.
+    fn mq_defer(&self, group: &str, at: u64) {
+        self.mq_service_ms.lock_safe().insert(group.to_string(), at);
+    }
+
+    /// Drive one group with the runner injected — the seam `tests/orchestration.rs`
+    /// uses to exercise the whole production path (selection, reconcile-first,
+    /// `drive`, the audit emission, `store_state`, the notices) **without
+    /// spawning `git` or `gh`** (CLAUDE.md constraint 3).
+    ///
+    /// **This is wiring, not logic.** Every decision is `mqloop::drive`'s. What
+    /// lives here is what only the registry can do: resolve the policy, the gate
+    /// and the verdict files, hold the state lock across the read-modify-write,
+    /// emit the audit events, and deliver the notices.
+    ///
+    /// **Reconcile runs first, always.** `merge_queue_reconcile_with` is
+    /// once-only per group per process, so this is a no-op after the first call
+    /// and costs nothing — but it makes the ordering a guarantee rather than an
+    /// assumption about which bind site ran when. §4's recovery decides whether
+    /// an in-flight batch may be resumed; a driver that observed one *before*
+    /// that decision would be acting on a record recovery was about to strand.
+    /// Its notices are delivered here, outside the state lock, for the
+    /// #467/#468 reason `merge_queue_reconcile` documents.
+    #[doc(hidden)] // pub for integration tests
+    pub fn mq_drive_group_with(
+        &self,
+        group: &str,
+        runner: &dyn mqdriver::MqRunner,
+        now: u64,
+    ) -> mqloop::DriveReport {
+        for n in self.merge_queue_reconcile_with(group, runner) {
+            let _ = self.deliver_to_orchestrator(group, &n, "loomux");
+        }
+        let policy = self.merge_queue_policy(group);
+        if !policy.enabled {
+            // Byte-for-byte unchanged behaviour with no `merge_queue:` block
+            // (§12). Checked here as well as in `next_mq_group` because this
+            // method is the test seam and a seam that skipped the product's own
+            // opt-in would be testing something the product cannot do.
+            return mqloop::DriveReport::default();
+        }
+        let dir = self.group_dir(group);
+        let gate = self.merge_queue_gate(group);
+        let report = {
+            let _state_guard = self.mq_state_lock.lock_safe();
+            let mut state = match mqloop::load_state(&dir) {
+                // A file this build cannot act on is audited and **left alone**
+                // — §11.2's promise that an older build does not destroy what a
+                // newer one wrote. Backed off too, so an unreadable file is one
+                // audit line every few minutes rather than one every tick.
+                Err(e) => {
+                    self.audit(
+                        group,
+                        "loomux",
+                        mqloop::audit_action::STRANDED,
+                        json!({ "reason": "unusable merge_queue.json", "detail": format!("{e:?}") }),
+                    );
+                    self.mq_defer(group, now.saturating_add(MQ_DRIVE_BACKOFF_MS));
+                    return mqloop::DriveReport::default();
+                }
+                Ok(s) => s,
+            };
+            let cfg = mqloop::DriveConfig {
+                group,
+                max_batch: policy.max_batch,
+                checks_timeout_minutes: policy.checks_timeout_minutes,
+                now_ms: now,
+            };
+            let rep =
+                mqloop::drive(runner, &mut state, &cfg, &gate, &|pr| self.verdict_map(group, pr));
+            if rep.changed {
+                if let Err(e) = mqloop::store_state(&dir, &state) {
+                    // A transition the next restart forgets is not a transition.
+                    // Audited loudly and backed off; the batch record on disk is
+                    // whatever survived, and reconcile is what fixes it.
+                    self.audit(
+                        group,
+                        "loomux",
+                        mqloop::audit_action::STRANDED,
+                        json!({ "reason": "merge_queue.json could not be written", "detail": e }),
+                    );
+                    self.mq_defer(group, now.saturating_add(MQ_DRIVE_BACKOFF_MS));
+                }
+            }
+            rep
+        };
+        // Outside the lock: an audit write is cheap but a notice is a delivery,
+        // and a delivery enqueues.
+        for a in &report.audits {
+            self.audit(group, "loomux", a.action, a.detail.clone());
+        }
+        for n in &report.notices {
+            let _ = self.deliver_to_orchestrator(group, n, "loomux");
+        }
+        if report.backoff {
+            self.mq_defer(group, now.saturating_add(MQ_DRIVE_BACKOFF_MS));
+        } else {
+            // Not a backoff — just this group's turn in the rotation, so N
+            // groups with live queues share the wakes instead of the first one
+            // alphabetically taking every tick.
+            self.mq_defer(group, now);
+        }
+        report
     }
 
     pub fn deliver_to_orchestrator(&self, group: &str, text: &str, from: &str) -> Result<(), String> {
@@ -35603,6 +35842,12 @@ pub struct GhPollTick {
     pub fired: Vec<String>,
     /// Whether the intake half's due-group scan ran on this wake.
     pub intake_scanned: bool,
+    /// The group the merge-queue driver serviced on this wake, if any (#698).
+    ///
+    /// The group rather than a bool, because "one group per wake, oldest
+    /// serviced first" is the tick's whole bound and a bool could not tell a
+    /// rotation from a group monopolising every wake.
+    pub mq_serviced: Option<String>,
 }
 
 /// Whether the unified poller's INTAKE half is due on a wake at `now`, given
