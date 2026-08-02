@@ -39,6 +39,30 @@ pub const LESSONS_PATH: &str = ".loomux/lessons.md";
 /// constant overhead that does not grow with the file.
 pub const LESSONS_BYTE_CAP: usize = 4096;
 
+/// A `## ` heading carrying this literal marks its entry **pinned**: eviction
+/// takes it last, after the preamble and every unpinned entry (#498). It is a
+/// priority, not an exemption — if the pinned entries *alone* still exceed
+/// `LESSONS_BYTE_CAP` the oldest of them is evicted too, because the cap is
+/// the #189 guardrail and nothing in the file may argue past it.
+///
+/// A documented convention, not a schema: an unmarked file behaves exactly as
+/// it did before this existed, except eviction lands on entry boundaries. The
+/// marker is injected verbatim with the rest of the heading — this module
+/// never rewrites lesson content.
+pub const PIN_MARKER: &str = "[pinned]";
+
+/// Hard ceiling on the eviction notice `cap` prepends when it drops entries.
+/// The notice names the dropped entries' headings, which are **untrusted
+/// bytes from the file** — so it needs its own bound, or a file full of
+/// pathological headings could smuggle unbounded content into a kickoff past
+/// `LESSONS_BYTE_CAP`. Titles are clipped individually and the list stops
+/// with "and N more" once this bound is in reach.
+///
+/// This is the "small, bounded constant" the module contract adds on top of
+/// `LESSONS_BYTE_CAP`: what `load_lessons_note` returns is at most
+/// `LESSONS_BYTE_CAP + NOTICE_BYTE_CAP + 1`.
+pub const NOTICE_BYTE_CAP: usize = 768;
+
 /// Opens the untrusted block in a kickoff (#268 review finding #1): the
 /// provenance framing ahead of this line is prefix-only, so without an
 /// explicit *closing* line, lesson content ending in instruction-shaped text
