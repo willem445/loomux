@@ -116,9 +116,30 @@ pub fn assign_kill_on_close_job(pid: u32) -> Option<JobHandle> {
     }
 }
 
+/// A pane's ConPTY master, shared out of the global map (#719). See
+/// [`PtyHandle::writer`] for why these two are `Arc<Mutex<..>>` rather than
+/// plain fields.
+pub type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
+/// A pane's stdin writer, shared out of the global map (#719).
+pub type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
 pub struct PtyHandle {
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    /// #719: shared, so `resize_pty`/`size` can take the ConPTY call out of
+    /// the global `ptys` lock's scope — clone the `Arc`, drop the map guard,
+    /// then work. Per-pane, so one pane's resize serializes only against
+    /// itself.
+    master: SharedMaster,
+    /// #719: shared for the same reason as `master`, and for the sharper one
+    /// that motivated the issue. `write_all` into ConPTY's small input pipe
+    /// blocks for as long as the child declines to drain it — unbounded, in
+    /// the case the issue is about (a busy agent). Doing that while holding
+    /// the global `ptys` map lock converted "one agent is busy" into "every
+    /// pty command in the app is queued": the map lock is what `write_pty`,
+    /// `resize_pty`, `get_output`, the attention scan and pane teardown all
+    /// contend on. Cloning the `Arc` out under the map lock and writing under
+    /// this per-pane lock keeps the blocking exactly where it belongs — on
+    /// the one pane whose pipe is full.
+    writer: SharedWriter,
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Rolling tail of raw output, teed off the reader thread.
     output: Arc<Mutex<OutputBuf>>,
@@ -190,31 +211,84 @@ impl PtyManager {
         }
     }
 
-    /// Raw write into a pty's stdin; used by orchestration to type prompts
-    /// into agent CLIs so the human sees them verbatim.
-    pub fn write_bytes(&self, id: u32, bytes: &[u8]) -> Result<(), String> {
-        let mut ptys = self.ptys.lock_safe();
-        let pty = ptys.get_mut(&id).ok_or("pty not found")?;
-        pty.writer.write_all(bytes).map_err(|e| e.to_string())
+    /// This pane's stdin writer, cloned out of the global map (#719). The map
+    /// lock is held for a hashmap lookup and one `Arc` clone and is released
+    /// before the caller touches the pipe, so no IO ever happens inside it.
+    ///
+    /// Lock order, and the reason there is no deadlock to find here: the
+    /// writer lock is a LEAF. Nothing takes the `ptys` map lock (or the output
+    /// ring's, or `neutral_gate_throttle`'s) while holding it, and every
+    /// acquisition of it in this file follows this method — map lock taken,
+    /// released, then writer lock. The reader thread and the attention scan
+    /// (#717/#725) never touch the writer at all.
+    fn writer_handle(&self, id: u32) -> Option<SharedWriter> {
+        Some(self.ptys.lock_safe().get(&id)?.writer.clone())
     }
 
-    /// The whole body of the `write_pty` command, minus the Tauri wrapper —
-    /// extracted so an integration test can drive exactly what a frontend
-    /// keystroke runs against a real (fake) pty with no `AppHandle`, the same
-    /// seam and the same reason as `note_user_input` (#496 PR-A).
+    /// This pane's ConPTY master, cloned out of the global map — same contract
+    /// as [`PtyManager::writer_handle`], for the resize/geometry calls.
+    fn master_handle(&self, id: u32) -> Option<SharedMaster> {
+        Some(self.ptys.lock_safe().get(&id)?.master.clone())
+    }
+
+    /// Raw write into a pty's stdin; used by orchestration to type prompts
+    /// into agent CLIs so the human sees them verbatim.
+    ///
+    /// #719: still synchronous-completion, deliberately. `Ok` here has always
+    /// meant "these bytes went out", and two callers depend on exactly that:
+    /// `deliver_prompt` records its own delivered text only once this returns
+    /// `Ok` (see `OrchRegistry::record_delivered_text` — a record of text that
+    /// never reached the pane is the fail-OPEN direction for the question
+    /// gate's mask), and the echo-verified typing loop measures the child's
+    /// output from *after* the paste is out. Buffering this write into a queue
+    /// and returning early would quietly turn both into claims about bytes
+    /// that might never be written. What #719 changes is only where the
+    /// blocking happens: on this pane's own writer lock, on the caller's own
+    /// (orchestration background) thread, instead of on the global map lock.
+    pub fn write_bytes(&self, id: u32, bytes: &[u8]) -> Result<(), String> {
+        let writer = self.writer_handle(id).ok_or("pty not found")?;
+        let mut w = writer.lock_safe();
+        w.write_all(bytes).map_err(|e| e.to_string())
+    }
+
+    /// The whole body of the `write_pty` command (#719), minus the Tauri
+    /// wrapper — extracted so an integration test can drive exactly what a
+    /// frontend keystroke runs against a real (fake) pty with no `AppHandle`,
+    /// the same seam and the same reason as `note_user_input` (#496 PR-A).
+    ///
+    /// **Ordering: the human-input signal is recorded BEFORE the bytes go
+    /// out, and that is the load-bearing direction.** `note_user_input`'s
+    /// stamp and box-occupancy counter are what the question gate, the
+    /// stranded-text flush and the autonomous idle tick read to answer "is a
+    /// human mid-typing in this pane right now?" (#111, #171, #496, #518).
+    /// Recording first means the answer is "yes" for the whole window in
+    /// which the keystroke is in flight — including the pathological window
+    /// this issue is about, where the child is not draining and the write
+    /// parks for seconds. Recording after the write would leave that entire
+    /// window reading "nothing typed", which is precisely the clobber #111
+    /// exists to prevent: a delivery would paste over a line the human has
+    /// already committed to. The reverse error — believing a human typed
+    /// slightly before their bytes land — only ever makes loomux hold MORE,
+    /// which is the fail-safe direction every one of those readers is written
+    /// for. This is also exactly the order the pre-#719 command used, so
+    /// nothing downstream moves.
     pub fn write_from_frontend(&self, id: u32, data: &str, human: bool) -> Result<(), String> {
         self.note_user_input(id, data, human);
         self.write_bytes(id, data.as_bytes())
     }
 
-    /// The body of the `change_dir` command: format the `cd` for this pane's
-    /// OWN shell and write it. Same extraction rationale as
-    /// `write_from_frontend`.
+    /// The body of the `change_dir` command (#719): format the `cd` for this
+    /// pane's OWN shell and write it, with the global map lock released before
+    /// the write. Same extraction rationale as `write_from_frontend`.
     pub fn write_cd(&self, id: u32, path: &str) -> Result<(), String> {
-        let mut ptys = self.ptys.lock_safe();
-        let pty = ptys.get_mut(&id).ok_or("pty not found")?;
-        let line = cd_command_line(path, pty.shell_kind);
-        pty.writer.write_all(line.as_bytes()).map_err(|e| e.to_string())
+        let (writer, kind) = {
+            let ptys = self.ptys.lock_safe();
+            let pty = ptys.get(&id).ok_or("pty not found")?;
+            (pty.writer.clone(), pty.shell_kind)
+        };
+        let line = cd_command_line(path, kind);
+        let mut w = writer.lock_safe();
+        w.write_all(line.as_bytes()).map_err(|e| e.to_string())
     }
 
     /// Record one FRONTEND-originated write for the human-input signals
@@ -393,8 +467,11 @@ impl PtyManager {
     /// (`orchestration::termgrid`) only lands text where the human saw it if
     /// the grid is the pane's real width and height.
     pub fn size(&self, id: u32) -> Option<(u16, u16)> {
-        let ptys = self.ptys.lock_safe();
-        let sz = ptys.get(&id)?.master.get_size().ok()?;
+        // #719: the map lock is released before the ConPTY query, so this
+        // orchestration-thread call can no longer be what a pty command waits
+        // behind (nor wait behind one itself).
+        let master = self.master_handle(id)?;
+        let sz = master.lock_safe().get_size().ok()?;
         Some((sz.cols, sz.rows))
     }
 
@@ -546,8 +623,10 @@ impl PtyManager {
         self.ptys.lock_safe().insert(
             id,
             PtyHandle {
-                master: pair.master,
-                writer: Box::new(CaptureWriter(captured.clone(), gate)),
+                master: Arc::new(Mutex::new(pair.master)),
+                writer: Arc::new(Mutex::new(
+                    Box::new(CaptureWriter(captured.clone(), gate)) as Box<dyn Write + Send>
+                )),
                 killer,
                 output,
                 user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -607,8 +686,8 @@ impl PtyManager {
 }
 
 /// Test-only write barrier for [`PtyManager::register_gated_fake_for_test`]
-/// (#719). A fake pty's writer calls `enter` and parks there until
-/// [`PtyWriteGate::open`] releases it, standing in for a child that has
+/// (#719). A fake pty's writer calls [`PtyWriteGate::enter`] and parks there
+/// until [`PtyWriteGate::open`] releases it, standing in for a child that has
 /// stopped draining its stdin pipe.
 ///
 /// Deliberately a rendezvous, not a sleep: the test learns the write is
@@ -1287,8 +1366,8 @@ pub fn spawn_pty(
     state.ptys.lock_safe().insert(
         id,
         PtyHandle {
-            master: pair.master,
-            writer,
+            master: Arc::new(Mutex::new(pair.master)),
+            writer: Arc::new(Mutex::new(writer)),
             killer,
             output: output.clone(),
             user_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1446,21 +1525,65 @@ pub fn pty_backend_info() -> PtyBackendInfo {
 /// default (it only ever makes delivery hold MORE). The parameter is additive,
 /// so the command's existing shape stays valid — `write_pty(id, data)` still
 /// compiles, still deserializes, and still means what it always meant.
+/// #719: `async` + `spawn_blocking`, and the whole body — not just the write —
+/// goes to the blocking pool. Tauri dispatches a *synchronous* command by
+/// calling it directly on the webview main thread, and polls an async
+/// command's future there too up to its first real await (the #716/#724
+/// finding), so anything left before the `spawn_blocking` call would still run
+/// on the GUI thread. What is left here is a channel send. `note_user_input`
+/// in particular moves off it: its throttled `phantom-input-gated` breadcrumb
+/// is a file write, which has no business on the thread that paints.
+///
+/// **What this does NOT change is ordering, and that is deliberate.** This
+/// command still resolves only once the bytes are actually out, because the
+/// frontend's ordered writer (`src/ptywrite.ts`, issue #65) keeps exactly one
+/// `write_pty` in flight per pane and chains the next one on this promise —
+/// that chain, not the backend, is what makes a bracketed paste's terminator
+/// unable to overtake its body. Returning early (a queue, a fire-and-forget
+/// send) would dissolve both that ordering guarantee and the end-to-end back
+/// pressure it rests on: today a pane whose child has stopped reading simply
+/// stops accepting chunks, so the unsent remainder waits in the pane's own JS
+/// queue and NOTHING accumulates backend-side. A backend queue would have to
+/// answer "and what when it fills?" with either unbounded memory or dropped
+/// keystrokes — a truncated command line submitted by the Enter behind it.
+/// Preserving back pressure is the bounded-memory answer. Only the *thread*
+/// and the *lock scope* change.
 #[tauri::command]
-pub fn write_pty(
-    state: State<PtyManager>,
+pub async fn write_pty(
+    app: AppHandle,
     id: u32,
     data: String,
     human: Option<bool>,
 ) -> Result<(), String> {
-    state.write_from_frontend(id, &data, human.unwrap_or(true))
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<PtyManager>().ok_or("pty state unavailable")?;
+        state.write_from_frontend(id, &data, human.unwrap_or(true))
+    })
+    .await
+    .map_err(|e| format!("pty write task failed: {e}"))?
 }
 
+/// Deliberately still synchronous, unlike `write_pty` above (#719).
+///
+/// The global-lock half of the issue applies here and is fixed: the ConPTY
+/// call now happens outside the `ptys` map lock, so a resize can neither wait
+/// behind another pane's work nor make another pane wait behind it. Going
+/// further and moving it off the main thread would be a bad trade. A resize is
+/// bounded local work — `ResizePseudoConsole` repaints, it does not wait on the
+/// child to consume anything — so it cannot produce the unbounded stall
+/// `write_pty` could, and #432 already collapses resize bursts (debounce,
+/// drag holds, same-size skip) so few of them are issued at all. Against that,
+/// a sync command inherits arrival ordering from the main thread's own
+/// dispatch, and resizes NEED it: `shouldResizePty` (src/panefit.ts) suppresses
+/// only an *identically sized* in-flight call, so two different sizes can be
+/// outstanding at once, and off-thread they could land in either order — which
+/// would leave ConPTY at the older geometry with no event to correct it. The
+/// ordering is worth more here than the few milliseconds.
 #[tauri::command]
 pub fn resize_pty(state: State<PtyManager>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
-    let ptys = state.ptys.lock_safe();
-    let pty = ptys.get(&id).ok_or("pty not found")?;
-    pty.master
+    let master = state.master_handle(id).ok_or("pty not found")?;
+    let master = master.lock_safe();
+    master
         .resize(PtySize {
             rows,
             cols,
@@ -1502,9 +1625,21 @@ pub fn dir_info(path: String) -> DirInfo {
 /// Send a `cd` into a pane's shell, so the folder picker can drive it. The
 /// command is formatted for the pane's *own* shell kind (#194 P2), not the
 /// machine default — a cmd or Git Bash pane must not receive PowerShell syntax.
+///
+/// #719: async for the same reason as `write_pty` — this is the same
+/// `write_all` into the same pipe, and a pane whose child is not draining
+/// wedges it exactly as hard. It is not ordered against the frontend's
+/// keystroke chain, and never was: a folder-picker `cd` and whatever the human
+/// is typing are separate invokes racing for the pane's writer, before this
+/// change as after it. Each write is still atomic against the other.
 #[tauri::command]
-pub fn change_dir(state: State<PtyManager>, id: u32, path: String) -> Result<(), String> {
-    state.write_cd(id, &path)
+pub async fn change_dir(app: AppHandle, id: u32, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.try_state::<PtyManager>().ok_or("pty state unavailable")?;
+        state.write_cd(id, &path)
+    })
+    .await
+    .map_err(|e| format!("pty write task failed: {e}"))?
 }
 
 /// Build a shell-appropriate `cd` command line (Enter-terminated) for the pane's
