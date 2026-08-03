@@ -170,7 +170,9 @@ test("normalizeGoal caps by code points, never mid-character, and never ends in 
   const emoji = "🐛".repeat(MAX_GOAL_CHARS + 10);
   const capped = normalizeGoal(emoji);
   assert.equal(Array.from(capped).length, MAX_GOAL_CHARS);
-  assert.ok(!/[\uD800-\uDFFF]$/.test(capped.slice(-1)), "no lone surrogate at the cap");
+  // Exact, so a cap that split a surrogate pair (or counted UTF-16 units) would
+  // show up as a different string rather than merely a different length.
+  assert.equal(capped, "🐛".repeat(MAX_GOAL_CHARS));
   // A cap that lands on the collapsed space must not leave a trailing one.
   const trailing = normalizeGoal("y".repeat(MAX_GOAL_CHARS - 1) + "   tail");
   assert.ok(!trailing.endsWith(" "), `no trailing space: ${JSON.stringify(trailing.slice(-3))}`);
