@@ -8,6 +8,15 @@ enforcement tests: `src-tauri/tests/perf_dispatch.rs` (**E1**) and
 S2/S3. Sections are numbered so a manifest entry can cite one
 (`see performance.md §4 X1`).
 
+**How to read a cite here.** The **symbol** is the cite — a function, const,
+static or struct field, written as `` `file.rs` `Type::member` ``. Any `~L`
+beside it is a navigation hint, deliberately *not* maintained: a hint that has
+drifted is not a defect and not a review finding, and re-deriving one is never
+a reason to touch this file. Line numbers were the cite until #743 S7, and they
+did not survive contact — three PRs re-broke them in a fortnight, and two
+(§4 X4, X6) pointed at unrelated code from the day they were written, because
+nothing about a wrong number looks wrong. Grep the symbol.
+
 ## 1. The model
 
 One thread — the webview/GUI thread — services **all** of: keyboard and mouse
@@ -36,7 +45,7 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
 - **P1 — `spawn_blocking` the whole body.** The command is a thin `async fn`
   whose entire body is handed off, nothing before the first await. Precedent:
   `git.rs` (all 22 commands, #399 + #726), `gh.rs` (all 10 commands, #724),
-  `write_pty` (`pty.rs:1552`) and `change_dir` (`:1657`), both #734. `git.rs`
+  `pty.rs` `write_pty` (~L1580) and `change_dir` (~L1685), both #734. `git.rs`
   is the one to copy: it is the largest instance, and the only one whose
   conversion had to give something up — the freeze it removed was also an
   accidental mutual exclusion, so it carries the worked example of restoring
@@ -49,12 +58,18 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
 - **P3 — Leaf locks, request-sized reads.** Take the map lock only to clone a
   handle out, release it, then take the per-item leaf lock; never nest the
   other way. Read the tail you need, not the whole ring. Precedent:
-  `PtyManager::writer_handle` (`pty.rs:214-224`, the stated lock order,
-  #719/#734),
-  `output_tail_bounded` (`pty.rs:453`) and `ATTENTION_SCAN_BYTES` = 4096
-  (`orchestration/mod.rs:2367`, #725). Also `QueueMap::mutate`
-  (`orchestration/queuestate.rs:163`) and `poll_watches`
-  (`orchestration/mod.rs:22679`), which snapshot then release.
+  `pty.rs` `PtyManager::writer_handle` (~L224 — the stated lock order,
+  #719/#734), `PtyManager::output_tail_bounded` (~L453) and
+  `orchestration/mod.rs` `ATTENTION_SCAN_BYTES` = 4096 (~L2367, #725), with
+  `STATUSLINE_SCAN_BYTES` = 64 KiB (~L7007) the same shape on the app's
+  hottest poll (#743 S7). Also `orchestration/queuestate.rs` `QueueMap::mutate` (~L163),
+  `orchestration/mod.rs` `OrchRegistry::poll_watches` (~L22741) and
+  `OrchRegistry::compact_signals_from` (~L25782), which snapshot then release.
+  The last of those is pinned by a test rather than by review —
+  `tests/perf_leaflocks.rs` holds a pane's output-ring mutex so the read parks
+  inside it, then asks whether the registry still answers. That technique is
+  the read-side of `PtyWriteGate` (`tests/ptywrite.rs`, #719) and is the way
+  to enforce INV-5 on any *new* lock that matters.
 - **P4 — Bounded throttle and bounded ladder, with an independent-evidence
   release.** A degraded mode is entered on a signal and left on evidence that
   does not depend on that signal still being right. Precedent:
@@ -71,7 +86,8 @@ Each is shipped, tested, and citable — prefer copying one to inventing a shape
 - **P6 — Backpressure, not queues, for pipes.** A full pipe parks the writer;
   that is the bounded-memory answer. Do not add a backend write queue to
   "smooth" it — an unbounded queue converts a stall into unbounded memory.
-  Precedent: `pty.rs:1549` and `doc/design/pty-input-path.md` §2.
+  Precedent: `pty.rs` `write_pty`'s doc (~L1570, the argument) and
+  `doc/design/pty-input-path.md` §2.
 
 ## 3. The invariants
 
@@ -116,8 +132,20 @@ scan pins the shape.
 - **INV-5 — Locks on latency-sensitive paths are leaves.** Map lock → release →
   leaf lock; reads are request-sized rather than clone-then-slice; CPU work
   (ANSI strip, parse, JSON format) runs outside the guard; no file IO under a
-  lock a poll path takes. See P3. *Enforced: review* (a source scan cannot see
-  lock scope; the census in §5 is the standing list).
+  lock a poll path takes. See P3.
+  **Latency-sensitive means cadenced, or on the webview thread, or both** —
+  a timer, an event stream, a poll, any sync command body. It is not "every
+  read in the codebase": an on-demand path that runs when an agent asks and
+  that nothing waits on is outside this invariant, and a whole-ring read there
+  can be the *right* answer (`orchestration/mod.rs`
+  `OrchRegistry::agent_output_tail`, ~L36577, is the
+  worked case — #520's grid replay reports blank cells if the escape stream
+  starts mid-way, so bounding it would change what the caller sees, not just
+  what it costs). Scope is the thing to establish first; a bound that costs
+  fidelity for a cost nobody pays is not a win.
+  *Enforced: review, and by test where the read can be held still* (a source
+  scan cannot see lock scope — see P3's last paragraph for the technique;
+  the census in §5 is the standing list).
 - **INV-6 — Degraded surfaces recover boundedly.** A coarser mode is never
   staler than its own window, a capped resource is re-acquired on a bounded
   ladder, and any suppression driven by a fallible signal has a release that
@@ -131,12 +159,12 @@ These are deliberate and stay. Each is argued **in code** at the cite; an E1/E2
 
 | id | subject | cite | the argument | invariant |
 |---|---|---|---|---|
-| **X1** | `resize_pty` stays sync | `pty.rs:1566-1594` (doc), `:1596` | A sync command inherits arrival ordering from main-thread dispatch, and resizes need it: `shouldResizePty` suppresses only an *identically sized* in-flight call, so two sizes can be outstanding and off-thread could land them in either order, leaving ConPTY at the older geometry with no event to correct it. The bounded-resize claim is marked ASSUMED in-code with its named falsifier. | INV-1 |
-| **X2** | `fm_delete_start` uses a dedicated OS thread, not `spawn_blocking` | `filemgr.rs:846-886` (doc), `:887` | `SHFileOperationW` is a Shell/COM API whose STA requirement the main thread was satisfying implicitly (wry `OleInitialize`s it). A generic async pool has no defined apartment state, so the thread enters its own STA for the duration. | INV-1 |
-| **X3** | The `thread::spawn`-and-stream family: `ft_search_start`, `ft_files_start`, `fm_hash_start` | `fileedit.rs:1134`, `:1211`, `filehash.rs:221` | Sync commands that start a cancellable streaming walk and return immediately. The work is off the webview thread and the results arrive as bounded batch events (P5 gates the handler side); the shared cancel registry is why they are threads with a flag rather than opaque pool tasks. | INV-1 |
-| **X4** | `mq_state_lock` held across git/gh subprocess runs, on the fleet's single gh-poll thread | `orchestration/mod.rs:8875` (doc), `:36907`, `mqdriver.rs:202` | One registry-wide lock is deliberate — the driver services one group per tick, so per-group locks buy no usable concurrency at the cost of a lock-ordering question. Every call is bounded by `MQ_CMD_TIMEOUT` (60 s), and the coupling is self-documented. **Scope of the exception: it costs fleet latency, not GUI latency** — nothing here runs on the webview thread. Decoupling is #748, not a licence to widen this. | INV-4, INV-5 |
-| **X5** | The compact-nudge cadence reads every agent's full pty tail | `orchestration/mod.rs:25815-25850` (doc), `:25851` | The elevated cadence is registry-wide and its cost is bounded and stated: ≤256 KiB × 6 wakes/min per agent (sub-1 MiB/s for a large fleet), and the elevated cadence itself cannot run beyond ~20 min by the state machine's own timeouts. Two cheap tightenings are named in-code, neither built speculatively. | INV-5 |
-| **X6** | `AUDIT_LOCK` and `creation` are process-global | `orchestration/mod.rs:10001`, `:9063`, `:10175-10181` | Both serialize by design. `AUDIT_LOCK` makes append and rotation one unit and is held only for the open+write, never across orchestration work; the JSON is formatted before the lock is taken. `creation` serializes group id choice against orchestrator registration, which is a correctness requirement, and fires once per group launch. Named so each stays a decision rather than an accident. | INV-5 |
+| **X1** | `resize_pty` stays sync | `pty.rs` `resize_pty` + its doc (~L1624) | A sync command inherits arrival ordering from main-thread dispatch, and resizes need it: `shouldResizePty` suppresses only an *identically sized* in-flight call, so two sizes can be outstanding and off-thread could land them in either order, leaving ConPTY at the older geometry with no event to correct it. The bounded-resize claim is marked ASSUMED in-code with its named falsifier. | INV-1 |
+| **X2** | `fm_delete_start` uses a dedicated OS thread, not `spawn_blocking` | `filemgr.rs` `fm_delete_start` + its doc (~L887) | `SHFileOperationW` is a Shell/COM API whose STA requirement the main thread was satisfying implicitly (wry `OleInitialize`s it). A generic async pool has no defined apartment state, so the thread enters its own STA for the duration. | INV-1 |
+| **X3** | The `thread::spawn`-and-stream family: `ft_search_start`, `ft_files_start`, `fm_hash_start` | `fileedit.rs` `ft_search_start` (~L1134), `ft_files_start` (~L1211); `filehash.rs` `fm_hash_start` (~L221) | Sync commands that start a cancellable streaming walk and return immediately. The work is off the webview thread and the results arrive as bounded batch events (P5 gates the handler side); the shared cancel registry is why they are threads with a flag rather than opaque pool tasks. | INV-1 |
+| **X4** | `mq_state_lock` held across git/gh subprocess runs, on the fleet's single gh-poll thread | `orchestration/mod.rs` `OrchRegistry::mq_state_lock` + its doc (~L8914); the holding sites `queue_merge_with` (~L35967) and `mq_drive_group_with` (~L36346); `orchestration/mqdriver.rs` `MQ_CMD_TIMEOUT` (~L202) | One registry-wide lock is deliberate — the driver services one group per tick, so per-group locks buy no usable concurrency at the cost of a lock-ordering question. Every call is bounded by `MQ_CMD_TIMEOUT` (60 s), and the coupling is self-documented. **Scope of the exception: it costs fleet latency, not GUI latency** — nothing here runs on the webview thread. Decoupling is #748, not a licence to widen this. | INV-4, INV-5 |
+| **X5** | The compact-nudge cadence reads every agent's full pty tail (outside the `agents` lock since #743 S7 — the whole-ring *read* is the exception, not the lock scope) | `orchestration/mod.rs` `OrchRegistry::any_compact_pending` + its doc (~L25955) | The elevated cadence is registry-wide and its cost is bounded and stated: ≤256 KiB × 6 wakes/min per agent (sub-1 MiB/s for a large fleet), and the elevated cadence itself cannot run beyond ~20 min by the state machine's own timeouts. Two cheap tightenings are named in-code, neither built speculatively. | INV-5 |
+| **X6** | `AUDIT_LOCK` and `creation` are process-global | `orchestration/mod.rs` `AUDIT_LOCK` (~L10040), `append_audit` (~L10212), `rotate_audit_if_needed` (~L10070); `OrchRegistry::creation` (~L9102) | Both serialize by design. `AUDIT_LOCK` makes append and rotation one unit and is held only for the open+write, never across orchestration work; the JSON is formatted before the lock is taken. `creation` serializes group id choice against orchestrator registration, which is a correctness requirement, and fires once per group launch. Named so each stays a decision rather than an accident. | INV-5 |
 
 An exception is not a precedent. A new one needs its own argument, in code at
 the site, and a row here.
